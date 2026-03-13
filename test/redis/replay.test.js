@@ -124,6 +124,39 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('atomic buffer capping', () => {
+		it('concurrent publishes do not over-trim with size: 1', async () => {
+			const r = createReplay(client, { size: 1 });
+
+			// Publish two messages concurrently
+			await Promise.all([
+				r.publish(platform, 'chat', 'a', { id: 1 }),
+				r.publish(platform, 'chat', 'b', { id: 2 })
+			]);
+
+			// Buffer should have exactly 1 entry (the latest), not 0
+			const all = await r.since('chat', 0);
+			expect(all).toHaveLength(1);
+			expect(all[0].seq).toBe(2);
+		});
+
+		it('concurrent publishes with size: 2 keep exactly 2', async () => {
+			const r = createReplay(client, { size: 2 });
+
+			await Promise.all([
+				r.publish(platform, 'chat', 'a', { id: 1 }),
+				r.publish(platform, 'chat', 'b', { id: 2 }),
+				r.publish(platform, 'chat', 'c', { id: 3 })
+			]);
+
+			const all = await r.since('chat', 0);
+			expect(all).toHaveLength(2);
+			// Should keep the two most recent
+			expect(all[0].seq).toBe(2);
+			expect(all[1].seq).toBe(3);
+		});
+	});
+
 	describe('replay', () => {
 		it('sends missed messages on __replay:{topic} then end marker', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

@@ -28,6 +28,45 @@
  */
 
 /**
+ * Lua script for atomic publish: increment seq, store message, trim buffer.
+ *
+ * KEYS[1] = seq key
+ * KEYS[2] = buf key (sorted set)
+ * ARGV[1] = topic
+ * ARGV[2] = event
+ * ARGV[3] = data (JSON-encoded)
+ * ARGV[4] = maxSize
+ * ARGV[5] = ttl (seconds, 0 = no expiry)
+ *
+ * Returns the new sequence number.
+ */
+const PUBLISH_SCRIPT = `
+local seqKey = KEYS[1]
+local bufKey = KEYS[2]
+local topic = ARGV[1]
+local event = ARGV[2]
+local data = ARGV[3]
+local maxSize = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local seq = redis.call('incr', seqKey)
+local payload = cjson.encode({seq = seq, topic = topic, event = event, data = cjson.decode(data)})
+redis.call('zadd', bufKey, seq, payload)
+
+local count = redis.call('zcard', bufKey)
+if count > maxSize then
+  redis.call('zremrangebyrank', bufKey, 0, count - maxSize - 1)
+end
+
+if ttl > 0 then
+  redis.call('expire', seqKey, ttl)
+  redis.call('expire', bufKey, ttl)
+end
+
+return seq
+`;
+
+/**
  * Create a Redis-backed replay buffer.
  *
  * @param {import('./index.js').RedisClient} client
@@ -58,35 +97,15 @@ export function createReplay(client, options = {}) {
 		return client.key('replay:buf:' + topic);
 	}
 
-	/**
-	 * Optionally set TTL on a key.
-	 * @param {string} key
-	 */
-	async function touch(key) {
-		if (ttl > 0) {
-			await redis.expire(key, ttl);
-		}
-	}
-
 	return {
 		async publish(platform, topic, event, data) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			// Atomic: increment seq, store message, cap buffer
-			const seq = await redis.incr(sk);
-			const payload = JSON.stringify({ seq, topic, event, data });
-			await redis.zadd(bk, seq, payload);
-
-			// Trim to maxSize (remove lowest scores, keeping the newest)
-			const count = await redis.zcard(bk);
-			if (count > maxSize) {
-				await redis.zremrangebyrank(bk, 0, count - maxSize - 1);
-			}
-
-			// Touch TTL
-			await touch(sk);
-			await touch(bk);
+			await redis.eval(
+				PUBLISH_SCRIPT, 2, sk, bk,
+				topic, event, JSON.stringify(data ?? null), maxSize, ttl
+			);
 
 			return platform.publish(topic, event, data);
 		},

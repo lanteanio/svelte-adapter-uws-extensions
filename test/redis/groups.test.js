@@ -523,6 +523,40 @@ describe('redis groups', () => {
 		});
 	});
 
+	describe('stale member cleanup', () => {
+		it('heartbeat removes stale entries from crashed instances', async () => {
+			// Use a short memberTtl so the heartbeat interval is 5s (the minimum)
+			const g = createGroup(client, 'cleanup-test', { memberTtl: 10 });
+			const membersKey = client.key('group:cleanup-test:members');
+
+			// Insert a stale member entry directly into Redis
+			const staleData = JSON.stringify({
+				role: 'member',
+				instanceId: 'dead-instance',
+				ts: Date.now() - 20_000 // 20 seconds ago, well past 10s TTL
+			});
+			await client.redis.hset(membersKey, 'dead-instance:1', staleData);
+
+			// Add a live member so the heartbeat runs
+			const ws = mockWs();
+			await g.join(ws, platform);
+
+			// Verify stale entry exists before heartbeat
+			let all = await client.redis.hgetall(membersKey);
+			expect(Object.keys(all)).toContain('dead-instance:1');
+
+			// Wait for the heartbeat to fire (interval is max(memberTtlMs/3, 5000) = 5s)
+			// We use real timers, so wait just past the interval.
+			await new Promise((r) => setTimeout(r, 5100));
+
+			// Stale entry should be cleaned up
+			all = await client.redis.hgetall(membersKey);
+			expect(Object.keys(all)).not.toContain('dead-instance:1');
+
+			g.destroy();
+		}, 10000);
+	});
+
 	describe('member expiry', () => {
 		it('stale members are excluded from count', async () => {
 			// Manually insert a stale member entry into Redis

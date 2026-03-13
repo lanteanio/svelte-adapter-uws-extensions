@@ -136,6 +136,10 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('bannedUntil')) {
 					return evalRateLimit(args);
 				}
+				// Replay publish script (atomic incr + zadd + trim)
+				if (script.includes('zremrangebyrank') && script.includes('cjson.encode')) {
+					return evalReplayPublish(numKeys, args);
+				}
 				// Presence join script (hset + check if first live instance for user)
 				if (script.includes('hset') && script.includes('suffix') && !script.includes('hdel')) {
 					return evalPresenceJoin(args);
@@ -334,6 +338,37 @@ export function mockRedisClient(keyPrefix = '') {
 			}
 			h.set(memberId, memberData);
 			return 1;
+		}
+
+		// Replay publish Lua script simulation
+		// args layout: [seqKey, bufKey, topic, event, dataJson, maxSize, ttl]
+		function evalReplayPublish(numKeys, args) {
+			const seqKey = args[0];
+			const bufKey = args[1];
+			const topic = args[2];
+			const event = args[3];
+			const dataJson = args[4];
+			const maxSize = Number(args[5]);
+
+			// Increment seq
+			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
+			store.set(seqKey, String(v));
+			const seq = v;
+
+			// zadd
+			const data = JSON.parse(dataJson);
+			const payload = JSON.stringify({ seq, topic, event, data });
+			if (!sortedSets.has(bufKey)) sortedSets.set(bufKey, []);
+			const set = sortedSets.get(bufKey);
+			set.push({ score: seq, member: payload });
+			set.sort((a, b) => a.score - b.score);
+
+			// Trim
+			if (set.length > maxSize) {
+				set.splice(0, set.length - maxSize);
+			}
+
+			return seq;
 		}
 
 		return r;

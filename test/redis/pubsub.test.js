@@ -157,6 +157,139 @@ describe('redis pubsub bus', () => {
 		});
 	});
 
+	describe('wrap - options forwarding', () => {
+		it('publish() forwards the options argument to the original platform', () => {
+			const wrapped = bus.wrap(platform);
+			wrapped.publish('chat', 'msg', { text: 'hi' }, { relay: false });
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].options).toEqual({ relay: false });
+		});
+
+		it('publish() skips Redis when relay: false', async () => {
+			const wrapped = bus.wrap(platform);
+
+			const publishCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				publishCalls.push(ch);
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			wrapped.publish('chat', 'msg', { text: 'hi' }, { relay: false });
+			expect(publishCalls).toHaveLength(0);
+
+			// Without relay: false, should publish to Redis
+			wrapped.publish('chat', 'msg', { text: 'hi' });
+			expect(publishCalls).toHaveLength(1);
+		});
+
+		it('publish() sends to Redis when options are absent or relay is not false', async () => {
+			const wrapped = bus.wrap(platform);
+
+			const publishCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				publishCalls.push(ch);
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			wrapped.publish('chat', 'msg', { text: 'a' });
+			wrapped.publish('chat', 'msg', { text: 'b' }, {});
+			wrapped.publish('chat', 'msg', { text: 'c' }, { relay: true });
+			expect(publishCalls).toHaveLength(3);
+		});
+	});
+
+	describe('wrap - topic() passthrough', () => {
+		it('topic().created() publishes through the wrapped platform (goes to Redis)', async () => {
+			const wrapped = bus.wrap(platform);
+
+			const publishCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				publishCalls.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			wrapped.topic('chat').created({ id: 1 });
+
+			// Should have gone through wrapped.publish, reaching both local and Redis
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].topic).toBe('chat');
+			expect(platform.published[0].event).toBe('created');
+			expect(platform.published[0].data).toEqual({ id: 1 });
+
+			expect(publishCalls).toHaveLength(1);
+			expect(publishCalls[0].topic).toBe('chat');
+			expect(publishCalls[0].event).toBe('created');
+		});
+
+		it('topic().publish() routes through wrapped publish', async () => {
+			const wrapped = bus.wrap(platform);
+
+			const redisCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				redisCalls.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			wrapped.topic('room').publish('custom-event', { val: 42 });
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].event).toBe('custom-event');
+			expect(redisCalls).toHaveLength(1);
+		});
+
+		it('topic() helpers (updated, deleted, set, increment, decrement) all route through Redis', () => {
+			const wrapped = bus.wrap(platform);
+
+			const redisCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				redisCalls.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			const t = wrapped.topic('items');
+			t.updated({ id: 1 });
+			t.deleted({ id: 2 });
+			t.set('value');
+			t.increment(1);
+			t.decrement(1);
+
+			expect(redisCalls).toHaveLength(5);
+			expect(redisCalls.map((c) => c.event)).toEqual([
+				'updated', 'deleted', 'set', 'increment', 'decrement'
+			]);
+		});
+	});
+
+	describe('activate - platform update', () => {
+		it('second activate() with a different platform updates the forwarding target', async () => {
+			const platform1 = mockPlatform();
+			const platform2 = mockPlatform();
+
+			await bus.activate(platform1);
+			// Second activate with a different platform
+			await bus.activate(platform2);
+
+			const msg = JSON.stringify({
+				instanceId: 'other-instance',
+				topic: 'chat',
+				event: 'msg',
+				data: { text: 'hello' }
+			});
+			await client.redis.publish('uws:pubsub', msg);
+
+			// Should forward through platform2, not platform1
+			expect(platform2.published).toHaveLength(1);
+			expect(platform2.published[0].topic).toBe('chat');
+			expect(platform1.published).toHaveLength(0);
+		});
+	});
+
 	describe('custom channel', () => {
 		it('uses the configured channel name', async () => {
 			const customBus = createPubSubBus(client, { channel: 'custom:chan' });

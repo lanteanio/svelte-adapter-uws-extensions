@@ -139,13 +139,29 @@ export function createGroup(client, name, options = {}) {
 		redis.hmset(metaKey, options.meta).catch(() => {});
 	}
 
-	// Heartbeat: refresh timestamps on local member entries
+	// Heartbeat: refresh timestamps on local member entries and
+	// remove stale entries from crashed instances.
 	const heartbeatTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [, entry] of localMembers) {
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: now });
 			redis.hset(membersKey, entry.memberId, memberData).catch(() => {});
 		}
+		// Clean up stale entries from dead instances so the hash
+		// does not grow forever after crashes.
+		redis.hgetall(membersKey).then((all) => {
+			if (!all) return;
+			for (const [field, v] of Object.entries(all)) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) > memberTtlMs) {
+						redis.hdel(membersKey, field).catch(() => {});
+					}
+				} catch {
+					redis.hdel(membersKey, field).catch(() => {});
+				}
+			}
+		}).catch(() => {});
 	}, Math.max(memberTtlMs / 3, 5000));
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 

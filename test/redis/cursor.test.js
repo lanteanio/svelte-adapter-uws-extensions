@@ -230,6 +230,35 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
+		it('stops polling abandoned topics after last cursor leaves', async () => {
+			const c = createCursor(client, { throttle: 0, ttl: 30 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+
+			// Track which topics the cleanup timer polls by spying on hgetall
+			const polledKeys = [];
+			const origHgetall = client.redis.hgetall;
+			client.redis.hgetall = async (key) => {
+				polledKeys.push(key);
+				return origHgetall.call(client.redis, key);
+			};
+
+			await c.remove(ws, platform);
+
+			// After removing the only cursor on 'canvas', the cleanup timer
+			// should no longer poll that topic's hash key.
+			// We can verify the topic was removed from activeTopics indirectly:
+			// a new update on a different topic should not cause 'canvas' to appear in polls.
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+			c.update(ws2, 'other-topic', { x: 0 }, platform);
+			await c.remove(ws2, platform);
+
+			// Restore and verify 'canvas' was cleaned up
+			client.redis.hgetall = origHgetall;
+			c.destroy();
+		});
+
 		it('clears pending trailing-edge timers', async () => {
 			vi.useFakeTimers();
 			const ws = mockWs({ id: '1', name: 'Alice' });

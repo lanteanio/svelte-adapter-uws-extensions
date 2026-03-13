@@ -204,6 +204,30 @@ describe('postgres notify bridge', () => {
 		});
 	});
 
+	describe('activate - platform update', () => {
+		it('second activate() with a different platform updates the forwarding target', async () => {
+			const platform1 = mockPlatform();
+			const platform2 = mockPlatform();
+
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform1);
+
+			// Second activate -- idempotent for the listener, but updates platform
+			await bridge.activate(platform2);
+
+			client._simulate('changes', JSON.stringify({
+				topic: 'messages',
+				event: 'created',
+				data: { id: 1 }
+			}));
+
+			// Should forward through platform2, not platform1
+			expect(platform2.published).toHaveLength(1);
+			expect(platform2.published[0].topic).toBe('messages');
+			expect(platform1.published).toHaveLength(0);
+		});
+	});
+
 	describe('deactivate', () => {
 		it('runs UNLISTEN', async () => {
 			bridge = createNotifyBridge(client, { channel: 'changes' });

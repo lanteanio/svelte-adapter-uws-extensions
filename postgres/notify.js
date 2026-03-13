@@ -174,8 +174,11 @@ export function createNotifyBridge(client, options) {
 
 	return {
 		async activate(platform) {
-			if (active) return;
+			// Always update the platform reference so notifications
+			// are forwarded through the latest platform, even if a
+			// previous activate() already started the listener.
 			activePlatform = platform;
+			if (active) return;
 			active = true;
 			try {
 				await connect();

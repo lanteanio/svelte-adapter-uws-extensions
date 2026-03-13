@@ -63,19 +63,26 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {boolean} */
 	let active = false;
 
+	/** @type {import('svelte-adapter-uws').Platform | null} */
+	let activePlatform = null;
+
 	return {
 		wrap(platform) {
-			return {
-				publish(topic, event, data) {
-					// Publish locally
-					const result = platform.publish(topic, event, data);
+			const wrapped = {
+				publish(topic, event, data, options) {
+					// Publish locally, forwarding options as-is
+					const result = platform.publish(topic, event, data, options);
 
-					// Publish to Redis for other instances
-					const msg = JSON.stringify({ instanceId, topic, event, data });
-					client.redis.publish(channel, msg).catch(() => {
-						// Fire-and-forget: ioredis auto-reconnects.
-						// Swallowing here prevents unhandled rejections on transient disconnects.
-					});
+					// Only relay to Redis if the caller did not suppress relay.
+					// When relay is explicitly false the message is local-only
+					// (e.g. it already came from Redis on another instance).
+					if (!options || options.relay !== false) {
+						const msg = JSON.stringify({ instanceId, topic, event, data });
+						client.redis.publish(channel, msg).catch(() => {
+							// Fire-and-forget: ioredis auto-reconnects.
+							// Swallowing here prevents unhandled rejections on transient disconnects.
+						});
+					}
 
 					return result;
 				},
@@ -83,11 +90,26 @@ export function createPubSubBus(client, options = {}) {
 				sendTo: platform.sendTo.bind(platform),
 				get connections() { return platform.connections; },
 				subscribers: platform.subscribers.bind(platform),
-				topic: platform.topic.bind(platform)
+				topic(t) {
+					return {
+						publish(event, data) { wrapped.publish(t, event, data); },
+						created(data) { wrapped.publish(t, 'created', data); },
+						updated(data) { wrapped.publish(t, 'updated', data); },
+						deleted(data) { wrapped.publish(t, 'deleted', data); },
+						set(value) { wrapped.publish(t, 'set', value); },
+						increment(amount) { wrapped.publish(t, 'increment', amount); },
+						decrement(amount) { wrapped.publish(t, 'decrement', amount); }
+					};
+				}
 			};
+			return wrapped;
 		},
 
 		async activate(platform) {
+			// Always update the platform reference so remote messages
+			// are forwarded through the latest platform, even if a
+			// previous activate() already started the subscriber.
+			activePlatform = platform;
 			if (active) return;
 
 			subscriber = client.duplicate();
@@ -101,7 +123,7 @@ export function createPubSubBus(client, options = {}) {
 					// Forward to local platform only -- relay: false prevents the
 					// adapter from IPC-relaying to sibling workers, since each
 					// worker has its own Redis subscriber already receiving this.
-					platform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 				} catch {
 					// Malformed message, skip
 				}
@@ -112,6 +134,7 @@ export function createPubSubBus(client, options = {}) {
 				active = true;
 			} catch (err) {
 				// Clean up so the next activate() call can retry
+				activePlatform = null;
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;
 				throw err;
@@ -121,6 +144,7 @@ export function createPubSubBus(client, options = {}) {
 		async deactivate() {
 			if (!active || !subscriber) return;
 			active = false;
+			activePlatform = null;
 			await subscriber.unsubscribe(channel).catch(() => {});
 			await subscriber.quit().catch(() => subscriber.disconnect());
 			subscriber = null;

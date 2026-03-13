@@ -367,6 +367,59 @@ describe('redis presence', () => {
 			expect(await presence.count('room')).toBe(0);
 			expect(await presence.list('room')).toEqual([]);
 		});
+
+		it('unsubscribes ws from presence topics', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			expect(ws.isSubscribed('__presence:room')).toBe(true);
+
+			await presence.clear();
+
+			expect(ws.isSubscribed('__presence:room')).toBe(false);
+		});
+
+		it('unsubscribes sync-only observers from presence topics', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.sync(ws, 'room', platform);
+			expect(ws.isSubscribed('__presence:room')).toBe(true);
+
+			await presence.clear();
+
+			expect(ws.isSubscribed('__presence:room')).toBe(false);
+		});
+
+		it('stops forwarding remote events after clear', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			platform.reset();
+
+			await presence.clear();
+			platform.reset();
+
+			// Simulate a remote join -- should NOT be forwarded
+			const remoteMsg = JSON.stringify({
+				instanceId: 'remote-instance',
+				topic: 'room',
+				event: 'join',
+				payload: { key: 'bob', data: { id: 'bob', name: 'Bob' } }
+			});
+			await client.redis.publish(client.key('presence:events:room'), remoteMsg);
+
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('allows re-joining after clear', async () => {
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws1, 'room', platform);
+
+			await presence.clear();
+
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+			await presence.join(ws2, 'room', platform);
+
+			expect(await presence.count('room')).toBe(1);
+			expect(ws2.isSubscribed('__presence:room')).toBe(true);
+		});
 	});
 
 	describe('no key field in data', () => {

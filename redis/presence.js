@@ -478,7 +478,27 @@ export function createPresence(client, options = {}) {
 		},
 
 		async clear() {
-			// Clear all presence keys
+			// Unsubscribe all local ws from their presence topics
+			for (const [ws, connTopics] of wsTopics) {
+				for (const topic of connTopics.keys()) {
+					ws.unsubscribe('__presence:' + topic);
+				}
+			}
+			for (const [ws, topics] of syncObservers) {
+				for (const topic of topics) {
+					ws.unsubscribe('__presence:' + topic);
+				}
+			}
+
+			// Unsubscribe the Redis subscriber from all event channels
+			if (subscriber) {
+				for (const ch of subscribedChannels) {
+					await subscriber.unsubscribe(ch).catch(() => {});
+				}
+				subscribedChannels.clear();
+			}
+
+			// Clear all presence keys in Redis
 			const pattern = client.key('presence:*');
 			let cursor = '0';
 			do {

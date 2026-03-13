@@ -271,6 +271,7 @@ export function createCursor(client, options = {}) {
 					topicMap.delete(state.key);
 					if (topicMap.size === 0) {
 						topics.delete(topic);
+						activeTopics.delete(topic);
 					}
 					broadcastRemove(topic, state.key, platform);
 				}
