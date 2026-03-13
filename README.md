@@ -298,7 +298,7 @@ export async function close(ws, { platform }) {
 | `key` | `'id'` | Field for user dedup (multi-tab) |
 | `select` | identity | Extract public fields from userData |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
-| `ttl` | `90` | Hash entry expiry in seconds |
+| `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 
 #### API
 
@@ -360,7 +360,7 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 | Method | Description |
 |---|---|
-| `consume(ws, cost?)` | Attempt to consume tokens |
+| `consume(ws, cost?)` | Attempt to consume tokens. `cost` must be a positive integer. |
 | `reset(key)` | Clear the bucket for a key |
 | `ban(key, duration?)` | Manually ban a key |
 | `unban(key)` | Remove a ban |
@@ -406,8 +406,9 @@ export async function close(ws, { platform }) {
 
 | Option | Default | Description |
 |---|---|---|
-| `maxMembers` | `Infinity` | Maximum members allowed |
+| `maxMembers` | `Infinity` | Maximum members allowed (enforced atomically) |
 | `meta` | `{}` | Initial group metadata |
+| `memberTtl` | `120` | Member entry TTL in seconds. Entries from crashed instances expire after this period. |
 | `onJoin` | - | Called after a member joins |
 | `onLeave` | - | Called after a member leaves |
 | `onFull` | - | Called when a join is rejected (full) |
@@ -474,7 +475,7 @@ export function close(ws, { platform }) {
 |---|---|---|
 | `throttle` | `50` | Minimum ms between broadcasts per user per topic |
 | `select` | identity | Extract user data to broadcast alongside position |
-| `ttl` | `30` | Redis hash entry TTL in seconds (auto-refreshed on each broadcast) |
+| `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
 
 #### API
 
@@ -492,7 +493,7 @@ export function close(ws, { platform }) {
 
 ## Replay buffer (Postgres)
 
-Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs.
+Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table, so they are safe across multiple server instances.
 
 #### Setup
 
@@ -523,6 +524,11 @@ CREATE TABLE IF NOT EXISTS ws_replay (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_ws_replay_topic_seq ON ws_replay (topic, seq);
+
+CREATE TABLE IF NOT EXISTS ws_replay_seq (
+  topic TEXT PRIMARY KEY,
+  seq BIGINT NOT NULL DEFAULT 0
+);
 ```
 
 #### Options

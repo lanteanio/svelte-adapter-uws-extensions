@@ -107,7 +107,9 @@ export function createNotifyBridge(client, options) {
 		try {
 			const result = parse(msg.payload, msg.channel);
 			if (result && activePlatform) {
-				activePlatform.publish(result.topic, result.event, result.data);
+				// relay: false -- in clustered mode each worker has its own
+				// LISTEN connection, so relaying would duplicate delivery.
+				activePlatform.publish(result.topic, result.event, result.data, { relay: false });
 			}
 		} catch {
 			// Parse errors are non-fatal -- skip the notification
@@ -173,9 +175,19 @@ export function createNotifyBridge(client, options) {
 	return {
 		async activate(platform) {
 			if (active) return;
-			active = true;
 			activePlatform = platform;
-			await connect();
+			active = true;
+			try {
+				await connect();
+			} catch (err) {
+				if (!autoReconnect) {
+					// Without autoReconnect, reset so activate() can be retried
+					active = false;
+					activePlatform = null;
+				}
+				// With autoReconnect, connect() already scheduled a retry
+				throw err;
+			}
 		},
 
 		async deactivate() {

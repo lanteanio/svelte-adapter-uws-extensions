@@ -1,12 +1,16 @@
 /**
  * In-memory mock that implements the PgClient interface.
- * Parses SQL enough to simulate the ws_replay table operations.
+ * Parses SQL enough to simulate the ws_replay table operations
+ * and the ws_replay_seq table for atomic sequence generation.
  */
 export function mockPgClient() {
 	/** @type {Array<{id: number, topic: string, seq: number, event: string, data: any, created_at: Date}>} */
 	let rows = [];
 	let nextId = 1;
 	let tableCreated = false;
+
+	/** @type {Map<string, number>} topic -> seq */
+	const seqCounters = new Map();
 
 	return {
 		pool: {},
@@ -23,6 +27,15 @@ export function mockPgClient() {
 			// CREATE INDEX
 			if (sql.startsWith('CREATE INDEX')) {
 				return { rows: [], rowCount: 0 };
+			}
+
+			// INSERT INTO *_seq (atomic sequence generation)
+			if (sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
+				const topic = values[0];
+				const current = seqCounters.get(topic) || 0;
+				const next = current + 1;
+				seqCounters.set(topic, next);
+				return { rows: [{ seq: String(next) }], rowCount: 1 };
 			}
 
 			// INSERT
@@ -83,12 +96,25 @@ export function mockPgClient() {
 				return { rows: [], rowCount: before - rows.length };
 			}
 
+			// DELETE FROM *_seq WHERE topic = $1
+			if (sql.includes('DELETE FROM') && sql.includes('_seq') && sql.includes('WHERE topic')) {
+				const topic = values[0];
+				seqCounters.delete(topic);
+				return { rows: [], rowCount: 1 };
+			}
+
 			// DELETE FROM table WHERE topic = $1
 			if (sql.includes('DELETE FROM') && sql.includes('WHERE topic')) {
 				const topic = values[0];
 				const before = rows.length;
 				rows = rows.filter((r) => r.topic !== topic);
 				return { rows: [], rowCount: before - rows.length };
+			}
+
+			// DELETE FROM *_seq (clear all sequences)
+			if (sql.includes('DELETE FROM') && sql.includes('_seq')) {
+				seqCounters.clear();
+				return { rows: [], rowCount: 0 };
 			}
 
 			// DELETE FROM table (clear all)
@@ -105,6 +131,7 @@ export function mockPgClient() {
 
 		// Test helpers
 		_getRows() { return rows; },
-		_reset() { rows = []; nextId = 1; tableCreated = false; }
+		_getSeqCounters() { return seqCounters; },
+		_reset() { rows = []; nextId = 1; tableCreated = false; seqCounters.clear(); }
 	};
 }

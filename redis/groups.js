@@ -10,7 +10,7 @@
  *
  * Storage layout:
  *   - Key `{prefix}group:{name}:meta`     - hash (group metadata)
- *   - Key `{prefix}group:{name}:members`  - hash (field=memberId, value=JSON {role, instanceId})
+ *   - Key `{prefix}group:{name}:members`  - hash (field=memberId, value=JSON {role, instanceId, ts})
  *   - Key `{prefix}group:{name}:closed`   - string flag ("1" if closed)
  *   - Channel `{prefix}group:{name}:events` - pub/sub for cross-instance events
  *
@@ -22,6 +22,45 @@ import { randomBytes } from 'node:crypto';
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
 /**
+ * Lua script for atomic join: check capacity (excluding stale entries),
+ * clean up stale entries, and insert the new member in one roundtrip.
+ *
+ * KEYS[1] = members hash key
+ * ARGV[1] = maxMembers
+ * ARGV[2] = memberId
+ * ARGV[3] = member data JSON
+ * ARGV[4] = now (ms)
+ * ARGV[5] = memberTtl (ms)
+ *
+ * Returns 1 on success, 0 if full.
+ */
+const JOIN_SCRIPT = `
+local key = KEYS[1]
+local maxMembers = tonumber(ARGV[1])
+local memberId = ARGV[2]
+local memberData = ARGV[3]
+local now = tonumber(ARGV[4])
+local memberTtl = tonumber(ARGV[5])
+
+local all = redis.call('hgetall', key)
+local liveCount = 0
+for i = 1, #all, 2 do
+  local ok, val = pcall(cjson.decode, all[i+1])
+  if ok and val.ts and (now - val.ts) <= memberTtl then
+    liveCount = liveCount + 1
+  else
+    redis.call('hdel', key, all[i])
+  end
+end
+
+if liveCount >= maxMembers then
+  return 0
+end
+redis.call('hset', key, memberId, memberData)
+return 1
+`;
+
+/**
  * @typedef {'member' | 'admin' | 'viewer'} GroupRole
  */
 
@@ -29,6 +68,7 @@ const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
  * @typedef {Object} RedisGroupOptions
  * @property {number} [maxMembers=Infinity] - Maximum members allowed
  * @property {Record<string, any>} [meta] - Initial group metadata
+ * @property {number} [memberTtl=120] - Member entry TTL in seconds. Entries from crashed instances expire after this.
  * @property {(ws: any, role: GroupRole) => void} [onJoin]
  * @property {(ws: any, role: GroupRole) => void} [onLeave]
  * @property {(ws: any, role: GroupRole) => void} [onFull]
@@ -65,6 +105,8 @@ export function createGroup(client, name, options = {}) {
 	}
 
 	const maxMembers = options.maxMembers ?? Infinity;
+	const memberTtl = options.memberTtl ?? 120;
+	const memberTtlMs = memberTtl * 1000;
 	const onJoin = options.onJoin ?? null;
 	const onLeave = options.onLeave ?? null;
 	const onFull = options.onFull ?? null;
@@ -97,6 +139,16 @@ export function createGroup(client, name, options = {}) {
 		redis.hmset(metaKey, options.meta).catch(() => {});
 	}
 
+	// Heartbeat: refresh timestamps on local member entries
+	const heartbeatTimer = setInterval(() => {
+		const now = Date.now();
+		for (const [, entry] of localMembers) {
+			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: now });
+			redis.hset(membersKey, entry.memberId, memberData).catch(() => {});
+		}
+	}, Math.max(memberTtlMs / 3, 5000));
+	if (heartbeatTimer.unref) heartbeatTimer.unref();
+
 	// Subscriber for cross-instance events
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -104,8 +156,8 @@ export function createGroup(client, name, options = {}) {
 	let subscribedPlatform = null;
 
 	async function ensureSubscriber(platform) {
-		if (subscriber) return;
 		subscribedPlatform = platform;
+		if (subscriber) return;
 		subscriber = client.duplicate();
 		subscriber.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;
@@ -113,7 +165,27 @@ export function createGroup(client, name, options = {}) {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
 				if (subscribedPlatform) {
-					subscribedPlatform.publish(internalTopic, parsed.event, parsed.data);
+					// Handle role-filtered events: deliver only to matching local members
+					if (parsed.event === '__role_filtered') {
+						const { event, data, role } = parsed.data;
+						for (const [ws, entry] of localMembers) {
+							if (entry.role === role) {
+								subscribedPlatform.send(ws, internalTopic, event, data);
+							}
+						}
+					} else if (parsed.event === 'close') {
+						// Remote close: clean up local members just like a local close().
+						// relay: false -- each worker has its own subscriber.
+						subscribedPlatform.publish(internalTopic, 'close', parsed.data, { relay: false });
+						for (const [ws] of localMembers) {
+							ws.unsubscribe(internalTopic);
+						}
+						localMembers.clear();
+						if (onClose) onClose();
+					} else {
+						// relay: false -- each worker has its own subscriber.
+						subscribedPlatform.publish(internalTopic, parsed.event, parsed.data, { relay: false });
+					}
 				}
 			} catch {
 				// Malformed, skip
@@ -155,18 +227,26 @@ export function createGroup(client, name, options = {}) {
 				throw new Error(`redis group "${name}": invalid role "${role}"`);
 			}
 
-			// Check capacity
-			const currentCount = await redis.hlen(membersKey);
-			if (currentCount >= maxMembers) {
-				if (onFull) onFull(ws, role);
-				return false;
+			const memberId = instanceId + ':' + (++memberCounter);
+			const now = Date.now();
+			const memberData = JSON.stringify({ role, instanceId, ts: now });
+
+			// Atomic capacity check + insert (skips stale entries from crashed instances)
+			if (Number.isFinite(maxMembers)) {
+				const result = await redis.eval(
+					JOIN_SCRIPT, 1, membersKey,
+					maxMembers, memberId, memberData, now, memberTtlMs
+				);
+				if (result === 0) {
+					if (onFull) onFull(ws, role);
+					return false;
+				}
+			} else {
+				// No capacity limit, just insert
+				await redis.hset(membersKey, memberId, memberData);
 			}
 
-			const memberId = instanceId + ':' + (++memberCounter);
 			localMembers.set(ws, { role, memberId });
-
-			// Store in Redis
-			await redis.hset(membersKey, memberId, JSON.stringify({ role, instanceId }));
 
 			// Ensure cross-instance subscriber is running
 			await ensureSubscriber(platform);
@@ -183,6 +263,8 @@ export function createGroup(client, name, options = {}) {
 			for (const v of Object.values(allRaw)) {
 				try {
 					const parsed = JSON.parse(v);
+					// Filter out stale entries
+					if (parsed.ts && (now - parsed.ts) > memberTtlMs) continue;
 					membersList.push({ role: parsed.role });
 				} catch { /* skip corrupted */ }
 			}
@@ -225,8 +307,8 @@ export function createGroup(client, name, options = {}) {
 					platform.send(ws, internalTopic, event, data);
 				}
 			}
-			// For remote instances, publish the event with role filter info
-			// Remote instances will handle their own local role filtering
+			// For remote instances, publish with role filter info
+			// Remote subscriber handler will filter by role locally
 			await publishEvent('__role_filtered', { event, data, role });
 		},
 
@@ -246,7 +328,18 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async count() {
-			return redis.hlen(membersKey);
+			const all = await redis.hgetall(membersKey);
+			if (!all) return 0;
+			const now = Date.now();
+			let liveCount = 0;
+			for (const v of Object.values(all)) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) > memberTtlMs) continue;
+					liveCount++;
+				} catch { /* skip corrupted */ }
+			}
+			return liveCount;
 		},
 
 		has(ws) {
@@ -274,6 +367,7 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		destroy() {
+			clearInterval(heartbeatTimer);
 			if (subscriber) {
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;

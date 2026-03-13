@@ -92,6 +92,28 @@ describe('redis ratelimit', () => {
 		});
 	});
 
+	describe('consume - cost validation', () => {
+		it('throws on negative cost', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await expect(limiter.consume(ws, -2)).rejects.toThrow('positive integer');
+		});
+
+		it('throws on zero cost', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await expect(limiter.consume(ws, 0)).rejects.toThrow('positive integer');
+		});
+
+		it('throws on fractional cost', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await expect(limiter.consume(ws, 1.5)).rejects.toThrow('positive integer');
+		});
+
+		it('throws on non-number cost', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await expect(limiter.consume(ws, 'abc')).rejects.toThrow('positive integer');
+		});
+	});
+
 	describe('consume - refill', () => {
 		it('refills after interval passes', async () => {
 			const ws = mockWs({ ip: '1.2.3.4' });

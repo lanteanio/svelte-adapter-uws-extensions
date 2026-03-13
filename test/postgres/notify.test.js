@@ -6,7 +6,7 @@ import { createNotifyBridge } from '../../postgres/notify.js';
  * Mock PgClient with createClient() that returns a standalone Client mock
  * with LISTEN/NOTIFY simulation.
  */
-function mockPgClient() {
+function mockPgClient({ failConnect = false } = {}) {
 	let connListeners = new Map();
 	let queries = [];
 
@@ -22,7 +22,7 @@ function mockPgClient() {
 			if (idx !== -1) list.splice(idx, 1);
 		},
 		async connect() {
-			// Simulates pg.Client.connect()
+			if (failConnect) throw new Error('connection refused');
 		},
 		async query(text) {
 			queries.push(text);
@@ -103,8 +103,25 @@ describe('postgres notify bridge', () => {
 		});
 	});
 
+	describe('activate - failure handling', () => {
+		it('with autoReconnect:false, can retry activate after failure', async () => {
+			const failClient = mockPgClient({ failConnect: true });
+			bridge = createNotifyBridge(failClient, {
+				channel: 'changes',
+				autoReconnect: false
+			});
+
+			// First activate should throw
+			await expect(bridge.activate(platform)).rejects.toThrow('connection refused');
+
+			// Should be able to call activate again (not stuck)
+			await expect(bridge.activate(platform)).rejects.toThrow('connection refused');
+			// The point is it doesn't silently return -- it actually retries
+		});
+	});
+
 	describe('notification forwarding', () => {
-		it('forwards parsed notifications to platform.publish()', async () => {
+		it('forwards parsed notifications to platform.publish() with relay: false', async () => {
 			bridge = createNotifyBridge(client, { channel: 'changes' });
 			await bridge.activate(platform);
 
@@ -118,7 +135,8 @@ describe('postgres notify bridge', () => {
 			expect(platform.published[0]).toEqual({
 				topic: 'messages',
 				event: 'created',
-				data: { id: 1, text: 'hello' }
+				data: { id: 1, text: 'hello' },
+				options: { relay: false }
 			});
 		});
 
@@ -169,7 +187,8 @@ describe('postgres notify bridge', () => {
 			expect(platform.published[0]).toEqual({
 				topic: 'users',
 				event: 'insert',
-				data: { id: 42 }
+				data: { id: 42 },
+				options: { relay: false }
 			});
 		});
 

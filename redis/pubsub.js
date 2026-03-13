@@ -89,7 +89,6 @@ export function createPubSubBus(client, options = {}) {
 
 		async activate(platform) {
 			if (active) return;
-			active = true;
 
 			subscriber = client.duplicate();
 
@@ -99,14 +98,24 @@ export function createPubSubBus(client, options = {}) {
 					const parsed = JSON.parse(message);
 					// Skip messages from this instance (echo suppression)
 					if (parsed.instanceId === instanceId) return;
-					// Forward to local platform - this reaches local WebSocket clients
-					platform.publish(parsed.topic, parsed.event, parsed.data);
+					// Forward to local platform only -- relay: false prevents the
+					// adapter from IPC-relaying to sibling workers, since each
+					// worker has its own Redis subscriber already receiving this.
+					platform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 				} catch {
 					// Malformed message, skip
 				}
 			});
 
-			await subscriber.subscribe(channel);
+			try {
+				await subscriber.subscribe(channel);
+				active = true;
+			} catch (err) {
+				// Clean up so the next activate() call can retry
+				subscriber.quit().catch(() => subscriber.disconnect());
+				subscriber = null;
+				throw err;
+			}
 		},
 
 		async deactivate() {

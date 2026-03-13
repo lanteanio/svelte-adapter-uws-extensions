@@ -48,7 +48,7 @@ describe('redis cursor', () => {
 	});
 
 	describe('update - basic', () => {
-		it('first update broadcasts immediately', () => {
+		it('first update broadcasts immediately without relay: false', () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			cursors.update(ws, 'canvas', { x: 10, y: 20 }, platform);
 
@@ -60,6 +60,8 @@ describe('redis cursor', () => {
 				user: { id: '1', name: 'Alice' },
 				data: { x: 10, y: 20 }
 			});
+			// User-initiated broadcasts should relay to sibling workers
+			expect(platform.published[0].options).toBeUndefined();
 		});
 
 		it('uses select to extract user info', () => {
@@ -381,7 +383,7 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('forwards remote updates to local platform', () => {
+		it('forwards remote updates to local platform with relay: false', () => {
 			const c = createCursor(client, { throttle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
@@ -404,6 +406,7 @@ describe('redis cursor', () => {
 			expect(platform.published[0].topic).toBe('__cursor:canvas');
 			expect(platform.published[0].data.key).toBe('remote:1');
 			expect(platform.published[0].data.data).toEqual({ x: 77 });
+			expect(platform.published[0].options).toEqual({ relay: false });
 			c.destroy();
 		});
 
@@ -422,6 +425,88 @@ describe('redis cursor', () => {
 			// We test this indirectly: after the initial update there should be
 			// exactly 1 publish (local), not 2 (local + echo)
 			expect(platform.published).toHaveLength(0); // we reset after the initial
+			c.destroy();
+		});
+	});
+
+	describe('subscribe failure recovery', () => {
+		it('retries subscriber setup after subscribe() failure', async () => {
+			// Create a client whose duplicate's subscribe() fails once
+			const failClient = mockRedisClient('test:');
+			let failCount = 0;
+			const origDuplicate = failClient.duplicate.bind(failClient);
+			failClient.duplicate = () => {
+				const dup = origDuplicate();
+				const origSubscribe = dup.subscribe.bind(dup);
+				dup.subscribe = async (ch) => {
+					if (failCount === 0) {
+						failCount++;
+						throw new Error('connection lost');
+					}
+					return origSubscribe(ch);
+				};
+				return dup;
+			};
+
+			const c = createCursor(failClient, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			// First update triggers ensureSubscriber which will fail async
+			c.update(ws, 'canvas', { x: 0, y: 0 }, platform);
+
+			// Wait for the async failure to settle
+			await new Promise((r) => setTimeout(r, 10));
+
+			// Second update should retry and succeed
+			c.update(ws, 'canvas', { x: 10, y: 10 }, platform);
+			await new Promise((r) => setTimeout(r, 10));
+
+			// Simulate a remote event -- should now be received
+			const remoteMsg = JSON.stringify({
+				instanceId: 'remote-instance',
+				topic: 'canvas',
+				event: 'update',
+				payload: { key: 'remote:1', user: { id: '2' }, data: { x: 77 } }
+			});
+			await failClient.redis.publish('test:cursor:events', remoteMsg);
+
+			const remoteUpdates = platform.published.filter(
+				(p) => p.data && p.data.key === 'remote:1'
+			);
+			expect(remoteUpdates).toHaveLength(1);
+			c.destroy();
+		});
+	});
+
+	describe('platform update', () => {
+		it('uses the latest platform for remote event forwarding', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const platform1 = mockPlatform();
+			const platform2 = mockPlatform();
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+
+			// First update sets up subscriber with platform1
+			c.update(ws1, 'canvas', { x: 0 }, platform1);
+			platform1.reset();
+
+			// Second update with platform2 should update the platform ref
+			c.update(ws2, 'canvas', { x: 1 }, platform2);
+			platform2.reset();
+
+			// Simulate a remote event
+			const remoteMsg = JSON.stringify({
+				instanceId: 'remote-instance',
+				topic: 'canvas',
+				event: 'update',
+				payload: { key: 'remote:1', user: { id: '3' }, data: { x: 99 } }
+			});
+			client.redis.publish('test:cursor:events', remoteMsg);
+
+			// Should have been forwarded via platform2 (latest), not platform1
+			expect(platform2.published.filter((p) => p.data && p.data.key === 'remote:1')).toHaveLength(1);
+			expect(platform1.published.filter((p) => p.data && p.data.key === 'remote:1')).toHaveLength(0);
 			c.destroy();
 		});
 	});

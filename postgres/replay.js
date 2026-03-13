@@ -15,6 +15,15 @@
  *   )
  *   + index on (topic, seq)
  *
+ *   ws_replay_seq (
+ *     topic    TEXT PRIMARY KEY,
+ *     seq      BIGINT NOT NULL DEFAULT 0
+ *   )
+ *
+ * Sequences are generated atomically via the _seq table using
+ * INSERT ... ON CONFLICT DO UPDATE, so they are safe across multiple
+ * server instances without races.
+ *
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
 
@@ -58,6 +67,7 @@ export function createReplay(client, options = {}) {
 	}
 
 	const table = options.table || 'ws_replay';
+	const seqTable = table + '_seq';
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
 	const autoMigrate = options.autoMigrate !== false;
@@ -85,48 +95,33 @@ export function createReplay(client, options = {}) {
 		await client.query(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
+		// Atomic per-topic sequence counter table
+		await client.query(`
+			CREATE TABLE IF NOT EXISTS ${seqTable} (
+				topic TEXT PRIMARY KEY,
+				seq BIGINT NOT NULL DEFAULT 0
+			)
+		`);
 		migrated = true;
 	}
 
-	// Sequence counters cached in memory, seeded from DB on first access per topic.
-	// This avoids a DB roundtrip on every publish while still being correct
-	// across restarts (we read max(seq) on first publish to a topic).
-	/** @type {Map<string, number>} */
-	const seqCache = new Map();
-
-	// Per-topic lock to prevent concurrent nextSeq() calls from racing on
-	// the seed query. Without this, two concurrent publishes to the same
-	// never-before-seen topic would both read MAX(seq)=0, both get seq=1.
-	/** @type {Map<string, Promise<void>>} */
-	const seqLocks = new Map();
-
+	/**
+	 * Atomically get the next sequence number for a topic.
+	 * Uses INSERT ... ON CONFLICT DO UPDATE for cross-instance safety.
+	 */
 	async function nextSeq(topic) {
-		// Wait for any pending seed for this topic
-		while (seqLocks.has(topic)) {
-			await seqLocks.get(topic);
-		}
-
-		let current = seqCache.get(topic);
-		if (current === undefined) {
-			// Lock this topic while we seed from DB
-			let unlock;
-			const lock = new Promise((resolve) => { unlock = resolve; });
-			seqLocks.set(topic, lock);
-			try {
-				const res = await client.query(
-					`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM ${table} WHERE topic = $1`,
-					[topic]
-				);
-				current = parseInt(res.rows[0].max_seq, 10);
-			} finally {
-				seqLocks.delete(topic);
-				unlock();
-			}
-		}
-		current++;
-		seqCache.set(topic, current);
-		return current;
+		const res = await client.query(
+			`INSERT INTO ${seqTable} (topic, seq) VALUES ($1, 1)
+			 ON CONFLICT (topic) DO UPDATE SET seq = ${seqTable}.seq + 1
+			 RETURNING seq`,
+			[topic]
+		);
+		return parseInt(res.rows[0].seq, 10);
 	}
+
+	// Local publish counter per topic -- avoids COUNT(*) on every publish
+	/** @type {Map<string, number>} */
+	const publishCounts = new Map();
 
 	// Periodic cleanup
 	let cleanupTimer = null;
@@ -152,6 +147,9 @@ export function createReplay(client, options = {}) {
 						[ttl]
 					);
 				}
+
+				// Reset local counters after cleanup
+				publishCounts.clear();
 			} catch {
 				// Cleanup failures are non-fatal
 			}
@@ -169,18 +167,27 @@ export function createReplay(client, options = {}) {
 				[topic, seq, event, JSON.stringify(data)]
 			);
 
-			// Inline trim: if we have way more than maxSize for this topic, prune now
-			const countRes = await client.query(
-				`SELECT COUNT(*)::int AS cnt FROM ${table} WHERE topic = $1`,
-				[topic]
-			);
-			const cnt = countRes.rows[0].cnt;
-			if (cnt > maxSize) {
+			// Inline trim: use local counter to avoid COUNT(*) on every publish.
+			// On first publish per topic in this process, seed from the database
+			// so a fresh/restarted instance trims correctly.
+			let count;
+			if (publishCounts.has(topic)) {
+				count = publishCounts.get(topic) + 1;
+			} else {
+				const res = await client.query(
+					`SELECT COUNT(*)::int AS cnt FROM ${table} WHERE topic = $1`,
+					[topic]
+				);
+				count = parseInt(res.rows[0].cnt, 10);
+			}
+			publishCounts.set(topic, count);
+			if (count > maxSize) {
 				await client.query(`
 					DELETE FROM ${table} WHERE topic = $1 AND id NOT IN (
 						SELECT id FROM ${table} WHERE topic = $1 ORDER BY seq DESC LIMIT $2
 					)
 				`, [topic, maxSize]);
+				publishCounts.set(topic, maxSize);
 			}
 
 			return platform.publish(topic, event, data);
@@ -227,13 +234,15 @@ export function createReplay(client, options = {}) {
 		async clear() {
 			await ensureTable();
 			await client.query(`DELETE FROM ${table}`);
-			seqCache.clear();
+			await client.query(`DELETE FROM ${seqTable}`);
+			publishCounts.clear();
 		},
 
 		async clearTopic(topic) {
 			await ensureTable();
 			await client.query(`DELETE FROM ${table} WHERE topic = $1`, [topic]);
-			seqCache.delete(topic);
+			await client.query(`DELETE FROM ${seqTable} WHERE topic = $1`, [topic]);
+			publishCounts.delete(topic);
 		},
 
 		destroy() {

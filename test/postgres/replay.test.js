@@ -219,4 +219,55 @@ describe('postgres replay', () => {
 			expect(await replay.seq('todos')).toBe(1);
 		});
 	});
+
+	describe('cross-instance size cap', () => {
+		it('fresh instance trims rows left by a previous instance', async () => {
+			// Instance1 publishes 4 rows into a size:2 buffer
+			const replay1 = createReplay(client, { size: 2, cleanupInterval: 0 });
+			await replay1.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay1.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay1.publish(platform, 'chat', 'msg', { id: 3 });
+			// After 3 publishes with size:2, replay1 has trimmed to 2
+			let all = await replay1.since('chat', 0);
+			expect(all).toHaveLength(2);
+			replay1.destroy();
+
+			// Simulate the first instance crashing and publishing more rows
+			// by directly inserting into the mock DB
+			// Actually, let's just publish one more from a fresh instance
+			const replay2 = createReplay(client, { size: 2, cleanupInterval: 0 });
+			await replay2.publish(platform, 'chat', 'msg', { id: 4 });
+
+			// The fresh instance should have seeded its count from the DB
+			// and trimmed to 2 rows
+			all = await replay2.since('chat', 0);
+			expect(all).toHaveLength(2);
+			expect(all[0].data).toEqual({ id: 3 });
+			expect(all[1].data).toEqual({ id: 4 });
+			replay2.destroy();
+		});
+	});
+
+	describe('multi-instance sequence safety', () => {
+		it('two replay instances produce unique sequences for the same topic', async () => {
+			// Both instances share the same mock PG client,
+			// simulating two app instances using the same database
+			const replay1 = createReplay(client, { size: 100, cleanupInterval: 0 });
+			const replay2 = createReplay(client, { size: 100, cleanupInterval: 0 });
+
+			await replay1.publish(platform, 'chat', 'created', { from: 'instance1' });
+			await replay2.publish(platform, 'chat', 'created', { from: 'instance2' });
+			await replay1.publish(platform, 'chat', 'created', { from: 'instance1-again' });
+
+			const all = await replay1.since('chat', 0);
+			expect(all).toHaveLength(3);
+
+			// Sequences must be strictly monotonically increasing with no duplicates
+			const seqs = all.map((m) => m.seq);
+			expect(seqs).toEqual([1, 2, 3]);
+
+			replay1.destroy();
+			replay2.destroy();
+		});
+	});
 });

@@ -158,6 +158,9 @@ export function createRateLimit(client, options) {
 
 	return {
 		async consume(ws, cost = 1) {
+			if (typeof cost !== 'number' || !Number.isInteger(cost) || cost < 1) {
+				throw new Error('redis ratelimit: cost must be a positive integer');
+			}
 			const key = resolveKey(ws);
 			const now = Date.now();
 

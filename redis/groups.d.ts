@@ -8,6 +8,8 @@ export interface RedisGroupOptions {
 	maxMembers?: number;
 	/** Initial group metadata. */
 	meta?: Record<string, any>;
+	/** Member entry TTL in seconds. Entries from crashed instances expire after this. @default 120 */
+	memberTtl?: number;
 	/** Called after a member joins. */
 	onJoin?: (ws: any, role: GroupRole) => void;
 	/** Called after a member leaves. */

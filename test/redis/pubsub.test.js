@@ -24,7 +24,7 @@ describe('redis pubsub bus', () => {
 			expect(typeof wrapped.topic).toBe('function');
 		});
 
-		it('publish() calls the original platform.publish()', () => {
+		it('publish() calls the original platform.publish() without relay: false', () => {
 			const wrapped = bus.wrap(platform);
 			wrapped.publish('chat', 'msg', { text: 'hello' });
 
@@ -32,7 +32,8 @@ describe('redis pubsub bus', () => {
 			expect(platform.published[0]).toEqual({
 				topic: 'chat',
 				event: 'msg',
-				data: { text: 'hello' }
+				data: { text: 'hello' },
+				options: undefined
 			});
 		});
 
@@ -62,7 +63,7 @@ describe('redis pubsub bus', () => {
 			// Should not throw
 		});
 
-		it('forwards messages from Redis to local platform', async () => {
+		it('forwards messages from Redis to local platform with relay: false', async () => {
 			await bus.activate(platform);
 
 			// Simulate a message from another instance by publishing directly
@@ -79,7 +80,8 @@ describe('redis pubsub bus', () => {
 			expect(platform.published[0]).toEqual({
 				topic: 'chat',
 				event: 'msg',
-				data: { text: 'from-remote' }
+				data: { text: 'from-remote' },
+				options: { relay: false }
 			});
 		});
 
@@ -111,6 +113,47 @@ describe('redis pubsub bus', () => {
 				data: null
 			}));
 			expect(platform.published).toHaveLength(0);
+		});
+	});
+
+	describe('activate failure recovery', () => {
+		it('can retry after subscribe() fails', async () => {
+			// Create a client whose duplicate's subscribe() will fail once
+			const failClient = mockRedisClient();
+			let failCount = 0;
+			const origDuplicate = failClient.duplicate.bind(failClient);
+			failClient.duplicate = () => {
+				const dup = origDuplicate();
+				const origSubscribe = dup.subscribe.bind(dup);
+				dup.subscribe = async (ch) => {
+					if (failCount === 0) {
+						failCount++;
+						throw new Error('connection lost');
+					}
+					return origSubscribe(ch);
+				};
+				return dup;
+			};
+
+			const failBus = createPubSubBus(failClient);
+
+			// First activate should fail
+			await expect(failBus.activate(platform)).rejects.toThrow('connection lost');
+
+			// Second activate should succeed (not stuck on active=true)
+			await failBus.activate(platform);
+
+			// Verify it works
+			const msg = JSON.stringify({
+				instanceId: 'other',
+				topic: 'test',
+				event: 'ping',
+				data: null
+			});
+			await failClient.redis.publish('uws:pubsub', msg);
+			expect(platform.published).toHaveLength(1);
+
+			await failBus.deactivate();
 		});
 	});
 

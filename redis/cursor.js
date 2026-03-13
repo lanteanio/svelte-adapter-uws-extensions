@@ -89,31 +89,68 @@ export function createCursor(client, options = {}) {
 	let subscriberReady = false;
 
 	function ensureSubscriber(platform) {
-		if (subscriber) {
-			activePlatform = platform;
-			return;
-		}
-		subscriber = client.duplicate();
 		activePlatform = platform;
-		subscriber.on('message', (ch, message) => {
+		if (subscriber) return;
+		const sub = client.duplicate();
+		subscriber = sub;
+		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
 			try {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
+				// relay: false -- each worker has its own subscriber,
+				// so no need to IPC-relay to sibling workers.
 				if (activePlatform) {
 					activePlatform.publish(
 						'__cursor:' + parsed.topic,
 						parsed.event,
-						parsed.payload
+						parsed.payload,
+						{ relay: false }
 					);
 				}
 			} catch {
 				// Malformed, skip
 			}
 		});
-		subscriber.subscribe(channel);
-		subscriberReady = true;
+		sub.subscribe(channel).then(() => {
+			subscriberReady = true;
+		}).catch(() => {
+			// Subscribe failed -- clean up so the next call can retry
+			sub.quit().catch(() => sub.disconnect());
+			if (subscriber === sub) {
+				subscriber = null;
+				subscriberReady = false;
+			}
+		});
 	}
+
+	const cursorTtlMs = cursorTtl * 1000;
+
+	// Track topics with local activity for periodic stale field cleanup
+	/** @type {Set<string>} */
+	const activeTopics = new Set();
+
+	// Periodic cleanup: remove stale fields from dead instances
+	const cleanupInterval = Math.max(cursorTtlMs, 10000);
+	const cleanupTimer = setInterval(() => {
+		const now = Date.now();
+		for (const topic of activeTopics) {
+			redis.hgetall(client.key('cursor:' + topic)).then((all) => {
+				if (!all) return;
+				for (const [field, v] of Object.entries(all)) {
+					try {
+						const parsed = JSON.parse(v);
+						if (parsed.ts && (now - parsed.ts) > cursorTtlMs) {
+							redis.hdel(client.key('cursor:' + topic), field).catch(() => {});
+						}
+					} catch {
+						redis.hdel(client.key('cursor:' + topic), field).catch(() => {});
+					}
+				}
+			}).catch(() => {});
+		}
+	}, cleanupInterval);
+	if (cleanupTimer.unref) cleanupTimer.unref();
 
 	function hashKey(topic) {
 		return client.key('cursor:' + topic);
@@ -139,8 +176,9 @@ export function createCursor(client, options = {}) {
 		// Local broadcast
 		platform.publish('__cursor:' + topic, 'update', { key, user, data });
 
-		// Persist to Redis hash (fire and forget)
-		redis.hset(hashKey(topic), key, JSON.stringify({ user, data })).catch(() => {});
+		// Persist to Redis hash with timestamp for per-entry staleness detection
+		const now = Date.now();
+		redis.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: now })).catch(() => {});
 		redis.expire(hashKey(topic), cursorTtl).catch(() => {});
 
 		// Relay to other instances
@@ -173,6 +211,7 @@ export function createCursor(client, options = {}) {
 
 			const state = getWsState(ws);
 			state.topics.add(topic);
+			activeTopics.add(topic);
 
 			let topicMap = topics.get(topic);
 			if (!topicMap) {
@@ -243,9 +282,13 @@ export function createCursor(client, options = {}) {
 		async list(topic) {
 			const all = await redis.hgetall(hashKey(topic));
 			const result = [];
+			const now = Date.now();
+			const ttlMs = cursorTtl * 1000;
 			for (const [key, v] of Object.entries(all)) {
 				try {
 					const parsed = JSON.parse(v);
+					// Filter out stale entries from crashed instances
+					if (parsed.ts && (now - parsed.ts) > ttlMs) continue;
 					result.push({ key, user: parsed.user, data: parsed.data });
 				} catch {
 					// Corrupted entry, skip
@@ -263,6 +306,7 @@ export function createCursor(client, options = {}) {
 			}
 			topics.clear();
 			wsState.clear();
+			activeTopics.clear();
 			connCounter = 0;
 
 			// Clear Redis keys
@@ -279,6 +323,7 @@ export function createCursor(client, options = {}) {
 
 		destroy() {
 			// Clear all timers
+			clearInterval(cleanupTimer);
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
 					if (entry.timer) clearTimeout(entry.timer);

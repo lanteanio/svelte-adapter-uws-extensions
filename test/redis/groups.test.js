@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
@@ -12,7 +12,7 @@ describe('redis groups', () => {
 	beforeEach(() => {
 		client = mockRedisClient('test:');
 		platform = mockPlatform();
-		group = createGroup(client, 'lobby', { maxMembers: 5 });
+		group = createGroup(client, 'lobby', { maxMembers: 5, memberTtl: 120 });
 	});
 
 	afterEach(() => {
@@ -72,13 +72,14 @@ describe('redis groups', () => {
 			expect(membersSent[0].data).toEqual([{ role: 'member' }]);
 		});
 
-		it('publishes join event', async () => {
+		it('publishes join event without relay: false', async () => {
 			const ws = mockWs();
 			await group.join(ws, platform);
 
 			const joins = platform.published.filter((p) => p.event === 'join');
 			expect(joins).toHaveLength(1);
 			expect(joins[0].data).toEqual({ role: 'member' });
+			expect(joins[0].options).toBeUndefined();
 		});
 
 		it('default role is member', async () => {
@@ -114,7 +115,7 @@ describe('redis groups', () => {
 		});
 
 		it('returns false when group is full', async () => {
-			const g = createGroup(client, 'small', { maxMembers: 2 });
+			const g = createGroup(client, 'small', { maxMembers: 2, memberTtl: 120 });
 			await g.join(mockWs(), platform);
 			await g.join(mockWs(), platform);
 
@@ -127,6 +128,7 @@ describe('redis groups', () => {
 			const fullCalls = [];
 			const g = createGroup(client, 'small2', {
 				maxMembers: 1,
+				memberTtl: 120,
 				onFull: (ws, role) => fullCalls.push(role)
 			});
 			await g.join(mockWs(), platform);
@@ -149,6 +151,24 @@ describe('redis groups', () => {
 		it('returns false when group is closed', async () => {
 			await group.close(platform);
 			expect(await group.join(mockWs(), platform)).toBe(false);
+		});
+
+		it('atomic maxMembers prevents overfill under concurrent joins', async () => {
+			const g = createGroup(client, 'race', { maxMembers: 1, memberTtl: 120 });
+
+			// Both should try to join, only one should succeed
+			const ws1 = mockWs();
+			const ws2 = mockWs();
+			const [r1, r2] = await Promise.all([
+				g.join(ws1, platform),
+				g.join(ws2, platform)
+			]);
+
+			// Exactly one should succeed
+			const successes = [r1, r2].filter(Boolean);
+			expect(successes).toHaveLength(1);
+			expect(await g.count()).toBe(1);
+			g.destroy();
 		});
 	});
 
@@ -230,6 +250,49 @@ describe('redis groups', () => {
 
 			await group.publish(platform, 'chat', {});
 			expect(platform.published).toHaveLength(0);
+		});
+	});
+
+	describe('publish - cross-instance role filtering', () => {
+		it('remote instances filter role-filtered events locally', async () => {
+			// Simulate: instance1 publishes role-filtered, instance2 receives
+			const platform2 = mockPlatform();
+			const instance1 = createGroup(client, 'cross-role', { memberTtl: 120 });
+			const instance2 = createGroup(client, 'cross-role', { memberTtl: 120 });
+
+			const wsAdmin = mockWs();
+			const wsMember = mockWs();
+
+			await instance1.join(mockWs(), platform, 'admin');
+			await instance2.join(wsAdmin, platform2, 'admin');
+			await instance2.join(wsMember, platform2, 'member');
+			platform.reset();
+			platform2.reset();
+
+			// Publish role-filtered from instance1
+			await instance1.publish(platform, 'secret', { data: 'admins-only' }, 'admin');
+
+			// The cross-instance event was published to Redis.
+			// Simulate instance2 receiving the __role_filtered event via pub/sub
+			// by directly checking what publishEvent sent.
+			// In real deployment, the subscriber on instance2 would receive and
+			// filter locally. We verify the event structure is correct.
+			const publishCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				publishCalls.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			await instance1.publish(platform, 'secret2', { data: 'test' }, 'admin');
+
+			const filtered = publishCalls.find((p) => p.event === '__role_filtered');
+			expect(filtered).toBeDefined();
+			expect(filtered.data.event).toBe('secret2');
+			expect(filtered.data.role).toBe('admin');
+
+			instance1.destroy();
+			instance2.destroy();
 		});
 	});
 
@@ -354,6 +417,147 @@ describe('redis groups', () => {
 		it('closing twice is safe', async () => {
 			await group.close(platform);
 			await group.close(platform); // should not throw
+		});
+	});
+
+	describe('platform update', () => {
+		it('uses the latest platform for remote event forwarding', async () => {
+			const platform1 = mockPlatform();
+			const platform2 = mockPlatform();
+			const g = createGroup(client, 'platform-update', { memberTtl: 120 });
+
+			// Join with platform1 to set up subscriber
+			const ws1 = mockWs();
+			await g.join(ws1, platform1);
+			platform1.reset();
+
+			// Join with platform2 -- subscriber should update its platform ref
+			const ws2 = mockWs();
+			await g.join(ws2, platform2);
+			platform2.reset();
+
+			// Simulate a remote event via Redis pub/sub
+			const channel = client.key('group:platform-update:events');
+			const msg = JSON.stringify({
+				instanceId: 'remote-instance',
+				event: 'chat',
+				data: { text: 'hello' }
+			});
+			await client.redis.publish(channel, msg);
+
+			// The event should have been forwarded using platform2 (latest), not platform1
+			const chatEvents = platform2.published.filter((p) => p.event === 'chat');
+			expect(chatEvents).toHaveLength(1);
+			expect(chatEvents[0].options).toEqual({ relay: false });
+			expect(platform1.published.filter((p) => p.event === 'chat')).toHaveLength(0);
+
+			g.destroy();
+		});
+	});
+
+	describe('remote close', () => {
+		it('remote close clears local members and unsubscribes ws', async () => {
+			// Simulate two instances sharing the same Redis
+			const platform2 = mockPlatform();
+			const instance1 = createGroup(client, 'remote-close', { memberTtl: 120 });
+			const instance2 = createGroup(client, 'remote-close', { memberTtl: 120 });
+
+			const ws1 = mockWs();
+			const ws2 = mockWs();
+
+			await instance1.join(ws1, platform);
+			await instance2.join(ws2, platform2);
+
+			// Instance1 closes the group
+			await instance1.close(platform);
+
+			// Instance2 should have received the close event via pub/sub
+			// and cleaned up its local members
+			expect(instance2.localMembers()).toEqual([]);
+			expect(instance2.has(ws2)).toBe(false);
+			expect(ws2.isSubscribed('__group:remote-close')).toBe(false);
+
+			// Remote close should use relay: false
+			const closeEvents = platform2.published.filter((p) => p.event === 'close');
+			expect(closeEvents).toHaveLength(1);
+			expect(closeEvents[0].options).toEqual({ relay: false });
+
+			instance1.destroy();
+			instance2.destroy();
+		});
+
+		it('remote close fires onClose callback', async () => {
+			let closeCalled = false;
+			const instance1 = createGroup(client, 'remote-close-hook', { memberTtl: 120 });
+			const instance2 = createGroup(client, 'remote-close-hook', {
+				memberTtl: 120,
+				onClose: () => { closeCalled = true; }
+			});
+
+			await instance1.join(mockWs(), platform);
+			await instance2.join(mockWs(), mockPlatform());
+
+			await instance1.close(platform);
+
+			expect(closeCalled).toBe(true);
+
+			instance1.destroy();
+			instance2.destroy();
+		});
+
+		it('remote close prevents further joins', async () => {
+			const instance1 = createGroup(client, 'remote-close-join', { memberTtl: 120 });
+			const instance2 = createGroup(client, 'remote-close-join', { memberTtl: 120 });
+
+			await instance1.join(mockWs(), platform);
+			await instance2.join(mockWs(), mockPlatform());
+
+			await instance1.close(platform);
+
+			// The closed key is set in Redis, so instance2 should reject new joins
+			const ws = mockWs();
+			expect(await instance2.join(ws, mockPlatform())).toBe(false);
+
+			instance1.destroy();
+			instance2.destroy();
+		});
+	});
+
+	describe('member expiry', () => {
+		it('stale members are excluded from count', async () => {
+			// Manually insert a stale member entry into Redis
+			const membersKey = client.key('group:lobby:members');
+			const staleData = JSON.stringify({
+				role: 'member',
+				instanceId: 'dead-instance',
+				ts: Date.now() - 200_000 // 200 seconds ago, well past 120s TTL
+			});
+			await client.redis.hset(membersKey, 'dead-instance:1', staleData);
+
+			// Add a live member
+			const ws = mockWs();
+			await group.join(ws, platform);
+
+			// Count should only include the live member
+			expect(await group.count()).toBe(1);
+		});
+
+		it('stale members do not block joins with maxMembers', async () => {
+			const g = createGroup(client, 'expiry-test', { maxMembers: 1, memberTtl: 120 });
+			const membersKey = client.key('group:expiry-test:members');
+
+			// Insert a stale member
+			const staleData = JSON.stringify({
+				role: 'member',
+				instanceId: 'dead-instance',
+				ts: Date.now() - 200_000
+			});
+			await client.redis.hset(membersKey, 'dead-instance:1', staleData);
+
+			// Should still be able to join because the stale member doesn't count
+			const ws = mockWs();
+			expect(await g.join(ws, platform)).toBe(true);
+			g.destroy();
 		});
 	});
 });

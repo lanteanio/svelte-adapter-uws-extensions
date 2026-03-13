@@ -7,8 +7,8 @@ export function mockPlatform() {
 		published: [],
 		sent: [],
 		connections: 0,
-		publish(topic, event, data) {
-			p.published.push({ topic, event, data });
+		publish(topic, event, data, options) {
+			p.published.push({ topic, event, data, options });
 			return true;
 		},
 		send(ws, topic, event, data) {
