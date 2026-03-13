@@ -1,0 +1,91 @@
+{
+  "name": "svelte-adapter-uws-extensions",
+  "version": "0.1.0",
+  "description": "Redis and Postgres extensions for svelte-adapter-uws - distributed pub/sub, replay buffers, presence tracking, rate limiting, groups, and DB change notifications",
+  "author": "Kevin Radziszewski",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./redis": {
+      "types": "./redis/index.d.ts",
+      "default": "./redis/index.js"
+    },
+    "./redis/pubsub": {
+      "types": "./redis/pubsub.d.ts",
+      "default": "./redis/pubsub.js"
+    },
+    "./redis/replay": {
+      "types": "./redis/replay.d.ts",
+      "default": "./redis/replay.js"
+    },
+    "./redis/presence": {
+      "types": "./redis/presence.d.ts",
+      "default": "./redis/presence.js"
+    },
+    "./postgres": {
+      "types": "./postgres/index.d.ts",
+      "default": "./postgres/index.js"
+    },
+    "./postgres/replay": {
+      "types": "./postgres/replay.d.ts",
+      "default": "./postgres/replay.js"
+    },
+    "./postgres/notify": {
+      "types": "./postgres/notify.d.ts",
+      "default": "./postgres/notify.js"
+    },
+    "./redis/ratelimit": {
+      "types": "./redis/ratelimit.d.ts",
+      "default": "./redis/ratelimit.js"
+    },
+    "./redis/groups": {
+      "types": "./redis/groups.d.ts",
+      "default": "./redis/groups.js"
+    },
+    "./redis/cursor": {
+      "types": "./redis/cursor.d.ts",
+      "default": "./redis/cursor.js"
+    }
+  },
+  "files": [
+    "redis",
+    "postgres",
+    "shared",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "peerDependencies": {
+    "svelte-adapter-uws": ">=0.2.0"
+  },
+  "dependencies": {
+    "ioredis": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  },
+  "keywords": [
+    "svelte",
+    "sveltekit",
+    "uwebsockets",
+    "redis",
+    "postgres",
+    "pubsub",
+    "websocket",
+    "presence",
+    "replay",
+    "ratelimit",
+    "groups",
+    "cursor",
+    "notify"
+  ]
+}
