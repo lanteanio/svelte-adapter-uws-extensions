@@ -6,18 +6,18 @@
  *
  * Table schema (auto-created if autoMigrate is true):
  *   ws_replay (
- *     id       BIGSERIAL PRIMARY KEY,
- *     topic    TEXT NOT NULL,
- *     seq      BIGINT NOT NULL,
- *     event    TEXT NOT NULL,
- *     data     JSONB,
- *     created_at TIMESTAMPTZ DEFAULT now()
+ *     ws_replay_id BIGSERIAL PRIMARY KEY,
+ *     topic        TEXT        NOT NULL,
+ *     seq          BIGINT      NOT NULL,
+ *     event        TEXT        NOT NULL,
+ *     data         JSONB,
+ *     created_date TIMESTAMPTZ DEFAULT now()
  *   )
  *   + index on (topic, seq)
  *
  *   ws_replay_seq (
- *     topic    TEXT PRIMARY KEY,
- *     seq      BIGINT NOT NULL DEFAULT 0
+ *     topic TEXT   PRIMARY KEY,
+ *     seq   BIGINT NOT NULL DEFAULT 0
  *   )
  *
  * Sequences are generated atomically via the _seq table using
@@ -68,6 +68,7 @@ export function createReplay(client, options = {}) {
 
 	const table = options.table || 'ws_replay';
 	const seqTable = table + '_seq';
+	const pkCol = table + '_id';
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
 	const autoMigrate = options.autoMigrate !== false;
@@ -84,12 +85,12 @@ export function createReplay(client, options = {}) {
 		if (migrated || !autoMigrate) return;
 		await client.query(`
 			CREATE TABLE IF NOT EXISTS ${table} (
-				id BIGSERIAL PRIMARY KEY,
-				topic TEXT NOT NULL,
-				seq BIGINT NOT NULL,
-				event TEXT NOT NULL,
-				data JSONB,
-				created_at TIMESTAMPTZ DEFAULT now()
+				${pkCol} BIGSERIAL   PRIMARY KEY,
+				topic    TEXT        NOT NULL,
+				seq      BIGINT      NOT NULL,
+				event    TEXT        NOT NULL,
+				data     JSONB,
+				created_date TIMESTAMPTZ DEFAULT now()
 			)
 		`);
 		await client.query(`
@@ -98,8 +99,8 @@ export function createReplay(client, options = {}) {
 		// Atomic per-topic sequence counter table
 		await client.query(`
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
-				topic TEXT PRIMARY KEY,
-				seq BIGINT NOT NULL DEFAULT 0
+				topic TEXT   PRIMARY KEY,
+				seq   BIGINT NOT NULL DEFAULT 0
 			)
 		`);
 		migrated = true;
@@ -111,9 +112,12 @@ export function createReplay(client, options = {}) {
 	 */
 	async function nextSeq(topic) {
 		const res = await client.query(
-			`INSERT INTO ${seqTable} (topic, seq) VALUES ($1, 1)
-			 ON CONFLICT (topic) DO UPDATE SET seq = ${seqTable}.seq + 1
-			 RETURNING seq`,
+			`INSERT INTO ${seqTable} (topic, seq)
+			      VALUES ($1, 1)
+			 ON CONFLICT (topic)
+			   DO UPDATE
+			         SET seq = ${seqTable}.seq + 1
+			   RETURNING seq`,
 			[topic]
 		);
 		return parseInt(res.rows[0].seq, 10);
@@ -132,18 +136,20 @@ export function createReplay(client, options = {}) {
 
 				// Trim by size: for each topic, keep only the newest `maxSize` rows
 				await client.query(`
-					DELETE FROM ${table} WHERE id IN (
-						SELECT id FROM (
-							SELECT id, ROW_NUMBER() OVER (PARTITION BY topic ORDER BY seq DESC) AS rn
-							FROM ${table}
-						) ranked WHERE rn > $1
-					)
+					DELETE FROM ${table}
+					 WHERE ${pkCol} IN (
+					       SELECT ${pkCol}
+					         FROM (SELECT ${pkCol},
+					                      ROW_NUMBER() OVER (PARTITION BY topic ORDER BY seq DESC) AS row_num
+					                 FROM ${table}) ranked
+					        WHERE row_num > $1)
 				`, [maxSize]);
 
 				// Trim by TTL
 				if (ttl > 0) {
 					await client.query(
-						`DELETE FROM ${table} WHERE created_at < now() - interval '1 second' * $1`,
+						`DELETE FROM ${table}
+						  WHERE created_date < now() - interval '1 second' * $1`,
 						[ttl]
 					);
 				}
@@ -163,7 +169,8 @@ export function createReplay(client, options = {}) {
 			const seq = await nextSeq(topic);
 
 			await client.query(
-				`INSERT INTO ${table} (topic, seq, event, data) VALUES ($1, $2, $3, $4)`,
+				`INSERT INTO ${table} (topic, seq, event, data)
+				      VALUES ($1, $2, $3, $4)`,
 				[topic, seq, event, JSON.stringify(data)]
 			);
 
@@ -175,17 +182,24 @@ export function createReplay(client, options = {}) {
 				count = publishCounts.get(topic) + 1;
 			} else {
 				const res = await client.query(
-					`SELECT COUNT(*)::int AS cnt FROM ${table} WHERE topic = $1`,
+					`SELECT COUNT(*)::int AS message_count
+					   FROM ${table}
+					  WHERE topic = $1`,
 					[topic]
 				);
-				count = parseInt(res.rows[0].cnt, 10);
+				count = parseInt(res.rows[0].message_count, 10);
 			}
 			publishCounts.set(topic, count);
 			if (count > maxSize) {
 				await client.query(`
-					DELETE FROM ${table} WHERE topic = $1 AND id NOT IN (
-						SELECT id FROM ${table} WHERE topic = $1 ORDER BY seq DESC LIMIT $2
-					)
+					DELETE FROM ${table}
+					 WHERE topic = $1
+					   AND ${pkCol} NOT IN (
+					       SELECT ${pkCol}
+					         FROM ${table}
+					        WHERE topic = $1
+					        ORDER BY seq DESC
+					        LIMIT $2)
 				`, [topic, maxSize]);
 				publishCounts.set(topic, maxSize);
 			}
@@ -196,7 +210,9 @@ export function createReplay(client, options = {}) {
 		async seq(topic) {
 			await ensureTable();
 			const res = await client.query(
-				`SELECT COALESCE(MAX(seq), 0)::int AS max_seq FROM ${table} WHERE topic = $1`,
+				`SELECT COALESCE(MAX(seq), 0)::int AS max_seq
+				   FROM ${table}
+				  WHERE topic = $1`,
 				[topic]
 			);
 			return parseInt(res.rows[0].max_seq, 10);
@@ -205,7 +221,11 @@ export function createReplay(client, options = {}) {
 		async since(topic, since) {
 			await ensureTable();
 			const res = await client.query(
-				`SELECT seq, topic, event, data FROM ${table} WHERE topic = $1 AND seq > $2 ORDER BY seq ASC`,
+				`SELECT seq, topic, event, data
+				   FROM ${table}
+				  WHERE topic = $1
+				    AND seq > $2
+				  ORDER BY seq ASC`,
 				[topic, since]
 			);
 			return res.rows.map((row) => ({
@@ -240,8 +260,12 @@ export function createReplay(client, options = {}) {
 
 		async clearTopic(topic) {
 			await ensureTable();
-			await client.query(`DELETE FROM ${table} WHERE topic = $1`, [topic]);
-			await client.query(`DELETE FROM ${seqTable} WHERE topic = $1`, [topic]);
+			await client.query(
+				`DELETE FROM ${table}
+				  WHERE topic = $1`, [topic]);
+			await client.query(
+				`DELETE FROM ${seqTable}
+				  WHERE topic = $1`, [topic]);
 			publishCounts.delete(topic);
 		},
 

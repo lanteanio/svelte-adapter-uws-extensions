@@ -4,7 +4,7 @@
  * and the ws_replay_seq table for atomic sequence generation.
  */
 export function mockPgClient() {
-	/** @type {Array<{id: number, topic: string, seq: number, event: string, data: any, created_at: Date}>} */
+	/** @type {Array<{ws_replay_id: number, topic: string, seq: number, event: string, data: any, created_date: Date}>} */
 	let rows = [];
 	let nextId = 1;
 	let tableCreated = false;
@@ -41,12 +41,12 @@ export function mockPgClient() {
 			// INSERT
 			if (sql.startsWith('INSERT INTO')) {
 				const row = {
-					id: nextId++,
+					ws_replay_id: nextId++,
 					topic: values[0],
 					seq: parseInt(values[1], 10),
 					event: values[2],
 					data: typeof values[3] === 'string' ? JSON.parse(values[3]) : values[3],
-					created_at: new Date()
+					created_date: new Date()
 				};
 				rows.push(row);
 				return { rows: [row], rowCount: 1 };
@@ -63,8 +63,8 @@ export function mockPgClient() {
 			// SELECT COUNT
 			if (sql.includes('COUNT(*)')) {
 				const topic = values[0];
-				const cnt = rows.filter((r) => r.topic === topic).length;
-				return { rows: [{ cnt }], rowCount: 1 };
+				const message_count = rows.filter((r) => r.topic === topic).length;
+				return { rows: [{ message_count }], rowCount: 1 };
 			}
 
 			// SELECT seq, topic, event, data ... WHERE topic = $1 AND seq > $2
@@ -83,16 +83,16 @@ export function mockPgClient() {
 				return { rows: result, rowCount: result.length };
 			}
 
-			// DELETE FROM table WHERE topic = $1 AND id NOT IN (... LIMIT $2)
+			// DELETE FROM table WHERE topic = $1 AND ws_replay_id NOT IN (... LIMIT $2)
 			if (sql.includes('DELETE FROM') && sql.includes('NOT IN') && sql.includes('LIMIT')) {
 				const topic = values[0];
 				const limit = parseInt(values[1], 10);
 				const topicRows = rows
 					.filter((r) => r.topic === topic)
 					.sort((a, b) => b.seq - a.seq);
-				const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.id));
+				const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.ws_replay_id));
 				const before = rows.length;
-				rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.id));
+				rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.ws_replay_id));
 				return { rows: [], rowCount: before - rows.length };
 			}
 
