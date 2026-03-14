@@ -19,8 +19,8 @@ export interface RedisPresenceTracker {
 	 */
 	join(ws: any, topic: string, platform: Platform): Promise<void>;
 
-	/** Remove a connection from all topics. */
-	leave(ws: any, platform: Platform): Promise<void>;
+	/** Remove a connection from a specific topic, or all topics if omitted. */
+	leave(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/** Send current presence list without joining. */
 	sync(ws: any, topic: string, platform: Platform): Promise<void>;
@@ -36,6 +36,24 @@ export interface RedisPresenceTracker {
 
 	/** Stop heartbeat timer and Redis subscriber. */
 	destroy(): void;
+
+	/**
+	 * Ready-made WebSocket hooks for zero-config presence.
+	 *
+	 * `subscribe` handles both regular topics (calls `join`) and `__presence:*`
+	 * topics (calls `sync` so the client gets the current list immediately).
+	 * `close` calls `leave`.
+	 *
+	 * @example
+	 * ```js
+	 * import { presence } from '$lib/server/presence';
+	 * export const { subscribe, close } = presence.hooks;
+	 * ```
+	 */
+	hooks: {
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		close(ws: any, ctx: { platform: Platform }): Promise<void>;
+	};
 }
 
 /**

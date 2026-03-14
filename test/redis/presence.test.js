@@ -206,6 +206,94 @@ describe('redis presence', () => {
 		});
 	});
 
+	describe('leave (per-topic)', () => {
+		it('removes user from only the specified topic', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room-a', platform);
+			await presence.join(ws, 'room-b', platform);
+
+			await presence.leave(ws, platform, 'room-a');
+
+			expect(await presence.count('room-a')).toBe(0);
+			expect(await presence.count('room-b')).toBe(1);
+		});
+
+		it('broadcasts leave only for the specified topic', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room-a', platform);
+			await presence.join(ws, 'room-b', platform);
+			platform.reset();
+
+			await presence.leave(ws, platform, 'room-a');
+
+			const leaves = platform.published.filter((p) => p.event === 'leave');
+			expect(leaves).toHaveLength(1);
+			expect(leaves[0].topic).toBe('__presence:room-a');
+		});
+
+		it('unsubscribes ws from the specified topic only', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room-a', platform);
+			await presence.join(ws, 'room-b', platform);
+
+			await presence.leave(ws, platform, 'room-a');
+
+			expect(ws.isSubscribed('__presence:room-a')).toBe(false);
+			expect(ws.isSubscribed('__presence:room-b')).toBe(true);
+		});
+
+		it('is safe to call for a topic the ws never joined', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room-a', platform);
+			platform.reset();
+
+			await presence.leave(ws, platform, 'nonexistent');
+			expect(platform.published).toHaveLength(0);
+			expect(await presence.count('room-a')).toBe(1);
+		});
+
+		it('allows subsequent leave-all after per-topic leave', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room-a', platform);
+			await presence.join(ws, 'room-b', platform);
+
+			await presence.leave(ws, platform, 'room-a');
+			await presence.leave(ws, platform);
+
+			expect(await presence.count('room-a')).toBe(0);
+			expect(await presence.count('room-b')).toBe(0);
+		});
+
+		it('respects multi-tab dedup for per-topic leave', async () => {
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '1', name: 'Alice' });
+
+			await presence.join(ws1, 'room', platform);
+			await presence.join(ws2, 'room', platform);
+			platform.reset();
+
+			await presence.leave(ws1, platform, 'room');
+
+			const leaves = platform.published.filter((p) => p.event === 'leave');
+			expect(leaves).toHaveLength(0);
+			expect(await presence.count('room')).toBe(1);
+		});
+
+		it('leaves sync-only observer from specific topic', async () => {
+			const wsObserver = mockWs({ id: 'admin', name: 'Admin' });
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+
+			await presence.join(ws1, 'room-a', platform);
+			await presence.sync(wsObserver, 'room-a', platform);
+			await presence.sync(wsObserver, 'room-b', platform);
+
+			await presence.leave(wsObserver, platform, 'room-a');
+
+			expect(wsObserver.isSubscribed('__presence:room-a')).toBe(false);
+			expect(wsObserver.isSubscribed('__presence:room-b')).toBe(true);
+		});
+	});
+
 	describe('sync', () => {
 		it('sends current list without joining', async () => {
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
@@ -435,6 +523,79 @@ describe('redis presence', () => {
 
 			expect(await p2.count('room')).toBe(2);
 			p2.destroy();
+		});
+	});
+
+	describe('hooks', () => {
+		it('API shape includes hooks with subscribe and close', () => {
+			expect(typeof presence.hooks.subscribe).toBe('function');
+			expect(typeof presence.hooks.close).toBe('function');
+		});
+
+		it('hooks.subscribe calls join for regular topics', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.hooks.subscribe(ws, 'room', { platform });
+
+			expect(await presence.count('room')).toBe(1);
+			expect(ws.isSubscribed('__presence:room')).toBe(true);
+		});
+
+		it('hooks.subscribe sends current list for __presence:* topics', async () => {
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws1, 'room', platform);
+			platform.reset();
+
+			const wsObserver = mockWs({ id: 'admin', name: 'Admin' });
+			await presence.hooks.subscribe(wsObserver, '__presence:room', { platform });
+
+			const lists = platform.sent.filter((s) => s.event === 'list');
+			expect(lists).toHaveLength(1);
+			expect(lists[0].data).toEqual([
+				{ key: '1', data: { id: '1', name: 'Alice' } }
+			]);
+			// Observer should NOT be counted
+			expect(await presence.count('room')).toBe(1);
+		});
+
+		it('hooks.subscribe sends empty list when no users exist', async () => {
+			const ws = mockWs({ id: 'admin', name: 'Admin' });
+			await presence.hooks.subscribe(ws, '__presence:empty', { platform });
+
+			const lists = platform.sent.filter((s) => s.event === 'list');
+			expect(lists).toHaveLength(1);
+			expect(lists[0].data).toEqual([]);
+		});
+
+		it('hooks.subscribe passes through other __-prefixed topics without error', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.hooks.subscribe(ws, '__other:topic', { platform });
+
+			// join ignores __ topics, so no presence state should exist
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('hooks.close calls leave', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			platform.reset();
+
+			await presence.hooks.close(ws, { platform });
+
+			const leaves = platform.published.filter((p) => p.event === 'leave');
+			expect(leaves).toHaveLength(1);
+			expect(await presence.count('room')).toBe(0);
+		});
+
+		it('destructured hooks work correctly', async () => {
+			const { subscribe, close } = presence.hooks;
+
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await subscribe(ws, 'room', { platform });
+			expect(await presence.count('room')).toBe(1);
+
+			platform.reset();
+			await close(ws, { platform });
+			expect(await presence.count('room')).toBe(0);
 		});
 	});
 

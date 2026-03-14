@@ -38,7 +38,7 @@ import { randomBytes } from 'node:crypto';
 /**
  * @typedef {Object} RedisCursorTracker
  * @property {(ws: any, topic: string, data: any, platform: import('svelte-adapter-uws').Platform) => void} update
- * @property {(ws: any, platform: import('svelte-adapter-uws').Platform) => Promise<void>} remove
+ * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} remove
  * @property {(topic: string) => Promise<CursorEntry[]>} list
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the Redis subscriber
@@ -257,10 +257,34 @@ export function createCursor(client, options = {}) {
 			}
 		},
 
-		async remove(ws, platform) {
+		async remove(ws, platform, topic) {
 			const state = wsState.get(ws);
 			if (!state) return;
 
+			if (topic !== undefined) {
+				// --- Per-topic remove ---
+				if (!state.topics.has(topic)) return;
+				state.topics.delete(topic);
+
+				const topicMap = topics.get(topic);
+				if (topicMap) {
+					const entry = topicMap.get(state.key);
+					if (entry) {
+						if (entry.timer) clearTimeout(entry.timer);
+						topicMap.delete(state.key);
+						if (topicMap.size === 0) {
+							topics.delete(topic);
+							activeTopics.delete(topic);
+						}
+						broadcastRemove(topic, state.key, platform);
+					}
+				}
+
+				if (state.topics.size === 0) wsState.delete(ws);
+				return;
+			}
+
+			// --- Remove from all topics ---
 			for (const topic of state.topics) {
 				const topicMap = topics.get(topic);
 				if (!topicMap) continue;

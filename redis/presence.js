@@ -102,12 +102,13 @@ return 1
 /**
  * @typedef {Object} RedisPresenceTracker
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} join
- * @property {(ws: any, platform: import('svelte-adapter-uws').Platform) => Promise<void>} leave
+ * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} leave
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} sync
  * @property {(topic: string) => Promise<Array<Record<string, any>>>} list
  * @property {(topic: string) => Promise<number>} count
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop heartbeat and subscriber
+ * @property {{ subscribe: (ws: any, topic: string, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, close: (ws: any, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void> }} hooks
  */
 
 /**
@@ -292,7 +293,8 @@ export function createPresence(client, options = {}) {
 		await redis.publish(ch, msg).catch(() => {});
 	}
 
-	return {
+	/** @type {RedisPresenceTracker} */
+	const tracker = {
 		async join(ws, topic, platform) {
 			if (topic.startsWith('__')) return;
 
@@ -364,8 +366,78 @@ export function createPresence(client, options = {}) {
 			platform.send(ws, '__presence:' + topic, 'list', list);
 		},
 
-		async leave(ws, platform) {
-			// Handle joined users
+		async leave(ws, platform, topic) {
+			if (topic !== undefined) {
+				// --- Per-topic leave ---
+				const connTopics = wsTopics.get(ws);
+				if (connTopics && connTopics.has(topic)) {
+					const { key, data } = connTopics.get(topic);
+					connTopics.delete(topic);
+					if (connTopics.size === 0) wsTopics.delete(ws);
+
+					ws.unsubscribe('__presence:' + topic);
+
+					const counts = localCounts.get(topic);
+					if (counts) {
+						const current = counts.get(key) || 0;
+						if (current <= 1) {
+							counts.delete(key);
+
+							const topicData = localData.get(topic);
+							if (topicData) {
+								topicData.delete(key);
+								if (topicData.size === 0) localData.delete(topic);
+							}
+
+							if (counts.size === 0) {
+								localCounts.delete(topic);
+								activeTopics.delete(topic);
+								if (!syncCounts.has(topic)) {
+									await unsubscribeFromTopic(topic);
+								}
+							}
+
+							const field = compoundField(key);
+							const suffix = '|' + key;
+							const now = Date.now();
+							const userGone = await redis.eval(
+								LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
+							);
+
+							if (userGone === 1) {
+								const payload = { key, data };
+								platform.publish('__presence:' + topic, 'leave', payload);
+								await publishEvent(topic, 'leave', payload);
+							}
+						} else {
+							counts.set(key, current - 1);
+						}
+					}
+				}
+
+				// Handle sync-only observer for this topic
+				const syncTopics = syncObservers.get(ws);
+				if (syncTopics && syncTopics.has(topic)) {
+					syncTopics.delete(topic);
+					if (syncTopics.size === 0) syncObservers.delete(ws);
+
+					ws.unsubscribe('__presence:' + topic);
+
+					const count = (syncCounts.get(topic) || 1) - 1;
+					if (count <= 0) {
+						syncCounts.delete(topic);
+						if (!localCounts.has(topic)) {
+							await unsubscribeFromTopic(topic);
+						}
+					} else {
+						syncCounts.set(topic, count);
+					}
+				}
+
+				return;
+			}
+
+			// --- Leave all topics ---
 			const connTopics = wsTopics.get(ws);
 			if (connTopics) {
 				for (const [topic, { key, data }] of connTopics) {
@@ -526,6 +598,22 @@ export function createPresence(client, options = {}) {
 			}
 			subscribedChannels.clear();
 			activePlatform = null;
+		},
+
+		hooks: {
+			async subscribe(ws, topic, { platform }) {
+				if (topic.startsWith('__presence:')) {
+					const realTopic = topic.slice('__presence:'.length);
+					await tracker.sync(ws, realTopic, platform);
+					return;
+				}
+				await tracker.join(ws, topic, platform);
+			},
+			async close(ws, { platform }) {
+				await tracker.leave(ws, platform);
+			}
 		}
 	};
+
+	return tracker;
 }

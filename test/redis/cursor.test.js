@@ -276,6 +276,77 @@ describe('redis cursor', () => {
 			expect(updates).toHaveLength(0);
 		});
 
+		it('per-topic: removes cursor from only the specified topic', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas-a', { x: 1 }, platform);
+			c.update(ws, 'canvas-b', { x: 2 }, platform);
+			platform.reset();
+
+			await c.remove(ws, platform, 'canvas-a');
+
+			const removes = platform.published.filter((e) => e.event === 'remove');
+			expect(removes).toHaveLength(1);
+			expect(removes[0].topic).toBe('__cursor:canvas-a');
+
+			// canvas-b should still have a cursor
+			const list = await c.list('canvas-b');
+			expect(list).toHaveLength(1);
+
+			// canvas-a should be empty
+			const listA = await c.list('canvas-a');
+			expect(listA).toEqual([]);
+			c.destroy();
+		});
+
+		it('per-topic: ws can still update remaining topics after per-topic remove', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas-a', { x: 1 }, platform);
+			c.update(ws, 'canvas-b', { x: 2 }, platform);
+
+			await c.remove(ws, platform, 'canvas-a');
+			platform.reset();
+
+			// Should still be able to update canvas-b
+			c.update(ws, 'canvas-b', { x: 3 }, platform);
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].data.data).toEqual({ x: 3 });
+			c.destroy();
+		});
+
+		it('per-topic: is safe to call for a topic the ws never had', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas-a', { x: 1 }, platform);
+			platform.reset();
+
+			await c.remove(ws, platform, 'nonexistent');
+			expect(platform.published).toHaveLength(0);
+
+			// canvas-a should still be intact
+			const list = await c.list('canvas-a');
+			expect(list).toHaveLength(1);
+			c.destroy();
+		});
+
+		it('per-topic: cleans up wsState when last topic is removed', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			await c.remove(ws, platform, 'canvas');
+
+			// After removing the only topic, remove-all should be a no-op
+			platform.reset();
+			await c.remove(ws, platform);
+			expect(platform.published).toHaveLength(0);
+			c.destroy();
+		});
+
 		it('removes entry from Redis hash', async () => {
 			const c = createCursor(client, { throttle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });

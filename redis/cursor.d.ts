@@ -42,10 +42,10 @@ export interface RedisCursorTracker {
 	update(ws: any, topic: string, data: any, platform: Platform): void;
 
 	/**
-	 * Remove a connection's cursor state from all topics and broadcast removal.
+	 * Remove a connection's cursor state from a specific topic, or all topics if omitted.
 	 * Call this from your `close` hook.
 	 */
-	remove(ws: any, platform: Platform): Promise<void>;
+	remove(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/**
 	 * Get current cursor positions for a topic across all instances.
