@@ -353,8 +353,12 @@ export function createPresence(client, options = {}) {
 				}
 			}
 
-			// Subscribe ws to presence channel
-			ws.subscribe('__presence:' + topic);
+			// Subscribe ws to presence channel (may have closed during async gap)
+			try {
+				ws.subscribe('__presence:' + topic);
+			} catch {
+				return;
+			}
 
 			// Send current list to this connection
 			const all = await redis.hgetall(hashKey(topic));
@@ -363,7 +367,11 @@ export function createPresence(client, options = {}) {
 			for (const [userKey, entry] of entries) {
 				list.push({ key: userKey, data: entry.data });
 			}
-			platform.send(ws, '__presence:' + topic, 'list', list);
+			try {
+				platform.send(ws, '__presence:' + topic, 'list', list);
+			} catch {
+				// WebSocket closed before send
+			}
 		},
 
 		async leave(ws, platform, topic) {
@@ -375,7 +383,7 @@ export function createPresence(client, options = {}) {
 					connTopics.delete(topic);
 					if (connTopics.size === 0) wsTopics.delete(ws);
 
-					ws.unsubscribe('__presence:' + topic);
+					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 
 					const counts = localCounts.get(topic);
 					if (counts) {
@@ -421,7 +429,7 @@ export function createPresence(client, options = {}) {
 					syncTopics.delete(topic);
 					if (syncTopics.size === 0) syncObservers.delete(ws);
 
-					ws.unsubscribe('__presence:' + topic);
+					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 
 					const count = (syncCounts.get(topic) || 1) - 1;
 					if (count <= 0) {
@@ -529,8 +537,12 @@ export function createPresence(client, options = {}) {
 				}
 			}
 
-			ws.subscribe(presenceTopic);
-			platform.send(ws, presenceTopic, 'list', list);
+			try {
+				ws.subscribe(presenceTopic);
+				platform.send(ws, presenceTopic, 'list', list);
+			} catch {
+				// WebSocket closed during async gap
+			}
 		},
 
 		async list(topic) {
@@ -553,12 +565,12 @@ export function createPresence(client, options = {}) {
 			// Unsubscribe all local ws from their presence topics
 			for (const [ws, connTopics] of wsTopics) {
 				for (const topic of connTopics.keys()) {
-					ws.unsubscribe('__presence:' + topic);
+					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				}
 			}
 			for (const [ws, topics] of syncObservers) {
 				for (const topic of topics) {
-					ws.unsubscribe('__presence:' + topic);
+					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				}
 			}
 
