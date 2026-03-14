@@ -252,7 +252,7 @@ export function createPresence(client, options = {}) {
 	async function ensureSubscriber(platform) {
 		activePlatform = platform;
 		if (!subscriber) {
-			subscriber = client.duplicate();
+			subscriber = client.duplicate({ enableReadyCheck: false });
 			subscriber.on('message', (ch, message) => {
 				try {
 					const parsed = JSON.parse(message);

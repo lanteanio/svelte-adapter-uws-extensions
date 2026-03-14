@@ -91,7 +91,7 @@ export function createCursor(client, options = {}) {
 	function ensureSubscriber(platform) {
 		activePlatform = platform;
 		if (subscriber) return;
-		const sub = client.duplicate();
+		const sub = client.duplicate({ enableReadyCheck: false });
 		subscriber = sub;
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;

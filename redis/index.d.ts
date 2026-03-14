@@ -18,8 +18,8 @@ export interface RedisClient {
 	readonly keyPrefix: string;
 	/** Prefix a key: `keyPrefix + key`. */
 	key(key: string): string;
-	/** Create a new connection with the same config (for subscribers). */
-	duplicate(): Redis;
+	/** Create a new connection with the same config. Pass overrides to change options (e.g. `{ enableReadyCheck: false }` for subscriber clients). */
+	duplicate(overrides?: RedisOptions): Redis;
 	/** Gracefully disconnect all connections. */
 	quit(): Promise<void>;
 }

@@ -95,7 +95,7 @@ export const redis = createRedisClient({
 |---|---|
 | `redis.redis` | The underlying ioredis instance |
 | `redis.key(k)` | Returns `keyPrefix + k` |
-| `redis.duplicate()` | New connection with same config (for subscribers) |
+| `redis.duplicate(overrides?)` | New connection with same config. Pass ioredis options to override defaults. |
 | `redis.quit()` | Gracefully disconnect all connections |
 
 ---
@@ -305,12 +305,38 @@ export async function close(ws, { platform }) {
 | Method | Description |
 |---|---|
 | `join(ws, topic, platform)` | Add connection to presence |
-| `leave(ws, platform)` | Remove from all topics |
+| `leave(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
 | `sync(ws, topic, platform)` | Send list without joining |
 | `list(topic)` | Get current users |
 | `count(topic)` | Count unique users |
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
+| `hooks` | `{ subscribe, close }` -- ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
+
+#### Zero-config hooks
+
+Instead of writing `subscribe` and `close` handlers manually, destructure `presence.hooks`:
+
+```js
+// src/hooks.ws.js
+import { presence } from '$lib/server/presence';
+export const { subscribe, close } = presence.hooks;
+```
+
+`subscribe` handles both regular topics (calls `join`) and `__presence:*` topics (calls `sync` so the client gets the current list). `close` calls `leave`.
+
+If you need custom logic (auth gating, logging), wrap the hooks:
+
+```js
+import { presence } from '$lib/server/presence';
+
+export async function subscribe(ws, topic, ctx) {
+  if (!ctx.platform.getUserData(ws).authenticated) return;
+  await presence.hooks.subscribe(ws, topic, ctx);
+}
+
+export const { close } = presence.hooks;
+```
 
 ---
 
@@ -482,7 +508,7 @@ export function close(ws, { platform }) {
 | Method | Description |
 |---|---|
 | `update(ws, topic, data, platform)` | Broadcast cursor position (throttled per user per topic) |
-| `remove(ws, platform)` | Remove from all topics and broadcast removal |
+| `remove(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
 | `list(topic)` | Get current positions across all instances |
 | `clear()` | Reset all local and Redis state |
 | `destroy()` | Stop the Redis subscriber and clear timers |

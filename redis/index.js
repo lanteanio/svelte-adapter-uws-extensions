@@ -23,7 +23,7 @@ import { ConnectionError } from '../shared/errors.js';
  * @property {import('ioredis').Redis} redis - The underlying ioredis instance
  * @property {string} keyPrefix - The key prefix
  * @property {(key: string) => string} key - Prefix a key: `keyPrefix + key`
- * @property {() => import('ioredis').Redis} duplicate - Create a new connection with the same config (for subscribers)
+ * @property {(overrides?: import('ioredis').RedisOptions) => import('ioredis').Redis} duplicate - Create a new connection with the same config (for subscribers)
  * @property {() => Promise<void>} quit - Gracefully disconnect
  */
 
@@ -89,8 +89,8 @@ export function createRedisClient(options = {}) {
 			return keyPrefix + k;
 		},
 
-		duplicate() {
-			const dup = redis.duplicate();
+		duplicate(overrides) {
+			const dup = overrides ? redis.duplicate(overrides) : redis.duplicate();
 			duplicates.push(dup);
 			return dup;
 		},

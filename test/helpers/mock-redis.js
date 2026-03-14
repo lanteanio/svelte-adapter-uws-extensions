@@ -168,7 +168,7 @@ export function mockRedisClient(keyPrefix = '') {
 			},
 
 			// Lifecycle
-			duplicate() {
+			duplicate(/* overrides */) {
 				const dup = mockRedis();
 				// Register this duplicate as a pub/sub receiver
 				pubsubHandlers.push({
@@ -380,7 +380,7 @@ export function mockRedisClient(keyPrefix = '') {
 		redis,
 		keyPrefix,
 		key(k) { return keyPrefix + k; },
-		duplicate() { return redis.duplicate(); },
+		duplicate(overrides) { return redis.duplicate(overrides); },
 		async quit() {},
 		// Test helpers
 		_store: store,

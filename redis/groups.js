@@ -174,7 +174,7 @@ export function createGroup(client, name, options = {}) {
 	async function ensureSubscriber(platform) {
 		subscribedPlatform = platform;
 		if (subscriber) return;
-		subscriber = client.duplicate();
+		subscriber = client.duplicate({ enableReadyCheck: false });
 		subscriber.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;
 			try {

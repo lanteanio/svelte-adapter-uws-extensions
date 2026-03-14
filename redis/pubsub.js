@@ -112,7 +112,7 @@ export function createPubSubBus(client, options = {}) {
 			activePlatform = platform;
 			if (active) return;
 
-			subscriber = client.duplicate();
+			subscriber = client.duplicate({ enableReadyCheck: false });
 
 			subscriber.on('message', (ch, message) => {
 				if (ch !== channel) return;
