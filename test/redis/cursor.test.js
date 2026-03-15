@@ -628,4 +628,103 @@ describe('redis cursor', () => {
 			expect(platform.published).toHaveLength(0);
 		});
 	});
+
+	describe('per-topic broadcast budget (#3)', () => {
+		it('topicThrottle limits aggregate broadcasts per topic', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, {
+				throttle: 0, // no per-connection throttle
+				topicThrottle: 100 // max 10 broadcasts/sec per topic
+			});
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+			const ws3 = mockWs({ id: '3', name: 'Charlie' });
+
+			// First update broadcasts immediately (leading edge)
+			c.update(ws1, 'canvas', { x: 1 }, platform);
+			expect(platform.published).toHaveLength(1);
+
+			// Second update within the window is coalesced
+			c.update(ws2, 'canvas', { x: 2 }, platform);
+			expect(platform.published).toHaveLength(1);
+
+			// Third update also coalesced
+			c.update(ws3, 'canvas', { x: 3 }, platform);
+			expect(platform.published).toHaveLength(1);
+
+			// After the window passes, trailing edge flushes all dirty entries
+			vi.advanceTimersByTime(100);
+			// ws2 and ws3 should now be broadcast
+			expect(platform.published).toHaveLength(3);
+
+			c.destroy();
+		});
+
+		it('topicThrottle sends latest data per key', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 0 }, platform);
+			platform.reset();
+
+			// Multiple updates coalesced -- only latest should be broadcast
+			c.update(ws, 'canvas', { x: 10 }, platform);
+			c.update(ws, 'canvas', { x: 20 }, platform);
+			c.update(ws, 'canvas', { x: 99 }, platform);
+
+			vi.advanceTimersByTime(100);
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].data.data).toEqual({ x: 99 });
+
+			c.destroy();
+		});
+
+		it('topicThrottle: 0 disables aggregate throttle', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+
+			c.update(ws1, 'canvas', { x: 1 }, platform);
+			c.update(ws2, 'canvas', { x: 2 }, platform);
+
+			// Both should broadcast immediately (no aggregate throttle)
+			expect(platform.published).toHaveLength(2);
+
+			c.destroy();
+		});
+
+		it('different topics have independent budgets', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			// Each topic gets its own leading-edge broadcast
+			c.update(ws, 'canvas-a', { x: 1 }, platform);
+			c.update(ws, 'canvas-b', { x: 2 }, platform);
+
+			expect(platform.published).toHaveLength(2);
+
+			c.destroy();
+		});
+
+		it('topicThrottle timers are cleaned up on destroy', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			c.update(ws, 'canvas', { x: 0 }, platform);
+			platform.reset();
+
+			c.update(ws, 'canvas', { x: 10 }, platform);
+			c.destroy();
+
+			vi.advanceTimersByTime(200);
+			expect(platform.published).toHaveLength(0);
+		});
+	});
 });

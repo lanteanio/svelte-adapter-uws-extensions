@@ -60,11 +60,17 @@ for i = 1, #all, 2 do
   end
 end
 
-local result = {isFirst}
-for i = 1, #all do
-  result[#result + 1] = all[i]
+-- For small hashes return entries inline (saves a round trip).
+-- For large hashes return only the flag; the caller fetches the
+-- list via a coalesced HGETALL shared across concurrent joiners.
+if #all <= 200 then
+  local result = {isFirst}
+  for i = 1, #all do
+    result[#result + 1] = all[i]
+  end
+  return result
 end
-return result
+return {isFirst}
 `;
 
 /**
@@ -268,6 +274,22 @@ export function createPresence(client, options = {}) {
 	/** @type {Set<string>} */
 	const activeTopics = new Set();
 	const heartbeatTimer = setInterval(() => {
+		// Detect dead connections whose close handler never fired.
+		// Under mass disconnect, the runtime may drop close events.
+		// Probe each tracked ws; if the probe throws the socket is
+		// dead and we synchronously purge it from local state so the
+		// refresh loop below never touches it.
+		if (activePlatform) {
+			const dead = [];
+			for (const [ws] of wsTopics) {
+				try { ws.getBufferedAmount(); } catch { dead.push(ws); }
+			}
+			for (const ws of dead) {
+				// Full leave (sync Phase 1 + async Phase 2 fire-and-forget)
+				tracker.leave(ws, activePlatform).catch(() => {});
+			}
+		}
+
 		const now = Date.now();
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
@@ -385,15 +407,14 @@ export function createPresence(client, options = {}) {
 			// cleaned local state -- undo any Redis write and bail out.
 			if (!wsTopics.has(ws)) return;
 
-			// all will hold the raw hash entries for the initial list.
-			// When prevCount === 0 the Lua script returns them inline
-			// (no separate HGETALL needed). Otherwise we coalesce so
-			// N connections joining the same topic share one round trip.
 			let all;
 
 			if (prevCount === 0) {
 				// New user on this instance -- single Lua call does
-				// HSET + EXPIRE + dedup check + returns all entries.
+				// HSET + EXPIRE + dedup check.  For small hashes the
+				// script returns all entries inline (1 round trip).
+				// For large hashes it returns only the dedup flag and
+				// we fetch the list via coalesceHgetall below.
 				const now = Date.now();
 				const field = compoundField(key);
 				const value = JSON.stringify({ data, ts: now });
@@ -410,11 +431,14 @@ export function createPresence(client, options = {}) {
 					return;
 				}
 
-				// Parse result: [isFirst, field1, val1, field2, val2, ...]
 				const isFirstGlobally = result[0];
-				all = {};
-				for (let i = 1; i < result.length; i += 2) {
-					all[result[i]] = result[i + 1];
+
+				if (result.length > 1) {
+					// Small hash: entries returned inline
+					all = {};
+					for (let i = 1; i < result.length; i += 2) {
+						all[result[i]] = result[i + 1];
+					}
 				}
 
 				if (isFirstGlobally === 1) {
@@ -422,7 +446,12 @@ export function createPresence(client, options = {}) {
 					platform.publish('__presence:' + topic, 'join', payload);
 					await publishEvent(topic, 'join', payload);
 				}
-			} else {
+			}
+
+			// Fetch initial list via coalesced HGETALL when the script
+			// did not return entries inline (large hash or dedup join).
+			// Concurrent joiners share a single Redis round trip.
+			if (!all) {
 				all = await coalesceHgetall(topic);
 			}
 
@@ -574,23 +603,39 @@ export function createPresence(client, options = {}) {
 
 			// Phase 2: Async Redis cleanup. Local state is already clean so
 			// the heartbeat will not refresh any of these entries.
-			for (const { topic, key, data, needsUnsub } of pendingLeaves) {
+			// Use a pipeline to batch all LEAVE_SCRIPT EVALs into a single
+			// Redis round trip. Under mass disconnect (1000+ connections)
+			// this avoids overwhelming the Redis command queue.
+			for (const { needsUnsub, topic } of pendingLeaves) {
 				if (needsUnsub) {
 					await unsubscribeFromTopic(topic);
 				}
+			}
 
+			const now = Date.now();
+			const pipe = redis.pipeline();
+			for (const { topic, key } of pendingLeaves) {
 				const field = compoundField(key);
 				const suffix = '|' + key;
-				const now = Date.now();
-				const userGone = await redis.eval(
-					LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
-				);
+				pipe.eval(LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs);
+			}
 
-				if (userGone === 1) {
-					const payload = { key, data };
-					platform.publish('__presence:' + topic, 'leave', payload);
-					await publishEvent(topic, 'leave', payload);
-				}
+			let results;
+			try {
+				results = await pipe.exec();
+			} catch {
+				// Pipeline failed -- CLEANUP_SCRIPT will handle stale entries via TTL
+				return;
+			}
+
+			// Broadcast leave events for users that are completely gone
+			for (let i = 0; i < pendingLeaves.length; i++) {
+				const [err, userGone] = results[i];
+				if (err || userGone !== 1) continue;
+				const { topic, key, data } = pendingLeaves[i];
+				const payload = { key, data };
+				platform.publish('__presence:' + topic, 'leave', payload);
+				await publishEvent(topic, 'leave', payload);
 			}
 
 			// Async unsubscribe for sync-only observer topics

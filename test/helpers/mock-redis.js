@@ -171,6 +171,34 @@ export function mockRedisClient(keyPrefix = '') {
 				return ['0', matched];
 			},
 
+			// Pipeline support for batched commands
+			pipeline() {
+				const commands = [];
+				const p = new Proxy({}, {
+					get(_, method) {
+						if (method === 'exec') {
+							return async () => {
+								const results = [];
+								for (const { method: m, args } of commands) {
+									try {
+										const result = await r[m](...args);
+										results.push([null, result]);
+									} catch (err) {
+										results.push([err, null]);
+									}
+								}
+								return results;
+							};
+						}
+						return (...args) => {
+							commands.push({ method, args });
+							return p;
+						};
+					}
+				});
+				return p;
+			},
+
 			// Lifecycle
 			duplicate(/* overrides */) {
 				const dup = mockRedis();

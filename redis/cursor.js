@@ -49,6 +49,9 @@ return removed
  * @typedef {Object} RedisCursorOptions
  * @property {number} [throttle=50] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
+ * @property {number} [topicThrottle=0] - Minimum ms between aggregate broadcasts per
+ *   topic. Caps total Redis writes regardless of connection count. 0 = no limit.
+ *   Set to ~16 (60/sec) to prevent Redis saturation under high concurrency.
  * @property {(userData: any) => any} [select] - Extract user-identifying data from userData.
  *   Defaults to the full userData.
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
@@ -80,6 +83,7 @@ return removed
  */
 export function createCursor(client, options = {}) {
 	const throttleMs = options.throttle ?? 50;
+	const topicThrottleMs = options.topicThrottle ?? 0;
 	const select = options.select || ((userData) => userData);
 	const cursorTtl = options.ttl || 30;
 
@@ -189,7 +193,16 @@ export function createCursor(client, options = {}) {
 	/**
 	 * Broadcast locally + relay to other instances via Redis.
 	 */
-	function broadcast(topic, key, user, data, platform) {
+	/**
+	 * Per-topic aggregate throttle state.
+	 * When topicThrottleMs > 0, excess broadcasts are coalesced and
+	 * flushed on a trailing-edge timer so total Redis load per topic
+	 * is capped regardless of connection count.
+	 * @type {Map<string, { lastFlush: number, timer: any, dirty: Map<string, { user: any, data: any, platform: any }> }>}
+	 */
+	const topicFlush = new Map();
+
+	function doBroadcast(topic, key, user, data, platform) {
 		// Local broadcast
 		platform.publish('__cursor:' + topic, 'update', { key, user, data });
 
@@ -206,6 +219,50 @@ export function createCursor(client, options = {}) {
 			payload: { key, user, data }
 		});
 		redis.publish(channel, msg).catch(() => {});
+	}
+
+	function broadcast(topic, key, user, data, platform) {
+		if (topicThrottleMs <= 0) {
+			doBroadcast(topic, key, user, data, platform);
+			return;
+		}
+
+		// Per-topic aggregate throttle
+		let state = topicFlush.get(topic);
+		if (!state) {
+			state = { lastFlush: 0, timer: null, dirty: new Map() };
+			topicFlush.set(topic, state);
+		}
+
+		// Always store the latest data per key
+		state.dirty.set(key, { user, data, platform });
+
+		const now = Date.now();
+
+		// Leading edge: flush immediately if window has passed
+		if (now - state.lastFlush >= topicThrottleMs) {
+			if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+			state.lastFlush = now;
+			for (const [k, v] of state.dirty) {
+				doBroadcast(topic, k, v.user, v.data, v.platform);
+			}
+			state.dirty.clear();
+			return;
+		}
+
+		// Trailing edge: schedule flush at end of window
+		if (!state.timer) {
+			state.timer = setTimeout(() => {
+				const s = topicFlush.get(topic);
+				if (!s) return;
+				s.timer = null;
+				s.lastFlush = Date.now();
+				for (const [k, v] of s.dirty) {
+					doBroadcast(topic, k, v.user, v.data, v.platform);
+				}
+				s.dirty.clear();
+			}, topicThrottleMs - (now - state.lastFlush));
+		}
 	}
 
 	function broadcastRemove(topic, key, platform) {
@@ -346,7 +403,11 @@ export function createCursor(client, options = {}) {
 					if (entry.timer) clearTimeout(entry.timer);
 				}
 			}
+			for (const [, state] of topicFlush) {
+				if (state.timer) clearTimeout(state.timer);
+			}
 			topics.clear();
+			topicFlush.clear();
 			wsState.clear();
 			activeTopics.clear();
 			connCounter = 0;
@@ -371,6 +432,10 @@ export function createCursor(client, options = {}) {
 					if (entry.timer) clearTimeout(entry.timer);
 				}
 			}
+			for (const [, state] of topicFlush) {
+				if (state.timer) clearTimeout(state.timer);
+			}
+			topicFlush.clear();
 			if (subscriber) {
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;

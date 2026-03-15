@@ -10,6 +10,15 @@ export interface RedisCursorOptions {
 	throttle?: number;
 
 	/**
+	 * Minimum ms between aggregate broadcasts per topic, across all
+	 * connections. Caps total Redis writes regardless of connection count.
+	 * Set to ~16 (60 broadcasts/sec) to prevent Redis saturation under
+	 * high concurrency. 0 disables the aggregate throttle.
+	 * @default 0
+	 */
+	topicThrottle?: number;
+
+	/**
 	 * Extract user-identifying data from userData.
 	 * Broadcast alongside cursor data so other clients know who the cursor belongs to.
 	 * @default identity

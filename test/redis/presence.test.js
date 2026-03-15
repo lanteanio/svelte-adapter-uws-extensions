@@ -743,4 +743,94 @@ describe('redis presence', () => {
 			instance2.destroy();
 		});
 	});
+
+	describe('dead connection cleanup (#4)', () => {
+		it('heartbeat detects dead ws and cleans up presence', async () => {
+			// Use a short heartbeat so the test does not wait long
+			const p = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, name: ud.name }),
+				heartbeat: 200,
+				ttl: 10
+			});
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+
+			await p.join(ws1, 'room', platform);
+			await p.join(ws2, 'room', platform);
+			expect(await p.count('room')).toBe(2);
+
+			// Simulate ws1 dying without close handler firing
+			ws1.close();
+
+			// Wait for the heartbeat to fire and detect the dead connection
+			await new Promise((r) => setTimeout(r, 350));
+
+			// ws1 should have been cleaned up by the heartbeat probe
+			expect(await p.count('room')).toBe(1);
+			const list = await p.list('room');
+			expect(list).toHaveLength(1);
+			expect(list[0]).toEqual({ id: '2', name: 'Bob' });
+
+			p.destroy();
+		});
+
+		it('heartbeat leave for dead ws broadcasts leave event', async () => {
+			const p = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, name: ud.name }),
+				heartbeat: 200,
+				ttl: 10
+			});
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			await p.join(ws1, 'room', platform);
+			platform.reset();
+
+			ws1.close();
+			await new Promise((r) => setTimeout(r, 350));
+
+			const leaves = platform.published.filter((e) => e.event === 'leave');
+			expect(leaves).toHaveLength(1);
+			expect(leaves[0].data.key).toBe('1');
+
+			p.destroy();
+		});
+	});
+
+	describe('pipeline batch leave (#1)', () => {
+		it('mass disconnect cleans up all entries', async () => {
+			const connections = [];
+			for (let i = 0; i < 20; i++) {
+				const ws = mockWs({ id: String(i), name: 'User' + i });
+				await presence.join(ws, 'room', platform);
+				connections.push(ws);
+			}
+			expect(await presence.count('room')).toBe(20);
+
+			// Disconnect all at once via leave-all
+			await Promise.all(connections.map((ws) => presence.leave(ws, platform)));
+
+			expect(await presence.count('room')).toBe(0);
+			expect(await presence.list('room')).toEqual([]);
+		});
+
+		it('pipeline leave broadcasts correct leave events', async () => {
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '1', name: 'Alice' }); // same user, different tab
+			await presence.join(ws1, 'room-a', platform);
+			await presence.join(ws1, 'room-b', platform);
+			await presence.join(ws2, 'room-a', platform);
+			platform.reset();
+
+			// Leave-all for ws1 uses pipeline internally
+			await presence.leave(ws1, platform);
+
+			const leaves = platform.published.filter((p) => p.event === 'leave');
+			// ws1 should leave room-b (only connection), but NOT room-a (ws2 still there with same key)
+			expect(leaves).toHaveLength(1);
+			expect(leaves[0].topic).toBe('__presence:room-b');
+		});
+	});
 });
