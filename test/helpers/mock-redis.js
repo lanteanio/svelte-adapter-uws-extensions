@@ -140,8 +140,8 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('zremrangebyrank') && script.includes('cjson.encode')) {
 					return evalReplayPublish(numKeys, args);
 				}
-				// Presence join script (hset + check if first live instance for user)
-				if (script.includes('hset') && script.includes('suffix') && !script.includes('hdel')) {
+				// Presence join script (hset + expire, no dedup scan)
+				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
 					return evalPresenceJoin(args);
 				}
 				// Presence leave script (hdel + check remaining by suffix)
@@ -276,43 +276,18 @@ export function mockRedisClient(keyPrefix = '') {
 		}
 
 		// Presence join Lua script simulation
-		// Returns [isFirst, field1, val1, field2, val2, ...] to match the
-		// real Lua script which folds HSET + EXPIRE + HGETALL into one call.
+		// HSET + EXPIRE, always returns 1.  Cross-instance dedup was removed
+		// from the real Lua script (O(N) scan per join was the bottleneck).
 		function evalPresenceJoin(args) {
 			const key = args[0];
 			const field = args[1];
 			const value = args[2];
-			const suffix = args[3];
-			const now = Number(args[4]);
-			const ttlMs = Number(args[5]);
-			// args[6] = ttlSec (for EXPIRE, no-op in mock)
+			// args[3] = ttlSec (for EXPIRE, no-op in mock)
 
-			// hset
 			if (!hashes.has(key)) hashes.set(key, new Map());
 			hashes.get(key).set(field, value);
 
-			// Check if another live instance already has this user
-			const h = hashes.get(key);
-			let isFirst = 1;
-			for (const [f, v] of h) {
-				if (f === field) continue;
-				if (f.length >= suffix.length && f.slice(-suffix.length) === suffix) {
-					try {
-						const parsed = JSON.parse(v);
-						if (parsed.ts && (now - parsed.ts) <= ttlMs) {
-							isFirst = 0;
-							break;
-						}
-					} catch { /* skip */ }
-				}
-			}
-
-			// Return all hash entries alongside the flag
-			const result = [isFirst];
-			for (const [f, v] of h) {
-				result.push(f, v);
-			}
-			return result;
+			return 1;
 		}
 
 		// Presence leave Lua script simulation

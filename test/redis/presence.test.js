@@ -599,8 +599,8 @@ describe('redis presence', () => {
 		});
 	});
 
-	describe('cross-instance join dedup', () => {
-		it('same user joining on second instance does not broadcast a second join', async () => {
+	describe('cross-instance join behavior', () => {
+		it('same user joining on second instance broadcasts join (client dedup)', async () => {
 			const platform2 = mockPlatform();
 			const instance1 = createPresence(client, {
 				key: 'id',
@@ -618,15 +618,18 @@ describe('redis presence', () => {
 			const ws1 = mockWs({ id: 'alice', name: 'Alice' });
 			const ws2 = mockWs({ id: 'alice', name: 'Alice' });
 
-			// Alice joins on instance1 -- should broadcast join
+			// Alice joins on instance1 -- broadcasts join
 			await instance1.join(ws1, 'room', platform);
 			const joins1 = platform.published.filter((p) => p.event === 'join');
 			expect(joins1).toHaveLength(1);
 
-			// Alice joins on instance2 -- should NOT broadcast join (already present globally)
+			// Alice joins on instance2 -- also broadcasts join.
+			// Cross-instance dedup was removed because the O(N) scan per join
+			// was the scalability bottleneck.  Duplicate join events are
+			// harmless: the client does Map.set(key, data) which is idempotent.
 			await instance2.join(ws2, 'room', platform2);
 			const joins2 = platform2.published.filter((p) => p.event === 'join');
-			expect(joins2).toHaveLength(0);
+			expect(joins2).toHaveLength(1);
 
 			instance1.destroy();
 			instance2.destroy();

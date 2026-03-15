@@ -20,57 +20,32 @@
 import { randomBytes } from 'node:crypto';
 
 /**
- * Lua script for atomic join: set this instance's field, expire the key,
- * check if the user already exists on another instance (non-stale),
- * and return all hash entries so the caller can skip a separate HGETALL.
+ * Lua script for atomic join: set this instance's field and expire the key.
  *
  * KEYS[1] = hash key
  * ARGV[1] = field to set (instanceId|userKey)
  * ARGV[2] = field value (JSON with data and ts)
- * ARGV[3] = "|userKey" suffix to match
- * ARGV[4] = now (ms)
- * ARGV[5] = presenceTtlMs
- * ARGV[6] = presenceTtl (seconds, for EXPIRE)
+ * ARGV[3] = presenceTtl (seconds, for EXPIRE)
  *
- * Returns {isFirst, field1, val1, field2, val2, ...} so a single round
- * trip handles HSET + EXPIRE + dedup check + HGETALL.
+ * Cross-instance dedup is intentionally omitted. The local localCounts
+ * map already prevents duplicate joins from the same user on the same
+ * instance (the script only runs when prevCount === 0). If the same
+ * user joins on a second instance, both broadcast "join" -- the client
+ * handles this as an idempotent Map.set on the same key.
+ *
+ * Removing the HGETALL + O(N) scan that was here before drops per-join
+ * Redis work from O(N) to O(1), fixing the O(N^2) total cost that
+ * killed the server at 2000+ concurrent joins.
  */
 const JOIN_SCRIPT = `
 local key = KEYS[1]
 local field = ARGV[1]
 local value = ARGV[2]
-local suffix = ARGV[3]
-local now = tonumber(ARGV[4])
-local ttlMs = tonumber(ARGV[5])
-local ttlSec = tonumber(ARGV[6])
+local ttlSec = tonumber(ARGV[3])
 
 redis.call('hset', key, field, value)
 redis.call('expire', key, ttlSec)
-
-local all = redis.call('hgetall', key)
-local isFirst = 1
-for i = 1, #all, 2 do
-  local f = all[i]
-  if f ~= field and #f >= #suffix and string.sub(f, -#suffix) == suffix then
-    local ok, parsed = pcall(cjson.decode, all[i+1])
-    if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
-      isFirst = 0
-      break
-    end
-  end
-end
-
--- For small hashes return entries inline (saves a round trip).
--- For large hashes return only the flag; the caller fetches the
--- list via a coalesced HGETALL shared across concurrent joiners.
-if #all <= 200 then
-  local result = {isFirst}
-  for i = 1, #all do
-    result[#result + 1] = all[i]
-  end
-  return result
-end
-return {isFirst}
+return 1
 `;
 
 /**
@@ -416,21 +391,14 @@ export function createPresence(client, options = {}) {
 			// cleaned local state -- undo any Redis write and bail out.
 			if (!wsTopics.has(ws)) return;
 
-			let all;
-
 			if (prevCount === 0) {
-				// New user on this instance -- single Lua call does
-				// HSET + EXPIRE + dedup check.  For small hashes the
-				// script returns all entries inline (1 round trip).
-				// For large hashes it returns only the dedup flag and
-				// we fetch the list via coalesceHgetall below.
+				// New user on this instance -- HSET + EXPIRE in one Lua call.
 				const now = Date.now();
 				const field = compoundField(key);
 				const value = JSON.stringify({ data, ts: now });
-				const suffix = '|' + key;
-				const result = await redis.eval(
+				await redis.eval(
 					JOIN_SCRIPT, 1, hashKey(topic),
-					field, value, suffix, now, presenceTtlMs, presenceTtl
+					field, value, presenceTtl
 				);
 
 				// Guard: if ws closed while awaiting Redis, remove the field
@@ -440,29 +408,14 @@ export function createPresence(client, options = {}) {
 					return;
 				}
 
-				const isFirstGlobally = result[0];
-
-				if (result.length > 1) {
-					// Small hash: entries returned inline
-					all = {};
-					for (let i = 1; i < result.length; i += 2) {
-						all[result[i]] = result[i + 1];
-					}
-				}
-
-				if (isFirstGlobally === 1) {
-					const payload = { key, data };
-					platform.publish('__presence:' + topic, 'join', payload);
-					await publishEvent(topic, 'join', payload);
-				}
+				const payload = { key, data };
+				platform.publish('__presence:' + topic, 'join', payload);
+				await publishEvent(topic, 'join', payload);
 			}
 
-			// Fetch initial list via coalesced HGETALL when the script
-			// did not return entries inline (large hash or dedup join).
+			// Fetch initial list via coalesced HGETALL.
 			// Concurrent joiners share a single Redis round trip.
-			if (!all) {
-				all = await coalesceHgetall(topic);
-			}
+			const all = await coalesceHgetall(topic);
 
 			// Subscribe ws to presence channel (may have closed during async gap)
 			try {
