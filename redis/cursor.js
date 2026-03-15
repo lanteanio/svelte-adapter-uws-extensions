@@ -221,6 +221,45 @@ export function createCursor(client, options = {}) {
 		redis.publish(channel, msg).catch(() => {});
 	}
 
+	/**
+	 * Flush all coalesced entries for a topic as a single "bulk" event.
+	 * The client receives one event with all cursor positions instead of
+	 * N individual events landing in the same microtask. This turns N
+	 * store updates per frame into one, and reduces Redis PUBLISH calls
+	 * from N to 1 per flush window.
+	 *
+	 * Each entry is still persisted individually to the Redis hash so
+	 * the per-key TTL and staleness detection work unchanged.
+	 */
+	function flushBulk(topic, dirty) {
+		const entries = [];
+		const now = Date.now();
+		let flushPlatform = null;
+
+		for (const [k, v] of dirty) {
+			entries.push({ key: k, user: v.user, data: v.data });
+			flushPlatform = v.platform;
+			// Persist each entry individually to Redis hash
+			redis.hset(hashKey(topic), k, JSON.stringify({ user: v.user, data: v.data, ts: now })).catch(() => {});
+		}
+
+		redis.expire(hashKey(topic), cursorTtl).catch(() => {});
+
+		if (flushPlatform) {
+			// Single local broadcast with all positions
+			flushPlatform.publish('__cursor:' + topic, 'bulk', entries);
+
+			// Single relay to other instances
+			const msg = JSON.stringify({
+				instanceId,
+				topic,
+				event: 'bulk',
+				payload: entries
+			});
+			redis.publish(channel, msg).catch(() => {});
+		}
+	}
+
 	function broadcast(topic, key, user, data, platform) {
 		if (topicThrottleMs <= 0) {
 			doBroadcast(topic, key, user, data, platform);
@@ -243,8 +282,13 @@ export function createCursor(client, options = {}) {
 		if (now - state.lastFlush >= topicThrottleMs) {
 			if (state.timer) { clearTimeout(state.timer); state.timer = null; }
 			state.lastFlush = now;
-			for (const [k, v] of state.dirty) {
+			if (state.dirty.size === 1) {
+				// Single entry: use normal event so the client does not
+				// need to handle bulk for the common non-contended case.
+				const [k, v] = state.dirty.entries().next().value;
 				doBroadcast(topic, k, v.user, v.data, v.platform);
+			} else {
+				flushBulk(topic, state.dirty);
 			}
 			state.dirty.clear();
 			return;
@@ -257,8 +301,11 @@ export function createCursor(client, options = {}) {
 				if (!s) return;
 				s.timer = null;
 				s.lastFlush = Date.now();
-				for (const [k, v] of s.dirty) {
+				if (s.dirty.size === 1) {
+					const [k, v] = s.dirty.entries().next().value;
 					doBroadcast(topic, k, v.user, v.data, v.platform);
+				} else {
+					flushBulk(topic, s.dirty);
 				}
 				s.dirty.clear();
 			}, topicThrottleMs - (now - state.lastFlush));

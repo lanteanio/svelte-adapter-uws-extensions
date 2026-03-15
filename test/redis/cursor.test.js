@@ -641,27 +641,28 @@ describe('redis cursor', () => {
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			const ws3 = mockWs({ id: '3', name: 'Charlie' });
 
-			// First update broadcasts immediately (leading edge)
+			// First update broadcasts immediately (leading edge, single entry = normal update)
 			c.update(ws1, 'canvas', { x: 1 }, platform);
 			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].event).toBe('update');
 
-			// Second update within the window is coalesced
+			// Second and third updates within the window are coalesced
 			c.update(ws2, 'canvas', { x: 2 }, platform);
-			expect(platform.published).toHaveLength(1);
-
-			// Third update also coalesced
 			c.update(ws3, 'canvas', { x: 3 }, platform);
 			expect(platform.published).toHaveLength(1);
 
-			// After the window passes, trailing edge flushes all dirty entries
+			// After the window passes, trailing edge flushes as a single bulk event
 			vi.advanceTimersByTime(100);
-			// ws2 and ws3 should now be broadcast
-			expect(platform.published).toHaveLength(3);
+			expect(platform.published).toHaveLength(2); // 1 update + 1 bulk
+			const bulk = platform.published[1];
+			expect(bulk.event).toBe('bulk');
+			expect(bulk.data).toHaveLength(2);
+			expect(bulk.data.map((e) => e.data.x).sort()).toEqual([2, 3]);
 
 			c.destroy();
 		});
 
-		it('topicThrottle sends latest data per key', () => {
+		it('single coalesced entry uses normal update event, not bulk', () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
 
@@ -670,14 +671,42 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 0 }, platform);
 			platform.reset();
 
-			// Multiple updates coalesced -- only latest should be broadcast
-			c.update(ws, 'canvas', { x: 10 }, platform);
-			c.update(ws, 'canvas', { x: 20 }, platform);
+			// Only one entry coalesced -- should use normal update, not bulk
 			c.update(ws, 'canvas', { x: 99 }, platform);
+			vi.advanceTimersByTime(100);
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].event).toBe('update');
+			expect(platform.published[0].data.data).toEqual({ x: 99 });
+
+			c.destroy();
+		});
+
+		it('topicThrottle sends latest data per key in bulk', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+
+			c.update(ws1, 'canvas', { x: 0 }, platform);
+			platform.reset();
+
+			// Multiple updates from same key -- only latest should appear in bulk
+			c.update(ws1, 'canvas', { x: 10 }, platform);
+			c.update(ws1, 'canvas', { x: 99 }, platform);
+			c.update(ws2, 'canvas', { x: 50 }, platform);
 
 			vi.advanceTimersByTime(100);
 			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].data.data).toEqual({ x: 99 });
+			const bulk = platform.published[0];
+			expect(bulk.event).toBe('bulk');
+			expect(bulk.data).toHaveLength(2);
+
+			const alice = bulk.data.find((e) => e.data.x === 99);
+			const bob = bulk.data.find((e) => e.data.x === 50);
+			expect(alice).toBeDefined();
+			expect(bob).toBeDefined();
 
 			c.destroy();
 		});
