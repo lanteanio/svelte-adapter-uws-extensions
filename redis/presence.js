@@ -304,6 +304,15 @@ export function createPresence(client, options = {}) {
 			redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), now, presenceTtlMs).catch((err) => {
 				console.warn('presence heartbeat: stale cleanup failed for topic "' + topic + '":', err.message);
 			});
+
+			// Publish heartbeat event so the adapter core client can
+			// refresh maxAge timestamps for active users.  Without this,
+			// client-side maxAge evicts live users that have not had a
+			// fresh join/list event within the window.
+			if (activePlatform && data && data.size > 0) {
+				const keys = [...data.keys()];
+				activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
+			}
 		}
 	}, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();

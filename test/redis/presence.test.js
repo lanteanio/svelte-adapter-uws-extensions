@@ -799,6 +799,58 @@ describe('redis presence', () => {
 		});
 	});
 
+	describe('heartbeat publishes heartbeat event for client maxAge', () => {
+		it('publishes heartbeat with active user keys on each tick', async () => {
+			const p = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, name: ud.name }),
+				heartbeat: 200,
+				ttl: 10
+			});
+
+			const ws1 = mockWs({ id: '1', name: 'Alice' });
+			const ws2 = mockWs({ id: '2', name: 'Bob' });
+
+			await p.join(ws1, 'room', platform);
+			await p.join(ws2, 'room', platform);
+			platform.reset();
+
+			// Wait for one heartbeat tick
+			await new Promise((r) => setTimeout(r, 350));
+
+			const heartbeats = platform.published.filter((e) => e.event === 'heartbeat');
+			expect(heartbeats.length).toBeGreaterThanOrEqual(1);
+
+			const hb = heartbeats[0];
+			expect(hb.topic).toBe('__presence:room');
+			expect(hb.data).toContain('1');
+			expect(hb.data).toContain('2');
+
+			p.destroy();
+		});
+
+		it('does not publish heartbeat for topics with no active users', async () => {
+			const p = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id }),
+				heartbeat: 200,
+				ttl: 10
+			});
+
+			const ws = mockWs({ id: '1' });
+			await p.join(ws, 'room', platform);
+			await p.leave(ws, platform);
+			platform.reset();
+
+			await new Promise((r) => setTimeout(r, 350));
+
+			const heartbeats = platform.published.filter((e) => e.event === 'heartbeat');
+			expect(heartbeats).toHaveLength(0);
+
+			p.destroy();
+		});
+	});
+
 	describe('pipeline batch leave (#1)', () => {
 		it('mass disconnect cleans up all entries', async () => {
 			const connections = [];
