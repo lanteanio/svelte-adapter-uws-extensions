@@ -333,6 +333,10 @@ export function createPresence(client, options = {}) {
 			// Subscribe to cross-instance events for this topic
 			await subscribeToTopic(topic, platform);
 
+			// Guard: if ws was closed during the async gap, leave() already
+			// cleaned local state -- undo any Redis write and bail out.
+			if (!wsTopics.has(ws)) return;
+
 			if (prevCount === 0) {
 				// New user on this instance -- check if globally new via atomic Lua
 				const now = Date.now();
@@ -344,6 +348,13 @@ export function createPresence(client, options = {}) {
 					field, value, suffix, now, presenceTtlMs
 				);
 				await redis.expire(hashKey(topic), presenceTtl);
+
+				// Guard: if ws closed while awaiting Redis, remove the field
+				// we just set and bail -- leave() already cleaned local state.
+				if (!wsTopics.has(ws)) {
+					await redis.hdel(hashKey(topic), field).catch(() => {});
+					return;
+				}
 
 				if (isFirstGlobally === 1) {
 					// No other live instance has this user -- broadcast join
@@ -446,7 +457,18 @@ export function createPresence(client, options = {}) {
 			}
 
 			// --- Leave all topics ---
+			// Phase 1: Synchronous cleanup of ALL local state before any async
+			// work. This prevents the heartbeat from refreshing dead entries and
+			// lets concurrent join() calls detect the closed ws via wsTopics.
 			const connTopics = wsTopics.get(ws);
+			wsTopics.delete(ws);
+
+			const syncTopics = syncObservers.get(ws);
+			syncObservers.delete(ws);
+
+			/** @type {Array<{ topic: string, key: string, data: Record<string, any>, needsUnsub: boolean }>} */
+			const pendingLeaves = [];
+
 			if (connTopics) {
 				for (const [topic, { key, data }] of connTopics) {
 					const counts = localCounts.get(topic);
@@ -456,60 +478,67 @@ export function createPresence(client, options = {}) {
 					if (current <= 1) {
 						counts.delete(key);
 
-						// Clean up local data for this user on this topic
 						const topicData = localData.get(topic);
 						if (topicData) {
 							topicData.delete(key);
 							if (topicData.size === 0) localData.delete(topic);
 						}
 
+						let needsUnsub = false;
 						if (counts.size === 0) {
 							localCounts.delete(topic);
 							activeTopics.delete(topic);
-							// Unsubscribe from Redis channel if no sync observers remain
 							if (!syncCounts.has(topic)) {
-								await unsubscribeFromTopic(topic);
+								needsUnsub = true;
 							}
 						}
 
-						// Atomically remove this instance's field and check if user
-						// is still present on another instance (ignoring stale entries)
-						const field = compoundField(key);
-						const suffix = '|' + key;
-						const now = Date.now();
-						const userGone = await redis.eval(
-							LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
-						);
-
-						if (userGone === 1) {
-							// No other instance has this user -- broadcast leave
-							const payload = { key, data };
-							platform.publish('__presence:' + topic, 'leave', payload);
-							await publishEvent(topic, 'leave', payload);
-						}
+						pendingLeaves.push({ topic, key, data, needsUnsub });
 					} else {
 						counts.set(key, current - 1);
 					}
 				}
-				wsTopics.delete(ws);
 			}
 
-			// Handle sync-only observers
-			const syncTopics = syncObservers.get(ws);
 			if (syncTopics) {
 				for (const topic of syncTopics) {
 					const count = (syncCounts.get(topic) || 1) - 1;
 					if (count <= 0) {
 						syncCounts.delete(topic);
-						// Unsubscribe from Redis channel if no joined users remain
-						if (!localCounts.has(topic)) {
-							await unsubscribeFromTopic(topic);
-						}
 					} else {
 						syncCounts.set(topic, count);
 					}
 				}
-				syncObservers.delete(ws);
+			}
+
+			// Phase 2: Async Redis cleanup. Local state is already clean so
+			// the heartbeat will not refresh any of these entries.
+			for (const { topic, key, data, needsUnsub } of pendingLeaves) {
+				if (needsUnsub) {
+					await unsubscribeFromTopic(topic);
+				}
+
+				const field = compoundField(key);
+				const suffix = '|' + key;
+				const now = Date.now();
+				const userGone = await redis.eval(
+					LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
+				);
+
+				if (userGone === 1) {
+					const payload = { key, data };
+					platform.publish('__presence:' + topic, 'leave', payload);
+					await publishEvent(topic, 'leave', payload);
+				}
+			}
+
+			// Async unsubscribe for sync-only observer topics
+			if (syncTopics) {
+				for (const topic of syncTopics) {
+					if (!syncCounts.has(topic) && !localCounts.has(topic)) {
+						await unsubscribeFromTopic(topic);
+					}
+				}
 			}
 		},
 
