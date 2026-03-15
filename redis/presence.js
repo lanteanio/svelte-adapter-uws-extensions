@@ -80,6 +80,33 @@ return result
  *
  * Returns 1 if user is completely gone (broadcast leave), 0 if still present.
  */
+/**
+ * Lua script for server-side stale field cleanup.
+ * Runs HGETALL + timestamp check + HDEL entirely on Redis,
+ * avoiding transferring the full hash to the client.
+ *
+ * KEYS[1] = hash key
+ * ARGV[1] = now (ms)
+ * ARGV[2] = ttlMs
+ *
+ * Returns number of removed fields.
+ */
+const CLEANUP_SCRIPT = `-- CLEANUP_STALE
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local ttlMs = tonumber(ARGV[2])
+local all = redis.call('hgetall', key)
+local removed = 0
+for i = 1, #all, 2 do
+  local ok, parsed = pcall(cjson.decode, all[i+1])
+  if (ok and parsed.ts and (now - parsed.ts) > ttlMs) or not ok then
+    redis.call('hdel', key, all[i])
+    removed = removed + 1
+  end
+end
+return removed
+`;
+
 const LEAVE_SCRIPT = `
 local key = KEYS[1]
 local field = ARGV[1]
@@ -251,20 +278,10 @@ export function createPresence(client, options = {}) {
 				}
 			}
 			redis.expire(hashKey(topic), presenceTtl).catch(() => {});
-			// Clean up stale fields from dead instances
-			redis.hgetall(hashKey(topic)).then((all) => {
-				if (!all) return;
-				for (const [field, v] of Object.entries(all)) {
-					try {
-						const parsed = JSON.parse(v);
-						if (parsed.ts && (now - parsed.ts) > presenceTtlMs) {
-							redis.hdel(hashKey(topic), field).catch(() => {});
-						}
-					} catch { /* corrupted, remove */
-						redis.hdel(hashKey(topic), field).catch(() => {});
-					}
-				}
-			}).catch(() => {});
+			// Clean up stale fields from dead instances (runs entirely on Redis)
+			redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), now, presenceTtlMs).catch((err) => {
+				console.warn('presence heartbeat: stale cleanup failed for topic "' + topic + '":', err.message);
+			});
 		}
 	}, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
@@ -281,6 +298,9 @@ export function createPresence(client, options = {}) {
 		activePlatform = platform;
 		if (!subscriber) {
 			subscriber = client.duplicate({ enableReadyCheck: false });
+			subscriber.on('error', (err) => {
+				console.error('presence subscriber error:', err.message);
+			});
 			subscriber.on('message', (ch, message) => {
 				try {
 					const parsed = JSON.parse(message);

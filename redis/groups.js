@@ -19,6 +19,32 @@
 
 import { randomBytes } from 'node:crypto';
 
+/**
+ * Lua script for server-side stale field cleanup.
+ * Runs HGETALL + timestamp check + HDEL entirely on Redis.
+ *
+ * KEYS[1] = hash key
+ * ARGV[1] = now (ms)
+ * ARGV[2] = ttlMs
+ *
+ * Returns number of removed fields.
+ */
+const CLEANUP_SCRIPT = `-- CLEANUP_STALE
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local ttlMs = tonumber(ARGV[2])
+local all = redis.call('hgetall', key)
+local removed = 0
+for i = 1, #all, 2 do
+  local ok, parsed = pcall(cjson.decode, all[i+1])
+  if (ok and parsed.ts and (now - parsed.ts) > ttlMs) or not ok then
+    redis.call('hdel', key, all[i])
+    removed = removed + 1
+  end
+end
+return removed
+`;
+
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
 /**
@@ -147,21 +173,10 @@ export function createGroup(client, name, options = {}) {
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: now });
 			redis.hset(membersKey, entry.memberId, memberData).catch(() => {});
 		}
-		// Clean up stale entries from dead instances so the hash
-		// does not grow forever after crashes.
-		redis.hgetall(membersKey).then((all) => {
-			if (!all) return;
-			for (const [field, v] of Object.entries(all)) {
-				try {
-					const parsed = JSON.parse(v);
-					if (parsed.ts && (now - parsed.ts) > memberTtlMs) {
-						redis.hdel(membersKey, field).catch(() => {});
-					}
-				} catch {
-					redis.hdel(membersKey, field).catch(() => {});
-				}
-			}
-		}).catch(() => {});
+		// Clean up stale entries from dead instances (runs entirely on Redis)
+		redis.eval(CLEANUP_SCRIPT, 1, membersKey, now, memberTtlMs).catch((err) => {
+			console.warn('groups heartbeat: stale cleanup failed for group "' + name + '":', err.message);
+		});
 	}, Math.max(memberTtlMs / 3, 5000));
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
@@ -175,6 +190,9 @@ export function createGroup(client, name, options = {}) {
 		subscribedPlatform = platform;
 		if (subscriber) return;
 		subscriber = client.duplicate({ enableReadyCheck: false });
+		subscriber.on('error', (err) => {
+			console.error('groups subscriber error:', err.message);
+		});
 		subscriber.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;
 			try {

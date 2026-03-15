@@ -19,6 +19,33 @@
 import { randomBytes } from 'node:crypto';
 
 /**
+ * Lua script for server-side stale field cleanup.
+ * Runs HGETALL + timestamp check + HDEL entirely on Redis,
+ * avoiding transferring the full hash to the client.
+ *
+ * KEYS[1] = hash key
+ * ARGV[1] = now (ms)
+ * ARGV[2] = ttlMs
+ *
+ * Returns number of removed fields.
+ */
+const CLEANUP_SCRIPT = `-- CLEANUP_STALE
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local ttlMs = tonumber(ARGV[2])
+local all = redis.call('hgetall', key)
+local removed = 0
+for i = 1, #all, 2 do
+  local ok, parsed = pcall(cjson.decode, all[i+1])
+  if (ok and parsed.ts and (now - parsed.ts) > ttlMs) or not ok then
+    redis.call('hdel', key, all[i])
+    removed = removed + 1
+  end
+end
+return removed
+`;
+
+/**
  * @typedef {Object} RedisCursorOptions
  * @property {number} [throttle=50] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
@@ -86,13 +113,15 @@ export function createCursor(client, options = {}) {
 	let subscriber = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
-	let subscriberReady = false;
 
 	function ensureSubscriber(platform) {
 		activePlatform = platform;
 		if (subscriber) return;
 		const sub = client.duplicate({ enableReadyCheck: false });
 		subscriber = sub;
+		sub.on('error', (err) => {
+			console.error('cursor subscriber error:', err.message);
+		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
 			try {
@@ -113,14 +142,12 @@ export function createCursor(client, options = {}) {
 			}
 		});
 		sub.subscribe(channel).then(() => {
-			subscriberReady = true;
-		}).catch(() => {
+			}).catch(() => {
 			// Subscribe failed -- clean up so the next call can retry
 			sub.quit().catch(() => sub.disconnect());
 			if (subscriber === sub) {
 				subscriber = null;
-				subscriberReady = false;
-			}
+				}
 		});
 	}
 
@@ -135,19 +162,9 @@ export function createCursor(client, options = {}) {
 	const cleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const topic of activeTopics) {
-			redis.hgetall(client.key('cursor:' + topic)).then((all) => {
-				if (!all) return;
-				for (const [field, v] of Object.entries(all)) {
-					try {
-						const parsed = JSON.parse(v);
-						if (parsed.ts && (now - parsed.ts) > cursorTtlMs) {
-							redis.hdel(client.key('cursor:' + topic), field).catch(() => {});
-						}
-					} catch {
-						redis.hdel(client.key('cursor:' + topic), field).catch(() => {});
-					}
-				}
-			}).catch(() => {});
+			redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), now, cursorTtlMs).catch((err) => {
+				console.warn('cursor cleanup: stale removal failed for topic "' + topic + '":', err.message);
+			});
 		}
 	}, cleanupInterval);
 	if (cleanupTimer.unref) cleanupTimer.unref();
@@ -358,7 +375,6 @@ export function createCursor(client, options = {}) {
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;
 			}
-			subscriberReady = false;
 			activePlatform = null;
 		}
 	};

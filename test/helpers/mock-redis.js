@@ -148,6 +148,10 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('hdel') && script.includes('suffix')) {
 					return evalPresenceLeave(args);
 				}
+				// Stale field cleanup script (server-side HGETALL + HDEL)
+				if (script.includes('CLEANUP_STALE')) {
+					return evalCleanupStale(args);
+				}
 				// Group join script (atomic capacity check + insert)
 				if (script.includes('cjson.decode') && script.includes('liveCount')) {
 					return evalGroupJoin(args);
@@ -196,8 +200,8 @@ export function mockRedisClient(keyPrefix = '') {
 			const maxPoints = Number(args[1]);
 			const interval = Number(args[2]);
 			const cost = Number(args[3]);
-			const now = Number(args[4]);
-			const blockDuration = Number(args[5]);
+			const blockDuration = Number(args[4]);
+			const now = Date.now(); // Simulates Redis TIME command
 
 			if (!hashes.has(key)) hashes.set(key, new Map());
 			const h = hashes.get(key);
@@ -380,6 +384,31 @@ export function mockRedisClient(keyPrefix = '') {
 			}
 
 			return seq;
+		}
+
+		// Stale field cleanup Lua script simulation
+		function evalCleanupStale(args) {
+			const key = args[0];
+			const now = Number(args[1]);
+			const ttlMs = Number(args[2]);
+
+			const h = hashes.get(key);
+			if (!h) return 0;
+
+			const toRemove = [];
+			for (const [f, v] of h) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) > ttlMs) {
+						toRemove.push(f);
+					}
+				} catch {
+					toRemove.push(f);
+				}
+			}
+			for (const f of toRemove) h.delete(f);
+			if (h.size === 0) hashes.delete(key);
+			return toRemove.length;
 		}
 
 		return r;

@@ -18,8 +18,9 @@
  * ARGV[1] = max points
  * ARGV[2] = interval (ms)
  * ARGV[3] = cost
- * ARGV[4] = now (ms)
- * ARGV[5] = blockDuration (ms)
+ * ARGV[4] = blockDuration (ms)
+ *
+ * Uses Redis TIME internally for clock-skew-safe timestamps.
  *
  * Returns: [allowed (0/1), remaining, resetMs]
  */
@@ -28,8 +29,11 @@ local key = KEYS[1]
 local maxPoints = tonumber(ARGV[1])
 local interval = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
-local now = tonumber(ARGV[4])
-local blockDuration = tonumber(ARGV[5])
+local blockDuration = tonumber(ARGV[4])
+
+-- Use Redis server time to avoid clock skew between app server and Redis
+local rtime = redis.call('TIME')
+local now = tonumber(rtime[1]) * 1000 + math.floor(tonumber(rtime[2]) / 1000)
 
 local points = tonumber(redis.call('hget', key, 'points'))
 local resetAt = tonumber(redis.call('hget', key, 'resetAt'))
@@ -162,7 +166,6 @@ export function createRateLimit(client, options) {
 				throw new Error('redis ratelimit: cost must be a positive integer');
 			}
 			const key = resolveKey(ws);
-			const now = Date.now();
 
 			const result = await redis.eval(
 				CONSUME_SCRIPT,
@@ -171,7 +174,6 @@ export function createRateLimit(client, options) {
 				points,
 				interval,
 				cost,
-				now,
 				blockDuration
 			);
 
