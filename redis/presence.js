@@ -20,8 +20,9 @@
 import { randomBytes } from 'node:crypto';
 
 /**
- * Lua script for atomic join: set this instance's field and check if
- * the user already exists on another instance (non-stale).
+ * Lua script for atomic join: set this instance's field, expire the key,
+ * check if the user already exists on another instance (non-stale),
+ * and return all hash entries so the caller can skip a separate HGETALL.
  *
  * KEYS[1] = hash key
  * ARGV[1] = field to set (instanceId|userKey)
@@ -29,9 +30,10 @@ import { randomBytes } from 'node:crypto';
  * ARGV[3] = "|userKey" suffix to match
  * ARGV[4] = now (ms)
  * ARGV[5] = presenceTtlMs
+ * ARGV[6] = presenceTtl (seconds, for EXPIRE)
  *
- * Returns 1 if this is the first live instance for the user (broadcast join),
- * 0 if another live instance already has this user.
+ * Returns {isFirst, field1, val1, field2, val2, ...} so a single round
+ * trip handles HSET + EXPIRE + dedup check + HGETALL.
  */
 const JOIN_SCRIPT = `
 local key = KEYS[1]
@@ -40,20 +42,29 @@ local value = ARGV[2]
 local suffix = ARGV[3]
 local now = tonumber(ARGV[4])
 local ttlMs = tonumber(ARGV[5])
+local ttlSec = tonumber(ARGV[6])
 
 redis.call('hset', key, field, value)
+redis.call('expire', key, ttlSec)
 
 local all = redis.call('hgetall', key)
+local isFirst = 1
 for i = 1, #all, 2 do
   local f = all[i]
   if f ~= field and #f >= #suffix and string.sub(f, -#suffix) == suffix then
     local ok, parsed = pcall(cjson.decode, all[i+1])
     if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
-      return 0
+      isFirst = 0
+      break
     end
   end
 end
-return 1
+
+local result = {isFirst}
+for i = 1, #all do
+  result[#result + 1] = all[i]
+end
+return result
 `;
 
 /**
@@ -162,8 +173,25 @@ export function createPresence(client, options = {}) {
 	 */
 	const syncCounts = new Map();
 
+	/**
+	 * Dedup in-flight HGETALL requests for the same topic. Multiple callers
+	 * awaiting the same key share one Redis round trip.
+	 * @type {Map<string, Promise<Record<string, string>>>}
+	 */
+	const hgetallInflight = new Map();
+
 	function hashKey(topic) {
 		return client.key('presence:' + topic);
+	}
+
+	function coalesceHgetall(topic) {
+		const key = hashKey(topic);
+		let pending = hgetallInflight.get(key);
+		if (!pending) {
+			pending = redis.hgetall(key).finally(() => hgetallInflight.delete(key));
+			hgetallInflight.set(key, pending);
+		}
+		return pending;
 	}
 
 	function eventChannel(topic) {
@@ -337,17 +365,23 @@ export function createPresence(client, options = {}) {
 			// cleaned local state -- undo any Redis write and bail out.
 			if (!wsTopics.has(ws)) return;
 
+			// all will hold the raw hash entries for the initial list.
+			// When prevCount === 0 the Lua script returns them inline
+			// (no separate HGETALL needed). Otherwise we coalesce so
+			// N connections joining the same topic share one round trip.
+			let all;
+
 			if (prevCount === 0) {
-				// New user on this instance -- check if globally new via atomic Lua
+				// New user on this instance -- single Lua call does
+				// HSET + EXPIRE + dedup check + returns all entries.
 				const now = Date.now();
 				const field = compoundField(key);
 				const value = JSON.stringify({ data, ts: now });
 				const suffix = '|' + key;
-				const isFirstGlobally = await redis.eval(
+				const result = await redis.eval(
 					JOIN_SCRIPT, 1, hashKey(topic),
-					field, value, suffix, now, presenceTtlMs
+					field, value, suffix, now, presenceTtlMs, presenceTtl
 				);
-				await redis.expire(hashKey(topic), presenceTtl);
 
 				// Guard: if ws closed while awaiting Redis, remove the field
 				// we just set and bail -- leave() already cleaned local state.
@@ -356,12 +390,20 @@ export function createPresence(client, options = {}) {
 					return;
 				}
 
+				// Parse result: [isFirst, field1, val1, field2, val2, ...]
+				const isFirstGlobally = result[0];
+				all = {};
+				for (let i = 1; i < result.length; i += 2) {
+					all[result[i]] = result[i + 1];
+				}
+
 				if (isFirstGlobally === 1) {
-					// No other live instance has this user -- broadcast join
 					const payload = { key, data };
 					platform.publish('__presence:' + topic, 'join', payload);
 					await publishEvent(topic, 'join', payload);
 				}
+			} else {
+				all = await coalesceHgetall(topic);
 			}
 
 			// Subscribe ws to presence channel (may have closed during async gap)
@@ -372,7 +414,6 @@ export function createPresence(client, options = {}) {
 			}
 
 			// Send current list to this connection
-			const all = await redis.hgetall(hashKey(topic));
 			const entries = parseEntries(all);
 			const list = [];
 			for (const [userKey, entry] of entries) {
@@ -543,7 +584,7 @@ export function createPresence(client, options = {}) {
 		},
 
 		async sync(ws, topic, platform) {
-			const all = await redis.hgetall(hashKey(topic));
+			const all = await coalesceHgetall(topic);
 			const presenceTopic = '__presence:' + topic;
 			const entries = parseEntries(all);
 			const list = [];
