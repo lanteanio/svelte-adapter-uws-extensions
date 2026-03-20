@@ -1,4 +1,6 @@
 import type { RedisClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisRateLimitOptions {
 	/** Tokens available per interval. Must be a positive integer. */
@@ -9,6 +11,10 @@ export interface RedisRateLimitOptions {
 	blockDuration?: number;
 	/** Key extraction mode. @default 'ip' */
 	keyBy?: 'ip' | 'connection' | ((ws: any) => string);
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface ConsumeResult {

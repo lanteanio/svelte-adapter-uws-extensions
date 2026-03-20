@@ -64,8 +64,8 @@ export function createRedisClient(options = {}) {
 	}
 
 	// Track duplicate connections for cleanup
-	/** @type {import('ioredis').Redis[]} */
-	const duplicates = [];
+	/** @type {Set<import('ioredis').Redis>} */
+	const duplicates = new Set();
 
 	/** @type {boolean} */
 	let shuttingDown = false;
@@ -75,6 +75,7 @@ export function createRedisClient(options = {}) {
 		shuttingDown = true;
 		const all = [redis, ...duplicates];
 		await Promise.allSettled(all.map((c) => c.quit().catch(() => c.disconnect())));
+		duplicates.clear();
 	}
 
 	if (autoShutdown && typeof process !== 'undefined') {
@@ -91,7 +92,10 @@ export function createRedisClient(options = {}) {
 
 		duplicate(overrides) {
 			const dup = overrides ? redis.duplicate(overrides) : redis.duplicate();
-			duplicates.push(dup);
+			duplicates.add(dup);
+			const cleanup = () => duplicates.delete(dup);
+			dup.on('close', cleanup);
+			dup.on('end', cleanup);
 			return dup;
 		},
 

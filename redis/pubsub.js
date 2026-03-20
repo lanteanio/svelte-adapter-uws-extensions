@@ -57,6 +57,13 @@ export function createPubSubBus(client, options = {}) {
 	const channel = options.channel || 'uws:pubsub';
 	const instanceId = randomBytes(8).toString('hex');
 
+	const b = options.breaker;
+	const m = options.metrics;
+	const mRelayed = m?.counter('pubsub_messages_relayed_total', 'Messages relayed to Redis');
+	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
+	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
+	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush');
+
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
 
@@ -66,25 +73,69 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 
+	// Microtask relay batching: coalesce Redis publishes within a single
+	// event-loop tick into one pipelined round trip.
+	/** @type {Array<string>} */
+	let relayBatch = [];
+	let relayScheduled = false;
+
+	function scheduleRelay(msg) {
+		relayBatch.push(msg);
+		if (!relayScheduled) {
+			relayScheduled = true;
+			queueMicrotask(flushRelay);
+		}
+	}
+
+	function flushRelay() {
+		const batch = relayBatch;
+		relayBatch = [];
+		relayScheduled = false;
+		if (b) {
+			try { b.guard(); } catch { return; }
+		}
+		if (batch.length === 1) {
+			client.redis.publish(channel, batch[0]).then(() => {
+				mBatchSize?.observe(1);
+				mRelayed?.inc(1);
+				b?.success();
+			}).catch((err) => { b?.failure(err); });
+			return;
+		}
+		const pipe = client.redis.pipeline();
+		for (let i = 0; i < batch.length; i++) {
+			pipe.publish(channel, batch[i]);
+		}
+		pipe.exec().then(() => {
+			mBatchSize?.observe(batch.length);
+			mRelayed?.inc(batch.length);
+			b?.success();
+		}).catch((err) => { b?.failure(err); });
+	}
+
 	return {
 		wrap(platform) {
 			const wrapped = {
 				publish(topic, event, data, options) {
-					// Publish locally, forwarding options as-is
 					const result = platform.publish(topic, event, data, options);
 
-					// Only relay to Redis if the caller did not suppress relay.
-					// When relay is explicitly false the message is local-only
-					// (e.g. it already came from Redis on another instance).
 					if (!options || options.relay !== false) {
-						const msg = JSON.stringify({ instanceId, topic, event, data });
-						client.redis.publish(channel, msg).catch(() => {
-							// Fire-and-forget: ioredis auto-reconnects.
-							// Swallowing here prevents unhandled rejections on transient disconnects.
-						});
+						scheduleRelay(JSON.stringify({ instanceId, topic, event, data }));
 					}
 
 					return result;
+				},
+				batch(messages) {
+					const results = platform.batch(messages);
+					for (let i = 0; i < messages.length; i++) {
+						const m = messages[i];
+						if (!m.options || m.options.relay !== false) {
+							scheduleRelay(JSON.stringify({
+								instanceId, topic: m.topic, event: m.event, data: m.data
+							}));
+						}
+					}
+					return results;
 				},
 				send: platform.send.bind(platform),
 				sendTo: platform.sendTo.bind(platform),
@@ -111,6 +162,7 @@ export function createPubSubBus(client, options = {}) {
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
 			if (active) return;
+			b?.guard();
 
 			subscriber = client.duplicate({ enableReadyCheck: false });
 
@@ -119,7 +171,11 @@ export function createPubSubBus(client, options = {}) {
 				try {
 					const parsed = JSON.parse(message);
 					// Skip messages from this instance (echo suppression)
-					if (parsed.instanceId === instanceId) return;
+					if (parsed.instanceId === instanceId) {
+						mEchoSuppressed?.inc();
+						return;
+					}
+					mReceived?.inc();
 					// Forward to local platform only -- relay: false prevents the
 					// adapter from IPC-relaying to sibling workers, since each
 					// worker has its own Redis subscriber already receiving this.
@@ -131,9 +187,10 @@ export function createPubSubBus(client, options = {}) {
 
 			try {
 				await subscriber.subscribe(channel);
+				b?.success();
 				active = true;
 			} catch (err) {
-				// Clean up so the next activate() call can retry
+				b?.failure(err);
 				activePlatform = null;
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;

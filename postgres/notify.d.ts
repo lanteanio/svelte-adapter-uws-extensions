@@ -1,5 +1,7 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { PgClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface NotifyBridgeOptions {
 	/** Postgres LISTEN channel name. Required. */
@@ -17,6 +19,10 @@ export interface NotifyBridgeOptions {
 
 	/** ms between reconnect attempts. @default 3000 */
 	reconnectInterval?: number;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface NotifyBridge {

@@ -30,6 +30,9 @@ export function mockRedisClient(keyPrefix = '') {
 				}
 				return count;
 			},
+			async unlink(...keys) {
+				return r.del(...keys);
+			},
 			async expire() { return 1; },
 			async pexpire() { return 1; },
 
@@ -45,12 +48,19 @@ export function mockRedisClient(keyPrefix = '') {
 				const set = sortedSets.get(key);
 				return set ? set.length : 0;
 			},
-			async zrangebyscore(key, min, max) {
+			async zrangebyscore(key, min, max, ...extra) {
 				const set = sortedSets.get(key);
 				if (!set) return [];
 				const lo = min === '-inf' ? -Infinity : Number(min);
 				const hi = max === '+inf' ? Infinity : Number(max);
-				return set.filter((e) => e.score >= lo && e.score <= hi).map((e) => e.member);
+				let result = set.filter((e) => e.score >= lo && e.score <= hi).map((e) => e.member);
+				const limitIdx = extra.indexOf('LIMIT');
+				if (limitIdx !== -1) {
+					const offset = Number(extra[limitIdx + 1]);
+					const count = Number(extra[limitIdx + 2]);
+					result = result.slice(offset, offset + count);
+				}
+				return result;
 			},
 			async zremrangebyrank(key, start, stop) {
 				const set = sortedSets.get(key);
@@ -84,6 +94,10 @@ export function mockRedisClient(keyPrefix = '') {
 			async hget(key, field) {
 				const h = hashes.get(key);
 				return h ? (h.get(field) || null) : null;
+			},
+			async hmget(key, ...fields) {
+				const h = hashes.get(key);
+				return fields.map((f) => (h ? (h.get(String(f)) ?? null) : null));
 			},
 			async hgetall(key) {
 				const h = hashes.get(key);
@@ -132,6 +146,10 @@ export function mockRedisClient(keyPrefix = '') {
 
 			// Eval - dispatches based on script content
 			async eval(script, numKeys, ...args) {
+				// Ban script (atomic ban with Redis TIME)
+				if (script.includes('defaultPoints') && script.includes('defaultInterval')) {
+					return evalBanScript(args);
+				}
 				// Rate limit script (token bucket)
 				if (script.includes('bannedUntil')) {
 					return evalRateLimit(args);
@@ -152,9 +170,21 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('CLEANUP_STALE')) {
 					return evalCleanupStale(args);
 				}
+				// Count dedup script (presence: deduplicated by userKey via | separator)
+				if (script.includes('seen[userKey] = true') && script.includes('pairs(seen)')) {
+					return evalCountDedupScript(args);
+				}
+				// Count script (server-side live entry count)
+				if (script.includes('count = count + 1') && !script.includes('hdel') && !script.includes('hset')) {
+					return evalCountScript(args);
+				}
+				// List script (server-side presence list with dedup)
+				if (script.includes('seen[userKey]') && script.includes('best[userKey]')) {
+					return evalListScript(args);
+				}
 				// Group join script (atomic capacity check + insert)
 				if (script.includes('cjson.decode') && script.includes('liveCount')) {
-					return evalGroupJoin(args);
+					return evalGroupJoin(numKeys, args);
 				}
 				throw new Error('mock-redis: unrecognized eval script');
 			},
@@ -218,6 +248,10 @@ export function mockRedisClient(keyPrefix = '') {
 				return r;
 			},
 
+			defineCommand(name, { lua }) {
+				r[name] = async (numKeys, ...args) => r.eval(lua, numKeys, ...args);
+			},
+
 			_subscribedChannels: subscribedChannels,
 			_listeners: listeners
 		};
@@ -275,6 +309,26 @@ export function mockRedisClient(keyPrefix = '') {
 			return [0, Math.max(0, pts), resetAt - now];
 		}
 
+		// Ban Lua script simulation
+		function evalBanScript(args) {
+			const key = args[0];
+			const duration = Number(args[1]);
+			const defaultPoints = Number(args[2]);
+			const defaultInterval = Number(args[3]);
+			const now = Date.now();
+
+			if (!hashes.has(key)) hashes.set(key, new Map());
+			const h = hashes.get(key);
+
+			const pts = h.get('points') ?? String(defaultPoints);
+			const rst = h.get('resetAt') ?? String(now + defaultInterval);
+
+			h.set('points', String(pts));
+			h.set('resetAt', String(rst));
+			h.set('bannedUntil', String(now + duration));
+			return 1;
+		}
+
 		// Presence join Lua script simulation
 		// HSET + EXPIRE, always returns 1.  Cross-instance dedup was removed
 		// from the real Lua script (O(N) scan per join was the bottleneck).
@@ -322,26 +376,33 @@ export function mockRedisClient(keyPrefix = '') {
 			return 1; // User is gone
 		}
 
-		// Group join Lua script simulation
-		function evalGroupJoin(args) {
+		// Group join Lua script simulation (2 keys: members, closed)
+		function evalGroupJoin(numKeys, args) {
 			const key = args[0];
-			const maxMembers = Number(args[1]);
-			const memberId = args[2];
-			const memberData = args[3];
-			const now = Number(args[4]);
-			const memberTtlMs = Number(args[5]);
+			const closedFlag = numKeys >= 2 ? args[1] : null;
+			const argOffset = numKeys;
+			const maxMembers = Number(args[argOffset]);
+			const memberId = args[argOffset + 1];
+			const memberData = args[argOffset + 2];
+			const now = Number(args[argOffset + 3]);
+			const memberTtlMs = Number(args[argOffset + 4]);
+
+			if (closedFlag && store.get(closedFlag) === '1') {
+				return [-1];
+			}
 
 			if (!hashes.has(key)) hashes.set(key, new Map());
 			const h = hashes.get(key);
 
-			// Count live members, remove stale
 			let liveCount = 0;
 			const toRemove = [];
+			const live = [];
 			for (const [f, v] of h) {
 				try {
 					const val = JSON.parse(v);
 					if (val.ts && (now - val.ts) <= memberTtlMs) {
 						liveCount++;
+						live.push(v);
 					} else {
 						toRemove.push(f);
 					}
@@ -352,10 +413,11 @@ export function mockRedisClient(keyPrefix = '') {
 			for (const f of toRemove) h.delete(f);
 
 			if (liveCount >= maxMembers) {
-				return 0;
+				return [0];
 			}
 			h.set(memberId, memberData);
-			return 1;
+			live.push(memberData);
+			return [1, ...live];
 		}
 
 		// Replay publish Lua script simulation
@@ -389,6 +451,72 @@ export function mockRedisClient(keyPrefix = '') {
 			return seq;
 		}
 
+		// Count dedup Lua script simulation (presence: deduplicated by userKey)
+		function evalCountDedupScript(args) {
+			const key = args[0];
+			const now = Number(args[1]);
+			const ttlMs = Number(args[2]);
+			const h = hashes.get(key);
+			if (!h) return 0;
+			const seen = new Set();
+			for (const [field, v] of h) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) <= ttlMs) {
+						const sep = field.indexOf('|');
+						const userKey = sep !== -1 ? field.slice(sep + 1) : field;
+						seen.add(userKey);
+					}
+				} catch { /* skip */ }
+			}
+			return seen.size;
+		}
+
+		// Count Lua script simulation
+		function evalCountScript(args) {
+			const key = args[0];
+			const now = Number(args[1]);
+			const ttlMs = Number(args[2]);
+			const h = hashes.get(key);
+			if (!h) return 0;
+			let count = 0;
+			for (const [, v] of h) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) <= ttlMs) count++;
+				} catch { /* skip */ }
+			}
+			return count;
+		}
+
+		// List Lua script simulation (presence list with per-user dedup)
+		function evalListScript(args) {
+			const key = args[0];
+			const now = Number(args[1]);
+			const ttlMs = Number(args[2]);
+			const h = hashes.get(key);
+			if (!h) return [];
+			const seen = new Map();
+			for (const [field, v] of h) {
+				try {
+					const parsed = JSON.parse(v);
+					if (parsed.ts && (now - parsed.ts) <= ttlMs) {
+						const sep = field.indexOf('|');
+						const userKey = sep !== -1 ? field.slice(sep + 1) : field;
+						const existing = seen.get(userKey);
+						if (!existing || parsed.ts > existing.ts) {
+							seen.set(userKey, { ts: parsed.ts, json: v });
+						}
+					}
+				} catch { /* skip */ }
+			}
+			const out = [];
+			for (const [k, v] of seen) {
+				out.push(k, v.json);
+			}
+			return out;
+		}
+
 		// Stale field cleanup Lua script simulation
 		function evalCleanupStale(args) {
 			const key = args[0];
@@ -402,7 +530,7 @@ export function mockRedisClient(keyPrefix = '') {
 			for (const [f, v] of h) {
 				try {
 					const parsed = JSON.parse(v);
-					if (parsed.ts && (now - parsed.ts) > ttlMs) {
+					if (!parsed.ts || (now - parsed.ts) > ttlMs) {
 						toRemove.push(f);
 					}
 				} catch {

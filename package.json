@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.1.9",
+  "version": "0.4.0",
   "description": "Redis and Postgres extensions for svelte-adapter-uws - distributed pub/sub, replay buffers, presence tracking, rate limiting, groups, and DB change notifications",
   "author": "Kevin Radziszewski",
   "license": "MIT",
@@ -53,11 +53,20 @@
     "./redis/cursor": {
       "types": "./redis/cursor.d.ts",
       "default": "./redis/cursor.js"
+    },
+    "./prometheus": {
+      "types": "./prometheus/index.d.ts",
+      "default": "./prometheus/index.js"
+    },
+    "./breaker": {
+      "types": "./shared/breaker.d.ts",
+      "default": "./shared/breaker.js"
     }
   },
   "files": [
     "redis",
     "postgres",
+    "prometheus",
     "shared",
     "LICENSE",
     "README.md"
@@ -70,7 +79,7 @@
     "node": ">=20.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": ">=0.2.0"
+    "svelte-adapter-uws": ">=0.4.0"
   },
   "dependencies": {
     "ioredis": "^5.0.0"
@@ -94,6 +103,8 @@
     "ratelimit",
     "groups",
     "cursor",
-    "notify"
+    "notify",
+    "prometheus",
+    "metrics"
   ]
 }

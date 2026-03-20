@@ -1,14 +1,20 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface PubSubBusOptions {
 	/** Redis channel name for pub/sub messages. @default 'uws:pubsub' */
 	channel?: string;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface PubSubBus {
 	/**
-	 * Returns a new Platform whose publish() sends to Redis + local.
+	 * Returns a new Platform whose publish() and batch() send to Redis + local.
 	 * Use this wrapped platform everywhere you call publish().
 	 */
 	wrap(platform: Platform): Platform;

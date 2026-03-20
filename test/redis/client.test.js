@@ -8,6 +8,7 @@ vi.mock('ioredis', () => {
 		this.duplicate = vi.fn(() => new MockRedis());
 		this.quit = vi.fn(() => Promise.resolve());
 		this.disconnect = vi.fn();
+		this.on = vi.fn(() => this);
 	});
 	return { default: MockRedis };
 });

@@ -79,6 +79,13 @@ export function createReplay(client, options = {}) {
 		throw new Error(`postgres replay: invalid table name "${table}"`);
 	}
 
+	const b = options.breaker;
+	const m = options.metrics;
+	const mt = m?.mapTopic;
+	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
+	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
+	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+
 	let migrated = false;
 
 	async function ensureTable() {
@@ -96,7 +103,6 @@ export function createReplay(client, options = {}) {
 		await client.query(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
-		// Atomic per-topic sequence counter table
 		await client.query(`
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
@@ -106,43 +112,32 @@ export function createReplay(client, options = {}) {
 		migrated = true;
 	}
 
-	/**
-	 * Atomically get the next sequence number for a topic.
-	 * Uses INSERT ... ON CONFLICT DO UPDATE for cross-instance safety.
-	 */
-	async function nextSeq(topic) {
-		const res = await client.query(
-			`INSERT INTO ${seqTable} (topic, seq)
-			      VALUES ($1, 1)
-			 ON CONFLICT (topic)
-			   DO UPDATE
-			         SET seq = ${seqTable}.seq + 1
-			   RETURNING seq`,
-			[topic]
-		);
-		return parseInt(res.rows[0].seq, 10);
-	}
-
-	// Local publish counter per topic -- avoids COUNT(*) on every publish
-	/** @type {Map<string, number>} */
-	const publishCounts = new Map();
-
 	// Periodic cleanup
 	let cleanupTimer = null;
+	let cleanupRunning = false;
 	if (cleanupInterval > 0) {
 		cleanupTimer = setInterval(async () => {
+			if (cleanupRunning) return;
+			if (b && !b.isHealthy) return;
+			cleanupRunning = true;
 			try {
 				await ensureTable();
 
 				// Trim by size: for each topic, keep only the newest `maxSize` rows
 				await client.query(`
-					DELETE FROM ${table}
-					 WHERE ${pkCol} IN (
-					       SELECT ${pkCol}
-					         FROM (SELECT ${pkCol},
-					                      ROW_NUMBER() OVER (PARTITION BY topic ORDER BY seq DESC) AS row_num
-					                 FROM ${table}) ranked
-					        WHERE row_num > $1)
+					DELETE FROM ${table} r
+					 USING (
+					   SELECT sub.topic,
+					          (SELECT seq FROM ${table}
+					            WHERE topic = sub.topic
+					            ORDER BY seq DESC
+					            OFFSET $1
+					            LIMIT 1) AS cutoff_seq
+					     FROM (SELECT DISTINCT topic FROM ${table}) sub
+					 ) cutoffs
+					 WHERE r.topic = cutoffs.topic
+					   AND cutoffs.cutoff_seq IS NOT NULL
+					   AND r.seq <= cutoffs.cutoff_seq
 				`, [maxSize]);
 
 				// Trim by TTL
@@ -154,10 +149,11 @@ export function createReplay(client, options = {}) {
 					);
 				}
 
-				// Reset local counters after cleanup
-				publishCounts.clear();
-			} catch {
-				// Cleanup failures are non-fatal
+				b?.success();
+				} catch (err) {
+				b?.failure(err);
+			} finally {
+				cleanupRunning = false;
 			}
 		}, cleanupInterval);
 		if (cleanupTimer.unref) cleanupTimer.unref();
@@ -165,69 +161,97 @@ export function createReplay(client, options = {}) {
 
 	return {
 		async publish(platform, topic, event, data) {
-			await ensureTable();
-			const seq = await nextSeq(topic);
-
-			await client.query(
-				`INSERT INTO ${table} (topic, seq, event, data)
-				      VALUES ($1, $2, $3, $4)`,
-				[topic, seq, event, JSON.stringify(data)]
-			);
-
-			// Inline trim: use local counter to avoid COUNT(*) on every publish.
-			// On first publish per topic in this process, seed from the database
-			// so a fresh/restarted instance trims correctly.
-			let count;
-			if (publishCounts.has(topic)) {
-				count = publishCounts.get(topic) + 1;
-			} else {
-				const res = await client.query(
-					`SELECT COUNT(*)::int AS message_count
-					   FROM ${table}
-					  WHERE topic = $1`,
-					[topic]
-				);
-				count = parseInt(res.rows[0].message_count, 10);
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'replay_publish_' + table,
+					text: `WITH new_seq AS (
+						INSERT INTO ${seqTable} (topic, seq)
+						     VALUES ($1, 1)
+						ON CONFLICT (topic)
+						  DO UPDATE SET seq = ${seqTable}.seq + 1
+						  RETURNING seq
+					)
+					INSERT INTO ${table} (topic, seq, event, data)
+					SELECT $1, new_seq.seq, $2, $3
+					  FROM new_seq
+					RETURNING seq`,
+					values: [topic, event, JSON.stringify(data ?? null)]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
 			}
-			publishCounts.set(topic, count);
-			if (count > maxSize) {
-				await client.query(`
-					DELETE FROM ${table}
-					 WHERE topic = $1
-					   AND ${pkCol} NOT IN (
-					       SELECT ${pkCol}
-					         FROM ${table}
-					        WHERE topic = $1
-					        ORDER BY seq DESC
-					        LIMIT $2)
-				`, [topic, maxSize]);
-				publishCounts.set(topic, maxSize);
+			const seq = parseInt(res.rows[0].seq, 10);
+			mPublishes?.inc({ topic: mt(topic) });
+
+			// Trim by sequence number: seqs are contiguous per topic
+			// (1, 2, 3, ...) so the cutoff is trivially computable.
+			// This avoids the previous COUNT(*) + subquery approach
+			// that was O(N) on every publish.
+			// Trim failure must not block the live publish path --
+			// the periodic cleanup will catch any excess rows later.
+			if (seq > maxSize) {
+				try {
+					await client.query({
+						name: 'replay_trim_' + table,
+						text: `DELETE FROM ${table}
+						 WHERE topic = $1
+						   AND seq <= $2`,
+						values: [topic, seq - maxSize]
+					});
+				} catch {
+					// Non-fatal: the next successful publish re-trims with a
+					// higher cutoff. With cleanupInterval: 0, persistent trim
+					// failures cause unbounded growth.
+				}
 			}
 
 			return platform.publish(topic, event, data);
 		},
 
 		async seq(topic) {
-			await ensureTable();
-			const res = await client.query(
-				`SELECT COALESCE(MAX(seq), 0)::int AS max_seq
-				   FROM ${table}
-				  WHERE topic = $1`,
-				[topic]
-			);
-			return parseInt(res.rows[0].max_seq, 10);
+			if (b) b.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'replay_seq_' + table,
+					text: `SELECT COALESCE(seq, 0)::int AS current_seq
+					         FROM ${seqTable}
+					        WHERE topic = $1`,
+					values: [topic]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			return res.rows.length > 0 ? parseInt(res.rows[0].current_seq, 10) : 0;
 		},
 
 		async since(topic, since) {
-			await ensureTable();
-			const res = await client.query(
-				`SELECT seq, topic, event, data
-				   FROM ${table}
-				  WHERE topic = $1
-				    AND seq > $2
-				  ORDER BY seq ASC`,
-				[topic, since]
-			);
+			if (b) b.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'replay_since_' + table,
+					text: `SELECT seq, topic, event, data
+					   FROM ${table}
+					  WHERE topic = $1
+					    AND seq > $2
+					  ORDER BY seq ASC`,
+					values: [topic, since]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 			return res.rows.map((row) => ({
 				seq: parseInt(row.seq, 10),
 				topic: row.topic,
@@ -236,9 +260,61 @@ export function createReplay(client, options = {}) {
 			}));
 		},
 
-		async replay(ws, topic, sinceSeq, platform) {
-			const missed = await this.since(topic, sinceSeq);
+		async replay(ws, topic, sinceSeq, platform, reqId) {
+			b?.guard();
+			try {
+				await ensureTable();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 			const replayTopic = '__replay:' + topic;
+
+			let missedRes;
+			try {
+				missedRes = await client.query({
+					name: 'replay_since_' + table,
+					text: `SELECT seq, topic, event, data
+					   FROM ${table}
+					  WHERE topic = $1
+					    AND seq > $2
+					  ORDER BY seq ASC`,
+					values: [topic, sinceSeq]
+				});
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			const missed = missedRes.rows.map((row) => ({
+				seq: parseInt(row.seq, 10),
+				topic: row.topic,
+				event: row.event,
+				data: row.data
+			}));
+
+			if (sinceSeq > 0 && missed.length > 0 && missed[0].seq > sinceSeq + 1) {
+				mTruncations?.inc({ topic: mt(topic) });
+				platform.send(ws, replayTopic, 'truncated', null);
+			} else if (sinceSeq > 0 && missed.length === 0) {
+				try {
+					const seqRes = await client.query({
+						name: 'replay_seq_' + table,
+						text: `SELECT COALESCE(seq, 0)::int AS current_seq
+						         FROM ${seqTable}
+						        WHERE topic = $1`,
+						values: [topic]
+					});
+					const currentSeq = seqRes.rows.length > 0 ? parseInt(seqRes.rows[0].current_seq, 10) : 0;
+					if (currentSeq > sinceSeq) {
+						mTruncations?.inc({ topic: mt(topic) });
+						platform.send(ws, replayTopic, 'truncated', null);
+					}
+				} catch (err) {
+					b?.failure(err);
+					throw err;
+				}
+			}
+			b?.success();
 
 			for (let i = 0; i < missed.length; i++) {
 				const msg = missed[i];
@@ -248,25 +324,38 @@ export function createReplay(client, options = {}) {
 					data: msg.data
 				});
 			}
-			platform.send(ws, replayTopic, 'end', null);
+			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
+			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
 		},
 
 		async clear() {
-			await ensureTable();
-			await client.query(`DELETE FROM ${table}`);
-			await client.query(`DELETE FROM ${seqTable}`);
-			publishCounts.clear();
+			if (b) b.guard();
+			try {
+				await ensureTable();
+				await client.query(`DELETE FROM ${table}`);
+				await client.query(`DELETE FROM ${seqTable}`);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async clearTopic(topic) {
-			await ensureTable();
-			await client.query(
-				`DELETE FROM ${table}
-				  WHERE topic = $1`, [topic]);
-			await client.query(
-				`DELETE FROM ${seqTable}
-				  WHERE topic = $1`, [topic]);
-			publishCounts.delete(topic);
+			if (b) b.guard();
+			try {
+				await ensureTable();
+				await client.query(
+					`DELETE FROM ${table}
+					  WHERE topic = $1`, [topic]);
+				await client.query(
+					`DELETE FROM ${seqTable}
+					  WHERE topic = $1`, [topic]);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		destroy() {

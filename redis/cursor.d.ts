@@ -1,5 +1,7 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisCursorOptions {
 	/**
@@ -32,6 +34,10 @@ export interface RedisCursorOptions {
 	 * @default 30
 	 */
 	ttl?: number;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface CursorEntry {
@@ -57,6 +63,13 @@ export interface RedisCursorTracker {
 	remove(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/**
+	 * Send all current cursor positions for a topic to a single connection.
+	 * Sends a `bulk` event on `__cursor:{topic}` with the full cursor list.
+	 * Called automatically by `hooks.subscribe` when a client subscribes.
+	 */
+	snapshot(ws: any, topic: string, platform: Platform): Promise<void>;
+
+	/**
 	 * Get current cursor positions for a topic across all instances.
 	 */
 	list(topic: string): Promise<CursorEntry[]>;
@@ -66,6 +79,26 @@ export interface RedisCursorTracker {
 
 	/** Stop the Redis subscriber and clear local timers. */
 	destroy(): void;
+
+	/**
+	 * Ready-made WebSocket hooks for zero-config cursor tracking.
+	 *
+	 * `subscribe` sends a snapshot of existing cursors when a client subscribes
+	 * to a `__cursor:*` topic.
+	 * `message` handles incoming `{ type: 'cursor', topic, data }` messages.
+	 * `close` removes the connection's cursors from all topics.
+	 *
+	 * @example
+	 * ```js
+	 * import { cursor } from '$lib/server/cursor';
+	 * export const { subscribe, message, close } = cursor.hooks;
+	 * ```
+	 */
+	hooks: {
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void> | void;
+		message(ws: any, ctx: { data: any; platform: Platform }): void;
+		close(ws: any, ctx: { platform: Platform }): Promise<void>;
+	};
 }
 
 /**

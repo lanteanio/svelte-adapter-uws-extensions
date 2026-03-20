@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../redis/pubsub.js';
+import { createCircuitBreaker } from '../../shared/breaker.js';
 
 describe('redis pubsub bus', () => {
 	let client;
@@ -48,6 +49,21 @@ describe('redis pubsub bus', () => {
 			const ws = {};
 			wrapped.send(ws, 'chat', 'msg', { text: 'hi' });
 			expect(platform.sent).toHaveLength(1);
+		});
+	});
+
+	describe('batch', () => {
+		it('wrapped platform exposes batch() that publishes multiple messages', () => {
+			const wrapped = bus.wrap(platform);
+			const results = wrapped.batch([
+				{ topic: 'chat', event: 'msg', data: { text: 'a' } },
+				{ topic: 'chat', event: 'msg', data: { text: 'b' } }
+			]);
+
+			expect(results).toEqual([true, true]);
+			expect(platform.published).toHaveLength(2);
+			expect(platform.published[0].data.text).toBe('a');
+			expect(platform.published[1].data.text).toBe('b');
 		});
 	});
 
@@ -177,27 +193,27 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.publish('chat', 'msg', { text: 'hi' }, { relay: false });
+			await Promise.resolve(); // flush microtask batch
 			expect(publishCalls).toHaveLength(0);
 
-			// Without relay: false, should publish to Redis
 			wrapped.publish('chat', 'msg', { text: 'hi' });
+			await Promise.resolve(); // flush microtask batch
 			expect(publishCalls).toHaveLength(1);
 		});
 
 		it('publish() sends to Redis when options are absent or relay is not false', async () => {
+			// Activate so subscriber can receive the batched messages
+			await bus.activate(platform);
+			platform.reset();
+
 			const wrapped = bus.wrap(platform);
-
-			const publishCalls = [];
-			const origPublish = client.redis.publish;
-			client.redis.publish = async (ch, msg) => {
-				publishCalls.push(ch);
-				return origPublish.call(client.redis, ch, msg);
-			};
-
 			wrapped.publish('chat', 'msg', { text: 'a' });
 			wrapped.publish('chat', 'msg', { text: 'b' }, {});
 			wrapped.publish('chat', 'msg', { text: 'c' }, { relay: true });
-			expect(publishCalls).toHaveLength(3);
+
+			// All 3 publishes are local (synchronous) + relayed via microtask batch.
+			// The local publishes happen immediately:
+			expect(platform.published).toHaveLength(3);
 		});
 	});
 
@@ -213,8 +229,8 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.topic('chat').created({ id: 1 });
+			await Promise.resolve(); // flush microtask batch
 
-			// Should have gone through wrapped.publish, reaching both local and Redis
 			expect(platform.published).toHaveLength(1);
 			expect(platform.published[0].topic).toBe('chat');
 			expect(platform.published[0].event).toBe('created');
@@ -236,21 +252,15 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.topic('room').publish('custom-event', { val: 42 });
+			await Promise.resolve(); // flush microtask batch
 
 			expect(platform.published).toHaveLength(1);
 			expect(platform.published[0].event).toBe('custom-event');
 			expect(redisCalls).toHaveLength(1);
 		});
 
-		it('topic() helpers (updated, deleted, set, increment, decrement) all route through Redis', () => {
+		it('topic() helpers (updated, deleted, set, increment, decrement) all route through Redis', async () => {
 			const wrapped = bus.wrap(platform);
-
-			const redisCalls = [];
-			const origPublish = client.redis.publish;
-			client.redis.publish = async (ch, msg) => {
-				redisCalls.push(JSON.parse(msg));
-				return origPublish.call(client.redis, ch, msg);
-			};
 
 			const t = wrapped.topic('items');
 			t.updated({ id: 1 });
@@ -259,8 +269,9 @@ describe('redis pubsub bus', () => {
 			t.increment(1);
 			t.decrement(1);
 
-			expect(redisCalls).toHaveLength(5);
-			expect(redisCalls.map((c) => c.event)).toEqual([
+			// All 5 events should have been published locally
+			expect(platform.published).toHaveLength(5);
+			expect(platform.published.map((c) => c.event)).toEqual([
 				'updated', 'deleted', 'set', 'increment', 'decrement'
 			]);
 		});
@@ -305,6 +316,40 @@ describe('redis pubsub bus', () => {
 
 			expect(platform.published).toHaveLength(1);
 			expect(platform.published[0].topic).toBe('test');
+		});
+	});
+
+	describe('breaker accounting in activate', () => {
+		it('records success() when subscribe succeeds', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const bus = createPubSubBus(client, { breaker });
+
+			breaker.failure();
+			expect(breaker.failures).toBe(1);
+
+			await bus.activate(platform);
+			expect(breaker.failures).toBe(0);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('records failure() when subscribe fails', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const failClient = mockRedisClient('test:');
+			const origDuplicate = failClient.duplicate.bind(failClient);
+			failClient.duplicate = (overrides) => {
+				const dup = origDuplicate(overrides);
+				dup.subscribe = async () => { throw new Error('subscribe failed'); };
+				return dup;
+			};
+
+			const bus = createPubSubBus(failClient, { breaker });
+
+			await expect(bus.activate(platform)).rejects.toThrow('subscribe failed');
+			expect(breaker.failures).toBe(1);
+
+			breaker.destroy();
 		});
 	});
 });

@@ -18,72 +18,61 @@
  */
 
 import { randomBytes } from 'node:crypto';
-
-/**
- * Lua script for server-side stale field cleanup.
- * Runs HGETALL + timestamp check + HDEL entirely on Redis.
- *
- * KEYS[1] = hash key
- * ARGV[1] = now (ms)
- * ARGV[2] = ttlMs
- *
- * Returns number of removed fields.
- */
-const CLEANUP_SCRIPT = `-- CLEANUP_STALE
-local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local ttlMs = tonumber(ARGV[2])
-local all = redis.call('hgetall', key)
-local removed = 0
-for i = 1, #all, 2 do
-  local ok, parsed = pcall(cjson.decode, all[i+1])
-  if (ok and parsed.ts and (now - parsed.ts) > ttlMs) or not ok then
-    redis.call('hdel', key, all[i])
-    removed = removed + 1
-  end
-end
-return removed
-`;
+import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
 /**
- * Lua script for atomic join: check capacity (excluding stale entries),
- * clean up stale entries, and insert the new member in one roundtrip.
+ * Lua script for atomic join: check closed flag, check capacity
+ * (excluding stale entries), clean up stale entries, and insert
+ * the new member in one roundtrip.
  *
  * KEYS[1] = members hash key
+ * KEYS[2] = closed flag key
  * ARGV[1] = maxMembers
  * ARGV[2] = memberId
  * ARGV[3] = member data JSON
  * ARGV[4] = now (ms)
  * ARGV[5] = memberTtl (ms)
  *
- * Returns 1 on success, 0 if full.
+ * Returns {-1} if closed, {0} if full, {1, ...live} on success.
  */
 const JOIN_SCRIPT = `
 local key = KEYS[1]
+local closedFlag = KEYS[2]
 local maxMembers = tonumber(ARGV[1])
 local memberId = ARGV[2]
 local memberData = ARGV[3]
 local now = tonumber(ARGV[4])
 local memberTtl = tonumber(ARGV[5])
 
+if redis.call('get', closedFlag) == '1' then
+  return {-1}
+end
+
 local all = redis.call('hgetall', key)
 local liveCount = 0
+local stale = {}
+local live = {}
 for i = 1, #all, 2 do
   local ok, val = pcall(cjson.decode, all[i+1])
   if ok and val.ts and (now - val.ts) <= memberTtl then
     liveCount = liveCount + 1
+    live[#live + 1] = all[i+1]
   else
-    redis.call('hdel', key, all[i])
+    stale[#stale + 1] = all[i]
   end
+end
+if #stale > 0 then
+  redis.call('hdel', key, unpack(stale))
 end
 
 if liveCount >= maxMembers then
-  return 0
+  return {0}
 end
 redis.call('hset', key, memberId, memberData)
-return 1
+live[#live + 1] = memberData
+return {1, unpack(live)}
 `;
 
 /**
@@ -132,6 +121,9 @@ export function createGroup(client, name, options = {}) {
 
 	const maxMembers = options.maxMembers ?? Infinity;
 	const memberTtl = options.memberTtl ?? 120;
+	if (typeof memberTtl !== 'number' || !Number.isFinite(memberTtl) || memberTtl < 1) {
+		throw new Error('redis group: memberTtl must be a positive number (seconds)');
+	}
 	const memberTtlMs = memberTtl * 1000;
 	const onJoin = options.onJoin ?? null;
 	const onLeave = options.onLeave ?? null;
@@ -149,6 +141,13 @@ export function createGroup(client, name, options = {}) {
 	const instanceId = randomBytes(8).toString('hex');
 	const redis = client.redis;
 
+	const b = options.breaker;
+	const m = options.metrics;
+	const mJoins = m?.counter('group_joins_total', 'Group join events', ['group']);
+	const mRejected = m?.counter('group_joins_rejected_total', 'Group joins rejected (full)', ['group']);
+	const mGroupLeaves = m?.counter('group_leaves_total', 'Group leave events', ['group']);
+	const mPublishes = m?.counter('group_publishes_total', 'Group publish events', ['group']);
+
 	const metaKey = client.key('group:' + name + ':meta');
 	const membersKey = client.key('group:' + name + ':members');
 	const closedKey = client.key('group:' + name + ':closed');
@@ -159,25 +158,36 @@ export function createGroup(client, name, options = {}) {
 	/** @type {Map<any, { role: GroupRole, memberId: string }>} */
 	const localMembers = new Map();
 	let memberCounter = 0;
+	let isClosed = false;
 
-	// Set initial metadata
+	let pendingMeta = null;
+	let metaInitError = null;
 	if (options.meta) {
-		redis.hmset(metaKey, options.meta).catch(() => {});
+		const initialMeta = options.meta;
+		pendingMeta = redis.hmset(metaKey, initialMeta)
+			.then(() => { pendingMeta = null; })
+			.catch((err) => {
+				pendingMeta = null;
+				metaInitError = err;
+				console.warn('groups: initial meta write failed for "' + name + '":', err.message);
+			});
 	}
 
 	// Heartbeat: refresh timestamps on local member entries and
 	// remove stale entries from crashed instances.
 	const heartbeatTimer = setInterval(() => {
+		if (b && !b.isHealthy) return;
 		const now = Date.now();
+		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: now });
-			redis.hset(membersKey, entry.memberId, memberData).catch(() => {});
+			pipe.hset(membersKey, entry.memberId, memberData);
 		}
-		// Clean up stale entries from dead instances (runs entirely on Redis)
-		redis.eval(CLEANUP_SCRIPT, 1, membersKey, now, memberTtlMs).catch((err) => {
-			console.warn('groups heartbeat: stale cleanup failed for group "' + name + '":', err.message);
+		pipe.eval(CLEANUP_SCRIPT, 1, membersKey, now, memberTtlMs);
+		pipe.exec().catch((err) => {
+			if (err) console.warn('groups heartbeat: pipeline failed for group "' + name + '":', err.message);
 		});
-	}, Math.max(memberTtlMs / 3, 5000));
+	}, memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 	// Subscriber for cross-instance events
@@ -189,17 +199,16 @@ export function createGroup(client, name, options = {}) {
 	async function ensureSubscriber(platform) {
 		subscribedPlatform = platform;
 		if (subscriber) return;
-		subscriber = client.duplicate({ enableReadyCheck: false });
-		subscriber.on('error', (err) => {
+		const sub = client.duplicate({ enableReadyCheck: false });
+		sub.on('error', (err) => {
 			console.error('groups subscriber error:', err.message);
 		});
-		subscriber.on('message', (ch, message) => {
+		sub.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;
 			try {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
 				if (subscribedPlatform) {
-					// Handle role-filtered events: deliver only to matching local members
 					if (parsed.event === '__role_filtered') {
 						const { event, data, role } = parsed.data;
 						for (const [ws, entry] of localMembers) {
@@ -208,16 +217,14 @@ export function createGroup(client, name, options = {}) {
 							}
 						}
 					} else if (parsed.event === 'close') {
-						// Remote close: clean up local members just like a local close().
-						// relay: false -- each worker has its own subscriber.
+						isClosed = true;
 						subscribedPlatform.publish(internalTopic, 'close', parsed.data, { relay: false });
 						for (const [ws] of localMembers) {
-							ws.unsubscribe(internalTopic);
+							try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 						}
 						localMembers.clear();
 						if (onClose) onClose();
 					} else {
-						// relay: false -- each worker has its own subscriber.
 						subscribedPlatform.publish(internalTopic, parsed.event, parsed.data, { relay: false });
 					}
 				}
@@ -225,34 +232,64 @@ export function createGroup(client, name, options = {}) {
 				// Malformed, skip
 			}
 		});
-		await subscriber.subscribe(eventChannel);
+		try {
+			await sub.subscribe(eventChannel);
+		} catch (err) {
+			sub.quit().catch(() => sub.disconnect());
+			throw err;
+		}
+		subscriber = sub;
 	}
 
 	async function publishEvent(event, data) {
 		const msg = JSON.stringify({ instanceId, event, data });
-		await redis.publish(eventChannel, msg).catch(() => {});
+		await redis.publish(eventChannel, msg);
 	}
 
-	return {
+	/** @type {RedisGroup} */
+	const group = {
 		get name() { return name; },
 
 		async getMeta() {
-			const raw = await redis.hgetall(metaKey);
-			return raw || {};
+			if (b) b.guard();
+			if (pendingMeta) await pendingMeta;
+			if (metaInitError && options.meta) {
+				try {
+					await redis.hmset(metaKey, options.meta);
+					metaInitError = null;
+				} catch (err) {
+					b?.failure(err);
+					throw err;
+				}
+			}
+			try {
+				const raw = await redis.hgetall(metaKey);
+				b?.success();
+				return raw || {};
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async setMeta(meta) {
-			if (Object.keys(meta).length === 0) {
-				await redis.del(metaKey);
-			} else {
-				await redis.hmset(metaKey, meta);
+			if (b) b.guard();
+			try {
+				if (Object.keys(meta).length === 0) {
+					await redis.del(metaKey);
+				} else {
+					await redis.hmset(metaKey, meta);
+				}
+				metaInitError = null;
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
 			}
 		},
 
 		async join(ws, platform, role = 'member') {
-			// Check closed
-			const closed = await redis.get(closedKey);
-			if (closed === '1') return false;
+			if (isClosed) return false;
 
 			// Idempotent
 			if (localMembers.has(ws)) return true;
@@ -265,45 +302,87 @@ export function createGroup(client, name, options = {}) {
 			const now = Date.now();
 			const memberData = JSON.stringify({ role, instanceId, ts: now });
 
-			// Atomic capacity check + insert (skips stale entries from crashed instances)
-			if (Number.isFinite(maxMembers)) {
-				const result = await redis.eval(
-					JOIN_SCRIPT, 1, membersKey,
-					maxMembers, memberId, memberData, now, memberTtlMs
+			try {
+				await ensureSubscriber(platform);
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+
+			const effectiveMax = Number.isFinite(maxMembers) ? maxMembers : 999999999;
+			b?.guard();
+			let result;
+			try {
+				result = await redis.eval(
+					JOIN_SCRIPT, 2, membersKey, closedKey,
+					effectiveMax, memberId, memberData, now, memberTtlMs
 				);
-				if (result === 0) {
-					if (onFull) onFull(ws, role);
-					return false;
-				}
-			} else {
-				// No capacity limit, just insert
-				await redis.hset(membersKey, memberId, memberData);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			if (result[0] === -1) {
+				isClosed = true;
+				return false;
+			}
+			if (result[0] === 0) {
+				mRejected?.inc({ group: name });
+				if (onFull) onFull(ws, role);
+				return false;
 			}
 
 			localMembers.set(ws, { role, memberId });
 
-			// Ensure cross-instance subscriber is running
-			await ensureSubscriber(platform);
+			try {
+				ws.subscribe(internalTopic);
+			} catch {
+				localMembers.delete(ws);
+				try {
+					await redis.hdel(membersKey, memberId);
+				} catch (rollbackErr) {
+					throw new Error('redis group "' + name + '": join rollback failed, orphaned member in Redis: ' + rollbackErr.message);
+				}
+				return false;
+			}
 
-			// Publish join before subscribing (joiner doesn't see own join)
+			let freshAll;
+			try {
+				freshAll = await redis.hgetall(membersKey);
+			} catch (err) {
+				localMembers.delete(ws);
+				try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+				try {
+					await redis.hdel(membersKey, memberId);
+				} catch (rollbackErr) {
+					throw new Error('redis group "' + name + '": join rollback failed, orphaned member in Redis: ' + rollbackErr.message);
+				}
+				throw err;
+			}
+
+			// Publish join event only after the snapshot succeeded.
+			// This prevents orphaned join events when the snapshot step
+			// fails, eliminating the need for compensating leave events.
 			platform.publish(internalTopic, 'join', { role });
-			await publishEvent('join', { role });
+			await publishEvent('join', { role }).catch(() => {});
 
-			ws.subscribe(internalTopic);
-
-			// Send current member list to the joiner
-			const allRaw = await redis.hgetall(membersKey);
+			const freshNow = Date.now();
 			const membersList = [];
-			for (const v of Object.values(allRaw)) {
+			for (const [, v] of Object.entries(freshAll)) {
 				try {
 					const parsed = JSON.parse(v);
-					// Filter out stale entries
-					if (parsed.ts && (now - parsed.ts) > memberTtlMs) continue;
-					membersList.push({ role: parsed.role });
+					if (parsed.ts && (freshNow - parsed.ts) <= memberTtlMs) {
+						membersList.push({ role: parsed.role });
+					}
 				} catch { /* skip corrupted */ }
 			}
-			platform.send(ws, internalTopic, 'members', membersList);
+			try {
+				platform.send(ws, internalTopic, 'members', membersList);
+			} catch {
+				// ws closed after subscribe
+			}
 
+			mJoins?.inc({ group: name });
 			if (onJoin) onJoin(ws, role);
 			return true;
 		},
@@ -312,26 +391,40 @@ export function createGroup(client, name, options = {}) {
 			const entry = localMembers.get(ws);
 			if (!entry) return;
 
+			let skipHdel = false;
+			if (b) { try { b.guard(); } catch { skipHdel = true; } }
+
+			if (skipHdel) {
+				return;
+			}
+
+			try {
+				await redis.hdel(membersKey, entry.memberId);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				return;
+			}
+
 			localMembers.delete(ws);
-			ws.unsubscribe(internalTopic);
+			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 
-			// Remove from Redis
-			await redis.hdel(membersKey, entry.memberId);
-
-			platform.publish(internalTopic, 'leave', { role: entry.role });
-			await publishEvent('leave', { role: entry.role });
+			mGroupLeaves?.inc({ group: name });
+			const leavePayload = { role: entry.role };
+			platform.publish(internalTopic, 'leave', leavePayload);
+			await publishEvent('leave', leavePayload).catch(() => {});
 
 			if (onLeave) onLeave(ws, entry.role);
 		},
 
 		async publish(platform, event, data, role) {
-			const closed = await redis.get(closedKey);
-			if (closed === '1') return;
+			if (isClosed) return;
+			mPublishes?.inc({ group: name });
 
 			if (role == null) {
 				// Broadcast to all via topic
 				platform.publish(internalTopic, event, data);
-				await publishEvent(event, data);
+				await publishEvent(event, data).catch(() => {});
 				return;
 			}
 
@@ -343,7 +436,7 @@ export function createGroup(client, name, options = {}) {
 			}
 			// For remote instances, publish with role filter info
 			// Remote subscriber handler will filter by role locally
-			await publishEvent('__role_filtered', { event, data, role });
+			await publishEvent('__role_filtered', { event, data, role }).catch(() => {});
 		},
 
 		send(platform, ws, event, data) {
@@ -362,18 +455,16 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async count() {
-			const all = await redis.hgetall(membersKey);
-			if (!all) return 0;
+			if (b) b.guard();
 			const now = Date.now();
-			let liveCount = 0;
-			for (const v of Object.values(all)) {
-				try {
-					const parsed = JSON.parse(v);
-					if (parsed.ts && (now - parsed.ts) > memberTtlMs) continue;
-					liveCount++;
-				} catch { /* skip corrupted */ }
+			try {
+				const result = await redis.eval(COUNT_SCRIPT, 1, membersKey, now, memberTtlMs);
+				b?.success();
+				return result;
+			} catch (err) {
+				b?.failure(err);
+				throw err;
 			}
-			return liveCount;
 		},
 
 		has(ws) {
@@ -381,21 +472,40 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async close(platform) {
-			const alreadyClosed = await redis.get(closedKey);
-			if (alreadyClosed === '1') return;
+			b?.guard();
+			try {
+				const alreadyClosed = await redis.get(closedKey);
+				if (alreadyClosed === '1') {
+					isClosed = true;
+					platform.publish(internalTopic, 'close', null);
+					await publishEvent('close', null);
+					for (const [ws] of localMembers) {
+						try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+					}
+					localMembers.clear();
+					await redis.del(membersKey);
+					b?.success();
+					if (onClose) onClose();
+					return;
+				}
 
-			await redis.set(closedKey, '1');
+				await redis.set(closedKey, '1');
+				isClosed = true;
 
-			platform.publish(internalTopic, 'close', null);
-			await publishEvent('close', null);
+				platform.publish(internalTopic, 'close', null);
+				await publishEvent('close', null);
 
-			for (const [ws] of localMembers) {
-				ws.unsubscribe(internalTopic);
+				for (const [ws] of localMembers) {
+					try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+				}
+				localMembers.clear();
+
+				await redis.del(membersKey);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
 			}
-			localMembers.clear();
-
-			// Clean up Redis keys
-			await redis.del(membersKey);
 
 			if (onClose) onClose();
 		},
@@ -407,6 +517,24 @@ export function createGroup(client, name, options = {}) {
 				subscriber = null;
 			}
 			subscribedPlatform = null;
+		},
+
+		hooks: {
+			async subscribe(ws, topic, { platform }) {
+				if (topic === internalTopic) {
+					await group.join(ws, platform);
+				}
+			},
+			async unsubscribe(ws, topic, { platform }) {
+				if (topic === internalTopic) {
+					await group.leave(ws, platform);
+				}
+			},
+			async close(ws, { platform }) {
+				await group.leave(ws, platform);
+			}
 		}
 	};
+
+	return group;
 }

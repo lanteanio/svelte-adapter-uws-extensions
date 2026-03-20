@@ -164,7 +164,7 @@ describe('postgres replay', () => {
 				ws: fakeWs,
 				topic: '__replay:chat',
 				event: 'end',
-				data: null
+				data: { reqId: undefined }
 			});
 		});
 
@@ -245,6 +245,117 @@ describe('postgres replay', () => {
 			expect(all[0].data).toEqual({ id: 3 });
 			expect(all[1].data).toEqual({ id: 4 });
 			replay2.destroy();
+		});
+	});
+
+	describe('trim failure does not block live publish', () => {
+		it('publish succeeds and live broadcast happens when trim query fails', async () => {
+			const r = createReplay(client, { size: 2, cleanupInterval: 0 });
+
+			// Publish 3 messages so trim triggers on the 3rd
+			await r.publish(platform, 'chat', 'msg', { id: 1 });
+			await r.publish(platform, 'chat', 'msg', { id: 2 });
+
+			// Make the trim query fail
+			const origQuery = client.query.bind(client);
+			let queryCount = 0;
+			client.query = async (textOrObj, values) => {
+				const sql = typeof textOrObj === 'object' ? textOrObj.text : textOrObj;
+				if (sql && sql.includes('DELETE FROM') && sql.includes('seq <=')) {
+					throw new Error('trim failed');
+				}
+				return origQuery(textOrObj, values);
+			};
+
+			platform.reset();
+
+			// 3rd publish should still succeed (trim failure is non-fatal)
+			await r.publish(platform, 'chat', 'msg', { id: 3 });
+
+			// Live broadcast should have happened
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].data).toEqual({ id: 3 });
+
+			// seq and since should include the new message
+			expect(await r.seq('chat')).toBe(3);
+			const msgs = await r.since('chat', 2);
+			expect(msgs).toHaveLength(1);
+			expect(msgs[0].data).toEqual({ id: 3 });
+
+			client.query = origQuery;
+			r.destroy();
+		});
+	});
+
+	describe('oversize buffer after trim failure', () => {
+		it('since() returns more than maxSize entries when trim fails and cleanup is disabled', async () => {
+			const r = createReplay(client, { size: 2, cleanupInterval: 0 });
+
+			await r.publish(platform, 'chat', 'msg', { id: 1 });
+			await r.publish(platform, 'chat', 'msg', { id: 2 });
+
+			// Make trim fail from now on
+			const origQuery = client.query.bind(client);
+			client.query = async (textOrObj, values) => {
+				const sql = typeof textOrObj === 'object' ? textOrObj.text : textOrObj;
+				if (sql && sql.includes('DELETE FROM') && sql.includes('seq <=')) {
+					throw new Error('trim failed');
+				}
+				return origQuery(textOrObj, values);
+			};
+
+			// These publishes succeed (insert works) but trim is skipped
+			await r.publish(platform, 'chat', 'msg', { id: 3 });
+			await r.publish(platform, 'chat', 'msg', { id: 4 });
+
+			// Buffer is now oversized: 4 entries with maxSize=2
+			const all = await r.since('chat', 0);
+			expect(all).toHaveLength(4);
+
+			client.query = origQuery;
+
+			// Next successful publish re-trims
+			await r.publish(platform, 'chat', 'msg', { id: 5 });
+			const afterTrim = await r.since('chat', 0);
+			expect(afterTrim).toHaveLength(2);
+			expect(afterTrim[0].data).toEqual({ id: 4 });
+			expect(afterTrim[1].data).toEqual({ id: 5 });
+
+			r.destroy();
+		});
+
+		it('replay detects truncation after oversize buffer is trimmed', async () => {
+			const r = createReplay(client, { size: 2, cleanupInterval: 0 });
+
+			// Build an oversized buffer
+			const origQuery = client.query.bind(client);
+			await r.publish(platform, 'chat', 'msg', { id: 1 });
+			await r.publish(platform, 'chat', 'msg', { id: 2 });
+
+			client.query = async (textOrObj, values) => {
+				const sql = typeof textOrObj === 'object' ? textOrObj.text : textOrObj;
+				if (sql && sql.includes('DELETE FROM') && sql.includes('seq <=')) {
+					throw new Error('trim failed');
+				}
+				return origQuery(textOrObj, values);
+			};
+			await r.publish(platform, 'chat', 'msg', { id: 3 });
+			await r.publish(platform, 'chat', 'msg', { id: 4 });
+
+			client.query = origQuery;
+
+			// Now trim succeeds, trimming seq 1,2,3 (keeping 4,5)
+			await r.publish(platform, 'chat', 'msg', { id: 5 });
+
+			// A client that last saw seq 2 should get truncation
+			const fakeWs = {};
+			platform.reset();
+			await r.replay(fakeWs, 'chat', 2, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(1);
+
+			r.destroy();
 		});
 	});
 

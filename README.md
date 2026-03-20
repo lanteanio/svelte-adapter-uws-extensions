@@ -13,6 +13,7 @@ The core adapter keeps everything in-process memory. That works great for single
 - **Distributed broadcast groups** - named groups with membership and roles that span instances
 - **Shared cursor state** - ephemeral positions (cursors, selections, drawing strokes) visible across instances
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
+- **Prometheus metrics** - expose extension metrics for scraping, zero overhead when disabled
 
 ---
 
@@ -37,11 +38,18 @@ The core adapter keeps everything in-process memory. That works great for single
 - [Replay buffer (Postgres)](#replay-buffer-postgres)
 - [LISTEN/NOTIFY bridge](#listennotify-bridge)
 
+**Observability**
+- [Prometheus metrics](#prometheus-metrics)
+
+**Reliability**
+- [Circuit breaker](#circuit-breaker)
+
 **Operations**
 - [Graceful shutdown](#graceful-shutdown)
 - [Testing](#testing)
 
-**Help**
+**More**
+- [Related projects](#related-projects)
 - [License](#license)
 
 ---
@@ -296,7 +304,7 @@ export async function close(ws, { platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `key` | `'id'` | Field for user dedup (multi-tab) |
-| `select` | identity | Extract public fields from userData |
+| `select` | strips `__`-prefixed keys | Extract public fields from userData |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 
@@ -500,7 +508,7 @@ export function close(ws, { platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `throttle` | `50` | Minimum ms between broadcasts per user per topic |
-| `select` | identity | Extract user data to broadcast alongside position |
+| `select` | strips `__`-prefixed keys | Extract user data to broadcast alongside position |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
 
 #### API
@@ -667,6 +675,222 @@ The client side needs no changes -- the core `crud('messages')` store already ha
 
 ---
 
+**Observability**
+
+## Prometheus metrics
+
+Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled -- every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
+
+#### Setup
+
+```js
+// src/lib/server/metrics.js
+import { createMetrics } from 'svelte-adapter-uws-extensions/prometheus';
+
+export const metrics = createMetrics({
+  prefix: 'myapp_',
+  mapTopic: (topic) => topic.startsWith('room:') ? 'room:*' : topic
+});
+```
+
+Pass the `metrics` object to any extension via its options:
+
+```js
+import { metrics } from './metrics.js';
+import { redis } from './redis.js';
+import { createPresence } from 'svelte-adapter-uws-extensions/redis/presence';
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
+import { createReplay } from 'svelte-adapter-uws-extensions/redis/replay';
+import { createRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
+import { createGroup } from 'svelte-adapter-uws-extensions/redis/groups';
+import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
+
+export const bus = createPubSubBus(redis, { metrics });
+export const presence = createPresence(redis, { metrics, key: 'id' });
+export const replay = createReplay(redis, { metrics });
+export const limiter = createRateLimit(redis, { points: 10, interval: 1000, metrics });
+export const lobby = createGroup(redis, 'lobby', { metrics });
+export const cursors = createCursor(redis, { metrics });
+```
+
+#### Mounting the endpoint
+
+With uWebSockets.js:
+
+```js
+app.get('/metrics', metrics.handler);
+```
+
+Or use `metrics.serialize()` to get the raw text and serve it however you like.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `prefix` | `''` | Prefix for all metric names |
+| `mapTopic` | identity | Map topic names to bounded label values for cardinality control |
+| `defaultBuckets` | `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` | Default histogram buckets |
+
+Metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*` and label names must match `[a-zA-Z_][a-zA-Z0-9_]*` (no `__` prefix). Invalid names throw at registration time. HELP text containing backslashes or newlines is escaped automatically.
+
+#### Cardinality control
+
+If your topics are user-generated (e.g. `room:abc123`), per-topic labels will grow unbounded. Use `mapTopic` to collapse them:
+
+```js
+const metrics = createMetrics({
+  mapTopic: (topic) => {
+    if (topic.startsWith('room:')) return 'room:*';
+    if (topic.startsWith('user:')) return 'user:*';
+    return topic;
+  }
+});
+```
+
+#### Metrics reference
+
+**Pub/sub bus**
+
+| Metric | Type | Description |
+|---|---|---|
+| `pubsub_messages_relayed_total` | counter | Messages relayed to Redis |
+| `pubsub_messages_received_total` | counter | Messages received from Redis |
+| `pubsub_echo_suppressed_total` | counter | Messages dropped by echo suppression |
+| `pubsub_relay_batch_size` | histogram | Relay batch size per flush |
+
+**Presence**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `presence_joins_total` | counter | `topic` | Join events |
+| `presence_leaves_total` | counter | `topic` | Leave events |
+| `presence_heartbeats_total` | counter | | Heartbeat refresh cycles |
+| `presence_stale_cleaned_total` | counter | | Stale entries removed by cleanup |
+
+**Replay buffer (Redis and Postgres)**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `replay_publishes_total` | counter | `topic` | Messages published |
+| `replay_messages_replayed_total` | counter | `topic` | Messages replayed to clients |
+| `replay_truncations_total` | counter | `topic` | Truncation events detected |
+
+**Rate limiting**
+
+| Metric | Type | Description |
+|---|---|---|
+| `ratelimit_allowed_total` | counter | Requests allowed |
+| `ratelimit_denied_total` | counter | Requests denied |
+| `ratelimit_bans_total` | counter | Bans applied |
+
+**Broadcast groups**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `group_joins_total` | counter | `group` | Join events |
+| `group_joins_rejected_total` | counter | `group` | Joins rejected (full) |
+| `group_leaves_total` | counter | `group` | Leave events |
+| `group_publishes_total` | counter | `group` | Publish events |
+
+**Cursor**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `cursor_updates_total` | counter | `topic` | Cursor update calls |
+| `cursor_broadcasts_total` | counter | `topic` | Broadcasts actually sent |
+| `cursor_throttled_total` | counter | `topic` | Updates deferred by throttle |
+
+**LISTEN/NOTIFY bridge**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `notify_received_total` | counter | `channel` | Notifications received |
+| `notify_parse_errors_total` | counter | `channel` | Parse failures |
+| `notify_reconnects_total` | counter | | Reconnect attempts |
+
+---
+
+**Reliability**
+
+## Circuit breaker
+
+Prevents thundering herd when a backend goes down. When Redis or Postgres becomes unreachable, every extension that uses the breaker fails fast instead of queueing up timeouts, and fire-and-forget operations (heartbeats, relay flushes, cursor broadcasts) are skipped entirely.
+
+Three states:
+- **healthy** -- everything works, requests go through
+- **broken** -- too many failures, requests fail fast via `CircuitBrokenError`
+- **probing** -- one request is allowed through to test if the backend is back
+
+#### Setup
+
+```js
+// src/lib/server/breaker.js
+import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
+
+export const breaker = createCircuitBreaker({
+  failureThreshold: 5,
+  resetTimeout: 30000,
+  onStateChange: (from, to) => console.log(`circuit: ${from} -> ${to}`)
+});
+```
+
+Pass the same breaker to all extensions that share a backend:
+
+```js
+import { breaker } from './breaker.js';
+
+export const bus = createPubSubBus(redis, { breaker });
+export const presence = createPresence(redis, { breaker, key: 'id' });
+export const replay = createReplay(redis, { breaker });
+export const limiter = createRateLimit(redis, { points: 10, interval: 1000, breaker });
+```
+
+Failures from any extension contribute to the same breaker. When one trips it, all others fail fast.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `failureThreshold` | `5` | Consecutive failures before breaking |
+| `resetTimeout` | `30000` | Ms before transitioning from broken to probing |
+| `onStateChange` | - | Called on state transitions: `(from, to) => void` |
+
+#### API
+
+| Method / Property | Description |
+|---|---|
+| `breaker.state` | `'healthy'`, `'broken'`, or `'probing'` |
+| `breaker.isHealthy` | `true` only when state is `'healthy'` |
+| `breaker.failures` | Current consecutive failure count |
+| `breaker.guard()` | Throws `CircuitBrokenError` if the circuit is broken |
+| `breaker.success()` | Record a successful operation |
+| `breaker.failure()` | Record a failed operation |
+| `breaker.reset()` | Force back to healthy |
+| `breaker.destroy()` | Clear internal timers |
+
+#### How extensions use it
+
+Awaited operations (join, consume, publish) call `guard()` before the Redis/Postgres call, `success()` after, and `failure()` in the catch block. When the circuit is broken, `guard()` throws `CircuitBrokenError` and the operation never reaches the backend.
+
+Fire-and-forget operations (heartbeat refresh, relay flush, cursor broadcast) check `isHealthy` and skip entirely when the circuit is not healthy. This prevents piling up commands on a dead connection.
+
+#### Error handling
+
+```js
+import { CircuitBrokenError } from 'svelte-adapter-uws-extensions/breaker';
+
+try {
+  await replay.publish(platform, 'chat', 'msg', data);
+} catch (err) {
+  if (err instanceof CircuitBrokenError) {
+    // Backend is down -- degrade gracefully
+    platform.publish('chat', 'msg', data); // local-only delivery
+  }
+}
+```
+
+---
+
 **Operations**
 
 ## Graceful shutdown
@@ -689,6 +913,14 @@ npm test
 ```
 
 Tests use in-memory mocks for Redis and Postgres, no running services needed.
+
+---
+
+## Related projects
+
+- [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) -- The core adapter this package extends. Single-process WebSocket pub/sub, presence, replay, and more for SvelteKit on uWebSockets.js.
+- [svelte-realtime](https://github.com/lanteanio/svelte-realtime) -- Opinionated full-stack starter built on the adapter. Auth, database, real-time CRUD, and deployment config out of the box.
+- [svelte-realtime-demo](https://github.com/lanteanio/svelte-realtime-demo) -- Live demo of svelte-realtime. [Try it here.](https://svelte-realtime-demo.lantean.io/)
 
 ---
 

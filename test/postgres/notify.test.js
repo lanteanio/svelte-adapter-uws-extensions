@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createNotifyBridge } from '../../postgres/notify.js';
+import { createCircuitBreaker } from '../../shared/breaker.js';
 
 /**
  * Mock PgClient with createClient() that returns a standalone Client mock
@@ -83,6 +84,16 @@ describe('postgres notify bridge', () => {
 			bridge = createNotifyBridge(client, { channel: 'test' });
 			expect(typeof bridge.activate).toBe('function');
 			expect(typeof bridge.deactivate).toBe('function');
+		});
+
+		it('throws on negative reconnectInterval', () => {
+			expect(() => createNotifyBridge(client, { channel: 'x', reconnectInterval: -1 }))
+				.toThrow('non-negative');
+		});
+
+		it('throws on non-function parse', () => {
+			expect(() => createNotifyBridge(client, { channel: 'x', parse: 'bad' }))
+				.toThrow('parse must be a function');
 		});
 	});
 
@@ -253,6 +264,79 @@ describe('postgres notify bridge', () => {
 			}));
 
 			expect(platform.published).toHaveLength(0);
+		});
+	});
+
+	describe('breaker accounting', () => {
+		it('records failure() when LISTEN connection error fires', async () => {
+			const listeners = new Map();
+			const testClient = {
+				pool: {},
+				createClient() {
+					return {
+						on(ev, fn) {
+							if (!listeners.has(ev)) listeners.set(ev, []);
+							listeners.get(ev).push(fn);
+						},
+						removeListener(ev, fn) {
+							const arr = listeners.get(ev);
+							if (arr) { const i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1); }
+						},
+						async connect() {},
+						async query() { return { rows: [], rowCount: 0 }; },
+						async end() {}
+					};
+				},
+				async query() { return { rows: [], rowCount: 0 }; },
+				async end() {}
+			};
+
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const b = createNotifyBridge(testClient, {
+				channel: 'ch',
+				breaker,
+				autoReconnect: false
+			});
+			await b.activate(platform);
+
+			expect(breaker.failures).toBe(0);
+			const errorFns = listeners.get('error') || [];
+			expect(errorFns.length).toBeGreaterThan(0);
+			errorFns[0](new Error('connection lost'));
+			expect(breaker.failures).toBe(1);
+
+			breaker.destroy();
+		});
+
+		it('records success() when activate connect succeeds', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			bridge = createNotifyBridge(client, {
+				channel: 'changes',
+				breaker,
+				autoReconnect: false
+			});
+			breaker.failure();
+			expect(breaker.failures).toBe(1);
+
+			await bridge.activate(platform);
+			expect(breaker.failures).toBe(0);
+
+			breaker.destroy();
+		});
+
+		it('records failure() when activate connect fails', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const failClient = mockPgClient({ failConnect: true });
+			bridge = createNotifyBridge(failClient, {
+				channel: 'changes',
+				breaker,
+				autoReconnect: false
+			});
+
+			await expect(bridge.activate(platform)).rejects.toThrow('connection refused');
+			expect(breaker.failures).toBe(1);
+
+			breaker.destroy();
 		});
 	});
 });

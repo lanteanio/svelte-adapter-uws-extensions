@@ -3,6 +3,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { createCursor } from '../../redis/cursor.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
 
 describe('redis cursor', () => {
 	let client;
@@ -44,6 +45,145 @@ describe('redis cursor', () => {
 
 		it('throws on non-function select', () => {
 			expect(() => createCursor(client, { select: 'bad' })).toThrow('function');
+		});
+
+		it('throws on invalid topicThrottle', () => {
+			expect(() => createCursor(client, { topicThrottle: -5 })).toThrow('non-negative');
+			expect(() => createCursor(client, { topicThrottle: 'bad' })).toThrow('non-negative');
+		});
+
+		it('throws on invalid ttl', () => {
+			expect(() => createCursor(client, { ttl: 0 })).toThrow('ttl must be a positive');
+			expect(() => createCursor(client, { ttl: -1 })).toThrow('ttl must be a positive');
+			expect(() => createCursor(client, { ttl: 'bad' })).toThrow('ttl must be a positive');
+		});
+	});
+
+	describe('default select recursive stripping', () => {
+		it('strips nested __-prefixed keys', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', profile: { name: 'Alice', __token: 'x' } });
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.profile.name).toBe('Alice');
+			expect(platform.published[0].data.user.profile.__token).toBeUndefined();
+			c.destroy();
+		});
+
+		it('handles circular references without crashing', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const userData = { id: '1', name: 'Alice' };
+			userData.self = userData;
+			const ws = mockWs(userData);
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.id).toBe('1');
+			expect(platform.published[0].data.user.name).toBe('Alice');
+			c.destroy();
+		});
+
+		it('strips sensitive-regex keys like password and token', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', password: 'secret', sessionToken: 'xyz' });
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.id).toBe('1');
+			expect(platform.published[0].data.user.password).toBeUndefined();
+			expect(platform.published[0].data.user.sessionToken).toBeUndefined();
+			c.destroy();
+		});
+	});
+
+	describe('userData sanitization', () => {
+		it('strips __subscriptions and remoteAddress from userData', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({
+				id: '1',
+				name: 'Alice',
+				__subscriptions: new Set(['room']),
+				remoteAddress: '127.0.0.1'
+			});
+			c.update(ws, 'canvas', { x: 10 }, platform);
+
+			expect(platform.published[0].data.user.__subscriptions).toBeUndefined();
+			expect(platform.published[0].data.user.remoteAddress).toBeUndefined();
+			expect(platform.published[0].data.user.id).toBe('1');
+			c.destroy();
+		});
+	});
+
+	describe('snapshot', () => {
+		it('sends current cursors as a bulk event to a single connection', async () => {
+			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+			const ws1 = mockWs({ id: '1' });
+			const ws2 = mockWs({ id: '2' });
+
+			c.update(ws1, 'canvas', { x: 10 }, platform);
+			c.update(ws2, 'canvas', { x: 20 }, platform);
+			platform.reset();
+
+			const receiver = mockWs({ id: 'new' });
+			await c.snapshot(receiver, 'canvas', platform);
+
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0].topic).toBe('__cursor:canvas');
+			expect(platform.sent[0].event).toBe('bulk');
+			expect(platform.sent[0].data).toHaveLength(2);
+			c.destroy();
+		});
+
+		it('does not send bulk when no cursors exist', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const receiver = mockWs({ id: 'new' });
+			await c.snapshot(receiver, 'empty-topic', platform);
+
+			expect(platform.sent).toHaveLength(0);
+			c.destroy();
+		});
+	});
+
+	describe('hooks', () => {
+		it('API shape includes hooks with subscribe, message, and close', () => {
+			expect(typeof cursors.hooks.subscribe).toBe('function');
+			expect(typeof cursors.hooks.message).toBe('function');
+			expect(typeof cursors.hooks.close).toBe('function');
+		});
+
+		it('hooks.message dispatches cursor updates', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1' });
+
+			c.hooks.message(ws, {
+				data: { type: 'cursor', topic: 'canvas', data: { x: 42 } },
+				platform
+			});
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].data.data).toEqual({ x: 42 });
+			c.destroy();
+		});
+
+		it('hooks.message ignores non-cursor messages', () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1' });
+
+			c.hooks.message(ws, { data: { type: 'chat', text: 'hi' }, platform });
+			expect(platform.published).toHaveLength(0);
+			c.destroy();
+		});
+
+		it('hooks.close removes all cursor state', async () => {
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 10 }, platform);
+			platform.reset();
+
+			await c.hooks.close(ws, { platform });
+
+			const removes = platform.published.filter((e) => e.event === 'remove');
+			expect(removes).toHaveLength(1);
+			c.destroy();
 		});
 	});
 
@@ -425,7 +565,7 @@ describe('redis cursor', () => {
 	});
 
 	describe('cross-instance relay', () => {
-		it('publishes updates to Redis pub/sub channel', () => {
+		it('publishes updates to Redis pub/sub channel', async () => {
 			const c = createCursor(client, { throttle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
@@ -438,6 +578,7 @@ describe('redis cursor', () => {
 			};
 
 			c.update(ws, 'canvas', { x: 10, y: 20 }, platform);
+			await new Promise((r) => setTimeout(r, 0));
 
 			expect(publishCalls).toHaveLength(1);
 			expect(publishCalls[0].channel).toBe('test:cursor:events');
@@ -452,6 +593,7 @@ describe('redis cursor', () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
+			await new Promise((r) => setTimeout(r, 10));
 
 			const publishCalls = [];
 			const origPublish = client.redis.publish;
@@ -525,6 +667,51 @@ describe('redis cursor', () => {
 			// We test this indirectly: after the initial update there should be
 			// exactly 1 publish (local), not 2 (local + echo)
 			expect(platform.published).toHaveLength(0); // we reset after the initial
+			c.destroy();
+		});
+	});
+
+	describe('subscriber backfill on startup', () => {
+		it('backfills remote cursor entries after subscriber becomes ready', async () => {
+			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+
+			const remoteKey = 'remote-instance:1';
+			const remoteData = JSON.stringify({
+				user: { id: '2' },
+				data: { x: 77 },
+				ts: Date.now()
+			});
+			await client.redis.hset('test:cursor:canvas', remoteKey, remoteData);
+
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'canvas', { x: 10 }, platform);
+
+			await new Promise((r) => setTimeout(r, 20));
+
+			const bulkEvents = platform.published.filter(
+				(p) => p.event === 'bulk' && p.options && p.options.relay === false
+			);
+			expect(bulkEvents.length).toBeGreaterThanOrEqual(1);
+			const entries = bulkEvents[0].data;
+			const remoteEntry = entries.find((e) => e.key === remoteKey);
+			expect(remoteEntry).toBeDefined();
+			expect(remoteEntry.data).toEqual({ x: 77 });
+
+			c.destroy();
+		});
+
+		it('does not backfill entries from the local instance', async () => {
+			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 10 }, platform);
+			await new Promise((r) => setTimeout(r, 20));
+
+			const bulkEvents = platform.published.filter(
+				(p) => p.event === 'bulk' && p.options && p.options.relay === false
+			);
+			expect(bulkEvents).toHaveLength(0);
+
 			c.destroy();
 		});
 	});
@@ -754,6 +941,300 @@ describe('redis cursor', () => {
 
 			vi.advanceTimersByTime(200);
 			expect(platform.published).toHaveLength(0);
+		});
+	});
+
+	describe('remove suppresses local broadcast when Redis fails', () => {
+		it('per-topic remove does not publish locally when hdel fails', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'doc', { x: 10 }, platform);
+			platform.reset();
+
+			const listBefore = await c.list('doc');
+			expect(listBefore).toHaveLength(1);
+
+			const origHdel = client.redis.hdel;
+			client.redis.hdel = async () => { throw new Error('hdel failed'); };
+
+			await c.remove(ws, platform, 'doc');
+
+			const removes = platform.published.filter((p) => p.event === 'remove');
+			expect(removes).toHaveLength(0);
+
+			client.redis.hdel = origHdel;
+			const listAfter = await c.list('doc');
+			expect(listAfter).toHaveLength(1);
+
+			c.destroy();
+		});
+
+		it('remove-all does not publish locally when pipeline fails', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'doc', { x: 10 }, platform);
+			c.update(ws, 'canvas', { y: 20 }, platform);
+			platform.reset();
+
+			const origPipeline = client.redis.pipeline;
+			client.redis.pipeline = () => {
+				return new Proxy({}, {
+					get(_, method) {
+						if (method === 'exec') {
+							return async () => { throw new Error('pipeline failed'); };
+						}
+						return () => new Proxy({}, {
+							get: (_, m) => m === 'exec'
+								? async () => { throw new Error('pipeline failed'); }
+								: () => {}
+						});
+					}
+				});
+			};
+
+			await c.remove(ws, platform);
+
+			const removes = platform.published.filter((p) => p.event === 'remove');
+			expect(removes).toHaveLength(0);
+
+			client.redis.pipeline = origPipeline;
+			c.destroy();
+		});
+
+		it('per-topic remove publishes locally when hdel succeeds', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'doc', { x: 10 }, platform);
+			platform.reset();
+
+			await c.remove(ws, platform, 'doc');
+
+			const removes = platform.published.filter((p) => p.event === 'remove');
+			expect(removes).toHaveLength(1);
+
+			const listAfter = await c.list('doc');
+			expect(listAfter).toEqual([]);
+
+			c.destroy();
+		});
+	});
+
+	describe('sensitive data warning for arrays', () => {
+		it('warns about sensitive keys nested inside arrays', () => {
+			vi.useRealTimers();
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const c = createCursor(client, { throttle: 0, select: (ud) => ud });
+
+			const ws = mockWs({ id: '1', profiles: [{ authToken: 'secret' }] });
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.stringContaining('authToken')
+			);
+
+			warn.mockRestore();
+			c.destroy();
+		});
+	});
+
+	describe('write-after-broadcast consistency', () => {
+		it('does not relay cross-instance when Redis pipeline fails', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			// Track relay publishes
+			const relayMessages = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				relayMessages.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			// Make pipeline fail
+			const origPipeline = client.redis.pipeline;
+			client.redis.pipeline = () => {
+				return new Proxy({}, {
+					get(_, method) {
+						if (method === 'exec') {
+							return async () => { throw new Error('pipeline failed'); };
+						}
+						return () => new Proxy({}, {
+							get: (_, m) => m === 'exec'
+								? async () => { throw new Error('pipeline failed'); }
+								: () => {}
+						});
+					}
+				});
+			};
+
+			c.update(ws, 'canvas', { x: 10, y: 20 }, platform);
+
+			// Local broadcast should still happen
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].data.data).toEqual({ x: 10, y: 20 });
+
+			// Wait for async pipeline to settle
+			await new Promise((r) => setTimeout(r, 50));
+
+			// No relay should have been sent since pipeline failed
+			expect(relayMessages).toHaveLength(0);
+
+			client.redis.pipeline = origPipeline;
+			client.redis.publish = origPublish;
+			c.destroy();
+		});
+
+		it('relays cross-instance when Redis pipeline succeeds', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			const relayMessages = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				relayMessages.push(JSON.parse(msg));
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			c.update(ws, 'canvas', { x: 10 }, platform);
+
+			// Wait for async pipeline + relay
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(relayMessages.length).toBeGreaterThanOrEqual(1);
+			const relay = relayMessages.find((m) => m.event === 'update');
+			expect(relay).toBeDefined();
+			expect(relay.payload.data).toEqual({ x: 10 });
+
+			client.redis.publish = origPublish;
+			c.destroy();
+		});
+
+		it('list() returns empty when pipeline failed but local broadcast happened', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			// Make pipeline fail so data never reaches Redis
+			const origPipeline = client.redis.pipeline;
+			client.redis.pipeline = () => {
+				return new Proxy({}, {
+					get(_, method) {
+						if (method === 'exec') {
+							return async () => { throw new Error('pipeline failed'); };
+						}
+						return () => new Proxy({}, {
+							get: (_, m) => m === 'exec'
+								? async () => { throw new Error('pipeline failed'); }
+								: () => {}
+						});
+					}
+				});
+			};
+
+			c.update(ws, 'canvas', { x: 10 }, platform);
+
+			// Local broadcast happened
+			expect(platform.published).toHaveLength(1);
+
+			// Wait for pipeline to settle
+			await new Promise((r) => setTimeout(r, 50));
+
+			// list() reads from Redis, which was never written
+			client.redis.pipeline = origPipeline;
+			const list = await c.list('canvas');
+			expect(list).toEqual([]);
+
+			c.destroy();
+		});
+
+		it('list() returns data when pipeline succeeds', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, { throttle: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 42 }, platform);
+
+			// Wait for pipeline to complete
+			await new Promise((r) => setTimeout(r, 50));
+
+			const list = await c.list('canvas');
+			expect(list).toHaveLength(1);
+			expect(list[0].data).toEqual({ x: 42 });
+
+			c.destroy();
+		});
+	});
+
+	describe('breaker accounting in cursor', () => {
+		it('skips Redis write and relay when breaker is broken', () => {
+			vi.useRealTimers();
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.failure();
+
+			const c = createCursor(client, { throttle: 0, breaker });
+			const ws = mockWs({ id: '1' });
+
+			const hsetCalls = [];
+			const origHset = client.redis.hset;
+			client.redis.hset = async (...args) => {
+				hsetCalls.push(args);
+				return origHset.apply(client.redis, args);
+			};
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+
+			// Local broadcast still happens
+			expect(platform.published).toHaveLength(1);
+
+			// Redis was not touched
+			expect(hsetCalls).toHaveLength(0);
+
+			client.redis.hset = origHset;
+			c.destroy();
+			breaker.destroy();
+		});
+
+		it('list() throws when breaker is broken', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.failure();
+
+			const c = createCursor(client, { throttle: 0, breaker });
+			await expect(c.list('canvas')).rejects.toThrow(CircuitBrokenError);
+
+			c.destroy();
+			breaker.destroy();
+		});
+
+		it('remove does not publish locally when breaker is broken', async () => {
+			vi.useRealTimers();
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const c = createCursor(client, { throttle: 0, breaker });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+
+			breaker.failure();
+			platform.reset();
+
+			await c.remove(ws, platform);
+
+			const removes = platform.published.filter((p) => p.event === 'remove');
+			expect(removes).toHaveLength(0);
+
+			breaker.reset();
+			const list = await c.list('canvas');
+			expect(list).toHaveLength(1);
+
+			c.destroy();
+			breaker.destroy();
 		});
 	});
 });

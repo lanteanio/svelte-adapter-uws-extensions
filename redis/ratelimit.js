@@ -35,9 +35,10 @@ local blockDuration = tonumber(ARGV[4])
 local rtime = redis.call('TIME')
 local now = tonumber(rtime[1]) * 1000 + math.floor(tonumber(rtime[2]) / 1000)
 
-local points = tonumber(redis.call('hget', key, 'points'))
-local resetAt = tonumber(redis.call('hget', key, 'resetAt'))
-local bannedUntil = tonumber(redis.call('hget', key, 'bannedUntil'))
+local vals = redis.call('hmget', key, 'points', 'resetAt', 'bannedUntil')
+local points = tonumber(vals[1])
+local resetAt = tonumber(vals[2])
+local bannedUntil = tonumber(vals[3])
 
 -- Initialize if missing
 if points == nil then
@@ -60,7 +61,7 @@ end
 -- Try to consume
 if points >= cost then
   points = points - cost
-  redis.call('hmset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
+  redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
   -- Set TTL to avoid stale keys: interval + blockDuration + buffer
   local ttlMs = interval + blockDuration + 60000
   redis.call('pexpire', key, ttlMs)
@@ -70,16 +71,34 @@ end
 -- Exhausted
 if blockDuration > 0 then
   bannedUntil = now + blockDuration
-  redis.call('hmset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
+  redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
   local ttlMs = blockDuration + 60000
   redis.call('pexpire', key, ttlMs)
   return {0, 0, blockDuration}
 end
 
-redis.call('hmset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
+redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
 local ttlMs = interval + 60000
 redis.call('pexpire', key, ttlMs)
 return {0, math.max(0, points), resetAt - now}
+`;
+
+const BAN_SCRIPT = `
+local key = KEYS[1]
+local duration = tonumber(ARGV[1])
+local defaultPoints = tonumber(ARGV[2])
+local defaultInterval = tonumber(ARGV[3])
+
+local rtime = redis.call('TIME')
+local now = tonumber(rtime[1]) * 1000 + math.floor(tonumber(rtime[2]) / 1000)
+
+local vals = redis.call('hmget', key, 'points', 'resetAt')
+local pts = vals[1] or defaultPoints
+local rst = vals[2] or (now + defaultInterval)
+
+redis.call('hset', key, 'points', pts, 'resetAt', rst, 'bannedUntil', now + duration)
+redis.call('pexpire', key, duration + 60000)
+return 1
 `;
 
 /**
@@ -135,10 +154,24 @@ export function createRateLimit(client, options) {
 
 	const redis = client.redis;
 
+	const b = options.breaker;
+	const m = options.metrics;
+	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed');
+	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied');
+	const mBans = m?.counter('ratelimit_bans_total', 'Bans applied');
+
 	// Per-connection keying uses a WeakMap to avoid leaks
 	const wsKeys = new WeakMap();
 	let connCounter = 0;
 
+	/**
+	 * Resolve the rate limit key for a WebSocket connection.
+	 *
+	 * In 'ip' mode (default), uses `userData.remoteAddress` which the core
+	 * adapter v0.4.0+ resolves via ADDRESS_HEADER/XFF_DEPTH — so this is
+	 * the real client IP when behind a proxy, not the raw socket address.
+	 * Falls back to `ip`, `address`, then 'unknown'.
+	 */
 	function resolveKey(ws) {
 		if (typeof keyBy === 'function') return keyBy(ws);
 		if (keyBy === 'connection') {
@@ -167,59 +200,92 @@ export function createRateLimit(client, options) {
 			}
 			const key = resolveKey(ws);
 
-			const result = await redis.eval(
-				CONSUME_SCRIPT,
-				1,
-				bucketKey(key),
-				points,
-				interval,
-				cost,
-				blockDuration
-			);
+			b?.guard();
+			let result;
+			try {
+				result = await redis.eval(
+					CONSUME_SCRIPT,
+					1,
+					bucketKey(key),
+					points,
+					interval,
+					cost,
+					blockDuration
+				);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+
+			const allowed = result[0] === 1;
+			if (allowed) {
+				mAllowed?.inc();
+			} else {
+				mDenied?.inc();
+			}
 
 			return {
-				allowed: result[0] === 1,
+				allowed,
 				remaining: result[1],
 				resetMs: result[2]
 			};
 		},
 
 		async reset(key) {
-			await redis.del(bucketKey(key));
+			if (b) b.guard();
+			try {
+				await redis.del(bucketKey(key));
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async ban(key, duration) {
 			const dur = duration ?? (blockDuration || 60000);
-			const now = Date.now();
+			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');
 			const bk = bucketKey(key);
-			// Preserve existing points (if any) so unban restores the bucket
-			const existingPoints = await redis.hget(bk, 'points');
-			const existingResetAt = await redis.hget(bk, 'resetAt');
-			await redis.hmset(
-				bk,
-				'points', existingPoints ?? points,
-				'resetAt', existingResetAt ?? (now + interval),
-				'bannedUntil', now + dur
-			);
-			await redis.pexpire(bk, dur + 60000);
+			b?.guard();
+			try {
+				await redis.eval(BAN_SCRIPT, 1, bk, dur, points, interval);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			mBans?.inc();
 		},
 
 		async unban(key) {
-			const bk = bucketKey(key);
-			await redis.hset(bk, 'bannedUntil', 0);
+			if (b) b.guard();
+			try {
+				await redis.hset(bucketKey(key), 'bannedUntil', 0);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async clear() {
-			const pattern = client.key('ratelimit:*');
-			let cursor = '0';
-			do {
-				const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-				cursor = nextCursor;
-				if (keys.length > 0) {
-					await redis.del(...keys);
-				}
-			} while (cursor !== '0');
-			connCounter = 0;
+			if (b) b.guard();
+			try {
+				const pattern = client.key('ratelimit:*');
+				let cursor = '0';
+				do {
+					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+					cursor = nextCursor;
+					if (keys.length > 0) {
+						await redis.unlink(...keys);
+					}
+				} while (cursor !== '0');
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		}
 	};
 }

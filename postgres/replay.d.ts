@@ -1,5 +1,7 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { PgClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface PgReplayOptions {
 	/** Table name. @default 'ws_replay' */
@@ -12,6 +14,10 @@ export interface PgReplayOptions {
 	autoMigrate?: boolean;
 	/** Cleanup interval in ms (0 to disable). @default 60000 */
 	cleanupInterval?: number;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface BufferedMessage {
@@ -37,8 +43,13 @@ export interface PgReplayBuffer {
 	/**
 	 * Send buffered messages to a single connection. Sends each missed
 	 * message on `__replay:{topic}`, then an end marker.
+	 *
+	 * If the buffer has been trimmed past `sinceSeq`, a `truncated` event
+	 * is sent before the messages so the client knows data was lost.
+	 *
+	 * @param reqId - Optional correlation ID for disambiguating concurrent replays.
 	 */
-	replay(ws: any, topic: string, sinceSeq: number, platform: Platform): Promise<void>;
+	replay(ws: any, topic: string, sinceSeq: number, platform: Platform, reqId?: string): Promise<void>;
 
 	/** Clear all replay data. */
 	clear(): Promise<void>;

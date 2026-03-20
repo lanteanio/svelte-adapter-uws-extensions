@@ -15,6 +15,9 @@ export function mockPlatform() {
 			p.sent.push({ ws, topic, event, data });
 			return 1;
 		},
+		batch(messages) {
+			return messages.map((m) => p.publish(m.topic, m.event, m.data));
+		},
 		sendTo(filter, topic, event, data) {
 			return 0;
 		},

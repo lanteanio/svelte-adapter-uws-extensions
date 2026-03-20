@@ -1,5 +1,7 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export type GroupRole = 'member' | 'admin' | 'viewer';
 
@@ -18,6 +20,10 @@ export interface RedisGroupOptions {
 	onFull?: (ws: any, role: GroupRole) => void;
 	/** Called when the group is closed. */
 	onClose?: () => void;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface RedisGroup {
@@ -56,6 +62,25 @@ export interface RedisGroup {
 
 	/** Stop the Redis subscriber. */
 	destroy(): void;
+
+	/**
+	 * Ready-made WebSocket hooks for zero-config group membership.
+	 *
+	 * `subscribe` auto-joins when the client subscribes to this group's internal topic.
+	 * `unsubscribe` auto-leaves when the client unsubscribes (requires core v0.4.0+).
+	 * `close` leaves the group on disconnect.
+	 *
+	 * @example
+	 * ```js
+	 * import { group } from '$lib/server/group';
+	 * export const { subscribe, unsubscribe, close } = group.hooks;
+	 * ```
+	 */
+	hooks: {
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		close(ws: any, ctx: { platform: Platform }): Promise<void>;
+	};
 }
 
 /**

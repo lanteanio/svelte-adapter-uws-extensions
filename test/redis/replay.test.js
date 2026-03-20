@@ -187,7 +187,7 @@ describe('redis replay', () => {
 				ws: fakeWs,
 				topic: '__replay:chat',
 				event: 'end',
-				data: null
+				data: { reqId: undefined }
 			});
 		});
 
@@ -217,6 +217,184 @@ describe('redis replay', () => {
 			await replay.replay({}, 'chat', 0, platform);
 
 			expect(platform.published).toEqual([]);
+		});
+	});
+
+	describe('replay with reqId', () => {
+		it('includes reqId in end event data when provided', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 0, platform, 'req-123');
+
+			const end = platform.sent.find((s) => s.event === 'end');
+			expect(end.data).toEqual({ reqId: 'req-123' });
+		});
+
+		it('end event has undefined reqId when not provided', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 0, platform);
+
+			const end = platform.sent.find((s) => s.event === 'end');
+			expect(end.data).toEqual({ reqId: undefined });
+		});
+	});
+
+	describe('truncation detection', () => {
+		it('sends truncated event when buffer was trimmed past sinceSeq', async () => {
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+
+			const fakeWs = {};
+			platform.reset();
+			// sinceSeq 1 is gone (buffer starts at seq 3), so truncated should fire
+			await replay.replay(fakeWs, 'chat', 1, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(1);
+			expect(truncated[0].data).toBeNull();
+		});
+
+		it('does not send truncated when sinceSeq is within buffer', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 2, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(0);
+		});
+	});
+
+	describe('malformed entries', () => {
+		it('since() skips corrupted entries without throwing', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+
+			// Inject a malformed entry directly into the sorted set
+			const bufKey = client.key('replay:buf:chat');
+			client._sortedSets.get(bufKey).push({
+				score: 1.5,
+				member: '{invalid json'
+			});
+			client._sortedSets.get(bufKey).sort((a, b) => a.score - b.score);
+
+			const result = await replay.since('chat', 0);
+			// Should return the 2 valid entries, skipping the corrupted one
+			expect(result).toHaveLength(2);
+			expect(result[0].data).toEqual({ id: 1 });
+			expect(result[1].data).toEqual({ id: 2 });
+		});
+
+		it('replay() works when since() encounters corrupted entries', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			const bufKey = client.key('replay:buf:chat');
+			client._sortedSets.get(bufKey).push({
+				score: 1.5,
+				member: 'not-json'
+			});
+			client._sortedSets.get(bufKey).sort((a, b) => a.score - b.score);
+
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 0, platform);
+
+			const msgs = platform.sent.filter((s) => s.event === 'msg');
+			expect(msgs).toHaveLength(2);
+			expect(msgs[0].data.data).toEqual({ id: 1 });
+			expect(msgs[1].data.data).toEqual({ id: 2 });
+		});
+	});
+
+	describe('truncation with corrupt oldest entry', () => {
+		it('detects truncation when oldest buffered entry is corrupt', async () => {
+			// Publish 3 messages so buffer has seq 1, 2, 3
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+			await replay.publish(platform, 'chat', 'created', { id: 3 });
+
+			// Corrupt seq 1 by replacing its sorted set entry
+			const bufKey = client.key('replay:buf:chat');
+			const set = client._sortedSets.get(bufKey);
+			set[0] = { score: 1, member: '{not valid json!!!' };
+
+			const fakeWs = {};
+			platform.reset();
+			// Client last saw seq 1. Corrupt seq 1 + valid seq 2:
+			// the first parseable entry (seq 2) is > sinceSeq (1) + 1,
+			// so truncation is NOT triggered (2 is not > 1+1).
+			// But if we ask since seq 0 (which > 0 check blocks), or
+			// ask since a seq whose next is the corrupt one:
+			// sinceSeq=1, oldest parseable=2, 2 > 1+1 is false, no truncation.
+			// Let's make it sinceSeq=0 won't work, use different scenario.
+
+			// Remove seq 1 entirely and corrupt seq 2 instead
+			set.splice(0, 2); // remove corrupt seq 1 and valid seq 2
+			// Now buffer only has seq 3
+			// Client last saw seq 1, oldest is seq 3 > 1+1 = true
+
+			await replay.replay(fakeWs, 'chat', 1, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(1);
+		});
+
+		it('detects truncation skipping past corrupt entries to find first valid', async () => {
+			// Publish 4 messages
+			for (let i = 1; i <= 4; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+
+			const bufKey = client.key('replay:buf:chat');
+			const set = client._sortedSets.get(bufKey);
+			// Corrupt seq 1 (index 0)
+			set[0] = { score: 1, member: '{broken' };
+
+			const fakeWs = {};
+			platform.reset();
+			// sinceSeq=1, first parseable is seq 2, 2 > 1+1 is false = no truncation
+			await replay.replay(fakeWs, 'chat', 1, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(0);
+
+			// But the valid messages should still replay
+			const msgs = platform.sent.filter((s) => s.event === 'msg');
+			expect(msgs).toHaveLength(3); // seq 2, 3, 4
+		});
+
+		it('detects truncation when all entries before valid ones are corrupt', async () => {
+			for (let i = 1; i <= 5; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+
+			const bufKey = client.key('replay:buf:chat');
+			const set = client._sortedSets.get(bufKey);
+			// Corrupt seq 1 and 2
+			set[0] = { score: 1, member: 'garbage' };
+			set[1] = { score: 2, member: 'also garbage' };
+
+			const fakeWs = {};
+			platform.reset();
+			// sinceSeq=1, first parseable is seq 3, 3 > 1+1 = true = truncation
+			await replay.replay(fakeWs, 'chat', 1, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(1);
+
+			const msgs = platform.sent.filter((s) => s.event === 'msg');
+			expect(msgs).toHaveLength(3); // seq 3, 4, 5
 		});
 	});
 

@@ -81,8 +81,21 @@ export function createNotifyBridge(client, options) {
 
 	const channel = options.channel;
 	const autoReconnect = options.autoReconnect !== false;
-	const reconnectInterval = options.reconnectInterval || 3000;
+	const reconnectInterval = options.reconnectInterval ?? 3000;
+	if (typeof reconnectInterval !== 'number' || !Number.isFinite(reconnectInterval) || reconnectInterval < 0) {
+		throw new Error('notify bridge: reconnectInterval must be a non-negative number');
+	}
+	if (options.parse != null && typeof options.parse !== 'function') {
+		throw new Error('notify bridge: parse must be a function');
+	}
+	const isDefaultParser = !options.parse;
 	const parse = options.parse || defaultParse;
+
+	const b = options.breaker;
+	const m = options.metrics;
+	const mReceived = m?.counter('notify_received_total', 'Notifications received', ['channel']);
+	const mParseErrors = m?.counter('notify_parse_errors_total', 'Notification parse failures', ['channel']);
+	const mReconnects = m?.counter('notify_reconnects_total', 'Connection reconnect attempts');
 
 	/** @type {import('pg').Client | null} */
 	let conn = null;
@@ -104,19 +117,27 @@ export function createNotifyBridge(client, options) {
 
 	function onNotification(msg) {
 		if (msg.channel !== channel) return;
+		mReceived?.inc({ channel });
+		if (msg.payload && msg.payload.length > 7500) {
+			console.warn(
+				`[postgres/notify] payload on "${channel}" is ${msg.payload.length} bytes — ` +
+				'approaching the ~8000 byte Postgres NOTIFY limit'
+			);
+		}
 		try {
 			const result = parse(msg.payload, msg.channel);
 			if (result && activePlatform) {
-				// relay: false -- in clustered mode each worker has its own
-				// LISTEN connection, so relaying would duplicate delivery.
 				activePlatform.publish(result.topic, result.event, result.data, { relay: false });
+			} else if (!result && isDefaultParser) {
+				mParseErrors?.inc({ channel });
 			}
 		} catch {
-			// Parse errors are non-fatal -- skip the notification
+			mParseErrors?.inc({ channel });
 		}
 	}
 
 	async function connect() {
+		b?.guard();
 		try {
 			// Use a standalone Client instead of pool.connect() to avoid
 			// permanently holding a pool connection. LISTEN needs a persistent
@@ -130,7 +151,9 @@ export function createNotifyBridge(client, options) {
 			// pg requires channel name to be a valid identifier or quoted
 			// Use double-quoting to handle any channel name safely
 			await conn.query(`LISTEN "${channel.replace(/"/g, '""')}"`);
+			b?.success();
 		} catch (err) {
+			b?.failure(err);
 			if (conn) {
 				try { await conn.end(); } catch { /* ignore */ }
 			}
@@ -142,7 +165,8 @@ export function createNotifyBridge(client, options) {
 		}
 	}
 
-	function handleError() {
+	function handleError(err) {
+		b?.failure(err);
 		cleanup();
 		if (active && autoReconnect) {
 			scheduleReconnect();
@@ -151,6 +175,7 @@ export function createNotifyBridge(client, options) {
 
 	function scheduleReconnect() {
 		if (reconnectTimer) return;
+		mReconnects?.inc();
 		reconnectTimer = setTimeout(async () => {
 			reconnectTimer = null;
 			if (!active) return;

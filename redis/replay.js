@@ -50,7 +50,8 @@ local maxSize = tonumber(ARGV[4])
 local ttl = tonumber(ARGV[5])
 
 local seq = redis.call('incr', seqKey)
-local payload = cjson.encode({seq = seq, topic = topic, event = event, data = cjson.decode(data)})
+local envelope = cjson.encode({seq = seq, topic = topic, event = event})
+local payload = string.sub(envelope, 1, -2) .. ',"data":' .. data .. '}'
 redis.call('zadd', bufKey, seq, payload)
 
 local count = redis.call('zcard', bufKey)
@@ -89,6 +90,13 @@ export function createReplay(client, options = {}) {
 	const ttl = options.ttl || 0;
 	const redis = client.redis;
 
+	const b = options.breaker;
+	const m = options.metrics;
+	const mt = m?.mapTopic;
+	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
+	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
+	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+
 	function seqKey(topic) {
 		return client.key('replay:seq:' + topic);
 	}
@@ -102,28 +110,87 @@ export function createReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			await redis.eval(
-				PUBLISH_SCRIPT, 2, sk, bk,
-				topic, event, JSON.stringify(data ?? null), maxSize, ttl
-			);
+			b?.guard();
+			try {
+				await redis.eval(
+					PUBLISH_SCRIPT, 2, sk, bk,
+					topic, event, JSON.stringify(data ?? null), maxSize, ttl
+				);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			mPublishes?.inc({ topic: mt(topic) });
 
 			return platform.publish(topic, event, data);
 		},
 
 		async seq(topic) {
-			const val = await redis.get(seqKey(topic));
-			return val ? parseInt(val, 10) : 0;
+			if (b) b.guard();
+			try {
+				const val = await redis.get(seqKey(topic));
+				b?.success();
+				return val ? parseInt(val, 10) : 0;
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async since(topic, since) {
-			// Get all entries with score > since
-			const raw = await redis.zrangebyscore(bufKey(topic), since + 1, '+inf');
-			return raw.map((entry) => JSON.parse(entry));
+			if (b) b.guard();
+			let raw;
+			try {
+				raw = await redis.zrangebyscore(bufKey(topic), since + 1, '+inf');
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			const result = [];
+			for (let i = 0; i < raw.length; i++) {
+				try {
+					result.push(JSON.parse(raw[i]));
+				} catch { /* skip corrupted entry */ }
+			}
+			return result;
 		},
 
-		async replay(ws, topic, sinceSeq, platform) {
-			const missed = await this.since(topic, sinceSeq);
+		async replay(ws, topic, sinceSeq, platform, reqId) {
+			if (b) b.guard();
 			const replayTopic = '__replay:' + topic;
+
+			let rawAll;
+			try {
+				rawAll = await redis.zrangebyscore(bufKey(topic), '-inf', '+inf');
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			let oldestSeq = null;
+			for (let i = 0; i < rawAll.length; i++) {
+				try {
+					const parsed = JSON.parse(rawAll[i]);
+					if (parsed.seq != null) {
+						oldestSeq = parsed.seq;
+						break;
+					}
+				} catch { /* skip corrupt */ }
+			}
+			if (oldestSeq !== null && sinceSeq > 0 && oldestSeq > sinceSeq + 1) {
+				mTruncations?.inc({ topic: mt(topic) });
+				platform.send(ws, replayTopic, 'truncated', null);
+			}
+
+			const missed = [];
+			for (let i = 0; i < rawAll.length; i++) {
+				try {
+					const parsed = JSON.parse(rawAll[i]);
+					if (parsed.seq > sinceSeq) missed.push(parsed);
+				} catch { /* skip corrupted */ }
+			}
 
 			for (let i = 0; i < missed.length; i++) {
 				const msg = missed[i];
@@ -133,24 +200,38 @@ export function createReplay(client, options = {}) {
 					data: msg.data
 				});
 			}
-			platform.send(ws, replayTopic, 'end', null);
+			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
+			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
 		},
 
 		async clear() {
-			// Find and delete all replay keys with our prefix
-			const pattern = client.key('replay:*');
-			let cursor = '0';
-			do {
-				const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-				cursor = nextCursor;
-				if (keys.length > 0) {
-					await redis.del(...keys);
-				}
-			} while (cursor !== '0');
+			if (b) b.guard();
+			try {
+				const pattern = client.key('replay:*');
+				let cursor = '0';
+				do {
+					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+					cursor = nextCursor;
+					if (keys.length > 0) {
+						await redis.unlink(...keys);
+					}
+				} while (cursor !== '0');
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		},
 
 		async clearTopic(topic) {
-			await redis.del(seqKey(topic), bufKey(topic));
+			if (b) b.guard();
+			try {
+				await redis.unlink(seqKey(topic), bufKey(topic));
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
 		}
 	};
 }

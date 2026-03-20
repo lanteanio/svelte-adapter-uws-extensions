@@ -1,5 +1,7 @@
 import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
+import type { MetricsRegistry } from '../prometheus/index.js';
+import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisPresenceOptions {
 	/** Field in selected data for user dedup. @default 'id' */
@@ -10,6 +12,10 @@ export interface RedisPresenceOptions {
 	heartbeat?: number;
 	/** TTL in seconds for presence hash entries. @default 90 */
 	ttl?: number;
+	/** Prometheus metrics registry. */
+	metrics?: MetricsRegistry;
+	/** Circuit breaker instance. */
+	breaker?: CircuitBreaker;
 }
 
 export interface RedisPresenceTracker {
@@ -42,16 +48,19 @@ export interface RedisPresenceTracker {
 	 *
 	 * `subscribe` handles both regular topics (calls `join`) and `__presence:*`
 	 * topics (calls `sync` so the client gets the current list immediately).
+	 * `unsubscribe` removes presence from a single topic when the client
+	 * unsubscribes (requires core adapter v0.4.0+).
 	 * `close` calls `leave`.
 	 *
 	 * @example
 	 * ```js
 	 * import { presence } from '$lib/server/presence';
-	 * export const { subscribe, close } = presence.hooks;
+	 * export const { subscribe, unsubscribe, close } = presence.hooks;
 	 * ```
 	 */
 	hooks: {
 		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};
 }
