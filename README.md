@@ -42,6 +42,7 @@ The core adapter keeps everything in-process memory. That works great for single
 - [Prometheus metrics](#prometheus-metrics)
 
 **Reliability**
+- [Failure handling](#failure-handling)
 - [Circuit breaker](#circuit-breaker)
 
 **Operations**
@@ -144,7 +145,9 @@ export const pg = createPgClient({
 
 ## Pub/sub bus
 
-Distributes `platform.publish()` calls across multiple server instances via Redis pub/sub. Each instance publishes locally AND to Redis. Incoming Redis messages are forwarded to the local platform with echo suppression (messages from the same instance are ignored).
+Distributes `platform.publish()` calls across multiple server instances via Redis pub/sub. Each instance publishes locally AND to Redis. Incoming Redis messages are forwarded to the local platform with echo suppression (messages originating from the same instance are dropped on receive, keyed by a per-process instance ID).
+
+Multiple `publish()` calls within the same event-loop tick are coalesced into a single Redis pipeline via microtask batching. This means a form action that publishes to three topics results in one pipelined round trip, not three independent commands.
 
 #### Setup
 
@@ -197,6 +200,10 @@ export function message(ws, { data, platform }) {
 ## Replay buffer (Redis)
 
 Same API as the core `createReplay` plugin, but backed by Redis sorted sets. Messages survive restarts and are shared across instances.
+
+Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script -- no second round trip required.
+
+When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
 
 #### Setup
 
@@ -268,6 +275,12 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 ## Presence
 
 Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub.
+
+Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone -- local maps, the Redis field, and any broadcast join event are reversed. This prevents ghost entries that would show a user as online when they never fully connected.
+
+Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that removes this instance's field from the hash and then scans remaining fields for the same user key, ignoring stale entries. Leave is only broadcast when no other instance holds a live entry for that user, preventing premature "user left" notifications in multi-instance deployments.
+
+Zombie cleanup runs on the heartbeat interval. Each tick, every tracked WebSocket is probed via `getBufferedAmount()` -- if the call throws, the socket is dead and its presence is removed synchronously before the heartbeat writes to Redis. The heartbeat then refreshes timestamps on all live entries via a Redis pipeline and runs a server-side Lua cleanup script (`CLEANUP_SCRIPT`) that scans the hash and removes any fields whose timestamp exceeds the TTL. This handles crashed instances whose close handlers never fired.
 
 #### Setup
 
@@ -527,7 +540,11 @@ export function close(ws, { platform }) {
 
 ## Replay buffer (Postgres)
 
-Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table, so they are safe across multiple server instances.
+Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table using `INSERT ... ON CONFLICT DO UPDATE`, so concurrent publishes from multiple instances produce strictly ordered sequences with no duplicates or gaps.
+
+Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq - maxSize`. If the trim query fails, the publish still succeeds -- the periodic background cleanup (configurable via `cleanupInterval`) catches any excess rows later.
+
+Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay.
 
 #### Setup
 
@@ -669,9 +686,13 @@ The client side needs no changes -- the core `crud('messages')` store already ha
 
 #### Limitations
 
-- Payload is limited to 8KB by Postgres. For large rows, send the row ID in the notification and let the client fetch the full row.
+- **Payload is hard-limited to ~8000 bytes by Postgres** (`pg_notify` silently truncates or errors above this). This is a Postgres constraint, not a library limitation. The bridge warns at 7500 bytes. For large rows, send the row ID in the notification and let the client fetch the full row via an API call.
 - Only fires from triggers. Changes made outside your app (manual SQL, migrations) are invisible unless you add triggers for those tables too.
 - This is not logical replication. It is simpler, works on every Postgres provider, and needs no extensions or superuser access.
+
+#### When to use this instead of Redis pub/sub
+
+If your real-time events are driven by database writes and you do not need Redis for other extensions (presence, rate limiting, groups, cursors), the LISTEN/NOTIFY bridge is a simpler deployment: no Redis infrastructure, no separate pub/sub channel management, and your notifications are inherently tied to committed transactions. Use the Redis pub/sub bus when you need to broadcast events that do not originate from database writes, or when you are already running Redis for other extensions.
 
 ---
 
@@ -811,6 +832,24 @@ const metrics = createMetrics({
 ---
 
 **Reliability**
+
+## Failure handling
+
+Every Redis and Postgres extension accepts an optional `breaker` option -- a shared [circuit breaker](#circuit-breaker) that tracks backend health across all extensions wired to it. When the breaker trips, each extension degrades differently depending on whether the operation is critical or best-effort:
+
+| Extension | Awaited operations (join, consume, publish) | Fire-and-forget operations |
+|---|---|---|
+| **Pub/sub bus** | `wrap().publish()` queues to local platform only; relay to Redis is skipped silently | Microtask relay flush is skipped entirely |
+| **Presence** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh and stale cleanup are skipped |
+| **Replay buffer** | `publish()` / `replay()` / `seq()` throw `CircuitBrokenError` | -- |
+| **Rate limiting** | `consume()` throws `CircuitBrokenError` (fail-closed -- requests are blocked, not allowed through) | -- |
+| **Broadcast groups** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh is skipped |
+| **Cursor** | -- | Hash writes and cross-instance relay are skipped; local throttle continues |
+| **LISTEN/NOTIFY** | `activate()` throws; auto-reconnect retries on its own interval | -- |
+
+The breaker is a three-state machine: **healthy** (all requests pass through) -> **broken** after N consecutive failures (all requests fail fast via `CircuitBrokenError`) -> **probing** after a timeout (one request is allowed through to test recovery) -> back to **healthy** on success. See [Circuit breaker](#circuit-breaker) for configuration.
+
+---
 
 ## Circuit breaker
 

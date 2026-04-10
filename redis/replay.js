@@ -164,7 +164,6 @@ export function createReplay(client, options = {}) {
 			let rawAll;
 			try {
 				rawAll = await redis.zrangebyscore(bufKey(topic), '-inf', '+inf');
-				b?.success();
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -191,6 +190,21 @@ export function createReplay(client, options = {}) {
 					if (parsed.seq > sinceSeq) missed.push(parsed);
 				} catch { /* skip corrupted */ }
 			}
+
+			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0) {
+				try {
+					const val = await redis.get(seqKey(topic));
+					const currentSeq = val ? parseInt(val, 10) : 0;
+					if (currentSeq > sinceSeq) {
+						mTruncations?.inc({ topic: mt(topic) });
+						platform.send(ws, replayTopic, 'truncated', null);
+					}
+				} catch (err) {
+					b?.failure(err);
+					throw err;
+				}
+			}
+			b?.success();
 
 			for (let i = 0; i < missed.length; i++) {
 				const msg = missed[i];

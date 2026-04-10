@@ -398,6 +398,58 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('truncation with empty buffer', () => {
+		it('detects truncation when buffer is empty but seq has advanced', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+
+			// Wipe the buffer but leave the seq counter intact
+			const bufKey = client.key('replay:buf:chat');
+			client._sortedSets.delete(bufKey);
+
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 1, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(1);
+			expect(truncated[0].data).toBeNull();
+
+			// End marker should still be sent
+			const end = platform.sent.filter((s) => s.event === 'end');
+			expect(end).toHaveLength(1);
+		});
+
+		it('does not send truncated when buffer is empty and seq has not advanced', async () => {
+			const fakeWs = {};
+			platform.reset();
+			await replay.replay(fakeWs, 'chat', 0, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(0);
+
+			// Only end marker
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0].event).toBe('end');
+		});
+
+		it('does not send truncated when sinceSeq is 0 even with empty buffer', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			const bufKey = client.key('replay:buf:chat');
+			client._sortedSets.delete(bufKey);
+
+			const fakeWs = {};
+			platform.reset();
+			// sinceSeq 0 means fresh client, never truncate
+			await replay.replay(fakeWs, 'chat', 0, platform);
+
+			const truncated = platform.sent.filter((s) => s.event === 'truncated');
+			expect(truncated).toHaveLength(0);
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

@@ -5,6 +5,22 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-04-10
+
+### Fixed
+
+- **Redis replay: gap detection when buffer is empty.** When all buffered entries had been trimmed (by size cap or TTL expiry) but the sequence counter had advanced past the client's `sinceSeq`, `replay()` did not fire a `truncated` event. The client would receive only an `end` marker and assume it was caught up, silently missing messages. Now falls back to checking the seq counter when the sorted set is empty, matching the Postgres replay behavior that already handled this case.
+
+### Changed
+
+- **README: failure handling section.** Added a top-level table describing per-extension degradation behavior when the circuit breaker trips.
+- **README: pub/sub bus.** Documented echo suppression mechanism and microtask batching (multiple publishes in one tick become a single Redis pipeline).
+- **README: presence.** Documented staged join with rollback on failure, atomic leave check via Lua script, and zombie cleanup via heartbeat probing (`getBufferedAmount()`) and server-side Lua stale field removal.
+- **README: replay buffer (Redis and Postgres).** Documented atomic sequence numbering, buffer trimming behavior, and gap detection (including the empty-buffer edge case).
+- **README: LISTEN/NOTIFY bridge.** Strengthened 8KB payload limit documentation and added guidance on when to use LISTEN/NOTIFY vs Redis pub/sub.
+
+---
+
 ## [0.4.0] - 2025-03-19
 
 ### Breaking Changes
