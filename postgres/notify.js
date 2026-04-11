@@ -131,8 +131,11 @@ export function createNotifyBridge(client, options) {
 			} else if (!result && isDefaultParser) {
 				mParseErrors?.inc({ channel });
 			}
-		} catch {
+		} catch (err) {
 			mParseErrors?.inc({ channel });
+			if (!isDefaultParser) {
+				console.warn(`[postgres/notify] parse error on "${channel}":`, err.message || err);
+			}
 		}
 	}
 

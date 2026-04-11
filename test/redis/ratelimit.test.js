@@ -49,6 +49,33 @@ describe('redis ratelimit', () => {
 		});
 	});
 
+	describe('key versioning', () => {
+		it('uses versioned key prefix to isolate Lua script versions', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await limiter.consume(ws);
+
+			const allKeys = [...client._hashes.keys()];
+			const rlKeys = allKeys.filter((k) => k.includes('ratelimit'));
+			expect(rlKeys).toHaveLength(1);
+			expect(rlKeys[0]).toMatch(/^test:v\d+:ratelimit:1\.2\.3\.4$/);
+		});
+
+		it('clear() only scans versioned keys', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await limiter.consume(ws);
+
+			// Plant an unversioned key that should NOT be cleared
+			client._hashes.set('test:ratelimit:old', new Map([['points', '5']]));
+
+			await limiter.clear();
+
+			const allKeys = [...client._hashes.keys()];
+			const rlKeys = allKeys.filter((k) => k.includes('ratelimit'));
+			// The old unversioned key should survive
+			expect(rlKeys).toEqual(['test:ratelimit:old']);
+		});
+	});
+
 	describe('consume - basic token bucket', () => {
 		it('first consume is allowed and decrements remaining', async () => {
 			const ws = mockWs({ ip: '1.2.3.4' });

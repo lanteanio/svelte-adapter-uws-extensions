@@ -154,6 +154,11 @@ export function createRateLimit(client, options) {
 
 	const redis = client.redis;
 
+	// Version prefix for Redis keys. Different script versions use different
+	// key spaces so rolling deployments with algorithm changes don't produce
+	// inconsistent rate limiting. Old-version keys expire naturally via TTL.
+	const SCRIPT_VERSION = 'v1';
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed');
@@ -190,7 +195,7 @@ export function createRateLimit(client, options) {
 	}
 
 	function bucketKey(key) {
-		return client.key('ratelimit:' + key);
+		return client.key(SCRIPT_VERSION + ':ratelimit:' + key);
 	}
 
 	return {
@@ -272,7 +277,7 @@ export function createRateLimit(client, options) {
 		async clear() {
 			if (b) b.guard();
 			try {
-				const pattern = client.key('ratelimit:*');
+				const pattern = client.key(SCRIPT_VERSION + ':ratelimit:*');
 				let cursor = '0';
 				do {
 					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);

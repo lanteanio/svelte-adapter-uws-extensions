@@ -849,6 +849,32 @@ Every Redis and Postgres extension accepts an optional `breaker` option -- a sha
 
 The breaker is a three-state machine: **healthy** (all requests pass through) -> **broken** after N consecutive failures (all requests fail fast via `CircuitBrokenError`) -> **probing** after a timeout (one request is allowed through to test recovery) -> back to **healthy** on success. See [Circuit breaker](#circuit-breaker) for configuration.
 
+#### Notifying clients of degradation
+
+When Redis pub/sub fails, live streams on other replicas stop receiving updates. Connected clients continue showing stale data with no indication that the stream is degraded. Use the `onStateChange` callback to publish a system-level event so clients can surface this:
+
+```js
+import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
+
+let distributed; // the bus.wrap(platform) reference
+
+export const breaker = createCircuitBreaker({
+  failureThreshold: 5,
+  resetTimeout: 30000,
+  onStateChange: (from, to) => {
+    if (!distributed) return;
+    if (to === 'broken') {
+      // Local-only publish -- Redis is down, but local clients still receive it
+      distributed.publish('__system', 'degraded', { reason: 'backend unavailable' });
+    } else if (from === 'broken' && to === 'healthy') {
+      distributed.publish('__system', 'recovered', null);
+    }
+  }
+});
+```
+
+On the client side, subscribe to `__system` and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data.
+
 ---
 
 ## Circuit breaker
@@ -952,6 +978,57 @@ npm test
 ```
 
 Tests use in-memory mocks for Redis and Postgres, no running services needed.
+
+### Testing your own code
+
+The `svelte-adapter-uws-extensions/testing` entry point exports the same in-memory mocks used by the extensions' own test suite. Use them to test your extension-consuming code without running Redis or Postgres:
+
+```js
+import { mockRedisClient, mockPlatform, mockWs } from 'svelte-adapter-uws-extensions/testing';
+import { createPresence } from 'svelte-adapter-uws-extensions/redis/presence';
+import { createRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
+import { describe, it, expect } from 'vitest';
+
+describe('presence', () => {
+  it('tracks users across topics', async () => {
+    const client = mockRedisClient();
+    const platform = mockPlatform();
+    const presence = createPresence(client, { key: 'id' });
+
+    const ws = mockWs({ id: 'user-1', name: 'Alice' });
+    await presence.join(ws, 'room:lobby', platform);
+
+    expect(await presence.count('room:lobby')).toBe(1);
+    expect(platform.published.some(p => p.event === 'join')).toBe(true);
+
+    presence.destroy();
+  });
+});
+
+describe('rate limiting', () => {
+  it('blocks after exhausting points', async () => {
+    const client = mockRedisClient();
+    const limiter = createRateLimit(client, { points: 3, interval: 10000 });
+    const ws = mockWs({ remoteAddress: '1.2.3.4' });
+
+    for (let i = 0; i < 3; i++) {
+      expect((await limiter.consume(ws)).allowed).toBe(true);
+    }
+    expect((await limiter.consume(ws)).allowed).toBe(false);
+  });
+});
+```
+
+#### Available mocks
+
+| Export | What it mocks | Supports |
+|---|---|---|
+| `mockRedisClient(prefix?)` | `createRedisClient()` | Strings, hashes, sorted sets, pub/sub, pipelines, scan, Lua eval for all extension scripts |
+| `mockPlatform()` | Platform API | `publish()`, `send()`, `batch()`, `topic()` -- records all calls in `.published` and `.sent` |
+| `mockWs(userData?)` | uWS WebSocket | `subscribe()`, `unsubscribe()`, `getUserData()`, `getBufferedAmount()`, `close()` |
+| `mockPgClient()` | `createPgClient()` | SQL parsing for replay buffer operations, sequence counters |
+
+The circuit breaker (`createCircuitBreaker()`) is pure logic with no I/O -- use it directly in tests, no mock needed.
 
 ---
 

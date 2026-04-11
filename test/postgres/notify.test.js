@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createNotifyBridge } from '../../postgres/notify.js';
 import { createCircuitBreaker } from '../../shared/breaker.js';
@@ -212,6 +212,37 @@ describe('postgres notify bridge', () => {
 
 			client._simulate('changes', 'anything');
 			expect(platform.published).toHaveLength(0);
+		});
+
+		it('logs warning when custom parse throws', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			bridge = createNotifyBridge(client, {
+				channel: 'changes',
+				parse: () => { throw new Error('bad payload'); }
+			});
+			await bridge.activate(platform);
+
+			client._simulate('changes', 'whatever');
+			expect(platform.published).toHaveLength(0);
+			expect(warnSpy).toHaveBeenCalledOnce();
+			expect(warnSpy.mock.calls[0][0]).toContain('[postgres/notify]');
+			expect(warnSpy.mock.calls[0][1]).toContain('bad payload');
+			warnSpy.mockRestore();
+		});
+
+		it('does not log warning when default parser encounters bad JSON', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform);
+
+			client._simulate('changes', 'not-json');
+			expect(platform.published).toHaveLength(0);
+			// Default parser handles errors silently via its own try/catch
+			const notifyWarns = warnSpy.mock.calls.filter(
+				(c) => c[0] && typeof c[0] === 'string' && c[0].includes('parse error')
+			);
+			expect(notifyWarns).toHaveLength(0);
+			warnSpy.mockRestore();
 		});
 	});
 

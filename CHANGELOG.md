@@ -5,6 +5,20 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-04-11
+
+### Added
+
+- **Testing entry point** (`svelte-adapter-uws-extensions/testing`). Exports the same in-memory mocks used by the extensions' own test suite: `mockRedisClient`, `mockPlatform`, `mockWs`, `mockPgClient`. Enables downstream projects to test extension-consuming code without running Redis or Postgres.
+
+### Changed
+
+- **Rate limiter: versioned Redis keys.** Bucket keys now include a version prefix (`v1:ratelimit:{key}` instead of `ratelimit:{key}`). When the Lua script algorithm changes in a future release, the version will be bumped so rolling deployments with different script versions use separate key spaces. Old-version keys expire naturally via their existing TTL. No migration needed -- existing unversioned keys will expire on their own.
+- **Notify bridge: warn on custom parse errors.** When a custom `parse` function throws, the bridge now logs a `console.warn` with the channel name and error message. Previously, custom parse errors were counted in the `notify_parse_errors_total` metric but produced no log output, making them invisible without Prometheus.
+- **README: degradation notification pattern.** Added a "Notifying clients of degradation" subsection under Failure handling, showing how to wire `onStateChange` to publish a system-level event so clients can surface a stale-data banner when Redis pub/sub fails.
+
+---
+
 ## [0.4.1] - 2026-04-10
 
 ### Fixed
