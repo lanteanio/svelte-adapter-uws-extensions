@@ -26,6 +26,14 @@ export interface CircuitBreaker {
 	failure(err?: any): void;
 	/** Force back to healthy state. */
 	reset(): void;
+	/**
+	 * Register a state-transition listener. Multiple subscribers are
+	 * supported and the constructor-time `onStateChange` callback (if
+	 * any) is itself one of them. Returns an unsubscribe function.
+	 * Listener errors are swallowed so one bad listener cannot break
+	 * the others.
+	 */
+	subscribe(handler: (from: string, to: string) => void): () => void;
 	/** Clear internal timers. */
 	destroy(): void;
 }

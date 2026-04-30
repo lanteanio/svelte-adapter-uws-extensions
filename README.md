@@ -190,6 +190,11 @@ export function message(ws, { data, platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `channel` | `'uws:pubsub'` | Redis channel name |
+| `systemChannel` | `'__realtime'` | Topic for auto-emitted `degraded` / `recovered` events. `null` or `false` to disable. Requires a `breaker` |
+| `onDegraded` | -- | Server-side handler invoked once when the breaker leaves the healthy state |
+| `onRecovered` | -- | Server-side handler invoked once when the breaker returns to the healthy state |
+
+See [Notifying clients of degradation](#notifying-clients-of-degradation) for the full pattern.
 
 #### API
 
@@ -331,6 +336,7 @@ export async function close(ws, { platform }) {
 | `select` | strips `__`-prefixed keys | Extract public fields from userData |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
+| `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `list` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 
 #### API
 
@@ -341,9 +347,45 @@ export async function close(ws, { platform }) {
 | `sync(ws, topic, platform)` | Send list without joining |
 | `list(topic)` | Get current users |
 | `count(topic)` | Count unique users |
+| `metrics()` | Synchronous snapshot: `{ totalOnline, heartbeatLatencyMs, staleCleanedTotal }`. See [Metrics snapshot](#metrics-snapshot). |
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
 | `hooks` | `{ subscribe, close }` -- ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
+
+#### Metrics snapshot
+
+`presence.metrics()` returns a synchronous snapshot of in-memory state:
+
+| Field | Description |
+|---|---|
+| `totalOnline` | Sum of unique-users-per-topic across all topics this instance is locally tracking. The same user in two topics counts twice; per-topic counts sum cleanly. |
+| `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator -- a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
+| `staleCleanedTotal` | Cumulative count of stale fields removed by the heartbeat-driven cleanup script since this instance started. A non-zero rate means crashed sibling instances' presence is being cleaned up; a zero rate is the healthy steady state. |
+
+The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge), `presence_stale_cleaned_total` (counter, already shipped pre-0.5.0).
+
+#### Keyspace cleanup mode
+
+By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `leave` event. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
+
+`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore -- typically because the only tracker crashed), this instance emits an empty `list` event on `__presence:<topic>` so local subscribers can refresh their UI to "no one here."
+
+```js
+const presence = createPresence(redis, {
+  key: 'id',
+  keyspaceNotifications: true
+});
+```
+
+**Operator burden:** Redis must be configured to publish keyspace events:
+
+```
+CONFIG SET notify-keyspace-events Ex
+```
+
+(or any flagset that includes both `K`/`E` and `x` -- e.g. `Ex`, `KEA`, etc.) If the `psubscribe` call fails because keyspace events are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
+
+**Scope:** this is hash-key expiry (whole topic gone), not per-field expiry. Per-field cleanup of stale entries from crashed instances continues to run via the heartbeat-driven cleanup script. Per-field hash TTLs would require Redis 7.4+ `HEXPIRE` and a different storage layout; that's a future evolution, not part of this mode.
 
 #### Zero-config hooks
 
@@ -1160,6 +1202,8 @@ const metrics = createMetrics({
 | `pubsub_messages_received_total` | counter | Messages received from Redis |
 | `pubsub_echo_suppressed_total` | counter | Messages dropped by echo suppression |
 | `pubsub_relay_batch_size` | histogram | Relay batch size per flush |
+| `pubsub_degraded_total` | counter | Auto-emitted `degraded` events |
+| `pubsub_recovered_total` | counter | Auto-emitted `recovered` events |
 
 **Presence**
 
@@ -1169,6 +1213,9 @@ const metrics = createMetrics({
 | `presence_leaves_total` | counter | `topic` | Leave events |
 | `presence_heartbeats_total` | counter | | Heartbeat refresh cycles |
 | `presence_stale_cleaned_total` | counter | | Stale entries removed by cleanup |
+| `presence_total_online` | gauge | `topic` | Unique users present per topic on this instance |
+| `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms |
+| `presence_keyspace_cleanups_total` | counter | | Topic hash expiries that triggered an empty-list emit (keyspace mode only) |
 
 **Replay buffer (Redis and Postgres)**
 
@@ -1233,29 +1280,33 @@ The breaker is a three-state machine: **healthy** (all requests pass through) ->
 
 #### Notifying clients of degradation
 
-When Redis pub/sub fails, live streams on other replicas stop receiving updates. Connected clients continue showing stale data with no indication that the stream is degraded. Use the `onStateChange` callback to publish a system-level event so clients can surface this:
+When Redis pub/sub fails, live streams on other replicas stop receiving updates. Connected clients continue showing stale data with no indication that the stream is degraded. The pub/sub bus emits this directly: when the shared breaker leaves the healthy state, a `degraded` event fires on the bus's `systemChannel` (default `'__realtime'`); when it returns to healthy, a `recovered` event fires.
 
 ```js
 import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
 
-let distributed; // the bus.wrap(platform) reference
+export const breaker = createCircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 });
 
-export const breaker = createCircuitBreaker({
-  failureThreshold: 5,
-  resetTimeout: 30000,
-  onStateChange: (from, to) => {
-    if (!distributed) return;
-    if (to === 'broken') {
-      // Local-only publish -- Redis is down, but local clients still receive it
-      distributed.publish('__system', 'degraded', { reason: 'backend unavailable' });
-    } else if (from === 'broken' && to === 'healthy') {
-      distributed.publish('__system', 'recovered', null);
-    }
-  }
+export const bus = createPubSubBus(redis, {
+  breaker,
+  // optional handlers for server-side reactions (logging, alerts):
+  onDegraded: () => console.warn('pubsub bus degraded'),
+  onRecovered: () => console.info('pubsub bus recovered')
 });
 ```
 
-On the client side, subscribe to `__system` and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data.
+On the client side, subscribe to the `__realtime` topic and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data. The event payload is `{ at: <epoch ms> }` so a client can show "lost connection 12s ago".
+
+Both the topic name and the auto-emission are configurable:
+
+| Option | Default | Description |
+|---|---|---|
+| `systemChannel` | `'__realtime'` | Topic used for `degraded` / `recovered` events. Set to `null` or `false` to disable auto-emission. |
+| `onDegraded` | -- | Server-side handler invoked once on the healthy -> non-healthy transition |
+| `onRecovered` | -- | Server-side handler invoked once on the non-healthy -> healthy transition |
+
+Auto-emission is local-only -- Redis is what's degraded, so the event reaches local clients via the underlying platform without attempting a relay. Each instance reports its own breaker state to its own clients. If you need different semantics (cross-instance forwarding, custom payload, filtering by failure type), use `breaker.subscribe(handler)` to register your own listener and emit through whichever channel you prefer.
 
 ---
 

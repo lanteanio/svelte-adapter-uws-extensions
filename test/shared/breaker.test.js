@@ -155,6 +155,73 @@ describe('circuit breaker', () => {
 		});
 	});
 
+	describe('subscribe', () => {
+		it('returns an unsubscribe function', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const unsubscribe = breaker.subscribe(() => {});
+			expect(typeof unsubscribe).toBe('function');
+			unsubscribe();
+			breaker.destroy();
+		});
+
+		it('delivers transitions to multiple subscribers', () => {
+			const a = [];
+			const b = [];
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.subscribe((from, to) => a.push({ from, to }));
+			breaker.subscribe((from, to) => b.push({ from, to }));
+			breaker.failure();
+			expect(a).toEqual([{ from: 'healthy', to: 'broken' }]);
+			expect(b).toEqual([{ from: 'healthy', to: 'broken' }]);
+			breaker.destroy();
+		});
+
+		it('unsubscribed listener stops receiving transitions', () => {
+			const a = [];
+			const b = [];
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const unsubscribe = breaker.subscribe((from, to) => a.push({ from, to }));
+			breaker.subscribe((from, to) => b.push({ from, to }));
+			breaker.failure();
+			unsubscribe();
+			breaker.reset();
+			expect(a).toHaveLength(1);
+			expect(b).toHaveLength(2);
+			breaker.destroy();
+		});
+
+		it('coexists with the constructor onStateChange', () => {
+			const a = [];
+			const b = [];
+			const breaker = createCircuitBreaker({
+				failureThreshold: 1,
+				onStateChange: (from, to) => a.push({ from, to })
+			});
+			breaker.subscribe((from, to) => b.push({ from, to }));
+			breaker.failure();
+			expect(a).toEqual([{ from: 'healthy', to: 'broken' }]);
+			expect(b).toEqual([{ from: 'healthy', to: 'broken' }]);
+			breaker.destroy();
+		});
+
+		it('a throwing listener does not affect the others', () => {
+			const a = [];
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.subscribe(() => { throw new Error('boom'); });
+			breaker.subscribe((from, to) => a.push({ from, to }));
+			breaker.failure();
+			expect(a).toEqual([{ from: 'healthy', to: 'broken' }]);
+			breaker.destroy();
+		});
+
+		it('rejects a non-function handler', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			expect(() => breaker.subscribe('not a function')).toThrow('must be a function');
+			expect(() => breaker.subscribe(null)).toThrow('must be a function');
+			breaker.destroy();
+		});
+	});
+
 	describe('CircuitBrokenError', () => {
 		it('is an instance of Error', () => {
 			const err = new CircuitBrokenError();

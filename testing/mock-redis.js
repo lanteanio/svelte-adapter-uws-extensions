@@ -11,6 +11,7 @@ export function mockRedisClient(keyPrefix = '') {
 	function mockRedis() {
 		const listeners = new Map();
 		const subscribedChannels = new Set();
+		const subscribedPatterns = new Set();
 
 		const r = {
 			// String ops
@@ -143,6 +144,17 @@ export function mockRedisClient(keyPrefix = '') {
 				subscribedChannels.delete(channel);
 				return 1;
 			},
+			// Pattern-subscribe stubs. Pattern matching is not simulated
+			// (publish() never fires pmessage); tests that exercise pmessage
+			// fish the listener out of `_listeners` and dispatch directly.
+			async psubscribe(pattern) {
+				subscribedPatterns.add(pattern);
+				return 1;
+			},
+			async punsubscribe(pattern) {
+				subscribedPatterns.delete(pattern);
+				return 1;
+			},
 
 			// Eval - dispatches based on script content
 			async eval(script, numKeys, ...args) {
@@ -265,6 +277,7 @@ export function mockRedisClient(keyPrefix = '') {
 			},
 
 			_subscribedChannels: subscribedChannels,
+			_subscribedPatterns: subscribedPatterns,
 			_listeners: listeners
 		};
 
@@ -614,6 +627,7 @@ export function mockRedisClient(keyPrefix = '') {
 		// Test helpers
 		_store: store,
 		_sortedSets: sortedSets,
-		_hashes: hashes
+		_hashes: hashes,
+		_pubsubHandlers: pubsubHandlers
 	};
 }

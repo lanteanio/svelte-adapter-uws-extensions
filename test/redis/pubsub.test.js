@@ -319,6 +319,256 @@ describe('redis pubsub bus', () => {
 		});
 	});
 
+	describe('degraded / recovered hooks', () => {
+		it('fires onDegraded when the breaker leaves healthy', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+
+			breaker.failure();
+			expect(degradedCalls).toBe(1);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('fires onRecovered when the breaker returns to healthy', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			let recoveredCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				onRecovered: () => { recoveredCalls++; }
+			});
+			await bus.activate(platform);
+
+			breaker.failure();
+			expect(recoveredCalls).toBe(0);
+			breaker.reset();
+			expect(recoveredCalls).toBe(1);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('does not re-fire onDegraded on broken -> probing', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30 });
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+
+			breaker.failure();
+			expect(degradedCalls).toBe(1);
+
+			await new Promise((r) => setTimeout(r, 60));
+			expect(breaker.state).toBe('probing');
+			expect(degradedCalls).toBe(1);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('does not re-fire onDegraded on probing -> broken', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30 });
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+
+			breaker.failure();
+			await new Promise((r) => setTimeout(r, 60));
+			expect(breaker.state).toBe('probing');
+			expect(degradedCalls).toBe(1);
+
+			breaker.guard();
+			breaker.failure();
+			expect(breaker.state).toBe('broken');
+			expect(degradedCalls).toBe(1);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('emits on the default systemChannel without explicit configuration', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, { breaker });
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].topic).toBe('__realtime');
+			expect(platform.published[0].event).toBe('degraded');
+			expect(platform.published[0].data).toMatchObject({ at: expect.any(Number) });
+
+			breaker.reset();
+			expect(platform.published).toHaveLength(2);
+			expect(platform.published[1].topic).toBe('__realtime');
+			expect(platform.published[1].event).toBe('recovered');
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('emits on a custom systemChannel', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, { breaker, systemChannel: '__system' });
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+			expect(platform.published[0].topic).toBe('__system');
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('does not emit when systemChannel is null', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				systemChannel: null,
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+			expect(platform.published).toHaveLength(0);
+			expect(degradedCalls).toBe(1);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('does not emit when systemChannel is false', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, { breaker, systemChannel: false });
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+			expect(platform.published).toHaveLength(0);
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('emits without a callback when only systemChannel is configured', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, { breaker });
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].topic).toBe('__realtime');
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('does nothing without a breaker', async () => {
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+			platform.reset();
+
+			expect(platform.published).toHaveLength(0);
+			expect(degradedCalls).toBe(0);
+
+			await bus.deactivate();
+		});
+
+		it('skips Redis when emitting (auto-emit is local only)', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, { breaker });
+			await bus.activate(platform);
+
+			const redisCalls = [];
+			const origPublish = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				redisCalls.push({ ch, msg });
+				return origPublish.call(client.redis, ch, msg);
+			};
+
+			breaker.failure();
+			await new Promise((r) => setTimeout(r, 5));
+
+			// The local platform receives the event.
+			const localSystem = platform.published.find((p) => p.topic === '__realtime');
+			expect(localSystem).toBeDefined();
+
+			// No relay went through Redis -- the bus emits directly via the
+			// underlying platform, not the wrapped one.
+			const relayed = redisCalls.find((c) => {
+				try { return JSON.parse(c.msg).topic === '__realtime'; } catch { return false; }
+			});
+			expect(relayed).toBeUndefined();
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('a throwing onDegraded does not break emission', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const bus = createPubSubBus(client, {
+				breaker,
+				onDegraded: () => { throw new Error('user code threw'); }
+			});
+			await bus.activate(platform);
+			platform.reset();
+
+			breaker.failure();
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].event).toBe('degraded');
+
+			await bus.deactivate();
+			breaker.destroy();
+		});
+
+		it('deactivate unsubscribes from the breaker', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			let degradedCalls = 0;
+			const bus = createPubSubBus(client, {
+				breaker,
+				onDegraded: () => { degradedCalls++; }
+			});
+			await bus.activate(platform);
+			await bus.deactivate();
+
+			breaker.failure();
+			expect(degradedCalls).toBe(0);
+
+			breaker.destroy();
+		});
+
+		it('validates onDegraded must be a function', () => {
+			expect(() => createPubSubBus(client, { onDegraded: 'nope' })).toThrow('onDegraded');
+		});
+
+		it('validates onRecovered must be a function', () => {
+			expect(() => createPubSubBus(client, { onRecovered: 42 })).toThrow('onRecovered');
+		});
+
+		it('validates systemChannel must be a string, null, or false', () => {
+			expect(() => createPubSubBus(client, { systemChannel: 123 })).toThrow('systemChannel');
+		});
+	});
+
 	describe('breaker accounting in activate', () => {
 		it('records success() when subscribe succeeds', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 5 });

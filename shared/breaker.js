@@ -37,6 +37,7 @@ export class CircuitBrokenError extends Error {
  * @property {() => void} success - Record a successful operation
  * @property {(err?: any) => void} failure - Record a failed operation
  * @property {() => void} reset - Force back to healthy
+ * @property {(handler: (from: string, to: string) => void) => () => void} subscribe - Register a state-transition listener; returns an unsubscribe function
  * @property {() => void} destroy - Clear internal timers
  */
 
@@ -91,11 +92,16 @@ export function createCircuitBreaker(options = {}) {
 	let probeAllowed = false;
 	let resetTimer = null;
 
+	const listeners = new Set();
+	if (onStateChange) listeners.add(onStateChange);
+
 	function transition(to) {
 		const from = state;
 		if (from === to) return;
 		state = to;
-		if (onStateChange) onStateChange(from, to);
+		for (const listener of listeners) {
+			try { listener(from, to); } catch { /* don't let one listener break the others */ }
+		}
 	}
 
 	function scheduleProbe() {
@@ -150,6 +156,14 @@ export function createCircuitBreaker(options = {}) {
 			failures = 0;
 			probeAllowed = false;
 			transition('healthy');
+		},
+
+		subscribe(handler) {
+			if (typeof handler !== 'function') {
+				throw new Error('circuit breaker: subscribe handler must be a function');
+			}
+			listeners.add(handler);
+			return () => listeners.delete(handler);
 		},
 
 		destroy() {

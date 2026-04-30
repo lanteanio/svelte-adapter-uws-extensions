@@ -12,10 +12,33 @@ export interface RedisPresenceOptions {
 	heartbeat?: number;
 	/** TTL in seconds for presence hash entries. @default 90 */
 	ttl?: number;
+	/**
+	 * Subscribe to `__keyevent@*__:expired` so a topic's local subscribers
+	 * receive an empty `list` event the moment its presence hash expires.
+	 * Catches the instance-died scenario where a sync-only observer would
+	 * otherwise show stale data forever.
+	 *
+	 * Requires `CONFIG SET notify-keyspace-events Ex` (or any flagset
+	 * including `K`/`E` and `x`) on the Redis server. If the psubscribe
+	 * fails the failure is logged once and the rest of the tracker keeps
+	 * working without the keyspace branch.
+	 *
+	 * @default false
+	 */
+	keyspaceNotifications?: boolean;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+}
+
+export interface PresenceMetricsSnapshot {
+	/** Sum of unique-users-per-topic across all topics this instance is locally tracking. */
+	totalOnline: number;
+	/** Duration of the most recent heartbeat tick in milliseconds. */
+	heartbeatLatencyMs: number;
+	/** Cumulative count of stale fields removed by the heartbeat-driven cleanup script since startup. */
+	staleCleanedTotal: number;
 }
 
 export interface RedisPresenceTracker {
@@ -36,6 +59,14 @@ export interface RedisPresenceTracker {
 
 	/** Get the number of unique users present on a topic. */
 	count(topic: string): Promise<number>;
+
+	/**
+	 * Snapshot of local presence health metrics. Synchronous; reads
+	 * in-memory state only. The same numbers are exposed as Prometheus
+	 * gauges (`presence_total_online`, `presence_heartbeat_latency_ms`)
+	 * when a metrics registry is attached.
+	 */
+	metrics(): PresenceMetricsSnapshot;
 
 	/** Clear all presence state. */
 	clear(): Promise<void>;

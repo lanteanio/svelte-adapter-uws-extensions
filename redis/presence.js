@@ -113,6 +113,14 @@ function stripInternal(obj, ancestors) {
  * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh expiry)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3)
+ * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its presence hash expires (instance-died scenario). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired).
+ */
+
+/**
+ * @typedef {Object} PresenceMetricsSnapshot
+ * @property {number} totalOnline - Sum of unique-users-per-topic across all topics this instance is locally tracking. Same user in two topics counts as two; per-topic counts sum cleanly.
+ * @property {number} heartbeatLatencyMs - Duration of the most recent heartbeat tick in milliseconds.
+ * @property {number} staleCleanedTotal - Cumulative count of stale fields removed by the heartbeat-driven `CLEANUP_SCRIPT` since this instance started.
  */
 
 /**
@@ -122,6 +130,7 @@ function stripInternal(obj, ancestors) {
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} sync
  * @property {(topic: string) => Promise<Array<Record<string, any>>>} list
  * @property {(topic: string) => Promise<number>} count
+ * @property {() => PresenceMetricsSnapshot} metrics
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop heartbeat and subscriber
  * @property {{ subscribe: (ws: any, topic: string, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, unsubscribe: (ws: any, topic: string, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, close: (ws: any, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void> }} hooks
@@ -153,6 +162,8 @@ export function createPresence(client, options = {}) {
 	const instanceId = randomBytes(8).toString('hex');
 	const redis = client.redis;
 
+	const keyspaceNotifications = options.keyspaceNotifications === true;
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mt = m?.mapTopic;
@@ -160,6 +171,13 @@ export function createPresence(client, options = {}) {
 	const mLeaves = m?.counter('presence_leaves_total', 'Presence leave events', ['topic']);
 	const mHeartbeats = m?.counter('presence_heartbeats_total', 'Heartbeat refresh cycles');
 	const mStaleCleaned = m?.counter('presence_stale_cleaned_total', 'Stale entries removed by cleanup');
+	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
+	const mHeartbeatLatency = m?.gauge('presence_heartbeat_latency_ms', 'Duration of the most recent heartbeat tick in milliseconds');
+	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash expiry triggered a local empty-list emit');
+
+	let lastHeartbeatLatency = 0;
+	let staleCleanedTotal = 0;
+	let keyspaceSubscribed = false;
 
 	const SENSITIVE_RE = /token|secret|password|key|auth|session|cookie|jwt|credential/i;
 	let sensitiveWarned = false;
@@ -312,6 +330,7 @@ export function createPresence(client, options = {}) {
 	/** @type {Set<string>} */
 	const activeTopics = new Set();
 	const heartbeatTimer = setInterval(() => {
+		const tickStart = Date.now();
 		mHeartbeats?.inc();
 		// Detect dead connections whose close handler never fired.
 		// Under mass disconnect, the runtime may drop close events.
@@ -329,7 +348,19 @@ export function createPresence(client, options = {}) {
 			}
 		}
 
-		if (b && !b.isHealthy) return;
+		// totalOnline gauge tracks current state, which is meaningful
+		// even when the breaker is broken and the rest of the tick bails.
+		if (mTotalOnline) {
+			for (const [topic, counts] of localCounts) {
+				mTotalOnline.set({ topic: mt(topic) }, counts.size);
+			}
+		}
+
+		if (b && !b.isHealthy) {
+			lastHeartbeatLatency = Date.now() - tickStart;
+			mHeartbeatLatency?.set(lastHeartbeatLatency);
+			return;
+		}
 		const now = cachedNow();
 		const pipe = redis.pipeline();
 		for (const topic of activeTopics) {
@@ -342,13 +373,12 @@ export function createPresence(client, options = {}) {
 			}
 			pipe.expire(hkey, presenceTtl);
 
-			if (mStaleCleaned) {
-				redis.eval(CLEANUP_SCRIPT, 1, hkey, now, presenceTtlMs).then((cleaned) => {
-					if (cleaned > 0) mStaleCleaned.inc(cleaned);
-				}).catch(() => {});
-			} else {
-				pipe.eval(CLEANUP_SCRIPT, 1, hkey, now, presenceTtlMs);
-			}
+			redis.eval(CLEANUP_SCRIPT, 1, hkey, now, presenceTtlMs).then((cleaned) => {
+				if (cleaned > 0) {
+					staleCleanedTotal += cleaned;
+					mStaleCleaned?.inc(cleaned);
+				}
+			}).catch(() => {});
 
 			if (activePlatform && data && data.size > 0) {
 				const keys = [...data.keys()];
@@ -356,6 +386,8 @@ export function createPresence(client, options = {}) {
 			}
 		}
 		pipe.exec().catch(() => {});
+		lastHeartbeatLatency = Date.now() - tickStart;
+		mHeartbeatLatency?.set(lastHeartbeatLatency);
 	}, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
@@ -389,6 +421,30 @@ export function createPresence(client, options = {}) {
 					// Malformed, skip
 				}
 			});
+			if (keyspaceNotifications) {
+				const presencePrefix = client.key('presence:');
+				const eventsPrefix = client.key('presence:events:');
+				subscriber.on('pmessage', (_pattern, _channel, expiredKey) => {
+					if (typeof expiredKey !== 'string') return;
+					if (!expiredKey.startsWith(presencePrefix)) return;
+					if (expiredKey.startsWith(eventsPrefix)) return;
+					const topic = expiredKey.slice(presencePrefix.length);
+					if (activePlatform) {
+						activePlatform.publish('__presence:' + topic, 'list', []);
+						mKeyspaceCleanups?.inc();
+					}
+				});
+				try {
+					await subscriber.psubscribe('__keyevent@*__:expired');
+					keyspaceSubscribed = true;
+				} catch (err) {
+					console.warn(
+						'[redis/presence] keyspace notifications: psubscribe failed -- ' +
+						'enable on Redis with `CONFIG SET notify-keyspace-events Ex` (or any flagset including `K`/`E` and `x`): ' +
+						err.message
+					);
+				}
+			}
 		}
 	}
 
@@ -413,11 +469,14 @@ export function createPresence(client, options = {}) {
 			subscribedChannels.delete(ch);
 			await subscriber.unsubscribe(ch).catch(() => {});
 		}
-		if (subscribedChannels.size === 0 && subscriber) {
+		// Don't idle-shutdown when keyspace notifications are on -- the
+		// pattern subscription is the whole point of keeping the
+		// subscriber alive.
+		if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
 			if (!idleTimer) {
 				idleTimer = setTimeout(() => {
 					idleTimer = null;
-					if (subscribedChannels.size === 0 && subscriber) {
+					if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
 						subscriber.quit().catch(() => subscriber.disconnect());
 						subscriber = null;
 					}
@@ -1005,6 +1064,18 @@ export function createPresence(client, options = {}) {
 			}
 		},
 
+		metrics() {
+			let totalOnline = 0;
+			for (const [, counts] of localCounts) {
+				totalOnline += counts.size;
+			}
+			return {
+				totalOnline,
+				heartbeatLatencyMs: lastHeartbeatLatency,
+				staleCleanedTotal
+			};
+		},
+
 		async clear() {
 			b?.guard();
 			try {
@@ -1061,6 +1132,7 @@ export function createPresence(client, options = {}) {
 				subscriber = null;
 			}
 			subscribedChannels.clear();
+			keyspaceSubscribed = false;
 			activePlatform = null;
 		},
 

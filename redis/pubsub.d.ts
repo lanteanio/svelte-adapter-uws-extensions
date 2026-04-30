@@ -6,6 +6,26 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export interface PubSubBusOptions {
 	/** Redis channel name for pub/sub messages. @default 'uws:pubsub' */
 	channel?: string;
+	/**
+	 * Topic used for auto-emitted `degraded` / `recovered` events on the
+	 * local platform when the breaker leaves or returns to the healthy
+	 * state. Set to `null` or `false` to disable auto-emission. Requires
+	 * a `breaker` to do anything.
+	 *
+	 * @default '__realtime'
+	 */
+	systemChannel?: string | null | false;
+	/**
+	 * Called once when the breaker leaves the healthy state. Useful when
+	 * you want to react server-side (log, alert) without parsing the
+	 * auto-emitted event. Requires a `breaker`.
+	 */
+	onDegraded?: () => void;
+	/**
+	 * Called once when the breaker returns to the healthy state. Requires
+	 * a `breaker`.
+	 */
+	onRecovered?: () => void;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */

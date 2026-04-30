@@ -14,6 +14,9 @@ import { randomBytes } from 'node:crypto';
 /**
  * @typedef {Object} PubSubBusOptions
  * @property {string} [channel='uws:pubsub'] - Redis channel name for pub/sub messages
+ * @property {string | null | false} [systemChannel='__realtime'] - Topic used for auto-emitted `degraded` / `recovered` events on the local platform. Set to `null` or `false` to disable auto-emission.
+ * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
+ * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
  */
 
 /**
@@ -63,6 +66,21 @@ export function createPubSubBus(client, options = {}) {
 	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
 	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
 	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush');
+	const mDegraded = m?.counter('pubsub_degraded_total', 'Auto-emitted degraded events');
+	const mRecovered = m?.counter('pubsub_recovered_total', 'Auto-emitted recovered events');
+
+	const systemChannel = options.systemChannel === undefined ? '__realtime' : options.systemChannel;
+	const onDegraded = options.onDegraded;
+	const onRecovered = options.onRecovered;
+	if (onDegraded !== undefined && typeof onDegraded !== 'function') {
+		throw new Error('pubsub bus: onDegraded must be a function');
+	}
+	if (onRecovered !== undefined && typeof onRecovered !== 'function') {
+		throw new Error('pubsub bus: onRecovered must be a function');
+	}
+	if (systemChannel && typeof systemChannel !== 'string') {
+		throw new Error('pubsub bus: systemChannel must be a string, null, or false');
+	}
 
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -72,6 +90,9 @@ export function createPubSubBus(client, options = {}) {
 
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
+
+	/** @type {(() => void) | null} */
+	let unsubscribeBreaker = null;
 
 	// Microtask relay batching: coalesce Redis publishes within a single
 	// event-loop tick into one pipelined round trip.
@@ -164,6 +185,28 @@ export function createPubSubBus(client, options = {}) {
 			if (active) return;
 			b?.guard();
 
+			if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
+				unsubscribeBreaker = b.subscribe((from, to) => {
+					if (from === 'healthy' && to !== 'healthy') {
+						if (onDegraded) {
+							try { onDegraded(); } catch { /* don't propagate user errors */ }
+						}
+						if (systemChannel && activePlatform) {
+							activePlatform.publish(systemChannel, 'degraded', { at: Date.now() });
+							mDegraded?.inc();
+						}
+					} else if (from !== 'healthy' && to === 'healthy') {
+						if (onRecovered) {
+							try { onRecovered(); } catch { /* don't propagate user errors */ }
+						}
+						if (systemChannel && activePlatform) {
+							activePlatform.publish(systemChannel, 'recovered', { at: Date.now() });
+							mRecovered?.inc();
+						}
+					}
+				});
+			}
+
 			subscriber = client.duplicate({ enableReadyCheck: false });
 
 			subscriber.on('message', (ch, message) => {
@@ -194,11 +237,19 @@ export function createPubSubBus(client, options = {}) {
 				activePlatform = null;
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;
+				if (unsubscribeBreaker) {
+					unsubscribeBreaker();
+					unsubscribeBreaker = null;
+				}
 				throw err;
 			}
 		},
 
 		async deactivate() {
+			if (unsubscribeBreaker) {
+				unsubscribeBreaker();
+				unsubscribeBreaker = null;
+			}
 			if (!active || !subscriber) return;
 			active = false;
 			activePlatform = null;
