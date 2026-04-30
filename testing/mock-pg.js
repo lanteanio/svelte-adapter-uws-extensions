@@ -447,6 +447,19 @@ export function mockPgClient() {
 				return { rows: [{ message_count }], rowCount: 1 };
 			}
 
+			// SELECT seq FROM ... WHERE topic = $1 AND seq >= $2 ORDER BY seq ASC LIMIT 1 (gap probe)
+			if (sql.startsWith('SELECT seq FROM') && sql.includes('seq >=') && sql.includes('LIMIT 1')) {
+				const topic = values[0];
+				const target = parseInt(values[1], 10);
+				const matches = rows
+					.filter((r) => r.topic === topic && r.seq >= target)
+					.sort((a, b) => a.seq - b.seq);
+				if (matches.length > 0) {
+					return { rows: [{ seq: String(matches[0].seq) }], rowCount: 1 };
+				}
+				return { rows: [], rowCount: 0 };
+			}
+
 			// SELECT seq, topic, event, data ... WHERE topic = $1 AND seq > $2
 			if (sql.includes('SELECT seq, topic, event, data')) {
 				const topic = values[0];

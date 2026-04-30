@@ -450,6 +450,92 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('gap', () => {
+		it('validates lastSeenSeq is a non-negative integer', async () => {
+			await expect(replay.gap('chat', -1)).rejects.toThrow('non-negative integer');
+			await expect(replay.gap('chat', 1.5)).rejects.toThrow('non-negative integer');
+			await expect(replay.gap('chat', 'abc')).rejects.toThrow('non-negative integer');
+		});
+
+		it('returns not truncated when lastSeenSeq is 0 (fresh client)', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			expect(await replay.gap('chat', 0)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when next seq is in the buffer', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('chat', 2)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when fully caught up', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 3)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns truncated with missingFrom when buffer was trimmed', async () => {
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			// size: 5 means seqs 3..7 are buffered, seqs 1, 2 are gone
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('returns truncated when buffer is empty but seq has advanced', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			const bufKey = client.key('replay:buf:chat');
+			client._sortedSets.delete(bufKey);
+
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('returns not truncated for an unknown topic', async () => {
+			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when consumer is ahead of the buffer', async () => {
+			// Buffer seq counter is at 3, but consumer claims to have seen 10.
+			// Inconsistent state, but no truncation has occurred from the
+			// buffer's perspective, so report no gap.
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 10)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('skips corrupt entries and reports truncated when first valid is past target', async () => {
+			for (let i = 1; i <= 5; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			// Corrupt seq 2 (the consumer's next-needed entry)
+			const bufKey = client.key('replay:buf:chat');
+			const set = client._sortedSets.get(bufKey);
+			set[1] = { score: 2, member: '{not valid json' };
+
+			// First parseable >= 2 is seq 3, so seq 2 is effectively missing
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('skips corrupt entries when the next valid entry equals target', async () => {
+			for (let i = 1; i <= 4; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			// Corrupt seq 1, leaving seq 2 valid as the next-needed entry
+			const bufKey = client.key('replay:buf:chat');
+			const set = client._sortedSets.get(bufKey);
+			set[0] = { score: 1, member: 'broken' };
+
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: false, missingFrom: null });
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

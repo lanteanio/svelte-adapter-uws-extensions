@@ -209,6 +209,12 @@ Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + 
 
 When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
 
+The same gap state is exposed as a callable: `gap(topic, lastSeenSeq)` returns `{ truncated, missingFrom }` without driving a full WebSocket replay. Useful for SSR loaders that want to decide between an incremental `since()` fetch and a full reload before the page even opens its socket.
+
+#### Aggregate vs broadcast topics
+
+Replay buffers track one sequence per topic, so the topic boundary is also the gap-detection boundary. Map topics to **aggregates** (`auction:a1b2`, `chat:room-7`, `doc:abc123`) rather than broadcast channels (`auctions:all`, `chat:everyone`). With one topic per aggregate, the buffer size budget covers a real history window per aggregate and gap detection is meaningful: if a client missed seq 14 of `chat:room-7`, you know exactly which room to refetch. With one broadcast topic, a hot aggregate can rotate the buffer past every other aggregate's history within seconds, so any reconnecting client looks "truncated" even when the aggregate they care about hasn't changed in an hour.
+
 #### Setup
 
 ```js
@@ -269,6 +275,7 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 |---|---|
 | `publish(platform, topic, event, data)` | Store + broadcast |
 | `seq(topic)` | Current sequence number |
+| `gap(topic, lastSeenSeq)` | Probe for a buffer gap. Returns `{ truncated, missingFrom }` |
 | `since(topic, seq)` | Messages after a sequence |
 | `replay(ws, topic, sinceSeq, platform)` | Send missed messages to one client |
 | `clear()` | Delete all replay data |
@@ -548,7 +555,9 @@ Same API as the Redis replay buffer, but backed by a Postgres table. Best suited
 
 Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq - maxSize`. If the trim query fails, the publish still succeeds -- the periodic background cleanup (configurable via `cleanupInterval`) catches any excess rows later.
 
-Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay.
+Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
+
+The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here -- one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
 #### Setup
 

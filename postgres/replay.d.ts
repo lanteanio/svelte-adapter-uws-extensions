@@ -27,6 +27,13 @@ export interface BufferedMessage {
 	data: unknown;
 }
 
+export interface ReplayGap {
+	/** True when the buffer no longer holds the next sequence the consumer needs. */
+	truncated: boolean;
+	/** The first sequence the consumer is missing (`lastSeenSeq + 1`), or null when caught up. */
+	missingFrom: number | null;
+}
+
 export interface PgReplayBuffer {
 	/**
 	 * Publish a message through the buffer. Stores it in Postgres with a
@@ -36,6 +43,19 @@ export interface PgReplayBuffer {
 
 	/** Get the current sequence number for a topic. Returns 0 if unknown. */
 	seq(topic: string): Promise<number>;
+
+	/**
+	 * Inspect whether the buffer still holds the next sequence after
+	 * `lastSeenSeq`. Returns `{ truncated: true, missingFrom: lastSeenSeq + 1 }`
+	 * when the next row is not in the buffer but the seq counter has advanced
+	 * past it; otherwise `{ truncated: false, missingFrom: null }`.
+	 *
+	 * Useful for clients that want to decide between an incremental replay
+	 * and a full reload before opening a WebSocket. `lastSeenSeq` of 0
+	 * always returns `{ truncated: false, missingFrom: null }` (a fresh
+	 * client has no history to lose).
+	 */
+	gap(topic: string, lastSeenSeq: number): Promise<ReplayGap>;
 
 	/** Get all buffered messages after a given sequence number. */
 	since(topic: string, since: number): Promise<BufferedMessage[]>;

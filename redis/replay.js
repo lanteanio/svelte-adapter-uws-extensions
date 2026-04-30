@@ -21,6 +21,7 @@
  * @typedef {Object} RedisReplayBuffer
  * @property {(platform: import('svelte-adapter-uws').Platform, topic: string, event: string, data?: unknown) => Promise<boolean>} publish
  * @property {(topic: string) => Promise<number>} seq
+ * @property {(topic: string, lastSeenSeq: number) => Promise<{truncated: boolean, missingFrom: number | null}>} gap
  * @property {(topic: string, since: number) => Promise<Array<{seq: number, topic: string, event: string, data: unknown}>>} since
  * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<void>} replay
  * @property {() => Promise<void>} clear
@@ -136,6 +137,51 @@ export function createReplay(client, options = {}) {
 				b?.failure(err);
 				throw err;
 			}
+		},
+
+		async gap(topic, lastSeenSeq) {
+			if (!Number.isInteger(lastSeenSeq) || lastSeenSeq < 0) {
+				throw new Error(`redis replay: lastSeenSeq must be a non-negative integer, got ${lastSeenSeq}`);
+			}
+			if (lastSeenSeq === 0) return { truncated: false, missingFrom: null };
+
+			const target = lastSeenSeq + 1;
+			if (b) b.guard();
+
+			let raw;
+			try {
+				raw = await redis.zrangebyscore(bufKey(topic), target, '+inf');
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+
+			for (let i = 0; i < raw.length; i++) {
+				try {
+					const parsed = JSON.parse(raw[i]);
+					if (parsed.seq != null) {
+						b?.success();
+						if (parsed.seq > target) {
+							return { truncated: true, missingFrom: target };
+						}
+						return { truncated: false, missingFrom: null };
+					}
+				} catch { /* skip corrupt */ }
+			}
+
+			let val;
+			try {
+				val = await redis.get(seqKey(topic));
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			b?.success();
+			const currentSeq = val ? parseInt(val, 10) : 0;
+			if (currentSeq > lastSeenSeq) {
+				return { truncated: true, missingFrom: target };
+			}
+			return { truncated: false, missingFrom: null };
 		},
 
 		async since(topic, since) {

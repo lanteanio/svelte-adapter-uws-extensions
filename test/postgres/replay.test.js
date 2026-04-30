@@ -259,6 +259,63 @@ describe('postgres replay', () => {
 		});
 	});
 
+	describe('gap', () => {
+		it('validates lastSeenSeq is a non-negative integer', async () => {
+			await expect(replay.gap('chat', -1)).rejects.toThrow('non-negative integer');
+			await expect(replay.gap('chat', 1.5)).rejects.toThrow('non-negative integer');
+			await expect(replay.gap('chat', 'abc')).rejects.toThrow('non-negative integer');
+		});
+
+		it('returns not truncated when lastSeenSeq is 0 (fresh client)', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			expect(await replay.gap('chat', 0)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when next seq is in the buffer', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('chat', 2)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when fully caught up', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 3)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns truncated with missingFrom when buffer was trimmed', async () => {
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			// size: 5 means seqs 3..7 are buffered, seqs 1, 2 are gone
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('returns truncated when buffer is empty but seq has advanced', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			await client.query('DELETE FROM ws_replay WHERE topic = $1', ['chat']);
+
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('returns not truncated for an unknown topic', async () => {
+			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns not truncated when consumer is ahead of the buffer', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			expect(await replay.gap('chat', 10)).toEqual({ truncated: false, missingFrom: null });
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
