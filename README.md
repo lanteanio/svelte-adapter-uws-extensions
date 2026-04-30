@@ -1872,11 +1872,57 @@ presence.destroy();
 
 ## Testing
 
+This repo runs tests in two layers. Both stay green; you can run either independently.
+
 ```bash
-npm test
+npm test                  # mock layer (24 files, 861 tests, no services needed)
+npm run test:integration  # integration layer (real Redis 7 + Postgres 16 in Docker)
 ```
 
-Tests use in-memory mocks for Redis and Postgres, no running services needed.
+### Mock layer (`test/`)
+
+In-memory mocks for Redis and Postgres that mirror the public APIs closely enough to drive the extensions through their happy paths and edge cases. Fast feedback (~15s for the full suite), no Docker required.
+
+The mocks live at `testing/mock-redis.js` and `testing/mock-pg.js` and are exported as `svelte-adapter-uws-extensions/testing` so consumers of this package can use them too. See [Testing your own code](#testing-your-own-code) below.
+
+### Integration layer (`test/integration/`)
+
+Exercises the same modules against real services in `docker compose`. Picks up cases the mocks can only approximate: Lua atomicity inside Redis EVAL, Postgres LISTEN/NOTIFY cross-connection delivery, real TTL/EXPIRE behaviour, partial-index plans on the job queue.
+
+The compose stack at [`test/integration/docker-compose.yml`](test/integration/docker-compose.yml) binds non-default host ports so it does not clash with a locally running Postgres/Redis: **Postgres on `55432`**, **Redis on `56379`**. `test/integration/global-setup.js` runs `docker compose up -d --wait` before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL` for the tests to read, and tears the stack down with `docker compose down -v` afterwards.
+
+The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine:
+
+```bash
+INTEGRATION_REDIS_HOST_PORT=56380 \
+INTEGRATION_POSTGRES_HOST_PORT=55433 \
+INTEGRATION_COMPOSE_PROJECT=my-slice \
+npm run test:integration
+```
+
+Project name auto-derives from the port pair when overridden, so unique ports also mean unique container names.
+
+#### Adding a new integration test
+
+1. Drop a `*.test.js` file under `test/integration/redis/` or `test/integration/postgres/`.
+2. In `beforeAll`, build a real client:
+
+   ```js
+   import { createRedisClient } from '../../../redis/index.js';
+   // or: import { createPgClient } from '../../../postgres/index.js';
+
+   beforeAll(() => {
+     client = createRedisClient({
+       url: process.env.INTEGRATION_REDIS_URL,
+       keyPrefix: 'inttest-yourmodule:',  // namespace per test file
+       autoShutdown: false                // tests own the lifecycle
+     });
+   });
+   ```
+3. In `beforeEach`, wipe state under your prefix (Redis: `SCAN MATCH prefix* + UNLINK`; Postgres: `TRUNCATE` your test tables, or use distinct channels for LISTEN/NOTIFY).
+4. In `afterAll`, `await client.quit()` / `await client.end()`.
+
+The integration layer is additive: the mock-based test for a module stays in place when you add the integration counterpart. They cover different failure modes.
 
 ### Testing your own code
 
