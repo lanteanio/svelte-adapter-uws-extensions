@@ -4,12 +4,18 @@
  * Same API as the core createReplay plugin, but stores messages in Redis
  * sorted sets so they survive restarts and are shared across instances.
  *
- * Storage layout per topic:
+ * Pass `storage: 'stream'` to dispatch to the Redis Streams backend
+ * (XADD/XRANGE) instead. Both backends share the seq counter shape
+ * but use different buf-key prefixes so they can coexist.
+ *
+ * Storage layout per topic (default sorted-set backend):
  *   - Key `{prefix}replay:seq:{topic}` - INCR counter for sequence numbers
  *   - Key `{prefix}replay:buf:{topic}` - sorted set (score = seq, member = JSON payload)
  *
  * @module svelte-adapter-uws-extensions/redis/replay
  */
+
+import { createStreamReplay } from './replay-stream.js';
 
 /**
  * @typedef {Object} RedisReplayOptions
@@ -98,6 +104,12 @@ return seq
  * @returns {RedisReplayBuffer}
  */
 export function createReplay(client, options = {}) {
+	if (options.storage !== undefined && options.storage !== 'sortedset' && options.storage !== 'stream') {
+		throw new Error(`redis replay: storage must be 'sortedset' or 'stream', got ${options.storage}`);
+	}
+	if (options.storage === 'stream') {
+		return createStreamReplay(client, options);
+	}
 	if (options.size !== undefined) {
 		if (typeof options.size !== 'number' || options.size < 1 || !Number.isInteger(options.size)) {
 			throw new Error(`redis replay: size must be a positive integer, got ${options.size}`);

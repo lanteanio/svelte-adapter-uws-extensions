@@ -334,11 +334,30 @@ export async function message(ws, { data, platform }) {
 
 | Option | Default | Description |
 |---|---|---|
+| `storage` | `'sortedset'` | Backend: `'sortedset'` (default) uses ZADD; `'stream'` uses XADD. See [Stream backend](#stream-backend). |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Key expiry in seconds (0 = never) |
 | `durability` | -- | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
 | `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
 | `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` blocks indefinitely (Redis WAIT semantics). |
+
+#### Stream backend
+
+`storage: 'stream'` dispatches to a Redis Streams implementation (`XADD`/`XRANGE`) instead of the default sorted-set one. Same external contract -- the same `publish` / `seq` / `gap` / `since` / `replay` / `clear` methods, same `durability: 'replicated'` mode, same metrics. Two changes under the hood:
+
+- Listpack encoding is more compact than sorted-set encoding for typical message shapes -- meaningfully smaller memory for buffers in the thousands of entries per topic.
+- Stream IDs are `<seq>-0` where `seq` is the same INCR counter the sorted-set backend uses. `XRANGE` against `(seq-0` filters natively by sequence number, so range queries skip the app-side scan the sorted-set backend does for some paths.
+
+```js
+const replay = createReplay(redis, {
+  storage: 'stream',
+  size: 10000
+});
+```
+
+Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) but different buf-key prefixes (`replay:buf:{topic}` for sorted-set, `replay:streambuf:{topic}` for stream), so they can coexist on the same Redis without WRONGTYPE collisions. A single topic should pick one backend at startup and stay there -- there is no built-in migration helper for switching an existing topic from one backend to the other (greenfield deployments don't need it; if you have one in flight and need to migrate, drain consumers, copy entries with a one-off script, and switch).
+
+The stream backend works on Redis 5+; listpack encoding is the Redis 7+ default that delivers the memory win.
 
 #### Replicated durability
 

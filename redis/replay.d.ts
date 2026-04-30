@@ -4,6 +4,16 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisReplayOptions {
+	/**
+	 * Storage backend. `'sortedset'` (default) uses ZADD/ZRANGEBYSCORE
+	 * for compatibility back to Redis 5. `'stream'` uses XADD/XRANGE
+	 * with `<seq>-0` IDs; listpack encoding is more compact and
+	 * range queries filter natively by sequence number. Both backends
+	 * implement the same external contract.
+	 *
+	 * @default 'sortedset'
+	 */
+	storage?: 'sortedset' | 'stream';
 	/** Max messages per topic. @default 1000 */
 	size?: number;
 	/** TTL in seconds for replay keys (0 = no expiry). @default 0 */

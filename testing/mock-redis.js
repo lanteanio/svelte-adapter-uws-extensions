@@ -6,7 +6,24 @@ export function mockRedisClient(keyPrefix = '') {
 	const store = new Map();       // key -> value (string)
 	const sortedSets = new Map();  // key -> [{score, member}]
 	const hashes = new Map();      // key -> Map<field, value>
+	const streams = new Map();     // key -> [{id, fields: [[k, v], ...]}]
 	const pubsubHandlers = [];     // {channel, handler}
+
+	function compareStreamIds(a, b) {
+		const [aMs, aSeq] = a.split('-').map(Number);
+		const [bMs, bSeq] = b.split('-').map(Number);
+		if (aMs !== bMs) return aMs - bMs;
+		return aSeq - bSeq;
+	}
+
+	function parseStreamRange(s) {
+		if (s === '-') return { id: '0-0', exclusive: false };
+		if (s === '+') return { id: '99999999999999-99999999999999', exclusive: false };
+		const exclusive = String(s).startsWith('(');
+		const raw = exclusive ? String(s).slice(1) : String(s);
+		const id = raw.includes('-') ? raw : raw + '-0';
+		return { id, exclusive };
+	}
 
 	function mockRedis() {
 		const listeners = new Map();
@@ -29,6 +46,7 @@ export function mockRedisClient(keyPrefix = '') {
 					if (store.delete(k)) count++;
 					if (sortedSets.delete(k)) count++;
 					if (hashes.delete(k)) count++;
+					if (streams.delete(k)) count++;
 				}
 				return count;
 			},
@@ -81,6 +99,83 @@ export function mockRedisClient(keyPrefix = '') {
 				if (!set) return 0;
 				const removed = set.splice(start, stop - start + 1);
 				return removed.length;
+			},
+
+			// Stream ops
+			async xadd(key, ...args) {
+				let i = 0;
+				let maxLen = -1;
+				if (args[i] === 'MAXLEN' || args[i] === 'maxlen') {
+					i++;
+					if (args[i] === '~' || args[i] === '=') i++;
+					maxLen = Number(args[i]);
+					i++;
+				}
+				const idArg = String(args[i++]);
+				const fields = [];
+				while (i < args.length) {
+					fields.push([String(args[i]), String(args[i + 1])]);
+					i += 2;
+				}
+				if (!streams.has(key)) streams.set(key, []);
+				const stream = streams.get(key);
+
+				let resolvedId;
+				if (idArg === '*') {
+					const ms = Date.now();
+					const last = stream[stream.length - 1];
+					if (last) {
+						const [lastMs, lastSeq] = last.id.split('-').map(Number);
+						resolvedId = ms <= lastMs
+							? `${lastMs}-${lastSeq + 1}`
+							: `${ms}-0`;
+					} else {
+						resolvedId = `${ms}-0`;
+					}
+				} else {
+					resolvedId = idArg.includes('-') ? idArg : idArg + '-0';
+					if (stream.length > 0) {
+						const last = stream[stream.length - 1];
+						if (compareStreamIds(last.id, resolvedId) >= 0) {
+							throw new Error('ERR The ID specified in XADD is equal or smaller than the target stream top item');
+						}
+					}
+				}
+
+				stream.push({ id: resolvedId, fields });
+				if (maxLen >= 0 && stream.length > maxLen) {
+					stream.splice(0, stream.length - maxLen);
+				}
+				return resolvedId;
+			},
+			async xrange(key, start, end, ...rest) {
+				let count = -1;
+				for (let i = 0; i < rest.length; i++) {
+					if (rest[i] === 'COUNT' || rest[i] === 'count') {
+						count = Number(rest[i + 1]);
+						break;
+					}
+				}
+				const stream = streams.get(key);
+				if (!stream) return [];
+				const startCmp = parseStreamRange(start);
+				const endCmp = parseStreamRange(end);
+				const out = [];
+				for (const entry of stream) {
+					if (compareStreamIds(entry.id, startCmp.id) < 0) continue;
+					if (startCmp.exclusive && entry.id === startCmp.id) continue;
+					if (compareStreamIds(entry.id, endCmp.id) > 0) break;
+					if (endCmp.exclusive && entry.id === endCmp.id) continue;
+					const flat = [];
+					for (const [f, v] of entry.fields) flat.push(f, v);
+					out.push([entry.id, flat]);
+					if (count > 0 && out.length >= count) break;
+				}
+				return out;
+			},
+			async xlen(key) {
+				const stream = streams.get(key);
+				return stream ? stream.length : 0;
 			},
 
 			// Hash ops
@@ -210,6 +305,10 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('zremrangebyrank') && script.includes('cjson.encode')) {
 					return evalReplayPublish(numKeys, args);
 				}
+				// Streams replay publish script (atomic incr + xadd MAXLEN)
+				if (script.includes('xadd') && script.includes('MAXLEN')) {
+					return evalStreamReplayPublish(numKeys, args);
+				}
 				// Presence join script (hset + expire, no dedup scan)
 				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
 					return evalPresenceJoin(args);
@@ -260,7 +359,7 @@ export function mockRedisClient(keyPrefix = '') {
 				const pattern = matchIdx !== -1 ? args[matchIdx + 1] : '*';
 				const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
 
-				const allKeys = [...store.keys(), ...sortedSets.keys(), ...hashes.keys()];
+				const allKeys = [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()];
 				const matched = allKeys.filter((k) => regex.test(k));
 				return ['0', matched];
 			},
@@ -487,6 +586,33 @@ export function mockRedisClient(keyPrefix = '') {
 			return [1, ...live];
 		}
 
+		// Streams replay publish Lua script simulation
+		// args layout: [seqKey, bufKey, maxSize, ttl, topic, event, dataJson]
+		function evalStreamReplayPublish(numKeys, args) {
+			const seqKey = args[0];
+			const bufKey = args[1];
+			const maxSize = Number(args[2]);
+			const topic = args[4];
+			const event = args[5];
+			const dataJson = args[6];
+
+			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
+			store.set(seqKey, String(v));
+			const seq = v;
+
+			const id = `${seq}-0`;
+			if (!streams.has(bufKey)) streams.set(bufKey, []);
+			const stream = streams.get(bufKey);
+			stream.push({
+				id,
+				fields: [['topic', topic], ['event', event], ['data', dataJson]]
+			});
+			if (stream.length > maxSize) {
+				stream.splice(0, stream.length - maxSize);
+			}
+			return seq;
+		}
+
 		// Replay publish Lua script simulation
 		// args layout: [seqKey, bufKey, topic, event, dataJson, maxSize, ttl]
 		function evalReplayPublish(numKeys, args) {
@@ -670,6 +796,7 @@ export function mockRedisClient(keyPrefix = '') {
 		_store: store,
 		_sortedSets: sortedSets,
 		_hashes: hashes,
+		_streams: streams,
 		_pubsubHandlers: pubsubHandlers
 	};
 }
