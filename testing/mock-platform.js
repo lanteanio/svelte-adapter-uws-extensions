@@ -3,10 +3,30 @@
  * Matches the core svelte-adapter-uws Platform interface.
  */
 export function mockPlatform() {
+	const pressureSubscribers = new Set();
 	const p = {
 		published: [],
 		sent: [],
 		connections: 0,
+		// platform.pressure stub. Default snapshot mirrors a healthy worker.
+		// Tests drive transitions via _setPressure(snapshot).
+		pressure: {
+			active: false,
+			subscriberRatio: 0,
+			publishRate: 0,
+			memoryMB: 0,
+			reason: 'NONE'
+		},
+		onPressure(cb) {
+			pressureSubscribers.add(cb);
+			return () => pressureSubscribers.delete(cb);
+		},
+		_setPressure(snapshot) {
+			p.pressure = snapshot;
+			for (const cb of pressureSubscribers) {
+				try { cb(snapshot); } catch { /* swallow */ }
+			}
+		},
 		publish(topic, event, data, options) {
 			p.published.push({ topic, event, data, options });
 			return true;

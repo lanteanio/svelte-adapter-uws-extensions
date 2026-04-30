@@ -48,6 +48,7 @@ The core adapter keeps everything in-process memory. That works great for single
 **Reliability**
 - [Failure handling](#failure-handling)
 - [Circuit breaker](#circuit-breaker)
+- [Admission control](#admission-control)
 
 **Operations**
 - [Graceful shutdown](#graceful-shutdown)
@@ -1258,6 +1259,13 @@ const metrics = createMetrics({
 | `notify_parse_errors_total` | counter | `channel` | Parse failures |
 | `notify_reconnects_total` | counter | | Reconnect attempts |
 
+**Admission control**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `admission_accepted_total` | counter | `class` | `shouldAccept` calls that returned `true` |
+| `admission_rejected_total` | counter | `class`, `reason` | `shouldAccept` calls that returned `false`, labeled with the pressure reason that caused rejection |
+
 ---
 
 **Reliability**
@@ -1386,6 +1394,103 @@ try {
   }
 }
 ```
+
+---
+
+## Admission control
+
+Pressure-aware companion to the [circuit breaker](#circuit-breaker). Where the breaker answers "is the backend up?", admission control answers "are we OK to take more work right now?" -- using the adapter's `platform.pressure` signal (memory, publish rate, subscriber ratio) to gate non-critical work before it ever reaches a backend.
+
+Requires `svelte-adapter-uws >= 0.5.0-next.1` (the version that ships `platform.pressure`).
+
+#### Setup
+
+```js
+// src/lib/server/admission.js
+import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
+
+export const ac = createAdmissionControl({
+  classes: {
+    critical:   ['MEMORY'],                              // refuse only on memory pressure
+    normal:     ['MEMORY', 'PUBLISH_RATE'],              // refuse on memory or publish rate
+    background: ['MEMORY', 'PUBLISH_RATE', 'SUBSCRIBERS'] // refuse on any pressure
+  }
+});
+```
+
+#### Usage
+
+```js
+// In a server endpoint or RPC handler:
+import { ac } from '$lib/server/admission';
+
+export async function POST({ platform, request }) {
+  if (!ac.shouldAccept('background', platform)) {
+    return new Response('busy', { status: 503 });
+  }
+  // ...proceed with the request...
+}
+```
+
+Each class is independently configured. The adapter has already collapsed concurrent signals (memory, publish rate, subscribers) into a single most-urgent `reason` -- this controller just maps the resolved reason to a per-class accept/reject decision.
+
+#### Class rule shapes
+
+A class rule is either an array of pressure reasons that should block this class, or a predicate function:
+
+```js
+classes: {
+  // Array form: block when reason is in this list
+  critical: ['MEMORY'],
+
+  // Predicate form: block when the predicate returns truthy
+  streaming: (snapshot) => snapshot.subscriberRatio > 50
+}
+```
+
+Predicates receive the full `PressureSnapshot` so they can apply custom thresholds (e.g. block above a specific publish-rate that's tighter than the adapter's). Array form is the simple-case shorthand and is what 90% of callers should use.
+
+Valid reason strings: `'NONE'`, `'PUBLISH_RATE'`, `'SUBSCRIBERS'`, `'MEMORY'`. Including `'NONE'` in a block list means "always block this class," which is occasionally useful for kill-switching a class without removing the wiring.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `classes` | (required) | Map of class name to admission rule. Must define at least one class. |
+| `metrics` | -- | Prometheus metrics registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `shouldAccept(className, platform)` | Returns `true` to admit, `false` to shed. Throws on unknown class name (typo defense) or missing `platform.pressure`. |
+
+`shouldAccept` reads `platform.pressure` via a property access -- no I/O, safe to call on every request hot path. The reason-precedence math (memory > publish rate > subscribers > none) lives in the adapter; this method only checks the resolved `reason` against the configured rule.
+
+#### Composition with the breaker
+
+Admission control and the circuit breaker check independent signals. Use them together:
+
+```js
+export async function POST({ platform, request }) {
+  // Local pressure check first -- cheaper, no Redis call.
+  if (!ac.shouldAccept('normal', platform)) {
+    return new Response('busy', { status: 503 });
+  }
+  // Then attempt the backend call. CircuitBrokenError surfaces if the
+  // breaker is open.
+  try {
+    await replay.publish(platform, 'chat', 'msg', data);
+  } catch (err) {
+    if (err instanceof CircuitBrokenError) {
+      return new Response('backend unavailable', { status: 503 });
+    }
+    throw err;
+  }
+}
+```
+
+The two layers complement each other: admission control prevents new work from piling up under server-local pressure; the breaker prevents thundering-herd retries against a dead backend.
 
 ---
 

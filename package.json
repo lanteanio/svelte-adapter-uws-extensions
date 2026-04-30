@@ -81,6 +81,10 @@
       "types": "./shared/breaker.d.ts",
       "default": "./shared/breaker.js"
     },
+    "./admission": {
+      "types": "./shared/admission.d.ts",
+      "default": "./shared/admission.js"
+    },
     "./testing": {
       "types": "./testing/index.d.ts",
       "default": "./testing/index.js"
