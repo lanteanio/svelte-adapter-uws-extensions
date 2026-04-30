@@ -12,6 +12,7 @@ export function mockRedisClient(keyPrefix = '') {
 		const listeners = new Map();
 		const subscribedChannels = new Set();
 		const subscribedPatterns = new Set();
+		const shardedChannels = new Set();
 
 		const r = {
 			// String ops
@@ -167,6 +168,33 @@ export function mockRedisClient(keyPrefix = '') {
 				subscribedPatterns.delete(pattern);
 				return 1;
 			},
+			// Sharded pub/sub. In a single-process mock there is no actual
+			// shard topology, so SPUBLISH / SSUBSCRIBE behave the same as
+			// regular pub/sub but dispatched on a separate `smessage`
+			// channel set so consumers using one model don't see traffic
+			// from the other.
+			async spublish(channel, message) {
+				for (const handler of pubsubHandlers) {
+					if (handler.shardedChannels && handler.shardedChannels.has(channel)) {
+						const listener = handler.listeners.get('smessage');
+						if (listener) listener(channel, message);
+					}
+				}
+				return 1;
+			},
+			async ssubscribe(channel) {
+				shardedChannels.add(channel);
+				return 1;
+			},
+			async sunsubscribe(channel) {
+				shardedChannels.delete(channel);
+				return 1;
+			},
+			// Server INFO stub. Tests can override `_info` (a string) to
+			// drive version detection in callers.
+			async info(/* section */) {
+				return r._info ?? '# Server\nredis_version:7.2.0\n';
+			},
 
 			// Eval - dispatches based on script content
 			async eval(script, numKeys, ...args) {
@@ -271,6 +299,7 @@ export function mockRedisClient(keyPrefix = '') {
 				// Register this duplicate as a pub/sub receiver
 				pubsubHandlers.push({
 					channels: dup._subscribedChannels,
+					shardedChannels: dup._shardedChannels,
 					listeners: dup._listeners
 				});
 				return dup;
@@ -290,6 +319,7 @@ export function mockRedisClient(keyPrefix = '') {
 
 			_subscribedChannels: subscribedChannels,
 			_subscribedPatterns: subscribedPatterns,
+			_shardedChannels: shardedChannels,
 			_listeners: listeners
 		};
 

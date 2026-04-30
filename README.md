@@ -28,6 +28,7 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Redis extensions**
 - [Pub/sub bus](#pubsub-bus)
+- [Sharded pub/sub bus](#sharded-pubsub-bus)
 - [Replay buffer (Redis)](#replay-buffer-redis)
 - [Presence](#presence)
 - [Rate limiting](#rate-limiting)
@@ -204,6 +205,69 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 | `bus.wrap(platform)` | Returns a new Platform whose `publish()` sends to Redis + local |
 | `bus.activate(platform)` | Start the Redis subscriber (idempotent) |
 | `bus.deactivate()` | Stop the subscriber |
+
+---
+
+## Sharded pub/sub bus
+
+`createPubSubBus` uses one channel for every message, so in a Redis Cluster every node receives every publish via the cluster bus. For deployments with many fine-grained topics where each subscriber only cares about a small subset (chat with millions of rooms, per-document collaboration, per-user feeds), most of that fan-out is wasted bandwidth.
+
+`createShardedBus` (`svelte-adapter-uws-extensions/redis/sharded-pubsub`) is the SPUBLISH/SSUBSCRIBE variant: per-topic channels, dynamic subscription via `follow(topic)` / `unfollow(topic)`, no wildcards. In Redis Cluster, messages stay on the shard that owns each channel rather than fanning out to every node.
+
+**Requires Redis 7+.** `activate()` runs `INFO server` and throws on older servers; use `createPubSubBus` for Redis 6 / older Valkey.
+
+#### Setup
+
+```js
+import { createShardedBus } from 'svelte-adapter-uws-extensions/redis/sharded-pubsub';
+
+export const bus = createShardedBus(redis, {
+  shardKey: (topic) => topic.split(':')[0]  // optional grouping
+});
+```
+
+#### Usage
+
+```js
+// src/hooks.ws.js
+import { bus } from '$lib/server/bus';
+
+let distributed;
+
+export async function open(ws, { platform }) {
+  await bus.activate(platform);
+  distributed = bus.wrap(platform);
+}
+
+// Wire follow / unfollow against WebSocket subscribe / unsubscribe:
+export const { subscribe, unsubscribe, close } = bus.hooks;
+
+// Or manually:
+// await bus.follow('chat:room-7');
+// distributed.publish('chat:room-7', 'msg', { text: 'hi' });
+// await bus.unfollow('chat:room-7');
+```
+
+`bus.hooks` is the recommended path -- it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `channelPrefix` | `'uws:sharded:'` | Prefix for sharded pub/sub channels |
+| `shardKey` | `(topic) => topic` | Map a topic to a shard label. The channel is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic). |
+
+#### When to use which bus
+
+| | `createPubSubBus` | `createShardedBus` |
+|---|---|---|
+| Redis version | any | 7+ |
+| Topology | standalone or cluster | meaningful only in cluster |
+| Channel model | one shared channel | per-topic (or per shard) |
+| Subscription | every instance auto-subscribes | dynamic via `follow` / `hooks` |
+| Best fit | most apps; broad-interest topics | many fine-grained topics with narrow audiences |
+
+If you don't have a concrete cluster + fine-grained-topics use case, `createPubSubBus` is simpler and sufficient.
 
 ---
 
@@ -1265,6 +1329,16 @@ const metrics = createMetrics({
 | `pubsub_relay_batch_size` | histogram | Relay batch size per flush |
 | `pubsub_degraded_total` | counter | Auto-emitted `degraded` events |
 | `pubsub_recovered_total` | counter | Auto-emitted `recovered` events |
+
+**Sharded pub/sub bus**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sharded_pubsub_messages_relayed_total` | counter | `topic` | Messages SPUBLISHed |
+| `sharded_pubsub_messages_received_total` | counter | `topic` | Messages received via SSUBSCRIBE |
+| `sharded_pubsub_echo_suppressed_total` | counter | | Sharded messages dropped by echo suppression |
+| `sharded_pubsub_ssubscribes_total` | counter | | SSUBSCRIBE calls (first follower per channel) |
+| `sharded_pubsub_sunsubscribes_total` | counter | | SUNSUBSCRIBE calls (last follower out) |
 
 **Presence**
 
