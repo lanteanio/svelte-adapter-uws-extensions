@@ -272,6 +272,35 @@ export async function message(ws, { data, platform }) {
 |---|---|---|
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Key expiry in seconds (0 = never) |
+| `durability` | -- | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
+| `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
+| `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` blocks indefinitely (Redis WAIT semantics). |
+
+#### Replicated durability
+
+For loss-sensitive flows (audit logs, financial events) opt in with `durability: 'replicated'`. After the write to the master, `publish()` runs `WAIT minReplicas replicationTimeoutMs`. If fewer than `minReplicas` replicas ack within the timeout, `publish()` throws `ReplicationTimeoutError` and skips the local broadcast -- the data is on the master only, and broadcasting would commit live consumers to state that could be lost if the master fails before replicas catch up.
+
+```js
+import { createReplay, ReplicationTimeoutError } from 'svelte-adapter-uws-extensions/redis/replay';
+
+const replay = createReplay(redis, {
+  durability: 'replicated',
+  minReplicas: 1,
+  replicationTimeoutMs: 1000
+});
+
+try {
+  await replay.publish(platform, 'orders', 'created', order);
+} catch (err) {
+  if (err instanceof ReplicationTimeoutError) {
+    // err.ack, err.minReplicas, err.timeoutMs available for logging
+    // Caller decides: retry, fail the request, or accept best-effort
+  }
+  throw err;
+}
+```
+
+The data is in the buffer on the master regardless of the WAIT outcome -- other instances doing `replay()` will still see it. Only the local broadcast is suppressed when the durability signal fails. WAIT command-level errors (network/protocol) bubble up as the original error and DO count as a circuit-breaker failure; an under-acked timeout is a separate signal layer and does NOT trip the breaker.
 
 #### API
 
@@ -279,7 +308,7 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 | Method | Description |
 |---|---|
-| `publish(platform, topic, event, data)` | Store + broadcast |
+| `publish(platform, topic, event, data)` | Store + broadcast. May throw `ReplicationTimeoutError` when `durability: 'replicated'`. |
 | `seq(topic)` | Current sequence number |
 | `gap(topic, lastSeenSeq)` | Probe for a buffer gap. Returns `{ truncated, missingFrom }` |
 | `since(topic, seq)` | Messages after a sequence |
@@ -1256,6 +1285,8 @@ const metrics = createMetrics({
 | `replay_publishes_total` | counter | `topic` | Messages published |
 | `replay_messages_replayed_total` | counter | `topic` | Messages replayed to clients |
 | `replay_truncations_total` | counter | `topic` | Truncation events detected |
+| `replay_replications_total` | counter | | Publishes confirmed replicated within timeout (Redis only, `durability: 'replicated'` mode) |
+| `replay_replication_timeouts_total` | counter | | Publishes that did not reach `minReplicas` within timeout |
 
 **Rate limiting**
 

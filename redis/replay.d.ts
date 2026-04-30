@@ -8,10 +8,46 @@ export interface RedisReplayOptions {
 	size?: number;
 	/** TTL in seconds for replay keys (0 = no expiry). @default 0 */
 	ttl?: number;
+	/**
+	 * Opt into per-publish replication signalling. After the write,
+	 * runs `WAIT minReplicas replicationTimeoutMs`; throws
+	 * `ReplicationTimeoutError` and skips the local broadcast when
+	 * fewer than `minReplicas` replicas ack within the timeout.
+	 * Use for loss-sensitive flows where the caller wants a
+	 * "replicated" signal before declaring success.
+	 */
+	durability?: 'replicated';
+	/**
+	 * Minimum replicas that must ack before publish is considered
+	 * durable. Only consulted when `durability: 'replicated'`.
+	 * @default 1
+	 */
+	minReplicas?: number;
+	/**
+	 * Per-publish replication timeout in milliseconds. `0` blocks
+	 * indefinitely (Redis WAIT semantics). Only consulted when
+	 * `durability: 'replicated'`.
+	 * @default 1000
+	 */
+	replicationTimeoutMs?: number;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+}
+
+/**
+ * Thrown by `publish()` when `durability: 'replicated'` is set and
+ * the Redis WAIT command reports fewer replicas than `minReplicas`
+ * within `replicationTimeoutMs`. Carries the actual ack count for
+ * caller introspection.
+ */
+export class ReplicationTimeoutError extends Error {
+	readonly name: 'ReplicationTimeoutError';
+	readonly ack: number;
+	readonly minReplicas: number;
+	readonly timeoutMs: number;
+	constructor(ack: number, minReplicas: number, timeoutMs: number);
 }
 
 export interface BufferedMessage {

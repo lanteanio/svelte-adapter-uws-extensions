@@ -15,7 +15,29 @@
  * @typedef {Object} RedisReplayOptions
  * @property {number} [size=1000] - Max messages per topic
  * @property {number} [ttl=0] - TTL in seconds for replay keys (0 = no expiry)
+ * @property {'replicated'} [durability] - Opt into per-publish replication signalling. After the write, runs `WAIT minReplicas replicationTimeoutMs`; throws `ReplicationTimeoutError` and skips the local broadcast when fewer than `minReplicas` replicas ack.
+ * @property {number} [minReplicas=1] - Minimum replicas that must ack before publish is considered durable. Required when `durability: 'replicated'`.
+ * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` blocks indefinitely (Redis WAIT semantics).
  */
+
+/**
+ * Thrown by `publish()` when `durability: 'replicated'` is set and the
+ * Redis WAIT command reports fewer replicas than `minReplicas` within
+ * `replicationTimeoutMs`. The data is in the master; the local broadcast
+ * was skipped to avoid committing live consumers to state that could be
+ * lost if the master fails before replicas catch up.
+ */
+export class ReplicationTimeoutError extends Error {
+	constructor(ack, minReplicas, timeoutMs) {
+		super(
+			`replication timed out: ${ack}/${minReplicas} replicas acked within ${timeoutMs}ms`
+		);
+		this.name = 'ReplicationTimeoutError';
+		this.ack = ack;
+		this.minReplicas = minReplicas;
+		this.timeoutMs = timeoutMs;
+	}
+}
 
 /**
  * @typedef {Object} RedisReplayBuffer
@@ -87,6 +109,27 @@ export function createReplay(client, options = {}) {
 		}
 	}
 
+	const replicated = options.durability === 'replicated';
+	if (options.durability !== undefined && options.durability !== 'replicated') {
+		throw new Error(`redis replay: durability must be 'replicated' or undefined, got ${options.durability}`);
+	}
+	let minReplicas = 1;
+	let replicationTimeoutMs = 1000;
+	if (replicated) {
+		if (options.minReplicas !== undefined) {
+			if (typeof options.minReplicas !== 'number' || !Number.isInteger(options.minReplicas) || options.minReplicas < 1) {
+				throw new Error(`redis replay: minReplicas must be a positive integer, got ${options.minReplicas}`);
+			}
+			minReplicas = options.minReplicas;
+		}
+		if (options.replicationTimeoutMs !== undefined) {
+			if (typeof options.replicationTimeoutMs !== 'number' || !Number.isInteger(options.replicationTimeoutMs) || options.replicationTimeoutMs < 0) {
+				throw new Error(`redis replay: replicationTimeoutMs must be a non-negative integer, got ${options.replicationTimeoutMs}`);
+			}
+			replicationTimeoutMs = options.replicationTimeoutMs;
+		}
+	}
+
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
 	const redis = client.redis;
@@ -97,6 +140,8 @@ export function createReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
+	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 
 	function seqKey(topic) {
 		return client.key('replay:seq:' + topic);
@@ -123,6 +168,23 @@ export function createReplay(client, options = {}) {
 				throw err;
 			}
 			mPublishes?.inc({ topic: mt(topic) });
+
+			if (replicated) {
+				let ack;
+				try {
+					ack = await redis.wait(minReplicas, replicationTimeoutMs);
+				} catch (err) {
+					// WAIT itself failed (network/protocol). Treat as a
+					// real backend failure for breaker accounting.
+					b?.failure(err);
+					throw err;
+				}
+				if (ack < minReplicas) {
+					mReplicationTimeouts?.inc();
+					throw new ReplicationTimeoutError(ack, minReplicas, replicationTimeoutMs);
+				}
+				mReplications?.inc();
+			}
 
 			return platform.publish(topic, event, data);
 		},

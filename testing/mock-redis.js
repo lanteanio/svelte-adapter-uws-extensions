@@ -37,6 +37,18 @@ export function mockRedisClient(keyPrefix = '') {
 			async expire() { return 1; },
 			async pexpire() { return 1; },
 
+			// Replication ack stub. Tests configure behavior via:
+			//   redis._waitAcks: number to override the ack count
+			//   redis._waitError: an Error to throw from wait()
+			// Default: return numReplicas so tests that don't care about
+			// replication see no behavior change.
+			async wait(numReplicas) {
+				if (r._waitError) throw r._waitError;
+				const v = r._waitAcks;
+				if (typeof v === 'number') return v;
+				return Number(numReplicas);
+			},
+
 			// Sorted set ops
 			async zadd(key, score, member) {
 				if (!sortedSets.has(key)) sortedSets.set(key, []);

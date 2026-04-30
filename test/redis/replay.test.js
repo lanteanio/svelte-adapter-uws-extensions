@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay } from '../../redis/replay.js';
+import { createReplay, ReplicationTimeoutError } from '../../redis/replay.js';
+import { createCircuitBreaker } from '../../shared/breaker.js';
 
 describe('redis replay', () => {
 	let client;
@@ -556,6 +557,166 @@ describe('redis replay', () => {
 
 			expect(await replay.seq('chat')).toBe(0);
 			expect(await replay.seq('todos')).toBe(1);
+		});
+	});
+
+	describe('replicated durability', () => {
+		it('rejects unknown durability values', () => {
+			expect(() => createReplay(client, { durability: 'strong' }))
+				.toThrow("durability must be 'replicated' or undefined");
+		});
+
+		it('rejects bad minReplicas', () => {
+			expect(() => createReplay(client, { durability: 'replicated', minReplicas: 0 }))
+				.toThrow('minReplicas must be a positive integer');
+			expect(() => createReplay(client, { durability: 'replicated', minReplicas: 1.5 }))
+				.toThrow('minReplicas must be a positive integer');
+		});
+
+		it('rejects negative replicationTimeoutMs', () => {
+			expect(() => createReplay(client, {
+				durability: 'replicated', replicationTimeoutMs: -1
+			})).toThrow('non-negative integer');
+		});
+
+		it('does not call WAIT when durability is unset', async () => {
+			let waitCalls = 0;
+			const origWait = client.redis.wait;
+			client.redis.wait = async (n) => { waitCalls++; return Number(n); };
+
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			expect(waitCalls).toBe(0);
+
+			client.redis.wait = origWait;
+		});
+
+		it('publishes and broadcasts when enough replicas ack', async () => {
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 2,
+				replicationTimeoutMs: 500
+			});
+			client.redis._waitAcks = 2;
+
+			await r.publish(platform, 'chat', 'created', { id: 1 });
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0]).toEqual({
+				topic: 'chat',
+				event: 'created',
+				data: { id: 1 },
+				options: undefined
+			});
+		});
+
+		it('throws ReplicationTimeoutError and skips broadcast when ack < minReplicas', async () => {
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 2,
+				replicationTimeoutMs: 500
+			});
+			client.redis._waitAcks = 1;
+
+			await expect(r.publish(platform, 'chat', 'created', { id: 1 }))
+				.rejects.toBeInstanceOf(ReplicationTimeoutError);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('exposes ack/minReplicas/timeoutMs on the error', async () => {
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 3,
+				replicationTimeoutMs: 250
+			});
+			client.redis._waitAcks = 1;
+
+			let caught;
+			try {
+				await r.publish(platform, 'chat', 'created', { id: 1 });
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).toBeInstanceOf(ReplicationTimeoutError);
+			expect(caught.ack).toBe(1);
+			expect(caught.minReplicas).toBe(3);
+			expect(caught.timeoutMs).toBe(250);
+		});
+
+		it('persists the data even when replication times out', async () => {
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 2,
+				replicationTimeoutMs: 100
+			});
+			client.redis._waitAcks = 1;
+
+			await r.publish(platform, 'chat', 'created', { id: 1 }).catch(() => {});
+
+			// The eval ran before WAIT, so the buffer has the entry.
+			// Other instances doing replay() will see it; only the
+			// local broadcast was suppressed.
+			expect(await r.seq('chat')).toBe(1);
+			const since = await r.since('chat', 0);
+			expect(since).toHaveLength(1);
+			expect(since[0].data).toEqual({ id: 1 });
+		});
+
+		it('counts a breaker failure when WAIT itself errors', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 1,
+				replicationTimeoutMs: 100,
+				breaker
+			});
+			client.redis._waitError = new Error('connection lost');
+
+			await expect(r.publish(platform, 'chat', 'created', { id: 1 }))
+				.rejects.toThrow('connection lost');
+			expect(breaker.failures).toBe(1);
+
+			client.redis._waitError = undefined;
+			breaker.destroy();
+		});
+
+		it('does NOT count a breaker failure when WAIT times out (just acks < min)', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 2,
+				replicationTimeoutMs: 100,
+				breaker
+			});
+			client.redis._waitAcks = 0;
+
+			await expect(r.publish(platform, 'chat', 'created', { id: 1 }))
+				.rejects.toBeInstanceOf(ReplicationTimeoutError);
+			// WAIT succeeded as a command; durability check is a separate
+			// signal layer and should not trip the breaker.
+			expect(breaker.failures).toBe(0);
+
+			breaker.destroy();
+		});
+
+		it('exposes Prometheus counters for replication outcomes', async () => {
+			const { createMetrics } = await import('../../prometheus/index.js');
+			const metrics = createMetrics();
+			const r = createReplay(client, {
+				durability: 'replicated',
+				minReplicas: 1,
+				replicationTimeoutMs: 100,
+				metrics
+			});
+
+			client.redis._waitAcks = 1;
+			await r.publish(platform, 'chat', 'created', { id: 1 });
+
+			client.redis._waitAcks = 0;
+			await r.publish(platform, 'chat', 'created', { id: 2 }).catch(() => {});
+
+			const out = metrics.serialize();
+			expect(out).toMatch(/replay_replications_total \d+/);
+			expect(out).toMatch(/replay_replication_timeouts_total \d+/);
 		});
 	});
 });
