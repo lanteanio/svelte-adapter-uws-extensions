@@ -247,6 +247,194 @@ describe('redis replay (stream backend)', () => {
 		});
 	});
 
+	describe('publishIdempotent', () => {
+		let r;
+
+		beforeEach(() => {
+			r = createReplay(client, { storage: 'stream', size: 100 });
+		});
+
+		it('rejects missing producerId', async () => {
+			await expect(r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, { requestId: 'r1' }))
+				.rejects.toThrow('producerId must be a non-empty string');
+		});
+
+		it('rejects missing requestId', async () => {
+			await expect(r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, { producerId: 'p1' }))
+				.rejects.toThrow('requestId must be a non-empty string');
+		});
+
+		it('rejects missing opts entirely', async () => {
+			await expect(r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }))
+				.rejects.toThrow('producerId, requestId');
+		});
+
+		it('first call returns isDuplicate: false and broadcasts', async () => {
+			const result = await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(result.isDuplicate).toBe(false);
+			expect(result.seq).toBe(1);
+			expect(platform.published).toHaveLength(1);
+		});
+
+		it('second call with same (producerId, requestId) returns cached seq, no broadcast', async () => {
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			platform.reset();
+
+			const result = await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(result.isDuplicate).toBe(true);
+			expect(result.seq).toBe(1);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('does not advance the seq counter on a duplicate', async () => {
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(await r.seq('chat')).toBe(1);
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(await r.seq('chat')).toBe(1);
+		});
+
+		it('does NOT cause false-positive truncation on duplicate retry', async () => {
+			// Pin the property: a duplicate retry must not advance the
+			// stream past the consumer's lastSeenSeq, so gap() reports
+			// no truncation.
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(await r.gap('chat', 1)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('different requestId on the same producer is treated as fresh', async () => {
+			const a = await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			const b = await r.publishIdempotent(platform, 'chat', 'msg', { id: 2 }, {
+				producerId: 'p1', requestId: 'r2'
+			});
+			expect(a.seq).toBe(1);
+			expect(a.isDuplicate).toBe(false);
+			expect(b.seq).toBe(2);
+			expect(b.isDuplicate).toBe(false);
+		});
+
+		it('different producerId same requestId is treated as fresh (separate namespace)', async () => {
+			const a = await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			const b = await r.publishIdempotent(platform, 'chat', 'msg', { id: 2 }, {
+				producerId: 'p2', requestId: 'r1'
+			});
+			expect(a.isDuplicate).toBe(false);
+			expect(b.isDuplicate).toBe(false);
+			expect(a.seq).toBe(1);
+			expect(b.seq).toBe(2);
+		});
+
+		it('cache is topic-scoped: same (producerId, requestId) on a different topic is fresh', async () => {
+			const a = await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			const b = await r.publishIdempotent(platform, 'todos', 'msg', { id: 2 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(a.isDuplicate).toBe(false);
+			expect(b.isDuplicate).toBe(false);
+		});
+
+		it('replay() includes the cached entry for fresh consumers', async () => {
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			// Even if a later retry hits the cache, an earlier-attached
+			// consumer that missed the original publish picks it up via
+			// replay since the entry is in the buffer.
+			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+
+			const ws = {};
+			platform.reset();
+			await r.replay(ws, 'chat', 0, platform);
+			const msgs = platform.sent.filter((s) => s.event === 'msg');
+			expect(msgs).toHaveLength(1);
+			expect(msgs[0].data).toEqual({ seq: 1, event: 'created', data: { id: 1 } });
+		});
+
+		it('runs WAIT only on fresh writes when durability is on', async () => {
+			const replicated = createReplay(client, {
+				storage: 'stream',
+				durability: 'replicated',
+				minReplicas: 1,
+				replicationTimeoutMs: 100
+			});
+			let waitCalls = 0;
+			const origWait = client.redis.wait;
+			client.redis.wait = async (n) => { waitCalls++; return Number(n); };
+
+			await replicated.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(waitCalls).toBe(1);
+
+			await replicated.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(waitCalls).toBe(1); // no second WAIT on duplicate
+
+			client.redis.wait = origWait;
+		});
+
+		it('throws ReplicationTimeoutError when ack < min on a fresh write', async () => {
+			const replicated = createReplay(client, {
+				storage: 'stream',
+				durability: 'replicated',
+				minReplicas: 2,
+				replicationTimeoutMs: 100
+			});
+			client.redis._waitAcks = 1;
+
+			await expect(replicated.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			})).rejects.toBeInstanceOf(ReplicationTimeoutError);
+
+			client.redis._waitAcks = undefined;
+		});
+
+		it('exposes Prometheus counters for hits and writes', async () => {
+			const { createMetrics } = await import('../../prometheus/index.js');
+			const metrics = createMetrics();
+			const tracked = createReplay(client, { storage: 'stream', metrics });
+
+			await tracked.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			await tracked.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+
+			const out = metrics.serialize();
+			expect(out).toMatch(/replay_idmp_writes_total\{topic="chat"\} 1/);
+			expect(out).toMatch(/replay_idmp_hits_total\{topic="chat"\} 1/);
+		});
+
+		it('is absent on the sorted-set backend', () => {
+			const ss = createReplay(client, {});
+			expect(ss.publishIdempotent).toBeUndefined();
+		});
+	});
+
 	describe('breaker accounting', () => {
 		it('records failure on publish error', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 5 });

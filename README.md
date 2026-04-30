@@ -359,6 +359,27 @@ Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) but di
 
 The stream backend works on Redis 5+; listpack encoding is the Redis 7+ default that delivers the memory win.
 
+#### Idempotent publish (stream backend only)
+
+For producers that need at-most-once semantics under retry, the stream backend exposes `publishIdempotent`:
+
+```js
+const replay = createReplay(redis, { storage: 'stream' });
+
+const { seq, isDuplicate } = await replay.publishIdempotent(platform, 'orders', 'created', order, {
+  producerId: 'order-service',
+  requestId: order.clientOrderId  // stable per-operation id supplied by the caller
+});
+```
+
+On a fresh `(producerId, requestId)` tuple, the call performs the same INCR + XADD + broadcast as `publish()` and stashes `seq` in a per-(producer, topic) dedup hash. On a repeat tuple within `idempotencyTtl` (default 48 hours), the call returns the cached seq, skips the XADD, and skips the local broadcast -- the original publish already broadcast to live consumers, and reconnecting consumers pick the entry up via `replay()` from the buffer.
+
+The `seq` counter only advances on fresh writes, so duplicate retries do not introduce gaps that would trigger false-positive truncation events on consumers.
+
+The dedup cache key is `{prefix}replay:idmp:{producerId}:{topic}` -- topic-scoped so the same `requestId` can be reused across topics without collision. Override the TTL per call via `opts.idempotencyTtl`, or globally via `idempotencyTtl` on `createReplay`.
+
+This pairs with the durable task runner (`postgres/tasks`): a task that publishes to the replay buffer can pass its task id as `requestId` so worker-crash retries don't double-publish.
+
 #### Replicated durability
 
 For loss-sensitive flows (audit logs, financial events) opt in with `durability: 'replicated'`. After the write to the master, `publish()` runs `WAIT minReplicas replicationTimeoutMs`. If fewer than `minReplicas` replicas ack within the timeout, `publish()` throws `ReplicationTimeoutError` and skips the local broadcast -- the data is on the master only, and broadcasting would commit live consumers to state that could be lost if the master fails before replicas catch up.
@@ -1380,6 +1401,8 @@ const metrics = createMetrics({
 | `replay_truncations_total` | counter | `topic` | Truncation events detected |
 | `replay_replications_total` | counter | | Publishes confirmed replicated within timeout (Redis only, `durability: 'replicated'` mode) |
 | `replay_replication_timeouts_total` | counter | | Publishes that did not reach `minReplicas` within timeout |
+| `replay_idmp_hits_total` | counter | `topic` | `publishIdempotent` calls served from the dedup cache (no XADD) |
+| `replay_idmp_writes_total` | counter | `topic` | `publishIdempotent` calls that produced a new entry |
 
 **Rate limiting**
 

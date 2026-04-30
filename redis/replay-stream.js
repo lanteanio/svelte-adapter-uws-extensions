@@ -22,6 +22,56 @@
 import { ReplicationTimeoutError } from './replay.js';
 
 /**
+ * Lua script for atomic idempotent publish.
+ *
+ * KEYS[1] = idmp cache key (hash; field = requestId, value = seq)
+ * KEYS[2] = seq key
+ * KEYS[3] = stream key
+ * ARGV[1] = requestId
+ * ARGV[2] = maxSize
+ * ARGV[3] = ttl seconds (0 = no expiry; applies to seq + stream keys)
+ * ARGV[4] = idmpTtl seconds (0 = no expiry on the dedup cache)
+ * ARGV[5] = topic
+ * ARGV[6] = event
+ * ARGV[7] = data (JSON-encoded)
+ *
+ * Returns {isDuplicate (1|0), seq}.
+ */
+const IDMP_PUBLISH_SCRIPT = `
+local idmpKey = KEYS[1]
+local seqKey = KEYS[2]
+local bufKey = KEYS[3]
+local requestId = ARGV[1]
+local maxSize = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local idmpTtl = tonumber(ARGV[4])
+local topic = ARGV[5]
+local event = ARGV[6]
+local data = ARGV[7]
+
+local cached = redis.call('hget', idmpKey, requestId)
+if cached then
+  return {1, tonumber(cached)}
+end
+
+local seq = redis.call('incr', seqKey)
+local id = seq .. '-0'
+redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'topic', topic, 'event', event, 'data', data)
+
+redis.call('hset', idmpKey, requestId, seq)
+if idmpTtl > 0 then
+  redis.call('expire', idmpKey, idmpTtl)
+end
+
+if ttl > 0 then
+  redis.call('expire', seqKey, ttl)
+  redis.call('expire', bufKey, ttl)
+end
+
+return {0, seq}
+`;
+
+/**
  * Lua script for atomic stream publish: increment seq counter, XADD
  * the entry with id `<seq>-0`, optionally apply TTL.
  *
@@ -109,6 +159,12 @@ export function createStreamReplay(client, options = {}) {
 
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
+	const defaultIdempotencyTtl = options.idempotencyTtl !== undefined
+		? options.idempotencyTtl
+		: 48 * 60 * 60;
+	if (typeof defaultIdempotencyTtl !== 'number' || !Number.isInteger(defaultIdempotencyTtl) || defaultIdempotencyTtl < 0) {
+		throw new Error(`redis stream replay: idempotencyTtl must be a non-negative integer, got ${defaultIdempotencyTtl}`);
+	}
 	const redis = client.redis;
 
 	const b = options.breaker;
@@ -119,6 +175,12 @@ export function createStreamReplay(client, options = {}) {
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
+	const mIdmpHits = m?.counter('replay_idmp_hits_total', 'publishIdempotent calls served from the dedup cache (no XADD)', ['topic']);
+	const mIdmpWrites = m?.counter('replay_idmp_writes_total', 'publishIdempotent calls that produced a new entry', ['topic']);
+
+	function idmpKey(producerId, topic) {
+		return client.key('replay:idmp:' + producerId + ':' + topic);
+	}
 
 	function seqKey(topic) {
 		return client.key('replay:seq:' + topic);
@@ -129,6 +191,69 @@ export function createStreamReplay(client, options = {}) {
 	}
 
 	return {
+		async publishIdempotent(platform, topic, event, data, opts) {
+			if (!opts || typeof opts !== 'object') {
+				throw new Error('redis stream replay: publishIdempotent requires { producerId, requestId } options');
+			}
+			const { producerId, requestId } = opts;
+			if (typeof producerId !== 'string' || producerId.length === 0) {
+				throw new Error('redis stream replay: producerId must be a non-empty string');
+			}
+			if (typeof requestId !== 'string' || requestId.length === 0) {
+				throw new Error('redis stream replay: requestId must be a non-empty string');
+			}
+			const idmpTtl = opts.idempotencyTtl !== undefined ? opts.idempotencyTtl : defaultIdempotencyTtl;
+			if (typeof idmpTtl !== 'number' || !Number.isInteger(idmpTtl) || idmpTtl < 0) {
+				throw new Error(`redis stream replay: idempotencyTtl must be a non-negative integer, got ${idmpTtl}`);
+			}
+
+			const ik = idmpKey(producerId, topic);
+			const sk = seqKey(topic);
+			const bk = bufKey(topic);
+
+			b?.guard();
+			let result;
+			try {
+				result = await redis.eval(
+					IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
+					requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null)
+				);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+
+			const isDuplicate = Number(result[0]) === 1;
+			const seq = Number(result[1]);
+
+			if (isDuplicate) {
+				mIdmpHits?.inc({ topic: mt(topic) });
+				return { seq, isDuplicate: true };
+			}
+
+			mIdmpWrites?.inc({ topic: mt(topic) });
+			mPublishes?.inc({ topic: mt(topic) });
+
+			if (replicated) {
+				let ack;
+				try {
+					ack = await redis.wait(minReplicas, replicationTimeoutMs);
+				} catch (err) {
+					b?.failure(err);
+					throw err;
+				}
+				if (ack < minReplicas) {
+					mReplicationTimeouts?.inc();
+					throw new ReplicationTimeoutError(ack, minReplicas, replicationTimeoutMs);
+				}
+				mReplications?.inc();
+			}
+
+			await platform.publish(topic, event, data);
+			return { seq, isDuplicate: false };
+		},
+
 		async publish(platform, topic, event, data) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);

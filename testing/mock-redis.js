@@ -305,6 +305,10 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('zremrangebyrank') && script.includes('cjson.encode')) {
 					return evalReplayPublish(numKeys, args);
 				}
+				// Streams replay idempotent publish script (hget cache, then incr + xadd + hset)
+				if (script.includes('xadd') && script.includes('hget') && script.includes('hset')) {
+					return evalIdmpStreamReplayPublish(numKeys, args);
+				}
 				// Streams replay publish script (atomic incr + xadd MAXLEN)
 				if (script.includes('xadd') && script.includes('MAXLEN')) {
 					return evalStreamReplayPublish(numKeys, args);
@@ -584,6 +588,44 @@ export function mockRedisClient(keyPrefix = '') {
 			h.set(memberId, memberData);
 			live.push(memberData);
 			return [1, ...live];
+		}
+
+		// Streams idempotent replay publish Lua script simulation
+		// args layout: [idmpKey, seqKey, bufKey, requestId, maxSize, ttl, idmpTtl, topic, event, dataJson]
+		function evalIdmpStreamReplayPublish(numKeys, args) {
+			const idmpKey = args[0];
+			const seqKey = args[1];
+			const bufKey = args[2];
+			const requestId = args[3];
+			const maxSize = Number(args[4]);
+			const topic = args[7];
+			const event = args[8];
+			const dataJson = args[9];
+
+			if (!hashes.has(idmpKey)) hashes.set(idmpKey, new Map());
+			const idmp = hashes.get(idmpKey);
+			if (idmp.has(requestId)) {
+				return [1, parseInt(idmp.get(requestId), 10)];
+			}
+
+			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
+			store.set(seqKey, String(v));
+			const seq = v;
+
+			const id = `${seq}-0`;
+			if (!streams.has(bufKey)) streams.set(bufKey, []);
+			const stream = streams.get(bufKey);
+			stream.push({
+				id,
+				fields: [['topic', topic], ['event', event], ['data', dataJson]]
+			});
+			if (stream.length > maxSize) {
+				stream.splice(0, stream.length - maxSize);
+			}
+
+			idmp.set(requestId, String(seq));
+
+			return [0, seq];
 		}
 
 		// Streams replay publish Lua script simulation

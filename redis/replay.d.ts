@@ -40,10 +40,33 @@ export interface RedisReplayOptions {
 	 * @default 1000
 	 */
 	replicationTimeoutMs?: number;
+	/**
+	 * Default TTL in seconds for the dedup cache used by
+	 * `publishIdempotent` (stream backend only). `0` disables expiry.
+	 * Per-call override via the `idempotencyTtl` option.
+	 * @default 172800 (48 hours)
+	 */
+	idempotencyTtl?: number;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+}
+
+export interface PublishIdempotentOptions {
+	/** Logical producer identifier; scopes the dedup cache. */
+	producerId: string;
+	/** Request identifier; the dedup key within the producer's namespace. */
+	requestId: string;
+	/** Override the default `idempotencyTtl` for this call. */
+	idempotencyTtl?: number;
+}
+
+export interface PublishIdempotentResult {
+	/** Sequence number of the entry (newly written or returned from cache). */
+	seq: number;
+	/** `true` when the call was served from the dedup cache. No XADD, no broadcast. */
+	isDuplicate: boolean;
 }
 
 /**
@@ -83,6 +106,27 @@ export interface RedisReplayBuffer {
 
 	/** Get the current sequence number for a topic. Returns 0 if unknown. */
 	seq(topic: string): Promise<number>;
+
+	/**
+	 * Publish with caller-provided idempotency. Stream backend only --
+	 * not present on the sorted-set backend. On a fresh `(producerId, requestId)`
+	 * tuple, performs the same INCR + XADD + broadcast as `publish()`
+	 * and caches `seq` in a dedup hash with TTL `idempotencyTtl`. On
+	 * a repeat tuple within the TTL, returns the cached seq, skips
+	 * the XADD, and skips the local broadcast (the original publish
+	 * already broadcast; live consumers either got it then or will
+	 * pick it up via `replay()` on reconnect).
+	 *
+	 * @returns `{ seq, isDuplicate }` -- `isDuplicate` is `true` when
+	 *   served from the dedup cache.
+	 */
+	publishIdempotent?(
+		platform: Platform,
+		topic: string,
+		event: string,
+		data: unknown,
+		opts: PublishIdempotentOptions
+	): Promise<PublishIdempotentResult>;
 
 	/**
 	 * Inspect whether the buffer still holds the next sequence after
