@@ -57,6 +57,22 @@
       "types": "./redis/cursor.d.ts",
       "default": "./redis/cursor.js"
     },
+    "./redis/idempotency": {
+      "types": "./redis/idempotency.d.ts",
+      "default": "./redis/idempotency.js"
+    },
+    "./redis/fence": {
+      "types": "./redis/fence.d.ts",
+      "default": "./redis/fence.js"
+    },
+    "./postgres/idempotency": {
+      "types": "./postgres/idempotency.d.ts",
+      "default": "./postgres/idempotency.js"
+    },
+    "./postgres/tasks": {
+      "types": "./postgres/tasks.d.ts",
+      "default": "./postgres/tasks.js"
+    },
     "./prometheus": {
       "types": "./prometheus/index.d.ts",
       "default": "./prometheus/index.js"

@@ -186,6 +186,18 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('cjson.decode') && script.includes('liveCount')) {
 					return evalGroupJoin(numKeys, args);
 				}
+				// Idempotency acquire (SET NX EX, then GET, distinguish pending vs result)
+				if (script.includes("'NX', 'EX', ARGV[2]") && script.includes("return {0, '', 1}")) {
+					return evalIdempotencyAcquire(args);
+				}
+				// Fence heartbeat (refresh PEXPIRE iff value matches)
+				if (script.includes("redis.call('PEXPIRE'") && script.includes('v == ARGV[1]')) {
+					return evalFenceHeartbeat(args);
+				}
+				// Fence release (DEL iff value matches)
+				if (script.includes("redis.call('DEL', KEYS[1])") && script.includes('v == ARGV[1]')) {
+					return evalFenceRelease(args);
+				}
 				throw new Error('mock-redis: unrecognized eval script');
 			},
 
@@ -515,6 +527,52 @@ export function mockRedisClient(keyPrefix = '') {
 				out.push(k, v.json);
 			}
 			return out;
+		}
+
+		// Idempotency acquire Lua script simulation
+		// args layout: [key, sentinel, acquireTtlSec]
+		// Returns: [1, '', 0] acquired, [0, '', 1] pending, [0, value, 0] cached result.
+		// TTL is not simulated; tests that exercise expiry should mutate the
+		// store directly or call the store's purge/clear surface.
+		function evalIdempotencyAcquire(args) {
+			const key = args[0];
+			const sentinel = args[1];
+			const existing = store.get(key);
+			if (existing === undefined) {
+				store.set(key, sentinel);
+				return [1, '', 0];
+			}
+			if (existing === sentinel) {
+				return [0, '', 1];
+			}
+			return [0, existing, 0];
+		}
+
+		// Fence heartbeat Lua script simulation
+		// args layout: [key, expectedFence, ttlMs]
+		// Returns 1 if value matches and the TTL is refreshed (no-op in mock), 0 otherwise.
+		function evalFenceHeartbeat(args) {
+			const key = args[0];
+			const expected = args[1];
+			const existing = store.get(key);
+			if (existing === expected) {
+				return 1;
+			}
+			return 0;
+		}
+
+		// Fence release Lua script simulation
+		// args layout: [key, expectedFence]
+		// Returns 1 if value matches and the key is deleted, 0 otherwise.
+		function evalFenceRelease(args) {
+			const key = args[0];
+			const expected = args[1];
+			const existing = store.get(key);
+			if (existing === expected) {
+				store.delete(key);
+				return 1;
+			}
+			return 0;
 		}
 
 		// Stale field cleanup Lua script simulation

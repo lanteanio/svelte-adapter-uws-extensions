@@ -38,6 +38,10 @@ The core adapter keeps everything in-process memory. That works great for single
 - [Replay buffer (Postgres)](#replay-buffer-postgres)
 - [LISTEN/NOTIFY bridge](#listennotify-bridge)
 
+**Cross-backend**
+- [Idempotency store](#idempotency-store)
+- [Task runner](#task-runner)
+
 **Observability**
 - [Prometheus metrics](#prometheus-metrics)
 
@@ -693,6 +697,375 @@ The client side needs no changes -- the core `crud('messages')` store already ha
 #### When to use this instead of Redis pub/sub
 
 If your real-time events are driven by database writes and you do not need Redis for other extensions (presence, rate limiting, groups, cursors), the LISTEN/NOTIFY bridge is a simpler deployment: no Redis infrastructure, no separate pub/sub channel management, and your notifications are inherently tied to committed transactions. Use the Redis pub/sub bus when you need to broadcast events that do not originate from database writes, or when you are already running Redis for other extensions.
+
+---
+
+**Cross-backend**
+
+## Idempotency store
+
+Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Use it for HTTP/RPC retries, webhook redeliveries, and any handler where the caller may legitimately repeat a request that must execute at most once -- charge-customer, send-email, create-order.
+
+The store exposes three states via `acquire(key)`:
+
+- **acquired** -- you own the slot. Run the work, then call `commit(result)` on success or `abort()` on failure.
+- **pending** -- another caller acquired the slot and has not committed yet. Decide locally whether to return a 409, retry later, or wait.
+- **result** -- a previous run committed. The cached value is returned.
+
+A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hold the key, so a crashed owner cannot deadlock retries forever. On `commit` the longer `ttl` (default 48 hours) replaces the sentinel and governs the cache lifetime.
+
+Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
+
+#### Setup (Redis)
+
+```js
+// src/lib/server/idempotency.js
+import { redis } from './redis.js';
+import { createIdempotencyStore } from 'svelte-adapter-uws-extensions/redis/idempotency';
+
+export const idempotency = createIdempotencyStore(redis, {
+  keyPrefix: 'idem:',
+  ttl: 48 * 3600,    // result cache lifetime (48h)
+  acquireTtl: 60     // pending-slot lifetime (60s)
+});
+```
+
+Backed by a single Redis string per key. The acquire path is one Lua-script round trip.
+
+#### Setup (Postgres)
+
+```js
+// src/lib/server/idempotency.js
+import { pg } from './pg.js';
+import { createIdempotencyStore } from 'svelte-adapter-uws-extensions/postgres/idempotency';
+
+export const idempotency = createIdempotencyStore(pg, {
+  table: 'ws_idempotency',
+  ttl: 48 * 3600,
+  acquireTtl: 60,
+  autoMigrate: true
+});
+```
+
+The Postgres backend periodically deletes expired rows (configurable via `cleanupInterval`, default 60s, 0 to disable). Stale pending rows clear on the next sweep without manual intervention.
+
+The Postgres table is created automatically on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS ws_idempotency (
+  key        TEXT        PRIMARY KEY,
+  status     TEXT        NOT NULL,
+  result     JSONB,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ws_idempotency_expires_at ON ws_idempotency (expires_at);
+```
+
+#### Usage
+
+```js
+// Wrap an effectful handler.  The caller passes a stable key per logical
+// operation; identical retries return the cached result.
+export async function placeOrder(input, ctx) {
+  const key = `order:${ctx.user.id}:${input.clientOrderId}`;
+
+  const slot = await idempotency.acquire(key);
+  if (slot.acquired) {
+    try {
+      const order = await db.createOrder(input);
+      await slot.commit(order);
+      return order;
+    } catch (err) {
+      await slot.abort();
+      throw err;
+    }
+  }
+  if (slot.pending) {
+    throw new Error('duplicate request in flight');
+  }
+  return slot.result;
+}
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `keyPrefix` (Redis) | `'idem:'` | Prepended to every Redis key after the client keyPrefix |
+| `table` (Postgres) | `'ws_idempotency'` | Table name |
+| `ttl` | `172800` (48h) | Result cache lifetime in seconds |
+| `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |
+| `autoMigrate` (Postgres) | `true` | Auto-create the table on first use |
+| `cleanupInterval` (Postgres) | `60000` | Periodic expired-row cleanup interval in ms (0 to disable) |
+| `breaker` | -- | Circuit breaker; bypassed when broken |
+| `metrics` | -- | Prometheus registry; emits `idempotency_*_total` counters |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `acquire(key)` | Returns `{acquired, commit, abort}` or `{acquired: false, pending: true}` or `{acquired: false, result}` |
+| `purge(key)` | Drop a single cached result |
+| `clear()` | Drop every key under the configured prefix / table |
+| `destroy()` (Postgres only) | Stop the cleanup timer |
+
+#### Choosing acquireTtl
+
+`acquireTtl` is the upper bound on how long a single execution of the wrapped operation can run before retries see the slot as available again. Set it longer than your worst expected latency for the wrapped handler, but short enough that a crashed instance does not block retries for too long. The default (60 seconds) suits most HTTP and RPC handlers; bump it for long-running tasks (large file uploads, multi-step workflows) and trim it for tight read-heavy paths.
+
+#### Pairing with the Dedup plugin
+
+The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`) is the single-instance fallback for the same contract. The shape is identical, so swapping the backend is a one-line change. Use the in-memory plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+
+---
+
+## Task runner
+
+Wraps an effectful operation in a state machine that survives process crashes and naturally fans across cluster instances. Use it for background work that absolutely must finish exactly once: charging a customer, sending a transactional email, posting to a webhook, kicking off a long-running pipeline.
+
+Three guarantees:
+
+- **Caller-retry idempotency.** Pair the runner with the idempotency store via the `idempotency` option. When a caller passes the same `idempotencyKey` twice, the second call returns the cached result instead of re-running the handler.
+- **Worker-crash recovery.** Every attempt holds a fence UUID and a `fence_expires_at` timestamp. The conditional commit `UPDATE ... WHERE fence = $current_fence` is atomic, so a stuck attempt that comes back from the dead cannot overwrite a completed attempt's result. A periodic recovery sweep reclaims rows whose fence has expired and re-drives the handler in any live instance.
+- **External-service idempotency.** The `idempotencyKey` is forwarded to the handler, where you pass it on to Stripe / SendGrid / S3 so the side-effect target de-duplicates retries too.
+
+#### Setup
+
+```js
+// src/lib/server/tasks.js
+import { pg } from './pg.js';
+import { idempotency } from './idempotency.js';
+import { createTaskRunner } from 'svelte-adapter-uws-extensions/postgres/tasks';
+
+export const tasks = createTaskRunner(pg, {
+  idempotency,           // optional but recommended
+  fenceTtl: 60,          // seconds; per-attempt fence lifetime
+  recoveryInterval: 30000,
+  cleanupInterval: 3600000,
+  rowTtl: 7 * 24 * 3600  // keep terminal rows for 7 days
+});
+
+tasks.register('charge-customer', async ({ input, idempotencyKey, signal }) => {
+  return await stripe.paymentIntents.create(
+    { amount: input.amount, customer: input.customerId },
+    { idempotencyKey, signal }
+  );
+}, {
+  retry: {
+    maxAttempts: 5,
+    backoff: (attempt) => Math.min(1000 * 2 ** (attempt - 1), 60000),
+    on: (err) => err.type === 'StripeAPIError'
+  }
+});
+```
+
+#### Usage
+
+```js
+// In a form action, RPC handler, anywhere with an awaited result
+import { tasks } from '$lib/server/tasks';
+
+export const actions = {
+  pay: async ({ request, locals }) => {
+    const { amount } = Object.fromEntries(await request.formData());
+    const result = await tasks.run('charge-customer', {
+      input: { amount, customerId: locals.user.stripeCustomerId },
+      idempotencyKey: `charge-${locals.user.id}-${request.headers.get('idempotency-key')}`
+    });
+    return { success: true, paymentIntentId: result.id };
+  }
+};
+```
+
+#### Schema
+
+The table is created automatically on first use (if `autoMigrate` is true):
+
+```sql
+CREATE TABLE IF NOT EXISTS ws_tasks (
+  task_id          UUID         PRIMARY KEY,
+  name             TEXT         NOT NULL,
+  input            JSONB,
+  idempotency_key  TEXT,
+  status           TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+  result           JSONB,
+  error            JSONB,
+  fence            UUID         NOT NULL,
+  fence_expires_at TIMESTAMPTZ  NOT NULL,
+  attempts         INT          NOT NULL DEFAULT 1,
+  created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ws_tasks_running_fence
+    ON ws_tasks (fence_expires_at) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_ws_tasks_terminal_updated
+    ON ws_tasks (updated_at) WHERE status IN ('committed', 'failed');
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `table` | `'ws_tasks'` | Table name |
+| `idempotency` | -- | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
+| `fenceTtl` | `60` | Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler runs. |
+| `heartbeatInterval` | `fenceTtl * 1000 / 3` | ms between fence heartbeats |
+| `recoveryInterval` | `30000` | ms between recovery sweeps. 0 disables. |
+| `recoveryBatchSize` | `10` | Max rows reclaimed per sweep |
+| `dispatchInterval` | `5000` | ms between dispatch sweeps that claim `enqueue`d pending rows. 0 disables. |
+| `dispatchBatchSize` | `10` | Max pending rows claimed per dispatch sweep |
+| `awaitPollInterval` | `500` | ms between row reads while `await()` waits |
+| `awaitTimeout` | `60000` | ms after which `await()` rejects if the task is still not terminal. 0 = no timeout. |
+| `cleanupInterval` | `3600000` | ms between cleanup sweeps. 0 disables. |
+| `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
+| `autoMigrate` | `true` | Auto-create the table on first use |
+| `breaker` | -- | Circuit breaker; bypassed when broken |
+| `metrics` | -- | Prometheus registry; emits `tasks_*_total` counters |
+
+#### Per-handler retry config
+
+Retry is declared at registration so the policy travels with the handler, not with each call site:
+
+```js
+tasks.register('flaky-webhook', handler, {
+  retry: {
+    maxAttempts: 5,
+    backoff: (attempt, err) => Math.min(1000 * 2 ** (attempt - 1), 60000),
+    on: (err) => !(err instanceof PermanentError)
+  }
+});
+```
+
+Default is no retry on handler-thrown errors -- safe for non-idempotent tasks. Stuck recovery (fence-expired-while-running) is always on; it is not the same thing as retry-on-failure.
+
+#### Handler context
+
+```ts
+{
+  input: TInput,                    // the input passed to run()
+  idempotencyKey: string | undefined, // forward to external services
+  fence: string,                    // this attempt's fence UUID, read-only
+  signal: AbortSignal,              // aborts when the fence is lost
+  attempt: number                   // 1-based attempt counter
+}
+```
+
+The `signal` fires when the heartbeat detects another worker has reclaimed the row (your fence_expires_at passed and the recovery sweep took over). Pass it to `fetch`, Stripe, anything that supports cancellation -- the handler should bail gracefully when it fires rather than racing the new owner.
+
+#### Errors
+
+`run()` throws three error shapes:
+
+- `UnknownTaskError` -- no handler registered for that name in this process. Recovery does not throw on unknown names because the handler may live on a different deployment.
+- `TaskInFlightError` -- the idempotency store reports the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
+- The handler's own thrown error, after retries are exhausted. Errors are serialised to `{name, message, stack, code, cause}` for the failed-row record and reconstructed as a plain `Error` if a sibling caller reads the row.
+
+#### Async path: `enqueue` + `await`
+
+`run()` blocks the calling process until the handler finishes. Two more verbs let you decouple submission from completion:
+
+- **`enqueue(name, opts)`** -- fire-and-forget. Inserts the row with `status='pending'` and returns the `taskId` immediately. A dispatch sweep on any live instance picks up the row and runs the handler in the background.
+- **`await(taskId, opts?)`** -- block until the task reaches a terminal status. Returns the committed result, throws the stored error, or rejects with a timeout if the task is still pending/running past `awaitTimeout`.
+
+```js
+import { tasks } from '$lib/server/tasks';
+
+// Submit a job that will be processed elsewhere
+const taskId = await tasks.enqueue('send-welcome-email', {
+  input: { userId: locals.user.id },
+  idempotencyKey: `welcome-${locals.user.id}`
+});
+
+// Optionally block on completion (or fire-and-forget by skipping this)
+const result = await tasks.await(taskId, { timeout: 30000 });
+```
+
+Use cases:
+
+- **HTTP handler returns 202 quickly**: `enqueue` and respond with the `taskId`. The client polls a status endpoint that reads the row.
+- **Cross-instance work distribution**: enqueue from a web tier; a worker tier with the handlers registered picks the row up via dispatch.
+- **Decoupling submission from result**: the dispatch sweep also picks up rows whose handler is unknown locally and leaves them in `running` until another instance reclaims them.
+
+The dispatch loop runs every `dispatchInterval` ms (default 5000) and claims up to `dispatchBatchSize` pending rows per sweep via `FOR UPDATE SKIP LOCKED`. Set `dispatchInterval: 0` to disable dispatch entirely (use only `run()` paths).
+
+`await` polls the task row every `awaitPollInterval` ms (default 500) until terminal or `awaitTimeout` ms (default 60000). For most use cases the runner-level defaults are fine; per-call overrides are available:
+
+```js
+await tasks.await(taskId, { pollInterval: 100, timeout: 10000 });
+```
+
+Errors thrown by the handler are reconstructed from the stored row (`name`, `message`, `stack`, `code`, `cause`) when `await` reads a `failed` row. The reconstructed error is a plain `Error`; the original prototype chain does not survive the JSON round-trip.
+
+#### Worker thread execution
+
+By default the handler runs in the current process. For CPU-bound work that would otherwise block the event loop -- image resize, hashing, large JSON parse, anything that genuinely consumes a CPU core for long enough to matter -- you can opt in to running the handler in a worker thread.
+
+The handler lives in a separate file whose default export is the handler. The runner spawns a thread pool per task; each thread imports the handler file once at startup and reuses the import across runs. Database and Redis clients cannot be shared across worker threads (native handles do not cross thread boundaries), so the worker file boots its own.
+
+```js
+// src/lib/server/workers/resize.js
+import sharp from 'sharp';
+
+export default async function resize({ input, signal }) {
+  return await sharp(input.imageBuffer, { signal })
+    .resize(input.width, input.height)
+    .toBuffer();
+}
+```
+
+```js
+// src/lib/server/tasks.js
+import { tasks } from './tasks.js';
+
+tasks.register('resize-image', null, {
+  worker: new URL('./workers/resize.js', import.meta.url)
+});
+
+// Or with explicit pool config:
+tasks.register('resize-image', null, {
+  worker: {
+    path: new URL('./workers/resize.js', import.meta.url),
+    pool: { size: 4, idleTimeout: 30000 }
+  }
+});
+```
+
+When `worker` is set, the `handler` argument to `register` must be `null` or omitted -- the handler argument exists in the worker file, not at the registration site. Pool defaults: `size: 1`, `idleTimeout: 30000` ms (set to `0` to keep workers warm forever). Workers spawn lazily on first run; idle workers past `idleTimeout` are terminated.
+
+The `signal` in the handler context fires when the runner detects a fence loss, exactly as for in-process handlers. The runner forwards an abort message to the worker; the worker translates it into a local `AbortController.abort()` so the handler can bail.
+
+When *not* to use this:
+
+- I/O-bound tasks (HTTP, database, Stripe). Workers add startup cost (~10ms cold, ~50MB memory) and connection-pool duplication; the event loop already handles I/O concurrency natively.
+- Anything that needs to share in-memory state with the main process. Workers have separate memory.
+
+When this *is* the right tool: a single handler that synchronously consumes the event loop for tens of milliseconds or more, where blocking the cluster instance's other work is unacceptable.
+
+#### Redis fence provider (force-takeover detection)
+
+Pass an optional `fence` provider to add a second source of truth for "is this attempt's fence still alive". The Postgres row remains the canonical record of task state; the provider mirrors the fence value to an external store with a short TTL refreshed by heartbeat. On every heartbeat tick the runner consults both sources -- either reporting "lost" aborts the handler.
+
+The primary value is force-takeover detection. If an operator manually deletes the fence key (or another instance forcibly releases it), the heartbeat sees the divergence and bails immediately, even if the Postgres `fence_expires_at` would still pass. Useful for ops scenarios like "drain this instance, kick its in-flight tasks off so the recovery sweep on a healthy instance picks them up faster than waiting for the Postgres deadline."
+
+```js
+import { createRedisFence } from 'svelte-adapter-uws-extensions/redis/fence';
+import { createTaskRunner } from 'svelte-adapter-uws-extensions/postgres/tasks';
+
+export const tasks = createTaskRunner(pg, {
+  idempotency,
+  fence: createRedisFence(redis, { keyPrefix: 'fence:' })
+});
+```
+
+The provider exposes `acquire`/`heartbeat`/`release`. The runner pairs each with the matching Postgres operation: `acquire` runs after the row is inserted/rearmed; `heartbeat` runs before the Postgres heartbeat each tick and short-circuits the abort path on its own; `release` is best-effort after a terminal commit/fail.
+
+`createRedisFence` options:
+
+| Option | Default | Description |
+|---|---|---|
+| `keyPrefix` | `'fence:'` | Prefix prepended (after the client keyPrefix) to every fence key |
+
+The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then pexpire end`, release is `if get == fence then del end`. No fence held by another owner can be released or refreshed by accident.
 
 ---
 
