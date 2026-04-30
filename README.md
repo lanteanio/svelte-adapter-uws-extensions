@@ -732,6 +732,37 @@ The client side needs no changes -- the core `crud('messages')` store already ha
 | `parse` | JSON with `{ topic, event, data }` | Parse notification payload into a publish call. Return null to skip. |
 | `autoReconnect` | `true` | Reconnect on connection loss |
 | `reconnectInterval` | `3000` | ms between reconnect attempts |
+| `multiListener` | `'all'` | `'all'`: every replica opens its own LISTEN (current default). `'advisory'`: leader-elected via `pg_try_advisory_lock`. See [Single-listener mode](#single-listener-mode). |
+| `lockId` | -- | Advisory lock id. Required when `multiListener: 'advisory'`. |
+| `pollInterval` | `5000` | ms between leader-election polls (advisory mode only). |
+
+#### Single-listener mode
+
+By default each replica in an N-replica deployment opens its own LISTEN connection. That's N persistent Postgres connections doing the same work, plus N copies of the same notification.
+
+`multiListener: 'advisory'` elects a single leader via Postgres advisory locks. One replica wins `pg_try_advisory_lock(lockId)` and holds the LISTEN connection; others poll for the lock every `pollInterval` ms. If the leader's connection drops, the session-scoped lock auto-releases and another replica picks it up on its next poll.
+
+```js
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
+import { createNotifyBridge } from 'svelte-adapter-uws-extensions/postgres/notify';
+
+const bus = createPubSubBus(redis);
+
+const bridge = createNotifyBridge(pg, {
+  channel: 'table_changes',
+  multiListener: 'advisory',
+  lockId: 0x6e6f7466  // any stable 32-bit id; e.g. CRC32 of the channel name
+});
+
+export function open(ws, { platform }) {
+  bus.activate(platform);
+  bridge.activate(bus.wrap(platform));
+}
+```
+
+**Requires a cross-instance pub/sub bus.** In `'all'` mode the bridge passes `relay: false` because every replica's local LISTEN already delivers the notification. In `'advisory'` mode only the leader has LISTEN active, so the leader publishes *with* relay -- the bus fans out to non-leader replicas via Redis. Without a bus the leader's local clients receive notifications but other replicas' clients don't.
+
+**Choosing a `lockId`.** Pick a stable 32-bit signed integer that's unique per channel within your deployment. CRC32 of the channel name is a reasonable hash; multiple channels in the same database need distinct ids.
 
 #### API
 

@@ -19,6 +19,14 @@
  *   Defaults to JSON.parse expecting { topic, event, data }.
  * @property {boolean} [autoReconnect=true] - Reconnect on connection loss
  * @property {number} [reconnectInterval=3000] - ms between reconnect attempts
+ * @property {'all' | 'advisory'} [multiListener='all'] -
+ *   `'all'`: every instance opens its own LISTEN connection. `'advisory'`:
+ *   one instance per cluster wins `pg_try_advisory_lock(lockId)` and holds
+ *   the LISTEN connection; others poll for the lock. Requires `lockId` and
+ *   that the platform is wrapped by a cross-instance pub/sub bus so the
+ *   leader's publishes reach non-leader replicas.
+ * @property {number} [lockId] - Advisory lock id. Required when `multiListener: 'advisory'`.
+ * @property {number} [pollInterval=5000] - ms between leader-election polls.
  */
 
 /**
@@ -91,6 +99,23 @@ export function createNotifyBridge(client, options) {
 	const isDefaultParser = !options.parse;
 	const parse = options.parse || defaultParse;
 
+	const multiListener = options.multiListener ?? 'all';
+	if (multiListener !== 'all' && multiListener !== 'advisory') {
+		throw new Error("notify bridge: multiListener must be 'all' or 'advisory'");
+	}
+	const advisory = multiListener === 'advisory';
+	let lockId;
+	if (advisory) {
+		if (typeof options.lockId !== 'number' || !Number.isInteger(options.lockId)) {
+			throw new Error("notify bridge: lockId is required and must be an integer when multiListener is 'advisory'");
+		}
+		lockId = options.lockId;
+	}
+	const pollInterval = options.pollInterval ?? 5000;
+	if (typeof pollInterval !== 'number' || !Number.isFinite(pollInterval) || pollInterval <= 0) {
+		throw new Error('notify bridge: pollInterval must be a positive number');
+	}
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mReceived = m?.counter('notify_received_total', 'Notifications received', ['channel']);
@@ -104,6 +129,9 @@ export function createNotifyBridge(client, options) {
 	let active = false;
 	/** @type {ReturnType<typeof setTimeout> | null} */
 	let reconnectTimer = null;
+	/** @type {ReturnType<typeof setInterval> | null} */
+	let pollTimer = null;
+	let isLeader = false;
 
 	function defaultParse(payload) {
 		try {
@@ -127,7 +155,13 @@ export function createNotifyBridge(client, options) {
 		try {
 			const result = parse(msg.payload, msg.channel);
 			if (result && activePlatform) {
-				activePlatform.publish(result.topic, result.event, result.data, { relay: false });
+				// In advisory mode, only the leader receives notifications;
+				// it must publish *with* relay so the bus fans out to
+				// non-leader replicas. In 'all' mode every instance has
+				// its own LISTEN, so suppress relay to avoid duplicate
+				// fan-out via the bus.
+				const publishOpts = advisory ? undefined : { relay: false };
+				activePlatform.publish(result.topic, result.event, result.data, publishOpts);
 			} else if (!result && isDefaultParser) {
 				mParseErrors?.inc({ channel });
 			}
@@ -171,8 +205,64 @@ export function createNotifyBridge(client, options) {
 	function handleError(err) {
 		b?.failure(err);
 		cleanup();
+		isLeader = false;
+		if (advisory) {
+			// Polling re-establishes the connection on the next tick.
+			return;
+		}
 		if (active && autoReconnect) {
 			scheduleReconnect();
+		}
+	}
+
+	async function ensureClient() {
+		if (conn) return;
+		conn = client.createClient();
+		conn.on('error', handleError);
+		await conn.connect();
+	}
+
+	async function advisoryTick() {
+		if (!active) return;
+		if (!conn) {
+			try {
+				await ensureClient();
+			} catch (err) {
+				b?.failure(err);
+				return;
+			}
+		}
+		try {
+			b?.guard();
+			const res = await conn.query('SELECT pg_try_advisory_lock($1) AS acquired', [lockId]);
+			const acquired = res.rows[0]?.acquired === true;
+			if (acquired && !isLeader) {
+				conn.on('notification', onNotification);
+				await conn.query(`LISTEN "${channel.replace(/"/g, '""')}"`);
+				isLeader = true;
+			} else if (!acquired && isLeader) {
+				try { await conn.query(`UNLISTEN "${channel.replace(/"/g, '""')}"`); } catch { /* ignore */ }
+				conn.removeListener('notification', onNotification);
+				isLeader = false;
+			}
+			b?.success();
+		} catch (err) {
+			b?.failure(err);
+			cleanup();
+			isLeader = false;
+		}
+	}
+
+	function startPolling() {
+		if (pollTimer) return;
+		pollTimer = setInterval(() => { advisoryTick().catch(() => {}); }, pollInterval);
+		if (pollTimer.unref) pollTimer.unref();
+	}
+
+	function stopPolling() {
+		if (pollTimer) {
+			clearInterval(pollTimer);
+			pollTimer = null;
 		}
 	}
 
@@ -208,6 +298,14 @@ export function createNotifyBridge(client, options) {
 			activePlatform = platform;
 			if (active) return;
 			active = true;
+			if (advisory) {
+				// Initial poll attempt; polling continues regardless of
+				// outcome so this never throws -- a follower replica is
+				// a valid steady state.
+				await advisoryTick();
+				startPolling();
+				return;
+			}
 			try {
 				await connect();
 			} catch (err) {
@@ -229,14 +327,20 @@ export function createNotifyBridge(client, options) {
 				clearTimeout(reconnectTimer);
 				reconnectTimer = null;
 			}
+			stopPolling();
 			if (conn) {
-				try {
-					await conn.query(`UNLISTEN "${channel.replace(/"/g, '""')}"`);
-				} catch {
-					// Connection may already be dead
+				// 'all' mode always has LISTEN active; advisory mode only
+				// when this replica is the leader.
+				if (!advisory || isLeader) {
+					try {
+						await conn.query(`UNLISTEN "${channel.replace(/"/g, '""')}"`);
+					} catch {
+						// Connection may already be dead
+					}
 				}
 				cleanup();
 			}
+			isLeader = false;
 		}
 	};
 }
