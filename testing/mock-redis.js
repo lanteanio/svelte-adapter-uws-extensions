@@ -8,6 +8,8 @@ export function mockRedisClient(keyPrefix = '') {
 	const hashes = new Map();      // key -> Map<field, value>
 	const streams = new Map();     // key -> [{id, fields: [[k, v], ...]}]
 	const pubsubHandlers = [];     // {channel, handler}
+	const functionLibraries = new Map(); // libname -> code
+	const registeredFunctions = new Map(); // funcName -> (keys, args) => unknown
 
 	function compareStreamIds(a, b) {
 		const [aMs, aSeq] = a.split('-').map(Number);
@@ -289,6 +291,52 @@ export function mockRedisClient(keyPrefix = '') {
 			// drive version detection in callers.
 			async info(/* section */) {
 				return r._info ?? '# Server\nredis_version:7.2.0\n';
+			},
+
+			// Redis Functions. The mock does NOT execute Lua; it stores
+			// loaded library code by name, and tests register handlers
+			// via the wrapped client's `_registerFunction(name, handler)`
+			// helper. fcall looks up the registered handler.
+			async function(subcommand, ...args) {
+				const sub = String(subcommand).toUpperCase();
+				if (sub === 'LOAD') {
+					const replace = String(args[0]).toUpperCase() === 'REPLACE';
+					const code = replace ? args[1] : args[0];
+					const m = String(code).match(/^#!lua\s+name=(\S+)/);
+					if (!m) throw new Error('ERR Missing library name in shebang');
+					const libname = m[1];
+					if (!replace && functionLibraries.has(libname)) {
+						throw new Error('ERR Library already exists');
+					}
+					functionLibraries.set(libname, code);
+					return libname;
+				}
+				if (sub === 'DELETE') {
+					const libname = args[0];
+					if (!functionLibraries.has(libname)) {
+						throw new Error('ERR Library not found');
+					}
+					functionLibraries.delete(libname);
+					return 'OK';
+				}
+				if (sub === 'LIST') {
+					return [...functionLibraries.keys()];
+				}
+				if (sub === 'FLUSH') {
+					functionLibraries.clear();
+					return 'OK';
+				}
+				throw new Error('ERR mock-redis: unsupported FUNCTION subcommand ' + sub);
+			},
+			async fcall(funcName, numKeys, ...rest) {
+				const handler = registeredFunctions.get(funcName);
+				if (!handler) {
+					throw new Error(`ERR Function not found: ${funcName}`);
+				}
+				const n = Number(numKeys);
+				const keys = rest.slice(0, n);
+				const args = rest.slice(n);
+				return handler(keys, args);
 			},
 
 			// Eval - dispatches based on script content
@@ -839,6 +887,13 @@ export function mockRedisClient(keyPrefix = '') {
 		_sortedSets: sortedSets,
 		_hashes: hashes,
 		_streams: streams,
-		_pubsubHandlers: pubsubHandlers
+		_pubsubHandlers: pubsubHandlers,
+		_functionLibraries: functionLibraries,
+		_registerFunction(funcName, handler) {
+			registeredFunctions.set(funcName, handler);
+		},
+		_unregisterFunction(funcName) {
+			registeredFunctions.delete(funcName);
+		}
 	};
 }

@@ -29,6 +29,10 @@
       "types": "./redis/sharded-pubsub.d.ts",
       "default": "./redis/sharded-pubsub.js"
     },
+    "./redis/functions": {
+      "types": "./redis/functions.d.ts",
+      "default": "./redis/functions.js"
+    },
     "./redis/replay": {
       "types": "./redis/replay.d.ts",
       "default": "./redis/replay.js"

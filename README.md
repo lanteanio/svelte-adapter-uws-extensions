@@ -50,6 +50,7 @@ The core adapter keeps everything in-process memory. That works great for single
 - [Failure handling](#failure-handling)
 - [Circuit breaker](#circuit-breaker)
 - [Admission control](#admission-control)
+- [Redis Functions](#redis-functions)
 
 **Operations**
 - [Graceful shutdown](#graceful-shutdown)
@@ -1444,6 +1445,14 @@ const metrics = createMetrics({
 | `admission_accepted_total` | counter | `class` | `shouldAccept` calls that returned `true` |
 | `admission_rejected_total` | counter | `class`, `reason` | `shouldAccept` calls that returned `false`, labeled with the pressure reason that caused rejection |
 
+**Redis Functions**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `redis_function_loads_total` | counter | `library` | `FUNCTION LOAD` calls |
+| `redis_function_calls_total` | counter | `library`, `function` | `FCALL` calls |
+| `redis_function_errors_total` | counter | `library`, `function` | `FCALL` calls that threw |
+
 ---
 
 **Reliability**
@@ -1669,6 +1678,63 @@ export async function POST({ platform, request }) {
 ```
 
 The two layers complement each other: admission control prevents new work from piling up under server-local pressure; the breaker prevents thundering-herd retries against a dead backend.
+
+---
+
+## Redis Functions
+
+`createFunctionLibrary` (`svelte-adapter-uws-extensions/redis/functions`) is a thin wrapper over Redis 7+ `FUNCTION LOAD` / `FCALL`. Versioned, hot-reloadable server-side scripts: ship a new library version and `load()` swaps it in atomically without an app redeploy.
+
+The library code is plain Lua and must start with `#!lua name=<libname>` -- the wrapper parses the name from the shebang. Inside the library, declare functions via `redis.register_function(...)`. Function names are global on the Redis server (not namespaced by library), which is why `call(funcName, ...)` keys on function name only.
+
+```js
+import { createFunctionLibrary } from 'svelte-adapter-uws-extensions/redis/functions';
+
+const lib = createFunctionLibrary(redis, `#!lua name=ws-presence
+redis.register_function('cleanup', function(keys, args)
+  -- args[1] = now (ms), args[2] = ttl (ms)
+  local now = tonumber(args[1])
+  local ttl = tonumber(args[2])
+  local removed = 0
+  -- ... iterate hash fields, HDEL stale ...
+  return removed
+end)
+`);
+
+await lib.load();
+const removed = await lib.call('cleanup', {
+  keys: ['presence:room1'],
+  args: [Date.now(), 90000]
+});
+
+await lib.delete();  // FUNCTION DELETE
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `metrics` | -- | Prometheus metrics registry. |
+| `breaker` | -- | Circuit breaker instance. |
+
+#### API
+
+| Method / Property | Description |
+|---|---|
+| `lib.name` | Library name parsed from the shebang |
+| `lib.load()` | `FUNCTION LOAD REPLACE`. Runs `INFO server` on first call and throws on Redis < 7. Idempotent. |
+| `lib.call(funcName, { keys?, args? })` | `FCALL` -- returns the function's return value |
+| `lib.delete()` | `FUNCTION DELETE <libname>` |
+
+#### When to use this vs `redis.eval`
+
+`redis.eval` is fine for one-off scripts that ship inside the app code. Use `createFunctionLibrary` when:
+
+- Scripts have meaningful versions and ops want to roll forward without an app deploy.
+- Multiple scripts belong together as a coherent library (shared helpers, etc.).
+- Scripts are large enough that parsing + caching them per `eval` becomes a measurable cost.
+
+Requires Redis 7+. There is no built-in fallback to `EVALSHA` for older servers because that would require maintaining each function in two forms (library function + plain Lua); on Redis 6 just call `redis.eval` directly with your own SHA caching.
 
 ---
 
