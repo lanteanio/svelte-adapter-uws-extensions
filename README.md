@@ -38,6 +38,7 @@ The core adapter keeps everything in-process memory. That works great for single
 **Postgres extensions**
 - [Replay buffer (Postgres)](#replay-buffer-postgres)
 - [LISTEN/NOTIFY bridge](#listennotify-bridge)
+- [Job queue](#job-queue)
 
 **Cross-backend**
 - [Idempotency store](#idempotency-store)
@@ -917,6 +918,113 @@ If your real-time events are driven by database writes and you do not need Redis
 
 ---
 
+## Job queue
+
+`createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on vanilla Postgres 9.5+ -- no extensions required.
+
+The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in -- the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
+
+#### Setup
+
+```js
+// src/lib/server/jobs.js
+import { pg } from './pg.js';
+import { createJobQueue } from 'svelte-adapter-uws-extensions/postgres/jobs';
+
+export const jobs = createJobQueue(pg, {
+  visibilityTimeout: 60000  // 60s default; per-call override on claim()
+});
+```
+
+#### Producer
+
+```js
+// In a request handler:
+await jobs.enqueue('email', { to: 'user@example.com', subject: 'Welcome' });
+```
+
+#### Consumer (worker loop)
+
+```js
+// In a separate worker process or background loop:
+async function workerLoop() {
+  while (running) {
+    const batch = await jobs.claim('email', { batchSize: 5, visibilityTimeoutMs: 30000 });
+    if (batch.length === 0) {
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    for (const job of batch) {
+      try {
+        await sendEmail(job.payload);
+        await jobs.complete(job.id);
+      } catch (err) {
+        if (job.attempts >= 5) {
+          await jobs.complete(job.id);  // give up after 5 tries
+          await logToDeadLetter(job, err);
+        } else {
+          await jobs.fail(job.id);  // release for retry
+        }
+      }
+    }
+  }
+}
+```
+
+For long-running jobs that need more visibility headroom, call `jobs.extend(id, additionalMs)` periodically while processing.
+
+#### Schema
+
+The table is created automatically on first use (if `autoMigrate` is true):
+
+```sql
+CREATE TABLE IF NOT EXISTS ws_jobs (
+  id            BIGSERIAL   PRIMARY KEY,
+  queue         TEXT        NOT NULL,
+  payload       JSONB,
+  claimed_at    TIMESTAMPTZ,
+  claimed_until TIMESTAMPTZ,
+  attempts      INTEGER     NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ws_jobs_queue_pending
+    ON ws_jobs (queue, id) WHERE claimed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ws_jobs_visibility
+    ON ws_jobs (claimed_until) WHERE claimed_at IS NOT NULL;
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `table` | `'ws_jobs'` | Table name |
+| `autoMigrate` | `true` | Auto-create the table on first use |
+| `visibilityTimeout` | `30000` | Default ms a claim is held before another worker can re-claim |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `enqueue(queue, payload)` | Insert a job; returns the job id |
+| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }` |
+| `complete(idOrIds)` | Delete the job(s) on success |
+| `fail(idOrIds)` | Release the claim for retry |
+| `extend(idOrIds, ms)` | Push back the visibility deadline |
+| `pending(queue?)` | Count of unclaimed jobs |
+| `clear(queue?)` | Delete all jobs (useful for tests) |
+
+#### When to use this vs createTaskRunner
+
+| | `createJobQueue` | `createTaskRunner` |
+|---|---|---|
+| Surface | minimal: claim / complete / fail | full state machine: idempotency + fence + retry + result tracking |
+| Best fit | "ingest event, defer work" with caller-driven retry | tasks that must complete exactly once with cross-instance recovery |
+| Result tracking | none (caller tracks via DB writes) | yes (`run` / `await`) |
+
+If your handler must run exactly once and you want the runtime to track the result, reach for `createTaskRunner`. If you want a lighter producer/consumer split with caller-driven retry, this is the simpler shape.
+
+---
+
 **Cross-backend**
 
 ## Idempotency store
@@ -1444,6 +1552,15 @@ const metrics = createMetrics({
 |---|---|---|---|
 | `admission_accepted_total` | counter | `class` | `shouldAccept` calls that returned `true` |
 | `admission_rejected_total` | counter | `class`, `reason` | `shouldAccept` calls that returned `false`, labeled with the pressure reason that caused rejection |
+
+**Job queue**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `jobs_enqueued_total` | counter | `queue` | Jobs enqueued |
+| `jobs_claimed_total` | counter | `queue` | Jobs claimed (rows returned by `claim`) |
+| `jobs_completed_total` | counter | `queue` | Jobs completed (deleted) |
+| `jobs_failed_total` | counter | `queue` | Jobs released via `fail()` for retry |
 
 **Redis Functions**
 

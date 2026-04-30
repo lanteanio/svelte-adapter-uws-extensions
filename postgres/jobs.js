@@ -1,0 +1,305 @@
+/**
+ * Postgres-backed job queue for svelte-adapter-uws.
+ *
+ * Minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on
+ * vanilla Postgres 9.5+ without any extensions. For deployments where
+ * pgmq is available, a separate `createPgmqWorker` primitive (future
+ * item) is the more featureful option; this primitive is for the
+ * common case of standard managed Postgres without extension support.
+ *
+ * Pairs with `createTaskRunner` as the "enqueue here, task runner
+ * dequeues" pattern. The task runner has full state-machine
+ * semantics (idempotency, fence, retry); this queue is a lighter
+ * batch-claim primitive. Pick the shape that fits the workload.
+ *
+ * Table schema (auto-created if autoMigrate is true):
+ *   ws_jobs (
+ *     id            BIGSERIAL PRIMARY KEY,
+ *     queue         TEXT        NOT NULL,
+ *     payload       JSONB,
+ *     claimed_at    TIMESTAMPTZ,
+ *     claimed_until TIMESTAMPTZ,
+ *     attempts      INTEGER     NOT NULL DEFAULT 0,
+ *     created_at    TIMESTAMPTZ DEFAULT now()
+ *   )
+ *   + partial index on (queue, id) WHERE claimed_at IS NULL
+ *   + index on (claimed_until) for visibility-timeout sweeps
+ *
+ * @module svelte-adapter-uws-extensions/postgres/jobs
+ */
+
+/**
+ * @typedef {Object} JobQueueOptions
+ * @property {string} [table='ws_jobs']
+ * @property {boolean} [autoMigrate=true]
+ * @property {number} [visibilityTimeout=30000] - Default ms a claim is held before another worker can re-claim
+ * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
+ * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]
+ */
+
+/**
+ * @typedef {Object} Job
+ * @property {string|number} id
+ * @property {string} queue
+ * @property {unknown} payload
+ * @property {number} attempts
+ * @property {Date} created_at
+ */
+
+/**
+ * Create a Postgres-backed job queue.
+ *
+ * @param {import('./index.js').PgClient} client
+ * @param {JobQueueOptions} [options]
+ */
+export function createJobQueue(client, options = {}) {
+	const table = options.table || 'ws_jobs';
+	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
+		throw new Error(`postgres jobs: invalid table name "${table}"`);
+	}
+	const autoMigrate = options.autoMigrate !== false;
+	const defaultVisibilityTimeout = options.visibilityTimeout ?? 30000;
+	if (typeof defaultVisibilityTimeout !== 'number' || !Number.isFinite(defaultVisibilityTimeout) || defaultVisibilityTimeout <= 0) {
+		throw new Error('postgres jobs: visibilityTimeout must be a positive number (ms)');
+	}
+
+	const b = options.breaker;
+	const m = options.metrics;
+	const mEnqueued = m?.counter('jobs_enqueued_total', 'Jobs enqueued', ['queue']);
+	const mClaimed = m?.counter('jobs_claimed_total', 'Jobs claimed (rows returned by claim)', ['queue']);
+	const mCompleted = m?.counter('jobs_completed_total', 'Jobs completed (deleted)', ['queue']);
+	const mFailed = m?.counter('jobs_failed_total', 'Jobs released via fail() for retry', ['queue']);
+
+	let migrated = false;
+
+	async function ensureTable() {
+		if (migrated || !autoMigrate) return;
+		await client.query(`
+			CREATE TABLE IF NOT EXISTS ${table} (
+				id            BIGSERIAL   PRIMARY KEY,
+				queue         TEXT        NOT NULL,
+				payload       JSONB,
+				claimed_at    TIMESTAMPTZ,
+				claimed_until TIMESTAMPTZ,
+				attempts      INTEGER     NOT NULL DEFAULT 0,
+				created_at    TIMESTAMPTZ DEFAULT now()
+			)
+		`);
+		await client.query(`
+			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
+			    ON ${table} (queue, id)
+			    WHERE claimed_at IS NULL
+		`);
+		await client.query(`
+			CREATE INDEX IF NOT EXISTS idx_${table}_visibility
+			    ON ${table} (claimed_until)
+			    WHERE claimed_at IS NOT NULL
+		`);
+		migrated = true;
+	}
+
+	function asArray(idOrIds) {
+		return Array.isArray(idOrIds) ? idOrIds : [idOrIds];
+	}
+
+	return {
+		async enqueue(queue, payload) {
+			if (typeof queue !== 'string' || queue.length === 0) {
+				throw new Error('postgres jobs: queue must be a non-empty string');
+			}
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'jobs_enqueue_' + table,
+					text: `INSERT INTO ${table} (queue, payload)
+					            VALUES ($1, $2)
+					        RETURNING id`,
+					values: [queue, JSON.stringify(payload ?? null)]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			mEnqueued?.inc({ queue });
+			return res.rows[0].id;
+		},
+
+		async claim(queue, opts = {}) {
+			if (typeof queue !== 'string' || queue.length === 0) {
+				throw new Error('postgres jobs: queue must be a non-empty string');
+			}
+			const batchSize = opts.batchSize ?? 1;
+			if (!Number.isInteger(batchSize) || batchSize < 1) {
+				throw new Error('postgres jobs: batchSize must be a positive integer');
+			}
+			const visibilityTimeoutMs = opts.visibilityTimeoutMs ?? defaultVisibilityTimeout;
+			if (typeof visibilityTimeoutMs !== 'number' || !Number.isFinite(visibilityTimeoutMs) || visibilityTimeoutMs <= 0) {
+				throw new Error('postgres jobs: visibilityTimeoutMs must be a positive number');
+			}
+
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'jobs_claim_' + table,
+					text: `WITH claimed AS (
+						SELECT id FROM ${table}
+						 WHERE queue = $1
+						   AND (claimed_at IS NULL OR claimed_until < now())
+						 ORDER BY id
+						   FOR UPDATE SKIP LOCKED
+						 LIMIT $2
+					)
+					UPDATE ${table} t
+					   SET claimed_at = now(),
+					       claimed_until = now() + ($3 || ' milliseconds')::interval,
+					       attempts = t.attempts + 1
+					  FROM claimed
+					 WHERE t.id = claimed.id
+					RETURNING t.id, t.queue, t.payload, t.attempts, t.created_at`,
+					values: [queue, batchSize, String(visibilityTimeoutMs)]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			if (res.rows.length > 0) mClaimed?.inc({ queue }, res.rows.length);
+			return res.rows.map((row) => ({
+				id: row.id,
+				queue: row.queue,
+				payload: row.payload,
+				attempts: row.attempts,
+				created_at: row.created_at
+			}));
+		},
+
+		async complete(idOrIds) {
+			const ids = asArray(idOrIds);
+			if (ids.length === 0) return;
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'jobs_complete_' + table,
+					text: `DELETE FROM ${table}
+					            WHERE id = ANY($1::bigint[])
+					      RETURNING queue`,
+					values: [ids]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			if (mCompleted) {
+				for (const row of res.rows) mCompleted.inc({ queue: row.queue });
+			}
+		},
+
+		async fail(idOrIds) {
+			const ids = asArray(idOrIds);
+			if (ids.length === 0) return;
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				res = await client.query({
+					name: 'jobs_fail_' + table,
+					text: `UPDATE ${table}
+					           SET claimed_at = NULL,
+					               claimed_until = NULL
+					         WHERE id = ANY($1::bigint[])
+					     RETURNING queue`,
+					values: [ids]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			if (mFailed) {
+				for (const row of res.rows) mFailed.inc({ queue: row.queue });
+			}
+		},
+
+		async extend(idOrIds, additionalMs) {
+			const ids = asArray(idOrIds);
+			if (ids.length === 0) return;
+			if (typeof additionalMs !== 'number' || !Number.isFinite(additionalMs) || additionalMs <= 0) {
+				throw new Error('postgres jobs: additionalMs must be a positive number');
+			}
+			b?.guard();
+			try {
+				await ensureTable();
+				await client.query({
+					name: 'jobs_extend_' + table,
+					text: `UPDATE ${table}
+					           SET claimed_until = claimed_until + ($2 || ' milliseconds')::interval
+					         WHERE id = ANY($1::bigint[])
+					           AND claimed_at IS NOT NULL`,
+					values: [ids, String(additionalMs)]
+				});
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+		},
+
+		async pending(queue) {
+			b?.guard();
+			let res;
+			try {
+				await ensureTable();
+				if (queue !== undefined) {
+					res = await client.query({
+						name: 'jobs_pending_q_' + table,
+						text: `SELECT COUNT(*)::int AS pending_count
+						          FROM ${table}
+						         WHERE queue = $1
+						           AND claimed_at IS NULL`,
+						values: [queue]
+					});
+				} else {
+					res = await client.query({
+						name: 'jobs_pending_all_' + table,
+						text: `SELECT COUNT(*)::int AS pending_count
+						          FROM ${table}
+						         WHERE claimed_at IS NULL`
+					});
+				}
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+			return res.rows[0].pending_count;
+		},
+
+		async clear(queue) {
+			b?.guard();
+			try {
+				await ensureTable();
+				if (queue !== undefined) {
+					await client.query(`DELETE FROM ${table} WHERE queue = $1`, [queue]);
+				} else {
+					await client.query(`DELETE FROM ${table}`);
+				}
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+				throw err;
+			}
+		},
+
+		destroy() {
+			// No timers; reserved for symmetry with other extensions.
+		}
+	};
+}

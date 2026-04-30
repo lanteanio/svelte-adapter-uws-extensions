@@ -81,6 +81,10 @@
       "types": "./postgres/tasks.d.ts",
       "default": "./postgres/tasks.js"
     },
+    "./postgres/jobs": {
+      "types": "./postgres/jobs.d.ts",
+      "default": "./postgres/jobs.js"
+    },
     "./prometheus": {
       "types": "./prometheus/index.d.ts",
       "default": "./prometheus/index.js"

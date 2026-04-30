@@ -29,6 +29,10 @@ export function mockPgClient() {
 	/** @type {Map<string, {task_id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number}>} */
 	const taskRows = new Map();
 
+	/** @type {Map<number, {id: number, queue: string, payload: any, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
+	const jobRows = new Map();
+	let jobNextId = 1;
+
 	function idemNow() {
 		return Date.now();
 	}
@@ -381,6 +385,158 @@ export function mockPgClient() {
 				return { rows: [], rowCount: before };
 			}
 
+			// ----- Job queue dispatch (markers: `queue` column, no `task_id`/`status`)
+
+			// Job enqueue: INSERT INTO ws_jobs (queue, payload) VALUES ($1, $2) RETURNING id
+			if (
+				sql.startsWith('INSERT INTO') &&
+				sql.includes('(queue, payload)') &&
+				sql.includes('RETURNING id')
+			) {
+				const id = jobNextId++;
+				jobRows.set(id, {
+					id,
+					queue: values[0],
+					payload: typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1],
+					claimed_at: null,
+					claimed_until: null,
+					attempts: 0,
+					created_at: new Date()
+				});
+				return { rows: [{ id }], rowCount: 1 };
+			}
+
+			// Job claim: WITH claimed AS (SELECT id FROM ws_jobs WHERE queue=$1 AND (claimed_at IS NULL OR claimed_until < now()) ...) UPDATE ... RETURNING ...
+			if (sql.includes('WITH claimed') && sql.includes('claimed_at IS NULL OR claimed_until')) {
+				const queue = values[0];
+				const limit = Number(values[1]);
+				const visibilityMs = Number(values[2]);
+				const now = Date.now();
+				const candidates = [];
+				for (const row of jobRows.values()) {
+					if (row.queue !== queue) continue;
+					if (row.claimed_at === null || (row.claimed_until !== null && row.claimed_until < now)) {
+						candidates.push(row);
+					}
+				}
+				candidates.sort((a, b) => a.id - b.id);
+				const claimed = candidates.slice(0, limit);
+				const out = [];
+				for (const row of claimed) {
+					row.claimed_at = now;
+					row.claimed_until = now + visibilityMs;
+					row.attempts += 1;
+					out.push({
+						id: row.id,
+						queue: row.queue,
+						payload: row.payload,
+						attempts: row.attempts,
+						created_at: row.created_at
+					});
+				}
+				return { rows: out, rowCount: out.length };
+			}
+
+			// Job complete: DELETE FROM ws_jobs WHERE id = ANY($1::bigint[]) RETURNING queue
+			if (
+				sql.startsWith('DELETE FROM') &&
+				sql.includes('id = ANY($1::bigint[])') &&
+				sql.includes('RETURNING queue')
+			) {
+				const ids = values[0];
+				const out = [];
+				for (const id of ids) {
+					const row = jobRows.get(Number(id));
+					if (row) {
+						out.push({ queue: row.queue });
+						jobRows.delete(Number(id));
+					}
+				}
+				return { rows: out, rowCount: out.length };
+			}
+
+			// Job fail: UPDATE ws_jobs SET claimed_at = NULL, claimed_until = NULL WHERE id = ANY($1::bigint[]) RETURNING queue
+			if (
+				sql.startsWith('UPDATE') &&
+				sql.includes('claimed_at = NULL') &&
+				sql.includes('claimed_until = NULL') &&
+				sql.includes('RETURNING queue')
+			) {
+				const ids = values[0];
+				const out = [];
+				for (const id of ids) {
+					const row = jobRows.get(Number(id));
+					if (row) {
+						row.claimed_at = null;
+						row.claimed_until = null;
+						out.push({ queue: row.queue });
+					}
+				}
+				return { rows: out, rowCount: out.length };
+			}
+
+			// Job extend: UPDATE ws_jobs SET claimed_until = claimed_until + ... WHERE id = ANY($1::bigint[]) AND claimed_at IS NOT NULL
+			if (
+				sql.startsWith('UPDATE') &&
+				sql.includes('claimed_until = claimed_until +') &&
+				sql.includes('claimed_at IS NOT NULL')
+			) {
+				const ids = values[0];
+				const additionalMs = Number(values[1]);
+				let count = 0;
+				for (const id of ids) {
+					const row = jobRows.get(Number(id));
+					if (row && row.claimed_at !== null) {
+						row.claimed_until = (row.claimed_until ?? Date.now()) + additionalMs;
+						count++;
+					}
+				}
+				return { rows: [], rowCount: count };
+			}
+
+			// Job pending count for one queue
+			if (
+				sql.includes('pending_count') &&
+				sql.includes('queue = $1') &&
+				sql.includes('claimed_at IS NULL')
+			) {
+				const queue = values[0];
+				let count = 0;
+				for (const row of jobRows.values()) {
+					if (row.queue === queue && row.claimed_at === null) count++;
+				}
+				return { rows: [{ pending_count: count }], rowCount: 1 };
+			}
+
+			// Job pending count across all queues
+			if (sql.includes('pending_count') && sql.includes('claimed_at IS NULL')) {
+				let count = 0;
+				for (const row of jobRows.values()) {
+					if (row.claimed_at === null) count++;
+				}
+				return { rows: [{ pending_count: count }], rowCount: 1 };
+			}
+
+			// Job clear scoped to a queue
+			if (sql.startsWith('DELETE FROM ws_jobs') && sql.includes('WHERE queue = $1')) {
+				const queue = values[0];
+				let removed = 0;
+				for (const [id, row] of jobRows) {
+					if (row.queue === queue) {
+						jobRows.delete(id);
+						removed++;
+					}
+				}
+				return { rows: [], rowCount: removed };
+			}
+
+			// Job clear all
+			if (sql.startsWith('DELETE FROM ws_jobs') && !sql.includes('WHERE')) {
+				const before = jobRows.size;
+				jobRows.clear();
+				return { rows: [], rowCount: before };
+			}
+
 			// CTE publish: atomic seq increment + insert in one query
 			if (sql.includes('WITH new_seq') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
 				const topic = values[0];
@@ -571,6 +727,7 @@ export function mockPgClient() {
 		_getSeqCounters() { return seqCounters; },
 		_getIdemRows() { return idemRows; },
 		_getTaskRows() { return taskRows; },
-		_reset() { rows = []; nextId = 1; tableCreated = false; seqCounters.clear(); idemRows.clear(); taskRows.clear(); }
+		_getJobRows() { return jobRows; },
+		_reset() { rows = []; nextId = 1; tableCreated = false; seqCounters.clear(); idemRows.clear(); taskRows.clear(); jobRows.clear(); jobNextId = 1; }
 	};
 }
