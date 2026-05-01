@@ -95,9 +95,12 @@ describe('redis fence (integration)', () => {
 		});
 
 		it('returns false when the key has expired between acquire and heartbeat', async () => {
-			// Acquire with 1-second TTL, wait past it, then heartbeat must report lost.
+			// Acquire with 1-second TTL, wait well past it, then heartbeat
+			// must report lost. SET EX has 1-second precision so expiry can
+			// land anywhere in the next second; the slack covers that plus
+			// Docker-on-Windows clock drift under full-suite load.
 			await fence.acquire('task-1', 'fence-a', 1);
-			await wait(1500);
+			await wait(3000);
 			const ok = await fence.heartbeat('task-1', 'fence-a', 30);
 			expect(ok).toBe(false);
 		});

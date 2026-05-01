@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stringly-typed event names lifted to `EVENTS` constants** in `redis/cursor`, `redis/presence`, and `redis/groups`. Wire strings are unchanged; the constants prevent typos at new emit sites.
 - **Postgres notify: precompute `quotedChannel` once** at factory entry instead of reapplying `replace(/"/g, '""')` on every LISTEN and UNLISTEN.
 - **Mock Redis: added `zrange(key, start, stop)`** to `testing/mock-redis.js` to support the new replay pipeline path. Additive; no existing mock consumer breaks.
+- **`postgres/tasks.js` split into focused modules.** The 1026-line factory now lives in a 634-line `tasks.js` plus three internal modules: `_tasks-errors.js` (`TaskInFlightError`, `UnknownTaskError`, `serialiseError`, `deserialiseError`), `_tasks-worker-pool.js` (`createWorkerPool`), and `_tasks-sql.js` (the SQL helper factory). `tasks.js` re-exports `TaskInFlightError` and `UnknownTaskError` so existing imports keep working. The duplicate `serialiseError` in `_worker-harness.js` is also removed in favor of the shared one.
 
 ### Migration
 

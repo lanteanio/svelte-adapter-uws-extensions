@@ -42,8 +42,15 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { Worker } from 'node:worker_threads';
-import { safeCreate } from '../shared/pg-migrate.js';
+import {
+	TaskInFlightError,
+	UnknownTaskError,
+	deserialiseError
+} from './_tasks-errors.js';
+import { createWorkerPool } from './_tasks-worker-pool.js';
+import { createTaskSql } from './_tasks-sql.js';
+
+export { TaskInFlightError, UnknownTaskError };
 
 /**
  * @typedef {Object} TaskRunnerOptions
@@ -103,246 +110,12 @@ import { safeCreate } from '../shared/pg-migrate.js';
 const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 const TABLE_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-/**
- * Thrown when a task is acquired by another worker (idempotency store
- * reports the slot as pending). Caller may retry after a backoff.
- */
-export class TaskInFlightError extends Error {
-	constructor(idempotencyKey) {
-		super(`task in flight for idempotency key "${idempotencyKey}"`);
-		this.name = 'TaskInFlightError';
-		this.idempotencyKey = idempotencyKey;
-	}
-}
-
-/**
- * Thrown when run() is called for an unregistered task name. The recovery
- * loop logs but does not throw on unknown names (the handler may live on a
- * different deployment).
- */
-export class UnknownTaskError extends Error {
-	constructor(name) {
-		super(`no handler registered for task "${name}"`);
-		this.name = 'UnknownTaskError';
-		this.taskName = name;
-	}
-}
-
-function serialiseError(err) {
-	if (!err || typeof err !== 'object') {
-		return { message: String(err), name: 'Error' };
-	}
-	const out = {
-		name: err.name || 'Error',
-		message: err.message || String(err)
-	};
-	if (err.stack) out.stack = err.stack;
-	if (err.cause !== undefined) {
-		try {
-			out.cause = err.cause instanceof Error ? serialiseError(err.cause) : err.cause;
-		} catch { /* skip un-serialisable cause */ }
-	}
-	if (err.code !== undefined) out.code = err.code;
-	return out;
-}
-
-function deserialiseError(payload) {
-	if (!payload || typeof payload !== 'object') {
-		return new Error(String(payload));
-	}
-	const err = new Error(payload.message);
-	err.name = payload.name || 'Error';
-	if (payload.stack) err.stack = payload.stack;
-	if (payload.cause !== undefined) err.cause = payload.cause;
-	if (payload.code !== undefined) err.code = payload.code;
-	return err;
-}
-
 function defaultBackoff(attempt) {
 	return Math.min(1000 * 2 ** (attempt - 1), 60000);
 }
 
 function delay(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
-
-/**
- * Build a lazy worker-thread pool for one task name.
- *
- * Workers are spawned on demand up to `size`; each handles one run at a
- * time. When a worker has been idle for `idleTimeout` ms it is terminated
- * and replaced on the next run. AbortSignal aborts are forwarded as
- * messages to the worker, which translates them back into a local
- * AbortController.signal that the user handler sees.
- *
- * @param {{ path: URL | string, pool?: { size?: number, idleTimeout?: number } }} workerOption
- * @param {string} taskName
- */
-function createWorkerPool(workerOption, taskName) {
-	const handlerPath = workerOption.path instanceof URL ? workerOption.path.href : String(workerOption.path);
-	const poolCfg = workerOption.pool || {};
-	const size = poolCfg.size !== undefined ? poolCfg.size : 1;
-	const idleTimeout = poolCfg.idleTimeout !== undefined ? poolCfg.idleTimeout : 30000;
-
-	if (!Number.isInteger(size) || size < 1) {
-		throw new Error(`postgres tasks: worker.pool.size for "${taskName}" must be a positive integer`);
-	}
-	if (!Number.isInteger(idleTimeout) || idleTimeout < 0) {
-		throw new Error(`postgres tasks: worker.pool.idleTimeout for "${taskName}" must be a non-negative integer`);
-	}
-
-	/** @type {Set<Worker>} */
-	const idle = new Set();
-	/** @type {Map<string, { worker: Worker, resolve: Function, reject: Function, ctx: any }>} */
-	const inFlight = new Map();
-	/** @type {Array<{ id: string, ctx: any, resolve: Function, reject: Function }>} */
-	const queue = [];
-	/** @type {WeakMap<Worker, NodeJS.Timeout>} */
-	const idleTimers = new WeakMap();
-	let workerCount = 0;
-	let destroyed = false;
-
-	function clearIdleTimer(worker) {
-		const t = idleTimers.get(worker);
-		if (t) {
-			clearTimeout(t);
-			idleTimers.delete(worker);
-		}
-	}
-
-	function scheduleIdleTimeout(worker) {
-		if (idleTimeout === 0) return;
-		const t = setTimeout(() => {
-			if (idle.has(worker)) {
-				idle.delete(worker);
-				workerCount -= 1;
-				worker.terminate().catch(() => {});
-			}
-		}, idleTimeout);
-		if (t.unref) t.unref();
-		idleTimers.set(worker, t);
-	}
-
-	function dispatch(worker, job) {
-		clearIdleTimer(worker);
-		idle.delete(worker);
-		inFlight.set(job.id, { worker, resolve: job.resolve, reject: job.reject, ctx: job.ctx });
-		worker.postMessage({
-			type: 'run',
-			id: job.id,
-			input: job.ctx.input,
-			idempotencyKey: job.ctx.idempotencyKey,
-			fence: job.ctx.fence,
-			attempt: job.ctx.attempt
-		});
-	}
-
-	function spawnWorker() {
-		const w = new Worker(HARNESS_URL, {
-			workerData: { handlerPath }
-		});
-		workerCount += 1;
-		if (w.unref) w.unref();
-		w.on('message', (msg) => {
-			const slot = inFlight.get(msg.id);
-			if (!slot) return;
-			inFlight.delete(msg.id);
-			if (msg.type === 'result') {
-				slot.resolve(msg.result);
-			} else if (msg.type === 'error') {
-				slot.reject(deserialiseError(msg.error));
-			}
-			// pick up next queued job, otherwise mark idle
-			const next = queue.shift();
-			if (next) {
-				dispatch(w, next);
-			} else {
-				idle.add(w);
-				scheduleIdleTimeout(w);
-			}
-		});
-		w.on('error', (err) => {
-			// Worker died.  Reject everything assigned to it.
-			for (const [id, slot] of inFlight) {
-				if (slot.worker === w) {
-					inFlight.delete(id);
-					slot.reject(err);
-				}
-			}
-			idle.delete(w);
-			clearIdleTimer(w);
-			workerCount -= 1;
-			// Drain queued jobs onto a replacement worker on next run.
-		});
-		w.on('exit', () => {
-			idle.delete(w);
-			clearIdleTimer(w);
-		});
-		return w;
-	}
-
-	return {
-		run(ctx) {
-			if (destroyed) {
-				return Promise.reject(new Error('task runner destroyed'));
-			}
-			return new Promise((resolve, reject) => {
-				const id = randomUUID();
-				const job = { id, ctx, resolve, reject };
-
-				const onAbort = () => {
-					const slot = inFlight.get(id);
-					if (slot) slot.worker.postMessage({ type: 'abort', id });
-				};
-				const cleanup = () => {
-					if (ctx.signal && !ctx.signal.aborted) {
-						ctx.signal.removeEventListener('abort', onAbort);
-					}
-				};
-				const wrappedResolve = (v) => { cleanup(); resolve(v); };
-				const wrappedReject = (e) => { cleanup(); reject(e); };
-				job.resolve = wrappedResolve;
-				job.reject = wrappedReject;
-
-				if (ctx.signal) {
-					if (ctx.signal.aborted) {
-						wrappedReject(ctx.signal.reason || new Error('aborted'));
-						return;
-					}
-					ctx.signal.addEventListener('abort', onAbort, { once: true });
-				}
-
-				let w = null;
-				for (const candidate of idle) { w = candidate; break; }
-				if (w) {
-					dispatch(w, job);
-				} else if (workerCount < size) {
-					dispatch(spawnWorker(), job);
-				} else {
-					queue.push(job);
-				}
-			});
-		},
-
-		destroy() {
-			destroyed = true;
-			for (const slot of inFlight.values()) {
-				slot.reject(new Error('task runner destroyed'));
-			}
-			inFlight.clear();
-			for (const job of queue) {
-				job.reject(new Error('task runner destroyed'));
-			}
-			queue.length = 0;
-			for (const w of idle) {
-				clearIdleTimer(w);
-				w.terminate().catch(() => {});
-			}
-			idle.clear();
-		}
-	};
 }
 
 /**
@@ -440,7 +213,6 @@ export function createTaskRunner(client, options = {}) {
 
 	/** @type {Map<string, TaskRegistration>} */
 	const handlers = new Map();
-	let migrated = false;
 	let recoveryTimer = null;
 	let recoveryRunning = false;
 	let dispatchTimer = null;
@@ -449,163 +221,7 @@ export function createTaskRunner(client, options = {}) {
 	let cleanupRunning = false;
 	let destroyed = false;
 
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				svti_tasks_id        UUID         PRIMARY KEY,
-				name                 TEXT         NOT NULL,
-				input                JSONB,
-				svti_idempotency_key TEXT,
-				status               TEXT         NOT NULL,
-				result               JSONB,
-				error                JSONB,
-				fence                UUID         NOT NULL,
-				fence_expires_at     TIMESTAMPTZ  NOT NULL,
-				attempts             INT          NOT NULL DEFAULT 1,
-				created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
-				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
-			)
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
-			    ON ${table} (fence_expires_at)
-			 WHERE status = 'running'
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_terminal_updated
-			    ON ${table} (updated_at)
-			 WHERE status IN ('committed', 'failed')
-		`);
-		migrated = true;
-	}
-
-	async function insertAttempt(taskId, name, input, idempotencyKey, fence) {
-		await client.query({
-			name: 'tasks_insert_' + table,
-			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at)
-			       VALUES
-			          ($1, $2, $3::jsonb, $4, 'running', $5, now() + ($6 || ' seconds')::interval)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, fence, fenceTtl]
-		});
-	}
-
-	async function heartbeatFence(taskId, fence) {
-		const res = await client.query({
-			name: 'tasks_heartbeat_' + table,
-			text: `UPDATE ${table}
-			          SET fence_expires_at = now() + ($3 || ' seconds')::interval,
-			              updated_at = now()
-			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
-			values: [taskId, fence, fenceTtl]
-		});
-		return res.rowCount > 0;
-	}
-
-	async function commitRow(taskId, fence, result) {
-		const res = await client.query({
-			name: 'tasks_commit_' + table,
-			text: `UPDATE ${table}
-			          SET status = 'committed',
-			              result = $3::jsonb,
-			              updated_at = now()
-			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
-			values: [taskId, fence, JSON.stringify(result === undefined ? null : result)]
-		});
-		return res.rowCount > 0;
-	}
-
-	async function failRow(taskId, fence, err) {
-		const res = await client.query({
-			name: 'tasks_fail_' + table,
-			text: `UPDATE ${table}
-			          SET status = 'failed',
-			              error = $3::jsonb,
-			              updated_at = now()
-			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
-			values: [taskId, fence, JSON.stringify(serialiseError(err))]
-		});
-		return res.rowCount > 0;
-	}
-
-	async function readRow(taskId) {
-		const res = await client.query({
-			name: 'tasks_read_' + table,
-			text: `SELECT status, result, error, attempts FROM ${table} WHERE svti_tasks_id = $1`,
-			values: [taskId]
-		});
-		return res.rows[0] || null;
-	}
-
-	async function insertPending(taskId, name, input, idempotencyKey) {
-		await client.query({
-			name: 'tasks_enqueue_' + table,
-			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at, attempts)
-			       VALUES
-			          ($1, $2, $3::jsonb, $4, 'pending', gen_random_uuid(), now(), 0)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null]
-		});
-	}
-
-	async function claimPending(limit) {
-		const res = await client.query({
-			name: 'tasks_claim_pending_' + table,
-			text: `WITH claimed AS (
-			         SELECT svti_tasks_id FROM ${table}
-			          WHERE status = 'pending'
-			          ORDER BY created_at ASC
-			          LIMIT $1
-			          FOR UPDATE SKIP LOCKED
-			       )
-			       UPDATE ${table} t
-			          SET status = 'running',
-			              fence = gen_random_uuid(),
-			              fence_expires_at = now() + ($2 || ' seconds')::interval,
-			              attempts = t.attempts + 1,
-			              updated_at = now()
-			         FROM claimed
-			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
-			values: [limit, fenceTtl]
-		});
-		return res.rows;
-	}
-
-	async function reclaimStuck(limit) {
-		const res = await client.query({
-			name: 'tasks_reclaim_' + table,
-			text: `WITH claimed AS (
-			         SELECT svti_tasks_id FROM ${table}
-			          WHERE status = 'running' AND fence_expires_at < now()
-			          ORDER BY fence_expires_at ASC
-			          LIMIT $1
-			          FOR UPDATE SKIP LOCKED
-			       )
-			       UPDATE ${table} t
-			          SET fence = gen_random_uuid(),
-			              fence_expires_at = now() + ($2 || ' seconds')::interval,
-			              attempts = t.attempts + 1,
-			              updated_at = now()
-			         FROM claimed
-			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
-			values: [limit, fenceTtl]
-		});
-		return res.rows;
-	}
-
-	async function deleteOldTerminal() {
-		const res = await client.query({
-			name: 'tasks_cleanup_' + table,
-			text: `DELETE FROM ${table}
-			        WHERE status IN ('committed', 'failed')
-			          AND updated_at < now() - ($1 || ' seconds')::interval`,
-			values: [rowTtl]
-		});
-		return res.rowCount;
-	}
+	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate });
 
 	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt) {
 		const reg = handlers.get(name);
@@ -628,7 +244,7 @@ export function createTaskRunner(client, options = {}) {
 							return;
 						}
 					}
-					const stillOurs = await heartbeatFence(taskId, fence);
+					const stillOurs = await sql.heartbeatFence(taskId, fence);
 					if (!stillOurs) {
 						heartbeatLost = true;
 						mFenceLost?.inc({ name });
@@ -673,20 +289,11 @@ export function createTaskRunner(client, options = {}) {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUUID();
-					await insertAttempt(taskId, name, input, idempotencyKey, fence);
+					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence);
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate fence and rearm the existing row.
 					fence = randomUUID();
-					await client.query({
-						name: 'tasks_rearm_' + table,
-						text: `UPDATE ${table}
-						          SET fence = $2,
-						              fence_expires_at = now() + ($3 || ' seconds')::interval,
-						              attempts = $4,
-						              updated_at = now()
-						        WHERE svti_tasks_id = $1`,
-						values: [taskId, fence, fenceTtl, attempt]
-					});
+					await sql.rearmAttempt(taskId, fence, attempt);
 				}
 				// else: dispatch/recovery first iteration uses the fence assigned by the
 				// claim CTE; no row mutation needed.
@@ -708,14 +315,14 @@ export function createTaskRunner(client, options = {}) {
 			}
 
 			if (handlerError === undefined) {
-				const committed = await commitRow(taskId, fence, result);
+				const committed = await sql.commitRow(taskId, fence, result);
 				if (committed && fenceProvider) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 				}
 				if (!committed) {
 					// Our fence was lost; another worker took over.  Read the
 					// row to learn the canonical outcome.
-					const row = await readRow(taskId);
+					const row = await sql.readRow(taskId);
 					if (row && row.status === 'committed') {
 						mRunCommit?.inc({ name });
 						return row.result;
@@ -743,7 +350,7 @@ export function createTaskRunner(client, options = {}) {
 				(typeof retry.on !== 'function' || retry.on(handlerError) !== false);
 
 			if (!canRetry) {
-				await failRow(taskId, fence, handlerError);
+				await sql.failRow(taskId, fence, handlerError);
 				if (fenceProvider) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 				}
@@ -764,8 +371,8 @@ export function createTaskRunner(client, options = {}) {
 		if (b && !b.isHealthy) return;
 		recoveryRunning = true;
 		try {
-			await ensureTable();
-			const reclaimed = await reclaimStuck(recoveryBatchSize);
+			await sql.ensureTable();
+			const reclaimed = await sql.reclaimStuck(recoveryBatchSize);
 			b?.success();
 			for (const row of reclaimed) {
 				const reg = handlers.get(row.name);
@@ -796,8 +403,8 @@ export function createTaskRunner(client, options = {}) {
 		if (b && !b.isHealthy) return;
 		dispatchRunning = true;
 		try {
-			await ensureTable();
-			const claimed = await claimPending(dispatchBatchSize);
+			await sql.ensureTable();
+			const claimed = await sql.claimPending(dispatchBatchSize);
 			b?.success();
 			for (const row of claimed) {
 				if (!handlers.has(row.name)) {
@@ -824,8 +431,8 @@ export function createTaskRunner(client, options = {}) {
 		if (b && !b.isHealthy) return;
 		cleanupRunning = true;
 		try {
-			await ensureTable();
-			await deleteOldTerminal();
+			await sql.ensureTable();
+			await sql.deleteOldTerminal();
 			b?.success();
 		} catch (err) {
 			b?.failure(err);
@@ -917,7 +524,7 @@ export function createTaskRunner(client, options = {}) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
 			}
 
-			await ensureTable();
+			await sql.ensureTable();
 
 			if (idempotency && idempotencyKey) {
 				const slot = await idempotency.acquire(idempotencyKey);
@@ -951,12 +558,12 @@ export function createTaskRunner(client, options = {}) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
 			}
 
-			await ensureTable();
+			await sql.ensureTable();
 
 			const taskId = randomUUID();
 			b?.guard();
 			try {
-				await insertPending(taskId, name, input, idempotencyKey);
+				await sql.insertPending(taskId, name, input, idempotencyKey);
 				b?.success();
 			} catch (err) {
 				b?.failure(err);
@@ -979,11 +586,11 @@ export function createTaskRunner(client, options = {}) {
 				throw new Error('postgres tasks: awaitTimeout must be a non-negative integer');
 			}
 
-			await ensureTable();
+			await sql.ensureTable();
 			const start = Date.now();
 
 			while (true) {
-				const row = await readRow(taskId);
+				const row = await sql.readRow(taskId);
 				if (!row) {
 					throw new Error(`postgres tasks: task "${taskId}" not found`);
 				}

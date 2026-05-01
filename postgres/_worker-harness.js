@@ -21,6 +21,7 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
+import { serialiseError } from './_tasks-errors.js';
 
 if (!parentPort) {
 	throw new Error('worker harness: must be loaded as a worker thread entry');
@@ -40,24 +41,6 @@ const handlerPromise = (async () => {
 
 /** @type {Map<string, AbortController>} */
 const controllers = new Map();
-
-function serialiseError(err) {
-	if (!err || typeof err !== 'object') {
-		return { message: String(err), name: 'Error' };
-	}
-	const out = {
-		name: err.name || 'Error',
-		message: err.message || String(err)
-	};
-	if (err.stack) out.stack = err.stack;
-	if (err.code !== undefined) out.code = err.code;
-	if (err.cause !== undefined) {
-		try {
-			out.cause = err.cause instanceof Error ? serialiseError(err.cause) : err.cause;
-		} catch { /* skip un-serialisable cause */ }
-	}
-	return out;
-}
 
 parentPort.on('message', async (msg) => {
 	if (msg && msg.type === 'run') {

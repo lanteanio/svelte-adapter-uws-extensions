@@ -116,8 +116,10 @@ describe('redis idempotency (integration)', () => {
 			const store = createIdempotencyStore(client, { acquireTtl: 1 });
 			await store.acquire('expire-me');
 
-			// Wait past the 1-second TTL.
-			await wait(1500);
+			// Wait well past the 1-second TTL. The slack absorbs clock drift
+			// between the Redis EX timer and the JS event loop on Docker-on-
+			// Windows under full-suite load.
+			await wait(3000);
 
 			const next = await store.acquire('expire-me');
 			expect(next.acquired).toBe(true);

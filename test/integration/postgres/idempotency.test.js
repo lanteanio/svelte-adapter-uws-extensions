@@ -219,8 +219,10 @@ describe('postgres idempotency (integration)', () => {
 				expect(first.acquired).toBe(true);
 				// Owner crashes; do not commit/abort.
 
-				// Wait past the 1s acquireTtl on real Postgres clock.
-				await wait(1100);
+				// Wait well past the 1s acquireTtl. The slack absorbs clock
+				// drift between Postgres now() and the JS event loop on
+				// Docker-on-Windows under full-suite load.
+				await wait(3000);
 
 				const second = await s.acquire('stuck');
 				expect(second.acquired).toBe(true);
@@ -238,7 +240,7 @@ describe('postgres idempotency (integration)', () => {
 				await first.commit('temp');
 				expect((await s.acquire('ephemeral')).result).toBe('temp');
 
-				await wait(1100);
+				await wait(3000);
 
 				const fresh = await s.acquire('ephemeral');
 				expect(fresh.acquired).toBe(true);

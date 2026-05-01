@@ -179,10 +179,14 @@ describe('postgres jobs (integration)', () => {
 	describe('visibility timeout reclaim', () => {
 		it('a job whose visibility expired becomes claimable again', async () => {
 			await queue.enqueue('vis', { id: 1 });
-			const first = await queue.claim('vis', { visibilityTimeoutMs: 300 });
+			const first = await queue.claim('vis', { visibilityTimeoutMs: 500 });
 			expect(first).toHaveLength(1);
 
-			await wait(1000);
+			// Wait far past the 500ms visibility. Docker-on-Windows clock
+			// drift between Postgres now() and the JS event loop can be
+			// startling under full-suite load, so the slack is deliberately
+			// large rather than just-enough.
+			await wait(3000);
 
 			const reclaim = await queue.claim('vis');
 			expect(reclaim).toHaveLength(1);
