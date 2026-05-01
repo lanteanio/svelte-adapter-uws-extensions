@@ -16,6 +16,9 @@
  */
 
 import { createStreamReplay } from './replay-stream.js';
+import { scanAndUnlink } from '../shared/redis-scan.js';
+import { ReplicationTimeoutError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+export { ReplicationTimeoutError };
 
 /**
  * @typedef {Object} RedisReplayOptions
@@ -25,25 +28,6 @@ import { createStreamReplay } from './replay-stream.js';
  * @property {number} [minReplicas=1] - Minimum replicas that must ack before publish is considered durable. Required when `durability: 'replicated'`.
  * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` blocks indefinitely (Redis WAIT semantics).
  */
-
-/**
- * Thrown by `publish()` when `durability: 'replicated'` is set and the
- * Redis WAIT command reports fewer replicas than `minReplicas` within
- * `replicationTimeoutMs`. The data is in the master; the local broadcast
- * was skipped to avoid committing live consumers to state that could be
- * lost if the master fails before replicas catch up.
- */
-export class ReplicationTimeoutError extends Error {
-	constructor(ack, minReplicas, timeoutMs) {
-		super(
-			`replication timed out: ${ack}/${minReplicas} replicas acked within ${timeoutMs}ms`
-		);
-		this.name = 'ReplicationTimeoutError';
-		this.ack = ack;
-		this.minReplicas = minReplicas;
-		this.timeoutMs = timeoutMs;
-	}
-}
 
 /**
  * @typedef {Object} RedisReplayBuffer
@@ -110,40 +94,10 @@ export function createReplay(client, options = {}) {
 	if (options.storage === 'stream') {
 		return createStreamReplay(client, options);
 	}
-	if (options.size !== undefined) {
-		if (typeof options.size !== 'number' || options.size < 1 || !Number.isInteger(options.size)) {
-			throw new Error(`redis replay: size must be a positive integer, got ${options.size}`);
-		}
-	}
-	if (options.ttl !== undefined) {
-		if (typeof options.ttl !== 'number' || options.ttl < 0 || !Number.isInteger(options.ttl)) {
-			throw new Error(`redis replay: ttl must be a non-negative integer, got ${options.ttl}`);
-		}
-	}
 
-	const replicated = options.durability === 'replicated';
-	if (options.durability !== undefined && options.durability !== 'replicated') {
-		throw new Error(`redis replay: durability must be 'replicated' or undefined, got ${options.durability}`);
-	}
-	let minReplicas = 1;
-	let replicationTimeoutMs = 1000;
-	if (replicated) {
-		if (options.minReplicas !== undefined) {
-			if (typeof options.minReplicas !== 'number' || !Number.isInteger(options.minReplicas) || options.minReplicas < 1) {
-				throw new Error(`redis replay: minReplicas must be a positive integer, got ${options.minReplicas}`);
-			}
-			minReplicas = options.minReplicas;
-		}
-		if (options.replicationTimeoutMs !== undefined) {
-			if (typeof options.replicationTimeoutMs !== 'number' || !Number.isInteger(options.replicationTimeoutMs) || options.replicationTimeoutMs < 0) {
-				throw new Error(`redis replay: replicationTimeoutMs must be a non-negative integer, got ${options.replicationTimeoutMs}`);
-			}
-			replicationTimeoutMs = options.replicationTimeoutMs;
-		}
-	}
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs } =
+		parseReplayOptions('redis replay', options);
 
-	const maxSize = options.size || 1000;
-	const ttl = options.ttl || 0;
 	const redis = client.redis;
 
 	const b = options.breaker;
@@ -182,20 +136,7 @@ export function createReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				let ack;
-				try {
-					ack = await redis.wait(minReplicas, replicationTimeoutMs);
-				} catch (err) {
-					// WAIT itself failed (network/protocol). Treat as a
-					// real backend failure for breaker accounting.
-					b?.failure(err);
-					throw err;
-				}
-				if (ack < minReplicas) {
-					mReplicationTimeouts?.inc();
-					throw new ReplicationTimeoutError(ack, minReplicas, replicationTimeoutMs);
-				}
-				mReplications?.inc();
+				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			return platform.publish(topic, event, data);
@@ -280,23 +221,39 @@ export function createReplay(client, options = {}) {
 		async replay(ws, topic, sinceSeq, platform, reqId) {
 			if (b) b.guard();
 			const replayTopic = '__replay:' + topic;
+			const bk = bufKey(topic);
 
-			let rawAll;
+			// Pipeline the oldest-entry probe (for truncation detection)
+			// alongside the seq>sinceSeq fetch so this is one RTT and the
+			// returned data covers only what the client actually needs.
+			// Fetch a small slice for the oldest probe so corrupt entries
+			// at the head don't hide the actual oldest valid seq.
+			let oldestRaw, missedRaw;
 			try {
-				rawAll = await redis.zrangebyscore(bufKey(topic), '-inf', '+inf');
+				const pipe = redis.pipeline();
+				pipe.zrange(bk, 0, 9);
+				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
+				const results = await pipe.exec();
+				if (results[0][0]) throw results[0][0];
+				if (results[1][0]) throw results[1][0];
+				oldestRaw = results[0][1];
+				missedRaw = results[1][1];
 			} catch (err) {
 				b?.failure(err);
 				throw err;
 			}
+
 			let oldestSeq = null;
-			for (let i = 0; i < rawAll.length; i++) {
-				try {
-					const parsed = JSON.parse(rawAll[i]);
-					if (parsed.seq != null) {
-						oldestSeq = parsed.seq;
-						break;
-					}
-				} catch { /* skip corrupt */ }
+			if (oldestRaw) {
+				for (let i = 0; i < oldestRaw.length; i++) {
+					try {
+						const parsed = JSON.parse(oldestRaw[i]);
+						if (parsed.seq != null) {
+							oldestSeq = parsed.seq;
+							break;
+						}
+					} catch { /* skip corrupt */ }
+				}
 			}
 			if (oldestSeq !== null && sinceSeq > 0 && oldestSeq > sinceSeq + 1) {
 				mTruncations?.inc({ topic: mt(topic) });
@@ -304,10 +261,9 @@ export function createReplay(client, options = {}) {
 			}
 
 			const missed = [];
-			for (let i = 0; i < rawAll.length; i++) {
+			for (let i = 0; i < missedRaw.length; i++) {
 				try {
-					const parsed = JSON.parse(rawAll[i]);
-					if (parsed.seq > sinceSeq) missed.push(parsed);
+					missed.push(JSON.parse(missedRaw[i]));
 				} catch { /* skip corrupted */ }
 			}
 
@@ -341,15 +297,7 @@ export function createReplay(client, options = {}) {
 		async clear() {
 			if (b) b.guard();
 			try {
-				const pattern = client.key('replay:*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) {
-						await redis.unlink(...keys);
-					}
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key('replay:*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

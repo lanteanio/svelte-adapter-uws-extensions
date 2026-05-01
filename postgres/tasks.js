@@ -43,6 +43,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { safeCreate } from '../shared/pg-migrate.js';
 
 /**
  * @typedef {Object} TaskRunnerOptions
@@ -448,23 +449,9 @@ export function createTaskRunner(client, options = {}) {
 	let cleanupRunning = false;
 	let destroyed = false;
 
-	async function safeCreate(ddl) {
-		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
-		// both connections pass the existence check, both run the create,
-		// the loser raises one of these codes. The object exists either way.
-		// Per-statement so a race on the first DDL does not skip later ones.
-		try {
-			await client.query(ddl);
-		} catch (err) {
-			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
-				throw err;
-			}
-		}
-	}
-
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${table} (
 				svti_tasks_id        UUID         PRIMARY KEY,
 				name                 TEXT         NOT NULL,
@@ -480,12 +467,12 @@ export function createTaskRunner(client, options = {}) {
 				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 			)
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
 			    ON ${table} (fence_expires_at)
 			 WHERE status = 'running'
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_terminal_updated
 			    ON ${table} (updated_at)
 			 WHERE status IN ('committed', 'failed')

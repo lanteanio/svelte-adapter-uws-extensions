@@ -121,6 +121,14 @@ describe('circuit breaker', () => {
 			breaker.destroy();
 		});
 
+		it('failures counter caps at failureThreshold during sustained outages', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 3 });
+			for (let i = 0; i < 10000; i++) breaker.failure();
+			expect(breaker.state).toBe('broken');
+			expect(breaker.failures).toBe(3);
+			breaker.destroy();
+		});
+
 		it('reset() forces back to healthy', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();

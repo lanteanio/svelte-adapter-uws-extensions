@@ -28,6 +28,8 @@
  * @module svelte-adapter-uws-extensions/postgres/idempotency
  */
 
+import { safeCreate } from '../shared/pg-migrate.js';
+
 /**
  * @typedef {Object} PgIdempotencyOptions
  * @property {string} [table='svti_idempotency'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
@@ -86,23 +88,9 @@ export function createIdempotencyStore(client, options = {}) {
 
 	let migrated = false;
 
-	async function safeCreate(ddl) {
-		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
-		// both connections pass the existence check, both run the create,
-		// the loser raises one of these codes. The object exists either way.
-		// Per-statement so a race on the first DDL does not skip later ones.
-		try {
-			await client.query(ddl);
-		} catch (err) {
-			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
-				throw err;
-			}
-		}
-	}
-
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${table} (
 				svti_idempotency_key TEXT        PRIMARY KEY,
 				status               TEXT        NOT NULL,
@@ -110,7 +98,7 @@ export function createIdempotencyStore(client, options = {}) {
 				expires_at           TIMESTAMPTZ NOT NULL
 			)
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table} (expires_at)
 		`);
 		migrated = true;

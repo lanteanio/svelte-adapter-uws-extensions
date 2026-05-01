@@ -19,15 +19,9 @@
  * @module svelte-adapter-uws-extensions/redis/functions
  */
 
-const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
+import { parseRedisVersion } from '../shared/redis-version.js';
 
-function parseRedisVersion(info) {
-	if (typeof info !== 'string') return null;
-	const m = info.match(/^redis_version:([0-9.]+)/m);
-	if (!m) return null;
-	const major = parseInt(m[1].split('.')[0], 10);
-	return Number.isFinite(major) ? major : null;
-}
+const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
 
 /**
  * @typedef {Object} FunctionLibraryOptions

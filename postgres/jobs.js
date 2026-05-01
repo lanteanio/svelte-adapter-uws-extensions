@@ -28,6 +28,8 @@
  * @module svelte-adapter-uws-extensions/postgres/jobs
  */
 
+import { safeCreate } from '../shared/pg-migrate.js';
+
 /**
  * @typedef {Object} JobQueueOptions
  * @property {string} [table='svti_jobs']
@@ -72,23 +74,9 @@ export function createJobQueue(client, options = {}) {
 
 	let migrated = false;
 
-	async function safeCreate(ddl) {
-		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
-		// both connections pass the existence check, both run the create,
-		// the loser raises one of these codes. The object exists either way.
-		// Per-statement so a race on the first DDL does not skip later ones.
-		try {
-			await client.query(ddl);
-		} catch (err) {
-			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
-				throw err;
-			}
-		}
-	}
-
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${table} (
 				svti_jobs_id  BIGSERIAL   PRIMARY KEY,
 				queue         TEXT        NOT NULL,
@@ -99,12 +87,12 @@ export function createJobQueue(client, options = {}) {
 				created_at    TIMESTAMPTZ DEFAULT now()
 			)
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
 			    ON ${table} (queue, svti_jobs_id)
 			    WHERE claimed_at IS NULL
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_visibility
 			    ON ${table} (claimed_until)
 			    WHERE claimed_at IS NOT NULL

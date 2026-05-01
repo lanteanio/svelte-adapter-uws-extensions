@@ -18,28 +18,15 @@
 
 import { randomBytes } from 'node:crypto';
 import { CLEANUP_SCRIPT } from '../shared/scripts.js';
+import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
+import { scanAndUnlink } from '../shared/redis-scan.js';
 
-const SENSITIVE_STRIP_RE = /token|secret|password|auth|session|cookie|jwt|credential/i;
-
-function stripInternal(obj, ancestors) {
-	if (!obj || typeof obj !== 'object') return obj;
-	if (!ancestors) ancestors = new WeakSet();
-	if (ancestors.has(obj)) return undefined;
-	ancestors.add(obj);
-	let result;
-	if (Array.isArray(obj)) {
-		result = obj.map((v) => stripInternal(v, ancestors));
-	} else {
-		result = {};
-		for (const k of Object.keys(obj)) {
-			if (k.startsWith('__') || SENSITIVE_STRIP_RE.test(k)) continue;
-			const v = obj[k];
-			result[k] = (v && typeof v === 'object') ? stripInternal(v, ancestors) : v;
-		}
-	}
-	ancestors.delete(obj);
-	return result;
-}
+/** Wire-protocol event names this module emits. */
+const EVENTS = Object.freeze({
+	UPDATE: 'update',
+	REMOVE: 'remove',
+	BULK: 'bulk'
+});
 
 /**
  * @typedef {Object} RedisCursorOptions
@@ -107,35 +94,7 @@ export function createCursor(client, options = {}) {
 	const mBroadcasts = m?.counter('cursor_broadcasts_total', 'Cursor broadcasts sent', ['topic']);
 	const mThrottled = m?.counter('cursor_throttled_total', 'Cursor updates deferred by throttle', ['topic']);
 
-	const SENSITIVE_RE = /token|secret|password|key|auth|session|cookie|jwt|credential/i;
-	let sensitiveWarned = false;
-
-	function warnSensitive(data, depth) {
-		if (sensitiveWarned || !data || typeof data !== 'object') return;
-		if (depth === undefined) depth = 0;
-		if (depth > 3) return;
-		if (Array.isArray(data)) {
-			for (let i = 0; i < data.length; i++) {
-				warnSensitive(data[i], depth + 1);
-				if (sensitiveWarned) return;
-			}
-			return;
-		}
-		for (const k of Object.keys(data)) {
-			if (SENSITIVE_RE.test(k)) {
-				console.warn(
-					`[redis/cursor] userData key "${k}" looks sensitive — ` +
-					'use the select option to strip it before broadcasting'
-				);
-				sensitiveWarned = true;
-				return;
-			}
-			if (typeof data[k] === 'object' && data[k] !== null) {
-				warnSensitive(data[k], depth + 1);
-				if (sensitiveWarned) return;
-			}
-		}
-	}
+	const warnSensitive = createSensitiveWarner('redis/cursor');
 
 	let connCounter = 0;
 
@@ -201,17 +160,17 @@ export function createCursor(client, options = {}) {
 						if (!all || !activePlatform) return;
 						const now = Date.now();
 						const entries = [];
-						for (const [key, v] of Object.entries(all)) {
+						for (const key of Object.keys(all)) {
 							if (key.startsWith(instanceId + ':')) continue;
 							try {
-								const parsed = JSON.parse(v);
+								const parsed = JSON.parse(all[key]);
 								if (parsed.ts && (now - parsed.ts) <= cursorTtlMs) {
 									entries.push({ key, user: parsed.user, data: parsed.data });
 								}
 							} catch { /* skip */ }
 						}
 						if (entries.length > 0 && activePlatform) {
-							activePlatform.publish('__cursor:' + topic, 'bulk', entries, { relay: false });
+							activePlatform.publish('__cursor:' + topic, EVENTS.BULK, entries, { relay: false });
 						}
 					}).catch(() => {});
 				}
@@ -292,7 +251,7 @@ export function createCursor(client, options = {}) {
 	function doBroadcast(topic, key, user, data, platform) {
 		mBroadcasts?.inc({ topic: mt(topic) });
 		const payload = { key, user, data };
-		platform.publish('__cursor:' + topic, 'update', payload);
+		platform.publish('__cursor:' + topic, EVENTS.UPDATE, payload);
 
 		if (b) { try { b.guard(); } catch { return; } }
 		const now = Date.now();
@@ -301,7 +260,7 @@ export function createCursor(client, options = {}) {
 		pipe.expire(hashKey(topic), cursorTtl);
 		pipe.exec().then(() => {
 			b?.success();
-			const relayMsg = JSON.stringify({ instanceId, topic, event: 'update', payload });
+			const relayMsg = JSON.stringify({ instanceId, topic, event: EVENTS.UPDATE, payload });
 			if (subscriberReady) {
 				subscriberReady.then(() => redis.publish(channel, relayMsg).catch(() => {}));
 			} else {
@@ -337,13 +296,13 @@ export function createCursor(client, options = {}) {
 		pipe.expire(hashKey(topic), cursorTtl);
 
 		if (flushPlatform) {
-			flushPlatform.publish('__cursor:' + topic, 'bulk', entries);
+			flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
 		}
 
 		pipe.exec().then(() => {
 			b?.success();
 			if (flushPlatform) {
-				const relayMsg = JSON.stringify({ instanceId, topic, event: 'bulk', payload: entries });
+				const relayMsg = JSON.stringify({ instanceId, topic, event: EVENTS.BULK, payload: entries });
 				if (subscriberReady) {
 					subscriberReady.then(() => redis.publish(channel, relayMsg).catch(() => {}));
 				} else {
@@ -416,12 +375,12 @@ export function createCursor(client, options = {}) {
 			return false;
 		}
 
-		platform.publish('__cursor:' + topic, 'remove', { key });
+		platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key });
 
 		const msg = JSON.stringify({
 			instanceId,
 			topic,
-			event: 'remove',
+			event: EVENTS.REMOVE,
 			payload: { key }
 		});
 		if (subscriberReady) {
@@ -551,7 +510,7 @@ export function createCursor(client, options = {}) {
 			for (const t of removedTopics) {
 				pipe.hdel(hashKey(t), state.key);
 				pipe.publish(channel, JSON.stringify({
-					instanceId, topic: t, event: 'remove', payload: { key: state.key }
+					instanceId, topic: t, event: EVENTS.REMOVE, payload: { key: state.key }
 				}));
 			}
 
@@ -564,7 +523,7 @@ export function createCursor(client, options = {}) {
 			}
 
 			for (const t of removedTopics) {
-				platform.publish('__cursor:' + t, 'remove', { key: state.key });
+				platform.publish('__cursor:' + t, EVENTS.REMOVE, { key: state.key });
 				const topicMap = topics.get(t);
 				if (topicMap) {
 					topicMap.delete(state.key);
@@ -587,7 +546,7 @@ export function createCursor(client, options = {}) {
 			const cursors = await this.list(topic);
 			if (cursors.length > 0) {
 				try {
-					platform.send(ws, '__cursor:' + topic, 'bulk', cursors);
+					platform.send(ws, '__cursor:' + topic, EVENTS.BULK, cursors);
 				} catch {
 					// WebSocket closed before send
 				}
@@ -607,15 +566,12 @@ export function createCursor(client, options = {}) {
 			const result = [];
 			const now = Date.now();
 			const ttlMs = cursorTtl * 1000;
-			for (const [key, v] of Object.entries(all)) {
+			for (const key of Object.keys(all)) {
 				try {
-					const parsed = JSON.parse(v);
-					// Filter out stale or timestamp-less entries
+					const parsed = JSON.parse(all[key]);
 					if (!parsed.ts || (now - parsed.ts) > ttlMs) continue;
 					result.push({ key, user: parsed.user, data: parsed.data });
-				} catch {
-					// Corrupted entry, skip
-				}
+				} catch { /* corrupted entry */ }
 			}
 			return result;
 		},
@@ -623,15 +579,7 @@ export function createCursor(client, options = {}) {
 		async clear() {
 			b?.guard();
 			try {
-				const pattern = client.key('cursor:*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) {
-						await redis.unlink(...keys);
-					}
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key('cursor:*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

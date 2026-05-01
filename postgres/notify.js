@@ -88,6 +88,7 @@ export function createNotifyBridge(client, options) {
 	}
 
 	const channel = options.channel;
+	const quotedChannel = '"' + channel.replace(/"/g, '""') + '"';
 	const autoReconnect = options.autoReconnect !== false;
 	const reconnectInterval = options.reconnectInterval ?? 3000;
 	if (typeof reconnectInterval !== 'number' || !Number.isFinite(reconnectInterval) || reconnectInterval < 0) {
@@ -185,9 +186,7 @@ export function createNotifyBridge(client, options) {
 			conn.on('error', handleError);
 			await conn.connect();
 
-			// pg requires channel name to be a valid identifier or quoted
-			// Use double-quoting to handle any channel name safely
-			await conn.query(`LISTEN "${channel.replace(/"/g, '""')}"`);
+			await conn.query(`LISTEN ${quotedChannel}`);
 			b?.success();
 		} catch (err) {
 			b?.failure(err);
@@ -238,10 +237,10 @@ export function createNotifyBridge(client, options) {
 			const acquired = res.rows[0]?.acquired === true;
 			if (acquired && !isLeader) {
 				conn.on('notification', onNotification);
-				await conn.query(`LISTEN "${channel.replace(/"/g, '""')}"`);
+				await conn.query(`LISTEN ${quotedChannel}`);
 				isLeader = true;
 			} else if (!acquired && isLeader) {
-				try { await conn.query(`UNLISTEN "${channel.replace(/"/g, '""')}"`); } catch { /* ignore */ }
+				try { await conn.query(`UNLISTEN ${quotedChannel}`); } catch { /* ignore */ }
 				conn.removeListener('notification', onNotification);
 				isLeader = false;
 			}
@@ -333,7 +332,7 @@ export function createNotifyBridge(client, options) {
 				// when this replica is the leader.
 				if (!advisory || isLeader) {
 					try {
-						await conn.query(`UNLISTEN "${channel.replace(/"/g, '""')}"`);
+						await conn.query(`UNLISTEN ${quotedChannel}`);
 					} catch {
 						// Connection may already be dead
 					}

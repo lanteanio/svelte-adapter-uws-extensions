@@ -19,7 +19,8 @@
  * @module svelte-adapter-uws-extensions/redis/replay-stream
  */
 
-import { ReplicationTimeoutError } from './replay.js';
+import { scanAndUnlink } from '../shared/redis-scan.js';
+import { parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 
 /**
  * Lua script for atomic idempotent publish.
@@ -125,40 +126,9 @@ function seqFromId(id) {
  * @returns {import('./replay.js').RedisReplayBuffer}
  */
 export function createStreamReplay(client, options = {}) {
-	if (options.size !== undefined) {
-		if (typeof options.size !== 'number' || options.size < 1 || !Number.isInteger(options.size)) {
-			throw new Error(`redis stream replay: size must be a positive integer, got ${options.size}`);
-		}
-	}
-	if (options.ttl !== undefined) {
-		if (typeof options.ttl !== 'number' || options.ttl < 0 || !Number.isInteger(options.ttl)) {
-			throw new Error(`redis stream replay: ttl must be a non-negative integer, got ${options.ttl}`);
-		}
-	}
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs } =
+		parseReplayOptions('redis stream replay', options);
 
-	const replicated = options.durability === 'replicated';
-	if (options.durability !== undefined && options.durability !== 'replicated') {
-		throw new Error(`redis stream replay: durability must be 'replicated' or undefined, got ${options.durability}`);
-	}
-	let minReplicas = 1;
-	let replicationTimeoutMs = 1000;
-	if (replicated) {
-		if (options.minReplicas !== undefined) {
-			if (typeof options.minReplicas !== 'number' || !Number.isInteger(options.minReplicas) || options.minReplicas < 1) {
-				throw new Error(`redis stream replay: minReplicas must be a positive integer, got ${options.minReplicas}`);
-			}
-			minReplicas = options.minReplicas;
-		}
-		if (options.replicationTimeoutMs !== undefined) {
-			if (typeof options.replicationTimeoutMs !== 'number' || !Number.isInteger(options.replicationTimeoutMs) || options.replicationTimeoutMs < 0) {
-				throw new Error(`redis stream replay: replicationTimeoutMs must be a non-negative integer, got ${options.replicationTimeoutMs}`);
-			}
-			replicationTimeoutMs = options.replicationTimeoutMs;
-		}
-	}
-
-	const maxSize = options.size || 1000;
-	const ttl = options.ttl || 0;
 	const defaultIdempotencyTtl = options.idempotencyTtl !== undefined
 		? options.idempotencyTtl
 		: 48 * 60 * 60;
@@ -236,18 +206,7 @@ export function createStreamReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				let ack;
-				try {
-					ack = await redis.wait(minReplicas, replicationTimeoutMs);
-				} catch (err) {
-					b?.failure(err);
-					throw err;
-				}
-				if (ack < minReplicas) {
-					mReplicationTimeouts?.inc();
-					throw new ReplicationTimeoutError(ack, minReplicas, replicationTimeoutMs);
-				}
-				mReplications?.inc();
+				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			await platform.publish(topic, event, data);
@@ -272,18 +231,7 @@ export function createStreamReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				let ack;
-				try {
-					ack = await redis.wait(minReplicas, replicationTimeoutMs);
-				} catch (err) {
-					b?.failure(err);
-					throw err;
-				}
-				if (ack < minReplicas) {
-					mReplicationTimeouts?.inc();
-					throw new ReplicationTimeoutError(ack, minReplicas, replicationTimeoutMs);
-				}
-				mReplications?.inc();
+				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			return platform.publish(topic, event, data);
@@ -425,13 +373,7 @@ export function createStreamReplay(client, options = {}) {
 		async clear() {
 			if (b) b.guard();
 			try {
-				const pattern = client.key('replay:*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) await redis.unlink(...keys);
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key('replay:*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

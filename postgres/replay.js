@@ -27,6 +27,8 @@
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
 
+import { safeCreate } from '../shared/pg-migrate.js';
+
 /**
  * @typedef {Object} PgReplayOptions
  * @property {string} [table='svti_replay'] - Table name
@@ -89,23 +91,9 @@ export function createReplay(client, options = {}) {
 
 	let migrated = false;
 
-	async function safeCreate(ddl) {
-		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
-		// both connections pass the existence check, both run the create,
-		// the loser raises one of these codes. The object exists either way.
-		// Per-statement so a race on the first DDL does not skip later ones.
-		try {
-			await client.query(ddl);
-		} catch (err) {
-			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
-				throw err;
-			}
-		}
-	}
-
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${table} (
 				${pkCol} BIGSERIAL   PRIMARY KEY,
 				topic    TEXT        NOT NULL,
@@ -115,10 +103,10 @@ export function createReplay(client, options = {}) {
 				created_at TIMESTAMPTZ DEFAULT now()
 			)
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
-		await safeCreate(`
+		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
 				seq   BIGINT NOT NULL DEFAULT 0

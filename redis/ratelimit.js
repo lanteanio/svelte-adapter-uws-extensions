@@ -11,6 +11,8 @@
  * @module svelte-adapter-uws-extensions/redis/ratelimit
  */
 
+import { scanAndUnlink } from '../shared/redis-scan.js';
+
 /**
  * Lua script for atomic token bucket consumption.
  *
@@ -277,15 +279,7 @@ export function createRateLimit(client, options) {
 		async clear() {
 			if (b) b.guard();
 			try {
-				const pattern = client.key(SCRIPT_VERSION + ':ratelimit:*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) {
-						await redis.unlink(...keys);
-					}
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

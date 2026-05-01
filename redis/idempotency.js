@@ -26,6 +26,8 @@
  * @module svelte-adapter-uws-extensions/redis/idempotency
  */
 
+import { scanAndUnlink } from '../shared/redis-scan.js';
+
 /**
  * Lua script for atomic acquire.
  *
@@ -202,15 +204,7 @@ export function createIdempotencyStore(client, options = {}) {
 		async clear() {
 			b?.guard();
 			try {
-				const pattern = client.key(keyPrefix + '*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) {
-						await redis.unlink(...keys);
-					}
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key(keyPrefix + '*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

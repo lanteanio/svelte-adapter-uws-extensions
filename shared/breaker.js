@@ -140,7 +140,7 @@ export function createCircuitBreaker(options = {}) {
 		},
 
 		failure() {
-			failures++;
+			if (failures < failureThreshold) failures++;
 			if (state === 'probing') {
 				transition('broken');
 				scheduleProbe();

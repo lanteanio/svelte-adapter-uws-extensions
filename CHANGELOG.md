@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Race-safe `CREATE TABLE IF NOT EXISTS`.** Concurrent first-use of a fresh module instance no longer fails on `pg_class_relname_nsp_index` collisions when two connections both pass the existence check. Each `CREATE TABLE` / `CREATE INDEX` is wrapped per-statement in a try/catch for SQLSTATE `23505`, `42P07`, `42710`. Affects `replay`, `idempotency`, `jobs`, `tasks`.
 - **TOCTOU fix in Redis `presence.destroy()` and `groups.destroy()`.** `subscriber` is now captured into a local before being nulled, so a `subscriber.quit()` rejection that fires after the null assignment no longer throws `TypeError` from inside the `.catch()` handler.
 
+### Performance
+
+- **Presence join: stringify userData once and reuse for the local cache.** The validation pass that called `JSON.stringify(data)` and discarded the result now keeps the serialized output for the topic-data cache write. About 25% off the per-call cost of the join hot path on a typical payload.
+- **Sorted-set replay: `replay(ws, topic, sinceSeq)` no longer fetches the entire buffer.** Replaced `ZRANGEBYSCORE -inf +inf` plus a double scan with a single pipeline of `ZRANGE 0 9` (oldest-entry probe, 10-entry head so corrupt leaders still surface a valid oldest seq) plus `ZRANGEBYSCORE sinceSeq+1 +inf` (only what the client missed). Same single round-trip. About 99% faster on the common case (client behind by a few of N buffered messages), neutral when the client missed everything. Network bandwidth now scales with miss size rather than buffer size.
+- **Cursor and presence snapshot loops: `for (const key of Object.keys(all))`** in place of `Object.entries(all)`. Drops the per-iteration `[k, v]` tuple allocation. 20 to 30 percent faster on hgetall snapshot iteration.
+- **Sharded pub/sub `close` hook: `Promise.all` parallel unfollow.** Sequential await per followed topic was a needless serialization on disconnect. Each unfollow's synchronous portion is atomic across the await point so concurrent calls do not race.
+
+### Fixed
+
+- **Circuit breaker: `failures` counter no longer grows unbounded after broken state.** `failure()` increments are now capped at `failureThreshold`, so the gauge stays meaningful as "consecutive failures" instead of climbing into the millions during sustained outages. State transitions are unchanged.
+
+### Internal
+
+- **Cross-module duplication consolidated under `shared/`.** New files: `pg-migrate.js` (`safeCreate(client, ddl)` for race-tolerant DDL across the four postgres modules), `redis-scan.js` (`scanAndUnlink(redis, pattern)` for admin-path key cleanup across six redis modules), `redis-version.js` (`parseRedisVersion(info)`), `sensitive.js` (`stripInternal` and `createSensitiveWarner` shared between `redis/cursor` and `redis/presence`), `replay-helpers.js` (`parseReplayOptions(prefix, options)` and `awaitReplication(...)` plus the `ReplicationTimeoutError` class shared between the sorted-set and stream replay backends). `redis/replay` re-exports `ReplicationTimeoutError` so existing imports continue to work. Net 200 plus lines deleted.
+- **Presence `leave()` split into `leaveTopic(ws, platform, topic)` and `leaveAll(ws, platform)`.** The 261-line method became a 2-line dispatcher plus two focused helpers. No behavior change.
+- **Stringly-typed event names lifted to `EVENTS` constants** in `redis/cursor`, `redis/presence`, and `redis/groups`. Wire strings are unchanged; the constants prevent typos at new emit sites.
+- **Postgres notify: precompute `quotedChannel` once** at factory entry instead of reapplying `replace(/"/g, '""')` on every LISTEN and UNLISTEN.
+- **Mock Redis: added `zrange(key, start, stop)`** to `testing/mock-redis.js` to support the new replay pipeline path. Additive; no existing mock consumer breaks.
+
 ### Migration
 
 Existing deployments with default table names need to either:

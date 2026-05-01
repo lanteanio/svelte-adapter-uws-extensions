@@ -22,6 +22,15 @@ import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
+/** Wire-protocol event names this module emits. */
+const EVENTS = Object.freeze({
+	JOIN: 'join',
+	LEAVE: 'leave',
+	CLOSE: 'close',
+	MEMBERS: 'members',
+	ROLE_FILTERED: '__role_filtered'
+});
+
 /**
  * Lua script for atomic join: check closed flag, check capacity
  * (excluding stale entries), clean up stale entries, and insert
@@ -209,16 +218,16 @@ export function createGroup(client, name, options = {}) {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
 				if (subscribedPlatform) {
-					if (parsed.event === '__role_filtered') {
+					if (parsed.event === EVENTS.ROLE_FILTERED) {
 						const { event, data, role } = parsed.data;
 						for (const [ws, entry] of localMembers) {
 							if (entry.role === role) {
 								subscribedPlatform.send(ws, internalTopic, event, data);
 							}
 						}
-					} else if (parsed.event === 'close') {
+					} else if (parsed.event === EVENTS.CLOSE) {
 						isClosed = true;
-						subscribedPlatform.publish(internalTopic, 'close', parsed.data, { relay: false });
+						subscribedPlatform.publish(internalTopic, EVENTS.CLOSE, parsed.data, { relay: false });
 						for (const [ws] of localMembers) {
 							try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 						}
@@ -363,8 +372,8 @@ export function createGroup(client, name, options = {}) {
 			// Publish join event only after the snapshot succeeded.
 			// This prevents orphaned join events when the snapshot step
 			// fails, eliminating the need for compensating leave events.
-			platform.publish(internalTopic, 'join', { role });
-			await publishEvent('join', { role }).catch(() => {});
+			platform.publish(internalTopic, EVENTS.JOIN, { role });
+			await publishEvent(EVENTS.JOIN, { role }).catch(() => {});
 
 			const freshNow = Date.now();
 			const membersList = [];
@@ -377,7 +386,7 @@ export function createGroup(client, name, options = {}) {
 				} catch { /* skip corrupted */ }
 			}
 			try {
-				platform.send(ws, internalTopic, 'members', membersList);
+				platform.send(ws, internalTopic, EVENTS.MEMBERS, membersList);
 			} catch {
 				// ws closed after subscribe
 			}
@@ -411,8 +420,8 @@ export function createGroup(client, name, options = {}) {
 
 			mGroupLeaves?.inc({ group: name });
 			const leavePayload = { role: entry.role };
-			platform.publish(internalTopic, 'leave', leavePayload);
-			await publishEvent('leave', leavePayload).catch(() => {});
+			platform.publish(internalTopic, EVENTS.LEAVE, leavePayload);
+			await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
 
 			if (onLeave) onLeave(ws, entry.role);
 		},
@@ -436,7 +445,7 @@ export function createGroup(client, name, options = {}) {
 			}
 			// For remote instances, publish with role filter info
 			// Remote subscriber handler will filter by role locally
-			await publishEvent('__role_filtered', { event, data, role }).catch(() => {});
+			await publishEvent(EVENTS.ROLE_FILTERED, { event, data, role }).catch(() => {});
 		},
 
 		send(platform, ws, event, data) {
@@ -477,8 +486,8 @@ export function createGroup(client, name, options = {}) {
 				const alreadyClosed = await redis.get(closedKey);
 				if (alreadyClosed === '1') {
 					isClosed = true;
-					platform.publish(internalTopic, 'close', null);
-					await publishEvent('close', null);
+					platform.publish(internalTopic, EVENTS.CLOSE, null);
+					await publishEvent(EVENTS.CLOSE, null);
 					for (const [ws] of localMembers) {
 						try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 					}
@@ -492,8 +501,8 @@ export function createGroup(client, name, options = {}) {
 				await redis.set(closedKey, '1');
 				isClosed = true;
 
-				platform.publish(internalTopic, 'close', null);
-				await publishEvent('close', null);
+				platform.publish(internalTopic, EVENTS.CLOSE, null);
+				await publishEvent(EVENTS.CLOSE, null);
 
 				for (const [ws] of localMembers) {
 					try { ws.unsubscribe(internalTopic); } catch { /* closed */ }

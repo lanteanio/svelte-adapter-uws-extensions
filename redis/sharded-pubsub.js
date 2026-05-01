@@ -23,6 +23,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { parseRedisVersion } from '../shared/redis-version.js';
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -39,14 +40,6 @@ import { randomBytes } from 'node:crypto';
  * @property {(topic: string) => Promise<void>} unfollow
  * @property {{ subscribe: Function, unsubscribe: Function, close: Function }} hooks
  */
-
-function parseRedisVersion(info) {
-	if (typeof info !== 'string') return null;
-	const m = info.match(/^redis_version:([0-9.]+)/m);
-	if (!m) return null;
-	const major = parseInt(m[1].split('.')[0], 10);
-	return Number.isFinite(major) ? major : null;
-}
 
 /**
  * Create a sharded Redis pub/sub bus.
@@ -338,9 +331,9 @@ export function createShardedBus(client, options = {}) {
 				const topics = wsFollows.get(ws);
 				if (!topics) return;
 				wsFollows.delete(ws);
-				for (const t of topics) {
-					await unfollow(t);
-				}
+				const pending = [];
+				for (const t of topics) pending.push(unfollow(t));
+				await Promise.all(pending);
 			}
 		}
 	};

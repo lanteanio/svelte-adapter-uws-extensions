@@ -82,6 +82,15 @@ export function mockRedisClient(keyPrefix = '') {
 				const set = sortedSets.get(key);
 				return set ? set.length : 0;
 			},
+			async zrange(key, start, stop) {
+				const set = sortedSets.get(key);
+				if (!set) return [];
+				const len = set.length;
+				const s = start < 0 ? Math.max(0, len + start) : Math.min(start, len);
+				const e = stop < 0 ? len + stop : Math.min(stop, len - 1);
+				if (s > e) return [];
+				return set.slice(s, e + 1).map((entry) => entry.member);
+			},
 			async zrangebyscore(key, min, max, ...extra) {
 				const set = sortedSets.get(key);
 				if (!set) return [];

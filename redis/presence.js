@@ -20,6 +20,8 @@
 import { randomBytes } from 'node:crypto';
 import { now as cachedNow } from '../shared/time.js';
 import { CLEANUP_SCRIPT, COUNT_DEDUP_SCRIPT, LIST_SCRIPT } from '../shared/scripts.js';
+import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
+import { scanAndUnlink } from '../shared/redis-scan.js';
 
 /**
  * Lua script for atomic join: set this instance's field and expire the key.
@@ -85,27 +87,14 @@ end
 return 1
 `;
 
-const SENSITIVE_STRIP_RE = /token|secret|password|auth|session|cookie|jwt|credential/i;
-
-function stripInternal(obj, ancestors) {
-	if (!obj || typeof obj !== 'object') return obj;
-	if (!ancestors) ancestors = new WeakSet();
-	if (ancestors.has(obj)) return undefined;
-	ancestors.add(obj);
-	let result;
-	if (Array.isArray(obj)) {
-		result = obj.map((v) => stripInternal(v, ancestors));
-	} else {
-		result = {};
-		for (const k of Object.keys(obj)) {
-			if (k.startsWith('__') || SENSITIVE_STRIP_RE.test(k)) continue;
-			const v = obj[k];
-			result[k] = (v && typeof v === 'object') ? stripInternal(v, ancestors) : v;
-		}
-	}
-	ancestors.delete(obj);
-	return result;
-}
+/** Wire-protocol event names this module emits. */
+const EVENTS = Object.freeze({
+	JOIN: 'join',
+	LEAVE: 'leave',
+	UPDATED: 'updated',
+	LIST: 'list',
+	HEARTBEAT: 'heartbeat'
+});
 
 /**
  * @typedef {Object} RedisPresenceOptions
@@ -179,35 +168,7 @@ export function createPresence(client, options = {}) {
 	let staleCleanedTotal = 0;
 	let keyspaceSubscribed = false;
 
-	const SENSITIVE_RE = /token|secret|password|key|auth|session|cookie|jwt|credential/i;
-	let sensitiveWarned = false;
-
-	function warnSensitive(data, depth) {
-		if (sensitiveWarned || !data || typeof data !== 'object') return;
-		if (depth === undefined) depth = 0;
-		if (depth > 3) return;
-		if (Array.isArray(data)) {
-			for (let i = 0; i < data.length; i++) {
-				warnSensitive(data[i], depth + 1);
-				if (sensitiveWarned) return;
-			}
-			return;
-		}
-		for (const k of Object.keys(data)) {
-			if (SENSITIVE_RE.test(k)) {
-				console.warn(
-					`[redis/presence] userData key "${k}" looks sensitive — ` +
-					'use the select option to strip it before broadcasting'
-				);
-				sensitiveWarned = true;
-				return;
-			}
-			if (typeof data[k] === 'object' && data[k] !== null) {
-				warnSensitive(data[k], depth + 1);
-				if (sensitiveWarned) return;
-			}
-		}
-	}
+	const warnSensitive = createSensitiveWarner('redis/presence');
 
 	let connCounter = 0;
 
@@ -304,23 +265,18 @@ export function createPresence(client, options = {}) {
 	 */
 	function parseEntries(all) {
 		const now = cachedNow();
-		const seen = new Map(); // userKey -> { data, ts }
-		for (const [field, v] of Object.entries(all)) {
+		const seen = new Map();
+		for (const field of Object.keys(all)) {
 			try {
-				const parsed = JSON.parse(v);
-				// Filter stale or timestamp-less entries
+				const parsed = JSON.parse(all[field]);
 				if (!parsed.ts || (now - parsed.ts) > presenceTtlMs) continue;
-				// Extract userKey from compound field
 				const sep = field.indexOf('|');
 				const userKey = sep !== -1 ? field.slice(sep + 1) : field;
-				// Keep the most recent entry per userKey
 				const existing = seen.get(userKey);
 				if (!existing || (parsed.ts || 0) > (existing.ts || 0)) {
 					seen.set(userKey, parsed);
 				}
-			} catch {
-				// Corrupted entry, skip
-			}
+			} catch { /* corrupted entry */ }
 		}
 		return seen;
 	}
@@ -382,7 +338,7 @@ export function createPresence(client, options = {}) {
 
 			if (activePlatform && data && data.size > 0) {
 				const keys = [...data.keys()];
-				activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
+				activePlatform.publish('__presence:' + topic, EVENTS.HEARTBEAT, keys);
 			}
 		}
 		pipe.exec().catch(() => {});
@@ -430,7 +386,7 @@ export function createPresence(client, options = {}) {
 					if (expiredKey.startsWith(eventsPrefix)) return;
 					const topic = expiredKey.slice(presencePrefix.length);
 					if (activePlatform) {
-						activePlatform.publish('__presence:' + topic, 'list', []);
+						activePlatform.publish('__presence:' + topic, EVENTS.LIST, []);
 						mKeyspaceCleanups?.inc();
 					}
 				});
@@ -534,11 +490,269 @@ export function createPresence(client, options = {}) {
 		if (didPublishJoin) {
 			mLeaves?.inc({ topic: mt(topic) });
 			const payload = { key, data };
-			platform.publish('__presence:' + topic, 'leave', payload);
-			await publishEvent(topic, 'leave', payload);
+			platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
+			await publishEvent(topic, EVENTS.LEAVE, payload);
 		}
 		if (!localCounts.has(topic) && !syncCounts.has(topic)) {
 			await unsubscribeFromTopic(topic);
+		}
+	}
+
+	async function leaveTopic(ws, platform, topic) {
+		const connTopics = wsTopics.get(ws);
+		if (connTopics && connTopics.has(topic)) {
+			const { key, data } = connTopics.get(topic);
+			connTopics.delete(topic);
+			if (connTopics.size === 0) wsTopics.delete(ws);
+
+			try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+
+			const counts = localCounts.get(topic);
+			if (counts) {
+				const current = counts.get(key) || 0;
+				if (current <= 1) {
+					counts.delete(key);
+
+					const topicData = localData.get(topic);
+					if (topicData) {
+						topicData.delete(key);
+						if (topicData.size === 0) localData.delete(topic);
+					}
+
+					if (counts.size === 0) {
+						localCounts.delete(topic);
+						activeTopics.delete(topic);
+						if (!syncCounts.has(topic)) {
+							await unsubscribeFromTopic(topic);
+						}
+					}
+
+					const field = compoundField(key);
+					const suffix = '|' + key;
+					const now = Date.now();
+					let userGone = -1;
+					let skipLeaveRedis = false;
+					if (b) { try { b.guard(); } catch { skipLeaveRedis = true; } }
+					if (!skipLeaveRedis) {
+						try {
+							userGone = await redis.eval(
+								LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
+							);
+							b?.success();
+						} catch (err) {
+							b?.failure(err);
+						}
+					}
+
+					if (userGone === 1) {
+						mLeaves?.inc({ topic: mt(topic) });
+						const payload = { key, data };
+						platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
+						await publishEvent(topic, EVENTS.LEAVE, payload);
+					}
+				} else {
+					counts.set(key, current - 1);
+					const topicData = localData.get(topic);
+					if (topicData) {
+						let newest = null;
+						for (const [otherWs, otherTopics] of wsTopics) {
+							if (otherWs === ws) continue;
+							const entry = otherTopics.get(topic);
+							if (entry && entry.key === key) newest = entry.data;
+						}
+						const cached = topicData.get(key);
+						if (newest && cached && !deepEqual(newest, cached.data)) {
+							const ser = JSON.stringify(newest);
+							topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
+							const now = Date.now();
+							try {
+								await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
+								const payload = { key, data: newest };
+								platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
+								publishEvent(topic, EVENTS.UPDATED, payload);
+							} catch {
+								topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
+							}
+						}
+					}
+				}
+			}
+		}
+
+		const syncTopics = syncObservers.get(ws);
+		if (syncTopics && syncTopics.has(topic)) {
+			syncTopics.delete(topic);
+			if (syncTopics.size === 0) syncObservers.delete(ws);
+
+			try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+
+			const count = (syncCounts.get(topic) || 1) - 1;
+			if (count <= 0) {
+				syncCounts.delete(topic);
+				if (!localCounts.has(topic)) {
+					await unsubscribeFromTopic(topic);
+				}
+			} else {
+				syncCounts.set(topic, count);
+			}
+		}
+	}
+
+	async function leaveAll(ws, platform) {
+		// Phase 1: synchronous cleanup of all local state before any async
+		// work. Prevents the heartbeat from refreshing dead entries and
+		// lets concurrent join() calls detect the closed ws via wsTopics.
+		const connTopics = wsTopics.get(ws);
+		wsTopics.delete(ws);
+
+		const syncTopics = syncObservers.get(ws);
+		syncObservers.delete(ws);
+
+		if (connTopics) {
+			for (const topic of connTopics.keys()) {
+				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+			}
+		}
+		if (syncTopics) {
+			for (const topic of syncTopics) {
+				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+			}
+		}
+
+		/** @type {Array<{ topic: string, key: string, data: Record<string, any>, needsUnsub: boolean }>} */
+		const pendingLeaves = [];
+		const pendingUpdatedRelays = [];
+		const deferredRestores = [];
+
+		if (connTopics) {
+			for (const [topic, { key, data }] of connTopics) {
+				const counts = localCounts.get(topic);
+				if (!counts) continue;
+
+				const current = counts.get(key) || 0;
+				if (current <= 1) {
+					counts.delete(key);
+
+					const topicData = localData.get(topic);
+					if (topicData) {
+						topicData.delete(key);
+						if (topicData.size === 0) localData.delete(topic);
+					}
+
+					let needsUnsub = false;
+					if (counts.size === 0) {
+						localCounts.delete(topic);
+						activeTopics.delete(topic);
+						if (!syncCounts.has(topic)) {
+							needsUnsub = true;
+						}
+					}
+
+					pendingLeaves.push({ topic, key, data, needsUnsub });
+				} else {
+					counts.set(key, current - 1);
+					const topicData = localData.get(topic);
+					if (topicData) {
+						let newest = null;
+						for (const [otherWs, otherTopics] of wsTopics) {
+							const entry = otherTopics.get(topic);
+							if (entry && entry.key === key) newest = entry.data;
+						}
+						const cached = topicData.get(key);
+						if (newest && cached && !deepEqual(newest, cached.data)) {
+							deferredRestores.push({ topic, key, newest, cached });
+						}
+					}
+				}
+			}
+		}
+
+		if (syncTopics) {
+			for (const topic of syncTopics) {
+				const count = (syncCounts.get(topic) || 1) - 1;
+				if (count <= 0) {
+					syncCounts.delete(topic);
+				} else {
+					syncCounts.set(topic, count);
+				}
+			}
+		}
+
+		for (const { topic, key, newest, cached } of deferredRestores) {
+			const topicData = localData.get(topic);
+			if (!topicData) continue;
+			const ser = JSON.stringify(newest);
+			topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
+			const now = Date.now();
+			try {
+				await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
+				const payload = { key, data: newest };
+				platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
+				pendingUpdatedRelays.push(publishEvent(topic, EVENTS.UPDATED, payload));
+			} catch {
+				topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
+			}
+		}
+
+		// Phase 2: async Redis cleanup. Local state is already clean so the
+		// heartbeat will not refresh any of these entries. The pipeline
+		// batches all LEAVE_SCRIPT evals into a single round-trip; under
+		// mass disconnect (1000+ connections) this avoids saturating the
+		// Redis command queue.
+		const unsubPromises = [];
+		for (const { needsUnsub, topic } of pendingLeaves) {
+			if (needsUnsub) {
+				unsubPromises.push(unsubscribeFromTopic(topic));
+			}
+		}
+		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
+
+		const now = Date.now();
+		const pipe = redis.pipeline();
+		for (const { topic, key } of pendingLeaves) {
+			const field = compoundField(key);
+			const suffix = '|' + key;
+			pipe.eval(LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs);
+		}
+
+		let results;
+		let skipPipeline = false;
+		if (b) { try { b.guard(); } catch { skipPipeline = true; } }
+		if (!skipPipeline) {
+			try {
+				results = await pipe.exec();
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+			}
+		}
+
+		// Broadcast leave events only when Redis confirmed the user is
+		// completely gone. If results is null (Redis unavailable or
+		// pipeline failed), suppress all leave broadcasts so we don't
+		// lie to other instances about a user that may still be present
+		// elsewhere.
+		const publishPromises = [];
+		for (let i = 0; i < pendingLeaves.length; i++) {
+			const userGone = results ? (!results[i][0] && results[i][1] === 1) : false;
+			if (!userGone) continue;
+			const { topic, key, data } = pendingLeaves[i];
+			mLeaves?.inc({ topic: mt(topic) });
+			const payload = { key, data };
+			platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
+			publishPromises.push(publishEvent(topic, EVENTS.LEAVE, payload));
+		}
+		if (publishPromises.length > 0) await Promise.all(publishPromises);
+		if (pendingUpdatedRelays.length > 0) await Promise.all(pendingUpdatedRelays);
+
+		if (syncTopics) {
+			const syncUnsubPromises = [];
+			for (const topic of syncTopics) {
+				if (!syncCounts.has(topic) && !localCounts.has(topic)) {
+					syncUnsubPromises.push(unsubscribeFromTopic(topic));
+				}
+			}
+			if (syncUnsubPromises.length > 0) await Promise.all(syncUnsubPromises);
 		}
 	}
 
@@ -554,7 +768,8 @@ export function createPresence(client, options = {}) {
 			const { __subscriptions, remoteAddress, ...safeData } = raw || {};
 			const key = resolveKey(safeData);
 			const data = select(safeData);
-			try { JSON.stringify(data); } catch {
+			let serializedData;
+			try { serializedData = JSON.stringify(data); } catch {
 				throw new Error('redis presence: select() must return JSON-serializable data');
 			}
 			warnSensitive(data);
@@ -643,12 +858,12 @@ export function createPresence(client, options = {}) {
 
 				const td = localData.get(topic);
 				if (td) {
-					td.set(key, { data, serialized: JSON.stringify(data), field: compoundField(key) });
+					td.set(key, { data, serialized: serializedData, field: compoundField(key) });
 				}
 
 				const payload = { key, data };
-				platform.publish('__presence:' + topic, 'updated', payload);
-				await publishEvent(topic, 'updated', payload);
+				platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
+				await publishEvent(topic, EVENTS.UPDATED, payload);
 			}
 
 			let all;
@@ -686,7 +901,7 @@ export function createPresence(client, options = {}) {
 				topicData = new Map();
 				localData.set(topic, topicData);
 			}
-			topicData.set(key, { data, serialized: JSON.stringify(data), field: compoundField(key) });
+			topicData.set(key, { data, serialized: serializedData, field: compoundField(key) });
 			activeTopics.add(topic);
 
 			// Publish join event only after the operation is fully committed.
@@ -695,8 +910,8 @@ export function createPresence(client, options = {}) {
 			if (isNewUser) {
 				mJoins?.inc({ topic: mt(topic) });
 				const payload = { key, data };
-				platform.publish('__presence:' + topic, 'join', payload);
-				await publishEvent(topic, 'join', payload);
+				platform.publish('__presence:' + topic, EVENTS.JOIN, payload);
+				await publishEvent(topic, EVENTS.JOIN, payload);
 			}
 
 			// Send current list to this connection
@@ -706,274 +921,15 @@ export function createPresence(client, options = {}) {
 				list.push({ key: userKey, data: entry.data });
 			}
 			try {
-				platform.send(ws, '__presence:' + topic, 'list', list);
+				platform.send(ws, '__presence:' + topic, EVENTS.LIST, list);
 			} catch {
 				// WebSocket closed before send
 			}
 		},
 
 		async leave(ws, platform, topic) {
-			if (topic !== undefined) {
-				// --- Per-topic leave ---
-				const connTopics = wsTopics.get(ws);
-				if (connTopics && connTopics.has(topic)) {
-					const { key, data } = connTopics.get(topic);
-					connTopics.delete(topic);
-					if (connTopics.size === 0) wsTopics.delete(ws);
-
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
-
-					const counts = localCounts.get(topic);
-					if (counts) {
-						const current = counts.get(key) || 0;
-						if (current <= 1) {
-							counts.delete(key);
-
-							const topicData = localData.get(topic);
-							if (topicData) {
-								topicData.delete(key);
-								if (topicData.size === 0) localData.delete(topic);
-							}
-
-							if (counts.size === 0) {
-								localCounts.delete(topic);
-								activeTopics.delete(topic);
-								if (!syncCounts.has(topic)) {
-									await unsubscribeFromTopic(topic);
-								}
-							}
-
-							const field = compoundField(key);
-							const suffix = '|' + key;
-							const now = Date.now();
-							let userGone = -1;
-							let skipLeaveRedis = false;
-							if (b) { try { b.guard(); } catch { skipLeaveRedis = true; } }
-							if (!skipLeaveRedis) {
-								try {
-									userGone = await redis.eval(
-										LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
-									);
-									b?.success();
-								} catch (err) {
-									b?.failure(err);
-								}
-							}
-
-							if (userGone === 1) {
-								mLeaves?.inc({ topic: mt(topic) });
-								const payload = { key, data };
-								platform.publish('__presence:' + topic, 'leave', payload);
-								await publishEvent(topic, 'leave', payload);
-							}
-						} else {
-							counts.set(key, current - 1);
-							const topicData = localData.get(topic);
-							if (topicData) {
-								let newest = null;
-								for (const [otherWs, otherTopics] of wsTopics) {
-									if (otherWs === ws) continue;
-									const entry = otherTopics.get(topic);
-									if (entry && entry.key === key) newest = entry.data;
-								}
-								const cached = topicData.get(key);
-								if (newest && cached && !deepEqual(newest, cached.data)) {
-									const ser = JSON.stringify(newest);
-									topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
-									const now = Date.now();
-									try {
-										await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
-										const payload = { key, data: newest };
-										platform.publish('__presence:' + topic, 'updated', payload);
-										publishEvent(topic, 'updated', payload);
-									} catch {
-										topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
-									}
-								}
-							}
-						}
-					}
-				}
-
-				// Handle sync-only observer for this topic
-				const syncTopics = syncObservers.get(ws);
-				if (syncTopics && syncTopics.has(topic)) {
-					syncTopics.delete(topic);
-					if (syncTopics.size === 0) syncObservers.delete(ws);
-
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
-
-					const count = (syncCounts.get(topic) || 1) - 1;
-					if (count <= 0) {
-						syncCounts.delete(topic);
-						if (!localCounts.has(topic)) {
-							await unsubscribeFromTopic(topic);
-						}
-					} else {
-						syncCounts.set(topic, count);
-					}
-				}
-
-				return;
-			}
-
-			// --- Leave all topics ---
-			// Phase 1: Synchronous cleanup of ALL local state before any async
-			// work. This prevents the heartbeat from refreshing dead entries and
-			// lets concurrent join() calls detect the closed ws via wsTopics.
-			const connTopics = wsTopics.get(ws);
-			wsTopics.delete(ws);
-
-			const syncTopics = syncObservers.get(ws);
-			syncObservers.delete(ws);
-
-			if (connTopics) {
-				for (const topic of connTopics.keys()) {
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
-				}
-			}
-			if (syncTopics) {
-				for (const topic of syncTopics) {
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
-				}
-			}
-
-			/** @type {Array<{ topic: string, key: string, data: Record<string, any>, needsUnsub: boolean }>} */
-			const pendingLeaves = [];
-			const pendingUpdatedRelays = [];
-			const deferredRestores = [];
-
-			if (connTopics) {
-				for (const [topic, { key, data }] of connTopics) {
-					const counts = localCounts.get(topic);
-					if (!counts) continue;
-
-					const current = counts.get(key) || 0;
-					if (current <= 1) {
-						counts.delete(key);
-
-						const topicData = localData.get(topic);
-						if (topicData) {
-							topicData.delete(key);
-							if (topicData.size === 0) localData.delete(topic);
-						}
-
-						let needsUnsub = false;
-						if (counts.size === 0) {
-							localCounts.delete(topic);
-							activeTopics.delete(topic);
-							if (!syncCounts.has(topic)) {
-								needsUnsub = true;
-							}
-						}
-
-						pendingLeaves.push({ topic, key, data, needsUnsub });
-					} else {
-						counts.set(key, current - 1);
-						const topicData = localData.get(topic);
-						if (topicData) {
-							let newest = null;
-							for (const [otherWs, otherTopics] of wsTopics) {
-								const entry = otherTopics.get(topic);
-								if (entry && entry.key === key) newest = entry.data;
-							}
-							const cached = topicData.get(key);
-							if (newest && cached && !deepEqual(newest, cached.data)) {
-								deferredRestores.push({ topic, key, newest, cached });
-							}
-						}
-					}
-				}
-			}
-
-			if (syncTopics) {
-				for (const topic of syncTopics) {
-					const count = (syncCounts.get(topic) || 1) - 1;
-					if (count <= 0) {
-						syncCounts.delete(topic);
-					} else {
-						syncCounts.set(topic, count);
-					}
-				}
-			}
-
-			for (const { topic, key, newest, cached } of deferredRestores) {
-				const topicData = localData.get(topic);
-				if (!topicData) continue;
-				const ser = JSON.stringify(newest);
-				topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
-				const now = Date.now();
-				try {
-					await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
-					const payload = { key, data: newest };
-					platform.publish('__presence:' + topic, 'updated', payload);
-					pendingUpdatedRelays.push(publishEvent(topic, 'updated', payload));
-				} catch {
-					topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
-				}
-			}
-
-			// Phase 2: Async Redis cleanup. Local state is already clean so
-			// the heartbeat will not refresh any of these entries.
-			// Use a pipeline to batch all LEAVE_SCRIPT EVALs into a single
-			// Redis round trip. Under mass disconnect (1000+ connections)
-			// this avoids overwhelming the Redis command queue.
-			const unsubPromises = [];
-			for (const { needsUnsub, topic } of pendingLeaves) {
-				if (needsUnsub) {
-					unsubPromises.push(unsubscribeFromTopic(topic));
-				}
-			}
-			if (unsubPromises.length > 0) await Promise.all(unsubPromises);
-
-			const now = Date.now();
-			const pipe = redis.pipeline();
-			for (const { topic, key } of pendingLeaves) {
-				const field = compoundField(key);
-				const suffix = '|' + key;
-				pipe.eval(LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs);
-			}
-
-			let results;
-			let skipPipeline = false;
-			if (b) { try { b.guard(); } catch { skipPipeline = true; } }
-			if (!skipPipeline) {
-				try {
-					results = await pipe.exec();
-					b?.success();
-				} catch (err) {
-					b?.failure(err);
-				}
-			}
-
-			// Broadcast leave events only when Redis confirmed the user
-			// is completely gone. If results is null (Redis unavailable
-			// or pipeline failed), suppress all leave broadcasts to avoid
-			// lying to other instances about a user that may still be
-			// present elsewhere.
-			const publishPromises = [];
-			for (let i = 0; i < pendingLeaves.length; i++) {
-				const userGone = results ? (!results[i][0] && results[i][1] === 1) : false;
-				if (!userGone) continue;
-				const { topic, key, data } = pendingLeaves[i];
-				mLeaves?.inc({ topic: mt(topic) });
-				const payload = { key, data };
-				platform.publish('__presence:' + topic, 'leave', payload);
-				publishPromises.push(publishEvent(topic, 'leave', payload));
-			}
-			if (publishPromises.length > 0) await Promise.all(publishPromises);
-			if (pendingUpdatedRelays.length > 0) await Promise.all(pendingUpdatedRelays);
-
-			// Async unsubscribe for sync-only observer topics
-			if (syncTopics) {
-				const syncUnsubPromises = [];
-				for (const topic of syncTopics) {
-					if (!syncCounts.has(topic) && !localCounts.has(topic)) {
-						syncUnsubPromises.push(unsubscribeFromTopic(topic));
-					}
-				}
-				if (syncUnsubPromises.length > 0) await Promise.all(syncUnsubPromises);
-			}
+			if (topic !== undefined) return leaveTopic(ws, platform, topic);
+			return leaveAll(ws, platform);
 		},
 
 		async sync(ws, topic, platform) {
@@ -1011,7 +967,7 @@ export function createPresence(client, options = {}) {
 
 			try {
 				ws.subscribe(presenceTopic);
-				platform.send(ws, presenceTopic, 'list', list);
+				platform.send(ws, presenceTopic, EVENTS.LIST, list);
 			} catch {
 				const topics = syncObservers.get(ws);
 				if (topics && topics.has(topic)) {
@@ -1079,15 +1035,7 @@ export function createPresence(client, options = {}) {
 		async clear() {
 			b?.guard();
 			try {
-				const pattern = client.key('presence:*');
-				let cursor = '0';
-				do {
-					const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-					cursor = nextCursor;
-					if (keys.length > 0) {
-						await redis.unlink(...keys);
-					}
-				} while (cursor !== '0');
+				await scanAndUnlink(redis, client.key('presence:*'));
 				b?.success();
 			} catch (err) {
 				b?.failure(err);
