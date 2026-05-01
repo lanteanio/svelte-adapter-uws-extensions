@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.1] - 2026-05-01
+
 ### Added
 
 - **Idempotency store** (`svelte-adapter-uws-extensions/redis/idempotency` and `svelte-adapter-uws-extensions/postgres/idempotency`). Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Three-state `acquire(key)` returns `acquired` (caller runs the work, then `commit(result)` or `abort()`), `pending` (another caller is mid-flight), or `result` (cached). Two TTLs: `acquireTtl` (default 60s) bounds a pending slot to prevent crashed-owner deadlocks; `ttl` (default 48h) governs result cache lifetime. Redis backend uses a single-round-trip Lua script with `SET NX EX`. Postgres backend uses an atomic `INSERT ... ON CONFLICT DO UPDATE` with `expires_at` and a periodic cleanup sweep. Both backends share the same contract; the adapter's in-memory `createDedup` plugin is the zero-config single-instance fallback. Optional `breaker` and `metrics` options match the rest of the extensions.
