@@ -4,7 +4,7 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface PgReplayOptions {
-	/** Table name. @default 'ws_replay' */
+	/** Table name. @default 'svti_replay' */
 	table?: string;
 	/** Max messages per topic. @default 1000 */
 	size?: number;

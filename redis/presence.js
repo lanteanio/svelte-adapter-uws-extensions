@@ -1128,8 +1128,9 @@ export function createPresence(client, options = {}) {
 				idleTimer = null;
 			}
 			if (subscriber) {
-				subscriber.quit().catch(() => subscriber.disconnect());
+				const sub = subscriber;
 				subscriber = null;
+				sub.quit().catch(() => sub.disconnect());
 			}
 			subscribedChannels.clear();
 			keyspaceSubscribed = false;

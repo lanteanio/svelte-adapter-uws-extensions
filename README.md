@@ -745,7 +745,7 @@ import { pg } from './pg.js';
 import { createReplay } from 'svelte-adapter-uws-extensions/postgres/replay';
 
 export const replay = createReplay(pg, {
-  table: 'ws_replay',
+  table: 'svti_replay',
   size: 1000,
   ttl: 86400,       // 24 hours
   autoMigrate: true  // auto-create table
@@ -757,17 +757,17 @@ export const replay = createReplay(pg, {
 The table is created automatically on first use (if `autoMigrate` is true):
 
 ```sql
-CREATE TABLE IF NOT EXISTS ws_replay (
-  id BIGSERIAL PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS svti_replay (
+  svti_replay_id BIGSERIAL PRIMARY KEY,
   topic TEXT NOT NULL,
   seq BIGINT NOT NULL,
   event TEXT NOT NULL,
   data JSONB,
   created_at TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_ws_replay_topic_seq ON ws_replay (topic, seq);
+CREATE INDEX IF NOT EXISTS idx_svti_replay_topic_seq ON svti_replay (topic, seq);
 
-CREATE TABLE IF NOT EXISTS ws_replay_seq (
+CREATE TABLE IF NOT EXISTS svti_replay_seq (
   topic TEXT PRIMARY KEY,
   seq BIGINT NOT NULL DEFAULT 0
 );
@@ -777,7 +777,7 @@ CREATE TABLE IF NOT EXISTS ws_replay_seq (
 
 | Option | Default | Description |
 |---|---|---|
-| `table` | `'ws_replay'` | Table name |
+| `table` | `'svti_replay'` | Table name |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Row expiry in seconds (0 = never) |
 | `autoMigrate` | `true` | Auto-create table |
@@ -940,8 +940,10 @@ export const jobs = createJobQueue(pg, {
 
 ```js
 // In a request handler:
-await jobs.enqueue('email', { to: 'user@example.com', subject: 'Welcome' });
+const id = await jobs.enqueue('email', { to: 'user@example.com', subject: 'Welcome' });
 ```
+
+`enqueue()` returns the row id verbatim from `pg`, which serialises `BIGINT`/`BIGSERIAL` columns as **strings** by default to avoid precision loss past `Number.MAX_SAFE_INTEGER`. Pass it through to `claim()`/`complete()`/`fail()`/`extend()` as-is. If you want a JS number for logging or comparison, coerce explicitly with `Number(id)` (safe up to 2^53 -- still ~9 quadrillion rows of headroom).
 
 #### Consumer (worker loop)
 
@@ -978,8 +980,8 @@ For long-running jobs that need more visibility headroom, call `jobs.extend(id, 
 The table is created automatically on first use (if `autoMigrate` is true):
 
 ```sql
-CREATE TABLE IF NOT EXISTS ws_jobs (
-  id            BIGSERIAL   PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS svti_jobs (
+  svti_jobs_id  BIGSERIAL   PRIMARY KEY,
   queue         TEXT        NOT NULL,
   payload       JSONB,
   claimed_at    TIMESTAMPTZ,
@@ -987,17 +989,17 @@ CREATE TABLE IF NOT EXISTS ws_jobs (
   attempts      INTEGER     NOT NULL DEFAULT 0,
   created_at    TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_ws_jobs_queue_pending
-    ON ws_jobs (queue, id) WHERE claimed_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_ws_jobs_visibility
-    ON ws_jobs (claimed_until) WHERE claimed_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_svti_jobs_queue_pending
+    ON svti_jobs (queue, svti_jobs_id) WHERE claimed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_svti_jobs_visibility
+    ON svti_jobs (claimed_until) WHERE claimed_at IS NOT NULL;
 ```
 
 #### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `table` | `'ws_jobs'` | Table name |
+| `table` | `'svti_jobs'` | Table name |
 | `autoMigrate` | `true` | Auto-create the table on first use |
 | `visibilityTimeout` | `30000` | Default ms a claim is held before another worker can re-claim |
 
@@ -1065,7 +1067,7 @@ import { pg } from './pg.js';
 import { createIdempotencyStore } from 'svelte-adapter-uws-extensions/postgres/idempotency';
 
 export const idempotency = createIdempotencyStore(pg, {
-  table: 'ws_idempotency',
+  table: 'svti_idempotency',
   ttl: 48 * 3600,
   acquireTtl: 60,
   autoMigrate: true
@@ -1077,13 +1079,13 @@ The Postgres backend periodically deletes expired rows (configurable via `cleanu
 The Postgres table is created automatically on first use:
 
 ```sql
-CREATE TABLE IF NOT EXISTS ws_idempotency (
-  key        TEXT        PRIMARY KEY,
-  status     TEXT        NOT NULL,
-  result     JSONB,
-  expires_at TIMESTAMPTZ NOT NULL
+CREATE TABLE IF NOT EXISTS svti_idempotency (
+  svti_idempotency_key TEXT        PRIMARY KEY,
+  status               TEXT        NOT NULL,
+  result               JSONB,
+  expires_at           TIMESTAMPTZ NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_ws_idempotency_expires_at ON ws_idempotency (expires_at);
+CREATE INDEX IF NOT EXISTS idx_svti_idempotency_expires_at ON svti_idempotency (expires_at);
 ```
 
 #### Usage
@@ -1092,9 +1094,9 @@ CREATE INDEX IF NOT EXISTS idx_ws_idempotency_expires_at ON ws_idempotency (expi
 // Wrap an effectful handler.  The caller passes a stable key per logical
 // operation; identical retries return the cached result.
 export async function placeOrder(input, ctx) {
-  const key = `order:${ctx.user.id}:${input.clientOrderId}`;
+  const idempotencyKey = `order:${ctx.user.id}:${input.clientOrderId}`;
 
-  const slot = await idempotency.acquire(key);
+  const slot = await idempotency.acquire(idempotencyKey);
   if (slot.acquired) {
     try {
       const order = await db.createOrder(input);
@@ -1117,7 +1119,7 @@ export async function placeOrder(input, ctx) {
 | Option | Default | Description |
 |---|---|---|
 | `keyPrefix` (Redis) | `'idem:'` | Prepended to every Redis key after the client keyPrefix |
-| `table` (Postgres) | `'ws_idempotency'` | Table name |
+| `table` (Postgres) | `'svti_idempotency'` | Table name |
 | `ttl` | `172800` (48h) | Result cache lifetime in seconds |
 | `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |
 | `autoMigrate` (Postgres) | `true` | Auto-create the table on first use |
@@ -1147,6 +1149,10 @@ The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`
 ## Task runner
 
 Wraps an effectful operation in a state machine that survives process crashes and naturally fans across cluster instances. Use it for background work that absolutely must finish exactly once: charging a customer, sending a transactional email, posting to a webhook, kicking off a long-running pipeline.
+
+**Requires Postgres 13+.** Uses the built-in `gen_random_uuid()` function (added to core in 13; older versions need the `pgcrypto` extension explicitly enabled, which the runner does not do for you).
+
+**Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** -- start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
 
 Three guarantees:
 
@@ -1207,31 +1213,31 @@ export const actions = {
 The table is created automatically on first use (if `autoMigrate` is true):
 
 ```sql
-CREATE TABLE IF NOT EXISTS ws_tasks (
-  task_id          UUID         PRIMARY KEY,
-  name             TEXT         NOT NULL,
-  input            JSONB,
-  idempotency_key  TEXT,
-  status           TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
-  result           JSONB,
-  error            JSONB,
-  fence            UUID         NOT NULL,
-  fence_expires_at TIMESTAMPTZ  NOT NULL,
-  attempts         INT          NOT NULL DEFAULT 1,
-  created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS svti_tasks (
+  svti_tasks_id        UUID         PRIMARY KEY,
+  name                 TEXT         NOT NULL,
+  input                JSONB,
+  svti_idempotency_key TEXT,
+  status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+  result               JSONB,
+  error                JSONB,
+  fence                UUID         NOT NULL,
+  fence_expires_at     TIMESTAMPTZ  NOT NULL,
+  attempts             INT          NOT NULL DEFAULT 1,
+  created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_ws_tasks_running_fence
-    ON ws_tasks (fence_expires_at) WHERE status = 'running';
-CREATE INDEX IF NOT EXISTS idx_ws_tasks_terminal_updated
-    ON ws_tasks (updated_at) WHERE status IN ('committed', 'failed');
+CREATE INDEX IF NOT EXISTS idx_svti_tasks_running_fence
+    ON svti_tasks (fence_expires_at) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
+    ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
 
 #### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `table` | `'ws_tasks'` | Table name |
+| `table` | `'svti_tasks'` | Table name |
 | `idempotency` | -- | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
 | `fenceTtl` | `60` | Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler runs. |
 | `heartbeatInterval` | `fenceTtl * 1000 / 3` | ms between fence heartbeats |

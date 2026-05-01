@@ -2678,6 +2678,42 @@ describe('redis presence', () => {
 			}
 		});
 	});
+
+	describe('destroy under subscriber quit() failure', () => {
+		it('falls back to disconnect() without throwing TypeError when quit rejects', async () => {
+			// Regression: destroy() previously called subscriber.quit().catch(() => subscriber.disconnect())
+			// then immediately set subscriber = null. If the catch fired AFTER the
+			// null-assignment, accessing subscriber.disconnect threw TypeError.
+			// The fix captures into a local before nulling the outer reference.
+			let disconnectCalled = false;
+			const origDuplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				const sub = origDuplicate(overrides);
+				sub.quit = () => Promise.reject(new Error('connection lost'));
+				sub.disconnect = () => { disconnectCalled = true; };
+				return sub;
+			};
+
+			const tracker = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: 'u1' });
+			await tracker.join(ws, 'room', platform);
+
+			let unhandled = null;
+			const onRejection = (err) => { unhandled = err; };
+			process.once('unhandledRejection', onRejection);
+
+			tracker.destroy();
+
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+
+			process.removeListener('unhandledRejection', onRejection);
+
+			expect(disconnectCalled).toBe(true);
+			expect(unhandled).toBeNull();
+		});
+	});
 });
 
 // Returns the listener map of the mock subscriber that has a 'pmessage'

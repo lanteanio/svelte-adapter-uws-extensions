@@ -231,7 +231,7 @@ describe('postgres replay', () => {
 			}
 
 			// Wipe all buffered rows but leave the seq counter
-			await client.query('DELETE FROM ws_replay WHERE topic = $1', ['chat']);
+			await client.query('DELETE FROM svti_replay WHERE topic = $1', ['chat']);
 
 			const fakeWs = {};
 			platform.reset();
@@ -248,7 +248,7 @@ describe('postgres replay', () => {
 		it('does not send truncated when sinceSeq is 0 even with empty buffer', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
-			await client.query('DELETE FROM ws_replay WHERE topic = $1', ['chat']);
+			await client.query('DELETE FROM svti_replay WHERE topic = $1', ['chat']);
 
 			const fakeWs = {};
 			platform.reset();
@@ -298,7 +298,7 @@ describe('postgres replay', () => {
 			for (let i = 1; i <= 3; i++) {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
-			await client.query('DELETE FROM ws_replay WHERE topic = $1', ['chat']);
+			await client.query('DELETE FROM svti_replay WHERE topic = $1', ['chat']);
 
 			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
 		});

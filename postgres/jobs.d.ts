@@ -3,7 +3,7 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface JobQueueOptions {
-	/** Table name. @default 'ws_jobs' */
+	/** Table name. @default 'svti_jobs' */
 	table?: string;
 	/** Auto-create table on first use. @default true */
 	autoMigrate?: boolean;

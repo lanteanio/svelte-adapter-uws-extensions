@@ -18,19 +18,19 @@
  *
  * Schema (auto-created):
  *
- *   ws_tasks (
- *     task_id          UUID         PRIMARY KEY,
- *     name             TEXT         NOT NULL,
- *     input            JSONB,
- *     idempotency_key  TEXT,
- *     status           TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
- *     result           JSONB,
- *     error            JSONB,
- *     fence            UUID         NOT NULL,
- *     fence_expires_at TIMESTAMPTZ  NOT NULL,
- *     attempts         INT          NOT NULL DEFAULT 1,
- *     created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
- *     updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+ *   svti_tasks (
+ *     svti_tasks_id        UUID         PRIMARY KEY,
+ *     name                 TEXT         NOT NULL,
+ *     input                JSONB,
+ *     svti_idempotency_key TEXT,
+ *     status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+ *     result               JSONB,
+ *     error                JSONB,
+ *     fence                UUID         NOT NULL,
+ *     fence_expires_at     TIMESTAMPTZ  NOT NULL,
+ *     attempts             INT          NOT NULL DEFAULT 1,
+ *     created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+ *     updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
  *   )
  *
  * The fence and execution-context paths are factored behind seams so
@@ -46,7 +46,7 @@ import { Worker } from 'node:worker_threads';
 
 /**
  * @typedef {Object} TaskRunnerOptions
- * @property {string} [table='ws_tasks'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
+ * @property {string} [table='svti_tasks'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
  * @property {import('../redis/idempotency.js').RedisIdempotencyStore | import('./idempotency.js').PgIdempotencyStore} [idempotency] - Optional cache for committed results.
  * @property {import('../redis/fence.js').RedisFenceProvider} [fence] - Optional external fence provider (e.g. `createRedisFence`). When set, the runner pairs Postgres heartbeats with the provider's heartbeat so a force-takeover via the external store is detected immediately.
  * @property {number} [fenceTtl=60] - Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler is running.
@@ -398,7 +398,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	const table = options.table || 'ws_tasks';
+	const table = options.table || 'svti_tasks';
 	if (!TABLE_PATTERN.test(table)) {
 		throw new Error(`postgres tasks: invalid table name "${table}"`);
 	}
@@ -448,30 +448,44 @@ export function createTaskRunner(client, options = {}) {
 	let cleanupRunning = false;
 	let destroyed = false;
 
+	async function safeCreate(ddl) {
+		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
+		// both connections pass the existence check, both run the create,
+		// the loser raises one of these codes. The object exists either way.
+		// Per-statement so a race on the first DDL does not skip later ones.
+		try {
+			await client.query(ddl);
+		} catch (err) {
+			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
+				throw err;
+			}
+		}
+	}
+
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await client.query(`
+		await safeCreate(`
 			CREATE TABLE IF NOT EXISTS ${table} (
-				task_id          UUID         PRIMARY KEY,
-				name             TEXT         NOT NULL,
-				input            JSONB,
-				idempotency_key  TEXT,
-				status           TEXT         NOT NULL,
-				result           JSONB,
-				error            JSONB,
-				fence            UUID         NOT NULL,
-				fence_expires_at TIMESTAMPTZ  NOT NULL,
-				attempts         INT          NOT NULL DEFAULT 1,
-				created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-				updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+				svti_tasks_id        UUID         PRIMARY KEY,
+				name                 TEXT         NOT NULL,
+				input                JSONB,
+				svti_idempotency_key TEXT,
+				status               TEXT         NOT NULL,
+				result               JSONB,
+				error                JSONB,
+				fence                UUID         NOT NULL,
+				fence_expires_at     TIMESTAMPTZ  NOT NULL,
+				attempts             INT          NOT NULL DEFAULT 1,
+				created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 			)
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
 			    ON ${table} (fence_expires_at)
 			 WHERE status = 'running'
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_terminal_updated
 			    ON ${table} (updated_at)
 			 WHERE status IN ('committed', 'failed')
@@ -483,7 +497,7 @@ export function createTaskRunner(client, options = {}) {
 		await client.query({
 			name: 'tasks_insert_' + table,
 			text: `INSERT INTO ${table}
-			          (task_id, name, input, idempotency_key, status, fence, fence_expires_at)
+			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at)
 			       VALUES
 			          ($1, $2, $3::jsonb, $4, 'running', $5, now() + ($6 || ' seconds')::interval)`,
 			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, fence, fenceTtl]
@@ -496,7 +510,7 @@ export function createTaskRunner(client, options = {}) {
 			text: `UPDATE ${table}
 			          SET fence_expires_at = now() + ($3 || ' seconds')::interval,
 			              updated_at = now()
-			        WHERE task_id = $1 AND fence = $2 AND status = 'running'`,
+			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
 			values: [taskId, fence, fenceTtl]
 		});
 		return res.rowCount > 0;
@@ -509,7 +523,7 @@ export function createTaskRunner(client, options = {}) {
 			          SET status = 'committed',
 			              result = $3::jsonb,
 			              updated_at = now()
-			        WHERE task_id = $1 AND fence = $2 AND status = 'running'`,
+			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
 			values: [taskId, fence, JSON.stringify(result === undefined ? null : result)]
 		});
 		return res.rowCount > 0;
@@ -522,7 +536,7 @@ export function createTaskRunner(client, options = {}) {
 			          SET status = 'failed',
 			              error = $3::jsonb,
 			              updated_at = now()
-			        WHERE task_id = $1 AND fence = $2 AND status = 'running'`,
+			        WHERE svti_tasks_id = $1 AND fence = $2 AND status = 'running'`,
 			values: [taskId, fence, JSON.stringify(serialiseError(err))]
 		});
 		return res.rowCount > 0;
@@ -531,7 +545,7 @@ export function createTaskRunner(client, options = {}) {
 	async function readRow(taskId) {
 		const res = await client.query({
 			name: 'tasks_read_' + table,
-			text: `SELECT status, result, error, attempts FROM ${table} WHERE task_id = $1`,
+			text: `SELECT status, result, error, attempts FROM ${table} WHERE svti_tasks_id = $1`,
 			values: [taskId]
 		});
 		return res.rows[0] || null;
@@ -541,7 +555,7 @@ export function createTaskRunner(client, options = {}) {
 		await client.query({
 			name: 'tasks_enqueue_' + table,
 			text: `INSERT INTO ${table}
-			          (task_id, name, input, idempotency_key, status, fence, fence_expires_at, attempts)
+			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at, attempts)
 			       VALUES
 			          ($1, $2, $3::jsonb, $4, 'pending', gen_random_uuid(), now(), 0)`,
 			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null]
@@ -552,7 +566,7 @@ export function createTaskRunner(client, options = {}) {
 		const res = await client.query({
 			name: 'tasks_claim_pending_' + table,
 			text: `WITH claimed AS (
-			         SELECT task_id FROM ${table}
+			         SELECT svti_tasks_id FROM ${table}
 			          WHERE status = 'pending'
 			          ORDER BY created_at ASC
 			          LIMIT $1
@@ -565,8 +579,8 @@ export function createTaskRunner(client, options = {}) {
 			              attempts = t.attempts + 1,
 			              updated_at = now()
 			         FROM claimed
-			        WHERE t.task_id = claimed.task_id
-			    RETURNING t.task_id, t.name, t.input, t.idempotency_key, t.fence, t.attempts`,
+			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;
@@ -576,7 +590,7 @@ export function createTaskRunner(client, options = {}) {
 		const res = await client.query({
 			name: 'tasks_reclaim_' + table,
 			text: `WITH claimed AS (
-			         SELECT task_id FROM ${table}
+			         SELECT svti_tasks_id FROM ${table}
 			          WHERE status = 'running' AND fence_expires_at < now()
 			          ORDER BY fence_expires_at ASC
 			          LIMIT $1
@@ -588,8 +602,8 @@ export function createTaskRunner(client, options = {}) {
 			              attempts = t.attempts + 1,
 			              updated_at = now()
 			         FROM claimed
-			        WHERE t.task_id = claimed.task_id
-			    RETURNING t.task_id, t.name, t.input, t.idempotency_key, t.fence, t.attempts`,
+			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;
@@ -683,7 +697,7 @@ export function createTaskRunner(client, options = {}) {
 						              fence_expires_at = now() + ($3 || ' seconds')::interval,
 						              attempts = $4,
 						              updated_at = now()
-						        WHERE task_id = $1`,
+						        WHERE svti_tasks_id = $1`,
 						values: [taskId, fence, fenceTtl, attempt]
 					});
 				}
@@ -779,7 +793,7 @@ export function createTaskRunner(client, options = {}) {
 				mRecovered?.inc({ name: row.name });
 				// Run in the background; do not await all reclaimed rows
 				// serially or one slow handler stalls the sweep.
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.task_id, row.attempts, row.fence).catch(() => {
+				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}
@@ -807,7 +821,7 @@ export function createTaskRunner(client, options = {}) {
 					continue;
 				}
 				mDispatched?.inc({ name: row.name });
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.task_id, row.attempts, row.fence).catch(() => {
+				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}

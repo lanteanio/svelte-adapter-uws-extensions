@@ -513,8 +513,9 @@ export function createGroup(client, name, options = {}) {
 		destroy() {
 			clearInterval(heartbeatTimer);
 			if (subscriber) {
-				subscriber.quit().catch(() => subscriber.disconnect());
+				const sub = subscriber;
 				subscriber = null;
+				sub.quit().catch(() => sub.disconnect());
 			}
 			subscribedPlatform = null;
 		},

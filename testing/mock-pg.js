@@ -3,19 +3,19 @@ import { randomUUID } from 'node:crypto';
 /**
  * In-memory mock that implements the PgClient interface.
  * Parses SQL enough to simulate:
- *   - the ws_replay table + ws_replay_seq counter
- *   - the ws_idempotency key/value/expires_at table
- *   - the ws_tasks task-runner state machine
+ *   - the svti_replay table + svti_replay_seq counter
+ *   - the svti_idempotency key/value/expires_at table
+ *   - the svti_tasks task-runner state machine
  *
  * SQL is dispatched by shape, not by table name, so custom table names
  * passed via options work as long as the column shape is recognisable.
  * Markers:
  *   - replay:        `topic`, `seq`
- *   - idempotency:   `expires_at` (without prefix), `WHERE key = $1`
- *   - tasks:         `fence_expires_at`, `task_id`, `gen_random_uuid()`
+ *   - idempotency:   `expires_at` (without prefix), `WHERE svti_idempotency_key = $1`
+ *   - tasks:         `fence_expires_at`, `svti_tasks_id`, `gen_random_uuid()`
  */
 export function mockPgClient() {
-	/** @type {Array<{ws_replay_id: number, topic: string, seq: number, event: string, data: any, created_date: Date}>} */
+	/** @type {Array<{svti_replay_id: number, topic: string, seq: number, event: string, data: any, created_at: Date}>} */
 	let rows = [];
 	let nextId = 1;
 	let tableCreated = false;
@@ -26,7 +26,7 @@ export function mockPgClient() {
 	/** @type {Map<string, {status: string, result: any, expires_at: number}>} */
 	const idemRows = new Map();
 
-	/** @type {Map<string, {task_id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number}>} */
+	/** @type {Map<string, {id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number}>} */
 	const taskRows = new Map();
 
 	/** @type {Map<number, {id: number, queue: string, payload: any, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
@@ -61,10 +61,10 @@ export function mockPgClient() {
 
 			// ----- Idempotency dispatch (matched first; markers: `expires_at`, `WHERE key`)
 
-			// Acquire: INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE expires_at < now() RETURNING status
+			// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING status
 			if (
 				sql.startsWith('INSERT INTO') &&
-				sql.includes('ON CONFLICT (key)') &&
+				sql.includes('ON CONFLICT (svti_idempotency_key)') &&
 				sql.includes('expires_at')
 			) {
 				const key = values[0];
@@ -82,10 +82,10 @@ export function mockPgClient() {
 				return { rows: [], rowCount: 0 };
 			}
 
-			// Read: SELECT status, result FROM ... WHERE key = $1 AND expires_at >= now()
+			// Read: SELECT status, result FROM ... WHERE svti_idempotency_key = $1 AND expires_at >= now()
 			if (
 				sql.startsWith('SELECT status, result FROM') &&
-				sql.includes('WHERE key = $1') &&
+				sql.includes('WHERE svti_idempotency_key = $1') &&
 				sql.includes('expires_at')
 			) {
 				const key = values[0];
@@ -97,11 +97,11 @@ export function mockPgClient() {
 			}
 
 			// Commit: UPDATE ... SET status = 'committed', result = $2::jsonb, expires_at = ...
-			// (Idempotency-specific: WHERE key = $1.  Task commits match a different branch below.)
+			// (Idempotency-specific: WHERE svti_idempotency_key = $1.  Task commits match a different branch below.)
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes("status = 'committed'") &&
-				sql.includes('WHERE key = $1')
+				sql.includes('WHERE svti_idempotency_key = $1')
 			) {
 				const key = values[0];
 				const result = typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1];
@@ -128,8 +128,8 @@ export function mockPgClient() {
 				return { rows: [], rowCount: removed };
 			}
 
-			// Abort / purge: DELETE FROM ... WHERE key = $1
-			if (sql.startsWith('DELETE FROM') && sql.includes('WHERE key = $1')) {
+			// Abort / purge: DELETE FROM ... WHERE svti_idempotency_key = $1
+			if (sql.startsWith('DELETE FROM') && sql.includes('WHERE svti_idempotency_key = $1')) {
 				const key = values[0];
 				const had = idemRows.delete(key);
 				return { rows: [], rowCount: had ? 1 : 0 };
@@ -138,26 +138,26 @@ export function mockPgClient() {
 			// Idempotency clear (default table name).  Custom table names
 			// fall through to the replay-table catch-all and would clear
 			// replay rows instead -- tests should use the default name.
-			if (sql.startsWith('DELETE FROM ws_idempotency') && !sql.includes('WHERE')) {
+			if (sql.startsWith('DELETE FROM svti_idempotency') && !sql.includes('WHERE')) {
 				const before = idemRows.size;
 				idemRows.clear();
 				return { rows: [], rowCount: before };
 			}
 
-			// ----- Task runner dispatch (markers: `fence_expires_at`, `task_id`)
+			// ----- Task runner dispatch (markers: `fence_expires_at`, `svti_tasks_id`)
 
 			// Task INSERT (run path): row creation with fresh fence, status='running'
 			if (
 				sql.startsWith('INSERT INTO') &&
-				sql.includes('task_id') &&
+				sql.includes('svti_tasks_id') &&
 				sql.includes('fence_expires_at') &&
-				sql.includes('idempotency_key') &&
+				sql.includes('svti_idempotency_key') &&
 				!sql.includes('gen_random_uuid()')
 			) {
 				const fenceTtlSec = Number(values[5]);
 				const now = Date.now();
 				taskRows.set(values[0], {
-					task_id: values[0],
+					id: values[0],
 					name: values[1],
 					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 					idempotency_key: values[3],
@@ -176,15 +176,15 @@ export function mockPgClient() {
 			// Task INSERT (enqueue path): status='pending', server-generated fence, attempts=0
 			if (
 				sql.startsWith('INSERT INTO') &&
-				sql.includes('task_id') &&
+				sql.includes('svti_tasks_id') &&
 				sql.includes('fence_expires_at') &&
-				sql.includes('idempotency_key') &&
+				sql.includes('svti_idempotency_key') &&
 				sql.includes("'pending'") &&
 				sql.includes('gen_random_uuid()')
 			) {
 				const now = Date.now();
 				taskRows.set(values[0], {
-					task_id: values[0],
+					id: values[0],
 					name: values[1],
 					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 					idempotency_key: values[3],
@@ -204,7 +204,7 @@ export function mockPgClient() {
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes('fence_expires_at = now() +') &&
-				sql.includes('WHERE task_id = $1 AND fence = $2 AND status = \'running\'') &&
+				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'') &&
 				!sql.includes("status = 'committed'") &&
 				!sql.includes("status = 'failed'")
 			) {
@@ -224,7 +224,7 @@ export function mockPgClient() {
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes("status = 'committed'") &&
-				sql.includes('WHERE task_id = $1 AND fence = $2 AND status = \'running\'')
+				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
 			) {
 				const taskId = values[0];
 				const fence = values[1];
@@ -243,7 +243,7 @@ export function mockPgClient() {
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes("status = 'failed'") &&
-				sql.includes('WHERE task_id = $1 AND fence = $2 AND status = \'running\'')
+				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
 			) {
 				const taskId = values[0];
 				const fence = values[1];
@@ -263,7 +263,7 @@ export function mockPgClient() {
 				sql.startsWith('UPDATE') &&
 				sql.includes('fence = $2') &&
 				sql.includes('attempts = $4') &&
-				sql.includes('WHERE task_id = $1')
+				sql.includes('WHERE svti_tasks_id = $1')
 			) {
 				const taskId = values[0];
 				const fence = values[1];
@@ -283,7 +283,7 @@ export function mockPgClient() {
 			// Task read: status, result, error, attempts
 			if (
 				sql.startsWith('SELECT status, result, error, attempts FROM') &&
-				sql.includes('WHERE task_id = $1')
+				sql.includes('WHERE svti_tasks_id = $1')
 			) {
 				const taskId = values[0];
 				const row = taskRows.get(taskId);
@@ -318,7 +318,7 @@ export function mockPgClient() {
 					row.attempts += 1;
 					row.updated_at = now;
 					out.push({
-						task_id: row.task_id,
+						id: row.id,
 						name: row.name,
 						input: row.input,
 						idempotency_key: row.idempotency_key,
@@ -349,7 +349,7 @@ export function mockPgClient() {
 					row.attempts += 1;
 					row.updated_at = now;
 					out.push({
-						task_id: row.task_id,
+						id: row.id,
 						name: row.name,
 						input: row.input,
 						idempotency_key: row.idempotency_key,
@@ -379,19 +379,19 @@ export function mockPgClient() {
 			}
 
 			// Task clear (default table name)
-			if (sql.startsWith('DELETE FROM ws_tasks') && !sql.includes('WHERE')) {
+			if (sql.startsWith('DELETE FROM svti_tasks') && !sql.includes('WHERE')) {
 				const before = taskRows.size;
 				taskRows.clear();
 				return { rows: [], rowCount: before };
 			}
 
-			// ----- Job queue dispatch (markers: `queue` column, no `task_id`/`status`)
+			// ----- Job queue dispatch (markers: `queue` column, no `svti_tasks_id`/`status`)
 
-			// Job enqueue: INSERT INTO ws_jobs (queue, payload) VALUES ($1, $2) RETURNING id
+			// Job enqueue: INSERT INTO svti_jobs (queue, payload) VALUES ($1, $2) RETURNING svti_jobs_id AS id
 			if (
 				sql.startsWith('INSERT INTO') &&
 				sql.includes('(queue, payload)') &&
-				sql.includes('RETURNING id')
+				sql.includes('RETURNING svti_jobs_id AS id')
 			) {
 				const id = jobNextId++;
 				jobRows.set(id, {
@@ -406,7 +406,7 @@ export function mockPgClient() {
 				return { rows: [{ id }], rowCount: 1 };
 			}
 
-			// Job claim: WITH claimed AS (SELECT id FROM ws_jobs WHERE queue=$1 AND (claimed_at IS NULL OR claimed_until < now()) ...) UPDATE ... RETURNING ...
+			// Job claim: WITH claimed AS (SELECT svti_jobs_id FROM svti_jobs WHERE queue=$1 AND (claimed_at IS NULL OR claimed_until < now()) ...) UPDATE ... RETURNING ...
 			if (sql.includes('WITH claimed') && sql.includes('claimed_at IS NULL OR claimed_until')) {
 				const queue = values[0];
 				const limit = Number(values[1]);
@@ -437,10 +437,10 @@ export function mockPgClient() {
 				return { rows: out, rowCount: out.length };
 			}
 
-			// Job complete: DELETE FROM ws_jobs WHERE id = ANY($1::bigint[]) RETURNING queue
+			// Job complete: DELETE FROM svti_jobs WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
 			if (
 				sql.startsWith('DELETE FROM') &&
-				sql.includes('id = ANY($1::bigint[])') &&
+				sql.includes('svti_jobs_id = ANY($1::bigint[])') &&
 				sql.includes('RETURNING queue')
 			) {
 				const ids = values[0];
@@ -455,7 +455,7 @@ export function mockPgClient() {
 				return { rows: out, rowCount: out.length };
 			}
 
-			// Job fail: UPDATE ws_jobs SET claimed_at = NULL, claimed_until = NULL WHERE id = ANY($1::bigint[]) RETURNING queue
+			// Job fail: UPDATE svti_jobs SET claimed_at = NULL, claimed_until = NULL WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes('claimed_at = NULL') &&
@@ -475,7 +475,7 @@ export function mockPgClient() {
 				return { rows: out, rowCount: out.length };
 			}
 
-			// Job extend: UPDATE ws_jobs SET claimed_until = claimed_until + ... WHERE id = ANY($1::bigint[]) AND claimed_at IS NOT NULL
+			// Job extend: UPDATE svti_jobs SET claimed_until = claimed_until + ... WHERE svti_jobs_id = ANY($1::bigint[]) AND claimed_at IS NOT NULL
 			if (
 				sql.startsWith('UPDATE') &&
 				sql.includes('claimed_until = claimed_until +') &&
@@ -518,7 +518,7 @@ export function mockPgClient() {
 			}
 
 			// Job clear scoped to a queue
-			if (sql.startsWith('DELETE FROM ws_jobs') && sql.includes('WHERE queue = $1')) {
+			if (sql.startsWith('DELETE FROM svti_jobs') && sql.includes('WHERE queue = $1')) {
 				const queue = values[0];
 				let removed = 0;
 				for (const [id, row] of jobRows) {
@@ -531,7 +531,7 @@ export function mockPgClient() {
 			}
 
 			// Job clear all
-			if (sql.startsWith('DELETE FROM ws_jobs') && !sql.includes('WHERE')) {
+			if (sql.startsWith('DELETE FROM svti_jobs') && !sql.includes('WHERE')) {
 				const before = jobRows.size;
 				jobRows.clear();
 				return { rows: [], rowCount: before };
@@ -544,12 +544,12 @@ export function mockPgClient() {
 				const next = current + 1;
 				seqCounters.set(topic, next);
 				const row = {
-					ws_replay_id: nextId++,
+					svti_replay_id: nextId++,
 					topic,
 					seq: next,
 					event: values[1],
 					data: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
-					created_date: new Date()
+					created_at: new Date()
 				};
 				rows.push(row);
 				return { rows: [{ seq: String(next) }], rowCount: 1 };
@@ -567,12 +567,12 @@ export function mockPgClient() {
 			// INSERT
 			if (sql.startsWith('INSERT INTO')) {
 				const row = {
-					ws_replay_id: nextId++,
+					svti_replay_id: nextId++,
 					topic: values[0],
 					seq: parseInt(values[1], 10),
 					event: values[2],
 					data: typeof values[3] === 'string' ? JSON.parse(values[3]) : values[3],
-					created_date: new Date()
+					created_at: new Date()
 				};
 				rows.push(row);
 				return { rows: [row], rowCount: 1 };
@@ -676,16 +676,16 @@ export function mockPgClient() {
 				return { rows: [], rowCount: totalRemoved };
 			}
 
-			// DELETE FROM table WHERE topic = $1 AND ws_replay_id NOT IN (... LIMIT $2)
+			// DELETE FROM table WHERE topic = $1 AND svti_replay_id NOT IN (... LIMIT $2)
 			if (sql.includes('DELETE FROM') && sql.includes('NOT IN') && sql.includes('LIMIT')) {
 				const topic = values[0];
 				const limit = parseInt(values[1], 10);
 				const topicRows = rows
 					.filter((r) => r.topic === topic)
 					.sort((a, b) => b.seq - a.seq);
-				const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.ws_replay_id));
+				const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.svti_replay_id));
 				const before = rows.length;
-				rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.ws_replay_id));
+				rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.svti_replay_id));
 				return { rows: [], rowCount: before - rows.length };
 			}
 

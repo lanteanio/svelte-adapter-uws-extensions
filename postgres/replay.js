@@ -5,17 +5,17 @@
  * Postgres table for durable history that survives restarts.
  *
  * Table schema (auto-created if autoMigrate is true):
- *   ws_replay (
- *     ws_replay_id BIGSERIAL PRIMARY KEY,
- *     topic        TEXT        NOT NULL,
- *     seq          BIGINT      NOT NULL,
- *     event        TEXT        NOT NULL,
- *     data         JSONB,
- *     created_date TIMESTAMPTZ DEFAULT now()
+ *   svti_replay (
+ *     svti_replay_id BIGSERIAL PRIMARY KEY,
+ *     topic          TEXT        NOT NULL,
+ *     seq            BIGINT      NOT NULL,
+ *     event          TEXT        NOT NULL,
+ *     data           JSONB,
+ *     created_at     TIMESTAMPTZ DEFAULT now()
  *   )
  *   + index on (topic, seq)
  *
- *   ws_replay_seq (
+ *   svti_replay_seq (
  *     topic TEXT   PRIMARY KEY,
  *     seq   BIGINT NOT NULL DEFAULT 0
  *   )
@@ -29,7 +29,7 @@
 
 /**
  * @typedef {Object} PgReplayOptions
- * @property {string} [table='ws_replay'] - Table name
+ * @property {string} [table='svti_replay'] - Table name
  * @property {number} [size=1000] - Max messages per topic
  * @property {number} [ttl=0] - TTL in seconds (0 = no expiry). Rows older than this are cleaned up periodically.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use
@@ -67,7 +67,7 @@ export function createReplay(client, options = {}) {
 		}
 	}
 
-	const table = options.table || 'ws_replay';
+	const table = options.table || 'svti_replay';
 	const seqTable = table + '_seq';
 	const pkCol = table + '_id';
 	const maxSize = options.size || 1000;
@@ -89,22 +89,36 @@ export function createReplay(client, options = {}) {
 
 	let migrated = false;
 
+	async function safeCreate(ddl) {
+		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
+		// both connections pass the existence check, both run the create,
+		// the loser raises one of these codes. The object exists either way.
+		// Per-statement so a race on the first DDL does not skip later ones.
+		try {
+			await client.query(ddl);
+		} catch (err) {
+			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
+				throw err;
+			}
+		}
+	}
+
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await client.query(`
+		await safeCreate(`
 			CREATE TABLE IF NOT EXISTS ${table} (
 				${pkCol} BIGSERIAL   PRIMARY KEY,
 				topic    TEXT        NOT NULL,
 				seq      BIGINT      NOT NULL,
 				event    TEXT        NOT NULL,
 				data     JSONB,
-				created_date TIMESTAMPTZ DEFAULT now()
+				created_at TIMESTAMPTZ DEFAULT now()
 			)
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
 				seq   BIGINT NOT NULL DEFAULT 0
@@ -145,7 +159,7 @@ export function createReplay(client, options = {}) {
 				if (ttl > 0) {
 					await client.query(
 						`DELETE FROM ${table}
-						  WHERE created_date < now() - interval '1 second' * $1`,
+						  WHERE created_at < now() - interval '1 second' * $1`,
 						[ttl]
 					);
 				}

@@ -5,7 +5,7 @@
  * retries within `ttl` return the original outcome rather than re-executing.
  * Same contract as the Redis backend, durable on disk.
  *
- * Three states are exposed via the `acquire(key)` return value:
+ * Three states are exposed via the `acquire(idempotencyKey)` return value:
  *   - acquired: the caller owns the slot; runs the work, then `commit(result)` or `abort()`.
  *   - pending:  another caller acquired the slot and has not committed yet.
  *   - result:   a previous run committed; the cached result is returned.
@@ -17,11 +17,11 @@
  * naturally clear without manual intervention.
  *
  * Table schema (auto-created if autoMigrate is true):
- *   ws_idempotency (
- *     key        TEXT        PRIMARY KEY,
- *     status     TEXT        NOT NULL,
- *     result     JSONB,
- *     expires_at TIMESTAMPTZ NOT NULL
+ *   svti_idempotency (
+ *     svti_idempotency_key TEXT        PRIMARY KEY,
+ *     status               TEXT        NOT NULL,
+ *     result               JSONB,
+ *     expires_at           TIMESTAMPTZ NOT NULL
  *   )
  *   + index on (expires_at) for cheap cleanup
  *
@@ -30,7 +30,7 @@
 
 /**
  * @typedef {Object} PgIdempotencyOptions
- * @property {string} [table='ws_idempotency'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
+ * @property {string} [table='svti_idempotency'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
  * @property {number} [ttl=172800] - Result cache lifetime in seconds. Default 48 hours.
  * @property {number} [acquireTtl=60] - Pending-slot lifetime in seconds. Default 60 seconds.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use.
@@ -66,7 +66,7 @@ export function createIdempotencyStore(client, options = {}) {
 		}
 	}
 
-	const table = options.table || 'ws_idempotency';
+	const table = options.table || 'svti_idempotency';
 	const ttl = options.ttl || 48 * 3600;
 	const acquireTtl = options.acquireTtl || 60;
 	const autoMigrate = options.autoMigrate !== false;
@@ -86,25 +86,39 @@ export function createIdempotencyStore(client, options = {}) {
 
 	let migrated = false;
 
+	async function safeCreate(ddl) {
+		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
+		// both connections pass the existence check, both run the create,
+		// the loser raises one of these codes. The object exists either way.
+		// Per-statement so a race on the first DDL does not skip later ones.
+		try {
+			await client.query(ddl);
+		} catch (err) {
+			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
+				throw err;
+			}
+		}
+	}
+
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await client.query(`
+		await safeCreate(`
 			CREATE TABLE IF NOT EXISTS ${table} (
-				key        TEXT        PRIMARY KEY,
-				status     TEXT        NOT NULL,
-				result     JSONB,
-				expires_at TIMESTAMPTZ NOT NULL
+				svti_idempotency_key TEXT        PRIMARY KEY,
+				status               TEXT        NOT NULL,
+				result               JSONB,
+				expires_at           TIMESTAMPTZ NOT NULL
 			)
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table} (expires_at)
 		`);
 		migrated = true;
 	}
 
-	function validateKey(userKey) {
-		if (typeof userKey !== 'string' || userKey.length === 0) {
-			throw new Error('postgres idempotency: key must be a non-empty string');
+	function validateKey(idempotencyKey) {
+		if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
+			throw new Error('postgres idempotency: idempotencyKey must be a non-empty string');
 		}
 	}
 
@@ -128,7 +142,7 @@ export function createIdempotencyStore(client, options = {}) {
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
-	function commitFor(userKey) {
+	function commitFor(idempotencyKey) {
 		return async function commit(result) {
 			b?.guard();
 			try {
@@ -138,8 +152,8 @@ export function createIdempotencyStore(client, options = {}) {
 					          SET status = 'committed',
 					              result = $2::jsonb,
 					              expires_at = now() + ($3 || ' seconds')::interval
-					        WHERE key = $1`,
-					values: [userKey, JSON.stringify(result === undefined ? null : result), ttl]
+					        WHERE svti_idempotency_key = $1`,
+					values: [idempotencyKey, JSON.stringify(result === undefined ? null : result), ttl]
 				});
 				b?.success();
 			} catch (err) {
@@ -150,14 +164,14 @@ export function createIdempotencyStore(client, options = {}) {
 		};
 	}
 
-	function abortFor(userKey) {
+	function abortFor(idempotencyKey) {
 		return async function abort() {
 			b?.guard();
 			try {
 				await client.query({
 					name: 'idem_abort_' + table,
-					text: `DELETE FROM ${table} WHERE key = $1`,
-					values: [userKey]
+					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
+					values: [idempotencyKey]
 				});
 				b?.success();
 			} catch (err) {
@@ -168,7 +182,7 @@ export function createIdempotencyStore(client, options = {}) {
 		};
 	}
 
-	async function attemptAcquire(userKey) {
+	async function attemptAcquire(idempotencyKey) {
 		// Insert a fresh pending row, OR take over an existing row whose
 		// expires_at has passed (crashed owner / expired cached result).
 		// `xmax = 0` distinguishes a fresh insert from a takeover but we
@@ -176,15 +190,15 @@ export function createIdempotencyStore(client, options = {}) {
 		// return at least one row.
 		const ins = await client.query({
 			name: 'idem_acquire_' + table,
-			text: `INSERT INTO ${table} (key, status, result, expires_at)
+			text: `INSERT INTO ${table} (svti_idempotency_key, status, result, expires_at)
 			       VALUES ($1, 'pending', NULL, now() + ($2 || ' seconds')::interval)
-			       ON CONFLICT (key) DO UPDATE
+			       ON CONFLICT (svti_idempotency_key) DO UPDATE
 			         SET status = 'pending',
 			             result = NULL,
 			             expires_at = now() + ($2 || ' seconds')::interval
 			         WHERE ${table}.expires_at < now()
 			       RETURNING status`,
-			values: [userKey, acquireTtl]
+			values: [idempotencyKey, acquireTtl]
 		});
 
 		if (ins.rowCount > 0) {
@@ -193,8 +207,8 @@ export function createIdempotencyStore(client, options = {}) {
 
 		const sel = await client.query({
 			name: 'idem_read_' + table,
-			text: `SELECT status, result FROM ${table} WHERE key = $1 AND expires_at >= now()`,
-			values: [userKey]
+			text: `SELECT status, result FROM ${table} WHERE svti_idempotency_key = $1 AND expires_at >= now()`,
+			values: [idempotencyKey]
 		});
 
 		if (sel.rowCount === 0) {
@@ -209,18 +223,18 @@ export function createIdempotencyStore(client, options = {}) {
 	}
 
 	return {
-		async acquire(userKey) {
-			validateKey(userKey);
+		async acquire(idempotencyKey) {
+			validateKey(idempotencyKey);
 
 			b?.guard();
 			let outcome;
 			try {
 				await ensureTable();
-				outcome = await attemptAcquire(userKey);
+				outcome = await attemptAcquire(idempotencyKey);
 				if (outcome === null) {
 					// Race: row was deleted between the conflict and the read.
 					// One retry catches it; if it still happens, treat as pending.
-					outcome = await attemptAcquire(userKey);
+					outcome = await attemptAcquire(idempotencyKey);
 					if (outcome === null) {
 						outcome = { acquired: false, pending: true };
 					}
@@ -235,8 +249,8 @@ export function createIdempotencyStore(client, options = {}) {
 				mAcquired?.inc();
 				return {
 					acquired: true,
-					commit: commitFor(userKey),
-					abort: abortFor(userKey)
+					commit: commitFor(idempotencyKey),
+					abort: abortFor(idempotencyKey)
 				};
 			}
 			if (outcome.pending) {
@@ -247,15 +261,15 @@ export function createIdempotencyStore(client, options = {}) {
 			return { acquired: false, result: outcome.result };
 		},
 
-		async purge(userKey) {
-			validateKey(userKey);
+		async purge(idempotencyKey) {
+			validateKey(idempotencyKey);
 			b?.guard();
 			try {
 				await ensureTable();
 				await client.query({
 					name: 'idem_purge_' + table,
-					text: `DELETE FROM ${table} WHERE key = $1`,
-					values: [userKey]
+					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
+					values: [idempotencyKey]
 				});
 				b?.success();
 			} catch (err) {

@@ -13,8 +13,8 @@
  * batch-claim primitive. Pick the shape that fits the workload.
  *
  * Table schema (auto-created if autoMigrate is true):
- *   ws_jobs (
- *     id            BIGSERIAL PRIMARY KEY,
+ *   svti_jobs (
+ *     svti_jobs_id  BIGSERIAL   PRIMARY KEY,
  *     queue         TEXT        NOT NULL,
  *     payload       JSONB,
  *     claimed_at    TIMESTAMPTZ,
@@ -22,7 +22,7 @@
  *     attempts      INTEGER     NOT NULL DEFAULT 0,
  *     created_at    TIMESTAMPTZ DEFAULT now()
  *   )
- *   + partial index on (queue, id) WHERE claimed_at IS NULL
+ *   + partial index on (queue, svti_jobs_id) WHERE claimed_at IS NULL
  *   + index on (claimed_until) for visibility-timeout sweeps
  *
  * @module svelte-adapter-uws-extensions/postgres/jobs
@@ -30,7 +30,7 @@
 
 /**
  * @typedef {Object} JobQueueOptions
- * @property {string} [table='ws_jobs']
+ * @property {string} [table='svti_jobs']
  * @property {boolean} [autoMigrate=true]
  * @property {number} [visibilityTimeout=30000] - Default ms a claim is held before another worker can re-claim
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
@@ -53,7 +53,7 @@
  * @param {JobQueueOptions} [options]
  */
 export function createJobQueue(client, options = {}) {
-	const table = options.table || 'ws_jobs';
+	const table = options.table || 'svti_jobs';
 	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
 		throw new Error(`postgres jobs: invalid table name "${table}"`);
 	}
@@ -72,11 +72,25 @@ export function createJobQueue(client, options = {}) {
 
 	let migrated = false;
 
+	async function safeCreate(ddl) {
+		// CREATE TABLE/INDEX IF NOT EXISTS races on concurrent first calls:
+		// both connections pass the existence check, both run the create,
+		// the loser raises one of these codes. The object exists either way.
+		// Per-statement so a race on the first DDL does not skip later ones.
+		try {
+			await client.query(ddl);
+		} catch (err) {
+			if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
+				throw err;
+			}
+		}
+	}
+
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
-		await client.query(`
+		await safeCreate(`
 			CREATE TABLE IF NOT EXISTS ${table} (
-				id            BIGSERIAL   PRIMARY KEY,
+				svti_jobs_id  BIGSERIAL   PRIMARY KEY,
 				queue         TEXT        NOT NULL,
 				payload       JSONB,
 				claimed_at    TIMESTAMPTZ,
@@ -85,12 +99,12 @@ export function createJobQueue(client, options = {}) {
 				created_at    TIMESTAMPTZ DEFAULT now()
 			)
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
-			    ON ${table} (queue, id)
+			    ON ${table} (queue, svti_jobs_id)
 			    WHERE claimed_at IS NULL
 		`);
-		await client.query(`
+		await safeCreate(`
 			CREATE INDEX IF NOT EXISTS idx_${table}_visibility
 			    ON ${table} (claimed_until)
 			    WHERE claimed_at IS NOT NULL
@@ -115,7 +129,7 @@ export function createJobQueue(client, options = {}) {
 					name: 'jobs_enqueue_' + table,
 					text: `INSERT INTO ${table} (queue, payload)
 					            VALUES ($1, $2)
-					        RETURNING id`,
+					        RETURNING svti_jobs_id AS id`,
 					values: [queue, JSON.stringify(payload ?? null)]
 				});
 				b?.success();
@@ -147,10 +161,10 @@ export function createJobQueue(client, options = {}) {
 				res = await client.query({
 					name: 'jobs_claim_' + table,
 					text: `WITH claimed AS (
-						SELECT id FROM ${table}
+						SELECT svti_jobs_id FROM ${table}
 						 WHERE queue = $1
 						   AND (claimed_at IS NULL OR claimed_until < now())
-						 ORDER BY id
+						 ORDER BY svti_jobs_id
 						   FOR UPDATE SKIP LOCKED
 						 LIMIT $2
 					)
@@ -159,8 +173,8 @@ export function createJobQueue(client, options = {}) {
 					       claimed_until = now() + ($3 || ' milliseconds')::interval,
 					       attempts = t.attempts + 1
 					  FROM claimed
-					 WHERE t.id = claimed.id
-					RETURNING t.id, t.queue, t.payload, t.attempts, t.created_at`,
+					 WHERE t.svti_jobs_id = claimed.svti_jobs_id
+					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.attempts, t.created_at`,
 					values: [queue, batchSize, String(visibilityTimeoutMs)]
 				});
 				b?.success();
@@ -188,7 +202,7 @@ export function createJobQueue(client, options = {}) {
 				res = await client.query({
 					name: 'jobs_complete_' + table,
 					text: `DELETE FROM ${table}
-					            WHERE id = ANY($1::bigint[])
+					            WHERE svti_jobs_id = ANY($1::bigint[])
 					      RETURNING queue`,
 					values: [ids]
 				});
@@ -214,7 +228,7 @@ export function createJobQueue(client, options = {}) {
 					text: `UPDATE ${table}
 					           SET claimed_at = NULL,
 					               claimed_until = NULL
-					         WHERE id = ANY($1::bigint[])
+					         WHERE svti_jobs_id = ANY($1::bigint[])
 					     RETURNING queue`,
 					values: [ids]
 				});
@@ -241,7 +255,7 @@ export function createJobQueue(client, options = {}) {
 					name: 'jobs_extend_' + table,
 					text: `UPDATE ${table}
 					           SET claimed_until = claimed_until + ($2 || ' milliseconds')::interval
-					         WHERE id = ANY($1::bigint[])
+					         WHERE svti_jobs_id = ANY($1::bigint[])
 					           AND claimed_at IS NOT NULL`,
 					values: [ids, String(additionalMs)]
 				});

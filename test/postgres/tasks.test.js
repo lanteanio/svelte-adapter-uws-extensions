@@ -287,7 +287,7 @@ describe('postgres tasks', () => {
 			// Plant a stuck row directly: status='running', fence_expires_at in the past
 			const taskRows = client._getTaskRows();
 			taskRows.set('stuck-1', {
-				task_id: 'stuck-1',
+				id: 'stuck-1',
 				name: 'worker',
 				input: null,
 				idempotency_key: null,
@@ -328,7 +328,7 @@ describe('postgres tasks', () => {
 		it('does not reclaim rows whose fence_expires_at is in the future', async () => {
 			const taskRows = client._getTaskRows();
 			taskRows.set('fresh-1', {
-				task_id: 'fresh-1',
+				id: 'fresh-1',
 				name: 'worker',
 				input: null,
 				idempotency_key: null,

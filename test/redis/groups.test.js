@@ -1410,4 +1410,41 @@ describe('redis groups', () => {
 			g.destroy();
 		});
 	});
+
+	describe('destroy under subscriber quit() failure', () => {
+		it('falls back to disconnect() without throwing TypeError when quit rejects', async () => {
+			// Regression: destroy() previously called subscriber.quit().catch(() => subscriber.disconnect())
+			// then immediately set subscriber = null. If the catch fired AFTER the
+			// null-assignment, accessing subscriber.disconnect threw TypeError.
+			// The fix captures into a local before nulling the outer reference.
+			let disconnectCalled = false;
+			const origDuplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				const sub = origDuplicate(overrides);
+				sub.quit = () => Promise.reject(new Error('connection lost'));
+				sub.disconnect = () => { disconnectCalled = true; };
+				return sub;
+			};
+
+			const g = createGroup(client, 'destroy-fallback', { maxMembers: 5, memberTtl: 120 });
+			await g.join(mockWs(), platform);
+
+			// Capture any unhandled rejection that escapes destroy().
+			let unhandled = null;
+			const onRejection = (err) => { unhandled = err; };
+			process.once('unhandledRejection', onRejection);
+
+			g.destroy();
+
+			// Allow the rejected quit() promise + .catch chain to settle.
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+
+			process.removeListener('unhandledRejection', onRejection);
+
+			expect(disconnectCalled).toBe(true);
+			expect(unhandled).toBeNull();
+		});
+	});
 });

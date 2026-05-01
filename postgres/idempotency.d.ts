@@ -4,7 +4,7 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 import type { IdempotencySlot } from '../redis/idempotency.js';
 
 export interface PgIdempotencyOptions {
-	/** Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. @default 'ws_idempotency' */
+	/** Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. @default 'svti_idempotency' */
 	table?: string;
 	/** Result cache lifetime in seconds. @default 172800 (48 hours) */
 	ttl?: number;
@@ -21,10 +21,10 @@ export interface PgIdempotencyOptions {
 }
 
 export interface PgIdempotencyStore {
-	/** Try to claim ownership of a key. Returns one of three slot shapes. */
-	acquire<T = unknown>(key: string): Promise<IdempotencySlot<T>>;
+	/** Try to claim ownership of an idempotency key. Returns one of three slot shapes. */
+	acquire<T = unknown>(idempotencyKey: string): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. */
-	purge(key: string): Promise<void>;
+	purge(idempotencyKey: string): Promise<void>;
 	/** Drop every row in the store's table. */
 	clear(): Promise<void>;
 	/** Stop the cleanup timer (call on shutdown if not relying on autoShutdown). */

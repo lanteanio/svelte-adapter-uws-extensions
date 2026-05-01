@@ -5,7 +5,7 @@ import type { RedisIdempotencyStore } from '../redis/idempotency.js';
 import type { PgIdempotencyStore } from './idempotency.js';
 
 export interface TaskRunnerOptions {
-	/** Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. @default 'ws_tasks' */
+	/** Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. @default 'svti_tasks' */
 	table?: string;
 	/** Optional cache for committed results. Pass an idempotency store to deduplicate caller retries. */
 	idempotency?: RedisIdempotencyStore | PgIdempotencyStore;
