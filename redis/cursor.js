@@ -153,26 +153,37 @@ export function createCursor(client, options = {}) {
 				// Malformed, skip
 			}
 		});
-		subscriberReady = sub.subscribe(channel).then(() => {
-			if (activePlatform && activeTopics.size > 0) {
-				for (const topic of activeTopics) {
-					redis.hgetall(hashKey(topic)).then((all) => {
-						if (!all || !activePlatform) return;
-						const now = Date.now();
-						const entries = [];
-						for (const key of Object.keys(all)) {
-							if (key.startsWith(instanceId + ':')) continue;
-							try {
-								const parsed = JSON.parse(all[key]);
-								if (parsed.ts && (now - parsed.ts) <= cursorTtlMs) {
-									entries.push({ key, user: parsed.user, data: parsed.data });
-								}
-							} catch { /* skip */ }
+		subscriberReady = sub.subscribe(channel).then(async () => {
+			if (!activePlatform || activeTopics.size === 0) return;
+			// One pipelined round-trip for every active topic's snapshot
+			// instead of one independent hgetall per topic. Faster when
+			// ioredis auto-pipelining is off (the default) and roughly
+			// neutral when on.
+			const topics = [...activeTopics];
+			const pipe = redis.pipeline();
+			for (const topic of topics) pipe.hgetall(hashKey(topic));
+			let results;
+			try {
+				results = await pipe.exec();
+			} catch { return; }
+			if (!activePlatform) return;
+			const now = Date.now();
+			for (let i = 0; i < topics.length; i++) {
+				const [, all] = results[i];
+				if (!all) continue;
+				const topic = topics[i];
+				const entries = [];
+				for (const key of Object.keys(all)) {
+					if (key.startsWith(instanceId + ':')) continue;
+					try {
+						const parsed = JSON.parse(all[key]);
+						if (parsed.ts && (now - parsed.ts) <= cursorTtlMs) {
+							entries.push({ key, user: parsed.user, data: parsed.data });
 						}
-						if (entries.length > 0 && activePlatform) {
-							activePlatform.publish('__cursor:' + topic, EVENTS.BULK, entries, { relay: false });
-						}
-					}).catch(() => {});
+					} catch { /* skip */ }
+				}
+				if (entries.length > 0 && activePlatform) {
+					activePlatform.publish('__cursor:' + topic, EVENTS.BULK, entries, { relay: false });
 				}
 			}
 		}).catch(() => {

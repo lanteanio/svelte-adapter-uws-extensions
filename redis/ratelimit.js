@@ -12,6 +12,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * Lua script for atomic token bucket consumption.
@@ -207,23 +208,9 @@ export function createRateLimit(client, options) {
 			}
 			const key = resolveKey(ws);
 
-			b?.guard();
-			let result;
-			try {
-				result = await redis.eval(
-					CONSUME_SCRIPT,
-					1,
-					bucketKey(key),
-					points,
-					interval,
-					cost,
-					blockDuration
-				);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const result = await withBreaker(b, () =>
+				redis.eval(CONSUME_SCRIPT, 1, bucketKey(key), points, interval, cost, blockDuration)
+			);
 
 			const allowed = result[0] === 1;
 			if (allowed) {
@@ -240,51 +227,23 @@ export function createRateLimit(client, options) {
 		},
 
 		async reset(key) {
-			if (b) b.guard();
-			try {
-				await redis.del(bucketKey(key));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.del(bucketKey(key)));
 		},
 
 		async ban(key, duration) {
 			const dur = duration ?? (blockDuration || 60000);
 			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');
 			const bk = bucketKey(key);
-			b?.guard();
-			try {
-				await redis.eval(BAN_SCRIPT, 1, bk, dur, points, interval);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.eval(BAN_SCRIPT, 1, bk, dur, points, interval));
 			mBans?.inc();
 		},
 
 		async unban(key) {
-			if (b) b.guard();
-			try {
-				await redis.hset(bucketKey(key), 'bannedUntil', 0);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.hset(bucketKey(key), 'bannedUntil', 0));
 		},
 
 		async clear() {
-			if (b) b.guard();
-			try {
-				await scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:*'));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:*')));
 		}
 	};
 }

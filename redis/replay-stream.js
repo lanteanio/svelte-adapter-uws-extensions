@@ -21,6 +21,7 @@
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * Lua script for atomic idempotent publish.
@@ -181,18 +182,10 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			b?.guard();
-			let result;
-			try {
-				result = await redis.eval(
-					IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
-					requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null)
-				);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const result = await withBreaker(b, () =>
+				redis.eval(IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
+					requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null))
+			);
 
 			const isDuplicate = Number(result[0]) === 1;
 			const seq = Number(result[1]);
@@ -217,17 +210,9 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			b?.guard();
-			try {
-				await redis.eval(
-					PUBLISH_SCRIPT, 2, sk, bk,
-					maxSize, ttl, topic, event, JSON.stringify(data ?? null)
-				);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () =>
+				redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, JSON.stringify(data ?? null))
+			);
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
@@ -238,15 +223,8 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async seq(topic) {
-			if (b) b.guard();
-			try {
-				const val = await redis.get(seqKey(topic));
-				b?.success();
-				return val ? parseInt(val, 10) : 0;
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const val = await withBreaker(b, () => redis.get(seqKey(topic)));
+			return val ? parseInt(val, 10) : 0;
 		},
 
 		async gap(topic, lastSeenSeq) {
@@ -291,16 +269,8 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
-			if (b) b.guard();
-			let entries;
-			try {
-				const startId = since >= 0 ? `(${since}-0` : '-';
-				entries = await redis.xrange(bufKey(topic), startId, '+');
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const startId = since >= 0 ? `(${since}-0` : '-';
+			const entries = await withBreaker(b, () => redis.xrange(bufKey(topic), startId, '+'));
 			const result = [];
 			for (const [id, flat] of entries) {
 				const fields = fieldsToObject(flat);
@@ -371,25 +341,11 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async clear() {
-			if (b) b.guard();
-			try {
-				await scanAndUnlink(redis, client.key('replay:*'));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => scanAndUnlink(redis, client.key('replay:*')));
 		},
 
 		async clearTopic(topic) {
-			if (b) b.guard();
-			try {
-				await redis.unlink(seqKey(topic), bufKey(topic));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
 		}
 	};
 }

@@ -18,6 +18,7 @@
 import { createStreamReplay } from './replay-stream.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+import { withBreaker } from '../shared/breaker.js';
 export { ReplicationTimeoutError };
 
 /**
@@ -122,17 +123,9 @@ export function createReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			b?.guard();
-			try {
-				await redis.eval(
-					PUBLISH_SCRIPT, 2, sk, bk,
-					topic, event, JSON.stringify(data ?? null), maxSize, ttl
-				);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () =>
+				redis.eval(PUBLISH_SCRIPT, 2, sk, bk, topic, event, JSON.stringify(data ?? null), maxSize, ttl)
+			);
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
@@ -143,15 +136,8 @@ export function createReplay(client, options = {}) {
 		},
 
 		async seq(topic) {
-			if (b) b.guard();
-			try {
-				const val = await redis.get(seqKey(topic));
-				b?.success();
-				return val ? parseInt(val, 10) : 0;
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const val = await withBreaker(b, () => redis.get(seqKey(topic)));
+			return val ? parseInt(val, 10) : 0;
 		},
 
 		async gap(topic, lastSeenSeq) {
@@ -200,15 +186,7 @@ export function createReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
-			if (b) b.guard();
-			let raw;
-			try {
-				raw = await redis.zrangebyscore(bufKey(topic), since + 1, '+inf');
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const raw = await withBreaker(b, () => redis.zrangebyscore(bufKey(topic), since + 1, '+inf'));
 			const result = [];
 			for (let i = 0; i < raw.length; i++) {
 				try {
@@ -295,25 +273,11 @@ export function createReplay(client, options = {}) {
 		},
 
 		async clear() {
-			if (b) b.guard();
-			try {
-				await scanAndUnlink(redis, client.key('replay:*'));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => scanAndUnlink(redis, client.key('replay:*')));
 		},
 
 		async clearTopic(topic) {
-			if (b) b.guard();
-			try {
-				await redis.unlink(seqKey(topic), bufKey(topic));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
 		}
 	};
 }

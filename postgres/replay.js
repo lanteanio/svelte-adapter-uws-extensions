@@ -28,6 +28,7 @@
  */
 
 import { safeCreate } from '../shared/pg-migrate.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -164,11 +165,9 @@ export function createReplay(client, options = {}) {
 
 	return {
 		async publish(platform, topic, event, data) {
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'replay_publish_' + table,
 					text: `WITH new_seq AS (
 						INSERT INTO ${seqTable} (topic, seq)
@@ -183,11 +182,7 @@ export function createReplay(client, options = {}) {
 					RETURNING seq`,
 					values: [topic, event, JSON.stringify(data ?? null)]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			const seq = parseInt(res.rows[0].seq, 10);
 			mPublishes?.inc({ topic: mt(topic) });
 
@@ -217,22 +212,16 @@ export function createReplay(client, options = {}) {
 		},
 
 		async seq(topic) {
-			if (b) b.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'replay_seq_' + table,
 					text: `SELECT COALESCE(seq, 0)::int AS current_seq
 					         FROM ${seqTable}
 					        WHERE topic = $1`,
 					values: [topic]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			return res.rows.length > 0 ? parseInt(res.rows[0].current_seq, 10) : 0;
 		},
 
@@ -283,11 +272,9 @@ export function createReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
-			if (b) b.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'replay_since_' + table,
 					text: `SELECT seq, topic, event, data
 					   FROM ${table}
@@ -296,11 +283,7 @@ export function createReplay(client, options = {}) {
 					  ORDER BY seq ASC`,
 					values: [topic, since]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			return res.rows.map((row) => ({
 				seq: parseInt(row.seq, 10),
 				topic: row.topic,
@@ -378,21 +361,15 @@ export function createReplay(client, options = {}) {
 		},
 
 		async clear() {
-			if (b) b.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
 				await client.query(`DELETE FROM ${table}`);
 				await client.query(`DELETE FROM ${seqTable}`);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 		},
 
 		async clearTopic(topic) {
-			if (b) b.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
 				await client.query(
 					`DELETE FROM ${table}
@@ -400,11 +377,7 @@ export function createReplay(client, options = {}) {
 				await client.query(
 					`DELETE FROM ${seqTable}
 					  WHERE topic = $1`, [topic]);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 		},
 
 		destroy() {

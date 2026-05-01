@@ -29,6 +29,7 @@
  */
 
 import { safeCreate } from '../shared/pg-migrate.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * @typedef {Object} JobQueueOptions
@@ -109,22 +110,16 @@ export function createJobQueue(client, options = {}) {
 			if (typeof queue !== 'string' || queue.length === 0) {
 				throw new Error('postgres jobs: queue must be a non-empty string');
 			}
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'jobs_enqueue_' + table,
 					text: `INSERT INTO ${table} (queue, payload)
 					            VALUES ($1, $2)
 					        RETURNING svti_jobs_id AS id`,
 					values: [queue, JSON.stringify(payload ?? null)]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			mEnqueued?.inc({ queue });
 			return res.rows[0].id;
 		},
@@ -142,11 +137,9 @@ export function createJobQueue(client, options = {}) {
 				throw new Error('postgres jobs: visibilityTimeoutMs must be a positive number');
 			}
 
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'jobs_claim_' + table,
 					text: `WITH claimed AS (
 						SELECT svti_jobs_id FROM ${table}
@@ -165,11 +158,7 @@ export function createJobQueue(client, options = {}) {
 					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.attempts, t.created_at`,
 					values: [queue, batchSize, String(visibilityTimeoutMs)]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			if (res.rows.length > 0) mClaimed?.inc({ queue }, res.rows.length);
 			return res.rows.map((row) => ({
 				id: row.id,
@@ -183,22 +172,16 @@ export function createJobQueue(client, options = {}) {
 		async complete(idOrIds) {
 			const ids = asArray(idOrIds);
 			if (ids.length === 0) return;
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'jobs_complete_' + table,
 					text: `DELETE FROM ${table}
 					            WHERE svti_jobs_id = ANY($1::bigint[])
 					      RETURNING queue`,
 					values: [ids]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			if (mCompleted) {
 				for (const row of res.rows) mCompleted.inc({ queue: row.queue });
 			}
@@ -207,11 +190,9 @@ export function createJobQueue(client, options = {}) {
 		async fail(idOrIds) {
 			const ids = asArray(idOrIds);
 			if (ids.length === 0) return;
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
-				res = await client.query({
+				return client.query({
 					name: 'jobs_fail_' + table,
 					text: `UPDATE ${table}
 					           SET claimed_at = NULL,
@@ -220,11 +201,7 @@ export function createJobQueue(client, options = {}) {
 					     RETURNING queue`,
 					values: [ids]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 			if (mFailed) {
 				for (const row of res.rows) mFailed.inc({ queue: row.queue });
 			}
@@ -236,10 +213,9 @@ export function createJobQueue(client, options = {}) {
 			if (typeof additionalMs !== 'number' || !Number.isFinite(additionalMs) || additionalMs <= 0) {
 				throw new Error('postgres jobs: additionalMs must be a positive number');
 			}
-			b?.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
-				await client.query({
+				return client.query({
 					name: 'jobs_extend_' + table,
 					text: `UPDATE ${table}
 					           SET claimed_until = claimed_until + ($2 || ' milliseconds')::interval
@@ -247,20 +223,14 @@ export function createJobQueue(client, options = {}) {
 					           AND claimed_at IS NOT NULL`,
 					values: [ids, String(additionalMs)]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 		},
 
 		async pending(queue) {
-			b?.guard();
-			let res;
-			try {
+			const res = await withBreaker(b, async () => {
 				await ensureTable();
 				if (queue !== undefined) {
-					res = await client.query({
+					return client.query({
 						name: 'jobs_pending_q_' + table,
 						text: `SELECT COUNT(*)::int AS pending_count
 						          FROM ${table}
@@ -268,36 +238,25 @@ export function createJobQueue(client, options = {}) {
 						           AND claimed_at IS NULL`,
 						values: [queue]
 					});
-				} else {
-					res = await client.query({
-						name: 'jobs_pending_all_' + table,
-						text: `SELECT COUNT(*)::int AS pending_count
-						          FROM ${table}
-						         WHERE claimed_at IS NULL`
-					});
 				}
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+				return client.query({
+					name: 'jobs_pending_all_' + table,
+					text: `SELECT COUNT(*)::int AS pending_count
+					          FROM ${table}
+					         WHERE claimed_at IS NULL`
+				});
+			});
 			return res.rows[0].pending_count;
 		},
 
 		async clear(queue) {
-			b?.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
 				if (queue !== undefined) {
-					await client.query(`DELETE FROM ${table} WHERE queue = $1`, [queue]);
-				} else {
-					await client.query(`DELETE FROM ${table}`);
+					return client.query(`DELETE FROM ${table} WHERE queue = $1`, [queue]);
 				}
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+				return client.query(`DELETE FROM ${table}`);
+			});
 		},
 
 		destroy() {

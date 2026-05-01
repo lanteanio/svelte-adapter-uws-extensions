@@ -27,6 +27,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * Lua script for atomic acquire.
@@ -129,15 +130,9 @@ export function createIdempotencyStore(client, options = {}) {
 			validateKey(userKey);
 			const k = fullKey(userKey);
 
-			b?.guard();
-			let raw;
-			try {
-				raw = await redis.eval(ACQUIRE_SCRIPT, 1, k, PENDING_SENTINEL, acquireTtl);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const raw = await withBreaker(b, () =>
+				redis.eval(ACQUIRE_SCRIPT, 1, k, PENDING_SENTINEL, acquireTtl)
+			);
 
 			const status = raw[0];
 			const value = raw[1];
@@ -149,25 +144,11 @@ export function createIdempotencyStore(client, options = {}) {
 					acquired: true,
 					async commit(result) {
 						const payload = JSON.stringify(result === undefined ? null : result);
-						b?.guard();
-						try {
-							await redis.set(k, payload, 'EX', ttl);
-							b?.success();
-						} catch (err) {
-							b?.failure(err);
-							throw err;
-						}
+						await withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
 						mCommits?.inc();
 					},
 					async abort() {
-						b?.guard();
-						try {
-							await redis.del(k);
-							b?.success();
-						} catch (err) {
-							b?.failure(err);
-							throw err;
-						}
+						await withBreaker(b, () => redis.del(k));
 						mAborts?.inc();
 					}
 				};
@@ -191,25 +172,11 @@ export function createIdempotencyStore(client, options = {}) {
 
 		async purge(userKey) {
 			validateKey(userKey);
-			b?.guard();
-			try {
-				await redis.del(fullKey(userKey));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => redis.del(fullKey(userKey)));
 		},
 
 		async clear() {
-			b?.guard();
-			try {
-				await scanAndUnlink(redis, client.key(keyPrefix + '*'));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => scanAndUnlink(redis, client.key(keyPrefix + '*')));
 		}
 	};
 }

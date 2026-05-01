@@ -22,6 +22,7 @@ import { now as cachedNow } from '../shared/time.js';
 import { CLEANUP_SCRIPT, COUNT_DEDUP_SCRIPT, LIST_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * Lua script for atomic join: set this instance's field and expire the key.
@@ -179,6 +180,15 @@ export function createPresence(client, options = {}) {
 	const wsTopics = new Map();
 
 	/**
+	 * Reverse index from `topic + '|' + userKey` to the set of ws connections
+	 * tracking that (topic, key) on this instance. Mirrors `wsTopics` so the
+	 * leave path can find another live connection for the same user without
+	 * scanning every ws on the instance.
+	 * @type {Map<string, Set<any>>}
+	 */
+	const topicKeyToWs = new Map();
+
+	/**
 	 * Local per-topic reference count per user key.
 	 * Used to know when the last local connection for a user leaves.
 	 * @type {Map<string, Map<string, number>>}
@@ -213,6 +223,36 @@ export function createPresence(client, options = {}) {
 
 	function hashKey(topic) {
 		return client.key('presence:' + topic);
+	}
+
+	function indexAdd(topic, userKey, ws) {
+		const k = topic + '|' + userKey;
+		let set = topicKeyToWs.get(k);
+		if (!set) {
+			set = new Set();
+			topicKeyToWs.set(k, set);
+		}
+		set.add(ws);
+	}
+
+	function indexRemove(topic, userKey, ws) {
+		const k = topic + '|' + userKey;
+		const set = topicKeyToWs.get(k);
+		if (!set) return;
+		set.delete(ws);
+		if (set.size === 0) topicKeyToWs.delete(k);
+	}
+
+	function findOtherWsData(topic, userKey, exceptWs) {
+		const set = topicKeyToWs.get(topic + '|' + userKey);
+		if (!set) return null;
+		let newest = null;
+		for (const ws of set) {
+			if (ws === exceptWs) continue;
+			const entry = wsTopics.get(ws)?.get(topic);
+			if (entry && entry.key === userKey) newest = entry.data;
+		}
+		return newest;
 	}
 
 	function coalesceHgetall(topic) {
@@ -460,6 +500,7 @@ export function createPresence(client, options = {}) {
 			connTopics.delete(topic);
 			if (connTopics.size === 0) wsTopics.delete(ws);
 		}
+		indexRemove(topic, key, ws);
 		const counts = localCounts.get(topic);
 		if (counts) {
 			if (prevCount === 0) {
@@ -504,6 +545,7 @@ export function createPresence(client, options = {}) {
 			const { key, data } = connTopics.get(topic);
 			connTopics.delete(topic);
 			if (connTopics.size === 0) wsTopics.delete(ws);
+			indexRemove(topic, key, ws);
 
 			try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 
@@ -554,12 +596,7 @@ export function createPresence(client, options = {}) {
 					counts.set(key, current - 1);
 					const topicData = localData.get(topic);
 					if (topicData) {
-						let newest = null;
-						for (const [otherWs, otherTopics] of wsTopics) {
-							if (otherWs === ws) continue;
-							const entry = otherTopics.get(topic);
-							if (entry && entry.key === key) newest = entry.data;
-						}
+						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
 						if (newest && cached && !deepEqual(newest, cached.data)) {
 							const ser = JSON.stringify(newest);
@@ -604,6 +641,11 @@ export function createPresence(client, options = {}) {
 		// lets concurrent join() calls detect the closed ws via wsTopics.
 		const connTopics = wsTopics.get(ws);
 		wsTopics.delete(ws);
+		if (connTopics) {
+			for (const [topic, { key }] of connTopics) {
+				indexRemove(topic, key, ws);
+			}
+		}
 
 		const syncTopics = syncObservers.get(ws);
 		syncObservers.delete(ws);
@@ -653,11 +695,7 @@ export function createPresence(client, options = {}) {
 					counts.set(key, current - 1);
 					const topicData = localData.get(topic);
 					if (topicData) {
-						let newest = null;
-						for (const [otherWs, otherTopics] of wsTopics) {
-							const entry = otherTopics.get(topic);
-							if (entry && entry.key === key) newest = entry.data;
-						}
+						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
 						if (newest && cached && !deepEqual(newest, cached.data)) {
 							deferredRestores.push({ topic, key, newest, cached });
@@ -790,6 +828,7 @@ export function createPresence(client, options = {}) {
 				wsTopics.set(ws, connTopics);
 			}
 			connTopics.set(topic, { key, data });
+			indexAdd(topic, key, ws);
 
 			let counts = existingCounts;
 			if (!counts) {
@@ -987,16 +1026,10 @@ export function createPresence(client, options = {}) {
 		},
 
 		async list(topic) {
-			b?.guard();
 			const now = cachedNow();
-			let raw;
-			try {
-				raw = await redis.eval(LIST_SCRIPT, 1, hashKey(topic), now, presenceTtlMs);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			const raw = await withBreaker(b, () =>
+				redis.eval(LIST_SCRIPT, 1, hashKey(topic), now, presenceTtlMs)
+			);
 			const result = [];
 			for (let i = 0; i < raw.length; i += 2) {
 				try {
@@ -1008,16 +1041,10 @@ export function createPresence(client, options = {}) {
 		},
 
 		async count(topic) {
-			b?.guard();
 			const now = cachedNow();
-			try {
-				const result = await redis.eval(COUNT_DEDUP_SCRIPT, 1, hashKey(topic), now, presenceTtlMs);
-				b?.success();
-				return result;
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			return withBreaker(b, () =>
+				redis.eval(COUNT_DEDUP_SCRIPT, 1, hashKey(topic), now, presenceTtlMs)
+			);
 		},
 
 		metrics() {
@@ -1033,14 +1060,7 @@ export function createPresence(client, options = {}) {
 		},
 
 		async clear() {
-			b?.guard();
-			try {
-				await scanAndUnlink(redis, client.key('presence:*'));
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => scanAndUnlink(redis, client.key('presence:*')));
 
 			for (const [ws, connTopics] of wsTopics) {
 				for (const topic of connTopics.keys()) {

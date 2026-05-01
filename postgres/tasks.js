@@ -49,6 +49,7 @@ import {
 } from './_tasks-errors.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql } from './_tasks-sql.js';
+import { withBreaker } from '../shared/breaker.js';
 
 export { TaskInFlightError, UnknownTaskError };
 
@@ -282,10 +283,9 @@ export function createTaskRunner(client, options = {}) {
 		let lastError;
 
 		while (true) {
-			b?.guard();
 			let result;
 			let handlerError;
-			try {
+			await withBreaker(b, async () => {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUUID();
@@ -300,11 +300,7 @@ export function createTaskRunner(client, options = {}) {
 				if (fenceProvider) {
 					await fenceProvider.acquire(taskId, fence, fenceTtl);
 				}
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 
 			mRunStart?.inc({ name });
 
@@ -561,14 +557,7 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 
 			const taskId = randomUUID();
-			b?.guard();
-			try {
-				await sql.insertPending(taskId, name, input, idempotencyKey);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey));
 			mEnqueued?.inc({ name });
 			return taskId;
 		},

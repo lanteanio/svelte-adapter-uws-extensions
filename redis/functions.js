@@ -20,6 +20,7 @@
  */
 
 import { parseRedisVersion } from '../shared/redis-version.js';
+import { withBreaker } from '../shared/breaker.js';
 
 const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
 
@@ -103,15 +104,8 @@ export function createFunctionLibrary(client, code, options = {}) {
 
 		async load() {
 			await ensureVersion();
-			b?.guard();
-			try {
-				await client.redis.function('LOAD', 'REPLACE', code);
-				b?.success();
-				mLoads?.inc({ library: name });
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => client.redis.function('LOAD', 'REPLACE', code));
+			mLoads?.inc({ library: name });
 		},
 
 		async call(funcName, opts = {}) {
@@ -124,29 +118,19 @@ export function createFunctionLibrary(client, code, options = {}) {
 				throw new Error('redis functions: keys and args must be arrays');
 			}
 
-			b?.guard();
 			let result;
 			try {
-				result = await client.redis.fcall(funcName, keys.length, ...keys, ...args);
-				b?.success();
-				mCalls?.inc({ library: name, function: funcName });
+				result = await withBreaker(b, () => client.redis.fcall(funcName, keys.length, ...keys, ...args));
 			} catch (err) {
-				b?.failure(err);
 				mErrors?.inc({ library: name, function: funcName });
 				throw err;
 			}
+			mCalls?.inc({ library: name, function: funcName });
 			return result;
 		},
 
 		async delete() {
-			b?.guard();
-			try {
-				await client.redis.function('DELETE', name);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => client.redis.function('DELETE', name));
 		}
 	};
 }

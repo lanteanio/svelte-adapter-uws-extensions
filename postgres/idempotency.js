@@ -29,6 +29,7 @@
  */
 
 import { safeCreate } from '../shared/pg-migrate.js';
+import { withBreaker } from '../shared/breaker.js';
 
 /**
  * @typedef {Object} PgIdempotencyOptions
@@ -132,40 +133,26 @@ export function createIdempotencyStore(client, options = {}) {
 
 	function commitFor(idempotencyKey) {
 		return async function commit(result) {
-			b?.guard();
-			try {
-				await client.query({
-					name: 'idem_commit_' + table,
-					text: `UPDATE ${table}
-					          SET status = 'committed',
-					              result = $2::jsonb,
-					              expires_at = now() + ($3 || ' seconds')::interval
-					        WHERE svti_idempotency_key = $1`,
-					values: [idempotencyKey, JSON.stringify(result === undefined ? null : result), ttl]
-				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => client.query({
+				name: 'idem_commit_' + table,
+				text: `UPDATE ${table}
+				          SET status = 'committed',
+				              result = $2::jsonb,
+				              expires_at = now() + ($3 || ' seconds')::interval
+				        WHERE svti_idempotency_key = $1`,
+				values: [idempotencyKey, JSON.stringify(result === undefined ? null : result), ttl]
+			}));
 			mCommits?.inc();
 		};
 	}
 
 	function abortFor(idempotencyKey) {
 		return async function abort() {
-			b?.guard();
-			try {
-				await client.query({
-					name: 'idem_abort_' + table,
-					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
-					values: [idempotencyKey]
-				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () => client.query({
+				name: 'idem_abort_' + table,
+				text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
+				values: [idempotencyKey]
+			}));
 			mAborts?.inc();
 		};
 	}
@@ -251,31 +238,21 @@ export function createIdempotencyStore(client, options = {}) {
 
 		async purge(idempotencyKey) {
 			validateKey(idempotencyKey);
-			b?.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
-				await client.query({
+				return client.query({
 					name: 'idem_purge_' + table,
 					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
 					values: [idempotencyKey]
 				});
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			});
 		},
 
 		async clear() {
-			b?.guard();
-			try {
+			await withBreaker(b, async () => {
 				await ensureTable();
-				await client.query(`DELETE FROM ${table}`);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+				return client.query(`DELETE FROM ${table}`);
+			});
 		},
 
 		destroy() {

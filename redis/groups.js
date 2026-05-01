@@ -19,6 +19,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
+import { withBreaker } from '../shared/breaker.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -282,19 +283,10 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async setMeta(meta) {
-			if (b) b.guard();
-			try {
-				if (Object.keys(meta).length === 0) {
-					await redis.del(metaKey);
-				} else {
-					await redis.hmset(metaKey, meta);
-				}
-				metaInitError = null;
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			await withBreaker(b, () =>
+				Object.keys(meta).length === 0 ? redis.del(metaKey) : redis.hmset(metaKey, meta)
+			);
+			metaInitError = null;
 		},
 
 		async join(ws, platform, role = 'member') {
@@ -464,16 +456,8 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async count() {
-			if (b) b.guard();
 			const now = Date.now();
-			try {
-				const result = await redis.eval(COUNT_SCRIPT, 1, membersKey, now, memberTtlMs);
-				b?.success();
-				return result;
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
+			return withBreaker(b, () => redis.eval(COUNT_SCRIPT, 1, membersKey, now, memberTtlMs));
 		},
 
 		has(ws) {
