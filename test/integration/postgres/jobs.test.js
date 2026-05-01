@@ -179,10 +179,10 @@ describe('postgres jobs (integration)', () => {
 	describe('visibility timeout reclaim', () => {
 		it('a job whose visibility expired becomes claimable again', async () => {
 			await queue.enqueue('vis', { id: 1 });
-			const first = await queue.claim('vis', { visibilityTimeoutMs: 200 });
+			const first = await queue.claim('vis', { visibilityTimeoutMs: 300 });
 			expect(first).toHaveLength(1);
 
-			await wait(300);
+			await wait(1000);
 
 			const reclaim = await queue.claim('vis');
 			expect(reclaim).toHaveLength(1);

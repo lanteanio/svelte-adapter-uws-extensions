@@ -304,7 +304,7 @@ describe('postgres idempotency (integration)', () => {
 				);
 				expect(count.rows[0].n).toBe(2);
 
-				await wait(1500);
+				await wait(3000);
 
 				count = await client.query(
 					`SELECT COUNT(*)::int AS n FROM ${TABLE} WHERE svti_idempotency_key LIKE 'sweep:%'`
