@@ -187,6 +187,42 @@ describe('postgres tasks core (integration)', () => {
 			const res = await client.query(`SELECT svti_idempotency_key FROM ${TABLE}`);
 			expect(res.rows[0].svti_idempotency_key).toBe('stable-key-1');
 		});
+
+		it('persists requestId on the row and exposes ctx.requestId to the handler', async () => {
+			runner = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				dispatchInterval: 0
+			});
+
+			let seen;
+			runner.register('echo', async ({ requestId }) => {
+				seen = requestId;
+				return 'ok';
+			});
+
+			await runner.run('echo', { input: null, requestId: 'req-end-to-end' });
+			expect(seen).toBe('req-end-to-end');
+
+			const res = await client.query(`SELECT request_id FROM ${TABLE}`);
+			expect(res.rows[0].request_id).toBe('req-end-to-end');
+		});
+
+		it('extracts requestId from a passed platform.requestId', async () => {
+			runner = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				dispatchInterval: 0
+			});
+
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; });
+			await runner.run('echo', { input: null, platform: { requestId: 'req-platform-real' } });
+
+			expect(seen).toBe('req-platform-real');
+			const res = await client.query(`SELECT request_id FROM ${TABLE}`);
+			expect(res.rows[0].request_id).toBe('req-platform-real');
+		});
 	});
 
 	describe('run + fail', () => {

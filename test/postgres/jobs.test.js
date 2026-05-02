@@ -55,6 +55,39 @@ describe('postgres job queue', () => {
 			const claimed = await queue.claim('ping');
 			expect(claimed[0].payload).toBe(null);
 		});
+
+		it('persists explicit requestId on the row', async () => {
+			await queue.enqueue('email', { x: 1 }, { requestId: 'req-job-1' });
+			const claimed = await queue.claim('email');
+			expect(claimed[0].requestId).toBe('req-job-1');
+		});
+
+		it('extracts requestId from a passed platform.requestId', async () => {
+			await queue.enqueue('email', { x: 1 }, { platform: { requestId: 'req-from-platform' } });
+			const claimed = await queue.claim('email');
+			expect(claimed[0].requestId).toBe('req-from-platform');
+		});
+
+		it('explicit requestId wins over platform.requestId when both are given', async () => {
+			await queue.enqueue('email', null, {
+				requestId: 'req-explicit',
+				platform: { requestId: 'req-from-platform' }
+			});
+			const claimed = await queue.claim('email');
+			expect(claimed[0].requestId).toBe('req-explicit');
+		});
+
+		it('returns requestId: null on jobs enqueued without a requestId', async () => {
+			await queue.enqueue('email', { x: 1 });
+			const claimed = await queue.claim('email');
+			expect(claimed[0].requestId).toBeNull();
+		});
+
+		it('treats empty-string requestId as null', async () => {
+			await queue.enqueue('email', null, { requestId: '' });
+			const claimed = await queue.claim('email');
+			expect(claimed[0].requestId).toBeNull();
+		});
 	});
 
 	describe('claim', () => {

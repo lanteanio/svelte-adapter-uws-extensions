@@ -35,6 +35,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 				name                 TEXT         NOT NULL,
 				input                JSONB,
 				svti_idempotency_key TEXT,
+				request_id           TEXT,
 				status               TEXT         NOT NULL,
 				result               JSONB,
 				error                JSONB,
@@ -44,6 +45,12 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 				created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
 				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 			)
+		`);
+		// Forward-migrate existing 0.5.0-next.1 deployments. ADD COLUMN IF NOT
+		// EXISTS is idempotent on Postgres 9.6+; safeCreate swallows the
+		// duplicate-column error path on older versions defensively.
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
 		`);
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
@@ -58,14 +65,14 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		migrated = true;
 	}
 
-	async function insertAttempt(taskId, name, input, idempotencyKey, fence) {
+	async function insertAttempt(taskId, name, input, idempotencyKey, fence, requestId) {
 		await client.query({
 			name: 'tasks_insert_' + table,
 			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at)
+			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at)
 			       VALUES
-			          ($1, $2, $3::jsonb, $4, 'running', $5, now() + ($6 || ' seconds')::interval)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, fence, fenceTtl]
+			          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval)`,
+			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null, fence, fenceTtl]
 		});
 	}
 
@@ -123,20 +130,20 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 	async function readRow(taskId) {
 		const res = await client.query({
 			name: 'tasks_read_' + table,
-			text: `SELECT status, result, error, attempts FROM ${table} WHERE svti_tasks_id = $1`,
+			text: `SELECT status, result, error, attempts, request_id FROM ${table} WHERE svti_tasks_id = $1`,
 			values: [taskId]
 		});
 		return res.rows[0] || null;
 	}
 
-	async function insertPending(taskId, name, input, idempotencyKey) {
+	async function insertPending(taskId, name, input, idempotencyKey, requestId) {
 		await client.query({
 			name: 'tasks_enqueue_' + table,
 			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, status, fence, fence_expires_at, attempts)
+			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, attempts)
 			       VALUES
-			          ($1, $2, $3::jsonb, $4, 'pending', gen_random_uuid(), now(), 0)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null]
+			          ($1, $2, $3::jsonb, $4, $5, 'pending', gen_random_uuid(), now(), 0)`,
+			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null]
 		});
 	}
 
@@ -158,7 +165,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 			              updated_at = now()
 			         FROM claimed
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.request_id, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;
@@ -181,7 +188,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 			              updated_at = now()
 			         FROM claimed
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.fence, t.attempts`,
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.request_id, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;

@@ -65,6 +65,7 @@ export function createPubSubBus(client, options = {}) {
 	const mRelayed = m?.counter('pubsub_messages_relayed_total', 'Messages relayed to Redis');
 	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
 	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
+	const mParseErrors = m?.counter('pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
 	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush');
 	const mDegraded = m?.counter('pubsub_degraded_total', 'Auto-emitted degraded events');
 	const mRecovered = m?.counter('pubsub_recovered_total', 'Auto-emitted recovered events');
@@ -277,7 +278,9 @@ export function createPubSubBus(client, options = {}) {
 						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 					}
 				} catch {
-					// Malformed message, skip
+					// Malformed envelope; counted so a stream of bad messages
+					// is observable instead of silently swallowed.
+					mParseErrors?.inc();
 				}
 			});
 

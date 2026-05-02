@@ -65,6 +65,7 @@ export function createShardedBus(client, options = {}) {
 	const mRelayed = m?.counter('sharded_pubsub_messages_relayed_total', 'Messages SPUBLISHed', ['topic']);
 	const mReceived = m?.counter('sharded_pubsub_messages_received_total', 'Messages received via SSUBSCRIBE', ['topic']);
 	const mEchoSuppressed = m?.counter('sharded_pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
+	const mParseErrors = m?.counter('sharded_pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
 	const mFollows = m?.counter('sharded_pubsub_ssubscribes_total', 'SSUBSCRIBE calls');
 	const mUnfollows = m?.counter('sharded_pubsub_sunsubscribes_total', 'SUNSUBSCRIBE calls');
 
@@ -170,7 +171,9 @@ export function createShardedBus(client, options = {}) {
 					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 				}
 			} catch {
-				// Malformed message; skip.
+				// Malformed envelope; counted so a stream of bad messages
+				// is observable instead of silently swallowed.
+				mParseErrors?.inc();
 			}
 		});
 	}

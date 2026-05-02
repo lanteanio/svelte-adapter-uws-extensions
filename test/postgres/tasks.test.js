@@ -133,6 +133,70 @@ describe('postgres tasks', () => {
 		});
 	});
 
+	describe('requestId threading', () => {
+		it('exposes ctx.requestId = null when no requestId is provided', async () => {
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; });
+			await runner.run('echo', { input: null });
+			expect(seen).toBeNull();
+		});
+
+		it('persists explicit requestId on the row and exposes it via ctx.requestId', async () => {
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; return 'ok'; });
+			await runner.run('echo', { input: null, requestId: 'req-abc-123' });
+
+			expect(seen).toBe('req-abc-123');
+			const rows = [...client._getTaskRows().values()];
+			expect(rows[0].request_id).toBe('req-abc-123');
+		});
+
+		it('extracts requestId from a passed platform.requestId', async () => {
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; });
+			await runner.run('echo', { input: null, platform: { requestId: 'req-from-platform' } });
+
+			expect(seen).toBe('req-from-platform');
+		});
+
+		it('explicit requestId wins over platform.requestId when both are given', async () => {
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; });
+			await runner.run('echo', {
+				input: null,
+				requestId: 'req-explicit',
+				platform: { requestId: 'req-from-platform' }
+			});
+			expect(seen).toBe('req-explicit');
+		});
+
+		it('treats empty-string requestId as null', async () => {
+			let seen;
+			runner.register('echo', async ({ requestId }) => { seen = requestId; });
+			await runner.run('echo', { input: null, requestId: '' });
+			expect(seen).toBeNull();
+		});
+
+		it('persists request_id through retry attempts', async () => {
+			let attempts = 0;
+			let lastRequestId;
+			runner.register('flaky', async ({ requestId }) => {
+				attempts++;
+				lastRequestId = requestId;
+				if (attempts < 2) throw new Error('not yet');
+				return 'ok';
+			}, {
+				retry: { maxAttempts: 3, backoff: () => 0 }
+			});
+
+			const result = await runner.run('flaky', { input: null, requestId: 'req-retry' });
+
+			expect(result).toBe('ok');
+			expect(attempts).toBe(2);
+			expect(lastRequestId).toBe('req-retry');
+		});
+	});
+
 	describe('idempotency integration', () => {
 		it('returns the cached result on second run with the same key', async () => {
 			const idempotency = createIdempotencyStore(client, { cleanupInterval: 0 });

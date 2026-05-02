@@ -59,6 +59,34 @@ describe('postgres tasks (enqueue / await / dispatch)', () => {
 			const row = client._getTaskRows().get(id);
 			expect(row.status).toBe('pending');
 		});
+
+		it('persists requestId on the pending row', async () => {
+			runner.register('echo', async () => 'ok');
+			const id = await runner.enqueue('echo', { input: null, requestId: 'req-enq-1' });
+			const row = client._getTaskRows().get(id);
+			expect(row.request_id).toBe('req-enq-1');
+		});
+
+		it('extracts requestId from platform.requestId', async () => {
+			runner.register('echo', async () => 'ok');
+			const id = await runner.enqueue('echo', {
+				input: null,
+				platform: { requestId: 'req-enq-platform' }
+			});
+			const row = client._getTaskRows().get(id);
+			expect(row.request_id).toBe('req-enq-platform');
+		});
+
+		it('explicit requestId wins over platform.requestId on enqueue', async () => {
+			runner.register('echo', async () => 'ok');
+			const id = await runner.enqueue('echo', {
+				input: null,
+				requestId: 'req-explicit',
+				platform: { requestId: 'req-from-platform' }
+			});
+			const row = client._getTaskRows().get(id);
+			expect(row.request_id).toBe('req-explicit');
+		});
 	});
 
 	describe('await', () => {

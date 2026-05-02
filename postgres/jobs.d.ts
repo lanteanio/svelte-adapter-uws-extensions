@@ -23,6 +23,12 @@ export interface Job {
 	id: string | number;
 	queue: string;
 	payload: unknown;
+	/**
+	 * The originating request id captured at enqueue() time. Persists on
+	 * the row so the handler can correlate logs back to the originating
+	 * request. `null` when the job was enqueued outside a request context.
+	 */
+	requestId: string | null;
 	attempts: number;
 	created_at: Date;
 }
@@ -34,9 +40,23 @@ export interface ClaimOptions {
 	visibilityTimeoutMs?: number;
 }
 
+export interface EnqueueOptions {
+	/**
+	 * Request id to persist on the row so the worker can correlate logs
+	 * back to the originating request. Takes precedence over
+	 * `platform.requestId` when both are provided.
+	 */
+	requestId?: string;
+	/**
+	 * Convenience for callers inside a request handler: when `platform` is
+	 * passed, `platform.requestId` is captured automatically.
+	 */
+	platform?: { requestId?: string };
+}
+
 export interface JobQueue {
 	/** Insert a job; returns the job id. */
-	enqueue(queue: string, payload: unknown): Promise<string | number>;
+	enqueue(queue: string, payload: unknown, opts?: EnqueueOptions): Promise<string | number>;
 
 	/**
 	 * Atomically claim up to `batchSize` jobs from the named queue

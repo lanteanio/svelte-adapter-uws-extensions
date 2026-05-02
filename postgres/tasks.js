@@ -224,7 +224,7 @@ export function createTaskRunner(client, options = {}) {
 
 	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate });
 
-	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt) {
+	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -264,6 +264,7 @@ export function createTaskRunner(client, options = {}) {
 			return await reg.executor({
 				input,
 				idempotencyKey,
+				requestId: requestId ?? null,
 				fence,
 				signal: controller.signal,
 				attempt
@@ -274,7 +275,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence) {
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -289,7 +290,7 @@ export function createTaskRunner(client, options = {}) {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUUID();
-					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence);
+					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId);
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate fence and rearm the existing row.
 					fence = randomUUID();
@@ -305,7 +306,7 @@ export function createTaskRunner(client, options = {}) {
 			mRunStart?.inc({ name });
 
 			try {
-				result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt);
+				result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId);
 			} catch (err) {
 				handlerError = err;
 			}
@@ -383,7 +384,7 @@ export function createTaskRunner(client, options = {}) {
 				mRecovered?.inc({ name: row.name });
 				// Run in the background; do not await all reclaimed rows
 				// serially or one slow handler stalls the sweep.
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence).catch(() => {
+				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence, row.request_id).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}
@@ -411,7 +412,7 @@ export function createTaskRunner(client, options = {}) {
 					continue;
 				}
 				mDispatched?.inc({ name: row.name });
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence).catch(() => {
+				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence, row.request_id).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}
@@ -519,6 +520,7 @@ export function createTaskRunner(client, options = {}) {
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
 			}
+			const requestId = resolveRequestId(runOptions);
 
 			await sql.ensureTable();
 
@@ -526,7 +528,7 @@ export function createTaskRunner(client, options = {}) {
 				const slot = await idempotency.acquire(idempotencyKey);
 				if (slot.acquired) {
 					try {
-						const result = await runWithoutCache(name, input, idempotencyKey);
+						const result = await runWithoutCache(name, input, idempotencyKey, requestId);
 						await slot.commit(result);
 						return result;
 					} catch (err) {
@@ -541,7 +543,7 @@ export function createTaskRunner(client, options = {}) {
 				return slot.result;
 			}
 
-			return runWithoutCache(name, input, idempotencyKey);
+			return runWithoutCache(name, input, idempotencyKey, requestId);
 		},
 
 		async enqueue(name, runOptions = {}) {
@@ -553,11 +555,12 @@ export function createTaskRunner(client, options = {}) {
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
 			}
+			const requestId = resolveRequestId(runOptions);
 
 			await sql.ensureTable();
 
 			const taskId = randomUUID();
-			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey));
+			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId));
 			mEnqueued?.inc({ name });
 			return taskId;
 		},
@@ -615,8 +618,22 @@ export function createTaskRunner(client, options = {}) {
 		}
 	};
 
-	function runWithoutCache(name, input, idempotencyKey) {
+	function runWithoutCache(name, input, idempotencyKey, requestId) {
 		const taskId = randomUUID();
-		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null);
+		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId);
 	}
+}
+
+// Resolve a request id from run / enqueue options. Explicit `requestId`
+// takes precedence over the platform-extracted one so callers can override
+// when running outside an HTTP/WS request context (cron, background sweep).
+function resolveRequestId(opts) {
+	if (typeof opts.requestId === 'string' && opts.requestId.length > 0) {
+		return opts.requestId;
+	}
+	const fromPlatform = opts.platform && opts.platform.requestId;
+	if (typeof fromPlatform === 'string' && fromPlatform.length > 0) {
+		return fromPlatform;
+	}
+	return null;
 }

@@ -59,6 +59,13 @@ export function mockPgClient() {
 				return { rows: [], rowCount: 0 };
 			}
 
+			// ALTER TABLE -- no-op: the mock's row shapes are dynamic so any
+			// added column is automatically accepted by INSERT / SELECT branches
+			// that reference it.
+			if (sql.startsWith('ALTER TABLE')) {
+				return { rows: [], rowCount: 0 };
+			}
+
 			// ----- Idempotency dispatch (matched first; markers: `expires_at`, `WHERE key`)
 
 			// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING status
@@ -154,17 +161,18 @@ export function mockPgClient() {
 				sql.includes('svti_idempotency_key') &&
 				!sql.includes('gen_random_uuid()')
 			) {
-				const fenceTtlSec = Number(values[5]);
+				const fenceTtlSec = Number(values[6]);
 				const now = Date.now();
 				taskRows.set(values[0], {
 					id: values[0],
 					name: values[1],
 					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 					idempotency_key: values[3],
+					request_id: values[4] ?? null,
 					status: 'running',
 					result: null,
 					error: null,
-					fence: values[4],
+					fence: values[5],
 					fence_expires_at: now + fenceTtlSec * 1000,
 					attempts: 1,
 					created_at: now,
@@ -188,6 +196,7 @@ export function mockPgClient() {
 					name: values[1],
 					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 					idempotency_key: values[3],
+					request_id: values[4] ?? null,
 					status: 'pending',
 					result: null,
 					error: null,
@@ -280,9 +289,9 @@ export function mockPgClient() {
 				return { rows: [], rowCount: 0 };
 			}
 
-			// Task read: status, result, error, attempts
+			// Task read: status, result, error, attempts, request_id
 			if (
-				sql.startsWith('SELECT status, result, error, attempts FROM') &&
+				sql.startsWith('SELECT status, result, error, attempts, request_id FROM') &&
 				sql.includes('WHERE svti_tasks_id = $1')
 			) {
 				const taskId = values[0];
@@ -293,7 +302,8 @@ export function mockPgClient() {
 						status: row.status,
 						result: row.result,
 						error: row.error,
-						attempts: row.attempts
+						attempts: row.attempts,
+						request_id: row.request_id ?? null
 					}],
 					rowCount: 1
 				};
@@ -322,6 +332,7 @@ export function mockPgClient() {
 						name: row.name,
 						input: row.input,
 						idempotency_key: row.idempotency_key,
+						request_id: row.request_id ?? null,
 						fence: row.fence,
 						attempts: row.attempts
 					});
@@ -353,6 +364,7 @@ export function mockPgClient() {
 						name: row.name,
 						input: row.input,
 						idempotency_key: row.idempotency_key,
+						request_id: row.request_id ?? null,
 						fence: row.fence,
 						attempts: row.attempts
 					});
@@ -387,10 +399,10 @@ export function mockPgClient() {
 
 			// ----- Job queue dispatch (markers: `queue` column, no `svti_tasks_id`/`status`)
 
-			// Job enqueue: INSERT INTO svti_jobs (queue, payload) VALUES ($1, $2) RETURNING svti_jobs_id AS id
+			// Job enqueue: INSERT INTO svti_jobs (queue, payload, request_id) VALUES ($1, $2, $3) RETURNING svti_jobs_id AS id
 			if (
 				sql.startsWith('INSERT INTO') &&
-				sql.includes('(queue, payload)') &&
+				sql.includes('(queue, payload, request_id)') &&
 				sql.includes('RETURNING svti_jobs_id AS id')
 			) {
 				const id = jobNextId++;
@@ -398,6 +410,7 @@ export function mockPgClient() {
 					id,
 					queue: values[0],
 					payload: typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1],
+					request_id: values[2] ?? null,
 					claimed_at: null,
 					claimed_until: null,
 					attempts: 0,
@@ -430,6 +443,7 @@ export function mockPgClient() {
 						id: row.id,
 						queue: row.queue,
 						payload: row.payload,
+						request_id: row.request_id ?? null,
 						attempts: row.attempts,
 						created_at: row.created_at
 					});

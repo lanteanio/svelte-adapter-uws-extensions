@@ -82,11 +82,16 @@ export function createJobQueue(client, options = {}) {
 				svti_jobs_id  BIGSERIAL   PRIMARY KEY,
 				queue         TEXT        NOT NULL,
 				payload       JSONB,
+				request_id    TEXT,
 				claimed_at    TIMESTAMPTZ,
 				claimed_until TIMESTAMPTZ,
 				attempts      INTEGER     NOT NULL DEFAULT 0,
 				created_at    TIMESTAMPTZ DEFAULT now()
 			)
+		`);
+		// Forward-migrate existing 0.5.0-next.1 deployments.
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
 		`);
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
@@ -106,18 +111,19 @@ export function createJobQueue(client, options = {}) {
 	}
 
 	return {
-		async enqueue(queue, payload) {
+		async enqueue(queue, payload, opts = {}) {
 			if (typeof queue !== 'string' || queue.length === 0) {
 				throw new Error('postgres jobs: queue must be a non-empty string');
 			}
+			const requestId = resolveRequestId(opts);
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
 				return client.query({
 					name: 'jobs_enqueue_' + table,
-					text: `INSERT INTO ${table} (queue, payload)
-					            VALUES ($1, $2)
+					text: `INSERT INTO ${table} (queue, payload, request_id)
+					            VALUES ($1, $2, $3)
 					        RETURNING svti_jobs_id AS id`,
-					values: [queue, JSON.stringify(payload ?? null)]
+					values: [queue, JSON.stringify(payload ?? null), requestId]
 				});
 			});
 			mEnqueued?.inc({ queue });
@@ -155,7 +161,7 @@ export function createJobQueue(client, options = {}) {
 					       attempts = t.attempts + 1
 					  FROM claimed
 					 WHERE t.svti_jobs_id = claimed.svti_jobs_id
-					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.attempts, t.created_at`,
+					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.request_id, t.attempts, t.created_at`,
 					values: [queue, batchSize, String(visibilityTimeoutMs)]
 				});
 			});
@@ -164,6 +170,7 @@ export function createJobQueue(client, options = {}) {
 				id: row.id,
 				queue: row.queue,
 				payload: row.payload,
+				requestId: row.request_id ?? null,
 				attempts: row.attempts,
 				created_at: row.created_at
 			}));
@@ -263,4 +270,18 @@ export function createJobQueue(client, options = {}) {
 			// No timers; reserved for symmetry with other extensions.
 		}
 	};
+}
+
+// Resolve a request id from enqueue options. Explicit `requestId` wins over
+// the platform-extracted one so callers can override outside an HTTP/WS
+// request context.
+function resolveRequestId(opts) {
+	if (typeof opts.requestId === 'string' && opts.requestId.length > 0) {
+		return opts.requestId;
+	}
+	const fromPlatform = opts.platform && opts.platform.requestId;
+	if (typeof fromPlatform === 'string' && fromPlatform.length > 0) {
+		return fromPlatform;
+	}
+	return null;
 }

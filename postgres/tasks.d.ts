@@ -44,6 +44,15 @@ export interface TaskHandlerContext<TInput = unknown> {
 	input: TInput;
 	/** Stable retry key. Forward to external services so they de-duplicate too. */
 	idempotencyKey: string | undefined;
+	/**
+	 * The originating request id captured at run() / enqueue() time. Persists
+	 * on the row so a handler running on a different worker thread or
+	 * instance (recovery sweep, dispatch claim) can correlate logs back to
+	 * the originating WS / HTTP request. `null` when the task was started
+	 * outside a request context (cron, direct invocation, recovery without
+	 * an upstream).
+	 */
+	requestId: string | null;
 	/** This attempt's fence UUID. Read-only. */
 	fence: string;
 	/** Aborts when the fence is lost (recovery loop took over mid-run). */
@@ -98,6 +107,19 @@ export interface TaskRunOptions<TInput = unknown> {
 	input?: TInput;
 	/** Stable retry key. */
 	idempotencyKey?: string;
+	/**
+	 * Request id to persist on the task row, exposed to the handler as
+	 * `ctx.requestId`. Takes precedence over `platform.requestId` when both
+	 * are provided.
+	 */
+	requestId?: string;
+	/**
+	 * Convenience for callers inside a request handler: when `platform` is
+	 * passed, `platform.requestId` is captured automatically. Pass the
+	 * `event.platform` from your SvelteKit handler. Ignored if `requestId`
+	 * is also set.
+	 */
+	platform?: { requestId?: string };
 }
 
 export interface TaskAwaitOptions {

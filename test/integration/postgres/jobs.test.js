@@ -125,6 +125,26 @@ describe('postgres jobs (integration)', () => {
 		it('returns empty array when queue is empty', async () => {
 			expect(await queue.claim('empty-q')).toEqual([]);
 		});
+
+		it('persists requestId on the row and surfaces it on the claimed job', async () => {
+			await queue.enqueue('email', { to: 'a@b.c' }, { requestId: 'req-job-real' });
+			const [job] = await queue.claim('email');
+			expect(job.requestId).toBe('req-job-real');
+		});
+
+		it('extracts requestId from a passed platform.requestId', async () => {
+			await queue.enqueue('email', { to: 'a@b.c' }, {
+				platform: { requestId: 'req-job-platform' }
+			});
+			const [job] = await queue.claim('email');
+			expect(job.requestId).toBe('req-job-platform');
+		});
+
+		it('returns requestId: null on jobs enqueued without a request context', async () => {
+			await queue.enqueue('email', { to: 'a@b.c' });
+			const [job] = await queue.claim('email');
+			expect(job.requestId).toBeNull();
+		});
 	});
 
 	describe('SKIP LOCKED concurrency', () => {

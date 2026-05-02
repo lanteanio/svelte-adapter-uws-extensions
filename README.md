@@ -1006,8 +1006,14 @@ export const jobs = createJobQueue(pg, {
 
 ```js
 // In a request handler:
-const id = await jobs.enqueue('email', { to: 'user@example.com', subject: 'Welcome' });
+const id = await jobs.enqueue(
+  'email',
+  { to: 'user@example.com', subject: 'Welcome' },
+  { platform }   // captures platform.requestId onto the row, surfaced as job.requestId on claim
+);
 ```
+
+The third argument is an options bag; `platform` (the SvelteKit `event.platform`) auto-captures the originating request id, or pass `requestId` explicitly to override. The captured id surfaces on `job.requestId` when the row is claimed, so the worker can correlate logs back to the request that enqueued the job.
 
 `enqueue()` returns the row id verbatim from `pg`, which serialises `BIGINT`/`BIGSERIAL` columns as **strings** by default to avoid precision loss past `Number.MAX_SAFE_INTEGER`. Pass it through to `claim()`/`complete()`/`fail()`/`extend()` as-is. If you want a JS number for logging or comparison, coerce explicitly with `Number(id)` (safe up to 2^53 -- still ~9 quadrillion rows of headroom).
 
@@ -1050,6 +1056,7 @@ CREATE TABLE IF NOT EXISTS svti_jobs (
   svti_jobs_id  BIGSERIAL   PRIMARY KEY,
   queue         TEXT        NOT NULL,
   payload       JSONB,
+  request_id    TEXT,                       -- originating platform.requestId, or null
   claimed_at    TIMESTAMPTZ,
   claimed_until TIMESTAMPTZ,
   attempts      INTEGER     NOT NULL DEFAULT 0,
@@ -1060,6 +1067,8 @@ CREATE INDEX IF NOT EXISTS idx_svti_jobs_queue_pending
 CREATE INDEX IF NOT EXISTS idx_svti_jobs_visibility
     ON svti_jobs (claimed_until) WHERE claimed_at IS NOT NULL;
 ```
+
+Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS request_id TEXT` on first use; idempotent and zero-downtime.
 
 #### Options
 
@@ -1073,8 +1082,8 @@ CREATE INDEX IF NOT EXISTS idx_svti_jobs_visibility
 
 | Method | Description |
 |---|---|
-| `enqueue(queue, payload)` | Insert a job; returns the job id |
-| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }` |
+| `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, platform? }` -- `platform.requestId` is captured automatically when `platform` is passed |
+| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. Each returned job carries `id, queue, payload, requestId, attempts, created_at` |
 | `complete(idOrIds)` | Delete the job(s) on success |
 | `fail(idOrIds)` | Release the claim for retry |
 | `extend(idOrIds, ms)` | Push back the visibility deadline |
@@ -1242,7 +1251,8 @@ export const tasks = createTaskRunner(pg, {
   rowTtl: 7 * 24 * 3600  // keep terminal rows for 7 days
 });
 
-tasks.register('charge-customer', async ({ input, idempotencyKey, signal }) => {
+tasks.register('charge-customer', async ({ input, idempotencyKey, requestId, signal }) => {
+  log.info({ requestId, customerId: input.customerId }, 'charging customer');
   return await stripe.paymentIntents.create(
     { amount: input.amount, customer: input.customerId },
     { idempotencyKey, signal }
@@ -1263,16 +1273,19 @@ tasks.register('charge-customer', async ({ input, idempotencyKey, signal }) => {
 import { tasks } from '$lib/server/tasks';
 
 export const actions = {
-  pay: async ({ request, locals }) => {
+  pay: async ({ request, locals, platform }) => {
     const { amount } = Object.fromEntries(await request.formData());
     const result = await tasks.run('charge-customer', {
       input: { amount, customerId: locals.user.stripeCustomerId },
-      idempotencyKey: `charge-${locals.user.id}-${request.headers.get('idempotency-key')}`
+      idempotencyKey: `charge-${locals.user.id}-${request.headers.get('idempotency-key')}`,
+      platform   // captures platform.requestId onto the row, exposed as ctx.requestId in the handler
     });
     return { success: true, paymentIntentId: result.id };
   }
 };
 ```
+
+Pass `platform` (the SvelteKit `event.platform`) to capture the originating request id automatically -- it lands on `svti_tasks.request_id` and surfaces as `ctx.requestId` in the handler so logs from inside the task correlate back to the WS / HTTP request that started it. Override explicitly via the `requestId` option for non-request contexts (cron, recovery, manual invocation).
 
 #### Schema
 
@@ -1284,6 +1297,7 @@ CREATE TABLE IF NOT EXISTS svti_tasks (
   name                 TEXT         NOT NULL,
   input                JSONB,
   svti_idempotency_key TEXT,
+  request_id           TEXT,                    -- originating platform.requestId, or null
   status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
   result               JSONB,
   error                JSONB,
@@ -1298,6 +1312,8 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_running_fence
 CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
     ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
+
+Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS request_id TEXT` on first use; idempotent and zero-downtime.
 
 #### Options
 
