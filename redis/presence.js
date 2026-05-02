@@ -5,11 +5,27 @@
  * in Redis hashes so it is shared across instances. Uses Redis pub/sub
  * for cross-instance join/leave notifications.
  *
+ * Wire shape clients see on `__presence:{topic}`:
+ *   - `presence_state` (sent once on subscribe to a single connection)
+ *       payload: `{[userKey]: data}` flat snapshot of current presence
+ *   - `presence_diff` (broadcast to topic subscribers, microtask-batched)
+ *       payload: `{joins: {[key]: data}, leaves: {[key]: data}}`
+ *       Same-tick joins+leaves on the same key collapse: latest op wins.
+ *   - `heartbeat` (broadcast to topic subscribers, per heartbeat interval)
+ *       payload: array of currently-known user keys
+ *
+ * The adapter's bundled `createPresence` plugin emits the same wire
+ * shape, so a single client decoder works for both single-instance and
+ * cluster deployments.
+ *
  * Storage layout per topic:
  *   - Key `{prefix}presence:{topic}` - hash
  *       field = `{instanceId}|{userKey}`, value = JSON `{ data, ts }`
  *       Each instance owns its own fields so cross-instance leave is safe.
- *   - Channel `{prefix}presence:events:{topic}` - pub/sub for join/leave events
+ *   - Channel `{prefix}presence:events:{topic}` - cross-instance pub/sub.
+ *       Internal envelope `{instanceId, topic, event, payload}` with
+ *       event in {'join', 'leave', 'updated'}; receiving instances
+ *       route those into their local diff buffer for client fan-out.
  *
  * Each instance also maintains a local connection map so it knows when to
  * publish leave events (last connection for a user on this instance).
@@ -88,13 +104,16 @@ end
 return 1
 `;
 
-/** Wire-protocol event names this module emits. */
-const EVENTS = Object.freeze({
+/**
+ * Internal cross-instance Redis pub/sub envelope event names. NOT the
+ * client wire shape -- clients see `presence_state` / `presence_diff` /
+ * `heartbeat`. These names live on the `presence:events:{topic}` channel
+ * between instances and are routed into the local diff buffer on receive.
+ */
+const INTERNAL_EVENTS = Object.freeze({
 	JOIN: 'join',
 	LEAVE: 'leave',
-	UPDATED: 'updated',
-	LIST: 'list',
-	HEARTBEAT: 'heartbeat'
+	UPDATED: 'updated'
 });
 
 /**
@@ -164,6 +183,8 @@ export function createPresence(client, options = {}) {
 	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
 	const mHeartbeatLatency = m?.gauge('presence_heartbeat_latency_ms', 'Duration of the most recent heartbeat tick in milliseconds');
 	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash expiry triggered a local empty-list emit');
+	const mDiffFrames = m?.counter('presence_diff_frames_total', 'presence_diff frames published to topic subscribers', ['topic']);
+	const mDiffCoalesced = m?.counter('presence_diff_coalesced_total', 'Buffered diff entries overwritten by a later op in the same tick', ['topic']);
 
 	let lastHeartbeatLatency = 0;
 	let staleCleanedTotal = 0;
@@ -220,6 +241,61 @@ export function createPresence(client, options = {}) {
 	 * @type {Map<string, Promise<Record<string, string>>>}
 	 */
 	const hgetallInflight = new Map();
+
+	/**
+	 * Per-topic pending diff buffer: latest op per key wins. Joins and
+	 * leaves on the same key in the same microtask collapse so the wire
+	 * only sees the net change. Flushed once per microtask via
+	 * `scheduleFlush`. Mirrors the buffer model the adapter's bundled
+	 * presence plugin uses, so a single client decoder handles both.
+	 * @type {Map<string, Map<string, { op: 'join' | 'leave', data: Record<string, any> }>>}
+	 */
+	const pendingDiffs = new Map();
+	let diffFlushScheduled = false;
+	/** @type {import('svelte-adapter-uws').Platform | null} */
+	let diffFlushPlatform = null;
+
+	function bufferDiff(topic, op, key, data, platform) {
+		let entries = pendingDiffs.get(topic);
+		if (!entries) {
+			entries = new Map();
+			pendingDiffs.set(topic, entries);
+		}
+		if (entries.has(key)) {
+			mDiffCoalesced?.inc({ topic: mt(topic) });
+		}
+		entries.set(key, { op, data });
+		diffFlushPlatform = platform;
+		if (!diffFlushScheduled) {
+			diffFlushScheduled = true;
+			queueMicrotask(flushPendingDiffs);
+		}
+	}
+
+	function flushPendingDiffs() {
+		diffFlushScheduled = false;
+		const platform = diffFlushPlatform;
+		diffFlushPlatform = null;
+		if (!platform) {
+			pendingDiffs.clear();
+			return;
+		}
+		for (const [topic, entries] of pendingDiffs) {
+			/** @type {Record<string, Record<string, any>>} */
+			const joins = {};
+			/** @type {Record<string, Record<string, any>>} */
+			const leaves = {};
+			for (const [key, { op, data }] of entries) {
+				if (op === 'join') joins[key] = data;
+				else leaves[key] = data;
+			}
+			try {
+				platform.publish('__presence:' + topic, 'presence_diff', { joins, leaves }, { relay: false });
+				mDiffFrames?.inc({ topic: mt(topic) });
+			} catch { /* platform unavailable mid-flight */ }
+		}
+		pendingDiffs.clear();
+	}
 
 	function hashKey(topic) {
 		return client.key('presence:' + topic);
@@ -378,7 +454,7 @@ export function createPresence(client, options = {}) {
 
 			if (activePlatform && data && data.size > 0) {
 				const keys = [...data.keys()];
-				activePlatform.publish('__presence:' + topic, EVENTS.HEARTBEAT, keys);
+				activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
 			}
 		}
 		pipe.exec().catch(() => {});
@@ -410,8 +486,13 @@ export function createPresence(client, options = {}) {
 					const prefix = client.key('presence:events:');
 					if (!ch.startsWith(prefix)) return;
 					const topic = ch.slice(prefix.length);
-					if (activePlatform) {
-						activePlatform.publish('__presence:' + topic, parsed.event, parsed.payload, { relay: false });
+					if (!activePlatform) return;
+					const ev = parsed.event;
+					const payload = parsed.payload;
+					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
+						bufferDiff(topic, 'join', payload?.key, payload?.data, activePlatform);
+					} else if (ev === INTERNAL_EVENTS.LEAVE) {
+						bufferDiff(topic, 'leave', payload?.key, payload?.data, activePlatform);
 					}
 				} catch {
 					// Malformed, skip
@@ -426,7 +507,7 @@ export function createPresence(client, options = {}) {
 					if (expiredKey.startsWith(eventsPrefix)) return;
 					const topic = expiredKey.slice(presencePrefix.length);
 					if (activePlatform) {
-						activePlatform.publish('__presence:' + topic, EVENTS.LIST, []);
+						activePlatform.publish('__presence:' + topic, 'presence_state', {}, { relay: false });
 						mKeyspaceCleanups?.inc();
 					}
 				});
@@ -530,9 +611,8 @@ export function createPresence(client, options = {}) {
 		}
 		if (didPublishJoin) {
 			mLeaves?.inc({ topic: mt(topic) });
-			const payload = { key, data };
-			platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
-			await publishEvent(topic, EVENTS.LEAVE, payload);
+			bufferDiff(topic, 'leave', key, data, platform);
+			await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data });
 		}
 		if (!localCounts.has(topic) && !syncCounts.has(topic)) {
 			await unsubscribeFromTopic(topic);
@@ -588,9 +668,8 @@ export function createPresence(client, options = {}) {
 
 					if (userGone === 1) {
 						mLeaves?.inc({ topic: mt(topic) });
-						const payload = { key, data };
-						platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
-						await publishEvent(topic, EVENTS.LEAVE, payload);
+						bufferDiff(topic, 'leave', key, data, platform);
+						await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data });
 					}
 				} else {
 					counts.set(key, current - 1);
@@ -604,9 +683,8 @@ export function createPresence(client, options = {}) {
 							const now = Date.now();
 							try {
 								await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
-								const payload = { key, data: newest };
-								platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
-								publishEvent(topic, EVENTS.UPDATED, payload);
+								bufferDiff(topic, 'join', key, newest, platform);
+								publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest });
 							} catch {
 								topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
 							}
@@ -724,9 +802,8 @@ export function createPresence(client, options = {}) {
 			const now = Date.now();
 			try {
 				await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
-				const payload = { key, data: newest };
-				platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
-				pendingUpdatedRelays.push(publishEvent(topic, EVENTS.UPDATED, payload));
+				bufferDiff(topic, 'join', key, newest, platform);
+				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest }));
 			} catch {
 				topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
 			}
@@ -776,9 +853,8 @@ export function createPresence(client, options = {}) {
 			if (!userGone) continue;
 			const { topic, key, data } = pendingLeaves[i];
 			mLeaves?.inc({ topic: mt(topic) });
-			const payload = { key, data };
-			platform.publish('__presence:' + topic, EVENTS.LEAVE, payload);
-			publishPromises.push(publishEvent(topic, EVENTS.LEAVE, payload));
+			bufferDiff(topic, 'leave', key, data, platform);
+			publishPromises.push(publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data }));
 		}
 		if (publishPromises.length > 0) await Promise.all(publishPromises);
 		if (pendingUpdatedRelays.length > 0) await Promise.all(pendingUpdatedRelays);
@@ -900,9 +976,8 @@ export function createPresence(client, options = {}) {
 					td.set(key, { data, serialized: serializedData, field: compoundField(key) });
 				}
 
-				const payload = { key, data };
-				platform.publish('__presence:' + topic, EVENTS.UPDATED, payload);
-				await publishEvent(topic, EVENTS.UPDATED, payload);
+				bufferDiff(topic, 'join', key, data, platform);
+				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data });
 			}
 
 			let all;
@@ -943,24 +1018,28 @@ export function createPresence(client, options = {}) {
 			topicData.set(key, { data, serialized: serializedData, field: compoundField(key) });
 			activeTopics.add(topic);
 
-			// Publish join event only after the operation is fully committed.
-			// This prevents orphaned join events when the snapshot or subscribe
-			// step fails, eliminating the need for compensating leave events.
+			// Buffer join only after the operation is fully committed.
+			// Prevents orphaned diffs when snapshot or subscribe fails -- the
+			// compensating leave inside undoJoin would collapse with this
+			// join in the buffer anyway, but skipping the buffer entirely
+			// keeps the cross-instance pubsub clean.
 			if (isNewUser) {
 				mJoins?.inc({ topic: mt(topic) });
-				const payload = { key, data };
-				platform.publish('__presence:' + topic, EVENTS.JOIN, payload);
-				await publishEvent(topic, EVENTS.JOIN, payload);
+				bufferDiff(topic, 'join', key, data, platform);
+				await publishEvent(topic, INTERNAL_EVENTS.JOIN, { key, data });
 			}
 
-			// Send current list to this connection
+			// Send current snapshot to this connection. Flat `{[key]: data}`
+			// shape mirrors the adapter's bundled presence plugin so a single
+			// client decoder handles both implementations.
 			const entries = parseEntries(all);
-			const list = [];
+			/** @type {Record<string, Record<string, any>>} */
+			const state = {};
 			for (const [userKey, entry] of entries) {
-				list.push({ key: userKey, data: entry.data });
+				state[userKey] = entry.data;
 			}
 			try {
-				platform.send(ws, '__presence:' + topic, EVENTS.LIST, list);
+				platform.send(ws, '__presence:' + topic, 'presence_state', state);
 			} catch {
 				// WebSocket closed before send
 			}
@@ -989,9 +1068,10 @@ export function createPresence(client, options = {}) {
 			}
 			const presenceTopic = '__presence:' + topic;
 			const entries = parseEntries(all);
-			const list = [];
+			/** @type {Record<string, Record<string, any>>} */
+			const state = {};
 			for (const [userKey, entry] of entries) {
-				list.push({ key: userKey, data: entry.data });
+				state[userKey] = entry.data;
 			}
 
 			let topics = syncObservers.get(ws);
@@ -1006,7 +1086,7 @@ export function createPresence(client, options = {}) {
 
 			try {
 				ws.subscribe(presenceTopic);
-				platform.send(ws, presenceTopic, EVENTS.LIST, list);
+				platform.send(ws, presenceTopic, 'presence_state', state);
 			} catch {
 				const topics = syncObservers.get(ws);
 				if (topics && topics.has(topic)) {
@@ -1059,6 +1139,10 @@ export function createPresence(client, options = {}) {
 			};
 		},
 
+		flushDiffs() {
+			flushPendingDiffs();
+		},
+
 		async clear() {
 			await withBreaker(b, () => scanAndUnlink(redis, client.key('presence:*')));
 
@@ -1086,6 +1170,9 @@ export function createPresence(client, options = {}) {
 			activeTopics.clear();
 			syncObservers.clear();
 			syncCounts.clear();
+			pendingDiffs.clear();
+			diffFlushScheduled = false;
+			diffFlushPlatform = null;
 			connCounter = 0;
 		},
 
@@ -1103,6 +1190,9 @@ export function createPresence(client, options = {}) {
 			subscribedChannels.clear();
 			keyspaceSubscribed = false;
 			activePlatform = null;
+			pendingDiffs.clear();
+			diffFlushScheduled = false;
+			diffFlushPlatform = null;
 		},
 
 		hooks: {

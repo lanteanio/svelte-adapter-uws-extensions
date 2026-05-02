@@ -492,9 +492,23 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub.
 
-Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone -- local maps, the Redis field, and any broadcast join event are reversed. This prevents ghost entries that would show a user as online when they never fully connected.
+#### Wire shape
 
-Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that removes this instance's field from the hash and then scans remaining fields for the same user key, ignoring stale entries. Leave is only broadcast when no other instance holds a live entry for that user, preventing premature "user left" notifications in multi-instance deployments.
+Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bundled `createPresence` plugin so a single client decoder handles both single-instance and cluster deployments:
+
+| Event | When | Payload | Direction |
+|---|---|---|---|
+| `presence_state` | Once on subscribe | `{[userKey]: data}` -- flat snapshot of current presence | Server -> single connection |
+| `presence_diff` | Microtask-batched after joins / leaves / updates | `{joins: {[key]: data}, leaves: {[key]: data}}` | Server -> topic subscribers |
+| `heartbeat` | Per heartbeat interval | `string[]` -- array of currently-known user keys | Server -> topic subscribers |
+
+`presence_diff` collapses by key per-tick: if the same user joins and leaves in the same microtask, only the latest op survives on the wire. An update (same user re-joins with different data) appears as a `joins` entry carrying the new data, since clients overwrite their `Map.set` on the same key.
+
+Cross-instance traffic on the dedicated `presence:events:{topic}` Redis pub/sub channel is `{instanceId, topic, event, payload}` with `event` in `'join' | 'leave' | 'updated'`. Receivers route inbound events into their local diff buffer for client fan-out, so clients only ever see the unified `presence_state` / `presence_diff` shape regardless of which instance the change originated on.
+
+Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone -- local maps, the Redis field, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
+
+Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that removes this instance's field from the hash and then scans remaining fields for the same user key, ignoring stale entries. Leave is only buffered into the diff when no other instance holds a live entry for that user, preventing premature "user left" notifications in multi-instance deployments.
 
 Zombie cleanup runs on the heartbeat interval. Each tick, every tracked WebSocket is probed via `getBufferedAmount()` -- if the call throws, the socket is dead and its presence is removed synchronously before the heartbeat writes to Redis. The heartbeat then refreshes timestamps on all live entries via a Redis pipeline and runs a server-side Lua cleanup script (`CLEANUP_SCRIPT`) that scans the hash and removes any fields whose timestamp exceeds the TTL. This handles crashed instances whose close handlers never fired.
 
@@ -536,7 +550,7 @@ export async function close(ws, { platform }) {
 | `select` | strips `__`-prefixed keys | Extract public fields from userData |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
-| `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `list` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
+| `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `presence_state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 
 #### API
 
@@ -548,6 +562,7 @@ export async function close(ws, { platform }) {
 | `list(topic)` | Get current users |
 | `count(topic)` | Count unique users |
 | `metrics()` | Synchronous snapshot: `{ totalOnline, heartbeatLatencyMs, staleCleanedTotal }`. See [Metrics snapshot](#metrics-snapshot). |
+| `flushDiffs()` | Drain the pending `presence_diff` buffer synchronously. Use in graceful-shutdown paths or tests that need the diff to land before the await chain continues. |
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
 | `hooks` | `{ subscribe, close }` -- ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
@@ -564,11 +579,18 @@ export async function close(ws, { platform }) {
 
 The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge), `presence_stale_cleaned_total` (counter, already shipped pre-0.5.0).
 
+Two additional counters track the diff-protocol behavior:
+
+| Metric | Description |
+|---|---|
+| `presence_diff_frames_total{topic="..."}` | `presence_diff` frames published to topic subscribers. Compared against `presence_joins_total` + `presence_leaves_total` it tells you how much per-tick coalescing the buffer is doing -- the bigger the gap, the more bandwidth saved versus per-event broadcast. |
+| `presence_diff_coalesced_total{topic="..."}` | Buffered diff entries overwritten by a later op in the same tick. A non-zero rate confirms the same-key collapse is working (e.g. a user reconnecting fast enough to leave-then-join in one tick). Zero is also a valid state under steady traffic. |
+
 #### Keyspace cleanup mode
 
-By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `leave` event. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
+By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `presence_diff` with the user in `leaves`. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
 
-`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore -- typically because the only tracker crashed), this instance emits an empty `list` event on `__presence:<topic>` so local subscribers can refresh their UI to "no one here."
+`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore -- typically because the only tracker crashed), this instance emits an empty `presence_state` event on `__presence:<topic>` so local subscribers can replace their entire local map with "no one here."
 
 ```js
 const presence = createPresence(redis, {

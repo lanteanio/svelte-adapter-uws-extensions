@@ -17,6 +17,18 @@ function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
+function joinDiffsFor(platform, key) {
+	return platform.published
+		.filter((p) => p.event === 'presence_diff')
+		.filter((p) => p.data && p.data.joins && key in p.data.joins);
+}
+
+function leaveDiffsFor(platform, key) {
+	return platform.published
+		.filter((p) => p.event === 'presence_diff')
+		.filter((p) => p.data && p.data.leaves && key in p.data.leaves);
+}
+
 describe('redis presence (integration)', () => {
 	let client;
 	let platform;
@@ -127,9 +139,9 @@ describe('redis presence (integration)', () => {
 
 			platform.reset();
 			await presence.leave(ws, platform);
+			presence.flushDiffs();
 
-			const leaves = platform.published.filter((p) => p.event === 'leave');
-			expect(leaves).toHaveLength(0);
+			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(0);
 
 			// Other instance's field should still be there.
 			const remaining = await client.redis.hkeys(client.key('presence:room'));
@@ -151,10 +163,11 @@ describe('redis presence (integration)', () => {
 
 			platform.reset();
 			await presence.leave(ws, platform);
+			presence.flushDiffs();
 
-			const leaves = platform.published.filter((p) => p.event === 'leave');
+			const leaves = leaveDiffsFor(platform, 'alice');
 			expect(leaves).toHaveLength(1);
-			expect(leaves[0].data).toMatchObject({ key: 'alice' });
+			expect(leaves[0].data.leaves.alice).toMatchObject({ id: 'alice' });
 		});
 
 		it('suffix-match does not cross userKey boundaries (alice vs malice)', async () => {
@@ -175,20 +188,22 @@ describe('redis presence (integration)', () => {
 
 			platform.reset();
 			await presence.leave(wsAlice, platform);
+			presence.flushDiffs();
 
-			const leaves = platform.published.filter((p) => p.event === 'leave' && p.data.key === 'alice');
-			expect(leaves).toHaveLength(1);
+			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(1);
 		});
 	});
 
 	describe('multi-tab dedup', () => {
-		it('two connections same userKey produce one hash field and one join broadcast', async () => {
+		it('two connections same userKey produce one hash field and one join diff', async () => {
 			const presence = makeTracker();
 			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
-			const joinsBefore = platform.published.filter((p) => p.event === 'join').length;
+			presence.flushDiffs();
+			const joinsBefore = joinDiffsFor(platform, 'alice').length;
 
 			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
-			const joinsAfter = platform.published.filter((p) => p.event === 'join').length;
+			presence.flushDiffs();
+			const joinsAfter = joinDiffsFor(platform, 'alice').length;
 			expect(joinsAfter).toBe(joinsBefore);
 
 			expect(await presence.count('room')).toBe(1);
@@ -196,7 +211,7 @@ describe('redis presence (integration)', () => {
 			expect(fields).toHaveLength(1);
 		});
 
-		it('closing the last tab removes the Redis field and broadcasts leave', async () => {
+		it('closing the last tab removes the Redis field and broadcasts a leave diff', async () => {
 			const presence = makeTracker();
 			const ws1 = mockWs({ id: 'alice', name: 'Alice' });
 			const ws2 = mockWs({ id: 'alice', name: 'Alice' });
@@ -205,11 +220,12 @@ describe('redis presence (integration)', () => {
 
 			platform.reset();
 			await presence.leave(ws1, platform);
-			expect(platform.published.filter((p) => p.event === 'leave')).toHaveLength(0);
+			presence.flushDiffs();
+			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(0);
 
 			await presence.leave(ws2, platform);
-			const leaves = platform.published.filter((p) => p.event === 'leave');
-			expect(leaves).toHaveLength(1);
+			presence.flushDiffs();
+			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(1);
 			expect(await presence.count('room')).toBe(0);
 
 			const fields = await client.redis.hkeys(client.key('presence:room'));
@@ -314,10 +330,12 @@ describe('redis presence (integration)', () => {
 			platformB.reset();
 
 			await trackerA.leave(wsA, platformA);
-			expect(platformA.published.filter((p) => p.event === 'leave')).toHaveLength(0);
+			trackerA.flushDiffs();
+			expect(leaveDiffsFor(platformA, 'alice')).toHaveLength(0);
 
 			await trackerB.leave(wsB, platformB);
-			expect(platformB.published.filter((p) => p.event === 'leave')).toHaveLength(1);
+			trackerB.flushDiffs();
+			expect(leaveDiffsFor(platformB, 'alice')).toHaveLength(1);
 		});
 	});
 

@@ -32,6 +32,16 @@ export interface RedisPresenceOptions {
 	breaker?: CircuitBreaker;
 }
 
+/**
+ * Wire shape clients see on `__presence:{topic}`. Mirrors the adapter's
+ * bundled `createPresence` plugin so a single client decoder works for
+ * both single-instance and cluster deployments.
+ */
+export type PresenceWireEvent =
+	| { event: 'presence_state'; data: Record<string, Record<string, any>> }
+	| { event: 'presence_diff'; data: { joins: Record<string, Record<string, any>>; leaves: Record<string, Record<string, any>> } }
+	| { event: 'heartbeat'; data: string[] };
+
 export interface PresenceMetricsSnapshot {
 	/** Sum of unique-users-per-topic across all topics this instance is locally tracking. */
 	totalOnline: number;
@@ -67,6 +77,14 @@ export interface RedisPresenceTracker {
 	 * when a metrics registry is attached.
 	 */
 	metrics(): PresenceMetricsSnapshot;
+
+	/**
+	 * Drain the pending diff buffer synchronously. The diff buffer
+	 * normally flushes on the next microtask after a join / leave /
+	 * update; call this when a test or graceful-shutdown path needs
+	 * the `presence_diff` to land before the await chain continues.
+	 */
+	flushDiffs(): void;
 
 	/** Clear all presence state. */
 	clear(): Promise<void>;
