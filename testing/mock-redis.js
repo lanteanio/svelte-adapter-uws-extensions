@@ -36,7 +36,25 @@ export function mockRedisClient(keyPrefix = '') {
 		const r = {
 			// String ops
 			async get(key) { return store.get(key) || null; },
-			async set(key, val) { store.set(key, String(val)); return 'OK'; },
+			async set(key, val, ...flags) {
+				// Real Redis SET accepts NX / XX / EX / PX / EXAT / PXAT / KEEPTTL
+				// flags. Mock honors the conditional gates (NX / XX) since they
+				// affect return value; TTL flags are accepted and ignored
+				// (tests that exercise expiry should mutate the store directly
+				// or simulate via test helpers).
+				let nx = false;
+				let xx = false;
+				for (let i = 0; i < flags.length; i++) {
+					const f = String(flags[i]).toUpperCase();
+					if (f === 'NX') nx = true;
+					else if (f === 'XX') xx = true;
+					else if (f === 'EX' || f === 'PX' || f === 'EXAT' || f === 'PXAT') i++;
+				}
+				if (nx && store.has(key)) return null;
+				if (xx && !store.has(key)) return null;
+				store.set(key, String(val));
+				return 'OK';
+			},
 			async incr(key) {
 				const v = parseInt(store.get(key) || '0', 10) + 1;
 				store.set(key, String(v));

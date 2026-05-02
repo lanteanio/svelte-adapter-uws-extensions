@@ -42,6 +42,7 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Cross-backend**
 - [Idempotency store](#idempotency-store)
+- [Distributed lock](#distributed-lock)
 - [Task runner](#task-runner)
 
 **Observability**
@@ -1448,6 +1449,89 @@ export async function placeOrder(input, ctx) {
 #### Pairing with the Dedup plugin
 
 The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`) is the single-instance fallback for the same contract. The shape is identical, so swapping the backend is a one-line change. Use the in-memory plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+
+---
+
+## Distributed lock
+
+Cluster-wide mutual-exclusion primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; this is the Redis-backed swap for multi-instance deployments. Distinct from `redis/fence` (B2c): the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose mutex any user code can grab.
+
+#### Setup
+
+```js
+import { redis } from './redis.js';
+import { createDistributedLock } from 'svelte-adapter-uws-extensions/redis/lock';
+
+export const lock = createDistributedLock(redis, {
+  defaultTtlMs: 30_000,
+  maxWaitMs: 5000
+});
+```
+
+#### Use
+
+```js
+import { lock } from '$lib/server/lock';
+
+await lock.withLock('order-42', async (signal) => {
+  // serialized cluster-wide. Bail when `signal.aborted` if the heartbeat
+  // detects we lost ownership mid-flight.
+  if (signal.aborted) return;
+  await processOrder(42);
+});
+```
+
+`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide mutex on `key`. The user fn cannot forget to release -- the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
+
+#### How it works
+
+1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` -- atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
+2. **Retry.** On collision (someone else holds the key), sleep `retryDelayMs` and try again. After `maxWaitMs` total wait, throw `LockAcquireTimeoutError`.
+3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. If the heartbeat returns 0 (we no longer own the key -- operator force-takeover, TTL elapsed before we could refresh), the supplied `AbortSignal` fires with a `LockLostError` and the heartbeat stops.
+4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless).
+
+The `AbortSignal` shape is the cluster-correctness story: when the heartbeat detects loss, your code learns immediately and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `keyPrefix` | `'lock:'` | Prefix prepended (after the client `keyPrefix`) to every lock key. |
+| `defaultTtlMs` | `30000` | TTL on a held lock in milliseconds. The heartbeat refreshes this back to the original value before it elapses; if the holder dies and stops heartbeating, the lock auto-expires after at most `ttlMs` so cluster work is not permanently blocked. |
+| `retryDelayMs` | `50` | Sleep between acquire retries when the key is held by another instance. Constant retry; no exponential backoff. |
+| `maxWaitMs` | `5000` | Total time to wait before throwing `LockAcquireTimeoutError`. Override per call via `withLock(key, fn, { maxWaitMs })`. |
+| `heartbeatMs` | `defaultTtlMs / 3` | Heartbeat refresh interval. Default keeps margin for one missed beat. |
+| `mapKey` | identity | Map lock key names to bounded label values for metric cardinality. |
+| `breaker` | -- | Optional circuit breaker for the Redis ops. |
+| `metrics` | -- | Optional Prometheus metrics registry. |
+
+#### Per-call options
+
+| Option | Description |
+|---|---|
+| `ttlMs` | Override the holder TTL for this call. |
+| `maxWaitMs` | Override the maximum acquire wait for this call. |
+| `signal` | External cancellation signal. Aborts the acquire loop and the inner-`fn` execution; the lock is still released cleanly on the way out (we held it; we give it back). |
+
+#### Errors
+
+- **`LockAcquireTimeoutError`** -- thrown by `withLock` when `maxWaitMs` elapses without a successful acquire. Properties: `key`, `waitedMs`.
+- **`LockLostError`** -- surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it's up to your code to react. Property: `key`.
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `lock_acquired_total{key_class}` | Counter of successful acquires. `key_class` is `mapKey(key)`. |
+| `lock_acquire_wait_ms` | Histogram of time waited from `withLock` call to successful acquire (ms). Observed only on success. |
+| `lock_acquire_timeouts_total{key_class}` | Counter of `withLock` calls that exceeded `maxWaitMs` without acquiring. |
+| `lock_lost_total{key_class}` | Counter of locks lost mid-flight via heartbeat detection. A non-zero rate signals operator force-takeover or holder TTL elapsing -- both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
+
+#### When to use which
+
+- **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" -- dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
+- **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
+- **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal -- caching the outcome is.
 
 ---
 

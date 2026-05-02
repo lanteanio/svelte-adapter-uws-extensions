@@ -73,6 +73,10 @@
       "types": "./redis/fence.d.ts",
       "default": "./redis/fence.js"
     },
+    "./redis/lock": {
+      "types": "./redis/lock.d.ts",
+      "default": "./redis/lock.js"
+    },
     "./redis/registry": {
       "types": "./redis/registry.d.ts",
       "default": "./redis/registry.js"
