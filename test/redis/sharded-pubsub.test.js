@@ -532,4 +532,222 @@ describe('redis sharded bus', () => {
 			breaker.destroy();
 		});
 	});
+
+	describe('followBatch', () => {
+		it('SSUBSCRIBE happens once per channel for an N-topic batch', async () => {
+			const bus = createShardedBus(client, {
+				shardKey: (topic) => topic.split(':')[0]
+			});
+			await bus.activate(platform);
+
+			const original = client.redis.duplicate;
+			let ssubscribeCalls = 0;
+			let lastChannelArgs = null;
+			client.redis.duplicate = (opts) => {
+				const dup = original.call(client.redis, opts);
+				const orig = dup.ssubscribe.bind(dup);
+				dup.ssubscribe = async (...channels) => {
+					ssubscribeCalls++;
+					lastChannelArgs = channels;
+					return orig(...channels);
+				};
+				return dup;
+			};
+			// Re-activate so the duplicate is created fresh under the spy.
+			await bus.deactivate();
+			await bus.activate(platform);
+			ssubscribeCalls = 0;
+
+			await bus.followBatch([
+				'chat:room1', 'chat:room2', 'audit:created', 'audit:updated'
+			]);
+			expect(ssubscribeCalls).toBe(1); // one batched call
+			expect(lastChannelArgs.sort()).toEqual(['uws:sharded:audit', 'uws:sharded:chat']);
+
+			await bus.deactivate();
+			client.redis.duplicate = original;
+		});
+
+		it('empty array no-ops', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await expect(bus.followBatch([])).resolves.toBeUndefined();
+			await bus.deactivate();
+		});
+
+		it('non-array input throws', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await expect(bus.followBatch('chat')).rejects.toThrow(/array of topics/);
+			await bus.deactivate();
+		});
+
+		it('throws if called before activate()', async () => {
+			const bus = createShardedBus(client);
+			await expect(bus.followBatch(['chat'])).rejects.toThrow(/activate/);
+		});
+
+		it('duplicate topics in the input collapse to one refcount bump', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+
+			await bus.followBatch(['chat', 'chat', 'chat']);
+			// Single unfollow should be enough to drop the channel.
+			await bus.unfollow('chat');
+
+			const handlers = client._pubsubHandlers;
+			const dup = handlers[handlers.length - 1];
+			expect(dup.shardedChannels.has('uws:sharded:chat')).toBe(false);
+
+			await bus.deactivate();
+		});
+
+		it('a topic already followed via follow() does not re-SSUBSCRIBE in the batch', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+
+			const original = client.redis.duplicate;
+			let ssubscribeCalls = 0;
+			client.redis.duplicate = (opts) => {
+				const dup = original.call(client.redis, opts);
+				const orig = dup.ssubscribe.bind(dup);
+				dup.ssubscribe = async (...channels) => {
+					ssubscribeCalls++;
+					return orig(...channels);
+				};
+				return dup;
+			};
+			await bus.deactivate();
+			await bus.activate(platform);
+
+			ssubscribeCalls = 0;
+			await bus.follow('chat');
+			expect(ssubscribeCalls).toBe(1);
+
+			await bus.followBatch(['chat', 'audit']);
+			expect(ssubscribeCalls).toBe(2); // one new channel from the batch (audit only)
+
+			await bus.deactivate();
+			client.redis.duplicate = original;
+		});
+
+		it('rolls back refcounts when SSUBSCRIBE fails', async () => {
+			let dupRef;
+			const originalDuplicate = client.redis.duplicate;
+			client.redis.duplicate = (opts) => {
+				const dup = originalDuplicate.call(client.redis, opts);
+				dupRef = dup;
+				dup.ssubscribe = async () => { throw new Error('subscribe failed'); };
+				return dup;
+			};
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+
+			await expect(bus.followBatch(['chat', 'audit'])).rejects.toThrow('subscribe failed');
+
+			// After rollback, follow() of either topic should still trigger a
+			// fresh SSUBSCRIBE (i.e., the refcount got fully unwound to zero).
+			let calls = 0;
+			dupRef.ssubscribe = async (...channels) => { calls += channels.length; return channels.length; };
+			await bus.follow('chat');
+			expect(calls).toBe(1);
+
+			await bus.deactivate();
+			client.redis.duplicate = originalDuplicate;
+		});
+
+		it('inbound messages on the new channels reach the local platform after followBatch', async () => {
+			const bus = createShardedBus(client, {
+				shardKey: (topic) => topic.split(':')[0]
+			});
+			await bus.activate(platform);
+
+			await bus.followBatch(['chat:room1', 'audit:created']);
+
+			// Drive a cross-instance smessage on the chat channel.
+			const handlers = client._pubsubHandlers;
+			const dup = handlers[handlers.length - 1];
+			const listener = dup.listeners.get('smessage');
+			listener('uws:sharded:chat', JSON.stringify({
+				instanceId: 'OTHER', topic: 'chat:room1', event: 'msg', data: { x: 1 }
+			}));
+			expect(platform.published.some((p) => p.topic === 'chat:room1' && p.event === 'msg')).toBe(true);
+
+			await bus.deactivate();
+		});
+	});
+
+	describe('hooks.subscribeBatch', () => {
+		it('calls followBatch under the hood and tracks per-ws topics', async () => {
+			const bus = createShardedBus(client, {
+				shardKey: (topic) => topic.split(':')[0]
+			});
+			await bus.activate(platform);
+
+			const ws = {};
+			await bus.hooks.subscribeBatch(ws, ['chat:room1', 'chat:room2', 'audit:created'], { platform });
+
+			const handlers = client._pubsubHandlers;
+			const dup = handlers[handlers.length - 1];
+			expect(dup.shardedChannels.has('uws:sharded:chat')).toBe(true);
+			expect(dup.shardedChannels.has('uws:sharded:audit')).toBe(true);
+
+			// close should unfollow all three topics on this ws.
+			await bus.hooks.close(ws, { platform });
+			expect(dup.shardedChannels.size).toBe(0);
+
+			await bus.deactivate();
+		});
+
+		it('skips __-prefixed topics in the batch', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+
+			const ws = {};
+			await bus.hooks.subscribeBatch(ws, ['chat', '__internal', '__realtime'], { platform });
+
+			const handlers = client._pubsubHandlers;
+			const dup = handlers[handlers.length - 1];
+			expect([...dup.shardedChannels]).toEqual(['uws:sharded:chat']);
+
+			await bus.deactivate();
+		});
+
+		it('skips topics this ws already follows so duplicates do not leak refcount', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+
+			const ws = {};
+			await bus.hooks.subscribeBatch(ws, ['chat'], { platform });
+			await bus.hooks.subscribeBatch(ws, ['chat', 'audit'], { platform });
+
+			// One unsubscribe per topic should remove from the ws's set; the
+			// channel only goes away when refcount reaches zero.
+			await bus.hooks.unsubscribe(ws, 'chat', { platform });
+			await bus.hooks.unsubscribe(ws, 'audit', { platform });
+
+			const handlers = client._pubsubHandlers;
+			const dup = handlers[handlers.length - 1];
+			expect(dup.shardedChannels.size).toBe(0);
+
+			await bus.deactivate();
+		});
+
+		it('empty array no-ops', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const ws = {};
+			await expect(bus.hooks.subscribeBatch(ws, [], { platform })).resolves.toBeUndefined();
+			await bus.deactivate();
+		});
+
+		it('a non-array input is a silent no-op (matches the per-topic subscribe hook tolerance)', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const ws = {};
+			await expect(bus.hooks.subscribeBatch(ws, null, { platform })).resolves.toBeUndefined();
+			await expect(bus.hooks.subscribeBatch(ws, undefined, { platform })).resolves.toBeUndefined();
+			await bus.deactivate();
+		});
+	});
 });

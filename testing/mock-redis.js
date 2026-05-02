@@ -303,13 +303,17 @@ export function mockRedisClient(keyPrefix = '') {
 				}
 				return 1;
 			},
-			async ssubscribe(channel) {
-				shardedChannels.add(channel);
-				return 1;
+			async ssubscribe(...channels) {
+				for (const ch of channels) shardedChannels.add(ch);
+				return channels.length;
 			},
-			async sunsubscribe(channel) {
-				shardedChannels.delete(channel);
-				return 1;
+			async sunsubscribe(...channels) {
+				if (channels.length === 0) {
+					shardedChannels.clear();
+					return 0;
+				}
+				for (const ch of channels) shardedChannels.delete(ch);
+				return channels.length;
 			},
 			// Server INFO stub. Tests can override `_info` (a string) to
 			// drive version detection in callers.

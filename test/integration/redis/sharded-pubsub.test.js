@@ -360,4 +360,68 @@ describe('redis sharded pubsub bus (integration)', () => {
 			await expect(bus.follow('chat')).rejects.toThrow('activate() must be called before follow()');
 		});
 	});
+
+	describe('followBatch (real SSUBSCRIBE batching)', () => {
+		it('SSUBSCRIBEs grouped channels in one round trip', async () => {
+			const channelPrefix = uniqueChannelPrefix('batch');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (topic) => topic.split(':')[0]
+			}));
+			const busB = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (topic) => topic.split(':')[0]
+			}));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			await busB.followBatch(['chat:room1', 'chat:room2', 'audit:created']);
+
+			// Cross-instance SPUBLISH on each underlying channel must reach B.
+			busA.wrap(platformA).publish('chat:room1', 'msg', { id: 1 });
+			busA.wrap(platformA).publish('audit:created', 'event', { id: 2 });
+
+			await waitFor(() => platformB.published.find((p) => p.data && p.data.id === 1) !== undefined);
+			await waitFor(() => platformB.published.find((p) => p.data && p.data.id === 2) !== undefined);
+		});
+
+		it('subscribeBatch hook lands one round trip per channel for an N-topic batch', async () => {
+			const channelPrefix = uniqueChannelPrefix('hookbatch');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (topic) => topic.split(':')[0]
+			}));
+			const busB = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (topic) => topic.split(':')[0]
+			}));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			const ws = {};
+			await busB.hooks.subscribeBatch(ws, ['org:42:items', 'org:42:audit', 'org:42:notifications'], {
+				platform: platformB
+			});
+
+			// All three should now route through the single 'org' shard channel.
+			busA.wrap(platformA).publish('org:42:items', 'updated', { tag: 'A' });
+			busA.wrap(platformA).publish('org:42:audit', 'created', { tag: 'B' });
+			busA.wrap(platformA).publish('org:42:notifications', 'incoming', { tag: 'C' });
+
+			await waitFor(() => platformB.published.filter((p) => p.data && ['A', 'B', 'C'].includes(p.data.tag)).length === 3);
+
+			// hooks.close should release every topic this ws followed.
+			await busB.hooks.close(ws, { platform: platformB });
+
+			// Wait for SUNSUBSCRIBE to take effect cluster-wide.
+			await wait(50);
+			busA.wrap(platformA).publish('org:42:items', 'updated', { tag: 'X' });
+			await wait(150);
+			expect(platformB.published.find((p) => p.data && p.data.tag === 'X')).toBeUndefined();
+		});
+	});
 });

@@ -56,6 +56,22 @@ export interface ShardedBus {
 	follow(topic: string): Promise<void>;
 
 	/**
+	 * Bulk follow. Groups input topics by shard channel and SSUBSCRIBE
+	 * the new channels in one round trip. Refcount semantics for
+	 * individual topics match `follow`: each call bumps every input
+	 * topic's refcount by 1, and only channel transitions trigger Redis
+	 * traffic. Empty arrays no-op; duplicate topics in the input collapse
+	 * to one refcount bump.
+	 *
+	 * Pairs with the adapter's `subscribeBatch` hook so an N-topic
+	 * subscribe batch lands as one round-trip-per-channel rather than
+	 * one round-trip-per-topic. With the adapter's next.7 client-side
+	 * coalescing, the win covers initial-mount subscribes too, not just
+	 * reconnect resubscribes.
+	 */
+	followBatch(topics: string[]): Promise<void>;
+
+	/**
 	 * Decrement the follower count for `topic`. SUNSUBSCRIBE the
 	 * channel if this was the last follower of any topic mapping to
 	 * it.
@@ -64,11 +80,13 @@ export interface ShardedBus {
 
 	/**
 	 * Ready-made WebSocket hooks. `subscribe` calls `follow`,
-	 * `unsubscribe` calls `unfollow`, `close` unfollows every topic
-	 * the connection had subscribed to.
+	 * `subscribeBatch` calls `followBatch` (skipping `__`-prefixed
+	 * topics like `subscribe` does), `unsubscribe` calls `unfollow`,
+	 * `close` unfollows every topic the connection had subscribed to.
 	 */
 	hooks: {
 		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		subscribeBatch(ws: any, topics: string[], ctx: { platform: Platform }): Promise<void>;
 		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};

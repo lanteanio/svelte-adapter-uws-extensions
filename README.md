@@ -272,6 +272,24 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 
 `bus.hooks` is the recommended path -- it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
 
+#### Bulk follow (`followBatch`, `bus.hooks.subscribeBatch`)
+
+`bus.followBatch(topics)` groups the input topics by shard channel and `SSUBSCRIBE`s any new channels in one round trip. Pairs with the adapter's `subscribeBatch` hook (`hooks.ws.subscribeBatch`) so an N-topic subscribe batch lands as one round-trip-per-channel rather than one round-trip-per-topic. With the adapter's client-side coalescing (next.7+), the win covers initial-mount subscribes too, not just reconnect resubscribes.
+
+```js
+// Today (works, but N round trips):
+export const subscribeBatch = async (ws, topics) => {
+  for (const topic of topics) await bus.follow(topic);
+};
+
+// Recommended -- one round trip per shard channel:
+export const { subscribeBatch } = bus.hooks;
+```
+
+Single `follow` / `unfollow` keep their existing semantics; `followBatch` is purely additive. Refcount semantics for individual topics match `follow`: each call to `followBatch` bumps every input topic's refcount by 1, and only channel transitions trigger Redis traffic. Empty arrays no-op; duplicate topics in the input collapse to one refcount bump.
+
+`bus.hooks.subscribeBatch` skips `__`-prefixed topics like the per-topic `subscribe` hook does, and skips topics this `ws` is already following so a duplicate batch from a flaky reconnect doesn't leak refcount.
+
 #### Wire-batched publish (`publishBatched`)
 
 `distributed.publishBatched(messages)` ships **one** SPUBLISH envelope per shard channel per call. Receivers fan out via `platform.publishBatched` so each follower sees **one** WebSocket frame per call.

@@ -254,6 +254,82 @@ export function createShardedBus(client, options = {}) {
 		}
 	}
 
+	/**
+	 * Bulk follow. Groups input topics by shard channel, runs one
+	 * SSUBSCRIBE round trip for any channel transitioning from refcount 0
+	 * to active. Refcount semantics for individual topics match `follow`:
+	 * each call to `followBatch` bumps every input topic's refcount by 1,
+	 * and only the channel transitions trigger Redis traffic.
+	 *
+	 * Pairs with the adapter's `subscribeBatch` hook so an N-topic
+	 * subscribe batch turns into one round-trip-per-channel rather than
+	 * one round-trip-per-topic. With the adapter's next.7 client-side
+	 * coalescing, the win covers initial-mount subscribes too, not just
+	 * reconnect resubscribes.
+	 *
+	 * Empty arrays no-op. Duplicate topics in the input collapse to one
+	 * refcount bump.
+	 *
+	 * @param {string[]} topics
+	 */
+	async function followBatch(topics) {
+		if (!subscriber) {
+			throw new Error('sharded bus: activate() must be called before followBatch()');
+		}
+		if (!Array.isArray(topics)) {
+			throw new TypeError('sharded bus: followBatch requires an array of topics');
+		}
+		if (topics.length === 0) return;
+
+		const touchedTopics = new Set();
+		const activatedTopics = [];
+		const channelsToSubscribe = [];
+
+		for (const topic of topics) {
+			if (typeof topic !== 'string' || topic.length === 0) continue;
+			if (touchedTopics.has(topic)) continue;
+			touchedTopics.add(topic);
+			const count = followCounts.get(topic) || 0;
+			followCounts.set(topic, count + 1);
+			if (count > 0) continue;
+			activatedTopics.push(topic);
+
+			const channel = channelFor(topic);
+			const chCount = channelRefcounts.get(channel) || 0;
+			channelRefcounts.set(channel, chCount + 1);
+			if (chCount === 0) channelsToSubscribe.push(channel);
+		}
+
+		if (channelsToSubscribe.length === 0) return;
+
+		b?.guard();
+		try {
+			// ioredis accepts multiple channels in one ssubscribe call; this
+			// collapses N new-channel subscribes into one round trip when the
+			// caller's topics span multiple shards.
+			await subscriber.ssubscribe(...channelsToSubscribe);
+			for (const ch of channelsToSubscribe) subscribedChannels.add(ch);
+			b?.success();
+			mFollows?.inc(channelsToSubscribe.length);
+		} catch (err) {
+			b?.failure(err);
+			// Roll back every refcount bump we did under this call so the
+			// caller can retry without leaking stale counts.
+			for (const topic of touchedTopics) {
+				const cur = followCounts.get(topic) || 0;
+				if (cur <= 1) followCounts.delete(topic);
+				else followCounts.set(topic, cur - 1);
+			}
+			for (const topic of activatedTopics) {
+				const channel = channelFor(topic);
+				const chCur = channelRefcounts.get(channel) || 0;
+				if (chCur <= 1) channelRefcounts.delete(channel);
+				else channelRefcounts.set(channel, chCur - 1);
+			}
+			throw err;
+		}
+	}
+
 	async function unfollow(topic) {
 		const count = followCounts.get(topic) || 0;
 		if (count === 0) return;
@@ -370,6 +446,7 @@ export function createShardedBus(client, options = {}) {
 		activate,
 		deactivate,
 		follow,
+		followBatch,
 		unfollow,
 		hooks: {
 			async subscribe(ws, topic) {
@@ -382,6 +459,23 @@ export function createShardedBus(client, options = {}) {
 				if (topics.has(topic)) return;
 				topics.add(topic);
 				await follow(topic);
+			},
+			async subscribeBatch(ws, topics) {
+				if (!Array.isArray(topics) || topics.length === 0) return;
+				let wsTopics = wsFollows.get(ws);
+				if (!wsTopics) {
+					wsTopics = new Set();
+					wsFollows.set(ws, wsTopics);
+				}
+				const fresh = [];
+				for (const topic of topics) {
+					if (typeof topic !== 'string' || topic.startsWith('__')) continue;
+					if (wsTopics.has(topic)) continue;
+					wsTopics.add(topic);
+					fresh.push(topic);
+				}
+				if (fresh.length === 0) return;
+				await followBatch(fresh);
 			},
 			async unsubscribe(ws, topic) {
 				const topics = wsFollows.get(ws);
