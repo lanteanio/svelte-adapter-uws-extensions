@@ -736,11 +736,22 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 |---|---|
 | `lookup(userId)` | Resolve a userId to its current entry (`{instanceId, sessionId, ts}`) or `null`. |
 | `request(target, event, data?, opts?)` | Cluster-routed request/reply. Resolves with the reply. |
+| `send(target, topic, event, data?)` | Cluster-routed `platform.send` counterpart. Fire-and-forget. See [Targeted sends](#registry-targeted-sends) below. |
 | `sendCoalesced(target, message)` | Cluster-routed coalesce-by-key send. Fire-and-forget. See [Coalesced sends](#registry-coalesced-sends) below. |
 | `size()` | Count of users registered to THIS instance (local view, scrape-time). |
 | `instanceId` | Stable id for this instance, also the name of its push channel. |
 | `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
 | `destroy()` | Stop the heartbeat timer and Redis subscriber. |
+
+#### Targeted sends {#registry-targeted-sends}
+
+`registry.send(target, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.send(ws, topic, event, data)`. Lookup resolves the owning instance, self-targeting short-circuits to a local `platform.send`, otherwise a fire-and-forget envelope `{type:'send', sessionId, topic, event, data}` ships on the owner's push channel.
+
+```js
+registry.send('user-123', 'notifications', 'incoming', { id: 42 });
+```
+
+Fire-and-forget: no Promise<reply>, no acknowledgement. Callers who need a delivery signal should use `request(...)` instead. A user offline at lookup-time silently drops with `push_sends_total{result="offline"}`. Mid-flight migration (user disconnects between lookup and arrival) drops on the receiver with `push_sends_total{result="late"}`.
 
 #### Coalesced sends {#registry-coalesced-sends}
 
@@ -770,6 +781,7 @@ Best fit: targeted latest-value streams where the target is a *user*, not a topi
 | `push_registry_size` | Gauge: connections registered to this instance. Scrape-time, no continuous accounting. |
 | `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
 | `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map -- target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
+| `push_sends_total{result="ok|self|offline|late|error"}` | Outcomes for `send(...)`. Same result space as `push_coalesced_total` -- `ok` cross-instance, `self` short-circuited locally, `offline` entry missing or local-ws-gone, `late` receive-side miss after migration, `error` Redis publish or local `platform.send` threw. |
 
 #### Registry edge cases
 

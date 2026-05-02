@@ -120,6 +120,28 @@ export interface ConnectionRegistry {
 		message: { key: string; topic: string; event: string; data?: unknown }
 	): Promise<void>;
 
+	/**
+	 * Cluster-routed counterpart to `platform.send(ws, topic, event, data)`.
+	 * Fire-and-forget: routes to the owning instance, which calls
+	 * `platform.send(ws, topic, event, data)` locally.
+	 *
+	 * Self-targeting (the origin instance owns the user) short-circuits
+	 * to a local `platform.send` with no Redis hop.
+	 *
+	 * Edge cases:
+	 *  - **User offline:** silently drops. Callers who want a status signal
+	 *    should use `request(...)` instead.
+	 *  - **Mid-flight migration:** sender's envelope lands on the old owner,
+	 *    which no longer has the `ws`; drops with a
+	 *    `push_sends_total{result="late"}` increment on the receiver side.
+	 *
+	 * @example
+	 * ```js
+	 * registry.send('user-123', 'notifications', 'incoming', { id: 42 });
+	 * ```
+	 */
+	send(target: string, topic: string, event: string, data?: unknown): Promise<void>;
+
 	/** Count of users registered to THIS instance (local view, scrape-time). */
 	size(): number;
 

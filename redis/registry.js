@@ -136,6 +136,7 @@ export function createConnectionRegistry(client, options) {
 	const mRegistrySize = m?.gauge('push_registry_size', 'Connections registered to this instance');
 	const mLateReply = m?.counter('push_late_replies_total', 'Replies that arrived after their request expired or migrated');
 	const mCoalesced = m?.counter('push_coalesced_total', 'Cluster coalesced sends by outcome', ['result']);
+	const mSends = m?.counter('push_sends_total', 'Cluster sends by outcome', ['result']);
 
 	function userKey(userId) {
 		return client.key(keyPrefix + 'conns:' + userId);
@@ -269,7 +270,25 @@ export function createConnectionRegistry(client, options) {
 			case 'request': handleInboundRequest(envelope); break;
 			case 'reply': handleInboundReply(envelope); break;
 			case 'coalesced': handleInboundCoalesced(envelope); break;
+			case 'send': handleInboundSend(envelope); break;
 			default: /* unknown type, ignore for forward compatibility */ break;
+		}
+	}
+
+	function handleInboundSend(env) {
+		const { sessionId, topic, event, data } = env;
+		if (typeof sessionId !== 'string' || typeof topic !== 'string' || typeof event !== 'string') return;
+		const ws = sessionToWs.get(sessionId);
+		if (!ws || !activePlatform) {
+			mSends?.inc({ result: 'late' });
+			return;
+		}
+		try {
+			activePlatform.send(ws, topic, event, data);
+		} catch {
+			// fire-and-forget: a thrown send on the receiver surfaces as a
+			// missing frame on the wire. Callers needing a delivery signal
+			// should use registry.request instead.
 		}
 	}
 
@@ -469,10 +488,66 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
+	async function send(target, topic, event, data) {
+		if (typeof target !== 'string' || target.length === 0) {
+			throw new Error('registry.send: target must be a non-empty userId string');
+		}
+		if (typeof topic !== 'string' || topic.length === 0) {
+			throw new Error('registry.send: topic must be a non-empty string');
+		}
+		if (typeof event !== 'string' || event.length === 0) {
+			throw new Error('registry.send: event must be a non-empty string');
+		}
+
+		const entry = await lookup(target);
+		if (!entry) {
+			mSends?.inc({ result: 'offline' });
+			return;
+		}
+
+		// Self-targeting: short-circuit to local platform.send.
+		if (entry.instanceId === instanceId) {
+			const ws = sessionToWs.get(entry.sessionId);
+			if (!ws || !activePlatform) {
+				mSends?.inc({ result: 'offline' });
+				return;
+			}
+			try {
+				activePlatform.send(ws, topic, event, data);
+				mSends?.inc({ result: 'self' });
+			} catch {
+				mSends?.inc({ result: 'error' });
+			}
+			return;
+		}
+
+		// Cross-instance: fire-and-forget envelope on the owning instance's
+		// push channel. No reply path. A user that disconnects between the
+		// lookup and the receive surfaces as a `late` increment on the
+		// receiver side; this method does not surface that to the caller.
+		await ensureSubscriber(activePlatform);
+		const envelope = {
+			type: 'send',
+			sessionId: entry.sessionId,
+			topic,
+			event,
+			data
+		};
+		try {
+			await redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope));
+			breaker?.success();
+			mSends?.inc({ result: 'ok' });
+		} catch (err) {
+			breaker?.failure(err);
+			mSends?.inc({ result: 'error' });
+		}
+	}
+
 	const tracker = /** @type {ConnectionRegistry} */ ({
 		instanceId,
 		lookup,
 		request,
+		send,
 		sendCoalesced,
 		size() { return localUsers.size; },
 		hooks: {

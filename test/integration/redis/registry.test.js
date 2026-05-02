@@ -201,6 +201,29 @@ describe('redis connection registry (integration)', () => {
 		});
 	});
 
+	it('cross-instance send reaches the owning instance via the push channel', async () => {
+		const platformA = mockPlatform();
+		const platformB = mockPlatform();
+		const regOrigin = makeRegistry();
+		const regOwner = makeRegistry();
+
+		const ws = wsWithSession({ userId: 'gina' }, 's-gina');
+		await regOwner.hooks.open(ws, { platform: platformB });
+		const filler = wsWithSession({ userId: 'origin-only' }, 's-origin');
+		await regOrigin.hooks.open(filler, { platform: platformA });
+
+		await regOrigin.send('gina', 'notifications', 'incoming', { id: 99 });
+		await wait(50);
+
+		expect(platformB.sent).toHaveLength(1);
+		expect(platformB.sent[0]).toMatchObject({
+			ws,
+			topic: 'notifications',
+			event: 'incoming',
+			data: { id: 99 }
+		});
+	});
+
 	it('heartbeat refreshes TTL on locally-owned entries', async () => {
 		const platform = mockPlatform();
 		// Short ttl + short heartbeat so we can observe the refresh in real time.

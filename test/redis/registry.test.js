@@ -615,6 +615,157 @@ describe('redis connection registry', () => {
 		});
 	});
 
+	describe('send: self-targeting', () => {
+		it('short-circuits to local platform.send without a Redis hop', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+
+			await registry.send('u-1', 'notifications', 'incoming', { id: 42 });
+
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0]).toMatchObject({
+				ws,
+				topic: 'notifications',
+				event: 'incoming',
+				data: { id: 42 }
+			});
+		});
+
+		it('silently drops when the user is offline', async () => {
+			await expect(
+				registry.send('nobody', 'notifications', 'incoming')
+			).resolves.toBeUndefined();
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('silently drops when the local sessionToWs has no ws', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			await registry.hooks.close(ws, { platform });
+
+			await registry.send('u-1', 'notifications', 'incoming');
+			expect(platform.sent).toHaveLength(0);
+		});
+	});
+
+	describe('send: cross-instance routing', () => {
+		it('routes the envelope and calls platform.send on the owning instance', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			await registry.send('u-1', 'notifications', 'incoming', { id: 42 });
+			await new Promise((r) => setImmediate(r));
+
+			expect(platformOwner.sent).toHaveLength(1);
+			expect(platformOwner.sent[0]).toMatchObject({
+				ws,
+				topic: 'notifications',
+				event: 'incoming',
+				data: { id: 42 }
+			});
+
+			await owner.destroy();
+		});
+
+		it('drops with a late counter increment when the receiver no longer has the ws', async () => {
+			const metrics = createMetrics();
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			await owner.hooks.close(ws, { platform: platformOwner });
+
+			// Re-plant the registry entry so origin still routes to owner.
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', owner.instanceId,
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+
+			await registry.send('u-1', 'topic', 'event', null);
+			await new Promise((r) => setImmediate(r));
+
+			expect(platformOwner.sent).toHaveLength(0);
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_sends_total\{result="late"\}\s+1/);
+
+			await owner.destroy();
+		});
+
+		it('does not return a reply (fire-and-forget)', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			const result = await registry.send('u-1', 't', 'e');
+			expect(result).toBeUndefined();
+			await owner.destroy();
+		});
+	});
+
+	describe('send: validation', () => {
+		it('rejects an empty target', async () => {
+			await expect(registry.send('', 't', 'e')).rejects.toThrow(/non-empty/);
+		});
+
+		it('rejects a missing topic', async () => {
+			await expect(registry.send('u', '', 'e')).rejects.toThrow(/topic/);
+		});
+
+		it('rejects a missing event', async () => {
+			await expect(registry.send('u', 't', '')).rejects.toThrow(/event/);
+		});
+	});
+
+	describe('send: metrics', () => {
+		it('counts outcomes self | offline | ok', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+
+			// self
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await local.hooks.open(ws, { platform });
+			await local.send('u-1', 't', 'e', { x: 1 });
+
+			// offline
+			await local.send('nobody', 't', 'e');
+
+			// ok (cross-instance) -- spin up a sibling owner
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (w) => w.getUserData()?.userId
+			});
+			const wsB = wsWithSession({ userId: 'u-2' }, 's-2');
+			await owner.hooks.open(wsB, { platform: platformOwner });
+
+			await local.send('u-2', 't', 'e');
+			await new Promise((r) => setImmediate(r));
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_sends_total\{result="self"\}\s+1/);
+			expect(out).toMatch(/push_sends_total\{result="offline"\}\s+1/);
+			expect(out).toMatch(/push_sends_total\{result="ok"\}\s+1/);
+
+			await owner.destroy();
+			await local.destroy();
+		});
+	});
+
 	describe('destroy', () => {
 		it('rejects all in-flight requests', async () => {
 			const local = createConnectionRegistry(client, {
