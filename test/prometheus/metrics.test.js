@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createMetrics } from '../../prometheus/index.js';
+import {
+	createMetrics,
+	wirePublishRateMetrics,
+	connectionMetricsHook
+} from '../../prometheus/index.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
@@ -820,6 +824,242 @@ describe('prometheus metrics', () => {
 			const output = metrics.serialize();
 			expect(output).toContain('replay_publishes_total{topic="room:*"} 2');
 			expect(output).toContain('replay_publishes_total{topic="global"} 1');
+		});
+	});
+
+	describe('wirePublishRateMetrics', () => {
+		it('throws on missing platform / metrics', () => {
+			const m = createMetrics();
+			expect(() => wirePublishRateMetrics(null, m)).toThrow('platform is required');
+			expect(() => wirePublishRateMetrics({ pressure: {} }, null)).toThrow('metrics registry is required');
+		});
+
+		it('throws on invalid topN', () => {
+			const m = createMetrics();
+			const platform = mockPlatform();
+			expect(() => wirePublishRateMetrics(platform, m, { topN: 0 })).toThrow('topN must be a positive integer');
+			expect(() => wirePublishRateMetrics(platform, m, { topN: -1 })).toThrow('topN must be a positive integer');
+			expect(() => wirePublishRateMetrics(platform, m, { topN: 1.5 })).toThrow('topN must be a positive integer');
+		});
+
+		it('emits zero gauges when pressure has no topPublishers', () => {
+			const m = createMetrics();
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m);
+
+			const output = m.serialize();
+			expect(output).toContain('# TYPE ws_topic_publish_rate gauge');
+			expect(output).toContain('# TYPE ws_topic_publish_bytes gauge');
+			// No samples emitted since there are no topPublishers.
+			expect(output).not.toMatch(/ws_topic_publish_rate\{/);
+			expect(output).not.toMatch(/ws_topic_publish_bytes\{/);
+		});
+
+		it('reads topPublishers from the pressure snapshot at scrape time', () => {
+			const m = createMetrics();
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m);
+
+			platform._setPressure({
+				active: false,
+				subscriberRatio: 0,
+				publishRate: 0,
+				memoryMB: 0,
+				reason: 'NONE',
+				topPublishers: [
+					{ topic: 'chat', messagesPerSec: 1500, bytesPerSec: 32000 },
+					{ topic: 'cursors', messagesPerSec: 800, bytesPerSec: 12000 }
+				]
+			});
+
+			const output = m.serialize();
+			expect(output).toContain('ws_topic_publish_rate{topic="chat"} 1500');
+			expect(output).toContain('ws_topic_publish_rate{topic="cursors"} 800');
+			expect(output).toContain('ws_topic_publish_bytes{topic="chat"} 32000');
+			expect(output).toContain('ws_topic_publish_bytes{topic="cursors"} 12000');
+		});
+
+		it('caps cardinality at topN', () => {
+			const m = createMetrics();
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m, { topN: 2 });
+
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0,
+				topPublishers: [
+					{ topic: 'a', messagesPerSec: 10, bytesPerSec: 100 },
+					{ topic: 'b', messagesPerSec: 9,  bytesPerSec: 90 },
+					{ topic: 'c', messagesPerSec: 8,  bytesPerSec: 80 },
+					{ topic: 'd', messagesPerSec: 7,  bytesPerSec: 70 }
+				]
+			});
+
+			const output = m.serialize();
+			expect(output).toContain('ws_topic_publish_rate{topic="a"} 10');
+			expect(output).toContain('ws_topic_publish_rate{topic="b"} 9');
+			expect(output).not.toMatch(/ws_topic_publish_rate\{topic="c"\}/);
+			expect(output).not.toMatch(/ws_topic_publish_rate\{topic="d"\}/);
+		});
+
+		it('honors mapTopic from the registry', () => {
+			const m = createMetrics({
+				mapTopic: (t) => t.startsWith('chat:') ? 'chat:*' : t
+			});
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m);
+
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0,
+				topPublishers: [
+					{ topic: 'chat:room1', messagesPerSec: 100, bytesPerSec: 1000 },
+					{ topic: 'chat:room2', messagesPerSec: 50,  bytesPerSec: 500 }
+				]
+			});
+
+			const output = m.serialize();
+			// Both rooms collapse onto the same label; the second `set()`
+			// overwrites the first, so the visible value is the last entry's.
+			expect(output).toContain('ws_topic_publish_rate{topic="chat:*"} 50');
+		});
+
+		it('inline mapTopic option overrides the registry mapTopic', () => {
+			const m = createMetrics({ mapTopic: () => 'wrong' });
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m, { mapTopic: (t) => 'override-' + t });
+
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0,
+				topPublishers: [{ topic: 'a', messagesPerSec: 1, bytesPerSec: 1 }]
+			});
+
+			const output = m.serialize();
+			expect(output).toContain('ws_topic_publish_rate{topic="override-a"} 1');
+		});
+
+		it('reflects pressure changes between scrapes (collect at scrape time)', () => {
+			const m = createMetrics();
+			const platform = mockPlatform();
+			wirePublishRateMetrics(platform, m);
+
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0,
+				topPublishers: [{ topic: 'a', messagesPerSec: 100, bytesPerSec: 1000 }]
+			});
+			expect(m.serialize()).toContain('ws_topic_publish_rate{topic="a"} 100');
+
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0,
+				topPublishers: [{ topic: 'a', messagesPerSec: 50, bytesPerSec: 500 }]
+			});
+			expect(m.serialize()).toContain('ws_topic_publish_rate{topic="a"} 50');
+		});
+	});
+
+	describe('connectionMetricsHook', () => {
+		it('throws on missing metrics', () => {
+			expect(() => connectionMetricsHook(null)).toThrow('metrics registry is required');
+		});
+
+		it('throws when userClose is not a function', () => {
+			const m = createMetrics();
+			expect(() => connectionMetricsHook(m, 'nope')).toThrow('userClose must be a function');
+		});
+
+		it('returns a function with the close-hook signature', () => {
+			const m = createMetrics();
+			const hook = connectionMetricsHook(m);
+			expect(typeof hook).toBe('function');
+			// Take two parameters but tolerate any arity at call time.
+			expect(hook.length).toBeGreaterThanOrEqual(2);
+		});
+
+		it('observes duration / messages / bytes from ctx', async () => {
+			const m = createMetrics();
+			const close = connectionMetricsHook(m);
+
+			await close({}, {
+				code: 1000,
+				duration: 5000,         // 5 seconds
+				messagesIn: 12,
+				messagesOut: 8,
+				bytesIn: 2048,
+				bytesOut: 1024
+			});
+
+			const out = m.serialize();
+			expect(out).toContain('ws_connection_duration_seconds_count 1');
+			expect(out).toContain('ws_connection_duration_seconds_sum 5');
+			expect(out).toContain('ws_connection_messages_in_count 1');
+			expect(out).toContain('ws_connection_messages_in_sum 12');
+			expect(out).toContain('ws_connection_messages_out_sum 8');
+			expect(out).toContain('ws_connection_bytes_in_sum 2048');
+			expect(out).toContain('ws_connection_bytes_out_sum 1024');
+		});
+
+		it('counts close codes as labels', async () => {
+			const m = createMetrics();
+			const close = connectionMetricsHook(m);
+
+			await close({}, { code: 1000, duration: 100, messagesIn: 0, messagesOut: 0, bytesIn: 0, bytesOut: 0 });
+			await close({}, { code: 1000, duration: 100, messagesIn: 0, messagesOut: 0, bytesIn: 0, bytesOut: 0 });
+			await close({}, { code: 1006, duration: 100, messagesIn: 0, messagesOut: 0, bytesIn: 0, bytesOut: 0 });
+
+			const out = m.serialize();
+			expect(out).toContain('ws_connection_close_total{code="1000"} 2');
+			expect(out).toContain('ws_connection_close_total{code="1006"} 1');
+		});
+
+		it('skips fields that are missing from ctx', async () => {
+			const m = createMetrics();
+			const close = connectionMetricsHook(m);
+			await close({}, { code: 1000 }); // only code; no telemetry fields
+
+			const out = m.serialize();
+			expect(out).toContain('ws_connection_close_total{code="1000"} 1');
+			// Histograms with zero observations emit only TYPE / HELP lines,
+			// no _count or _sum samples.
+			expect(out).not.toMatch(/ws_connection_duration_seconds_count\b/);
+			expect(out).not.toMatch(/ws_connection_messages_in_count\b/);
+		});
+
+		it('skips negative-valued telemetry without observing', async () => {
+			const m = createMetrics();
+			const close = connectionMetricsHook(m);
+			await close({}, { code: 1000, duration: -1, messagesIn: -5, messagesOut: 5, bytesIn: 0, bytesOut: 0 });
+
+			const out = m.serialize();
+			// duration and messagesIn were negative -> not observed.
+			expect(out).not.toMatch(/ws_connection_duration_seconds_count\b/);
+			expect(out).not.toMatch(/ws_connection_messages_in_count\b/);
+			// messagesOut was non-negative -> observed.
+			expect(out).toContain('ws_connection_messages_out_count 1');
+			expect(out).toContain('ws_connection_messages_out_sum 5');
+		});
+
+		it('composes with a user-supplied close hook (called after metrics)', async () => {
+			const m = createMetrics();
+			const order = [];
+			const userClose = async (ws, ctx) => { order.push(['user', ctx.code]); };
+			const close = connectionMetricsHook(m, userClose);
+
+			await close({}, {
+				code: 4001,
+				duration: 250, messagesIn: 1, messagesOut: 1, bytesIn: 100, bytesOut: 100
+			});
+
+			expect(order).toEqual([['user', 4001]]);
+			expect(m.serialize()).toContain('ws_connection_close_total{code="4001"} 1');
+		});
+
+		it('does not throw if ctx is undefined', async () => {
+			const m = createMetrics();
+			const close = connectionMetricsHook(m);
+			await expect(close({}, undefined)).resolves.toBeUndefined();
 		});
 	});
 });

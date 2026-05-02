@@ -1554,6 +1554,38 @@ const metrics = createMetrics({
 });
 ```
 
+#### WebSocket observability helpers
+
+Two drop-in wirers for adapter telemetry:
+
+```js
+import {
+  createMetrics,
+  wirePublishRateMetrics,
+  connectionMetricsHook
+} from 'svelte-adapter-uws-extensions/prometheus';
+
+export const metrics = createMetrics({ prefix: 'myapp_' });
+
+// In setup, once you have a `platform`:
+wirePublishRateMetrics(platform, metrics, { topN: 10 });
+
+// In hooks.ws.js:
+export const close = connectionMetricsHook(metrics);
+```
+
+`wirePublishRateMetrics` registers `ws_topic_publish_rate{topic="..."}` and `ws_topic_publish_bytes{topic="..."}` gauges that read `platform.pressure.topPublishers` at scrape time -- no continuous accounting on the publish hot path. The `topN` cap (default 10) bounds gauge cardinality; the registry's `mapTopic` (or an inline `mapTopic` option) can further collapse user-generated topic names.
+
+`connectionMetricsHook(metrics, userClose?)` returns a close-hook that emits per-connection histograms (`ws_connection_duration_seconds`, `ws_connection_messages_in` / `_out`, `ws_connection_bytes_in` / `_out`) plus a `ws_connection_close_total{code}` counter from the close-ctx fields the adapter populates. Compose with your own close logic by passing a function as the second argument; it runs after the metrics are recorded:
+
+```js
+export const close = connectionMetricsHook(metrics, async (ws, ctx) => {
+  // your own teardown -- runs after metrics, with the same ctx
+});
+```
+
+Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the pressure snapshot and the duration / messages / bytes fields on the close ctx are only populated by that version.
+
 #### Metrics reference
 
 **Pub/sub bus**
@@ -1563,6 +1595,7 @@ const metrics = createMetrics({
 | `pubsub_messages_relayed_total` | counter | Messages relayed to Redis |
 | `pubsub_messages_received_total` | counter | Messages received from Redis |
 | `pubsub_echo_suppressed_total` | counter | Messages dropped by echo suppression |
+| `pubsub_parse_errors_total` | counter | Malformed envelopes dropped on receive |
 | `pubsub_relay_batch_size` | histogram | Relay batch size per flush |
 | `pubsub_degraded_total` | counter | Auto-emitted `degraded` events |
 | `pubsub_recovered_total` | counter | Auto-emitted `recovered` events |
@@ -1574,8 +1607,22 @@ const metrics = createMetrics({
 | `sharded_pubsub_messages_relayed_total` | counter | `topic` | Messages SPUBLISHed |
 | `sharded_pubsub_messages_received_total` | counter | `topic` | Messages received via SSUBSCRIBE |
 | `sharded_pubsub_echo_suppressed_total` | counter | | Sharded messages dropped by echo suppression |
+| `sharded_pubsub_parse_errors_total` | counter | | Malformed envelopes dropped on receive |
 | `sharded_pubsub_ssubscribes_total` | counter | | SSUBSCRIBE calls (first follower per channel) |
 | `sharded_pubsub_sunsubscribes_total` | counter | | SUNSUBSCRIBE calls (last follower out) |
+
+**Adapter telemetry (`wirePublishRateMetrics` + `connectionMetricsHook`)**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ws_topic_publish_rate` | gauge | `topic` | Messages per second sampled from `platform.pressure.topPublishers` (top N) |
+| `ws_topic_publish_bytes` | gauge | `topic` | Bytes per second sampled from `platform.pressure.topPublishers` (top N) |
+| `ws_connection_duration_seconds` | histogram | | Connection duration in seconds at close |
+| `ws_connection_messages_in` | histogram | | Messages received per connection at close |
+| `ws_connection_messages_out` | histogram | | Messages sent per connection at close |
+| `ws_connection_bytes_in` | histogram | | Bytes received per connection at close |
+| `ws_connection_bytes_out` | histogram | | Bytes sent per connection at close |
+| `ws_connection_close_total` | counter | `code` | Connections closed by close code |
 
 **Presence**
 

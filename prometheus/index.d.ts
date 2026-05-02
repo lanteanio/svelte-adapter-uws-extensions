@@ -52,3 +52,58 @@ export interface MetricsRegistry {
  * Create a Prometheus metrics registry.
  */
 export function createMetrics(options?: MetricsOptions): MetricsRegistry;
+
+export interface PublishRateMetricsOptions {
+	/** Cap the gauge cardinality at the top N publishers. @default 10 */
+	topN?: number;
+	/**
+	 * Override the registry's `mapTopic` for these gauges. Used to map
+	 * arbitrary topic names to bounded label values when topic identifiers
+	 * carry user IDs / session IDs.
+	 */
+	mapTopic?: (topic: string) => string;
+}
+
+/**
+ * Wire `platform.pressure.topPublishers` into per-topic publish-rate gauges
+ * (`ws_topic_publish_rate{topic="..."}`, `ws_topic_publish_bytes{topic="..."}`).
+ *
+ * Uses `gauge.collect()` so values are scraped on demand from the adapter's
+ * pressure snapshot rather than continuously accounted on the publish hot
+ * path. Read every Prometheus scrape; otherwise free.
+ *
+ * Requires `svelte-adapter-uws >= 0.5.0-next.4` for the `topPublishers` field
+ * on the pressure snapshot.
+ */
+export function wirePublishRateMetrics(
+	platform: {
+		pressure?: {
+			topPublishers?: Array<{
+				topic: string;
+				messagesPerSec: number;
+				bytesPerSec: number;
+			}>;
+		};
+	},
+	metrics: MetricsRegistry,
+	options?: PublishRateMetricsOptions
+): void;
+
+/**
+ * Returns a `close` hook that emits per-connection histograms and a
+ * close-code counter from the adapter's close-ctx telemetry. Composes
+ * with a user-provided close hook by passing it as the second argument.
+ *
+ * Emitted metrics:
+ *   - `ws_connection_duration_seconds` (histogram)
+ *   - `ws_connection_messages_in` / `ws_connection_messages_out` (histograms)
+ *   - `ws_connection_bytes_in` / `ws_connection_bytes_out` (histograms)
+ *   - `ws_connection_close_total{code}` (counter)
+ *
+ * Requires `svelte-adapter-uws >= 0.5.0-next.4` -- the duration / messages /
+ * bytes fields are only allocated when a `close` hook is registered.
+ */
+export function connectionMetricsHook(
+	metrics: MetricsRegistry,
+	userClose?: (ws: any, ctx: any) => void | Promise<void>
+): (ws: any, ctx: any) => Promise<void>;

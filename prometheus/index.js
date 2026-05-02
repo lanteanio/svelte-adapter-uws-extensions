@@ -404,3 +404,145 @@ export function createMetrics(options = {}) {
 		mapTopic
 	};
 }
+
+/**
+ * Default histogram buckets for `connectionMetricsHook`. Tuned for the
+ * realistic distribution of WebSocket session shapes:
+ *   - Duration: short reconnect (1s) -> idle dashboard tab (1 day).
+ *   - Messages: silent reconnect (1) -> chatty game (100k).
+ *   - Bytes: keepalive only (1KB) -> bulk transfer (256MB).
+ */
+const DEFAULT_DURATION_BUCKETS = [1, 10, 60, 300, 1800, 3600, 14400, 86400];
+const DEFAULT_MESSAGE_BUCKETS = [1, 10, 100, 1000, 10000, 100000];
+const DEFAULT_BYTE_BUCKETS = [1024, 65536, 1048576, 16777216, 268435456];
+
+/**
+ * Wire `platform.pressure.topPublishers` into per-topic publish-rate gauges.
+ *
+ * Uses `gauge.collect()` so values are scraped on demand from the adapter's
+ * pressure snapshot rather than continuously accounted on the publish hot
+ * path. Read every Prometheus scrape; otherwise free.
+ *
+ * @param {{ pressure?: { topPublishers?: Array<{topic: string, messagesPerSec: number, bytesPerSec: number}> } }} platform
+ * @param {ReturnType<typeof createMetrics>} metrics
+ * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
+ */
+export function wirePublishRateMetrics(platform, metrics, options = {}) {
+	if (!platform || typeof platform !== 'object') {
+		throw new TypeError('wirePublishRateMetrics: platform is required');
+	}
+	if (!metrics || typeof metrics.gauge !== 'function') {
+		throw new TypeError('wirePublishRateMetrics: metrics registry is required');
+	}
+	const topN = options.topN ?? 10;
+	if (!Number.isInteger(topN) || topN < 1) {
+		throw new TypeError('wirePublishRateMetrics: topN must be a positive integer');
+	}
+	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? ((t) => t);
+
+	const rateGauge = metrics.gauge(
+		'ws_topic_publish_rate',
+		'Top publishers by messages/sec, sampled from platform.pressure',
+		['topic']
+	);
+	const bytesGauge = metrics.gauge(
+		'ws_topic_publish_bytes',
+		'Top publishers by bytes/sec, sampled from platform.pressure',
+		['topic']
+	);
+
+	function snapshot() {
+		const top = platform.pressure && Array.isArray(platform.pressure.topPublishers)
+			? platform.pressure.topPublishers
+			: [];
+		return top.length > topN ? top.slice(0, topN) : top;
+	}
+
+	rateGauge.collect(() => {
+		for (const t of snapshot()) {
+			rateGauge.set({ topic: mapTopic(t.topic) }, t.messagesPerSec);
+		}
+	});
+	bytesGauge.collect(() => {
+		for (const t of snapshot()) {
+			bytesGauge.set({ topic: mapTopic(t.topic) }, t.bytesPerSec);
+		}
+	});
+}
+
+/**
+ * Returns a `close` hook that emits per-connection histograms + a close-code
+ * counter from the adapter's close-ctx telemetry. Composes with a user-
+ * provided close hook by passing `userClose` as the second argument.
+ *
+ * @param {ReturnType<typeof createMetrics>} metrics
+ * @param {((ws: any, ctx: any) => void | Promise<void>) | undefined} [userClose]
+ */
+export function connectionMetricsHook(metrics, userClose) {
+	if (!metrics || typeof metrics.histogram !== 'function') {
+		throw new TypeError('connectionMetricsHook: metrics registry is required');
+	}
+	if (userClose !== undefined && typeof userClose !== 'function') {
+		throw new TypeError('connectionMetricsHook: userClose must be a function if provided');
+	}
+
+	const durationHist = metrics.histogram(
+		'ws_connection_duration_seconds',
+		'Connection duration in seconds at close',
+		[],
+		DEFAULT_DURATION_BUCKETS
+	);
+	const msgsInHist = metrics.histogram(
+		'ws_connection_messages_in',
+		'Messages received per connection at close',
+		[],
+		DEFAULT_MESSAGE_BUCKETS
+	);
+	const msgsOutHist = metrics.histogram(
+		'ws_connection_messages_out',
+		'Messages sent per connection at close',
+		[],
+		DEFAULT_MESSAGE_BUCKETS
+	);
+	const bytesInHist = metrics.histogram(
+		'ws_connection_bytes_in',
+		'Bytes received per connection at close',
+		[],
+		DEFAULT_BYTE_BUCKETS
+	);
+	const bytesOutHist = metrics.histogram(
+		'ws_connection_bytes_out',
+		'Bytes sent per connection at close',
+		[],
+		DEFAULT_BYTE_BUCKETS
+	);
+	const closeCounter = metrics.counter(
+		'ws_connection_close_total',
+		'Connections closed by close code',
+		['code']
+	);
+
+	return async function close(ws, ctx) {
+		if (ctx) {
+			if (typeof ctx.duration === 'number' && ctx.duration >= 0) {
+				durationHist.observe(ctx.duration / 1000);
+			}
+			if (typeof ctx.messagesIn === 'number' && ctx.messagesIn >= 0) {
+				msgsInHist.observe(ctx.messagesIn);
+			}
+			if (typeof ctx.messagesOut === 'number' && ctx.messagesOut >= 0) {
+				msgsOutHist.observe(ctx.messagesOut);
+			}
+			if (typeof ctx.bytesIn === 'number' && ctx.bytesIn >= 0) {
+				bytesInHist.observe(ctx.bytesIn);
+			}
+			if (typeof ctx.bytesOut === 'number' && ctx.bytesOut >= 0) {
+				bytesOutHist.observe(ctx.bytesOut);
+			}
+			if (ctx.code !== undefined && ctx.code !== null) {
+				closeCounter.inc({ code: String(ctx.code) });
+			}
+		}
+		if (userClose) await userClose(ws, ctx);
+	};
+}
