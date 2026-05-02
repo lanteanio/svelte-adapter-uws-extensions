@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **README "Adapter wire-shape helpers" subsection grew a paragraph naming the scope of the adapter's `__chaos` harness** (WS-frame outbound chokepoint inside the test server, not cross-wire) and pointing at the adapter's `Wrap your own transport for cross-wire chaos` pattern for fault injection on ioredis / pg / other transports. Closes the misunderstanding at the docs level so tests reaching for cross-wire coverage see the boundary up front.
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.6`** (was `^0.5.0-next.0`). The new range matches the `0.5.0-next.4` adapter release that ships `platform.publishBatched`, `platform.sendCoalesced`, `platform.request`, `platform.requestId`, and `platform.pressure` (consumed or passed through by the bus wrap), the `0.5.0-next.5` adapter release that re-exports the curated wire-protocol helpers and `userData` slot constants from `svelte-adapter-uws/testing` (re-exported here in turn), and the `0.5.0-next.6` adapter release that adds the `upgradeAdmission` option to `createTestServer` so the two-tier admission contract test can drive a real connection storm.
 
 ## [0.5.0-next.1] - 2026-05-01

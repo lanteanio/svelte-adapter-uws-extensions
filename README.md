@@ -2173,6 +2173,8 @@ The re-exported names are the exact same identities as the adapter source (`expe
 
 `createTestServer` is intentionally not re-exported -- it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
 
+The adapter's `__chaos` harness on `createTestServer` covers the WS-frame outbound path (drop / delay frames going to connected clients). It does **not** reach traffic on other transports -- ioredis, pg, NATS, custom HTTP backends -- because each of those goes through its own client, not through the test server's outbound chokepoint. To inject faults at those wires, wrap the transport client in a chaos proxy: `createChaosState` is re-exported above and composes with any client method via a small `Proxy` wrapper. See the adapter's [Wrap your own transport for cross-wire chaos](https://github.com/lanteanio/svelte-adapter-uws#wrap-your-own-transport-for-cross-wire-chaos) section for the pattern. The `__chaos` JSDoc on the adapter's [testing.d.ts](https://github.com/lanteanio/svelte-adapter-uws/blob/main/testing.d.ts) names the WS-only scope explicitly so tests reaching for cross-wire coverage see the boundary at the type level.
+
 ---
 
 ## Related projects
