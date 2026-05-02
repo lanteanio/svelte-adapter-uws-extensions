@@ -2110,6 +2110,28 @@ describe('rate limiting', () => {
 
 The circuit breaker (`createCircuitBreaker()`) is pure logic with no I/O -- use it directly in tests, no mock needed.
 
+#### Adapter wire-shape helpers
+
+`svelte-adapter-uws-extensions/testing` also re-exports the curated wire-protocol helpers and `userData` slot constants the adapter exposes from `svelte-adapter-uws/testing`, so test code asserting on the wire format or per-connection state has one import location alongside the mocks:
+
+```js
+import {
+  // Wire-protocol helpers
+  esc, completeEnvelope, wrapBatchEnvelope, isValidWireTopic, createScopedTopic,
+  // Behavior helpers
+  collapseByCoalesceKey, resolveRequestId, createChaosState,
+  // userData slot constants
+  WS_SUBSCRIPTIONS, WS_COALESCED, WS_SESSION_ID, WS_PENDING_REQUESTS,
+  WS_STATS, WS_PLATFORM, WS_CAPS, WS_REQUEST_ID_KEY,
+  // Plus the in-memory mocks
+  mockRedisClient, mockPlatform, mockWs, mockPgClient
+} from 'svelte-adapter-uws-extensions/testing';
+```
+
+The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing-your-own-handlers) for the per-helper reference.
+
+`createTestServer` is intentionally not re-exported -- it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
+
 ---
 
 ## Related projects
