@@ -270,13 +270,20 @@ export function mockRedisClient(keyPrefix = '') {
 				}
 				return 1;
 			},
-			async subscribe(channel) {
-				subscribedChannels.add(channel);
-				return 1;
+			async subscribe(...channels) {
+				// Real ioredis SUBSCRIBE accepts variadic channels and reports
+				// the new total count. Single-arg callers continue to work.
+				for (const ch of channels) subscribedChannels.add(ch);
+				return subscribedChannels.size;
 			},
-			async unsubscribe(channel) {
-				subscribedChannels.delete(channel);
-				return 1;
+			async unsubscribe(...channels) {
+				if (channels.length === 0) {
+					// Zero-arg unsubscribe = "drop everything" per ioredis semantics.
+					subscribedChannels.clear();
+					return 0;
+				}
+				for (const ch of channels) subscribedChannels.delete(ch);
+				return subscribedChannels.size;
 			},
 			// Pattern-subscribe stubs. Pattern matching is not simulated
 			// (publish() never fires pmessage); tests that exercise pmessage

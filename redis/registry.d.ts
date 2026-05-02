@@ -11,6 +11,20 @@ export interface RegistryOptions {
 	identify(ws: any): string | null | undefined;
 
 	/**
+	 * Extract per-user attributes captured at registration time. Used by
+	 * `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped
+	 * broadcasts. Shallow values only -- string, number, boolean.
+	 * Numbers and booleans round-trip via `String()` for index-key
+	 * consistency. Compound queries (regex, array containment, nested
+	 * objects) are deliberately out of scope.
+	 *
+	 * Required for `sendTo(...)` -- callers using only `request`,
+	 * `send`, and `sendCoalesced` can omit it; the events channel and
+	 * secondary index are skipped when no `attributes` is provided.
+	 */
+	attributes?(ws: any): Record<string, string | number | boolean> | null | undefined;
+
+	/**
 	 * Prefix prepended to all registry keys and channels. Stacks with
 	 * the underlying client's `keyPrefix`.
 	 * @default ''
@@ -49,6 +63,8 @@ export interface RegistryEntry {
 	instanceId: string;
 	sessionId: string;
 	ts: number;
+	/** Attributes captured by the optional `attributes(ws)` option. Empty when none were configured. */
+	attrs: Record<string, string>;
 }
 
 export interface ConnectionRegistry {
@@ -141,6 +157,43 @@ export interface ConnectionRegistry {
 	 * ```
 	 */
 	send(target: string, topic: string, event: string, data?: unknown): Promise<void>;
+
+	/**
+	 * Cluster-wide attribute-filtered broadcast. Resolves matching userIds
+	 * via the local secondary index (built from the `attributes(ws)`
+	 * option), groups them by their owning instance, and ships one
+	 * envelope per owning instance on the existing per-instance push
+	 * channel. Each receiver re-resolves its own local matches and calls
+	 * `platform.send(ws, topic, event, data)` for each.
+	 *
+	 * Match shape is shallow equality only: one literal value per
+	 * attribute key, AND across keys. No regex, no array containment, no
+	 * nested-object queries. The filter-function escape hatch from
+	 * `platform.sendTo(filter, ...)` is deliberately not supported --
+	 * functions don't serialize across instances.
+	 *
+	 * Eventual consistency: a user reconnecting on a different instance
+	 * between the sender's index lookup and the receive can produce a
+	 * single best-effort missed delivery while the events channel
+	 * propagates the migration. Callers who need stronger guarantees
+	 * should use `request(...)` per userId or fan out via topic
+	 * subscribers.
+	 *
+	 * Throws when no `attributes` option was supplied at construction,
+	 * when criteria is empty, or when topic / event are missing.
+	 *
+	 * @example
+	 * ```js
+	 * registry.sendTo({ tenantId: 't42' }, 'announcements', 'created', payload);
+	 * registry.sendTo({ tenantId: 't42', role: 'admin' }, 'audit', 'created', payload);
+	 * ```
+	 */
+	sendTo(
+		criteria: Record<string, string | number | boolean>,
+		topic: string,
+		event: string,
+		data?: unknown
+	): Promise<void>;
 
 	/** Count of users registered to THIS instance (local view, scrape-time). */
 	size(): number;

@@ -47,6 +47,7 @@ return 0
 /**
  * @typedef {Object} RegistryOptions
  * @property {(ws: any) => string | null | undefined} identify - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them.
+ * @property {(ws: any) => Record<string, string | number | boolean> | null | undefined} [attributes] - Extract per-user attributes captured at registration time. Used by `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped broadcasts. Shallow values only (string / number / boolean); compound queries are deliberately out of scope.
  * @property {string} [keyPrefix=''] - Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`.
  * @property {number} [ttl=90] - Expiry on registry entries in seconds. Should be greater than `heartbeat * 3` so a missed beat doesn't drop a live user.
  * @property {number} [heartbeat=30000] - Refresh interval in ms.
@@ -109,6 +110,10 @@ export function createConnectionRegistry(client, options) {
 	if (typeof identify !== 'function') {
 		throw new Error('registry: identify must be a function');
 	}
+	const attributes = options.attributes;
+	if (attributes !== undefined && typeof attributes !== 'function') {
+		throw new Error('registry: attributes must be a function returning a flat object of string|number|boolean');
+	}
 	const keyPrefix = options.keyPrefix == null ? '' : String(options.keyPrefix);
 	const ttl = options.ttl ?? DEFAULT_TTL_SEC;
 	if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl < 1) {
@@ -137,6 +142,7 @@ export function createConnectionRegistry(client, options) {
 	const mLateReply = m?.counter('push_late_replies_total', 'Replies that arrived after their request expired or migrated');
 	const mCoalesced = m?.counter('push_coalesced_total', 'Cluster coalesced sends by outcome', ['result']);
 	const mSends = m?.counter('push_sends_total', 'Cluster sends by outcome', ['result']);
+	const mSendTo = m?.counter('push_sendto_total', 'Cluster attribute-targeted broadcasts by outcome', ['result']);
 
 	function userKey(userId) {
 		return client.key(keyPrefix + 'conns:' + userId);
@@ -144,7 +150,11 @@ export function createConnectionRegistry(client, options) {
 	function pushChannel(targetInstanceId) {
 		return client.key(keyPrefix + '__push:' + targetInstanceId);
 	}
+	function userKeyPattern() {
+		return client.key(keyPrefix + 'conns:*');
+	}
 	const ownPushChannel = pushChannel(instanceId);
+	const eventsChannel = client.key(keyPrefix + '__registry-events');
 
 	/**
 	 * Local sessionId -> ws map. Used by the receive path to resolve which
@@ -166,6 +176,100 @@ export function createConnectionRegistry(client, options) {
 	 */
 	const pending = new Map();
 
+	/**
+	 * Cluster-wide userId -> instanceId map, populated by the events
+	 * subscriber. Sender uses this to group `sendTo` matches by their
+	 * owning instance.
+	 * @type {Map<string, string>}
+	 */
+	const userToInstance = new Map();
+
+	/**
+	 * Shadow per-userId attribute snapshot used to keep the secondary
+	 * index consistent across re-registrations and close events.
+	 * @type {Map<string, Record<string, string>>}
+	 */
+	const userIdAttrs = new Map();
+
+	/**
+	 * Secondary index for `sendTo` lookups. Each attribute key has a
+	 * value-bucketed map of userId sets. Shallow equality only.
+	 * @type {Map<string, Map<string, Set<string>>>}
+	 */
+	const secondaryIndex = new Map();
+
+	function indexUser(userId, attrs) {
+		if (!attrs) return;
+		for (const [k, v] of Object.entries(attrs)) {
+			let byValue = secondaryIndex.get(k);
+			if (!byValue) {
+				byValue = new Map();
+				secondaryIndex.set(k, byValue);
+			}
+			let users = byValue.get(v);
+			if (!users) {
+				users = new Set();
+				byValue.set(v, users);
+			}
+			users.add(userId);
+		}
+	}
+
+	function unindexUser(userId, attrs) {
+		if (!attrs) return;
+		for (const [k, v] of Object.entries(attrs)) {
+			const byValue = secondaryIndex.get(k);
+			if (!byValue) continue;
+			const users = byValue.get(v);
+			if (!users) continue;
+			users.delete(userId);
+			if (users.size === 0) byValue.delete(v);
+			if (byValue.size === 0) secondaryIndex.delete(k);
+		}
+	}
+
+	function applyOpenEvent(userId, ownerInstanceId, attrs) {
+		const prevAttrs = userIdAttrs.get(userId);
+		if (prevAttrs) unindexUser(userId, prevAttrs);
+		userToInstance.set(userId, ownerInstanceId);
+		userIdAttrs.set(userId, attrs || {});
+		indexUser(userId, attrs);
+	}
+
+	function applyCloseEvent(userId, ownerInstanceId) {
+		// Only remove if the close came from the recorded owner. A stale
+		// close from a previous owner (after the user already migrated to a
+		// different instance) must not clear a live registration.
+		if (userToInstance.get(userId) !== ownerInstanceId) return;
+		const prevAttrs = userIdAttrs.get(userId);
+		if (prevAttrs) unindexUser(userId, prevAttrs);
+		userIdAttrs.delete(userId);
+		userToInstance.delete(userId);
+	}
+
+	/**
+	 * Coerce attribute values to strings for index-key consistency. Numbers
+	 * and booleans round-trip via `String()`; objects/arrays/null are
+	 * dropped (shallow values only per credo rule 1).
+	 *
+	 * @param {Record<string, unknown> | null | undefined} raw
+	 * @returns {Record<string, string>}
+	 */
+	function normalizeAttrs(raw) {
+		if (!raw || typeof raw !== 'object') return {};
+		const out = {};
+		for (const [k, v] of Object.entries(raw)) {
+			if (typeof k !== 'string' || k.length === 0) continue;
+			if (v === null || v === undefined) continue;
+			const t = typeof v;
+			if (t !== 'string' && t !== 'number' && t !== 'boolean') continue;
+			out[k] = String(v);
+		}
+		return out;
+	}
+
+	let bootstrapped = false;
+
 	if (mRegistrySize) {
 		mRegistrySize.collect(() => mRegistrySize.set(localUsers.size));
 	}
@@ -180,16 +284,52 @@ export function createConnectionRegistry(client, options) {
 		try { breaker.guard(); return true; } catch { return false; }
 	}
 
-	async function setEntry(userId, sessionId) {
+	async function setEntry(userId, sessionId, attrs) {
 		const key = userKey(userId);
 		const now = cachedNow();
 		try {
-			await redis.hset(key, 'instanceId', instanceId, 'sessionId', sessionId, 'ts', now);
+			if (attrs && Object.keys(attrs).length > 0) {
+				await redis.hset(
+					key,
+					'instanceId', instanceId,
+					'sessionId', sessionId,
+					'ts', now,
+					'attrs', JSON.stringify(attrs)
+				);
+			} else {
+				await redis.hset(key, 'instanceId', instanceId, 'sessionId', sessionId, 'ts', now);
+				// Best-effort clear: a previous registration may have left an
+				// attrs field; HDEL is fire-and-forget so a missing field is
+				// not an error.
+				try { await redis.hdel(key, 'attrs'); } catch { /* ignore */ }
+			}
 			await redis.expire(key, ttl);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
 			throw err;
+		}
+	}
+
+	function parseAttrsField(raw) {
+		if (typeof raw !== 'string' || raw.length === 0) return {};
+		try {
+			const parsed = JSON.parse(raw);
+			return normalizeAttrs(parsed);
+		} catch {
+			return {};
+		}
+	}
+
+	async function publishEvent(envelope) {
+		try {
+			await redis.publish(eventsChannel, JSON.stringify(envelope));
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			// Best-effort: a missed event leaves the cluster's index slightly
+			// stale until the next refresh / reconnect. The Redis hash stays
+			// authoritative.
 		}
 	}
 
@@ -223,7 +363,8 @@ export function createConnectionRegistry(client, options) {
 			return {
 				instanceId: result.instanceId,
 				sessionId: result.sessionId || '',
-				ts: Number(result.ts) || 0
+				ts: Number(result.ts) || 0,
+				attrs: parseAttrsField(result.attrs)
 			};
 		} catch (err) {
 			breaker?.failure(err);
@@ -239,16 +380,98 @@ export function createConnectionRegistry(client, options) {
 			console.error('[redis/registry] subscriber error:', err.message);
 		});
 		subscriber.on('message', (ch, raw) => {
-			if (ch !== ownPushChannel) return;
-			let envelope;
-			try { envelope = JSON.parse(raw); } catch { return; }
-			handleInbound(envelope);
+			if (ch === ownPushChannel) {
+				let envelope;
+				try { envelope = JSON.parse(raw); } catch { return; }
+				handleInbound(envelope);
+				return;
+			}
+			if (ch === eventsChannel) {
+				let envelope;
+				try { envelope = JSON.parse(raw); } catch { return; }
+				handleRegistryEvent(envelope);
+			}
 		});
-		await subscriber.subscribe(ownPushChannel);
+		await subscriber.subscribe(ownPushChannel, eventsChannel);
+
+		// Bootstrap the secondary index from existing entries. Subscribe
+		// first (so we don't miss live events fired during the SCAN), then
+		// SCAN; live events that race with the SCAN are idempotent under
+		// set semantics. Skipped when no `attributes` option was supplied
+		// since neither the index nor `sendTo` would have anything to do.
+		if (attributes && !bootstrapped) {
+			bootstrapped = true;
+			bootstrapIndex().catch(() => {
+				// Bootstrap is best-effort; live events fill in over time
+				// even without the initial SCAN.
+				bootstrapped = false;
+			});
+		}
 
 		if (!heartbeatTimer) {
 			heartbeatTimer = setInterval(heartbeatTick, heartbeatInterval);
 			if (heartbeatTimer.unref) heartbeatTimer.unref();
+		}
+	}
+
+	async function bootstrapIndex() {
+		if (!withBreakerGuard()) return;
+		const pattern = userKeyPattern();
+		let cursor = '0';
+		const seen = new Set();
+		do {
+			let res;
+			try {
+				res = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+				breaker?.success();
+			} catch (err) {
+				breaker?.failure(err);
+				return;
+			}
+			cursor = res[0];
+			const keys = res[1] || [];
+			for (const k of keys) {
+				if (seen.has(k)) continue;
+				seen.add(k);
+				let entry;
+				try {
+					entry = await redis.hgetall(k);
+					breaker?.success();
+				} catch (err) {
+					breaker?.failure(err);
+					continue;
+				}
+				if (!entry || !entry.instanceId) continue;
+				// Strip the prefix back off to recover the userId. Both
+				// keyPrefix (registry-level) and the client's own keyPrefix
+				// stack on the front of the key.
+				const userId = userIdFromKey(k);
+				if (!userId) continue;
+				const attrs = parseAttrsField(entry.attrs);
+				applyOpenEvent(userId, entry.instanceId, attrs);
+			}
+		} while (cursor !== '0');
+	}
+
+	function userIdFromKey(fullKey) {
+		// Recover the userId by stripping the longest common prefix the
+		// registry knows about. The full key is `client.keyPrefix +
+		// keyPrefix + 'conns:' + userId`. `client.key(...)` builds it; we
+		// invert by matching the same prefix back off.
+		const builtPrefix = client.key(keyPrefix + 'conns:');
+		if (fullKey.startsWith(builtPrefix)) return fullKey.slice(builtPrefix.length);
+		return null;
+	}
+
+	function handleRegistryEvent(envelope) {
+		if (!envelope || typeof envelope !== 'object') return;
+		const { type, userId, instanceId: ownerInstanceId } = envelope;
+		if (typeof userId !== 'string' || typeof ownerInstanceId !== 'string') return;
+		if (type === 'open') {
+			const attrs = normalizeAttrs(envelope.attrs);
+			applyOpenEvent(userId, ownerInstanceId, attrs);
+		} else if (type === 'close') {
+			applyCloseEvent(userId, ownerInstanceId);
 		}
 	}
 
@@ -271,7 +494,34 @@ export function createConnectionRegistry(client, options) {
 			case 'reply': handleInboundReply(envelope); break;
 			case 'coalesced': handleInboundCoalesced(envelope); break;
 			case 'send': handleInboundSend(envelope); break;
+			case 'sendTo': handleInboundSendTo(envelope); break;
 			default: /* unknown type, ignore for forward compatibility */ break;
+		}
+	}
+
+	function handleInboundSendTo(env) {
+		const { criteria, topic, event, data } = env;
+		if (!activePlatform || !criteria || typeof criteria !== 'object') return;
+		if (typeof topic !== 'string' || typeof event !== 'string') return;
+		const matches = resolveMatches(criteria);
+		if (matches.size === 0) return;
+		for (const userId of matches) {
+			// Only deliver to userIds we currently own locally. The sender's
+			// pre-grouping already targeted us, but a fast migration can
+			// invalidate that pre-grouping by the time the envelope arrives;
+			// authoritative match against this instance's own local map
+			// keeps the contract honest.
+			const sessionId = localUsers.get(userId);
+			if (!sessionId) continue;
+			const ws = sessionToWs.get(sessionId);
+			if (!ws) continue;
+			try {
+				activePlatform.send(ws, topic, event, data);
+			} catch {
+				// fire-and-forget: a thrown send surfaces as a missing frame
+				// on the wire. sendTo callers needing a delivery signal
+				// should fan out via registry.request per userId.
+			}
 		}
 	}
 
@@ -543,12 +793,125 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
+	/**
+	 * Resolve criteria to a Set of matching userIds via the secondary
+	 * index. Empty / malformed criteria returns the empty set so callers
+	 * can no-op without a special case. Compound criteria intersect across
+	 * keys (AND semantics).
+	 *
+	 * @param {Record<string, string | number | boolean>} criteria
+	 */
+	function resolveMatches(criteria) {
+		const norm = normalizeAttrs(criteria);
+		const keys = Object.keys(norm);
+		if (keys.length === 0) return new Set();
+		// Iterate in ascending bucket-size order so the first intersection
+		// is against the smallest set; cheaper than starting with a large
+		// bucket.
+		const buckets = [];
+		for (const k of keys) {
+			const byValue = secondaryIndex.get(k);
+			if (!byValue) return new Set();
+			const users = byValue.get(norm[k]);
+			if (!users || users.size === 0) return new Set();
+			buckets.push(users);
+		}
+		buckets.sort((a, b) => a.size - b.size);
+		const out = new Set();
+		for (const userId of buckets[0]) {
+			let inAll = true;
+			for (let i = 1; i < buckets.length; i++) {
+				if (!buckets[i].has(userId)) { inAll = false; break; }
+			}
+			if (inAll) out.add(userId);
+		}
+		return out;
+	}
+
+	async function sendTo(criteria, topic, event, data) {
+		if (!criteria || typeof criteria !== 'object') {
+			throw new Error('registry.sendTo: criteria must be a non-empty object');
+		}
+		if (typeof topic !== 'string' || topic.length === 0) {
+			throw new Error('registry.sendTo: topic must be a non-empty string');
+		}
+		if (typeof event !== 'string' || event.length === 0) {
+			throw new Error('registry.sendTo: event must be a non-empty string');
+		}
+		if (!attributes) {
+			throw new Error('registry.sendTo: requires `attributes` option on createConnectionRegistry');
+		}
+		const norm = normalizeAttrs(criteria);
+		if (Object.keys(norm).length === 0) {
+			throw new Error('registry.sendTo: criteria must include at least one attribute key');
+		}
+
+		const matches = resolveMatches(norm);
+		if (matches.size === 0) {
+			mSendTo?.inc({ result: 'empty' });
+			return;
+		}
+
+		// Group matching userIds by their owning instance. Users without a
+		// recorded owner (registered locally only, before the events
+		// channel propagated) fall into the self bucket so we still deliver.
+		const byOwner = new Map();
+		for (const userId of matches) {
+			const owner = userToInstance.get(userId) || instanceId;
+			let bucket = byOwner.get(owner);
+			if (!bucket) {
+				bucket = [];
+				byOwner.set(owner, bucket);
+			}
+			bucket.push(userId);
+		}
+
+		await ensureSubscriber(activePlatform);
+		const envelope = { type: 'sendTo', criteria: norm, topic, event, data };
+
+		let publishErrored = false;
+		const remotePublishes = [];
+
+		for (const [owner, userIds] of byOwner) {
+			if (owner === instanceId) {
+				// Self bucket: iterate locally, no Redis hop.
+				if (!activePlatform) continue;
+				for (const userId of userIds) {
+					const sessionId = localUsers.get(userId);
+					if (!sessionId) continue;
+					const ws = sessionToWs.get(sessionId);
+					if (!ws) continue;
+					try {
+						activePlatform.send(ws, topic, event, data);
+					} catch {
+						// fire-and-forget on the wire
+					}
+				}
+				continue;
+			}
+			remotePublishes.push(
+				redis.publish(pushChannel(owner), JSON.stringify(envelope))
+					.then(() => breaker?.success())
+					.catch((err) => {
+						breaker?.failure(err);
+						publishErrored = true;
+					})
+			);
+		}
+
+		if (remotePublishes.length > 0) {
+			await Promise.all(remotePublishes);
+		}
+		mSendTo?.inc({ result: publishErrored ? 'error' : 'ok' });
+	}
+
 	const tracker = /** @type {ConnectionRegistry} */ ({
 		instanceId,
 		lookup,
 		request,
 		send,
 		sendCoalesced,
+		sendTo,
 		size() { return localUsers.size; },
 		hooks: {
 			async open(ws, ctx) {
@@ -570,12 +933,23 @@ export function createConnectionRegistry(client, options) {
 				localUsers.set(userId, sessionId);
 				sessionToWs.set(sessionId, ws);
 
+				const attrs = attributes ? normalizeAttrs(attributes(ws)) : {};
+
+				// Update our own view of the secondary index synchronously
+				// before the broadcast lands -- self-targeting `sendTo` calls
+				// fired between the open hook and the events round trip
+				// still match against this newly-registered user.
+				if (attributes) applyOpenEvent(userId, instanceId, attrs);
+
 				try {
-					await setEntry(userId, sessionId);
+					await setEntry(userId, sessionId, attrs);
 				} catch {
 					// Best-effort: a write failure leaves the local maps populated
 					// so the user is still reachable from this instance until the
 					// heartbeat retries.
+				}
+				if (attributes) {
+					await publishEvent({ type: 'open', userId, instanceId, attrs });
 				}
 			},
 			async close(ws, _ctx) {
@@ -587,6 +961,15 @@ export function createConnectionRegistry(client, options) {
 					sessionToWs.delete(sessionId);
 				}
 				await deleteIfOurs(userId);
+				// Local index update and broadcast happen unconditionally
+				// once the local maps clear: the compare-and-delete above
+				// already protects the Redis row from clobbering a migrated
+				// entry, and the recipients of the close event guard with
+				// `applyCloseEvent`'s owner check before unindexing.
+				if (attributes) {
+					applyCloseEvent(userId, instanceId);
+					await publishEvent({ type: 'close', userId, instanceId });
+				}
 			}
 		},
 		async destroy() {
@@ -602,6 +985,10 @@ export function createConnectionRegistry(client, options) {
 			pending.clear();
 			localUsers.clear();
 			sessionToWs.clear();
+			userToInstance.clear();
+			userIdAttrs.clear();
+			secondaryIndex.clear();
+			bootstrapped = false;
 			if (subscriber) {
 				const sub = subscriber;
 				subscriber = null;

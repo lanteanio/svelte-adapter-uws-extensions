@@ -713,8 +713,9 @@ Mid-flight migration (user reconnects to a different instance between lookup and
 
 | Key | Shape | Notes |
 |---|---|---|
-| `{prefix}conns:{userId}` | Hash `{instanceId, sessionId, ts}` | Most-recent-connection-wins. A second device on the same `userId` replaces the first; targeting from `request(...)` always reaches the most recent connection. |
+| `{prefix}conns:{userId}` | Hash `{instanceId, sessionId, ts, attrs?}` | Most-recent-connection-wins. A second device on the same `userId` replaces the first; targeting from `request(...)` always reaches the most recent connection. `attrs` is a JSON-encoded snapshot of the optional `attributes(ws)` callback's return value -- present only when `attributes` is wired and returns at least one value. |
 | `{prefix}__push:{instanceId}` | Pub/sub channel | Each instance subscribes to its own channel. Inbound messages dispatch by `envelope.type`. |
+| `{prefix}__registry-events` | Pub/sub channel | Shared across all instances. Carries `{type:'open' | 'close', userId, instanceId, attrs?}` envelopes so each instance can maintain a live secondary index for `sendTo(...)`. Skipped when no `attributes` option was supplied. |
 
 Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only removes the registry entry when the stored `instanceId` still matches this instance. Prevents a stale close from clobbering a registration that already migrated to another instance via a fast laptop-then-phone reconnect.
 
@@ -723,6 +724,7 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | Option | Default | Description |
 |---|---|---|
 | `identify` | (required) | `(ws) => userId | null`. Anonymous connections are skipped. |
+| `attributes` | -- | `(ws) => Record<string, string | number | boolean>`. Required for `sendTo(...)`. Captures per-user attributes at registration time for tenant- / role- / cohort-scoped broadcasts. Numbers and booleans are coerced to strings for index-key consistency; nested objects, arrays, and `null` values are dropped (shallow values only per credo rule 1). |
 | `keyPrefix` | `''` | Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`. |
 | `ttl` | `90` | Expiry on registry entries in seconds. Should be > `heartbeat * 3` so a missed beat doesn't drop a live user. |
 | `heartbeat` | `30000` | TTL refresh interval in ms. Each tick `EXPIRE`s every locally-owned entry. |
@@ -738,6 +740,7 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | `request(target, event, data?, opts?)` | Cluster-routed request/reply. Resolves with the reply. |
 | `send(target, topic, event, data?)` | Cluster-routed `platform.send` counterpart. Fire-and-forget. See [Targeted sends](#registry-targeted-sends) below. |
 | `sendCoalesced(target, message)` | Cluster-routed coalesce-by-key send. Fire-and-forget. See [Coalesced sends](#registry-coalesced-sends) below. |
+| `sendTo(criteria, topic, event, data?)` | Attribute-targeted broadcast across the cluster. Requires `attributes` option. See [Attribute-targeted broadcast](#registry-sendto) below. |
 | `size()` | Count of users registered to THIS instance (local view, scrape-time). |
 | `instanceId` | Stable id for this instance, also the name of its push channel. |
 | `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
@@ -772,6 +775,54 @@ Per-`(connection, key)` replacement happens on the receiver via the adapter's ex
 
 Best fit: targeted latest-value streams where the target is a *user*, not a topic. Cursor positions inside a doc, typing indicators between two users, presence-state pushes from a moderator to a single subscriber. Topic-broadcast coalesce (every subscriber sees the same stream) already works cluster-wide via `bus.wrap(platform).publish(...)` on either bus and per-receiver A1 logic; this method covers the remaining gap.
 
+#### Attribute-targeted broadcast {#registry-sendto}
+
+`registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined -- whatever you return from `attributes(ws)` is what `sendTo` can match against. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
+
+```js
+import { createConnectionRegistry } from 'svelte-adapter-uws-extensions/redis/registry';
+
+const registry = createConnectionRegistry(redis, {
+  identify: (ws) => ws.getUserData()?.userId,
+  attributes: (ws) => {
+    const ud = ws.getUserData();
+    return { role: ud.role, region: ud.region };
+  }
+});
+
+// Broadcast to every connection where attributes.role === 'admin':
+registry.sendTo({ role: 'admin' }, 'alerts', 'warning', { message: 'High load' });
+
+// Compound match (AND across keys):
+registry.sendTo({ role: 'admin', region: 'eu' }, 'audit', 'created', payload);
+```
+
+`platform.sendTo(filter, topic, event, data)` accepts a filter function -- functions don't serialize across instances, so the filter-function escape hatch is deliberately not lifted here. The cluster shape is shallow equality only: one literal value per attribute key, AND across keys. No regex, no array containment, no nested-object queries. Apps that need richer queries should publish to a dedicated topic and route their own broadcasts.
+
+How it works:
+
+1. Each instance maintains an in-memory secondary index: `Map<attrKey, Map<attrValue, Set<userId>>>` plus a shadow `userId -> attrs` map and a `userId -> instanceId` map.
+2. Updates ride a shared `{prefix}__registry-events` Redis pub/sub channel. Every successful `hooks.open` publishes `{type:'open', userId, instanceId, attrs}`; every successful close publishes `{type:'close', userId, instanceId}` (compare-and-delete already protects against a stale close from a previous owner).
+3. When a new instance starts up, it bootstraps the index by SCAN-ing the existing `{prefix}conns:*` hashes and calling HGETALL on each to populate from the live registry state. Subscribe-first / SCAN-second keeps the bootstrap race-tolerant under set semantics.
+4. `sendTo(criteria, ...)` resolves matching userIds via the local index, groups them by their owning instance, fires once per owning instance on the existing `{prefix}__push:` channel: `{type:'sendTo', criteria, topic, event, data}`.
+5. Each receiving instance re-resolves matches against its own authoritative local index and calls `platform.send(ws, topic, event, data)` for each match. Authoritative-on-receiver matching tolerates one round of sender-index staleness from a fast user migration.
+
+`sendTo` is fire-and-forget. No reply, no acknowledgement, no per-target outcome. The single `push_sendto_total` counter records sender-side outcomes:
+
+| `result` label | Meaning |
+|---|---|
+| `ok` | At least one match resolved; envelopes published successfully (or only self-matches that delivered locally without Redis traffic). |
+| `empty` | No matches resolved by the local index. The call no-ops. |
+| `error` | At least one Redis publish failed; partial delivery still occurred for the successful publishes and any local self-matches. |
+
+Eventual consistency caveats:
+
+- **Mid-flight migration.** A user reconnecting on a different instance between the sender's index lookup and the receive can produce a single best-effort missed delivery while the registry-events channel propagates the migration.
+- **Pubsub disconnect.** If the registry's subscriber connection drops, in-memory indexes will not update until reconnect; the `attrs` field on the Redis hash stays authoritative for `lookup(userId)`. The next call to `ensureSubscriber()` (e.g., on the next `hooks.open`) re-bootstraps via SCAN.
+- **Topics outside the bus.** Only topics published via `platform.send`/`platform.publish` reach the receiving connections; matched users with no active subscription on the targeted topic still receive the event since `platform.send` is per-connection, not per-topic.
+
+For exact targeting (audit log, billing, transactional broadcasts), use `request(...)` per userId or fan out via topic subscribers with the bus.
+
 #### Metrics
 
 | Metric | Description |
@@ -782,6 +833,7 @@ Best fit: targeted latest-value streams where the target is a *user*, not a topi
 | `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
 | `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map -- target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
 | `push_sends_total{result="ok|self|offline|late|error"}` | Outcomes for `send(...)`. Same result space as `push_coalesced_total` -- `ok` cross-instance, `self` short-circuited locally, `offline` entry missing or local-ws-gone, `late` receive-side miss after migration, `error` Redis publish or local `platform.send` threw. |
+| `push_sendto_total{result="ok|empty|error"}` | Outcomes for `sendTo(...)`. `ok` is "at least one match resolved, all publishes succeeded (or only self-matches)"; `empty` is "no matches resolved by the local index"; `error` is "at least one Redis publish failed." Per-call counter, not per-target -- one `sendTo` produces exactly one increment regardless of how many matches it fans out to. |
 
 #### Registry edge cases
 

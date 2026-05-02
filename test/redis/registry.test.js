@@ -792,4 +792,708 @@ describe('redis connection registry', () => {
 			await expect(registry.destroy()).resolves.toBeUndefined();
 		});
 	});
+
+	describe('attributes / sendTo: construction', () => {
+		it('rejects a non-function attributes option', () => {
+			expect(() => createConnectionRegistry(client, {
+				identify: () => 'x',
+				attributes: 'nope'
+			})).toThrow(/attributes/);
+			expect(() => createConnectionRegistry(client, {
+				identify: () => 'x',
+				attributes: {}
+			})).toThrow(/attributes/);
+		});
+
+		it('accepts a valid attributes function', () => {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			expect(typeof r.sendTo).toBe('function');
+			r.destroy();
+		});
+
+		it('sendTo throws when no attributes option was supplied', async () => {
+			await expect(
+				registry.sendTo({ tenantId: 't' }, 'topic', 'event')
+			).rejects.toThrow(/attributes/);
+		});
+	});
+
+	describe('attributes / sendTo: storage and registry events', () => {
+		it('persists attrs as a JSON-encoded field on the registry hash', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({
+					tenantId: ws.getUserData()?.tenantId,
+					role: ws.getUserData()?.role
+				})
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-1', tenantId: 't42', role: 'admin' }, 's-1');
+				await local.hooks.open(ws, { platform });
+
+				const raw = await client.redis.hgetall(client.key('conns:u-1'));
+				expect(raw.attrs).toBeDefined();
+				expect(JSON.parse(raw.attrs)).toEqual({ tenantId: 't42', role: 'admin' });
+
+				const entry = await local.lookup('u-1');
+				expect(entry.attrs).toEqual({ tenantId: 't42', role: 'admin' });
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('omits the attrs field when attributes returns an empty object', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: () => ({})
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+				await local.hooks.open(ws, { platform });
+
+				const raw = await client.redis.hgetall(client.key('conns:u-1'));
+				expect(raw.attrs).toBeUndefined();
+
+				const entry = await local.lookup('u-1');
+				expect(entry.attrs).toEqual({});
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('coerces number / boolean attribute values to strings; drops null / object values', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ws.getUserData()?.attrs
+			});
+			try {
+				const ws = wsWithSession({
+					userId: 'u-1',
+					attrs: {
+						tenantId: 't42',
+						seat: 7,
+						isAdmin: true,
+						preferences: { theme: 'dark' }, // dropped
+						deletedAt: null // dropped
+					}
+				}, 's-1');
+				await local.hooks.open(ws, { platform });
+
+				const entry = await local.lookup('u-1');
+				expect(entry.attrs).toEqual({ tenantId: 't42', seat: '7', isAdmin: 'true' });
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('publishes an open event on the registry-events channel after a successful registration', async () => {
+			const events = [];
+			const sub = client.duplicate({ enableReadyCheck: false });
+			sub.on('message', (ch, raw) => {
+				if (ch === client.key('__registry-events')) {
+					events.push(JSON.parse(raw));
+				}
+			});
+			await sub.subscribe(client.key('__registry-events'));
+
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-1', tenantId: 't42' }, 's-1');
+				await local.hooks.open(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				expect(events).toEqual([{
+					type: 'open',
+					userId: 'u-1',
+					instanceId: local.instanceId,
+					attrs: { tenantId: 't42' }
+				}]);
+			} finally {
+				await local.destroy();
+				await sub.quit().catch(() => sub.disconnect());
+			}
+		});
+
+		it('publishes a close event when the close hook fires', async () => {
+			const events = [];
+			const sub = client.duplicate({ enableReadyCheck: false });
+			sub.on('message', (ch, raw) => {
+				if (ch === client.key('__registry-events')) {
+					events.push(JSON.parse(raw));
+				}
+			});
+			await sub.subscribe(client.key('__registry-events'));
+
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-1', tenantId: 't42' }, 's-1');
+				await local.hooks.open(ws, { platform });
+				await local.hooks.close(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				expect(events.map((e) => e.type)).toEqual(['open', 'close']);
+				expect(events[1]).toEqual({
+					type: 'close',
+					userId: 'u-1',
+					instanceId: local.instanceId
+				});
+			} finally {
+				await local.destroy();
+				await sub.quit().catch(() => sub.disconnect());
+			}
+		});
+	});
+
+	describe('attributes / sendTo: secondary index from registry events', () => {
+		it('builds the index from sibling open events', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				// Trigger ensureSubscriber so the events listener is wired.
+				const lws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				// Inject a sibling open event manually.
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'remote-u',
+						instanceId: 'remote-inst',
+						attrs: { tenantId: 't42' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				// resolveMatches isn't public, so exercise via sendTo against a
+				// fake remote to confirm the index registered the user.
+				let captured = null;
+				const handlers = client._pubsubHandlers;
+				const probe = client.duplicate({ enableReadyCheck: false });
+				probe.on('message', (ch, raw) => {
+					if (ch === client.key('__push:remote-inst')) captured = JSON.parse(raw);
+				});
+				await probe.subscribe(client.key('__push:remote-inst'));
+
+				await local.sendTo({ tenantId: 't42' }, 'announcements', 'created', { id: 1 });
+				await new Promise((r) => setImmediate(r));
+
+				expect(captured).toMatchObject({
+					type: 'sendTo',
+					criteria: { tenantId: 't42' },
+					topic: 'announcements',
+					event: 'created'
+				});
+
+				await probe.quit().catch(() => probe.disconnect());
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('removes from the index on a sibling close event', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const lws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'remote-u',
+						instanceId: 'remote-inst',
+						attrs: { tenantId: 't42' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'close',
+						userId: 'remote-u',
+						instanceId: 'remote-inst'
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				const metrics = createMetrics();
+				const localM = createConnectionRegistry(client, {
+					identify: (ws) => ws.getUserData()?.userId,
+					attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+					metrics
+				});
+				const lws2 = wsWithSession({ userId: 'self2', tenantId: 't1' }, 'self2-s');
+				await localM.hooks.open(lws2, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				// Now sendTo for tenant t42 from a fresh registry should resolve empty.
+				await localM.sendTo({ tenantId: 't42' }, 'topic', 'event');
+				const out = await metrics.serialize();
+				expect(out).toMatch(/push_sendto_total\{result="empty"\}\s+1/);
+
+				await localM.destroy();
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('updates the index when a re-registration changes attrs', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				metrics
+			});
+			try {
+				const lws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				const captured = [];
+				const probe = client.duplicate({ enableReadyCheck: false });
+				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
+				await probe.subscribe(
+					client.key('__push:inst-A'),
+					client.key('__push:inst-B')
+				);
+
+				// Initial registration on tenant 't42' / inst-A.
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'mover',
+						instanceId: 'inst-A',
+						attrs: { tenantId: 't42' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				// Re-registration on tenant 't99' / inst-B.
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'mover',
+						instanceId: 'inst-B',
+						attrs: { tenantId: 't99' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				// t42 should be empty (mover was reindexed under t99).
+				captured.length = 0;
+				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
+				await new Promise((r) => setImmediate(r));
+				expect(captured).toHaveLength(0);
+
+				// t99 should resolve to one envelope on inst-B's push channel.
+				await local.sendTo({ tenantId: 't99' }, 'topic', 'event');
+				await new Promise((r) => setImmediate(r));
+				expect(captured).toHaveLength(1);
+				expect(captured[0].ch).toBe(client.key('__push:inst-B'));
+
+				const out = await metrics.serialize();
+				expect(out).toMatch(/push_sendto_total\{result="empty"\}\s+1/);
+				expect(out).toMatch(/push_sendto_total\{result="ok"\}\s+1/);
+
+				await probe.quit().catch(() => probe.disconnect());
+			} finally {
+				await local.destroy();
+			}
+		});
+	});
+
+	describe('attributes / sendTo: bootstrap from existing Redis state', () => {
+		it('populates the index from existing hash entries on activate', async () => {
+			// Plant entries before any registry boots up.
+			await client.redis.hset(
+				client.key('conns:pre-1'),
+				'instanceId', 'inst-A',
+				'sessionId', 'pre-1-s',
+				'ts', Date.now(),
+				'attrs', JSON.stringify({ tenantId: 't42', role: 'admin' })
+			);
+			await client.redis.hset(
+				client.key('conns:pre-2'),
+				'instanceId', 'inst-A',
+				'sessionId', 'pre-2-s',
+				'ts', Date.now(),
+				'attrs', JSON.stringify({ tenantId: 't42', role: 'member' })
+			);
+			await client.redis.hset(
+				client.key('conns:pre-3'),
+				'instanceId', 'inst-B',
+				'sessionId', 'pre-3-s',
+				'ts', Date.now(),
+				'attrs', JSON.stringify({ tenantId: 't99' })
+			);
+
+			let captured = [];
+			const probe = client.duplicate({ enableReadyCheck: false });
+			probe.on('message', (ch, raw) => {
+				if (ch.startsWith(client.key('__push:'))) {
+					captured.push({ ch, env: JSON.parse(raw) });
+				}
+			});
+			await probe.subscribe(client.key('__push:inst-A'), client.key('__push:inst-B'));
+
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				// Trigger activate via a no-op open to ensure the bootstrap fires.
+				const ws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(ws, { platform });
+				// Bootstrap is async; let the event loop drain.
+				await new Promise((r) => setImmediate(r));
+				await new Promise((r) => setImmediate(r));
+
+				captured = []; // ignore the open event from self
+				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
+				await new Promise((r) => setImmediate(r));
+
+				// Both pre-1 and pre-2 are on inst-A, so one envelope on inst-A.
+				const aEnvs = captured.filter((c) => c.ch === client.key('__push:inst-A'));
+				expect(aEnvs).toHaveLength(1);
+				expect(aEnvs[0].env).toMatchObject({
+					type: 'sendTo',
+					criteria: { tenantId: 't42' },
+					topic: 'topic',
+					event: 'event'
+				});
+			} finally {
+				await local.destroy();
+				await probe.quit().catch(() => probe.disconnect());
+			}
+		});
+	});
+
+	describe('attributes / sendTo: routing', () => {
+		it('self-targeting matches deliver via local platform.send without a Redis hop', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws1 = wsWithSession({ userId: 'u-1', tenantId: 't42' }, 's-1');
+				const ws2 = wsWithSession({ userId: 'u-2', tenantId: 't42' }, 's-2');
+				const ws3 = wsWithSession({ userId: 'u-3', tenantId: 't99' }, 's-3');
+				await local.hooks.open(ws1, { platform });
+				await local.hooks.open(ws2, { platform });
+				await local.hooks.open(ws3, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				platform.sent.length = 0;
+				await local.sendTo({ tenantId: 't42' }, 'announcements', 'created', { id: 1 });
+				await new Promise((r) => setImmediate(r));
+
+				// Both u-1 and u-2 received; u-3 (different tenant) did not.
+				expect(platform.sent).toHaveLength(2);
+				const wssReached = new Set(platform.sent.map((s) => s.ws));
+				expect(wssReached).toEqual(new Set([ws1, ws2]));
+				expect(platform.sent[0]).toMatchObject({
+					topic: 'announcements',
+					event: 'created',
+					data: { id: 1 }
+				});
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('compound criteria intersect attributes (AND semantics)', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => {
+					const ud = ws.getUserData();
+					return { tenantId: ud.tenantId, role: ud.role };
+				}
+			});
+			try {
+				const wsAdmin = wsWithSession({ userId: 'u-1', tenantId: 't42', role: 'admin' }, 's-1');
+				const wsMember = wsWithSession({ userId: 'u-2', tenantId: 't42', role: 'member' }, 's-2');
+				const wsOtherTenant = wsWithSession({ userId: 'u-3', tenantId: 't99', role: 'admin' }, 's-3');
+				await local.hooks.open(wsAdmin, { platform });
+				await local.hooks.open(wsMember, { platform });
+				await local.hooks.open(wsOtherTenant, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				platform.sent.length = 0;
+				await local.sendTo({ tenantId: 't42', role: 'admin' }, 'audit', 'created', { e: 1 });
+				await new Promise((r) => setImmediate(r));
+
+				expect(platform.sent).toHaveLength(1);
+				expect(platform.sent[0].ws).toBe(wsAdmin);
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('publishes one envelope per owning instance for cross-instance matches', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const lws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				// Two remote users on instance A, one remote user on instance B.
+				for (const env of [
+					{ userId: 'r-1', instanceId: 'inst-A', attrs: { tenantId: 't42' } },
+					{ userId: 'r-2', instanceId: 'inst-A', attrs: { tenantId: 't42' } },
+					{ userId: 'r-3', instanceId: 'inst-B', attrs: { tenantId: 't42' } }
+				]) {
+					await client.redis.publish(
+						client.key('__registry-events'),
+						JSON.stringify({ type: 'open', ...env })
+					);
+				}
+				await new Promise((r) => setImmediate(r));
+
+				const captured = [];
+				const probe = client.duplicate({ enableReadyCheck: false });
+				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
+				await probe.subscribe(
+					client.key('__push:inst-A'),
+					client.key('__push:inst-B')
+				);
+
+				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
+				await new Promise((r) => setImmediate(r));
+
+				// Two distinct push channels → two envelopes (not three, since
+				// inst-A coalesces r-1 + r-2 into one).
+				expect(captured).toHaveLength(2);
+				const channels = new Set(captured.map((c) => c.ch));
+				expect(channels).toEqual(new Set([
+					client.key('__push:inst-A'),
+					client.key('__push:inst-B')
+				]));
+
+				await probe.quit().catch(() => probe.disconnect());
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('mixed local + remote: local fires immediately, remote ships an envelope', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const lws = wsWithSession({ userId: 'local-u', tenantId: 't42' }, 'local-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'remote-u',
+						instanceId: 'inst-B',
+						attrs: { tenantId: 't42' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				const captured = [];
+				const probe = client.duplicate({ enableReadyCheck: false });
+				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
+				await probe.subscribe(client.key('__push:inst-B'));
+
+				platform.sent.length = 0;
+				await local.sendTo({ tenantId: 't42' }, 'topic', 'event', { x: 1 });
+				await new Promise((r) => setImmediate(r));
+
+				expect(platform.sent).toHaveLength(1);
+				expect(platform.sent[0].ws).toBe(lws);
+				expect(captured).toHaveLength(1);
+				expect(captured[0].env).toMatchObject({
+					type: 'sendTo',
+					criteria: { tenantId: 't42' },
+					topic: 'topic',
+					event: 'event',
+					data: { x: 1 }
+				});
+
+				await probe.quit().catch(() => probe.disconnect());
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('empty-match returns without publishing or sending', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				metrics
+			});
+			try {
+				const lws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(lws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				platform.sent.length = 0;
+				await local.sendTo({ tenantId: 'unknown-tenant' }, 'topic', 'event');
+				expect(platform.sent).toHaveLength(0);
+
+				const out = await metrics.serialize();
+				expect(out).toMatch(/push_sendto_total\{result="empty"\}\s+1/);
+			} finally {
+				await local.destroy();
+			}
+		});
+	});
+
+	describe('attributes / sendTo: receiver-side', () => {
+		it('iterates the receiver own local matches at receive time', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws1 = wsWithSession({ userId: 'u-1', tenantId: 't42' }, 's-1');
+				const ws2 = wsWithSession({ userId: 'u-2', tenantId: 't42' }, 's-2');
+				const ws3 = wsWithSession({ userId: 'u-3', tenantId: 't99' }, 's-3');
+				await owner.hooks.open(ws1, { platform: platformOwner });
+				await owner.hooks.open(ws2, { platform: platformOwner });
+				await owner.hooks.open(ws3, { platform: platformOwner });
+				await new Promise((r) => setImmediate(r));
+
+				// Synthesize an inbound sendTo envelope on owner's push channel.
+				platformOwner.sent.length = 0;
+				await client.redis.publish(
+					client.key('__push:' + owner.instanceId),
+					JSON.stringify({
+						type: 'sendTo',
+						criteria: { tenantId: 't42' },
+						topic: 'announcements',
+						event: 'created',
+						data: { id: 1 }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				// u-1 and u-2 should receive; u-3 (different tenant) should not.
+				expect(platformOwner.sent).toHaveLength(2);
+				const reached = new Set(platformOwner.sent.map((s) => s.ws));
+				expect(reached).toEqual(new Set([ws1, ws2]));
+			} finally {
+				await owner.destroy();
+			}
+		});
+
+		it('no-ops cleanly when the receiver has no local matches', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws1 = wsWithSession({ userId: 'u-1', tenantId: 't1' }, 's-1');
+				await owner.hooks.open(ws1, { platform: platformOwner });
+				await new Promise((r) => setImmediate(r));
+
+				platformOwner.sent.length = 0;
+				await client.redis.publish(
+					client.key('__push:' + owner.instanceId),
+					JSON.stringify({
+						type: 'sendTo',
+						criteria: { tenantId: 't42' },
+						topic: 'announcements',
+						event: 'created'
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+
+				expect(platformOwner.sent).toHaveLength(0);
+			} finally {
+				await owner.destroy();
+			}
+		});
+	});
+
+	describe('attributes / sendTo: validation', () => {
+		let withAttrs;
+		beforeEach(() => {
+			withAttrs = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+		});
+		afterEach(async () => {
+			await withAttrs.destroy();
+		});
+
+		it('rejects null criteria', async () => {
+			await expect(withAttrs.sendTo(null, 't', 'e')).rejects.toThrow(/criteria/);
+		});
+
+		it('rejects an empty object after normalization', async () => {
+			// All values get dropped (null / object) so the result is empty.
+			await expect(
+				withAttrs.sendTo({ ignored: { nested: 'obj' } }, 't', 'e')
+			).rejects.toThrow(/at least one/);
+		});
+
+		it('rejects a missing topic / event', async () => {
+			await expect(withAttrs.sendTo({ tenantId: 't' }, '', 'e')).rejects.toThrow(/topic/);
+			await expect(withAttrs.sendTo({ tenantId: 't' }, 't', '')).rejects.toThrow(/event/);
+		});
+	});
+
+	describe('attributes / sendTo: metrics', () => {
+		it('counts ok / empty / error outcomes on the push_sendto_total counter', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				metrics
+			});
+			try {
+				const ws = wsWithSession({ userId: 'self', tenantId: 't42' }, 's-self');
+				await local.hooks.open(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				// Empty path
+				await local.sendTo({ tenantId: 'nope' }, 'topic', 'event');
+				// Self-only path -- sender doesn't publish anywhere remotely; ok still recorded
+				// because there were matches (one local) and no publish error.
+				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
+
+				await new Promise((r) => setImmediate(r));
+
+				const out = await metrics.serialize();
+				expect(out).toMatch(/push_sendto_total\{result="empty"\}\s+1/);
+				expect(out).toMatch(/push_sendto_total\{result="ok"\}\s+1/);
+			} finally {
+				await local.destroy();
+			}
+		});
+	});
 });
