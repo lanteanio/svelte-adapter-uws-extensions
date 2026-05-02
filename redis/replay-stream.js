@@ -161,7 +161,7 @@ export function createStreamReplay(client, options = {}) {
 		return client.key('replay:streambuf:' + topic);
 	}
 
-	return {
+	const tracker = {
 		async publishIdempotent(platform, topic, event, data, opts) {
 			if (!opts || typeof opts !== 'object') {
 				throw new Error('redis stream replay: publishIdempotent requires { producerId, requestId } options');
@@ -346,6 +346,21 @@ export function createStreamReplay(client, options = {}) {
 
 		async clearTopic(topic) {
 			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
+		},
+
+		// Returns a hook function for `hooks.ws.resume`. Loops over the
+		// client's per-topic lastSeenSeqs and gap-fills via the existing
+		// replay() pipeline, which already detects + emits truncation
+		// per topic.
+		resumeHook() {
+			return async (ws, ctx) => {
+				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
+				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
+					const seq = typeof sinceSeq === 'number' && sinceSeq >= 0 ? sinceSeq : 0;
+					await tracker.replay(ws, topic, seq, ctx.platform);
+				}
+			};
 		}
 	};
+	return tracker;
 }

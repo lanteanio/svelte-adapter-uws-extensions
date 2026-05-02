@@ -97,6 +97,20 @@ export interface ReplayGap {
 	missingFrom: number | null;
 }
 
+/**
+ * Hook function compatible with `hooks.ws.resume` from `svelte-adapter-uws`.
+ * Loops over the client's per-topic `lastSeenSeqs` and gap-fills via the
+ * underlying `replay()` pipeline.
+ */
+export type ResumeHook = (
+	ws: any,
+	ctx: {
+		lastSeenSeqs?: Record<string, number>;
+		platform: Platform;
+		sessionId?: string;
+	}
+) => Promise<void>;
+
 export interface RedisReplayBuffer {
 	/**
 	 * Publish a message through the buffer. Stores it in Redis with a
@@ -160,6 +174,19 @@ export interface RedisReplayBuffer {
 
 	/** Clear the buffer for a single topic. */
 	clearTopic(topic: string): Promise<void>;
+
+	/**
+	 * Returns a hook function for `hooks.ws.resume`. Iterates over the
+	 * client's per-topic `lastSeenSeqs` and gap-fills via `replay()`,
+	 * which already detects + emits truncation per topic.
+	 *
+	 * @example
+	 * ```js
+	 * const replay = createReplay(redis);
+	 * export const resume = replay.resumeHook();
+	 * ```
+	 */
+	resumeHook(): ResumeHook;
 }
 
 /**

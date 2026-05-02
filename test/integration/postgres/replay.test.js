@@ -337,6 +337,45 @@ describe('postgres replay (integration)', () => {
 		});
 	});
 
+	describe('resumeHook against real Postgres', () => {
+		it('drives multi-topic gap-fill via the existing replay() pipeline', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'chat', 'msg', { id: 'c2' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't2' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't3' });
+
+			const fakeWs = {};
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook(fakeWs, {
+				lastSeenSeqs: { chat: 1, todos: 2 },
+				platform
+			});
+
+			const chat = platform.sent.filter((s) => s.topic === '__replay:chat');
+			const todos = platform.sent.filter((s) => s.topic === '__replay:todos');
+			expect(chat.filter((s) => s.event === 'msg').map((s) => s.data.seq)).toEqual([2]);
+			expect(todos.filter((s) => s.event === 'msg').map((s) => s.data.seq)).toEqual([3]);
+			expect(chat.find((s) => s.event === 'end')).toBeDefined();
+			expect(todos.find((s) => s.event === 'end')).toBeDefined();
+		});
+
+		it('emits truncated for trimmed topics via the indexed seq lookup', async () => {
+			// size: 5 by default in this suite; publish 8 to evict seqs 1-3.
+			for (let i = 1; i <= 8; i++) {
+				await replay.publish(platform, 'chat', 'msg', { id: i });
+			}
+
+			const fakeWs = {};
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook(fakeWs, { lastSeenSeqs: { chat: 1 }, platform });
+
+			expect(platform.sent.find((s) => s.event === 'truncated')).toBeDefined();
+		});
+	});
+
 	describe('clearTopic / clear', () => {
 		it('clearTopic removes only that topic', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

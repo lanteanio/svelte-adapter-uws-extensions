@@ -163,7 +163,7 @@ export function createReplay(client, options = {}) {
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
-	return {
+	const tracker = {
 		async publish(platform, topic, event, data) {
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
@@ -385,6 +385,21 @@ export function createReplay(client, options = {}) {
 				clearInterval(cleanupTimer);
 				cleanupTimer = null;
 			}
+		},
+
+		// Returns a hook function for `hooks.ws.resume`. Loops over the
+		// client's per-topic lastSeenSeqs and gap-fills via the existing
+		// replay() pipeline, which already detects + emits truncation
+		// per topic.
+		resumeHook() {
+			return async (ws, ctx) => {
+				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
+				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
+					const seq = typeof sinceSeq === 'number' && sinceSeq >= 0 ? sinceSeq : 0;
+					await tracker.replay(ws, topic, seq, ctx.platform);
+				}
+			};
 		}
 	};
+	return tracker;
 }

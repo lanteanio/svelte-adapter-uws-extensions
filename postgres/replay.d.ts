@@ -34,6 +34,20 @@ export interface ReplayGap {
 	missingFrom: number | null;
 }
 
+/**
+ * Hook function compatible with `hooks.ws.resume` from `svelte-adapter-uws`.
+ * Loops over the client's per-topic `lastSeenSeqs` and gap-fills via the
+ * underlying `replay()` pipeline.
+ */
+export type ResumeHook = (
+	ws: any,
+	ctx: {
+		lastSeenSeqs?: Record<string, number>;
+		platform: Platform;
+		sessionId?: string;
+	}
+) => Promise<void>;
+
 export interface PgReplayBuffer {
 	/**
 	 * Publish a message through the buffer. Stores it in Postgres with a
@@ -79,6 +93,19 @@ export interface PgReplayBuffer {
 
 	/** Stop the cleanup timer. */
 	destroy(): void;
+
+	/**
+	 * Returns a hook function for `hooks.ws.resume`. Iterates over the
+	 * client's per-topic `lastSeenSeqs` and gap-fills via `replay()`,
+	 * which already detects + emits truncation per topic.
+	 *
+	 * @example
+	 * ```js
+	 * const replay = createReplay(pg);
+	 * export const resume = replay.resumeHook();
+	 * ```
+	 */
+	resumeHook(): ResumeHook;
 }
 
 /**

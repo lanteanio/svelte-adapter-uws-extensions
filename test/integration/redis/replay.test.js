@@ -194,6 +194,46 @@ describe('redis replay (integration)', () => {
 		});
 	});
 
+	describe('resumeHook against real Redis', () => {
+		it('drives multi-topic gap-fill via the existing replay() pipeline', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'chat', 'msg', { id: 'c2' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't2' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't3' });
+
+			const fakeWs = {};
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook(fakeWs, {
+				lastSeenSeqs: { chat: 1, todos: 2 },
+				platform
+			});
+
+			const chat = platform.sent.filter((s) => s.topic === '__replay:chat');
+			const todos = platform.sent.filter((s) => s.topic === '__replay:todos');
+			// chat: msg seq=2 + end. todos: msg seq=3 + end.
+			expect(chat.filter((s) => s.event === 'msg').map((s) => s.data.seq)).toEqual([2]);
+			expect(todos.filter((s) => s.event === 'msg').map((s) => s.data.seq)).toEqual([3]);
+			expect(chat.find((s) => s.event === 'end')).toBeDefined();
+			expect(todos.find((s) => s.event === 'end')).toBeDefined();
+		});
+
+		it('emits truncated for trimmed topics through the wire ZRANGEBYSCORE path', async () => {
+			// size: 5; publish 8 to evict seqs 1-3.
+			for (let i = 1; i <= 8; i++) {
+				await replay.publish(platform, 'chat', 'msg', { id: i });
+			}
+
+			const fakeWs = {};
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook(fakeWs, { lastSeenSeqs: { chat: 1 }, platform });
+
+			expect(platform.sent.find((s) => s.event === 'truncated')).toBeDefined();
+		});
+	});
+
 	describe('TTL (real EXPIRE applied by the Lua script)', () => {
 		it('sets a TTL on both keys when ttl is non-zero', async () => {
 			const r = createReplay(client, { size: 5, ttl: 600 });

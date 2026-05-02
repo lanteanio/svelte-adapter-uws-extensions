@@ -368,6 +368,34 @@ export async function message(ws, { data, platform }) {
 }
 ```
 
+#### Session resumption (`resumeHook`)
+
+The adapter's WebSocket `resume` hook fires on reconnect when the client presents per-topic `lastSeenSeqs` from `sessionStorage`. `resumeHook()` returns a hook function that drives gap-fill across every topic the client cared about, in one line:
+
+```js
+// src/lib/server/replay.js
+export const replay = createReplay(redis);
+
+// src/hooks.ws.js
+import { replay } from '$lib/server/replay';
+export const resume = replay.resumeHook();
+```
+
+The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(ws, topic, sinceSeq, platform)` per topic. Per-topic truncation detection still happens inside `replay()` -- a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
+
+For finer control -- custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work -- compose by hand:
+
+```js
+export async function resume(ws, { lastSeenSeqs, platform }) {
+  for (const [topic, sinceSeq] of Object.entries(lastSeenSeqs)) {
+    await replay.replay(ws, topic, sinceSeq, platform);
+  }
+  // ... your own resume work alongside replay
+}
+```
+
+The same `resumeHook()` is available on the Postgres backend; behavior is identical.
+
 #### Options
 
 | Option | Default | Description |
@@ -772,6 +800,8 @@ Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq
 Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
 
 The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here -- one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
+
+`resumeHook()` is available with identical semantics to the Redis backend; see [Session resumption](#session-resumption-resumehook).
 
 #### Setup
 

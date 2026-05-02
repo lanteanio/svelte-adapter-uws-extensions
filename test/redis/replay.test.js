@@ -537,6 +537,119 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('resumeHook', () => {
+		it('returns an async function', () => {
+			const hook = replay.resumeHook();
+			expect(typeof hook).toBe('function');
+		});
+
+		it('no-ops without a ctx', async () => {
+			const hook = replay.resumeHook();
+			await hook({});
+			await hook({}, undefined);
+			await hook({}, null);
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('no-ops without lastSeenSeqs', async () => {
+			const hook = replay.resumeHook();
+			await hook({}, { platform });
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('no-ops without platform', async () => {
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 } });
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('no-ops on empty lastSeenSeqs', async () => {
+			const hook = replay.resumeHook();
+			const fakeWs = {};
+			await hook(fakeWs, { lastSeenSeqs: {}, platform });
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('replays a single topic from the given seq', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay.publish(platform, 'chat', 'msg', { id: 3 });
+			platform.reset();
+
+			const fakeWs = {};
+			const hook = replay.resumeHook();
+			await hook(fakeWs, { lastSeenSeqs: { chat: 1 }, platform });
+
+			// 2 missed messages + end marker
+			expect(platform.sent).toHaveLength(3);
+			expect(platform.sent[0].data).toMatchObject({ seq: 2 });
+			expect(platform.sent[1].data).toMatchObject({ seq: 3 });
+			expect(platform.sent[2].event).toBe('end');
+		});
+
+		it('replays multiple topics in iteration order', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't2' });
+			platform.reset();
+
+			const fakeWs = {};
+			const hook = replay.resumeHook();
+			await hook(fakeWs, {
+				lastSeenSeqs: { chat: 0, todos: 1 },
+				platform
+			});
+
+			// chat: msg seq=1 + end. todos: msg seq=2 + end.
+			const chatEvents = platform.sent.filter((s) => s.topic === '__replay:chat');
+			const todoEvents = platform.sent.filter((s) => s.topic === '__replay:todos');
+			expect(chatEvents).toHaveLength(2);
+			expect(todoEvents).toHaveLength(2);
+			expect(chatEvents[0].data).toMatchObject({ seq: 1 });
+			expect(todoEvents[0].data).toMatchObject({ seq: 2 });
+		});
+
+		it('treats sinceSeq=0 as a fresh subscriber (replays everything)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 0 }, platform });
+
+			expect(platform.sent.filter((s) => s.event === 'msg')).toHaveLength(2);
+		});
+
+		it('coerces non-numeric or negative sinceSeq to 0', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { chat: 'oops', todos: -5 },
+				platform
+			});
+
+			// Both treated as 0 -> replay everything
+			const chatMsgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			expect(chatMsgs).toHaveLength(1);
+		});
+
+		it('emits truncated when the buffer no longer holds the next seq', async () => {
+			// Buffer size is 5; publishing 7 trims [1, 2] out so seq 2 is gone.
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'msg', { id: i });
+			}
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+
+			const truncated = platform.sent.find((s) => s.event === 'truncated');
+			expect(truncated).toBeDefined();
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

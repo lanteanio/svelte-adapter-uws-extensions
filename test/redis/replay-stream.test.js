@@ -200,6 +200,70 @@ describe('redis replay (stream backend)', () => {
 		});
 	});
 
+	describe('resumeHook', () => {
+		it('returns an async function', () => {
+			expect(typeof replay.resumeHook()).toBe('function');
+		});
+
+		it('no-ops on missing ctx fields', async () => {
+			const hook = replay.resumeHook();
+			await hook({});
+			await hook({}, { platform });
+			await hook({}, { lastSeenSeqs: { chat: 1 } });
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('replays a single topic from the given seq', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+
+			expect(platform.sent.filter((s) => s.event === 'msg')).toHaveLength(1);
+			expect(platform.sent.find((s) => s.event === 'end')).toBeDefined();
+		});
+
+		it('replays multiple topics in iteration order', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't1' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't2' });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 0, todos: 1 }, platform });
+
+			const chat = platform.sent.filter((s) => s.topic === '__replay:chat');
+			const todos = platform.sent.filter((s) => s.topic === '__replay:todos');
+			expect(chat).toHaveLength(2);
+			expect(todos).toHaveLength(2);
+		});
+
+		it('coerces non-numeric or negative sinceSeq to 0', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 'oops' }, platform });
+
+			expect(platform.sent.filter((s) => s.event === 'msg')).toHaveLength(1);
+		});
+
+		it('emits truncated when the stream no longer holds the next seq', async () => {
+			// size: 5 in this suite; publish 7 to trim seqs 1-2.
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'msg', { id: i });
+			}
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+
+			expect(platform.sent.find((s) => s.event === 'truncated')).toBeDefined();
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
