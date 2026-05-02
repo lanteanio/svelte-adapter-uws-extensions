@@ -736,10 +736,30 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 |---|---|
 | `lookup(userId)` | Resolve a userId to its current entry (`{instanceId, sessionId, ts}`) or `null`. |
 | `request(target, event, data?, opts?)` | Cluster-routed request/reply. Resolves with the reply. |
+| `sendCoalesced(target, message)` | Cluster-routed coalesce-by-key send. Fire-and-forget. See [Coalesced sends](#registry-coalesced-sends) below. |
 | `size()` | Count of users registered to THIS instance (local view, scrape-time). |
 | `instanceId` | Stable id for this instance, also the name of its push channel. |
 | `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
 | `destroy()` | Stop the heartbeat timer and Redis subscriber. |
+
+#### Coalesced sends {#registry-coalesced-sends}
+
+`registry.sendCoalesced(target, { key, topic, event, data })` is the cluster-routed counterpart to the adapter's `platform.sendCoalesced(ws, ...)` -- one slot per `(connection, key)` tuple, latest-value-wins. Fire-and-forget; no reply path, no `Promise<reply>`.
+
+```js
+registry.sendCoalesced('user-123', {
+  key: 'cursor:doc-7',
+  topic: 'doc:7',
+  event: 'cursor',
+  data: { x: 410, y: 220 }
+});
+```
+
+Routing follows the same shape as `request(...)`: lookup the owning instance, self-target short-circuits to a local `platform.sendCoalesced(ws, ...)`, otherwise a fire-and-forget envelope `{type:'coalesced', sessionId, key, topic, event, data}` ships on the owner's push channel and the receiver calls `platform.sendCoalesced` locally.
+
+Per-`(connection, key)` replacement happens on the receiver via the adapter's existing coalesce semantics, so a duplicate or out-of-order envelope from a flaky link is collapsed on arrival rather than producing a stutter on the wire. Ordering is preserved within a `(user, key)` tuple as long as the user does not move instances mid-flight; instance migration triggers one transient out-of-order moment that the per-connection coalesce collapses on the new instance.
+
+Best fit: targeted latest-value streams where the target is a *user*, not a topic. Cursor positions inside a doc, typing indicators between two users, presence-state pushes from a moderator to a single subscriber. Topic-broadcast coalesce (every subscriber sees the same stream) already works cluster-wide via `bus.wrap(platform).publish(...)` on either bus and per-receiver A1 logic; this method covers the remaining gap.
 
 #### Metrics
 
@@ -749,6 +769,7 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | `push_reply_latency_ms` | Histogram of request-publish to reply-receive in milliseconds (success path). |
 | `push_registry_size` | Gauge: connections registered to this instance. Scrape-time, no continuous accounting. |
 | `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
+| `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map -- target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
 
 #### Registry edge cases
 

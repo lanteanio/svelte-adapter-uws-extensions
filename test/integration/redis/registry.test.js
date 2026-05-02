@@ -169,6 +169,38 @@ describe('redis connection registry (integration)', () => {
 		expect(reply).toEqual({ event: 'ping', data: { n: 1 }, here: true });
 	});
 
+	it('cross-instance sendCoalesced reaches the owning instance via the push channel', async () => {
+		const platformA = mockPlatform();
+		const platformB = mockPlatform();
+		const regOrigin = makeRegistry();
+		const regOwner = makeRegistry();
+
+		const ws = wsWithSession({ userId: 'frank' }, 's-frank');
+		await regOwner.hooks.open(ws, { platform: platformB });
+		// Origin needs an active subscriber to publish too; touch its hooks once.
+		const filler = wsWithSession({ userId: 'origin-only' }, 's-origin');
+		await regOrigin.hooks.open(filler, { platform: platformA });
+
+		await regOrigin.sendCoalesced('frank', {
+			key: 'cursor:doc-7',
+			topic: 'doc:7',
+			event: 'cursor',
+			data: { x: 410, y: 220 }
+		});
+
+		// Allow the SPUBLISH + subscriber dispatch + microtask to land.
+		await wait(50);
+
+		expect(platformB.sentCoalesced).toHaveLength(1);
+		expect(platformB.sentCoalesced[0]).toMatchObject({
+			ws,
+			key: 'cursor:doc-7',
+			topic: 'doc:7',
+			event: 'cursor',
+			data: { x: 410, y: 220 }
+		});
+	});
+
 	it('heartbeat refreshes TTL on locally-owned entries', async () => {
 		const platform = mockPlatform();
 		// Short ttl + short heartbeat so we can observe the refresh in real time.

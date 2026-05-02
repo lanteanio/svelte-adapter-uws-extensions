@@ -90,6 +90,36 @@ export interface ConnectionRegistry {
 		options?: { timeoutMs?: number }
 	): Promise<TReply>;
 
+	/**
+	 * Cluster-routed coalesce-by-key send. Fire-and-forget: routes to the
+	 * owning instance, which calls `platform.sendCoalesced(ws, message)`
+	 * locally. Per-`(connection, key)` replacement happens on the receiver
+	 * side via the adapter's existing coalesce semantics, so a duplicate
+	 * or out-of-order envelope from a flaky link is collapsed on arrival.
+	 *
+	 * Self-targeting (the origin instance owns the user) short-circuits
+	 * to a local `platform.sendCoalesced` with no Redis hop.
+	 *
+	 * Ordering is preserved within a `(user, key)` tuple as long as the
+	 * user does not move instances mid-flight; instance migration triggers
+	 * one transient out-of-order moment that the per-connection coalesce
+	 * collapses on the new instance.
+	 *
+	 * @example
+	 * ```js
+	 * registry.sendCoalesced('user-123', {
+	 *   key: 'cursor:doc-7',
+	 *   topic: 'doc:doc-7',
+	 *   event: 'cursor',
+	 *   data: { x: 410, y: 220 }
+	 * });
+	 * ```
+	 */
+	sendCoalesced(
+		target: string,
+		message: { key: string; topic: string; event: string; data?: unknown }
+	): Promise<void>;
+
 	/** Count of users registered to THIS instance (local view, scrape-time). */
 	size(): number;
 

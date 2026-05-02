@@ -438,6 +438,183 @@ describe('redis connection registry', () => {
 		});
 	});
 
+	describe('sendCoalesced: self-targeting', () => {
+		it('short-circuits to local platform.sendCoalesced without a Redis hop', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+
+			await registry.sendCoalesced('u-1', {
+				key: 'cursor:doc-7',
+				topic: 'doc:7',
+				event: 'cursor',
+				data: { x: 10, y: 20 }
+			});
+
+			expect(platform.sentCoalesced).toHaveLength(1);
+			expect(platform.sentCoalesced[0]).toMatchObject({
+				ws,
+				key: 'cursor:doc-7',
+				topic: 'doc:7',
+				event: 'cursor',
+				data: { x: 10, y: 20 }
+			});
+		});
+
+		it('silently drops when the user is offline', async () => {
+			await expect(
+				registry.sendCoalesced('nobody', { key: 'k', topic: 't', event: 'e' })
+			).resolves.toBeUndefined();
+			expect(platform.sentCoalesced).toHaveLength(0);
+		});
+
+		it('silently drops when the local sessionToWs has no ws (race after disconnect)', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			await registry.hooks.close(ws, { platform });
+
+			await registry.sendCoalesced('u-1', { key: 'k', topic: 't', event: 'e' });
+			expect(platform.sentCoalesced).toHaveLength(0);
+		});
+	});
+
+	describe('sendCoalesced: cross-instance routing', () => {
+		it('publishes the coalesced envelope on the owning instance push channel', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			await registry.sendCoalesced('u-1', {
+				key: 'cursor:doc-7',
+				topic: 'doc:7',
+				event: 'cursor',
+				data: { x: 100, y: 200 }
+			});
+
+			// Allow the pubsub dispatch + microtask to process.
+			await new Promise((r) => setImmediate(r));
+
+			expect(platformOwner.sentCoalesced).toHaveLength(1);
+			expect(platformOwner.sentCoalesced[0]).toMatchObject({
+				ws,
+				key: 'cursor:doc-7',
+				topic: 'doc:7',
+				event: 'cursor',
+				data: { x: 100, y: 200 }
+			});
+
+			await owner.destroy();
+		});
+
+		it('drops on the receiver when the local sessionId no longer maps to a ws', async () => {
+			const metrics = createMetrics();
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+
+			// Owner registers and immediately drops the ws locally without a
+			// Redis cleanup, then the remote envelope arrives.
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			await owner.hooks.close(ws, { platform: platformOwner });
+
+			// Re-plant the registry entry so origin still routes to owner.
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', owner.instanceId,
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+
+			await registry.sendCoalesced('u-1', { key: 'k', topic: 't', event: 'e', data: 1 });
+			await new Promise((r) => setImmediate(r));
+
+			expect(platformOwner.sentCoalesced).toHaveLength(0);
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_coalesced_total\{result="late"\}\s+1/);
+
+			await owner.destroy();
+		});
+
+		it('does not return a reply (fire-and-forget)', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			const result = await registry.sendCoalesced('u-1', {
+				key: 'k', topic: 't', event: 'e'
+			});
+			expect(result).toBeUndefined();
+			await owner.destroy();
+		});
+	});
+
+	describe('sendCoalesced: validation', () => {
+		it('rejects an empty target', async () => {
+			await expect(
+				registry.sendCoalesced('', { key: 'k', topic: 't', event: 'e' })
+			).rejects.toThrow(/non-empty/);
+		});
+
+		it('rejects a non-object message', async () => {
+			await expect(registry.sendCoalesced('u', null)).rejects.toThrow();
+			await expect(registry.sendCoalesced('u', 'string')).rejects.toThrow();
+		});
+
+		it('rejects a missing or non-string key', async () => {
+			await expect(
+				registry.sendCoalesced('u', { topic: 't', event: 'e' })
+			).rejects.toThrow(/key/);
+			await expect(
+				registry.sendCoalesced('u', { key: '', topic: 't', event: 'e' })
+			).rejects.toThrow(/key/);
+		});
+	});
+
+	describe('sendCoalesced: metrics', () => {
+		it('counts outcomes ok | self | offline | late', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+
+			// self
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await local.hooks.open(ws, { platform });
+			await local.sendCoalesced('u-1', { key: 'k', topic: 't', event: 'e' });
+
+			// offline
+			await local.sendCoalesced('nobody', { key: 'k', topic: 't', event: 'e' });
+
+			// ok (cross-instance) -- spin up a sibling owner
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (w) => w.getUserData()?.userId
+			});
+			const wsB = wsWithSession({ userId: 'u-2' }, 's-2');
+			await owner.hooks.open(wsB, { platform: platformOwner });
+
+			await local.sendCoalesced('u-2', { key: 'k', topic: 't', event: 'e' });
+			await new Promise((r) => setImmediate(r));
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_coalesced_total\{result="self"\}\s+1/);
+			expect(out).toMatch(/push_coalesced_total\{result="offline"\}\s+1/);
+			expect(out).toMatch(/push_coalesced_total\{result="ok"\}\s+1/);
+
+			await owner.destroy();
+			await local.destroy();
+		});
+	});
+
 	describe('destroy', () => {
 		it('rejects all in-flight requests', async () => {
 			const local = createConnectionRegistry(client, {

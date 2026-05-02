@@ -135,6 +135,7 @@ export function createConnectionRegistry(client, options) {
 	);
 	const mRegistrySize = m?.gauge('push_registry_size', 'Connections registered to this instance');
 	const mLateReply = m?.counter('push_late_replies_total', 'Replies that arrived after their request expired or migrated');
+	const mCoalesced = m?.counter('push_coalesced_total', 'Cluster coalesced sends by outcome', ['result']);
 
 	function userKey(userId) {
 		return client.key(keyPrefix + 'conns:' + userId);
@@ -267,7 +268,25 @@ export function createConnectionRegistry(client, options) {
 		switch (envelope.type) {
 			case 'request': handleInboundRequest(envelope); break;
 			case 'reply': handleInboundReply(envelope); break;
+			case 'coalesced': handleInboundCoalesced(envelope); break;
 			default: /* unknown type, ignore for forward compatibility */ break;
+		}
+	}
+
+	function handleInboundCoalesced(env) {
+		const { sessionId, key, topic, event, data } = env;
+		if (typeof sessionId !== 'string' || typeof key !== 'string') return;
+		const ws = sessionToWs.get(sessionId);
+		if (!ws || !activePlatform) {
+			mCoalesced?.inc({ result: 'late' });
+			return;
+		}
+		try {
+			activePlatform.sendCoalesced(ws, { key, topic, event, data });
+		} catch {
+			// fire-and-forget: a thrown sendCoalesced on the receiver
+			// surfaces as a missing frame on the wire, which the next
+			// per-key send will overwrite anyway.
 		}
 	}
 
@@ -392,10 +411,69 @@ export function createConnectionRegistry(client, options) {
 		});
 	}
 
+	async function sendCoalesced(target, message) {
+		if (typeof target !== 'string' || target.length === 0) {
+			throw new Error('registry.sendCoalesced: target must be a non-empty userId string');
+		}
+		if (!message || typeof message !== 'object') {
+			throw new Error('registry.sendCoalesced: message must be an object');
+		}
+		if (typeof message.key !== 'string' || message.key.length === 0) {
+			throw new Error('registry.sendCoalesced: message.key must be a non-empty string');
+		}
+		const { key, topic, event, data } = message;
+
+		const entry = await lookup(target);
+		if (!entry) {
+			mCoalesced?.inc({ result: 'offline' });
+			return;
+		}
+
+		// Self-targeting: short-circuit to local platform.sendCoalesced.
+		if (entry.instanceId === instanceId) {
+			const ws = sessionToWs.get(entry.sessionId);
+			if (!ws || !activePlatform) {
+				mCoalesced?.inc({ result: 'offline' });
+				return;
+			}
+			try {
+				activePlatform.sendCoalesced(ws, { key, topic, event, data });
+				mCoalesced?.inc({ result: 'self' });
+			} catch {
+				mCoalesced?.inc({ result: 'error' });
+			}
+			return;
+		}
+
+		// Cross-instance: publish a fire-and-forget envelope on the owning
+		// instance's push channel. No reply path, no per-message ref --
+		// per-key replacement happens on the receiver via the existing
+		// platform.sendCoalesced semantics, so a duplicate or out-of-order
+		// envelope from a flaky link just gets coalesced on arrival.
+		await ensureSubscriber(activePlatform);
+		const envelope = {
+			type: 'coalesced',
+			sessionId: entry.sessionId,
+			key,
+			topic,
+			event,
+			data
+		};
+		try {
+			await redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope));
+			breaker?.success();
+			mCoalesced?.inc({ result: 'ok' });
+		} catch (err) {
+			breaker?.failure(err);
+			mCoalesced?.inc({ result: 'error' });
+		}
+	}
+
 	const tracker = /** @type {ConnectionRegistry} */ ({
 		instanceId,
 		lookup,
 		request,
+		sendCoalesced,
 		size() { return localUsers.size; },
 		hooks: {
 			async open(ws, ctx) {
