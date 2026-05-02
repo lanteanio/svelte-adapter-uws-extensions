@@ -204,6 +204,112 @@ describe('redis sharded pubsub bus (integration)', () => {
 		});
 	});
 
+	describe('publishBatched cross-connection', () => {
+		it('a batched envelope round-trips on a per-shard channel and re-dispatches via publishBatched', async () => {
+			const channelPrefix = uniqueChannelPrefix('batched');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (t) => t.split(':')[0]
+			}));
+			const busB = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (t) => t.split(':')[0]
+			}));
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+			await busB.follow('chat:room2');
+
+			busA.wrap(platformA).publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: { i: 1 } },
+				{ topic: 'chat:room2', event: 'msg', data: { i: 2 } },
+				{ topic: 'chat:room1', event: 'msg', data: { i: 3 } }
+			]);
+
+			await waitFor(() => platformB.publishedBatches.length > 0);
+			const batch = platformB.publishedBatches[0].messages;
+			expect(batch).toHaveLength(3);
+			expect(batch.map((m) => m.data.i)).toEqual([1, 2, 3]);
+			for (const m of batch) {
+				expect(m.options).toEqual({ relay: false });
+			}
+		});
+
+		it('groups by shard channel: two shards = two SPUBLISH envelopes, two batches on receiver', async () => {
+			const channelPrefix = uniqueChannelPrefix('batched-shards');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (t) => t.split(':')[0]
+			}));
+			const busB = track(createShardedBus(client, {
+				channelPrefix,
+				shardKey: (t) => t.split(':')[0]
+			}));
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+			await busB.follow('audit:org1');
+
+			busA.wrap(platformA).publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: { kind: 'chat-1' } },
+				{ topic: 'chat:room1', event: 'msg', data: { kind: 'chat-2' } },
+				{ topic: 'audit:org1', event: 'created', data: { kind: 'audit-1' } }
+			]);
+
+			// Two batched envelopes (one per shard channel) arrive on B.
+			await waitFor(() => platformB.publishedBatches.length === 2);
+			const allLocal = platformB.publishedBatches.flatMap((b) => b.messages);
+			expect(allLocal).toHaveLength(3);
+			const kinds = new Set(allLocal.map((m) => m.data.kind));
+			expect(kinds).toEqual(new Set(['chat-1', 'chat-2', 'audit-1']));
+		});
+
+		it('echo suppression: emitter is not double-delivered for batched envelopes', async () => {
+			const channelPrefix = uniqueChannelPrefix('batched-echo');
+			const platform = mockPlatform();
+			const bus = track(createShardedBus(client, { channelPrefix }));
+			await bus.activate(platform);
+			await bus.follow('chat');
+
+			bus.wrap(platform).publishBatched([
+				{ topic: 'chat', event: 'msg', data: { i: 1 } },
+				{ topic: 'chat', event: 'msg', data: { i: 2 } }
+			]);
+
+			// Generous wait so a missed echo suppression would surface as a
+			// second publishBatched call on the local platform.
+			await wait(200);
+			expect(platform.publishedBatches).toHaveLength(1);
+		});
+
+		it('preserves order across the wire for a 50-message batch', async () => {
+			const channelPrefix = uniqueChannelPrefix('batched-order');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, { channelPrefix }));
+			const busB = track(createShardedBus(client, { channelPrefix }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat');
+
+			const messages = [];
+			for (let i = 0; i < 50; i++) {
+				messages.push({ topic: 'chat', event: 'msg', data: { i } });
+			}
+			busA.wrap(platformA).publishBatched(messages);
+
+			await waitFor(() => platformB.publishedBatches.length > 0);
+			const got = platformB.publishedBatches[0].messages.map((m) => m.data.i);
+			expect(got).toEqual(messages.map((_, i) => i));
+		});
+	});
+
 	describe('follow / unfollow lifecycle', () => {
 		it('unfollow stops delivery on a real connection', async () => {
 			const channelPrefix = uniqueChannelPrefix('unfollow');

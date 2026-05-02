@@ -189,6 +189,26 @@ export function message(ws, { data, platform }) {
 }
 ```
 
+#### Wire-batched publish (`publishBatched`)
+
+When a single request publishes many events at once -- bulk imports, room state resets, audit fanouts -- use `publishBatched` instead of a `publish` loop. It ships **one** Redis envelope for the whole batch, and receivers fan out via `platform.publishBatched` so each subscriber sees **one** WebSocket frame per call.
+
+```js
+distributed.publishBatched([
+  { topic: 'org:42:items', event: 'updated', data: a },
+  { topic: 'org:42:items', event: 'updated', data: b },
+  { topic: 'org:42:audit',  event: 'created', data: c }
+]);
+```
+
+Trade-offs vs `wrapped.publish` in a tight loop:
+
+- **Redis publish count drops linearly with batch size.** A 50-message batch is one PUBLISH on the wire instead of 50 -- around 50x reduction on the bulk-import profile, ~3x on small disjoint batches (measured in `bench/01-publish-batched-bus.mjs`).
+- **Per-subscriber wire frames drop too.** A subscriber receives one frame containing N events instead of N frames containing one event each.
+- **Per-message `relay: false` is honored.** Flagged messages still publish locally but are excluded from the Redis envelope.
+
+`wrapped.batch(messages)` is left in place for callers that explicitly want N independent publishes; it does not produce wire batching. Use `publishBatched` whenever you want one frame per subscriber per call.
+
 #### Options
 
 | Option | Default | Description |
@@ -204,7 +224,7 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 
 | Method | Description |
 |---|---|
-| `bus.wrap(platform)` | Returns a new Platform whose `publish()` sends to Redis + local |
+| `bus.wrap(platform)` | Returns a new Platform whose `publish()`, `batch()`, and `publishBatched()` send to Redis + local. Other Platform methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass through unchanged |
 | `bus.activate(platform)` | Start the Redis subscriber (idempotent) |
 | `bus.deactivate()` | Stop the subscriber |
 
@@ -251,6 +271,22 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 ```
 
 `bus.hooks` is the recommended path -- it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
+
+#### Wire-batched publish (`publishBatched`)
+
+`distributed.publishBatched(messages)` ships **one** SPUBLISH envelope per shard channel per call. Receivers fan out via `platform.publishBatched` so each follower sees **one** WebSocket frame per call.
+
+```js
+distributed.publishBatched([
+  { topic: 'chat:room1', event: 'msg',     data: a },
+  { topic: 'chat:room2', event: 'msg',     data: b },
+  { topic: 'audit:org1', event: 'created', data: c }
+]);
+// With shardKey: (t) => t.split(':')[0], this is two SPUBLISH envelopes
+// (one to the 'chat' shard channel, one to 'audit') instead of three.
+```
+
+Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with batch size, per-subscriber wire frames drop from N to 1, per-message `relay: false` honored. Use `publishBatched` for bulk operations; `wrapped.batch(messages)` remains a per-event loop for callers that explicitly want N separate publishes.
 
 #### Options
 

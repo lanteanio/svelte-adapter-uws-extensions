@@ -317,6 +317,107 @@ describe('redis pubsub bus (integration)', () => {
 		});
 	});
 
+	describe('publishBatched cross-connection', () => {
+		it('a batched envelope round-trips and re-dispatches via publishBatched on the receiver', async () => {
+			const channel = uniqueChannel('batched-rt');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createPubSubBus(client, { channel }));
+			const busB = track(createPubSubBus(client, { channel }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			busA.wrap(platformA).publishBatched([
+				{ topic: 'chat', event: 'msg', data: { i: 1 } },
+				{ topic: 'chat', event: 'msg', data: { i: 2 } },
+				{ topic: 'audit', event: 'created', data: { i: 3 } }
+			]);
+
+			// B receives ONE batched envelope and re-dispatches via publishBatched.
+			await waitFor(() => platformB.publishedBatches.length > 0);
+			expect(platformB.publishedBatches).toHaveLength(1);
+			const batch = platformB.publishedBatches[0].messages;
+			expect(batch).toHaveLength(3);
+			expect(batch.map((m) => m.data.i)).toEqual([1, 2, 3]);
+			// All three carry relay: false so the receiving adapter does not
+			// re-relay back into the cluster bus.
+			for (const m of batch) {
+				expect(m.options).toEqual({ relay: false });
+			}
+
+			// A is echo-suppressed: its own publishBatched call ran locally
+			// once, the round-tripped envelope did not produce a second.
+			expect(platformA.publishedBatches).toHaveLength(1);
+		});
+
+		it('preserves submission order across the wire', async () => {
+			const channel = uniqueChannel('batched-order');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createPubSubBus(client, { channel }));
+			const busB = track(createPubSubBus(client, { channel }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			const messages = [];
+			for (let i = 0; i < 50; i++) {
+				messages.push({ topic: 'chat', event: 'msg', data: { i } });
+			}
+			busA.wrap(platformA).publishBatched(messages);
+
+			await waitFor(() => platformB.publishedBatches.length > 0);
+			const got = platformB.publishedBatches[0].messages.map((m) => m.data.i);
+			expect(got).toEqual(messages.map((_, i) => i));
+		});
+
+		it('mixes publish + publishBatched in one tick and both arrive on the remote', async () => {
+			const channel = uniqueChannel('batched-mix');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createPubSubBus(client, { channel }));
+			const busB = track(createPubSubBus(client, { channel }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			const wrapped = busA.wrap(platformA);
+			wrapped.publish('a', 'x', { kind: 'single' });
+			wrapped.publishBatched([
+				{ topic: 'b', event: 'y', data: { kind: 'batched', i: 1 } },
+				{ topic: 'b', event: 'y', data: { kind: 'batched', i: 2 } }
+			]);
+			wrapped.publish('c', 'z', { kind: 'single' });
+
+			await waitFor(() => platformB.published.length >= 4);
+			const single = platformB.published.filter((p) => p.data && p.data.kind === 'single');
+			const batched = platformB.publishedBatches[0]?.messages || [];
+			expect(single).toHaveLength(2);
+			expect(batched).toHaveLength(2);
+		});
+
+		it('per-message relay: false suppresses only the flagged message on the wire', async () => {
+			const channel = uniqueChannel('batched-relay-false');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createPubSubBus(client, { channel }));
+			const busB = track(createPubSubBus(client, { channel }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			busA.wrap(platformA).publishBatched([
+				{ topic: 'a', event: 'x', data: 1 },
+				{ topic: 'a', event: 'x', data: 2, options: { relay: false } },
+				{ topic: 'a', event: 'x', data: 3 }
+			]);
+
+			await waitFor(() => platformB.publishedBatches.length > 0);
+			const got = platformB.publishedBatches[0].messages.map((m) => m.data);
+			expect(got).toEqual([1, 3]);
+
+			// All three still ran on A's local platform.
+			expect(platformA.publishedBatches[0].messages).toHaveLength(3);
+		});
+	});
+
 	describe('subscriber lifecycle', () => {
 		it('deactivate() releases the subscriber and stops delivering', async () => {
 			const channel = uniqueChannel('deactivate');

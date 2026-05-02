@@ -95,13 +95,15 @@ export function createPubSubBus(client, options = {}) {
 	let unsubscribeBreaker = null;
 
 	// Microtask relay batching: coalesce Redis publishes within a single
-	// event-loop tick into one pipelined round trip.
-	/** @type {Array<string>} */
+	// event-loop tick into one pipelined round trip. Each envelope tracks
+	// its underlying message count so the relayed-messages counter stays
+	// accurate when batch envelopes carry many messages each.
+	/** @type {Array<{msg: string, count: number}>} */
 	let relayBatch = [];
 	let relayScheduled = false;
 
-	function scheduleRelay(msg) {
-		relayBatch.push(msg);
+	function scheduleRelay(msg, count) {
+		relayBatch.push({ msg, count });
 		if (!relayScheduled) {
 			relayScheduled = true;
 			queueMicrotask(flushRelay);
@@ -115,21 +117,24 @@ export function createPubSubBus(client, options = {}) {
 		if (b) {
 			try { b.guard(); } catch { return; }
 		}
+		let totalMessages = 0;
+		for (let i = 0; i < batch.length; i++) totalMessages += batch[i].count;
+
 		if (batch.length === 1) {
-			client.redis.publish(channel, batch[0]).then(() => {
+			client.redis.publish(channel, batch[0].msg).then(() => {
 				mBatchSize?.observe(1);
-				mRelayed?.inc(1);
+				mRelayed?.inc(totalMessages);
 				b?.success();
 			}).catch((err) => { b?.failure(err); });
 			return;
 		}
 		const pipe = client.redis.pipeline();
 		for (let i = 0; i < batch.length; i++) {
-			pipe.publish(channel, batch[i]);
+			pipe.publish(channel, batch[i].msg);
 		}
 		pipe.exec().then(() => {
 			mBatchSize?.observe(batch.length);
-			mRelayed?.inc(batch.length);
+			mRelayed?.inc(totalMessages);
 			b?.success();
 		}).catch((err) => { b?.failure(err); });
 	}
@@ -141,11 +146,15 @@ export function createPubSubBus(client, options = {}) {
 					const result = platform.publish(topic, event, data, options);
 
 					if (!options || options.relay !== false) {
-						scheduleRelay(JSON.stringify({ instanceId, topic, event, data }));
+						scheduleRelay(JSON.stringify({ instanceId, topic, event, data }), 1);
 					}
 
 					return result;
 				},
+				// Per-event loop. Mirrors `platform.batch` semantics: N submitted
+				// messages produce N wire frames per subscriber. Use
+				// `publishBatched` instead when you want one wire frame per
+				// subscriber per call.
 				batch(messages) {
 					const results = platform.batch(messages);
 					for (let i = 0; i < messages.length; i++) {
@@ -153,14 +162,41 @@ export function createPubSubBus(client, options = {}) {
 						if (!m.options || m.options.relay !== false) {
 							scheduleRelay(JSON.stringify({
 								instanceId, topic: m.topic, event: m.event, data: m.data
-							}));
+							}), 1);
 						}
 					}
 					return results;
 				},
+				// Wire-batched publish. One Redis envelope per call carries the
+				// whole list; receivers fan out via local `platform.publishBatched`
+				// for one wire frame per subscriber. Empty arrays no-op.
+				publishBatched(messages) {
+					if (!Array.isArray(messages)) {
+						throw new TypeError('pubsub bus: publishBatched requires an array of messages');
+					}
+					if (messages.length === 0) return;
+
+					platform.publishBatched(messages);
+
+					const relayable = [];
+					for (let i = 0; i < messages.length; i++) {
+						const m = messages[i];
+						if (!m.options || m.options.relay !== false) {
+							relayable.push({ topic: m.topic, event: m.event, data: m.data });
+						}
+					}
+					if (relayable.length === 0) return;
+
+					scheduleRelay(JSON.stringify({ instanceId, batch: relayable }), relayable.length);
+				},
 				send: platform.send.bind(platform),
 				sendTo: platform.sendTo.bind(platform),
+				sendCoalesced: platform.sendCoalesced.bind(platform),
+				request: platform.request.bind(platform),
 				get connections() { return platform.connections; },
+				get requestId() { return platform.requestId; },
+				get pressure() { return platform.pressure; },
+				onPressure: platform.onPressure.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
 				topic(t) {
 					return {
@@ -213,16 +249,33 @@ export function createPubSubBus(client, options = {}) {
 				if (ch !== channel) return;
 				try {
 					const parsed = JSON.parse(message);
-					// Skip messages from this instance (echo suppression)
+					// Skip messages from this instance (echo suppression).
+					// One check per envelope; batched envelopes carry one
+					// instanceId for the whole batch.
 					if (parsed.instanceId === instanceId) {
 						mEchoSuppressed?.inc();
 						return;
 					}
-					mReceived?.inc();
-					// Forward to local platform only -- relay: false prevents the
-					// adapter from IPC-relaying to sibling workers, since each
-					// worker has its own Redis subscriber already receiving this.
-					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+					// relay: false prevents the adapter from IPC-relaying to
+					// sibling workers, since each worker has its own Redis
+					// subscriber already receiving this envelope.
+					if (Array.isArray(parsed.batch)) {
+						mReceived?.inc(parsed.batch.length);
+						const local = new Array(parsed.batch.length);
+						for (let i = 0; i < parsed.batch.length; i++) {
+							const m = parsed.batch[i];
+							local[i] = {
+								topic: m.topic,
+								event: m.event,
+								data: m.data,
+								options: { relay: false }
+							};
+						}
+						activePlatform.publishBatched(local);
+					} else {
+						mReceived?.inc();
+						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+					}
 				} catch {
 					// Malformed message, skip
 				}

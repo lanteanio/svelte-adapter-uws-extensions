@@ -67,6 +67,241 @@ describe('redis pubsub bus', () => {
 		});
 	});
 
+	describe('publishBatched', () => {
+		it('throws on non-array input', () => {
+			const wrapped = bus.wrap(platform);
+			expect(() => wrapped.publishBatched('nope')).toThrow('publishBatched requires an array');
+			expect(() => wrapped.publishBatched(null)).toThrow('publishBatched requires an array');
+			expect(() => wrapped.publishBatched({ topic: 'x' })).toThrow('publishBatched requires an array');
+		});
+
+		it('no-ops on empty array (no Redis call, no local fan-out)', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(ch); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(0);
+			expect(platform.published).toHaveLength(0);
+			expect(platform.publishedBatches).toHaveLength(0);
+		});
+
+		it('calls platform.publishBatched locally with the original messages', () => {
+			const wrapped = bus.wrap(platform);
+			wrapped.publishBatched([
+				{ topic: 'chat', event: 'msg', data: { text: 'a' } },
+				{ topic: 'audit', event: 'created', data: { id: 1 } }
+			]);
+
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages).toHaveLength(2);
+			expect(platform.published.filter((p) => p.batched)).toHaveLength(2);
+		});
+
+		it('ships ONE Redis envelope per call carrying the whole batch', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => {
+				calls.push({ ch, parsed: JSON.parse(msg) });
+				return orig.call(client.redis, ch, msg);
+			};
+
+			wrapped.publishBatched([
+				{ topic: 'chat', event: 'msg', data: { text: 'a' } },
+				{ topic: 'chat', event: 'msg', data: { text: 'b' } },
+				{ topic: 'chat', event: 'msg', data: { text: 'c' } }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(1);
+			expect(calls[0].ch).toBe('uws:pubsub');
+			expect(calls[0].parsed.instanceId).toBeDefined();
+			expect(calls[0].parsed.topic).toBeUndefined();
+			expect(calls[0].parsed.batch).toHaveLength(3);
+			expect(calls[0].parsed.batch[0]).toEqual({ topic: 'chat', event: 'msg', data: { text: 'a' } });
+		});
+
+		it('honors per-message relay: false (excludes from envelope, keeps local)', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'x', data: 1 },
+				{ topic: 'b', event: 'y', data: 2, options: { relay: false } },
+				{ topic: 'c', event: 'z', data: 3 }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(1);
+			expect(calls[0].batch).toHaveLength(2);
+			expect(calls[0].batch.map((m) => m.topic)).toEqual(['a', 'c']);
+			// All 3 still went through the local publishBatched.
+			expect(platform.publishedBatches[0].messages).toHaveLength(3);
+		});
+
+		it('skips Redis entirely when every message has relay: false', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(ch); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'x', data: 1, options: { relay: false } },
+				{ topic: 'b', event: 'y', data: 2, options: { relay: false } }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(0);
+			expect(platform.publishedBatches).toHaveLength(1);
+		});
+
+		it('mixes with publish() in the same tick (both ride the same pipeline flush)', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publish('a', 'x', 1);
+			wrapped.publishBatched([{ topic: 'b', event: 'y', data: 2 }]);
+			wrapped.publish('c', 'z', 3);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(3);
+			expect(calls.find((p) => p.topic === 'a')).toBeDefined();
+			expect(calls.find((p) => p.topic === 'c')).toBeDefined();
+			expect(calls.find((p) => p.batch)).toBeDefined();
+		});
+
+		it('receiver dispatches batched envelope via platform.publishBatched with relay: false', async () => {
+			await bus.activate(platform);
+			platform.reset();
+
+			const envelope = JSON.stringify({
+				instanceId: 'other-instance',
+				batch: [
+					{ topic: 'a', event: 'x', data: 1 },
+					{ topic: 'b', event: 'y', data: 2 }
+				]
+			});
+			await client.redis.publish('uws:pubsub', envelope);
+
+			expect(platform.publishedBatches).toHaveLength(1);
+			const local = platform.publishedBatches[0].messages;
+			expect(local).toHaveLength(2);
+			expect(local[0]).toEqual({
+				topic: 'a',
+				event: 'x',
+				data: 1,
+				options: { relay: false }
+			});
+			expect(local[1].options).toEqual({ relay: false });
+		});
+
+		it('receiver echo-suppresses the whole batched envelope on instanceId match', async () => {
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }]);
+			await new Promise((r) => setTimeout(r, 5));
+			const ownInstanceId = calls[0].instanceId;
+
+			platform.reset();
+
+			// An echoed envelope (matching instanceId) carrying multiple messages
+			// must drop the entire batch on one check, not per-message.
+			const echo = JSON.stringify({
+				instanceId: ownInstanceId,
+				batch: [
+					{ topic: 'a', event: 'x', data: 1 },
+					{ topic: 'b', event: 'y', data: 2 }
+				]
+			});
+			await client.redis.publish('uws:pubsub', echo);
+
+			expect(platform.publishedBatches).toHaveLength(0);
+			expect(platform.published).toHaveLength(0);
+		});
+	});
+
+	describe('wrap - new platform passthroughs', () => {
+		it('exposes publishBatched, sendCoalesced, request, requestId, pressure, onPressure', () => {
+			const wrapped = bus.wrap(platform);
+			expect(typeof wrapped.publishBatched).toBe('function');
+			expect(typeof wrapped.sendCoalesced).toBe('function');
+			expect(typeof wrapped.request).toBe('function');
+			expect(typeof wrapped.requestId).toBe('string');
+			expect(wrapped.pressure).toBeDefined();
+			expect(typeof wrapped.onPressure).toBe('function');
+		});
+
+		it('sendCoalesced delegates to the original platform', () => {
+			const wrapped = bus.wrap(platform);
+			const ws = {};
+			wrapped.sendCoalesced(ws, { key: 'price', payload: { v: 100 } });
+			expect(platform.sentCoalesced).toHaveLength(1);
+			expect(platform.sentCoalesced[0]).toMatchObject({ ws, key: 'price', payload: { v: 100 } });
+		});
+
+		it('request delegates to the original platform', async () => {
+			const wrapped = bus.wrap(platform);
+			const ws = {};
+			await wrapped.request(ws, 'confirm', { op: 'delete' }, { timeoutMs: 100 });
+			expect(platform.requested).toHaveLength(1);
+			expect(platform.requested[0]).toMatchObject({
+				ws,
+				event: 'confirm',
+				data: { op: 'delete' },
+				options: { timeoutMs: 100 }
+			});
+		});
+
+		it('requestId getter reads from the underlying platform', () => {
+			platform.requestId = 'req-abc-123';
+			const wrapped = bus.wrap(platform);
+			expect(wrapped.requestId).toBe('req-abc-123');
+		});
+
+		it('pressure getter reflects platform pressure transitions', () => {
+			const wrapped = bus.wrap(platform);
+			platform._setPressure({
+				active: true, reason: 'MEMORY',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 999
+			});
+			expect(wrapped.pressure.active).toBe(true);
+			expect(wrapped.pressure.reason).toBe('MEMORY');
+		});
+
+		it('onPressure subscribes to the underlying platform', () => {
+			const wrapped = bus.wrap(platform);
+			let received = null;
+			const off = wrapped.onPressure((snap) => { received = snap; });
+
+			platform._setPressure({
+				active: true, reason: 'PUBLISH_RATE',
+				subscriberRatio: 0, publishRate: 9999, memoryMB: 0
+			});
+			expect(received).toMatchObject({ reason: 'PUBLISH_RATE' });
+
+			off();
+			platform._setPressure({
+				active: false, reason: 'NONE',
+				subscriberRatio: 0, publishRate: 0, memoryMB: 0
+			});
+			// After unsubscribe, no further updates land in `received`.
+			expect(received).toMatchObject({ reason: 'PUBLISH_RATE' });
+		});
+	});
+
 	describe('activate / deactivate', () => {
 		it('activate is idempotent', async () => {
 			await bus.activate(platform);

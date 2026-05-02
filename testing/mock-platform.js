@@ -6,8 +6,12 @@ export function mockPlatform() {
 	const pressureSubscribers = new Set();
 	const p = {
 		published: [],
+		publishedBatches: [],
 		sent: [],
+		sentCoalesced: [],
+		requested: [],
 		connections: 0,
+		requestId: '',
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
@@ -31,9 +35,30 @@ export function mockPlatform() {
 			p.published.push({ topic, event, data, options });
 			return true;
 		},
+		publishBatched(messages) {
+			p.publishedBatches.push({ messages });
+			for (let i = 0; i < messages.length; i++) {
+				const m = messages[i];
+				p.published.push({
+					topic: m.topic,
+					event: m.event,
+					data: m.data,
+					options: m.options,
+					batched: true
+				});
+			}
+		},
 		send(ws, topic, event, data) {
 			p.sent.push({ ws, topic, event, data });
 			return 1;
+		},
+		sendCoalesced(ws, payload) {
+			p.sentCoalesced.push({ ws, ...payload });
+			return 1;
+		},
+		request(ws, event, data, options) {
+			p.requested.push({ ws, event, data, options });
+			return Promise.resolve(undefined);
 		},
 		batch(messages) {
 			return messages.map((m) => p.publish(m.topic, m.event, m.data));
@@ -57,7 +82,10 @@ export function mockPlatform() {
 		},
 		reset() {
 			p.published.length = 0;
+			p.publishedBatches.length = 0;
 			p.sent.length = 0;
+			p.sentCoalesced.length = 0;
+			p.requested.length = 0;
 		}
 	};
 	return p;

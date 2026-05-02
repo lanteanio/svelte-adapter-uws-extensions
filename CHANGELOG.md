@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Wire-batched publish on both pub/sub buses.** `wrapped.publishBatched(messages)` ships **one** Redis envelope per call (one PUBLISH for `createPubSubBus`, or one SPUBLISH per shard channel for `createShardedBus`), and receivers fan out via `platform.publishBatched` so each subscriber sees one WebSocket frame per call. Compared to a `wrapped.publish` loop in the same tick, Redis publish count drops linearly with batch size (50x reduction on a 50-message bulk-import bench, around 3x on a 3-message disjoint control); end-to-end latency drops 1.9x to 4.5x across the three bench profiles in `bench/01-publish-batched-bus.mjs`. Per-message `relay: false` is honored. `wrapped.batch(messages)` is left in place for callers that explicitly want N independent publishes; it does not produce wire batching. Requires `svelte-adapter-uws >= 0.5.0-next.4`.
+- **Bus wrap exposes the rest of the Platform surface.** `wrap(platform)` now also passes through `sendCoalesced`, `request`, `requestId`, `pressure`, and `onPressure` from the underlying platform, so user code can use the wrapped object as a complete Platform replacement. Previously these methods were missing from the wrap and required reaching back to the raw platform.
+
+### Changed
+
+- **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.4`** (was `^0.5.0-next.0`). The new range matches the `0.5.0-next.4` adapter release that ships `platform.publishBatched`, `platform.sendCoalesced`, `platform.request`, `platform.requestId`, and `platform.pressure` -- all of which the bus wrap now consumes or passes through.
+
 ## [0.5.0-next.1] - 2026-05-01
 
 ### Added

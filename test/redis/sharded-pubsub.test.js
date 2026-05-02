@@ -127,6 +127,242 @@ describe('redis sharded bus', () => {
 		});
 	});
 
+	describe('publishBatched', () => {
+		it('throws on non-array input', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			expect(() => wrapped.publishBatched('nope')).toThrow('publishBatched requires an array');
+			expect(() => wrapped.publishBatched(null)).toThrow('publishBatched requires an array');
+
+			await bus.deactivate();
+		});
+
+		it('no-ops on empty array', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.spublish;
+			client.redis.spublish = async (ch, msg) => { calls.push(ch); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(0);
+			expect(platform.publishedBatches).toHaveLength(0);
+
+			await bus.deactivate();
+		});
+
+		it('calls platform.publishBatched locally', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			wrapped.publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: 1 },
+				{ topic: 'chat:room2', event: 'msg', data: 2 }
+			]);
+
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages).toHaveLength(2);
+
+			await bus.deactivate();
+		});
+
+		it('groups messages by shard channel: one SPUBLISH envelope per channel', async () => {
+			const bus = createShardedBus(client, {
+				shardKey: (t) => t.split(':')[0]
+			});
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.spublish;
+			client.redis.spublish = async (ch, msg) => {
+				calls.push({ ch, parsed: JSON.parse(msg) });
+				return orig.call(client.redis, ch, msg);
+			};
+
+			// 4 messages across 2 shards (chat / audit).
+			wrapped.publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: 1 },
+				{ topic: 'chat:room2', event: 'msg', data: 2 },
+				{ topic: 'audit:org1', event: 'created', data: 3 },
+				{ topic: 'audit:org2', event: 'created', data: 4 }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(2);
+			const chat = calls.find((c) => c.ch === 'uws:sharded:chat');
+			const audit = calls.find((c) => c.ch === 'uws:sharded:audit');
+			expect(chat.parsed.batch).toHaveLength(2);
+			expect(audit.parsed.batch).toHaveLength(2);
+			expect(chat.parsed.batch.map((m) => m.data)).toEqual([1, 2]);
+			expect(audit.parsed.batch.map((m) => m.data)).toEqual([3, 4]);
+
+			await bus.deactivate();
+		});
+
+		it('per-topic shardKey (default) ships one envelope per topic', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.spublish;
+			client.redis.spublish = async (ch, msg) => { calls.push({ ch }); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: 1 },
+				{ topic: 'chat:room2', event: 'msg', data: 2 }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(2);
+			expect(calls.map((c) => c.ch).sort()).toEqual([
+				'uws:sharded:chat:room1',
+				'uws:sharded:chat:room2'
+			]);
+
+			await bus.deactivate();
+		});
+
+		it('honors per-message relay: false (excludes from envelope, keeps local)', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.spublish;
+			client.redis.spublish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'x', data: 1 },
+				{ topic: 'a', event: 'y', data: 2, options: { relay: false } },
+				{ topic: 'a', event: 'z', data: 3 }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			// One channel ('uws:sharded:a'), one envelope, two messages.
+			expect(calls).toHaveLength(1);
+			expect(calls[0].batch).toHaveLength(2);
+			expect(calls[0].batch.map((m) => m.event)).toEqual(['x', 'z']);
+			// Local fan-out gets all 3.
+			expect(platform.publishedBatches[0].messages).toHaveLength(3);
+
+			await bus.deactivate();
+		});
+
+		it('skips Redis entirely when every message has relay: false', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+
+			const calls = [];
+			const orig = client.redis.spublish;
+			client.redis.spublish = async (ch, msg) => { calls.push(ch); return orig.call(client.redis, ch, msg); };
+
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'x', data: 1, options: { relay: false } },
+				{ topic: 'b', event: 'y', data: 2, options: { relay: false } }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(0);
+
+			await bus.deactivate();
+		});
+
+		it('cross-instance: receiver dispatches batched envelope via platform.publishBatched', async () => {
+			const busA = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const busB = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+			await busB.follow('chat:room2');
+
+			const wrapped = busA.wrap(platformA);
+			wrapped.publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: { id: 1 } },
+				{ topic: 'chat:room2', event: 'msg', data: { id: 2 } }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			// B received the batched envelope and re-dispatched via publishBatched.
+			expect(platformB.publishedBatches).toHaveLength(1);
+			const local = platformB.publishedBatches[0].messages;
+			expect(local).toHaveLength(2);
+			expect(local[0].options).toEqual({ relay: false });
+			expect(local[1].options).toEqual({ relay: false });
+
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
+		it('echo-suppresses the whole batched envelope on instanceId match', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await bus.follow('chat');
+
+			const wrapped = bus.wrap(platform);
+			wrapped.publishBatched([
+				{ topic: 'chat', event: 'msg', data: 1 },
+				{ topic: 'chat', event: 'msg', data: 2 }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			// Local fan-out happened (1 publishBatched call recorded), but the
+			// SPUBLISHed echo did NOT round-trip back into a second call.
+			expect(platform.publishedBatches).toHaveLength(1);
+
+			await bus.deactivate();
+		});
+	});
+
+	describe('wrap - new platform passthroughs', () => {
+		it('exposes publishBatched, sendCoalesced, request, requestId, pressure, onPressure', () => {
+			const bus = createShardedBus(client);
+			const wrapped = bus.wrap(platform);
+			expect(typeof wrapped.publishBatched).toBe('function');
+			expect(typeof wrapped.sendCoalesced).toBe('function');
+			expect(typeof wrapped.request).toBe('function');
+			expect(typeof wrapped.requestId).toBe('string');
+			expect(wrapped.pressure).toBeDefined();
+			expect(typeof wrapped.onPressure).toBe('function');
+		});
+
+		it('sendCoalesced and request delegate to the underlying platform', async () => {
+			const bus = createShardedBus(client);
+			const wrapped = bus.wrap(platform);
+			const ws = {};
+			wrapped.sendCoalesced(ws, { key: 'cursor:doc-1', payload: { x: 10, y: 20 } });
+			await wrapped.request(ws, 'confirm', { op: 'delete' });
+
+			expect(platform.sentCoalesced).toHaveLength(1);
+			expect(platform.requested).toHaveLength(1);
+		});
+
+		it('requestId / pressure getters track the underlying platform', () => {
+			const bus = createShardedBus(client);
+			platform.requestId = 'req-9';
+			const wrapped = bus.wrap(platform);
+			expect(wrapped.requestId).toBe('req-9');
+
+			platform._setPressure({
+				active: true, reason: 'SUBSCRIBERS',
+				subscriberRatio: 0.95, publishRate: 0, memoryMB: 0
+			});
+			expect(wrapped.pressure.reason).toBe('SUBSCRIBERS');
+		});
+	});
+
 	describe('follow / unfollow', () => {
 		it('SSUBSCRIBE on first follow, SUNSUBSCRIBE on last unfollow', async () => {
 			const bus = createShardedBus(client);

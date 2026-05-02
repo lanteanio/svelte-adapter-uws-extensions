@@ -88,18 +88,20 @@ export function createShardedBus(client, options = {}) {
 	const wsFollows = new WeakMap();
 
 	// Per-channel microtask batch: coalesce SPUBLISHes for the same
-	// channel within one tick into a single pipelined call.
-	/** @type {Map<string, Array<string>>} */
+	// channel within one tick into a single pipelined call. Each entry
+	// tracks the underlying topic list so the relayed-messages counter
+	// stays accurate when batch envelopes carry many messages.
+	/** @type {Map<string, Array<{msg: string, topics: string[]}>>} */
 	let channelBatches = new Map();
 	let relayScheduled = false;
 
-	function scheduleRelay(channel, msg, topic) {
+	function scheduleRelay(channel, msg, topics) {
 		let arr = channelBatches.get(channel);
 		if (!arr) {
 			arr = [];
 			channelBatches.set(channel, arr);
 		}
-		arr.push({ msg, topic });
+		arr.push({ msg, topics });
 		if (!relayScheduled) {
 			relayScheduled = true;
 			queueMicrotask(flushRelay);
@@ -123,8 +125,10 @@ export function createShardedBus(client, options = {}) {
 		}
 		pipe.exec().then(() => {
 			for (const { entries } of counts) {
-				for (const { topic } of entries) {
-					mRelayed?.inc({ topic: mt(topic) });
+				for (const { topics } of entries) {
+					for (let i = 0; i < topics.length; i++) {
+						mRelayed?.inc({ topic: mt(topics[i]) });
+					}
 				}
 			}
 			b?.success();
@@ -141,12 +145,28 @@ export function createShardedBus(client, options = {}) {
 		subscriber.on('smessage', (ch, message) => {
 			try {
 				const parsed = JSON.parse(message);
+				// One echo check per envelope; batched envelopes carry
+				// one instanceId for the whole batch.
 				if (parsed.instanceId === instanceId) {
 					mEchoSuppressed?.inc();
 					return;
 				}
-				mReceived?.inc({ topic: mt(parsed.topic) });
-				if (activePlatform) {
+				if (!activePlatform) return;
+				if (Array.isArray(parsed.batch)) {
+					const local = new Array(parsed.batch.length);
+					for (let i = 0; i < parsed.batch.length; i++) {
+						const m = parsed.batch[i];
+						mReceived?.inc({ topic: mt(m.topic) });
+						local[i] = {
+							topic: m.topic,
+							event: m.event,
+							data: m.data,
+							options: { relay: false }
+						};
+					}
+					activePlatform.publishBatched(local);
+				} else {
+					mReceived?.inc({ topic: mt(parsed.topic) });
 					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 				}
 			} catch {
@@ -269,10 +289,14 @@ export function createShardedBus(client, options = {}) {
 					const result = platform.publish(topic, event, data, opts);
 					if (!opts || opts.relay !== false) {
 						const channel = channelFor(topic);
-						scheduleRelay(channel, JSON.stringify({ instanceId, topic, event, data }), topic);
+						scheduleRelay(channel, JSON.stringify({ instanceId, topic, event, data }), [topic]);
 					}
 					return result;
 				},
+				// Per-event loop. Mirrors `platform.batch` semantics: N submitted
+				// messages produce N wire frames per subscriber. Use
+				// `publishBatched` instead when you want one wire frame per
+				// subscriber per call.
 				batch(messages) {
 					const results = platform.batch(messages);
 					for (let i = 0; i < messages.length; i++) {
@@ -281,14 +305,50 @@ export function createShardedBus(client, options = {}) {
 							const channel = channelFor(mes.topic);
 							scheduleRelay(channel, JSON.stringify({
 								instanceId, topic: mes.topic, event: mes.event, data: mes.data
-							}), mes.topic);
+							}), [mes.topic]);
 						}
 					}
 					return results;
 				},
+				// Wire-batched publish. One SPUBLISH envelope per shard channel
+				// per call. Receivers fan out via local `platform.publishBatched`
+				// for one wire frame per subscriber. Empty arrays no-op.
+				publishBatched(messages) {
+					if (!Array.isArray(messages)) {
+						throw new TypeError('sharded bus: publishBatched requires an array of messages');
+					}
+					if (messages.length === 0) return;
+
+					platform.publishBatched(messages);
+
+					/** @type {Map<string, Array<{topic: string, event: string, data: unknown}>>} */
+					const byChannel = new Map();
+					for (let i = 0; i < messages.length; i++) {
+						const mes = messages[i];
+						if (mes.options && mes.options.relay === false) continue;
+						const ch = channelFor(mes.topic);
+						let arr = byChannel.get(ch);
+						if (!arr) {
+							arr = [];
+							byChannel.set(ch, arr);
+						}
+						arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
+					}
+
+					for (const [ch, batch] of byChannel) {
+						const topics = new Array(batch.length);
+						for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
+						scheduleRelay(ch, JSON.stringify({ instanceId, batch }), topics);
+					}
+				},
 				send: platform.send.bind(platform),
 				sendTo: platform.sendTo.bind(platform),
+				sendCoalesced: platform.sendCoalesced.bind(platform),
+				request: platform.request.bind(platform),
 				get connections() { return platform.connections; },
+				get requestId() { return platform.requestId; },
+				get pressure() { return platform.pressure; },
+				onPressure: platform.onPressure.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
 				topic(t) {
 					return {
