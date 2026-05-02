@@ -636,6 +636,111 @@ export const { close } = presence.hooks;
 
 ---
 
+## Connection registry
+
+The adapter's `platform.request(ws, ...)` is single-instance: it takes a local `ws` reference, so it only works against connections owned by the calling instance. `createConnectionRegistry` is the cluster-routed counterpart -- a `userId -> {instanceId, sessionId, ts}` map in Redis plus a per-instance push channel that lets any instance route a request to whichever one currently owns a given user's WebSocket.
+
+#### Setup
+
+```js
+// src/lib/server/registry.js
+import { redis } from './redis.js';
+import { createConnectionRegistry } from 'svelte-adapter-uws-extensions/redis/registry';
+
+export const registry = createConnectionRegistry(redis, {
+  identify: (ws) => ws.getUserData()?.userId
+});
+```
+
+Wire the open / close hooks so each connection is tracked cluster-wide:
+
+```js
+// src/hooks.ws.js
+import { registry } from '$lib/server/registry';
+
+export const open = registry.hooks.open;
+export const close = registry.hooks.close;
+```
+
+The `identify` function returns the user identity for a WebSocket (return `null` / `undefined` for anonymous connections; the registry skips them). The registry reads the per-connection `WS_SESSION_ID` slot the adapter stamps on userData, so no other configuration is required.
+
+#### Cluster-routed request/reply
+
+```js
+// From any instance:
+const reply = await registry.request('user-123', 'confirm-action', { op: 'delete' }, {
+  timeoutMs: 5000
+});
+if (reply.confirmed) await actuallyDelete();
+```
+
+The lookup resolves which instance currently owns `user-123`'s connection. If that's the calling instance, the request short-circuits to a local `platform.request(ws, ...)` -- no Redis hop. Otherwise the request envelope ships across the per-instance push channel, the owning instance calls `platform.request` locally, and the reply ships back on the origin's push channel.
+
+Wire envelopes (internal):
+
+| Direction | Channel | Payload |
+|---|---|---|
+| Origin -> owner | `{prefix}__push:{ownerInstanceId}` | `{type:'request', ref, sessionId, event, data, replyTo, timeoutMs}` |
+| Owner -> origin | `{prefix}__push:{originInstanceId}` | `{type:'reply', ref, data}` or `{type:'reply', ref, error}` |
+
+`request(...)` rejects on:
+
+- the target user being offline (no entry in Redis)
+- the request timing out (`timeoutMs` exceeded)
+- the owning instance reporting a handler error from its `platform.request`
+
+Mid-flight migration (user reconnects to a different instance between lookup and reply) surfaces as a timeout on the origin; the owning instance's late reply lands on a missing pending entry and is dropped with a `push_late_replies_total` increment. See [Edge cases](#registry-edge-cases) below.
+
+#### Storage shape
+
+| Key | Shape | Notes |
+|---|---|---|
+| `{prefix}conns:{userId}` | Hash `{instanceId, sessionId, ts}` | Most-recent-connection-wins. A second device on the same `userId` replaces the first; targeting from `request(...)` always reaches the most recent connection. |
+| `{prefix}__push:{instanceId}` | Pub/sub channel | Each instance subscribes to its own channel. Inbound messages dispatch by `envelope.type`. |
+
+Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only removes the registry entry when the stored `instanceId` still matches this instance. Prevents a stale close from clobbering a registration that already migrated to another instance via a fast laptop-then-phone reconnect.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `identify` | (required) | `(ws) => userId | null`. Anonymous connections are skipped. |
+| `keyPrefix` | `''` | Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`. |
+| `ttl` | `90` | Expiry on registry entries in seconds. Should be > `heartbeat * 3` so a missed beat doesn't drop a live user. |
+| `heartbeat` | `30000` | TTL refresh interval in ms. Each tick `EXPIRE`s every locally-owned entry. |
+| `requestTimeoutMs` | `5000` | Default timeout for `request(...)` calls. Overridable per call via `options.timeoutMs`. |
+| `breaker` | -- | Optional circuit breaker for Redis ops. |
+| `metrics` | -- | Optional Prometheus metrics registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `lookup(userId)` | Resolve a userId to its current entry (`{instanceId, sessionId, ts}`) or `null`. |
+| `request(target, event, data?, opts?)` | Cluster-routed request/reply. Resolves with the reply. |
+| `size()` | Count of users registered to THIS instance (local view, scrape-time). |
+| `instanceId` | Stable id for this instance, also the name of its push channel. |
+| `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
+| `destroy()` | Stop the heartbeat timer and Redis subscriber. |
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `push_requests_total{result="ok|offline|timeout|error"}` | Outcomes for `request(...)` calls. `ok` is a successful reply; `offline` is a missing or local-ws-gone entry; `timeout` is no reply within `timeoutMs`; `error` is a handler-thrown error or a Redis publish failure. |
+| `push_reply_latency_ms` | Histogram of request-publish to reply-receive in milliseconds (success path). |
+| `push_registry_size` | Gauge: connections registered to this instance. Scrape-time, no continuous accounting. |
+| `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
+
+#### Registry edge cases
+
+- **User reconnects to a different instance mid-request.** The origin's pending entry waits on the OLD instance's reply channel. The user's new connection won't reply on that channel; the request times out. Any late reply from the old instance after teardown lands on a missing pending entry and is silently dropped (`push_late_replies_total` increments).
+- **Owning instance crashes between request publish and local `platform.request`.** Same shape as above -- request times out. The Redis entry remains until the TTL expires (sliding heartbeat cleared by the dead instance), after which subsequent `request(...)` calls see `result="offline"` from the lookup.
+- **Self-targeting** (the origin instance owns the user). Short-circuits to a local `platform.request(ws, ...)` without round-tripping Redis. One conditional in the dispatcher; not a special case at the API surface.
+- **Anonymous connections.** `identify(ws)` returning `null` / `undefined` makes the open / close hooks no-op. Anonymous users are not addressable through the registry by design.
+
+---
+
 ## Rate limiting
 
 Same API as the core `createRateLimit` plugin, but backed by Redis using an atomic Lua script. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.

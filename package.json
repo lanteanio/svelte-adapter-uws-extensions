@@ -73,6 +73,10 @@
       "types": "./redis/fence.d.ts",
       "default": "./redis/fence.js"
     },
+    "./redis/registry": {
+      "types": "./redis/registry.d.ts",
+      "default": "./redis/registry.js"
+    },
     "./postgres/idempotency": {
       "types": "./postgres/idempotency.d.ts",
       "default": "./postgres/idempotency.js"

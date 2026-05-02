@@ -190,10 +190,25 @@ export function mockRedisClient(keyPrefix = '') {
 			},
 
 			// Hash ops
-			async hset(key, field, value) {
+			async hset(key, ...args) {
 				if (!hashes.has(key)) hashes.set(key, new Map());
-				hashes.get(key).set(String(field), String(value));
-				return 1;
+				const h = hashes.get(key);
+				let added = 0;
+				if (args.length === 2) {
+					if (!h.has(String(args[0]))) added++;
+					h.set(String(args[0]), String(args[1]));
+				} else if (typeof args[0] === 'object' && args[0] !== null) {
+					for (const [f, v] of Object.entries(args[0])) {
+						if (!h.has(String(f))) added++;
+						h.set(String(f), String(v));
+					}
+				} else {
+					for (let i = 0; i < args.length; i += 2) {
+						if (!h.has(String(args[i]))) added++;
+						h.set(String(args[i]), String(args[i + 1]));
+					}
+				}
+				return added;
 			},
 			async hmset(key, ...args) {
 				if (!hashes.has(key)) hashes.set(key, new Map());
@@ -409,6 +424,10 @@ export function mockRedisClient(keyPrefix = '') {
 				// Fence release (DEL iff value matches)
 				if (script.includes("redis.call('DEL', KEYS[1])") && script.includes('v == ARGV[1]')) {
 					return evalFenceRelease(args);
+				}
+				// Registry compare-and-delete (HGET instanceId, UNLINK iff matches)
+				if (script.includes("'hget'") && script.includes("'unlink'") && script.includes('current == ours')) {
+					return evalRegistryCompareDelete(args);
 				}
 				throw new Error('mock-redis: unrecognized eval script');
 			},
@@ -850,6 +869,20 @@ export function mockRedisClient(keyPrefix = '') {
 			const existing = store.get(key);
 			if (existing === expected) {
 				store.delete(key);
+				return 1;
+			}
+			return 0;
+		}
+
+		// Registry compare-and-delete: only UNLINK if the stored
+		// `instanceId` field matches `ours`.
+		function evalRegistryCompareDelete(args) {
+			const key = args[0];
+			const ours = args[1];
+			const h = hashes.get(key);
+			if (!h) return 0;
+			if (h.get('instanceId') === ours) {
+				hashes.delete(key);
 				return 1;
 			}
 			return 0;

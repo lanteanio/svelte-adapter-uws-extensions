@@ -1,0 +1,467 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mockRedisClient } from '../helpers/mock-redis.js';
+import { mockPlatform } from '../helpers/mock-platform.js';
+import { mockWs } from '../helpers/mock-ws.js';
+import { createConnectionRegistry } from '../../redis/registry.js';
+import { createMetrics } from '../../prometheus/index.js';
+import { createCircuitBreaker } from '../../shared/breaker.js';
+import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+
+function wsWithSession(userData, sessionId) {
+	const ws = mockWs(userData);
+	ws.getUserData()[WS_SESSION_ID] = sessionId;
+	return ws;
+}
+
+describe('redis connection registry', () => {
+	let client;
+	let platform;
+	let registry;
+
+	beforeEach(() => {
+		client = mockRedisClient('app:');
+		platform = mockPlatform();
+		registry = createConnectionRegistry(client, {
+			identify: (ws) => ws.getUserData()?.userId,
+			heartbeat: 60000,
+			ttl: 90
+		});
+	});
+
+	afterEach(async () => {
+		await registry.destroy();
+	});
+
+	describe('construction', () => {
+		it('requires options with identify', () => {
+			expect(() => createConnectionRegistry(client)).toThrow();
+			expect(() => createConnectionRegistry(client, {})).toThrow('identify must be a function');
+		});
+
+		it('rejects invalid ttl', () => {
+			expect(() => createConnectionRegistry(client, {
+				identify: () => 'x',
+				ttl: 0
+			})).toThrow();
+		});
+
+		it('rejects invalid heartbeat', () => {
+			expect(() => createConnectionRegistry(client, {
+				identify: () => 'x',
+				heartbeat: -1
+			})).toThrow();
+		});
+
+		it('rejects invalid requestTimeoutMs', () => {
+			expect(() => createConnectionRegistry(client, {
+				identify: () => 'x',
+				requestTimeoutMs: 'soon'
+			})).toThrow();
+		});
+
+		it('exposes a stable instanceId per registry', () => {
+			expect(typeof registry.instanceId).toBe('string');
+			expect(registry.instanceId.length).toBeGreaterThan(0);
+
+			const r2 = createConnectionRegistry(client, { identify: () => 'x' });
+			expect(r2.instanceId).not.toBe(registry.instanceId);
+			r2.destroy();
+		});
+	});
+
+	describe('hooks.open / close', () => {
+		it('registers a user with userId + sessionId', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+
+			const entry = await registry.lookup('u-1');
+			expect(entry).toMatchObject({
+				instanceId: registry.instanceId,
+				sessionId: 's-1'
+			});
+			expect(entry.ts).toBeGreaterThan(0);
+		});
+
+		it('skips anonymous connections (identify returns null)', async () => {
+			const ws = wsWithSession({}, 's-1');
+			await registry.hooks.open(ws, { platform });
+			expect(registry.size()).toBe(0);
+		});
+
+		it('skips when sessionId is not stamped', async () => {
+			const ws = mockWs({ userId: 'u-1' });
+			await registry.hooks.open(ws, { platform });
+			expect(registry.size()).toBe(0);
+		});
+
+		it('most-recent-wins: a second device replaces the first', async () => {
+			const wsA = wsWithSession({ userId: 'u-1' }, 's-laptop');
+			const wsB = wsWithSession({ userId: 'u-1' }, 's-phone');
+			await registry.hooks.open(wsA, { platform });
+			await registry.hooks.open(wsB, { platform });
+
+			expect(registry.size()).toBe(1);
+			const entry = await registry.lookup('u-1');
+			expect(entry.sessionId).toBe('s-phone');
+		});
+
+		it('close removes the user from the registry', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			await registry.hooks.close(ws, { platform });
+
+			expect(registry.size()).toBe(0);
+			expect(await registry.lookup('u-1')).toBeNull();
+		});
+
+		it('close is safe for anonymous connections', async () => {
+			const ws = wsWithSession({}, 's-1');
+			await expect(registry.hooks.close(ws, { platform })).resolves.toBeUndefined();
+		});
+
+		it('close does NOT delete entries owned by another instance', async () => {
+			// Pre-populate Redis as if another instance had registered the user.
+			const otherInstanceId = 'other-instance-id-XYZ';
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', otherInstanceId,
+				'sessionId', 's-other',
+				'ts', Date.now()
+			);
+
+			// Local close hook with the same userId fires (e.g. user just
+			// migrated away). The compare-and-delete must leave the other
+			// instance's record intact.
+			const ws = wsWithSession({ userId: 'u-1' }, 's-local');
+			await registry.hooks.close(ws, { platform });
+
+			const entry = await registry.lookup('u-1');
+			expect(entry.instanceId).toBe(otherInstanceId);
+			expect(entry.sessionId).toBe('s-other');
+		});
+	});
+
+	describe('lookup', () => {
+		it('returns null for unknown users', async () => {
+			expect(await registry.lookup('nobody')).toBeNull();
+		});
+
+		it('returns the entry for a registered user', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			const entry = await registry.lookup('u-1');
+			expect(entry).toMatchObject({ instanceId: registry.instanceId, sessionId: 's-1' });
+		});
+	});
+
+	describe('request: self-targeting (origin owns the user)', () => {
+		it('short-circuits to local platform.request without a Redis hop', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+
+			platform.request = async (target, event, data) => {
+				return { received: { target: target === ws, event, data } };
+			};
+
+			const reply = await registry.request('u-1', 'confirm', { op: 'go' });
+			expect(reply.received.event).toBe('confirm');
+			expect(reply.received.data).toEqual({ op: 'go' });
+			expect(reply.received.target).toBe(true);
+		});
+
+		it('rejects when the user is offline', async () => {
+			await expect(registry.request('nobody', 'event'))
+				.rejects.toThrow(/offline/);
+		});
+
+		it('rejects when the local sessionId map has no ws (race after disconnect)', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+
+			// Force the entry to look like ours but drop the local sessionToWs binding
+			// by closing through the hook (which deletes both local maps and Redis).
+			await registry.hooks.close(ws, { platform });
+			await expect(registry.request('u-1', 'event')).rejects.toThrow(/offline/);
+		});
+
+		it('propagates handler errors from local platform.request', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			platform.request = async () => { throw new Error('rejected'); };
+
+			await expect(registry.request('u-1', 'confirm')).rejects.toThrow('rejected');
+		});
+	});
+
+	describe('request: cross-instance routing', () => {
+		it('routes to the owning instance and resolves with the reply', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			platformOwner.request = async (targetWs, event, data) => {
+				return { ok: true, event, data, sameWs: targetWs === ws };
+			};
+
+			// Origin instance does NOT own the user; uses cross-instance path.
+			const reply = await registry.request('u-1', 'confirm', { id: 42 });
+			expect(reply.ok).toBe(true);
+			expect(reply.event).toBe('confirm');
+			expect(reply.data).toEqual({ id: 42 });
+			expect(reply.sameWs).toBe(true);
+
+			await owner.destroy();
+		});
+
+		it('rejects with a handler error when the owning instance throws', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			platformOwner.request = async () => { throw new Error('handler kaboom'); };
+
+			await expect(registry.request('u-1', 'event')).rejects.toThrow(/handler kaboom/);
+			await owner.destroy();
+		});
+
+		it('rejects with offline when the owning instance no longer has the ws', async () => {
+			// Owner registers, then drops the ws locally without removing the
+			// Redis entry (simulates a crash mid-flight).
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			// Simulate the owner crashing and losing its local sessionToWs map
+			// without dropping the Redis registry entry.
+			await owner.destroy();
+
+			// Re-register the same userId in Redis under a fresh phantom
+			// instanceId so origin's request finds an "owning" instance whose
+			// subscriber is gone. The request must time out (no reply path).
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', 'phantom-instance',
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+
+			await expect(
+				registry.request('u-1', 'event', null, { timeoutMs: 50 })
+			).rejects.toThrow(/timed out/);
+		});
+	});
+
+	describe('request: timeout handling', () => {
+		it('rejects with a timeout error when no reply arrives', async () => {
+			// Plant an entry with no live owning subscriber.
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', 'no-listener',
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+
+			await expect(
+				registry.request('u-1', 'event', null, { timeoutMs: 30 })
+			).rejects.toThrow(/timed out/);
+		});
+
+		it('uses the configured default timeoutMs when no per-call override is passed', async () => {
+			const fast = createConnectionRegistry(client, {
+				identify: () => 'x',
+				requestTimeoutMs: 30
+			});
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', 'no-listener',
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+			await expect(fast.request('u-1', 'event')).rejects.toThrow(/timed out/);
+			await fast.destroy();
+		});
+	});
+
+	describe('late replies (mid-flight migration)', () => {
+		it('drops a reply whose request already timed out and increments the counter', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics,
+				requestTimeoutMs: 30
+			});
+
+			// Set up an owner whose handler delays past the timeout.
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			platformOwner.request = async () => {
+				await new Promise((r) => setTimeout(r, 60));
+				return { tooLate: true };
+			};
+
+			await expect(
+				local.request('u-1', 'event', null, { timeoutMs: 30 })
+			).rejects.toThrow(/timed out/);
+
+			// Wait for the owner's reply to arrive after timeout.
+			await new Promise((r) => setTimeout(r, 80));
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_late_replies_total\s+1/);
+			expect(out).toMatch(/push_requests_total\{result="timeout"\}\s+1/);
+
+			await owner.destroy();
+			await local.destroy();
+		});
+	});
+
+	describe('inbound: no local ws (offline at receive)', () => {
+		it('replies with offline error when the sessionId is not local', async () => {
+			// Owner registers user but local sessionToWs is empty by manipulating
+			// state through a separate registry that wrote to Redis but lost ws.
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+
+			// Drop the ws locally (simulate connection close that didn't propagate
+			// to the close hook yet). We do this by mutating the sessionToWs map
+			// indirectly: trigger close hook then re-write the Redis entry to
+			// point back to the same instance + same session.
+			await owner.hooks.close(ws, { platform: platformOwner });
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', owner.instanceId,
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+
+			await expect(
+				registry.request('u-1', 'event', null, { timeoutMs: 100 })
+			).rejects.toThrow(/offline/);
+
+			await owner.destroy();
+		});
+	});
+
+	describe('metrics', () => {
+		it('counts request results by outcome', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+
+			// Self-target ok
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await local.hooks.open(ws, { platform });
+			platform.request = async () => ({ ok: true });
+			await local.request('u-1', 'event');
+
+			// Offline
+			await expect(local.request('nobody', 'event')).rejects.toThrow();
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_requests_total\{result="ok"\}\s+1/);
+			expect(out).toMatch(/push_requests_total\{result="offline"\}\s+1/);
+			await local.destroy();
+		});
+
+		it('records reply latency on success', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+			const ws = wsWithSession({ userId: 'u-1' }, 's-1');
+			await local.hooks.open(ws, { platform });
+			platform.request = async () => ({ ok: true });
+			await local.request('u-1', 'event');
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_reply_latency_ms_count\s+1/);
+			await local.destroy();
+		});
+
+		it('exposes registry size as a gauge that scrapes from local map', async () => {
+			const metrics = createMetrics();
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				metrics
+			});
+			const ws1 = wsWithSession({ userId: 'u-1' }, 's-1');
+			const ws2 = wsWithSession({ userId: 'u-2' }, 's-2');
+			await local.hooks.open(ws1, { platform });
+			await local.hooks.open(ws2, { platform });
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/push_registry_size\s+2/);
+			await local.destroy();
+		});
+	});
+
+	describe('breaker integration', () => {
+		it('lookup returns null without throwing when breaker is broken', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+			breaker.failure(new Error('down'));
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				breaker
+			});
+			expect(await local.lookup('u-1')).toBeNull();
+			await local.destroy();
+		});
+
+		it('request rejects with offline when breaker is broken (lookup short-circuits)', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+			breaker.failure(new Error('down'));
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				breaker
+			});
+			await expect(local.request('u-1', 'event')).rejects.toThrow(/offline/);
+			await local.destroy();
+		});
+	});
+
+	describe('destroy', () => {
+		it('rejects all in-flight requests', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				requestTimeoutMs: 5000
+			});
+			// Plant an entry pointing at a phantom instance so the request
+			// stays in-flight (no listener on the phantom push channel).
+			await client.redis.hset(
+				client.key('conns:u-1'),
+				'instanceId', 'phantom',
+				'sessionId', 's-1',
+				'ts', Date.now()
+			);
+			const inflight = local.request('u-1', 'event');
+			// Allow microtasks to register the pending entry.
+			await new Promise((r) => setImmediate(r));
+			await local.destroy();
+			await expect(inflight).rejects.toThrow(/destroyed/);
+		});
+
+		it('is idempotent', async () => {
+			await registry.destroy();
+			await expect(registry.destroy()).resolves.toBeUndefined();
+		});
+	});
+});
