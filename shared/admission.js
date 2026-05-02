@@ -31,18 +31,23 @@ const REASONS_FOR_DOC = 'PUBLISH_RATE, SUBSCRIBERS, MEMORY';
  */
 
 /**
- * @typedef {Array<PressureReason> | ((snapshot: PressureSnapshot) => boolean)} ClassRule
+ * @typedef {{ clusterTopPublisher: { threshold: number } }} ClusterTopPublisherRule
+ */
+
+/**
+ * @typedef {Array<PressureReason> | ((snapshot: PressureSnapshot) => boolean) | ClusterTopPublisherRule} ClassRule
  */
 
 /**
  * @typedef {Object} AdmissionControlOptions
- * @property {Record<string, ClassRule>} classes - Per-class block rule. Either a list of pressure reasons that should block this class, or a predicate that returns true to block.
+ * @property {Record<string, ClassRule>} classes - Per-class block rule. Either a list of pressure reasons that should block this class, a predicate that returns true to block, or a `{clusterTopPublisher: {threshold}}` object that consults a publish-rate aggregator on a per-topic basis.
+ * @property {{ rateOf(topic: string): number } | null} [aggregator] - Cluster publish-rate aggregator (from `redis/publish-rate`). Required when any class uses the `clusterTopPublisher` rule shape.
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  */
 
 /**
  * @typedef {Object} AdmissionControl
- * @property {(className: string, platform: { readonly pressure: PressureSnapshot }) => boolean} shouldAccept
+ * @property {(className: string, platform: { readonly pressure: PressureSnapshot }, opts?: { topic?: string }) => boolean} shouldAccept
  */
 
 /**
@@ -71,7 +76,7 @@ export function createAdmissionControl(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('admission control: options object is required');
 	}
-	const { classes, metrics } = options;
+	const { classes, metrics, aggregator } = options;
 	if (!classes || typeof classes !== 'object') {
 		throw new Error('admission control: classes is required and must be an object');
 	}
@@ -80,8 +85,9 @@ export function createAdmissionControl(options) {
 		throw new Error('admission control: classes must define at least one class');
 	}
 
-	/** @type {Map<string, Set<PressureReason> | ((snap: PressureSnapshot) => boolean)>} */
+	/** @type {Map<string, Set<PressureReason> | ((snap: PressureSnapshot) => boolean) | { kind: 'clusterTopPublisher', threshold: number }>} */
 	const compiled = new Map();
+	let needsAggregator = false;
 	for (const name of classNames) {
 		const rule = classes[name];
 		if (Array.isArray(rule)) {
@@ -96,9 +102,27 @@ export function createAdmissionControl(options) {
 			compiled.set(name, new Set(rule));
 		} else if (typeof rule === 'function') {
 			compiled.set(name, rule);
+		} else if (rule && typeof rule === 'object' && rule.clusterTopPublisher) {
+			const cfg = rule.clusterTopPublisher;
+			if (!cfg || typeof cfg.threshold !== 'number' || !Number.isFinite(cfg.threshold) || cfg.threshold < 0) {
+				throw new Error(
+					`admission control: class "${name}" clusterTopPublisher rule requires a non-negative numeric threshold`
+				);
+			}
+			compiled.set(name, { kind: 'clusterTopPublisher', threshold: cfg.threshold });
+			needsAggregator = true;
 		} else {
 			throw new Error(
-				`admission control: class "${name}" rule must be an array of reasons or a predicate function`
+				`admission control: class "${name}" rule must be an array of reasons, a predicate function, or a {clusterTopPublisher: {threshold}} object`
+			);
+		}
+	}
+
+	if (needsAggregator) {
+		if (!aggregator || typeof aggregator.rateOf !== 'function') {
+			throw new Error(
+				'admission control: a clusterTopPublisher rule was configured but no aggregator was passed. ' +
+				'Provide one via `createAdmissionControl({ aggregator: createPublishRateAggregator(...) })`.'
 			);
 		}
 	}
@@ -107,7 +131,7 @@ export function createAdmissionControl(options) {
 	const mRejected = metrics?.counter('admission_rejected_total', 'Admissions rejected', ['class', 'reason']);
 
 	return {
-		shouldAccept(className, platform) {
+		shouldAccept(className, platform, opts) {
 			const rule = compiled.get(className);
 			if (rule === undefined) {
 				throw new Error(`admission control: unknown class "${className}"`);
@@ -117,13 +141,25 @@ export function createAdmissionControl(options) {
 			}
 			const snap = platform.pressure;
 			let blocked;
+			let blockReason = snap.reason;
 			if (typeof rule === 'function') {
 				blocked = !!rule(snap);
-			} else {
+			} else if (rule instanceof Set) {
 				blocked = rule.has(snap.reason);
+			} else if (rule && rule.kind === 'clusterTopPublisher') {
+				const topic = opts && opts.topic;
+				if (typeof topic !== 'string' || topic.length === 0) {
+					throw new Error(
+						`admission control: class "${className}" uses the clusterTopPublisher rule; ` +
+						'shouldAccept must be called with a {topic: "..."} third argument.'
+					);
+				}
+				const rate = aggregator.rateOf(topic);
+				blocked = rate >= rule.threshold;
+				if (blocked) blockReason = 'CLUSTER_TOP_PUBLISHER';
 			}
 			if (blocked) {
-				mRejected?.inc({ class: className, reason: snap.reason });
+				mRejected?.inc({ class: className, reason: blockReason });
 				return false;
 			}
 			mAccepted?.inc({ class: className });

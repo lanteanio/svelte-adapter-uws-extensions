@@ -33,11 +33,11 @@ describe('admission control', () => {
 		it('rejects rules that are neither array nor function', () => {
 			expect(() => createAdmissionControl({
 				classes: { critical: 'MEMORY' }
-			})).toThrow('must be an array of reasons or a predicate function');
+			})).toThrow('must be an array of reasons');
 
 			expect(() => createAdmissionControl({
 				classes: { critical: 42 }
-			})).toThrow('must be an array of reasons or a predicate function');
+			})).toThrow('must be an array of reasons');
 		});
 
 		it('accepts valid reason arrays', () => {
@@ -206,6 +206,94 @@ describe('admission control', () => {
 			});
 			// critical class is not in PUBLISH_RATE's block list, so accept.
 			expect(ac.shouldAccept('critical', platform)).toBe(true);
+		});
+	});
+
+	describe('clusterTopPublisher rule', () => {
+		function makeAggregator(rateMap = {}) {
+			return {
+				rateOf: (topic) => rateMap[topic] || 0
+			};
+		}
+
+		it('rejects when the cluster-wide rate for the topic is at or above threshold', () => {
+			const ac = createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 1000 } } },
+				aggregator: makeAggregator({ 'org:42:audit': 1500, 'chat:room1': 500 })
+			});
+
+			expect(ac.shouldAccept('hot', platform, { topic: 'org:42:audit' })).toBe(false);
+			expect(ac.shouldAccept('hot', platform, { topic: 'chat:room1' })).toBe(true);
+		});
+
+		it('accepts when the topic is unknown to the aggregator', () => {
+			const ac = createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 100 } } },
+				aggregator: makeAggregator({})
+			});
+			expect(ac.shouldAccept('hot', platform, { topic: 'cold-topic' })).toBe(true);
+		});
+
+		it('throws if shouldAccept is called without a topic', () => {
+			const ac = createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 100 } } },
+				aggregator: makeAggregator({})
+			});
+			expect(() => ac.shouldAccept('hot', platform)).toThrow(/topic/);
+			expect(() => ac.shouldAccept('hot', platform, {})).toThrow(/topic/);
+			expect(() => ac.shouldAccept('hot', platform, { topic: '' })).toThrow(/topic/);
+		});
+
+		it('throws at construction time if no aggregator is provided', () => {
+			expect(() => createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 100 } } }
+			})).toThrow(/aggregator/);
+		});
+
+		it('throws on a non-numeric or negative threshold', () => {
+			expect(() => createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 'lots' } } },
+				aggregator: makeAggregator({})
+			})).toThrow(/threshold/);
+			expect(() => createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: -1 } } },
+				aggregator: makeAggregator({})
+			})).toThrow(/threshold/);
+		});
+
+		it('records admission_rejected_total with reason="CLUSTER_TOP_PUBLISHER"', async () => {
+			const { createMetrics } = await import('../../prometheus/index.js');
+			const metrics = createMetrics();
+			const ac = createAdmissionControl({
+				classes: { hot: { clusterTopPublisher: { threshold: 100 } } },
+				aggregator: makeAggregator({ 'hot-topic': 5000 }),
+				metrics
+			});
+			ac.shouldAccept('hot', platform, { topic: 'hot-topic' });
+			ac.shouldAccept('hot', platform, { topic: 'cold-topic' });
+
+			const out = await metrics.serialize();
+			expect(out).toMatch(/admission_rejected_total\{class="hot",reason="CLUSTER_TOP_PUBLISHER"\}\s+1/);
+			expect(out).toMatch(/admission_accepted_total\{class="hot"\}\s+1/);
+		});
+
+		it('coexists with reason-array and predicate rules', () => {
+			const aggregator = makeAggregator({ 'hot': 9999 });
+			const ac = createAdmissionControl({
+				classes: {
+					critical: ['MEMORY'],
+					streaming: (snap) => snap.subscriberRatio > 50,
+					hot: { clusterTopPublisher: { threshold: 100 } }
+				},
+				aggregator
+			});
+
+			platform._setPressure({
+				active: true, subscriberRatio: 10, publishRate: 0, memoryMB: 100, reason: 'NONE'
+			});
+			expect(ac.shouldAccept('critical', platform)).toBe(true);
+			expect(ac.shouldAccept('streaming', platform)).toBe(true);
+			expect(ac.shouldAccept('hot', platform, { topic: 'hot' })).toBe(false);
 		});
 	});
 });

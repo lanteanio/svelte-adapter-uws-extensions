@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
 	createMetrics,
 	wirePublishRateMetrics,
+	wireClusterPublishRateMetrics,
 	connectionMetricsHook
 } from '../../prometheus/index.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
@@ -1060,6 +1061,88 @@ describe('prometheus metrics', () => {
 			const m = createMetrics();
 			const close = connectionMetricsHook(m);
 			await expect(close({}, undefined)).resolves.toBeUndefined();
+		});
+	});
+
+	describe('wireClusterPublishRateMetrics', () => {
+		function makeAggregator(topPublishers) {
+			return { topPublishers };
+		}
+
+		it('rejects bad inputs', () => {
+			const m = createMetrics();
+			expect(() => wireClusterPublishRateMetrics(null, m)).toThrow('aggregator is required');
+			expect(() => wireClusterPublishRateMetrics({ topPublishers: [] }, null)).toThrow('metrics registry is required');
+			const agg = makeAggregator([]);
+			expect(() => wireClusterPublishRateMetrics(agg, m, { topN: 0 })).toThrow('topN must be a positive integer');
+			expect(() => wireClusterPublishRateMetrics(agg, m, { topN: 1.5 })).toThrow('topN must be a positive integer');
+		});
+
+		it('emits cluster_topic_publish_rate and cluster_topic_publish_bytes from aggregator.topPublishers at scrape time', async () => {
+			const m = createMetrics();
+			const agg = makeAggregator([
+				{ topic: 'chat:room1', messagesPerSec: 300, bytesPerSec: 3000 },
+				{ topic: 'audit:org1', messagesPerSec: 50, bytesPerSec: 500 }
+			]);
+			wireClusterPublishRateMetrics(agg, m);
+
+			const out = await m.serialize();
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="chat:room1"\}\s+300/);
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="audit:org1"\}\s+50/);
+			expect(out).toMatch(/cluster_topic_publish_bytes\{topic="chat:room1"\}\s+3000/);
+		});
+
+		it('caps emitted gauges at topN', async () => {
+			const m = createMetrics();
+			const agg = makeAggregator([
+				{ topic: 'a', messagesPerSec: 5, bytesPerSec: 50 },
+				{ topic: 'b', messagesPerSec: 4, bytesPerSec: 40 },
+				{ topic: 'c', messagesPerSec: 3, bytesPerSec: 30 }
+			]);
+			wireClusterPublishRateMetrics(agg, m, { topN: 2 });
+
+			const out = await m.serialize();
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="a"\}/);
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="b"\}/);
+			expect(out).not.toMatch(/cluster_topic_publish_rate\{topic="c"\}/);
+		});
+
+		it('honors mapTopic for cardinality control', async () => {
+			const m = createMetrics();
+			const agg = makeAggregator([
+				{ topic: 'org:42:items', messagesPerSec: 10, bytesPerSec: 100 }
+			]);
+			wireClusterPublishRateMetrics(agg, m, {
+				mapTopic: (t) => t.split(':')[0]
+			});
+
+			const out = await m.serialize();
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="org"\}\s+10/);
+			expect(out).not.toMatch(/cluster_topic_publish_rate\{topic="org:42:items"\}/);
+		});
+
+		it('handles an empty topPublishers list', async () => {
+			const m = createMetrics();
+			const agg = makeAggregator([]);
+			wireClusterPublishRateMetrics(agg, m);
+
+			const out = await m.serialize();
+			expect(out).toMatch(/# TYPE cluster_topic_publish_rate gauge/);
+			expect(out).not.toMatch(/cluster_topic_publish_rate\{/);
+		});
+
+		it('reflects aggregator updates between scrapes', async () => {
+			const m = createMetrics();
+			let snap = [{ topic: 'a', messagesPerSec: 1, bytesPerSec: 10 }];
+			const agg = { get topPublishers() { return snap; } };
+			wireClusterPublishRateMetrics(agg, m);
+
+			let out = await m.serialize();
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="a"\}\s+1/);
+
+			snap = [{ topic: 'a', messagesPerSec: 999, bytesPerSec: 9999 }];
+			out = await m.serialize();
+			expect(out).toMatch(/cluster_topic_publish_rate\{topic="a"\}\s+999/);
 		});
 	});
 });

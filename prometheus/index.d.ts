@@ -90,6 +90,32 @@ export function wirePublishRateMetrics(
 ): void;
 
 /**
+ * Wire cluster-wide publish-rate gauges from a publish-rate aggregator
+ * (`redis/publish-rate`). Mirrors `wirePublishRateMetrics` but at the
+ * cluster layer: the gauges scrape the aggregator's merged top-N at
+ * collect time, no continuous accounting.
+ *
+ * Emits:
+ *   - `cluster_topic_publish_rate{topic="..."}` (gauge)
+ *   - `cluster_topic_publish_bytes{topic="..."}` (gauge)
+ *
+ * Both wirers (per-instance + cluster) can be active simultaneously --
+ * the local view shows hot-shard pressure, the cluster view shows
+ * global capacity.
+ */
+export function wireClusterPublishRateMetrics(
+	aggregator: {
+		topPublishers: Array<{
+			topic: string;
+			messagesPerSec: number;
+			bytesPerSec: number;
+		}>;
+	},
+	metrics: MetricsRegistry,
+	options?: PublishRateMetricsOptions
+): void;
+
+/**
  * Returns a `close` hook that emits per-connection histograms and a
  * close-code counter from the adapter's close-ctx telemetry. Composes
  * with a user-provided close hook by passing it as the second argument.

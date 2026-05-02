@@ -1935,6 +1935,83 @@ Auto-emission is local-only -- Redis is what's degraded, so the event reaches lo
 
 ---
 
+## Cluster publish-rate aggregator
+
+`createPublishRateAggregator` (`svelte-adapter-uws-extensions/redis/publish-rate`) gives every instance a cluster-wide view of which topics are hottest across the whole deployment. Each instance broadcasts its own `platform.pressure.topPublishers` slice on a Redis pub/sub channel; every instance maintains a sliding-window view of all instances' slices and merges them into a cluster-wide top-N. No leader election -- each instance is its own aggregator. Storage cost is `O(instances * topN)` per instance, bounded and small.
+
+#### Setup
+
+```js
+// src/lib/server/publish-rate.js
+import { redis } from './redis.js';
+import { createPublishRateAggregator } from 'svelte-adapter-uws-extensions/redis/publish-rate';
+
+export const aggregator = createPublishRateAggregator(redis, {
+  publishInterval: 5000,
+  staleAfter: 12000,
+  topN: 20
+});
+
+// In your open hook (or any startup path with a platform reference):
+export async function open(ws, { platform }) {
+  await aggregator.activate(platform);
+}
+```
+
+#### API
+
+| Member | Description |
+|---|---|
+| `instanceId` | Stable id for this instance, used as the from-tag on outbound slice envelopes. |
+| `topPublishers` | Cluster-wide top publishers, merged from this instance's local slice (read fresh from `platform.pressure.topPublishers`) and the cached remote slices (stale entries dropped). Sorted descending by `messagesPerSec`, capped at `topN`. Each entry is `{topic, messagesPerSec, bytesPerSec, contributingInstances}`. Pure memory computation. |
+| `rateOf(topic)` | Cluster-wide messagesPerSec for a topic, or 0 if not in the merged top-N. Used by the `clusterTopPublisher` admission rule. |
+| `activate(platform)` | Open the subscriber and start the broadcast timer. Idempotent. |
+| `deactivate()` | Stop the timer, drop the subscriber, clear cached slices. |
+
+#### Wire envelope (internal)
+
+```
+Channel: {channel}                          (default: 'uws:pressure:rates')
+Payload: {instanceId, ts, slice: [{topic, messagesPerSec, bytesPerSec}, ...]}
+```
+
+Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; entries older than `staleAfter` are dropped on the next merge.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `channel` | `'uws:pressure:rates'` | Redis channel for slice broadcasts. |
+| `publishInterval` | `5000` | How often this instance broadcasts its slice (ms). |
+| `staleAfter` | `12000` | Drop a remote instance's slice if no fresher one arrives within this window (ms). Should be at least `2 * publishInterval`. |
+| `topN` | `20` | Cap on per-instance slice and merged result. Bounds storage cost. |
+| `breaker` | -- | Optional circuit breaker for the publish call. |
+| `metrics` | -- | Optional Prometheus metrics registry. |
+
+#### Pairing with admission control
+
+`createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` consults `aggregator.rateOf(topic)` on every `shouldAccept` call. Memory-only lookup, no Redis traffic on the hot path. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
+
+#### Pairing with prometheus
+
+`wireClusterPublishRateMetrics(aggregator, metrics, { topN })` registers two gauges that scrape the merged top-N at collect time:
+
+- `cluster_topic_publish_rate{topic}` -- cluster-wide messagesPerSec, summed across instances
+- `cluster_topic_publish_bytes{topic}` -- cluster-wide bytesPerSec, summed across instances
+
+Both wirers (per-instance via `wirePublishRateMetrics`, cluster via `wireClusterPublishRateMetrics`) can be active simultaneously. The local view shows hot-shard pressure; the cluster view shows global capacity.
+
+#### Aggregator metrics
+
+| Metric | Description |
+|---|---|
+| `cluster_publish_rate_broadcasts_total` | Slice envelopes published by this instance. |
+| `cluster_publish_rate_received_total` | Slice envelopes received from sibling instances. |
+| `cluster_publish_rate_parse_errors_total` | Malformed envelopes dropped on receive. |
+| `cluster_publish_rate_instance_count` | Gauge: sibling instances contributing slices (excluding self) at scrape time. Useful for cluster-size monitoring. |
+
+---
+
 ## Circuit breaker
 
 Prevents thundering herd when a backend goes down. When Redis or Postgres becomes unreachable, every extension that uses the breaker fails fast instead of queueing up timeouts, and fire-and-forget operations (heartbeats, relay flushes, cursor broadcasts) are skipped entirely.
@@ -2108,6 +2185,32 @@ export async function POST({ platform, request }) {
 ```
 
 The two layers complement each other: admission control prevents new work from piling up under server-local pressure; the breaker prevents thundering-herd retries against a dead backend.
+
+#### Cluster-aware shedding (`clusterTopPublisher` rule)
+
+`platform.pressure.topPublishers` is per-instance. In an N-instance cluster, a topic that's hot across every instance simultaneously looks the same locally as one that's only hot here -- but it warrants a different response. The `clusterTopPublisher` rule consults a `createPublishRateAggregator` (`redis/publish-rate`) to shed at the cluster layer:
+
+```js
+import { createPublishRateAggregator } from 'svelte-adapter-uws-extensions/redis/publish-rate';
+import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
+
+const aggregator = createPublishRateAggregator(redis);
+await aggregator.activate(platform);
+
+export const ac = createAdmissionControl({
+  aggregator,
+  classes: {
+    nonCritical: { clusterTopPublisher: { threshold: 5000 } }
+  }
+});
+
+// In a request handler that publishes to a hot topic:
+if (!ac.shouldAccept('nonCritical', platform, { topic: 'org:42:audit' })) {
+  return new Response('busy', { status: 503 });
+}
+```
+
+The rule's check is a memory-only lookup (`aggregator.rateOf(topic)` against the merged top-N); no Redis traffic on the hot path. Rejected admissions surface in `admission_rejected_total{class, reason="CLUSTER_TOP_PUBLISHER"}`. See [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator) for aggregator setup.
 
 #### Two-tier admission (handshake + message)
 

@@ -471,6 +471,59 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
 }
 
 /**
+ * Wire cluster-wide publish-rate gauges from a publish-rate aggregator
+ * (`redis/publish-rate`). Mirrors `wirePublishRateMetrics` but at the
+ * cluster layer: the gauges scrape the aggregator's merged top-N at
+ * collect time, no continuous accounting. Both wirers can be active
+ * simultaneously -- the local view shows hot-shard pressure, the
+ * cluster view shows global capacity.
+ *
+ * @param {{ topPublishers: Array<{topic: string, messagesPerSec: number, bytesPerSec: number}> }} aggregator
+ * @param {ReturnType<typeof createMetrics>} metrics
+ * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
+ */
+export function wireClusterPublishRateMetrics(aggregator, metrics, options = {}) {
+	if (!aggregator || typeof aggregator !== 'object') {
+		throw new TypeError('wireClusterPublishRateMetrics: aggregator is required');
+	}
+	if (!metrics || typeof metrics.gauge !== 'function') {
+		throw new TypeError('wireClusterPublishRateMetrics: metrics registry is required');
+	}
+	const topN = options.topN ?? 10;
+	if (!Number.isInteger(topN) || topN < 1) {
+		throw new TypeError('wireClusterPublishRateMetrics: topN must be a positive integer');
+	}
+	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? ((t) => t);
+
+	const rateGauge = metrics.gauge(
+		'cluster_topic_publish_rate',
+		'Top publishers by cluster-wide messages/sec, summed across instances',
+		['topic']
+	);
+	const bytesGauge = metrics.gauge(
+		'cluster_topic_publish_bytes',
+		'Top publishers by cluster-wide bytes/sec, summed across instances',
+		['topic']
+	);
+
+	function snapshot() {
+		const top = Array.isArray(aggregator.topPublishers) ? aggregator.topPublishers : [];
+		return top.length > topN ? top.slice(0, topN) : top;
+	}
+
+	rateGauge.collect(() => {
+		for (const t of snapshot()) {
+			rateGauge.set({ topic: mapTopic(t.topic) }, t.messagesPerSec);
+		}
+	});
+	bytesGauge.collect(() => {
+		for (const t of snapshot()) {
+			bytesGauge.set({ topic: mapTopic(t.topic) }, t.bytesPerSec);
+		}
+	});
+}
+
+/**
  * Returns a `close` hook that emits per-connection histograms + a close-code
  * counter from the adapter's close-ctx telemetry. Composes with a user-
  * provided close hook by passing `userClose` as the second argument.

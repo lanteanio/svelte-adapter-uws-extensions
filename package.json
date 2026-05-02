@@ -77,6 +77,10 @@
       "types": "./redis/registry.d.ts",
       "default": "./redis/registry.js"
     },
+    "./redis/publish-rate": {
+      "types": "./redis/publish-rate.d.ts",
+      "default": "./redis/publish-rate.js"
+    },
     "./postgres/idempotency": {
       "types": "./postgres/idempotency.d.ts",
       "default": "./postgres/idempotency.js"
