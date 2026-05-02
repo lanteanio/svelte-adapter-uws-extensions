@@ -3,6 +3,12 @@ import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
+export interface ClusterSubject {
+	topic: string;
+	/** Local subscriber count for this topic on the contributing instance. */
+	count: number;
+}
+
 export interface PublishRateAggregatorOptions {
 	/**
 	 * Redis pub/sub channel for slice broadcasts.
@@ -30,6 +36,18 @@ export interface PublishRateAggregatorOptions {
 	 * @default 20
 	 */
 	topN?: number;
+
+	/**
+	 * Optional contributor for cluster-wide subscriber counts. Called
+	 * fresh on every broadcast tick to gather this instance's per-topic
+	 * subscriber list. Sorted descending by `count` and capped at `topN`
+	 * before broadcast. When wired, the broadcast envelope grows a `subs`
+	 * field; `subscribersOf(topic)` returns the merged sum.
+	 *
+	 * The sharded bus exposes `bus.localSubjects(platform)` as the
+	 * natural source: `subjects: () => bus.localSubjects(platform)`.
+	 */
+	subjects?: () => ClusterSubject[];
 
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
@@ -70,6 +88,18 @@ export interface PublishRateAggregator {
 	 * rule for per-topic load shedding.
 	 */
 	rateOf(topic: string): number;
+
+	/**
+	 * Cluster-wide subscriber count for a topic, summed across this
+	 * instance's live local count (from `subjects()`) and all non-stale
+	 * remote contributions. Returns 0 when no `subjects` callback is
+	 * wired and no remote instance has reported the topic.
+	 *
+	 * Eventually-consistent within `publishInterval`; bounded by
+	 * `staleAfter`. The sharded bus's `bus.subscribers(topic)` delegates
+	 * here when an aggregator is wired.
+	 */
+	subscribersOf(topic: string): number;
 }
 
 /**

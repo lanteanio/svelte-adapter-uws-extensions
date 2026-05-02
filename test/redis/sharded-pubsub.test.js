@@ -750,4 +750,85 @@ describe('redis sharded bus', () => {
 			await bus.deactivate();
 		});
 	});
+
+	describe('localSubjects', () => {
+		it('enumerates followed topics with their live local count', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await bus.follow('chat:room1');
+			await bus.follow('audit:org1');
+
+			const counts = { 'chat:room1': 4, 'audit:org1': 2 };
+			platform.subscribers = (t) => counts[t] || 0;
+
+			const out = bus.localSubjects(platform);
+			const byTopic = Object.fromEntries(out.map((s) => [s.topic, s.count]));
+			expect(byTopic).toEqual({ 'chat:room1': 4, 'audit:org1': 2 });
+			await bus.deactivate();
+		});
+
+		it('omits topics with 0 local subscribers', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await bus.follow('chat:room1');
+			await bus.follow('empty:topic');
+
+			platform.subscribers = (t) => t === 'chat:room1' ? 3 : 0;
+
+			const out = bus.localSubjects(platform);
+			expect(out).toEqual([{ topic: 'chat:room1', count: 3 }]);
+			await bus.deactivate();
+		});
+
+		it('returns an empty array when nothing is followed', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			expect(bus.localSubjects(platform)).toEqual([]);
+			await bus.deactivate();
+		});
+
+		it('returns an empty array when given a platform without subscribers()', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await bus.follow('chat:room1');
+			expect(bus.localSubjects({})).toEqual([]);
+			await bus.deactivate();
+		});
+	});
+
+	describe('bus.subscribers (cluster-aware)', () => {
+		it('falls back to the local count when no aggregator is wired', async () => {
+			const bus = createShardedBus(client);
+			await bus.activate(platform);
+			await bus.follow('chat:room1');
+			platform.subscribers = (t) => t === 'chat:room1' ? 5 : 0;
+			expect(bus.subscribers('chat:room1')).toBe(5);
+			expect(bus.subscribers('unknown')).toBe(0);
+			await bus.deactivate();
+		});
+
+		it('returns 0 before activate (no platform reference yet)', () => {
+			const bus = createShardedBus(client);
+			expect(bus.subscribers('any')).toBe(0);
+		});
+
+		it('delegates to the wired aggregator when provided', async () => {
+			const fakeAggregator = {
+				subscribersOf(topic) {
+					return topic === 'shared' ? 17 : 0;
+				}
+			};
+			const bus = createShardedBus(client, { subscribersAggregator: fakeAggregator });
+			await bus.activate(platform);
+			await bus.follow('shared');
+			expect(bus.subscribers('shared')).toBe(17);
+			expect(bus.subscribers('other')).toBe(0);
+			await bus.deactivate();
+		});
+
+		it('rejects an aggregator without subscribersOf', () => {
+			expect(() => createShardedBus(client, { subscribersAggregator: {} })).toThrow(/subscribersOf/);
+			expect(() => createShardedBus(client, { subscribersAggregator: null })).toThrow(/subscribersOf/);
+		});
+	});
 });

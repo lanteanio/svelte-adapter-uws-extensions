@@ -3,6 +3,10 @@ import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
+export interface SubscribersAggregatorLike {
+	subscribersOf(topic: string): number;
+}
+
 export interface ShardedBusOptions {
 	/**
 	 * Prefix for sharded pub/sub channels. Each topic maps to
@@ -19,6 +23,17 @@ export interface ShardedBusOptions {
 	 * multiple topics to share a single channel.
 	 */
 	shardKey?: (topic: string) => string;
+	/**
+	 * Optional aggregator (typically from `redis/publish-rate`) that
+	 * provides cluster-wide subscriber counts. When wired,
+	 * `bus.subscribers(topic)` returns the cluster-wide count;
+	 * otherwise it returns the local count only.
+	 *
+	 * Wire `bus.localSubjects(platform)` as the aggregator's
+	 * `subjects` source so this bus's followed topics contribute to
+	 * the cluster broadcast.
+	 */
+	subscribersAggregator?: SubscribersAggregatorLike;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -77,6 +92,31 @@ export interface ShardedBus {
 	 * it.
 	 */
 	unfollow(topic: string): Promise<void>;
+
+	/**
+	 * Snapshot every topic this bus is currently following with its
+	 * local subscriber count from the supplied platform. Topics with 0
+	 * local subscribers are omitted. Use as the `subjects` callback on
+	 * `createPublishRateAggregator` so the aggregator can broadcast
+	 * subscriber counts cluster-wide.
+	 *
+	 * Topics subscribed outside the bus's hooks (raw `ws.subscribe`
+	 * bypass) are not enumerated; they will not propagate cluster-wide
+	 * via this path.
+	 */
+	localSubjects(platform: Platform): Array<{ topic: string; count: number }>;
+
+	/**
+	 * Cluster-wide subscriber count for a topic. Returns
+	 * `aggregator.subscribersOf(topic)` when a `subscribersAggregator`
+	 * was wired; otherwise returns the local count
+	 * (`platform.subscribers(topic)`).
+	 *
+	 * Eventually-consistent within the aggregator's `publishInterval`
+	 * for the remote contribution; the local read is always live. For
+	 * exact counts, track a Redis SET cluster-wide and `SCARD` it.
+	 */
+	subscribers(topic: string): number;
 
 	/**
 	 * Ready-made WebSocket hooks. `subscribe` calls `follow`,

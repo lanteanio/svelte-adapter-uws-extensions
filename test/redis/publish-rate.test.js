@@ -302,4 +302,275 @@ describe('redis publish-rate aggregator', () => {
 			await expect(agg.deactivate()).resolves.toBeUndefined();
 		});
 	});
+
+	describe('subjects (cluster subscriber counts)', () => {
+		it('rejects a non-function subjects option', () => {
+			expect(() => createPublishRateAggregator(client, { subjects: 'nope' })).toThrow(/subjects/);
+			expect(() => createPublishRateAggregator(client, { subjects: 123 })).toThrow(/subjects/);
+		});
+
+		it('omits the subs field when no subjects callback is wired', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+
+			let received;
+			const handlers = client._pubsubHandlers;
+			const probeDup = handlers[handlers.length - 1];
+			const orig = probeDup.listeners.get('message');
+			probeDup.listeners.set('message', (ch, raw) => {
+				if (orig) orig(ch, raw);
+				try { received = JSON.parse(raw); } catch { /* noop */ }
+			});
+			await agg._broadcastNow();
+			await new Promise((r) => setImmediate(r));
+
+			expect(received).toBeDefined();
+			expect(received.subs).toBeUndefined();
+			await agg.deactivate();
+		});
+
+		it('broadcasts subs when the subjects callback returns a list', async () => {
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => [
+					{ topic: 'chat:room1', count: 5 },
+					{ topic: 'audit:org1', count: 2 }
+				]
+			});
+			await agg.activate(platform);
+
+			let received;
+			const handlers = client._pubsubHandlers;
+			const probeDup = handlers[handlers.length - 1];
+			const orig = probeDup.listeners.get('message');
+			probeDup.listeners.set('message', (ch, raw) => {
+				if (orig) orig(ch, raw);
+				try { received = JSON.parse(raw); } catch { /* noop */ }
+			});
+			await agg._broadcastNow();
+			await new Promise((r) => setImmediate(r));
+
+			expect(received).toBeDefined();
+			expect(Array.isArray(received.subs)).toBe(true);
+			expect(received.subs).toHaveLength(2);
+			const byTopic = Object.fromEntries(received.subs.map((s) => [s.topic, s.count]));
+			expect(byTopic).toEqual({ 'chat:room1': 5, 'audit:org1': 2 });
+			await agg.deactivate();
+		});
+
+		it('caps the local subs at topN sorted descending by count', async () => {
+			const big = Array.from({ length: 30 }, (_, i) => ({ topic: 't' + i, count: 30 - i }));
+			const agg = createPublishRateAggregator(client, {
+				topN: 5,
+				subjects: () => big
+			});
+			await agg.activate(platform);
+
+			let received;
+			const handlers = client._pubsubHandlers;
+			const probeDup = handlers[handlers.length - 1];
+			const orig = probeDup.listeners.get('message');
+			probeDup.listeners.set('message', (ch, raw) => {
+				if (orig) orig(ch, raw);
+				try { received = JSON.parse(raw); } catch { /* noop */ }
+			});
+			await agg._broadcastNow();
+			await new Promise((r) => setImmediate(r));
+
+			expect(received.subs).toHaveLength(5);
+			expect(received.subs[0]).toEqual({ topic: 't0', count: 30 });
+			expect(received.subs[4]).toEqual({ topic: 't4', count: 26 });
+			await agg.deactivate();
+		});
+
+		it('dedupes duplicate topics in the local subs slice', async () => {
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => [
+					{ topic: 'chat:room1', count: 3 },
+					{ topic: 'chat:room1', count: 2 }
+				]
+			});
+			await agg.activate(platform);
+
+			let received;
+			const handlers = client._pubsubHandlers;
+			const probeDup = handlers[handlers.length - 1];
+			const orig = probeDup.listeners.get('message');
+			probeDup.listeners.set('message', (ch, raw) => {
+				if (orig) orig(ch, raw);
+				try { received = JSON.parse(raw); } catch { /* noop */ }
+			});
+			await agg._broadcastNow();
+			await new Promise((r) => setImmediate(r));
+
+			expect(received.subs).toHaveLength(1);
+			expect(received.subs[0]).toEqual({ topic: 'chat:room1', count: 5 });
+			await agg.deactivate();
+		});
+
+		it('catches a throwing subjects callback and broadcasts an empty subs slice', async () => {
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => { throw new Error('boom'); }
+			});
+			await agg.activate(platform);
+
+			let received;
+			const handlers = client._pubsubHandlers;
+			const probeDup = handlers[handlers.length - 1];
+			const orig = probeDup.listeners.get('message');
+			probeDup.listeners.set('message', (ch, raw) => {
+				if (orig) orig(ch, raw);
+				try { received = JSON.parse(raw); } catch { /* noop */ }
+			});
+			await agg._broadcastNow();
+			await new Promise((r) => setImmediate(r));
+
+			expect(received).toBeDefined();
+			expect(received.subs).toEqual([]);
+			await agg.deactivate();
+		});
+	});
+
+	describe('subscribersOf', () => {
+		it('returns 0 for an unknown topic', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+			expect(agg.subscribersOf('nope')).toBe(0);
+			await agg.deactivate();
+		});
+
+		it('sums the local count and remote contributions', async () => {
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => [{ topic: 'chat:room1', count: 5 }]
+			});
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'instB',
+				ts: Date.now(),
+				slice: [],
+				subs: [{ topic: 'chat:room1', count: 7 }]
+			}));
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'instC',
+				ts: Date.now(),
+				slice: [],
+				subs: [{ topic: 'chat:room1', count: 3 }]
+			}));
+			await new Promise((r) => setImmediate(r));
+
+			expect(agg.subscribersOf('chat:room1')).toBe(15); // 5 + 7 + 3
+			await agg.deactivate();
+		});
+
+		it('returns the live local count even when no remotes have reported the topic', async () => {
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => [{ topic: 'solo', count: 4 }]
+			});
+			await agg.activate(platform);
+			expect(agg.subscribersOf('solo')).toBe(4);
+			await agg.deactivate();
+		});
+
+		it('returns the remote sum even when subjects is not wired', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'instB',
+				ts: Date.now(),
+				slice: [],
+				subs: [{ topic: 'remote-only', count: 9 }]
+			}));
+			await new Promise((r) => setImmediate(r));
+
+			expect(agg.subscribersOf('remote-only')).toBe(9);
+			await agg.deactivate();
+		});
+
+		it('drops a remote subs contribution past staleAfter', async () => {
+			const agg = createPublishRateAggregator(client, { staleAfter: 50 });
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'gone',
+				ts: Date.now() - 200,
+				slice: [],
+				subs: [{ topic: 'phantom', count: 12 }]
+			}));
+			await new Promise((r) => setImmediate(r));
+
+			expect(agg.subscribersOf('phantom')).toBe(0);
+			await agg.deactivate();
+		});
+
+		it('reads the local slice fresh on every call (no stale cache)', async () => {
+			let count = 1;
+			const agg = createPublishRateAggregator(client, {
+				subjects: () => [{ topic: 'live', count }]
+			});
+			await agg.activate(platform);
+
+			expect(agg.subscribersOf('live')).toBe(1);
+			count = 7;
+			expect(agg.subscribersOf('live')).toBe(7);
+			await agg.deactivate();
+		});
+	});
+
+	describe('subs envelope compatibility', () => {
+		it('parses an envelope without a subs field cleanly (back-compat)', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'old-style',
+				ts: Date.now(),
+				slice: [{ topic: 't', messagesPerSec: 10, bytesPerSec: 100 }]
+				// no subs field
+			}));
+			await new Promise((r) => setImmediate(r));
+
+			// slice merged; subs absent doesn't poison anything.
+			expect(agg.rateOf('t')).toBe(10);
+			expect(agg.subscribersOf('t')).toBe(0);
+			await agg.deactivate();
+		});
+
+		it('ignores subs field when not subscribing to it (forward-compat)', async () => {
+			// Aggregator with no subjects -- still receives subs from siblings,
+			// caches them, and exposes via subscribersOf.
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'newer',
+				ts: Date.now(),
+				slice: [],
+				subs: [{ topic: 'shared', count: 4 }]
+			}));
+			await new Promise((r) => setImmediate(r));
+
+			expect(agg.subscribersOf('shared')).toBe(4);
+			await agg.deactivate();
+		});
+
+		it('deactivate clears remote subs cache', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+
+			client.redis.publish('uws:pressure:rates', JSON.stringify({
+				instanceId: 'sibling',
+				ts: Date.now(),
+				slice: [],
+				subs: [{ topic: 't', count: 3 }]
+			}));
+			await new Promise((r) => setImmediate(r));
+			expect(agg.subscribersOf('t')).toBe(3);
+
+			await agg.deactivate();
+			await agg.activate(platform);
+			expect(agg.subscribersOf('t')).toBe(0);
+			await agg.deactivate();
+		});
+	});
 });

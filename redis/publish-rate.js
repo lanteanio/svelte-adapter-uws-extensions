@@ -29,11 +29,18 @@
 import { randomBytes } from 'node:crypto';
 
 /**
+ * @typedef {Object} ClusterSubject
+ * @property {string} topic
+ * @property {number} count - Local subscriber count for this topic on the contributing instance.
+ */
+
+/**
  * @typedef {Object} PublishRateAggregatorOptions
  * @property {string} [channel='uws:pressure:rates'] - Redis pub/sub channel for slice broadcasts.
  * @property {number} [publishInterval=5000] - How often this instance broadcasts its slice (ms).
  * @property {number} [staleAfter=12000] - Drop a remote instance's slice from the merge if no fresher one arrives within this window (ms). Should be at least 2x `publishInterval` to tolerate a missed beat.
  * @property {number} [topN=20] - Cap on the per-instance slice and on the merged result. Bounds storage cost.
+ * @property {() => ClusterSubject[]} [subjects] - Optional contributor for cluster-wide subscriber counts. Called fresh on every broadcast tick to gather this instance's per-topic subscriber list. Sorted descending by count and capped at `topN`. When wired, the broadcast envelope grows a `subs` field; `subscribersOf(topic)` returns the merged sum.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  */
@@ -68,6 +75,10 @@ export function createPublishRateAggregator(client, options = {}) {
 	if (!Number.isInteger(topN) || topN < 1) {
 		throw new Error('publish-rate: topN must be a positive integer');
 	}
+	const subjects = options.subjects;
+	if (subjects !== undefined && typeof subjects !== 'function') {
+		throw new Error('publish-rate: subjects must be a function returning Array<{topic, count}>');
+	}
 	const breaker = options.breaker;
 
 	const m = options.metrics;
@@ -86,6 +97,14 @@ export function createPublishRateAggregator(client, options = {}) {
 	 */
 	const remoteSlices = new Map();
 
+	/**
+	 * Per-remote-instance subscriber-count cache. Same staleness rules as
+	 * `remoteSlices`. Local count is read fresh from `subjects()` on each
+	 * `subscribersOf(topic)` query so it's always current.
+	 * @type {Map<string, { ts: number, subs: Map<string, number> }>}
+	 */
+	const remoteSubs = new Map();
+
 	let activePlatform = null;
 	let subscriber = null;
 	let publishTimer = null;
@@ -103,6 +122,9 @@ export function createPublishRateAggregator(client, options = {}) {
 		for (const [id, entry] of remoteSlices) {
 			if (now - entry.ts > staleAfter) remoteSlices.delete(id);
 		}
+		for (const [id, entry] of remoteSubs) {
+			if (now - entry.ts > staleAfter) remoteSubs.delete(id);
+		}
 	}
 
 	function snapshotLocalSlice() {
@@ -111,10 +133,32 @@ export function createPublishRateAggregator(client, options = {}) {
 		return top.length > topN ? top.slice(0, topN) : top.slice();
 	}
 
+	function snapshotLocalSubjects() {
+		if (!subjects) return null;
+		let raw;
+		try { raw = subjects(); } catch { return []; }
+		if (!Array.isArray(raw)) return [];
+		// Dedupe by topic (sum counts) and cap at topN by descending count.
+		const merged = new Map();
+		for (const s of raw) {
+			if (!s || typeof s.topic !== 'string') continue;
+			const c = Number(s.count) || 0;
+			merged.set(s.topic, (merged.get(s.topic) || 0) + c);
+		}
+		const arr = [];
+		for (const [topic, count] of merged) arr.push({ topic, count });
+		arr.sort((a, b) => b.count - a.count);
+		return arr.length > topN ? arr.slice(0, topN) : arr;
+	}
+
 	async function broadcastSlice() {
 		if (!activated) return;
 		const slice = snapshotLocalSlice();
-		const envelope = JSON.stringify({ instanceId, ts: Date.now(), slice });
+		const subs = snapshotLocalSubjects();
+		const payload = subs === null
+			? { instanceId, ts: Date.now(), slice }
+			: { instanceId, ts: Date.now(), slice, subs };
+		const envelope = JSON.stringify(payload);
 		try {
 			await redis.publish(channel, envelope);
 			breaker?.success();
@@ -150,6 +194,15 @@ export function createPublishRateAggregator(client, options = {}) {
 			}
 			const ts = typeof env.ts === 'number' ? env.ts : Date.now();
 			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
+			if (Array.isArray(env.subs)) {
+				const subsMap = new Map();
+				for (const s of env.subs) {
+					if (!s || typeof s.topic !== 'string') continue;
+					const c = Number(s.count) || 0;
+					subsMap.set(s.topic, (subsMap.get(s.topic) || 0) + c);
+				}
+				remoteSubs.set(env.instanceId, { ts, subs: subsMap });
+			}
 			mReceived?.inc();
 		});
 		await subscriber.subscribe(channel);
@@ -172,6 +225,7 @@ export function createPublishRateAggregator(client, options = {}) {
 			try { await sub.quit(); } catch { try { sub.disconnect(); } catch { /* ignore */ } }
 		}
 		remoteSlices.clear();
+		remoteSubs.clear();
 		activePlatform = null;
 	}
 
@@ -235,12 +289,38 @@ export function createPublishRateAggregator(client, options = {}) {
 		return 0;
 	}
 
+	/**
+	 * Cluster-wide subscriber count for a topic, summed across this
+	 * instance's live local count (read fresh from `subjects()` on every
+	 * call) and all non-stale remote contributions. Returns 0 when no
+	 * `subjects` callback was wired and no remote instance has reported
+	 * the topic. Pure memory lookup; no Redis traffic on the hot path.
+	 *
+	 * Eventually-consistent within `publishInterval`; staleness bound by
+	 * `staleAfter`. Callers needing exact counts should track a Redis SET
+	 * cluster-wide and `SCARD` it instead.
+	 */
+	function subscribersOf(topic) {
+		pruneStale();
+		let total = 0;
+		const local = snapshotLocalSubjects();
+		if (local) {
+			for (const s of local) if (s.topic === topic) total += s.count;
+		}
+		for (const entry of remoteSubs.values()) {
+			const c = entry.subs.get(topic);
+			if (c) total += c;
+		}
+		return total;
+	}
+
 	return {
 		instanceId,
 		activate,
 		deactivate,
 		get topPublishers() { return computeTopPublishers(); },
 		rateOf,
+		subscribersOf,
 		/** Force an immediate broadcast tick. Useful in tests; bypasses the timer. */
 		_broadcastNow() { return broadcastSlice(); }
 	};

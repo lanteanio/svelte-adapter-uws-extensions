@@ -29,6 +29,7 @@ import { parseRedisVersion } from '../shared/redis-version.js';
  * @typedef {Object} ShardedBusOptions
  * @property {string} [channelPrefix='uws:sharded:'] - Prefix for sharded pub/sub channels.
  * @property {(topic: string) => string} [shardKey] - Map a topic to a shard label. The channel name is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic).
+ * @property {{ subscribersOf(topic: string): number }} [subscribersAggregator] - Optional aggregator (typically from `redis/publish-rate`) wired with this bus's `localSubjects` as its `subjects` source. When present, `bus.subscribers(topic)` returns the cluster-wide count. When absent, `bus.subscribers(topic)` returns the local count only.
  */
 
 /**
@@ -57,6 +58,12 @@ export function createShardedBus(client, options = {}) {
 		throw new Error('sharded bus: shardKey must be a function');
 	}
 	const shardKey = options.shardKey || ((topic) => topic);
+	const subscribersAggregator = options.subscribersAggregator;
+	if (subscribersAggregator !== undefined && (
+		!subscribersAggregator || typeof subscribersAggregator.subscribersOf !== 'function'
+	)) {
+		throw new Error('sharded bus: subscribersAggregator must expose subscribersOf(topic)');
+	}
 	const instanceId = randomBytes(8).toString('hex');
 
 	const b = options.breaker;
@@ -361,6 +368,35 @@ export function createShardedBus(client, options = {}) {
 		}
 	}
 
+	/**
+	 * Snapshot every topic this bus is currently following with its
+	 * local subscriber count from the supplied platform. Use as the
+	 * `subjects` callback on `createPublishRateAggregator` so the
+	 * aggregator can broadcast subscriber counts cluster-wide:
+	 *
+	 *     const bus = createShardedBus(client);
+	 *     const aggregator = createPublishRateAggregator(client, {
+	 *       subjects: () => bus.localSubjects(platform)
+	 *     });
+	 *
+	 * Topics with 0 local subscribers are omitted -- they have nothing
+	 * to contribute. Topics subscribed outside the bus's hooks (raw
+	 * `ws.subscribe` bypass) are not enumerated; they will not propagate
+	 * cluster-wide via this path.
+	 *
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 * @returns {Array<{topic: string, count: number}>}
+	 */
+	function localSubjects(platform) {
+		if (!platform || typeof platform.subscribers !== 'function') return [];
+		const out = [];
+		for (const topic of followCounts.keys()) {
+			const count = platform.subscribers(topic) | 0;
+			if (count > 0) out.push({ topic, count });
+		}
+		return out;
+	}
+
 	const bus = {
 		wrap(platform) {
 			const wrapped = {
@@ -448,6 +484,27 @@ export function createShardedBus(client, options = {}) {
 		follow,
 		followBatch,
 		unfollow,
+		localSubjects,
+		/**
+		 * Cluster-wide subscriber count for a topic. Returns the local
+		 * count (`platform.subscribers(topic)`) plus the remote sum from
+		 * the wired aggregator's `subscribersOf(topic)`. When no
+		 * aggregator is wired, returns the local count only.
+		 *
+		 * Eventually-consistent within the aggregator's `publishInterval`
+		 * for the remote contribution; the local read is always live.
+		 *
+		 * @param {string} topic
+		 * @returns {number}
+		 */
+		subscribers(topic) {
+			const local = activePlatform ? activePlatform.subscribers(topic) | 0 : 0;
+			if (!subscribersAggregator) return local;
+			// Aggregator's subscribersOf already includes self (via its
+			// own `subjects()` callback wired to bus.localSubjects).
+			// Trust it as the cluster total.
+			return subscribersAggregator.subscribersOf(topic);
+		},
 		hooks: {
 			async subscribe(ws, topic) {
 				if (topic.startsWith('__')) return;

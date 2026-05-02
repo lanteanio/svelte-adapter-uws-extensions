@@ -1965,6 +1965,7 @@ export async function open(ws, { platform }) {
 | `instanceId` | Stable id for this instance, used as the from-tag on outbound slice envelopes. |
 | `topPublishers` | Cluster-wide top publishers, merged from this instance's local slice (read fresh from `platform.pressure.topPublishers`) and the cached remote slices (stale entries dropped). Sorted descending by `messagesPerSec`, capped at `topN`. Each entry is `{topic, messagesPerSec, bytesPerSec, contributingInstances}`. Pure memory computation. |
 | `rateOf(topic)` | Cluster-wide messagesPerSec for a topic, or 0 if not in the merged top-N. Used by the `clusterTopPublisher` admission rule. |
+| `subscribersOf(topic)` | Cluster-wide subscriber count for a topic, summed across this instance's live local count (from the optional `subjects` callback) and cached non-stale remote contributions. Returns 0 when no `subjects` is wired and no remote instance has reported the topic. The sharded bus's `bus.subscribers(topic)` delegates here when an aggregator is wired. |
 | `activate(platform)` | Open the subscriber and start the broadcast timer. Idempotent. |
 | `deactivate()` | Stop the timer, drop the subscriber, clear cached slices. |
 
@@ -1972,10 +1973,10 @@ export async function open(ws, { platform }) {
 
 ```
 Channel: {channel}                          (default: 'uws:pressure:rates')
-Payload: {instanceId, ts, slice: [{topic, messagesPerSec, bytesPerSec}, ...]}
+Payload: {instanceId, ts, slice: [{topic, messagesPerSec, bytesPerSec}, ...], subs?: [{topic, count}, ...]}
 ```
 
-Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; entries older than `staleAfter` are dropped on the next merge.
+Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; entries older than `staleAfter` are dropped on the next merge. The `subs` field is omitted when no `subjects` callback is configured. Aggregators on either side of a version skew tolerate envelopes with or without `subs` (forward and backward compatible).
 
 #### Options
 
@@ -1984,13 +1985,43 @@ Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; 
 | `channel` | `'uws:pressure:rates'` | Redis channel for slice broadcasts. |
 | `publishInterval` | `5000` | How often this instance broadcasts its slice (ms). |
 | `staleAfter` | `12000` | Drop a remote instance's slice if no fresher one arrives within this window (ms). Should be at least `2 * publishInterval`. |
-| `topN` | `20` | Cap on per-instance slice and merged result. Bounds storage cost. |
+| `topN` | `20` | Cap on per-instance slice and merged result. Bounds storage cost. Also caps the `subs` slice (sorted descending by `count`). |
+| `subjects` | -- | Optional `() => Array<{topic, count}>` contributor for cluster-wide subscriber counts. Called fresh on every broadcast tick. When wired, the envelope grows a `subs` field and `subscribersOf(topic)` returns the merged sum. Pair with the sharded bus via `subjects: () => bus.localSubjects(platform)`. |
 | `breaker` | -- | Optional circuit breaker for the publish call. |
 | `metrics` | -- | Optional Prometheus metrics registry. |
 
 #### Pairing with admission control
 
 `createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` consults `aggregator.rateOf(topic)` on every `shouldAccept` call. Memory-only lookup, no Redis traffic on the hot path. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
+
+#### Pairing with the sharded bus (cluster subscriber counts)
+
+The aggregator's `subjects` option is the channel for cluster-wide subscriber counts. Wire the sharded bus's `localSubjects(platform)` helper as the contributor; the bus exposes a matching `bus.subscribers(topic)` that delegates to `aggregator.subscribersOf(topic)`:
+
+```js
+import { createShardedBus } from 'svelte-adapter-uws-extensions/redis/sharded-pubsub';
+import { createPublishRateAggregator } from 'svelte-adapter-uws-extensions/redis/publish-rate';
+
+const bus = createShardedBus(redis);
+const aggregator = createPublishRateAggregator(redis, {
+  subjects: () => bus.localSubjects(platform)
+});
+
+// One option to also pass subscribersAggregator into the bus so
+// bus.subscribers(topic) returns the cluster-wide count rather than
+// just the local one:
+const busWithCluster = createShardedBus(redis, { subscribersAggregator: aggregator });
+
+await bus.activate(platform);
+await aggregator.activate(platform);
+
+const cluster = busWithCluster.subscribers('chat:room-7');
+// Local count + sum from non-stale remote instances.
+```
+
+Without an aggregator wired, `bus.subscribers(topic)` returns the local count only -- same number `platform.subscribers(topic)` reports. Eventually-consistent within `publishInterval` for the remote contribution; the local read is always live. For exact counts (audit log, billing), track a Redis SET cluster-wide on subscribe / unsubscribe and `SCARD` it.
+
+The unsharded `createPubSubBus` does not track per-topic state (it forwards every topic through a single Redis channel), so it does not expose `localSubjects` / `subscribers`. Apps that need cluster-wide subscriber counts on the unsharded bus thread their own per-topic state into the aggregator's `subjects` callback.
 
 #### Pairing with prometheus
 
