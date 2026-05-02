@@ -77,6 +77,10 @@
       "types": "./redis/lock.d.ts",
       "default": "./redis/lock.js"
     },
+    "./redis/session": {
+      "types": "./redis/session.d.ts",
+      "default": "./redis/session.js"
+    },
     "./redis/registry": {
       "types": "./redis/registry.d.ts",
       "default": "./redis/registry.js"

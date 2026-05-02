@@ -73,8 +73,19 @@ export function mockRedisClient(keyPrefix = '') {
 			async unlink(...keys) {
 				return r.del(...keys);
 			},
-			async expire() { return 1; },
-			async pexpire() { return 1; },
+			async expire(key) {
+				// Real Redis EXPIRE returns 1 if the timeout was set, 0 if
+				// the key does not exist. TTL itself is not simulated; tests
+				// that exercise expiry should mutate the store directly.
+				const exists = store.has(key) || sortedSets.has(key)
+					|| hashes.has(key) || streams.has(key);
+				return exists ? 1 : 0;
+			},
+			async pexpire(key) {
+				const exists = store.has(key) || sortedSets.has(key)
+					|| hashes.has(key) || streams.has(key);
+				return exists ? 1 : 0;
+			},
 
 			// Replication ack stub. Tests configure behavior via:
 			//   redis._waitAcks: number to override the ack count

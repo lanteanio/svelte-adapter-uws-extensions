@@ -43,6 +43,7 @@ The core adapter keeps everything in-process memory. That works great for single
 **Cross-backend**
 - [Idempotency store](#idempotency-store)
 - [Distributed lock](#distributed-lock)
+- [Distributed session](#distributed-session)
 - [Task runner](#task-runner)
 
 **Observability**
@@ -1532,6 +1533,111 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 - **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" -- dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
 - **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
 - **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal -- caching the outcome is.
+
+---
+
+## Distributed session
+
+Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; this is the Redis-backed swap for multi-instance deployments where a session created on instance A must be readable from instance B after a load-balancer hop.
+
+Pairs with [Connection registry](#connection-registry): when both are wired, the session provides the durable per-user state (survives disconnect, persists across reconnect, available before a WS even opens), while the registry provides the live "where is this user right now" pointer (only meaningful while the WS is connected). They answer different questions and compose without overlap.
+
+#### Setup
+
+```js
+import { redis } from './redis.js';
+import { createDistributedSession } from 'svelte-adapter-uws-extensions/redis/session';
+
+export const sessions = createDistributedSession(redis, {
+  ttlMs: 30 * 60 * 1000   // 30 minutes
+});
+```
+
+#### Use
+
+```js
+// On login (HTTP handler):
+await sessions.set(token, { userId: 42, role: 'admin' });
+
+// On WS upgrade or HTTP request:
+const data = await sessions.get(token);
+if (!data) return error(401, 'session expired');
+
+// Refresh without reading data:
+await sessions.touch(token);
+
+// Logout:
+await sessions.delete(token);
+```
+
+#### Storage shape
+
+Each session is one Redis string at `{prefix}sess:{token}` containing the JSON-encoded data, with a TTL of `ttlMs`. Single round-trip for every operation: `SET key json PX ttl` to write, `GET key` plus `PEXPIRE key ttl` to read with sliding refresh, `PEXPIRE` to touch, `UNLINK` to delete. JSON blob keeps the whole record atomic on replace; partial-field updates are not a feature -- callers do `set(token, { ...await get(token), changed: 'value' })` for that.
+
+#### Sliding TTL
+
+Every `set` resets the TTL to `ttlMs`. By default `get` and `touch` also extend the TTL on a hit (the adapter's bundled `Session` plugin does the same). Disable read-time refresh via `refreshOnGet: false` for read-only flows where reads should not act as liveness signals.
+
+`touch(token)` and `delete(token)` return `true` if the entry was present and the operation succeeded, `false` if the entry was missing or already expired. `get(token)` returns `null` for missing, expired, or corrupt (non-JSON) entries; the corrupt-entry path is treated as a miss so the next `set` cleanly overwrites.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `keyPrefix` | `'sess:'` | Prefix prepended (after the client `keyPrefix`) to every session key. |
+| `ttlMs` | `86_400_000` (24h) | Sliding TTL window in milliseconds. |
+| `refreshOnGet` | `true` | Whether `get(token)` extends the TTL on a hit. |
+| `breaker` | -- | Optional circuit breaker for the Redis ops. |
+| `metrics` | -- | Optional Prometheus metrics registry. |
+
+#### Pairing with the bundled Session plugin
+
+The shape is identical: same `get` / `set` / `delete` / `touch` / `clear` names, same sliding-TTL semantics. The Redis-backed methods return `Promise<T>` while the bundled plugin's are synchronous, so a swap requires `await` on the call sites -- but otherwise the contract is shared. Use the bundled plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+
+#### Pairing with the connection registry
+
+Sessions and the [Connection registry](#connection-registry) answer different questions:
+
+- **Session:** "What does the system know about this user across HTTP and WS?" Survives disconnect; persists across reconnect; available even when the user has no live WS.
+- **Registry:** "Which instance currently owns this user's WS, and what attributes did the connection register with?" Lives only while the WS is connected; cleared on close (compare-and-delete).
+
+Wire them together by storing the auth token both on the WS userData (so the registry can identify the user) and using the same token to look up session data:
+
+```js
+// hooks.ws.js
+import { sessions } from '$lib/server/sessions';
+import { registry } from '$lib/server/registry';
+
+export async function upgrade({ cookies }) {
+  const token = cookies.get('session_id');
+  if (!token) return false;
+  const session = await sessions.get(token);
+  if (!session) return false;
+  return { token, userId: session.userId };
+}
+
+export const open = registry.hooks.open;
+export const close = registry.hooks.close;
+
+export async function message(ws) {
+  await sessions.touch(ws.getUserData().token);
+}
+```
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `session_get_total{result="hit|miss"}` | Counter of get calls. Hit rate signals cache freshness; a miss spike under steady traffic suggests TTL is too short. |
+| `session_set_total` | Counter of set calls. |
+| `session_delete_total{result="present|absent"}` | Counter of delete calls. `present` = the entry existed; `absent` = the token was already gone (idempotent logout). |
+| `session_touch_total{result="present|absent"}` | Counter of touch calls. `absent` = the entry was missing or already expired. |
+
+#### `clear()` and operational notes
+
+`clear()` removes every session under the configured `keyPrefix` via SCAN + UNLINK. Cluster-wide cost scales with total session count -- not a hot-path operation. Use for graceful-shutdown teardowns, test harnesses, or operator-initiated wipes (e.g., post-incident "log everyone out"). Other keys outside the prefix are untouched.
+
+There is intentionally no `size()` method: a cluster-wide count of session keys requires SCAN every time, and exposing it as a synchronous-looking accessor would be misleading. Apps that want session counts should track a separate Redis SET on `set` / `delete` and `SCARD` it.
 
 ---
 
