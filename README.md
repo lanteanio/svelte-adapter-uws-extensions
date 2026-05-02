@@ -1931,6 +1931,47 @@ export async function POST({ platform, request }) {
 
 The two layers complement each other: admission control prevents new work from piling up under server-local pressure; the breaker prevents thundering-herd retries against a dead backend.
 
+#### Two-tier admission (handshake + message)
+
+The adapter ships a separate admission layer at the WebSocket handshake path -- before any TLS / header work -- via the `upgradeAdmission` option on its `wsOptions` (and on `createTestServer` for test harnesses). The two layers operate at different points in the connection lifecycle and are configured independently:
+
+| Layer | Where | Sheds | Configured via |
+|---|---|---|---|
+| Handshake | Adapter, before `res.upgrade()` | Concurrent in-flight upgrades and per-tick handshake budget | `wsOptions.upgradeAdmission = { maxConcurrent, perTickBudget }` |
+| Message / RPC | Extensions, in your handler | Per-class load-shedding against `platform.pressure` | `createAdmissionControl({ classes })` plus a `shouldAccept(...)` check |
+
+Wire both for full coverage of "new connections under storm" and "established connections under pressure":
+
+```js
+// svelte.config.js (or wherever you configure the adapter)
+import adapter from 'svelte-adapter-uws';
+
+export default {
+  kit: {
+    adapter: adapter({
+      websocket: {
+        upgradeAdmission: { maxConcurrent: 200, perTickBudget: 50 }
+      }
+    })
+  }
+};
+```
+
+```js
+// In your message / RPC handler
+import { ac } from '$lib/server/admission';
+
+export function message(ws, { data, platform }) {
+  if (!ac.shouldAccept('background', platform)) {
+    ws.send(JSON.stringify({ error: 'overloaded' }));
+    return;
+  }
+  // ...handle the message...
+}
+```
+
+Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race -- the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission) section for the handshake-tier reference.
+
 ---
 
 ## Redis Functions
