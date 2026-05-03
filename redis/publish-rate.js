@@ -27,6 +27,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { assert } from '../shared/assert.js';
+import { MAX_AGGREGATOR_REMOTE_INSTANCES } from '../shared/caps.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -109,6 +111,7 @@ export function createPublishRateAggregator(client, options = {}) {
 	let subscriber = null;
 	let publishTimer = null;
 	let activated = false;
+	let remoteInstancesWarnFired = false;
 
 	if (mInstanceCount) {
 		mInstanceCount.collect(() => {
@@ -192,8 +195,22 @@ export function createPublishRateAggregator(client, options = {}) {
 				mParseErrors?.inc();
 				return;
 			}
+			assert(
+				env.instanceId !== instanceId,
+				'publish-rate.echo-suppression',
+				{ instanceId: env.instanceId }
+			);
 			const ts = typeof env.ts === 'number' ? env.ts : Date.now();
 			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
+			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteInstancesWarnFired) {
+				remoteInstancesWarnFired = true;
+				console.warn(
+					'[publish-rate] aggregator is tracking ' + remoteSlices.size +
+					' sibling instances. Cluster sizes past this threshold typically ' +
+					'indicate a deployment misconfig or stale-instance leak; staleAfter ' +
+					'pruning normally caps remote slice retention.'
+				);
+			}
 			if (Array.isArray(env.subs)) {
 				const subsMap = new Map();
 				for (const s of env.subs) {

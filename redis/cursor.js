@@ -20,6 +20,7 @@ import { randomBytes } from 'node:crypto';
 import { CLEANUP_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 
 /** Wire-protocol event names this module emits. */
 const EVENTS = Object.freeze({
@@ -232,6 +233,11 @@ export function createCursor(client, options = {}) {
 	function getWsState(ws) {
 		let state = wsState.get(ws);
 		if (!state) {
+			if (wsState.size >= MAX_CURSOR_WS) {
+				throw new Error(
+					`redis cursor: local ws count exceeded ${MAX_CURSOR_WS} on this instance`
+				);
+			}
 			const user = select(safeUserData(ws));
 			try { JSON.stringify(user); } catch {
 				throw new Error('redis cursor: select() must return JSON-serializable data');
@@ -419,6 +425,11 @@ export function createCursor(client, options = {}) {
 
 			let topicMap = topics.get(topic);
 			if (!topicMap) {
+				if (topics.size >= MAX_CURSOR_TOPICS) {
+					throw new Error(
+						`redis cursor: local topic count exceeded ${MAX_CURSOR_TOPICS} on this instance`
+					);
+				}
 				topicMap = new Map();
 				topics.set(topic, topicMap);
 			}

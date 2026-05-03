@@ -50,6 +50,7 @@ import {
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql } from './_tasks-sql.js';
 import { withBreaker } from '../shared/breaker.js';
+import { MAX_TASK_HANDLERS } from '../shared/caps.js';
 
 export { TaskInFlightError, UnknownTaskError };
 
@@ -458,6 +459,12 @@ export function createTaskRunner(client, options = {}) {
 			}
 			if (handlers.has(name)) {
 				throw new Error(`postgres tasks: task "${name}" is already registered`);
+			}
+			if (handlers.size >= MAX_TASK_HANDLERS) {
+				throw new Error(
+					`postgres tasks: registered task count exceeded ${MAX_TASK_HANDLERS} ` +
+					`-- registration is bootstrap-time, this number is already pathological`
+				);
 			}
 
 			const workerOption = registrationOptions.worker;

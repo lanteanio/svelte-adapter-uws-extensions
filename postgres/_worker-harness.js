@@ -42,9 +42,23 @@ const handlerPromise = (async () => {
 /** @type {Map<string, AbortController>} */
 const controllers = new Map();
 
+const MAX_WORKER_CONTROLLERS = 10_000_000;
+
 parentPort.on('message', async (msg) => {
 	if (msg && msg.type === 'run') {
 		const id = msg.id;
+		// Per-worker cap on in-flight controllers. Mirrors the
+		// MAX_REGISTRY_PENDING_REQUESTS shape: a leaking dispatcher (pump
+		// loop never awaits) hits the cap before the heap fills with
+		// orphaned controllers.
+		if (controllers.size >= MAX_WORKER_CONTROLLERS) {
+			parentPort.postMessage({
+				type: 'error',
+				id,
+				error: { name: 'Error', message: 'worker harness: in-flight controller cap exceeded' }
+			});
+			return;
+		}
 		const controller = new AbortController();
 		controllers.set(id, controller);
 

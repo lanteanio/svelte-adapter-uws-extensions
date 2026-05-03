@@ -9,6 +9,7 @@
 
 import Redis from 'ioredis';
 import { ConnectionError } from '../shared/errors.js';
+import { MAX_REDIS_DUPLICATES_PER_CLIENT } from '../shared/caps.js';
 
 /**
  * @typedef {Object} RedisClientOptions
@@ -66,6 +67,7 @@ export function createRedisClient(options = {}) {
 	// Track duplicate connections for cleanup
 	/** @type {Set<import('ioredis').Redis>} */
 	const duplicates = new Set();
+	let duplicatesWarnFired = false;
 
 	/** @type {boolean} */
 	let shuttingDown = false;
@@ -93,6 +95,16 @@ export function createRedisClient(options = {}) {
 		duplicate(overrides) {
 			const dup = overrides ? redis.duplicate(overrides) : redis.duplicate();
 			duplicates.add(dup);
+			if (duplicates.size >= MAX_REDIS_DUPLICATES_PER_CLIENT && !duplicatesWarnFired) {
+				duplicatesWarnFired = true;
+				console.warn(
+					'[redis] client has spawned ' + duplicates.size +
+					' duplicate connections. A single Node process should never need ' +
+					'more than a handful (one per subscriber-shaped module). Each ' +
+					'duplicate owns a real ioredis socket; check for a lifecycle leak ' +
+					'where modules are constructed without a corresponding deactivate.'
+				);
+			}
 			const cleanup = () => duplicates.delete(dup);
 			dup.on('close', cleanup);
 			dup.on('end', cleanup);

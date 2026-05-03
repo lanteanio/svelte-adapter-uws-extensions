@@ -39,6 +39,7 @@ import { CLEANUP_SCRIPT, COUNT_DEDUP_SCRIPT, LIST_SCRIPT } from '../shared/scrip
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
+import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 
 /**
  * Lua script for atomic join: set this instance's field and expire the key.
@@ -900,6 +901,11 @@ export function createPresence(client, options = {}) {
 			// fully committed so the heartbeat cannot write a ghost entry
 			// to Redis during any async gap.
 			if (!connTopics) {
+				if (wsTopics.size >= MAX_PRESENCE_WS) {
+					throw new Error(
+						`presence: local ws count exceeded ${MAX_PRESENCE_WS} on this instance`
+					);
+				}
 				connTopics = new Map();
 				wsTopics.set(ws, connTopics);
 			}
@@ -908,6 +914,11 @@ export function createPresence(client, options = {}) {
 
 			let counts = existingCounts;
 			if (!counts) {
+				if (localCounts.size >= MAX_PRESENCE_TOPICS) {
+					throw new Error(
+						`presence: local topic count exceeded ${MAX_PRESENCE_TOPICS} on this instance`
+					);
+				}
 				counts = new Map();
 				localCounts.set(topic, counts);
 			}

@@ -10,6 +10,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { assert } from '../shared/assert.js';
+import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
 
 /**
  * @typedef {Object} PubSubBusOptions
@@ -102,9 +104,20 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {Array<{msg: string, count: number}>} */
 	let relayBatch = [];
 	let relayScheduled = false;
+	let relayBatchWarnFired = false;
 
 	function scheduleRelay(msg, count) {
+		assert(count >= 1, 'pubsub.relay-batch.count-positive', { count });
 		relayBatch.push({ msg, count });
+		if (relayBatch.length >= MAX_PUBSUB_RELAY_BATCH_PER_TICK && !relayBatchWarnFired) {
+			relayBatchWarnFired = true;
+			console.warn(
+				'[pubsub] microtask relay batch reached ' + relayBatch.length +
+				' entries in one tick. The batch is drained every microtask, so a ' +
+				'caller emitted a million publishes in one synchronous burst -- likely ' +
+				'a publish-in-loop without yielding.'
+			);
+		}
 		if (!relayScheduled) {
 			relayScheduled = true;
 			queueMicrotask(flushRelay);
@@ -250,6 +263,11 @@ export function createPubSubBus(client, options = {}) {
 				if (ch !== channel) return;
 				try {
 					const parsed = JSON.parse(message);
+					assert(
+						typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string',
+						'pubsub.envelope.shape',
+						{ ch }
+					);
 					// Skip messages from this instance (echo suppression).
 					// One check per envelope; batched envelopes carry one
 					// instanceId for the whole batch.

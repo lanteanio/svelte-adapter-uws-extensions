@@ -26,6 +26,13 @@
 import { randomBytes } from 'node:crypto';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { now as cachedNow } from '../shared/time.js';
+import { assert } from '../shared/assert.js';
+import {
+	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
+	MAX_REGISTRY_PENDING_REQUESTS,
+	MAX_REGISTRY_USER_INDEX,
+	MAX_REGISTRY_INDEX_VALUES_PER_KEY
+} from '../shared/caps.js';
 
 /**
  * Lua-atomic compare-and-delete: only removes the registry entry if the
@@ -212,6 +219,16 @@ export function createConnectionRegistry(client, options) {
 				byValue.set(v, users);
 			}
 			users.add(userId);
+			if (users.size >= MAX_REGISTRY_INDEX_VALUES_PER_KEY && !indexValuesWarnFired.has(k)) {
+				indexValuesWarnFired.add(k);
+				console.warn(
+					'[registry] secondary-index bucket for attribute "' + k +
+					'" has grown to ' + users.size + ' userIds. Eviction would corrupt ' +
+					'sendTo matching, so the index keeps growing -- raise this if the ' +
+					'cardinality is legitimate, or check for an attributes(ws) callback ' +
+					'returning unique values per connection.'
+				);
+			}
 		}
 	}
 
@@ -234,6 +251,15 @@ export function createConnectionRegistry(client, options) {
 		userToInstance.set(userId, ownerInstanceId);
 		userIdAttrs.set(userId, attrs || {});
 		indexUser(userId, attrs);
+		if (userToInstance.size >= MAX_REGISTRY_USER_INDEX && !userIndexWarnFired) {
+			userIndexWarnFired = true;
+			console.warn(
+				'[registry] cluster-wide user index has grown to ' + userToInstance.size +
+				' entries. Each entry is ~32 bytes of Map state per instance maintaining ' +
+				'the index. Eviction would mis-route sendTo, so the index keeps growing -- ' +
+				'split the cluster or stop registering anonymous-shaped userIds.'
+			);
+		}
 	}
 
 	function applyCloseEvent(userId, ownerInstanceId) {
@@ -269,6 +295,13 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	let bootstrapped = false;
+
+	// One-shot warn flags for the cluster-wide caps. The adapter's
+	// equivalent (`topicSeqsWarnFired` in handler.js) uses the same
+	// pattern: fire once when the threshold is first crossed, surface the
+	// leak shape, then stay quiet so a runaway producer can't spam logs.
+	let userIndexWarnFired = false;
+	const indexValuesWarnFired = new Set();
 
 	if (mRegistrySize) {
 		mRegistrySize.collect(() => mRegistrySize.set(localUsers.size));
@@ -467,6 +500,11 @@ export function createConnectionRegistry(client, options) {
 		if (!envelope || typeof envelope !== 'object') return;
 		const { type, userId, instanceId: ownerInstanceId } = envelope;
 		if (typeof userId !== 'string' || typeof ownerInstanceId !== 'string') return;
+		assert(
+			type === 'open' || type === 'close',
+			'registry.events.payload-type',
+			{ type }
+		);
 		if (type === 'open') {
 			const attrs = normalizeAttrs(envelope.attrs);
 			applyOpenEvent(userId, ownerInstanceId, attrs);
@@ -584,6 +622,13 @@ export function createConnectionRegistry(client, options) {
 			mLateReply?.inc();
 			return;
 		}
+		assert(
+			typeof slot.resolve === 'function' &&
+			typeof slot.reject === 'function' &&
+			typeof slot.startTime === 'number',
+			'registry.pending-entry.shape',
+			{ ref }
+		);
 		clearTimeout(slot.timer);
 		pending.delete(ref);
 		const elapsed = Date.now() - slot.startTime;
@@ -648,6 +693,19 @@ export function createConnectionRegistry(client, options) {
 
 		// Cross-instance: publish request, wait for reply on own push channel.
 		await ensureSubscriber(activePlatform);
+
+		// Per-instance cap on in-flight requests. Mirrors adapter's
+		// `WS_PENDING_REQUESTS` shape, scaled per-instance: a leaking
+		// caller (e.g. `request()` without `await`) hits the cap before
+		// the heap fills with pending entries.
+		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
+			mRequests?.inc({ result: 'error' });
+			throw new Error(
+				'registry.request: pending requests exceeded ' +
+				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
+			);
+		}
+
 		const ref = randomBytes(12).toString('hex');
 		const envelope = {
 			type: 'request',
@@ -930,6 +988,16 @@ export function createConnectionRegistry(client, options) {
 				if (prevSession && prevSession !== sessionId) {
 					sessionToWs.delete(prevSession);
 				}
+
+				// Per-instance state cap. Skip registration past the cap so a
+				// runaway connection storm or an identify() returning unique
+				// per-call values can't exhaust process memory. The user is
+				// anonymous from the registry's POV until the next reconnect
+				// that finds the cap below the threshold.
+				if (!localUsers.has(userId) && localUsers.size >= MAX_REGISTRY_SESSIONS_PER_INSTANCE) {
+					return;
+				}
+
 				localUsers.set(userId, sessionId);
 				sessionToWs.set(sessionId, ws);
 
@@ -959,6 +1027,13 @@ export function createConnectionRegistry(client, options) {
 				if (sessionId) {
 					localUsers.delete(userId);
 					sessionToWs.delete(sessionId);
+					// Pairs with the open hook's two writes; either both maps
+					// reflect the user or neither does.
+					assert(
+						localUsers.size === sessionToWs.size,
+						'registry.session-shadow.consistency',
+						{ localUsers: localUsers.size, sessionToWs: sessionToWs.size }
+					);
 				}
 				await deleteIfOurs(userId);
 				// Local index update and broadcast happen unconditionally

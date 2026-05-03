@@ -599,3 +599,10 @@ export function connectionMetricsHook(metrics, userClose) {
 		if (userClose) await userClose(ws, ctx);
 	};
 }
+
+// Re-export the assertion-metrics wirer for discoverability alongside
+// the other `wire*Metrics` factories. Source-of-truth lives in
+// `shared/assert.js` so the assert helper owns its observability
+// surface end-to-end.
+export { wireAssertionMetrics } from '../shared/assert.js';
+

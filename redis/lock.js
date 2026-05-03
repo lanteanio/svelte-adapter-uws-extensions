@@ -18,6 +18,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { assert } from '../shared/assert.js';
 
 /**
  * Lua: refresh the lock's TTL only if our fence token still owns the key.
@@ -230,6 +231,16 @@ export function createDistributedLock(client, options = {}) {
 		} finally {
 			clearInterval(heartbeatTimer);
 			if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+			// `lost === true` is set only inside the heartbeat callback,
+			// which then calls controller.abort(...). The signal must
+			// always be aborted by the time we observe `lost`. The reverse
+			// is not true: an external signal may have aborted the
+			// controller without lostLock firing.
+			assert(
+				!lost || controller.signal.aborted,
+				'lock.heartbeat.signal-aborted-iff-lost',
+				{ key }
+			);
 			if (!lost) {
 				try {
 					await redis.eval(RELEASE_SCRIPT, 1, fullK, fenceToken);

@@ -24,6 +24,11 @@
 
 import { randomBytes } from 'node:crypto';
 import { parseRedisVersion } from '../shared/redis-version.js';
+import { assert } from '../shared/assert.js';
+import {
+	MAX_SHARDED_BUS_TOPICS,
+	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
+} from '../shared/caps.js';
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -95,6 +100,9 @@ export function createShardedBus(client, options = {}) {
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
 	const wsFollows = new WeakMap();
 
+	// One-shot warn flag for the per-tick microtask batch cap.
+	let batchChannelsWarnFired = false;
+
 	// Per-channel microtask batch: coalesce SPUBLISHes for the same
 	// channel within one tick into a single pipelined call. Each entry
 	// tracks the underlying topic list so the relayed-messages counter
@@ -110,6 +118,15 @@ export function createShardedBus(client, options = {}) {
 			channelBatches.set(channel, arr);
 		}
 		arr.push({ msg, topics });
+		if (channelBatches.size >= MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK && !batchChannelsWarnFired) {
+			batchChannelsWarnFired = true;
+			console.warn(
+				'[sharded-bus] microtask batch reached ' + channelBatches.size +
+				' distinct channels in one tick. The batch is drained every microtask, ' +
+				'so reaching this size means a publisher emitted a million distinct ' +
+				'channels in one synchronous burst -- likely a topic-cardinality leak.'
+			);
+		}
 		if (!relayScheduled) {
 			relayScheduled = true;
 			queueMicrotask(flushRelay);
@@ -153,6 +170,11 @@ export function createShardedBus(client, options = {}) {
 		subscriber.on('smessage', (ch, message) => {
 			try {
 				const parsed = JSON.parse(message);
+				assert(
+					typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string',
+					'sharded-bus.envelope.shape',
+					{ ch }
+				);
 				// One echo check per envelope; batched envelopes carry
 				// one instanceId for the whole batch.
 				if (parsed.instanceId === instanceId) {
@@ -235,6 +257,16 @@ export function createShardedBus(client, options = {}) {
 			throw new Error('sharded bus: activate() must be called before follow()');
 		}
 		const count = followCounts.get(topic) || 0;
+		// Per-instance cap on distinct followed topics. Mirrors the
+		// adapter's WS_SUBSCRIPTIONS denial shape but at the bus layer.
+		// The reject is structured so callers can distinguish "topic
+		// rejected" from a Redis failure.
+		if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
+			throw new Error(
+				'sharded bus: distinct topic count exceeded ' +
+				MAX_SHARDED_BUS_TOPICS + ' on this instance'
+			);
+		}
 		followCounts.set(topic, count + 1);
 		// Channel refcount tracks distinct active topics resolving to
 		// the channel, not raw follow-call count. Only bump when this
@@ -297,6 +329,13 @@ export function createShardedBus(client, options = {}) {
 			if (touchedTopics.has(topic)) continue;
 			touchedTopics.add(topic);
 			const count = followCounts.get(topic) || 0;
+			// Per-instance cap shared with `follow`. New topics past the
+			// cap are silently skipped here (rather than rejecting the
+			// whole batch) so a partial subscribe can still land for the
+			// caller's existing topics.
+			if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
+				continue;
+			}
 			followCounts.set(topic, count + 1);
 			if (count > 0) continue;
 			activatedTopics.push(topic);

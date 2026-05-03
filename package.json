@@ -109,6 +109,10 @@
       "types": "./shared/breaker.d.ts",
       "default": "./shared/breaker.js"
     },
+    "./assert": {
+      "types": "./shared/assert.d.ts",
+      "default": "./shared/assert.js"
+    },
     "./admission": {
       "types": "./shared/admission.d.ts",
       "default": "./shared/admission.js"
@@ -136,7 +140,7 @@
     "node": ">=20.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.5.0-next.6"
+    "svelte-adapter-uws": "^0.5.0-next.8"
   },
   "dependencies": {
     "ioredis": "^5.0.0"

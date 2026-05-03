@@ -2129,6 +2129,84 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 
 **Reliability**
 
+## Capacity model
+
+Every internal `Map` / `Set` / queue of factory-or-module-level scope declares an explicit upper bound and a documented saturation behavior, so a runaway publisher, a subscribe-in-loop bug, or a topic-cardinality leak can no longer exhaust process memory silently. Mirrors the adapter's `0.5.0-next.8` capacity-cap pattern, scaled one tier up: where the adapter caps **per-connection** at 1M, we cap **per-instance** at 10M (an instance can hold ~1M concurrent uWS connections with ~10 entries of state per connection on average), and **cluster-wide** warn-only caps land at 100M (beyond which the in-memory index itself becomes a real memory concern, ~3.2GB on each instance maintaining the index).
+
+Saturation behavior is matched to each data structure's contract:
+
+- **State the protocol depends on** (`userToInstance` for `sendTo` routing, the secondary index buckets, the cluster-wide user index): **warn-only**. Eviction would corrupt routing or matching, so a single structured `console.warn` fires the first time the cap is crossed -- surfacing the leak shape -- and the index keeps growing.
+- **State with overwrite-by-key contract**: not currently used in extensions (this saturation shape lives in the adapter's `WS_COALESCED` and the throttle/debounce plugins).
+- **State bounded by the caller** (registry pending requests, presence ws, cursor ws, sharded bus topics, groups local members): **reject new** -- the adding caller surfaces an explicit error, and the saturated entry is not added.
+- **Per-tick microtask batches** (sharded bus relay, pubsub relay): **warn-only** -- the batch is drained every microtask, so reaching the cap in one tick means a synchronous burst leak; the warn surfaces it without dropping any in-flight publishes.
+
+Caps live as named constants in `shared/caps.js`. They are not currently configurable per-instance; if a real workload needs a tighter or looser bound for a specific module, raise an issue and we'll add a per-factory option.
+
+| Cap | Default | Saturation | Notes |
+|---|---|---|---|
+| `MAX_REGISTRY_SESSIONS_PER_INSTANCE` | 10_000_000 | reject new | `hooks.open` skips the registration past the cap |
+| `MAX_REGISTRY_PENDING_REQUESTS` | 10_000_000 | reject new | `request(...)` rejects with "pending requests exceeded" |
+| `MAX_REGISTRY_USER_INDEX` | 100_000_000 | warn-only | cluster-wide; eviction would mis-route `sendTo` |
+| `MAX_REGISTRY_INDEX_VALUES_PER_KEY` | 10_000_000 | warn-only | per-attribute-key bucket in the secondary index |
+| `MAX_SHARDED_BUS_TOPICS` | 10_000_000 | reject new | `follow` / `followBatch` reject distinct-new past the cap |
+| `MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK` | 1_000_000 | warn-only | per-microtask outbound batch |
+| `MAX_PUBSUB_RELAY_BATCH_PER_TICK` | 1_000_000 | warn-only | per-microtask outbound batch |
+| `MAX_PRESENCE_WS` | 10_000_000 | reject new | per-instance ws joins |
+| `MAX_PRESENCE_TOPICS` | 10_000_000 | reject new | per-instance topic count |
+| `MAX_CURSOR_WS` | 10_000_000 | reject new | per-instance ws cursor activity |
+| `MAX_CURSOR_TOPICS` | 10_000_000 | reject new | per-instance cursor topic count |
+| `MAX_GROUPS_LOCAL_MEMBERS` | 10_000_000 | reject new | treated as "group full" |
+| `MAX_TASK_HANDLERS` | 10_000 | reject new | bootstrap-time `register(name, handler)` calls |
+| `MAX_REDIS_DUPLICATES_PER_CLIENT` | 1_000 | warn-only | duplicate ioredis connections per client wrapper |
+| `MAX_AGGREGATOR_REMOTE_INSTANCES` | 10_000 | warn-only | sibling instances on the publish-rate aggregator |
+| `MAX_BREAKER_LISTENERS` | 10_000 | reject new | listeners on a single breaker |
+
+Aggregate-memory protection still belongs to the adapter's `upgradeAdmission.maxConcurrent` (see the adapter's "Layered admission" section); per-instance caps are not the right place to defend against a 10M-connection DoS.
+
+---
+
+## Production assertions
+
+Critical invariants across the extensions are checked at runtime via a two-tier assertion helper that mirrors the adapter's `0.5.0-next.8` shape. Two helpers, `assert(cond, category, context)` and `devAssert(cond, message, context)`, live in `shared/assert.js` and fire at ~10 invariant sites today (envelope shape on inbound pubsub frames, registry session-shadow consistency, registry events-channel payload type, secondary-index consistency, lock heartbeat-vs-signal-aborted invariant, etc).
+
+#### How violations surface
+
+| Mode | `assert` behavior | `devAssert` behavior |
+|---|---|---|
+| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** -- a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | full no-op |
+| **Test** (`process.env.VITEST` or `NODE_ENV === 'test'`) | counter++, log, and throws so vitest surfaces the failure as a test error | log only, never throws |
+| **Development** (otherwise) | counter++, log, no throw | log only |
+
+`devAssert` is for cosmetic / DX hints (schema-mismatch warnings, etc); `assert` is for invariants whose violation indicates corrupted internal state. The DX framing matches the adapter's: hard assertions never fire on healthy code; if they fire, something is genuinely wrong, and the metric + log surface it without taking the worker down.
+
+#### Wiring the metric
+
+```js
+import { createMetrics } from 'svelte-adapter-uws-extensions/prometheus';
+import { wireAssertionMetrics } from 'svelte-adapter-uws-extensions/prometheus';
+
+const metrics = createMetrics();
+wireAssertionMetrics(metrics);
+```
+
+After wiring, every `assert` violation increments `extensions_assertion_violations_total{category}`. The label cardinality is bounded by the number of distinct categories declared in the source -- not user-input-driven.
+
+If a counter goes non-zero in production: file an issue with the category name, the log entries, and a description of the workload. The category names follow the convention `<module>.<invariant>` (e.g. `registry.session-shadow.consistency`, `pubsub.envelope.shape`).
+
+#### Reading counters in process
+
+`getAssertionCounters()` from `shared/assert.js` returns the live counter Map. Mirrors the adapter's `platform.assertions` shape -- the Map is the live state, not a snapshot, so consumers holding the reference see updates automatically.
+
+```js
+import { getAssertionCounters } from 'svelte-adapter-uws-extensions/assert';
+
+if (getAssertionCounters().size > 0) {
+  console.warn('extensions: invariant violations detected', getAssertionCounters());
+}
+```
+
+---
+
 ## Failure handling
 
 Every Redis and Postgres extension accepts an optional `breaker` option -- a shared [circuit breaker](#circuit-breaker) that tracks backend health across all extensions wired to it. When the breaker trips, each extension degrades differently depending on whether the operation is critical or best-effort:

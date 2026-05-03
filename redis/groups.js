@@ -20,6 +20,7 @@
 import { randomBytes } from 'node:crypto';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
+import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -330,6 +331,16 @@ export function createGroup(client, name, options = {}) {
 			if (result[0] === 0) {
 				mRejected?.inc({ group: name });
 				if (onFull) onFull(ws, role);
+				return false;
+			}
+
+			// Per-instance cap on local member count. Treat saturation
+			// the same as a "group full" rejection -- the caller already
+			// has graceful handling for that path.
+			if (!localMembers.has(ws) && localMembers.size >= MAX_GROUPS_LOCAL_MEMBERS) {
+				mRejected?.inc({ group: name });
+				if (onFull) onFull(ws, role);
+				try { await redis.hdel(membersKey, memberId); } catch { /* ignore */ }
 				return false;
 			}
 

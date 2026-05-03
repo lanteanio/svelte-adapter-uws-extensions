@@ -14,6 +14,8 @@
  * @module svelte-adapter-uws-extensions/breaker
  */
 
+import { MAX_BREAKER_LISTENERS } from './caps.js';
+
 export class CircuitBrokenError extends Error {
 	constructor() {
 		super('circuit breaker is open — backend unavailable');
@@ -161,6 +163,12 @@ export function createCircuitBreaker(options = {}) {
 		subscribe(handler) {
 			if (typeof handler !== 'function') {
 				throw new Error('circuit breaker: subscribe handler must be a function');
+			}
+			if (listeners.size >= MAX_BREAKER_LISTENERS) {
+				throw new Error(
+					'circuit breaker: listener count exceeded ' + MAX_BREAKER_LISTENERS +
+					' on this breaker -- a leak signal, since each module wires at most one'
+				);
 			}
 			listeners.add(handler);
 			return () => listeners.delete(handler);
