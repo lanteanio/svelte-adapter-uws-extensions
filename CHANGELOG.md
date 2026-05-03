@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.2] - 2026-05-03
+
 ### Breaking Changes
 
 - **`redis/presence` wire shape on `__presence:{topic}` migrated to `presence_state` / `presence_diff` / `heartbeat`** (was `list` / `join` / `leave` / `updated` / `heartbeat`). Mirrors the adapter's bundled `createPresence` plugin so a single client decoder works for both single-instance and cluster deployments. New shape:
