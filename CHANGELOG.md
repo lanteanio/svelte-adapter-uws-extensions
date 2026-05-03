@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.3] - 2026-05-04
+
 ### Added
 
 - **Production assertions + bounded-by-default capacity caps across the extensions.** Mirrors the adapter's `0.5.0-next.8` capacity-cap and assertion-helper pattern. New `shared/assert.js` exports `assert(cond, category, context)` and `devAssert(cond, message, context)` -- production-safe invariant helpers that increment a per-category counter Map and log a structured `[extensions/assert] {...}` line on violation, throwing only in test mode (`process.env.VITEST` or `NODE_ENV === 'test'`) so vitest surfaces failures. Production never throws because a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index. Helpers are wired at ~10 invariant sites today (`pubsub.envelope.shape`, `sharded-bus.envelope.shape`, `registry.events.payload-type`, `registry.session-shadow.consistency`, `registry.pending-entry.shape`, `publish-rate.echo-suppression`, `lock.heartbeat.signal-aborted-iff-lost`, `pubsub.relay-batch.count-positive`).
@@ -17,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.8`** (was `^0.5.0-next.6`). The new range matches the adapter release that ships the matching production-assertion and bounded-by-default capacity-cap work across the adapter core and bundled plugins.
+- **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.10`** (was `^0.5.0-next.6`). The new range matches the adapter release that ships the matching production-assertion and bounded-by-default capacity-cap work across the adapter core and bundled plugins.
 
 ## [0.5.0-next.2] - 2026-05-03
 
