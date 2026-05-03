@@ -236,6 +236,99 @@ describe('redis groups (integration)', () => {
 			const ok = await g2.join(mockWs(), mockPlatform());
 			expect(ok).toBe(false);
 		});
+
+		it('publish on instance-1 reaches local members on instance-2 via the events channel', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const g1 = makeGroup('cross-publish', { maxMembers: 5 });
+			const g2 = makeGroup('cross-publish', { maxMembers: 5 });
+
+			// One member on each instance to bring up both subscribers.
+			await g1.join(mockWs(), platformA);
+			await g2.join(mockWs(), platformB);
+
+			// Drain the join-side platform.publish frames so the assertion
+			// only sees the cross-instance broadcast.
+			platformA.reset();
+			platformB.reset();
+
+			await g1.publish(platformA, 'announcement', { msg: 'hello cluster' });
+			// Allow the SUBSCRIBE round-trip: publish -> Redis -> subscriber on B
+			// -> platform.publish on B's local topic.
+			await wait(50);
+
+			// A's own platform fanned out locally via platform.publish.
+			const aLocal = platformA.published.find(
+				(p) => p.event === 'announcement' && p.topic === '__group:cross-publish'
+			);
+			expect(aLocal).toBeDefined();
+			expect(aLocal.data).toEqual({ msg: 'hello cluster' });
+
+			// B received the same event over the events channel and re-fanned
+			// out locally via its own platform.publish (relay:false).
+			const bLocal = platformB.published.find(
+				(p) => p.event === 'announcement' && p.topic === '__group:cross-publish'
+			);
+			expect(bLocal).toBeDefined();
+			expect(bLocal.data).toEqual({ msg: 'hello cluster' });
+			expect(bLocal.options).toEqual({ relay: false });
+		});
+
+		it('role-filtered publish only reaches the matching role on the remote instance', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const g1 = makeGroup('cross-role', { maxMembers: 10 });
+			const g2 = makeGroup('cross-role', { maxMembers: 10 });
+
+			const wsAdminA = mockWs({ id: 'admin-a' });
+			const wsAdminB = mockWs({ id: 'admin-b' });
+			const wsViewerB = mockWs({ id: 'viewer-b' });
+			await g1.join(wsAdminA, platformA, 'admin');
+			await g2.join(wsAdminB, platformB, 'admin');
+			await g2.join(wsViewerB, platformB, 'viewer');
+
+			platformA.reset();
+			platformB.reset();
+
+			// A publishes role-filtered to admins.
+			await g1.publish(platformA, 'admin-only', { secret: true }, 'admin');
+			await wait(50);
+
+			// A's local admin received it via direct platform.send.
+			const aSends = platformA.sent.filter(
+				(s) => s.event === 'admin-only' && s.ws === wsAdminA
+			);
+			expect(aSends).toHaveLength(1);
+
+			// B's admin received it via the receiver's role filter on the
+			// '__role_filtered' envelope.
+			const bAdminSends = platformB.sent.filter(
+				(s) => s.event === 'admin-only' && s.ws === wsAdminB
+			);
+			expect(bAdminSends).toHaveLength(1);
+
+			// B's viewer must NOT have received it.
+			const bViewerSends = platformB.sent.filter(
+				(s) => s.event === 'admin-only' && s.ws === wsViewerB
+			);
+			expect(bViewerSends).toHaveLength(0);
+		});
+
+		it('leave on instance-1 reduces count seen by instance-2', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const g1 = makeGroup('cross-leave', { maxMembers: 5 });
+			const g2 = makeGroup('cross-leave', { maxMembers: 5 });
+
+			const wsA1 = mockWs();
+			const wsA2 = mockWs();
+			await g1.join(wsA1, platformA);
+			await g1.join(wsA2, platformA);
+			expect(await g2.count()).toBe(2);
+
+			await g1.leave(wsA1, platformA);
+			expect(await g2.count()).toBe(1);
+		});
 	});
 
 	describe('heartbeat refreshes member timestamps in real Redis', () => {

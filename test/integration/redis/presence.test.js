@@ -404,4 +404,62 @@ describe('redis presence (integration)', () => {
 			expect(ttl).toBeGreaterThan(1);
 		});
 	});
+
+	describe('cross-instance receiver routes events through the diff buffer', () => {
+		it('a remote join lands as presence_diff (not as legacy join/updated/leave events)', async () => {
+			// B18 retrofit: the wire shape on `__presence:{topic}` is
+			// presence_state / presence_diff / heartbeat. The cross-instance
+			// `presence:events:{topic}` channel still carries internal
+			// 'join'/'leave'/'updated' envelopes between instances; the
+			// receiver MUST translate into bufferDiff so observers on the
+			// remote instance see the diff shape, never the legacy names.
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const trackerA = makeTracker();
+			const trackerB = makeTracker();
+
+			// Bring B's subscriber up so it receives A's broadcast. Joining a
+			// dummy user on B is the simplest way to force ensureSubscriber.
+			const wsBrun = mockWs({ id: 'b-bootstrap', name: 'BBoot' });
+			await trackerB.join(wsBrun, 'room', platformB);
+			// Drain B's local frames so subsequent assertions see only the
+			// remote-driven traffic.
+			platformB.reset();
+
+			// Burst N joins on A in parallel; sequential awaits would
+			// guarantee one microtask per receive, but parallel issuance
+			// gives the diff buffer a real chance to coalesce on B.
+			const N = 10;
+			const wssA = Array.from({ length: N }, (_, i) =>
+				mockWs({ id: `u${i}`, name: `User ${i}` })
+			);
+			await Promise.all(wssA.map((ws) => trackerA.join(ws, 'room', platformA)));
+
+			// Allow real Redis pubsub round-trip + microtask flush on B.
+			await wait(150);
+			trackerB.flushDiffs();
+
+			const diffFrames = platformB.published.filter((p) => p.event === 'presence_diff');
+			// Every received join must surface as a presence_diff entry. No
+			// legacy 'join' / 'updated' / 'leave' / 'list' frames on the wire.
+			const legacy = platformB.published.filter(
+				(p) => p.event === 'join' || p.event === 'updated' || p.event === 'leave' || p.event === 'list'
+			);
+			expect(legacy).toHaveLength(0);
+
+			const allJoinKeys = new Set();
+			for (const f of diffFrames) {
+				if (f.data && f.data.joins) {
+					for (const k of Object.keys(f.data.joins)) allJoinKeys.add(k);
+				}
+			}
+			for (let i = 0; i < N; i++) {
+				expect(allJoinKeys.has(`u${i}`)).toBe(true);
+			}
+			// Sanity: receiver collapses bursts -- frame count must not exceed
+			// the per-message count, and in practice will be lower under any
+			// real-pubsub timing where multiple messages land in one tick.
+			expect(diffFrames.length).toBeLessThanOrEqual(N);
+		});
+	});
 });

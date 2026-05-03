@@ -233,6 +233,94 @@ describe('redis cursor (integration)', () => {
 			expect(updates).toHaveLength(1);
 		});
 
+		it('two real trackers: A.update is visible in B.list and arrives on B as an update event', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0,
+				select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0,
+				select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const wsB = mockWs({ id: 'bob' });
+
+			// Bring B's subscriber up before A publishes.
+			trackerB.update(wsB, 'canvas', { x: 0 }, platformB);
+			await wait(100);
+			platformA.reset();
+			platformB.reset();
+
+			trackerA.update(wsA, 'canvas', { x: 42, y: 7 }, platformA);
+
+			// Wait for the cross-instance relay to land on B.
+			await waitFor(() => platformB.published.some(
+				(p) => p.event === 'update' && p.data && p.data.user && p.data.user.id === 'alice'
+			));
+
+			const onB = platformB.published.find(
+				(p) => p.event === 'update' && p.data && p.data.user && p.data.user.id === 'alice'
+			);
+			expect(onB.topic).toBe('__cursor:canvas');
+			expect(onB.data.data).toEqual({ x: 42, y: 7 });
+			expect(onB.options).toEqual({ relay: false });
+
+			// B's list() also reflects the cross-instance write via the
+			// shared Redis hash.
+			const list = await trackerB.list('canvas');
+			const aliceEntry = list.find((e) => e.user && e.user.id === 'alice');
+			expect(aliceEntry).toBeDefined();
+			expect(aliceEntry.data).toEqual({ x: 42, y: 7 });
+		});
+
+		it('two real trackers: A.remove fires a remove event on B and clears B.list of the entry', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0,
+				select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0,
+				select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const wsB = mockWs({ id: 'bob' });
+
+			trackerB.update(wsB, 'canvas', { x: 0 }, platformB);
+			trackerA.update(wsA, 'canvas', { x: 5 }, platformA);
+
+			// Allow the cross-instance update to propagate so B has alice in
+			// its view.
+			await waitFor(async () => {
+				const list = await trackerB.list('canvas');
+				return list.some((e) => e.user && e.user.id === 'alice');
+			});
+			platformB.reset();
+
+			await trackerA.remove(wsA, platformA, 'canvas');
+
+			// Remove event lands on B via the events channel. Cursor's
+			// remove publish is fire-and-forget through the subscriberReady
+			// promise chain, so under suite load the wire-arrival of the
+			// envelope on B can lag a beat -- widen the poll window.
+			await waitFor(() => platformB.published.some(
+				(p) => p.event === 'remove'
+			), 5000);
+
+			const removeOnB = platformB.published.find((p) => p.event === 'remove');
+			expect(removeOnB.topic).toBe('__cursor:canvas');
+			expect(removeOnB.options).toEqual({ relay: false });
+
+			// B's list no longer contains alice.
+			const list = await trackerB.list('canvas');
+			expect(list.find((e) => e.user && e.user.id === 'alice')).toBeUndefined();
+		});
+
 		it('subscriber backfill: bulk event surfaces existing remote entries on first update', async () => {
 			// Pre-seed a remote entry directly into the hash from a
 			// separate connection.

@@ -9,7 +9,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
-import { createTaskRunner, UnknownTaskError } from '../../../postgres/tasks.js';
+import { createTaskRunner, UnknownTaskError, TaskInFlightError } from '../../../postgres/tasks.js';
+import { createIdempotencyStore } from '../../../postgres/idempotency.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
@@ -356,6 +357,114 @@ describe('postgres tasks core (integration)', () => {
 			const names = res.rows.map((r) => r.indexname);
 			expect(names).toContain(`idx_${TABLE}_running_fence`);
 			expect(names).toContain(`idx_${TABLE}_terminal_updated`);
+		});
+	});
+
+	describe('idempotency store + task runner across two instances', () => {
+		// Both runners share one Postgres-backed idempotency store. The
+		// store is the cross-instance coordination point: only one runner
+		// runs the handler; the other observes 'pending' or the cached
+		// 'committed' result.
+		let store;
+		let runnerA;
+		let runnerB;
+
+		beforeEach(async () => {
+			store = createIdempotencyStore(client, {
+				cleanupInterval: 0,
+				autoMigrate: true
+			});
+			// Wipe the idempotency table too. ensureTable() runs implicitly
+			// on first acquire(); pre-clean so prior tests do not leak.
+			try {
+				await client.query('TRUNCATE svti_idempotency');
+			} catch {
+				// Table may not exist yet; ensure it then truncate.
+				await store.acquire('seed-key').then((s) => s.acquired && s.abort());
+				await client.query('TRUNCATE svti_idempotency');
+			}
+		});
+
+		afterEach(() => {
+			if (runnerA) { runnerA.destroy(); runnerA = undefined; }
+			if (runnerB) { runnerB.destroy(); runnerB = undefined; }
+			if (store) { store.destroy(); store = undefined; }
+		});
+
+		it('only one runner executes; the other returns the cached result', async () => {
+			let aRanCount = 0;
+			let bRanCount = 0;
+			runnerA = createTaskRunner(client, {
+				idempotency: store,
+				recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0
+			});
+			runnerB = createTaskRunner(client, {
+				idempotency: store,
+				recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0
+			});
+			runnerA.register('echo', async ({ input }) => {
+				aRanCount += 1;
+				return { who: 'A', echoed: input };
+			});
+			runnerB.register('echo', async ({ input }) => {
+				bRanCount += 1;
+				return { who: 'B', echoed: input };
+			});
+
+			// First call lands on A, runs, commits to the idempotency store.
+			const first = await runnerA.run('echo', {
+				input: { v: 1 }, idempotencyKey: 'idem-shared'
+			});
+			expect(first).toEqual({ who: 'A', echoed: { v: 1 } });
+			expect(aRanCount).toBe(1);
+			expect(bRanCount).toBe(0);
+
+			// Second call from a DIFFERENT runner with the same key returns
+			// the cached result -- B's handler does NOT run.
+			const second = await runnerB.run('echo', {
+				input: { v: 2 }, idempotencyKey: 'idem-shared'
+			});
+			expect(second).toEqual({ who: 'A', echoed: { v: 1 } });
+			expect(bRanCount).toBe(0);
+		});
+
+		it('a concurrent in-flight call from another instance throws TaskInFlightError', async () => {
+			runnerA = createTaskRunner(client, {
+				idempotency: store,
+				recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0
+			});
+			runnerB = createTaskRunner(client, {
+				idempotency: store,
+				recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0
+			});
+			runnerA.register('slow', async () => {
+				await wait(300);
+				return { ok: true };
+			});
+			runnerB.register('slow', async () => {
+				return { unexpected: true };
+			});
+
+			const aPromise = runnerA.run('slow', {
+				input: null, idempotencyKey: 'idem-inflight'
+			});
+			// Give A time to acquire the slot before B tries.
+			await wait(50);
+
+			await expect(
+				runnerB.run('slow', { input: null, idempotencyKey: 'idem-inflight' })
+			).rejects.toBeInstanceOf(TaskInFlightError);
+
+			// A's promise still completes successfully.
+			const aResult = await aPromise;
+			expect(aResult).toEqual({ ok: true });
+
+			// After A commits, a fresh call from B returns the cached result
+			// rather than throwing again.
+			const replay = await runnerB.run('slow', {
+				input: null, idempotencyKey: 'idem-inflight'
+			});
+			expect(replay).toEqual({ ok: true });
 		});
 	});
 });

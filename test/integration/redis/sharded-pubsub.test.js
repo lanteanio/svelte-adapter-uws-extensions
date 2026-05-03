@@ -22,6 +22,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createRedisClient } from '../../../redis/index.js';
 import { createShardedBus } from '../../../redis/sharded-pubsub.js';
+import { createPublishRateAggregator } from '../../../redis/publish-rate.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 function wait(ms) {
@@ -422,6 +423,151 @@ describe('redis sharded pubsub bus (integration)', () => {
 			busA.wrap(platformA).publish('org:42:items', 'updated', { tag: 'X' });
 			await wait(150);
 			expect(platformB.published.find((p) => p.data && p.data.tag === 'X')).toBeUndefined();
+		});
+	});
+
+	describe('bus.subscribers delegating to publish-rate aggregator over real Redis', () => {
+		const aggs = [];
+		afterEach(async () => {
+			while (aggs.length) {
+				const a = aggs.pop();
+				await a.deactivate().catch(() => {});
+			}
+		});
+
+		// mockPlatform's `subscribers(topic)` returns 0; override to a
+		// per-test count map so we can drive `bus.localSubjects(platform)`
+		// (which calls `platform.subscribers(topic)`) into reporting non-zero
+		// values per topic.
+		function platformWithCounts(counts) {
+			const p = mockPlatform();
+			p.subscribers = (topic) => counts.get(topic) || 0;
+			return p;
+		}
+
+		it('returns the cluster-wide sum (local + remote) once both aggregators have broadcast', async () => {
+			const channelPrefix = uniqueChannelPrefix('subs');
+
+			const countsA = new Map([['chat:room1', 7], ['chat:room2', 3]]);
+			const countsB = new Map([['chat:room1', 12], ['audit:org', 5]]);
+			const platformA = platformWithCounts(countsA);
+			const platformB = platformWithCounts(countsB);
+
+			// Forward-declare the bus refs so the aggregator's subjects()
+			// callback (which fires on each broadcast tick, well after
+			// construction) can close over them.
+			let busA, busB;
+			const aggA = createPublishRateAggregator(client, {
+				channel: 'inttest:bus-subs',
+				subjects: () => busA.localSubjects(platformA)
+			});
+			const aggB = createPublishRateAggregator(client, {
+				channel: 'inttest:bus-subs',
+				subjects: () => busB.localSubjects(platformB)
+			});
+			aggs.push(aggA, aggB);
+
+			busA = track(createShardedBus(client, {
+				channelPrefix, subscribersAggregator: aggA
+			}));
+			busB = track(createShardedBus(client, {
+				channelPrefix, subscribersAggregator: aggB
+			}));
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await aggA.activate(platformA);
+			await aggB.activate(platformB);
+
+			await busA.follow('chat:room1');
+			await busA.follow('chat:room2');
+			await busB.follow('chat:room1');
+			await busB.follow('audit:org');
+
+			await aggA._broadcastNow();
+			await aggB._broadcastNow();
+			await wait(60);
+
+			// chat:room1: A=7, B=12; cluster sum 19.
+			expect(busA.subscribers('chat:room1')).toBe(19);
+			expect(busB.subscribers('chat:room1')).toBe(19);
+			// chat:room2: only A reports (count 3); both views see 3.
+			expect(busA.subscribers('chat:room2')).toBe(3);
+			expect(busB.subscribers('chat:room2')).toBe(3);
+			// audit:org: only B reports (count 5); both views see 5.
+			expect(busA.subscribers('audit:org')).toBe(5);
+			expect(busB.subscribers('audit:org')).toBe(5);
+			// Topic neither bus is following returns 0 cleanly.
+			expect(busA.subscribers('absent')).toBe(0);
+		});
+
+		it('partial unfollow + re-follow churn under default (per-topic) shards', async () => {
+			// Default shardKey is identity, so each topic owns its own
+			// shard channel. Unfollowing one topic SUNSUBSCRIBEs from that
+			// channel without affecting others. Tests the SUNSUBSCRIBE
+			// wire path under churn.
+			const channelPrefix = uniqueChannelPrefix('churn');
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const busA = track(createShardedBus(client, { channelPrefix }));
+			const busB = track(createShardedBus(client, { channelPrefix }));
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+
+			const all = ['t1', 't2', 't3', 't4', 't5'];
+			await busB.followBatch(all);
+			await busB.unfollow('t2');
+			await busB.unfollow('t4');
+			await wait(50);
+
+			for (const t of all) {
+				busA.wrap(platformA).publish(t, 'msg', { topic: t });
+			}
+
+			await waitFor(() => {
+				const seen = new Set(platformB.published.filter((p) => p.event === 'msg').map((p) => p.data && p.data.topic));
+				return seen.has('t1') && seen.has('t3') && seen.has('t5');
+			});
+			await wait(150);
+
+			const delivered = new Set(platformB.published
+				.filter((p) => p.event === 'msg')
+				.map((p) => p.data && p.data.topic));
+			expect(delivered.has('t1')).toBe(true);
+			expect(delivered.has('t3')).toBe(true);
+			expect(delivered.has('t5')).toBe(true);
+			expect(delivered.has('t2')).toBe(false);
+			expect(delivered.has('t4')).toBe(false);
+
+			// Re-follow t4; subsequent publishes reach B again.
+			await busB.follow('t4');
+			await wait(50);
+			platformB.reset();
+
+			busA.wrap(platformA).publish('t4', 'msg', { topic: 't4' });
+			await waitFor(() => platformB.published.find(
+				(p) => p.event === 'msg' && p.data && p.data.topic === 't4'
+			) !== undefined);
+
+			// t2 stays unfollowed -- still no delivery.
+			busA.wrap(platformA).publish('t2', 'msg', { topic: 't2' });
+			await wait(150);
+			const t2 = platformB.published.find(
+				(p) => p.event === 'msg' && p.data && p.data.topic === 't2'
+			);
+			expect(t2).toBeUndefined();
+		});
+
+		it('falls back to the local platform.subscribers() count when no aggregator is wired', async () => {
+			const channelPrefix = uniqueChannelPrefix('subs-local');
+			const counts = new Map([['only-local', 4]]);
+			const platform = platformWithCounts(counts);
+			const bus = track(createShardedBus(client, { channelPrefix }));
+			await bus.activate(platform);
+			await bus.follow('only-local');
+
+			expect(bus.subscribers('only-local')).toBe(4);
+			expect(bus.subscribers('absent')).toBe(0);
 		});
 	});
 });

@@ -240,4 +240,275 @@ describe('redis connection registry (integration)', () => {
 		const ttlAfter = await client.redis.ttl(client.key('conns:erin'));
 		expect(ttlAfter).toBeGreaterThanOrEqual(ttlBefore - 2);
 	});
+
+	describe('sendTo (cross-instance attribute filter)', () => {
+		function makeRegistryWithAttrs(opts = {}) {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ws.getUserData()?.attrs,
+				heartbeat: 60000,
+				ttl: 90,
+				...opts
+			});
+			registries.push(r);
+			return r;
+		}
+
+		function wsWithAttrs(userId, sessionId, attrs) {
+			return wsWithSession({ userId, attrs }, sessionId);
+		}
+
+		it('reaches a remote user via the secondary index after the events channel propagates', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const regA = makeRegistryWithAttrs();
+			const regB = makeRegistryWithAttrs();
+
+			// Both instances need an active subscriber + bootstrapped index
+			// before B's open broadcasts. Touch both registries with a noop
+			// open so subscribe(...) and bootstrapIndex run before the events
+			// fly.
+			const fillerA = wsWithAttrs('filler-a', 's-fa', { role: 'noop' });
+			const fillerB = wsWithAttrs('filler-b', 's-fb', { role: 'noop' });
+			await regA.hooks.open(fillerA, { platform: platformA });
+			await regB.hooks.open(fillerB, { platform: platformB });
+			// Drain any in-flight events propagation between the two instances
+			// before the targeted registration below.
+			await wait(50);
+
+			const wsTarget = wsWithAttrs('alice', 's-alice', { tenantId: 't1', role: 'admin' });
+			await regB.hooks.open(wsTarget, { platform: platformB });
+			// Allow the open event to reach A and update its secondary index.
+			await wait(50);
+
+			await regA.sendTo({ tenantId: 't1', role: 'admin' }, 'alerts', 'warning', { id: 1 });
+			await wait(50);
+
+			const matchingSends = platformB.sent.filter(
+				(s) => s.ws === wsTarget && s.topic === 'alerts' && s.event === 'warning'
+			);
+			expect(matchingSends).toHaveLength(1);
+			expect(matchingSends[0].data).toEqual({ id: 1 });
+			// Origin's own connection (attrs.role='noop') must NOT have been hit.
+			expect(platformA.sent.find((s) => s.topic === 'alerts')).toBeUndefined();
+		});
+
+		it('bootstraps the secondary index via SCAN against pre-existing entries', async () => {
+			const platformExisting = mockPlatform();
+			const regExisting = makeRegistryWithAttrs();
+
+			// Pre-existing registration on regExisting; the events broadcast
+			// went out, but a brand-new instance starting later cannot
+			// retroactively receive it.
+			const ws = wsWithAttrs('bob', 's-bob', { tenantId: 't2' });
+			await regExisting.hooks.open(ws, { platform: platformExisting });
+
+			// New instance comes up after the registration. ensureSubscriber
+			// fires bootstrapIndex which SCANs and pulls bob's attrs into the
+			// fresh index without seeing the original `open` event.
+			const platformLate = mockPlatform();
+			const regLate = makeRegistryWithAttrs();
+			const fillerLate = wsWithAttrs('filler-late', 's-fl', { role: 'noop' });
+			await regLate.hooks.open(fillerLate, { platform: platformLate });
+			// Bootstrap is async (best-effort); allow SCAN + hgetall round trips.
+			await wait(150);
+
+			await regLate.sendTo({ tenantId: 't2' }, 'broadcasts', 'hello', { ok: true });
+			await wait(50);
+
+			const hits = platformExisting.sent.filter(
+				(s) => s.ws === ws && s.topic === 'broadcasts' && s.event === 'hello'
+			);
+			expect(hits).toHaveLength(1);
+			expect(hits[0].data).toEqual({ ok: true });
+		});
+
+		it('compound criteria intersect across keys (AND semantics) over the wire', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const regA = makeRegistryWithAttrs();
+			const regB = makeRegistryWithAttrs();
+
+			// Subscriber bring-up + drain.
+			const fillerA = wsWithAttrs('filler-a', 's-fa', { role: 'noop' });
+			const fillerB = wsWithAttrs('filler-b', 's-fb', { role: 'noop' });
+			await regA.hooks.open(fillerA, { platform: platformA });
+			await regB.hooks.open(fillerB, { platform: platformB });
+			await wait(50);
+
+			const wsAdmin = wsWithAttrs('admin-1', 's-adm', { tenantId: 't3', role: 'admin' });
+			const wsUser = wsWithAttrs('user-1', 's-usr', { tenantId: 't3', role: 'user' });
+			await regB.hooks.open(wsAdmin, { platform: platformB });
+			await regB.hooks.open(wsUser, { platform: platformB });
+			await wait(50);
+
+			await regA.sendTo({ tenantId: 't3', role: 'admin' }, 'alerts', 'critical', { x: 1 });
+			await wait(50);
+
+			const adminHits = platformB.sent.filter((s) => s.ws === wsAdmin && s.event === 'critical');
+			const userHits = platformB.sent.filter((s) => s.ws === wsUser && s.event === 'critical');
+			expect(adminHits).toHaveLength(1);
+			expect(userHits).toHaveLength(0);
+		});
+
+		it('self-targeting bucket short-circuits without a Redis hop', async () => {
+			const platform = mockPlatform();
+			const registry = makeRegistryWithAttrs();
+
+			const wsLocal = wsWithAttrs('local-1', 's-loc', { tenantId: 'self' });
+			await registry.hooks.open(wsLocal, { platform });
+			// No wait needed: applyOpenEvent runs synchronously inside the open
+			// hook for the local instance, so the index is hot before sendTo
+			// returns. This is the exact path that exists to keep self-targeted
+			// sendTo deliverable without a round trip.
+
+			await registry.sendTo({ tenantId: 'self' }, 't', 'e', { v: 1 });
+			// No `await wait(...)` — the local branch fans out synchronously
+			// against the local map.
+			const hits = platform.sent.filter((s) => s.ws === wsLocal && s.event === 'e');
+			expect(hits).toHaveLength(1);
+			expect(hits[0].data).toEqual({ v: 1 });
+		});
+
+		it('sendTo with no matches no-ops without throwing', async () => {
+			const platform = mockPlatform();
+			const registry = makeRegistryWithAttrs();
+			const ws = wsWithAttrs('alone', 's-alone', { tenantId: 'X' });
+			await registry.hooks.open(ws, { platform });
+
+			await registry.sendTo({ tenantId: 'no-such-tenant' }, 't', 'e', { v: 1 });
+			expect(platform.sent.find((s) => s.event === 'e')).toBeUndefined();
+		});
+	});
+
+	describe('composition with presence (no key / channel collision)', () => {
+		it('registry attrs route a sendTo to a user who is also in a presence room on the owning instance', async () => {
+			// Both modules share one RedisClient (same keyPrefix). Registry
+			// owns conns:* and __push:* / __registry-events; presence owns
+			// presence:* and presence:events:*. Pin that the two namespaces
+			// do not conflict by running both end-to-end over the same
+			// client and verifying both deliver as expected.
+			const { createPresence } = await import('../../../redis/presence.js');
+
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+
+			const regA = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ws.getUserData()?.attrs,
+				heartbeat: 60000,
+				ttl: 90
+			});
+			const regB = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ws.getUserData()?.attrs,
+				heartbeat: 60000,
+				ttl: 90
+			});
+			registries.push(regA, regB);
+
+			const presenceA = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.userId, name: ud.name }),
+				heartbeat: 60000,
+				ttl: 180
+			});
+			const presenceB = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.userId, name: ud.name }),
+				heartbeat: 60000,
+				ttl: 180
+			});
+
+			try {
+				// Bring both instances' registry subscribers up first.
+				const fillerA = wsWithSession(
+					{ userId: 'filler-a', name: 'FillerA', attrs: { role: 'noop' } }, 's-fa'
+				);
+				const fillerB = wsWithSession(
+					{ userId: 'filler-b', name: 'FillerB', attrs: { role: 'noop' } }, 's-fb'
+				);
+				await regA.hooks.open(fillerA, { platform: platformA });
+				await regB.hooks.open(fillerB, { platform: platformB });
+
+				// Target user on instance A: registered with attrs AND in a
+				// presence room.
+				const wsTarget = wsWithSession(
+					{ userId: 'alice', name: 'Alice', attrs: { tenantId: 't1' } }, 's-alice'
+				);
+				await regA.hooks.open(wsTarget, { platform: platformA });
+				await presenceA.join(wsTarget, 'team:t1', platformA);
+
+				// Allow the registry events channel propagation.
+				await wait(50);
+
+				// From B: registry.sendTo by attrs reaches the target on A
+				// via the push channel.
+				await regB.sendTo({ tenantId: 't1' }, 'alerts', 'urgent', { id: 1 });
+				await wait(50);
+
+				const sentToTarget = platformA.sent.filter(
+					(s) => s.ws === wsTarget && s.topic === 'alerts' && s.event === 'urgent'
+				);
+				expect(sentToTarget).toHaveLength(1);
+
+				// From B: presence.list('team:t1') sees the target via the
+				// shared presence hash.
+				const list = await presenceB.list('team:t1');
+				const aliceEntry = list.find((e) => e.id === 'alice');
+				expect(aliceEntry).toEqual({ id: 'alice', name: 'Alice' });
+
+				// Sanity: registry hash AND presence hash both exist under
+				// distinct prefixed keyspaces (no overwrite from collision).
+				const regHashExists = await client.redis.exists(client.key('conns:alice'));
+				const presenceHashExists = await client.redis.exists(client.key('presence:team:t1'));
+				expect(regHashExists).toBe(1);
+				expect(presenceHashExists).toBe(1);
+			} finally {
+				presenceA.destroy();
+				presenceB.destroy();
+			}
+		});
+	});
+
+	describe('send / sendCoalesced edge cases', () => {
+		it('sendCoalesced no-ops at the receiver after a fast migration to a third party', async () => {
+			// A user appears on instance B, then migrates to instance C.
+			// An origin's `sendCoalesced` issued mid-flight using a stale
+			// lookup that still pointed at B must hit B's authoritative
+			// session-shadow check and decline to deliver.
+			const platformOrigin = mockPlatform();
+			const platformB = mockPlatform();
+			const platformC = mockPlatform();
+			const regOrigin = makeRegistry();
+			const regB = makeRegistry();
+			const regC = makeRegistry();
+
+			const fillerO = wsWithSession({ userId: 'origin-only' }, 's-origin');
+			await regOrigin.hooks.open(fillerO, { platform: platformOrigin });
+
+			const wsOnB = wsWithSession({ userId: 'henry' }, 's-B');
+			await regB.hooks.open(wsOnB, { platform: platformB });
+
+			// Migration: C registers second so most-recent-wins on the hash;
+			// B's local map still holds 'henry' until B's close hook fires
+			// (which, in a real reconnect race, hasn't happened yet).
+			const wsOnC = wsWithSession({ userId: 'henry' }, 's-C');
+			await regC.hooks.open(wsOnC, { platform: platformC });
+
+			// Origin's sendCoalesced lookup happens NOW: hash points at C, so
+			// the envelope lands on C's push channel, not B's. B's local map
+			// is the stale one, but it never receives the envelope.
+			await regOrigin.sendCoalesced('henry', {
+				key: 'cursor',
+				topic: 'doc',
+				event: 'pos',
+				data: { x: 1 }
+			});
+			await wait(50);
+
+			expect(platformC.sentCoalesced).toHaveLength(1);
+			expect(platformB.sentCoalesced).toHaveLength(0);
+		});
+	});
 });

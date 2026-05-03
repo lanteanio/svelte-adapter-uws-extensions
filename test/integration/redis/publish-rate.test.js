@@ -133,4 +133,113 @@ describe('redis publish-rate aggregator (integration)', () => {
 
 		expect(aggA.rateOf('hot')).toBe(600);
 	});
+
+	describe('subscribersOf (cluster-wide subject counts)', () => {
+		function makeAggWithSubjects(topPublishers, subjects, opts = {}) {
+			const p = mockPlatform();
+			p._setPressure({
+				active: false,
+				subscriberRatio: 0,
+				publishRate: 0,
+				memoryMB: 0,
+				reason: 'NONE',
+				topPublishers
+			});
+			const a = createPublishRateAggregator(client, {
+				channel: 'inttest:pubrate-subs',
+				subjects,
+				...opts
+			});
+			aggs.push(a);
+			return { agg: a, platform: p };
+		}
+
+		it('sums local + remote subscriber counts across instances after a broadcast tick', async () => {
+			const { agg: aggA, platform: pA } = makeAggWithSubjects(
+				[],
+				() => [{ topic: 'feed:42', count: 7 }, { topic: 'feed:99', count: 3 }]
+			);
+			const { agg: aggB, platform: pB } = makeAggWithSubjects(
+				[],
+				() => [{ topic: 'feed:42', count: 12 }]
+			);
+
+			await aggA.activate(pA);
+			await aggB.activate(pB);
+			await aggA._broadcastNow();
+			await aggB._broadcastNow();
+			await wait(50);
+
+			// Both observers see the cluster sum (A:7 + B:12 = 19).
+			expect(aggA.subscribersOf('feed:42')).toBe(19);
+			expect(aggB.subscribersOf('feed:42')).toBe(19);
+			// 'feed:99' only on A; both observers see A's contribution of 3.
+			expect(aggA.subscribersOf('feed:99')).toBe(3);
+			expect(aggB.subscribersOf('feed:99')).toBe(3);
+			// Topic nobody reports returns 0 cleanly.
+			expect(aggA.subscribersOf('absent')).toBe(0);
+		});
+
+		it('staleAfter pruning removes a contributor when its broadcast tick stops', async () => {
+			const { agg: aggA, platform: pA } = makeAggWithSubjects(
+				[],
+				() => [{ topic: 't', count: 1 }],
+				{ staleAfter: 100 }
+			);
+			const { agg: aggB, platform: pB } = makeAggWithSubjects(
+				[],
+				() => [{ topic: 't', count: 50 }]
+			);
+
+			await aggA.activate(pA);
+			await aggB.activate(pB);
+			await aggB._broadcastNow();
+			await wait(30);
+
+			expect(aggA.subscribersOf('t')).toBe(51);
+
+			await wait(150);
+			// B's contribution aged out; only A's local count remains.
+			expect(aggA.subscribersOf('t')).toBe(1);
+		});
+
+		it('subjects() throwing on one instance does not break the broadcast on the contributing instance', async () => {
+			// A's subjects throws; A's broadcast still goes out, the envelope
+			// just carries `subs: []` and consumers see no contribution from A.
+			let throwOnce = true;
+			const { agg: aggA, platform: pA } = makeAggWithSubjects(
+				[],
+				() => {
+					if (throwOnce) {
+						throwOnce = false;
+						throw new Error('boom');
+					}
+					return [{ topic: 't', count: 9 }];
+				}
+			);
+			const { agg: aggB, platform: pB } = makeAggWithSubjects(
+				[],
+				() => [{ topic: 't', count: 5 }]
+			);
+
+			await aggA.activate(pA);
+			await aggB.activate(pB);
+			// A's first broadcast: subjects() throws, envelope still publishes
+			// with empty subs.
+			await aggA._broadcastNow();
+			await aggB._broadcastNow();
+			await wait(50);
+
+			// B sees only its own local count + A's empty contribution.
+			// (A's local snapshot at this exact moment also throws so its own
+			// view of 't' is 0 + remote 5 = 5.)
+			expect(aggB.subscribersOf('t')).toBe(5);
+
+			// Subsequent A broadcast succeeds (throwOnce flipped).
+			await aggA._broadcastNow();
+			await wait(50);
+			expect(aggB.subscribersOf('t')).toBe(14);
+			expect(aggA.subscribersOf('t')).toBe(14);
+		});
+	});
 });

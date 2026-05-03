@@ -145,6 +145,135 @@ describe('postgres notify bridge (integration)', () => {
 		expect(platform.published).toHaveLength(0);
 	});
 
+	describe('multiListener: advisory leader election', () => {
+		// pg_advisory_lock is session-level: when a session ends (the
+		// bridge's dedicated client disconnects), the lock is released and
+		// the next polling follower wins it. The bridge owns its own
+		// connection (separate from the pool), so deactivate() ends that
+		// session and triggers failover. Pinning the failover behavior
+		// against real Postgres advisory locks is the point of this group;
+		// the mock test exercises only the polling logic with a fake
+		// pg_try_advisory_lock helper.
+		const bridges = [];
+		// Unique lockId per test run so a previous test's lingering session
+		// (rare but possible during teardown) cannot accidentally hold the
+		// lock against this run.
+		let lockId;
+
+		beforeEach(() => {
+			bridges.length = 0;
+			// Postgres advisory lock ids are bigint; stay well below 2^31 so
+			// signed-int columns / clients don't truncate.
+			lockId = Math.floor(Date.now() % 1_000_000_000) + Math.floor(Math.random() * 1000);
+		});
+
+		afterEach(async () => {
+			while (bridges.length) {
+				const b = bridges.pop();
+				await b.deactivate().catch(() => {});
+			}
+		});
+
+		function makeAdvisoryBridge(channel) {
+			const platform = mockPlatform();
+			const b = createNotifyBridge(client, {
+				channel,
+				multiListener: 'advisory',
+				lockId,
+				pollInterval: 200
+			});
+			bridges.push(b);
+			return { bridge: b, platform };
+		}
+
+		it('exactly one bridge wins the lock and receives notifications', async () => {
+			const channel = 'inttest_advisory_one';
+			const a = makeAdvisoryBridge(channel);
+			const b = makeAdvisoryBridge(channel);
+
+			await a.bridge.activate(a.platform);
+			await b.bridge.activate(b.platform);
+			// Allow the initial advisoryTick on the first activate to acquire,
+			// and the second activate's tick to observe the lock-held outcome.
+			await wait(100);
+
+			await client.query('SELECT pg_notify($1, $2)', [
+				channel,
+				JSON.stringify({ topic: 't', event: 'e', data: { v: 1 } })
+			]);
+			await waitFor(() => a.platform.published.length + b.platform.published.length > 0);
+
+			// Exactly one bridge is the leader; it received the publish.
+			const total = a.platform.published.length + b.platform.published.length;
+			expect(total).toBe(1);
+			expect(a.platform.published.length === 1 || b.platform.published.length === 1).toBe(true);
+		});
+
+		it('a follower takes over after the leader deactivates and releases the lock', async () => {
+			const channel = 'inttest_advisory_failover';
+			const a = makeAdvisoryBridge(channel);
+			const b = makeAdvisoryBridge(channel);
+
+			await a.bridge.activate(a.platform);
+			await b.bridge.activate(b.platform);
+			await wait(100);
+
+			// Identify the leader by who received the first notification.
+			await client.query('SELECT pg_notify($1, $2)', [
+				channel,
+				JSON.stringify({ topic: 't', event: 'first', data: { n: 1 } })
+			]);
+			await waitFor(() => a.platform.published.length + b.platform.published.length > 0);
+
+			const aIsLeader = a.platform.published.length === 1;
+			const leader = aIsLeader ? a : b;
+			const follower = aIsLeader ? b : a;
+			expect(follower.platform.published).toHaveLength(0);
+
+			// Leader gives up: deactivate ends its session and releases the
+			// advisory lock immediately.
+			await leader.bridge.deactivate();
+			// Drop the deactivated leader from the cleanup list.
+			const idx = bridges.indexOf(leader.bridge);
+			if (idx >= 0) bridges.splice(idx, 1);
+
+			// Wait for the follower's next poll tick (pollInterval=200ms).
+			// First tick after the lock is free will succeed.
+			await wait(400);
+
+			// New notification: only the surviving follower (now leader)
+			// receives it. Reset its platform first so we cleanly distinguish
+			// the failover delivery from the pre-failover one.
+			follower.platform.reset();
+			await client.query('SELECT pg_notify($1, $2)', [
+				channel,
+				JSON.stringify({ topic: 't', event: 'after-failover', data: { n: 2 } })
+			]);
+			await waitFor(() => follower.platform.published.length > 0);
+
+			expect(follower.platform.published).toHaveLength(1);
+			expect(follower.platform.published[0]).toMatchObject({
+				topic: 't', event: 'after-failover', data: { n: 2 }
+			});
+		});
+
+		it('a single-bridge cluster keeps working: no follower needed', async () => {
+			const channel = 'inttest_advisory_solo';
+			const a = makeAdvisoryBridge(channel);
+			await a.bridge.activate(a.platform);
+			await wait(100);
+
+			await client.query('SELECT pg_notify($1, $2)', [
+				channel,
+				JSON.stringify({ topic: 't', event: 'solo', data: { v: 9 } })
+			]);
+			await waitFor(() => a.platform.published.length > 0);
+			expect(a.platform.published[0]).toMatchObject({
+				topic: 't', event: 'solo', data: { v: 9 }
+			});
+		});
+	});
+
 	it('forwards notifications fired from a real trigger via pg_notify()', async () => {
 		// End-to-end shape: trigger calls pg_notify() inside a transaction;
 		// the notification is delivered after COMMIT to a separate listening
