@@ -31,11 +31,17 @@ const EVENTS = Object.freeze({
 
 /**
  * @typedef {Object} RedisCursorOptions
- * @property {number} [throttle=50] - Minimum ms between broadcasts per user per topic.
+ * @property {number} [throttle=16] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
- * @property {number} [topicThrottle=0] - Minimum ms between aggregate broadcasts per
- *   topic. Caps total Redis writes regardless of connection count. 0 = no limit.
- *   Set to ~16 (60/sec) to prevent Redis saturation under high concurrency.
+ *   Default 16 (60Hz) matches the world-state tick rate so an individual cursor's
+ *   motion stays smooth at the per-peer wire rate set by `topicThrottle`.
+ * @property {number} [topicThrottle=16] - World-state tick rate, in ms.
+ *   Per-topic aggregate cap on broadcasts: each topic emits at most one frame
+ *   per window, carrying the latest position for every cursor that moved.
+ *   Bandwidth per peer scales with active-mover count, not with mover-count
+ *   times per-mover rate. Default 16 (60Hz) suits typical small-to-medium
+ *   rooms; raise to 33 (30Hz) for high-density rooms where wire bytes matter.
+ *   0 disables the tick; per-cursor `throttle` then governs broadcast rate.
  * @property {(userData: any) => any} [select] - Extract user-identifying data from userData.
  *   Defaults to the full userData.
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
@@ -66,8 +72,8 @@ const EVENTS = Object.freeze({
  * @returns {RedisCursorTracker}
  */
 export function createCursor(client, options = {}) {
-	const throttleMs = options.throttle ?? 50;
-	const topicThrottleMs = options.topicThrottle ?? 0;
+	const throttleMs = options.throttle ?? 16;
+	const topicThrottleMs = options.topicThrottle ?? 16;
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis cursor: select must be a function');
 	}

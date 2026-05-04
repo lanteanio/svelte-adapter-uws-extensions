@@ -967,6 +967,8 @@ export async function close(ws, { platform }) {
 
 Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
 
+Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate -- 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
+
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
 
 #### Setup
@@ -977,7 +979,6 @@ import { redis } from './redis.js';
 import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
 
 export const cursors = createCursor(redis, {
-  throttle: 50,
   select: (userData) => ({ id: userData.id, name: userData.name, color: userData.color }),
   ttl: 30
 });
@@ -1005,7 +1006,8 @@ export function close(ws, { platform }) {
 
 | Option | Default | Description |
 |---|---|---|
-| `throttle` | `50` | Minimum ms between broadcasts per user per topic |
+| `throttle` | `16` | Minimum ms between broadcasts per user per topic. 60Hz default matches the world-state tick so an individual cursor stays smooth at the per-peer wire rate. |
+| `topicThrottle` | `16` | World-state tick rate in ms. Each topic emits at most one bulk frame per window, carrying the latest position for every cursor that moved. Raise to 33 (30Hz) for high-density rooms; 0 disables the tick. |
 | `select` | strips `__`-prefixed keys | Extract user data to broadcast alongside position |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
 

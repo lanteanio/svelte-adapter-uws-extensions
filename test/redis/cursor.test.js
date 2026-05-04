@@ -16,6 +16,7 @@ describe('redis cursor', () => {
 		platform = mockPlatform();
 		cursors = createCursor(client, {
 			throttle: 100,
+			topicThrottle: 0,
 			select: (userData) => ({ id: userData.id, name: userData.name })
 		});
 	});
@@ -61,7 +62,7 @@ describe('redis cursor', () => {
 
 	describe('default select recursive stripping', () => {
 		it('strips nested __-prefixed keys', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', profile: { name: 'Alice', __token: 'x' } });
 			c.update(ws, 'doc', { x: 1 }, platform);
 
@@ -71,7 +72,7 @@ describe('redis cursor', () => {
 		});
 
 		it('handles circular references without crashing', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const userData = { id: '1', name: 'Alice' };
 			userData.self = userData;
 			const ws = mockWs(userData);
@@ -83,7 +84,7 @@ describe('redis cursor', () => {
 		});
 
 		it('strips sensitive-regex keys like password and token', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', password: 'secret', sessionToken: 'xyz' });
 			c.update(ws, 'doc', { x: 1 }, platform);
 
@@ -96,7 +97,7 @@ describe('redis cursor', () => {
 
 	describe('userData sanitization', () => {
 		it('strips __subscriptions and remoteAddress from userData', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({
 				id: '1',
 				name: 'Alice',
@@ -114,7 +115,7 @@ describe('redis cursor', () => {
 
 	describe('snapshot', () => {
 		it('sends current cursors as a bulk event to a single connection', async () => {
-			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
 			const ws1 = mockWs({ id: '1' });
 			const ws2 = mockWs({ id: '2' });
 
@@ -133,7 +134,7 @@ describe('redis cursor', () => {
 		});
 
 		it('does not send bulk when no cursors exist', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'empty-topic', platform);
 
@@ -150,7 +151,7 @@ describe('redis cursor', () => {
 		});
 
 		it('hooks.message dispatches cursor updates', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.hooks.message(ws, {
@@ -164,7 +165,7 @@ describe('redis cursor', () => {
 		});
 
 		it('hooks.message ignores non-cursor messages', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.hooks.message(ws, { data: { type: 'chat', text: 'hi' }, platform });
@@ -173,7 +174,7 @@ describe('redis cursor', () => {
 		});
 
 		it('hooks.close removes all cursor state', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -207,6 +208,7 @@ describe('redis cursor', () => {
 		it('uses select to extract user info', () => {
 			const c = createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id })
 			});
 			const ws = mockWs({ id: '1', name: 'Alice', secret: 'token' });
@@ -218,7 +220,7 @@ describe('redis cursor', () => {
 		});
 
 		it('without select, broadcasts full userData', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', role: 'admin' });
 			c.update(ws, 'room', { x: 5, y: 5 }, platform);
 
@@ -286,7 +288,7 @@ describe('redis cursor', () => {
 		});
 
 		it('throttle: 0 broadcasts every update', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 0, y: 0 }, platform);
@@ -300,7 +302,7 @@ describe('redis cursor', () => {
 
 	describe('update - multiple topics', () => {
 		it('same ws can have cursor state on different topics', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -334,7 +336,7 @@ describe('redis cursor', () => {
 
 	describe('remove', () => {
 		it('removes ws from all topics and broadcasts removal', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -359,7 +361,7 @@ describe('redis cursor', () => {
 		});
 
 		it('cleans up empty topic maps', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -371,7 +373,7 @@ describe('redis cursor', () => {
 		});
 
 		it('stops polling abandoned topics after last cursor leaves', async () => {
-			const c = createCursor(client, { throttle: 0, ttl: 30 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, ttl: 30 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -417,7 +419,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: removes cursor from only the specified topic', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -441,7 +443,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: ws can still update remaining topics after per-topic remove', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -458,7 +460,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: is safe to call for a topic the ws never had', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -474,7 +476,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: cleans up wsState when last topic is removed', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -488,7 +490,7 @@ describe('redis cursor', () => {
 		});
 
 		it('removes entry from Redis hash', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -510,6 +512,7 @@ describe('redis cursor', () => {
 		it('returns current cursor positions from Redis', async () => {
 			const c = createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id, name: ud.name })
 			});
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
@@ -536,7 +539,7 @@ describe('redis cursor', () => {
 
 	describe('clear', () => {
 		it('resets all local and Redis state', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -566,7 +569,7 @@ describe('redis cursor', () => {
 
 	describe('cross-instance relay', () => {
 		it('publishes updates to Redis pub/sub channel', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Spy on redis.publish
@@ -589,7 +592,7 @@ describe('redis cursor', () => {
 		});
 
 		it('publishes remove events to Redis pub/sub channel', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -610,7 +613,7 @@ describe('redis cursor', () => {
 		});
 
 		it('stores cursor data in Redis hash', async () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 42, y: 99 }, platform);
@@ -626,7 +629,7 @@ describe('redis cursor', () => {
 		});
 
 		it('forwards remote updates to local platform with relay: false', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Trigger subscriber setup
@@ -653,7 +656,7 @@ describe('redis cursor', () => {
 		});
 
 		it('ignores messages from own instance (echo suppression)', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Trigger subscriber setup and get instanceId from a broadcast
@@ -673,7 +676,7 @@ describe('redis cursor', () => {
 
 	describe('subscriber backfill on startup', () => {
 		it('backfills remote cursor entries after subscriber becomes ready', async () => {
-			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
 
 			const remoteKey = 'remote-instance:1';
 			const remoteData = JSON.stringify({
@@ -701,7 +704,7 @@ describe('redis cursor', () => {
 		});
 
 		it('does not backfill entries from the local instance', async () => {
-			const c = createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -735,7 +738,7 @@ describe('redis cursor', () => {
 				return dup;
 			};
 
-			const c = createCursor(failClient, { throttle: 0 });
+			const c = createCursor(failClient, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// First update triggers ensureSubscriber which will fail async
@@ -767,7 +770,7 @@ describe('redis cursor', () => {
 
 	describe('platform update', () => {
 		it('uses the latest platform for remote event forwarding', () => {
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const platform1 = mockPlatform();
 			const platform2 = mockPlatform();
 
@@ -947,7 +950,7 @@ describe('redis cursor', () => {
 	describe('remove suppresses local broadcast when Redis fails', () => {
 		it('per-topic remove does not publish locally when hdel fails', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -973,7 +976,7 @@ describe('redis cursor', () => {
 
 		it('remove-all does not publish locally when pipeline fails', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -1007,7 +1010,7 @@ describe('redis cursor', () => {
 
 		it('per-topic remove publishes locally when hdel succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -1029,7 +1032,7 @@ describe('redis cursor', () => {
 		it('warns about sensitive keys nested inside arrays', () => {
 			vi.useRealTimers();
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-			const c = createCursor(client, { throttle: 0, select: (ud) => ud });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ud });
 
 			const ws = mockWs({ id: '1', profiles: [{ authToken: 'secret' }] });
 			c.update(ws, 'doc', { x: 1 }, platform);
@@ -1046,7 +1049,7 @@ describe('redis cursor', () => {
 	describe('write-after-broadcast consistency', () => {
 		it('does not relay cross-instance when Redis pipeline fails', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Track relay publishes
@@ -1093,7 +1096,7 @@ describe('redis cursor', () => {
 
 		it('relays cross-instance when Redis pipeline succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			const relayMessages = [];
@@ -1119,7 +1122,7 @@ describe('redis cursor', () => {
 
 		it('list() returns empty when pipeline failed but local broadcast happened', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Make pipeline fail so data never reaches Redis
@@ -1157,7 +1160,7 @@ describe('redis cursor', () => {
 
 		it('list() returns data when pipeline succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 42 }, platform);
@@ -1179,7 +1182,7 @@ describe('redis cursor', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const c = createCursor(client, { throttle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
 			const ws = mockWs({ id: '1' });
 
 			const hsetCalls = [];
@@ -1206,7 +1209,7 @@ describe('redis cursor', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const c = createCursor(client, { throttle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
 			await expect(c.list('canvas')).rejects.toThrow(CircuitBrokenError);
 
 			c.destroy();
@@ -1216,7 +1219,7 @@ describe('redis cursor', () => {
 		it('remove does not publish locally when breaker is broken', async () => {
 			vi.useRealTimers();
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
-			const c = createCursor(client, { throttle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);

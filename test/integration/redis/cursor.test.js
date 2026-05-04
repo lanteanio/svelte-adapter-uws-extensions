@@ -83,7 +83,7 @@ describe('redis cursor (integration)', () => {
 
 	describe('Redis hash storage', () => {
 		it('writes a cursor entry to the topic hash readable from a separate connection', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			c.update(ws, 'canvas', { x: 42, y: 99 }, platform);
 
@@ -112,7 +112,7 @@ describe('redis cursor (integration)', () => {
 		});
 
 		it('list() reflects writes after the pipeline lands', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			c.update(ws1, 'canvas', { x: 10 }, platform);
@@ -126,7 +126,7 @@ describe('redis cursor (integration)', () => {
 		});
 
 		it('hdel via remove() drops the entry from the real hash', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
 			await waitFor(async () => (await c.list('canvas')).length === 1);
@@ -140,7 +140,7 @@ describe('redis cursor (integration)', () => {
 
 	describe('TTL applied via EXPIRE in the broadcast pipeline', () => {
 		it('sets a positive TTL on the topic hash within the configured window', async () => {
-			const c = track(createCursor(client, { throttle: 0, ttl: 30 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0, ttl: 30 }));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
 
@@ -156,7 +156,7 @@ describe('redis cursor (integration)', () => {
 
 	describe('clear() with real SCAN over many keys', () => {
 		it('SCAN+UNLINK clears every cursor:* key under the prefix', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 
 			// Spread cursors across many topics so SCAN actually has to
 			// page through a non-trivial keyspace.
@@ -179,7 +179,7 @@ describe('redis cursor (integration)', () => {
 
 	describe('cross-instance pub/sub relay over the wire', () => {
 		it('a remote update on cursor:events lands in the other instance with relay: false', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 			const ws = mockWs({ id: '1' });
 
 			// First update wires the subscriber duplicate up.
@@ -219,7 +219,7 @@ describe('redis cursor (integration)', () => {
 		});
 
 		it('echo suppression: a tracker does not double-publish its own updates', async () => {
-			const c = track(createCursor(client, { throttle: 0 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
 
@@ -238,10 +238,12 @@ describe('redis cursor (integration)', () => {
 			const platformB = mockPlatform();
 			const trackerA = track(createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id })
 			}));
 			const trackerB = track(createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id })
 			}));
 
@@ -281,10 +283,12 @@ describe('redis cursor (integration)', () => {
 			const platformB = mockPlatform();
 			const trackerA = track(createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id })
 			}));
 			const trackerB = track(createCursor(client, {
 				throttle: 0,
+				topicThrottle: 0,
 				select: (ud) => ({ id: ud.id })
 			}));
 
@@ -329,7 +333,7 @@ describe('redis cursor (integration)', () => {
 				user: { id: '2' }, data: { x: 77 }, ts: Date.now()
 			}));
 
-			const c = track(createCursor(client, { throttle: 0, select: (ud) => ({ id: ud.id }) }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) }));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 10 }, platform);
 
@@ -348,7 +352,7 @@ describe('redis cursor (integration)', () => {
 
 	describe('list() filters stale entries by ts vs ttl', () => {
 		it('skips an entry whose ts is older than the configured ttl window', async () => {
-			const c = track(createCursor(client, { throttle: 0, ttl: 5 }));
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0, ttl: 5 }));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
 			await waitFor(async () => (await c.list('canvas')).length === 1);

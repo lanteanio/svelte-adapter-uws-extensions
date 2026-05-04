@@ -7,16 +7,21 @@ export interface RedisCursorOptions {
 	/**
 	 * Minimum ms between broadcasts per user per topic.
 	 * Trailing-edge timer ensures the final position is always sent.
-	 * @default 50
+	 * Default 16 (60Hz) matches the world-state tick rate so an individual
+	 * cursor's motion stays smooth at the per-peer wire rate.
+	 * @default 16
 	 */
 	throttle?: number;
 
 	/**
-	 * Minimum ms between aggregate broadcasts per topic, across all
-	 * connections. Caps total Redis writes regardless of connection count.
-	 * Set to ~16 (60 broadcasts/sec) to prevent Redis saturation under
-	 * high concurrency. 0 disables the aggregate throttle.
-	 * @default 0
+	 * World-state tick rate, in ms. Per-topic aggregate cap on broadcasts:
+	 * each topic emits at most one frame per window, carrying the latest
+	 * position for every cursor that moved. Bandwidth per peer scales with
+	 * active-mover count, not with mover-count times per-mover rate.
+	 * Default 16 (60Hz) suits typical small-to-medium rooms; raise to 33
+	 * (30Hz) for high-density rooms where wire bytes matter.
+	 * 0 disables the tick; per-cursor `throttle` then governs broadcast rate.
+	 * @default 16
 	 */
 	topicThrottle?: number;
 
