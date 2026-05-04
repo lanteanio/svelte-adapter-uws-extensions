@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.4] - 2026-05-04
+
 ### Changed
 
 - **`createCursor` defaults flipped to 60Hz world-state tick.** `throttle` defaults to `16` (was `50`) and `topicThrottle` defaults to `16` (was `0`). Out of the box the broadcast path is now a 60Hz world-state tick: each topic emits at most one bulk frame per 16ms window, carrying the latest position for every cursor that moved in that window. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate -- the same property the adapter's bundled cursor plugin recommends as the architecture for collaborative cursors at scale. Existing apps that prefer the previous "every update broadcast immediately, no aggregate cap" behavior should pass `topicThrottle: 0`; apps relying on the previous 50ms per-cursor floor should pass `throttle: 50` explicitly. For high-density rooms (>200 active movers) where the bulk-frame size becomes the per-peer bottleneck, raise `topicThrottle` to 33 (30Hz).
