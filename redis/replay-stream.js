@@ -20,7 +20,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
-import { parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+import { parseReplayOptions, awaitReplication, ReplayStorageError } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 
 /**
@@ -127,7 +127,7 @@ function seqFromId(id) {
  * @returns {import('./replay.js').RedisReplayBuffer}
  */
 export function createStreamReplay(client, options = {}) {
-	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs } =
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis stream replay', options);
 
 	const defaultIdempotencyTtl = options.idempotencyTtl !== undefined
@@ -148,6 +148,9 @@ export function createStreamReplay(client, options = {}) {
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 	const mIdmpHits = m?.counter('replay_idmp_hits_total', 'publishIdempotent calls served from the dedup cache (no XADD)', ['topic']);
 	const mIdmpWrites = m?.counter('replay_idmp_writes_total', 'publishIdempotent calls that produced a new entry', ['topic']);
+	const mStorageFallbacks = localFanoutOnStorageFailure
+		? m?.counter('replay_storage_fallbacks_total', 'Publishes that fell back to local fanout when storage failed', ['topic'])
+		: null;
 
 	function idmpKey(producerId, topic) {
 		return client.key('replay:idmp:' + producerId + ':' + topic);
@@ -182,10 +185,15 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			const result = await withBreaker(b, () =>
-				redis.eval(IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
-					requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null))
-			);
+			let result;
+			try {
+				result = await withBreaker(b, () =>
+					redis.eval(IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
+						requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null))
+				);
+			} catch (err) {
+				throw new ReplayStorageError('publishIdempotent', err);
+			}
 
 			const isDuplicate = Number(result[0]) === 1;
 			const seq = Number(result[1]);
@@ -210,9 +218,17 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			await withBreaker(b, () =>
-				redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, JSON.stringify(data ?? null))
-			);
+			try {
+				await withBreaker(b, () =>
+					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, JSON.stringify(data ?? null))
+				);
+			} catch (err) {
+				if (localFanoutOnStorageFailure) {
+					mStorageFallbacks?.inc({ topic: mt(topic) });
+					return platform.publish(topic, event, data);
+				}
+				throw new ReplayStorageError('publish', err);
+			}
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {

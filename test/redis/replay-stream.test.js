@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplicationTimeoutError } from '../../redis/replay.js';
+import { createReplay, ReplicationTimeoutError, ReplayStorageError } from '../../redis/replay.js';
 import { createCircuitBreaker } from '../../shared/breaker.js';
 
 describe('redis replay (stream backend)', () => {
@@ -510,6 +510,50 @@ describe('redis replay (stream backend)', () => {
 			expect(breaker.failures).toBe(1);
 
 			breaker.destroy();
+		});
+	});
+
+	describe('storage failure', () => {
+		it('publish throws ReplayStorageError with cause when storage fails', async () => {
+			const r = createReplay(client, { storage: 'stream' });
+			const failure = new Error('redis down');
+			client.redis.eval = async () => { throw failure; };
+
+			let caught;
+			try { await r.publish(platform, 'chat', 'msg', { id: 1 }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publish');
+			expect(caught.cause).toBe(failure);
+		});
+
+		it('publish falls back to platform.publish when localFanoutOnStorageFailure: true', async () => {
+			const r = createReplay(client, { storage: 'stream', localFanoutOnStorageFailure: true });
+			client.redis.eval = async () => { throw new Error('redis down'); };
+
+			const result = await r.publish(platform, 'chat', 'msg', { id: 1 });
+
+			expect(result).toBe(true);
+			expect(platform.published).toEqual([
+				{ topic: 'chat', event: 'msg', data: { id: 1 } }
+			]);
+		});
+
+		it('publishIdempotent always throws ReplayStorageError, even with localFanoutOnStorageFailure: true', async () => {
+			const r = createReplay(client, { storage: 'stream', localFanoutOnStorageFailure: true });
+			client.redis.eval = async () => { throw new Error('redis down'); };
+
+			let caught;
+			try {
+				await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+					producerId: 'p1', requestId: 'r1'
+				});
+			} catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publishIdempotent');
+			expect(platform.published).toHaveLength(0);
 		});
 	});
 });

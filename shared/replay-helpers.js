@@ -28,6 +28,22 @@ export class ReplicationTimeoutError extends Error {
 }
 
 /**
+ * Thrown by replay backends when the underlying storage call fails (Redis
+ * eval / Postgres query / circuit breaker open). Wraps the original error in
+ * `.cause`. Caller policy: catch this to fall back to a best-effort local
+ * `platform.publish`, or set `localFanoutOnStorageFailure: true` at
+ * construction time to have the backend do that for you.
+ */
+export class ReplayStorageError extends Error {
+	constructor(op, cause) {
+		super(`replay storage failed during ${op}: ${cause?.message ?? cause}`);
+		this.name = 'ReplayStorageError';
+		this.op = op;
+		this.cause = cause;
+	}
+}
+
+/**
  * Validate the replay options shared by the sorted-set and stream backends.
  * Returns normalized values with defaults filled in. Throws with the given
  * prefix in front of every error message so callers can identify which
@@ -35,7 +51,7 @@ export class ReplicationTimeoutError extends Error {
  *
  * @param {string} prefix
  * @param {Record<string, any>} options
- * @returns {{ maxSize: number, ttl: number, replicated: boolean, minReplicas: number, replicationTimeoutMs: number }}
+ * @returns {{ maxSize: number, ttl: number, replicated: boolean, minReplicas: number, replicationTimeoutMs: number, localFanoutOnStorageFailure: boolean }}
  */
 export function parseReplayOptions(prefix, options) {
 	if (options.size !== undefined) {
@@ -68,12 +84,17 @@ export function parseReplayOptions(prefix, options) {
 			replicationTimeoutMs = options.replicationTimeoutMs;
 		}
 	}
+	if (options.localFanoutOnStorageFailure !== undefined &&
+		typeof options.localFanoutOnStorageFailure !== 'boolean') {
+		throw new Error(`${prefix}: localFanoutOnStorageFailure must be a boolean, got ${options.localFanoutOnStorageFailure}`);
+	}
 	return {
 		maxSize: options.size || 1000,
 		ttl: options.ttl || 0,
 		replicated,
 		minReplicas,
-		replicationTimeoutMs
+		replicationTimeoutMs,
+		localFanoutOnStorageFailure: options.localFanoutOnStorageFailure === true
 	};
 }
 

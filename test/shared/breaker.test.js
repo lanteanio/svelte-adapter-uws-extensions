@@ -4,7 +4,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../redis/pubsub.js';
 import { createPresence } from '../../redis/presence.js';
-import { createReplay } from '../../redis/replay.js';
+import { createReplay, ReplayStorageError } from '../../redis/replay.js';
 import { createRateLimit } from '../../redis/ratelimit.js';
 import { createGroup } from '../../redis/groups.js';
 import { createCursor } from '../../redis/cursor.js';
@@ -281,7 +281,9 @@ describe('circuit breaker', () => {
 			breaker.failure();
 
 			const replay = createReplay(client, { breaker });
-			await expect(replay.publish(platform, 'chat', 'msg', {})).rejects.toThrow(CircuitBrokenError);
+			const err = await replay.publish(platform, 'chat', 'msg', {}).catch((e) => e);
+			expect(err).toBeInstanceOf(ReplayStorageError);
+			expect(err.cause).toBeInstanceOf(CircuitBrokenError);
 			breaker.destroy();
 		});
 
@@ -353,7 +355,9 @@ describe('circuit breaker', () => {
 			expect(breaker.state).toBe('broken');
 
 			// Both extensions now fail fast
-			await expect(replay.publish(platform, 'a', 'b', {})).rejects.toThrow(CircuitBrokenError);
+			const replayErr = await replay.publish(platform, 'a', 'b', {}).catch((e) => e);
+			expect(replayErr).toBeInstanceOf(ReplayStorageError);
+			expect(replayErr.cause).toBeInstanceOf(CircuitBrokenError);
 			await expect(limiter.consume(ws)).rejects.toThrow(CircuitBrokenError);
 
 			// Restore and reset
@@ -569,10 +573,12 @@ describe('circuit breaker', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const { createReplay: createPgReplay } = await import('../../postgres/replay.js');
+			const { createReplay: createPgReplay, ReplayStorageError: PgReplayStorageError } = await import('../../postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
 
-			await expect(replay.publish(platform, 'chat', 'msg', {})).rejects.toThrow(CircuitBrokenError);
+			const err = await replay.publish(platform, 'chat', 'msg', {}).catch((e) => e);
+			expect(err).toBeInstanceOf(PgReplayStorageError);
+			expect(err.cause).toBeInstanceOf(CircuitBrokenError);
 			expect(pgClient._queries).toHaveLength(0);
 
 			replay.destroy();

@@ -47,6 +47,26 @@ export interface RedisReplayOptions {
 	 * @default 172800 (48 hours)
 	 */
 	idempotencyTtl?: number;
+	/**
+	 * When `true`, `publish()` falls back to a best-effort
+	 * `platform.publish(topic, event, data)` if the underlying storage
+	 * call fails (Redis down, breaker open, etc.) instead of throwing.
+	 * The `replay_storage_fallbacks_total{topic}` counter increments
+	 * on each fallback, so observability is preserved.
+	 *
+	 * Default `false` is the safe choice for production: storage failure
+	 * surfaces as `ReplayStorageError` so reconnecting clients don't see
+	 * messages that were delivered live but never persisted. Set `true`
+	 * for dev environments running without Redis, or for use cases where
+	 * loss of replay durability is acceptable as long as live delivery
+	 * keeps working.
+	 *
+	 * Does not affect `publishIdempotent`, which always throws on
+	 * storage failure to preserve its exactly-once contract.
+	 *
+	 * @default false
+	 */
+	localFanoutOnStorageFailure?: boolean;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -81,6 +101,24 @@ export class ReplicationTimeoutError extends Error {
 	readonly minReplicas: number;
 	readonly timeoutMs: number;
 	constructor(ack: number, minReplicas: number, timeoutMs: number);
+}
+
+/**
+ * Thrown by `publish()` and `publishIdempotent()` when the underlying
+ * storage call fails (Redis eval, circuit breaker open, connection refused).
+ * The original error is preserved in `.cause`. Catch this to fall back to a
+ * best-effort `platform.publish(topic, event, data)`, or set
+ * `localFanoutOnStorageFailure: true` to have the backend do that for you.
+ *
+ * Always thrown by `publishIdempotent` even when the option is set, since
+ * silent fanout would issue the message but leave the dedup cache empty,
+ * breaking the exactly-once contract on a retry.
+ */
+export class ReplayStorageError extends Error {
+	readonly name: 'ReplayStorageError';
+	readonly op: string;
+	readonly cause: unknown;
+	constructor(op: string, cause: unknown);
 }
 
 export interface BufferedMessage {

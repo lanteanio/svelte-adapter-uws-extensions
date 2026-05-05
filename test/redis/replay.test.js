@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplicationTimeoutError } from '../../redis/replay.js';
+import { createReplay, ReplicationTimeoutError, ReplayStorageError } from '../../redis/replay.js';
 import { createCircuitBreaker } from '../../shared/breaker.js';
 
 describe('redis replay', () => {
@@ -830,6 +830,67 @@ describe('redis replay', () => {
 			const out = metrics.serialize();
 			expect(out).toMatch(/replay_replications_total \d+/);
 			expect(out).toMatch(/replay_replication_timeouts_total \d+/);
+		});
+	});
+
+	describe('storage failure', () => {
+		function failEval(c) {
+			const orig = c.redis.eval;
+			const failure = new Error('redis down');
+			c.redis.eval = async () => { throw failure; };
+			return { failure, restore: () => { c.redis.eval = orig; } };
+		}
+
+		it('throws ReplayStorageError when storage fails (default behavior)', async () => {
+			const r = createReplay(client);
+			const { failure, restore } = failEval(client);
+
+			let caught;
+			try { await r.publish(platform, 'chat', 'created', { id: 1 }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publish');
+			expect(caught.cause).toBe(failure);
+			expect(platform.published).toHaveLength(0);
+
+			restore();
+		});
+
+		it('falls back to platform.publish when localFanoutOnStorageFailure: true', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true });
+			const { restore } = failEval(client);
+
+			const result = await r.publish(platform, 'chat', 'created', { id: 1 });
+
+			expect(result).toBe(true);
+			expect(platform.published).toEqual([
+				{ topic: 'chat', event: 'created', data: { id: 1 } }
+			]);
+
+			restore();
+		});
+
+		it('counts the fallback in replay_storage_fallbacks_total but not replay_publishes_total', async () => {
+			const { createMetrics } = await import('../../prometheus/index.js');
+			const metrics = createMetrics();
+			const r = createReplay(client, { localFanoutOnStorageFailure: true, metrics });
+			const { restore } = failEval(client);
+
+			await r.publish(platform, 'chat', 'created', { id: 1 });
+
+			const out = metrics.serialize();
+			expect(out).toMatch(/replay_storage_fallbacks_total\{topic="chat"\} 1/);
+			expect(out).not.toMatch(/replay_publishes_total\{topic="chat"\} [1-9]/);
+
+			restore();
+		});
+
+		it('validates localFanoutOnStorageFailure must be a boolean', () => {
+			expect(() => createReplay(client, { localFanoutOnStorageFailure: 'yes' }))
+				.toThrow('localFanoutOnStorageFailure must be a boolean');
+			expect(() => createReplay(client, { localFanoutOnStorageFailure: 1 }))
+				.toThrow('localFanoutOnStorageFailure must be a boolean');
 		});
 	});
 });

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.5] - 2026-05-05
+
+### Added
+
+- **`ReplayStorageError` typed error class on every replay backend.** `redis/replay`, `redis/replay-stream`, and `postgres/replay` now wrap underlying storage failures (Redis eval / Postgres query / circuit breaker open) in `ReplayStorageError` with the original error preserved on `.cause`. Previously the underlying error propagated raw, so callers could not distinguish "storage failed, message lost" from any other error class on the publish path. The new error is re-exported from each backend module so callers do not need to dig into `shared/`.
+- **`localFanoutOnStorageFailure` option on `createReplay` (all three backends).** When set to `true`, `publish()` falls back to a best-effort `platform.publish(topic, event, data)` if the underlying storage call fails, instead of throwing. The new `replay_storage_fallbacks_total{topic}` counter increments on each fallback so the degraded path stays observable. Default `false` preserves the existing loud-failure semantics so production deployments do not silently lose replay durability while continuing to deliver live frames (a reconnecting client doing `gap()` / `since()` would otherwise see an inconsistency: peers connected at the moment received the message; reconnecting peers do not). Best fit for dev environments running without Redis / Postgres, or use cases that prefer continued live delivery over storage durability. `publishIdempotent` (stream backend only) always throws `ReplayStorageError` on storage failure even when this option is set, since silent fanout would issue the message but leave the dedup cache empty, breaking the exactly-once contract on a retry.
+
+### Changed
+
+- **`replay.publish()` storage failures now throw `ReplayStorageError` instead of the raw underlying error.** The original error is preserved on `.cause`. Any consumer that catches a specific underlying class (ioredis errors, `CircuitBrokenError`) needs to either catch `ReplayStorageError` and inspect `.cause`, or set `localFanoutOnStorageFailure: true` to opt into the silent-fallback policy. Affects `redis/replay` (sorted-set), `redis/replay-stream` (also `publishIdempotent`), and `postgres/replay`.
+
 ## [0.5.0-next.4] - 2026-05-04
 
 ### Changed

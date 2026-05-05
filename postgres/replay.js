@@ -29,6 +29,8 @@
 
 import { safeCreate } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { ReplayStorageError } from '../shared/replay-helpers.js';
+export { ReplayStorageError };
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -69,6 +71,11 @@ export function createReplay(client, options = {}) {
 			throw new Error(`postgres replay: ttl must be a non-negative integer, got ${options.ttl}`);
 		}
 	}
+	if (options.localFanoutOnStorageFailure !== undefined &&
+		typeof options.localFanoutOnStorageFailure !== 'boolean') {
+		throw new Error(`postgres replay: localFanoutOnStorageFailure must be a boolean, got ${options.localFanoutOnStorageFailure}`);
+	}
+	const localFanoutOnStorageFailure = options.localFanoutOnStorageFailure === true;
 
 	const table = options.table || 'svti_replay';
 	const seqTable = table + '_seq';
@@ -89,6 +96,9 @@ export function createReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mStorageFallbacks = localFanoutOnStorageFailure
+		? m?.counter('replay_storage_fallbacks_total', 'Publishes that fell back to local fanout when storage failed', ['topic'])
+		: null;
 
 	let migrated = false;
 
@@ -165,24 +175,33 @@ export function createReplay(client, options = {}) {
 
 	const tracker = {
 		async publish(platform, topic, event, data) {
-			const res = await withBreaker(b, async () => {
-				await ensureTable();
-				return client.query({
-					name: 'replay_publish_' + table,
-					text: `WITH new_seq AS (
-						INSERT INTO ${seqTable} (topic, seq)
-						     VALUES ($1, 1)
-						ON CONFLICT (topic)
-						  DO UPDATE SET seq = ${seqTable}.seq + 1
-						  RETURNING seq
-					)
-					INSERT INTO ${table} (topic, seq, event, data)
-					SELECT $1, new_seq.seq, $2, $3
-					  FROM new_seq
-					RETURNING seq`,
-					values: [topic, event, JSON.stringify(data ?? null)]
+			let res;
+			try {
+				res = await withBreaker(b, async () => {
+					await ensureTable();
+					return client.query({
+						name: 'replay_publish_' + table,
+						text: `WITH new_seq AS (
+							INSERT INTO ${seqTable} (topic, seq)
+							     VALUES ($1, 1)
+							ON CONFLICT (topic)
+							  DO UPDATE SET seq = ${seqTable}.seq + 1
+							  RETURNING seq
+						)
+						INSERT INTO ${table} (topic, seq, event, data)
+						SELECT $1, new_seq.seq, $2, $3
+						  FROM new_seq
+						RETURNING seq`,
+						values: [topic, event, JSON.stringify(data ?? null)]
+					});
 				});
-			});
+			} catch (err) {
+				if (localFanoutOnStorageFailure) {
+					mStorageFallbacks?.inc({ topic: mt(topic) });
+					return platform.publish(topic, event, data);
+				}
+				throw new ReplayStorageError('publish', err);
+			}
 			const seq = parseInt(res.rows[0].seq, 10);
 			mPublishes?.inc({ topic: mt(topic) });
 

@@ -17,9 +17,9 @@
 
 import { createStreamReplay } from './replay-stream.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
-import { ReplicationTimeoutError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+import { ReplicationTimeoutError, ReplayStorageError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
-export { ReplicationTimeoutError };
+export { ReplicationTimeoutError, ReplayStorageError };
 
 /**
  * @typedef {Object} RedisReplayOptions
@@ -96,7 +96,7 @@ export function createReplay(client, options = {}) {
 		return createStreamReplay(client, options);
 	}
 
-	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs } =
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis replay', options);
 
 	const redis = client.redis;
@@ -109,6 +109,9 @@ export function createReplay(client, options = {}) {
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
+	const mStorageFallbacks = localFanoutOnStorageFailure
+		? m?.counter('replay_storage_fallbacks_total', 'Publishes that fell back to local fanout when storage failed', ['topic'])
+		: null;
 
 	function seqKey(topic) {
 		return client.key('replay:seq:' + topic);
@@ -123,9 +126,17 @@ export function createReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
-			await withBreaker(b, () =>
-				redis.eval(PUBLISH_SCRIPT, 2, sk, bk, topic, event, JSON.stringify(data ?? null), maxSize, ttl)
-			);
+			try {
+				await withBreaker(b, () =>
+					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, topic, event, JSON.stringify(data ?? null), maxSize, ttl)
+				);
+			} catch (err) {
+				if (localFanoutOnStorageFailure) {
+					mStorageFallbacks?.inc({ topic: mt(topic) });
+					return platform.publish(topic, event, data);
+				}
+				throw new ReplayStorageError('publish', err);
+			}
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {

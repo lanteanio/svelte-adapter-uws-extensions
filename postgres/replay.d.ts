@@ -14,10 +14,41 @@ export interface PgReplayOptions {
 	autoMigrate?: boolean;
 	/** Cleanup interval in ms (0 to disable). @default 60000 */
 	cleanupInterval?: number;
+	/**
+	 * When `true`, `publish()` falls back to a best-effort
+	 * `platform.publish(topic, event, data)` if the underlying Postgres
+	 * call fails (connection refused, breaker open, etc.) instead of
+	 * throwing. The `replay_storage_fallbacks_total{topic}` counter
+	 * increments on each fallback.
+	 *
+	 * Default `false` is the safe choice for production: storage failure
+	 * surfaces as `ReplayStorageError` so reconnecting clients don't see
+	 * messages that were delivered live but never persisted. Set `true`
+	 * for dev environments running without Postgres, or for use cases
+	 * where loss of replay durability is acceptable as long as live
+	 * delivery keeps working.
+	 *
+	 * @default false
+	 */
+	localFanoutOnStorageFailure?: boolean;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+}
+
+/**
+ * Thrown by `publish()` when the underlying Postgres query fails (connection
+ * refused, circuit breaker open, etc). The original error is preserved in
+ * `.cause`. Catch this to fall back to a best-effort
+ * `platform.publish(topic, event, data)`, or set
+ * `localFanoutOnStorageFailure: true` to have the backend do that for you.
+ */
+export class ReplayStorageError extends Error {
+	readonly name: 'ReplayStorageError';
+	readonly op: string;
+	readonly cause: unknown;
+	constructor(op: string, cause: unknown);
 }
 
 export interface BufferedMessage {
