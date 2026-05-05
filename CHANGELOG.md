@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.6] - 2026-05-05
+
+### Changed
+
+- **Bus wrap exposes `subscribe`, `unsubscribe`, and `checkSubscribe` from the underlying platform.** `wrap(platform)` on both `createPubSubBus` and `createShardedBus` now passes through the three server-side subscription primitives that landed in `svelte-adapter-uws@0.5.0-next.13` / `next.14`. These are inherently local-worker (operating on a specific `(ws, topic)` pair) -- pure pass-through, no relay logic. Without this, code holding a wrapped platform as a complete `Platform` replacement would hit `undefined` when it reached for any of the three. `mockPlatform()` from `svelte-adapter-uws-extensions/testing` grew matching recording arrays (`subscribed`, `unsubscribed`, `checkedSubscribe`) so the wrap surface stays testable end-to-end without booting a real adapter.
+- **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.14`** (was `^0.5.0-next.12`). Required because `wrap()` now binds these three new methods unconditionally; an older platform without them would crash at wrap-time.
+
 ## [0.5.0-next.5] - 2026-05-05
 
 ### Added

@@ -22,7 +22,23 @@ describe('redis pubsub bus', () => {
 			expect(typeof wrapped.send).toBe('function');
 			expect(typeof wrapped.sendTo).toBe('function');
 			expect(typeof wrapped.subscribers).toBe('function');
+			expect(typeof wrapped.subscribe).toBe('function');
+			expect(typeof wrapped.unsubscribe).toBe('function');
+			expect(typeof wrapped.checkSubscribe).toBe('function');
 			expect(typeof wrapped.topic).toBe('function');
+		});
+
+		it('subscribe / unsubscribe / checkSubscribe delegate to the underlying platform', () => {
+			const wrapped = bus.wrap(platform);
+			const ws = {};
+
+			wrapped.subscribe(ws, 'chat');
+			wrapped.unsubscribe(ws, 'chat');
+			wrapped.checkSubscribe(ws, 'chat');
+
+			expect(platform.subscribed).toEqual([{ ws, topic: 'chat' }]);
+			expect(platform.unsubscribed).toEqual([{ ws, topic: 'chat' }]);
+			expect(platform.checkedSubscribe).toEqual([{ ws, topic: 'chat' }]);
 		});
 
 		it('publish() calls the original platform.publish() without relay: false', () => {

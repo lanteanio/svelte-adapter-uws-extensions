@@ -212,6 +212,9 @@ export function createPubSubBus(client, options = {}) {
 				get pressure() { return platform.pressure; },
 				onPressure: platform.onPressure.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
+				subscribe: platform.subscribe.bind(platform),
+				unsubscribe: platform.unsubscribe.bind(platform),
+				checkSubscribe: platform.checkSubscribe.bind(platform),
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

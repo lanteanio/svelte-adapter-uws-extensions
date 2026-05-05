@@ -10,6 +10,9 @@ export function mockPlatform() {
 		sent: [],
 		sentCoalesced: [],
 		requested: [],
+		subscribed: [],
+		unsubscribed: [],
+		checkedSubscribe: [],
 		connections: 0,
 		requestId: '',
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
@@ -69,6 +72,18 @@ export function mockPlatform() {
 		subscribers(topic) {
 			return 0;
 		},
+		subscribe(ws, topic) {
+			p.subscribed.push({ ws, topic });
+			return null;
+		},
+		unsubscribe(ws, topic) {
+			p.unsubscribed.push({ ws, topic });
+			return false;
+		},
+		checkSubscribe(ws, topic) {
+			p.checkedSubscribe.push({ ws, topic });
+			return null;
+		},
 		topic(t) {
 			return {
 				publish(event, data) { p.publish(t, event, data); },
@@ -86,6 +101,9 @@ export function mockPlatform() {
 			p.sent.length = 0;
 			p.sentCoalesced.length = 0;
 			p.requested.length = 0;
+			p.subscribed.length = 0;
+			p.unsubscribed.length = 0;
+			p.checkedSubscribe.length = 0;
 		}
 	};
 	return p;

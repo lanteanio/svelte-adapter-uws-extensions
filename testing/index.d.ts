@@ -57,12 +57,21 @@ export interface MockPlatform {
 	published: Array<{ topic: string; event: string; data: any; options?: any }>;
 	/** All `send()` calls recorded as `{ ws, topic, event, data }`. */
 	sent: Array<{ ws: any; topic: string; event: string; data: any }>;
+	/** All `subscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
+	subscribed: Array<{ ws: any; topic: string }>;
+	/** All `unsubscribe()` calls recorded as `{ ws, topic }`. Returns `false` (no-op) by default. */
+	unsubscribed: Array<{ ws: any; topic: string }>;
+	/** All `checkSubscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
+	checkedSubscribe: Array<{ ws: any; topic: string }>;
 	connections: number;
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
 	send(ws: any, topic: string, event: string, data?: any): number;
 	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];
 	sendTo(filter: any, topic: string, event: string, data?: any): number;
 	subscribers(topic: string): number;
+	subscribe(ws: any, topic: string): string | null;
+	unsubscribe(ws: any, topic: string): boolean;
+	checkSubscribe(ws: any, topic: string): string | null;
 	topic(t: string): {
 		publish(event: string, data?: any): void;
 		created(data?: any): void;
