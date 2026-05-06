@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.5.0-next.6",
+  "version": "0.5.0-next.7",
   "publishConfig": {
     "tag": "next"
   },
@@ -76,6 +76,10 @@
     "./redis/lock": {
       "types": "./redis/lock.d.ts",
       "default": "./redis/lock.js"
+    },
+    "./redis/leader": {
+      "types": "./redis/leader.d.ts",
+      "default": "./redis/leader.js"
     },
     "./redis/session": {
       "types": "./redis/session.d.ts",

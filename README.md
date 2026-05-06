@@ -1535,6 +1535,99 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 - **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" -- dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
 - **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
 - **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal -- caching the outcome is.
+- **`createLeader`** (next section) when the question is "which one of N workers should fire this scheduled job right now," not "who runs this critical section." Distinct from `withLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer.
+
+---
+
+## Leader election
+
+Cluster-wide leader-election primitive via Redis lease. One worker across the cluster holds the lease at any moment; the synchronous `isLeader()` getter is microsecond-cost and cached. Use for cluster-wide singletons (cron schedulers, periodic cleanup, health probes that should run from one place) where firing N times across N workers would be wrong. Designed to plug into `svelte-realtime`'s `live.configureCron({ leader })` hook.
+
+#### Setup
+
+```js
+// src/lib/server/leader.js
+import { redis } from './redis.js';
+import { createLeader } from 'svelte-adapter-uws-extensions/redis/leader';
+
+export const leader = createLeader(redis);
+```
+
+#### Use
+
+```js
+// src/hooks.ws.js
+import { leader } from '$lib/server/leader';
+import { configureCron } from 'svelte-realtime/server';
+
+export function init() {
+  configureCron({ leader: leader.isLeader });
+}
+
+export async function shutdown() {
+  // Best-effort release so a sibling takes over within `renewMs`
+  // instead of waiting for the full lease to expire.
+  await leader.stop();
+}
+```
+
+`isLeader()` is the only call on the hot path. It reads a cached boolean (no Redis I/O, microsecond cost) and is safe to call at every cron tick / scheduled-job entry. Falsy means "another worker holds the lease" or "no Redis, fail closed" -- in both cases the consumer skips.
+
+#### How it works
+
+1. **Acquire.** `SET <fullKey> <instanceId> NX PX <leaseMs>` on construction. If the key was free, this worker holds the lease and `_isLeader` flips true.
+2. **Renew.** Every `renewMs` (default `leaseMs / 3`), Lua-atomic `if get == instanceId then pexpire end`. Returns 1 -> still ours, refreshed; returns 0 -> we lost it (force-takeover or TTL elapsed before renewal could land), `_isLeader` flips false.
+3. **Re-acquire.** When `_isLeader` is false, the same renewal tick attempts a fresh `SET NX`. As soon as the holder releases or the lease expires server-side, the next non-leader to tick wins.
+4. **Release.** `stop()` runs Lua-atomic `if get == instanceId then del end`. Skipped if we already lost ownership; the compare guard means we never accidentally delete a sibling's lease.
+
+The compare-on-mutate guard on both renew and release means a stale tick from a worker that already lost leadership cannot extend or release somebody else's lease. Same shape and the same shared Lua scripts as `redis/lock`'s heartbeat -- intentionally identical so the two primitives can't drift on lease semantics.
+
+#### Failure model: fail-closed
+
+A renewal that throws (Redis disconnect, breaker open, network partition) drops `_isLeader` to false and surfaces the error to `onError`. The renewal interval keeps ticking so leadership can recover when Redis recovers. Errors never escape the interval -- a Redis blip cannot crash the worker.
+
+Across the cluster, a partitioned Redis means the lease expires server-side and no worker holds leadership until the partition heals -- jobs miss ticks rather than double-fire. Better-safe-than-double-fire is the deliberate choice: across most cron consumers, missing one tick is acceptable while running a job twice is not.
+
+GC-pause caveat: a long stop-the-world pause on the leader can cause brief overlap with a freshly-elected successor. Make jobs idempotent at the consumer; this primitive does not provide fencing tokens (consumer sinks for cron-style work rarely have the machinery to consume them anyway).
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `key` | `'leader'` | Redis key for the lease (prefixed by the client `keyPrefix`). |
+| `instanceId` | random hex | This worker's identity. Override only if you want a stable identity for diagnostics; correctness does not depend on it. |
+| `leaseMs` | `30000` | TTL on the lease in milliseconds. Worst-case window between leader death and successor takeover. |
+| `renewMs` | `leaseMs / 3` | Renewal interval, also the interval at which non-leaders attempt fresh acquire. Must be `< leaseMs`. |
+| `onError` | -- | Called on every Redis failure. Use for structured logging. Errors never escape the renewal interval regardless. |
+| `mapKey` | identity | Map the lease key to a bounded label value for cardinality control on the four `leader_*` counters. |
+| `breaker` | -- | Optional circuit breaker. Renewal failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
+| `metrics` | -- | Optional Prometheus metrics registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `isLeader()` | Synchronous cached check. Microsecond-cost. Call at the top of every scheduled-job entry. |
+| `currentLeader()` | Single-GET diagnostic read of the current owner's `instanceId`. Returns `null` if unowned or on Redis failure. |
+| `stop()` | Stop the renewal interval and best-effort release the lease via compare-and-delete. Idempotent. Never throws. |
+| `instanceId` | This worker's identity (provided or generated). |
+| `key` | The fully-prefixed lease key (useful for diagnostics). |
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `leader_acquired_total{key_class}` | Counter of successful acquires (transitions to leader). |
+| `leader_lost_total{key_class}` | Counter of leadership losses (transitions to non-leader, including renewal failure). |
+| `leader_renewals_total{key_class}` | Counter of successful renewals. |
+| `leader_renewal_failures_total{key_class}` | Counter of renewal calls that threw or returned 0 (lease vanished or taken over). |
+
+#### When to use which
+
+- **`createLeader`** for "exactly one of N workers fires this scheduled job." Cluster-wide singleton observation. The primitive holds long-lived state (the lease); the consumer polls `isLeader()` synchronously at every tick.
+- **`createDistributedLock`** for "only one of N workers runs this critical section right now." Per-call mutual exclusion around a function that returns. The primitive holds the lock only while the function is running and forwards the function's return value.
+
+Both use the same backing Lua scripts and the same lease semantics; they differ in consumer shape (long-lived observer vs. scoped serializer).
 
 ---
 

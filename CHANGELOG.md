@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.7] - 2026-05-07
+
+### Added
+
+- **`createLeader(redis, options?)`** exported from `svelte-adapter-uws-extensions/redis/leader`. Cluster-wide leader-election primitive via Redis lease: one worker across the cluster holds the lease at any moment; the synchronous `isLeader()` getter is microsecond-cost and cached. Designed to plug into `svelte-realtime`'s `live.configureCron({ leader })` hook so cron schedules fire once across the cluster instead of N times across N workers (SO_REUSEPORT or acceptor-mode setups). Backing primitive: `SET <key> <instanceId> NX PX <leaseMs>` to acquire, Lua-atomic compare-and-pexpire to renew, Lua-atomic compare-and-delete to release. Defaults: 30s lease, renew every 10s. Fail-closed model -- a renewal that throws drops `_isLeader` to false and surfaces via the optional `onError` callback; errors never escape the renewal interval so a Redis blip cannot crash the worker. `currentLeader()` does a single-GET diagnostic read of the live owner's `instanceId`. `stop()` is idempotent, never throws, and best-effort releases the lease so a sibling can take over within `renewMs` instead of waiting for the full lease. Four metrics: `leader_acquired_total{key_class}`, `leader_lost_total{key_class}`, `leader_renewals_total{key_class}`, `leader_renewal_failures_total{key_class}`. Distinct from `createDistributedLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer; both share the same Lua scripts and lease semantics via the new `shared/lease-scripts.js` module so the two primitives can't drift.
+
+### Changed
+
+- **`redis/lock` Lua scripts moved to `shared/lease-scripts.js`** for reuse by `redis/leader`. Lock's `HEARTBEAT_SCRIPT` and `RELEASE_SCRIPT` are now imported from the shared module under their generic names (`LEASE_RENEW_SCRIPT`, `LEASE_RELEASE_SCRIPT`). Pure refactor; no behavior change.
+
 ## [0.5.0-next.6] - 2026-05-05
 
 ### Changed

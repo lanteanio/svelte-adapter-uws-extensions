@@ -19,42 +19,10 @@
 
 import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
-
-/**
- * Lua: refresh the lock's TTL only if our fence token still owns the key.
- *
- * KEYS[1] = lock key
- * ARGV[1] = expected fence token
- * ARGV[2] = new TTL in milliseconds
- *
- * Returns 1 if still owned (TTL refreshed), 0 if not (key absent or
- * holds a different fence).
- */
-const HEARTBEAT_SCRIPT = `
-local v = redis.call('GET', KEYS[1])
-if v == ARGV[1] then
-  redis.call('PEXPIRE', KEYS[1], ARGV[2])
-  return 1
-end
-return 0
-`;
-
-/**
- * Lua: delete the lock only if our fence token still owns it.
- *
- * KEYS[1] = lock key
- * ARGV[1] = expected fence token
- *
- * Returns 1 if released, 0 if not.
- */
-const RELEASE_SCRIPT = `
-local v = redis.call('GET', KEYS[1])
-if v == ARGV[1] then
-  redis.call('DEL', KEYS[1])
-  return 1
-end
-return 0
-`;
+import {
+	LEASE_RENEW_SCRIPT as HEARTBEAT_SCRIPT,
+	LEASE_RELEASE_SCRIPT as RELEASE_SCRIPT
+} from '../shared/lease-scripts.js';
 
 /**
  * @typedef {Object} DistributedLockOptions
