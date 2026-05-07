@@ -177,6 +177,14 @@ export function createIdempotencyStore(client, options = {}) {
 
 		async clear() {
 			await withBreaker(b, () => scanAndUnlink(redis, client.key(keyPrefix + '*')));
+		},
+
+		// Symmetry with the Postgres idempotency store. The Redis backend
+		// has no DDL to run, so this resolves immediately. Provided so
+		// callers can write generic boot code: `await store.ready()`
+		// regardless of which backend is wired.
+		ready() {
+			return Promise.resolve();
 		}
 	};
 }

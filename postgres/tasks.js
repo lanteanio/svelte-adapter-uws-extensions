@@ -45,7 +45,8 @@ import { randomUUID } from 'node:crypto';
 import {
 	TaskInFlightError,
 	UnknownTaskError,
-	deserialiseError
+	deserialiseError,
+	serialiseError
 } from './_tasks-errors.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql } from './_tasks-sql.js';
@@ -53,6 +54,18 @@ import { withBreaker } from '../shared/breaker.js';
 import { MAX_TASK_HANDLERS } from '../shared/caps.js';
 
 export { TaskInFlightError, UnknownTaskError };
+
+/**
+ * @typedef {Object} TaskStateChangeEvent
+ * @property {string} taskId
+ * @property {string} name
+ * @property {'pending' | 'running' | null} oldStatus - `null` for the initial insert (row didn't exist before).
+ * @property {'pending' | 'running' | 'committed' | 'failed'} newStatus
+ * @property {number} attempt - 0 for `pending` rows just inserted by `enqueue`, 1+ for `running` and terminal.
+ * @property {string | null} requestId
+ * @property {unknown} [result] - Present when `newStatus === 'committed'`.
+ * @property {unknown} [error] - Present when `newStatus === 'failed'` (the deserialised handler error).
+ */
 
 /**
  * @typedef {Object} TaskRunnerOptions
@@ -70,6 +83,7 @@ export { TaskInFlightError, UnknownTaskError };
  * @property {number} [cleanupInterval=3600000] - ms between cleanup sweeps. 0 disables.
  * @property {number} [rowTtl=604800] - Seconds to keep terminal rows (committed/failed) before deletion. Default 7 days.
  * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
+ * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern -- still wants `postgres/notify`.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional Prometheus metrics registry.
  */
@@ -200,6 +214,10 @@ export function createTaskRunner(client, options = {}) {
 			throw new Error('postgres tasks: fence must implement acquire, heartbeat, and release');
 		}
 	}
+	if (options.onStateChange !== undefined && typeof options.onStateChange !== 'function') {
+		throw new Error('postgres tasks: onStateChange must be a function');
+	}
+	const onStateChange = options.onStateChange || null;
 
 	const b = options.breaker;
 	const m = options.metrics;
@@ -224,6 +242,45 @@ export function createTaskRunner(client, options = {}) {
 	let destroyed = false;
 
 	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate });
+
+	// One-shot ready() promise: kicks off ensureTable() at construction so
+	// callers that need the table to exist before they start polling
+	// (dashboards, status pages) can `await runner.ready()` without
+	// triggering a no-op task. Subsequent ensureTable() calls inside the
+	// state machine are no-ops via the migrated flag in createTaskSql.
+	const readyPromise = autoMigrate
+		? sql.ensureTable().catch((err) => {
+			// Swallow at the construction site so an unhandled rejection
+			// can't crash the worker; callers awaiting ready() see the
+			// real error via the rethrow below.
+			readyError = err;
+			throw err;
+		})
+		: Promise.resolve();
+	let readyError = null;
+
+	/**
+	 * Centralized state-change emitter. Errors thrown from the listener
+	 * (sync or via promise rejection) are caught and logged so a buggy
+	 * observer cannot break the state machine. Listeners run on the same
+	 * tick as the SQL commit but are awaited fire-and-forget; the runner
+	 * never blocks on the listener.
+	 *
+	 * @param {import('./tasks.js').TaskStateChangeEvent} event
+	 */
+	function fireStateChange(event) {
+		if (!onStateChange) return;
+		try {
+			const result = onStateChange(event);
+			if (result && typeof result.then === 'function') {
+				result.catch((err) => {
+					console.warn('[postgres tasks] onStateChange listener rejected:', err?.message ?? err);
+				});
+			}
+		} catch (err) {
+			console.warn('[postgres tasks] onStateChange listener threw:', err?.message ?? err);
+		}
+	}
 
 	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId) {
 		const reg = handlers.get(name);
@@ -287,22 +344,32 @@ export function createTaskRunner(client, options = {}) {
 		while (true) {
 			let result;
 			let handlerError;
+			let firedTransitionThisIter = null; // 'insert' | 'rearm' | null
 			await withBreaker(b, async () => {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUUID();
 					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId);
+					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate fence and rearm the existing row.
 					fence = randomUUID();
 					await sql.rearmAttempt(taskId, fence, attempt);
+					firedTransitionThisIter = 'rearm';
 				}
 				// else: dispatch/recovery first iteration uses the fence assigned by the
-				// claim CTE; no row mutation needed.
+				// claim CTE; no row mutation needed (the dispatch/recovery sweep
+				// already fired the state-change event).
 				if (fenceProvider) {
 					await fenceProvider.acquire(taskId, fence, fenceTtl);
 				}
 			});
+
+			if (firedTransitionThisIter === 'insert') {
+				fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null });
+			} else if (firedTransitionThisIter === 'rearm') {
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'running', attempt, requestId: requestId ?? null });
+			}
 
 			mRunStart?.inc({ name });
 
@@ -331,10 +398,12 @@ export function createTaskRunner(client, options = {}) {
 					}
 					// Row is still running under someone else's fence: yield
 					// the result we just produced; the canonical commit will
-					// land via that other worker.
+					// land via that other worker. No state-change fires
+					// here -- the canonical writer fires on commit.
 					mRunCommit?.inc({ name });
 					return result;
 				}
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, result });
 				mRunCommit?.inc({ name });
 				return result;
 			}
@@ -348,9 +417,12 @@ export function createTaskRunner(client, options = {}) {
 				(typeof retry.on !== 'function' || retry.on(handlerError) !== false);
 
 			if (!canRetry) {
-				await sql.failRow(taskId, fence, handlerError);
+				const failed = await sql.failRow(taskId, fence, handlerError);
 				if (fenceProvider) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
+				}
+				if (failed) {
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseError(handlerError) });
 				}
 				mRunFail?.inc({ name });
 				throw handlerError;
@@ -373,6 +445,18 @@ export function createTaskRunner(client, options = {}) {
 			const reclaimed = await sql.reclaimStuck(recoveryBatchSize);
 			b?.success();
 			for (const row of reclaimed) {
+				// reclaimStuck transitioned status from 'running' (with stale
+				// fence) to 'running' (with fresh fence + incremented
+				// attempts). Fire the state-change so observers see the
+				// retry boundary even if no handler is registered locally.
+				fireStateChange({
+					taskId: row.id,
+					name: row.name,
+					oldStatus: 'running',
+					newStatus: 'running',
+					attempt: row.attempts,
+					requestId: row.request_id ?? null
+				});
 				const reg = handlers.get(row.name);
 				if (!reg) {
 					// Unknown handler in this process.  Leave the row in
@@ -405,6 +489,18 @@ export function createTaskRunner(client, options = {}) {
 			const claimed = await sql.claimPending(dispatchBatchSize);
 			b?.success();
 			for (const row of claimed) {
+				// claimPending transitioned status from 'pending' to 'running'
+				// in the CTE update. Fire state-change for every claimed row
+				// so observers see the dispatch even when no handler is
+				// registered locally.
+				fireStateChange({
+					taskId: row.id,
+					name: row.name,
+					oldStatus: 'pending',
+					newStatus: 'running',
+					attempt: row.attempts,
+					requestId: row.request_id ?? null
+				});
 				if (!handlers.has(row.name)) {
 					// Unknown handler in this process.  Leave the row in
 					// 'running' state with our claimed fence; another instance
@@ -568,6 +664,14 @@ export function createTaskRunner(client, options = {}) {
 
 			const taskId = randomUUID();
 			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId));
+			fireStateChange({
+				taskId,
+				name,
+				oldStatus: null,
+				newStatus: 'pending',
+				attempt: 0,
+				requestId: requestId ?? null
+			});
 			mEnqueued?.inc({ name });
 			return taskId;
 		},
@@ -605,6 +709,65 @@ export function createTaskRunner(client, options = {}) {
 			}
 		},
 
+		ready() {
+			return readyPromise;
+		},
+
+		async list(listOptions = {}) {
+			const filterName = listOptions.name;
+			if (filterName !== undefined && (typeof filterName !== 'string' || filterName.length === 0)) {
+				throw new Error('postgres tasks: list.name must be a non-empty string');
+			}
+			const filterStatus = listOptions.status;
+			if (filterStatus !== undefined && filterStatus !== 'pending' && filterStatus !== 'running' && filterStatus !== 'committed' && filterStatus !== 'failed') {
+				throw new Error('postgres tasks: list.status must be one of pending|running|committed|failed');
+			}
+			const limit = listOptions.limit !== undefined ? listOptions.limit : 50;
+			if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+				throw new Error('postgres tasks: list.limit must be an integer in [1, 1000]');
+			}
+			const offset = listOptions.offset !== undefined ? listOptions.offset : 0;
+			if (!Number.isInteger(offset) || offset < 0) {
+				throw new Error('postgres tasks: list.offset must be a non-negative integer');
+			}
+			await sql.ensureTable();
+			const rows = await withBreaker(b, () => sql.listRows({
+				name: filterName ?? null,
+				status: filterStatus ?? null,
+				limit,
+				offset
+			}));
+			return rows.map(shapeTaskRow);
+		},
+
+		async counts(countOptions = {}) {
+			const filterName = countOptions.name;
+			if (filterName !== undefined && (typeof filterName !== 'string' || filterName.length === 0)) {
+				throw new Error('postgres tasks: counts.name must be a non-empty string');
+			}
+			await sql.ensureTable();
+			return withBreaker(b, () => sql.countByStatus({ name: filterName ?? null }));
+		},
+
+		async takeover(taskId) {
+			if (typeof taskId !== 'string' || taskId.length === 0) {
+				throw new Error('postgres tasks: taskId must be a non-empty string');
+			}
+			await sql.ensureTable();
+			const expiredFence = await withBreaker(b, () => sql.expireFence(taskId));
+			if (!expiredFence) return false;
+			// Compose: when a Redis fence provider is configured, releasing
+			// the mirror key cuts abort latency from O(heartbeatInterval) to
+			// the next heartbeat tick (the heartbeat first checks the
+			// external store before the Postgres row). Best-effort -- a
+			// failure here just means abort waits for the Postgres heartbeat
+			// to observe the expired fence_expires_at, which still happens.
+			if (fenceProvider) {
+				try { await fenceProvider.release(taskId, expiredFence); } catch { /* best-effort */ }
+			}
+			return true;
+		},
+
 		destroy() {
 			destroyed = true;
 			if (recoveryTimer) {
@@ -629,6 +792,32 @@ export function createTaskRunner(client, options = {}) {
 		const taskId = randomUUID();
 		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId);
 	}
+}
+
+/**
+ * Shape a row from listRows() (raw SQL row) into the public `TaskRow`
+ * shape: camelCase keys, Date instances for timestamps, parsed error.
+ * Internal `fence` column is intentionally excluded (it's a UUID with no
+ * caller value and surfacing it invites misuse).
+ */
+function shapeTaskRow(row) {
+	return {
+		id: row.id,
+		name: row.name,
+		input: row.input,
+		status: row.status,
+		result: row.result,
+		// row.error is the JSONB-stored shape from serialiseError (already
+		// parsed by pg). Pass it through directly: {name, message, stack?,
+		// code?, cause?} -- JSON-serialisable for UIs / dashboards.
+		// Callers wanting a live Error can do Object.assign(new Error(e.message), e).
+		error: row.error ?? null,
+		attempts: row.attempts,
+		requestId: row.request_id ?? null,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		fenceExpiresAt: row.fence_expires_at
+	};
 }
 
 // Resolve a request id from run / enqueue options. Explicit `requestId`

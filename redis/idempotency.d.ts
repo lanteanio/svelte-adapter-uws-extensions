@@ -45,6 +45,13 @@ export interface RedisIdempotencyStore {
 	purge(key: string): Promise<void>;
 	/** Drop every key under this store's prefix. */
 	clear(): Promise<void>;
+	/**
+	 * Symmetry with the Postgres idempotency store. The Redis backend
+	 * has no DDL to run, so this resolves immediately. Provided so
+	 * callers can write generic boot code: `await store.ready()`
+	 * regardless of which backend is wired.
+	 */
+	ready(): Promise<void>;
 }
 
 /**

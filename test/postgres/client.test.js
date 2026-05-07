@@ -20,9 +20,46 @@ describe('createPgClient', () => {
 		expect(typeof client.end).toBe('function');
 	});
 
-	it('throws if connectionString is missing', () => {
-		expect(() => createPgClient()).toThrow('connectionString is required');
-		expect(() => createPgClient({})).toThrow('connectionString is required');
+	it('throws if neither connectionString nor pool is provided', () => {
+		expect(() => createPgClient()).toThrow('connectionString or pool is required');
+		expect(() => createPgClient({})).toThrow('connectionString or pool is required');
+	});
+
+	it('wraps an externally-provided pool', () => {
+		const externalPool = {
+			query: vi.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+			end: vi.fn(() => Promise.resolve()),
+			on: vi.fn()
+		};
+		const client = createPgClient({ pool: externalPool });
+		expect(client.pool).toBe(externalPool);
+	});
+
+	it('end() is a no-op when the pool was provided externally', async () => {
+		const externalPool = {
+			query: vi.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+			end: vi.fn(() => Promise.resolve()),
+			on: vi.fn()
+		};
+		const client = createPgClient({ pool: externalPool });
+		await client.end();
+		await client.end();
+		expect(externalPool.end).not.toHaveBeenCalled();
+	});
+
+	it('createClient() throws when only a pool was provided', () => {
+		const externalPool = {
+			query: vi.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+			end: vi.fn(() => Promise.resolve()),
+			on: vi.fn()
+		};
+		const client = createPgClient({ pool: externalPool });
+		expect(() => client.createClient()).toThrow('createClient() requires connectionString');
+	});
+
+	it('rejects a non-Pool value passed as pool', () => {
+		expect(() => createPgClient({ pool: 'not-a-pool' })).toThrow('pool must be a pg.Pool instance');
+		expect(() => createPgClient({ pool: { query: 'not a function' } })).toThrow('pool must be a pg.Pool instance');
 	});
 
 	it('query delegates to pool.query', async () => {

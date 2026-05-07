@@ -479,4 +479,320 @@ describe('postgres tasks', () => {
 			expect(typeof row.error.stack).toBe('string');
 		});
 	});
+
+	describe('ready()', () => {
+		it('resolves once construction completes', async () => {
+			const r = createTaskRunner(client, { recoveryInterval: 0, cleanupInterval: 0 });
+			await expect(r.ready()).resolves.toBeUndefined();
+			r.destroy();
+		});
+
+		it('is idempotent (returns the same resolved promise)', async () => {
+			const r = createTaskRunner(client, { recoveryInterval: 0, cleanupInterval: 0 });
+			await r.ready();
+			await r.ready();
+			await r.ready();
+			r.destroy();
+		});
+
+		it('resolves immediately when autoMigrate is false', async () => {
+			const r = createTaskRunner(client, { autoMigrate: false, recoveryInterval: 0, cleanupInterval: 0 });
+			await expect(r.ready()).resolves.toBeUndefined();
+			r.destroy();
+		});
+	});
+
+	describe('list()', () => {
+		beforeEach(() => {
+			runner.register('alpha', async (ctx) => ctx.input);
+			runner.register('beta', async (ctx) => ctx.input);
+		});
+
+		it('returns rows shaped for the public API', async () => {
+			await runner.run('alpha', { input: { x: 1 } });
+			const rows = await runner.list();
+			expect(rows).toHaveLength(1);
+			const row = rows[0];
+			expect(row.name).toBe('alpha');
+			expect(row.status).toBe('committed');
+			expect(row.result).toEqual({ x: 1 });
+			expect(row.attempts).toBe(1);
+			expect(row.error).toBe(null);
+			expect(row.createdAt).toBeInstanceOf(Date);
+			expect(row.updatedAt).toBeInstanceOf(Date);
+			expect(row.fenceExpiresAt).toBeInstanceOf(Date);
+			expect('fence' in row).toBe(false); // internal UUID is not exposed
+		});
+
+		it('newest first by createdAt', async () => {
+			await runner.run('alpha', { input: 1 });
+			await new Promise((r) => setTimeout(r, 5));
+			await runner.run('alpha', { input: 2 });
+			const rows = await runner.list();
+			expect(rows.map((r) => r.result)).toEqual([2, 1]);
+		});
+
+		it('filters by name', async () => {
+			await runner.run('alpha', { input: 'a' });
+			await runner.run('beta', { input: 'b' });
+			const rows = await runner.list({ name: 'alpha' });
+			expect(rows.map((r) => r.name)).toEqual(['alpha']);
+		});
+
+		it('filters by status', async () => {
+			runner.register('boom', async () => { throw new Error('x'); });
+			await runner.run('alpha', { input: 1 });
+			await runner.run('boom', { input: null }).catch(() => {});
+			const ok = await runner.list({ status: 'committed' });
+			const bad = await runner.list({ status: 'failed' });
+			expect(ok.every((r) => r.status === 'committed')).toBe(true);
+			expect(bad.every((r) => r.status === 'failed')).toBe(true);
+		});
+
+		it('honors limit and offset', async () => {
+			for (let i = 0; i < 5; i++) {
+				await runner.run('alpha', { input: i });
+			}
+			const page1 = await runner.list({ limit: 2 });
+			const page2 = await runner.list({ limit: 2, offset: 2 });
+			expect(page1).toHaveLength(2);
+			expect(page2).toHaveLength(2);
+			expect(page1[0].id).not.toBe(page2[0].id);
+		});
+
+		it('rejects invalid filters', async () => {
+			await expect(runner.list({ name: '' })).rejects.toThrow(/name/);
+			await expect(runner.list({ status: 'bogus' })).rejects.toThrow(/status/);
+			await expect(runner.list({ limit: 0 })).rejects.toThrow(/limit/);
+			await expect(runner.list({ limit: 5000 })).rejects.toThrow(/limit/);
+			await expect(runner.list({ offset: -1 })).rejects.toThrow(/offset/);
+		});
+	});
+
+	describe('counts()', () => {
+		beforeEach(() => {
+			runner.register('alpha', async (ctx) => ctx.input);
+			runner.register('boom', async () => { throw new Error('x'); });
+		});
+
+		it('returns the full bucket set including zeros', async () => {
+			await runner.run('alpha', { input: 1 });
+			const c = await runner.counts();
+			expect(c).toEqual({
+				pending: 0,
+				running: 0,
+				committed: 1,
+				failed: 0,
+				total: 1
+			});
+		});
+
+		it('aggregates across statuses', async () => {
+			await runner.run('alpha', { input: 1 });
+			await runner.run('alpha', { input: 2 });
+			await runner.run('boom').catch(() => {});
+			const c = await runner.counts();
+			expect(c.committed).toBe(2);
+			expect(c.failed).toBe(1);
+			expect(c.total).toBe(3);
+		});
+
+		it('filters by name', async () => {
+			await runner.run('alpha', { input: 1 });
+			await runner.run('boom').catch(() => {});
+			const c = await runner.counts({ name: 'alpha' });
+			expect(c.committed).toBe(1);
+			expect(c.failed).toBe(0);
+			expect(c.total).toBe(1);
+		});
+	});
+
+	describe('takeover()', () => {
+		it('returns false if the row is not running', async () => {
+			runner.register('alpha', async (ctx) => ctx.input);
+			await runner.run('alpha', { input: 1 });
+			const taskId = [...client._getTaskRows().keys()][0];
+			expect(await runner.takeover(taskId)).toBe(false); // already committed
+		});
+
+		it('returns false for an unknown taskId', async () => {
+			expect(await runner.takeover('does-not-exist')).toBe(false);
+		});
+
+		it('expires the fence on a running row and returns true', async () => {
+			let release;
+			runner.register('slow', async () => new Promise((r) => { release = r; }));
+			const promise = runner.run('slow', { input: null });
+
+			// Wait for the row to be inserted in 'running' state.
+			await new Promise((r) => setTimeout(r, 10));
+			const taskId = [...client._getTaskRows().keys()][0];
+
+			expect(await runner.takeover(taskId)).toBe(true);
+			const row = client._getTaskRows().get(taskId);
+			expect(row.fence_expires_at).toBeLessThan(Date.now());
+
+			// Let the handler finish so the test exits cleanly.
+			release();
+			await promise.catch(() => {});
+		});
+
+		it('also releases the external fence when configured', async () => {
+			const released = [];
+			const fenceProvider = {
+				acquire: vi.fn(async () => true),
+				heartbeat: vi.fn(async () => true),
+				release: vi.fn(async (taskId, fence) => { released.push({ taskId, fence }); })
+			};
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				fence: fenceProvider
+			});
+			r.register('slow', async () => new Promise((res) => setTimeout(res, 1000)));
+			const promise = r.run('slow', { input: null });
+
+			await new Promise((res) => setTimeout(res, 10));
+			const taskId = [...client._getTaskRows().keys()][0];
+			const fenceBefore = client._getTaskRows().get(taskId).fence;
+
+			expect(await r.takeover(taskId)).toBe(true);
+			expect(released).toHaveLength(1);
+			expect(released[0]).toEqual({ taskId, fence: fenceBefore });
+
+			// Don't await `promise` -- the simulated long handler is just a setTimeout
+			// and will resolve cleanly; vi.restoreAllMocks() in beforeEach handles
+			// cleanup. r.destroy() stops the timers we created.
+			r.destroy();
+		});
+
+		it('rejects empty taskId', async () => {
+			await expect(runner.takeover('')).rejects.toThrow(/taskId/);
+		});
+	});
+
+	describe('onStateChange', () => {
+		it('fires for every state-machine transition on a successful run', async () => {
+			const events = [];
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				onStateChange: (e) => events.push(e)
+			});
+			r.register('alpha', async (ctx) => ({ ok: ctx.input }));
+
+			await r.run('alpha', { input: 'hi' });
+
+			// Expect: null -> running, then running -> committed.
+			expect(events).toHaveLength(2);
+			expect(events[0]).toMatchObject({ oldStatus: null, newStatus: 'running', name: 'alpha', attempt: 1 });
+			expect(events[1]).toMatchObject({ oldStatus: 'running', newStatus: 'committed', name: 'alpha', attempt: 1 });
+			expect(events[1].result).toEqual({ ok: 'hi' });
+			expect(events[0].taskId).toBe(events[1].taskId);
+
+			r.destroy();
+		});
+
+		it('fires for failed transitions with serialised error', async () => {
+			const events = [];
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				onStateChange: (e) => events.push(e)
+			});
+			r.register('boom', async () => { throw new Error('nope'); });
+
+			await r.run('boom').catch(() => {});
+
+			const failed = events.find((e) => e.newStatus === 'failed');
+			expect(failed).toBeDefined();
+			expect(failed.error).toMatchObject({ message: 'nope', name: 'Error' });
+			expect(typeof failed.error.stack).toBe('string');
+
+			r.destroy();
+		});
+
+		it('fires for pending->running on dispatch claim', async () => {
+			const events = [];
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				dispatchInterval: 0, // don't auto-tick
+				cleanupInterval: 0,
+				onStateChange: (e) => events.push(e)
+			});
+			r.register('alpha', async (ctx) => ctx.input);
+
+			const taskId = await r.enqueue('alpha', { input: 1 });
+			expect(events.find((e) => e.taskId === taskId && e.oldStatus === null && e.newStatus === 'pending')).toBeDefined();
+			events.length = 0;
+
+			// Manually trigger a dispatch tick (the runner's claim path is
+			// public via the timer; here we use the mock's internal state to
+			// confirm the call wires through). The simplest way is to call
+			// run() on a different instance pointing at the same store, but
+			// for this unit test we exercise the public path: enqueue + a
+			// short dispatchInterval.
+			const r2 = createTaskRunner(client, {
+				recoveryInterval: 0,
+				dispatchInterval: 5,
+				cleanupInterval: 0,
+				onStateChange: (e) => events.push(e)
+			});
+			r2.register('alpha', async (ctx) => ctx.input);
+
+			// Wait for dispatch to claim the row.
+			await new Promise((res) => setTimeout(res, 50));
+
+			const transition = events.find((e) => e.taskId === taskId && e.oldStatus === 'pending' && e.newStatus === 'running');
+			expect(transition).toBeDefined();
+			expect(transition.attempt).toBeGreaterThanOrEqual(1);
+
+			r.destroy();
+			r2.destroy();
+		});
+
+		it('listener errors are caught and do not break the state machine', async () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				onStateChange: () => { throw new Error('listener exploded'); }
+			});
+			r.register('alpha', async (ctx) => ctx.input);
+
+			// Run completes successfully despite the listener throwing on
+			// every transition.
+			await expect(r.run('alpha', { input: 42 })).resolves.toBe(42);
+			expect(warn).toHaveBeenCalled();
+
+			r.destroy();
+			warn.mockRestore();
+		});
+
+		it('async listener rejections are isolated', async () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				onStateChange: async () => { throw new Error('async listener exploded'); }
+			});
+			r.register('alpha', async (ctx) => ctx.input);
+
+			await expect(r.run('alpha', { input: 1 })).resolves.toBe(1);
+			// Allow microtasks to drain so the rejection is observed.
+			await new Promise((res) => setTimeout(res, 5));
+			expect(warn).toHaveBeenCalled();
+
+			r.destroy();
+			warn.mockRestore();
+		});
+
+		it('rejects non-function onStateChange', () => {
+			expect(() => createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				onStateChange: 'not a function'
+			})).toThrow(/onStateChange/);
+		});
+	});
 });

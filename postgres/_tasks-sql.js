@@ -136,6 +136,104 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		return res.rows[0] || null;
 	}
 
+	/**
+	 * List recent rows. Filters compose with AND. Newest first by
+	 * `created_at`. The status filter accepts a single status; null/undefined
+	 * means "all". The name filter is similar.
+	 *
+	 * Returns rows shaped for the public API (camelCase, Date instances for
+	 * timestamps, parsed JSON for input/result/error). The internal `fence`
+	 * column is intentionally excluded.
+	 */
+	async function listRows({ name = null, status = null, limit = 50, offset = 0 } = {}) {
+		const clauses = [];
+		const values = [];
+		if (name !== null && name !== undefined) {
+			values.push(name);
+			clauses.push(`name = $${values.length}`);
+		}
+		if (status !== null && status !== undefined) {
+			values.push(status);
+			clauses.push(`status = $${values.length}`);
+		}
+		const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+		values.push(limit);
+		const limitIdx = values.length;
+		values.push(offset);
+		const offsetIdx = values.length;
+		const res = await client.query({
+			text: `SELECT svti_tasks_id AS id,
+			              name,
+			              input,
+			              status,
+			              result,
+			              error,
+			              attempts,
+			              request_id,
+			              created_at,
+			              updated_at,
+			              fence_expires_at
+			         FROM ${table}
+			         ${where}
+			        ORDER BY created_at DESC
+			        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+			values
+		});
+		return res.rows;
+	}
+
+	/**
+	 * Status counts grouped by status. Optional name filter.
+	 * Always returns the full bucket set so callers don't have to
+	 * normalise zeros.
+	 */
+	async function countByStatus({ name = null } = {}) {
+		const values = [];
+		let where = '';
+		if (name !== null && name !== undefined) {
+			values.push(name);
+			where = `WHERE name = $1`;
+		}
+		const res = await client.query({
+			text: `SELECT status, COUNT(*)::int AS n
+			         FROM ${table}
+			         ${where}
+			        GROUP BY status`,
+			values
+		});
+		const out = { pending: 0, running: 0, committed: 0, failed: 0, total: 0 };
+		for (const r of res.rows) {
+			if (r.status in out) out[r.status] = r.n;
+			out.total += r.n;
+		}
+		return out;
+	}
+
+	/**
+	 * Force-takeover a running row by expiring its fence. The recovery
+	 * sweep on any live instance will reclaim the row on its next tick;
+	 * the in-flight handler's heartbeat will detect the loss and abort.
+	 *
+	 * Returns the row's current fence UUID if a row was running and got
+	 * taken over, or `null` if the row is no longer running (already
+	 * terminal, never existed at this status, or somebody else expired it
+	 * first). Caller can pass the returned fence to the external fence
+	 * provider's release() to cut the abort latency from
+	 * `heartbeatInterval` to one tick.
+	 */
+	async function expireFence(taskId) {
+		const res = await client.query({
+			name: 'tasks_expire_fence_' + table,
+			text: `UPDATE ${table}
+			          SET fence_expires_at = now() - interval '1 second',
+			              updated_at = now()
+			        WHERE svti_tasks_id = $1 AND status = 'running'
+			    RETURNING fence`,
+			values: [taskId]
+		});
+		return res.rows[0] ? res.rows[0].fence : null;
+	}
+
 	async function insertPending(taskId, name, input, idempotencyKey, requestId) {
 		await client.query({
 			name: 'tasks_enqueue_' + table,
@@ -213,6 +311,9 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		commitRow,
 		failRow,
 		readRow,
+		listRows,
+		countByStatus,
+		expireFence,
 		insertPending,
 		claimPending,
 		reclaimStuck,

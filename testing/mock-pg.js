@@ -372,6 +372,73 @@ export function mockPgClient() {
 				return { rows: out, rowCount: out.length };
 			}
 
+			// Task list: SELECT svti_tasks_id AS id, name, input, status, ... ORDER BY created_at DESC
+			if (
+				sql.startsWith('SELECT svti_tasks_id AS id') &&
+				sql.includes('ORDER BY created_at DESC') &&
+				sql.includes('LIMIT')
+			) {
+				let rows = [...taskRows.values()];
+				let valueIdx = 0;
+				if (sql.includes('name = $')) {
+					const filterName = values[valueIdx++];
+					rows = rows.filter((r) => r.name === filterName);
+				}
+				if (sql.includes('status = $')) {
+					const filterStatus = values[valueIdx++];
+					rows = rows.filter((r) => r.status === filterStatus);
+				}
+				rows.sort((a, b) => b.created_at - a.created_at);
+				const limit = Number(values[valueIdx++]);
+				const offset = Number(values[valueIdx++]);
+				const sliced = rows.slice(offset, offset + limit);
+				const out = sliced.map((r) => ({
+					id: r.id,
+					name: r.name,
+					input: r.input,
+					status: r.status,
+					result: r.result,
+					error: r.error,
+					attempts: r.attempts,
+					request_id: r.request_id ?? null,
+					created_at: new Date(r.created_at),
+					updated_at: new Date(r.updated_at),
+					fence_expires_at: new Date(r.fence_expires_at)
+				}));
+				return { rows: out, rowCount: out.length };
+			}
+
+			// Task counts: SELECT status, COUNT(*)::int AS n ... GROUP BY status
+			if (
+				sql.startsWith('SELECT status, COUNT(*)::int AS n') &&
+				sql.includes('GROUP BY status')
+			) {
+				let rows = [...taskRows.values()];
+				if (sql.includes('WHERE name = $1')) {
+					rows = rows.filter((r) => r.name === values[0]);
+				}
+				const counts = {};
+				for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+				const out = Object.entries(counts).map(([status, n]) => ({ status, n }));
+				return { rows: out, rowCount: out.length };
+			}
+
+			// Task takeover: expire fence_expires_at, RETURNING fence
+			if (
+				sql.startsWith('UPDATE') &&
+				sql.includes("fence_expires_at = now() - interval '1 second'") &&
+				sql.includes("status = 'running'") &&
+				sql.includes('RETURNING fence')
+			) {
+				const taskId = values[0];
+				const row = taskRows.get(taskId);
+				if (!row || row.status !== 'running') return { rows: [], rowCount: 0 };
+				const previousFence = row.fence;
+				row.fence_expires_at = Date.now() - 1000;
+				row.updated_at = Date.now();
+				return { rows: [{ fence: previousFence }], rowCount: 1 };
+			}
+
 			// Task cleanup: delete terminal rows older than rowTtl
 			if (
 				sql.startsWith('DELETE FROM') &&

@@ -27,6 +27,13 @@ export interface PgIdempotencyStore {
 	purge(idempotencyKey: string): Promise<void>;
 	/** Drop every row in the store's table. */
 	clear(): Promise<void>;
+	/**
+	 * Resolves once the store's auto-migration has completed (or
+	 * immediately if `autoMigrate: false`). The migration is kicked off
+	 * at construction so callers that need the table to exist before
+	 * they start polling can `await store.ready()`. Idempotent.
+	 */
+	ready(): Promise<void>;
 	/** Stop the cleanup timer (call on shutdown if not relying on autoShutdown). */
 	destroy(): void;
 }

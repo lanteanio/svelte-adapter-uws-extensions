@@ -105,6 +105,14 @@ export function createIdempotencyStore(client, options = {}) {
 		migrated = true;
 	}
 
+	// One-shot ready() promise: kicks off ensureTable() at construction so
+	// callers that need the table to exist before they start polling can
+	// `await idempotency.ready()`. Subsequent ensureTable() calls are
+	// no-ops via the migrated flag.
+	const readyPromise = autoMigrate
+		? ensureTable().catch((err) => { throw err; })
+		: Promise.resolve();
+
 	function validateKey(idempotencyKey) {
 		if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
 			throw new Error('postgres idempotency: idempotencyKey must be a non-empty string');
@@ -253,6 +261,10 @@ export function createIdempotencyStore(client, options = {}) {
 				await ensureTable();
 				return client.query(`DELETE FROM ${table}`);
 			});
+		},
+
+		ready() {
+			return readyPromise;
 		},
 
 		destroy() {

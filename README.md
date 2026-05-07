@@ -121,33 +121,44 @@ export const redis = createRedisClient({
 
 ## Postgres client
 
-Factory that wraps [pg](https://github.com/brianc/node-postgres) Pool with lifecycle management.
+Factory that wraps [pg](https://github.com/brianc/node-postgres) Pool with lifecycle management. Two construction modes:
 
 ```js
 // src/lib/server/pg.js
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 
+// (1) Owned-pool: the client constructs and owns its own pg.Pool.
 export const pg = createPgClient({
   connectionString: 'postgres://localhost:5432/mydb'
 });
+
+// (2) Wrapped-pool: pass an existing pg.Pool to share with raw `pg` use
+//     elsewhere, another framework integration, or a different module
+//     in the same app -- single connection footprint against the database.
+import pg from 'pg';
+const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+
+export const wrapped = createPgClient({ pool });
+// pg.end() is a no-op now -- the caller owns `pool`'s lifecycle.
 ```
 
 #### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `connectionString` | *required* | Postgres connection string |
-| `autoShutdown` | `true` | Disconnect on `sveltekit:shutdown` |
-| `options` | `{}` | Extra pg Pool options |
+| `connectionString` | -- | Postgres connection string. Required UNLESS `pool` is provided. |
+| `pool` | -- | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
+| `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Disconnect on `sveltekit:shutdown`. |
+| `options` | `{}` | Extra pg Pool options. Ignored when `pool` is provided. |
 
 #### API
 
 | Method | Description |
 |---|---|
-| `pg.pool` | The underlying pg Pool |
-| `pg.query(text, values?)` | Run a query |
-| `pg.createClient()` | New standalone pg.Client with same config (not from the pool) |
-| `pg.end()` | Gracefully close the pool |
+| `pg.pool` | The underlying pg Pool (provided or owned). |
+| `pg.query(text, values?)` | Run a query. |
+| `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided -- pass `connectionString` alongside `pool` to enable this path. |
+| `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
 
 ---
 
@@ -1846,9 +1857,59 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | `awaitTimeout` | `60000` | ms after which `await()` rejects if the task is still not terminal. 0 = no timeout. |
 | `cleanupInterval` | `3600000` | ms between cleanup sweeps. 0 disables. |
 | `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
-| `autoMigrate` | `true` | Auto-create the table on first use |
+| `autoMigrate` | `true` | Auto-create the table on first use. Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
+| `onStateChange` | -- | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |
 | `breaker` | -- | Circuit breaker; bypassed when broken |
 | `metrics` | -- | Prometheus registry; emits `tasks_*_total` counters |
+
+#### Live observation
+
+The runner owns every state-machine transition; expose what it knows via the `onStateChange` callback or read directly with `list()` / `counts()`. Both work without standing up `postgres/notify`.
+
+```js
+const tasks = createTaskRunner(pg, {
+  onStateChange(event) {
+    // event.{ taskId, name, oldStatus, newStatus, attempt, requestId, result?, error? }
+    metrics.inc(`tasks.${event.name}.${event.newStatus}`);
+    if (event.newStatus === 'committed') {
+      bus.publish(`task:${event.taskId}`, 'committed', { result: event.result });
+    }
+  }
+});
+
+// Wait for migration before polling.
+await tasks.ready();
+
+// Dashboard / admin polling tick.
+const recent = await tasks.list({ limit: 30 });
+const summary = await tasks.counts({ name: 'charge-customer' });
+// summary = { pending, running, committed, failed, total }
+```
+
+Transitions fired:
+
+- `null -> pending` -- `enqueue()` inserts the row.
+- `null -> running` -- `run()` inserts the first attempt directly.
+- `pending -> running` -- the dispatch sweep claims the row.
+- `running -> running` -- retry rearm (within the same `run()` loop) OR recovery sweep (a sibling instance reclaims an expired fence). `attempt` bumps either way.
+- `running -> committed` -- handler succeeded. `event.result` carries the value.
+- `running -> failed` -- handler errored past `retry.maxAttempts`. `event.error` carries the JSON-safe `{ name, message, stack?, code?, cause? }` shape.
+
+Errors thrown from the callback (sync or via promise rejection) are caught and `console.warn`ed; they do NOT roll back the state machine. Listeners run on the same tick as the SQL commit but are awaited fire-and-forget; the runner never blocks on them.
+
+Cluster-wide fan-out is a separate concern: `onStateChange` fires on the worker that performed the transition, not across the cluster. Use `postgres/notify` if every instance needs to react.
+
+#### Operator force-takeover
+
+```js
+// Drain this instance: kick its in-flight tasks off so the recovery sweep
+// on a healthy instance picks them up faster than waiting for the
+// fence_expires_at deadline.
+const took = await tasks.takeover(taskId);
+// took === true if a row was running and got taken over.
+```
+
+`takeover(taskId)` expires the Postgres fence AND (when a Redis fence provider is configured) releases the Redis mirror key, cutting abort latency from O(`heartbeatInterval`) to one tick. The recovery sweep then reclaims the row and re-drives the handler under the registered retry policy.
 
 #### Per-handler retry config
 

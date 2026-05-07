@@ -195,4 +195,15 @@ describe('postgres idempotency', () => {
 			expect((await store.acquire('k2')).acquired).toBe(true);
 		});
 	});
+
+	describe('ready()', () => {
+		it('resolves once the table migration completes', async () => {
+			await expect(store.ready()).resolves.toBeUndefined();
+		});
+
+		it('is idempotent', async () => {
+			await store.ready();
+			await store.ready();
+		});
+	});
 });

@@ -221,4 +221,10 @@ describe('redis idempotency', () => {
 			expect(slot.pending).toBe(true);
 		});
 	});
+
+	describe('ready()', () => {
+		it('resolves immediately (no DDL on Redis)', async () => {
+			await expect(store.ready()).resolves.toBeUndefined();
+		});
+	});
 });
