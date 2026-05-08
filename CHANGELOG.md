@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.9] - 2026-05-08
+
+### Fixed
+
+- **`bus.wrap(platform)` now exposes `maxPayloadLength`, `bufferedAmount`, and `onPublishRate`** on both `createPubSubBus` and `createShardedBus`. The first two landed in `svelte-adapter-uws@0.5.0-next.19` for backpressure-aware framework code (chunked-upload chunk-sizing, per-recipient send-queue depth checks); `onPublishRate` has been on `Platform` since `next.4` and was silently missing from the wrap for ~5 prerelease versions. Concrete consumer-visible bug closed: `svelte-realtime`'s `live.upload` chunk-size auto-discovery (`_captureUploadMaxFrameSize`) early-returned because `wrappedPlatform.maxPayloadLength` was `undefined`, forcing every upload chunk to the conservative 12 KB default regardless of the adapter's 1 MB cap. The three additions are pure pass-throughs: `maxPayloadLength` is a live getter (post-construction mutations propagate), the two methods are bound at wrap-construction (consistent with the existing `send` / `sendCoalesced` pattern, no per-call allocation).
+
+### Added
+
+- **`PLATFORM_KEYS` constant exported from `svelte-adapter-uws-extensions/testing`.** Single source of truth listing every public Platform member that the mock and `bus.wrap()` are expected to expose. New `test/redis/wrap-platform-parity.test.js` iterates this list and asserts each member is present on `mockPlatform()`, `createPubSubBus().wrap()`, and `createShardedBus().wrap()`. Drift on any of those three sites fails the test at CI time, with a clear "wrap is missing X" message -- before it ships and breaks downstream framework code in the wild. When the adapter adds a new Platform member, append it to `PLATFORM_KEYS` and the parity test names every site that needs an update.
+- **`mockPlatform()` grows `maxPayloadLength` (defaults to 1 MB, mirroring the adapter), `bufferedAmount(ws)` (returns 0; reassign for backpressure simulation), `onPublishRate(cb)` (registers a callback returning an unsubscribe), and `_emitPublishRate(events)` (test-only driver mirroring the `_setPressure` shape).** `MockPlatform` interface in `testing/index.d.ts` updated to match.
+
+### Changed
+
+- **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.19`** (was `^0.5.0-next.14`). Required because `bus.wrap` now binds `maxPayloadLength` / `bufferedAmount` unconditionally; a pre-`next.19` adapter without these members would crash at wrap-construction time.
+
 ## [0.5.0-next.8] - 2026-05-07
 
 ### Added

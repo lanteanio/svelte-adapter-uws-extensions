@@ -11,7 +11,7 @@
  */
 
 export { mockRedisClient } from './mock-redis.js';
-export { mockPlatform } from './mock-platform.js';
+export { mockPlatform, PLATFORM_KEYS } from './mock-platform.js';
 export { mockWs } from './mock-ws.js';
 export { mockPgClient } from './mock-pg.js';
 

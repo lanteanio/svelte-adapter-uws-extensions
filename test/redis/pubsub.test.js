@@ -25,6 +25,9 @@ describe('redis pubsub bus', () => {
 			expect(typeof wrapped.subscribe).toBe('function');
 			expect(typeof wrapped.unsubscribe).toBe('function');
 			expect(typeof wrapped.checkSubscribe).toBe('function');
+			expect(typeof wrapped.bufferedAmount).toBe('function');
+			expect(typeof wrapped.onPublishRate).toBe('function');
+			expect(typeof wrapped.maxPayloadLength).toBe('number');
 			expect(typeof wrapped.topic).toBe('function');
 		});
 

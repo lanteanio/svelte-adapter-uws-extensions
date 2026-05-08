@@ -64,6 +64,9 @@ export interface MockPlatform {
 	/** All `checkSubscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
 	checkedSubscribe: Array<{ ws: any; topic: string }>;
 	connections: number;
+	requestId: string;
+	/** Mirrors the adapter default of 1 MB; reassign directly to test other caps. */
+	maxPayloadLength: number;
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
 	send(ws: any, topic: string, event: string, data?: any): number;
 	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];
@@ -72,6 +75,12 @@ export interface MockPlatform {
 	subscribe(ws: any, topic: string): string | null;
 	unsubscribe(ws: any, topic: string): boolean;
 	checkSubscribe(ws: any, topic: string): string | null;
+	/** Always returns 0 in the mock. Tests requiring backpressure simulation can override. */
+	bufferedAmount(ws: any): number;
+	/** Register a publish-rate listener. Returns an unsubscribe function. Drive callbacks via `_emitPublishRate(events)`. */
+	onPublishRate(cb: (events: Array<{ topic: string; messagesPerSec: number; bytesPerSec: number }>) => void): () => void;
+	/** Test-only: invoke every registered publish-rate listener with the given events. */
+	_emitPublishRate(events: Array<{ topic: string; messagesPerSec: number; bytesPerSec: number }>): void;
 	topic(t: string): {
 		publish(event: string, data?: any): void;
 		created(data?: any): void;
@@ -89,6 +98,16 @@ export interface MockPlatform {
  * Create an in-memory Platform mock that records all publish/send calls.
  */
 export function mockPlatform(): MockPlatform;
+
+/**
+ * The complete set of public Platform members that `bus.wrap()` and the
+ * mock are expected to expose. Single source of truth for parity tests.
+ *
+ * When the adapter adds a new member: append it here, mirror it in
+ * `mockPlatform()`, and add the pass-through to both `bus.wrap()`
+ * implementations. Drift on any of those fails the parity test.
+ */
+export const PLATFORM_KEYS: ReadonlyArray<string>;
 
 // -- Mock WebSocket -----------------------------------------------------------
 

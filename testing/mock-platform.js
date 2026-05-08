@@ -1,9 +1,31 @@
 /**
+ * The complete set of public Platform members that `bus.wrap()` and the
+ * mock are expected to expose. Single source of truth: parity tests
+ * iterate this list to assert the wrap surface matches the adapter's
+ * Platform interface. When the adapter adds a new member, append it
+ * here AND mirror it in `mockPlatform()` below AND in the wrap
+ * implementations in `redis/pubsub.js` / `redis/sharded-pubsub.js`.
+ *
+ * Drift on any of those three sites fails the parity test at CI time.
+ */
+export const PLATFORM_KEYS = Object.freeze([
+	'publish', 'publishBatched', 'batch',
+	'send', 'sendTo', 'sendCoalesced',
+	'request',
+	'connections', 'requestId',
+	'pressure', 'onPressure', 'onPublishRate',
+	'subscribers', 'subscribe', 'unsubscribe', 'checkSubscribe',
+	'topic',
+	'maxPayloadLength', 'bufferedAmount'
+]);
+
+/**
  * Create a mock platform that records publish/send calls.
  * Matches the core svelte-adapter-uws Platform interface.
  */
 export function mockPlatform() {
 	const pressureSubscribers = new Set();
+	const publishRateSubscribers = new Set();
 	const p = {
 		published: [],
 		publishedBatches: [],
@@ -15,6 +37,10 @@ export function mockPlatform() {
 		checkedSubscribe: [],
 		connections: 0,
 		requestId: '',
+		// Mirror the adapter's default. `1024 * 1024` (1 MB) is the
+		// post-next.19 default; tests that need a different cap can
+		// reassign p.maxPayloadLength directly.
+		maxPayloadLength: 1024 * 1024,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
@@ -28,11 +54,23 @@ export function mockPlatform() {
 			pressureSubscribers.add(cb);
 			return () => pressureSubscribers.delete(cb);
 		},
+		onPublishRate(cb) {
+			publishRateSubscribers.add(cb);
+			return () => publishRateSubscribers.delete(cb);
+		},
 		_setPressure(snapshot) {
 			p.pressure = snapshot;
 			for (const cb of pressureSubscribers) {
 				try { cb(snapshot); } catch { /* swallow */ }
 			}
+		},
+		_emitPublishRate(events) {
+			for (const cb of publishRateSubscribers) {
+				try { cb(events); } catch { /* swallow */ }
+			}
+		},
+		bufferedAmount(_ws) {
+			return 0;
 		},
 		publish(topic, event, data, options) {
 			p.published.push({ topic, event, data, options });

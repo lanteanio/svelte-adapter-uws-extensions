@@ -503,10 +503,13 @@ export function createShardedBus(client, options = {}) {
 				get requestId() { return platform.requestId; },
 				get pressure() { return platform.pressure; },
 				onPressure: platform.onPressure.bind(platform),
+				onPublishRate: platform.onPublishRate.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
 				subscribe: platform.subscribe.bind(platform),
 				unsubscribe: platform.unsubscribe.bind(platform),
 				checkSubscribe: platform.checkSubscribe.bind(platform),
+				get maxPayloadLength() { return platform.maxPayloadLength; },
+				bufferedAmount: platform.bufferedAmount.bind(platform),
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },
