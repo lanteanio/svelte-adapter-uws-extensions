@@ -28,6 +28,7 @@
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
+import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 
 /**
  * Lua script for atomic acquire.
@@ -122,6 +123,9 @@ export function createIdempotencyStore(client, options = {}) {
 	function validateKey(userKey) {
 		if (typeof userKey !== 'string' || userKey.length === 0) {
 			throw new Error('redis idempotency: key must be a non-empty string');
+		}
+		if (userKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+			throw new Error('redis idempotency: key must be at most ' + MAX_IDEMPOTENCY_KEY_LENGTH + ' characters');
 		}
 	}
 

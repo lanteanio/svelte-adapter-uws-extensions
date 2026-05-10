@@ -121,6 +121,14 @@
       "types": "./shared/admission.d.ts",
       "default": "./shared/admission.js"
     },
+    "./bus-validate": {
+      "types": "./shared/bus-validate.d.ts",
+      "default": "./shared/bus-validate.js"
+    },
+    "./sensitive": {
+      "types": "./shared/sensitive.d.ts",
+      "default": "./shared/sensitive.js"
+    },
     "./testing": {
       "types": "./testing/index.d.ts",
       "default": "./testing/index.js"
@@ -133,7 +141,8 @@
     "shared",
     "testing",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "MIGRATION.md"
   ],
   "scripts": {
     "test": "vitest run",
@@ -141,7 +150,7 @@
     "test:integration": "vitest run --config vitest.config.integration.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "peerDependencies": {
     "svelte-adapter-uws": "^0.5.0-next.19"

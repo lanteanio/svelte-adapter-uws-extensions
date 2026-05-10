@@ -29,7 +29,7 @@ export interface LeaderOptions {
 	/**
 	 * Called on every Redis failure (renewal, fresh acquire, release).
 	 * Use for structured logging. Errors never escape the renewal
-	 * interval regardless -- `onError` is observability, not control flow.
+	 * interval regardless - `onError` is observability, not control flow.
 	 */
 	onError?: (err: Error) => void;
 	/**
@@ -56,7 +56,7 @@ export interface Leader {
 	/**
 	 * Stop the renewal interval and best-effort release the lease via
 	 * compare-and-delete so a sibling can take over within `renewMs`
-	 * instead of `leaseMs`. Idempotent. Never throws -- a release
+	 * instead of `leaseMs`. Idempotent. Never throws - a release
 	 * failure just means the lease will expire on its own.
 	 */
 	stop(): Promise<void>;

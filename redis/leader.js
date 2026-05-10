@@ -17,10 +17,10 @@
  * Failure model: fail-closed. A renewal that throws (Redis disconnect,
  * breaker open, network partition) drops `_isLeader` to false and surfaces
  * via `onError`; the renewal interval keeps ticking so leadership can
- * recover when Redis recovers. Errors never escape the interval -- a
+ * recover when Redis recovers. Errors never escape the interval - a
  * losing-Redis event must not crash the worker. Across the cluster, a
  * partitioned Redis means the lease expires server-side and no worker
- * holds leadership until the partition heals -- jobs miss ticks rather
+ * holds leadership until the partition heals - jobs miss ticks rather
  * than double-fire.
  *
  * GC pause caveat: a long stop-the-world pause on the leader can cause

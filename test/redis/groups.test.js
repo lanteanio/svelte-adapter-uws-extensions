@@ -480,7 +480,7 @@ describe('redis groups', () => {
 			await g.join(ws1, platform1);
 			platform1.reset();
 
-			// Join with platform2 -- subscriber should update its platform ref
+			// Join with platform2 - subscriber should update its platform ref
 			const ws2 = mockWs();
 			await g.join(ws2, platform2);
 			platform2.reset();
@@ -665,7 +665,7 @@ describe('redis groups', () => {
 
 			await expect(g.close(platform)).rejects.toThrow(CircuitBrokenError);
 
-			// isClosed should NOT be set -- the group is still open
+			// isClosed should NOT be set - the group is still open
 			// so new joins on a peer instance should still succeed
 			breaker.reset();
 			const ws2 = mockWs();
@@ -700,7 +700,7 @@ describe('redis groups', () => {
 			await g1.join(mockWs(), platform);
 			await g2.join(mockWs(), mockPlatform());
 
-			// g1 closes successfully -- closedKey is set in Redis
+			// g1 closes successfully - closedKey is set in Redis
 			await g1.close(platform);
 
 			// g2 should reject new joins because it reads closedKey from Redis
@@ -817,7 +817,7 @@ describe('redis groups', () => {
 			// First join should fail because subscriber setup fails
 			await expect(g.join(ws1, platform)).rejects.toThrow('subscribe failed');
 
-			// Subscriber should not be poisoned -- retry should work
+			// Subscriber should not be poisoned - retry should work
 			const ws2 = mockWs();
 			const result = await g.join(ws2, platform);
 			expect(result).toBe(true);
@@ -976,7 +976,7 @@ describe('redis groups', () => {
 
 			await expect(g.close(platform)).rejects.toThrow('publish failed');
 
-			// Retry -- closedKey is already set, so this takes the "already closed" path
+			// Retry - closedKey is already set, so this takes the "already closed" path
 			await g.close(platform);
 
 			expect(g.localMembers()).toHaveLength(0);

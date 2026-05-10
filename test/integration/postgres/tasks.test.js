@@ -420,7 +420,7 @@ describe('postgres tasks core (integration)', () => {
 			expect(bRanCount).toBe(0);
 
 			// Second call from a DIFFERENT runner with the same key returns
-			// the cached result -- B's handler does NOT run.
+			// the cached result - B's handler does NOT run.
 			const second = await runnerB.run('echo', {
 				input: { v: 2 }, idempotencyKey: 'idem-shared'
 			});
@@ -465,6 +465,57 @@ describe('postgres tasks core (integration)', () => {
 				input: null, idempotencyKey: 'idem-inflight'
 			});
 			expect(replay).toEqual({ ok: true });
+		});
+	});
+
+	// Pre-fix bug: idempotencyKey was used verbatim as the cache slot
+	// across all task names. Codex's round-5 PoC confirmed that a caller
+	// running tasks.run('publicTask', {idempotencyKey:'abc'}) right after
+	// a privileged tasks.run('privateTask', {idempotencyKey:'abc'}) read
+	// the private result without ever running publicTask. The fix
+	// namespaces the cache slot by task name.
+	describe('cross-task idempotency isolation', () => {
+		it('same idempotencyKey on two task names returns DIFFERENT cached results', async () => {
+			const idemStore = createIdempotencyStore(client, { autoMigrate: true });
+			runner = createTaskRunner(client, {
+				idempotency: idemStore,
+				recoveryInterval: 0, cleanupInterval: 0, dispatchInterval: 0
+			});
+
+			let privateRan = 0;
+			let publicRan = 0;
+			runner.register('private_task', async () => {
+				privateRan++;
+				return { from: 'private_task', secret: 'victim-only' };
+			});
+			runner.register('public_task', async () => {
+				publicRan++;
+				return { from: 'public_task' };
+			});
+
+			const privResult = await runner.run('private_task', { idempotencyKey: 'abc' });
+			expect(privResult).toEqual({ from: 'private_task', secret: 'victim-only' });
+			expect(privateRan).toBe(1);
+
+			// Same idempotencyKey, different task name: must NOT return the
+			// private cached result.
+			const pubResult = await runner.run('public_task', { idempotencyKey: 'abc' });
+			expect(pubResult).toEqual({ from: 'public_task' });
+			expect(pubResult.secret).toBeUndefined();
+			expect(publicRan).toBe(1);
+		});
+
+		it('rejects idempotencyKey longer than 256 characters', async () => {
+			runner = createTaskRunner(client, {
+				idempotency: createIdempotencyStore(client, { autoMigrate: true }),
+				recoveryInterval: 0, cleanupInterval: 0, dispatchInterval: 0
+			});
+			runner.register('echo', async ({ input }) => input);
+			const longKey = 'a'.repeat(300);
+			await expect(runner.run('echo', { input: null, idempotencyKey: longKey }))
+				.rejects.toThrow(/at most 256/);
+			await expect(runner.enqueue('echo', { input: null, idempotencyKey: longKey }))
+				.rejects.toThrow(/at most 256/);
 		});
 	});
 });

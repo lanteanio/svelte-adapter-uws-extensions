@@ -363,7 +363,7 @@ describe('redis connection registry (integration)', () => {
 			// sendTo deliverable without a round trip.
 
 			await registry.sendTo({ tenantId: 'self' }, 't', 'e', { v: 1 });
-			// No `await wait(...)` — the local branch fans out synchronously
+			// No `await wait(...)` - the local branch fans out synchronously
 			// against the local map.
 			const hits = platform.sent.filter((s) => s.ws === wsLocal && s.event === 'e');
 			expect(hits).toHaveLength(1);

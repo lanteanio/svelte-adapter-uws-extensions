@@ -36,6 +36,11 @@ describe('postgres replay', () => {
 			expect(() => createReplay(client, { table: '123bad' })).toThrow('invalid table name');
 		});
 
+		it('rejects reserved Postgres schema names', () => {
+			expect(() => createReplay(client, { table: 'pg_class' })).toThrow('reserved Postgres schema');
+			expect(() => createReplay(client, { table: 'information_schema_tables' })).toThrow('reserved Postgres schema');
+		});
+
 		it('works with no options', () => {
 			const r = createReplay(client, { cleanupInterval: 0 });
 			expect(typeof r.publish).toBe('function');

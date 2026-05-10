@@ -3,16 +3,16 @@
  *
  * Mirrors the adapter's two-tier shape from 0.5.0-next.8:
  *
- * - `assert(cond, category, context)` — production-safe invariant check.
+ * - `assert(cond, category, context)` - production-safe invariant check.
  *   On violation: increments the per-category counter on the live module-
  *   level Map, logs a structured `[extensions/assert] {...}` line, and
  *   (in test mode only) throws so vitest surfaces the failure as a test
- *   error. In production it does NOT throw — a thrown exception inside a
+ *   error. In production it does NOT throw - a thrown exception inside a
  *   Redis pubsub callback or a publish hot-path microtask could leave a
  *   half-applied transaction or a corrupted local index. Counter + log
  *   give us observability without the corruption risk.
  *
- * - `devAssert(cond, message, context)` — dev-time DX hint. Full no-op
+ * - `devAssert(cond, message, context)` - dev-time DX hint. Full no-op
  *   when `NODE_ENV === 'production'`. On violation in non-prod modes
  *   logs a warning. Use for cosmetic checks, schema-mismatch hints, etc.
  *   Does NOT throw, even in test mode (matches adapter shape: dev hints
@@ -93,7 +93,7 @@ export function devAssert(cond, message, context) {
 
 /**
  * Read the live counter Map. Mirrors the adapter's `platform.assertions`
- * shape. The Map is the live state -- not a snapshot -- so consumers
+ * shape. The Map is the live state - not a snapshot - so consumers
  * holding the reference see updates automatically.
  *
  * @returns {Map<string, number>}
@@ -108,7 +108,7 @@ export function getAssertionCounters() {
  * `assert` increments on every violation alongside the in-memory counter
  * Map. Cardinality is bounded by the number of distinct categories
  * declared by the assert call sites (~25 today, all module-level
- * constants — never user-input-driven).
+ * constants - never user-input-driven).
  *
  * Calling twice replaces the bound counter (the most-recent registry
  * wins). Pre-existing in-memory counter values are NOT replayed into the

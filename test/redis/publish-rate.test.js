@@ -537,7 +537,7 @@ describe('redis publish-rate aggregator', () => {
 		});
 
 		it('ignores subs field when not subscribing to it (forward-compat)', async () => {
-			// Aggregator with no subjects -- still receives subs from siblings,
+			// Aggregator with no subjects - still receives subs from siblings,
 			// caches them, and exposes via subscribersOf.
 			const agg = createPublishRateAggregator(client);
 			await agg.activate(platform);

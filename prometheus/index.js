@@ -2,7 +2,7 @@
  * Prometheus metrics extension for svelte-adapter-uws-extensions.
  *
  * Exposes extension metrics in Prometheus text exposition format.
- * No external dependencies -- the text format is trivial to produce.
+ * No external dependencies - the text format is trivial to produce.
  *
  * Zero overhead when not enabled: extensions check for the metrics object
  * with optional chaining, so the engine short-circuits on a single
@@ -475,7 +475,7 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
  * (`redis/publish-rate`). Mirrors `wirePublishRateMetrics` but at the
  * cluster layer: the gauges scrape the aggregator's merged top-N at
  * collect time, no continuous accounting. Both wirers can be active
- * simultaneously -- the local view shows hot-shard pressure, the
+ * simultaneously - the local view shows hot-shard pressure, the
  * cluster view shows global capacity.
  *
  * @param {{ topPublishers: Array<{topic: string, messagesPerSec: number, bytesPerSec: number}> }} aggregator

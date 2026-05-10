@@ -18,7 +18,7 @@ import { MAX_BREAKER_LISTENERS } from './caps.js';
 
 export class CircuitBrokenError extends Error {
 	constructor() {
-		super('circuit breaker is open — backend unavailable');
+		super('circuit breaker is open - backend unavailable');
 		this.name = 'CircuitBrokenError';
 	}
 }
@@ -167,7 +167,7 @@ export function createCircuitBreaker(options = {}) {
 			if (listeners.size >= MAX_BREAKER_LISTENERS) {
 				throw new Error(
 					'circuit breaker: listener count exceeded ' + MAX_BREAKER_LISTENERS +
-					' on this breaker -- a leak signal, since each module wires at most one'
+					' on this breaker - a leak signal, since each module wires at most one'
 				);
 			}
 			listeners.add(handler);

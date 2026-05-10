@@ -29,6 +29,7 @@ import {
 	MAX_SHARDED_BUS_TOPICS,
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
 } from '../shared/caps.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -85,6 +86,12 @@ export function createShardedBus(client, options = {}) {
 		return channelPrefix + shardKey(topic);
 	}
 
+	const validator = createBusValidator({
+		maxBytes: options.maxEnvelopeBytes,
+		allowSystemTopics: options.allowSystemTopics !== false,
+		allowedSystemTopics: []
+	});
+
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
 	let active = false;
@@ -124,7 +131,7 @@ export function createShardedBus(client, options = {}) {
 				'[sharded-bus] microtask batch reached ' + channelBatches.size +
 				' distinct channels in one tick. The batch is drained every microtask, ' +
 				'so reaching this size means a publisher emitted a million distinct ' +
-				'channels in one synchronous burst -- likely a topic-cardinality leak.'
+				'channels in one synchronous burst - likely a topic-cardinality leak.'
 			);
 		}
 		if (!relayScheduled) {
@@ -168,6 +175,13 @@ export function createShardedBus(client, options = {}) {
 			console.error('sharded bus subscriber error:', err.message);
 		});
 		subscriber.on('smessage', (ch, message) => {
+			const rawBytes = typeof message === 'string'
+				? Buffer.byteLength(message)
+				: /** @type {Buffer} */ (message).length;
+			if (!validator.acceptSize(rawBytes)) {
+				mParseErrors?.inc();
+				return;
+			}
 			try {
 				const parsed = JSON.parse(message);
 				assert(
@@ -183,19 +197,28 @@ export function createShardedBus(client, options = {}) {
 				}
 				if (!activePlatform) return;
 				if (Array.isArray(parsed.batch)) {
-					const local = new Array(parsed.batch.length);
+					const local = [];
 					for (let i = 0; i < parsed.batch.length; i++) {
 						const m = parsed.batch[i];
+						if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+							mParseErrors?.inc();
+							continue;
+						}
 						mReceived?.inc({ topic: mt(m.topic) });
-						local[i] = {
+						local.push({
 							topic: m.topic,
 							event: m.event,
 							data: m.data,
 							options: { relay: false }
-						};
+						});
 					}
+					if (local.length === 0) return;
 					activePlatform.publishBatched(local);
 				} else {
+					if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+						mParseErrors?.inc();
+						return;
+					}
 					mReceived?.inc({ topic: mt(parsed.topic) });
 					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 				}
@@ -401,7 +424,7 @@ export function createShardedBus(client, options = {}) {
 				await subscriber.sunsubscribe(channel);
 				mUnfollows?.inc();
 			} catch {
-				// SUNSUBSCRIBE failure is non-fatal -- the connection
+				// SUNSUBSCRIBE failure is non-fatal - the connection
 				// will be torn down on deactivate anyway.
 			}
 		}
@@ -418,7 +441,7 @@ export function createShardedBus(client, options = {}) {
 	 *       subjects: () => bus.localSubjects(platform)
 	 *     });
 	 *
-	 * Topics with 0 local subscribers are omitted -- they have nothing
+	 * Topics with 0 local subscribers are omitted - they have nothing
 	 * to contribute. Topics subscribed outside the bus's hooks (raw
 	 * `ws.subscribe` bypass) are not enumerated; they will not propagate
 	 * cluster-wide via this path.

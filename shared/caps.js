@@ -16,7 +16,7 @@
  * @module svelte-adapter-uws-extensions/shared/caps
  */
 
-// -- Per-instance state caps -------------------------------------------------
+// - Per-instance state caps -------------------------------------------------
 // Maps / Sets that grow with local connections, local subscriptions, or
 // local in-flight operations. One instance's worth of state. Reject-new on
 // saturation (or evict-with-flush for throttle/debounce-shaped buffers).
@@ -48,7 +48,7 @@ export const MAX_GROUPS_LOCAL_MEMBERS = 10_000_000;
 /** Worker controllers spawned by the task runner harness. */
 export const MAX_WORKER_CONTROLLERS = 10_000_000;
 
-// -- Cluster-wide warn-only caps ---------------------------------------------
+// - Cluster-wide warn-only caps ---------------------------------------------
 // Maps that mirror cluster-wide cardinality (every user across every
 // instance, etc). Eviction would corrupt routing, so saturation is warn-only:
 // a single structured `console.warn` fires the first time the cap is crossed
@@ -72,7 +72,7 @@ export const MAX_PRESENCE_INFLIGHT_HGETALL = 1_000_000;
 /** Per-topic dirty cursor entries before flush-and-evict. */
 export const MAX_CURSOR_DIRTY_PER_TOPIC = 1_000_000;
 
-// -- Per-tick microtask batch caps -------------------------------------------
+// - Per-tick microtask batch caps -------------------------------------------
 // Outbound batches that are drained every microtask. Crossing the cap
 // signals something allocated the entire cap's worth in one tick (leak).
 
@@ -82,7 +82,7 @@ export const MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK = 1_000_000;
 /** Entries in one pubsub relay microtask batch. */
 export const MAX_PUBSUB_RELAY_BATCH_PER_TICK = 1_000_000;
 
-// -- Structural caps ---------------------------------------------------------
+// - Structural caps ---------------------------------------------------------
 // Configuration / wiring limits, not state-driven. Smaller numbers because
 // the legitimate scale is genuinely smaller (a Node process should never
 // have 1K distinct ioredis duplicate connections; a deployment should never
@@ -99,3 +99,12 @@ export const MAX_TASK_HANDLERS = 10_000;
 
 /** `breaker.subscribe(handler)` listeners on a single breaker. */
 export const MAX_BREAKER_LISTENERS = 10_000;
+
+/**
+ * Defense-in-depth cap on the idempotency-store key after framework-level
+ * namespacing. Matches the worst-case `rpc:<path>:<256-char-user-key>` /
+ * `task:<name>:<256-char-user-key>` shape with headroom; framework
+ * boundaries (realtime `live.idempotent`, extensions `tasks.run`) cap the
+ * user-supplied portion at 256.
+ */
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 1024;

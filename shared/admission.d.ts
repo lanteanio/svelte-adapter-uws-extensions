@@ -24,9 +24,9 @@ export interface ClusterTopPublisherRule {
 
 /**
  * A per-class rule. One of:
- * - an array of reasons -- rejected when `pressure.reason` is in the list
- * - a predicate -- rejected when the predicate returns true for the current snapshot
- * - a `clusterTopPublisher` object -- rejected when the topic's cluster-wide rate is at threshold
+ * - an array of reasons - rejected when `pressure.reason` is in the list
+ * - a predicate - rejected when the predicate returns true for the current snapshot
+ * - a `clusterTopPublisher` object - rejected when the topic's cluster-wide rate is at threshold
  */
 export type AdmissionRule =
 	| readonly PressureReason[]
@@ -41,7 +41,7 @@ export interface AdmissionControlOptions {
 	/**
 	 * Map of class name to admission rule. Each class is independently
 	 * configured. `shouldAccept(className, ...)` with an unknown name
-	 * throws -- typos surface immediately rather than silently accepting.
+	 * throws - typos surface immediately rather than silently accepting.
 	 */
 	classes: Record<string, AdmissionRule>;
 	/**
@@ -62,7 +62,7 @@ export interface AdmissionControl {
 	 * `clusterTopPublisher` rule shape, pass the topic the request is
 	 * about to publish to: `shouldAccept('nonCritical', platform, { topic })`.
 	 *
-	 * Reads `platform.pressure` -- a property access, no I/O. Safe to
+	 * Reads `platform.pressure` - a property access, no I/O. Safe to
 	 * call on every request hot path. The reason-precedence math
 	 * (memory > publish rate > subscribers > none) lives in the
 	 * adapter; this method only checks the resolved `reason` against
@@ -80,7 +80,7 @@ export interface AdmissionControl {
 
 /**
  * Create a pressure-aware admission controller. Complements (does not
- * replace) the dependency circuit breaker -- the breaker answers "is
+ * replace) the dependency circuit breaker - the breaker answers "is
  * the backend up?", admission control answers "are we OK to take more
  * work right now?"
  */

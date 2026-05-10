@@ -126,7 +126,7 @@ export function wireClusterPublishRateMetrics(
  *   - `ws_connection_bytes_in` / `ws_connection_bytes_out` (histograms)
  *   - `ws_connection_close_total{code}` (counter)
  *
- * Requires `svelte-adapter-uws >= 0.5.0-next.4` -- the duration / messages /
+ * Requires `svelte-adapter-uws >= 0.5.0-next.4` - the duration / messages /
  * bytes fields are only allocated when a `close` hook is registered.
  */
 export function connectionMetricsHook(

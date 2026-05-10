@@ -311,7 +311,7 @@ describe('redis cursor (integration)', () => {
 			// Remove event lands on B via the events channel. Cursor's
 			// remove publish is fire-and-forget through the subscriberReady
 			// promise chain, so under suite load the wire-arrival of the
-			// envelope on B can lag a beat -- widen the poll window.
+			// envelope on B can lag a beat - widen the poll window.
 			await waitFor(() => platformB.published.some(
 				(p) => p.event === 'remove'
 			), 5000);

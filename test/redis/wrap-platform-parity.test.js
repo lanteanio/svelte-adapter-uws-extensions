@@ -8,7 +8,7 @@ import { createShardedBus } from '../../redis/sharded-pubsub.js';
  * Parity contract: every member listed in `PLATFORM_KEYS` (the canonical
  * set of public Platform members the adapter exposes) MUST be present on:
  *
- *   1. `mockPlatform()` itself -- otherwise the mock has drifted and
+ *   1. `mockPlatform()` itself - otherwise the mock has drifted and
  *      tests using it would silently see `undefined`.
  *   2. The object returned by `bus.wrap(platform)` for every bus that
  *      claims to return a Platform-shaped wrapper.

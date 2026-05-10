@@ -456,7 +456,7 @@ describe('redis presence (integration)', () => {
 			for (let i = 0; i < N; i++) {
 				expect(allJoinKeys.has(`u${i}`)).toBe(true);
 			}
-			// Sanity: receiver collapses bursts -- frame count must not exceed
+			// Sanity: receiver collapses bursts - frame count must not exceed
 			// the per-message count, and in practice will be lower under any
 			// real-pubsub timing where multiple messages land in one tick.
 			expect(diffFrames.length).toBeLessThanOrEqual(N);

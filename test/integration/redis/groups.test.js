@@ -344,4 +344,33 @@ describe('redis groups (integration)', () => {
 			expect(await group.count()).toBe(1);
 		});
 	});
+
+	// A member entry with non-numeric `ts` (e.g. planted directly via
+	// HSET into the group's member hash by an actor with Redis write
+	// access in a shared deployment) used to crash the JOIN_SCRIPT with
+	// "attempt to perform arithmetic on field 'ts'". `tonumber(val.ts)`
+	// now treats non-numeric ts as "stale" so the scan continues normally
+	// and the poisoned entry is harvested into the stale list and HDEL'd.
+	describe('JOIN_SCRIPT survives a hash entry with non-numeric ts', () => {
+		it('plants a poisoned ts entry; subsequent join does not crash and the entry is treated as stale', async () => {
+			const group = makeGroup('poison-room', { maxMembers: 5 });
+			// Write a hostile member entry directly into the members hash.
+			// Real production paths only insert through the script which
+			// stamps a numeric ts via Date.now(); this simulates an
+			// attacker with Redis write access.
+			const membersKey = client.key('group:members:poison-room');
+			await client.redis.hset(membersKey, 'attacker', JSON.stringify({
+				ts: 'injected', user: { id: 'evil' }
+			}));
+
+			// JOIN_SCRIPT used to crash here with "attempt to perform
+			// arithmetic on field 'ts' (a string value)". Post-fix, the
+			// poisoned ts is treated as stale (tonumber returns nil) and
+			// the entry lands in the HDEL list. The legit join proceeds.
+			const ok = await group.join(mockWs(), platform);
+			expect(ok).toBe(true);
+			// And the legit member shows up.
+			expect(await group.count()).toBe(1);
+		});
+	});
 });

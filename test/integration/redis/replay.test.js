@@ -192,6 +192,56 @@ describe('redis replay (integration)', () => {
 			const truncated = platform.sent.filter((s) => s.event === 'truncated');
 			expect(truncated).toHaveLength(1);
 		});
+
+		// Pre-fix bug: a client could send a `resume` frame with
+		// lastSeenSeqs:{"private:room":0} and read the entire replay
+		// buffer for a topic they could not subscribe to live. The fix
+		// routes platform.checkSubscribe before the buffer fetch.
+		it('honors platform.checkSubscribe denial: emits denied, no msg/end frames', async () => {
+			for (let i = 1; i <= 3; i++) {
+				await replay.publish(platform, 'private:room', 'created', { id: i, secret: 'leak' });
+			}
+
+			const fakeWs = {};
+			platform.reset();
+			platform.checkSubscribe = (_ws, _topic) => 'FORBIDDEN';
+
+			await replay.replay(fakeWs, 'private:room', 0, platform);
+
+			// Single denied frame; no msg or end.
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0]).toMatchObject({
+				topic: '__replay:private:room',
+				event: 'denied',
+				data: { code: 'FORBIDDEN' }
+			});
+			expect(platform.sent.find((s) => s.event === 'msg')).toBeUndefined();
+			expect(platform.sent.find((s) => s.event === 'end')).toBeUndefined();
+		});
+
+		it('async checkSubscribe returning a Promise<denial> still denies (no leak via async)', async () => {
+			await replay.publish(platform, 'private:room', 'created', { id: 1, secret: 'leak' });
+
+			const fakeWs = {};
+			platform.reset();
+			platform.checkSubscribe = async () => 'UNAUTHENTICATED';
+
+			await replay.replay(fakeWs, 'private:room', 0, platform);
+			expect(platform.sent[0].event).toBe('denied');
+			expect(platform.sent[0].data.code).toBe('UNAUTHENTICATED');
+			expect(platform.sent.find((s) => s.event === 'msg')).toBeUndefined();
+		});
+
+		it('platform without checkSubscribe falls back to current behavior (older adapter)', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			const fakeWs = {};
+			platform.reset();
+			platform.checkSubscribe = undefined;
+			await replay.replay(fakeWs, 'chat', 0, platform);
+			// Legacy: messages flow through.
+			expect(platform.sent.some((s) => s.event === 'msg')).toBe(true);
+		});
 	});
 
 	describe('resumeHook against real Redis', () => {

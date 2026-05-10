@@ -58,7 +58,7 @@ describe('redis function library', () => {
 			await lib.load();
 			expect(client._functionLibraries.has('ws-presence')).toBe(true);
 
-			// Load again with different code -- REPLACE makes this idempotent.
+			// Load again with different code - REPLACE makes this idempotent.
 			const updated = SAMPLE_LIB.replace('return 0', 'return 1');
 			const lib2 = createFunctionLibrary(client, updated);
 			await lib2.load();

@@ -21,10 +21,10 @@ export interface NotifyBridgeOptions {
 	reconnectInterval?: number;
 
 	/**
-	 * `'all'` (default) — every replica opens its own LISTEN connection
+	 * `'all'` (default) - every replica opens its own LISTEN connection
 	 * and forwards locally with `relay: false`.
 	 *
-	 * `'advisory'` — every replica polls `pg_try_advisory_lock(lockId)`
+	 * `'advisory'` - every replica polls `pg_try_advisory_lock(lockId)`
 	 * on a dedicated connection. The replica that wins the lock holds
 	 * the LISTEN connection and forwards notifications *with* relay so
 	 * the cross-instance pub/sub bus fans out to non-leader replicas.
@@ -54,6 +54,23 @@ export interface NotifyBridgeOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+
+	/**
+	 * Reject inbound `NOTIFY` payloads larger than this many bytes before
+	 * `JSON.parse` runs. Defends against a buggy or hostile trigger
+	 * flooding the bridge with oversized payloads.
+	 * @default 1048576 (1 MB)
+	 */
+	maxEnvelopeBytes?: number;
+
+	/**
+	 * When `false`, parsed envelopes addressed to `__`-prefixed topics
+	 * are dropped before the publish call. Belt-and-suspenders defense
+	 * in depth; safe to flip when the bridge only emits on user-space
+	 * topics.
+	 * @default true
+	 */
+	allowSystemTopics?: boolean;
 }
 
 export interface NotifyBridge {

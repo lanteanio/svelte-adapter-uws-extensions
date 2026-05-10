@@ -15,6 +15,8 @@ The core adapter keeps everything in-process memory. That works great for single
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
 - **Prometheus metrics** - expose extension metrics for scraping, zero overhead when disabled
 
+**Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
+
 ---
 
 ## Table of contents
@@ -134,20 +136,20 @@ export const pg = createPgClient({
 
 // (2) Wrapped-pool: pass an existing pg.Pool to share with raw `pg` use
 //     elsewhere, another framework integration, or a different module
-//     in the same app -- single connection footprint against the database.
+//     in the same app - single connection footprint against the database.
 import pg from 'pg';
 const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
 
 export const wrapped = createPgClient({ pool });
-// pg.end() is a no-op now -- the caller owns `pool`'s lifecycle.
+// pg.end() is a no-op now - the caller owns `pool`'s lifecycle.
 ```
 
 #### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `connectionString` | -- | Postgres connection string. Required UNLESS `pool` is provided. |
-| `pool` | -- | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
+| `connectionString` | - | Postgres connection string. Required UNLESS `pool` is provided. |
+| `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
 | `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Disconnect on `sveltekit:shutdown`. |
 | `options` | `{}` | Extra pg Pool options. Ignored when `pool` is provided. |
 
@@ -157,7 +159,7 @@ export const wrapped = createPgClient({ pool });
 |---|---|
 | `pg.pool` | The underlying pg Pool (provided or owned). |
 | `pg.query(text, values?)` | Run a query. |
-| `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided -- pass `connectionString` alongside `pool` to enable this path. |
+| `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
 | `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
 
 ---
@@ -204,7 +206,7 @@ export function message(ws, { data, platform }) {
 
 #### Wire-batched publish (`publishBatched`)
 
-When a single request publishes many events at once -- bulk imports, room state resets, audit fanouts -- use `publishBatched` instead of a `publish` loop. It ships **one** Redis envelope for the whole batch, and receivers fan out via `platform.publishBatched` so each subscriber sees **one** WebSocket frame per call.
+When a single request publishes many events at once - bulk imports, room state resets, audit fanouts - use `publishBatched` instead of a `publish` loop. It ships **one** Redis envelope for the whole batch, and receivers fan out via `platform.publishBatched` so each subscriber sees **one** WebSocket frame per call.
 
 ```js
 distributed.publishBatched([
@@ -216,7 +218,7 @@ distributed.publishBatched([
 
 Trade-offs vs `wrapped.publish` in a tight loop:
 
-- **Redis publish count drops linearly with batch size.** A 50-message batch is one PUBLISH on the wire instead of 50 -- around 50x reduction on the bulk-import profile, ~3x on small disjoint batches (measured in `bench/01-publish-batched-bus.mjs`).
+- **Redis publish count drops linearly with batch size.** A 50-message batch is one PUBLISH on the wire instead of 50 - around 50x reduction on the bulk-import profile, ~3x on small disjoint batches (measured in `bench/01-publish-batched-bus.mjs`).
 - **Per-subscriber wire frames drop too.** A subscriber receives one frame containing N events instead of N frames containing one event each.
 - **Per-message `relay: false` is honored.** Flagged messages still publish locally but are excluded from the Redis envelope.
 
@@ -228,8 +230,10 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 |---|---|---|
 | `channel` | `'uws:pubsub'` | Redis channel name |
 | `systemChannel` | `'__realtime'` | Topic for auto-emitted `degraded` / `recovered` events. `null` or `false` to disable. Requires a `breaker` |
-| `onDegraded` | -- | Server-side handler invoked once when the breaker leaves the healthy state |
-| `onRecovered` | -- | Server-side handler invoked once when the breaker returns to the healthy state |
+| `onDegraded` | - | Server-side handler invoked once when the breaker leaves the healthy state |
+| `onRecovered` | - | Server-side handler invoked once when the breaker returns to the healthy state |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. |
+| `allowSystemTopics` | `true` | When `false`, inbound envelopes addressed to `__`-prefixed topics are dropped (the configured `systemChannel` remains in an explicit allowlist). Belt-and-suspenders defense in depth on top of the wire-level subscribe gate; safe to flip when the app publishes only on user-space topics. |
 
 See [Notifying clients of degradation](#notifying-clients-of-degradation) for the full pattern.
 
@@ -283,7 +287,7 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 // await bus.unfollow('chat:room-7');
 ```
 
-`bus.hooks` is the recommended path -- it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
+`bus.hooks` is the recommended path - it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
 
 #### Bulk follow (`followBatch`, `bus.hooks.subscribeBatch`)
 
@@ -295,7 +299,7 @@ export const subscribeBatch = async (ws, topics) => {
   for (const topic of topics) await bus.follow(topic);
 };
 
-// Recommended -- one round trip per shard channel:
+// Recommended - one round trip per shard channel:
 export const { subscribeBatch } = bus.hooks;
 ```
 
@@ -325,6 +329,8 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 |---|---|---|
 | `channelPrefix` | `'uws:sharded:'` | Prefix for sharded pub/sub channels |
 | `shardKey` | `(topic) => topic` | Map a topic to a shard label. The channel is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic). |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the cluster bus with oversized payloads. |
+| `allowSystemTopics` | `true` | When `false`, inbound envelopes addressed to `__`-prefixed topics are dropped. Belt-and-suspenders defense in depth on top of the wire-level subscribe gate; safe to flip when the app publishes only on user-space topics. |
 
 #### When to use which bus
 
@@ -344,7 +350,7 @@ If you don't have a concrete cluster + fine-grained-topics use case, `createPubS
 
 Same API as the core `createReplay` plugin, but backed by Redis sorted sets. Messages survive restarts and are shared across instances.
 
-Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script -- no second round trip required.
+Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script - no second round trip required.
 
 When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
 
@@ -412,9 +418,9 @@ import { replay } from '$lib/server/replay';
 export const resume = replay.resumeHook();
 ```
 
-The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(ws, topic, sinceSeq, platform)` per topic. Per-topic truncation detection still happens inside `replay()` -- a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
+The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(ws, topic, sinceSeq, platform)` per topic. Per-topic truncation detection still happens inside `replay()` - a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
 
-For finer control -- custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work -- compose by hand:
+For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand:
 
 ```js
 export async function resume(ws, { lastSeenSeqs, platform }) {
@@ -434,15 +440,15 @@ The same `resumeHook()` is available on the Postgres backend; behavior is identi
 | `storage` | `'sortedset'` | Backend: `'sortedset'` (default) uses ZADD; `'stream'` uses XADD. See [Stream backend](#stream-backend). |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Key expiry in seconds (0 = never) |
-| `durability` | -- | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
+| `durability` | - | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
 | `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
 | `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` blocks indefinitely (Redis WAIT semantics). |
 
 #### Stream backend
 
-`storage: 'stream'` dispatches to a Redis Streams implementation (`XADD`/`XRANGE`) instead of the default sorted-set one. Same external contract -- the same `publish` / `seq` / `gap` / `since` / `replay` / `clear` methods, same `durability: 'replicated'` mode, same metrics. Two changes under the hood:
+`storage: 'stream'` dispatches to a Redis Streams implementation (`XADD`/`XRANGE`) instead of the default sorted-set one. Same external contract - the same `publish` / `seq` / `gap` / `since` / `replay` / `clear` methods, same `durability: 'replicated'` mode, same metrics. Two changes under the hood:
 
-- Listpack encoding is more compact than sorted-set encoding for typical message shapes -- meaningfully smaller memory for buffers in the thousands of entries per topic.
+- Listpack encoding is more compact than sorted-set encoding for typical message shapes - meaningfully smaller memory for buffers in the thousands of entries per topic.
 - Stream IDs are `<seq>-0` where `seq` is the same INCR counter the sorted-set backend uses. `XRANGE` against `(seq-0` filters natively by sequence number, so range queries skip the app-side scan the sorted-set backend does for some paths.
 
 ```js
@@ -452,7 +458,7 @@ const replay = createReplay(redis, {
 });
 ```
 
-Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) but different buf-key prefixes (`replay:buf:{topic}` for sorted-set, `replay:streambuf:{topic}` for stream), so they can coexist on the same Redis without WRONGTYPE collisions. A single topic should pick one backend at startup and stay there -- there is no built-in migration helper for switching an existing topic from one backend to the other (greenfield deployments don't need it; if you have one in flight and need to migrate, drain consumers, copy entries with a one-off script, and switch).
+Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) but different buf-key prefixes (`replay:buf:{topic}` for sorted-set, `replay:streambuf:{topic}` for stream), so they can coexist on the same Redis without WRONGTYPE collisions. A single topic should pick one backend at startup and stay there - there is no built-in migration helper for switching an existing topic from one backend to the other (greenfield deployments don't need it; if you have one in flight and need to migrate, drain consumers, copy entries with a one-off script, and switch).
 
 The stream backend works on Redis 5+; listpack encoding is the Redis 7+ default that delivers the memory win.
 
@@ -469,17 +475,17 @@ const { seq, isDuplicate } = await replay.publishIdempotent(platform, 'orders', 
 });
 ```
 
-On a fresh `(producerId, requestId)` tuple, the call performs the same INCR + XADD + broadcast as `publish()` and stashes `seq` in a per-(producer, topic) dedup hash. On a repeat tuple within `idempotencyTtl` (default 48 hours), the call returns the cached seq, skips the XADD, and skips the local broadcast -- the original publish already broadcast to live consumers, and reconnecting consumers pick the entry up via `replay()` from the buffer.
+On a fresh `(producerId, requestId)` tuple, the call performs the same INCR + XADD + broadcast as `publish()` and stashes `seq` in a per-(producer, topic) dedup hash. On a repeat tuple within `idempotencyTtl` (default 48 hours), the call returns the cached seq, skips the XADD, and skips the local broadcast - the original publish already broadcast to live consumers, and reconnecting consumers pick the entry up via `replay()` from the buffer.
 
 The `seq` counter only advances on fresh writes, so duplicate retries do not introduce gaps that would trigger false-positive truncation events on consumers.
 
-The dedup cache key is `{prefix}replay:idmp:{producerId}:{topic}` -- topic-scoped so the same `requestId` can be reused across topics without collision. Override the TTL per call via `opts.idempotencyTtl`, or globally via `idempotencyTtl` on `createReplay`.
+The dedup cache key is `{prefix}replay:idmp:{producerId}:{topic}` - topic-scoped so the same `requestId` can be reused across topics without collision. Override the TTL per call via `opts.idempotencyTtl`, or globally via `idempotencyTtl` on `createReplay`.
 
 This pairs with the durable task runner (`postgres/tasks`): a task that publishes to the replay buffer can pass its task id as `requestId` so worker-crash retries don't double-publish.
 
 #### Replicated durability
 
-For loss-sensitive flows (audit logs, financial events) opt in with `durability: 'replicated'`. After the write to the master, `publish()` runs `WAIT minReplicas replicationTimeoutMs`. If fewer than `minReplicas` replicas ack within the timeout, `publish()` throws `ReplicationTimeoutError` and skips the local broadcast -- the data is on the master only, and broadcasting would commit live consumers to state that could be lost if the master fails before replicas catch up.
+For loss-sensitive flows (audit logs, financial events) opt in with `durability: 'replicated'`. After the write to the master, `publish()` runs `WAIT minReplicas replicationTimeoutMs`. If fewer than `minReplicas` replicas ack within the timeout, `publish()` throws `ReplicationTimeoutError` and skips the local broadcast - the data is on the master only, and broadcasting would commit live consumers to state that could be lost if the master fails before replicas catch up.
 
 ```js
 import { createReplay, ReplicationTimeoutError } from 'svelte-adapter-uws-extensions/redis/replay';
@@ -501,7 +507,7 @@ try {
 }
 ```
 
-The data is in the buffer on the master regardless of the WAIT outcome -- other instances doing `replay()` will still see it. Only the local broadcast is suppressed when the durability signal fails. WAIT command-level errors (network/protocol) bubble up as the original error and DO count as a circuit-breaker failure; an under-acked timeout is a separate signal layer and does NOT trip the breaker.
+The data is in the buffer on the master regardless of the WAIT outcome - other instances doing `replay()` will still see it. Only the local broadcast is suppressed when the durability signal fails. WAIT command-level errors (network/protocol) bubble up as the original error and DO count as a circuit-breaker failure; an under-acked timeout is a separate signal layer and does NOT trip the breaker.
 
 #### API
 
@@ -529,19 +535,19 @@ Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bun
 
 | Event | When | Payload | Direction |
 |---|---|---|---|
-| `presence_state` | Once on subscribe | `{[userKey]: data}` -- flat snapshot of current presence | Server -> single connection |
+| `presence_state` | Once on subscribe | `{[userKey]: data}` - flat snapshot of current presence | Server -> single connection |
 | `presence_diff` | Microtask-batched after joins / leaves / updates | `{joins: {[key]: data}, leaves: {[key]: data}}` | Server -> topic subscribers |
-| `heartbeat` | Per heartbeat interval | `string[]` -- array of currently-known user keys | Server -> topic subscribers |
+| `heartbeat` | Per heartbeat interval | `string[]` - array of currently-known user keys | Server -> topic subscribers |
 
 `presence_diff` collapses by key per-tick: if the same user joins and leaves in the same microtask, only the latest op survives on the wire. An update (same user re-joins with different data) appears as a `joins` entry carrying the new data, since clients overwrite their `Map.set` on the same key.
 
 Cross-instance traffic on the dedicated `presence:events:{topic}` Redis pub/sub channel is `{instanceId, topic, event, payload}` with `event` in `'join' | 'leave' | 'updated'`. Receivers route inbound events into their local diff buffer for client fan-out, so clients only ever see the unified `presence_state` / `presence_diff` shape regardless of which instance the change originated on.
 
-Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone -- local maps, the Redis field, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
+Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone - local maps, the Redis field, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
 
 Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that removes this instance's field from the hash and then scans remaining fields for the same user key, ignoring stale entries. Leave is only buffered into the diff when no other instance holds a live entry for that user, preventing premature "user left" notifications in multi-instance deployments.
 
-Zombie cleanup runs on the heartbeat interval. Each tick, every tracked WebSocket is probed via `getBufferedAmount()` -- if the call throws, the socket is dead and its presence is removed synchronously before the heartbeat writes to Redis. The heartbeat then refreshes timestamps on all live entries via a Redis pipeline and runs a server-side Lua cleanup script (`CLEANUP_SCRIPT`) that scans the hash and removes any fields whose timestamp exceeds the TTL. This handles crashed instances whose close handlers never fired.
+Zombie cleanup runs on the heartbeat interval. Each tick, every tracked WebSocket is probed via `getBufferedAmount()` - if the call throws, the socket is dead and its presence is removed synchronously before the heartbeat writes to Redis. The heartbeat then refreshes timestamps on all live entries via a Redis pipeline and runs a server-side Lua cleanup script (`CLEANUP_SCRIPT`) that scans the hash and removes any fields whose timestamp exceeds the TTL. This handles crashed instances whose close handlers never fired.
 
 #### Setup
 
@@ -596,7 +602,7 @@ export async function close(ws, { platform }) {
 | `flushDiffs()` | Drain the pending `presence_diff` buffer synchronously. Use in graceful-shutdown paths or tests that need the diff to land before the await chain continues. |
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
-| `hooks` | `{ subscribe, close }` -- ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
+| `hooks` | `{ subscribe, close }` - ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
 
 #### Metrics snapshot
 
@@ -605,7 +611,7 @@ export async function close(ws, { platform }) {
 | Field | Description |
 |---|---|
 | `totalOnline` | Sum of unique-users-per-topic across all topics this instance is locally tracking. The same user in two topics counts twice; per-topic counts sum cleanly. |
-| `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator -- a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
+| `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator - a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
 | `staleCleanedTotal` | Cumulative count of stale fields removed by the heartbeat-driven cleanup script since this instance started. A non-zero rate means crashed sibling instances' presence is being cleaned up; a zero rate is the healthy steady state. |
 
 The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge), `presence_stale_cleaned_total` (counter, already shipped pre-0.5.0).
@@ -614,14 +620,14 @@ Two additional counters track the diff-protocol behavior:
 
 | Metric | Description |
 |---|---|
-| `presence_diff_frames_total{topic="..."}` | `presence_diff` frames published to topic subscribers. Compared against `presence_joins_total` + `presence_leaves_total` it tells you how much per-tick coalescing the buffer is doing -- the bigger the gap, the more bandwidth saved versus per-event broadcast. |
+| `presence_diff_frames_total{topic="..."}` | `presence_diff` frames published to topic subscribers. Compared against `presence_joins_total` + `presence_leaves_total` it tells you how much per-tick coalescing the buffer is doing - the bigger the gap, the more bandwidth saved versus per-event broadcast. |
 | `presence_diff_coalesced_total{topic="..."}` | Buffered diff entries overwritten by a later op in the same tick. A non-zero rate confirms the same-key collapse is working (e.g. a user reconnecting fast enough to leave-then-join in one tick). Zero is also a valid state under steady traffic. |
 
 #### Keyspace cleanup mode
 
 By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `presence_diff` with the user in `leaves`. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
 
-`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore -- typically because the only tracker crashed), this instance emits an empty `presence_state` event on `__presence:<topic>` so local subscribers can replace their entire local map with "no one here."
+`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore - typically because the only tracker crashed), this instance emits an empty `presence_state` event on `__presence:<topic>` so local subscribers can replace their entire local map with "no one here."
 
 ```js
 const presence = createPresence(redis, {
@@ -636,7 +642,7 @@ const presence = createPresence(redis, {
 CONFIG SET notify-keyspace-events Ex
 ```
 
-(or any flagset that includes both `K`/`E` and `x` -- e.g. `Ex`, `KEA`, etc.) If the `psubscribe` call fails because keyspace events are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
+(or any flagset that includes both `K`/`E` and `x` - e.g. `Ex`, `KEA`, etc.) If the `psubscribe` call fails because keyspace events are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
 
 **Scope:** this is hash-key expiry (whole topic gone), not per-field expiry. Per-field cleanup of stale entries from crashed instances continues to run via the heartbeat-driven cleanup script. Per-field hash TTLs would require Redis 7.4+ `HEXPIRE` and a different storage layout; that's a future evolution, not part of this mode.
 
@@ -669,7 +675,7 @@ export const { close } = presence.hooks;
 
 ## Connection registry
 
-The adapter's `platform.request(ws, ...)` is single-instance: it takes a local `ws` reference, so it only works against connections owned by the calling instance. `createConnectionRegistry` is the cluster-routed counterpart -- a `userId -> {instanceId, sessionId, ts}` map in Redis plus a per-instance push channel that lets any instance route a request to whichever one currently owns a given user's WebSocket.
+The adapter's `platform.request(ws, ...)` is single-instance: it takes a local `ws` reference, so it only works against connections owned by the calling instance. `createConnectionRegistry` is the cluster-routed counterpart - a `userId -> {instanceId, sessionId, ts}` map in Redis plus a per-instance push channel that lets any instance route a request to whichever one currently owns a given user's WebSocket.
 
 #### Setup
 
@@ -705,7 +711,7 @@ const reply = await registry.request('user-123', 'confirm-action', { op: 'delete
 if (reply.confirmed) await actuallyDelete();
 ```
 
-The lookup resolves which instance currently owns `user-123`'s connection. If that's the calling instance, the request short-circuits to a local `platform.request(ws, ...)` -- no Redis hop. Otherwise the request envelope ships across the per-instance push channel, the owning instance calls `platform.request` locally, and the reply ships back on the origin's push channel.
+The lookup resolves which instance currently owns `user-123`'s connection. If that's the calling instance, the request short-circuits to a local `platform.request(ws, ...)` - no Redis hop. Otherwise the request envelope ships across the per-instance push channel, the owning instance calls `platform.request` locally, and the reply ships back on the origin's push channel.
 
 Wire envelopes (internal):
 
@@ -726,7 +732,7 @@ Mid-flight migration (user reconnects to a different instance between lookup and
 
 | Key | Shape | Notes |
 |---|---|---|
-| `{prefix}conns:{userId}` | Hash `{instanceId, sessionId, ts, attrs?}` | Most-recent-connection-wins. A second device on the same `userId` replaces the first; targeting from `request(...)` always reaches the most recent connection. `attrs` is a JSON-encoded snapshot of the optional `attributes(ws)` callback's return value -- present only when `attributes` is wired and returns at least one value. |
+| `{prefix}conns:{userId}` | Hash `{instanceId, sessionId, ts, attrs?}` | Most-recent-connection-wins. A second device on the same `userId` replaces the first; targeting from `request(...)` always reaches the most recent connection. `attrs` is a JSON-encoded snapshot of the optional `attributes(ws)` callback's return value - present only when `attributes` is wired and returns at least one value. |
 | `{prefix}__push:{instanceId}` | Pub/sub channel | Each instance subscribes to its own channel. Inbound messages dispatch by `envelope.type`. |
 | `{prefix}__registry-events` | Pub/sub channel | Shared across all instances. Carries `{type:'open' | 'close', userId, instanceId, attrs?}` envelopes so each instance can maintain a live secondary index for `sendTo(...)`. Skipped when no `attributes` option was supplied. |
 
@@ -737,13 +743,13 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | Option | Default | Description |
 |---|---|---|
 | `identify` | (required) | `(ws) => userId | null`. Anonymous connections are skipped. |
-| `attributes` | -- | `(ws) => Record<string, string | number | boolean>`. Required for `sendTo(...)`. Captures per-user attributes at registration time for tenant- / role- / cohort-scoped broadcasts. Numbers and booleans are coerced to strings for index-key consistency; nested objects, arrays, and `null` values are dropped (shallow values only per credo rule 1). |
+| `attributes` | - | `(ws) => Record<string, string | number | boolean>`. Required for `sendTo(...)`. Captures per-user attributes at registration time for tenant- / role- / cohort-scoped broadcasts. Numbers and booleans are coerced to strings for index-key consistency; nested objects, arrays, and `null` values are dropped (shallow values only per credo rule 1). |
 | `keyPrefix` | `''` | Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`. |
 | `ttl` | `90` | Expiry on registry entries in seconds. Should be > `heartbeat * 3` so a missed beat doesn't drop a live user. |
 | `heartbeat` | `30000` | TTL refresh interval in ms. Each tick `EXPIRE`s every locally-owned entry. |
 | `requestTimeoutMs` | `5000` | Default timeout for `request(...)` calls. Overridable per call via `options.timeoutMs`. |
-| `breaker` | -- | Optional circuit breaker for Redis ops. |
-| `metrics` | -- | Optional Prometheus metrics registry. |
+| `breaker` | - | Optional circuit breaker for Redis ops. |
+| `metrics` | - | Optional Prometheus metrics registry. |
 
 #### API
 
@@ -771,7 +777,7 @@ Fire-and-forget: no Promise<reply>, no acknowledgement. Callers who need a deliv
 
 #### Coalesced sends {#registry-coalesced-sends}
 
-`registry.sendCoalesced(target, { key, topic, event, data })` is the cluster-routed counterpart to the adapter's `platform.sendCoalesced(ws, ...)` -- one slot per `(connection, key)` tuple, latest-value-wins. Fire-and-forget; no reply path, no `Promise<reply>`.
+`registry.sendCoalesced(target, { key, topic, event, data })` is the cluster-routed counterpart to the adapter's `platform.sendCoalesced(ws, ...)` - one slot per `(connection, key)` tuple, latest-value-wins. Fire-and-forget; no reply path, no `Promise<reply>`.
 
 ```js
 registry.sendCoalesced('user-123', {
@@ -790,7 +796,7 @@ Best fit: targeted latest-value streams where the target is a *user*, not a topi
 
 #### Attribute-targeted broadcast {#registry-sendto}
 
-`registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined -- whatever you return from `attributes(ws)` is what `sendTo` can match against. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
+`registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined - whatever you return from `attributes(ws)` is what `sendTo` can match against. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
 
 ```js
 import { createConnectionRegistry } from 'svelte-adapter-uws-extensions/redis/registry';
@@ -810,7 +816,7 @@ registry.sendTo({ role: 'admin' }, 'alerts', 'warning', { message: 'High load' }
 registry.sendTo({ role: 'admin', region: 'eu' }, 'audit', 'created', payload);
 ```
 
-`platform.sendTo(filter, topic, event, data)` accepts a filter function -- functions don't serialize across instances, so the filter-function escape hatch is deliberately not lifted here. The cluster shape is shallow equality only: one literal value per attribute key, AND across keys. No regex, no array containment, no nested-object queries. Apps that need richer queries should publish to a dedicated topic and route their own broadcasts.
+`platform.sendTo(filter, topic, event, data)` accepts a filter function - functions don't serialize across instances, so the filter-function escape hatch is deliberately not lifted here. The cluster shape is shallow equality only: one literal value per attribute key, AND across keys. No regex, no array containment, no nested-object queries. Apps that need richer queries should publish to a dedicated topic and route their own broadcasts.
 
 How it works:
 
@@ -844,14 +850,14 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 | `push_reply_latency_ms` | Histogram of request-publish to reply-receive in milliseconds (success path). |
 | `push_registry_size` | Gauge: connections registered to this instance. Scrape-time, no continuous accounting. |
 | `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
-| `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map -- target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
-| `push_sends_total{result="ok|self|offline|late|error"}` | Outcomes for `send(...)`. Same result space as `push_coalesced_total` -- `ok` cross-instance, `self` short-circuited locally, `offline` entry missing or local-ws-gone, `late` receive-side miss after migration, `error` Redis publish or local `platform.send` threw. |
-| `push_sendto_total{result="ok|empty|error"}` | Outcomes for `sendTo(...)`. `ok` is "at least one match resolved, all publishes succeeded (or only self-matches)"; `empty` is "no matches resolved by the local index"; `error` is "at least one Redis publish failed." Per-call counter, not per-target -- one `sendTo` produces exactly one increment regardless of how many matches it fans out to. |
+| `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map - target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
+| `push_sends_total{result="ok|self|offline|late|error"}` | Outcomes for `send(...)`. Same result space as `push_coalesced_total` - `ok` cross-instance, `self` short-circuited locally, `offline` entry missing or local-ws-gone, `late` receive-side miss after migration, `error` Redis publish or local `platform.send` threw. |
+| `push_sendto_total{result="ok|empty|error"}` | Outcomes for `sendTo(...)`. `ok` is "at least one match resolved, all publishes succeeded (or only self-matches)"; `empty` is "no matches resolved by the local index"; `error` is "at least one Redis publish failed." Per-call counter, not per-target - one `sendTo` produces exactly one increment regardless of how many matches it fans out to. |
 
 #### Registry edge cases
 
 - **User reconnects to a different instance mid-request.** The origin's pending entry waits on the OLD instance's reply channel. The user's new connection won't reply on that channel; the request times out. Any late reply from the old instance after teardown lands on a missing pending entry and is silently dropped (`push_late_replies_total` increments).
-- **Owning instance crashes between request publish and local `platform.request`.** Same shape as above -- request times out. The Redis entry remains until the TTL expires (sliding heartbeat cleared by the dead instance), after which subsequent `request(...)` calls see `result="offline"` from the lookup.
+- **Owning instance crashes between request publish and local `platform.request`.** Same shape as above - request times out. The Redis entry remains until the TTL expires (sliding heartbeat cleared by the dead instance), after which subsequent `request(...)` calls see `result="offline"` from the lookup.
 - **Self-targeting** (the origin instance owns the user). Short-circuits to a local `platform.request(ws, ...)` without round-tripping Redis. One conditional in the dispatcher; not a special case at the API surface.
 - **Anonymous connections.** `identify(ws)` returning `null` / `undefined` makes the open / close hooks no-op. Anonymous users are not addressable through the registry by design.
 
@@ -928,7 +934,7 @@ export const lobby = createGroup(redis, 'lobby', {
 });
 ```
 
-Note: the API signature is `createGroup(client, name, options)` instead of `createGroup(name, options)` -- the Redis client is the first argument.
+Note: the API signature is `createGroup(client, name, options)` instead of `createGroup(name, options)` - the Redis client is the first argument.
 
 #### Usage
 
@@ -978,7 +984,7 @@ export async function close(ws, { platform }) {
 
 Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
 
-Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate -- 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
+Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
 
@@ -1021,6 +1027,7 @@ export function close(ws, { platform }) {
 | `topicThrottle` | `16` | World-state tick rate in ms. Each topic emits at most one bulk frame per window, carrying the latest position for every cursor that moved. Raise to 33 (30Hz) for high-density rooms; 0 disables the tick. |
 | `select` | strips `__`-prefixed keys | Extract user data to broadcast alongside position |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound cursor envelopes larger than this before `JSON.parse` runs. The inner topic is always validated against the `__` denylist (the module constructs its own `__cursor:` wrapper prefix), so no `allowSystemTopics` knob is needed here. |
 
 #### API
 
@@ -1040,11 +1047,11 @@ export function close(ws, { platform }) {
 
 Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table using `INSERT ... ON CONFLICT DO UPDATE`, so concurrent publishes from multiple instances produce strictly ordered sequences with no duplicates or gaps.
 
-Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq - maxSize`. If the trim query fails, the publish still succeeds -- the periodic background cleanup (configurable via `cleanupInterval`) catches any excess rows later.
+Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq - maxSize`. If the trim query fails, the publish still succeeds - the periodic background cleanup (configurable via `cleanupInterval`) catches any excess rows later.
 
 Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
 
-The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here -- one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
+The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here - one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
 `resumeHook()` is available with identical semantics to the Redis backend; see [Session resumption](#session-resumption-resumehook).
 
@@ -1106,7 +1113,7 @@ Same as [Replay buffer (Redis)](#api-3), plus:
 
 ## LISTEN/NOTIFY bridge
 
-Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table -- this module handles the listening side.
+Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table - this module handles the listening side.
 
 Uses a standalone connection (not from the pool) since LISTEN requires a persistent connection that stays open for the lifetime of the bridge.
 
@@ -1168,7 +1175,7 @@ CREATE TRIGGER messages_notify
 
 Now any INSERT, UPDATE, or DELETE on the `messages` table will fire a notification. The bridge parses it and calls `platform.publish()`, which reaches all connected WebSocket clients subscribed to the topic.
 
-The client side needs no changes -- the core `crud('messages')` store already handles `created`, `updated`, and `deleted` events.
+The client side needs no changes - the core `crud('messages')` store already handles `created`, `updated`, and `deleted` events.
 
 #### Options
 
@@ -1179,8 +1186,10 @@ The client side needs no changes -- the core `crud('messages')` store already ha
 | `autoReconnect` | `true` | Reconnect on connection loss |
 | `reconnectInterval` | `3000` | ms between reconnect attempts |
 | `multiListener` | `'all'` | `'all'`: every replica opens its own LISTEN (current default). `'advisory'`: leader-elected via `pg_try_advisory_lock`. See [Single-listener mode](#single-listener-mode). |
-| `lockId` | -- | Advisory lock id. Required when `multiListener: 'advisory'`. |
+| `lockId` | - | Advisory lock id. Required when `multiListener: 'advisory'`. |
 | `pollInterval` | `5000` | ms between leader-election polls (advisory mode only). |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound `NOTIFY` payloads larger than this before `JSON.parse` runs. Defends against a buggy or hostile trigger flooding the bridge with oversized payloads. |
+| `allowSystemTopics` | `true` | When `false`, parsed envelopes addressed to `__`-prefixed topics are dropped before the publish call. Belt-and-suspenders defense in depth; safe to flip when the bridge only emits on user-space topics. |
 
 #### Single-listener mode
 
@@ -1206,7 +1215,7 @@ export function open(ws, { platform }) {
 }
 ```
 
-**Requires a cross-instance pub/sub bus.** In `'all'` mode the bridge passes `relay: false` because every replica's local LISTEN already delivers the notification. In `'advisory'` mode only the leader has LISTEN active, so the leader publishes *with* relay -- the bus fans out to non-leader replicas via Redis. Without a bus the leader's local clients receive notifications but other replicas' clients don't.
+**Requires a cross-instance pub/sub bus.** In `'all'` mode the bridge passes `relay: false` because every replica's local LISTEN already delivers the notification. In `'advisory'` mode only the leader has LISTEN active, so the leader publishes *with* relay - the bus fans out to non-leader replicas via Redis. Without a bus the leader's local clients receive notifications but other replicas' clients don't.
 
 **Choosing a `lockId`.** Pick a stable 32-bit signed integer that's unique per channel within your deployment. CRC32 of the channel name is a reasonable hash; multiple channels in the same database need distinct ids.
 
@@ -1231,9 +1240,9 @@ If your real-time events are driven by database writes and you do not need Redis
 
 ## Job queue
 
-`createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on vanilla Postgres 9.5+ -- no extensions required.
+`createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on vanilla Postgres 9.5+ - no extensions required.
 
-The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in -- the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
+The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in - the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
 
 #### Setup
 
@@ -1260,7 +1269,7 @@ const id = await jobs.enqueue(
 
 The third argument is an options bag; `platform` (the SvelteKit `event.platform`) auto-captures the originating request id, or pass `requestId` explicitly to override. The captured id surfaces on `job.requestId` when the row is claimed, so the worker can correlate logs back to the request that enqueued the job.
 
-`enqueue()` returns the row id verbatim from `pg`, which serialises `BIGINT`/`BIGSERIAL` columns as **strings** by default to avoid precision loss past `Number.MAX_SAFE_INTEGER`. Pass it through to `claim()`/`complete()`/`fail()`/`extend()` as-is. If you want a JS number for logging or comparison, coerce explicitly with `Number(id)` (safe up to 2^53 -- still ~9 quadrillion rows of headroom).
+`enqueue()` returns the row id verbatim from `pg`, which serialises `BIGINT`/`BIGSERIAL` columns as **strings** by default to avoid precision loss past `Number.MAX_SAFE_INTEGER`. Pass it through to `claim()`/`complete()`/`fail()`/`extend()` as-is. If you want a JS number for logging or comparison, coerce explicitly with `Number(id)` (safe up to 2^53 - still ~9 quadrillion rows of headroom).
 
 #### Consumer (worker loop)
 
@@ -1301,7 +1310,7 @@ CREATE TABLE IF NOT EXISTS svti_jobs (
   svti_jobs_id  BIGSERIAL   PRIMARY KEY,
   queue         TEXT        NOT NULL,
   payload       JSONB,
-  request_id    TEXT,                       -- originating platform.requestId, or null
+  request_id    TEXT,                       - originating platform.requestId, or null
   claimed_at    TIMESTAMPTZ,
   claimed_until TIMESTAMPTZ,
   attempts      INTEGER     NOT NULL DEFAULT 0,
@@ -1327,7 +1336,7 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 
 | Method | Description |
 |---|---|
-| `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, platform? }` -- `platform.requestId` is captured automatically when `platform` is passed |
+| `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, platform? }` - `platform.requestId` is captured automatically when `platform` is passed |
 | `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. Each returned job carries `id, queue, payload, requestId, attempts, created_at` |
 | `complete(idOrIds)` | Delete the job(s) on success |
 | `fail(idOrIds)` | Release the claim for retry |
@@ -1351,13 +1360,13 @@ If your handler must run exactly once and you want the runtime to track the resu
 
 ## Idempotency store
 
-Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Use it for HTTP/RPC retries, webhook redeliveries, and any handler where the caller may legitimately repeat a request that must execute at most once -- charge-customer, send-email, create-order.
+Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Use it for HTTP/RPC retries, webhook redeliveries, and any handler where the caller may legitimately repeat a request that must execute at most once - charge-customer, send-email, create-order.
 
 The store exposes three states via `acquire(key)`:
 
-- **acquired** -- you own the slot. Run the work, then call `commit(result)` on success or `abort()` on failure.
-- **pending** -- another caller acquired the slot and has not committed yet. Decide locally whether to return a 409, retry later, or wait.
-- **result** -- a previous run committed. The cached value is returned.
+- **acquired** - you own the slot. Run the work, then call `commit(result)` on success or `abort()` on failure.
+- **pending** - another caller acquired the slot and has not committed yet. Decide locally whether to return a 409, retry later, or wait.
+- **result** - a previous run committed. The cached value is returned.
 
 A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hold the key, so a crashed owner cannot deadlock retries forever. On `commit` the longer `ttl` (default 48 hours) replaces the sentinel and governs the cache lifetime.
 
@@ -1444,8 +1453,8 @@ export async function placeOrder(input, ctx) {
 | `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |
 | `autoMigrate` (Postgres) | `true` | Auto-create the table on first use |
 | `cleanupInterval` (Postgres) | `60000` | Periodic expired-row cleanup interval in ms (0 to disable) |
-| `breaker` | -- | Circuit breaker; bypassed when broken |
-| `metrics` | -- | Prometheus registry; emits `idempotency_*_total` counters |
+| `breaker` | - | Circuit breaker; bypassed when broken |
+| `metrics` | - | Prometheus registry; emits `idempotency_*_total` counters |
 
 #### API
 
@@ -1495,13 +1504,13 @@ await lock.withLock('order-42', async (signal) => {
 });
 ```
 
-`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide mutex on `key`. The user fn cannot forget to release -- the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
+`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide mutex on `key`. The user fn cannot forget to release - the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
 
 #### How it works
 
-1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` -- atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
+1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` - atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
 2. **Retry.** On collision (someone else holds the key), sleep `retryDelayMs` and try again. After `maxWaitMs` total wait, throw `LockAcquireTimeoutError`.
-3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. If the heartbeat returns 0 (we no longer own the key -- operator force-takeover, TTL elapsed before we could refresh), the supplied `AbortSignal` fires with a `LockLostError` and the heartbeat stops.
+3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. If the heartbeat returns 0 (we no longer own the key - operator force-takeover, TTL elapsed before we could refresh), the supplied `AbortSignal` fires with a `LockLostError` and the heartbeat stops.
 4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless).
 
 The `AbortSignal` shape is the cluster-correctness story: when the heartbeat detects loss, your code learns immediately and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
@@ -1516,8 +1525,8 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 | `maxWaitMs` | `5000` | Total time to wait before throwing `LockAcquireTimeoutError`. Override per call via `withLock(key, fn, { maxWaitMs })`. |
 | `heartbeatMs` | `defaultTtlMs / 3` | Heartbeat refresh interval. Default keeps margin for one missed beat. |
 | `mapKey` | identity | Map lock key names to bounded label values for metric cardinality. |
-| `breaker` | -- | Optional circuit breaker for the Redis ops. |
-| `metrics` | -- | Optional Prometheus metrics registry. |
+| `breaker` | - | Optional circuit breaker for the Redis ops. |
+| `metrics` | - | Optional Prometheus metrics registry. |
 
 #### Per-call options
 
@@ -1529,8 +1538,8 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 
 #### Errors
 
-- **`LockAcquireTimeoutError`** -- thrown by `withLock` when `maxWaitMs` elapses without a successful acquire. Properties: `key`, `waitedMs`.
-- **`LockLostError`** -- surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it's up to your code to react. Property: `key`.
+- **`LockAcquireTimeoutError`** - thrown by `withLock` when `maxWaitMs` elapses without a successful acquire. Properties: `key`, `waitedMs`.
+- **`LockLostError`** - surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it's up to your code to react. Property: `key`.
 
 #### Metrics
 
@@ -1539,13 +1548,13 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 | `lock_acquired_total{key_class}` | Counter of successful acquires. `key_class` is `mapKey(key)`. |
 | `lock_acquire_wait_ms` | Histogram of time waited from `withLock` call to successful acquire (ms). Observed only on success. |
 | `lock_acquire_timeouts_total{key_class}` | Counter of `withLock` calls that exceeded `maxWaitMs` without acquiring. |
-| `lock_lost_total{key_class}` | Counter of locks lost mid-flight via heartbeat detection. A non-zero rate signals operator force-takeover or holder TTL elapsing -- both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
+| `lock_lost_total{key_class}` | Counter of locks lost mid-flight via heartbeat detection. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
 
 #### When to use which
 
-- **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" -- dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
+- **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
 - **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
-- **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal -- caching the outcome is.
+- **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal - caching the outcome is.
 - **`createLeader`** (next section) when the question is "which one of N workers should fire this scheduled job right now," not "who runs this critical section." Distinct from `withLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer.
 
 ---
@@ -1582,7 +1591,7 @@ export async function shutdown() {
 }
 ```
 
-`isLeader()` is the only call on the hot path. It reads a cached boolean (no Redis I/O, microsecond cost) and is safe to call at every cron tick / scheduled-job entry. Falsy means "another worker holds the lease" or "no Redis, fail closed" -- in both cases the consumer skips.
+`isLeader()` is the only call on the hot path. It reads a cached boolean (no Redis I/O, microsecond cost) and is safe to call at every cron tick / scheduled-job entry. Falsy means "another worker holds the lease" or "no Redis, fail closed" - in both cases the consumer skips.
 
 #### How it works
 
@@ -1591,13 +1600,13 @@ export async function shutdown() {
 3. **Re-acquire.** When `_isLeader` is false, the same renewal tick attempts a fresh `SET NX`. As soon as the holder releases or the lease expires server-side, the next non-leader to tick wins.
 4. **Release.** `stop()` runs Lua-atomic `if get == instanceId then del end`. Skipped if we already lost ownership; the compare guard means we never accidentally delete a sibling's lease.
 
-The compare-on-mutate guard on both renew and release means a stale tick from a worker that already lost leadership cannot extend or release somebody else's lease. Same shape and the same shared Lua scripts as `redis/lock`'s heartbeat -- intentionally identical so the two primitives can't drift on lease semantics.
+The compare-on-mutate guard on both renew and release means a stale tick from a worker that already lost leadership cannot extend or release somebody else's lease. Same shape and the same shared Lua scripts as `redis/lock`'s heartbeat - intentionally identical so the two primitives can't drift on lease semantics.
 
 #### Failure model: fail-closed
 
-A renewal that throws (Redis disconnect, breaker open, network partition) drops `_isLeader` to false and surfaces the error to `onError`. The renewal interval keeps ticking so leadership can recover when Redis recovers. Errors never escape the interval -- a Redis blip cannot crash the worker.
+A renewal that throws (Redis disconnect, breaker open, network partition) drops `_isLeader` to false and surfaces the error to `onError`. The renewal interval keeps ticking so leadership can recover when Redis recovers. Errors never escape the interval - a Redis blip cannot crash the worker.
 
-Across the cluster, a partitioned Redis means the lease expires server-side and no worker holds leadership until the partition heals -- jobs miss ticks rather than double-fire. Better-safe-than-double-fire is the deliberate choice: across most cron consumers, missing one tick is acceptable while running a job twice is not.
+Across the cluster, a partitioned Redis means the lease expires server-side and no worker holds leadership until the partition heals - jobs miss ticks rather than double-fire. Better-safe-than-double-fire is the deliberate choice: across most cron consumers, missing one tick is acceptable while running a job twice is not.
 
 GC-pause caveat: a long stop-the-world pause on the leader can cause brief overlap with a freshly-elected successor. Make jobs idempotent at the consumer; this primitive does not provide fencing tokens (consumer sinks for cron-style work rarely have the machinery to consume them anyway).
 
@@ -1609,10 +1618,10 @@ GC-pause caveat: a long stop-the-world pause on the leader can cause brief overl
 | `instanceId` | random hex | This worker's identity. Override only if you want a stable identity for diagnostics; correctness does not depend on it. |
 | `leaseMs` | `30000` | TTL on the lease in milliseconds. Worst-case window between leader death and successor takeover. |
 | `renewMs` | `leaseMs / 3` | Renewal interval, also the interval at which non-leaders attempt fresh acquire. Must be `< leaseMs`. |
-| `onError` | -- | Called on every Redis failure. Use for structured logging. Errors never escape the renewal interval regardless. |
+| `onError` | - | Called on every Redis failure. Use for structured logging. Errors never escape the renewal interval regardless. |
 | `mapKey` | identity | Map the lease key to a bounded label value for cardinality control on the four `leader_*` counters. |
-| `breaker` | -- | Optional circuit breaker. Renewal failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
-| `metrics` | -- | Optional Prometheus metrics registry. |
+| `breaker` | - | Optional circuit breaker. Renewal failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
+| `metrics` | - | Optional Prometheus metrics registry. |
 
 #### API
 
@@ -1678,7 +1687,7 @@ await sessions.delete(token);
 
 #### Storage shape
 
-Each session is one Redis string at `{prefix}sess:{token}` containing the JSON-encoded data, with a TTL of `ttlMs`. Single round-trip for every operation: `SET key json PX ttl` to write, `GET key` plus `PEXPIRE key ttl` to read with sliding refresh, `PEXPIRE` to touch, `UNLINK` to delete. JSON blob keeps the whole record atomic on replace; partial-field updates are not a feature -- callers do `set(token, { ...await get(token), changed: 'value' })` for that.
+Each session is one Redis string at `{prefix}sess:{token}` containing the JSON-encoded data, with a TTL of `ttlMs`. Single round-trip for every operation: `SET key json PX ttl` to write, `GET key` plus `PEXPIRE key ttl` to read with sliding refresh, `PEXPIRE` to touch, `UNLINK` to delete. JSON blob keeps the whole record atomic on replace; partial-field updates are not a feature - callers do `set(token, { ...await get(token), changed: 'value' })` for that.
 
 #### Sliding TTL
 
@@ -1693,12 +1702,12 @@ Every `set` resets the TTL to `ttlMs`. By default `get` and `touch` also extend 
 | `keyPrefix` | `'sess:'` | Prefix prepended (after the client `keyPrefix`) to every session key. |
 | `ttlMs` | `86_400_000` (24h) | Sliding TTL window in milliseconds. |
 | `refreshOnGet` | `true` | Whether `get(token)` extends the TTL on a hit. |
-| `breaker` | -- | Optional circuit breaker for the Redis ops. |
-| `metrics` | -- | Optional Prometheus metrics registry. |
+| `breaker` | - | Optional circuit breaker for the Redis ops. |
+| `metrics` | - | Optional Prometheus metrics registry. |
 
 #### Pairing with the bundled Session plugin
 
-The shape is identical: same `get` / `set` / `delete` / `touch` / `clear` names, same sliding-TTL semantics. The Redis-backed methods return `Promise<T>` while the bundled plugin's are synchronous, so a swap requires `await` on the call sites -- but otherwise the contract is shared. Use the bundled plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+The shape is identical: same `get` / `set` / `delete` / `touch` / `clear` names, same sliding-TTL semantics. The Redis-backed methods return `Promise<T>` while the bundled plugin's are synchronous, so a swap requires `await` on the call sites - but otherwise the contract is shared. Use the bundled plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
 
 #### Pairing with the connection registry
 
@@ -1741,7 +1750,7 @@ export async function message(ws) {
 
 #### `clear()` and operational notes
 
-`clear()` removes every session under the configured `keyPrefix` via SCAN + UNLINK. Cluster-wide cost scales with total session count -- not a hot-path operation. Use for graceful-shutdown teardowns, test harnesses, or operator-initiated wipes (e.g., post-incident "log everyone out"). Other keys outside the prefix are untouched.
+`clear()` removes every session under the configured `keyPrefix` via SCAN + UNLINK. Cluster-wide cost scales with total session count - not a hot-path operation. Use for graceful-shutdown teardowns, test harnesses, or operator-initiated wipes (e.g., post-incident "log everyone out"). Other keys outside the prefix are untouched.
 
 There is intentionally no `size()` method: a cluster-wide count of session keys requires SCAN every time, and exposing it as a synchronous-looking accessor would be misleading. Apps that want session counts should track a separate Redis SET on `set` / `delete` and `SCARD` it.
 
@@ -1753,7 +1762,7 @@ Wraps an effectful operation in a state machine that survives process crashes an
 
 **Requires Postgres 13+.** Uses the built-in `gen_random_uuid()` function (added to core in 13; older versions need the `pgcrypto` extension explicitly enabled, which the runner does not do for you).
 
-**Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** -- start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
+**Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** - start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
 
 Three guarantees:
 
@@ -1811,7 +1820,7 @@ export const actions = {
 };
 ```
 
-Pass `platform` (the SvelteKit `event.platform`) to capture the originating request id automatically -- it lands on `svti_tasks.request_id` and surfaces as `ctx.requestId` in the handler so logs from inside the task correlate back to the WS / HTTP request that started it. Override explicitly via the `requestId` option for non-request contexts (cron, recovery, manual invocation).
+Pass `platform` (the SvelteKit `event.platform`) to capture the originating request id automatically - it lands on `svti_tasks.request_id` and surfaces as `ctx.requestId` in the handler so logs from inside the task correlate back to the WS / HTTP request that started it. Override explicitly via the `requestId` option for non-request contexts (cron, recovery, manual invocation).
 
 #### Schema
 
@@ -1823,8 +1832,8 @@ CREATE TABLE IF NOT EXISTS svti_tasks (
   name                 TEXT         NOT NULL,
   input                JSONB,
   svti_idempotency_key TEXT,
-  request_id           TEXT,                    -- originating platform.requestId, or null
-  status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+  request_id           TEXT,                    - originating platform.requestId, or null
+  status               TEXT         NOT NULL,  - 'running' | 'committed' | 'failed'
   result               JSONB,
   error                JSONB,
   fence                UUID         NOT NULL,
@@ -1846,7 +1855,7 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | Option | Default | Description |
 |---|---|---|
 | `table` | `'svti_tasks'` | Table name |
-| `idempotency` | -- | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
+| `idempotency` | - | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
 | `fenceTtl` | `60` | Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler runs. |
 | `heartbeatInterval` | `fenceTtl * 1000 / 3` | ms between fence heartbeats |
 | `recoveryInterval` | `30000` | ms between recovery sweeps. 0 disables. |
@@ -1858,9 +1867,9 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | `cleanupInterval` | `3600000` | ms between cleanup sweeps. 0 disables. |
 | `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
 | `autoMigrate` | `true` | Auto-create the table on first use. Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
-| `onStateChange` | -- | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |
-| `breaker` | -- | Circuit breaker; bypassed when broken |
-| `metrics` | -- | Prometheus registry; emits `tasks_*_total` counters |
+| `onStateChange` | - | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |
+| `breaker` | - | Circuit breaker; bypassed when broken |
+| `metrics` | - | Prometheus registry; emits `tasks_*_total` counters |
 
 #### Live observation
 
@@ -1888,12 +1897,12 @@ const summary = await tasks.counts({ name: 'charge-customer' });
 
 Transitions fired:
 
-- `null -> pending` -- `enqueue()` inserts the row.
-- `null -> running` -- `run()` inserts the first attempt directly.
-- `pending -> running` -- the dispatch sweep claims the row.
-- `running -> running` -- retry rearm (within the same `run()` loop) OR recovery sweep (a sibling instance reclaims an expired fence). `attempt` bumps either way.
-- `running -> committed` -- handler succeeded. `event.result` carries the value.
-- `running -> failed` -- handler errored past `retry.maxAttempts`. `event.error` carries the JSON-safe `{ name, message, stack?, code?, cause? }` shape.
+- `null -> pending` - `enqueue()` inserts the row.
+- `null -> running` - `run()` inserts the first attempt directly.
+- `pending -> running` - the dispatch sweep claims the row.
+- `running -> running` - retry rearm (within the same `run()` loop) OR recovery sweep (a sibling instance reclaims an expired fence). `attempt` bumps either way.
+- `running -> committed` - handler succeeded. `event.result` carries the value.
+- `running -> failed` - handler errored past `retry.maxAttempts`. `event.error` carries the JSON-safe `{ name, message, stack?, code?, cause? }` shape.
 
 Errors thrown from the callback (sync or via promise rejection) are caught and `console.warn`ed; they do NOT roll back the state machine. Listeners run on the same tick as the SQL commit but are awaited fire-and-forget; the runner never blocks on them.
 
@@ -1925,7 +1934,7 @@ tasks.register('flaky-webhook', handler, {
 });
 ```
 
-Default is no retry on handler-thrown errors -- safe for non-idempotent tasks. Stuck recovery (fence-expired-while-running) is always on; it is not the same thing as retry-on-failure.
+Default is no retry on handler-thrown errors - safe for non-idempotent tasks. Stuck recovery (fence-expired-while-running) is always on; it is not the same thing as retry-on-failure.
 
 #### Handler context
 
@@ -1939,22 +1948,22 @@ Default is no retry on handler-thrown errors -- safe for non-idempotent tasks. S
 }
 ```
 
-The `signal` fires when the heartbeat detects another worker has reclaimed the row (your fence_expires_at passed and the recovery sweep took over). Pass it to `fetch`, Stripe, anything that supports cancellation -- the handler should bail gracefully when it fires rather than racing the new owner.
+The `signal` fires when the heartbeat detects another worker has reclaimed the row (your fence_expires_at passed and the recovery sweep took over). Pass it to `fetch`, Stripe, anything that supports cancellation - the handler should bail gracefully when it fires rather than racing the new owner.
 
 #### Errors
 
 `run()` throws three error shapes:
 
-- `UnknownTaskError` -- no handler registered for that name in this process. Recovery does not throw on unknown names because the handler may live on a different deployment.
-- `TaskInFlightError` -- the idempotency store reports the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
+- `UnknownTaskError` - no handler registered for that name in this process. Recovery does not throw on unknown names because the handler may live on a different deployment.
+- `TaskInFlightError` - the idempotency store reports the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
 - The handler's own thrown error, after retries are exhausted. Errors are serialised to `{name, message, stack, code, cause}` for the failed-row record and reconstructed as a plain `Error` if a sibling caller reads the row.
 
 #### Async path: `enqueue` + `await`
 
 `run()` blocks the calling process until the handler finishes. Two more verbs let you decouple submission from completion:
 
-- **`enqueue(name, opts)`** -- fire-and-forget. Inserts the row with `status='pending'` and returns the `taskId` immediately. A dispatch sweep on any live instance picks up the row and runs the handler in the background.
-- **`await(taskId, opts?)`** -- block until the task reaches a terminal status. Returns the committed result, throws the stored error, or rejects with a timeout if the task is still pending/running past `awaitTimeout`.
+- **`enqueue(name, opts)`** - fire-and-forget. Inserts the row with `status='pending'` and returns the `taskId` immediately. A dispatch sweep on any live instance picks up the row and runs the handler in the background.
+- **`await(taskId, opts?)`** - block until the task reaches a terminal status. Returns the committed result, throws the stored error, or rejects with a timeout if the task is still pending/running past `awaitTimeout`.
 
 ```js
 import { tasks } from '$lib/server/tasks';
@@ -1987,7 +1996,7 @@ Errors thrown by the handler are reconstructed from the stored row (`name`, `mes
 
 #### Worker thread execution
 
-By default the handler runs in the current process. For CPU-bound work that would otherwise block the event loop -- image resize, hashing, large JSON parse, anything that genuinely consumes a CPU core for long enough to matter -- you can opt in to running the handler in a worker thread.
+By default the handler runs in the current process. For CPU-bound work that would otherwise block the event loop - image resize, hashing, large JSON parse, anything that genuinely consumes a CPU core for long enough to matter - you can opt in to running the handler in a worker thread.
 
 The handler lives in a separate file whose default export is the handler. The runner spawns a thread pool per task; each thread imports the handler file once at startup and reuses the import across runs. Database and Redis clients cannot be shared across worker threads (native handles do not cross thread boundaries), so the worker file boots its own.
 
@@ -2019,7 +2028,7 @@ tasks.register('resize-image', null, {
 });
 ```
 
-When `worker` is set, the `handler` argument to `register` must be `null` or omitted -- the handler argument exists in the worker file, not at the registration site. Pool defaults: `size: 1`, `idleTimeout: 30000` ms (set to `0` to keep workers warm forever). Workers spawn lazily on first run; idle workers past `idleTimeout` are terminated.
+When `worker` is set, the `handler` argument to `register` must be `null` or omitted - the handler argument exists in the worker file, not at the registration site. Pool defaults: `size: 1`, `idleTimeout: 30000` ms (set to `0` to keep workers warm forever). Workers spawn lazily on first run; idle workers past `idleTimeout` are terminated.
 
 The `signal` in the handler context fires when the runner detects a fence loss, exactly as for in-process handlers. The runner forwards an abort message to the worker; the worker translates it into a local `AbortController.abort()` so the handler can bail.
 
@@ -2032,7 +2041,7 @@ When this *is* the right tool: a single handler that synchronously consumes the 
 
 #### Redis fence provider (force-takeover detection)
 
-Pass an optional `fence` provider to add a second source of truth for "is this attempt's fence still alive". The Postgres row remains the canonical record of task state; the provider mirrors the fence value to an external store with a short TTL refreshed by heartbeat. On every heartbeat tick the runner consults both sources -- either reporting "lost" aborts the handler.
+Pass an optional `fence` provider to add a second source of truth for "is this attempt's fence still alive". The Postgres row remains the canonical record of task state; the provider mirrors the fence value to an external store with a short TTL refreshed by heartbeat. On every heartbeat tick the runner consults both sources - either reporting "lost" aborts the handler.
 
 The primary value is force-takeover detection. If an operator manually deletes the fence key (or another instance forcibly releases it), the heartbeat sees the divergence and bails immediately, even if the Postgres `fence_expires_at` would still pass. Useful for ops scenarios like "drain this instance, kick its in-flight tasks off so the recovery sweep on a healthy instance picks them up faster than waiting for the Postgres deadline."
 
@@ -2062,7 +2071,7 @@ The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then p
 
 ## Prometheus metrics
 
-Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled -- every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
+Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled - every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
 
 #### Setup
 
@@ -2150,13 +2159,13 @@ wirePublishRateMetrics(platform, metrics, { topN: 10 });
 export const close = connectionMetricsHook(metrics);
 ```
 
-`wirePublishRateMetrics` registers `ws_topic_publish_rate{topic="..."}` and `ws_topic_publish_bytes{topic="..."}` gauges that read `platform.pressure.topPublishers` at scrape time -- no continuous accounting on the publish hot path. The `topN` cap (default 10) bounds gauge cardinality; the registry's `mapTopic` (or an inline `mapTopic` option) can further collapse user-generated topic names.
+`wirePublishRateMetrics` registers `ws_topic_publish_rate{topic="..."}` and `ws_topic_publish_bytes{topic="..."}` gauges that read `platform.pressure.topPublishers` at scrape time - no continuous accounting on the publish hot path. The `topN` cap (default 10) bounds gauge cardinality; the registry's `mapTopic` (or an inline `mapTopic` option) can further collapse user-generated topic names.
 
 `connectionMetricsHook(metrics, userClose?)` returns a close-hook that emits per-connection histograms (`ws_connection_duration_seconds`, `ws_connection_messages_in` / `_out`, `ws_connection_bytes_in` / `_out`) plus a `ws_connection_close_total{code}` counter from the close-ctx fields the adapter populates. Compose with your own close logic by passing a function as the second argument; it runs after the metrics are recorded:
 
 ```js
 export const close = connectionMetricsHook(metrics, async (ws, ctx) => {
-  // your own teardown -- runs after metrics, with the same ctx
+  // your own teardown - runs after metrics, with the same ctx
 });
 ```
 
@@ -2291,10 +2300,10 @@ Every internal `Map` / `Set` / queue of factory-or-module-level scope declares a
 
 Saturation behavior is matched to each data structure's contract:
 
-- **State the protocol depends on** (`userToInstance` for `sendTo` routing, the secondary index buckets, the cluster-wide user index): **warn-only**. Eviction would corrupt routing or matching, so a single structured `console.warn` fires the first time the cap is crossed -- surfacing the leak shape -- and the index keeps growing.
+- **State the protocol depends on** (`userToInstance` for `sendTo` routing, the secondary index buckets, the cluster-wide user index): **warn-only**. Eviction would corrupt routing or matching, so a single structured `console.warn` fires the first time the cap is crossed - surfacing the leak shape - and the index keeps growing.
 - **State with overwrite-by-key contract**: not currently used in extensions (this saturation shape lives in the adapter's `WS_COALESCED` and the throttle/debounce plugins).
-- **State bounded by the caller** (registry pending requests, presence ws, cursor ws, sharded bus topics, groups local members): **reject new** -- the adding caller surfaces an explicit error, and the saturated entry is not added.
-- **Per-tick microtask batches** (sharded bus relay, pubsub relay): **warn-only** -- the batch is drained every microtask, so reaching the cap in one tick means a synchronous burst leak; the warn surfaces it without dropping any in-flight publishes.
+- **State bounded by the caller** (registry pending requests, presence ws, cursor ws, sharded bus topics, groups local members): **reject new** - the adding caller surfaces an explicit error, and the saturated entry is not added.
+- **Per-tick microtask batches** (sharded bus relay, pubsub relay): **warn-only** - the batch is drained every microtask, so reaching the cap in one tick means a synchronous burst leak; the warn surfaces it without dropping any in-flight publishes.
 
 Caps live as named constants in `shared/caps.js`. They are not currently configurable per-instance; if a real workload needs a tighter or looser bound for a specific module, raise an issue and we'll add a per-factory option.
 
@@ -2329,7 +2338,7 @@ Critical invariants across the extensions are checked at runtime via a two-tier 
 
 | Mode | `assert` behavior | `devAssert` behavior |
 |---|---|---|
-| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** -- a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | full no-op |
+| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** - a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | full no-op |
 | **Test** (`process.env.VITEST` or `NODE_ENV === 'test'`) | counter++, log, and throws so vitest surfaces the failure as a test error | log only, never throws |
 | **Development** (otherwise) | counter++, log, no throw | log only |
 
@@ -2345,13 +2354,13 @@ const metrics = createMetrics();
 wireAssertionMetrics(metrics);
 ```
 
-After wiring, every `assert` violation increments `extensions_assertion_violations_total{category}`. The label cardinality is bounded by the number of distinct categories declared in the source -- not user-input-driven.
+After wiring, every `assert` violation increments `extensions_assertion_violations_total{category}`. The label cardinality is bounded by the number of distinct categories declared in the source - not user-input-driven.
 
 If a counter goes non-zero in production: file an issue with the category name, the log entries, and a description of the workload. The category names follow the convention `<module>.<invariant>` (e.g. `registry.session-shadow.consistency`, `pubsub.envelope.shape`).
 
 #### Reading counters in process
 
-`getAssertionCounters()` from `shared/assert.js` returns the live counter Map. Mirrors the adapter's `platform.assertions` shape -- the Map is the live state, not a snapshot, so consumers holding the reference see updates automatically.
+`getAssertionCounters()` from `shared/assert.js` returns the live counter Map. Mirrors the adapter's `platform.assertions` shape - the Map is the live state, not a snapshot, so consumers holding the reference see updates automatically.
 
 ```js
 import { getAssertionCounters } from 'svelte-adapter-uws-extensions/assert';
@@ -2365,17 +2374,17 @@ if (getAssertionCounters().size > 0) {
 
 ## Failure handling
 
-Every Redis and Postgres extension accepts an optional `breaker` option -- a shared [circuit breaker](#circuit-breaker) that tracks backend health across all extensions wired to it. When the breaker trips, each extension degrades differently depending on whether the operation is critical or best-effort:
+Every Redis and Postgres extension accepts an optional `breaker` option - a shared [circuit breaker](#circuit-breaker) that tracks backend health across all extensions wired to it. When the breaker trips, each extension degrades differently depending on whether the operation is critical or best-effort:
 
 | Extension | Awaited operations (join, consume, publish) | Fire-and-forget operations |
 |---|---|---|
 | **Pub/sub bus** | `wrap().publish()` queues to local platform only; relay to Redis is skipped silently | Microtask relay flush is skipped entirely |
 | **Presence** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh and stale cleanup are skipped |
-| **Replay buffer** | `publish()` / `replay()` / `seq()` throw `CircuitBrokenError` | -- |
-| **Rate limiting** | `consume()` throws `CircuitBrokenError` (fail-closed -- requests are blocked, not allowed through) | -- |
+| **Replay buffer** | `publish()` / `replay()` / `seq()` throw `CircuitBrokenError` | - |
+| **Rate limiting** | `consume()` throws `CircuitBrokenError` (fail-closed - requests are blocked, not allowed through) | - |
 | **Broadcast groups** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh is skipped |
-| **Cursor** | -- | Hash writes and cross-instance relay are skipped; local throttle continues |
-| **LISTEN/NOTIFY** | `activate()` throws; auto-reconnect retries on its own interval | -- |
+| **Cursor** | - | Hash writes and cross-instance relay are skipped; local throttle continues |
+| **LISTEN/NOTIFY** | `activate()` throws; auto-reconnect retries on its own interval | - |
 
 The breaker is a three-state machine: **healthy** (all requests pass through) -> **broken** after N consecutive failures (all requests fail fast via `CircuitBrokenError`) -> **probing** after a timeout (one request is allowed through to test recovery) -> back to **healthy** on success. See [Circuit breaker](#circuit-breaker) for configuration.
 
@@ -2404,16 +2413,16 @@ Both the topic name and the auto-emission are configurable:
 | Option | Default | Description |
 |---|---|---|
 | `systemChannel` | `'__realtime'` | Topic used for `degraded` / `recovered` events. Set to `null` or `false` to disable auto-emission. |
-| `onDegraded` | -- | Server-side handler invoked once on the healthy -> non-healthy transition |
-| `onRecovered` | -- | Server-side handler invoked once on the non-healthy -> healthy transition |
+| `onDegraded` | - | Server-side handler invoked once on the healthy -> non-healthy transition |
+| `onRecovered` | - | Server-side handler invoked once on the non-healthy -> healthy transition |
 
-Auto-emission is local-only -- Redis is what's degraded, so the event reaches local clients via the underlying platform without attempting a relay. Each instance reports its own breaker state to its own clients. If you need different semantics (cross-instance forwarding, custom payload, filtering by failure type), use `breaker.subscribe(handler)` to register your own listener and emit through whichever channel you prefer.
+Auto-emission is local-only - Redis is what's degraded, so the event reaches local clients via the underlying platform without attempting a relay. Each instance reports its own breaker state to its own clients. If you need different semantics (cross-instance forwarding, custom payload, filtering by failure type), use `breaker.subscribe(handler)` to register your own listener and emit through whichever channel you prefer.
 
 ---
 
 ## Cluster publish-rate aggregator
 
-`createPublishRateAggregator` (`svelte-adapter-uws-extensions/redis/publish-rate`) gives every instance a cluster-wide view of which topics are hottest across the whole deployment. Each instance broadcasts its own `platform.pressure.topPublishers` slice on a Redis pub/sub channel; every instance maintains a sliding-window view of all instances' slices and merges them into a cluster-wide top-N. No leader election -- each instance is its own aggregator. Storage cost is `O(instances * topN)` per instance, bounded and small.
+`createPublishRateAggregator` (`svelte-adapter-uws-extensions/redis/publish-rate`) gives every instance a cluster-wide view of which topics are hottest across the whole deployment. Each instance broadcasts its own `platform.pressure.topPublishers` slice on a Redis pub/sub channel; every instance maintains a sliding-window view of all instances' slices and merges them into a cluster-wide top-N. No leader election - each instance is its own aggregator. Storage cost is `O(instances * topN)` per instance, bounded and small.
 
 #### Setup
 
@@ -2462,9 +2471,9 @@ Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; 
 | `publishInterval` | `5000` | How often this instance broadcasts its slice (ms). |
 | `staleAfter` | `12000` | Drop a remote instance's slice if no fresher one arrives within this window (ms). Should be at least `2 * publishInterval`. |
 | `topN` | `20` | Cap on per-instance slice and merged result. Bounds storage cost. Also caps the `subs` slice (sorted descending by `count`). |
-| `subjects` | -- | Optional `() => Array<{topic, count}>` contributor for cluster-wide subscriber counts. Called fresh on every broadcast tick. When wired, the envelope grows a `subs` field and `subscribersOf(topic)` returns the merged sum. Pair with the sharded bus via `subjects: () => bus.localSubjects(platform)`. |
-| `breaker` | -- | Optional circuit breaker for the publish call. |
-| `metrics` | -- | Optional Prometheus metrics registry. |
+| `subjects` | - | Optional `() => Array<{topic, count}>` contributor for cluster-wide subscriber counts. Called fresh on every broadcast tick. When wired, the envelope grows a `subs` field and `subscribersOf(topic)` returns the merged sum. Pair with the sharded bus via `subjects: () => bus.localSubjects(platform)`. |
+| `breaker` | - | Optional circuit breaker for the publish call. |
+| `metrics` | - | Optional Prometheus metrics registry. |
 
 #### Pairing with admission control
 
@@ -2495,7 +2504,7 @@ const cluster = busWithCluster.subscribers('chat:room-7');
 // Local count + sum from non-stale remote instances.
 ```
 
-Without an aggregator wired, `bus.subscribers(topic)` returns the local count only -- same number `platform.subscribers(topic)` reports. Eventually-consistent within `publishInterval` for the remote contribution; the local read is always live. For exact counts (audit log, billing), track a Redis SET cluster-wide on subscribe / unsubscribe and `SCARD` it.
+Without an aggregator wired, `bus.subscribers(topic)` returns the local count only - same number `platform.subscribers(topic)` reports. Eventually-consistent within `publishInterval` for the remote contribution; the local read is always live. For exact counts (audit log, billing), track a Redis SET cluster-wide on subscribe / unsubscribe and `SCARD` it.
 
 The unsharded `createPubSubBus` does not track per-topic state (it forwards every topic through a single Redis channel), so it does not expose `localSubjects` / `subscribers`. Apps that need cluster-wide subscriber counts on the unsharded bus thread their own per-topic state into the aggregator's `subjects` callback.
 
@@ -2503,8 +2512,8 @@ The unsharded `createPubSubBus` does not track per-topic state (it forwards ever
 
 `wireClusterPublishRateMetrics(aggregator, metrics, { topN })` registers two gauges that scrape the merged top-N at collect time:
 
-- `cluster_topic_publish_rate{topic}` -- cluster-wide messagesPerSec, summed across instances
-- `cluster_topic_publish_bytes{topic}` -- cluster-wide bytesPerSec, summed across instances
+- `cluster_topic_publish_rate{topic}` - cluster-wide messagesPerSec, summed across instances
+- `cluster_topic_publish_bytes{topic}` - cluster-wide bytesPerSec, summed across instances
 
 Both wirers (per-instance via `wirePublishRateMetrics`, cluster via `wireClusterPublishRateMetrics`) can be active simultaneously. The local view shows hot-shard pressure; the cluster view shows global capacity.
 
@@ -2524,9 +2533,9 @@ Both wirers (per-instance via `wirePublishRateMetrics`, cluster via `wireCluster
 Prevents thundering herd when a backend goes down. When Redis or Postgres becomes unreachable, every extension that uses the breaker fails fast instead of queueing up timeouts, and fire-and-forget operations (heartbeats, relay flushes, cursor broadcasts) are skipped entirely.
 
 Three states:
-- **healthy** -- everything works, requests go through
-- **broken** -- too many failures, requests fail fast via `CircuitBrokenError`
-- **probing** -- one request is allowed through to test if the backend is back
+- **healthy** - everything works, requests go through
+- **broken** - too many failures, requests fail fast via `CircuitBrokenError`
+- **probing** - one request is allowed through to test if the backend is back
 
 #### Setup
 
@@ -2590,7 +2599,7 @@ try {
   await replay.publish(platform, 'chat', 'msg', data);
 } catch (err) {
   if (err instanceof CircuitBrokenError) {
-    // Backend is down -- degrade gracefully
+    // Backend is down - degrade gracefully
     platform.publish('chat', 'msg', data); // local-only delivery
   }
 }
@@ -2600,7 +2609,7 @@ try {
 
 ## Admission control
 
-Pressure-aware companion to the [circuit breaker](#circuit-breaker). Where the breaker answers "is the backend up?", admission control answers "are we OK to take more work right now?" -- using the adapter's `platform.pressure` signal (memory, publish rate, subscriber ratio) to gate non-critical work before it ever reaches a backend.
+Pressure-aware companion to the [circuit breaker](#circuit-breaker). Where the breaker answers "is the backend up?", admission control answers "are we OK to take more work right now?" - using the adapter's `platform.pressure` signal (memory, publish rate, subscriber ratio) to gate non-critical work before it ever reaches a backend.
 
 Requires `svelte-adapter-uws >= 0.5.0-next.1` (the version that ships `platform.pressure`).
 
@@ -2633,7 +2642,7 @@ export async function POST({ platform, request }) {
 }
 ```
 
-Each class is independently configured. The adapter has already collapsed concurrent signals (memory, publish rate, subscribers) into a single most-urgent `reason` -- this controller just maps the resolved reason to a per-class accept/reject decision.
+Each class is independently configured. The adapter has already collapsed concurrent signals (memory, publish rate, subscribers) into a single most-urgent `reason` - this controller just maps the resolved reason to a per-class accept/reject decision.
 
 #### Class rule shapes
 
@@ -2658,7 +2667,7 @@ Valid reason strings: `'NONE'`, `'PUBLISH_RATE'`, `'SUBSCRIBERS'`, `'MEMORY'`. I
 | Option | Default | Description |
 |---|---|---|
 | `classes` | (required) | Map of class name to admission rule. Must define at least one class. |
-| `metrics` | -- | Prometheus metrics registry. |
+| `metrics` | - | Prometheus metrics registry. |
 
 #### API
 
@@ -2666,7 +2675,7 @@ Valid reason strings: `'NONE'`, `'PUBLISH_RATE'`, `'SUBSCRIBERS'`, `'MEMORY'`. I
 |---|---|
 | `shouldAccept(className, platform)` | Returns `true` to admit, `false` to shed. Throws on unknown class name (typo defense) or missing `platform.pressure`. |
 
-`shouldAccept` reads `platform.pressure` via a property access -- no I/O, safe to call on every request hot path. The reason-precedence math (memory > publish rate > subscribers > none) lives in the adapter; this method only checks the resolved `reason` against the configured rule.
+`shouldAccept` reads `platform.pressure` via a property access - no I/O, safe to call on every request hot path. The reason-precedence math (memory > publish rate > subscribers > none) lives in the adapter; this method only checks the resolved `reason` against the configured rule.
 
 #### Composition with the breaker
 
@@ -2674,7 +2683,7 @@ Admission control and the circuit breaker check independent signals. Use them to
 
 ```js
 export async function POST({ platform, request }) {
-  // Local pressure check first -- cheaper, no Redis call.
+  // Local pressure check first - cheaper, no Redis call.
   if (!ac.shouldAccept('normal', platform)) {
     return new Response('busy', { status: 503 });
   }
@@ -2695,7 +2704,7 @@ The two layers complement each other: admission control prevents new work from p
 
 #### Cluster-aware shedding (`clusterTopPublisher` rule)
 
-`platform.pressure.topPublishers` is per-instance. In an N-instance cluster, a topic that's hot across every instance simultaneously looks the same locally as one that's only hot here -- but it warrants a different response. The `clusterTopPublisher` rule consults a `createPublishRateAggregator` (`redis/publish-rate`) to shed at the cluster layer:
+`platform.pressure.topPublishers` is per-instance. In an N-instance cluster, a topic that's hot across every instance simultaneously looks the same locally as one that's only hot here - but it warrants a different response. The `clusterTopPublisher` rule consults a `createPublishRateAggregator` (`redis/publish-rate`) to shed at the cluster layer:
 
 ```js
 import { createPublishRateAggregator } from 'svelte-adapter-uws-extensions/redis/publish-rate';
@@ -2721,7 +2730,7 @@ The rule's check is a memory-only lookup (`aggregator.rateOf(topic)` against the
 
 #### Two-tier admission (handshake + message)
 
-The adapter ships a separate admission layer at the WebSocket handshake path -- before any TLS / header work -- via the `upgradeAdmission` option on its `wsOptions` (and on `createTestServer` for test harnesses). The two layers operate at different points in the connection lifecycle and are configured independently:
+The adapter ships a separate admission layer at the WebSocket handshake path - before any TLS / header work - via the `upgradeAdmission` option on its `wsOptions` (and on `createTestServer` for test harnesses). The two layers operate at different points in the connection lifecycle and are configured independently:
 
 | Layer | Where | Sheds | Configured via |
 |---|---|---|---|
@@ -2758,7 +2767,7 @@ export function message(ws, { data, platform }) {
 }
 ```
 
-Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race -- the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission) section for the handshake-tier reference.
+Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race - the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission) section for the handshake-tier reference.
 
 ---
 
@@ -2766,18 +2775,18 @@ Connections that make it past the handshake are not exempt from message-tier she
 
 `createFunctionLibrary` (`svelte-adapter-uws-extensions/redis/functions`) is a thin wrapper over Redis 7+ `FUNCTION LOAD` / `FCALL`. Versioned, hot-reloadable server-side scripts: ship a new library version and `load()` swaps it in atomically without an app redeploy.
 
-The library code is plain Lua and must start with `#!lua name=<libname>` -- the wrapper parses the name from the shebang. Inside the library, declare functions via `redis.register_function(...)`. Function names are global on the Redis server (not namespaced by library), which is why `call(funcName, ...)` keys on function name only.
+The library code is plain Lua and must start with `#!lua name=<libname>` - the wrapper parses the name from the shebang. Inside the library, declare functions via `redis.register_function(...)`. Function names are global on the Redis server (not namespaced by library), which is why `call(funcName, ...)` keys on function name only.
 
 ```js
 import { createFunctionLibrary } from 'svelte-adapter-uws-extensions/redis/functions';
 
 const lib = createFunctionLibrary(redis, `#!lua name=ws-presence
 redis.register_function('cleanup', function(keys, args)
-  -- args[1] = now (ms), args[2] = ttl (ms)
+  - args[1] = now (ms), args[2] = ttl (ms)
   local now = tonumber(args[1])
   local ttl = tonumber(args[2])
   local removed = 0
-  -- ... iterate hash fields, HDEL stale ...
+  - ... iterate hash fields, HDEL stale ...
   return removed
 end)
 `);
@@ -2795,8 +2804,8 @@ await lib.delete();  // FUNCTION DELETE
 
 | Option | Default | Description |
 |---|---|---|
-| `metrics` | -- | Prometheus metrics registry. |
-| `breaker` | -- | Circuit breaker instance. |
+| `metrics` | - | Prometheus metrics registry. |
+| `breaker` | - | Circuit breaker instance. |
 
 #### API
 
@@ -2804,7 +2813,7 @@ await lib.delete();  // FUNCTION DELETE
 |---|---|
 | `lib.name` | Library name parsed from the shebang |
 | `lib.load()` | `FUNCTION LOAD REPLACE`. Runs `INFO server` on first call and throws on Redis < 7. Idempotent. |
-| `lib.call(funcName, { keys?, args? })` | `FCALL` -- returns the function's return value |
+| `lib.call(funcName, { keys?, args? })` | `FCALL` - returns the function's return value |
 | `lib.delete()` | `FUNCTION DELETE <libname>` |
 
 #### When to use this vs `redis.eval`
@@ -2933,11 +2942,11 @@ describe('rate limiting', () => {
 | Export | What it mocks | Supports |
 |---|---|---|
 | `mockRedisClient(prefix?)` | `createRedisClient()` | Strings, hashes, sorted sets, pub/sub, pipelines, scan, Lua eval for all extension scripts |
-| `mockPlatform()` | Platform API | `publish()`, `send()`, `batch()`, `topic()` -- records all calls in `.published` and `.sent` |
+| `mockPlatform()` | Platform API | `publish()`, `send()`, `batch()`, `topic()` - records all calls in `.published` and `.sent` |
 | `mockWs(userData?)` | uWS WebSocket | `subscribe()`, `unsubscribe()`, `getUserData()`, `getBufferedAmount()`, `close()` |
 | `mockPgClient()` | `createPgClient()` | SQL parsing for replay buffer operations, sequence counters |
 
-The circuit breaker (`createCircuitBreaker()`) is pure logic with no I/O -- use it directly in tests, no mock needed.
+The circuit breaker (`createCircuitBreaker()`) is pure logic with no I/O - use it directly in tests, no mock needed.
 
 #### Adapter wire-shape helpers
 
@@ -2959,17 +2968,17 @@ import {
 
 The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing-your-own-handlers) for the per-helper reference.
 
-`createTestServer` is intentionally not re-exported -- it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
+`createTestServer` is intentionally not re-exported - it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
 
-The adapter's `__chaos` harness on `createTestServer` covers the WS-frame outbound path (drop / delay frames going to connected clients). It does **not** reach traffic on other transports -- ioredis, pg, NATS, custom HTTP backends -- because each of those goes through its own client, not through the test server's outbound chokepoint. To inject faults at those wires, wrap the transport client in a chaos proxy: `createChaosState` is re-exported above and composes with any client method via a small `Proxy` wrapper. See the adapter's [Wrap your own transport for cross-wire chaos](https://github.com/lanteanio/svelte-adapter-uws#wrap-your-own-transport-for-cross-wire-chaos) section for the pattern. The `__chaos` JSDoc on the adapter's [testing.d.ts](https://github.com/lanteanio/svelte-adapter-uws/blob/main/testing.d.ts) names the WS-only scope explicitly so tests reaching for cross-wire coverage see the boundary at the type level.
+The adapter's `__chaos` harness on `createTestServer` covers the WS-frame outbound path (drop / delay frames going to connected clients). It does **not** reach traffic on other transports - ioredis, pg, NATS, custom HTTP backends - because each of those goes through its own client, not through the test server's outbound chokepoint. To inject faults at those wires, wrap the transport client in a chaos proxy: `createChaosState` is re-exported above and composes with any client method via a small `Proxy` wrapper. See the adapter's [Wrap your own transport for cross-wire chaos](https://github.com/lanteanio/svelte-adapter-uws#wrap-your-own-transport-for-cross-wire-chaos) section for the pattern. The `__chaos` JSDoc on the adapter's [testing.d.ts](https://github.com/lanteanio/svelte-adapter-uws/blob/main/testing.d.ts) names the WS-only scope explicitly so tests reaching for cross-wire coverage see the boundary at the type level.
 
 ---
 
 ## Related projects
 
-- [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) -- The core adapter this package extends. Single-process WebSocket pub/sub, presence, replay, and more for SvelteKit on uWebSockets.js.
-- [svelte-realtime](https://github.com/lanteanio/svelte-realtime) -- Opinionated full-stack starter built on the adapter. Auth, database, real-time CRUD, and deployment config out of the box.
-- [svelte-realtime-demo](https://github.com/lanteanio/svelte-realtime-demo) -- Live demo of svelte-realtime. [Try it here.](https://svelte-realtime-demo.lantean.io/)
+- [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) - The core adapter this package extends. Single-process WebSocket pub/sub, presence, replay, and more for SvelteKit on uWebSockets.js.
+- [svelte-realtime](https://github.com/lanteanio/svelte-realtime) - Opinionated full-stack starter built on the adapter. Auth, database, real-time CRUD, and deployment config out of the box.
+- [svelte-realtime-demo](https://github.com/lanteanio/svelte-realtime-demo) - Live demo of svelte-realtime. [Try it here.](https://svelte-realtime-demo.lantean.io/)
 
 ---
 

@@ -33,6 +33,9 @@ local maxPoints = tonumber(ARGV[1])
 local interval = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
 local blockDuration = tonumber(ARGV[4])
+if maxPoints == nil or interval == nil or cost == nil or blockDuration == nil then
+  return redis.error_reply('CONSUME: maxPoints/interval/cost/blockDuration must be numeric')
+end
 
 -- Use Redis server time to avoid clock skew between app server and Redis
 local rtime = redis.call('TIME')
@@ -91,6 +94,9 @@ local key = KEYS[1]
 local duration = tonumber(ARGV[1])
 local defaultPoints = tonumber(ARGV[2])
 local defaultInterval = tonumber(ARGV[3])
+if duration == nil or defaultPoints == nil or defaultInterval == nil then
+  return redis.error_reply('BAN: duration/defaultPoints/defaultInterval must be numeric')
+end
 
 local rtime = redis.call('TIME')
 local now = tonumber(rtime[1]) * 1000 + math.floor(tonumber(rtime[2]) / 1000)
@@ -176,7 +182,7 @@ export function createRateLimit(client, options) {
 	 * Resolve the rate limit key for a WebSocket connection.
 	 *
 	 * In 'ip' mode (default), uses `userData.remoteAddress` which the core
-	 * adapter v0.4.0+ resolves via ADDRESS_HEADER/XFF_DEPTH — so this is
+	 * adapter v0.4.0+ resolves via ADDRESS_HEADER/XFF_DEPTH - so this is
 	 * the real client IP when behind a proxy, not the raw socket address.
 	 * Falls back to `ip`, `address`, then 'unknown'.
 	 */

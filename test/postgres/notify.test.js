@@ -228,7 +228,7 @@ describe('postgres notify bridge', () => {
 
 			// Should be able to call activate again (not stuck)
 			await expect(bridge.activate(platform)).rejects.toThrow('connection refused');
-			// The point is it doesn't silently return -- it actually retries
+			// The point is it doesn't silently return - it actually retries
 		});
 	});
 
@@ -355,7 +355,7 @@ describe('postgres notify bridge', () => {
 			bridge = createNotifyBridge(client, { channel: 'changes' });
 			await bridge.activate(platform1);
 
-			// Second activate -- idempotent for the listener, but updates platform
+			// Second activate - idempotent for the listener, but updates platform
 			await bridge.activate(platform2);
 
 			client._simulate('changes', JSON.stringify({

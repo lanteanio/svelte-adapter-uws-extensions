@@ -32,7 +32,7 @@ export {
 	WS_REQUEST_ID_KEY
 } from 'svelte-adapter-uws/testing';
 
-// -- Mock Redis ---------------------------------------------------------------
+// - Mock Redis ---------------------------------------------------------------
 
 export interface MockRedisClient extends RedisClient {
 	/** Direct access to the string store (key -> value). */
@@ -50,7 +50,7 @@ export interface MockRedisClient extends RedisClient {
  */
 export function mockRedisClient(keyPrefix?: string): MockRedisClient;
 
-// -- Mock Platform ------------------------------------------------------------
+// - Mock Platform ------------------------------------------------------------
 
 export interface MockPlatform {
 	/** All `publish()` calls recorded as `{ topic, event, data, options }`. */
@@ -109,7 +109,7 @@ export function mockPlatform(): MockPlatform;
  */
 export const PLATFORM_KEYS: ReadonlyArray<string>;
 
-// -- Mock WebSocket -----------------------------------------------------------
+// - Mock WebSocket -----------------------------------------------------------
 
 export interface MockWs<T extends Record<string, any> = Record<string, any>> {
 	getUserData(): T;
@@ -130,7 +130,7 @@ export interface MockWs<T extends Record<string, any> = Record<string, any>> {
  */
 export function mockWs<T extends Record<string, any> = Record<string, any>>(userData?: T): MockWs<T>;
 
-// -- Mock Postgres ------------------------------------------------------------
+// - Mock Postgres ------------------------------------------------------------
 
 export interface MockPgClient {
 	readonly pool: {};

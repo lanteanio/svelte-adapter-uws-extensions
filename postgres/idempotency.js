@@ -28,8 +28,9 @@
  * @module svelte-adapter-uws-extensions/postgres/idempotency
  */
 
-import { safeCreate } from '../shared/pg-migrate.js';
+import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 
 /**
  * @typedef {Object} PgIdempotencyOptions
@@ -75,9 +76,7 @@ export function createIdempotencyStore(client, options = {}) {
 	const autoMigrate = options.autoMigrate !== false;
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 60000;
 
-	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
-		throw new Error(`postgres idempotency: invalid table name "${table}"`);
-	}
+	assertSafeTableName(table, 'postgres idempotency');
 
 	const b = options.breaker;
 	const m = options.metrics;
@@ -116,6 +115,9 @@ export function createIdempotencyStore(client, options = {}) {
 	function validateKey(idempotencyKey) {
 		if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
 			throw new Error('postgres idempotency: idempotencyKey must be a non-empty string');
+		}
+		if (idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+			throw new Error('postgres idempotency: idempotencyKey must be at most ' + MAX_IDEMPOTENCY_KEY_LENGTH + ' characters');
 		}
 	}
 
@@ -169,7 +171,7 @@ export function createIdempotencyStore(client, options = {}) {
 		// Insert a fresh pending row, OR take over an existing row whose
 		// expires_at has passed (crashed owner / expired cached result).
 		// `xmax = 0` distinguishes a fresh insert from a takeover but we
-		// only need to know "did we end up owning this row" -- both paths
+		// only need to know "did we end up owning this row" - both paths
 		// return at least one row.
 		const ins = await client.query({
 			name: 'idem_acquire_' + table,

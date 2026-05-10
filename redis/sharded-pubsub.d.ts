@@ -38,6 +38,23 @@ export interface ShardedBusOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+
+	/**
+	 * Reject inbound bus envelopes larger than this many bytes before
+	 * `JSON.parse` runs. Defends against a hostile co-tenant or
+	 * compromised peer flooding the cluster bus with oversized payloads.
+	 * @default 1048576 (1 MB)
+	 */
+	maxEnvelopeBytes?: number;
+
+	/**
+	 * When `false`, inbound envelopes addressed to `__`-prefixed topics
+	 * are dropped. Belt-and-suspenders defense in depth on top of the
+	 * adapter's wire-level subscribe gate; safe to flip when the app
+	 * publishes only on user-space topics.
+	 * @default true
+	 */
+	allowSystemTopics?: boolean;
 }
 
 export interface ShardedBus {

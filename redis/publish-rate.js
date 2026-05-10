@@ -4,13 +4,13 @@
  * Each instance broadcasts its own per-topic slice (sampled from
  * `platform.pressure.topPublishers`) on a Redis pub/sub channel; every
  * instance maintains a sliding-window view of all instances' slices and
- * merges them into a cluster-wide top-N. No leader election -- each
+ * merges them into a cluster-wide top-N. No leader election - each
  * instance is its own aggregator. Storage cost is `O(instances * topN)`
  * per instance, bounded and small.
  *
  * Why this exists: `platform.pressure.topPublishers` is per-instance.
  * In an N-instance cluster, a topic that's hot across every instance
- * looks the same locally as one that's only hot here -- but it warrants
+ * looks the same locally as one that's only hot here - but it warrants
  * a different response. Cluster-wide pressure is genuine load; local-only
  * is a hot-shard signal. The cluster `topPublisher` admission rule
  * (`shared/admission.js`) reads the merged view to shed at the cluster

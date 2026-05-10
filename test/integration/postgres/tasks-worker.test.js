@@ -194,7 +194,7 @@ describe('postgres tasks worker-thread mode (integration)', () => {
 		// heartbeat stopped refreshing it. The surviving instance's
 		// recovery sweep observes the elapsed fence, claims the row
 		// (bumping attempts and rotating the fence), and dispatches the
-		// handler -- which here is a worker-thread handler.
+		// handler - which here is a worker-thread handler.
 		//
 		// Plants the stuck row directly via SQL so the test does not
 		// depend on simulating a worker crash (the pool's exit handler

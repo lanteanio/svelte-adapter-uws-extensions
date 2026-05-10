@@ -13,11 +13,15 @@ export const CLEANUP_SCRIPT = `-- CLEANUP_STALE
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local ttlMs = tonumber(ARGV[2])
+if now == nil or ttlMs == nil then
+  return redis.error_reply('CLEANUP: now/ttlMs must be numeric')
+end
 local all = redis.call('hgetall', key)
 local stale = {}
 for i = 1, #all, 2 do
   local ok, parsed = pcall(cjson.decode, all[i+1])
-  if not ok or not parsed.ts or (now - parsed.ts) > ttlMs then
+  local ts = ok and parsed and tonumber(parsed.ts) or nil
+  if not ts or (now - ts) > ttlMs then
     stale[#stale + 1] = all[i]
   end
 end
@@ -42,10 +46,14 @@ export const COUNT_SCRIPT = `
 local all = redis.call('hgetall', KEYS[1])
 local now = tonumber(ARGV[1])
 local ttlMs = tonumber(ARGV[2])
+if now == nil or ttlMs == nil then
+  return redis.error_reply('COUNT: now/ttlMs must be numeric')
+end
 local count = 0
 for i = 1, #all, 2 do
   local ok, parsed = pcall(cjson.decode, all[i+1])
-  if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
+  local ts = ok and parsed and tonumber(parsed.ts) or nil
+  if ts and (now - ts) <= ttlMs then
     count = count + 1
   end
 end
@@ -67,10 +75,14 @@ export const COUNT_DEDUP_SCRIPT = `
 local all = redis.call('hgetall', KEYS[1])
 local now = tonumber(ARGV[1])
 local ttlMs = tonumber(ARGV[2])
+if now == nil or ttlMs == nil then
+  return redis.error_reply('COUNT_DEDUP: now/ttlMs must be numeric')
+end
 local seen = {}
 for i = 1, #all, 2 do
   local ok, parsed = pcall(cjson.decode, all[i+1])
-  if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
+  local ts = ok and parsed and tonumber(parsed.ts) or nil
+  if ts and (now - ts) <= ttlMs then
     local sep = string.find(all[i], '|', 1, true)
     local userKey = sep and string.sub(all[i], sep + 1) or all[i]
     seen[userKey] = true
@@ -98,15 +110,19 @@ export const LIST_SCRIPT = `
 local all = redis.call('hgetall', KEYS[1])
 local now = tonumber(ARGV[1])
 local ttlMs = tonumber(ARGV[2])
+if now == nil or ttlMs == nil then
+  return redis.error_reply('LIST: now/ttlMs must be numeric')
+end
 local seen = {}
 local best = {}
 for i = 1, #all, 2 do
   local ok, parsed = pcall(cjson.decode, all[i+1])
-  if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
+  local ts = ok and parsed and tonumber(parsed.ts) or nil
+  if ts and (now - ts) <= ttlMs then
     local sep = string.find(all[i], '|', 1, true)
     local userKey = sep and string.sub(all[i], sep + 1) or all[i]
-    if not seen[userKey] or parsed.ts > seen[userKey] then
-      seen[userKey] = parsed.ts
+    if not seen[userKey] or ts > seen[userKey] then
+      seen[userKey] = ts
       best[userKey] = all[i+1]
     end
   end

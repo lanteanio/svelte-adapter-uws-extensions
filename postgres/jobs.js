@@ -28,7 +28,7 @@
  * @module svelte-adapter-uws-extensions/postgres/jobs
  */
 
-import { safeCreate } from '../shared/pg-migrate.js';
+import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
 
 /**
@@ -57,9 +57,7 @@ import { withBreaker } from '../shared/breaker.js';
  */
 export function createJobQueue(client, options = {}) {
 	const table = options.table || 'svti_jobs';
-	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
-		throw new Error(`postgres jobs: invalid table name "${table}"`);
-	}
+	assertSafeTableName(table, 'postgres jobs');
 	const autoMigrate = options.autoMigrate !== false;
 	const defaultVisibilityTimeout = options.visibilityTimeout ?? 30000;
 	if (typeof defaultVisibilityTimeout !== 'number' || !Number.isFinite(defaultVisibilityTimeout) || defaultVisibilityTimeout <= 0) {

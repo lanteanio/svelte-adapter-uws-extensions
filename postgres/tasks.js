@@ -23,7 +23,7 @@
  *     name                 TEXT         NOT NULL,
  *     input                JSONB,
  *     svti_idempotency_key TEXT,
- *     status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+ *     status               TEXT         NOT NULL,  - 'running' | 'committed' | 'failed'
  *     result               JSONB,
  *     error                JSONB,
  *     fence                UUID         NOT NULL,
@@ -51,6 +51,7 @@ import {
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql } from './_tasks-sql.js';
 import { withBreaker } from '../shared/breaker.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS } from '../shared/caps.js';
 
 export { TaskInFlightError, UnknownTaskError };
@@ -83,7 +84,7 @@ export { TaskInFlightError, UnknownTaskError };
  * @property {number} [cleanupInterval=3600000] - ms between cleanup sweeps. 0 disables.
  * @property {number} [rowTtl=604800] - Seconds to keep terminal rows (committed/failed) before deletion. Default 7 days.
  * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
- * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern -- still wants `postgres/notify`.
+ * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern - still wants `postgres/notify`.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional Prometheus metrics registry.
  */
@@ -124,7 +125,6 @@ export { TaskInFlightError, UnknownTaskError };
  */
 
 const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
-const TABLE_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 function defaultBackoff(attempt) {
 	return Math.min(1000 * 2 ** (attempt - 1), 60000);
@@ -189,9 +189,7 @@ export function createTaskRunner(client, options = {}) {
 	}
 
 	const table = options.table || 'svti_tasks';
-	if (!TABLE_PATTERN.test(table)) {
-		throw new Error(`postgres tasks: invalid table name "${table}"`);
-	}
+	assertSafeTableName(table, 'postgres tasks');
 
 	const fenceTtl = options.fenceTtl || 60;
 	const heartbeatInterval = options.heartbeatInterval || Math.max(1000, Math.floor(fenceTtl * 1000 / 3));
@@ -399,7 +397,7 @@ export function createTaskRunner(client, options = {}) {
 					// Row is still running under someone else's fence: yield
 					// the result we just produced; the canonical commit will
 					// land via that other worker. No state-change fires
-					// here -- the canonical writer fires on commit.
+					// here - the canonical writer fires on commit.
 					mRunCommit?.inc({ name });
 					return result;
 				}
@@ -623,12 +621,19 @@ export function createTaskRunner(client, options = {}) {
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
 			}
+			if (idempotencyKey !== undefined && idempotencyKey.length > 256) {
+				throw new Error('postgres tasks: idempotencyKey must be at most 256 characters');
+			}
 			const requestId = resolveRequestId(runOptions);
 
 			await sql.ensureTable();
 
 			if (idempotency && idempotencyKey) {
-				const slot = await idempotency.acquire(idempotencyKey);
+				// Namespace by task name so the same user-supplied
+				// idempotencyKey across different tasks lands in
+				// different slots.
+				const cacheKey = 'task:' + name + ':' + idempotencyKey;
+				const slot = await idempotency.acquire(cacheKey);
 				if (slot.acquired) {
 					try {
 						const result = await runWithoutCache(name, input, idempotencyKey, requestId);
@@ -657,6 +662,9 @@ export function createTaskRunner(client, options = {}) {
 			const idempotencyKey = runOptions.idempotencyKey;
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
+			}
+			if (idempotencyKey !== undefined && idempotencyKey.length > 256) {
+				throw new Error('postgres tasks: idempotencyKey must be at most 256 characters');
 			}
 			const requestId = resolveRequestId(runOptions);
 
@@ -759,7 +767,7 @@ export function createTaskRunner(client, options = {}) {
 			// Compose: when a Redis fence provider is configured, releasing
 			// the mirror key cuts abort latency from O(heartbeatInterval) to
 			// the next heartbeat tick (the heartbeat first checks the
-			// external store before the Postgres row). Best-effort -- a
+			// external store before the Postgres row). Best-effort - a
 			// failure here just means abort waits for the Postgres heartbeat
 			// to observe the expired fence_expires_at, which still happens.
 			if (fenceProvider) {
@@ -809,7 +817,7 @@ function shapeTaskRow(row) {
 		result: row.result,
 		// row.error is the JSONB-stored shape from serialiseError (already
 		// parsed by pg). Pass it through directly: {name, message, stack?,
-		// code?, cause?} -- JSON-serialisable for UIs / dashboards.
+		// code?, cause?} - JSON-serialisable for UIs / dashboards.
 		// Callers wanting a live Error can do Object.assign(new Error(e.message), e).
 		error: row.error ?? null,
 		attempts: row.attempts,

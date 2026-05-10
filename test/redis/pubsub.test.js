@@ -765,7 +765,7 @@ describe('redis pubsub bus', () => {
 			const localSystem = platform.published.find((p) => p.topic === '__realtime');
 			expect(localSystem).toBeDefined();
 
-			// No relay went through Redis -- the bus emits directly via the
+			// No relay went through Redis - the bus emits directly via the
 			// underlying platform, not the wrapped one.
 			const relayed = redisCalls.find((c) => {
 				try { return JSON.parse(c.msg).topic === '__realtime'; } catch { return false; }

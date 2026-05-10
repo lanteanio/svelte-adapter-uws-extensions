@@ -4,7 +4,7 @@
  * NOTE on standalone vs cluster: this stack runs a single standalone
  * Redis 7. Standalone Redis accepts SPUBLISH/SSUBSCRIBE/SUNSUBSCRIBE
  * commands and routes messages between subscribers, but there is no
- * shard topology -- so the "shard isolation" guarantee that matters in
+ * shard topology - so the "shard isolation" guarantee that matters in
  * a real cluster (a SPUBLISH only fans out to the shard owning the
  * channel) is not exercisable here. What we CAN verify on standalone:
  *
@@ -549,7 +549,7 @@ describe('redis sharded pubsub bus (integration)', () => {
 				(p) => p.event === 'msg' && p.data && p.data.topic === 't4'
 			) !== undefined);
 
-			// t2 stays unfollowed -- still no delivery.
+			// t2 stays unfollowed - still no delivery.
 			busA.wrap(platformA).publish('t2', 'msg', { topic: 't2' });
 			await wait(150);
 			const t2 = platformB.published.find(

@@ -43,6 +43,15 @@ export interface RedisCursorOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+
+	/**
+	 * Reject inbound cursor envelopes larger than this many bytes before
+	 * `JSON.parse` runs. The inner topic is always validated against the
+	 * `__` denylist (the module constructs its own `__cursor:` wrapper
+	 * prefix), so no `allowSystemTopics` knob is exposed here.
+	 * @default 1048576 (1 MB)
+	 */
+	maxEnvelopeBytes?: number;
 }
 
 export interface CursorEntry {

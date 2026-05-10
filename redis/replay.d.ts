@@ -169,7 +169,7 @@ export interface RedisReplayBuffer {
 	 * already broadcast; live consumers either got it then or will
 	 * pick it up via `replay()` on reconnect).
 	 *
-	 * @returns `{ seq, isDuplicate }` -- `isDuplicate` is `true` when
+	 * @returns `{ seq, isDuplicate }` - `isDuplicate` is `true` when
 	 *   served from the dedup cache.
 	 */
 	publishIdempotent?(

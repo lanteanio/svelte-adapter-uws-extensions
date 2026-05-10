@@ -186,7 +186,7 @@ export function createDistributedLock(client, options = {}) {
 				}
 			} catch (err) {
 				breaker?.failure(err);
-				// A flaky heartbeat does not abort by itself -- the next tick
+				// A flaky heartbeat does not abort by itself - the next tick
 				// retries. The TTL is still on track unless heartbeats stay
 				// failing past `ttlMs`, at which point the next tick will
 				// observe the absent key and abort cleanly.

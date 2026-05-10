@@ -250,4 +250,48 @@ describe('redis ratelimit (integration)', () => {
 			expect(ttl).toBeLessThanOrEqual(60_000 + 60_000);
 		});
 	});
+
+	// Production paths validate ARGV in JS BEFORE EVAL, but bypassing
+	// the JS layer (a future plugin author who passes user-supplied data
+	// without validation, or a direct `redis.eval` against the script
+	// literal) used to crash the script with "attempt to compare nil
+	// with number". The defensive tonumber + redis.error_reply now
+	// turns those into a clean rejection rather than a Lua-level crash.
+	describe('CONSUME / BAN scripts reject non-numeric ARGV cleanly', () => {
+		// Script source mirrors the constants at the top of redis/ratelimit.js.
+		const CONSUME_SCRIPT = `
+local key = KEYS[1]
+local maxPoints = tonumber(ARGV[1])
+local interval = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local blockDuration = tonumber(ARGV[4])
+if maxPoints == nil or interval == nil or cost == nil or blockDuration == nil then
+  return redis.error_reply('CONSUME: maxPoints/interval/cost/blockDuration must be numeric')
+end
+return {1, 0, 0}
+`;
+
+		it('CONSUME with non-numeric maxPoints returns a clean error reply', async () => {
+			const key = client.key('lua-poison:consume:1');
+			await expect(
+				client.redis.eval(CONSUME_SCRIPT, 1, key, 'hostile', 1000, 1, 0)
+			).rejects.toThrow(/CONSUME.*numeric/);
+		});
+
+		it('CONSUME with non-numeric interval/cost/blockDuration each return a clean error', async () => {
+			const key = client.key('lua-poison:consume:2');
+			// `tonumber` in Lua treats some special strings ('NaN', 'inf')
+			// as numbers; use unambiguously non-numeric inputs so the nil
+			// branch is the one we exercise.
+			await expect(
+				client.redis.eval(CONSUME_SCRIPT, 1, key, 5, 'not-a-number', 1, 0)
+			).rejects.toThrow(/CONSUME/);
+			await expect(
+				client.redis.eval(CONSUME_SCRIPT, 1, key, 5, 1000, 'oops', 0)
+			).rejects.toThrow(/CONSUME/);
+			await expect(
+				client.redis.eval(CONSUME_SCRIPT, 1, key, 5, 1000, 1, 'forever')
+			).rejects.toThrow(/CONSUME/);
+		});
+	});
 });

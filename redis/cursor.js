@@ -21,6 +21,7 @@ import { CLEANUP_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 
 /** Wire-protocol event names this module emits. */
 const EVENTS = Object.freeze({
@@ -94,6 +95,15 @@ export function createCursor(client, options = {}) {
 	const redis = client.redis;
 	const channel = client.key('cursor:events');
 
+	const validator = createBusValidator({
+		maxBytes: options.maxEnvelopeBytes,
+		// `__cursor:` is constructed by this module, not from the wire,
+		// so the inbound `parsed.topic` we validate is the inner topic
+		// (`mouse:roomA`, etc.) which must NOT itself be `__`-prefixed.
+		allowSystemTopics: false,
+		allowedSystemTopics: []
+	});
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mt = m?.mapTopic;
@@ -145,9 +155,14 @@ export function createCursor(client, options = {}) {
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
+			const rawBytes = typeof message === 'string'
+				? Buffer.byteLength(message)
+				: /** @type {Buffer} */ (message).length;
+			if (!validator.acceptSize(rawBytes)) return;
 			try {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
+				if (!validator.acceptEnvelope(parsed.topic, parsed.event)) return;
 				if (activePlatform) {
 					activePlatform.publish(
 						'__cursor:' + parsed.topic,

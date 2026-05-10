@@ -39,6 +39,14 @@ describe('postgres idempotency', () => {
 			expect(() => createIdempotencyStore(client, { table: 'drop table;--', cleanupInterval: 0 })).toThrow('invalid table name');
 			expect(() => createIdempotencyStore(client, { table: '123bad', cleanupInterval: 0 })).toThrow('invalid table name');
 		});
+
+		it('throws on reserved Postgres schema names (pg_*, information_schema*)', () => {
+			expect(() => createIdempotencyStore(client, { table: 'pg_class', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+			expect(() => createIdempotencyStore(client, { table: 'pg_authid', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+			expect(() => createIdempotencyStore(client, { table: 'PG_TYPE', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+			expect(() => createIdempotencyStore(client, { table: 'information_schema_tables', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+			expect(() => createIdempotencyStore(client, { table: 'INFORMATION_SCHEMA_columns', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+		});
 	});
 
 	describe('acquire - basic flow', () => {

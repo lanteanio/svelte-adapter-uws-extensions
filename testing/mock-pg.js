@@ -59,7 +59,7 @@ export function mockPgClient() {
 				return { rows: [], rowCount: 0 };
 			}
 
-			// ALTER TABLE -- no-op: the mock's row shapes are dynamic so any
+			// ALTER TABLE - no-op: the mock's row shapes are dynamic so any
 			// added column is automatically accepted by INSERT / SELECT branches
 			// that reference it.
 			if (sql.startsWith('ALTER TABLE')) {
@@ -144,7 +144,7 @@ export function mockPgClient() {
 
 			// Idempotency clear (default table name).  Custom table names
 			// fall through to the replay-table catch-all and would clear
-			// replay rows instead -- tests should use the default name.
+			// replay rows instead - tests should use the default name.
 			if (sql.startsWith('DELETE FROM svti_idempotency') && !sql.includes('WHERE')) {
 				const before = idemRows.size;
 				idemRows.clear();

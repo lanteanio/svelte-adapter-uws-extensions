@@ -32,6 +32,11 @@ describe('postgres tasks', () => {
 			expect(() => createTaskRunner(client, { table: 'drop;--', recoveryInterval: 0, cleanupInterval: 0 })).toThrow('invalid table name');
 		});
 
+		it('throws on reserved Postgres schema names', () => {
+			expect(() => createTaskRunner(client, { table: 'pg_class', recoveryInterval: 0, cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+			expect(() => createTaskRunner(client, { table: 'information_schema_tables', recoveryInterval: 0, cleanupInterval: 0 })).toThrow('reserved Postgres schema');
+		});
+
 		it('throws on non-positive fenceTtl', () => {
 			expect(() => createTaskRunner(client, { fenceTtl: 0, recoveryInterval: 0, cleanupInterval: 0 })).toThrow('fenceTtl');
 			expect(() => createTaskRunner(client, { fenceTtl: -1, recoveryInterval: 0, cleanupInterval: 0 })).toThrow('fenceTtl');
@@ -660,7 +665,7 @@ describe('postgres tasks', () => {
 			expect(released).toHaveLength(1);
 			expect(released[0]).toEqual({ taskId, fence: fenceBefore });
 
-			// Don't await `promise` -- the simulated long handler is just a setTimeout
+			// Don't await `promise` - the simulated long handler is just a setTimeout
 			// and will resolve cleanly; vi.restoreAllMocks() in beforeEach handles
 			// cleanup. r.destroy() stops the timers we created.
 			r.destroy();

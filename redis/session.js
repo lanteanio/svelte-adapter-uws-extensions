@@ -98,7 +98,7 @@ export function createDistributedSession(client, options = {}) {
 			try {
 				data = JSON.parse(raw);
 			} catch {
-				// Corrupt entry -- treat as miss; let the next set overwrite.
+				// Corrupt entry - treat as miss; let the next set overwrite.
 				mGet?.inc({ result: 'miss' });
 				return null;
 			}

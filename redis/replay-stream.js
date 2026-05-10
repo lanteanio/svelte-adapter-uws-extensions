@@ -22,6 +22,7 @@
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { parseReplayOptions, awaitReplication, ReplayStorageError } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
+import { checkReplayAccess } from '../shared/replay-gate.js';
 
 /**
  * Lua script for atomic idempotent publish.
@@ -50,6 +51,9 @@ local idmpTtl = tonumber(ARGV[4])
 local topic = ARGV[5]
 local event = ARGV[6]
 local data = ARGV[7]
+if maxSize == nil or ttl == nil or idmpTtl == nil then
+  return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl must be numeric')
+end
 
 local cached = redis.call('hget', idmpKey, requestId)
 if cached then
@@ -95,6 +99,9 @@ local ttl = tonumber(ARGV[2])
 local topic = ARGV[3]
 local event = ARGV[4]
 local data = ARGV[5]
+if maxSize == nil or ttl == nil then
+  return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl must be numeric')
+end
 
 local seq = redis.call('incr', seqKey)
 local id = seq .. '-0'
@@ -303,8 +310,9 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async replay(ws, topic, sinceSeq, platform, reqId) {
-			if (b) b.guard();
+			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
+			if (b) b.guard();
 
 			let entries;
 			try {

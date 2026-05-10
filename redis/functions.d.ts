@@ -29,7 +29,7 @@ export interface FunctionLibrary {
 
 	/**
 	 * Invoke a registered function via `FCALL <funcName> <numkeys> <keys...> <args...>`.
-	 * Note: FCALL keys on function name, not library name -- function
+	 * Note: FCALL keys on function name, not library name - function
 	 * names are global across the server.
 	 */
 	call(funcName: string, opts?: FunctionCallOptions): Promise<unknown>;

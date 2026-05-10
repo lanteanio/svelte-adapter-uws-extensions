@@ -135,7 +135,7 @@ describe('redis leader', () => {
 
 			await waitFor(() => a.isLeader() || b.isLeader());
 
-			// Sample several times -- mutual exclusion is the invariant.
+			// Sample several times - mutual exclusion is the invariant.
 			for (let i = 0; i < 5; i++) {
 				expect(a.isLeader() && b.isLeader()).toBe(false);
 				await sleep(20);

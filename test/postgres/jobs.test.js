@@ -17,6 +17,11 @@ describe('postgres job queue', () => {
 			expect(() => createJobQueue(client, { table: 'drop table;--' })).toThrow('invalid table name');
 		});
 
+		it('rejects reserved Postgres schema names', () => {
+			expect(() => createJobQueue(client, { table: 'pg_class' })).toThrow('reserved Postgres schema');
+			expect(() => createJobQueue(client, { table: 'information_schema_tables' })).toThrow('reserved Postgres schema');
+		});
+
 		it('rejects non-positive visibilityTimeout', () => {
 			expect(() => createJobQueue(client, { visibilityTimeout: 0 })).toThrow('positive number');
 		});

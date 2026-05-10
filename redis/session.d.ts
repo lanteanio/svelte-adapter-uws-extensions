@@ -61,7 +61,7 @@ export interface DistributedSession<T = unknown> {
 
 	/**
 	 * Remove every session under this store's `keyPrefix`. SCAN-based
-	 * cleanup -- cluster-wide cost scales with total session count.
+	 * cleanup - cluster-wide cost scales with total session count.
 	 * Not a hot-path operation; use for graceful-shutdown teardowns,
 	 * test harnesses, or operator-initiated wipes.
 	 */

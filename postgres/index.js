@@ -38,7 +38,7 @@ const { Pool, Client } = pg;
  *
  *   2. Pass `pool` (an existing `pg.Pool`): the client wraps the provided
  *      pool without constructing its own. `autoShutdown` defaults to `false`
- *      and `end()` is a no-op -- the caller is responsible for closing the
+ *      and `end()` is a no-op - the caller is responsible for closing the
  *      pool. Use this when your app already maintains a pool (e.g. shared
  *      with raw `pg` use elsewhere) and wants a single connection footprint
  *      against the database.
@@ -106,7 +106,7 @@ export function createPgClient(opts) {
 	}
 
 	// createClient() needs a connectionString. If the user only passed a
-	// pool, we don't have one -- defer the error until createClient() is
+	// pool, we don't have one - defer the error until createClient() is
 	// actually invoked, since most consumers (the task runner, idempotency
 	// stores, etc.) only need pool.query() and never createClient().
 	const connectionConfig = opts.connectionString
@@ -124,7 +124,7 @@ export function createPgClient(opts) {
 			if (!connectionConfig) {
 				throw new ConnectionError(
 					'postgres',
-					'createClient() requires connectionString -- pass it alongside pool when wrapping an external pool'
+					'createClient() requires connectionString - pass it alongside pool when wrapping an external pool'
 				);
 			}
 			return new Client(connectionConfig);

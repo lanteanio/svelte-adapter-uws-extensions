@@ -56,6 +56,9 @@ local memberId = ARGV[2]
 local memberData = ARGV[3]
 local now = tonumber(ARGV[4])
 local memberTtl = tonumber(ARGV[5])
+if maxMembers == nil or now == nil or memberTtl == nil then
+  return redis.error_reply('JOIN: maxMembers/now/memberTtl must be numeric')
+end
 
 if redis.call('get', closedFlag) == '1' then
   return {-1}
@@ -67,7 +70,8 @@ local stale = {}
 local live = {}
 for i = 1, #all, 2 do
   local ok, val = pcall(cjson.decode, all[i+1])
-  if ok and val.ts and (now - val.ts) <= memberTtl then
+  local ts = ok and val and tonumber(val.ts) or nil
+  if ts and (now - ts) <= memberTtl then
     liveCount = liveCount + 1
     live[#live + 1] = all[i+1]
   else
@@ -335,7 +339,7 @@ export function createGroup(client, name, options = {}) {
 			}
 
 			// Per-instance cap on local member count. Treat saturation
-			// the same as a "group full" rejection -- the caller already
+			// the same as a "group full" rejection - the caller already
 			// has graceful handling for that path.
 			if (!localMembers.has(ws) && localMembers.size >= MAX_GROUPS_LOCAL_MEMBERS) {
 				mRejected?.inc({ group: name });

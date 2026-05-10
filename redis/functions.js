@@ -10,7 +10,7 @@
  * `FUNCTION LOAD REPLACE`, so an updated library swaps in atomically
  * without an app redeploy. `call(funcName, { keys, args })` issues
  * `FCALL` against the function (note: FCALL keys on function name,
- * not library name -- function names are global across the server).
+ * not library name - function names are global across the server).
  *
  * Requires Redis 7+. `load()` runs `INFO server` on first call and
  * throws on older servers; users on Redis 6 should use `redis.eval`
@@ -50,7 +50,7 @@ const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
  * ```js
  * const lib = createFunctionLibrary(redis, `#!lua name=ws-presence
  *   redis.register_function('cleanup', function(keys, args)
- *     -- ...
+ *     - ...
  *   end)
  * `);
  * await lib.load();

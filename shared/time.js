@@ -1,5 +1,5 @@
 /**
- * Cached Date.now() — updated every second via setInterval.
+ * Cached Date.now() - updated every second via setInterval.
  *
  * Hot paths (heartbeat loops, throttle checks, stale detection) call
  * Date.now() thousands of times per tick. This module caches the value

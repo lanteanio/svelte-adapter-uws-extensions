@@ -41,6 +41,27 @@ export function stripInternal(obj, ancestors) {
 }
 
 /**
+ * Redact the password segment of a connection URL so the URL is safe to
+ * embed in log lines and error messages. Matches the standard `scheme://
+ * user:password@host[:port][/path]` shape and substitutes the password
+ * for `***`. Other URL forms (no userinfo, no password, query strings)
+ * pass through untouched. Defensive against non-string input so callers
+ * can pipe through arbitrary error context without a type guard.
+ *
+ * @param {unknown} url
+ * @returns {string}
+ */
+export function redactConnectionUrl(url) {
+	if (typeof url !== 'string' || url.length === 0) return String(url);
+	// `:\/\/` opens the userinfo region; `[^\s/:@]*` matches an empty or
+	// non-empty username (redis URLs often omit it: `redis://:secret@host`);
+	// the captured `:` opens the password segment; `[^@\s/]+` swallows the
+	// password greedily up to (but not past) the next `@` so a `@` later in
+	// the URL (query string, path) is not misread.
+	return url.replace(/(:\/\/[^\s/:@]*:)[^@\s/]+@/, '$1***@');
+}
+
+/**
  * Create a one-shot warner for sensitive userData keys. The returned
  * function recursively scans up to depth 3, calls console.warn on the
  * first match it finds, and latches so subsequent calls are no-ops.

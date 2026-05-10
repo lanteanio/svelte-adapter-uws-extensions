@@ -594,7 +594,7 @@ describe('redis connection registry', () => {
 			// offline
 			await local.sendCoalesced('nobody', { key: 'k', topic: 't', event: 'e' });
 
-			// ok (cross-instance) -- spin up a sibling owner
+			// ok (cross-instance) - spin up a sibling owner
 			const platformOwner = mockPlatform();
 			const owner = createConnectionRegistry(client, {
 				identify: (w) => w.getUserData()?.userId
@@ -745,7 +745,7 @@ describe('redis connection registry', () => {
 			// offline
 			await local.send('nobody', 't', 'e');
 
-			// ok (cross-instance) -- spin up a sibling owner
+			// ok (cross-instance) - spin up a sibling owner
 			const platformOwner = mockPlatform();
 			const owner = createConnectionRegistry(client, {
 				identify: (w) => w.getUserData()?.userId
@@ -1482,7 +1482,7 @@ describe('redis connection registry', () => {
 
 				// Empty path
 				await local.sendTo({ tenantId: 'nope' }, 'topic', 'event');
-				// Self-only path -- sender doesn't publish anywhere remotely; ok still recorded
+				// Self-only path - sender doesn't publish anywhere remotely; ok still recorded
 				// because there were matches (one local) and no publish error.
 				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
 

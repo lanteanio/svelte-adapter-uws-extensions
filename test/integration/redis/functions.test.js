@@ -70,7 +70,7 @@ describe('redis function library (integration)', () => {
 			if (keys.length > 0) await client.redis.unlink(...keys);
 		} while (cursor !== '0');
 
-		// Function namespace is global per server -- always start from a
+		// Function namespace is global per server - always start from a
 		// clean slate so a previous failed test does not leak state.
 		await deleteLib(client, LIB_NAME);
 	});

@@ -67,12 +67,12 @@ export interface TaskRunnerOptions {
 	/**
 	 * Local-worker callback fired AFTER each state-machine transition
 	 * commits. Use for UI dashboards, metrics, structured logs, webhooks
-	 * -- anything the runner already knows about that today requires
+	 * - anything the runner already knows about that today requires
 	 * polling or wiring `postgres/notify`.
 	 *
 	 * Errors thrown from the callback (or rejected promises) are caught
 	 * and logged; they do NOT roll back the state machine. Listeners
-	 * never block the runner -- async listeners are fired-and-forgotten.
+	 * never block the runner - async listeners are fired-and-forgotten.
 	 *
 	 * Cluster-wide fan-out is a separate concern: this callback fires on
 	 * the worker that performed the transition. Use `postgres/notify`
@@ -265,7 +265,7 @@ export interface TaskRunner {
 	 * Returns rows shaped for the public API (camelCase keys, `Date`
 	 * instances, parsed JSON, `error` as the JSON-safe shape from
 	 * `TaskError`). The internal `fence` UUID is intentionally
-	 * excluded -- it has no caller value and exposing it invites misuse.
+	 * excluded - it has no caller value and exposing it invites misuse.
 	 */
 	list(options?: {
 		name?: string;
@@ -295,7 +295,7 @@ export interface TaskRunner {
 	 * if the row is no longer running (already terminal, never
 	 * existed at this status, or somebody else expired it first).
 	 *
-	 * Use case: "drain this instance" -- kick its in-flight tasks off
+	 * Use case: "drain this instance" - kick its in-flight tasks off
 	 * so the recovery sweep on a healthy instance picks them up faster
 	 * than waiting for the Postgres fence deadline.
 	 */

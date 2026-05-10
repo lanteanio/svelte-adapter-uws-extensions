@@ -10,6 +10,7 @@
 import Redis from 'ioredis';
 import { ConnectionError } from '../shared/errors.js';
 import { MAX_REDIS_DUPLICATES_PER_CLIENT } from '../shared/caps.js';
+import { redactConnectionUrl } from '../shared/sensitive.js';
 
 /**
  * @typedef {Object} RedisClientOptions
@@ -61,7 +62,7 @@ export function createRedisClient(options = {}) {
 	try {
 		redis = new Redis(url, redisOpts);
 	} catch (err) {
-		throw new ConnectionError('redis', `failed to create client for ${url}`, err);
+		throw new ConnectionError('redis', `failed to create client for ${redactConnectionUrl(url)}`, err);
 	}
 
 	// Track duplicate connections for cleanup

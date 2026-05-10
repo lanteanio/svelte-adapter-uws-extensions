@@ -751,7 +751,7 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 10, y: 10 }, platform);
 			await new Promise((r) => setTimeout(r, 10));
 
-			// Simulate a remote event -- should now be received
+			// Simulate a remote event - should now be received
 			const remoteMsg = JSON.stringify({
 				instanceId: 'remote-instance',
 				topic: 'canvas',
@@ -861,7 +861,7 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 0 }, platform);
 			platform.reset();
 
-			// Only one entry coalesced -- should use normal update, not bulk
+			// Only one entry coalesced - should use normal update, not bulk
 			c.update(ws, 'canvas', { x: 99 }, platform);
 			vi.advanceTimersByTime(100);
 
@@ -882,7 +882,7 @@ describe('redis cursor', () => {
 			c.update(ws1, 'canvas', { x: 0 }, platform);
 			platform.reset();
 
-			// Multiple updates from same key -- only latest should appear in bulk
+			// Multiple updates from same key - only latest should appear in bulk
 			c.update(ws1, 'canvas', { x: 10 }, platform);
 			c.update(ws1, 'canvas', { x: 99 }, platform);
 			c.update(ws2, 'canvas', { x: 50 }, platform);

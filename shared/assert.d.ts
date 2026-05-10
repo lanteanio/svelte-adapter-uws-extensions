@@ -11,7 +11,7 @@ import type { MetricsRegistry } from '../prometheus/index.js';
  * Test mode (`process.env.VITEST` or `NODE_ENV === 'test'`): also throws,
  * so vitest surfaces the failure as a test error.
  *
- * Production: does NOT throw — a thrown exception inside a Redis pubsub
+ * Production: does NOT throw - a thrown exception inside a Redis pubsub
  * callback or a publish hot-path microtask could leave a half-applied
  * transaction or a corrupted local index. Counter + log only.
  */
@@ -26,7 +26,7 @@ export function devAssert(cond: boolean, message: string, context?: Record<strin
 
 /**
  * Read the live per-category violation counter Map. The Map is the live
- * state — not a snapshot — so consumers holding the reference see updates
+ * state - not a snapshot - so consumers holding the reference see updates
  * automatically. Mirrors the adapter's `platform.assertions` shape.
  */
 export function getAssertionCounters(): Map<string, number>;

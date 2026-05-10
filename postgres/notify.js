@@ -3,13 +3,15 @@
  *
  * Listens on a Postgres channel for notifications and forwards them to
  * platform.publish(). The user is responsible for setting up the trigger
- * that calls pg_notify() -- this module only handles the listening side.
+ * that calls pg_notify() - this module only handles the listening side.
  *
  * Uses a dedicated connection (not from the pool) since LISTEN requires
  * a persistent connection that cannot be shared.
  *
  * @module svelte-adapter-uws-extensions/postgres/notify
  */
+
+import { createBusValidator } from '../shared/bus-validate.js';
 
 /**
  * @typedef {Object} NotifyBridgeOptions
@@ -27,6 +29,8 @@
  *   leader's publishes reach non-leader replicas.
  * @property {number} [lockId] - Advisory lock id. Required when `multiListener: 'advisory'`.
  * @property {number} [pollInterval=5000] - ms between leader-election polls.
+ * @property {number} [maxEnvelopeBytes=1048576] - Reject NOTIFY payloads larger than this many bytes (after the parser hands back a topic/event tuple). Defends against an actor with `pg_notify` privilege fanning out a giant envelope. Postgres caps NOTIFY at ~8000 bytes, so the default 1 MB is well above any legitimate use.
+ * @property {boolean} [allowSystemTopics=true] - When false, drop notifications whose parsed `topic` starts with `__`. Defense-in-depth on top of the wire-level subscribe gate.
  */
 
 /**
@@ -90,6 +94,11 @@ export function createNotifyBridge(client, options) {
 	const channel = options.channel;
 	const quotedChannel = '"' + channel.replace(/"/g, '""') + '"';
 	const autoReconnect = options.autoReconnect !== false;
+	const validator = createBusValidator({
+		maxBytes: options.maxEnvelopeBytes,
+		allowSystemTopics: options.allowSystemTopics !== false,
+		allowedSystemTopics: []
+	});
 	const reconnectInterval = options.reconnectInterval ?? 3000;
 	if (typeof reconnectInterval !== 'number' || !Number.isFinite(reconnectInterval) || reconnectInterval < 0) {
 		throw new Error('notify bridge: reconnectInterval must be a non-negative number');
@@ -149,13 +158,27 @@ export function createNotifyBridge(client, options) {
 		mReceived?.inc({ channel });
 		if (msg.payload && msg.payload.length > 7500) {
 			console.warn(
-				`[postgres/notify] payload on "${channel}" is ${msg.payload.length} bytes — ` +
+				`[postgres/notify] payload on "${channel}" is ${msg.payload.length} bytes - ` +
 				'approaching the ~8000 byte Postgres NOTIFY limit'
 			);
+		}
+		// Pre-parse size guard. Postgres caps NOTIFY at ~8000 bytes by
+		// default, but the user's parser may unwrap into a larger object
+		// graph. We bound the input the parser ever sees as defense
+		// against an actor with `pg_notify` privilege injecting a giant
+		// envelope across the cluster.
+		const rawBytes = msg.payload ? Buffer.byteLength(msg.payload) : 0;
+		if (!validator.acceptSize(rawBytes)) {
+			mParseErrors?.inc({ channel });
+			return;
 		}
 		try {
 			const result = parse(msg.payload, msg.channel);
 			if (result && activePlatform) {
+				if (!validator.acceptEnvelope(result.topic, result.event)) {
+					mParseErrors?.inc({ channel });
+					return;
+				}
 				// In advisory mode, only the leader receives notifications;
 				// it must publish *with* relay so the bus fans out to
 				// non-leader replicas. In 'all' mode every instance has
@@ -299,7 +322,7 @@ export function createNotifyBridge(client, options) {
 			active = true;
 			if (advisory) {
 				// Initial poll attempt; polling continues regardless of
-				// outcome so this never throws -- a follower replica is
+				// outcome so this never throws - a follower replica is
 				// a valid steady state.
 				await advisoryTick();
 				startPolling();

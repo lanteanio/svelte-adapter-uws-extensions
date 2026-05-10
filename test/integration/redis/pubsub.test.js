@@ -92,7 +92,7 @@ describe('redis pubsub bus (integration)', () => {
 			await bus.activate(platform);
 
 			// Use a separate publisher client so we are simulating a sibling
-			// process publishing in -- the bus's own subscriber duplicate
+			// process publishing in - the bus's own subscriber duplicate
 			// should pick this up via the wire.
 			const publisher = createRedisClient({
 				url: process.env.INTEGRATION_REDIS_URL,
@@ -118,7 +118,7 @@ describe('redis pubsub bus (integration)', () => {
 			}
 		});
 
-		it('delivery flows through the wrap() publish path -- two buses see each other', async () => {
+		it('delivery flows through the wrap() publish path - two buses see each other', async () => {
 			const channel = uniqueChannel('twobus');
 			const platformA = mockPlatform();
 			const platformB = mockPlatform();
@@ -449,6 +449,144 @@ describe('redis pubsub bus (integration)', () => {
 			}));
 			await waitFor(() => platform.published.length > 0);
 			expect(platform.published).toHaveLength(1);
+		});
+	});
+
+	// Inbound envelope validation. The bus republishes anything its
+	// subscriber receives. Without these gates an attacker with Redis
+	// write access (compromised co-tenant, leaked ACL, exposed port)
+	// can fan out a single PUBLISH to every cluster node.
+	describe('hostile envelope rejection', () => {
+		it('drops envelopes larger than maxEnvelopeBytes BEFORE JSON.parse runs', async () => {
+			const channel = uniqueChannel('size-cap');
+			// 1 KB cap so the test payload is small.
+			const bus = track(createPubSubBus(client, { channel, maxEnvelopeBytes: 1024 }));
+			await bus.activate(platform);
+
+			const big = JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat',
+				event: 'msg',
+				data: { padding: 'x'.repeat(2048) }
+			});
+			expect(big.length).toBeGreaterThan(1024);
+			await client.redis.publish(channel, big);
+			await wait(150);
+			expect(platform.published).toHaveLength(0);
+
+			// Confirm a small envelope under the cap still arrives.
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat',
+				event: 'msg',
+				data: { ok: true }
+			}));
+			await waitFor(() => platform.published.length > 0);
+			expect(platform.published[0].data).toEqual({ ok: true });
+		});
+
+		it('drops envelopes with non-string topic', async () => {
+			const channel = uniqueChannel('bad-topic-type');
+			const bus = track(createPubSubBus(client, { channel }));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 12345,
+				event: 'msg',
+				data: 'leak'
+			}));
+			await wait(150);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('drops envelopes with control characters in topic', async () => {
+			const channel = uniqueChannel('ctrl-topic');
+			const bus = track(createPubSubBus(client, { channel }));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat\nINJECT',
+				event: 'msg',
+				data: null
+			}));
+			await wait(150);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('drops envelopes with a non-string event', async () => {
+			const channel = uniqueChannel('bad-event');
+			const bus = track(createPubSubBus(client, { channel }));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat',
+				event: { evil: true },
+				data: null
+			}));
+			await wait(150);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('blocks injected __signal: topic when allowSystemTopics:false', async () => {
+			// Defense in depth on top of the wire-level subscribe gate:
+			// even if a future regression let clients subscribe to __
+			// topics, hostile bus traffic still cannot reach them.
+			const channel = uniqueChannel('sigblock');
+			const bus = track(createPubSubBus(client, { channel, allowSystemTopics: false }));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: '__signal:victim',
+				event: 'force-logout',
+				data: { redirect: 'https://attacker.example' }
+			}));
+			await wait(150);
+			expect(platform.published.find((p) => p.topic === '__signal:victim')).toBeUndefined();
+		});
+
+		it('still allows the bus\'s own systemChannel through when allowSystemTopics:false', async () => {
+			// The pubsub bus emits its own __realtime degraded/recovered
+			// events through this same channel; the explicit allowlist
+			// must keep them flowing.
+			const channel = uniqueChannel('sysch');
+			const bus = track(createPubSubBus(client, {
+				channel,
+				systemChannel: '__realtime',
+				allowSystemTopics: false
+			}));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: '__realtime',
+				event: 'degraded',
+				data: { at: 1 }
+			}));
+			await waitFor(() => platform.published.length > 0);
+			expect(platform.published[0].topic).toBe('__realtime');
+		});
+
+		it('skips invalid entries within a batch but lets valid ones through', async () => {
+			const channel = uniqueChannel('mixed-batch');
+			const bus = track(createPubSubBus(client, { channel }));
+			await bus.activate(platform);
+
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				batch: [
+					{ topic: 'chat', event: 'msg', data: { ok: 1 } },
+					{ topic: 'chat\nbad', event: 'msg', data: { ok: 2 } },
+					{ topic: 'chat', event: 'msg', data: { ok: 3 } }
+				]
+			}));
+			await waitFor(() => platform.publishedBatches.length > 0);
+			const batch = platform.publishedBatches[0].messages;
+			expect(batch).toHaveLength(2);
+			expect(batch.map((m) => m.data.ok)).toEqual([1, 3]);
 		});
 	});
 });

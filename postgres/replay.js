@@ -27,9 +27,10 @@
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
 
-import { safeCreate } from '../shared/pg-migrate.js';
+import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
 import { ReplayStorageError } from '../shared/replay-helpers.js';
+import { checkReplayAccess } from '../shared/replay-gate.js';
 export { ReplayStorageError };
 
 /**
@@ -85,10 +86,7 @@ export function createReplay(client, options = {}) {
 	const autoMigrate = options.autoMigrate !== false;
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 60000;
 
-	// Validate table name to prevent SQL injection (alphanumeric + underscore only)
-	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
-		throw new Error(`postgres replay: invalid table name "${table}"`);
-	}
+	assertSafeTableName(table, 'postgres replay');
 
 	const b = options.breaker;
 	const m = options.metrics;
@@ -312,6 +310,8 @@ export function createReplay(client, options = {}) {
 		},
 
 		async replay(ws, topic, sinceSeq, platform, reqId) {
+			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
+			const replayTopic = '__replay:' + topic;
 			b?.guard();
 			try {
 				await ensureTable();
@@ -319,7 +319,6 @@ export function createReplay(client, options = {}) {
 				b?.failure(err);
 				throw err;
 			}
-			const replayTopic = '__replay:' + topic;
 
 			let missedRes;
 			try {

@@ -52,7 +52,7 @@ import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
  * Cross-instance dedup is intentionally omitted. The local localCounts
  * map already prevents duplicate joins from the same user on the same
  * instance (the script only runs when prevCount === 0). If the same
- * user joins on a second instance, both broadcast "join" -- the client
+ * user joins on a second instance, both broadcast "join" - the client
  * handles this as an idempotent Map.set on the same key.
  *
  * Removing the HGETALL + O(N) scan that was here before drops per-join
@@ -64,6 +64,9 @@ local key = KEYS[1]
 local field = ARGV[1]
 local value = ARGV[2]
 local ttlSec = tonumber(ARGV[3])
+if ttlSec == nil then
+  return redis.error_reply('PRESENCE_JOIN: ttlSec must be numeric')
+end
 
 redis.call('hset', key, field, value)
 redis.call('expire', key, ttlSec)
@@ -89,6 +92,9 @@ local field = ARGV[1]
 local suffix = ARGV[2]
 local now = tonumber(ARGV[3])
 local ttlMs = tonumber(ARGV[4])
+if now == nil or ttlMs == nil then
+  return redis.error_reply('PRESENCE_LEAVE: now/ttlMs must be numeric')
+end
 
 redis.call('hdel', key, field)
 
@@ -97,7 +103,8 @@ for i = 1, #all, 2 do
   local f = all[i]
   if string.find(f, suffix, #f - #suffix + 1, true) then
     local ok, parsed = pcall(cjson.decode, all[i+1])
-    if ok and parsed.ts and (now - parsed.ts) <= ttlMs then
+    local ts = ok and parsed and tonumber(parsed.ts) or nil
+    if ts and (now - ts) <= ttlMs then
       return 0
     end
   end
@@ -107,7 +114,7 @@ return 1
 
 /**
  * Internal cross-instance Redis pub/sub envelope event names. NOT the
- * client wire shape -- clients see `presence_state` / `presence_diff` /
+ * client wire shape - clients see `presence_state` / `presence_diff` /
  * `heartbeat`. These names live on the `presence:events:{topic}` channel
  * between instances and are routed into the local diff buffer on receive.
  */
@@ -416,7 +423,7 @@ export function createPresence(client, options = {}) {
 				try { ws.getBufferedAmount(); } catch { dead.push(ws); }
 			}
 			for (const ws of dead) {
-				// Full leave (sync Phase 1 + async Phase 2 fire-and-forget)
+				// Full leave (sync Step 1 + async Step 2 fire-and-forget)
 				tracker.leave(ws, activePlatform).catch(() => {});
 			}
 		}
@@ -517,7 +524,7 @@ export function createPresence(client, options = {}) {
 					keyspaceSubscribed = true;
 				} catch (err) {
 					console.warn(
-						'[redis/presence] keyspace notifications: psubscribe failed -- ' +
+						'[redis/presence] keyspace notifications: psubscribe failed - ' +
 						'enable on Redis with `CONFIG SET notify-keyspace-events Ex` (or any flagset including `K`/`E` and `x`): ' +
 						err.message
 					);
@@ -547,7 +554,7 @@ export function createPresence(client, options = {}) {
 			subscribedChannels.delete(ch);
 			await subscriber.unsubscribe(ch).catch(() => {});
 		}
-		// Don't idle-shutdown when keyspace notifications are on -- the
+		// Don't idle-shutdown when keyspace notifications are on - the
 		// pattern subscription is the whole point of keeping the
 		// subscriber alive.
 		if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
@@ -715,7 +722,7 @@ export function createPresence(client, options = {}) {
 	}
 
 	async function leaveAll(ws, platform) {
-		// Phase 1: synchronous cleanup of all local state before any async
+		// Step 1: synchronous cleanup of all local state before any async
 		// work. Prevents the heartbeat from refreshing dead entries and
 		// lets concurrent join() calls detect the closed ws via wsTopics.
 		const connTopics = wsTopics.get(ws);
@@ -810,7 +817,7 @@ export function createPresence(client, options = {}) {
 			}
 		}
 
-		// Phase 2: async Redis cleanup. Local state is already clean so the
+		// Step 2: async Redis cleanup. Local state is already clean so the
 		// heartbeat will not refresh any of these entries. The pipeline
 		// batches all LEAVE_SCRIPT evals into a single round-trip; under
 		// mass disconnect (1000+ connections) this avoids saturating the
@@ -1030,7 +1037,7 @@ export function createPresence(client, options = {}) {
 			activeTopics.add(topic);
 
 			// Buffer join only after the operation is fully committed.
-			// Prevents orphaned diffs when snapshot or subscribe fails -- the
+			// Prevents orphaned diffs when snapshot or subscribe fails - the
 			// compensating leave inside undoJoin would collapse with this
 			// join in the buffer anyway, but skipping the buffer entirely
 			// keeps the cross-instance pubsub clean.

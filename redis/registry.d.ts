@@ -13,12 +13,12 @@ export interface RegistryOptions {
 	/**
 	 * Extract per-user attributes captured at registration time. Used by
 	 * `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped
-	 * broadcasts. Shallow values only -- string, number, boolean.
+	 * broadcasts. Shallow values only - string, number, boolean.
 	 * Numbers and booleans round-trip via `String()` for index-key
 	 * consistency. Compound queries (regex, array containment, nested
 	 * objects) are deliberately out of scope.
 	 *
-	 * Required for `sendTo(...)` -- callers using only `request`,
+	 * Required for `sendTo(...)` - callers using only `request`,
 	 * `send`, and `sendCoalesced` can omit it; the events channel and
 	 * secondary index are skipped when no `attributes` is provided.
 	 */

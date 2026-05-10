@@ -398,7 +398,7 @@ describe('circuit breaker', () => {
 			const cursor = createCursor(client, { throttle: 0, breaker });
 			const ws = mockWs({ id: 'u1' });
 
-			// Should not throw -- local broadcast still works, Redis is skipped
+			// Should not throw - local broadcast still works, Redis is skipped
 			cursor.update(ws, 'doc', { x: 10 }, platform);
 			expect(platform.published.length).toBeGreaterThan(0);
 

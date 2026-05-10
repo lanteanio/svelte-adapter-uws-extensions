@@ -19,6 +19,7 @@ import { createStreamReplay } from './replay-stream.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
+import { checkReplayAccess } from '../shared/replay-gate.js';
 export { ReplicationTimeoutError, ReplayStorageError };
 
 /**
@@ -62,6 +63,9 @@ local event = ARGV[2]
 local data = ARGV[3]
 local maxSize = tonumber(ARGV[4])
 local ttl = tonumber(ARGV[5])
+if maxSize == nil or ttl == nil then
+  return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl must be numeric')
+end
 
 local seq = redis.call('incr', seqKey)
 local envelope = cjson.encode({seq = seq, topic = topic, event = event})
@@ -208,8 +212,9 @@ export function createReplay(client, options = {}) {
 		},
 
 		async replay(ws, topic, sinceSeq, platform, reqId) {
-			if (b) b.guard();
+			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
+			if (b) b.guard();
 			const bk = bufKey(topic);
 
 			// Pipeline the oldest-entry probe (for truncation detection)

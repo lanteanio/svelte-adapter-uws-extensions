@@ -12,6 +12,7 @@
 import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
 import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 
 /**
  * @typedef {Object} PubSubBusOptions
@@ -19,6 +20,8 @@ import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
  * @property {string | null | false} [systemChannel='__realtime'] - Topic used for auto-emitted `degraded` / `recovered` events on the local platform. Set to `null` or `false` to disable auto-emission.
  * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
  * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
+ * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound envelopes larger than this many bytes BEFORE JSON.parse runs. Defends against bus-side DoS in shared-Redis deployments.
+ * @property {boolean} [allowSystemTopics=true] - When false, drop inbound envelopes whose topic starts with `__` (apart from this bus's own `systemChannel`). Defense-in-depth against bus-side topic injection on shared-Redis deployments. The wire-level subscribe gate already blocks clients from receiving such republished messages by default.
  */
 
 /**
@@ -85,6 +88,12 @@ export function createPubSubBus(client, options = {}) {
 		throw new Error('pubsub bus: systemChannel must be a string, null, or false');
 	}
 
+	const validator = createBusValidator({
+		maxBytes: options.maxEnvelopeBytes,
+		allowSystemTopics: options.allowSystemTopics !== false,
+		allowedSystemTopics: systemChannel ? [systemChannel] : []
+	});
+
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
 
@@ -114,7 +123,7 @@ export function createPubSubBus(client, options = {}) {
 			console.warn(
 				'[pubsub] microtask relay batch reached ' + relayBatch.length +
 				' entries in one tick. The batch is drained every microtask, so a ' +
-				'caller emitted a million publishes in one synchronous burst -- likely ' +
+				'caller emitted a million publishes in one synchronous burst - likely ' +
 				'a publish-in-loop without yielding.'
 			);
 		}
@@ -267,6 +276,16 @@ export function createPubSubBus(client, options = {}) {
 
 			subscriber.on('message', (ch, message) => {
 				if (ch !== channel) return;
+				// Pre-parse size guard. A bus subscriber that JSON.parses an
+				// arbitrarily large attacker payload pays parsing CPU + V8
+				// heap before any further validation can fire.
+				const rawBytes = typeof message === 'string'
+					? Buffer.byteLength(message)
+					: /** @type {Buffer} */ (message).length;
+				if (!validator.acceptSize(rawBytes)) {
+					mParseErrors?.inc();
+					return;
+				}
 				try {
 					const parsed = JSON.parse(message);
 					assert(
@@ -285,19 +304,28 @@ export function createPubSubBus(client, options = {}) {
 					// sibling workers, since each worker has its own Redis
 					// subscriber already receiving this envelope.
 					if (Array.isArray(parsed.batch)) {
-						mReceived?.inc(parsed.batch.length);
-						const local = new Array(parsed.batch.length);
+						const local = [];
 						for (let i = 0; i < parsed.batch.length; i++) {
 							const m = parsed.batch[i];
-							local[i] = {
+							if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+								mParseErrors?.inc();
+								continue;
+							}
+							local.push({
 								topic: m.topic,
 								event: m.event,
 								data: m.data,
 								options: { relay: false }
-							};
+							});
 						}
+						if (local.length === 0) return;
+						mReceived?.inc(local.length);
 						activePlatform.publishBatched(local);
 					} else {
+						if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+							mParseErrors?.inc();
+							return;
+						}
 						mReceived?.inc();
 						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
 					}

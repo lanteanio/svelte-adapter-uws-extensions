@@ -10,7 +10,7 @@
  *
  * Storage layout:
  *   - Hash `{prefix}conns:{userId}` with fields `instanceId`, `sessionId`, `ts`.
- *     Most-recent-connection-wins -- a second device replaces the first.
+ *     Most-recent-connection-wins - a second device replaces the first.
  *     Sliding TTL refreshed on every `hooks.open` and on the heartbeat tick.
  *
  * Wire envelopes on `{prefix}__push:{instanceId}`:
@@ -224,7 +224,7 @@ export function createConnectionRegistry(client, options) {
 				console.warn(
 					'[registry] secondary-index bucket for attribute "' + k +
 					'" has grown to ' + users.size + ' userIds. Eviction would corrupt ' +
-					'sendTo matching, so the index keeps growing -- raise this if the ' +
+					'sendTo matching, so the index keeps growing - raise this if the ' +
 					'cardinality is legitimate, or check for an attributes(ws) callback ' +
 					'returning unique values per connection.'
 				);
@@ -256,7 +256,7 @@ export function createConnectionRegistry(client, options) {
 			console.warn(
 				'[registry] cluster-wide user index has grown to ' + userToInstance.size +
 				' entries. Each entry is ~32 bytes of Map state per instance maintaining ' +
-				'the index. Eviction would mis-route sendTo, so the index keeps growing -- ' +
+				'the index. Eviction would mis-route sendTo, so the index keeps growing - ' +
 				'split the cluster or stop registering anonymous-shaped userIds.'
 			);
 		}
@@ -1004,7 +1004,7 @@ export function createConnectionRegistry(client, options) {
 				const attrs = attributes ? normalizeAttrs(attributes(ws)) : {};
 
 				// Update our own view of the secondary index synchronously
-				// before the broadcast lands -- self-targeting `sendTo` calls
+				// before the broadcast lands - self-targeting `sendTo` calls
 				// fired between the open hook and the events round trip
 				// still match against this newly-registered user.
 				if (attributes) applyOpenEvent(userId, instanceId, attrs);

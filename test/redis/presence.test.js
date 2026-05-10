@@ -879,7 +879,7 @@ describe('redis presence', () => {
 			data.self = data;
 			const ws = mockWs(data);
 			// Behavior contract: either resolves (cycles stripped) or throws a
-			// JSON-serializable error -- never an unhandled rejection.
+			// JSON-serializable error - never an unhandled rejection.
 			let outcome = 'unset';
 			try {
 				await local.join(ws, 'room', platform);
@@ -1314,7 +1314,7 @@ describe('redis presence', () => {
 
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platformA);
-			// Second join with a different platform -- subsequent forwarded events
+			// Second join with a different platform - subsequent forwarded events
 			// should land on platformB, not platformA.
 			const ws2 = mockWs({ id: '2' });
 			await local.join(ws2, 'room', platformB);

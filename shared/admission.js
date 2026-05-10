@@ -3,7 +3,7 @@
  *
  * Pressure-aware companion to the dependency circuit breaker. Where the
  * breaker answers "is the backend up?", admission control answers "are
- * we OK to take more work right now?" -- using `platform.pressure` from
+ * we OK to take more work right now?" - using `platform.pressure` from
  * the adapter (memory, publish rate, subscriber ratio) to gate
  * non-critical work before it ever reaches a backend.
  *
