@@ -25,11 +25,13 @@ export interface BusValidatorOptions {
 	maxBytes?: number;
 
 	/**
-	 * When `false`, reject any topic starting with `__` (apart from the
-	 * explicit allowlist). Apps that publish only over user-space topics
-	 * may set this for defense in depth on top of the wire-level
-	 * subscribe gate.
-	 * @default true
+	 * When `false` (default), reject any topic starting with `__` apart
+	 * from the explicit allowlist. Foreign actors with bus write access
+	 * cannot inject forged `__signal:*` / `__rpc` / plugin-internal
+	 * frames into the local platform. Apps that legitimately bus-relay
+	 * user-defined `__`-prefixed topics (rare) can opt back in via
+	 * `allowSystemTopics: true`.
+	 * @default false
 	 */
 	allowSystemTopics?: boolean;
 
@@ -64,10 +66,16 @@ export interface BusValidator {
 }
 
 /**
- * Mirror of the adapter's `isValidWireTopic` (kept inline here to avoid
- * importing deep into the adapter package). Returns `true` for valid
- * topic strings: non-empty, at most 256 characters, no control bytes
- * (charCode < 32).
+ * Mirror of the adapter's `isValidWireTopic` for its unconditional
+ * rejections. Returns `true` for valid topic strings: non-empty, at
+ * most 256 characters, no control bytes (charCode < 32), no `"` (34)
+ * or `\\` (92). The quote / backslash rejection matches the adapter's
+ * `esc(topic)` rejection set, so a topic that survives this validator
+ * is also safe to embed in a JSON envelope.
+ *
+ * Non-ASCII rejection is opt-in on the adapter side and is NOT mirrored
+ * here, since server-side code legitimately produces topics with
+ * localized labels (e.g. `__signal:José`) that the bus relays.
  */
 export function isValidBusTopic(topic: unknown): boolean;
 

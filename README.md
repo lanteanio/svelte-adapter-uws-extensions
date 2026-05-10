@@ -233,7 +233,7 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 | `onDegraded` | - | Server-side handler invoked once when the breaker leaves the healthy state |
 | `onRecovered` | - | Server-side handler invoked once when the breaker returns to the healthy state |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. |
-| `allowSystemTopics` | `true` | When `false`, inbound envelopes addressed to `__`-prefixed topics are dropped (the configured `systemChannel` remains in an explicit allowlist). Belt-and-suspenders defense in depth on top of the wire-level subscribe gate; safe to flip when the app publishes only on user-space topics. |
+| `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped; the configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so the bus's own degraded / recovered events still flow. Closes the bus-injection class in shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 See [Notifying clients of degradation](#notifying-clients-of-degradation) for the full pattern.
 
@@ -330,7 +330,7 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 | `channelPrefix` | `'uws:sharded:'` | Prefix for sharded pub/sub channels |
 | `shardKey` | `(topic) => topic` | Map a topic to a shard label. The channel is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic). |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the cluster bus with oversized payloads. |
-| `allowSystemTopics` | `true` | When `false`, inbound envelopes addressed to `__`-prefixed topics are dropped. Belt-and-suspenders defense in depth on top of the wire-level subscribe gate; safe to flip when the app publishes only on user-space topics. |
+| `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped. Closes the bus-injection class in shared-Redis deployments. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 #### When to use which bus
 
@@ -1189,7 +1189,7 @@ The client side needs no changes - the core `crud('messages')` store already han
 | `lockId` | - | Advisory lock id. Required when `multiListener: 'advisory'`. |
 | `pollInterval` | `5000` | ms between leader-election polls (advisory mode only). |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound `NOTIFY` payloads larger than this before `JSON.parse` runs. Defends against a buggy or hostile trigger flooding the bridge with oversized payloads. |
-| `allowSystemTopics` | `true` | When `false`, parsed envelopes addressed to `__`-prefixed topics are dropped before the publish call. Belt-and-suspenders defense in depth; safe to flip when the bridge only emits on user-space topics. |
+| `allowSystemTopics` | `false` | When `false` (default), parsed envelopes addressed to `__`-prefixed topics are dropped before the publish call. Closes the NOTIFY-injection class where a foreign publisher (or hostile DBA) could inject forged `__signal:*` / `__rpc` / plugin-internal frames via `pg_notify`. Apps that legitimately bridge user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 #### Single-listener mode
 

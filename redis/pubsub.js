@@ -21,7 +21,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
  * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
  * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound envelopes larger than this many bytes BEFORE JSON.parse runs. Defends against bus-side DoS in shared-Redis deployments.
- * @property {boolean} [allowSystemTopics=true] - When false, drop inbound envelopes whose topic starts with `__` (apart from this bus's own `systemChannel`). Defense-in-depth against bus-side topic injection on shared-Redis deployments. The wire-level subscribe gate already blocks clients from receiving such republished messages by default.
+ * @property {boolean} [allowSystemTopics=false] - Default false: drop inbound envelopes whose topic starts with `__` apart from this bus's own `systemChannel`. Defense against bus-side topic injection on shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in via `allowSystemTopics: true`.
  */
 
 /**
@@ -90,7 +90,7 @@ export function createPubSubBus(client, options = {}) {
 
 	const validator = createBusValidator({
 		maxBytes: options.maxEnvelopeBytes,
-		allowSystemTopics: options.allowSystemTopics !== false,
+		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: systemChannel ? [systemChannel] : []
 	});
 

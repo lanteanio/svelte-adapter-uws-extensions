@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.11] - 2026-05-10
+
+### Security
+
+- **`allowSystemTopics` default flipped from `true` to `false` on every bus subscriber (`createPubSubBus`, `createShardedBus`, `createNotifyBridge`).** The wire-level `__`-subscribe gate (adapter side) blocks clients from receiving forged system-topic frames, but the bus republish path bypasses it: a foreign Redis / Postgres publisher can `PUBLISH` an envelope with `topic: "__signal:victim"` and have it forwarded to the local platform via `platform.publish`, which IS reachable by server-side subscribers (`live.signal()` is one). The previous `true` default left this class open by default; the new `false` default closes it. The bus's own configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so degraded / recovered events still flow. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `allowSystemTopics: true`.
+
+### Fixed
+
+- **`isValidBusTopic` now rejects `"` (charCode 34) and `\\` (charCode 92) for parity with the adapter's `isValidWireTopic` unconditional rejections.** Pre-fix, the bus validator only checked control bytes (`< 32`); a topic containing `"` or `\\` would survive validation and crash the adapter's publish path inside `esc(topic)` instead of being rejected at the bus boundary. The comment claiming "tested for parity" is now backed by 12 new cases in `test/shared/bus-validate.test.js` covering the unconditional-rejection corpus plus the new `allowSystemTopics: false` default behavior. Non-ASCII rejection (the adapter's `allowNonAsciiTopics` opt-in) is intentionally NOT mirrored, since server-side code legitimately produces topics with localized labels (e.g. `__signal:Jose`) that the bus relays.
+
 ## [0.5.0-next.10] - 2026-05-10
 
 ### Changed

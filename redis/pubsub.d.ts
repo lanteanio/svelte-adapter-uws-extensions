@@ -40,12 +40,15 @@ export interface PubSubBusOptions {
 	maxEnvelopeBytes?: number;
 
 	/**
-	 * When `false`, inbound envelopes addressed to `__`-prefixed topics
-	 * are dropped (the configured `systemChannel` remains in an explicit
-	 * allowlist). Belt-and-suspenders defense in depth on top of the
-	 * adapter's wire-level subscribe gate; safe to flip when the app
-	 * publishes only on user-space topics.
-	 * @default true
+	 * When `false` (default), inbound envelopes addressed to `__`-prefixed
+	 * topics are dropped; the configured `systemChannel` remains in an
+	 * explicit allowlist so the bus's own degraded / recovered events
+	 * still flow. Closes the bus-injection class in shared-Redis
+	 * deployments where a foreign publisher could otherwise inject
+	 * forged `__signal:*` / `__rpc` / plugin-internal frames. Apps that
+	 * legitimately bus-relay user-defined `__`-prefixed topics (rare)
+	 * can opt back in via `allowSystemTopics: true`.
+	 * @default false
 	 */
 	allowSystemTopics?: boolean;
 }

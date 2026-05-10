@@ -30,9 +30,18 @@ const MAX_TOPIC_LEN = 256;
 const MAX_EVENT_LEN = 256;
 
 /**
- * Mirror of svelte-adapter-uws/files/utils.js#isValidWireTopic. Kept
- * inline here so the extensions package does not import deep into the
- * adapter (peer dependency). The two are tested for parity.
+ * Mirror of svelte-adapter-uws/files/utils.js#isValidWireTopic for its
+ * unconditional rejections: non-empty string, at most 256 chars, no
+ * control bytes (< 32), no `"` (34), no `\\` (92). The last two would
+ * crash the adapter's publish path inside `esc(topic)`; rejecting at the
+ * bus boundary fails fast instead of throwing inside the subscriber's
+ * republish loop. Kept inline here so the extensions package does not
+ * import deep into the adapter (peer dependency).
+ *
+ * Note: non-ASCII rejection is opt-in on the adapter side
+ * (`allowNonAsciiTopics`) and is NOT mirrored here, since server-side
+ * code legitimately produces topics with localized labels (e.g.
+ * `__signal:José`) that the bus then relays.
  *
  * @param {unknown} topic
  * @returns {boolean}
@@ -40,7 +49,8 @@ const MAX_EVENT_LEN = 256;
 export function isValidBusTopic(topic) {
 	if (typeof topic !== 'string' || topic.length === 0 || topic.length > MAX_TOPIC_LEN) return false;
 	for (let i = 0; i < topic.length; i++) {
-		if (topic.charCodeAt(i) < 32) return false;
+		const c = topic.charCodeAt(i);
+		if (c < 32 || c === 34 || c === 92) return false;
 	}
 	return true;
 }
@@ -50,10 +60,12 @@ export function isValidBusTopic(topic) {
  * @property {number} [maxBytes=1048576] - Reject envelopes whose raw
  *   bytes exceed this length. Applied BEFORE JSON.parse so the parser
  *   never sees attacker-stuffed payloads.
- * @property {boolean} [allowSystemTopics=true] - When false, reject
- *   any topic starting with `__` (apart from the explicit allowlist).
- *   Apps that publish only over user-space topics may set this for
- *   defense in depth on top of the wire-level subscribe gate.
+ * @property {boolean} [allowSystemTopics=false] - When false (default),
+ *   reject any topic starting with `__` apart from the explicit
+ *   allowlist. Foreign actors with bus write access cannot inject
+ *   forged `__signal:*`, `__rpc`, or plugin-internal frames. Apps
+ *   that legitimately bus-relay user-defined `__`-prefixed topics
+ *   (rare) can opt back in via `allowSystemTopics: true`.
  * @property {string[]} [allowedSystemTopics=[]] - Exact-match topic
  *   names that bypass the system-topic denylist. The bus owner adds
  *   its own `systemChannel` here (e.g. `__realtime`) so the bus can
@@ -72,7 +84,7 @@ export function createBusValidator(options = {}) {
 	const maxBytes = typeof options.maxBytes === 'number' && options.maxBytes > 0
 		? options.maxBytes
 		: DEFAULT_MAX_ENVELOPE_BYTES;
-	const allowSystemTopics = options.allowSystemTopics !== false;
+	const allowSystemTopics = options.allowSystemTopics === true;
 	/** @type {Set<string>} */
 	const explicitAllow = new Set(Array.isArray(options.allowedSystemTopics) ? options.allowedSystemTopics : []);
 

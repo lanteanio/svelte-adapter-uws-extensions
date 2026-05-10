@@ -51,7 +51,7 @@ ALTER TABLE svti_tasks RENAME COLUMN idempotency_key TO svti_idempotency_key;
 
 ### 3. Inbound bus envelopes are validated before republish
 
-**What changed.** Every bus subscriber (`createPubSubBus`, `createShardedBus`, `createNotifyBridge`, `createCursor`) now gates inbound envelopes on raw byte size, topic shape, event shape, and an optional `__`-prefix denylist before republishing. Default `maxEnvelopeBytes` is 1 MB; default `allowSystemTopics` is `true` for backward compatibility, with the bus's own configured `systemChannel` (default `__realtime`) always allowlisted.
+**What changed.** Every bus subscriber (`createPubSubBus`, `createShardedBus`, `createNotifyBridge`, `createCursor`) now gates inbound envelopes on raw byte size, topic shape, event shape, and a `__`-prefix denylist before republishing. Default `maxEnvelopeBytes` is 1 MB; default `allowSystemTopics` is `false` (secure-by-default since 0.5.0-next.21 / next.11; was briefly `true` in next.10 for backward compatibility but flipped because the wire-level `__`-subscribe gate alone does not cover bus-republish). The bus's own configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so degraded / recovered events still flow.
 
 **How to migrate.** No code change required for default deployments. If your application publishes envelopes larger than 1 MB on the bus, raise `maxEnvelopeBytes` explicitly:
 
@@ -62,13 +62,13 @@ createNotifyBridge(pg, { maxEnvelopeBytes: 4 * 1024 * 1024 });
 createCursor(redis, { maxEnvelopeBytes: 4 * 1024 * 1024 });
 ```
 
-For defense in depth, opt out of system-prefixed user topics:
+If your app legitimately bus-relays user-defined `__`-prefixed topics (uncommon), opt back in:
 
 ```js
-createPubSubBus(redis, { allowSystemTopics: false });
+createPubSubBus(redis, { allowSystemTopics: true });
 ```
 
-Topics longer than 256 chars or containing control characters are now rejected; review any code that constructs topic names dynamically.
+Topics longer than 256 chars or containing control characters are also rejected; review any code that constructs topic names dynamically.
 
 ### 4. Replay backends consult `platform.checkSubscribe` before reading history
 

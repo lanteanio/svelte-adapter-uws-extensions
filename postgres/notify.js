@@ -30,7 +30,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
  * @property {number} [lockId] - Advisory lock id. Required when `multiListener: 'advisory'`.
  * @property {number} [pollInterval=5000] - ms between leader-election polls.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject NOTIFY payloads larger than this many bytes (after the parser hands back a topic/event tuple). Defends against an actor with `pg_notify` privilege fanning out a giant envelope. Postgres caps NOTIFY at ~8000 bytes, so the default 1 MB is well above any legitimate use.
- * @property {boolean} [allowSystemTopics=true] - When false, drop notifications whose parsed `topic` starts with `__`. Defense-in-depth on top of the wire-level subscribe gate.
+ * @property {boolean} [allowSystemTopics=false] - Default false: drop notifications whose parsed `topic` starts with `__`. Defense against a foreign publisher (or hostile DBA) injecting forged `__signal:*` / `__rpc` / plugin-internal frames via `pg_notify`. Apps that legitimately bridge user-defined `__`-prefixed topics (rare) can opt back in via `allowSystemTopics: true`.
  */
 
 /**
@@ -96,7 +96,7 @@ export function createNotifyBridge(client, options) {
 	const autoReconnect = options.autoReconnect !== false;
 	const validator = createBusValidator({
 		maxBytes: options.maxEnvelopeBytes,
-		allowSystemTopics: options.allowSystemTopics !== false,
+		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: []
 	});
 	const reconnectInterval = options.reconnectInterval ?? 3000;

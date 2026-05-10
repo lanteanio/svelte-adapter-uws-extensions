@@ -48,11 +48,12 @@ export interface ShardedBusOptions {
 	maxEnvelopeBytes?: number;
 
 	/**
-	 * When `false`, inbound envelopes addressed to `__`-prefixed topics
-	 * are dropped. Belt-and-suspenders defense in depth on top of the
-	 * adapter's wire-level subscribe gate; safe to flip when the app
-	 * publishes only on user-space topics.
-	 * @default true
+	 * When `false` (default), inbound envelopes addressed to `__`-prefixed
+	 * topics are dropped. Closes the bus-injection class in shared-Redis
+	 * deployments. Apps that legitimately bus-relay user-defined
+	 * `__`-prefixed topics (rare) can opt back in via
+	 * `allowSystemTopics: true`.
+	 * @default false
 	 */
 	allowSystemTopics?: boolean;
 }

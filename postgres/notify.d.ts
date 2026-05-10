@@ -64,11 +64,14 @@ export interface NotifyBridgeOptions {
 	maxEnvelopeBytes?: number;
 
 	/**
-	 * When `false`, parsed envelopes addressed to `__`-prefixed topics
-	 * are dropped before the publish call. Belt-and-suspenders defense
-	 * in depth; safe to flip when the bridge only emits on user-space
-	 * topics.
-	 * @default true
+	 * When `false` (default), parsed envelopes addressed to `__`-prefixed
+	 * topics are dropped before the publish call. Closes the
+	 * NOTIFY-injection class where a foreign publisher (or hostile DBA)
+	 * could otherwise inject forged `__signal:*` / `__rpc` /
+	 * plugin-internal frames via `pg_notify`. Apps that legitimately
+	 * bridge user-defined `__`-prefixed topics (rare) can opt back in
+	 * via `allowSystemTopics: true`.
+	 * @default false
 	 */
 	allowSystemTopics?: boolean;
 }

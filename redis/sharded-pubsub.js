@@ -88,7 +88,7 @@ export function createShardedBus(client, options = {}) {
 
 	const validator = createBusValidator({
 		maxBytes: options.maxEnvelopeBytes,
-		allowSystemTopics: options.allowSystemTopics !== false,
+		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: []
 	});
 
