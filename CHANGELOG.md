@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.10] - 2026-05-10
+
 ### Changed
 
 - **Bumped `engines.node` to `>=22.0.0` (was `>=20.0.0`).** Tracks `svelte-adapter-uws` 0.5, which pins `uWebSockets.js` v20.67.0 (Node 20 dropped upstream). Node 22 LTS, Node 24 current, and Node 26 supported. See `MIGRATION.md` for the runtime-bump checklist.
