@@ -77,6 +77,23 @@ export interface PubSubBus {
 
 	/** Stop the Redis subscriber and clean up. */
 	deactivate(): Promise<void>;
+
+	/**
+	 * Ready-made WebSocket hooks. Destructure `const { open } = bus.hooks`
+	 * into your `hooks.ws.js` for a one-line wiring that:
+	 *   1. activates the Redis subscriber (idempotent; only the first call
+	 *      opens the subscriber), and
+	 *   2. subscribes the connection to the bus's `systemChannel` via the
+	 *      platform-trust path, so `degraded` / `recovered` events reach
+	 *      it. Skipped when `systemChannel` is `null` or `false`.
+	 *
+	 * Subscribing through `platform.subscribe` (server-trust) intentionally
+	 * bypasses the wire-level `__`-prefix gate that the adapter enforces
+	 * on client-sent subscribe frames.
+	 */
+	hooks: {
+		open(ws: any, ctx: { platform: Platform }): Promise<void>;
+	};
 }
 
 /**

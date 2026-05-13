@@ -25,6 +25,16 @@ import { createBusValidator } from '../shared/bus-validate.js';
  */
 
 /**
+ * @typedef {Object} PubSubBusHooks
+ * @property {(ws: import('svelte-adapter-uws').WS, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>} open -
+ *   Drop-in `hooks.ws.open` that subscribes `ws` to the bus's `systemChannel`
+ *   (so `degraded` / `recovered` events reach this connection) and activates
+ *   the Redis subscriber. Both calls are idempotent: per-connection subscribe
+ *   is a no-op on repeat; activate early-outs after the first call. When
+ *   `systemChannel` is `null` or `false`, only the activate step runs.
+ */
+
+/**
  * @typedef {Object} PubSubBus
  * @property {(platform: import('svelte-adapter-uws').Platform) => import('svelte-adapter-uws').Platform} wrap -
  *   Returns a new Platform whose publish() sends to Redis + local.
@@ -34,6 +44,11 @@ import { createBusValidator } from '../shared/bus-validate.js';
  *   original platform.publish(). Call this once at startup (e.g. in your open hook).
  * @property {() => Promise<void>} deactivate -
  *   Stop the Redis subscriber and clean up.
+ * @property {PubSubBusHooks} hooks -
+ *   Ready-made hooks for `hooks.ws.js`. Destructure `const { open } = bus.hooks`
+ *   for a one-line wiring that activates the bus AND puts every connection in
+ *   `systemChannel`'s subscriber set so `degraded` / `recovered` events are
+ *   delivered.
  */
 
 /**
@@ -51,10 +66,9 @@ import { createBusValidator } from '../shared/bus-validate.js';
  * const redis = createRedisClient({ url: 'redis://localhost:6379' });
  * const bus = createPubSubBus(redis);
  *
- * // In your open hook:
- * export function open(ws, { platform }) {
- *   bus.activate(platform); // idempotent, only subscribes once
- * }
+ * // Drop-in open hook: activates the bus AND subscribes every connection
+ * // to the systemChannel so degraded / recovered events are delivered.
+ * export const { open } = bus.hooks;
  *
  * // Use the wrapped platform for publishing:
  * const distributed = bus.wrap(platform);
@@ -163,7 +177,7 @@ export function createPubSubBus(client, options = {}) {
 		}).catch((err) => { b?.failure(err); });
 	}
 
-	return {
+	const bus = {
 		wrap(platform) {
 			const wrapped = {
 				publish(topic, event, data, options) {
@@ -365,6 +379,22 @@ export function createPubSubBus(client, options = {}) {
 			await subscriber.unsubscribe(channel).catch(() => {});
 			await subscriber.quit().catch(() => subscriber.disconnect());
 			subscriber = null;
+		},
+
+		hooks: {
+			async open(ws, ctx) {
+				const platform = ctx && ctx.platform;
+				if (!platform) return;
+				// systemChannel uses the platform-trust path (`platform.subscribe`),
+				// not the wire path, so it bypasses the adapter's `__`-prefix
+				// gate. Subscribing here is what restores `degraded` / `recovered`
+				// delivery after the wire path was closed in adapter 0.5.0-next.21.
+				if (systemChannel) {
+					platform.subscribe(ws, systemChannel);
+				}
+				await bus.activate(platform);
+			}
 		}
 	};
+	return bus;
 }

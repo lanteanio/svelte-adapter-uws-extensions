@@ -137,6 +137,37 @@ export const { subscribe, unsubscribe, close } = presence.hooks;
 
 **How to migrate.** On Redis 6 or older Valkey, use `createPubSubBus` instead of `createShardedBus` and use `redis.eval` directly instead of `createFunctionLibrary`. Upgrade Redis to 7+ to use the new modules.
 
+### Pub/sub bus `systemChannel` delivery requires `bus.hooks.open`
+
+**What changed.** `svelte-adapter-uws@0.5.0-next.21` closed the wire-level path that put connections into `__`-prefixed subscriber sets. Pre-next.21, the `svelte-realtime` client store wire-subscribed to `__realtime` and the server-side subscriber set was populated as a side effect; the pub/sub bus's auto-emitted `degraded` / `recovered` events reached every connected client through that membership. After the wire-gate change, nothing populated the subscriber set on the server, so the bus published into an empty set and clients never saw the events - any `{#if $health === 'degraded'}` banner was silently dead. `bus.hooks.open` (new in this release) puts every connection into `systemChannel`'s subscriber set via the platform-trust path (`platform.subscribe`), which intentionally bypasses the wire-level gate.
+
+**How to migrate.** If you use `createPubSubBus` with a `breaker` and follow the README's degradation-banner pattern, swap your open hook from:
+
+```js
+// before
+export function open(ws, { platform }) {
+  bus.activate(platform);
+}
+```
+
+to:
+
+```js
+// after
+export const { open } = bus.hooks;
+```
+
+or, if your open hook does additional work:
+
+```js
+export async function open(ws, ctx) {
+  await bus.hooks.open(ws, ctx);
+  // ... other open-hook work
+}
+```
+
+`bus.activate(platform)` still works for the subscriber-half; the difference is that `bus.hooks.open` ALSO subscribes the connection to `systemChannel`. If you set `systemChannel: null` or `false`, no migration is required - `bus.hooks.open` still activates the subscriber and skips the per-WS subscribe. Bump the `svelte-adapter-uws` peer minimum to `>=0.5.0-next.23` to also clear the cosmetic `[ws] subscribe denied topic=__realtime` console warn on every page mount; the `bus.hooks.open` fix itself works against any 0.5 adapter.
+
 ### Presence wire shape on `__presence:{topic}` migrated to `presence_state` / `presence_diff`
 
 **Only impacts apps with hand-rolled WebSocket clients consuming the wire directly.**
@@ -240,7 +271,7 @@ For high-density rooms (>200 active movers) raise `topicThrottle` to 33 (30Hz).
 
 **What changed.** When `createPubSubBus` shares a circuit breaker with the rest of the extensions, the bus subscribes to the breaker and auto-emits `degraded` / `recovered` events on a configurable system topic (default `'__realtime'`). Replaces the manually wired `breaker.onStateChange` to `distributed.publish('__system', ...)` pattern that the README previously documented.
 
-**How to migrate.** Remove any manual wiring of breaker state to a `__system` topic if you previously followed the README pattern. To disable auto-emission, set `systemChannel: null` or `false`. To use a different topic, set `systemChannel: 'my-status-topic'`. The `onDegraded` / `onRecovered` callbacks remain available for server-side reactions regardless.
+**How to migrate.** Remove any manual wiring of breaker state to a `__system` topic if you previously followed the README pattern. To disable auto-emission, set `systemChannel: null` or `false`. To use a different topic, set `systemChannel: 'my-status-topic'`. The `onDegraded` / `onRecovered` callbacks remain available for server-side reactions regardless. **Delivery to clients also requires wiring `bus.hooks.open` in your `hooks.ws.js`** - see [Pub/sub bus `systemChannel` delivery requires `bus.hooks.open`](#pubsub-bus-systemchannel-delivery-requires-bushooksopen) under Required source changes.
 
 ### Default `select` strips `__`-prefixed and sensitive keys on presence and cursor
 

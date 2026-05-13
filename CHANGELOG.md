@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.13] - 2026-05-14
+
+### Added
+
+- **`bus.hooks.open` on `createPubSubBus`.** One-line `hooks.ws.js` wiring that subscribes every connection to the bus's `systemChannel` AND activates the Redis subscriber. Drop-in: `export const { open } = bus.hooks;`. Mirrors the `bus.hooks` surface already exposed by `createShardedBus`.
+
+### Fixed
+
+- **`degraded` / `recovered` events now reach clients.** With `svelte-adapter-uws` 0.5.0-next.21+, `__`-prefixed wire subscribes are denied, and from 0.5.0-next.23+ the client store does not send the wire frame at all. Nothing else was putting the connection into the `systemChannel` subscriber set server-side, so the pubsub bus's auto-emitted state-change events published into an empty set and `$health === 'degraded'` was silently dead. The new `bus.hooks.open` puts every connection in via the platform-trust path (`platform.subscribe`), which intentionally bypasses the wire-level `__`-prefix gate. Apps that documented a `{#if $health === 'degraded'}` banner regain delivery once they swap `bus.activate(platform)` for `bus.hooks.open(ws, ctx)`. Bump the `svelte-adapter-uws` peer minimum to `0.5.0-next.23` to also clear the cosmetic `[ws] subscribe denied` console warns on every page mount.
+
 ## [0.5.0-next.12] - 2026-05-13
 
 ### Changed

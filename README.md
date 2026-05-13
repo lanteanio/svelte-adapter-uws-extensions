@@ -201,18 +201,28 @@ import { bus } from '$lib/server/bus';
 
 let distributed;
 
-export function open(ws, { platform }) {
-  // Start subscriber (idempotent, only subscribes once)
-  bus.activate(platform);
-  // Get a wrapped platform that publishes to Redis + local
-  distributed = bus.wrap(platform);
+export async function open(ws, ctx) {
+  // Activates the Redis subscriber (idempotent) AND subscribes the
+  // connection to the bus's systemChannel so degraded / recovered
+  // events reach it. One line, zero ceremony.
+  await bus.hooks.open(ws, ctx);
+  // Wrapped platform: publish() reaches local clients AND every other instance.
+  distributed = bus.wrap(ctx.platform);
 }
 
 export function message(ws, { data, platform }) {
   const msg = JSON.parse(Buffer.from(data).toString());
-  // This publish reaches local clients AND all other instances
   distributed.publish('chat', 'message', msg);
 }
+```
+
+If your open hook does nothing else, drop the ceremony entirely:
+
+```js
+// src/hooks.ws.js
+import { bus } from '$lib/server/bus';
+
+export const { open } = bus.hooks;
 ```
 
 #### Wire-batched publish (`publishBatched`)
@@ -253,7 +263,8 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 | Method | Description |
 |---|---|
 | `bus.wrap(platform)` | Returns a new Platform whose `publish()`, `batch()`, and `publishBatched()` send to Redis + local. Other Platform methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass through unchanged |
-| `bus.activate(platform)` | Start the Redis subscriber (idempotent) |
+| `bus.hooks` | Ready-made WebSocket hooks. `open(ws, ctx)` activates the Redis subscriber (idempotent) AND subscribes `ws` to the bus's `systemChannel` so `degraded` / `recovered` events are delivered. Destructure for one-line `hooks.ws.js` wiring: `export const { open } = bus.hooks;` |
+| `bus.activate(platform)` | Start the Redis subscriber (idempotent). Equivalent to the subscriber half of `bus.hooks.open`; prefer `bus.hooks.open` for new code |
 | `bus.deactivate()` | Stop the subscriber |
 
 ---
@@ -2404,6 +2415,7 @@ The breaker is a three-state machine: **healthy** (all requests pass through) ->
 When Redis pub/sub fails, live streams on other replicas stop receiving updates. Connected clients continue showing stale data with no indication that the stream is degraded. The pub/sub bus emits this directly: when the shared breaker leaves the healthy state, a `degraded` event fires on the bus's `systemChannel` (default `'__realtime'`); when it returns to healthy, a `recovered` event fires.
 
 ```js
+// src/lib/server/bus.js
 import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
 import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
 
@@ -2417,7 +2429,17 @@ export const bus = createPubSubBus(redis, {
 });
 ```
 
-On the client side, subscribe to the `__realtime` topic and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data. The event payload is `{ at: <epoch ms> }` so a client can show "lost connection 12s ago".
+```js
+// src/hooks.ws.js
+import { bus } from '$lib/server/bus';
+
+// bus.hooks.open subscribes every connection to the systemChannel.
+// Without this wiring, degraded / recovered events publish into an
+// empty subscriber set and clients never hear about the outage.
+export const { open } = bus.hooks;
+```
+
+On the client, subscribe to the `__realtime` topic and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data. The event payload is `{ at: <epoch ms> }` so a client can show "lost connection 12s ago".
 
 Both the topic name and the auto-emission are configurable:
 

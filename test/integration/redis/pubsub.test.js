@@ -450,6 +450,56 @@ describe('redis pubsub bus (integration)', () => {
 			await waitFor(() => platform.published.length > 0);
 			expect(platform.published).toHaveLength(1);
 		});
+
+		it('hooks.open activates the bus AND records the systemChannel subscribe', async () => {
+			// Regression: prior to this fix, the wire subscribe from the
+			// client was the only path putting a WS into __realtime's
+			// subscriber set. Adapter next.21 closed that path, leaving
+			// degraded / recovered events with zero subscribers. hooks.open
+			// owns subscriber-set membership server-side via the platform-
+			// trust path.
+			const channel = uniqueChannel('hooks-open');
+			const bus = track(createPubSubBus(client, { channel }));
+			const ws = { id: 'w1' };
+
+			await bus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+
+			// Confirm activate ran: a remote publish on `channel` is
+			// forwarded through the bus's subscriber duplicate to the
+			// local platform.
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat',
+				event: 'msg',
+				data: { ok: 1 }
+			}));
+			await waitFor(() => platform.published.some((p) => p.topic === 'chat'));
+		});
+
+		it('hooks.open is safe to call once per connection (activate stays idempotent)', async () => {
+			const channel = uniqueChannel('hooks-open-many');
+			const bus = track(createPubSubBus(client, { channel }));
+
+			await bus.hooks.open({ id: 'w1' }, { platform });
+			await bus.hooks.open({ id: 'w2' }, { platform });
+			await bus.hooks.open({ id: 'w3' }, { platform });
+
+			expect(platform.subscribed.map((s) => s.topic)).toEqual(['__realtime', '__realtime', '__realtime']);
+
+			// One remote publish should arrive exactly once - confirms a
+			// single subscriber duplicate handles all three open calls.
+			await client.redis.publish(channel, JSON.stringify({
+				instanceId: 'remote',
+				topic: 'chat',
+				event: 'msg',
+				data: null
+			}));
+			await waitFor(() => platform.published.some((p) => p.topic === 'chat'));
+			const chatPublishes = platform.published.filter((p) => p.topic === 'chat');
+			expect(chatPublishes).toHaveLength(1);
+		});
 	});
 
 	// Inbound envelope validation. The bus republishes anything its

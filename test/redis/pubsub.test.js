@@ -856,4 +856,135 @@ describe('redis pubsub bus', () => {
 			breaker.destroy();
 		});
 	});
+
+	describe('hooks.open', () => {
+		it('exposes an async open hook', () => {
+			expect(bus.hooks).toBeDefined();
+			expect(typeof bus.hooks.open).toBe('function');
+		});
+
+		it('subscribes the connection to the default systemChannel', async () => {
+			const ws = { id: 'w1' };
+			await bus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+
+			await bus.deactivate();
+		});
+
+		it('subscribes the connection to a custom systemChannel', async () => {
+			const customBus = createPubSubBus(client, { systemChannel: '__status' });
+			const ws = { id: 'w1' };
+
+			await customBus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__status' }]);
+
+			await customBus.deactivate();
+		});
+
+		it('does not subscribe when systemChannel is null', async () => {
+			const noChBus = createPubSubBus(client, { systemChannel: null });
+			const ws = { id: 'w1' };
+
+			await noChBus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([]);
+
+			await noChBus.deactivate();
+		});
+
+		it('does not subscribe when systemChannel is false', async () => {
+			const noChBus = createPubSubBus(client, { systemChannel: false });
+			const ws = { id: 'w1' };
+
+			await noChBus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([]);
+
+			await noChBus.deactivate();
+		});
+
+		it('activates the Redis subscriber on first call', async () => {
+			let duplicates = 0;
+			const origDuplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				duplicates++;
+				return origDuplicate(overrides);
+			};
+
+			expect(duplicates).toBe(0);
+			await bus.hooks.open({ id: 'w1' }, { platform });
+			expect(duplicates).toBe(1);
+
+			await bus.deactivate();
+		});
+
+		it('activate is idempotent across many open calls', async () => {
+			let duplicates = 0;
+			const origDuplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				duplicates++;
+				return origDuplicate(overrides);
+			};
+
+			await bus.hooks.open({ id: 'w1' }, { platform });
+			await bus.hooks.open({ id: 'w2' }, { platform });
+			await bus.hooks.open({ id: 'w3' }, { platform });
+
+			expect(duplicates).toBe(1);
+			expect(platform.subscribed).toHaveLength(3);
+
+			await bus.deactivate();
+		});
+
+		it('survives a missing platform without throwing', async () => {
+			await expect(bus.hooks.open({ id: 'w1' }, {})).resolves.toBeUndefined();
+			await expect(bus.hooks.open({ id: 'w1' }, undefined)).resolves.toBeUndefined();
+			expect(platform.subscribed).toEqual([]);
+		});
+
+		it('survives destructuring (open detached from bus.hooks)', async () => {
+			let duplicates = 0;
+			const origDuplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				duplicates++;
+				return origDuplicate(overrides);
+			};
+
+			const { open } = bus.hooks;
+			const ws = { id: 'detached' };
+
+			await open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+			expect(duplicates).toBe(1);
+
+			await bus.deactivate();
+		});
+
+		it('subscribe is recorded for the WS and the publish goes to the same topic', async () => {
+			// The mock platform does not route publish to its subscribed
+			// set, so this is the unit-shape of the bug fix: the WS is
+			// recorded in subscribers, AND degraded fires on the same
+			// topic. The end-to-end routing assertion lives in the
+			// integration test.
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const wiredBus = createPubSubBus(client, { breaker });
+			const ws = { id: 'w1' };
+
+			await wiredBus.hooks.open(ws, { platform });
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+
+			platform.reset();
+			breaker.failure();
+
+			const degradedFrame = platform.published.find((p) => p.topic === '__realtime' && p.event === 'degraded');
+			expect(degradedFrame).toBeDefined();
+
+			await wiredBus.deactivate();
+			breaker.destroy();
+		});
+	});
 });
