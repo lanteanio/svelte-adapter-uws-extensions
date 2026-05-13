@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.12] - 2026-05-13
+
+### Changed
+
+- **Warning messages now link to short-URL explainers.** Eight `console.warn` sites (`postgres/notify`, `redis/index`, `redis/presence`, `redis/publish-rate`, `redis/pubsub`, `redis/registry` x2, `redis/sharded-pubsub`, `shared/sensitive`) append a `See: https://svti.me/<slug>` pointer so an operator hitting a warning in production can land on a canonical writeup instead of grepping the source for context. No behavior change; pure ergonomics.
+- **`MIGRATION.md` reorganized into four tiers** (Critical / Required source changes / Notable defaults and behaviors / Cosmetic) instead of one long flat numbered list. Most apps only need to read the first two sections; type-only refactors and niche edge cases are now out of the critical path. The cluster of three "default `select` strips ..." items collapsed into a single entry covering the `__`-prefix strip, the sensitive-key strip, and the one-time warnings. Peer-dep mention updated from `^0.5.0-next.19` to `^0.5.0` now that the 0.5 line is stable.
+- **README: version-compatibility table for the three ecosystem packages.** Lists which `svelte-adapter-uws` / `svelte-realtime` / `svelte-adapter-uws-extensions` ranges go together (0.4.x mutually compatible, 0.5.x mutually compatible), the Node 22+ / Redis 7+ caveats, and the `MIGRATION.md` pointer for the 0.4 -> 0.5 upgrade.
+
 ## [0.5.0-next.11] - 2026-05-10
 
 ### Security

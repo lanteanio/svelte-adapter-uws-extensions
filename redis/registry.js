@@ -226,7 +226,8 @@ export function createConnectionRegistry(client, options) {
 					'" has grown to ' + users.size + ' userIds. Eviction would corrupt ' +
 					'sendTo matching, so the index keeps growing - raise this if the ' +
 					'cardinality is legitimate, or check for an attributes(ws) callback ' +
-					'returning unique values per connection.'
+					'returning unique values per connection.\n' +
+					'  See: https://svti.me/registry-index'
 				);
 			}
 		}
@@ -257,7 +258,8 @@ export function createConnectionRegistry(client, options) {
 				'[registry] cluster-wide user index has grown to ' + userToInstance.size +
 				' entries. Each entry is ~32 bytes of Map state per instance maintaining ' +
 				'the index. Eviction would mis-route sendTo, so the index keeps growing - ' +
-				'split the cluster or stop registering anonymous-shaped userIds.'
+				'split the cluster or stop registering anonymous-shaped userIds.\n' +
+				'  See: https://svti.me/registry-index'
 			);
 		}
 	}

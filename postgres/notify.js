@@ -159,7 +159,8 @@ export function createNotifyBridge(client, options) {
 		if (msg.payload && msg.payload.length > 7500) {
 			console.warn(
 				`[postgres/notify] payload on "${channel}" is ${msg.payload.length} bytes - ` +
-				'approaching the ~8000 byte Postgres NOTIFY limit'
+				'approaching the ~8000 byte Postgres NOTIFY limit\n' +
+				'  See: https://svti.me/pg-notify-limit'
 			);
 		}
 		// Pre-parse size guard. Postgres caps NOTIFY at ~8000 bytes by

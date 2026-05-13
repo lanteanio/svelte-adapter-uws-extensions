@@ -103,7 +103,8 @@ export function createRedisClient(options = {}) {
 					' duplicate connections. A single Node process should never need ' +
 					'more than a handful (one per subscriber-shaped module). Each ' +
 					'duplicate owns a real ioredis socket; check for a lifecycle leak ' +
-					'where modules are constructed without a corresponding deactivate.'
+					'where modules are constructed without a corresponding deactivate.\n' +
+					'  See: https://svti.me/redis-duplicates'
 				);
 			}
 			const cleanup = () => duplicates.delete(dup);

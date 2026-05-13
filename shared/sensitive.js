@@ -85,7 +85,8 @@ export function createSensitiveWarner(prefix) {
 			if (SENSITIVE_WARN_RE.test(k)) {
 				console.warn(
 					`[${prefix}] userData key "${k}" looks sensitive; ` +
-					'use the select option to strip it before broadcasting'
+					'use the select option to strip it before broadcasting\n' +
+					'  See: https://svti.me/userdata-sensitive'
 				);
 				warned = true;
 				return;

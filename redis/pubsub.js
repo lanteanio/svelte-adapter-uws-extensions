@@ -124,7 +124,8 @@ export function createPubSubBus(client, options = {}) {
 				'[pubsub] microtask relay batch reached ' + relayBatch.length +
 				' entries in one tick. The batch is drained every microtask, so a ' +
 				'caller emitted a million publishes in one synchronous burst - likely ' +
-				'a publish-in-loop without yielding.'
+				'a publish-in-loop without yielding.\n' +
+				'  See: https://svti.me/pubsub-burst'
 			);
 		}
 		if (!relayScheduled) {

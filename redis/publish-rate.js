@@ -208,7 +208,8 @@ export function createPublishRateAggregator(client, options = {}) {
 					'[publish-rate] aggregator is tracking ' + remoteSlices.size +
 					' sibling instances. Cluster sizes past this threshold typically ' +
 					'indicate a deployment misconfig or stale-instance leak; staleAfter ' +
-					'pruning normally caps remote slice retention.'
+					'pruning normally caps remote slice retention.\n' +
+					'  See: https://svti.me/publish-rate-aggregator'
 				);
 			}
 			if (Array.isArray(env.subs)) {

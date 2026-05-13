@@ -131,7 +131,8 @@ export function createShardedBus(client, options = {}) {
 				'[sharded-bus] microtask batch reached ' + channelBatches.size +
 				' distinct channels in one tick. The batch is drained every microtask, ' +
 				'so reaching this size means a publisher emitted a million distinct ' +
-				'channels in one synchronous burst - likely a topic-cardinality leak.'
+				'channels in one synchronous burst - likely a topic-cardinality leak.\n' +
+				'  See: https://svti.me/sharded-bus-burst'
 			);
 		}
 		if (!relayScheduled) {

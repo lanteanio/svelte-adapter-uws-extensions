@@ -526,7 +526,8 @@ export function createPresence(client, options = {}) {
 					console.warn(
 						'[redis/presence] keyspace notifications: psubscribe failed - ' +
 						'enable on Redis with `CONFIG SET notify-keyspace-events Ex` (or any flagset including `K`/`E` and `x`): ' +
-						err.message
+						err.message + '\n' +
+						'  See: https://svti.me/redis-keyspace'
 					);
 				}
 			}

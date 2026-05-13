@@ -69,6 +69,17 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Getting started**
 
+## Version compatibility
+
+The three ecosystem packages move together. Bump them as a group:
+
+| `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
+|---|---|---|---|
+| `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
+| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ for `createShardedBus` / `createFunctionLibrary`. See `MIGRATION.md` if upgrading from 0.4. |
+
+Mixed-version installs are rejected at install time with a peer-dep warning.
+
 ## Installation
 
 ```bash
