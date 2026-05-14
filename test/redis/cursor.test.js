@@ -27,6 +27,8 @@ describe('redis cursor', () => {
 
 	describe('createCursor', () => {
 		it('returns a cursor tracker with the expected API', () => {
+			expect(typeof cursors.attach).toBe('function');
+			expect(typeof cursors.detach).toBe('function');
 			expect(typeof cursors.update).toBe('function');
 			expect(typeof cursors.remove).toBe('function');
 			expect(typeof cursors.list).toBe('function');
@@ -140,6 +142,81 @@ describe('redis cursor', () => {
 
 			expect(platform.sent).toHaveLength(0);
 			c.destroy();
+		});
+	});
+
+	describe('attach / detach', () => {
+		it('attach subscribes the connection to __cursor:{topic}', async () => {
+			const ws = mockWs({ id: '1' });
+			await cursors.attach(ws, 'canvas', platform);
+
+			expect(platform.subscribed).toEqual([{ ws, topic: '__cursor:canvas' }]);
+		});
+
+		it('attach calls snapshot so the new connection sees existing cursors', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
+			const mover = mockWs({ id: 'mover' });
+			c.update(mover, 'canvas', { x: 10 }, platform);
+			platform.reset();
+
+			const joiner = mockWs({ id: 'joiner' });
+			await c.attach(joiner, 'canvas', platform);
+
+			const bulkToJoiner = platform.sent.find((s) => s.ws === joiner && s.topic === '__cursor:canvas');
+			expect(bulkToJoiner).toBeDefined();
+			expect(bulkToJoiner.event).toBe('bulk');
+			expect(bulkToJoiner.data).toHaveLength(1);
+			c.destroy();
+		});
+
+		it('attach with no existing cursors does not send a bulk frame', async () => {
+			const ws = mockWs({ id: '1' });
+			await cursors.attach(ws, 'empty-canvas', platform);
+
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('attach + update on a remote ws delivers an update on the local subscriber set', async () => {
+			// End-to-end intent of the fix: a connection that came in via
+			// attach IS in __cursor:{topic}'s subscriber set, so when
+			// another connection publishes an update, the platform's
+			// publish path treats the attached ws as a deliverable target.
+			// Mock platform records subscribes and publishes; routing is
+			// asserted via the integration test.
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const watcher = mockWs({ id: 'watcher' });
+			const mover = mockWs({ id: 'mover' });
+
+			await c.attach(watcher, 'canvas', platform);
+			expect(platform.subscribed.find((s) => s.ws === watcher && s.topic === '__cursor:canvas')).toBeDefined();
+
+			c.update(mover, 'canvas', { x: 99 }, platform);
+
+			const updates = platform.published.filter((p) => p.topic === '__cursor:canvas' && p.event === 'update');
+			expect(updates).toHaveLength(1);
+			c.destroy();
+		});
+
+		it('detach unsubscribes the connection from __cursor:{topic}', () => {
+			const ws = mockWs({ id: '1' });
+			cursors.detach(ws, 'canvas', platform);
+
+			expect(platform.unsubscribed).toEqual([{ ws, topic: '__cursor:canvas' }]);
+		});
+
+		it('attach is safe when platform.subscribe throws (closed ws)', async () => {
+			const ws = mockWs({ id: '1' });
+			platform.subscribe = () => { throw new Error('ws closed'); };
+
+			await expect(cursors.attach(ws, 'canvas', platform)).resolves.toBeUndefined();
+			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('detach is safe when platform.unsubscribe throws (closed ws)', () => {
+			const ws = mockWs({ id: '1' });
+			platform.unsubscribe = () => { throw new Error('ws closed'); };
+
+			expect(() => cursors.detach(ws, 'canvas', platform)).not.toThrow();
 		});
 	});
 

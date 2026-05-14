@@ -58,6 +58,17 @@ const EVENTS = Object.freeze({
 
 /**
  * @typedef {Object} RedisCursorTracker
+ * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} attach -
+ *   Opt this connection into receiving cursor updates for `topic`. Subscribes
+ *   the connection to the internal `__cursor:` channel via the platform-trust
+ *   path (which intentionally bypasses the adapter's wire-level `__`-prefix
+ *   gate) and sends the current cursor state. Mirrors `presence.join` and the
+ *   pubsub bus's `bus.hooks.open` - the extension owns server-side subscriber-
+ *   set membership for the topics it publishes to.
+ * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => void} detach -
+ *   Stop this connection from receiving cursor updates for `topic`. Safe to
+ *   call on a closed connection (uWS releases automatically on disconnect, so
+ *   detach is only needed when a still-connected user leaves a room).
  * @property {(ws: any, topic: string, data: any, platform: import('svelte-adapter-uws').Platform) => void} update
  * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} remove
  * @property {(topic: string) => Promise<CursorEntry[]>} list
@@ -431,6 +442,27 @@ export function createCursor(client, options = {}) {
 
 	/** @type {RedisCursorTracker} */
 	const tracker = {
+		async attach(ws, topic, platform) {
+			// platform.subscribe is the server-trust path; intentionally
+			// bypasses the wire-level __-prefix gate that the adapter
+			// applies to client subscribe frames. Without this call, the
+			// publishes in update() / doBroadcast() / flushTopic() fan
+			// out to an empty subscriber set and no client ever sees a
+			// cursor frame.
+			try {
+				platform.subscribe(ws, '__cursor:' + topic);
+			} catch {
+				return;
+			}
+			await tracker.snapshot(ws, topic, platform);
+		},
+
+		detach(ws, topic, platform) {
+			try {
+				platform.unsubscribe(ws, '__cursor:' + topic);
+			} catch { /* closed */ }
+		},
+
 		update(ws, topic, data, platform) {
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);

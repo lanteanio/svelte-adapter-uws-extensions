@@ -65,6 +65,26 @@ export interface CursorEntry {
 
 export interface RedisCursorTracker {
 	/**
+	 * Opt this connection into receiving cursor updates for `topic`.
+	 * Subscribes the connection to the internal `__cursor:` channel via
+	 * the platform-trust path (which intentionally bypasses the wire-level
+	 * `__`-prefix gate) and sends the current cursor state. Call from your
+	 * "join room" RPC, mirroring `presence.join`.
+	 *
+	 * Without `attach`, the publishes in `update` fan out to an empty
+	 * subscriber set and no client ever sees a cursor frame.
+	 */
+	attach(ws: any, topic: string, platform: Platform): Promise<void>;
+
+	/**
+	 * Stop this connection from receiving cursor updates for `topic`. Safe
+	 * to call on a closed connection. uWS releases subscriptions on
+	 * disconnect automatically, so `detach` is only needed when a
+	 * still-connected user leaves a room.
+	 */
+	detach(ws: any, topic: string, platform: Platform): void;
+
+	/**
 	 * Broadcast a cursor position update. Throttled per user per topic.
 	 * Call this from your `message` hook when you receive cursor data.
 	 */
@@ -79,7 +99,8 @@ export interface RedisCursorTracker {
 	/**
 	 * Send all current cursor positions for a topic to a single connection.
 	 * Sends a `bulk` event on `__cursor:{topic}` with the full cursor list.
-	 * Called automatically by `hooks.subscribe` when a client subscribes.
+	 * Folded into `attach` for typical use; exposed for advanced callers
+	 * that want to resend a snapshot without re-subscribing.
 	 */
 	snapshot(ws: any, topic: string, platform: Platform): Promise<void>;
 
@@ -95,17 +116,21 @@ export interface RedisCursorTracker {
 	destroy(): void;
 
 	/**
-	 * Ready-made WebSocket hooks for zero-config cursor tracking.
+	 * Ready-made WebSocket hooks for cursor tracking.
 	 *
-	 * `subscribe` sends a snapshot of existing cursors when a client subscribes
-	 * to a `__cursor:*` topic.
 	 * `message` handles incoming `{ type: 'cursor', topic, data }` messages.
 	 * `close` removes the connection's cursors from all topics.
+	 *
+	 * `subscribe` is a no-op under current adapters: the adapter's wire-level
+	 * `__`-prefix gate denies any inbound `__cursor:*` subscribe frame, so
+	 * this hook never fires. Kept for backward source-compat; new code should
+	 * call `tracker.attach(ws, topic, platform)` from the app's "join room"
+	 * RPC instead.
 	 *
 	 * @example
 	 * ```js
 	 * import { cursor } from '$lib/server/cursor';
-	 * export const { subscribe, message, close } = cursor.hooks;
+	 * export const { message, close } = cursor.hooks;
 	 * ```
 	 */
 	hooks: {

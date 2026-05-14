@@ -168,6 +168,32 @@ export async function open(ws, ctx) {
 
 `bus.activate(platform)` still works for the subscriber-half; the difference is that `bus.hooks.open` ALSO subscribes the connection to `systemChannel`. If you set `systemChannel: null` or `false`, no migration is required - `bus.hooks.open` still activates the subscriber and skips the per-WS subscribe. Bump the `svelte-adapter-uws` peer minimum to `>=0.5.0-next.23` to also clear the cosmetic `[ws] subscribe denied topic=__realtime` console warn on every page mount; the `bus.hooks.open` fix itself works against any 0.5 adapter.
 
+### Cursor delivery requires `tracker.attach(ws, topic, platform)`
+
+**What changed.** Same regression class as the pubsub `systemChannel` issue above. `svelte-adapter-uws@0.5.0-next.21` closed the wire-level path that put connections into `__`-prefixed subscriber sets; pre-next.21, the client store's wire subscribe to `__cursor:{topic}` populated the subscriber set as a side effect. After next.21, the wire frame is denied; after next.23, the client does not send it. The cursor extension publishes to `__cursor:{topic}` from `update` / the bulk-flush tick / `remove`, but nothing else subscribed connections to that channel server-side, so every cursor frame fanned out into an empty subscriber set and cross-tab / cross-user cursors were silently dropped. `tracker.attach(ws, topic, platform)` (new in this release) owns membership via the platform-trust path (`platform.subscribe`), which intentionally bypasses the wire-level gate, and folds the snapshot send into the same call.
+
+**How to migrate.** Call `cursors.attach(ws, topic, platform)` from your "join room" RPC (the same place you call `presence.join`), and `cursors.detach` from your "leave room" RPC if the user stays connected:
+
+```js
+// before - publishes went into an empty subscriber set on adapter next.21+
+export async function joinBoard(ws, { topic, platform }) {
+  await presence.join(ws, topic, platform);
+}
+
+// after
+export async function joinBoard(ws, { topic, platform }) {
+  await presence.join(ws, topic, platform);
+  await cursors.attach(ws, topic, platform);
+}
+
+export function leaveBoard(ws, { topic, platform }) {
+  presence.leave(ws, topic, platform);
+  cursors.detach(ws, topic, platform);
+}
+```
+
+No `close`-hook change required: uWS releases all per-`ws` subscriptions on disconnect, so `cursors.remove(ws, platform)` in your `close` hook still handles cleanup. The legacy `cursors.hooks.subscribe` slot is now a no-op (the adapter's wire gate prevents it from ever firing); it stays exported for source-compat but new code should not rely on it.
+
 ### Presence wire shape on `__presence:{topic}` migrated to `presence_state` / `presence_diff`
 
 **Only impacts apps with hand-rolled WebSocket clients consuming the wire directly.**

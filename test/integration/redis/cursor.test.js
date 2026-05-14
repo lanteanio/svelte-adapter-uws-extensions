@@ -325,6 +325,73 @@ describe('redis cursor (integration)', () => {
 			expect(list.find((e) => e.user && e.user.id === 'alice')).toBeUndefined();
 		});
 
+		it('attach puts the ws in __cursor:{topic} membership; a remote update is publishable to that subscriber set', async () => {
+			// Regression: prior to the attach fix, no path put a ws into
+			// __cursor:{topic}'s subscriber set server-side (the adapter's
+			// wire-level __-prefix gate denies the client-sent subscribe),
+			// so even a perfectly-relayed remote update fanned out to an
+			// empty set locally. attach owns that membership via the
+			// platform-trust path.
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const wsB = mockWs({ id: 'bob' });
+
+			await trackerB.attach(wsB, 'canvas', platformB);
+			expect(platformB.subscribed.find(
+				(s) => s.ws === wsB && s.topic === '__cursor:canvas'
+			)).toBeDefined();
+
+			// Ensure B's Redis subscriber is live before A publishes.
+			trackerB.update(wsB, 'canvas', { x: 0 }, platformB);
+			await wait(100);
+			platformB.reset();
+
+			trackerA.update(wsA, 'canvas', { x: 42 }, platformA);
+
+			await waitFor(() => platformB.published.some(
+				(p) => p.event === 'update' && p.data?.user?.id === 'alice'
+			));
+
+			const onB = platformB.published.find(
+				(p) => p.event === 'update' && p.data?.user?.id === 'alice'
+			);
+			expect(onB.topic).toBe('__cursor:canvas');
+			expect(onB.data.data).toEqual({ x: 42 });
+		});
+
+		it('attach sends a bulk snapshot reflecting cross-instance state', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+
+			// A populates a cursor on the shared hash.
+			const wsA = mockWs({ id: 'alice' });
+			trackerA.update(wsA, 'canvas', { x: 42 }, platformA);
+			await waitFor(async () => (await trackerB.list('canvas')).length >= 1);
+
+			// B's new connection attaches and receives the snapshot.
+			const wsB = mockWs({ id: 'bob' });
+			await trackerB.attach(wsB, 'canvas', platformB);
+
+			const bulk = platformB.sent.find((s) => s.ws === wsB && s.topic === '__cursor:canvas');
+			expect(bulk).toBeDefined();
+			expect(bulk.event).toBe('bulk');
+			expect(bulk.data.some((e) => e.user?.id === 'alice' && e.data?.x === 42)).toBe(true);
+		});
+
 		it('subscriber backfill: bulk event surfaces existing remote entries on first update', async () => {
 			// Pre-seed a remote entry directly into the hash from a
 			// separate connection.

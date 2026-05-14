@@ -1025,6 +1025,21 @@ export const cursors = createCursor(redis, {
 
 #### Usage
 
+Cursor publishes go to the internal `__cursor:{topic}` channel. Clients receive those frames only if the extension has subscribed them server-side - the adapter's wire-level `__`-prefix gate intentionally denies client-sent `__cursor:` subscribe frames. Call `cursors.attach(ws, topic, platform)` from your "join room" RPC (mirroring `presence.join`); without it, every `update` fans out to an empty subscriber set.
+
+```js
+// src/lib/server/rpc.js (or wherever you handle joinBoard / leaveBoard)
+import { cursors } from '$lib/server/cursors';
+
+export async function joinBoard(ws, { topic, platform }) {
+  await cursors.attach(ws, topic, platform);   // subscribes ws + sends snapshot
+}
+
+export function leaveBoard(ws, { topic, platform }) {
+  cursors.detach(ws, topic, platform);          // unsubscribes (only needed if the user stays connected)
+}
+```
+
 ```js
 // src/hooks.ws.js
 import { cursors } from '$lib/server/cursors';
@@ -1038,6 +1053,7 @@ export function message(ws, { data, platform }) {
 
 export function close(ws, { platform }) {
   cursors.remove(ws, platform);
+  // No per-topic detach needed - uWS releases all subscriptions on disconnect.
 }
 ```
 
@@ -1055,6 +1071,8 @@ export function close(ws, { platform }) {
 
 | Method | Description |
 |---|---|
+| `attach(ws, topic, platform)` | Opt the connection into receiving cursor updates for `topic` (subscribes to `__cursor:{topic}` server-side and sends a snapshot). Required for any client to see cursor frames. |
+| `detach(ws, topic, platform)` | Stop the connection from receiving updates for `topic`. Only needed for explicit leave; uWS handles disconnect cleanup. |
 | `update(ws, topic, data, platform)` | Broadcast cursor position (throttled per user per topic) |
 | `remove(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
 | `list(topic)` | Get current positions across all instances |

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.14] - 2026-05-14
+
+### Added
+
+- **`tracker.attach(ws, topic, platform)` and `tracker.detach(ws, topic, platform)` on `createCursor`.** Call `attach` from your "join room" RPC (mirroring `presence.join`) to opt the connection into receiving cursor updates for a topic; `detach` reverses it for explicit-leave flows. `attach` subscribes the connection to the internal `__cursor:{topic}` channel via the platform-trust path AND sends a snapshot of existing cursors in one step.
+
+### Fixed
+
+- **Cursor frames now reach clients.** Same regression class as the pubsub `systemChannel` issue fixed in 0.5.0-next.13. `cursor.update` publishes to `__cursor:{topic}`, but nothing in the extension was subscribing connections to that channel server-side. Pre-`svelte-adapter-uws@0.5.0-next.21`, the client store's wire subscribe to `__cursor:{topic}` populated the subscriber set as a side effect; after next.21 the wire frame is denied, and after next.23 the client does not send it. Result: hundreds of `moveCursor` RPCs fan out into an empty subscriber set, cross-tab / cross-user cursors silently dropped. `tracker.attach(ws, topic, platform)` (new) owns membership via `platform.subscribe`; call it from the same RPC where you call `presence.join`. The dead `hooks.subscribe` predicate path is kept as a no-op for source-compat.
+
 ## [0.5.0-next.13] - 2026-05-14
 
 ### Added
