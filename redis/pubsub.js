@@ -242,6 +242,12 @@ export function createPubSubBus(client, options = {}) {
 				checkSubscribe: platform.checkSubscribe.bind(platform),
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: platform.bufferedAmount.bind(platform),
+				// Framework conventions stashed on the source platform by
+				// app init code (e.g. `platform.replay = createReplay(...)`)
+				// must survive the wrap so downstream framework auto-routing
+				// can discover them on the wrapped seam too. Live getter so
+				// post-wrap reassignment propagates.
+				get replay() { return platform.replay; },
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

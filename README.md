@@ -262,7 +262,7 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 
 | Method | Description |
 |---|---|
-| `bus.wrap(platform)` | Returns a new Platform whose `publish()`, `batch()`, and `publishBatched()` send to Redis + local. Other Platform methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass through unchanged |
+| `bus.wrap(platform)` | Returns a new Platform whose `publish()`, `batch()`, and `publishBatched()` send to Redis + local. Other Platform methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass through unchanged. App-stashed convention slots (`platform.replay` for svelte-realtime's auto-replay routing) are forwarded as live getters so framework discovery survives the wrap on the cron seam |
 | `bus.hooks` | Ready-made WebSocket hooks. `open(ws, ctx)` activates the Redis subscriber (idempotent) AND subscribes `ws` to the bus's `systemChannel` so `degraded` / `recovered` events are delivered. Destructure for one-line `hooks.ws.js` wiring: `export const { open } = bus.hooks;` |
 | `bus.activate(platform)` | Start the Redis subscriber (idempotent). Equivalent to the subscriber half of `bus.hooks.open`; prefer `bus.hooks.open` for new code |
 | `bus.deactivate()` | Stop the subscriber |

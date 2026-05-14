@@ -95,3 +95,50 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(seen).toHaveLength(1);
 	});
 });
+
+/**
+ * Framework conventions stashed on the source platform (e.g.
+ * `platform.replay = createReplay(...)`) are NOT adapter Platform members
+ * but downstream frameworks discover them by property access on whatever
+ * platform reference they hold. When that reference is a `bus.wrap(...)`
+ * result (the `configureCron({ bus })` path in svelte-realtime is the
+ * known case), the wrap must forward them as live getters; otherwise the
+ * framework's discovery falls through and the feature is silently dead.
+ *
+ * Drift on these forwards has the same shape as the parity gap above,
+ * but the contract is wider than `PLATFORM_KEYS` so it lives in its own
+ * describe block. Add a new `it()` here when svelte-realtime grows
+ * another convention slot the wrap is expected to preserve.
+ */
+describe('Framework conventions: bus wraps preserve app-stashed properties', () => {
+	it('pubsub wrap forwards platform.replay as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+
+		expect(wrapped.replay).toBeUndefined();
+
+		const replay = { publish: () => {}, seq: () => 0 };
+		platform.replay = replay;
+		expect(wrapped.replay).toBe(replay);
+
+		platform.replay = undefined;
+		expect(wrapped.replay).toBeUndefined();
+	});
+
+	it('sharded wrap forwards platform.replay as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+
+		expect(wrapped.replay).toBeUndefined();
+
+		const replay = { publish: () => {}, seq: () => 0 };
+		platform.replay = replay;
+		expect(wrapped.replay).toBe(replay);
+	});
+
+	it('mockPlatform exposes a replay slot defaulting to undefined', () => {
+		const platform = mockPlatform();
+		expect('replay' in platform).toBe(true);
+		expect(platform.replay).toBeUndefined();
+	});
+});

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-next.15] - 2026-05-14
+
+### Fixed
+
+- **`bus.wrap(platform)` now forwards `platform.replay` as a live getter on both `createPubSubBus` and `createShardedBus`.** Apps following svelte-realtime's `platform.replay = createReplay(...)` install convention had auto-replay routing silently bypass any seam that ran through `bus.wrap` - most visibly the cron seam, because `configureCron({ bus })` wraps internally on every tick. The wrap's strict allowlist returned an object literal without a `replay` slot, so the framework's discovery saw `undefined` and the buffer was never engaged. Fix: explicit `get replay()` forward (cheap getter, zero hot-path cost) on both bus wraps. The mock platform grows a matching `replay` slot, and `test/redis/wrap-platform-parity.test.js` gains a "framework conventions" describe block that drift-detects future convention-forward gaps. No app-side change required; the `setCronPlatform(platform) + configureCron({ leader, bus })` pattern from svelte-realtime's MIGRATION starts working as documented.
+
 ## [0.5.0-next.14] - 2026-05-14
 
 ### Added

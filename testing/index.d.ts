@@ -67,6 +67,12 @@ export interface MockPlatform {
 	requestId: string;
 	/** Mirrors the adapter default of 1 MB; reassign directly to test other caps. */
 	maxPayloadLength: number;
+	/**
+	 * Framework-convention slot: svelte-realtime's auto-replay routing
+	 * reads `platform.replay`. Defaults to `undefined`; tests that need to
+	 * drive replay paths reassign it directly (`platform.replay = createReplay(...)`).
+	 */
+	replay?: unknown;
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
 	send(ws: any, topic: string, event: string, data?: any): number;
 	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];

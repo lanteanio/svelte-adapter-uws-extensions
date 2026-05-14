@@ -41,6 +41,10 @@ export function mockPlatform() {
 		// post-next.19 default; tests that need a different cap can
 		// reassign p.maxPayloadLength directly.
 		maxPayloadLength: 1024 * 1024,
+		// Framework-convention slot: svelte-realtime's auto-replay routing
+		// reads `platform.replay`. Default `undefined`; tests that need to
+		// drive replay paths reassign it directly.
+		replay: undefined,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
