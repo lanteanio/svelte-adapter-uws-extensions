@@ -38,8 +38,14 @@ export interface MetricsRegistry {
 	counter(name: string, help: string, labelNames?: string[]): Counter;
 	/** Create a gauge metric. */
 	gauge(name: string, help: string, labelNames?: string[]): Gauge;
-	/** Create a histogram metric. */
-	histogram(name: string, help: string, labelNames?: string[], buckets?: number[]): Histogram;
+	/**
+	 * Create a histogram metric. Observations must be non-negative by
+	 * default (Prometheus convention; negative values corrupt `_sum` and
+	 * break histogram bucket monotonicity). Pass `allowNegative = true`
+	 * to opt in for signed-observation use cases (latency skew, profit
+	 * & loss, temperature deltas).
+	 */
+	histogram(name: string, help: string, labelNames?: string[], buckets?: number[], allowNegative?: boolean): Histogram;
 	/** Serialize all metrics in Prometheus text exposition format. */
 	serialize(): string;
 	/** uWebSockets.js HTTP handler for the /metrics endpoint. */

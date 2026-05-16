@@ -95,10 +95,48 @@ export function createBusValidator(options = {}) {
 		 * drop the message (the caller should bump a parse-error metric
 		 * and skip).
 		 *
+		 * **Prefer `acceptRaw(message)`** for new callsites - it
+		 * computes the byte length internally and removes the off-by-
+		 * encoding foot-gun where a caller passes `.length` (character
+		 * count, not byte count) on a UTF-8 string with multi-byte
+		 * characters. Existing call sites have been migrated to
+		 * `acceptRaw`; this entry point is retained for backward
+		 * compatibility and may be removed in a future major.
+		 *
 		 * @param {number} bytes
+		 * @deprecated Use `acceptRaw(message)` instead.
 		 */
 		acceptSize(bytes) {
 			return typeof bytes === 'number' && bytes >= 0 && bytes <= maxBytes;
+		},
+
+		/**
+		 * Pre-parse size guard that computes byte length internally
+		 * from the raw message. Accepts string (encoded as UTF-8 byte
+		 * length), Buffer, Uint8Array, or any other ArrayBuffer view.
+		 * Returns false for any other input shape (drop the message).
+		 *
+		 * This is the preferred entry point for new bus subscribers -
+		 * pass the raw message you received from the transport and
+		 * the validator handles the encoding nuance. The pre-this-
+		 * change `acceptSize(bytes)` API was a foot-gun: a caller who
+		 * passed `message.length` on a UTF-8 string with multi-byte
+		 * characters (Asian text, emoji) under-counted the actual byte
+		 * length and the cap silently failed open.
+		 *
+		 * @param {unknown} message
+		 */
+		acceptRaw(message) {
+			if (typeof message === 'string') {
+				return Buffer.byteLength(message) <= maxBytes;
+			}
+			if (Buffer.isBuffer(message)) {
+				return message.byteLength <= maxBytes;
+			}
+			if (ArrayBuffer.isView(message)) {
+				return /** @type {ArrayBufferView} */ (message).byteLength <= maxBytes;
+			}
+			return false;
 		},
 
 		/**

@@ -49,8 +49,26 @@ export interface BusValidator {
 	 * Pre-parse size guard. Pass the byte length of the raw message (not
 	 * the parsed object). Returns `true` to proceed, `false` to drop the
 	 * message (the caller should bump a parse-error metric and skip).
+	 *
+	 * @deprecated Prefer `acceptRaw(message)` - it computes the byte
+	 * length internally and removes the off-by-encoding foot-gun where a
+	 * caller passes `.length` (character count) on a UTF-8 string with
+	 * multi-byte characters.
 	 */
 	acceptSize(bytes: number): boolean;
+
+	/**
+	 * Pre-parse size guard that computes byte length internally from the
+	 * raw message. Accepts `string` (encoded as UTF-8 byte length),
+	 * `Buffer`, `Uint8Array`, or any other `ArrayBuffer` view. Returns
+	 * `false` for any other input shape (drop the message).
+	 *
+	 * Preferred over `acceptSize(bytes)` for all new bus subscribers - no
+	 * caller-side `Buffer.byteLength` boilerplate, no risk of passing
+	 * `.length` on a UTF-8 string with multi-byte characters and under-
+	 * counting the actual byte length.
+	 */
+	acceptRaw(message: string | Buffer | Uint8Array | ArrayBufferView | unknown): boolean;
 
 	/**
 	 * Post-parse envelope check. Returns `true` if the envelope is safe

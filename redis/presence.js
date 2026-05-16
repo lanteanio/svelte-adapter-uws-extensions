@@ -18,10 +18,19 @@
  * shape, so a single client decoder works for both single-instance and
  * cluster deployments.
  *
- * Storage layout per topic:
- *   - Key `{prefix}presence:{topic}` - hash
- *       field = `{instanceId}|{userKey}`, value = JSON `{ data, ts }`
- *       Each instance owns its own fields so cross-instance leave is safe.
+ * Storage layout (two hashes per topic, Redis 7.4+ HEXPIRE for per-field TTL):
+ *   - `{prefix}presence:topic:{topic}` - hash, field=userKey, value=JSON{data,ts}
+ *       One entry per unique user on the topic. Backs `list()` / `count()`.
+ *   - `{prefix}presence:user:{topic}:{userKey}` - hash, field=instanceId, value=ts
+ *       One entry per instance currently presenting this user. Backs JOIN/LEAVE
+ *       broadcast decision (HLEN check).
+ *
+ * Per-field TTLs via HPEXPIRE replace the previous timestamp-filter scan in
+ * the Lua leave script: stale entries from a crashed instance auto-expire
+ * field-by-field via Redis itself rather than via application-side filters.
+ * Mass-disconnect is now O(N) Redis-blocked work (one HDEL+HLEN per leave)
+ * rather than O(N x M_topic) (one HGETALL+linear-suffix-scan per leave).
+ *
  *   - Channel `{prefix}presence:events:{topic}` - cross-instance pub/sub.
  *       Internal envelope `{instanceId, topic, event, payload}` with
  *       event in {'join', 'leave', 'updated'}; receiving instances
@@ -34,82 +43,104 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { now as cachedNow } from '../shared/time.js';
-import { CLEANUP_SCRIPT, COUNT_DEDUP_SCRIPT, LIST_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 
 /**
- * Lua script for atomic join: set this instance's field and expire the key.
+ * Lua script for atomic JOIN. Sets this instance's field on the per-user
+ * hash (the "is this user here?" index), refreshes both hashes' per-field
+ * TTLs via HPEXPIRE, and writes the user's data to the per-topic hash with
+ * a newer-ts-wins conditional set.
  *
- * KEYS[1] = hash key
- * ARGV[1] = field to set (instanceId|userKey)
- * ARGV[2] = field value (JSON with data and ts)
- * ARGV[3] = presenceTtl (seconds, for EXPIRE)
+ * KEYS[1] = userHashKey  (presence:user:{topic}:{userKey})
+ * KEYS[2] = topicHashKey (presence:topic:{topic})
+ * ARGV[1] = instanceId
+ * ARGV[2] = userKey (also the field on topicHashKey)
+ * ARGV[3] = topicHashValue (JSON {data, ts} pre-stringified)
+ * ARGV[4] = ts (numeric, for the conditional set)
+ * ARGV[5] = ttlMs (numeric, for HPEXPIRE)
  *
- * Cross-instance dedup is intentionally omitted. The local localCounts
- * map already prevents duplicate joins from the same user on the same
- * instance (the script only runs when prevCount === 0). If the same
- * user joins on a second instance, both broadcast "join" - the client
- * handles this as an idempotent Map.set on the same key.
+ * Returns 1 if this was the FIRST instance to present this user on the
+ * topic (HLEN was 0 before our HSET) -> caller broadcasts a join. Returns
+ * 0 if the user was already present from another instance or another
+ * tab on this instance via an idempotent re-run.
  *
- * Removing the HGETALL + O(N) scan that was here before drops per-join
- * Redis work from O(N) to O(1), fixing the O(N^2) total cost that
- * killed the server at 2000+ concurrent joins.
+ * The conditional set on the topic hash preserves the "newer data wins"
+ * property the previous LIST_SCRIPT enforced at read time. Two instances
+ * with the same userKey but different `select()` output land deterministic
+ * data on the topic hash regardless of arrival order: the higher-ts write
+ * wins. Concurrent instances with the same ts (rare) tie-break on write
+ * order, which is acceptable; subsequent heartbeats do not re-write data
+ * so the tie-break sticks.
+ *
+ * Note: HSET on an existing field clears its per-field TTL, so every
+ * HSET in this script is paired with HPEXPIRE in the same atomic block.
  */
 const JOIN_SCRIPT = `
-local key = KEYS[1]
-local field = ARGV[1]
-local value = ARGV[2]
-local ttlSec = tonumber(ARGV[3])
-if ttlSec == nil then
-  return redis.error_reply('PRESENCE_JOIN: ttlSec must be numeric')
+local userKey = KEYS[1]
+local topicKey = KEYS[2]
+local instanceId = ARGV[1]
+local userKeyStr = ARGV[2]
+local topicHashValue = ARGV[3]
+local newTs = tonumber(ARGV[4])
+local ttlMs = tonumber(ARGV[5])
+if newTs == nil or ttlMs == nil then
+  return redis.error_reply('PRESENCE_JOIN: newTs/ttlMs must be numeric')
 end
 
-redis.call('hset', key, field, value)
-redis.call('expire', key, ttlSec)
-return 1
+local wasEmpty = (redis.call('HLEN', userKey) == 0)
+
+redis.call('HSET', userKey, instanceId, newTs)
+redis.call('HPEXPIRE', userKey, ttlMs, 'FIELDS', 1, instanceId)
+
+local existing = redis.call('HGET', topicKey, userKeyStr)
+local shouldWrite = true
+if existing then
+  local ok, parsed = pcall(cjson.decode, existing)
+  local existingTs = ok and parsed and tonumber(parsed.ts) or 0
+  if newTs < existingTs then shouldWrite = false end
+end
+if shouldWrite then
+  redis.call('HSET', topicKey, userKeyStr, topicHashValue)
+end
+redis.call('HPEXPIRE', topicKey, ttlMs, 'FIELDS', 1, userKeyStr)
+
+return wasEmpty and 1 or 0
 `;
 
 /**
- * Lua script for atomic leave + check if user is still present on
- * another instance (non-stale). Removes this instance's field and scans
- * remaining fields for the same userKey, ignoring stale entries.
+ * Lua script for atomic LEAVE. Removes this instance's field from the
+ * per-user hash and broadcasts only when no other instance still has the
+ * user (HLEN == 0 after our HDEL).
  *
- * KEYS[1] = hash key
- * ARGV[1] = field to remove (instanceId|userKey)
- * ARGV[2] = "|userKey" suffix to match
- * ARGV[3] = now (ms)
- * ARGV[4] = presenceTtlMs
+ * KEYS[1] = userHashKey  (presence:user:{topic}:{userKey})
+ * KEYS[2] = topicHashKey (presence:topic:{topic})
+ * ARGV[1] = instanceId
+ * ARGV[2] = userKey
  *
- * Returns 1 if user is completely gone (broadcast leave), 0 if still present.
+ * Returns 1 if this instance was the last one presenting this user on the
+ * topic -> caller broadcasts a leave AND the per-topic hash entry is
+ * removed. Returns 0 if another instance still has the user (no broadcast,
+ * per-topic hash unchanged).
+ *
+ * The O(1) HLEN check replaces the previous O(M_topic) suffix-scan loop.
+ * Mass-disconnect of N users is now O(N) Redis-blocked Lua time rather
+ * than O(N x M_topic).
  */
 const LEAVE_SCRIPT = `
-local key = KEYS[1]
-local field = ARGV[1]
-local suffix = ARGV[2]
-local now = tonumber(ARGV[3])
-local ttlMs = tonumber(ARGV[4])
-if now == nil or ttlMs == nil then
-  return redis.error_reply('PRESENCE_LEAVE: now/ttlMs must be numeric')
-end
+local userKey = KEYS[1]
+local topicKey = KEYS[2]
+local instanceId = ARGV[1]
+local userKeyStr = ARGV[2]
 
-redis.call('hdel', key, field)
-
-local all = redis.call('hgetall', key)
-for i = 1, #all, 2 do
-  local f = all[i]
-  if string.find(f, suffix, #f - #suffix + 1, true) then
-    local ok, parsed = pcall(cjson.decode, all[i+1])
-    local ts = ok and parsed and tonumber(parsed.ts) or nil
-    if ts and (now - ts) <= ttlMs then
-      return 0
-    end
-  end
+redis.call('HDEL', userKey, instanceId)
+if redis.call('HLEN', userKey) == 0 then
+  redis.call('HDEL', topicKey, userKeyStr)
+  return 1
 end
-return 1
+return 0
 `;
 
 /**
@@ -128,16 +159,16 @@ const INTERNAL_EVENTS = Object.freeze({
  * @typedef {Object} RedisPresenceOptions
  * @property {string} [key='id'] - Field in selected data for user dedup
  * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData
- * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh expiry)
- * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3)
- * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its presence hash expires (instance-died scenario). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired).
+ * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
+ * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
+ * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its per-topic presence hash key expires (instance-died scenario where every field of the hash has expired). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired). With per-field TTLs, individual field expiry does NOT emit a key-expired notification; only whole-key expiry does, which happens when every field of the topic hash has expired (no live instances presenting any user on this topic).
  */
 
 /**
  * @typedef {Object} PresenceMetricsSnapshot
  * @property {number} totalOnline - Sum of unique-users-per-topic across all topics this instance is locally tracking. Same user in two topics counts as two; per-topic counts sum cleanly.
  * @property {number} heartbeatLatencyMs - Duration of the most recent heartbeat tick in milliseconds.
- * @property {number} staleCleanedTotal - Cumulative count of stale fields removed by the heartbeat-driven `CLEANUP_SCRIPT` since this instance started.
+ * @property {number} staleCleanedTotal - Reserved for backward compatibility. Always 0 in this build: staleness is enforced by Redis per-field HPEXPIRE rather than an application-side cleanup script, so there is nothing to count.
  */
 
 /**
@@ -181,13 +212,43 @@ export function createPresence(client, options = {}) {
 
 	const keyspaceNotifications = options.keyspaceNotifications === true;
 
+	// Per-field hash TTL (HPEXPIRE / HEXPIRE) requires Redis 7.4+. Defer the
+	// version probe to first use so createPresence() can stay synchronous and
+	// fast; the probe runs once, caches its result, and rejects any further
+	// redis call with a clear error if the server is too old. Mirrors the
+	// gating pattern createShardedBus uses for SPUBLISH / SSUBSCRIBE.
+	let featureProbe = null;
+	function ensureRedis74() {
+		if (!featureProbe) {
+			featureProbe = redis.info('server').then((info) => {
+				const m = /redis_version:(\d+)\.(\d+)/.exec(info || '');
+				if (!m) return; // can't parse - assume compatible
+				const major = Number(m[1]);
+				const minor = Number(m[2]);
+				if (major < 7 || (major === 7 && minor < 4)) {
+					throw new Error(
+						'redis presence: requires Redis 7.4+ for per-field TTL (HEXPIRE); ' +
+						'got ' + m[1] + '.' + m[2] + '. Upgrade Redis or use the in-memory ' +
+						'createPresence plugin from svelte-adapter-uws/plugins/presence.'
+					);
+				}
+			}).catch((err) => {
+				// Reset on transient INFO failures so we re-probe on next call.
+				// Hard errors (version mismatch) re-throw verbatim from the await.
+				if (err && /requires Redis 7\.4\+/.test(err.message)) throw err;
+				featureProbe = null;
+				throw err;
+			});
+		}
+		return featureProbe;
+	}
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mt = m?.mapTopic;
 	const mJoins = m?.counter('presence_joins_total', 'Presence join events', ['topic']);
 	const mLeaves = m?.counter('presence_leaves_total', 'Presence leave events', ['topic']);
 	const mHeartbeats = m?.counter('presence_heartbeats_total', 'Heartbeat refresh cycles');
-	const mStaleCleaned = m?.counter('presence_stale_cleaned_total', 'Stale entries removed by cleanup');
 	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
 	const mHeartbeatLatency = m?.gauge('presence_heartbeat_latency_ms', 'Duration of the most recent heartbeat tick in milliseconds');
 	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash expiry triggered a local empty-list emit');
@@ -305,8 +366,15 @@ export function createPresence(client, options = {}) {
 		pendingDiffs.clear();
 	}
 
-	function hashKey(topic) {
-		return client.key('presence:' + topic);
+	// Per-topic hash: one field per unique user on the topic. Backs list() / count().
+	function topicHashKey(topic) {
+		return client.key('presence:topic:' + topic);
+	}
+
+	// Per-user hash for a topic: one field per instance currently presenting this
+	// user. HLEN drives the JOIN/LEAVE broadcast decision.
+	function userHashKey(topic, userKey) {
+		return client.key('presence:user:' + topic + ':' + userKey);
 	}
 
 	function indexAdd(topic, userKey, ws) {
@@ -340,7 +408,7 @@ export function createPresence(client, options = {}) {
 	}
 
 	function coalesceHgetall(topic) {
-		const key = hashKey(topic);
+		const key = topicHashKey(topic);
 		let pending = hgetallInflight.get(key);
 		if (!pending) {
 			pending = redis.hgetall(key).finally(() => hgetallInflight.delete(key));
@@ -351,10 +419,6 @@ export function createPresence(client, options = {}) {
 
 	function eventChannel(topic) {
 		return client.key('presence:events:' + topic);
-	}
-
-	function compoundField(userKey) {
-		return instanceId + '|' + userKey;
 	}
 
 	/**
@@ -384,22 +448,18 @@ export function createPresence(client, options = {}) {
 	}
 
 	/**
-	 * Parse hash entries, deduplicate by userKey, filter stale entries.
-	 * Returns an array of { key, data } objects.
+	 * Parse the per-topic hash HGETALL result into a Map<userKey, {data, ts}>.
+	 * Staleness filtering and cross-instance deduplication are no longer
+	 * needed: the new storage layout uses one field per userKey (Redis
+	 * collapses cross-instance writes via HSET on the same field), and per-
+	 * field HPEXPIRE removes stale entries before HGETALL sees them. So this
+	 * is now just a JSON-parse + drop-corrupted loop.
 	 */
 	function parseEntries(all) {
-		const now = cachedNow();
 		const seen = new Map();
-		for (const field of Object.keys(all)) {
+		for (const userKey of Object.keys(all)) {
 			try {
-				const parsed = JSON.parse(all[field]);
-				if (!parsed.ts || (now - parsed.ts) > presenceTtlMs) continue;
-				const sep = field.indexOf('|');
-				const userKey = sep !== -1 ? field.slice(sep + 1) : field;
-				const existing = seen.get(userKey);
-				if (!existing || (parsed.ts || 0) > (existing.ts || 0)) {
-					seen.set(userKey, parsed);
-				}
+				seen.set(userKey, JSON.parse(all[userKey]));
 			} catch { /* corrupted entry */ }
 		}
 		return seen;
@@ -441,28 +501,30 @@ export function createPresence(client, options = {}) {
 			mHeartbeatLatency?.set(lastHeartbeatLatency);
 			return;
 		}
-		const now = cachedNow();
+		// HPEXPIRE refresh per locally-owned (topic, userKey). We do NOT
+		// re-HSET the data here: HSET on an existing field clears its TTL
+		// (Redis 7.4+ semantics) so an HSET-then-HPEXPIRE pair would be
+		// required, doubling the heartbeat cost. Data only changes when a
+		// user's select() output changes, which goes through the JOIN flow
+		// where HSET + HPEXPIRE are paired inside the JOIN_SCRIPT.
+		//
+		// Staleness from crashed instances no longer needs an application-side
+		// cleanup pass: per-field HPEXPIRE auto-removes fields whose owning
+		// instance stopped heartbeating, exactly the behavior the previous
+		// CLEANUP_SCRIPT simulated at every tick.
 		const pipe = redis.pipeline();
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
-			const hkey = hashKey(topic);
-			if (data) {
-				for (const [, entry] of data) {
-					pipe.hset(hkey, entry.field, '{"data":' + entry.serialized + ',"ts":' + now + '}');
+			if (data && data.size > 0) {
+				const topicHash = topicHashKey(topic);
+				for (const userKey of data.keys()) {
+					pipe.hpexpire(userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId);
+					pipe.hpexpire(topicHash, presenceTtlMs, 'FIELDS', 1, userKey);
 				}
-			}
-			pipe.expire(hkey, presenceTtl);
-
-			redis.eval(CLEANUP_SCRIPT, 1, hkey, now, presenceTtlMs).then((cleaned) => {
-				if (cleaned > 0) {
-					staleCleanedTotal += cleaned;
-					mStaleCleaned?.inc(cleaned);
+				if (activePlatform) {
+					const keys = [...data.keys()];
+					activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
 				}
-			}).catch(() => {});
-
-			if (activePlatform && data && data.size > 0) {
-				const keys = [...data.keys()];
-				activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
 			}
 		}
 		pipe.exec().catch(() => {});
@@ -507,13 +569,17 @@ export function createPresence(client, options = {}) {
 				}
 			});
 			if (keyspaceNotifications) {
-				const presencePrefix = client.key('presence:');
-				const eventsPrefix = client.key('presence:events:');
+				// The per-topic hash key expires only when every field has
+				// expired (no live instances presenting any user on this
+				// topic). That is the "whole topic empty" signal we forward
+				// as an empty presence_state to local subscribers. Per-user
+				// hash keys (presence:user:{topic}:{userKey}) and the events
+				// channel are filtered out.
+				const topicPrefix = client.key('presence:topic:');
 				subscriber.on('pmessage', (_pattern, _channel, expiredKey) => {
 					if (typeof expiredKey !== 'string') return;
-					if (!expiredKey.startsWith(presencePrefix)) return;
-					if (expiredKey.startsWith(eventsPrefix)) return;
-					const topic = expiredKey.slice(presencePrefix.length);
+					if (!expiredKey.startsWith(topicPrefix)) return;
+					const topic = expiredKey.slice(topicPrefix.length);
 					if (activePlatform) {
 						activePlatform.publish('__presence:' + topic, 'presence_state', {}, { relay: false });
 						mKeyspaceCleanups?.inc();
@@ -579,10 +645,12 @@ export function createPresence(client, options = {}) {
 	}
 
 	/**
-	 * Full undo of a staged join. Rolls back local state, cleans up the
-	 * Redis hash field if it was written, publishes a compensating leave
-	 * event if a join was broadcast, and unsubscribes from the topic's
-	 * Redis channel when no local observers remain.
+	 * Full undo of a staged join. Rolls back local state, reverts the Redis
+	 * state to its pre-join shape (full leave if this was the first local
+	 * connection, data-restore via JOIN_SCRIPT if there were other tabs
+	 * already presenting this user), publishes a compensating leave event
+	 * if a join was broadcast, and unsubscribes from the topic's Redis
+	 * channel when no local observers remain.
 	 */
 	async function undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, didPublishJoin, platform) {
 		const connTopics = wsTopics.get(ws);
@@ -606,17 +674,32 @@ export function createPresence(client, options = {}) {
 		const topicData = localData.get(topic);
 		if (topicData) {
 			if (prevData !== undefined) {
-				topicData.set(key, { data: prevData, serialized: JSON.stringify(prevData), field: compoundField(key) });
+				topicData.set(key, { data: prevData });
 			} else {
 				topicData.delete(key);
 			}
 			if (topicData.size === 0) localData.delete(topic);
 		}
 		if (prevCount > 0 && prevData !== undefined) {
-			const prevValue = JSON.stringify({ data: prevData, ts: Date.now() });
-			await redis.hset(hashKey(topic), compoundField(key), prevValue);
+			// Other local tabs still present this user. Restore the per-topic
+			// hash data to prevData via JOIN_SCRIPT (which handles HSET +
+			// HPEXPIRE atomically). Per-user hash field for this instance is
+			// already present from the now-rolled-back join; the script's
+			// idempotent HSET refreshes its TTL.
+			const ts = Date.now();
+			const value = JSON.stringify({ data: prevData, ts });
+			await redis.eval(
+				JOIN_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
+				instanceId, key, value, ts, presenceTtlMs
+			).catch(() => {});
 		} else {
-			await redis.hdel(hashKey(topic), compoundField(key));
+			// This was the first local presence for this user on this topic.
+			// LEAVE_SCRIPT removes our instance's entry on the per-user hash
+			// and clears the per-topic hash field if HLEN dropped to zero.
+			await redis.eval(
+				LEAVE_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
+				instanceId, key
+			).catch(() => {});
 		}
 		if (didPublishJoin) {
 			mLeaves?.inc({ topic: mt(topic) });
@@ -658,16 +741,15 @@ export function createPresence(client, options = {}) {
 						}
 					}
 
-					const field = compoundField(key);
-					const suffix = '|' + key;
-					const now = Date.now();
 					let userGone = -1;
 					let skipLeaveRedis = false;
 					if (b) { try { b.guard(); } catch { skipLeaveRedis = true; } }
 					if (!skipLeaveRedis) {
 						try {
 							userGone = await redis.eval(
-								LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs
+								LEAVE_SCRIPT, 2,
+								userHashKey(topic, key), topicHashKey(topic),
+								instanceId, key
 							);
 							b?.success();
 						} catch (err) {
@@ -687,15 +769,18 @@ export function createPresence(client, options = {}) {
 						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
 						if (newest && cached && !deepEqual(newest, cached.data)) {
-							const ser = JSON.stringify(newest);
-							topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
-							const now = Date.now();
+							topicData.set(key, { data: newest });
+							const ts = Date.now();
 							try {
-								await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
+								await redis.eval(
+									JOIN_SCRIPT, 2,
+									userHashKey(topic, key), topicHashKey(topic),
+									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
+								);
 								bufferDiff(topic, 'join', key, newest, platform);
 								publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest });
 							} catch {
-								topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
+								topicData.set(key, { data: cached.data });
 							}
 						}
 					}
@@ -806,15 +891,18 @@ export function createPresence(client, options = {}) {
 		for (const { topic, key, newest, cached } of deferredRestores) {
 			const topicData = localData.get(topic);
 			if (!topicData) continue;
-			const ser = JSON.stringify(newest);
-			topicData.set(key, { data: newest, serialized: ser, field: compoundField(key) });
-			const now = Date.now();
+			topicData.set(key, { data: newest });
+			const ts = Date.now();
 			try {
-				await redis.hset(hashKey(topic), compoundField(key), JSON.stringify({ data: newest, ts: now }));
+				await redis.eval(
+					JOIN_SCRIPT, 2,
+					userHashKey(topic, key), topicHashKey(topic),
+					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
+				);
 				bufferDiff(topic, 'join', key, newest, platform);
 				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest }));
 			} catch {
-				topicData.set(key, { data: cached.data, serialized: cached.serialized, field: cached.field });
+				topicData.set(key, { data: cached.data });
 			}
 		}
 
@@ -822,7 +910,10 @@ export function createPresence(client, options = {}) {
 		// heartbeat will not refresh any of these entries. The pipeline
 		// batches all LEAVE_SCRIPT evals into a single round-trip; under
 		// mass disconnect (1000+ connections) this avoids saturating the
-		// Redis command queue.
+		// Redis command queue. Each LEAVE_SCRIPT is now O(1) Redis-blocked
+		// Lua time, so the total Redis-blocked time scales linearly with
+		// N (the disconnect count), not with N x M (where M was the topic
+		// hash size in the pre-Design-G layout).
 		const unsubPromises = [];
 		for (const { needsUnsub, topic } of pendingLeaves) {
 			if (needsUnsub) {
@@ -831,12 +922,13 @@ export function createPresence(client, options = {}) {
 		}
 		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
 
-		const now = Date.now();
 		const pipe = redis.pipeline();
 		for (const { topic, key } of pendingLeaves) {
-			const field = compoundField(key);
-			const suffix = '|' + key;
-			pipe.eval(LEAVE_SCRIPT, 1, hashKey(topic), field, suffix, now, presenceTtlMs);
+			pipe.eval(
+				LEAVE_SCRIPT, 2,
+				userHashKey(topic, key), topicHashKey(topic),
+				instanceId, key
+			);
 		}
 
 		let results;
@@ -890,12 +982,20 @@ export function createPresence(client, options = {}) {
 			const raw = ws.getUserData();
 			const { __subscriptions, remoteAddress, ...safeData } = raw || {};
 			const key = resolveKey(safeData);
-			const data = select(safeData);
+			// Warn first on the raw select output so developers see sensitive
+			// keys their select forwarded (the warning fires once per process
+			// and is the signal that they should tighten the select). Then
+			// deep-strip for the wire: a user-supplied select might return
+			// data with nested sensitive keys, and the wire output must not
+			// carry them regardless of how select is wired. resolveKey runs
+			// on the shallow safeData to keep id / name resolution unchanged.
+			const selected = select(safeData);
+			warnSensitive(selected);
+			const data = stripInternal(selected);
 			let serializedData;
 			try { serializedData = JSON.stringify(data); } catch {
 				throw new Error('redis presence: select() must return JSON-serializable data');
 			}
-			warnSensitive(data);
 
 			// Snapshot state for rollback
 			const existingCounts = localCounts.get(topic);
@@ -940,6 +1040,16 @@ export function createPresence(client, options = {}) {
 			}
 
 			try {
+				// Redis 7.4+ feature gate (HEXPIRE). Probe once, cache. Throwing
+				// here treats version mismatch as a join failure - same shape
+				// as any other startup-time misconfiguration.
+				await ensureRedis74();
+			} catch (err) {
+				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+				throw err;
+			}
+
+			try {
 				await subscribeToTopic(topic, platform);
 			} catch (err) {
 				b?.failure(err);
@@ -956,18 +1066,26 @@ export function createPresence(client, options = {}) {
 
 			let didRedisWrite = false;
 			let isNewUser = false;
+			// `serializedData` is computed above to surface non-JSON-serializable
+			// data eagerly via the throw. The body below stringifies the full
+			// {data, ts} envelope per call since ts is fresh.
 
 			if (prevCount === 0) {
-				const now = Date.now();
-				const field = compoundField(key);
-				const value = JSON.stringify({ data, ts: now });
+				const ts = Date.now();
+				const value = JSON.stringify({ data, ts });
 				try {
-					await redis.eval(
-						JOIN_SCRIPT, 1, hashKey(topic),
-						field, value, presenceTtl
+					const wasEmpty = await redis.eval(
+						JOIN_SCRIPT, 2,
+						userHashKey(topic, key), topicHashKey(topic),
+						instanceId, key, value, ts, presenceTtlMs
 					);
 					didRedisWrite = true;
-					isNewUser = true;
+					// `wasEmpty === 1` means this instance was the FIRST to
+					// present this user on the topic across the cluster; only
+					// then do we broadcast a join. Same-user-already-on-another-
+					// instance returns 0 and the script's HSET still updates
+					// the per-topic data via newer-ts-wins.
+					isNewUser = wasEmpty === 1;
 				} catch (err) {
 					b?.failure(err);
 					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
@@ -975,15 +1093,28 @@ export function createPresence(client, options = {}) {
 				}
 
 				if (!wsTopics.has(ws)) {
-					await redis.hdel(hashKey(topic), field).catch(() => {});
+					// ws closed during the eval. Roll back our Redis write so
+					// the per-user hash entry does not linger past TTL.
+					await redis.eval(
+						LEAVE_SCRIPT, 2,
+						userHashKey(topic, key), topicHashKey(topic),
+						instanceId, key
+					).catch(() => {});
 					return;
 				}
 			} else if (prevData !== undefined && !deepEqual(prevData, data)) {
+				// Same instance, same user, different `select()` output.
+				// JOIN_SCRIPT's newer-ts conditional set overwrites the per-
+				// topic data, and refreshes the per-user-hash TTL so this
+				// path counts as an implicit heartbeat for our entry.
 				try {
-					const now = Date.now();
-					const field = compoundField(key);
-					const value = JSON.stringify({ data, ts: now });
-					await redis.hset(hashKey(topic), field, value);
+					const ts = Date.now();
+					const value = JSON.stringify({ data, ts });
+					await redis.eval(
+						JOIN_SCRIPT, 2,
+						userHashKey(topic, key), topicHashKey(topic),
+						instanceId, key, value, ts, presenceTtlMs
+					);
 				} catch (err) {
 					b?.failure(err);
 					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
@@ -991,9 +1122,7 @@ export function createPresence(client, options = {}) {
 				}
 
 				const td = localData.get(topic);
-				if (td) {
-					td.set(key, { data, serialized: serializedData, field: compoundField(key) });
-				}
+				if (td) td.set(key, { data });
 
 				bufferDiff(topic, 'join', key, data, platform);
 				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data });
@@ -1018,10 +1147,14 @@ export function createPresence(client, options = {}) {
 			}
 
 			// If ws closed after subscribe, leave() already handled
-			// local cleanup and leave events. Just clean the Redis field.
+			// local cleanup and leave events. Just clean the Redis state.
 			if (!wsTopics.has(ws)) {
 				if (didRedisWrite) {
-					redis.hdel(hashKey(topic), compoundField(key)).catch(() => {});
+					redis.eval(
+						LEAVE_SCRIPT, 2,
+						userHashKey(topic, key), topicHashKey(topic),
+						instanceId, key
+					).catch(() => {});
 				}
 				return;
 			}
@@ -1034,7 +1167,7 @@ export function createPresence(client, options = {}) {
 				topicData = new Map();
 				localData.set(topic, topicData);
 			}
-			topicData.set(key, { data, serialized: serializedData, field: compoundField(key) });
+			topicData.set(key, { data });
 			activeTopics.add(topic);
 
 			// Buffer join only after the operation is fully committed.
@@ -1125,14 +1258,17 @@ export function createPresence(client, options = {}) {
 		},
 
 		async list(topic) {
-			const now = cachedNow();
-			const raw = await withBreaker(b, () =>
-				redis.eval(LIST_SCRIPT, 1, hashKey(topic), now, presenceTtlMs)
-			);
+			// Direct HGETALL on the per-topic hash. Staleness is enforced by
+			// Redis HPEXPIRE per field, so we no longer need a Lua-side
+			// timestamp filter. The mock-redis prunes expired fields at read
+			// time to mirror this; real Redis 7.4+ expires them by background
+			// task and HGETALL never returns them.
+			await ensureRedis74();
+			const all = await withBreaker(b, () => redis.hgetall(topicHashKey(topic)));
 			const result = [];
-			for (let i = 0; i < raw.length; i += 2) {
+			for (const userKey of Object.keys(all)) {
 				try {
-					const parsed = JSON.parse(raw[i + 1]);
+					const parsed = JSON.parse(all[userKey]);
 					result.push(parsed.data);
 				} catch { /* skip corrupted */ }
 			}
@@ -1140,10 +1276,11 @@ export function createPresence(client, options = {}) {
 		},
 
 		async count(topic) {
-			const now = cachedNow();
-			return withBreaker(b, () =>
-				redis.eval(COUNT_DEDUP_SCRIPT, 1, hashKey(topic), now, presenceTtlMs)
-			);
+			// HLEN on the per-topic hash. Per-field auto-expiry means HLEN
+			// reflects the live count without needing a dedup or timestamp
+			// scan; one userKey per live user is the storage invariant.
+			await ensureRedis74();
+			return withBreaker(b, () => redis.hlen(topicHashKey(topic)));
 		},
 
 		metrics() {

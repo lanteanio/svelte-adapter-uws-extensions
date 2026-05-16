@@ -47,6 +47,76 @@ describe('postgres idempotency', () => {
 			expect(() => createIdempotencyStore(client, { table: 'information_schema_tables', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
 			expect(() => createIdempotencyStore(client, { table: 'INFORMATION_SCHEMA_columns', cleanupInterval: 0 })).toThrow('reserved Postgres schema');
 		});
+
+		it('throws on invalid maxResultBytes', () => {
+			expect(() => createIdempotencyStore(client, { maxResultBytes: 0, cleanupInterval: 0 })).toThrow('maxResultBytes');
+			expect(() => createIdempotencyStore(client, { maxResultBytes: -1, cleanupInterval: 0 })).toThrow('maxResultBytes');
+			expect(() => createIdempotencyStore(client, { maxResultBytes: 1.5, cleanupInterval: 0 })).toThrow('maxResultBytes');
+		});
+
+		it('accepts Infinity for maxResultBytes (opt-out)', () => {
+			expect(() => createIdempotencyStore(client, { maxResultBytes: Infinity, cleanupInterval: 0 })).not.toThrow();
+		});
+	});
+
+	describe('maxResultBytes cap', () => {
+		it('commit rejects results exceeding the default 256 KB cap', async () => {
+			const s = createIdempotencyStore(client, { cleanupInterval: 0 });
+			const slot = await s.acquire('k-too-big');
+			expect(slot.acquired).toBe(true);
+			const tooBig = { payload: 'x'.repeat(257 * 1024) };
+			await expect(slot.commit(tooBig)).rejects.toMatchObject({
+				name: 'IdempotencyResultTooLargeError',
+				code: 'IDEMPOTENCY_RESULT_TOO_LARGE'
+			});
+			s.destroy();
+		});
+
+		it('commit succeeds for results under the cap', async () => {
+			const s = createIdempotencyStore(client, { cleanupInterval: 0 });
+			const slot = await s.acquire('k-ok');
+			expect(slot.acquired).toBe(true);
+			await expect(slot.commit({ result: 'small' })).resolves.toBeUndefined();
+			s.destroy();
+		});
+
+		it('error carries bytes and maxBytes properties', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: 10, cleanupInterval: 0 });
+			const slot = await s.acquire('k-err');
+			expect(slot.acquired).toBe(true);
+			try {
+				await slot.commit({ longField: 'longer than ten bytes' });
+				throw new Error('should have rejected');
+			} catch (err) {
+				expect(err.code).toBe('IDEMPOTENCY_RESULT_TOO_LARGE');
+				expect(err.maxBytes).toBe(10);
+				expect(err.bytes).toBeGreaterThan(10);
+			}
+			s.destroy();
+		});
+
+		it('failed commit does NOT issue an UPDATE (row stays pending)', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: 10, cleanupInterval: 0 });
+			const slot = await s.acquire('k-pending');
+			const querySpy = vi.spyOn(client, 'query');
+			await expect(slot.commit({ x: 'too long' })).rejects.toMatchObject({ code: 'IDEMPOTENCY_RESULT_TOO_LARGE' });
+			// commit() should have thrown BEFORE calling client.query for the UPDATE.
+			const commitCalls = querySpy.mock.calls.filter(([q]) => {
+				const text = typeof q === 'string' ? q : q?.text;
+				return text && text.includes('SET status');
+			});
+			expect(commitCalls.length).toBe(0);
+			s.destroy();
+		});
+
+		it('Infinity disables the cap', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: Infinity, cleanupInterval: 0 });
+			const slot = await s.acquire('k-huge');
+			expect(slot.acquired).toBe(true);
+			const huge = { payload: 'x'.repeat(1024 * 1024) };
+			await expect(slot.commit(huge)).resolves.toBeUndefined();
+			s.destroy();
+		});
 	});
 
 	describe('acquire - basic flow', () => {

@@ -141,6 +141,74 @@ describe('redis distributed lock', () => {
 		});
 	});
 
+	describe('withLock: retry-delay jitter (thundering-herd avoidance)', () => {
+		it('retry sleeps are jittered, not all identical, and bounded by 1.25x retryDelayMs', async () => {
+			// Plant a foreign holder so every acquire attempt fails and the
+			// jittered sleep runs. Sample sleeps; verify they are not all
+			// identical (the pre-fix behavior) and the upper bound holds.
+			// The lower bound is not asserted because the sleep is clamped
+			// to (callMaxWaitMs - elapsed), so the final retries before
+			// timeout will fall below the [0.75x] floor.
+			const RETRY_DELAY = 40;
+			const lock = createDistributedLock(client, {
+				retryDelayMs: RETRY_DELAY,
+				maxWaitMs: RETRY_DELAY * 10
+			});
+			await client.redis.set(client.key('lock:contested'), 'foreign', 'NX', 'PX', 60000);
+
+			const samples = [];
+			const origSetTimeout = global.setTimeout;
+			/** @type {any} */
+			global.setTimeout = function (fn, ms) {
+				if (typeof ms === 'number' && ms > 0 && ms <= RETRY_DELAY * 1.25 + 1) samples.push(ms);
+				return origSetTimeout(fn, ms);
+			};
+
+			try {
+				await lock.withLock('contested', async () => {}).catch(() => {});
+			} finally {
+				global.setTimeout = origSetTimeout;
+			}
+
+			expect(samples.length).toBeGreaterThan(2);
+			const max = RETRY_DELAY * 1.25;
+			for (const s of samples) {
+				expect(s).toBeLessThanOrEqual(max);
+			}
+			// Confirm at least two samples differ (no jitter would mean every
+			// non-clamped sample equals RETRY_DELAY exactly).
+			const distinct = new Set(samples);
+			expect(distinct.size).toBeGreaterThan(1);
+		});
+
+		it('jitter never produces a negative or out-of-budget sleep', async () => {
+			// When elapsed approaches callMaxWaitMs, the sleep is clamped to
+			// the remaining budget. Verify the clamp still works under jitter.
+			const lock = createDistributedLock(client, {
+				retryDelayMs: 100,
+				maxWaitMs: 10
+			});
+			await client.redis.set(client.key('lock:tight'), 'foreign', 'NX', 'PX', 60000);
+
+			let maxSeen = 0;
+			const origSetTimeout = global.setTimeout;
+			/** @type {any} */
+			global.setTimeout = function (fn, ms) {
+				if (typeof ms === 'number' && ms > 0) maxSeen = Math.max(maxSeen, ms);
+				return origSetTimeout(fn, ms);
+			};
+
+			try {
+				await lock.withLock('tight', async () => {}).catch(() => {});
+			} finally {
+				global.setTimeout = origSetTimeout;
+			}
+
+			// Every captured sleep must be within the maxWaitMs budget.
+			expect(maxSeen).toBeLessThanOrEqual(10);
+		});
+	});
+
 	describe('withLock: acquire timeout', () => {
 		it('throws LockAcquireTimeoutError after maxWaitMs', async () => {
 			const lock = createDistributedLock(client, {
@@ -307,6 +375,53 @@ describe('redis distributed lock', () => {
 			// First heartbeat after acquire failed; subsequent heartbeats
 			// succeeded; signal never fired.
 			expect(aborted).toBe(false);
+			client.redis.eval = realEval;
+		});
+
+		it('heartbeat refreshes never overlap when an eval is slower than heartbeatMs', async () => {
+			// Pre-fix: setInterval(async () => ...) fired a new eval every
+			// heartbeatMs regardless of whether the previous eval was still in
+			// flight. With heartbeatMs=5 and eval taking 40ms, the pre-fix
+			// code would have 8 concurrent heartbeat evals at any moment.
+			// Post-fix: each tick is chained off the previous promise, so the
+			// number of CONCURRENT heartbeat evals (eval calls carrying the
+			// HEARTBEAT_SCRIPT first arg) never exceeds 1.
+			const lock = createDistributedLock(client, {
+				defaultTtlMs: 1000,
+				heartbeatMs: 5
+			});
+
+			const realEval = client.redis.eval.bind(client.redis);
+			let inFlightHeartbeats = 0;
+			let maxConcurrentHeartbeats = 0;
+			client.redis.eval = async (script, ...args) => {
+				const isHeartbeat = script.includes("'pexpire'");
+				if (isHeartbeat) {
+					inFlightHeartbeats++;
+					maxConcurrentHeartbeats = Math.max(maxConcurrentHeartbeats, inFlightHeartbeats);
+				}
+				try {
+					if (isHeartbeat) {
+						// Make every heartbeat eval take significantly longer
+						// than heartbeatMs. Several setInterval ticks fire
+						// during a single in-flight heartbeat.
+						await sleep(40);
+					}
+					return await realEval(script, ...args);
+				} finally {
+					if (isHeartbeat) inFlightHeartbeats--;
+				}
+			};
+
+			const result = lock.withLock('slow', async () => {
+				// Hold long enough for many heartbeat ticks to schedule onto
+				// the in-flight chain. Pre-fix this would land in 8+
+				// concurrent evals; post-fix the chain serializes them to 1.
+				await sleep(200);
+			});
+			await result;
+
+			expect(maxConcurrentHeartbeats).toBeLessThanOrEqual(1);
 			client.redis.eval = realEval;
 		});
 	});

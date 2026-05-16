@@ -26,8 +26,20 @@
 
 import { stripInternal } from './sensitive.js';
 
-const IS_TEST_MODE = !!process.env.VITEST || process.env.NODE_ENV === 'test';
-const IS_PROD = process.env.NODE_ENV === 'production';
+/**
+ * Test-mode and production-mode checks are evaluated per call (not at
+ * module load) so a test that flips `process.env.NODE_ENV` or sets
+ * `process.env.VITEST` partway through its run gets the updated mode
+ * on the next `assert` / `devAssert` invocation. Module-load snapshots
+ * are stale by the time the test mutates env, which is the typical
+ * shape for vitest setup files that re-enter mode mid-run.
+ */
+function isTestMode() {
+	return !!process.env.VITEST || process.env.NODE_ENV === 'test';
+}
+function isProd() {
+	return process.env.NODE_ENV === 'production';
+}
 
 /**
  * Per-category violation counter. Survives the lifetime of the process.
@@ -69,7 +81,7 @@ export function assert(cond, category, context) {
 		? { category }
 		: { category, context: safeContext });
 	console.error('[extensions/assert] ' + payload);
-	if (IS_TEST_MODE) {
+	if (isTestMode()) {
 		throw new Error('extensions assertion failed: ' + category + ' ' + payload);
 	}
 	// Production: counter + log only. Throwing here could corrupt state
@@ -84,7 +96,7 @@ export function assert(cond, category, context) {
  * @param {Record<string, unknown>} [context]
  */
 export function devAssert(cond, message, context) {
-	if (IS_PROD) return;
+	if (isProd()) return;
 	if (cond) return;
 	const safeContext = context ? stripInternal(context) : undefined;
 	const suffix = safeContext === undefined ? '' : ' ' + JSON.stringify(safeContext);

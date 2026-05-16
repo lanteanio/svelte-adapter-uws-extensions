@@ -176,10 +176,7 @@ export function createShardedBus(client, options = {}) {
 			console.error('sharded bus subscriber error:', err.message);
 		});
 		subscriber.on('smessage', (ch, message) => {
-			const rawBytes = typeof message === 'string'
-				? Buffer.byteLength(message)
-				: /** @type {Buffer} */ (message).length;
-			if (!validator.acceptSize(rawBytes)) {
+			if (!validator.acceptRaw(message)) {
 				mParseErrors?.inc();
 				return;
 			}

@@ -101,6 +101,23 @@ export function createRedisFence(client, options = {}) {
 	}
 
 	return {
+		// acquire() intentionally uses plain SET (no NX). This is force-takeover
+		// semantics by design, not a missing guard. The Postgres state machine
+		// is the canonical lock: the `claimPending` / `reclaimStuck` CTEs use
+		// `FOR UPDATE SKIP LOCKED` + `UPDATE ... SET fence = gen_random_uuid()`
+		// so only ONE worker ever owns a given (taskId, fence) pair. By the
+		// time acquire() runs in Redis, the Postgres row already says this
+		// worker owns this task. Adding NX would actively BREAK reclaim: the
+		// whole point of reclaim is that a previous owner's fence has expired
+		// and a new fence value should overwrite the stale Redis mirror. NX
+		// would silently leave the stale fence in place, the new worker's
+		// heartbeat would immediately see a value mismatch, and the task
+		// would never run.
+		//
+		// The atomic-equality guarantees this provider DOES enforce are in the
+		// HEARTBEAT_SCRIPT and RELEASE_SCRIPT Lua blocks above - those check
+		// `GET == expected` before mutating, so a previous owner can't refresh
+		// or release a fence they no longer hold.
 		async acquire(taskId, fence, ttlSec) {
 			const key = fullKey(taskId);
 			validateFence(fence);

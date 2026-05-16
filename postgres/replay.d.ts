@@ -51,6 +51,22 @@ export class ReplayStorageError extends Error {
 	constructor(op: string, cause: unknown);
 }
 
+/**
+ * Thrown by `publish()` when the caller-supplied `data` cannot be serialized
+ * to JSON (typically a `BigInt`, a circular reference, or another value
+ * `JSON.stringify` refuses). Distinct from `ReplayStorageError` because this
+ * is a caller-input bug, not a transient storage failure - so
+ * `localFanoutOnStorageFailure: true` does NOT cause the publish to fall
+ * back to `platform.publish`. The original `TypeError` is preserved in
+ * `.cause`.
+ */
+export class ReplaySerializationError extends Error {
+	readonly name: 'ReplaySerializationError';
+	readonly op: string;
+	readonly cause: unknown;
+	constructor(op: string, cause: unknown);
+}
+
 export interface BufferedMessage {
 	seq: number;
 	topic: string;

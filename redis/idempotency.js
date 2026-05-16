@@ -29,6 +29,11 @@
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
+import { IdempotencyResultTooLargeError } from '../shared/errors.js';
+
+export { IdempotencyResultTooLargeError };
+
+const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
 
 /**
  * Lua script for atomic acquire.
@@ -61,6 +66,13 @@ const PENDING_SENTINEL = '__idem_pending__';
  * @property {string} [keyPrefix='idem:'] - Prefix prepended (after the client keyPrefix) to every key.
  * @property {number} [ttl=172800] - Result cache lifetime in seconds. Default 48 hours.
  * @property {number} [acquireTtl=60] - Pending-slot lifetime in seconds (anti-deadlock). Default 60 seconds.
+ * @property {number} [maxResultBytes=262144] - Cap on the JSON-encoded byte length
+ *   of a committed result. Past the cap, `commit(result)` rejects with
+ *   `IdempotencyResultTooLargeError` (`code: 'IDEMPOTENCY_RESULT_TOO_LARGE'`) and
+ *   the slot is NOT committed. The default 256 KB matches the operational shape
+ *   Redis pubsub / Postgres NOTIFY and the cluster bus can absorb without
+ *   becoming meta-stable. Operators with legitimately larger payloads opt up
+ *   explicitly. Pass `Infinity` to disable.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional metrics registry (Prometheus).
  */
@@ -98,6 +110,10 @@ export function createIdempotencyStore(client, options = {}) {
 		if (typeof options.acquireTtl !== 'number' || options.acquireTtl < 1 || !Number.isInteger(options.acquireTtl)) {
 			throw new Error(`redis idempotency: acquireTtl must be a positive integer, got ${options.acquireTtl}`);
 		}
+	}
+	const maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES;
+	if (maxResultBytes !== Infinity && (!Number.isInteger(maxResultBytes) || maxResultBytes < 1)) {
+		throw new Error(`redis idempotency: maxResultBytes must be a positive integer or Infinity, got ${maxResultBytes}`);
 	}
 	if (options.keyPrefix !== undefined && typeof options.keyPrefix !== 'string') {
 		throw new Error('redis idempotency: keyPrefix must be a string');
@@ -148,6 +164,15 @@ export function createIdempotencyStore(client, options = {}) {
 					acquired: true,
 					async commit(result) {
 						const payload = JSON.stringify(result === undefined ? null : result);
+						const bytes = Buffer.byteLength(payload);
+						if (bytes > maxResultBytes) {
+							// Throw BEFORE writing to Redis so the slot stays as
+							// the pending sentinel. The caller can decide to
+							// abort() (release the slot) or fall through (let
+							// the acquireTtl expire); either path keeps the
+							// store in a coherent state.
+							throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
+						}
 						await withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
 						mCommits?.inc();
 					},

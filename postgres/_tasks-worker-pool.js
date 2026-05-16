@@ -22,6 +22,21 @@ const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
  */
 export function createWorkerPool(workerOption, taskName) {
 	const handlerPath = workerOption.path instanceof URL ? workerOption.path.href : String(workerOption.path);
+	// Reject non-file URL schemes. Node's dynamic import() still accepts
+	// `data:` URLs (which execute inline code) on the current LTS line;
+	// `http:` / `https:` are blocked by Node, but blocking them explicitly
+	// here surfaces a clearer error and is future-proof if Node ever
+	// re-enables network imports. Any string we accept must point at a
+	// file the developer wrote and intends to load - paths derived from
+	// user input (cookies, query strings, header values, message bodies)
+	// have no business reaching this option.
+	if (!handlerPath.startsWith('file://')) {
+		throw new Error(
+			`postgres tasks: worker.path for "${taskName}" must be a file: URL ` +
+			`(typically \`new URL('./handler.js', import.meta.url)\` or the string returned ` +
+			`by \`import.meta.resolve('./handler.js')\`). Received: ${JSON.stringify(handlerPath.slice(0, 80))}.`
+		);
+	}
 	const poolCfg = workerOption.pool || {};
 	const size = poolCfg.size !== undefined ? poolCfg.size : 1;
 	const idleTimeout = poolCfg.idleTimeout !== undefined ? poolCfg.idleTimeout : 30000;
@@ -88,6 +103,14 @@ export function createWorkerPool(workerOption, taskName) {
 		w.on('message', (msg) => {
 			const slot = inFlight.get(msg.id);
 			if (!slot) return;
+			// Reject messages that reference an in-flight id this worker
+			// was not dispatched to. The worker IS user code (handler
+			// path is user-supplied); a misbehaving or compromised
+			// handler that postMessages a forged result for another
+			// worker's id could otherwise hijack that task's resolve()
+			// path. Mirrors the existing slot.worker === w check on the
+			// 'error' listener below.
+			if (slot.worker !== w) return;
 			inFlight.delete(msg.id);
 			if (msg.type === 'result') {
 				slot.resolve(msg.result);

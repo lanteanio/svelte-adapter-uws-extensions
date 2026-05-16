@@ -322,9 +322,17 @@ export function createConnectionRegistry(client, options) {
 	async function setEntry(userId, sessionId, attrs) {
 		const key = userKey(userId);
 		const now = cachedNow();
+		// Pipeline HSET (+ optional HDEL when attrs are absent) and EXPIRE
+		// into a single MULTI/EXEC round-trip. Pre-fix this was 2-3 awaited
+		// round-trips, which left a half-applied state observable to other
+		// readers if the process died between HSET and EXPIRE: the key would
+		// be present with the new fields but no TTL, lingering past the
+		// presence-expiry window. The MULTI wraps the writes in a Redis
+		// transaction so either all three land or none of them do.
 		try {
+			const tx = redis.multi();
 			if (attrs && Object.keys(attrs).length > 0) {
-				await redis.hset(
+				tx.hset(
 					key,
 					'instanceId', instanceId,
 					'sessionId', sessionId,
@@ -332,13 +340,13 @@ export function createConnectionRegistry(client, options) {
 					'attrs', JSON.stringify(attrs)
 				);
 			} else {
-				await redis.hset(key, 'instanceId', instanceId, 'sessionId', sessionId, 'ts', now);
+				tx.hset(key, 'instanceId', instanceId, 'sessionId', sessionId, 'ts', now);
 				// Best-effort clear: a previous registration may have left an
-				// attrs field; HDEL is fire-and-forget so a missing field is
-				// not an error.
-				try { await redis.hdel(key, 'attrs'); } catch { /* ignore */ }
+				// attrs field; HDEL on a missing field is a no-op.
+				tx.hdel(key, 'attrs');
 			}
-			await redis.expire(key, ttl);
+			tx.expire(key, ttl);
+			await tx.exec();
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -452,35 +460,59 @@ export function createConnectionRegistry(client, options) {
 	async function bootstrapIndex() {
 		if (!withBreakerGuard()) return;
 		const pattern = userKeyPattern();
-		let cursor = '0';
+		// Cluster-aware iteration mirrors shared/redis-scan.js. On a Cluster
+		// client, SCAN routes to a randomly-sampled node and the remaining
+		// masters are silently skipped; iterating `nodes('master')` covers
+		// the full keyspace. On standalone the targets array is just [redis].
+		const targets = typeof /** @type {any} */ (redis).nodes === 'function'
+			? /** @type {any} */ (redis).nodes('master')
+			: [redis];
 		const seen = new Set();
+		for (const node of targets) {
+			await bootstrapFromNode(node, pattern, seen);
+		}
+	}
+
+	async function bootstrapFromNode(node, pattern, seen) {
+		let cursor = '0';
 		do {
-			let res;
+			let scanRes;
 			try {
-				res = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+				scanRes = await node.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
 				breaker?.success();
 			} catch (err) {
 				breaker?.failure(err);
 				return;
 			}
-			cursor = res[0];
-			const keys = res[1] || [];
-			for (const k of keys) {
-				if (seen.has(k)) continue;
-				seen.add(k);
-				let entry;
-				try {
-					entry = await redis.hgetall(k);
-					breaker?.success();
-				} catch (err) {
-					breaker?.failure(err);
-					continue;
-				}
-				if (!entry || !entry.instanceId) continue;
+			cursor = scanRes[0];
+			const keys = (scanRes[1] || []).filter((k) => !seen.has(k));
+			if (keys.length === 0) continue;
+			for (const k of keys) seen.add(k);
+
+			// Pipelined HGETALL: one round-trip per SCAN batch (up to 100
+			// keys) instead of N serial round-trips. On Cluster, the keys
+			// returned by SCAN all belong to this master's slot range, so
+			// the pipeline executes locally on `node`.
+			let results;
+			try {
+				const pipe = node.pipeline();
+				for (const k of keys) pipe.hgetall(k);
+				results = await pipe.exec();
+				breaker?.success();
+			} catch (err) {
+				breaker?.failure(err);
+				continue;
+			}
+
+			for (let i = 0; i < keys.length; i++) {
+				const tuple = (results && results[i]) || [];
+				const err = tuple[0];
+				const entry = tuple[1];
+				if (err || !entry || !entry.instanceId) continue;
 				// Strip the prefix back off to recover the userId. Both
 				// keyPrefix (registry-level) and the client's own keyPrefix
 				// stack on the front of the key.
-				const userId = userIdFromKey(k);
+				const userId = userIdFromKey(keys[i]);
 				if (!userId) continue;
 				const attrs = parseAttrsField(entry.attrs);
 				applyOpenEvent(userId, entry.instanceId, attrs);

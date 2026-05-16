@@ -97,6 +97,59 @@ describe('redis cursor', () => {
 		});
 	});
 
+	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
+		it('strips nested sensitive keys even when select is identity', () => {
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				select: /** @type {any} */ ((ud) => ud)
+			});
+			const ws = mockWs({
+				id: '1',
+				profile: { name: 'Alice', token: 'shh', authToken: 'xyz' }
+			});
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.id).toBe('1');
+			expect(platform.published[0].data.user.profile.name).toBe('Alice');
+			expect(platform.published[0].data.user.profile.token).toBeUndefined();
+			expect(platform.published[0].data.user.profile.authToken).toBeUndefined();
+			c.destroy();
+		});
+
+		it('strips nested __-prefixed keys even when select picks the parent', () => {
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				select: (ud) => ({ id: ud.id, meta: ud.meta })
+			});
+			const ws = mockWs({
+				id: '1',
+				meta: { displayName: 'Alice', __internal: 'leak' }
+			});
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.meta.displayName).toBe('Alice');
+			expect(platform.published[0].data.user.meta.__internal).toBeUndefined();
+			c.destroy();
+		});
+
+		it('strips constructor / prototype keys returned by a select that re-injects them', () => {
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				select: (ud) => ({ id: ud.id, constructor: 'forged', prototype: 'forged' })
+			});
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'doc', { x: 1 }, platform);
+
+			expect(platform.published[0].data.user.id).toBe('1');
+			expect(platform.published[0].data.user.constructor).not.toBe('forged');
+			expect(platform.published[0].data.user.prototype).toBeUndefined();
+			c.destroy();
+		});
+	});
+
 	describe('userData sanitization', () => {
 		it('strips __subscriptions and remoteAddress from userData', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });

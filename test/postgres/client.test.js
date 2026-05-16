@@ -74,4 +74,38 @@ describe('createPgClient', () => {
 		await client.end();
 		expect(client.pool.end).toHaveBeenCalledTimes(1);
 	});
+
+	it('pool error handler redacts DSN-shaped substrings in err.message before logging', () => {
+		// Regression: pg embeds the connection DSN in some failure-mode
+		// message strings (auth failed, host unreachable, SSL mismatch).
+		// The pool 'error' listener must pipe err.message through
+		// redactConnectionUrl so the password segment never reaches
+		// stderr / log aggregators.
+		const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const client = createPgClient({ connectionString: 'postgres://localhost/test' });
+		// Capture the 'error' handler the factory registered on the pool.
+		const onCalls = /** @type {any} */ (client.pool.on).mock.calls;
+		const errorHandlerEntry = onCalls.find((call) => call[0] === 'error');
+		expect(errorHandlerEntry).toBeDefined();
+		const errorHandler = errorHandlerEntry[1];
+
+		errorHandler(new Error('connect ECONNREFUSED postgres://app:hunter2@db.internal:5432/main'));
+		const logged = errSpy.mock.calls[0].join(' ');
+		expect(logged).toContain('postgres: idle client error');
+		expect(logged).toContain('postgres://app:***@db.internal:5432/main');
+		expect(logged).not.toContain('hunter2');
+		errSpy.mockRestore();
+	});
+
+	it('pool error handler is defensive against non-string err.message', () => {
+		const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const client = createPgClient({ connectionString: 'postgres://localhost/test' });
+		const errorHandlerEntry = /** @type {any} */ (client.pool.on).mock.calls.find((call) => call[0] === 'error');
+		const errorHandler = errorHandlerEntry[1];
+
+		// Object without a string message - the handler falls back to String(err).
+		errorHandler({ code: 'ECONNRESET' });
+		expect(errSpy.mock.calls[0][0]).toBe('postgres: idle client error');
+		errSpy.mockRestore();
+	});
 });

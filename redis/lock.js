@@ -19,6 +19,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
+import { monotonicNow } from '../shared/time.js';
 import {
 	LEASE_RENEW_SCRIPT as HEARTBEAT_SCRIPT,
 	LEASE_RELEASE_SCRIPT as RELEASE_SCRIPT
@@ -141,8 +142,11 @@ export function createDistributedLock(client, options = {}) {
 		const keyClass = mapKey(key);
 		const fenceToken = randomBytes(16).toString('hex');
 
-		// Acquire loop
-		const start = Date.now();
+		// Acquire loop. Timing uses `monotonicNow()` (a `performance.now()`-backed
+		// counter) so a backward NTP step between successive reads cannot make
+		// elapsed appear negative (extending the timeout indefinitely) or
+		// produce a histogram observation that underflows the bucket boundaries.
+		const start = monotonicNow();
 		while (true) {
 			let result;
 			try {
@@ -153,16 +157,24 @@ export function createDistributedLock(client, options = {}) {
 				throw err;
 			}
 			if (result === 'OK') {
-				mWait?.observe(Date.now() - start);
+				mWait?.observe(monotonicNow() - start);
 				mAcquired?.inc({ key_class: keyClass });
 				break;
 			}
-			const elapsed = Date.now() - start;
+			const elapsed = monotonicNow() - start;
 			if (elapsed >= callMaxWaitMs) {
 				mTimeouts?.inc({ key_class: keyClass });
 				throw new LockAcquireTimeoutError(key, elapsed);
 			}
-			await sleepWithAbort(Math.min(retryDelayMs, callMaxWaitMs - elapsed), externalSignal);
+			// Jittered backoff: spread N contending callers across the retry
+			// window so a single key-handoff does not produce an N-way SET-NX
+			// burst on the Redis socket. Math.random is the right primitive
+			// (thundering-herd avoidance, not security-relevant). +/-25% of
+			// retryDelayMs preserves the expected wait while smearing actual
+			// delays over [0.75x, 1.25x] of the configured base.
+			const jitter = (Math.random() - 0.5) * 0.5 * retryDelayMs;
+			const delay = Math.max(0, Math.min(retryDelayMs + jitter, callMaxWaitMs - elapsed));
+			await sleepWithAbort(delay, externalSignal);
 		}
 
 		// Held: start heartbeat, run user fn under combined signal, release.
@@ -174,14 +186,22 @@ export function createDistributedLock(client, options = {}) {
 		}
 
 		let lost = false;
-		const heartbeatTimer = setInterval(async () => {
+		// Chain-style heartbeat: a `setInterval(async ...)` callback running
+		// slower than the interval produces concurrent Redis evals against
+		// the same fence key, races the breaker accounting, and breaks the
+		// "one in-flight refresh at a time" invariant the lease state machine
+		// assumes. Instead, queue each refresh onto the previous one's promise
+		// chain so a slow tick never overlaps itself. Mirrors leader.js#tick
+		// (see leader.js:174-179 for the canonical pattern).
+		let inFlight = Promise.resolve();
+		async function heartbeatTick() {
+			if (lost) return;
 			try {
 				const r = await redis.eval(HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
 				breaker?.success();
 				if (Number(r) !== 1) {
 					lost = true;
 					mLost?.inc({ key_class: keyClass });
-					clearInterval(heartbeatTimer);
 					controller.abort(new LockLostError(key));
 				}
 			} catch (err) {
@@ -191,6 +211,9 @@ export function createDistributedLock(client, options = {}) {
 				// failing past `ttlMs`, at which point the next tick will
 				// observe the absent key and abort cleanly.
 			}
+		}
+		const heartbeatTimer = setInterval(() => {
+			inFlight = inFlight.then(heartbeatTick).catch(() => {});
 		}, heartbeatMs);
 		if (heartbeatTimer.unref) heartbeatTimer.unref();
 

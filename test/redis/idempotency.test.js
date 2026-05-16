@@ -38,6 +38,83 @@ describe('redis idempotency', () => {
 			const s = createIdempotencyStore(client, { keyPrefix: '' });
 			expect(typeof s.acquire).toBe('function');
 		});
+
+		it('throws on invalid maxResultBytes', () => {
+			expect(() => createIdempotencyStore(client, { maxResultBytes: 0 })).toThrow('maxResultBytes');
+			expect(() => createIdempotencyStore(client, { maxResultBytes: -1 })).toThrow('maxResultBytes');
+			expect(() => createIdempotencyStore(client, { maxResultBytes: 1.5 })).toThrow('maxResultBytes');
+		});
+
+		it('accepts Infinity for maxResultBytes (opt-out)', () => {
+			expect(() => createIdempotencyStore(client, { maxResultBytes: Infinity })).not.toThrow();
+		});
+	});
+
+	describe('maxResultBytes cap', () => {
+		it('commit rejects results exceeding the default 256 KB cap', async () => {
+			const s = createIdempotencyStore(client);
+			const slot = await s.acquire('k-too-big');
+			expect(slot.acquired).toBe(true);
+			// 257 KB string -> >262144 byte JSON payload.
+			const tooBig = { payload: 'x'.repeat(257 * 1024) };
+			await expect(slot.commit(tooBig)).rejects.toMatchObject({
+				name: 'IdempotencyResultTooLargeError',
+				code: 'IDEMPOTENCY_RESULT_TOO_LARGE'
+			});
+		});
+
+		it('commit succeeds for results under the cap', async () => {
+			const s = createIdempotencyStore(client);
+			const slot = await s.acquire('k-ok');
+			expect(slot.acquired).toBe(true);
+			await expect(slot.commit({ result: 'small' })).resolves.toBeUndefined();
+		});
+
+		it('honors a custom maxResultBytes', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: 32 });
+			const slot = await s.acquire('k-tight');
+			expect(slot.acquired).toBe(true);
+			// JSON.stringify(this) is well over 32 bytes
+			await expect(slot.commit({ a: 'longer than thirty-two bytes when serialized' })).rejects.toMatchObject({
+				code: 'IDEMPOTENCY_RESULT_TOO_LARGE'
+			});
+		});
+
+		it('error carries bytes and maxBytes properties', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: 10 });
+			const slot = await s.acquire('k-err');
+			expect(slot.acquired).toBe(true);
+			try {
+				await slot.commit({ longField: 'longer than ten bytes' });
+				throw new Error('should have rejected');
+			} catch (err) {
+				expect(err.code).toBe('IDEMPOTENCY_RESULT_TOO_LARGE');
+				expect(err.maxBytes).toBe(10);
+				expect(err.bytes).toBeGreaterThan(10);
+			}
+		});
+
+		it('failed commit leaves the slot as pending so abort() or expiry can clean up', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: 10 });
+			const slot = await s.acquire('k-pending');
+			await expect(slot.commit({ x: 'too long' })).rejects.toMatchObject({ code: 'IDEMPOTENCY_RESULT_TOO_LARGE' });
+
+			// A second acquire should still see the slot as pending (sentinel still in place).
+			const slot2 = await s.acquire('k-pending');
+			expect(slot2.acquired).toBe(false);
+			expect(slot2.pending).toBe(true);
+
+			// Caller can release via the original slot.
+			await slot.abort();
+		});
+
+		it('Infinity disables the cap', async () => {
+			const s = createIdempotencyStore(client, { maxResultBytes: Infinity });
+			const slot = await s.acquire('k-huge');
+			expect(slot.acquired).toBe(true);
+			const huge = { payload: 'x'.repeat(1024 * 1024) };
+			await expect(slot.commit(huge)).resolves.toBeUndefined();
+		});
 	});
 
 	describe('acquire - basic flow', () => {

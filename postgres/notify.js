@@ -92,6 +92,22 @@ export function createNotifyBridge(client, options) {
 	}
 
 	const channel = options.channel;
+	// Validate the channel name against the same `[a-zA-Z_][a-zA-Z0-9_]*`
+	// regex used for table names. The double-quote escape on `quotedChannel`
+	// below is RFC-correct for delimited identifiers, but an unconstrained
+	// channel name still admits Unicode tricks and reserved-namespace
+	// confusion. Rejecting at the factory boundary catches the foot-gun
+	// before any LISTEN / NOTIFY query goes out.
+	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(channel)) {
+		throw new Error(
+			`notify bridge: channel name "${channel}" must match [a-zA-Z_][a-zA-Z0-9_]* ` +
+			`(no spaces, dashes, dots, quotes, or non-ASCII characters).`
+		);
+	}
+	const lowerChannel = channel.toLowerCase();
+	if (lowerChannel.startsWith('pg_') || lowerChannel.startsWith('information_schema')) {
+		throw new Error(`notify bridge: channel name "${channel}" is in a reserved Postgres namespace`);
+	}
 	const quotedChannel = '"' + channel.replace(/"/g, '""') + '"';
 	const autoReconnect = options.autoReconnect !== false;
 	const validator = createBusValidator({
@@ -168,8 +184,7 @@ export function createNotifyBridge(client, options) {
 		// graph. We bound the input the parser ever sees as defense
 		// against an actor with `pg_notify` privilege injecting a giant
 		// envelope across the cluster.
-		const rawBytes = msg.payload ? Buffer.byteLength(msg.payload) : 0;
-		if (!validator.acceptSize(rawBytes)) {
+		if (!validator.acceptRaw(msg.payload ?? '')) {
 			mParseErrors?.inc({ channel });
 			return;
 		}

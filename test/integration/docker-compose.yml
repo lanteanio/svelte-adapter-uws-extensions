@@ -1,6 +1,10 @@
 services:
   redis:
-    image: redis:7-alpine
+    # Redis 7.4+ required for the per-field hash TTL primitive (HEXPIRE family)
+    # used by createPresence. Pinning to the 7.4 minor avoids drift if the
+    # 7-alpine tag floats to a future major. Bump to redis:8-alpine when we
+    # adopt Redis 8 features (e.g. JSON, vector search).
+    image: redis:7.4-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "${INTEGRATION_REDIS_HOST_PORT:-56379}:6379"

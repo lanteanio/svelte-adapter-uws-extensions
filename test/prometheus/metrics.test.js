@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
 	createMetrics,
 	wirePublishRateMetrics,
@@ -217,6 +217,265 @@ describe('prometheus metrics', () => {
 		});
 	});
 
+	describe('histogram negative-observation rejection (defense-in-depth)', () => {
+		it('rejects a negative observation by default (mirrors counter.inc()`s rule)', () => {
+			const m = createMetrics();
+			const h = m.histogram('latency', 'help');
+			expect(() => h.observe(-1)).toThrow('histogram value must not be negative');
+			expect(() => h.observe(-0.5)).toThrow('histogram value must not be negative');
+			expect(() => h.observe(Number.NEGATIVE_INFINITY)).toThrow();
+		});
+
+		it('rejects a negative observation with labels', () => {
+			const m = createMetrics();
+			const h = m.histogram('latency', 'help', ['method']);
+			expect(() => h.observe({ method: 'GET' }, -1)).toThrow('histogram value must not be negative');
+		});
+
+		it('rejects a negative observation in the bare-value overload', () => {
+			const m = createMetrics();
+			const h = m.histogram('latency', 'help');
+			// observe(value) (no labels arg) - the constructor swaps positional args internally.
+			expect(() => h.observe(-42)).toThrow('histogram value must not be negative');
+		});
+
+		it('still accepts zero and positive observations', () => {
+			const m = createMetrics();
+			const h = m.histogram('latency', 'help');
+			expect(() => h.observe(0)).not.toThrow();
+			expect(() => h.observe(1)).not.toThrow();
+			expect(() => h.observe(1.5)).not.toThrow();
+			expect(() => h.observe(Number.MAX_SAFE_INTEGER)).not.toThrow();
+		});
+
+		it('allows negative observations when allowNegative: true is set at registration', () => {
+			const m = createMetrics();
+			// 5th positional arg is allowNegative.
+			const h = m.histogram('signed_latency', 'help', [], [-100, -10, 0, 10, 100], true);
+			expect(() => h.observe(-50)).not.toThrow();
+			expect(() => h.observe(50)).not.toThrow();
+			expect(() => h.observe(0)).not.toThrow();
+			// The bucket counts should land correctly.
+			const out = h.serialize();
+			expect(out).toContain('signed_latency_count 3');
+		});
+
+		it('rejects NaN regardless of allowNegative (uses the existing assertFinite path)', () => {
+			const m = createMetrics();
+			const h1 = m.histogram('h1', 'help');
+			const h2 = m.histogram('h2', 'help', [], undefined, true);
+			expect(() => h1.observe(NaN)).toThrow();
+			expect(() => h2.observe(NaN)).toThrow();
+		});
+	});
+
+	describe('per-metric maxSeries cap', () => {
+		let warnSpy;
+		beforeEach(() => {
+			warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			warnSpy.mockClear();
+		});
+
+		it('counter: drops new labelsets past the cap, keeps existing ones', () => {
+			const m = createMetrics();
+			const c = m.counter('drops', 'help', ['k'], 3);
+			c.inc({ k: 'a' });
+			c.inc({ k: 'b' });
+			c.inc({ k: 'c' });
+			// Existing keys keep getting incremented even after cap reached.
+			c.inc({ k: 'a' }, 10);
+			// New label values past the cap are silently dropped.
+			c.inc({ k: 'd' });
+			c.inc({ k: 'e' });
+
+			const out = m.serialize();
+			expect(out).toContain('drops{k="a"} 11');
+			expect(out).toContain('drops{k="b"} 1');
+			expect(out).toContain('drops{k="c"} 1');
+			expect(out).not.toContain('k="d"');
+			expect(out).not.toContain('k="e"');
+		});
+
+		it('gauge: drops new labelsets via set/inc/dec past the cap', () => {
+			const m = createMetrics();
+			const g = m.gauge('g', 'help', ['k'], 2);
+			g.set({ k: 'a' }, 1);
+			g.inc({ k: 'b' }, 5);
+			g.set({ k: 'c' }, 100); // dropped
+			g.inc({ k: 'd' }, 1);   // dropped
+			g.dec({ k: 'e' }, 1);   // dropped
+
+			const out = m.serialize();
+			expect(out).toContain('g{k="a"} 1');
+			expect(out).toContain('g{k="b"} 5');
+			expect(out).not.toContain('k="c"');
+			expect(out).not.toContain('k="d"');
+			expect(out).not.toContain('k="e"');
+		});
+
+		it('histogram: drops new labelsets at observe time past the cap', () => {
+			const m = createMetrics();
+			const h = m.histogram('lat', 'help', ['route'], [10, 100], false, 2);
+			h.observe({ route: '/a' }, 5);
+			h.observe({ route: '/b' }, 50);
+			h.observe({ route: '/c' }, 500); // dropped, no new series
+
+			const out = m.serialize();
+			expect(out).toContain('lat_count{route="/a"}');
+			expect(out).toContain('lat_count{route="/b"}');
+			expect(out).not.toContain('route="/c"');
+		});
+
+		it('warns once per metric and increments the lazy dropped-series counter', () => {
+			const m = createMetrics();
+			const c = m.counter('foo', 'help', ['k'], 1);
+			c.inc({ k: 'a' });
+			c.inc({ k: 'b' }); // first drop
+			c.inc({ k: 'c' }); // second drop, no extra warn
+			c.inc({ k: 'd' }); // third drop, still no extra warn
+
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(warnSpy.mock.calls[0][0]).toContain('hit maxSeries cap 1');
+
+			const out = m.serialize();
+			expect(out).toContain('prometheus_series_dropped_total{metric="foo"} 3');
+		});
+
+		it('dropped-series counter is lazily registered - not present until first drop', () => {
+			const m = createMetrics();
+			m.counter('clean', 'help', ['k'], 5);
+			expect(m.serialize()).not.toContain('prometheus_series_dropped_total');
+		});
+
+		it('per-metric maxSeries overrides the registry default', () => {
+			const m = createMetrics({ maxSeries: 2 });
+			const small = m.counter('small', 'help', ['k']);
+			const big = m.counter('big', 'help', ['k'], 100);
+
+			for (let i = 0; i < 50; i++) {
+				small.inc({ k: 's' + i });
+				big.inc({ k: 'b' + i });
+			}
+
+			const out = m.serialize();
+			// small honored registry default (2); big honored its own override.
+			expect((out.match(/^small\{/gm) || []).length).toBe(2);
+			expect((out.match(/^big\{/gm) || []).length).toBe(50);
+		});
+
+		it('Infinity disables the cap', () => {
+			const m = createMetrics({ maxSeries: Infinity });
+			const c = m.counter('uncapped', 'help', ['k']);
+			for (let i = 0; i < 50; i++) c.inc({ k: 'v' + i });
+			const out = m.serialize();
+			expect((out.match(/^uncapped\{/gm) || []).length).toBe(50);
+		});
+
+		it('rejects invalid maxSeries at construction (per-metric)', () => {
+			const m = createMetrics();
+			expect(() => m.counter('x', 'help', ['k'], 0)).toThrow('maxSeries');
+			expect(() => m.counter('x', 'help', ['k'], -1)).toThrow('maxSeries');
+			expect(() => m.counter('x', 'help', ['k'], 1.5)).toThrow('maxSeries');
+		});
+
+		it('rejects invalid maxSeries at construction (registry default)', () => {
+			expect(() => createMetrics({ maxSeries: 0 })).toThrow('maxSeries');
+			expect(() => createMetrics({ maxSeries: -1 })).toThrow('maxSeries');
+			expect(() => createMetrics({ maxSeries: 1.5 })).toThrow('maxSeries');
+		});
+
+		it('dropped-series counter respects prefix', () => {
+			const m = createMetrics({ prefix: 'app_' });
+			const c = m.counter('foo', 'help', ['k'], 1);
+			c.inc({ k: 'a' });
+			c.inc({ k: 'b' });
+			const out = m.serialize();
+			expect(out).toContain('app_prometheus_series_dropped_total');
+			expect(out).toContain('metric="app_foo"');
+		});
+
+		it('default cap is 10000 (large enough that typical metrics never hit it)', () => {
+			const m = createMetrics();
+			const c = m.counter('typical', 'help', ['k']);
+			// Operate well under the default - sanity check the constant.
+			for (let i = 0; i < 100; i++) c.inc({ k: 'v' + i });
+			const out = m.serialize();
+			expect(out).not.toContain('prometheus_series_dropped_total');
+			expect((out.match(/^typical\{/gm) || []).length).toBe(100);
+		});
+	});
+
+	describe('histogram maxBuckets cap', () => {
+		it('rejects bucket arrays longer than the default 32', () => {
+			const m = createMetrics();
+			const tooMany = Array.from({ length: 33 }, (_, i) => i + 1);
+			expect(() => m.histogram('h', 'help', [], tooMany))
+				.toThrow('buckets length 33 exceeds maxBuckets 32');
+		});
+
+		it('accepts bucket arrays exactly at the cap', () => {
+			const m = createMetrics();
+			const exact = Array.from({ length: 32 }, (_, i) => i + 1);
+			expect(() => m.histogram('h', 'help', [], exact)).not.toThrow();
+		});
+
+		it('default bucket array (DEFAULT_BUCKETS) is well under the cap', () => {
+			const m = createMetrics();
+			expect(() => m.histogram('h', 'help')).not.toThrow();
+		});
+
+		it('per-metric maxBuckets override beats registry default', () => {
+			const m = createMetrics();
+			// 7th positional arg overrides
+			const tight = Array.from({ length: 10 }, (_, i) => i + 1);
+			expect(() => m.histogram('h1', 'help', [], tight, false, undefined, 5))
+				.toThrow('buckets length 10 exceeds maxBuckets 5');
+			expect(() => m.histogram('h2', 'help', [], tight, false, undefined, 10)).not.toThrow();
+		});
+
+		it('registry-wide maxBuckets default applies to all histograms', () => {
+			const m = createMetrics({ maxBuckets: 4 });
+			expect(() => m.histogram('h1', 'help', [], [1, 2, 3, 4])).not.toThrow();
+			expect(() => m.histogram('h2', 'help', [], [1, 2, 3, 4, 5]))
+				.toThrow('exceeds maxBuckets 4');
+		});
+
+		it('Infinity disables the cap (opt-out)', () => {
+			const m = createMetrics({ maxBuckets: Infinity });
+			const lots = Array.from({ length: 200 }, (_, i) => i + 1);
+			expect(() => m.histogram('big', 'help', [], lots)).not.toThrow();
+		});
+
+		it('rejects invalid maxBuckets at registry construction', () => {
+			expect(() => createMetrics({ maxBuckets: 0 })).toThrow('maxBuckets must be a positive integer');
+			expect(() => createMetrics({ maxBuckets: -1 })).toThrow('maxBuckets must be a positive integer');
+			expect(() => createMetrics({ maxBuckets: 1.5 })).toThrow('maxBuckets must be a positive integer');
+		});
+
+		it('rejects invalid maxBuckets per-metric', () => {
+			const m = createMetrics();
+			expect(() => m.histogram('h', 'help', [], [1, 2], false, undefined, 0))
+				.toThrow('maxBuckets');
+			expect(() => m.histogram('h2', 'help', [], [1, 2], false, undefined, -1))
+				.toThrow('maxBuckets');
+			expect(() => m.histogram('h3', 'help', [], [1, 2], false, undefined, 1.5))
+				.toThrow('maxBuckets');
+		});
+
+		it('rejects non-array buckets at registration', () => {
+			const m = createMetrics();
+			expect(() => m.histogram('h', 'help', [], 'not an array'))
+				.toThrow('buckets must be an array');
+		});
+
+		it('error message points the developer at the configurable knobs', () => {
+			const m = createMetrics();
+			const tooMany = Array.from({ length: 50 }, (_, i) => i + 1);
+			expect(() => m.histogram('h', 'help', [], tooMany))
+				.toThrow('Pass a smaller bucket array');
+		});
+	});
+
 	describe('serialize', () => {
 		it('returns empty string for empty registry', () => {
 			const m = createMetrics();
@@ -250,6 +509,151 @@ describe('prometheus metrics', () => {
 			expect(status).toBe('200 OK');
 			expect(headers['Content-Type']).toBe('text/plain; version=0.0.4; charset=utf-8');
 			expect(body).toContain('test_total 1');
+		});
+	});
+
+	describe('authedHandler', () => {
+		function mockRes() {
+			const captured = { status: null, headers: {}, body: null, corked: false };
+			const res = {
+				_captured: captured,
+				writeStatus(s) { captured.status = s; },
+				writeHeader(k, v) { captured.headers[k] = v; },
+				end(b) { captured.body = b; },
+				cork(fn) { captured.corked = true; fn(); },
+				onAborted(_fn) { captured.onAborted = _fn; }
+			};
+			return res;
+		}
+
+		it('throws if predicate is not a function', () => {
+			const m = createMetrics();
+			expect(() => m.authedHandler()).toThrow('predicate must be a function');
+			expect(() => m.authedHandler('token')).toThrow('predicate must be a function');
+			expect(() => m.authedHandler(123)).toThrow('predicate must be a function');
+		});
+
+		it('serves metrics when predicate returns true', async () => {
+			const m = createMetrics();
+			m.counter('hits_total', 'help').inc();
+			const handler = m.authedHandler(() => true);
+			const res = mockRes();
+
+			await handler(res, {});
+
+			expect(res._captured.status).toBe('200 OK');
+			expect(res._captured.headers['Content-Type']).toBe('text/plain; version=0.0.4; charset=utf-8');
+			expect(res._captured.body).toContain('hits_total 1');
+			expect(res._captured.corked).toBe(true);
+		});
+
+		it('returns 401 when predicate returns false', async () => {
+			const m = createMetrics();
+			m.counter('hits_total', 'help').inc();
+			const handler = m.authedHandler(() => false);
+			const res = mockRes();
+
+			await handler(res, {});
+
+			expect(res._captured.status).toBe('401 Unauthorized');
+			expect(res._captured.body).toBe('Unauthorized\n');
+			// Body must not leak metrics data
+			expect(res._captured.body).not.toContain('hits_total');
+		});
+
+		it('awaits async predicate', async () => {
+			const m = createMetrics();
+			m.counter('hits_total', 'help').inc();
+			let resolved = false;
+			const handler = m.authedHandler(async () => {
+				await new Promise((r) => setTimeout(r, 5));
+				resolved = true;
+				return true;
+			});
+			const res = mockRes();
+
+			await handler(res, {});
+
+			expect(resolved).toBe(true);
+			expect(res._captured.status).toBe('200 OK');
+		});
+
+		it('predicate that throws is treated as denial (no info leak)', async () => {
+			const m = createMetrics();
+			const handler = m.authedHandler(() => {
+				throw new Error('database is on fire');
+			});
+			const res = mockRes();
+
+			await handler(res, {});
+
+			expect(res._captured.status).toBe('401 Unauthorized');
+			expect(res._captured.body).toBe('Unauthorized\n');
+			// Error message must not leak
+			expect(res._captured.body).not.toContain('database is on fire');
+		});
+
+		it('predicate that rejects is treated as denial', async () => {
+			const m = createMetrics();
+			const handler = m.authedHandler(async () => {
+				throw new Error('async fail');
+			});
+			const res = mockRes();
+
+			await handler(res, {});
+
+			expect(res._captured.status).toBe('401 Unauthorized');
+		});
+
+		it('predicate receives res and req', async () => {
+			const m = createMetrics();
+			let receivedRes, receivedReq;
+			const handler = m.authedHandler((res, req) => {
+				receivedRes = res;
+				receivedReq = req;
+				return true;
+			});
+			const res = mockRes();
+			const req = { getHeader: () => 'ok' };
+
+			await handler(res, req);
+
+			expect(receivedRes).toBe(res);
+			expect(receivedReq).toBe(req);
+		});
+
+		it('token-based predicate pattern works end-to-end', async () => {
+			const m = createMetrics();
+			m.counter('hits_total', 'help').inc();
+			const expectedToken = 'secret-token';
+			const handler = m.authedHandler((res, req) => req.getHeader('x-scrape-token') === expectedToken);
+
+			// Wrong token
+			const res1 = mockRes();
+			await handler(res1, { getHeader: () => 'wrong' });
+			expect(res1._captured.status).toBe('401 Unauthorized');
+
+			// Right token
+			const res2 = mockRes();
+			await handler(res2, { getHeader: (h) => h === 'x-scrape-token' ? expectedToken : '' });
+			expect(res2._captured.status).toBe('200 OK');
+			expect(res2._captured.body).toContain('hits_total 1');
+		});
+
+		it('does not write response when client aborted before predicate resolved', async () => {
+			const m = createMetrics();
+			const handler = m.authedHandler(async () => {
+				await new Promise((r) => setTimeout(r, 10));
+				return true;
+			});
+			const res = mockRes();
+			// Simulate abort: fire onAborted synchronously before predicate resolves
+			const promise = handler(res, {});
+			res._captured.onAborted();
+			await promise;
+
+			expect(res._captured.status).toBe(null);
+			expect(res._captured.body).toBe(null);
 		});
 	});
 

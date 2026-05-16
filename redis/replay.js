@@ -17,10 +17,10 @@
 
 import { createStreamReplay } from './replay-stream.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
-import { ReplicationTimeoutError, ReplayStorageError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
+import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
-export { ReplicationTimeoutError, ReplayStorageError };
+export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 
 /**
  * @typedef {Object} RedisReplayOptions
@@ -130,9 +130,22 @@ export function createReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
+			// Serialize BEFORE entering the storage try-block. A JSON.stringify
+			// throw (BigInt, circular reference, etc.) is a caller-input bug,
+			// not a transient storage failure, and must not trigger the
+			// localFanoutOnStorageFailure fallback - that would silently
+			// degrade the durability contract on payloads the user thought
+			// were being persisted.
+			let payload;
+			try {
+				payload = JSON.stringify(data ?? null);
+			} catch (err) {
+				throw new ReplaySerializationError('publish', err);
+			}
+
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, topic, event, JSON.stringify(data ?? null), maxSize, ttl)
+					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, topic, event, payload, maxSize, ttl)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
@@ -201,6 +214,14 @@ export function createReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
+			// Reject malformed since values defensively. Negative since
+			// would expand `since + 1` to <= 0 and ZRANGEBYSCORE would
+			// return every entry in the buffer. Authorization is handled
+			// upstream (checkSubscribe gate) for the replay() entrypoint
+			// but since() is a direct caller API; this gate protects
+			// against buggy host code that forwards client input
+			// unchecked.
+			if (!Number.isInteger(since) || since < 0) return [];
 			const raw = await withBreaker(b, () => redis.zrangebyscore(bufKey(topic), since + 1, '+inf'));
 			const result = [];
 			for (let i = 0; i < raw.length; i++) {
@@ -213,6 +234,13 @@ export function createReplay(client, options = {}) {
 
 		async replay(ws, topic, sinceSeq, platform, reqId) {
 			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
+			// Same input gate as `since()`: malformed sinceSeq would
+			// return the entire buffer via `sinceSeq + 1 <= 0`. Emit a
+			// bare `end` marker so the wire protocol shape is preserved.
+			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
+				platform.send(ws, '__replay:' + topic, 'end', { reqId: reqId || undefined });
+				return;
+			}
 			const replayTopic = '__replay:' + topic;
 			if (b) b.guard();
 			const bk = bufKey(topic);
@@ -304,7 +332,12 @@ export function createReplay(client, options = {}) {
 			return async (ws, ctx) => {
 				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
 				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
-					const seq = typeof sinceSeq === 'number' && sinceSeq >= 0 ? sinceSeq : 0;
+					// Normalize wire-supplied sinceSeq. Reject non-integers
+					// (fractional, NaN, Infinity, non-number) by falling
+					// through to 0 (resume from start). Negative values
+					// would also fall through, but tracker.replay() now
+					// validates internally as defense-in-depth.
+					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
 					await tracker.replay(ws, topic, seq, ctx.platform);
 				}
 			};

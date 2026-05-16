@@ -37,8 +37,21 @@ export function mockPgClient() {
 		return Date.now();
 	}
 
-	return {
-		pool: {},
+	const client = {
+		// `pool.connect()` returns a pinned-connection wrapper. The mock
+		// does not model Postgres-side transaction semantics (statements
+		// queued between BEGIN and COMMIT just go through the same query
+		// dispatch); production atomicity is verified at the integration
+		// tier. BEGIN / COMMIT / ROLLBACK are accepted as no-ops so the
+		// shared `withTransaction` helper works against this mock.
+		pool: {
+			async connect() {
+				return {
+					query: (textOrObj, values) => client.query(textOrObj, values),
+					release: () => {}
+				};
+			}
+		},
 
 		async query(textOrObj, values) {
 			if (typeof textOrObj === 'object' && textOrObj !== null) {
@@ -47,6 +60,13 @@ export function mockPgClient() {
 			}
 			if (!values) values = [];
 			const sql = textOrObj.trim().replace(/\s+/g, ' ');
+
+			// Transaction-control statements: accepted as no-ops by the mock.
+			// The mock does not model atomicity; rely on the integration tier
+			// for that assertion.
+			if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+				return { rows: [], rowCount: 0 };
+			}
 
 			// CREATE TABLE
 			if (sql.startsWith('CREATE TABLE')) {
@@ -811,4 +831,5 @@ export function mockPgClient() {
 		_getJobRows() { return jobRows; },
 		_reset() { rows = []; nextId = 1; tableCreated = false; seqCounters.clear(); idemRows.clear(); taskRows.clear(); jobRows.clear(); jobNextId = 1; }
 	};
+	return client;
 }

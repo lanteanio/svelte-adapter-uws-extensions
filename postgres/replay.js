@@ -29,9 +29,10 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
-import { ReplayStorageError } from '../shared/replay-helpers.js';
+import { withTransaction } from '../shared/pg-tx.js';
+import { ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
-export { ReplayStorageError };
+export { ReplayStorageError, ReplaySerializationError };
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -111,7 +112,7 @@ export function createReplay(client, options = {}) {
 				data     JSONB,
 				created_at TIMESTAMPTZ DEFAULT now()
 			)
-		`);
+		`, { table, columns: [pkCol, 'topic', 'seq', 'event', 'data', 'created_at'] });
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
@@ -120,7 +121,7 @@ export function createReplay(client, options = {}) {
 				topic TEXT   PRIMARY KEY,
 				seq   BIGINT NOT NULL DEFAULT 0
 			)
-		`);
+		`, { table: seqTable, columns: ['topic', 'seq'] });
 		migrated = true;
 	}
 
@@ -173,6 +174,18 @@ export function createReplay(client, options = {}) {
 
 	const tracker = {
 		async publish(platform, topic, event, data) {
+			// Serialize BEFORE entering the storage try-block. A JSON.stringify
+			// throw (BigInt, circular reference, etc.) is a caller-input bug,
+			// not a transient storage failure, and must not trigger the
+			// localFanoutOnStorageFailure fallback - that would silently
+			// degrade the durability contract on payloads the user thought
+			// were being persisted.
+			let payload;
+			try {
+				payload = JSON.stringify(data ?? null);
+			} catch (err) {
+				throw new ReplaySerializationError('publish', err);
+			}
 			let res;
 			try {
 				res = await withBreaker(b, async () => {
@@ -190,7 +203,7 @@ export function createReplay(client, options = {}) {
 						SELECT $1, new_seq.seq, $2, $3
 						  FROM new_seq
 						RETURNING seq`,
-						values: [topic, event, JSON.stringify(data ?? null)]
+						values: [topic, event, payload]
 					});
 				});
 			} catch (err) {
@@ -381,20 +394,29 @@ export function createReplay(client, options = {}) {
 		async clear() {
 			await withBreaker(b, async () => {
 				await ensureTable();
-				await client.query(`DELETE FROM ${table}`);
-				await client.query(`DELETE FROM ${seqTable}`);
+				// Run the two DELETEs in a transaction so an interruption between
+				// them cannot leave the seqTable populated with topics whose
+				// data rows are already gone. A pooled-connection BEGIN/COMMIT
+				// is required because the default `client.query()` may check
+				// out a different connection per call.
+				await withTransaction(client, async (tx) => {
+					await tx.query(`DELETE FROM ${table}`);
+					await tx.query(`DELETE FROM ${seqTable}`);
+				});
 			});
 		},
 
 		async clearTopic(topic) {
 			await withBreaker(b, async () => {
 				await ensureTable();
-				await client.query(
-					`DELETE FROM ${table}
-					  WHERE topic = $1`, [topic]);
-				await client.query(
-					`DELETE FROM ${seqTable}
-					  WHERE topic = $1`, [topic]);
+				await withTransaction(client, async (tx) => {
+					await tx.query(
+						`DELETE FROM ${table}
+						  WHERE topic = $1`, [topic]);
+					await tx.query(
+						`DELETE FROM ${seqTable}
+						  WHERE topic = $1`, [topic]);
+				});
 			});
 		},
 

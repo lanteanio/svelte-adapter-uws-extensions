@@ -166,10 +166,7 @@ export function createCursor(client, options = {}) {
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
-			const rawBytes = typeof message === 'string'
-				? Buffer.byteLength(message)
-				: /** @type {Buffer} */ (message).length;
-			if (!validator.acceptSize(rawBytes)) return;
+			if (!validator.acceptRaw(message)) return;
 			try {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
@@ -270,11 +267,20 @@ export function createCursor(client, options = {}) {
 					`redis cursor: local ws count exceeded ${MAX_CURSOR_WS} on this instance`
 				);
 			}
-			const user = select(safeUserData(ws));
+			// Warn first on the raw select output so developers see sensitive
+			// keys their select forwarded (the warning fires once per process
+			// and is the signal that they should tighten the select). Then
+			// deep-strip for the wire: the default select is stripInternal
+			// already (idempotent re-strip is fine); a user-supplied select
+			// (e.g. an identity passthrough) might return data with nested
+			// sensitive keys, and the wire output must not carry them
+			// regardless of how select is wired.
+			const selected = select(safeUserData(ws));
+			warnSensitive(selected);
+			const user = stripInternal(selected);
 			try { JSON.stringify(user); } catch {
 				throw new Error('redis cursor: select() must return JSON-serializable data');
 			}
-			warnSensitive(user);
 			state = {
 				key: instanceId + ':' + (++connCounter),
 				user,

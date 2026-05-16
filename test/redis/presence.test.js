@@ -453,6 +453,44 @@ describe('redis presence', () => {
 		});
 	});
 
+	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
+		it('strips nested sensitive keys even when select is identity', async () => {
+			const local = createPresence(client, {
+				key: 'id',
+				select: /** @type {any} */ ((ud) => ud)
+			});
+			const ws = mockWs({
+				id: '1',
+				name: 'Alice',
+				profile: { displayName: 'A', token: 'shh', authToken: 'xyz' }
+			});
+			await local.join(ws, 'room', platform);
+
+			const state = statesOf(platform)[0];
+			expect(state.data['1'].profile.displayName).toBe('A');
+			expect(state.data['1'].profile).not.toHaveProperty('token');
+			expect(state.data['1'].profile).not.toHaveProperty('authToken');
+			local.destroy();
+		});
+
+		it('strips nested __-prefixed keys when select picks the parent', async () => {
+			const local = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, meta: ud.meta })
+			});
+			const ws = mockWs({
+				id: '1',
+				meta: { displayName: 'Alice', __internal: 'leak' }
+			});
+			await local.join(ws, 'room', platform);
+
+			const state = statesOf(platform)[0];
+			expect(state.data['1'].meta.displayName).toBe('Alice');
+			expect(state.data['1'].meta).not.toHaveProperty('__internal');
+			local.destroy();
+		});
+	});
+
 	describe('hooks', () => {
 		it('exposes subscribe / unsubscribe / close', () => {
 			expect(typeof presence.hooks.subscribe).toBe('function');
@@ -677,7 +715,10 @@ describe('redis presence', () => {
 			const pmessageListener = subscriberHandler.listeners.get('pmessage');
 			expect(typeof pmessageListener).toBe('function');
 
-			const expiredKey = client.key('presence:room');
+			// Storage layout: the per-topic hash key is `presence:topic:{topic}`.
+			// Whole-key expiry fires only when every field has expired (no live
+			// instances presenting any user on this topic).
+			const expiredKey = client.key('presence:topic:room');
 			pmessageListener('__keyevent@*__:expired', '__keyevent@0__:expired', expiredKey);
 
 			const empties = platform.published.filter(

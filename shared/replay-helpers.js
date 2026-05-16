@@ -44,6 +44,26 @@ export class ReplayStorageError extends Error {
 }
 
 /**
+ * Thrown by replay backends when the caller-supplied `data` cannot be
+ * serialized to JSON (typically because it contains a `BigInt`, a circular
+ * reference, or another value `JSON.stringify` refuses to encode). Distinct
+ * from `ReplayStorageError` because this is a caller-input bug, not a
+ * transient storage failure - so `localFanoutOnStorageFailure: true` does
+ * NOT cause the publish to fall back to `platform.publish`. The local
+ * fanout would either re-throw on its own serializer or silently degrade
+ * the durability promise; neither is the right answer to malformed input.
+ * Wraps the original `TypeError` from `JSON.stringify` in `.cause`.
+ */
+export class ReplaySerializationError extends Error {
+	constructor(op, cause) {
+		super(`replay payload could not be serialized during ${op}: ${cause?.message ?? cause}`);
+		this.name = 'ReplaySerializationError';
+		this.op = op;
+		this.cause = cause;
+	}
+}
+
+/**
  * Validate the replay options shared by the sorted-set and stream backends.
  * Returns normalized values with defaults filled in. Throws with the given
  * prefix in front of every error message so callers can identify which

@@ -40,6 +40,19 @@ function assertFinite(value, method) {
 }
 
 /**
+ * Default per-metric series cap. A "series" in Prometheus is one
+ * (metric, labelset) combination - each unique labelset creates a new
+ * sample row in `/metrics` output. Past ~10k label combinations per
+ * metric, Grafana queries time out, prometheus scrape volume balloons,
+ * and the metric becomes operationally useless. This default protects
+ * against unbounded-cardinality leaks (e.g. labeling by client IP,
+ * user-controlled topic, or request ID without `mapTopic` containment).
+ * Pass `Infinity` to opt out per-metric or registry-wide; pass a smaller
+ * value when you know the legitimate cardinality is bounded.
+ */
+const DEFAULT_MAX_SERIES = 10_000;
+
+/**
  * Serialize a label set into a stable string key for Map lookups.
  * Labels are sorted to ensure {a="1",b="2"} and {b="2",a="1"} hit the same entry.
  */
@@ -91,8 +104,22 @@ function formatValue(v) {
 	return String(v);
 }
 
+/**
+ * Validate the resolved `maxSeries` value. Must be a positive integer
+ * or Infinity (the "no cap" opt-out).
+ *
+ * @param {unknown} value
+ * @param {string} metricName
+ */
+function validateMaxSeries(value, metricName) {
+	if (value === Infinity) return;
+	if (!Number.isInteger(value) || value < 1) {
+		throw new Error(`metric "${metricName}": maxSeries must be a positive integer or Infinity, got ${value}`);
+	}
+}
+
 class Counter {
-	constructor(name, help, labelNames) {
+	constructor(name, help, labelNames, maxSeries) {
 		validateMetricName(name);
 		if (typeof help !== 'string') {
 			throw new Error(`metric "${name}": help must be a string`);
@@ -110,10 +137,21 @@ class Counter {
 				seen.add(labelNames[i]);
 			}
 		}
+		validateMaxSeries(maxSeries, name);
 		this.name = name;
 		this.help = help;
 		this.labelNames = labelNames || [];
+		this.maxSeries = maxSeries;
 		this.samples = new Map();
+		/**
+		 * Callback invoked when a new label-key would exceed `maxSeries`.
+		 * Set by `createMetrics()` so the registry-level dropped-series
+		 * counter can be lazily registered and labeled by metric name.
+		 * @type {((metricName: string) => void) | null}
+		 */
+		this._onDrop = null;
+		/** Latch so the warn-on-cap log fires once per metric, not per drop. */
+		this._warned = false;
 	}
 
 	inc(labels, n) {
@@ -126,9 +164,14 @@ class Counter {
 		if (val < 0) throw new Error('counter value must not be negative');
 		validateLabels(labels, this.labelNames, this.name);
 		const key = labelKey(labels);
+		const existing = this.samples.get(key);
+		if (!existing && this.samples.size >= this.maxSeries) {
+			recordSeriesDrop(this);
+			return;
+		}
 		this.samples.set(key, {
 			labels: labels || null,
-			value: (this.samples.get(key)?.value || 0) + val
+			value: (existing?.value || 0) + val
 		});
 	}
 
@@ -144,7 +187,7 @@ class Counter {
 }
 
 class Gauge {
-	constructor(name, help, labelNames) {
+	constructor(name, help, labelNames, maxSeries) {
 		validateMetricName(name);
 		if (typeof help !== 'string') {
 			throw new Error(`metric "${name}": help must be a string`);
@@ -162,11 +205,15 @@ class Gauge {
 				seen.add(labelNames[i]);
 			}
 		}
+		validateMaxSeries(maxSeries, name);
 		this.name = name;
 		this.help = help;
 		this.labelNames = labelNames || [];
+		this.maxSeries = maxSeries;
 		this.samples = new Map();
 		this.collectFn = null;
+		this._onDrop = null;
+		this._warned = false;
 	}
 
 	set(labels, n) {
@@ -177,6 +224,10 @@ class Gauge {
 		assertFinite(n, 'gauge.set()');
 		validateLabels(labels, this.labelNames, this.name);
 		const key = labelKey(labels);
+		if (!this.samples.has(key) && this.samples.size >= this.maxSeries) {
+			recordSeriesDrop(this);
+			return;
+		}
 		this.samples.set(key, { labels: labels || null, value: n });
 	}
 
@@ -189,6 +240,10 @@ class Gauge {
 		assertFinite(val, 'gauge.inc()');
 		validateLabels(labels, this.labelNames, this.name);
 		const key = labelKey(labels);
+		if (!this.samples.has(key) && this.samples.size >= this.maxSeries) {
+			recordSeriesDrop(this);
+			return;
+		}
 		const current = this.samples.get(key)?.value || 0;
 		this.samples.set(key, { labels: labels || null, value: current + val });
 	}
@@ -202,6 +257,10 @@ class Gauge {
 		assertFinite(val, 'gauge.dec()');
 		validateLabels(labels, this.labelNames, this.name);
 		const key = labelKey(labels);
+		if (!this.samples.has(key) && this.samples.size >= this.maxSeries) {
+			recordSeriesDrop(this);
+			return;
+		}
 		const current = this.samples.get(key)?.value || 0;
 		this.samples.set(key, { labels: labels || null, value: current - val });
 	}
@@ -227,8 +286,21 @@ class Gauge {
 
 const DEFAULT_BUCKETS = [1, 5, 10, 25, 50, 100, 250, 500, 1000];
 
+/**
+ * De-facto bucket count cap across mature Prometheus client libraries
+ * (Go's `client_golang` warns past ~100, Java's Micrometer soft-caps at
+ * 64, Python's `prometheus_client` has no hard cap but practitioners
+ * recommend staying under 32). 32 is generous for any realistic latency
+ * / size / duration distribution; past that, each labelset's
+ * per-histogram state expands linearly (each bucket is one counter +
+ * one wire-format `_bucket` line at scrape time), and the percentile
+ * resolution gain past 32 well-chosen buckets is marginal. Pass
+ * `Infinity` to opt out per-metric or registry-wide.
+ */
+const DEFAULT_MAX_BUCKETS = 32;
+
 class Histogram {
-	constructor(name, help, labelNames, buckets) {
+	constructor(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
 		validateMetricName(name);
 		if (typeof help !== 'string') {
 			throw new Error(`metric "${name}": help must be a string`);
@@ -246,18 +318,43 @@ class Histogram {
 				seen.add(labelNames[i]);
 			}
 		}
+		validateMaxSeries(maxSeries, name);
+		if (maxBuckets !== Infinity && (!Number.isInteger(maxBuckets) || maxBuckets < 1)) {
+			throw new Error(`metric "${name}": maxBuckets must be a positive integer or Infinity, got ${maxBuckets}`);
+		}
 		this.name = name;
 		this.help = help;
 		this.labelNames = labelNames || [];
+		this.maxSeries = maxSeries;
 		const rawBuckets = buckets || DEFAULT_BUCKETS;
+		if (!Array.isArray(rawBuckets)) {
+			throw new Error(`metric "${name}": buckets must be an array`);
+		}
+		if (rawBuckets.length > maxBuckets) {
+			throw new Error(
+				`metric "${name}": buckets length ${rawBuckets.length} exceeds maxBuckets ${maxBuckets}. ` +
+				'Mature Prometheus clients soft-cap at 32; percentile-resolution gains past that are marginal ' +
+				'while per-labelset state and scrape volume grow linearly. Pass a smaller bucket array, or ' +
+				'override `maxBuckets` per-metric (7th positional arg to `histogram()`) or registry-wide ' +
+				'(`createMetrics({ maxBuckets })`).'
+			);
+		}
 		for (let i = 0; i < rawBuckets.length; i++) {
 			if (typeof rawBuckets[i] !== 'number' || !Number.isFinite(rawBuckets[i])) {
 				throw new Error(`metric "${name}": bucket values must be finite numbers, got ${rawBuckets[i]}`);
 			}
 		}
 		this.buckets = [...new Set(rawBuckets)].sort((a, b) => a - b);
+		// Histograms are non-negative by default (Prometheus convention).
+		// Negative observations corrupt `_sum` and break histogram bucket
+		// monotonicity (`rate()` queries return wrong values), so reject
+		// them unless the caller explicitly opts in. Signed-observation
+		// use cases (latency skew, p&l, temperature deltas) pass true.
+		this.allowNegative = allowNegative === true;
 		// per label-key: { counts: number[], sum: number, count: number }
 		this.samples = new Map();
+		this._onDrop = null;
+		this._warned = false;
 	}
 
 	observe(labels, value) {
@@ -266,10 +363,17 @@ class Histogram {
 			labels = undefined;
 		}
 		assertFinite(value, 'histogram.observe()');
+		if (!this.allowNegative && value < 0) {
+			throw new Error('histogram value must not be negative (pass `allowNegative: true` at histogram() registration to opt in)');
+		}
 		validateLabels(labels, this.labelNames, this.name);
 		const key = labelKey(labels);
 		let state = this.samples.get(key);
 		if (!state) {
+			if (this.samples.size >= this.maxSeries) {
+				recordSeriesDrop(this);
+				return;
+			}
 			state = {
 				labels: labels || null,
 				counts: new Array(this.buckets.length).fill(0),
@@ -311,10 +415,43 @@ class Histogram {
 }
 
 /**
+ * Drop callback called from `Counter.inc` / `Gauge.set/inc/dec` /
+ * `Histogram.observe` when adding a new (metric, labelset) combination
+ * would push `samples.size` past the metric's `maxSeries` cap. Routes
+ * to the registry-level dropped-series counter (registered lazily on
+ * first drop) and warn-once-per-metric to console.
+ *
+ * @param {Counter | Gauge | Histogram} metric
+ */
+function recordSeriesDrop(metric) {
+	if (metric._onDrop) metric._onDrop(metric.name);
+	if (!metric._warned) {
+		metric._warned = true;
+		console.warn(
+			`[prometheus] metric "${metric.name}" hit maxSeries cap ` +
+			`${metric.maxSeries} - subsequent unique labelsets dropped. ` +
+			'See `prometheus_series_dropped_total{metric="' + metric.name + '"}` ' +
+			'for ongoing drop count. Bump `maxSeries` if legitimate, or use ' +
+			'`mapTopic` to bound the label cardinality.'
+		);
+	}
+}
+
+/**
  * @typedef {Object} MetricsOptions
  * @property {string} [prefix=''] - Prefix for all metric names
  * @property {(topic: string) => string} [mapTopic] - Map topic names to bounded label values for cardinality control
  * @property {number[]} [defaultBuckets] - Default histogram buckets
+ * @property {number} [maxSeries=10_000] - Default per-metric series cap (label combinations).
+ *   Past the cap, new labelsets are dropped, a warn-once log fires per metric, and the
+ *   built-in `prometheus_series_dropped_total{metric}` counter (lazily registered on first
+ *   drop) tracks the ongoing drop rate. Pass `Infinity` to disable. Individual metrics
+ *   can override via the per-factory `maxSeries` argument.
+ * @property {number} [maxBuckets=32] - Maximum number of buckets a histogram may declare.
+ *   Each labelset's per-histogram state grows linearly with bucket count (one counter per
+ *   bucket + one `_bucket` line per scrape); mature client libraries soft-cap around 32.
+ *   Throws at registration if the bucket array exceeds the cap. Pass `Infinity` to disable.
+ *   Individual histograms can override via the per-factory `maxBuckets` argument.
  */
 
 /**
@@ -331,8 +468,17 @@ class Histogram {
  * // Pass to extensions:
  * const presence = createPresence(redis, { metrics, key: 'id' });
  *
- * // Mount the endpoint:
+ * // Mount the endpoint. RECOMMENDED: bind `/metrics` behind a network
+ * // barrier (private scrape port, internal LB, sidecar) rather than
+ * // exposing it next to public traffic. When that is not available,
+ * // wrap with `metrics.authedHandler(predicate)`:
  * app.get('/metrics', metrics.handler);
+ * //
+ * // OR (auth helper for same-listener mounts):
+ * // const token = process.env.METRICS_SCRAPE_TOKEN;
+ * // app.get('/metrics', metrics.authedHandler(
+ * //   (res, req) => req.getHeader('x-scrape-token') === token
+ * // ));
  * ```
  */
 export function createMetrics(options = {}) {
@@ -342,40 +488,90 @@ export function createMetrics(options = {}) {
 	}
 	const mapTopic = options.mapTopic || ((t) => t);
 	const defaultBuckets = options.defaultBuckets || DEFAULT_BUCKETS;
+	const defaultMaxSeries = options.maxSeries ?? DEFAULT_MAX_SERIES;
+	validateMaxSeries(defaultMaxSeries, '<registry default>');
+	const defaultMaxBuckets = options.maxBuckets ?? DEFAULT_MAX_BUCKETS;
+	if (defaultMaxBuckets !== Infinity && (!Number.isInteger(defaultMaxBuckets) || defaultMaxBuckets < 1)) {
+		throw new Error(`createMetrics: maxBuckets must be a positive integer or Infinity, got ${defaultMaxBuckets}`);
+	}
 	const registry = new Map();
 
-	function counter(name, help, labelNames) {
+	/**
+	 * Lazily-registered counter that records each (metric, drop) event.
+	 * Created on first drop so a healthy registry never adds the extra
+	 * series-dropped lines to its `/metrics` output. Itself has
+	 * `maxSeries: Infinity` so a high-cardinality drop pattern cannot
+	 * cause the drop counter itself to start dropping.
+	 * @type {Counter | null}
+	 */
+	let droppedCounter = null;
+	const droppedCounterName = prefix + 'prometheus_series_dropped_total';
+
+	/**
+	 * Wire the per-metric `_onDrop` hook to a lazy registration of the
+	 * registry-level dropped-series counter. Called from the factories
+	 * after each metric is created.
+	 *
+	 * @param {Counter | Gauge | Histogram} metric
+	 */
+	function attachDropHook(metric) {
+		metric._onDrop = (metricName) => {
+			if (!droppedCounter) {
+				droppedCounter = new Counter(
+					droppedCounterName,
+					'Number of (metric, labelset) combinations dropped because the metric reached its maxSeries cap.',
+					['metric'],
+					Infinity
+				);
+				registry.set(droppedCounterName, droppedCounter);
+			}
+			droppedCounter.inc({ metric: metricName });
+		};
+	}
+
+	function counter(name, help, labelNames, maxSeries) {
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Counter)) throw new Error(`metric "${fullName}" already registered as a different type`);
 			return existing;
 		}
-		const c = new Counter(fullName, help, labelNames);
+		const c = new Counter(fullName, help, labelNames, maxSeries ?? defaultMaxSeries);
+		attachDropHook(c);
 		registry.set(fullName, c);
 		return c;
 	}
 
-	function gauge(name, help, labelNames) {
+	function gauge(name, help, labelNames, maxSeries) {
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Gauge)) throw new Error(`metric "${fullName}" already registered as a different type`);
 			return existing;
 		}
-		const g = new Gauge(fullName, help, labelNames);
+		const g = new Gauge(fullName, help, labelNames, maxSeries ?? defaultMaxSeries);
+		attachDropHook(g);
 		registry.set(fullName, g);
 		return g;
 	}
 
-	function histogram(name, help, labelNames, buckets) {
+	function histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Histogram)) throw new Error(`metric "${fullName}" already registered as a different type`);
 			return existing;
 		}
-		const h = new Histogram(fullName, help, labelNames, buckets || defaultBuckets);
+		const h = new Histogram(
+			fullName,
+			help,
+			labelNames,
+			buckets || defaultBuckets,
+			allowNegative,
+			maxSeries ?? defaultMaxSeries,
+			maxBuckets ?? defaultMaxBuckets
+		);
+		attachDropHook(h);
 		registry.set(fullName, h);
 		return h;
 	}
@@ -395,12 +591,85 @@ export function createMetrics(options = {}) {
 		res.end(serialize());
 	}
 
+	/**
+	 * Wrap `handler` with a caller-supplied auth predicate. The predicate
+	 * receives `(res, req)` and returns truthy to allow the request or
+	 * falsy to deny. May be synchronous or return a Promise. When the
+	 * predicate denies, the response is a `401 Unauthorized` with a
+	 * minimal text body and no metrics payload.
+	 *
+	 * This is an *opt-in* wrapper. The default `handler` does no auth -
+	 * the recommended deployment shape is to bind `/metrics` behind a
+	 * network barrier (private port, internal load balancer, sidecar
+	 * scrape target) rather than relying on app-layer auth. Use this
+	 * helper when the metrics endpoint lives on the same listener as
+	 * public traffic and a network barrier is not available.
+	 *
+	 * Predicate exceptions are caught and treated as denial (500-level
+	 * info is not leaked back; the response is the same 401 shape).
+	 *
+	 * @param {(res: any, req: any) => boolean | Promise<boolean>} predicate
+	 * @returns {(res: any, req: any) => Promise<void>}
+	 *
+	 * @example
+	 * ```js
+	 * // Token-based auth from env
+	 * const expectedToken = process.env.METRICS_SCRAPE_TOKEN;
+	 * app.get('/metrics', metrics.authedHandler((res, req) => {
+	 *   return req.getHeader('x-scrape-token') === expectedToken;
+	 * }));
+	 * ```
+	 *
+	 * @example
+	 * ```js
+	 * // IP-allowlist (when behind a non-CDN reverse proxy that surfaces
+	 * // the real client IP via the upgrade hook's userData chain).
+	 * const SCRAPE_ALLOWLIST = new Set(['10.0.0.5', '10.0.0.6']);
+	 * app.get('/metrics', metrics.authedHandler((res, req) => {
+	 *   const ip = Buffer.from(res.getRemoteAddressAsText()).toString();
+	 *   return SCRAPE_ALLOWLIST.has(ip);
+	 * }));
+	 * ```
+	 */
+	function authedHandler(predicate) {
+		if (typeof predicate !== 'function') {
+			throw new Error('createMetrics.authedHandler: predicate must be a function');
+		}
+		return async function authedMetricsHandler(res, req) {
+			// uWS requires onAborted before any async work so a client
+			// hang-up does not leave us calling res.* on a dead socket.
+			let aborted = false;
+			res.onAborted(() => { aborted = true; });
+
+			let allowed;
+			try {
+				allowed = await predicate(res, req);
+			} catch {
+				allowed = false;
+			}
+			if (aborted) return;
+
+			res.cork(() => {
+				if (allowed) {
+					res.writeStatus('200 OK');
+					res.writeHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+					res.end(serialize());
+				} else {
+					res.writeStatus('401 Unauthorized');
+					res.writeHeader('Content-Type', 'text/plain; charset=utf-8');
+					res.end('Unauthorized\n');
+				}
+			});
+		};
+	}
+
 	return {
 		counter,
 		gauge,
 		histogram,
 		serialize,
 		handler,
+		authedHandler,
 		mapTopic
 	};
 }

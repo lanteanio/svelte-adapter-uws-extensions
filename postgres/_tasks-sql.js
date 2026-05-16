@@ -45,7 +45,14 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 				created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
 				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 			)
-		`);
+		`, {
+			table,
+			// `request_id` is intentionally NOT in the expected set: it's
+			// added by the ALTER TABLE below for forward-migrated next.1
+			// deployments, so the table may legitimately pre-exist without
+			// it before the ALTER runs.
+			columns: ['svti_tasks_id', 'name', 'input', 'svti_idempotency_key', 'status', 'result', 'error', 'fence', 'fence_expires_at', 'attempts', 'created_at', 'updated_at']
+		});
 		// Forward-migrate existing 0.5.0-next.1 deployments. ADD COLUMN IF NOT
 		// EXISTS is idempotent on Postgres 9.6+; safeCreate swallows the
 		// duplicate-column error path on older versions defensively.

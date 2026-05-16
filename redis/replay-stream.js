@@ -20,7 +20,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
-import { parseReplayOptions, awaitReplication, ReplayStorageError } from '../shared/replay-helpers.js';
+import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
 
@@ -192,11 +192,21 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
+			// Serialize BEFORE entering the storage try-block so a malformed
+			// payload (BigInt, circular reference, etc.) does not surface as
+			// a misleading ReplayStorageError or trigger any fallback path.
+			let payload;
+			try {
+				payload = JSON.stringify(data ?? null);
+			} catch (err) {
+				throw new ReplaySerializationError('publishIdempotent', err);
+			}
+
 			let result;
 			try {
 				result = await withBreaker(b, () =>
 					redis.eval(IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
-						requestId, maxSize, ttl, idmpTtl, topic, event, JSON.stringify(data ?? null))
+						requestId, maxSize, ttl, idmpTtl, topic, event, payload)
 				);
 			} catch (err) {
 				throw new ReplayStorageError('publishIdempotent', err);
@@ -225,9 +235,19 @@ export function createStreamReplay(client, options = {}) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
 
+			// Serialize BEFORE entering the storage try-block. See publishIdempotent
+			// above for the rationale: a malformed payload is a caller-input bug
+			// that must bypass localFanoutOnStorageFailure.
+			let payload;
+			try {
+				payload = JSON.stringify(data ?? null);
+			} catch (err) {
+				throw new ReplaySerializationError('publish', err);
+			}
+
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, JSON.stringify(data ?? null))
+					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, payload)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
@@ -292,7 +312,15 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
-			const startId = since >= 0 ? `(${since}-0` : '-';
+			// Reject malformed since values defensively. Negative since
+			// fell through to `'-'` (XRANGE from start of stream) and
+			// returned the entire buffer; the audit treated this as a
+			// data-leak vector for buggy host code that forwards client
+			// input unchecked. Authorization is handled upstream in
+			// replay() via checkSubscribe; since() is a direct caller
+			// API and needs its own gate.
+			if (!Number.isInteger(since) || since < 0) return [];
+			const startId = `(${since}-0`;
 			const entries = await withBreaker(b, () => redis.xrange(bufKey(topic), startId, '+'));
 			const result = [];
 			for (const [id, flat] of entries) {
@@ -312,11 +340,19 @@ export function createStreamReplay(client, options = {}) {
 		async replay(ws, topic, sinceSeq, platform, reqId) {
 			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
+			// Same input gate as since(): malformed sinceSeq would fall
+			// through to `'-'` (entire stream) via the prior ternary.
+			// Emit a bare `end` marker so the wire protocol shape is
+			// preserved.
+			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
+				platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+				return;
+			}
 			if (b) b.guard();
 
 			let entries;
 			try {
-				const startId = sinceSeq >= 0 ? `(${sinceSeq}-0` : '-';
+				const startId = `(${sinceSeq}-0`;
 				entries = await redis.xrange(bufKey(topic), startId, '+');
 			} catch (err) {
 				b?.failure(err);
@@ -380,7 +416,11 @@ export function createStreamReplay(client, options = {}) {
 			return async (ws, ctx) => {
 				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
 				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
-					const seq = typeof sinceSeq === 'number' && sinceSeq >= 0 ? sinceSeq : 0;
+					// Tighten the wire-supplied sinceSeq normalization to
+					// reject fractional / NaN / Infinity / non-number.
+					// Defense-in-depth alongside tracker.replay()'s own
+					// integer check.
+					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
 					await tracker.replay(ws, topic, seq, ctx.platform);
 				}
 			};

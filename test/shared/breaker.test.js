@@ -540,7 +540,12 @@ describe('circuit breaker', () => {
 
 		it('postgres replay: clear() does not double-guard on fresh instance', async () => {
 			const pgClient = {
-				pool: {},
+				pool: {
+					connect: async () => ({
+						query: async () => ({ rows: [], rowCount: 0 }),
+						release: () => {}
+					})
+				},
 				async query() { return { rows: [], rowCount: 0 }; },
 				async end() {}
 			};

@@ -98,6 +98,56 @@ describe('shared/assert', () => {
 		});
 	});
 
+	describe('test-mode detection is per-call (not module-load snapshot)', () => {
+		it('assert: respects a NODE_ENV flip between calls', () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			const originalVitest = process.env.VITEST;
+			const originalNodeEnv = process.env.NODE_ENV;
+			try {
+				// Simulate prod-mode mid-run: no VITEST, NODE_ENV=production.
+				delete process.env.VITEST;
+				process.env.NODE_ENV = 'production';
+				// Should NOT throw (prod path counts + logs only).
+				expect(() => assert(false, 'mode.prod-skip')).not.toThrow();
+
+				// Flip back to test mode for the next call.
+				process.env.NODE_ENV = 'test';
+				expect(() => assert(false, 'mode.test-throws')).toThrow(/extensions assertion failed/);
+			} finally {
+				if (originalVitest === undefined) delete process.env.VITEST;
+				else process.env.VITEST = originalVitest;
+				if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+				else process.env.NODE_ENV = originalNodeEnv;
+				errSpy.mockRestore();
+			}
+		});
+
+		it('devAssert: respects a NODE_ENV flip from prod to dev between calls', () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const originalVitest = process.env.VITEST;
+			const originalNodeEnv = process.env.NODE_ENV;
+			try {
+				// Prod mode: devAssert is a no-op (no warning).
+				delete process.env.VITEST;
+				process.env.NODE_ENV = 'production';
+				devAssert(false, 'mode.prod-noop');
+				expect(warnSpy).not.toHaveBeenCalled();
+
+				// Flip to dev: subsequent call warns.
+				process.env.NODE_ENV = 'development';
+				devAssert(false, 'mode.dev-warns');
+				expect(warnSpy).toHaveBeenCalledTimes(1);
+				expect(warnSpy.mock.calls[0][0]).toContain('mode.dev-warns');
+			} finally {
+				if (originalVitest === undefined) delete process.env.VITEST;
+				else process.env.VITEST = originalVitest;
+				if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+				else process.env.NODE_ENV = originalNodeEnv;
+				warnSpy.mockRestore();
+			}
+		});
+	});
+
 	describe('wireAssertionMetrics', () => {
 		it('rejects an absent metrics registry', () => {
 			expect(() => wireAssertionMetrics(null)).toThrow(/metrics/);

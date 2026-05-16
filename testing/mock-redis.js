@@ -6,10 +6,108 @@ export function mockRedisClient(keyPrefix = '') {
 	const store = new Map();       // key -> value (string)
 	const sortedSets = new Map();  // key -> [{score, member}]
 	const hashes = new Map();      // key -> Map<field, value>
+	const hashFieldExpiry = new Map(); // key -> Map<field, expireAtMs> (Redis 7.4+ HEXPIRE)
 	const streams = new Map();     // key -> [{id, fields: [[k, v], ...]}]
 	const pubsubHandlers = [];     // {channel, handler}
 	const functionLibraries = new Map(); // libname -> code
 	const registeredFunctions = new Map(); // funcName -> (keys, args) => unknown
+
+	// Lazy expiry of TTL'd hash fields. Real Redis 7.4+ expires fields at
+	// background-task time; the mock checks at read time. Idempotent.
+	function pruneExpiredFields(key) {
+		const ex = hashFieldExpiry.get(key);
+		if (!ex) return;
+		const h = hashes.get(key);
+		const now = Date.now();
+		let droppedAny = false;
+		for (const [field, expireAt] of ex) {
+			if (expireAt <= now) {
+				ex.delete(field);
+				if (h) h.delete(field);
+				droppedAny = true;
+			}
+		}
+		if (ex.size === 0) hashFieldExpiry.delete(key);
+		if (droppedAny && h && h.size === 0) hashes.delete(key);
+	}
+
+	function clearFieldExpiry(key, fields) {
+		const ex = hashFieldExpiry.get(key);
+		if (!ex) return;
+		for (const f of fields) ex.delete(String(f));
+		if (ex.size === 0) hashFieldExpiry.delete(key);
+	}
+
+	function parseHashFieldExpireArgs(args) {
+		let condition = null;
+		let i = 0;
+		while (i < args.length) {
+			const a = String(args[i]).toUpperCase();
+			if (a === 'NX' || a === 'XX' || a === 'GT' || a === 'LT') {
+				condition = a;
+				i++;
+			} else if (a === 'FIELDS') {
+				i++;
+				break;
+			} else {
+				throw new Error('mock-redis: HEXPIRE/HPEXPIRE: unexpected arg ' + a);
+			}
+		}
+		const numFields = Number(args[i++]);
+		const fields = [];
+		for (let j = 0; j < numFields; j++) fields.push(String(args[i + j]));
+		return { condition, fields };
+	}
+
+	function _hexpireCore(key, ttlMs, rest) {
+		pruneExpiredFields(key);
+		const { condition, fields } = parseHashFieldExpireArgs(rest);
+		const h = hashes.get(key);
+		const out = [];
+		const newExpireAt = Date.now() + ttlMs;
+		for (const field of fields) {
+			if (!h || !h.has(field)) {
+				out.push(-2);
+				continue;
+			}
+			let ex = hashFieldExpiry.get(key);
+			const currentExpireAt = ex?.get(field);
+			if (condition === 'NX' && currentExpireAt !== undefined) { out.push(0); continue; }
+			if (condition === 'XX' && currentExpireAt === undefined) { out.push(0); continue; }
+			if (condition === 'GT' && currentExpireAt !== undefined && newExpireAt <= currentExpireAt) { out.push(0); continue; }
+			if (condition === 'LT' && currentExpireAt !== undefined && newExpireAt >= currentExpireAt) { out.push(0); continue; }
+			if (!ex) {
+				ex = new Map();
+				hashFieldExpiry.set(key, ex);
+			}
+			ex.set(field, newExpireAt);
+			out.push(1);
+		}
+		return out;
+	}
+
+	function _httlCore(key, rest, divisor) {
+		pruneExpiredFields(key);
+		if (String(rest[0]).toUpperCase() !== 'FIELDS') {
+			throw new Error('mock-redis: HTTL/HPTTL requires FIELDS keyword');
+		}
+		const numFields = Number(rest[1]);
+		const fields = [];
+		for (let j = 0; j < numFields; j++) fields.push(String(rest[2 + j]));
+		const h = hashes.get(key);
+		const ex = hashFieldExpiry.get(key);
+		const out = [];
+		const now = Date.now();
+		for (const field of fields) {
+			if (!h || !h.has(field)) { out.push(-2); continue; }
+			const expireAt = ex?.get(field);
+			if (expireAt === undefined) { out.push(-1); continue; }
+			const remainingMs = expireAt - now;
+			if (remainingMs <= 0) { out.push(-2); continue; }
+			out.push(divisor === 1 ? remainingMs : Math.ceil(remainingMs / divisor));
+		}
+		return out;
+	}
 
 	function compareStreamIds(a, b) {
 		const [aMs, aSeq] = a.split('-').map(Number);
@@ -66,6 +164,7 @@ export function mockRedisClient(keyPrefix = '') {
 					if (store.delete(k)) count++;
 					if (sortedSets.delete(k)) count++;
 					if (hashes.delete(k)) count++;
+					hashFieldExpiry.delete(k);
 					if (streams.delete(k)) count++;
 				}
 				return count;
@@ -220,73 +319,129 @@ export function mockRedisClient(keyPrefix = '') {
 
 			// Hash ops
 			async hset(key, ...args) {
+				pruneExpiredFields(key);
 				if (!hashes.has(key)) hashes.set(key, new Map());
 				const h = hashes.get(key);
 				let added = 0;
+				const touchedFields = [];
 				if (args.length === 2) {
-					if (!h.has(String(args[0]))) added++;
-					h.set(String(args[0]), String(args[1]));
+					const f = String(args[0]);
+					if (!h.has(f)) added++;
+					h.set(f, String(args[1]));
+					touchedFields.push(f);
 				} else if (typeof args[0] === 'object' && args[0] !== null) {
 					for (const [f, v] of Object.entries(args[0])) {
-						if (!h.has(String(f))) added++;
-						h.set(String(f), String(v));
+						const fs = String(f);
+						if (!h.has(fs)) added++;
+						h.set(fs, String(v));
+						touchedFields.push(fs);
 					}
 				} else {
 					for (let i = 0; i < args.length; i += 2) {
-						if (!h.has(String(args[i]))) added++;
-						h.set(String(args[i]), String(args[i + 1]));
+						const f = String(args[i]);
+						if (!h.has(f)) added++;
+						h.set(f, String(args[i + 1]));
+						touchedFields.push(f);
 					}
 				}
+				// Real Redis 7.4+: HSET on an existing field with a TTL clears that TTL.
+				// Mirror that semantics so callers cannot accidentally rely on the TTL
+				// persisting across an HSET-overwrite. New fields get no TTL by default.
+				clearFieldExpiry(key, touchedFields);
 				return added;
 			},
 			async hmset(key, ...args) {
+				pruneExpiredFields(key);
 				if (!hashes.has(key)) hashes.set(key, new Map());
 				const h = hashes.get(key);
-				// hmset(key, field, value, field, value, ...)
-				// or hmset(key, { field: value, ... })
+				const touchedFields = [];
 				if (typeof args[0] === 'object' && args[0] !== null) {
 					for (const [f, v] of Object.entries(args[0])) {
-						h.set(String(f), String(v));
+						const fs = String(f);
+						h.set(fs, String(v));
+						touchedFields.push(fs);
 					}
 				} else {
 					for (let i = 0; i < args.length; i += 2) {
-						h.set(String(args[i]), String(args[i + 1]));
+						const fs = String(args[i]);
+						h.set(fs, String(args[i + 1]));
+						touchedFields.push(fs);
 					}
 				}
+				clearFieldExpiry(key, touchedFields);
 				return 'OK';
 			},
 			async hget(key, field) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				return h ? (h.get(field) || null) : null;
 			},
 			async hmget(key, ...fields) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				return fields.map((f) => (h ? (h.get(String(f)) ?? null) : null));
 			},
 			async hgetall(key) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				if (!h) return {};
 				const result = {};
 				for (const [k, v] of h) result[k] = v;
 				return result;
 			},
+			async hexists(key, field) {
+				pruneExpiredFields(key);
+				const h = hashes.get(key);
+				return h && h.has(String(field)) ? 1 : 0;
+			},
 			async hdel(key, ...fields) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				if (!h) return 0;
 				let count = 0;
 				for (const f of fields) {
-					if (h.delete(f)) count++;
+					if (h.delete(String(f))) count++;
 				}
+				clearFieldExpiry(key, fields);
 				if (h.size === 0) hashes.delete(key);
 				return count;
 			},
 			async hlen(key) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				return h ? h.size : 0;
 			},
 			async hkeys(key) {
+				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				return h ? [...h.keys()] : [];
+			},
+			async hincrby(key, field, delta) {
+				pruneExpiredFields(key);
+				if (!hashes.has(key)) hashes.set(key, new Map());
+				const h = hashes.get(key);
+				const fs = String(field);
+				const next = (Number(h.get(fs)) || 0) + Number(delta);
+				h.set(fs, String(next));
+				return next;
+			},
+
+			// Redis 7.4+: per-field TTL primitives.
+			// Returns an array of integers, one per requested field:
+			//   1  = TTL set / refreshed
+			//   0  = condition failed (NX with existing TTL, XX with no TTL, etc.)
+			//  -2  = field does not exist on the hash
+			async hexpire(key, ttlSec, ...rest) {
+				return _hexpireCore(key, Number(ttlSec) * 1000, rest);
+			},
+			async hpexpire(key, ttlMs, ...rest) {
+				return _hexpireCore(key, Number(ttlMs), rest);
+			},
+			async httl(key, ...rest) {
+				return _httlCore(key, rest, 1000);
+			},
+			async hpttl(key, ...rest) {
+				return _httlCore(key, rest, 1);
 			},
 
 			// Pub/sub
@@ -352,9 +507,12 @@ export function mockRedisClient(keyPrefix = '') {
 				return channels.length;
 			},
 			// Server INFO stub. Tests can override `_info` (a string) to
-			// drive version detection in callers.
+			// drive version detection in callers. Default reports 7.4.0 since
+			// the mock now supports per-field HEXPIRE; callers that probe the
+			// server version to gate on Redis 7.4+ (e.g. presence) see a
+			// compatible server out of the box.
 			async info(/* section */) {
-				return r._info ?? '# Server\nredis_version:7.2.0\n';
+				return r._info ?? '# Server\nredis_version:7.4.0\n';
 			},
 
 			// Redis Functions. The mock does NOT execute Lua; it stores
@@ -425,11 +583,20 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('xadd') && script.includes('MAXLEN')) {
 					return evalStreamReplayPublish(numKeys, args);
 				}
-				// Presence join script (hset + expire, no dedup scan)
+				// Presence JOIN (Design G: per-user hash + per-topic hash, HPEXPIRE field TTL)
+				if (script.includes('PRESENCE_JOIN') && script.includes('HPEXPIRE')) {
+					return evalPresenceJoinG(args);
+				}
+				// Presence LEAVE (Design G: HDEL + HLEN check, no scan)
+				if (script.includes('HDEL') && script.includes('HLEN')
+					&& !script.includes('HPEXPIRE') && !script.includes('hdel')) {
+					return evalPresenceLeaveG(args);
+				}
+				// Presence join script (hset + expire, no dedup scan) - legacy pre-Design-G
 				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
 					return evalPresenceJoin(args);
 				}
-				// Presence leave script (hdel + check remaining by suffix)
+				// Presence leave script (hdel + check remaining by suffix) - legacy pre-Design-G
 				if (script.includes('hdel') && script.includes('suffix')) {
 					return evalPresenceLeave(args);
 				}
@@ -510,6 +677,16 @@ export function mockRedisClient(keyPrefix = '') {
 					}
 				});
 				return p;
+			},
+
+			// MULTI / EXEC transaction support. The mock implementation is
+			// structurally identical to `pipeline()` since the mock does not
+			// model Redis-side atomicity (a real Redis MULTI wraps the
+			// commands in a transaction). Tests that need to verify the
+			// transaction shape (e.g. assert that all three writes land or
+			// none) should run against the integration tier instead.
+			multi() {
+				return r.pipeline();
 			},
 
 			// Lifecycle
@@ -628,6 +805,87 @@ export function mockRedisClient(keyPrefix = '') {
 			hashes.get(key).set(field, value);
 
 			return 1;
+		}
+
+		// Presence JOIN (Design G) - per-user hash + per-topic hash + HPEXPIRE.
+		// Mirrors the Lua semantics: HSET + HPEXPIRE on userHash; newer-ts
+		// conditional HSET on topicHash; HPEXPIRE on topicHash; returns 1 iff
+		// userHash was empty before (caller broadcasts a join).
+		function evalPresenceJoinG(args) {
+			const userHashKey = args[0];
+			const topicHashKey = args[1];
+			const instanceId = args[2];
+			const userKeyStr = args[3];
+			const topicHashValue = args[4];
+			const newTs = Number(args[5]);
+			const ttlMs = Number(args[6]);
+
+			// HLEN check (after pruning expired fields)
+			pruneExpiredFields(userHashKey);
+			const userHash = hashes.get(userHashKey);
+			const wasEmpty = !userHash || userHash.size === 0;
+
+			// HSET userHash + HPEXPIRE
+			if (!hashes.has(userHashKey)) hashes.set(userHashKey, new Map());
+			hashes.get(userHashKey).set(instanceId, String(newTs));
+			clearFieldExpiry(userHashKey, [instanceId]);
+			let ex = hashFieldExpiry.get(userHashKey);
+			if (!ex) { ex = new Map(); hashFieldExpiry.set(userHashKey, ex); }
+			ex.set(instanceId, Date.now() + ttlMs);
+
+			// Newer-ts conditional set on topicHash
+			pruneExpiredFields(topicHashKey);
+			const topicHash = hashes.get(topicHashKey);
+			let shouldWrite = true;
+			if (topicHash && topicHash.has(userKeyStr)) {
+				try {
+					const parsed = JSON.parse(topicHash.get(userKeyStr));
+					const existingTs = Number(parsed.ts) || 0;
+					if (newTs < existingTs) shouldWrite = false;
+				} catch { /* corrupted - allow overwrite */ }
+			}
+			if (shouldWrite) {
+				if (!hashes.has(topicHashKey)) hashes.set(topicHashKey, new Map());
+				hashes.get(topicHashKey).set(userKeyStr, topicHashValue);
+				clearFieldExpiry(topicHashKey, [userKeyStr]);
+			}
+			// Always refresh TTL on topicHash field (even when write was skipped
+			// for newer-ts, to keep the field alive on heartbeat).
+			let tex = hashFieldExpiry.get(topicHashKey);
+			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
+			tex.set(userKeyStr, Date.now() + ttlMs);
+
+			return wasEmpty ? 1 : 0;
+		}
+
+		// Presence LEAVE (Design G) - HDEL my instanceId from per-user hash,
+		// HLEN check, conditional HDEL from per-topic hash if zero remaining.
+		function evalPresenceLeaveG(args) {
+			const userHashKey = args[0];
+			const topicHashKey = args[1];
+			const instanceId = args[2];
+			const userKeyStr = args[3];
+
+			pruneExpiredFields(userHashKey);
+			const userHash = hashes.get(userHashKey);
+			if (userHash) {
+				userHash.delete(instanceId);
+				clearFieldExpiry(userHashKey, [instanceId]);
+				if (userHash.size === 0) hashes.delete(userHashKey);
+			}
+
+			const remaining = hashes.get(userHashKey);
+			const isFullyGone = !remaining || remaining.size === 0;
+			if (isFullyGone) {
+				const topicHash = hashes.get(topicHashKey);
+				if (topicHash) {
+					topicHash.delete(userKeyStr);
+					clearFieldExpiry(topicHashKey, [userKeyStr]);
+					if (topicHash.size === 0) hashes.delete(topicHashKey);
+				}
+				return 1;
+			}
+			return 0;
 		}
 
 		// Presence leave Lua script simulation

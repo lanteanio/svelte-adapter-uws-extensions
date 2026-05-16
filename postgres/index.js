@@ -9,6 +9,7 @@
 
 import pg from 'pg';
 import { ConnectionError } from '../shared/errors.js';
+import { redactConnectionUrl } from '../shared/sensitive.js';
 
 const { Pool, Client } = pg;
 
@@ -82,7 +83,12 @@ export function createPgClient(opts) {
 		pool.on('error', (err) => {
 			// Idle client errors should not crash the process.
 			// pg Pool handles reconnection automatically.
-			console.error('postgres: idle client error', err.message);
+			// pg embeds the connection DSN in some failure-mode message
+			// strings (auth failed, host unreachable, SSL mismatch); pipe
+			// through redactConnectionUrl so the password segment never
+			// reaches stderr / log aggregators.
+			const message = typeof err?.message === 'string' ? redactConnectionUrl(err.message) : String(err);
+			console.error('postgres: idle client error', message);
 		});
 	} else {
 		pool = externalPool;

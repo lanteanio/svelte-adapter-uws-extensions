@@ -458,12 +458,23 @@ describe('redis connection registry (integration)', () => {
 				const aliceEntry = list.find((e) => e.id === 'alice');
 				expect(aliceEntry).toEqual({ id: 'alice', name: 'Alice' });
 
-				// Sanity: registry hash AND presence hash both exist under
+				// Sanity: registry hash AND presence hashes all exist under
 				// distinct prefixed keyspaces (no overwrite from collision).
+				// presence/createPresence (Design G) stores TWO hashes per
+				// topic: presence:topic:{topic} for list/count, and one
+				// presence:user:{topic}:{userKey} per user for the leave
+				// HLEN check. The userKey here resolves to "__conn:<n>" via
+				// presence's fallback because the test's userData uses
+				// userId rather than id; the precise key shape does not
+				// matter for this collision-sanity check - what matters is
+				// that the per-user hash exists under the presence:user:
+				// namespace.
 				const regHashExists = await client.redis.exists(client.key('conns:alice'));
-				const presenceHashExists = await client.redis.exists(client.key('presence:team:t1'));
+				const presenceTopicHashExists = await client.redis.exists(client.key('presence:topic:team:t1'));
+				const presenceUserKeys = await client.redis.keys(client.key('presence:user:team:t1:*'));
 				expect(regHashExists).toBe(1);
-				expect(presenceHashExists).toBe(1);
+				expect(presenceTopicHashExists).toBe(1);
+				expect(presenceUserKeys).toHaveLength(1);
 			} finally {
 				presenceA.destroy();
 				presenceB.destroy();

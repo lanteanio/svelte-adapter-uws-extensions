@@ -300,10 +300,7 @@ export function createPubSubBus(client, options = {}) {
 				// Pre-parse size guard. A bus subscriber that JSON.parses an
 				// arbitrarily large attacker payload pays parsing CPU + V8
 				// heap before any further validation can fire.
-				const rawBytes = typeof message === 'string'
-					? Buffer.byteLength(message)
-					: /** @type {Buffer} */ (message).length;
-				if (!validator.acceptSize(rawBytes)) {
+				if (!validator.acceptRaw(message)) {
 					mParseErrors?.inc();
 					return;
 				}

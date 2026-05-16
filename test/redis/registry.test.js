@@ -1186,6 +1186,110 @@ describe('redis connection registry', () => {
 				await probe.quit().catch(() => probe.disconnect());
 			}
 		});
+
+		it('uses one pipelined HGETALL batch per SCAN page (not N serial HGETALLs)', async () => {
+			// Plant 5 entries. With COUNT 100 SCAN, all 5 land in one page,
+			// so bootstrap should construct ONE pipeline with all 5 hgetalls
+			// queued inside - not 5 separate redis.pipeline() instances or
+			// 5 separate exec round-trips.
+			for (let i = 1; i <= 5; i++) {
+				await client.redis.hset(
+					client.key('conns:pipe-' + i),
+					'instanceId', 'inst-X',
+					'sessionId', 'pipe-' + i + '-s',
+					'ts', Date.now(),
+					'attrs', JSON.stringify({ tenantId: 'tP' })
+				);
+			}
+
+			let pipelineExecs = 0;
+			// Track the MAX hgetalls queued across all pipelines this test
+			// triggers (not just the last). setEntry also uses a pipeline
+			// MULTI/EXEC for the HSET + HDEL + EXPIRE round-trip; without the
+			// max, a setEntry pipeline running AFTER the bootstrap pipeline
+			// would zero this counter out.
+			let maxHgetallsInOnePipeline = 0;
+
+			const origPipeline = client.redis.pipeline.bind(client.redis);
+			client.redis.pipeline = () => {
+				const pipe = origPipeline();
+				let count = 0;
+				return new Proxy(pipe, {
+					get(target, prop) {
+						if (prop === 'hgetall') {
+							return (...args) => { count++; return target.hgetall(...args); };
+						}
+						if (prop === 'exec') {
+							return async () => {
+								pipelineExecs++;
+								if (count > maxHgetallsInOnePipeline) maxHgetallsInOnePipeline = count;
+								return target.exec();
+							};
+						}
+						return target[prop];
+					}
+				});
+			};
+
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws = wsWithSession({ userId: 'self', tenantId: 't1' }, 'self-s');
+				await local.hooks.open(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+				await new Promise((r) => setImmediate(r));
+
+				// At least one pipeline batch (the bootstrap SCAN page) queued
+				// five HGETALLs. The pre-fix code called redis.hgetall(k)
+				// directly for each key, never constructing a pipeline at all.
+				expect(pipelineExecs).toBeGreaterThanOrEqual(1);
+				expect(maxHgetallsInOnePipeline).toBeGreaterThanOrEqual(5);
+			} finally {
+				client.redis.pipeline = origPipeline;
+				await local.destroy();
+			}
+		});
+
+		it('setEntry uses MULTI/EXEC so HSET + (optional HDEL) + EXPIRE land atomically', async () => {
+			// Spy on redis.multi() to verify setEntry uses the transactional
+			// path. The pre-fix code did three serial awaited round-trips
+			// which left a half-applied state observable to other readers
+			// if the process died between HSET and EXPIRE (key present
+			// without a TTL).
+			let multiCalls = 0;
+			let hsetQueued = 0;
+			let expireQueued = 0;
+			const origMulti = client.redis.multi.bind(client.redis);
+			client.redis.multi = () => {
+				multiCalls++;
+				const tx = origMulti();
+				return new Proxy(tx, {
+					get(target, prop) {
+						if (prop === 'hset') return (...args) => { hsetQueued++; return target.hset(...args); };
+						if (prop === 'expire') return (...args) => { expireQueued++; return target.expire(...args); };
+						return target[prop];
+					}
+				});
+			};
+
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			});
+			try {
+				const ws = wsWithSession({ userId: 'multi-user', tenantId: 't1' }, 's-1');
+				await local.hooks.open(ws, { platform });
+
+				expect(multiCalls).toBeGreaterThanOrEqual(1);
+				expect(hsetQueued).toBeGreaterThanOrEqual(1);
+				expect(expireQueued).toBeGreaterThanOrEqual(1);
+			} finally {
+				client.redis.multi = origMulti;
+				await local.destroy();
+			}
+		});
 	});
 
 	describe('attributes / sendTo: routing', () => {

@@ -31,12 +31,23 @@
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
+import { IdempotencyResultTooLargeError } from '../shared/errors.js';
+
+export { IdempotencyResultTooLargeError };
+
+const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
 
 /**
  * @typedef {Object} PgIdempotencyOptions
  * @property {string} [table='svti_idempotency'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
  * @property {number} [ttl=172800] - Result cache lifetime in seconds. Default 48 hours.
  * @property {number} [acquireTtl=60] - Pending-slot lifetime in seconds. Default 60 seconds.
+ * @property {number} [maxResultBytes=262144] - Cap on the JSON-encoded byte length
+ *   of a committed result. Past the cap, `commit(result)` rejects with
+ *   `IdempotencyResultTooLargeError` (`code: 'IDEMPOTENCY_RESULT_TOO_LARGE'`) and
+ *   the row is left in the pending state for the `acquireTtl` to expire. Same
+ *   default and semantics as the Redis backend so the two stores are
+ *   drop-in interchangeable. Pass `Infinity` to disable.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use.
  * @property {number} [cleanupInterval=60000] - How often expired rows are deleted (ms). 0 disables.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
@@ -69,6 +80,10 @@ export function createIdempotencyStore(client, options = {}) {
 			throw new Error(`postgres idempotency: acquireTtl must be a positive integer, got ${options.acquireTtl}`);
 		}
 	}
+	const maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES;
+	if (maxResultBytes !== Infinity && (!Number.isInteger(maxResultBytes) || maxResultBytes < 1)) {
+		throw new Error(`postgres idempotency: maxResultBytes must be a positive integer or Infinity, got ${maxResultBytes}`);
+	}
 
 	const table = options.table || 'svti_idempotency';
 	const ttl = options.ttl || 48 * 3600;
@@ -97,7 +112,7 @@ export function createIdempotencyStore(client, options = {}) {
 				result               JSONB,
 				expires_at           TIMESTAMPTZ NOT NULL
 			)
-		`);
+		`, { table, columns: ['svti_idempotency_key', 'status', 'result', 'expires_at'] });
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table} (expires_at)
 		`);
@@ -143,6 +158,14 @@ export function createIdempotencyStore(client, options = {}) {
 
 	function commitFor(idempotencyKey) {
 		return async function commit(result) {
+			const payload = JSON.stringify(result === undefined ? null : result);
+			const bytes = Buffer.byteLength(payload);
+			if (bytes > maxResultBytes) {
+				// Throw BEFORE writing so the row stays in the pending state.
+				// The caller can call abort() to release it; otherwise the
+				// acquireTtl expiration sweeps it.
+				throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
+			}
 			await withBreaker(b, () => client.query({
 				name: 'idem_commit_' + table,
 				text: `UPDATE ${table}
@@ -150,7 +173,7 @@ export function createIdempotencyStore(client, options = {}) {
 				              result = $2::jsonb,
 				              expires_at = now() + ($3 || ' seconds')::interval
 				        WHERE svti_idempotency_key = $1`,
-				values: [idempotencyKey, JSON.stringify(result === undefined ? null : result), ttl]
+				values: [idempotencyKey, payload, ttl]
 			}));
 			mCommits?.inc();
 		};

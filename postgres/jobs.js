@@ -86,7 +86,14 @@ export function createJobQueue(client, options = {}) {
 				attempts      INTEGER     NOT NULL DEFAULT 0,
 				created_at    TIMESTAMPTZ DEFAULT now()
 			)
-		`);
+		`, {
+			table,
+			// `request_id` is intentionally NOT in the expected set: it's
+			// added by the ALTER TABLE on the very next line for forward-
+			// migrated next.1 deployments, so the table may legitimately
+			// pre-exist without it before the ALTER runs.
+			columns: ['svti_jobs_id', 'queue', 'payload', 'claimed_at', 'claimed_until', 'attempts', 'created_at']
+		});
 		// Forward-migrate existing 0.5.0-next.1 deployments.
 		await safeCreate(client, `
 			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT

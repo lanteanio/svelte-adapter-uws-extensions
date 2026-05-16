@@ -17,6 +17,31 @@ If you have a small app and want the 5-minute version, see the [docs site upgrad
 
 These close real security bugs in idiomatic 0.4 code paths.
 
+### `createPresence` requires Redis 7.4+ (was 7.0+)
+
+**What changed.** `createPresence` was rewritten to use Redis 7.4+'s per-field hash TTL primitive (`HEXPIRE` family) so a single LEAVE_SCRIPT call is now O(1) Redis-blocked Lua time rather than O(M) where M is the topic's total presence-field count. Mass-disconnect of N users on instance restart is now O(N) rather than O(N x M); the previous quadratic behavior was reachable at realistic auctions/chat scale (10k users x 10 instances) and could block Redis for seconds during a server restart. The new code probes `INFO server` on first use and throws on older Redis with the message `redis presence: requires Redis 7.4+ for per-field TTL (HEXPIRE); got X.Y.Z`.
+
+**Storage layout.** The pre-fix per-topic hash was `presence:{topic}` with fields keyed by `{instanceId}|{userKey}`. The new layout splits storage:
+
+- `presence:topic:{topic}` HASH, field=`userKey`, value=JSON `{data, ts}`. One field per unique user on the topic. Backs `list()` / `count()`.
+- `presence:user:{topic}:{userKey}` HASH, field=`instanceId`, value=`ts`. One field per instance currently presenting this user. Backs the leave HLEN check.
+
+Both hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is gone; keys implicitly disappear when their last field expires.
+
+**How to migrate.**
+
+1. **Upgrade Redis to 7.4 or newer.** Every major managed Redis (AWS ElastiCache, Upstash, Redis Cloud, MemoryDB) supports it. Self-hosters bump the image tag (`redis:7.4-alpine` is the canonical pin).
+
+2. **Rolling deploy.** Old (0.4) and new (0.5) instances coexist by writing to disjoint key namespaces. Old keys at `presence:{topic}` are ignored by the new code and expire naturally as the old instances drain. During the rollout window, `list()` / `count()` from new instances miss old-instance presence; convergence completes within one TTL of full rollout. If your TTL is the default 90 seconds, plan a ~2-minute rollout completion before relying on accurate presence counts.
+
+3. **`metrics().staleCleanedTotal` is now always 0.** Per-field staleness is enforced atomically by Redis HPEXPIRE rather than by an application-side cleanup script, so there is nothing to count. The field stays in the return shape for backward-compatibility. The corresponding Prometheus counter `presence_stale_cleaned_total` is no longer registered.
+
+4. **`keyspaceNotifications: true` scope is narrower.** Pre-fix, the option subscribed to whole-key `__keyevent@*__:expired` for `presence:{topic}` keys and emitted an empty `presence_state` when one fired. Same shape in 0.5 (the per-topic hash whole-key expiry only fires when every field has expired, i.e. no live instances). Per-field expiry (a single crashed instance) does NOT trigger this notification; users disappear from `list()` / `count()` results lazily. If you need explicit per-field-expiry events, subscribe to `__keyevent@*__:hexpired` separately (separate Redis CONFIG flag).
+
+5. **Falling back to single-instance.** If you can't upgrade Redis, switch to the in-memory `createPresence` plugin from `svelte-adapter-uws/plugins/presence`. Public API is the same; you lose cross-instance presence which is the whole point of the Redis variant, but for single-instance deployments it's a clean drop-in.
+
+If your app uses `createPresence` and you cannot upgrade Redis immediately, pin `svelte-adapter-uws-extensions` to the last 0.5.x release before this change.
+
 ### Replay backends consult `platform.checkSubscribe` before reading history
 
 **What changed.** Every `replay()` implementation (Redis sorted-set, Redis streams, Postgres) now calls `platform.checkSubscribe(ws, topic)` first. On denial, it sends a single `{event:'denied', data:{code:<denial>, reqId}}` frame on `__replay:{topic}` and returns without reading the buffer. Pre-fix, an attacker could send a crafted `lastSeenSeqs` map and read history for a topic they could not subscribe to live.

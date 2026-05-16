@@ -50,6 +50,7 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Observability**
 - [Prometheus metrics](#prometheus-metrics)
+- [Sensitive data](#sensitive-data)
 
 **Reliability**
 - [Failure handling](#failure-handling)
@@ -59,6 +60,7 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Operations**
 - [Graceful shutdown](#graceful-shutdown)
+- [Multi-tenant deployments](#multi-tenant-deployments)
 - [Testing](#testing)
 
 **More**
@@ -76,7 +78,7 @@ The three ecosystem packages move together. Bump them as a group:
 | `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
 |---|---|---|---|
 | `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
-| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ for `createShardedBus` / `createFunctionLibrary`. See `MIGRATION.md` if upgrading from 0.4. |
+| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ for `createPresence` (per-field HEXPIRE). See `MIGRATION.md` if upgrading from 0.4. |
 
 Mixed-version installs are rejected at install time with a peer-dep warning.
 
@@ -175,6 +177,45 @@ export const wrapped = createPgClient({ pool });
 
 ---
 
+## Authorization model
+
+Every extension in this package is an **authorization-free primitive**. None of them know who the caller is, what roles the caller has, or whether the requested action is allowed - they execute whatever the caller passes against the shared Redis or Postgres backend. Calling `replay.replay(ws, topic, since)`, `idempotency.handle(key, fn)`, `lock.withLock(key, fn)`, or `queue.enqueue(task)` is no more an authorization check than `redis.GET key` or `pg.query('SELECT ...')` is one.
+
+Your message handler is the gate. Identity is established at connect time by the adapter's [`upgrade()` hook](https://github.com/lanteanio/svelte-adapter-uws#authentication) and stashed on the socket via `ws.getUserData()`. Your `message()` handler reads that identity, decides whether the action is allowed, and **only then** invokes the extension:
+
+```js
+// hooks.ws.js
+import { idempotency } from './idempotency.js';
+
+export async function message(ws, { data }) {
+  const { action, input } = JSON.parse(Buffer.from(data).toString());
+  const { userId, role } = ws.getUserData() ?? {};
+
+  // 1. Authentication: did upgrade() reject? If not, ws.getUserData() is non-empty.
+  if (!userId) return;
+
+  // 2. Authorization: this handler decides. The extension does not.
+  if (action === 'place-order' && !canPlaceOrders(userId, role)) return;
+
+  // 3. Only now is the extension invoked. The key is prefixed with the
+  //    trusted userId so a wire-supplied clientOrderId cannot collide
+  //    with another user's namespace.
+  const key = `order:${userId}:${input.clientOrderId}`;
+  await idempotency.handle(key, () => persistOrder(userId, input));
+}
+```
+
+Higher-level frameworks built on this adapter (e.g. [`svelte-realtime`](https://github.com/lanteanio/svelte-realtime)) wrap this pattern: `ctx.user` is the same identity object the adapter's `upgrade()` hook returned, and the framework's `_guard` / `live.public()` / `// realtime-allow-public` machinery is the authorization layer at the RPC seam. The extensions below still do not gate anything themselves; the framework's auth lives outside them.
+
+Two failure modes deserve specific call-out for distributed extensions:
+
+- **Key collisions across tenants on a shared backend.** A `lock.withLock('account:42', ...)` call on a shared Redis hits the same lock entry regardless of which app instance or which tenant issued it. If your handler builds the key from a wire field without checking ownership, an unauthorized caller can grab the lock and stall any legitimate owner. Derive keys from a trusted prefix (`account:${assertedAccountId(ctx, payload.accountId)}`), and consider per-tenant key prefixes on the client itself (`createRedisClient({ keyPrefix: \`tenant:${tenantId}:\` })`) when you operate one Redis across multiple tenants - see [shared-Redis tenancy notes](#operational-notes-for-shared-redis-tenancy) for the deployment shape.
+- **Replay / pub-sub fanout to unauthorized subscribers.** A subscribe gate is still your responsibility. The replay buffer hands history to whoever asks; the pub/sub bus broadcasts whatever publishes arrive. Gate topic-subscribe in your handler before invoking the extension.
+
+The same pattern applies to every extension in this README: read identity, decide, derive keys/topics from trusted identity prefixes, **then** invoke. An extension that "looks like an auth gate" by virtue of accepting an identity-shaped key is just substituting whatever string the caller hands it.
+
+---
+
 **Redis extensions**
 
 ## Pub/sub bus
@@ -182,6 +223,8 @@ export const wrapped = createPgClient({ pool });
 Distributes `platform.publish()` calls across multiple server instances via Redis pub/sub. Each instance publishes locally AND to Redis. Incoming Redis messages are forwarded to the local platform with echo suppression (messages originating from the same instance are dropped on receive, keyed by a per-process instance ID).
 
 Multiple `publish()` calls within the same event-loop tick are coalesced into a single Redis pipeline via microtask batching. This means a form action that publishes to three topics results in one pipelined round trip, not three independent commands.
+
+> **Authorization:** the bus delivers whatever publishes arrive to whoever is subscribed. It does not gate topic-subscribe or topic-publish. If a topic should be limited to a subset of users, enforce that in your subscribe / message handler. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -276,6 +319,8 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 `createShardedBus` (`svelte-adapter-uws-extensions/redis/sharded-pubsub`) is the SPUBLISH/SSUBSCRIBE variant: per-topic channels, dynamic subscription via `follow(topic)` / `unfollow(topic)`, no wildcards. In Redis Cluster, messages stay on the shard that owns each channel rather than fanning out to every node.
 
 **Requires Redis 7+.** `activate()` runs `INFO server` and throws on older servers; use `createPubSubBus` for Redis 6 / older Valkey.
+
+> **Authorization:** same as the unsharded bus - the sharded variant is a delivery optimization, not an access gate. Gate `follow(topic)` calls and publishes in your handler. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -375,6 +420,8 @@ Same API as the core `createReplay` plugin, but backed by Redis sorted sets. Mes
 Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script - no second round trip required.
 
 When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
+
+> **Authorization:** the replay buffer is identity-blind - it hands history to whoever subscribes to `__replay:{topic}`. Gate the topic-subscribe in your handler before invoking the replay extension. See [Authorization model](#authorization-model).
 
 The same gap state is exposed as a callable: `gap(topic, lastSeenSeq)` returns `{ truncated, missingFrom }` without driving a full WebSocket replay. Useful for SSR loaders that want to decide between an incremental `since()` fetch and a full reload before the page even opens its socket.
 
@@ -551,6 +598,10 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub.
 
+**Requires Redis 7.4+.** Uses the per-field hash TTL primitive (`HEXPIRE` family) so staleness is enforced atomically by Redis rather than by an application-side cleanup script. `createPresence` runs `INFO server` on first use and throws on older servers; fall back to the in-memory `createPresence` from `svelte-adapter-uws/plugins/presence` for single-instance deployments on older Redis.
+
+> **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorization model](#authorization-model).
+
 #### Wire shape
 
 Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bundled `createPresence` plugin so a single client decoder handles both single-instance and cluster deployments:
@@ -565,11 +616,13 @@ Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bun
 
 Cross-instance traffic on the dedicated `presence:events:{topic}` Redis pub/sub channel is `{instanceId, topic, event, payload}` with `event` in `'join' | 'leave' | 'updated'`. Receivers route inbound events into their local diff buffer for client fan-out, so clients only ever see the unified `presence_state` / `presence_diff` shape regardless of which instance the change originated on.
 
-Joins are staged with full rollback on failure: local state is set up first, then the Redis hash field is written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone - local maps, the Redis field, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
+Joins are staged with full rollback on failure: local state is set up first, then the Redis hashes are written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone - local maps, the Redis state, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
 
-Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that removes this instance's field from the hash and then scans remaining fields for the same user key, ignoring stale entries. Leave is only buffered into the diff when no other instance holds a live entry for that user, preventing premature "user left" notifications in multi-instance deployments.
+**Storage layout (two hashes per topic).** `presence:topic:{topic}` is a hash keyed by `userKey` -> JSON `{data, ts}`; one field per unique user on the topic. It backs `list()` and `count()`. `presence:user:{topic}:{userKey}` is a hash keyed by `instanceId` -> `ts`; one field per instance currently presenting this user. It is what `LEAVE_SCRIPT` consults via `HLEN` to decide whether to broadcast a leave (HLEN == 0 after the script's `HDEL` means this instance was the last one). The per-field TTL on both hashes is set with `HPEXPIRE`, so a crashed instance's entries auto-expire field-by-field without an application-side cleanup pass. Whole-key TTL is intentionally NOT set; the key implicitly disappears when its last field expires.
 
-Zombie cleanup runs on the heartbeat interval. Each tick, every tracked WebSocket is probed via `getBufferedAmount()` - if the call throws, the socket is dead and its presence is removed synchronously before the heartbeat writes to Redis. The heartbeat then refreshes timestamps on all live entries via a Redis pipeline and runs a server-side Lua cleanup script (`CLEANUP_SCRIPT`) that scans the hash and removes any fields whose timestamp exceeds the TTL. This handles crashed instances whose close handlers never fired.
+Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that does `HDEL instanceId` on the per-user hash and an O(1) `HLEN` check. If zero remaining, it also `HDEL`s the userKey from the per-topic hash and returns 1; the application broadcasts a leave. Mass disconnect of N users is therefore O(N) Redis-blocked Lua time, regardless of the topic's total user count.
+
+Crashed-instance cleanup is implicit: the heartbeat refreshes per-field TTLs via `HPEXPIRE` on every tick, so an instance that stops heartbeating loses its presence entries field-by-field as Redis expires them. The previous heartbeat-driven CLEANUP_SCRIPT pass is no longer needed - Redis 7.4+ does the work in its background expiry task. Zombie cleanup of locally-dead WebSockets still runs on the heartbeat interval: each tick probes every tracked WebSocket via `getBufferedAmount()` and synchronously purges any whose call throws before the HPEXPIRE refresh runs.
 
 #### Setup
 
@@ -634,9 +687,9 @@ export async function close(ws, { platform }) {
 |---|---|
 | `totalOnline` | Sum of unique-users-per-topic across all topics this instance is locally tracking. The same user in two topics counts twice; per-topic counts sum cleanly. |
 | `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator - a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
-| `staleCleanedTotal` | Cumulative count of stale fields removed by the heartbeat-driven cleanup script since this instance started. A non-zero rate means crashed sibling instances' presence is being cleaned up; a zero rate is the healthy steady state. |
+| `staleCleanedTotal` | Reserved for backward compatibility. Always `0` since per-field staleness is now enforced atomically by Redis via `HPEXPIRE` rather than by an application-side cleanup script. The field stays for callers that read it.|
 
-The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge), `presence_stale_cleaned_total` (counter, already shipped pre-0.5.0).
+The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge). The pre-Design-G `presence_stale_cleaned_total` counter is no longer registered.
 
 Two additional counters track the diff-protocol behavior:
 
@@ -666,7 +719,7 @@ CONFIG SET notify-keyspace-events Ex
 
 (or any flagset that includes both `K`/`E` and `x` - e.g. `Ex`, `KEA`, etc.) If the `psubscribe` call fails because keyspace events are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
 
-**Scope:** this is hash-key expiry (whole topic gone), not per-field expiry. Per-field cleanup of stale entries from crashed instances continues to run via the heartbeat-driven cleanup script. Per-field hash TTLs would require Redis 7.4+ `HEXPIRE` and a different storage layout; that's a future evolution, not part of this mode.
+**Scope:** this hooks into whole-key expiry of `presence:topic:{topic}`, which fires once every field has expired (no live instances presenting any user on this topic). Per-field expiry from individual crashed instances is handled atomically by Redis 7.4+ `HEXPIRE` and does NOT trigger this notification - the user just disappears from `list()` / `count()` results without an explicit "user left" event. Apps that need an explicit "user left" event for crashed instances either accept the eventual-consistency story (subscribers see the user disappear on the next presence query) or wire a sweeper that subscribes to `__keyevent@*__:hexpired` (per-field expiry events, separate flag from whole-key `:expired`).
 
 #### Zero-config hooks
 
@@ -889,6 +942,8 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 
 Same API as the core `createRateLimit` plugin, but backed by Redis using an atomic Lua script. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.
 
+> **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorization model](#authorization-model).
+
 #### Setup
 
 ```js
@@ -942,6 +997,8 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 ## Broadcast groups
 
 Same API as the core `createGroup` plugin, but membership is stored in Redis so groups work across multiple server instances. Local WebSocket tracking is maintained per-instance, and cross-instance events are relayed via Redis pub/sub.
+
+> **Authorization:** the `onJoin` hook is the join-decision site; the plugin itself does not authorize. Returning a role admits the socket; throwing rejects. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -1009,6 +1066,8 @@ Same API as the core `createCursor` plugin, but cursor positions are shared acro
 Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
+
+> **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -1091,6 +1150,8 @@ Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq
 
 Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
 
+> **Authorization:** same as the Redis replay buffer - history goes to whoever subscribes to `__replay:{topic}`. Gate topic-subscribe in your handler. See [Authorization model](#authorization-model).
+
 The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here - one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
 `resumeHook()` is available with identical semantics to the Redis backend; see [Session resumption](#session-resumption-resumehook).
@@ -1156,6 +1217,8 @@ Same as [Replay buffer (Redis)](#api-3), plus:
 Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table - this module handles the listening side.
 
 Uses a standalone connection (not from the pool) since LISTEN requires a persistent connection that stays open for the lifetime of the bridge.
+
+> **Authorization:** the bridge forwards every NOTIFY payload from Postgres straight to `platform.publish()`. The trigger that emits the NOTIFY is the trust boundary - if your trigger fires on every row mutation regardless of tenant, the published topic must encode the tenant so subscribers see only their own data, AND your subscribe gate must enforce that tenants only subscribe to their own topics. Treating a NOTIFY payload as "already authenticated because it came from the DB" is incorrect; the DB does not know who is subscribing. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -1283,6 +1346,8 @@ If your real-time events are driven by database writes and you do not need Redis
 `createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on vanilla Postgres 9.5+ - no extensions required.
 
 The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in - the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
+
+> **Authorization:** the queue does not check who is allowed to enqueue. If your handler calls `queue.enqueue('emails', payload)` with a wire-supplied payload, an attacker can enqueue arbitrary background work for your workers to execute. Validate every enqueue at the handler boundary; treat the `claimed` payload server-side as untrusted input. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -1412,6 +1477,8 @@ A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hol
 
 Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
 
+> **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always derive the key from a trusted identity prefix - e.g. `\`order:${userId}:${payload.clientOrderId}\``. See [Authorization model](#authorization-model).
+
 #### Setup (Redis)
 
 ```js
@@ -1518,6 +1585,8 @@ The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`
 ## Distributed lock
 
 Cluster-wide mutual-exclusion primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; this is the Redis-backed swap for multi-instance deployments. Distinct from `redis/fence` (B2c): the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose mutex any user code can grab.
+
+> **Authorization:** `withLock(key, fn)` serializes whoever calls it under that key; it does not check whether the caller owns the resource the key represents. A wire-supplied lock key lets an attacker grab a lock on a resource they don't own and stall any legitimate owner. Derive lock keys from a trusted prefix - e.g. `\`account:${assertedAccountId(ctx, payload.accountId)}\``. See [Authorization model](#authorization-model).
 
 #### Setup
 
@@ -1697,6 +1766,8 @@ Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Ses
 
 Pairs with [Connection registry](#connection-registry): when both are wired, the session provides the durable per-user state (survives disconnect, persists across reconnect, available before a WS even opens), while the registry provides the live "where is this user right now" pointer (only meaningful while the WS is connected). They answer different questions and compose without overlap.
 
+> **Authorization:** the session store maps tokens to data. Producing the token-to-user binding (your auth layer) and validating the token before lookup (your `upgrade()` hook or middleware) are NOT the plugin's job. If your handler calls `session.get(payload.token)` with a wire-supplied token without first confirming the caller owns it, an attacker can lift any active token they happen to know and impersonate its owner. See [Authorization model](#authorization-model).
+
 #### Setup
 
 ```js
@@ -1803,6 +1874,8 @@ Wraps an effectful operation in a state machine that survives process crashes an
 **Requires Postgres 13+.** Uses the built-in `gen_random_uuid()` function (added to core in 13; older versions need the `pgcrypto` extension explicitly enabled, which the runner does not do for you).
 
 **Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** - start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
+
+> **Authorization:** `run(taskName, args)` executes the registered handler with whatever args the caller passes. If your message handler forwards a wire payload straight to `run(...)` without validating that the caller is allowed to invoke this task and own the inputs, an attacker can drive arbitrary registered tasks with arbitrary inputs - charge an account they don't own, send a webhook on someone else's behalf. The handler is server-trusted; the args are not. Validate at the handler boundary, treat args server-side as untrusted input. See [Authorization model](#authorization-model).
 
 Three guarantees:
 
@@ -2155,6 +2228,20 @@ app.get('/metrics', metrics.handler);
 
 Or use `metrics.serialize()` to get the raw text and serve it however you like.
 
+**Recommended deployment shape:** mount the metrics endpoint behind a network barrier whenever possible - a private scrape-only port, an internal load balancer, or a sidecar scrape target. The default `metrics.handler` does no auth; the assumption is that your scraper is the only thing that can reach the listener.
+
+When same-listener mount is unavoidable (the metrics endpoint shares its port with public traffic), use `metrics.authedHandler(predicate)`:
+
+```js
+// Token-based auth, token from env
+const expectedToken = process.env.METRICS_SCRAPE_TOKEN;
+app.get('/metrics', metrics.authedHandler(
+  (res, req) => req.getHeader('x-scrape-token') === expectedToken
+));
+```
+
+The predicate receives `(res, req)` and returns truthy to allow or falsy to deny. Async predicates are awaited. Predicate exceptions are caught and treated as denial. Denials return `401 Unauthorized` with no metrics body and no internal error info leaked.
+
 #### Options
 
 | Option | Default | Description |
@@ -2162,6 +2249,8 @@ Or use `metrics.serialize()` to get the raw text and serve it however you like.
 | `prefix` | `''` | Prefix for all metric names |
 | `mapTopic` | identity | Map topic names to bounded label values for cardinality control |
 | `defaultBuckets` | `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` | Default histogram buckets |
+| `maxSeries` | `10_000` | Per-metric series cap; past this, new labelsets are dropped and `prometheus_series_dropped_total{metric}` counts them. Pass `Infinity` to disable. |
+| `maxBuckets` | `32` | Maximum buckets a histogram may declare. Throws at registration if exceeded. Pass `Infinity` to disable. |
 
 Metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*` and label names must match `[a-zA-Z_][a-zA-Z0-9_]*` (no `__` prefix). Invalid names throw at registration time. HELP text containing backslashes or newlines is escaped automatically.
 
@@ -2329,6 +2418,82 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `redis_function_loads_total` | counter | `library` | `FUNCTION LOAD` calls |
 | `redis_function_calls_total` | counter | `library`, `function` | `FCALL` calls |
 | `redis_function_errors_total` | counter | `library`, `function` | `FCALL` calls that threw |
+
+---
+
+## Sensitive data
+
+Three helpers in [`shared/sensitive.js`](shared/sensitive.js) (re-exported from `svelte-adapter-uws-extensions/sensitive`) cover the recurring "this value might be a credential" problem so callers do not have to write a redactor per call site.
+
+### `stripInternal(obj)` -- safe to spread, safe to log
+
+Recursively strips sensitive and adapter-internal keys from a user-supplied object, returning a clone you can hand to `Object.assign`, `JSON.stringify`, or `console.log` without leaking credentials or polluting the prototype chain.
+
+```js
+import { stripInternal } from 'svelte-adapter-uws-extensions/sensitive';
+
+const userData = JSON.parse(req.body);
+const safe = stripInternal(userData);
+
+console.log('upload from', safe);   // safe to log
+Object.assign(target, safe);        // safe to spread
+JSON.stringify(safe);               // safe to serialize
+```
+
+**Safe to spread** (no prototype pollution at the target).
+
+- Keys starting with `__` are dropped at every depth. Catches `__proto__` on a `JSON.parse('{"__proto__":{...}}')` payload before it can reach an `Object.assign` target.
+- The literal own-property names `constructor` and `prototype` are dropped. Catches the parallel "shadow via own property on the target" class.
+- The result is still a plain `{}` (not `Object.create(null)`) so callers depend on `.toString()`, `.hasOwnProperty()`, and `instanceof Object`. The spread-safety guarantee comes from filtering the dangerous keys at iteration, not from a null-prototype result.
+
+**Safe to log** (no credentials in logs).
+
+- Keys matching `/token|secret|password|auth|session|cookie|jwt|credential/i` are dropped at every depth. Conservative substring match: a `session_id` field is dropped; a `payment_method` field is not. If your domain field name happens to contain one of those substrings, give the public-surface field a different name.
+- Binary views (`Buffer`, `Uint8Array`, any `TypedArray`, `DataView`, raw `ArrayBuffer`) are replaced with the string `'[bytes: <byteLength>]'`. Naively walking a `Buffer` via `Object.keys` yields `{"0":byte0,"1":byte1,...}` which `JSON.stringify` happily serializes -- if those bytes were a JWT, the credential lands in stderr.
+
+**Cycle-safe.** A per-call `WeakSet` tracks ancestors; the second visit to a node returns `undefined` rather than recursing forever.
+
+**Not safe for** keys whose name does not match the conservative pattern. `account_balance`, `internal_billing_ref`, `medical_record_id` -- the helper does not know those are sensitive in your domain. If your app has domain-specific PII, layer a second redactor on top of `stripInternal`.
+
+### `redactConnectionUrl(url)` -- safe to embed in logs and errors
+
+Redacts the password segment of a connection URL so the URL is safe to include in error messages, structured log lines, or assertion context. Substitutes `:password@` userinfo and `password=` / `pass=` / `pwd=` query params with `***`. Other URL bytes pass through unchanged.
+
+```js
+import { redactConnectionUrl } from 'svelte-adapter-uws-extensions/sensitive';
+
+const url = 'postgres://user:hunter2@db.internal:5432/app?sslmode=require';
+console.error('connect failed:', redactConnectionUrl(url));
+// connect failed: postgres://user:***@db.internal:5432/app?sslmode=require
+```
+
+Three classes the byte-level scan handles correctly that a naive regex misses:
+
+- **Passwords containing `@`** (`redis://user:p@ssword@host`) -- a first-`@` regex stops too early and leaks the password tail; the scan walks to the LAST `@` in the authority region.
+- **IPv6 hosts** (`redis://:secret@[::1]:6379`) -- bracket-aware scanning suspends authority-terminator detection inside `[...]` so the `:` and `@` of an IPv6 host are not confused with userinfo.
+- **Query-string passwords** (`postgres://host/db?password=hunter2`) -- pg accepts `password` as a connection parameter; redaction is case-insensitive and also matches `pass` and `pwd`.
+
+Non-string input passes through `String(url)` without scanning, so callers can pipe arbitrary error context through without a type guard. Used internally by every connection failure log so a leaked DSN cannot escape via an unwrapped `err.message`.
+
+### `createSensitiveWarner(prefix)` -- one-shot dev warning
+
+Returns a function that scans a userData object (up to depth 3) and calls `console.warn` once if it finds a key matching `/token|secret|password|key|auth|session|cookie|jwt|credential/i`. After the first warning the function latches and is a no-op. Designed for plugin `select` callbacks: the plugin wires a warner per topic and surfaces a one-time hint when a developer forgets to strip credentials from broadcast data.
+
+```js
+import { createSensitiveWarner } from 'svelte-adapter-uws-extensions/sensitive';
+const warn = createSensitiveWarner('redis/cursor');
+warn(userData); // logs once if userData has anything credential-shaped
+warn(userData); // no-op after the latch
+```
+
+The warner uses the broader pattern (the bare substring `"key"` is included) because at the warning stage the cost of a false positive is just a developer-facing `console.warn` line, not silent data loss. The redaction pattern used by `stripInternal` deliberately omits `"key"` to avoid dropping legitimate id-like fields.
+
+### What these helpers do not do
+
+- **Inbound payload validation.** These helpers redact what flows OUT; they do not validate what comes IN. Use a schema validator (`zod`, `valibot`, custom) at the message-handler boundary.
+- **Wire-format payloads to clients.** A handler that returns user data to the client should redact at the boundary explicitly. Piping through `stripInternal` works but is a heavy hammer -- a typed select projection is usually clearer.
+- **Domain-specific PII filtering.** The conservative substring pattern catches generic credentials, not application-specific PII. If your domain has fields the helper cannot recognize, layer a second redactor.
+- **Replace not logging sensitive data in the first place.** The cheapest credential leak is the one you never log. Default to redaction at the source.
 
 ---
 
@@ -2891,6 +3056,132 @@ await redis.quit();
 await pg.end();
 presence.destroy();
 ```
+
+---
+
+## Multi-tenant deployments
+
+When two or more tenants share one Redis (or one Postgres) instance, the defaults will collide silently. The failure mode is the worst-case shape: cross-tenant data leakage on subscribe, cross-tenant cache hits on idempotency keys, cross-tenant lock contention on lock keys. Nothing throws; the wrong tenant just sees the wrong data.
+
+The package gives you the knobs to fix this, but the defaults are tuned for the single-tenant 80% case. Multi-tenant deployments must explicitly opt in. Two namespaces matter: **keys** and **channels**. They are separate concerns and need separate handling.
+
+### Keys (`keyPrefix`)
+
+Every Redis extension that stores state in keys honors a `keyPrefix` option that stacks on top of the underlying client's `keyPrefix`. Setting the client's prefix once isolates **all** key-based extensions for that client at the same time:
+
+```js
+import { createRedisClient } from 'svelte-adapter-uws-extensions/redis';
+
+const redis = createRedisClient({
+  url: 'redis://localhost:6379',
+  keyPrefix: `tenant-${tenantId}:`   // every key written by every extension below gets this prefix
+});
+
+// All of these now write keys under `tenant-${tenantId}:`...
+const lock = createDistributedLock(redis);           // keys: tenant-A:lock:...
+const sess = createDistributedSession(redis);        // keys: tenant-A:sess:...
+const idem = createIdempotencyStore(redis);          // keys: tenant-A:idem:...
+const registry = createConnectionRegistry(redis);    // keys: tenant-A:conns:...
+```
+
+Each extension has its own per-extension default sub-prefix (`lock:`, `sess:`, `idem:`, `fence:`, `''` for registry) that stacks **after** the client's prefix, so two extensions on the same client cannot collide with each other either.
+
+### Channels (`channel` / `channelPrefix`)
+
+ioredis's `keyPrefix` does NOT apply to pub/sub commands (`PUBLISH`, `SUBSCRIBE`, `SSUBSCRIBE`). Redis channels are a separate namespace from keys, and ioredis only rewrites the key-shaped commands. **Channels are not auto-prefixed.** A `createPubSubBus(redis)` call on a `keyPrefix: 'tenant-A:'` client still publishes on the literal channel name `uws:pubsub` -- the same channel every other tenant on the same Redis is subscribed to.
+
+The three extensions that default to a globally-named channel must be overridden explicitly per tenant:
+
+| Extension | Default | Multi-tenant override |
+|---|---|---|
+| `createPubSubBus` | `channel: 'uws:pubsub'` | `channel: \`tenant-${tenantId}:uws:pubsub\`` |
+| `createShardedBus` | `channelPrefix: 'uws:sharded:'` | `channelPrefix: \`tenant-${tenantId}:uws:sharded:\`` |
+| `createPublishRateAggregator` | `channel: 'uws:pressure:rates'` | `channel: \`tenant-${tenantId}:uws:pressure:rates\`` |
+
+```js
+const bus = createPubSubBus(redis, {
+  channel: `tenant-${tenantId}:uws:pubsub`
+});
+
+const sharded = createShardedBus(redis, {
+  channelPrefix: `tenant-${tenantId}:uws:sharded:`
+});
+```
+
+The `createConnectionRegistry` extension is the exception in this category: its channels are built via `client.key(keyPrefix + '__registry-events')` at the application layer, so a registry-level `keyPrefix` option DOES isolate registry channels too. Pass `createConnectionRegistry(redis, { keyPrefix: \`tenant-${tenantId}:\` })` if you mount it on a shared client without a client-level prefix.
+
+### Topic-name collisions on the sharded bus
+
+`createShardedBus` uses **one Redis channel per topic** (after the `channelPrefix`). Topic names are user-supplied. Two tenants that both use a topic literally called `'alerts'` -- even with different `channelPrefix` values -- still land on different channels because the prefix is part of the channel name. But topic names that travel through your client API (e.g. a URL path or a wire field) and a subscriber that re-uses one bus across tenants would re-introduce the collision. Keep one bus per tenant, or build the per-tenant tenancy into the topic name itself if you must share a bus.
+
+### Postgres LISTEN/NOTIFY
+
+The LISTEN/NOTIFY channel name is supplied by the caller (`createNotifyBridge(pg, { channel: '...' })`). It is NOT auto-prefixed. Multi-tenant deployments must either run one channel per tenant (`channel: \`tenant-${tenantId}:table_changes\``) or have the trigger emit a payload that carries the tenant id and gate the forward path on the subscriber side. The former is cleaner; the latter is necessary only when a single trigger has to fan out to multiple subscribers AND the trigger cannot encode the tenant in the channel name.
+
+### Per-database isolation (alternative)
+
+If your Redis is configured with multiple databases (the `db` option on the connection string), each tenant can use a different `db` number for full isolation without any per-extension overrides. Costs: limited to 16 databases by default, more complex to monitor, and Redis Cluster does not support multiple databases at all. Per-prefix isolation is the recommended approach for any deployment that might scale past 16 tenants or onto Cluster.
+
+### Full multi-tenant example
+
+```js
+// src/lib/server/redis-per-tenant.js
+import { createRedisClient } from 'svelte-adapter-uws-extensions/redis';
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
+import { createDistributedLock } from 'svelte-adapter-uws-extensions/redis/lock';
+import { createIdempotencyStore } from 'svelte-adapter-uws-extensions/redis/idempotency';
+import { createConnectionRegistry } from 'svelte-adapter-uws-extensions/redis/registry';
+
+export function tenantStack(tenantId) {
+  // One isolated namespace per tenant - both keys and channels.
+  const redis = createRedisClient({
+    url: process.env.REDIS_URL,
+    keyPrefix: `tenant-${tenantId}:`        // isolates KEYS for every extension below
+  });
+
+  const bus      = createPubSubBus(redis, {
+    channel: `tenant-${tenantId}:uws:pubsub`   // isolates the bus CHANNEL (keyPrefix doesn't apply to pubsub)
+  });
+  const lock     = createDistributedLock(redis);     // keys auto-prefixed via client
+  const idem     = createIdempotencyStore(redis);    // keys auto-prefixed via client
+  const registry = createConnectionRegistry(redis);  // keys + channels auto-prefixed via client
+
+  return { redis, bus, lock, idem, registry };
+}
+```
+
+Then route every per-request piece of state through the tenant-specific stack:
+
+```js
+// hooks.ws.js
+import { tenantStack } from '$lib/server/redis-per-tenant.js';
+
+const stacks = new Map();
+function stackFor(tenantId) {
+  let s = stacks.get(tenantId);
+  if (!s) { s = tenantStack(tenantId); stacks.set(tenantId, s); }
+  return s;
+}
+
+export async function upgrade({ cookies }) {
+  const { tenantId, userId } = await getSession(cookies);
+  if (!tenantId) return false;
+  // ws.getUserData() gets tenantId so every message handler can find its stack
+  return { tenantId, userId };
+}
+
+export async function message(ws, { data, platform }) {
+  const { tenantId } = ws.getUserData();
+  const { bus, lock } = stackFor(tenantId);
+  // ...use bus / lock / idem from THIS tenant's stack only.
+}
+```
+
+A handler that pulls extensions from the wrong tenant's stack -- e.g. by reading `tenantId` from the wire payload instead of from `ws.getUserData()` -- defeats the isolation. Treat the tenantId on the socket as the trust anchor; `ws.getUserData().tenantId` is server-trusted because you put it there in `upgrade()`. The same trust contract as `live.push` ([Trust model](https://github.com/lanteanio/svelte-realtime#server-initiated-push)) applies here.
+
+### Costs
+
+Per-tenant prefixes add a handful of bytes to every key name and every published message. Redis pricing is dominated by op count and memory, not channel-name length, so the overhead is unmeasurable on production workloads. The bigger cost is operational: per-tenant prefixes require operator discipline to apply consistently, and a missed override surfaces only as silent cross-tenant data. The default-permissive shape is a deliberate trade -- single-tenant deployments are the 80% case; multi-tenant deployments are an explicit opt-in.
 
 ---
 

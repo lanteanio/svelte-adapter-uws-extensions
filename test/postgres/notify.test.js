@@ -196,6 +196,33 @@ describe('postgres notify bridge', () => {
 			expect(() => createNotifyBridge(client, { channel: 'x', parse: 'bad' }))
 				.toThrow('parse must be a function');
 		});
+
+		it('rejects channel names with shapes Postgres would refuse without quoting', () => {
+			expect(() => createNotifyBridge(client, { channel: 'has space' }))
+				.toThrow(/must match/);
+			expect(() => createNotifyBridge(client, { channel: 'with-dash' }))
+				.toThrow(/must match/);
+			expect(() => createNotifyBridge(client, { channel: 'with.dot' }))
+				.toThrow(/must match/);
+			expect(() => createNotifyBridge(client, { channel: '1startswithdigit' }))
+				.toThrow(/must match/);
+			expect(() => createNotifyBridge(client, { channel: 'with"quote' }))
+				.toThrow(/must match/);
+		});
+
+		it('rejects channel names in reserved Postgres namespaces', () => {
+			expect(() => createNotifyBridge(client, { channel: 'pg_internal' }))
+				.toThrow(/reserved Postgres namespace/);
+			expect(() => createNotifyBridge(client, { channel: 'information_schema_table' }))
+				.toThrow(/reserved Postgres namespace/);
+		});
+
+		it('accepts well-formed channel names', () => {
+			expect(() => createNotifyBridge(client, { channel: 'updates' })).not.toThrow();
+			expect(() => createNotifyBridge(client, { channel: 'table_changes' })).not.toThrow();
+			expect(() => createNotifyBridge(client, { channel: '_internal' })).not.toThrow();
+			expect(() => createNotifyBridge(client, { channel: 'CamelCase123' })).not.toThrow();
+		});
 	});
 
 	describe('activate', () => {

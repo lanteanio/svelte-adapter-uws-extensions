@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplicationTimeoutError, ReplayStorageError } from '../../redis/replay.js';
+import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../redis/replay.js';
 import { createCircuitBreaker } from '../../shared/breaker.js';
 
 describe('redis replay', () => {
@@ -891,6 +891,104 @@ describe('redis replay', () => {
 				.toThrow('localFanoutOnStorageFailure must be a boolean');
 			expect(() => createReplay(client, { localFanoutOnStorageFailure: 1 }))
 				.toThrow('localFanoutOnStorageFailure must be a boolean');
+		});
+	});
+
+	describe('serialization failure (caller-input bug)', () => {
+		it('throws ReplaySerializationError when data contains a BigInt', async () => {
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', { id: 1n }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught).not.toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publish');
+			expect(caught.cause).toBeInstanceOf(TypeError);
+		});
+
+		it('throws ReplaySerializationError when data contains a circular reference', async () => {
+			const data = /** @type {any} */ ({ id: 1 });
+			data.self = data;
+
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', data); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+		});
+
+		it('does NOT fall back to platform.publish even with localFanoutOnStorageFailure: true', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true });
+
+			let caught;
+			try { await r.publish(platform, 'chat', 'created', { id: 1n }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('does NOT touch storage (no redis.eval call) when serialization fails', async () => {
+			let evalCalls = 0;
+			const origEval = client.redis.eval;
+			client.redis.eval = async (...args) => { evalCalls++; return origEval.call(client.redis, ...args); };
+
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', { id: 1n }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(evalCalls).toBe(0);
+
+			client.redis.eval = origEval;
+		});
+	});
+
+	describe('sinceSeq input validation (defense-in-depth)', () => {
+		beforeEach(async () => {
+			for (let i = 0; i < 5; i++) {
+				await replay.publish(platform, 'chat', 'msg', { i });
+			}
+		});
+
+		it('since() rejects negative sinceSeq (no ZRANGEBYSCORE dump)', async () => {
+			expect(await replay.since('chat', -1)).toEqual([]);
+			expect(await replay.since('chat', -100)).toEqual([]);
+			expect(await replay.since('chat', Number.NEGATIVE_INFINITY)).toEqual([]);
+		});
+
+		it('since() rejects NaN / Infinity / non-integer', async () => {
+			expect(await replay.since('chat', NaN)).toEqual([]);
+			expect(await replay.since('chat', Infinity)).toEqual([]);
+			expect(await replay.since('chat', 1.5)).toEqual([]);
+		});
+
+		it('since() rejects non-number sinceSeq', async () => {
+			expect(await replay.since('chat', /** @type {any} */ ('0'))).toEqual([]);
+			expect(await replay.since('chat', /** @type {any} */ (null))).toEqual([]);
+		});
+
+		it('since() still accepts 0 (resume from start)', async () => {
+			expect((await replay.since('chat', 0)).length).toBeGreaterThan(0);
+		});
+
+		it('replay() with negative sinceSeq sends only an end marker (no buffer dump)', async () => {
+			// Replay requires a checkSubscribe gate; supply a permissive mock.
+			platform.checkSubscribe = async () => null;
+			const ws = {};
+			await replay.replay(ws, 'chat', -1, platform, 'r1');
+			const replayFrames = platform.sent.filter((s) => s.topic === '__replay:chat');
+			expect(replayFrames.filter((f) => f.event === 'msg')).toHaveLength(0);
+			const end = replayFrames.find((f) => f.event === 'end');
+			expect(end).toBeDefined();
+		});
+
+		it('replay() with NaN sinceSeq sends only end marker', async () => {
+			platform.checkSubscribe = async () => null;
+			const ws = {};
+			await replay.replay(ws, 'chat', NaN, platform, 'r2');
+			const msgFrames = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			expect(msgFrames).toHaveLength(0);
 		});
 	});
 });

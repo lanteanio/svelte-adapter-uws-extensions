@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay } from '../../postgres/replay.js';
+import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../postgres/replay.js';
 
 describe('postgres replay', () => {
 	let client;
@@ -416,6 +416,55 @@ describe('postgres replay', () => {
 			expect(await replay.seq('chat')).toBe(0);
 			expect(await replay.seq('todos')).toBe(1);
 		});
+
+		it('clear runs both DELETEs inside a BEGIN/COMMIT transaction', async () => {
+			// Spy on pool.connect() to capture the transaction-control statements.
+			const seen = [];
+			const origConnect = client.pool.connect.bind(client.pool);
+			client.pool.connect = async () => {
+				const c = await origConnect();
+				return {
+					query: async (textOrObj, values) => {
+						const text = typeof textOrObj === 'object' ? textOrObj.text : textOrObj;
+						seen.push(text.trim());
+						return c.query(textOrObj, values);
+					},
+					release: c.release
+				};
+			};
+			try {
+				await replay.clear();
+			} finally {
+				client.pool.connect = origConnect;
+			}
+			expect(seen[0]).toBe('BEGIN');
+			expect(seen[seen.length - 1]).toBe('COMMIT');
+			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(2);
+		});
+
+		it('clearTopic runs both DELETEs inside a BEGIN/COMMIT transaction', async () => {
+			const seen = [];
+			const origConnect = client.pool.connect.bind(client.pool);
+			client.pool.connect = async () => {
+				const c = await origConnect();
+				return {
+					query: async (textOrObj, values) => {
+						const text = typeof textOrObj === 'object' ? textOrObj.text : textOrObj;
+						seen.push(text.trim());
+						return c.query(textOrObj, values);
+					},
+					release: c.release
+				};
+			};
+			try {
+				await replay.clearTopic('chat');
+			} finally {
+				client.pool.connect = origConnect;
+			}
+			expect(seen[0]).toBe('BEGIN');
+			expect(seen[seen.length - 1]).toBe('COMMIT');
+			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(2);
+		});
 	});
 
 	describe('cross-instance size cap', () => {
@@ -577,6 +626,59 @@ describe('postgres replay', () => {
 
 			replay1.destroy();
 			replay2.destroy();
+		});
+	});
+
+	describe('serialization failure (caller-input bug)', () => {
+		it('throws ReplaySerializationError when data contains a BigInt', async () => {
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', { id: 1n }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught).not.toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publish');
+			expect(caught.cause).toBeInstanceOf(TypeError);
+		});
+
+		it('throws ReplaySerializationError when data contains a circular reference', async () => {
+			const data = /** @type {any} */ ({ id: 1 });
+			data.self = data;
+
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', data); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+		});
+
+		it('does NOT fall back to platform.publish even with localFanoutOnStorageFailure: true', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true, cleanupInterval: 0 });
+			try {
+				let caught;
+				try { await r.publish(platform, 'chat', 'created', { id: 1n }); }
+				catch (err) { caught = err; }
+
+				expect(caught).toBeInstanceOf(ReplaySerializationError);
+				expect(platform.published).toHaveLength(0);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('does NOT issue any client.query when serialization fails', async () => {
+			let queryCalls = 0;
+			const origQuery = client.query.bind(client);
+			client.query = (...args) => { queryCalls++; return origQuery(...args); };
+
+			let caught;
+			try { await replay.publish(platform, 'chat', 'created', { id: 1n }); }
+			catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(queryCalls).toBe(0);
+
+			client.query = origQuery;
 		});
 	});
 });
