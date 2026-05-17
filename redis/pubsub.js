@@ -243,11 +243,14 @@ export function createPubSubBus(client, options = {}) {
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: platform.bufferedAmount.bind(platform),
 				// Framework conventions stashed on the source platform by
-				// app init code (e.g. `platform.replay = createReplay(...)`)
-				// must survive the wrap so downstream framework auto-routing
-				// can discover them on the wrapped seam too. Live getter so
-				// post-wrap reassignment propagates.
+				// app init code (e.g. `platform.replay = createReplay(...)`,
+				// `platform.redis = ioredisClient`) must survive the wrap so
+				// downstream framework auto-routing can discover them on the
+				// wrapped seam too. Live getters so post-wrap reassignment
+				// propagates.
 				get replay() { return platform.replay; },
+				get redis() { return platform.redis; },
+				get presence() { return platform.presence; },
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

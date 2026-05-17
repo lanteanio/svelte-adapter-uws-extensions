@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-17
+
+### Fixed
+
+- **`bus.wrap(platform)` now forwards `platform.redis` and `platform.presence` on the wrapped seam (live getters), matching the existing `replay` forwarding.** Pre-fix, only `replay` was forwarded. Framework code that stashes conventions on the source platform in init - e.g. `platform.redis = redis.redis` to enable `svelte-realtime`'s cluster-shared `live.room({ presence })` Redis HASH - found those conventions on the source platform but NOT on the wrapped platform that `createMessage({ platform: bus.wrap })` hands to per-message ctx. The framework's `_clusterPresenceAcquire` / `_clusterPresenceList` then saw `ctx.platform.redis === undefined` and fell through to the in-memory `_presenceRef` Map, silently negating the cluster-presence fix. The bug manifested in any multi-replica deploy that wired `platform.redis` correctly in init but still saw per-replica "Online" rosters in chat / room demos. The fix adds live getters for `redis` and `presence` to the wrapped object so post-wrap reassignment on the source platform also propagates - same pattern the existing `replay` getter uses.
+
 ## [0.5.0-next.16] - 2026-05-16
 
 ### Changed
