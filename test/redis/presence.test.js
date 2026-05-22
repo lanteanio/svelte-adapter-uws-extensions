@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createPresence } from '../../redis/presence.js';
+import { createPresence, WsClosedError } from '../../redis/presence.js';
 import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
 import { createMetrics } from '../../prometheus/index.js';
 
@@ -1130,7 +1130,7 @@ describe('redis presence', () => {
 	});
 
 	describe('rollback on join failure', () => {
-		it('rolls back local state when ws.subscribe throws after Redis write', async () => {
+		it('throws WsClosedError when ws.subscribe throws after Redis write; rolls back local state', async () => {
 			const local = createPresence(client, { key: 'id' });
 			const ws = mockWs({ id: '1' });
 			ws.subscribe = (topic) => {
@@ -1138,7 +1138,12 @@ describe('redis presence', () => {
 				return true;
 			};
 
-			await local.join(ws, 'room', platform);
+			await expect(local.join(ws, 'room', platform)).rejects.toMatchObject({
+				name: 'WsClosedError',
+				code: 'WS_CLOSED',
+				operation: 'presence.join',
+				topic: 'room'
+			});
 
 			expect(await local.count('room')).toBe(0);
 			expect(diffsOf(platform).filter((d) => '1' in (d.data.joins || {}))).toHaveLength(0);
@@ -1157,6 +1162,106 @@ describe('redis presence', () => {
 			expect(diffsOf(platform).filter((d) => '1' in (d.data.joins || {}))).toHaveLength(0);
 
 			client.redis.hgetall = original;
+			local.destroy();
+		});
+	});
+
+	describe('WsClosedError on ws-closed during async gap', () => {
+		// Pins the contract that `join()` throws `WsClosedError` (`code:
+		// 'WS_CLOSED'`) instead of silently returning when the websocket
+		// closes during any of the five internal async gaps. Without this,
+		// the RPC wrapper in svelte-realtime reports `status=ok` for joins
+		// that never committed - operators trust the metric and the metric
+		// lies. State rollback is preserved on every path; the throw is
+		// purely an observability signal.
+
+		it('throws when ws.getBufferedAmount probe fails after subscribeToTopic', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: '1' });
+			ws.getBufferedAmount = () => { throw new Error('closed'); };
+
+			await expect(local.join(ws, 'room', platform)).rejects.toMatchObject({
+				name: 'WsClosedError',
+				code: 'WS_CLOSED',
+				topic: 'room'
+			});
+			expect(await local.count('room')).toBe(0);
+			local.destroy();
+		});
+
+		it('throws when ws closes during the JOIN_SCRIPT eval; rolls back the Redis write', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: '1' });
+
+			const originalEval = client.redis.eval.bind(client.redis);
+			let firstEvalSeen = false;
+			client.redis.eval = async (...args) => {
+				const out = await originalEval(...args);
+				// Close the ws between the eval landing and the
+				// post-eval wsTopics.has(ws) check. Manual `leave`
+				// simulates the close-hook running during the gap.
+				if (!firstEvalSeen) {
+					firstEvalSeen = true;
+					await local.leave(ws, platform);
+				}
+				return out;
+			};
+
+			await expect(local.join(ws, 'room', platform)).rejects.toMatchObject({
+				name: 'WsClosedError',
+				code: 'WS_CLOSED'
+			});
+			expect(await local.count('room')).toBe(0);
+			local.destroy();
+		});
+
+		it('throws when ws closes after Redis state landed but before ws.subscribe', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: '1' });
+			ws.subscribe = (topic) => {
+				if (topic === '__presence:room') {
+					// Simulate the close hook racing in during the ws.subscribe
+					// call: leave runs before the post-subscribe wsTopics check.
+					local.leave(ws, platform);
+					return true;
+				}
+				return true;
+			};
+
+			await expect(local.join(ws, 'room', platform)).rejects.toMatchObject({
+				name: 'WsClosedError',
+				code: 'WS_CLOSED'
+			});
+			expect(await local.count('room')).toBe(0);
+			local.destroy();
+		});
+
+		it('emits a status=ok-shaped successful join unchanged when ws stays open', async () => {
+			// Negative control: the happy path must not throw and must not
+			// increment the aborted counter. Without this, a future refactor
+			// could throw too eagerly and not get caught.
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: '1' });
+
+			await expect(local.join(ws, 'room', platform)).resolves.toBeUndefined();
+			expect(await local.count('room')).toBe(1);
+			local.destroy();
+		});
+
+		it('increments `presence_joins_aborted_total{topic,reason="ws_closed"}` on the abort path', async () => {
+			const metrics = createMetrics();
+			const local = createPresence(client, { key: 'id', metrics });
+			const ws = mockWs({ id: '1' });
+			ws.getBufferedAmount = () => { throw new Error('closed'); };
+
+			await expect(local.join(ws, 'room', platform)).rejects.toThrow();
+
+			const out = await metrics.serialize();
+			// Serializer sorts labels alphabetically -> `reason,topic`.
+			expect(out).toMatch(/presence_joins_aborted_total\{reason="ws_closed",topic="room"\}\s+1/);
+			// Negative control: a clean join must not bump the aborted
+			// counter, otherwise an operator would see false positives.
+			expect(out).not.toMatch(/presence_joins_aborted_total\{[^}]*\}\s+[2-9]/);
 			local.destroy();
 		});
 	});

@@ -74,6 +74,18 @@ export interface CursorEntry {
 	data: any;
 }
 
+/**
+ * Thrown by `attach()` when the websocket closes before `platform.subscribe`
+ * can land. Same shape as `presence.WsClosedError`; catch on `err.code ===
+ * 'WS_CLOSED'` for cross-feature handling.
+ */
+export class WsClosedError extends Error {
+	name: 'WsClosedError';
+	code: 'WS_CLOSED';
+	operation: string;
+	topic: string;
+}
+
 export interface RedisCursorTracker {
 	/**
 	 * Opt this connection into receiving cursor updates for `topic`.
@@ -84,6 +96,14 @@ export interface RedisCursorTracker {
 	 *
 	 * Without `attach`, the publishes in `update` fan out to an empty
 	 * subscriber set and no client ever sees a cursor frame.
+	 *
+	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
+	 *   has already closed by the time `platform.subscribe` runs. No state
+	 *   to roll back (`wsState` is only created on `update`); callers do
+	 *   not need to compensate. The follow-up `snapshot()` call is skipped
+	 *   when this throws. Snapshot-send failures on an already-subscribed
+	 *   connection are NOT thrown - cursor frames are self-recovering via
+	 *   the next bulk tick.
 	 */
 	attach(ws: any, topic: string, platform: Platform): Promise<void>;
 

@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createCursor } from '../../redis/cursor.js';
+import { createCursor, WsClosedError } from '../../redis/cursor.js';
 import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
+import { createMetrics } from '../../prometheus/index.js';
 
 describe('redis cursor', () => {
 	let client;
@@ -352,12 +353,56 @@ describe('redis cursor', () => {
 			expect(platform.unsubscribed).toEqual([{ ws, topic: '__cursor:canvas' }]);
 		});
 
-		it('attach is safe when platform.subscribe throws (closed ws)', async () => {
+		it('attach throws WsClosedError when platform.subscribe throws (closed ws); no snapshot is sent', async () => {
 			const ws = mockWs({ id: '1' });
 			platform.subscribe = () => { throw new Error('ws closed'); };
 
-			await expect(cursors.attach(ws, 'canvas', platform)).resolves.toBeUndefined();
+			await expect(cursors.attach(ws, 'canvas', platform)).rejects.toMatchObject({
+				name: 'WsClosedError',
+				code: 'WS_CLOSED',
+				operation: 'cursor.attach',
+				topic: 'canvas'
+			});
+			// Snapshot must not be sent when subscribe never landed - otherwise
+			// the operator sees a frame on the wire to a ws the platform
+			// already rejected for subscription.
 			expect(platform.sent).toHaveLength(0);
+		});
+
+		it('attach increments `cursor_attaches_aborted_total{topic,reason="ws_closed"}` on the abort path', async () => {
+			const metrics = createMetrics();
+			const c = createCursor(client, {
+				throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, metrics
+			});
+			const ws = mockWs({ id: '1' });
+			const localPlatform = mockPlatform();
+			localPlatform.subscribe = () => { throw new Error('ws closed'); };
+
+			await expect(c.attach(ws, 'canvas', localPlatform)).rejects.toThrow();
+
+			const out = await metrics.serialize();
+			// Serializer sorts labels alphabetically -> `reason,topic`.
+			expect(out).toMatch(/cursor_attaches_aborted_total\{reason="ws_closed",topic="canvas"\}\s+1/);
+			c.destroy();
+		});
+
+		it('attach snapshot-send failure does NOT throw (state already committed; client recovers via next bulk)', async () => {
+			// Intentional asymmetry vs subscribe failure: by the time snapshot()
+			// runs the subscribe has already landed and cursor frames will
+			// reach the client via the next coalesced flush. Throwing here
+			// would force callers to compensate for an already-committed
+			// subscription. Pin the asymmetry so a well-meaning refactor
+			// does not "unify" the two paths.
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const seedWs = mockWs({ id: 'seed' });
+			c.update(seedWs, 'canvas', { x: 1, y: 1 }, platform);
+
+			const joiner = mockWs({ id: 'joiner' });
+			const localPlatform = mockPlatform();
+			localPlatform.send = () => { throw new Error('ws closed mid-send'); };
+
+			await expect(c.attach(joiner, 'canvas', localPlatform)).resolves.toBeUndefined();
+			c.destroy();
 		});
 
 		it('detach is safe when platform.unsubscribe throws (closed ws)', () => {

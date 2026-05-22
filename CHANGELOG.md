@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-05-22
+
+### Fixed
+
+- **`redis/presence.js` and `redis/cursor.js`: `presence.join()` and `cursor.attach()` now throw `WsClosedError` (`code: 'WS_CLOSED'`) instead of silently returning when the websocket closes during an internal async gap.** Pre-fix, six sites across the two modules detected a closed websocket post-await (five in `presence.join`: pre-probe `wsTopics.has(ws)` checks, the `ws.getBufferedAmount()` probe catch, the post-`JOIN_SCRIPT`-eval `wsTopics.has(ws)` check, the `ws.subscribe('__presence:...')` catch, and the post-subscribe `wsTopics.has(ws)` check; one in `cursor.attach`: the `platform.subscribe` catch) and unwound state cleanly via `undoJoin` / explicit `LEAVE_SCRIPT` evals, but then `return`-ed without throwing. The calling RPC wrapper in `svelte-realtime` saw no error and reported `status="ok"` for these calls; under mass-connect stress (the original 1000-bot probe surfaced ~10-15% of WS dropped post-open by kernel/uWS accept backpressure) operators watched `svelte_realtime_rpc_total{status="ok"}` advance by the full attempted-count while only ~85% of bots actually landed in the per-topic presence set. The extensions-side `presence_joins_total` counter also under-reported, because it only fires on the cross-cluster `isNewUser` path, which the silent-return sites never reached. State rollback semantics are unchanged on every path; the throw is purely the missing observability signal. `WsClosedError` is re-exported from both `'svelte-adapter-uws-extensions/redis/presence'` and `'svelte-adapter-uws-extensions/redis/cursor'`; the stable catch shape is `err.code === 'WS_CLOSED'` so callers do not need to branch by feature. Snapshot-send failures in `cursor.attach` (post-subscribe `platform.send` throws) and `presence.join` (post-commit `platform.send` throws) intentionally do NOT throw - state is already committed and clients recover via the next bulk frame / `presence_diff`. Two new metrics: `presence_joins_aborted_total{topic, reason}` and `cursor_attaches_aborted_total{topic, reason}` (currently only `reason="ws_closed"`; the label is future-proofed). 6 new tests in `test/redis/presence.test.js` (`WsClosedError on ws-closed during async gap` block) + 2 new tests in `test/redis/cursor.test.js`; 2 existing tests updated to assert the throw instead of the silent return. All 1458 extensions tests pass (was 1451).
+
 ## [0.5.4] - 2026-05-22
 
 ### Added

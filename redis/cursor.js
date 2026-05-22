@@ -40,6 +40,9 @@ import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { WsClosedError } from '../shared/errors.js';
+
+export { WsClosedError };
 
 /** Wire-protocol event names this module emits. */
 const EVENTS = Object.freeze({
@@ -140,6 +143,7 @@ export function createCursor(client, options = {}) {
 	const mUpdates = m?.counter('cursor_updates_total', 'Cursor update calls', ['topic']);
 	const mBroadcasts = m?.counter('cursor_broadcasts_total', 'Cursor broadcasts sent', ['topic']);
 	const mThrottled = m?.counter('cursor_throttled_total', 'Cursor updates deferred by throttle', ['topic']);
+	const mAttachesAborted = m?.counter('cursor_attaches_aborted_total', 'Cursor attach calls that aborted because the websocket closed before `platform.subscribe` could complete. Symmetric with `presence_joins_aborted_total`; same `WS_CLOSED` cause.', ['topic', 'reason']);
 
 	const warnSensitive = createSensitiveWarner('redis/cursor');
 
@@ -674,8 +678,17 @@ export function createCursor(client, options = {}) {
 			try {
 				platform.subscribe(ws, '__cursor:' + topic);
 			} catch {
-				return;
+				// ws closed before subscribe could land. No state to roll back
+				// (no wsState entry exists yet; that is only created on update).
+				// Throw so the caller can distinguish a no-op-and-rollback from
+				// a successful attach; without this the RPC metric reports
+				// status=ok for connections that never received cursor frames.
+				mAttachesAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
+				throw new WsClosedError('cursor.attach', topic);
 			}
+			// snapshot() itself swallows ws-closed during platform.send (the
+			// state is already committed; clients recover via the next bulk
+			// frame). Intentional asymmetry with subscribe failure above.
 			await tracker.snapshot(ws, topic, platform);
 		},
 

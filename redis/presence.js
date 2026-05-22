@@ -47,6 +47,9 @@ import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
+import { WsClosedError } from '../shared/errors.js';
+
+export { WsClosedError };
 
 /**
  * Lua script for atomic JOIN. Sets this instance's field on the per-user
@@ -247,6 +250,7 @@ export function createPresence(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic;
 	const mJoins = m?.counter('presence_joins_total', 'Presence join events', ['topic']);
+	const mJoinsAborted = m?.counter('presence_joins_aborted_total', 'Presence join calls that aborted before commit because the websocket closed during an async gap. Server state was rolled back before the throw. Distinct from `presence_joins_total` (commits) and from generic RPC error metrics (which bucket all throws together regardless of cause).', ['topic', 'reason']);
 	const mLeaves = m?.counter('presence_leaves_total', 'Presence leave events', ['topic']);
 	const mHeartbeats = m?.counter('presence_heartbeats_total', 'Heartbeat refresh cycles');
 	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
@@ -985,6 +989,15 @@ export function createPresence(client, options = {}) {
 		}
 	}
 
+	// Throw helper for "ws closed during async gap" paths inside join(). All
+	// five callsites need the same metric label and the same typed error;
+	// inlining a helper avoids drift between them and keeps each callsite
+	// single-line.
+	function throwWsClosed(topic) {
+		mJoinsAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
+		throw new WsClosedError('presence.join', topic);
+	}
+
 	/** @type {RedisPresenceTracker} */
 	const tracker = {
 		async join(ws, topic, platform) {
@@ -1071,11 +1084,15 @@ export function createPresence(client, options = {}) {
 				throw err;
 			}
 
-			if (!wsTopics.has(ws)) return;
+			// ws closed during `await subscribeToTopic`. The close hook already
+			// ran leaveAll, which swept localCounts / wsTopics for this ws;
+			// no compensating undoJoin needed. Throw so the caller sees the
+			// abort instead of a silent success.
+			if (!wsTopics.has(ws)) throwWsClosed(topic);
 
 			try { ws.getBufferedAmount(); } catch {
 				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
-				return;
+				throwWsClosed(topic);
 			}
 
 			let didRedisWrite = false;
@@ -1108,13 +1125,14 @@ export function createPresence(client, options = {}) {
 
 				if (!wsTopics.has(ws)) {
 					// ws closed during the eval. Roll back our Redis write so
-					// the per-user hash entry does not linger past TTL.
+					// the per-user hash entry does not linger past TTL, then
+					// surface the abort to the caller.
 					await redis.eval(
 						LEAVE_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key
 					).catch(() => {});
-					return;
+					throwWsClosed(topic);
 				}
 			} else if (prevData !== undefined && !deepEqual(prevData, data)) {
 				// Same instance, same user, different `select()` output.
@@ -1157,7 +1175,7 @@ export function createPresence(client, options = {}) {
 				ws.subscribe('__presence:' + topic);
 			} catch {
 				await undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, false, platform);
-				return;
+				throwWsClosed(topic);
 			}
 
 			// If ws closed after subscribe, leave() already handled
@@ -1170,7 +1188,7 @@ export function createPresence(client, options = {}) {
 						instanceId, key
 					).catch(() => {});
 				}
-				return;
+				throwWsClosed(topic);
 			}
 
 			// Commit localData and activeTopics now that the join is

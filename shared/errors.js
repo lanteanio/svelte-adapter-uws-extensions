@@ -57,3 +57,41 @@ export class IdempotencyResultTooLargeError extends Error {
 		this.maxBytes = maxBytes;
 	}
 }
+
+/**
+ * Thrown by RPC-shaped operations (`presence.join`, `cursor.attach`) when the
+ * caller's websocket closes during an async gap before the operation could
+ * commit, OR the websocket was already gone by the time the operation
+ * resumed from one of its awaits. Server-side state is fully rolled back
+ * before the throw so the caller does not need to compensate.
+ *
+ * Stable contract: `err.code === 'WS_CLOSED'`. Catch on the code, not the
+ * class - future RPC-shaped operations that hit the same pattern throw the
+ * same code. The `operation` field carries the dotted path (e.g.
+ * `'presence.join'`) for operators that want to bucket by feature without
+ * parsing the message.
+ *
+ * Pattern in callers:
+ *
+ * ```js
+ * try {
+ *   await presence.join(ws, topic, platform);
+ * } catch (err) {
+ *   if (err.code === 'WS_CLOSED') return; // ws already gone, no compensation needed
+ *   throw err;
+ * }
+ * ```
+ */
+export class WsClosedError extends Error {
+	/**
+	 * @param {string} operation - Dotted operation path, e.g. `'presence.join'`.
+	 * @param {string} topic
+	 */
+	constructor(operation, topic) {
+		super(`${operation}: websocket closed during async gap (topic="${topic}"); rolled back`);
+		this.name = 'WsClosedError';
+		this.code = 'WS_CLOSED';
+		this.operation = operation;
+		this.topic = topic;
+	}
+}

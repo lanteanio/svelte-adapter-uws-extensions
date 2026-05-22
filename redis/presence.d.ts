@@ -51,10 +51,29 @@ export interface PresenceMetricsSnapshot {
 	staleCleanedTotal: number;
 }
 
+/**
+ * Thrown by `join()` when the websocket closes during an async gap before
+ * the join can commit. Server-side state is fully rolled back before the
+ * throw. Catch on `err.code === 'WS_CLOSED'` rather than the class - the
+ * same code is shared with `cursor.attach` and any future RPC-shaped
+ * operation in this package.
+ */
+export class WsClosedError extends Error {
+	name: 'WsClosedError';
+	code: 'WS_CLOSED';
+	operation: string;
+	topic: string;
+}
+
 export interface RedisPresenceTracker {
 	/**
 	 * Add a connection to a topic's presence.
 	 * Ignores `__`-prefixed topics. Idempotent.
+	 *
+	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
+	 *   closes during one of the internal async gaps (subscribe, Redis eval,
+	 *   snapshot fetch, ws.subscribe). Server state is rolled back before
+	 *   the throw; callers do not need to compensate.
 	 */
 	join(ws: any, topic: string, platform: Platform): Promise<void>;
 
