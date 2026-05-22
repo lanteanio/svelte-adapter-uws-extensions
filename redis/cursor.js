@@ -143,14 +143,22 @@ export function createCursor(client, options = {}) {
 	const mUpdates = m?.counter('cursor_updates_total', 'Cursor update calls', ['topic']);
 	const mBroadcasts = m?.counter('cursor_broadcasts_total', 'Cursor broadcasts sent', ['topic']);
 	const mThrottled = m?.counter('cursor_throttled_total', 'Cursor updates deferred by throttle', ['topic']);
-	const mAttachesAborted = m?.counter('cursor_attaches_aborted_total', 'Cursor attach calls that aborted because the websocket closed before `platform.subscribe` could complete. Symmetric with `presence_joins_aborted_total`; same `WS_CLOSED` cause.', ['topic', 'reason']);
+	const mAttachesAborted = m?.counter('cursor_attaches_aborted_total', 'Cursor attach calls that aborted because the websocket closed before `ws.subscribe` could complete. Symmetric with `presence_joins_aborted_total`; same `WS_CLOSED` cause.', ['topic', 'reason']);
 
 	const warnSensitive = createSensitiveWarner('redis/cursor');
 
 	let connCounter = 0;
 
 	function safeUserData(ws) {
-		const raw = typeof ws.getUserData === 'function' ? ws.getUserData() : {};
+		// Closed-WS race: getWsState (called from `update`) may reach here
+		// after an `await` that outlasted the socket; `ws.getUserData()`
+		// throws on a freed native handle. Fall back to an empty userData
+		// rather than crashing the worker. Matches adapter 0.5.5's
+		// `plugins/cursor/server.js getWsState` guard.
+		let raw = {};
+		if (typeof ws.getUserData === 'function') {
+			try { raw = ws.getUserData(); } catch { raw = {}; }
+		}
 		if (!raw || typeof raw !== 'object') return {};
 		const { __subscriptions, remoteAddress, ...safeData } = raw;
 		return safeData;
@@ -395,8 +403,16 @@ export function createCursor(client, options = {}) {
 	 * - `lastFlush`: target-anchored timestamp of the most recent flush.
 	 *   Advanced by `topicThrottleMs` per cycle (not to actual fire time) so
 	 *   a single late tick does not compound drift on subsequent cycles.
+	 * - `pendingMicroflush`: a leading-edge flush is queued for the current
+	 *   cadence slot; co-arriving broadcasts (from either local OR peer-
+	 *   relay sources) in the same JS pass append to `dirty` /
+	 *   `inboundDirty` and ship as one combined frame when the microtask
+	 *   runs. Without this, a single co-arriving cursor fired alone as a
+	 *   single-cursor UPDATE while every other cursor in the same pass
+	 *   queued for the trailing tick - 86 percent fragmentation observed at
+	 *   1000-mover load on Hetzner CCX13 with `topicThrottle: 8`.
 	 *
-	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number }>}
+	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number, pendingMicroflush: boolean }>}
 	 */
 	const topicFlush = new Map();
 
@@ -575,10 +591,21 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Schedule a local cursor for the next coalesced flush. The leading-
-	 * edge check fires synchronously when `topicThrottleMs` has elapsed
-	 * since the last flush (preserves the contract that the first call on
-	 * an idle topic publishes immediately, without a setTimeout(0) detour).
+	 * Schedule a local cursor for the next coalesced flush. The leading-edge
+	 * check claims the cadence slot synchronously when `topicThrottleMs` has
+	 * elapsed since the last flush, then defers the actual `flushBoth` by one
+	 * microtask. Co-arriving broadcasts in the same JS pass (from this
+	 * function OR `enqueueInbound` - they share `state.pendingMicroflush`)
+	 * see `now - state.lastFlush < topicThrottleMs` and take the trailing
+	 * path, accumulating into `state.dirty` / `state.inboundDirty`. The
+	 * microtask then flushes everything as one combined frame.
+	 *
+	 * Without this defer, the first cursor in a post-pause burst fires alone
+	 * as a single-cursor UPDATE while every co-arriving cursor in the same
+	 * pass queues for the trailing tick. Demo measured 86 percent
+	 * fragmentation (1794 single UPDATEs vs 38 BULKs in 30s) at 1000-mover
+	 * load on Hetzner CCX13 with `topicThrottle: 8`. After the defer:
+	 * single UPDATE rate collapses, BULK rate matches cycle rate.
 	 */
 	function broadcast(topic, key, user, data, platform) {
 		if (topicThrottleMs <= 0) {
@@ -588,17 +615,28 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0 };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0, pendingMicroflush: false };
 			topicFlush.set(topic, state);
 		}
 		state.dirty.set(key, { user, data, platform });
 
 		const now = Date.now();
 		if (now - state.lastFlush >= topicThrottleMs) {
-			// Leading-edge synchronous flush.
+			// Claim the cadence slot synchronously so subsequent broadcasts
+			// in the same JS pass take the trailing path and accumulate.
 			state.lastFlush = now;
-			flushBoth(topic, state);
 			dirtyTopics.delete(topic);
+			if (!state.pendingMicroflush) {
+				state.pendingMicroflush = true;
+				queueMicrotask(() => {
+					state.pendingMicroflush = false;
+					// flushBoth clears `dirty` and `inboundDirty` internally
+					// and early-returns on empty; this guard saves the
+					// for-of entry cost on the empty case.
+					if (state.dirty.size === 0 && state.inboundDirty.size === 0) return;
+					flushBoth(topic, state);
+				});
+			}
 			return;
 		}
 
@@ -631,16 +669,26 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0 };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0, pendingMicroflush: false };
 			topicFlush.set(topic, state);
 		}
 		state.inboundDirty.set(key, { data, platform });
 
 		const now = Date.now();
 		if (now - state.lastFlush >= topicThrottleMs) {
+			// Symmetric with `broadcast()`: same shared `pendingMicroflush`
+			// per topic state, so if a local broadcast already claimed the
+			// slot the peer-relay entry just appends and ships with it.
 			state.lastFlush = now;
-			flushBoth(topic, state);
 			dirtyTopics.delete(topic);
+			if (!state.pendingMicroflush) {
+				state.pendingMicroflush = true;
+				queueMicrotask(() => {
+					state.pendingMicroflush = false;
+					if (state.dirty.size === 0 && state.inboundDirty.size === 0) return;
+					flushBoth(topic, state);
+				});
+			}
 			return;
 		}
 
@@ -675,14 +723,22 @@ export function createCursor(client, options = {}) {
 	/** @type {RedisCursorTracker} */
 	const tracker = {
 		async attach(ws, topic, platform) {
+			// Raw `ws.subscribe` (uWS-native) NOT `platform.subscribe`. As of
+			// adapter 0.5.5 `platform.subscribe` swallows uWS's "closed
+			// websocket" throw and returns the same `null` sentinel it returns
+			// on success, so a try/catch around `platform.subscribe` cannot
+			// distinguish closed-ws from success without racing on
+			// `platform.closedWsAborts`. uWS-native `ws.subscribe` still throws
+			// on closed-ws, so the throw-WsClosedError contract holds. Mirrors
+			// what `presence.join` already does with `ws.subscribe('__presence:...')`.
 			try {
-				platform.subscribe(ws, '__cursor:' + topic);
+				ws.subscribe('__cursor:' + topic);
 			} catch {
-				// ws closed before subscribe could land. No state to roll back
-				// (no wsState entry exists yet; that is only created on update).
-				// Throw so the caller can distinguish a no-op-and-rollback from
-				// a successful attach; without this the RPC metric reports
-				// status=ok for connections that never received cursor frames.
+				// No state to roll back (no `wsState` entry exists yet; that
+				// is only created on `update`). Throw so the caller can
+				// distinguish a no-op-and-rollback from a successful attach;
+				// without this the RPC metric reports `status=ok` for
+				// connections that never received cursor frames.
 				mAttachesAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
 				throw new WsClosedError('cursor.attach', topic);
 			}

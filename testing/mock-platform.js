@@ -16,7 +16,8 @@ export const PLATFORM_KEYS = Object.freeze([
 	'pressure', 'onPressure', 'onPublishRate',
 	'subscribers', 'subscribe', 'unsubscribe', 'checkSubscribe',
 	'topic',
-	'maxPayloadLength', 'bufferedAmount'
+	'maxPayloadLength', 'bufferedAmount',
+	'closedWsAborts'
 ]);
 
 /**
@@ -76,6 +77,12 @@ export function mockPlatform() {
 		bufferedAmount(_ws) {
 			return 0;
 		},
+		// Mirrors adapter 0.5.5's `platform.closedWsAborts` counter.
+		// Tests that want to simulate a non-zero value can reassign
+		// `p.closedWsAborts` directly; the default zero matches a healthy
+		// worker and keeps the parity-test surface symmetric with the
+		// adapter's real platform shape.
+		closedWsAborts: 0,
 		publish(topic, event, data, options) {
 			p.published.push({ topic, event, data, options });
 			return true;

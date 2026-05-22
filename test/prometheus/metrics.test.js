@@ -916,6 +916,12 @@ describe('prometheus metrics', () => {
 			cursor.update(ws, 'doc', { x: 10, y: 20 }, platform);
 			cursor.update(ws, 'doc', { x: 30, y: 40 }, platform);
 
+			// Leading-edge is microtask-deferred (see redis/cursor.js
+			// broadcast); the broadcasts counter increments inside
+			// flushBoth, which runs in the queued microtask. Drain
+			// before reading the metric.
+			await Promise.resolve();
+
 			const output = metrics.serialize();
 			expect(output).toContain('cursor_updates_total{topic="doc"} 2');
 			expect(output).toContain('cursor_broadcasts_total{topic="doc"}');

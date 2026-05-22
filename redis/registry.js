@@ -1008,9 +1008,17 @@ export function createConnectionRegistry(client, options) {
 		hooks: {
 			async open(ws, ctx) {
 				await ensureSubscriber(ctx?.platform);
-				const userId = identify(ws);
-				if (!userId) return;
-				const ud = ws.getUserData ? ws.getUserData() : {};
+				// Closed-WS race: the ws may have closed during the
+				// `await ensureSubscriber` above. `identify(ws)` and the
+				// subsequent `ws.getUserData()` both throw on a freed
+				// native handle; bail silently rather than crashing the
+				// worker. No state to roll back yet.
+				let userId, ud;
+				try {
+					userId = identify(ws);
+					if (!userId) return;
+					ud = ws.getUserData ? ws.getUserData() : {};
+				} catch { return; }
 				// Read the session id via the adapter's slot symbol.
 				const sessionId = sessionIdFromUserData(ud);
 				if (!sessionId) return;

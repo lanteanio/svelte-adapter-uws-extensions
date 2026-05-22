@@ -75,6 +75,29 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(seen).toHaveLength(1); // unsubscribed
 	});
 
+	it('pubsub wrap forwards closedWsAborts as a live getter', () => {
+		// Adapter 0.5.5 added `platform.closedWsAborts` (counter that
+		// tracks how many times ws-targeted platform methods swallowed
+		// a "closed websocket" throw). The wrap must surface it live so
+		// operators reading the wrapped seam see the same number as
+		// readers of the source platform.
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.closedWsAborts).toBe(0);
+
+		platform.closedWsAborts = 42;
+		expect(wrapped.closedWsAborts).toBe(42);
+	});
+
+	it('sharded wrap forwards closedWsAborts as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.closedWsAborts).toBe(0);
+
+		platform.closedWsAborts = 7;
+		expect(wrapped.closedWsAborts).toBe(7);
+	});
+
 	it('sharded wrap forwards maxPayloadLength / bufferedAmount / onPublishRate', () => {
 		const platform = mockPlatform();
 		// Methods are captured at wrap-construction (consistent with the

@@ -242,6 +242,7 @@ export function createPubSubBus(client, options = {}) {
 				checkSubscribe: platform.checkSubscribe.bind(platform),
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: platform.bufferedAmount.bind(platform),
+				get closedWsAborts() { return platform.closedWsAborts ?? 0; },
 				// Framework conventions stashed on the source platform by
 				// app init code (e.g. `platform.replay = createReplay(...)`,
 				// `platform.redis = ioredisClient`) must survive the wrap so

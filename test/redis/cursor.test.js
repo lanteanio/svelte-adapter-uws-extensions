@@ -290,11 +290,15 @@ describe('redis cursor', () => {
 	});
 
 	describe('attach / detach', () => {
-		it('attach subscribes the connection to __cursor:{topic}', async () => {
+		it('attach subscribes the connection to __cursor:{topic} via uWS-native ws.subscribe', async () => {
+			// As of adapter 0.5.5 we use raw `ws.subscribe` (not
+			// `platform.subscribe`) so a closed-ws throw still propagates;
+			// the membership lands in `ws._topics`, not in `platform.subscribed`.
 			const ws = mockWs({ id: '1' });
 			await cursors.attach(ws, 'canvas', platform);
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__cursor:canvas' }]);
+			expect(ws.isSubscribed('__cursor:canvas')).toBe(true);
+			expect(platform.subscribed).toEqual([]);
 		});
 
 		it('attach calls snapshot so the new connection sees existing cursors', async () => {
@@ -337,7 +341,7 @@ describe('redis cursor', () => {
 			const mover = mockWs({ id: 'mover' });
 
 			await c.attach(watcher, 'canvas', platform);
-			expect(platform.subscribed.find((s) => s.ws === watcher && s.topic === '__cursor:canvas')).toBeDefined();
+			expect(watcher.isSubscribed('__cursor:canvas')).toBe(true);
 
 			c.update(mover, 'canvas', { x: 99 }, platform);
 
@@ -353,9 +357,13 @@ describe('redis cursor', () => {
 			expect(platform.unsubscribed).toEqual([{ ws, topic: '__cursor:canvas' }]);
 		});
 
-		it('attach throws WsClosedError when platform.subscribe throws (closed ws); no snapshot is sent', async () => {
+		it('attach throws WsClosedError when ws.subscribe throws (closed ws); no snapshot is sent', async () => {
+			// ws-native subscribe throws on a closed ws (mockWs models uWS:
+			// `assertOpen()` rejects post-close). Tests target ws.subscribe
+			// directly now, mirroring how presence.join is tested against
+			// raw ws.subscribe for `__presence:` topics.
 			const ws = mockWs({ id: '1' });
-			platform.subscribe = () => { throw new Error('ws closed'); };
+			ws.close();
 
 			await expect(cursors.attach(ws, 'canvas', platform)).rejects.toMatchObject({
 				name: 'WsClosedError',
@@ -375,10 +383,9 @@ describe('redis cursor', () => {
 				throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, metrics
 			});
 			const ws = mockWs({ id: '1' });
-			const localPlatform = mockPlatform();
-			localPlatform.subscribe = () => { throw new Error('ws closed'); };
+			ws.close();
 
-			await expect(c.attach(ws, 'canvas', localPlatform)).rejects.toThrow();
+			await expect(c.attach(ws, 'canvas', platform)).rejects.toThrow();
 
 			const out = await metrics.serialize();
 			// Serializer sorts labels alphabetically -> `reason,topic`.
@@ -1217,7 +1224,7 @@ describe('redis cursor', () => {
 	});
 
 	describe('per-topic broadcast budget (#3)', () => {
-		it('topicThrottle limits aggregate broadcasts per topic', () => {
+		it('topicThrottle limits aggregate broadcasts per topic', async () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, {
 				throttle: 0, // no per-connection throttle
@@ -1228,8 +1235,11 @@ describe('redis cursor', () => {
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			const ws3 = mockWs({ id: '3', name: 'Charlie' });
 
-			// First update broadcasts immediately (leading edge, single entry = normal update)
+			// First update claims the leading-edge slot synchronously then
+			// defers the flush by one microtask so co-arriving cursors batch.
+			// Drain that microtask before asserting.
 			c.update(ws1, 'canvas', { x: 1 }, platform);
+			await Promise.resolve();
 			const positionsAfterFirst = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
 			expect(positionsAfterFirst).toHaveLength(1);
 			expect(positionsAfterFirst[0].event).toBe('update');
@@ -1316,15 +1326,18 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('different topics have independent budgets', () => {
+		it('different topics have independent budgets', async () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
-			// Each topic gets its own leading-edge broadcast
+			// Each topic gets its own leading-edge broadcast. Leading-edge
+			// is microtask-deferred (so co-arriving cursors in the same JS
+			// pass batch into one frame per topic); drain before asserting.
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
 			c.update(ws, 'canvas-b', { x: 2 }, platform);
+			await Promise.resolve();
 
 			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(2);
 
@@ -1394,6 +1407,7 @@ describe('redis cursor', () => {
 			// Seed an idle topic so lastFlush != 0 (subsequent calls are within-window).
 			const localWs = mockWs({ id: '1' });
 			c.update(localWs, 'canvas', { x: 1 }, platform);
+			await Promise.resolve();  // drain leading-edge microtask before resetting
 			platform.reset();
 
 			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
@@ -1448,6 +1462,103 @@ describe('redis cursor', () => {
 		});
 	});
 
+	describe('leading-edge microtask-defer (#5: burst-coalescing regression)', () => {
+		// Pins the contract that co-arriving cursors in the same JS pass
+		// batch into one BULK rather than fragmenting (first cursor flushes
+		// alone as UPDATE; rest queue for the trailing tick). Demo measured
+		// 86% fragmentation pre-fix at 1000-mover load. The microtask defer
+		// claims the cadence slot synchronously so subsequent broadcasts
+		// take the trailing path and accumulate, then the queueMicrotask
+		// callback ships everything as one frame.
+		//
+		// Real-clock sleep (not `vi.useFakeTimers()`) is required: this
+		// asserts behaviour ACROSS cadence cycles, which means the
+		// `Date.now() - state.lastFlush >= topicThrottleMs` check needs to
+		// see real wall-clock advance between bursts. Fake timers freeze
+		// Date.now() unless you advance them, but advancing them does not
+		// drain queued microtasks - so the leading-edge microtask from the
+		// previous burst would still be pending when the next burst lands.
+
+		it('N bursts of M co-arriving local cursors batch as N bulks of M entries each (no single-cursor UPDATEs)', async () => {
+			const topicThrottleMs = 20;
+			const c = createCursor(client, {
+				throttle: 0, topicThrottle: topicThrottleMs, snapshotIntervalMs: 0
+			});
+			const N = 3;
+			const M = 8;
+
+			const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+			for (let burst = 0; burst < N; burst++) {
+				// All M cursors dispatched in a single sync pass: the
+				// microtask defer turns this into one queued flush, not M
+				// separate publishes.
+				for (let i = 0; i < M; i++) {
+					const ws = mockWs({ id: `${burst}-${i}` });
+					c.update(ws, 'canvas', { x: i, burst }, platform);
+				}
+				await Promise.resolve();
+				// Sleep > topicThrottleMs so the next burst hits the
+				// leading edge again.
+				await sleep(topicThrottleMs + 5);
+			}
+			// Drain any tail microtask + tick.
+			await sleep(topicThrottleMs + 5);
+
+			const updates = platform.published.filter((p) => p.event === 'update');
+			const bulks = platform.published.filter((p) => p.event === 'bulk');
+			expect(updates).toHaveLength(0);
+			expect(bulks).toHaveLength(N);
+			for (const bulk of bulks) {
+				expect(bulk.data).toHaveLength(M);
+			}
+
+			c.destroy();
+		});
+
+		it('peer-relayed cursors share the same pendingMicroflush slot with local cursors (one bulk, not two)', async () => {
+			// Cross-source coalescing: when a local broadcast claims the
+			// leading-edge slot in the same JS pass as an inbound peer
+			// relay, both should ship in ONE combined bulk (local +
+			// inbound), not two separate frames. Symmetry: same applies if
+			// the inbound peer claims the slot first.
+			const topicThrottleMs = 20;
+			const c = createCursor(client, {
+				throttle: 0, topicThrottle: topicThrottleMs, snapshotIntervalMs: 0
+			});
+			const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+			// Prime the pubsub subscriber by issuing one local update first
+			// and letting it fully settle (so subsequent broadcasts and the
+			// inbound relay run on an idle topic).
+			c.update(mockWs({ id: 'prime' }), 'canvas', { x: 0 }, platform);
+			await Promise.resolve();
+			await sleep(topicThrottleMs + 5);
+			platform.reset();
+
+			// Single JS pass: one local broadcast + one inbound peer relay.
+			c.update(mockWs({ id: 'local-1' }), 'canvas', { x: 11 }, platform);
+			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
+			const onMessage = handler.listeners.get('message');
+			onMessage(client.key('cursor:events'), JSON.stringify({
+				instanceId: 'OTHER',
+				topic: 'canvas',
+				event: 'update',
+				payload: { key: 'OTHER:7', data: { x: 77 } }
+			}));
+			await Promise.resolve();
+
+			const positions = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positions).toHaveLength(1);
+			expect(positions[0].event).toBe('bulk');
+			expect(positions[0].data).toHaveLength(2);
+			const keys = positions[0].data.map((e) => e.key);
+			expect(keys.some((k) => k === 'OTHER:7')).toBe(true);
+
+			c.destroy();
+		});
+	});
+
 	describe('scheduler health: stats()', () => {
 		it('exposes flushes / drift / dirtyTopics / activeTopics', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
@@ -1471,12 +1582,13 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('flushes counter increments on every flush (leading + trailing edge)', () => {
+		it('flushes counter increments on every flush (leading + trailing edge)', async () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
 
-			c.update(ws, 'canvas', { x: 1 }, platform);  // leading-edge flush
+			c.update(ws, 'canvas', { x: 1 }, platform);  // claims leading slot
+			await Promise.resolve();  // drain leading-edge microtask -> flushes++
 			expect(c.stats().flushes).toBe(1);
 
 			c.update(ws, 'canvas', { x: 2 }, platform);  // queued for tick
@@ -1488,12 +1600,13 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('drift accumulators stay non-negative and zero when scheduler fires on time', () => {
+		it('drift accumulators stay non-negative and zero when scheduler fires on time', async () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 50, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
 
-			c.update(ws, 'canvas', { x: 1 }, platform);  // leading-edge sync
+			c.update(ws, 'canvas', { x: 1 }, platform);  // claims leading slot
+			await Promise.resolve();  // drain leading-edge microtask
 			c.update(ws, 'canvas', { x: 2 }, platform);  // queued
 
 			// Under fake timers the trailing-edge tick fires exactly at its

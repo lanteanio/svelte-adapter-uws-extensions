@@ -98,12 +98,17 @@ export interface RedisCursorTracker {
 	 * subscriber set and no client ever sees a cursor frame.
 	 *
 	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
-	 *   has already closed by the time `platform.subscribe` runs. No state
-	 *   to roll back (`wsState` is only created on `update`); callers do
-	 *   not need to compensate. The follow-up `snapshot()` call is skipped
+	 *   has already closed by the time the underlying `ws.subscribe` runs.
+	 *   No state to roll back (`wsState` is only created on `update`); callers
+	 *   do not need to compensate. The follow-up `snapshot()` call is skipped
 	 *   when this throws. Snapshot-send failures on an already-subscribed
 	 *   connection are NOT thrown - cursor frames are self-recovering via
-	 *   the next bulk tick.
+	 *   the next bulk tick. Note: this module uses the uWS-native
+	 *   `ws.subscribe` for `__cursor:*` topics (mirroring presence's
+	 *   `__presence:*` path), not `platform.subscribe` - as of adapter 0.5.5
+	 *   `platform.subscribe` swallows closed-ws throws and returns the same
+	 *   sentinel on success and on close, which would silently break this
+	 *   throw contract.
 	 */
 	attach(ws: any, topic: string, platform: Platform): Promise<void>;
 
