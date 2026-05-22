@@ -909,6 +909,7 @@ describe('prometheus metrics', () => {
 		it('counts updates and broadcasts', async () => {
 			const cursor = createCursor(client, {
 				throttle: 0,
+				topicThrottle: 8,
 				metrics
 			});
 			const ws = mockWs({ id: 'u1' });
@@ -916,11 +917,9 @@ describe('prometheus metrics', () => {
 			cursor.update(ws, 'doc', { x: 10, y: 20 }, platform);
 			cursor.update(ws, 'doc', { x: 30, y: 40 }, platform);
 
-			// Leading-edge is microtask-deferred (see redis/cursor.js
-			// broadcast); the broadcasts counter increments inside
-			// flushBoth, which runs in the queued microtask. Drain
-			// before reading the metric.
-			await Promise.resolve();
+			// Always-tick: broadcasts increment inside `flushBoth`, which
+			// runs in the libuv timers phase. Wait one cadence cycle.
+			await new Promise((r) => setTimeout(r, 20));
 
 			const output = metrics.serialize();
 			expect(output).toContain('cursor_updates_total{topic="doc"} 2');

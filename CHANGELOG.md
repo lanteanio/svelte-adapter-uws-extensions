@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-05-23
+
+### Changed
+
+- **Peer dependency floor bumped to `svelte-adapter-uws ^0.5.6`** (was `^0.5.5`).
+
+### Fixed
+
+- **`redis/cursor.js` `broadcast()` and `enqueueInbound()` rewritten as always-tick; the 0.5.5/0.5.6 `queueMicrotask` + `pendingMicroflush` design did not fix the production fragmentation it claimed to.** The 0.5.6 deferred-flush variant assumed co-arriving cursor broadcasts share a single JS task so they would all land in `state.dirty` before the deferred flush fired. They don't share a task: uWS dispatches each WS message as its own JS task, and N-API drains microtasks at the C++/JS boundary between tasks - so the deferred flush actually ran BEFORE the next socket's message handler, with a cross-socket coalescing window of zero. Demo verification under deployed 0.5.6 at Hetzner CCX13 (same 1000-cursor stress profile that motivated the original fix): smoothness probe over 30s saw ~99 percent single-cursor UPDATEs / ~1 percent BULKs (3356 vs 12 in 30s) - essentially the pre-fix shape. The new always-tick design drops the leading-edge synchronous fire and the microtask defer entirely; every broadcast appends to `state.dirty` (or `state.inboundDirty`), adds the topic to `dirtyTopics`, and arms the tracker-wide tick timer. `setTimeout(0)` lands in libuv's timers phase, which only fires AFTER the poll phase has processed every ready message on every socket - so all broadcasts dispatched in the same loop iteration end up in one flush regardless of how many task boundaries separate them. Structurally correct independent of dispatch model, and the same trade-off the bundled adapter cursor plugin makes. First-cursor latency cost: up to `topicThrottleMs` (16ms default, one frame budget) before fanout - below the perceptual floor for cursor smoothness. `state.lastFlush` initialized to `Date.now() - topicThrottleMs` (was `0`) so first-fire drift stats are not polluted by `Date.now()` worth of "lateness" on cold topics. New mandatory cross-task-boundary regression test in `test/redis/cursor.test.js` drives 50 updates each across an `await Promise.resolve()` boundary (the exact dispatch shape uWS produces) and asserts they all coalesce into one bulk per cadence cycle - the 0.5.5/0.5.6 `queueMicrotask` design fails this test, always-tick passes. Plus a cross-source-and-cross-task variant for `enqueueInbound`. Bench at `bench/03-cursor-always-tick.mjs` ports the adapter's three-way A/B/C comparison (sync / queueMicrotask / always-tick) under cross-task driving.
+
 ## [0.5.6] - 2026-05-23
 
 ### Changed

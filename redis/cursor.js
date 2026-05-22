@@ -403,16 +403,11 @@ export function createCursor(client, options = {}) {
 	 * - `lastFlush`: target-anchored timestamp of the most recent flush.
 	 *   Advanced by `topicThrottleMs` per cycle (not to actual fire time) so
 	 *   a single late tick does not compound drift on subsequent cycles.
-	 * - `pendingMicroflush`: a leading-edge flush is queued for the current
-	 *   cadence slot; co-arriving broadcasts (from either local OR peer-
-	 *   relay sources) in the same JS pass append to `dirty` /
-	 *   `inboundDirty` and ship as one combined frame when the microtask
-	 *   runs. Without this, a single co-arriving cursor fired alone as a
-	 *   single-cursor UPDATE while every other cursor in the same pass
-	 *   queued for the trailing tick - 86 percent fragmentation observed at
-	 *   1000-mover load on Hetzner CCX13 with `topicThrottle: 8`.
+	 *   Initialized to `Date.now() - topicThrottleMs` so the first broadcast
+	 *   on a new topic is "cycle ready" without polluting drift stats with
+	 *   the full `Date.now()` lateness an init of 0 would imply.
 	 *
-	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number, pendingMicroflush: boolean }>}
+	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number }>}
 	 */
 	const topicFlush = new Map();
 
@@ -570,9 +565,10 @@ export function createCursor(client, options = {}) {
 				dirtyTopics.delete(topic);
 
 				// Target-anchored: advance lastFlush by the cadence amount.
-				// Multi-cycle backlog collapse to `now` so the next leading-
-				// edge check `(now - lastFlush) >= topicThrottleMs` works as
-				// expected without firing every queued cycle on this turn.
+				// Multi-cycle backlog collapse to `now` so the next
+				// broadcast's `Date.now() - lastFlush >= topicThrottleMs`
+				// delay computation does not fire every queued cycle on
+				// this turn.
 				state.lastFlush = drift < topicThrottleMs ? deadline : now;
 			} else if (deadline < nextDeadline) {
 				nextDeadline = deadline;
@@ -591,21 +587,31 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Schedule a local cursor for the next coalesced flush. The leading-edge
-	 * check claims the cadence slot synchronously when `topicThrottleMs` has
-	 * elapsed since the last flush, then defers the actual `flushBoth` by one
-	 * microtask. Co-arriving broadcasts in the same JS pass (from this
-	 * function OR `enqueueInbound` - they share `state.pendingMicroflush`)
-	 * see `now - state.lastFlush < topicThrottleMs` and take the trailing
-	 * path, accumulating into `state.dirty` / `state.inboundDirty`. The
-	 * microtask then flushes everything as one combined frame.
+	 * Schedule a local cursor for the next coalesced flush. Always-tick: every
+	 * call appends to `state.dirty`, adds the topic to `dirtyTopics`, and arms
+	 * the tracker-wide tick timer. NO leading-edge synchronous fire and NO
+	 * microtask defer.
 	 *
-	 * Without this defer, the first cursor in a post-pause burst fires alone
-	 * as a single-cursor UPDATE while every co-arriving cursor in the same
-	 * pass queues for the trailing tick. Demo measured 86 percent
-	 * fragmentation (1794 single UPDATEs vs 38 BULKs in 30s) at 1000-mover
-	 * load on Hetzner CCX13 with `topicThrottle: 8`. After the defer:
-	 * single UPDATE rate collapses, BULK rate matches cycle rate.
+	 * Why: uWS dispatches each WS message as its own JS task, and N-API
+	 * drains microtasks at the C++/JS boundary between dispatches. A
+	 * `queueMicrotask`-deferred flush fires BEFORE the next socket's message
+	 * handler runs, so cross-socket coalescing is impossible at the microtask
+	 * level. `setTimeout(0)` is in libuv's timers phase and fires only after
+	 * the poll phase processes every ready message on every socket - so all
+	 * broadcasts dispatched in the same loop iteration end up in one flush
+	 * regardless of how many task boundaries separate them.
+	 *
+	 * 0.5.5/0.5.6 shipped a `queueMicrotask` + `pendingMicroflush` variant
+	 * built on the wrong dispatch-model assumption (that co-arriving
+	 * broadcasts share a JS task). Demo measured ~99% single-cursor UPDATE /
+	 * ~1% BULK at 1000-mover load on the deployed 0.5.6 - essentially the
+	 * pre-fix shape. The bench validated the assumed input shape (all
+	 * broadcasts in one synchronous task) instead of the input shape uWS
+	 * actually produces (per-message tasks separated by microtask drains).
+	 *
+	 * First-cursor latency cost of always-tick: up to `topicThrottleMs` (16ms
+	 * default, one frame budget) before fanout. Below the perceptual floor
+	 * for cursors. Same trade-off the adapter's bundled cursor plugin makes.
 	 */
 	function broadcast(topic, key, user, data, platform) {
 		if (topicThrottleMs <= 0) {
@@ -615,34 +621,19 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0, pendingMicroflush: false };
+			// Anchor `lastFlush` one cycle in the past so the first broadcast
+			// is treated as "cycle ready" with zero drift on the very first
+			// tick. Without this, `Date.now() - 0` would be a huge "lateness"
+			// that pollutes the drift stats forever.
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: Date.now() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
 		state.dirty.set(key, { user, data, platform });
-
-		const now = Date.now();
-		if (now - state.lastFlush >= topicThrottleMs) {
-			// Claim the cadence slot synchronously so subsequent broadcasts
-			// in the same JS pass take the trailing path and accumulate.
-			state.lastFlush = now;
-			dirtyTopics.delete(topic);
-			if (!state.pendingMicroflush) {
-				state.pendingMicroflush = true;
-				queueMicrotask(() => {
-					state.pendingMicroflush = false;
-					// flushBoth clears `dirty` and `inboundDirty` internally
-					// and early-returns on empty; this guard saves the
-					// for-of entry cost on the empty case.
-					if (state.dirty.size === 0 && state.inboundDirty.size === 0) return;
-					flushBoth(topic, state);
-				});
-			}
-			return;
-		}
-
-		// Within window: trailing-edge flush via the scheduler tick.
 		dirtyTopics.add(topic);
-		armTick(Math.max(0, topicThrottleMs - (now - state.lastFlush)));
+
+		const elapsed = Date.now() - state.lastFlush;
+		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
+		armTick(delay);
 	}
 
 	/**
@@ -669,31 +660,19 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0, pendingMicroflush: false };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: Date.now() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
 		state.inboundDirty.set(key, { data, platform });
-
-		const now = Date.now();
-		if (now - state.lastFlush >= topicThrottleMs) {
-			// Symmetric with `broadcast()`: same shared `pendingMicroflush`
-			// per topic state, so if a local broadcast already claimed the
-			// slot the peer-relay entry just appends and ships with it.
-			state.lastFlush = now;
-			dirtyTopics.delete(topic);
-			if (!state.pendingMicroflush) {
-				state.pendingMicroflush = true;
-				queueMicrotask(() => {
-					state.pendingMicroflush = false;
-					if (state.dirty.size === 0 && state.inboundDirty.size === 0) return;
-					flushBoth(topic, state);
-				});
-			}
-			return;
-		}
-
 		dirtyTopics.add(topic);
-		armTick(Math.max(0, topicThrottleMs - (now - state.lastFlush)));
+
+		// Symmetric with `broadcast()` always-tick: both source paths share
+		// the same `state` and the same tracker-wide tick timer, so a local
+		// broadcast and a peer-relayed inbound landing in the same loop
+		// iteration ship together as one combined frame at the next tick.
+		const elapsed = Date.now() - state.lastFlush;
+		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
+		armTick(delay);
 	}
 
 	async function broadcastRemove(topic, key, platform) {

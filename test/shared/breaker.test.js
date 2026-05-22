@@ -612,7 +612,12 @@ describe('circuit breaker', () => {
 
 		it('cursor: clear() does not wipe local state when breaker is broken', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
-			const cursor = createCursor(client, { throttle: 0, breaker });
+			// topicThrottle: 0 forces the immediate-broadcast path so
+			// `queueSnapshot` populates the in-memory pending map
+			// synchronously. The default (16ms) defers the snapshot to
+			// the next tick; this test asserts state preservation under
+			// breaker rejection and shouldn't depend on tick timing.
+			const cursor = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
 
 			const ws = mockWs({ id: '1' });
 			cursor.update(ws, 'room', { x: 10 }, platform);
