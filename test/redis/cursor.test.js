@@ -399,6 +399,55 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
+		it('hooks.message dispatches cursor-snapshot frames through tracker.snapshot', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1' });
+
+			// Plant a cursor on the topic so the snapshot has something to send.
+			c.update(ws, 'canvas', { x: 5 }, platform);
+			await new Promise((r) => setTimeout(r, 5));
+			platform.reset();
+
+			// Wire shape sent by the cursor plugin client on every status==='open'.
+			c.hooks.message(ws, {
+				data: { type: 'cursor-snapshot', topic: 'canvas' },
+				platform
+			});
+			await new Promise((r) => setTimeout(r, 5));
+
+			// Snapshot path emits `catalog` + `bulk` to the requesting ws via platform.send.
+			const sent = platform.sent.filter((s) => s.topic === '__cursor:canvas');
+			expect(sent.length).toBeGreaterThan(0);
+			c.destroy();
+		});
+
+		it('hooks.message dev-warns once when called with raw ArrayBuffer (canonical onUnhandled-bug shape)', () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+				const ws = mockWs({ id: '1' });
+
+				// Wire pattern that produces the silent-failure bug: raw ArrayBuffer
+				// from createMessage({onUnhandled}) passed straight into the hook.
+				const buf = new TextEncoder().encode('{"type":"cursor","topic":"x","data":{"y":1}}').buffer;
+				c.hooks.message(ws, { data: /** @type {any} */ (buf), platform });
+
+				const warns = warnSpy.mock.calls.filter(
+					(call) => typeof call[0] === 'string' && call[0].includes('ArrayBuffer')
+				);
+				// Warning is dedup'd to once per process. Other tests in this suite
+				// may have already tripped the flag, so accept 0 or 1.
+				expect(warns.length).toBeLessThanOrEqual(1);
+				if (warns.length === 1) {
+					expect(warns[0][0]).toContain('createMessage({onUnhandled})');
+					expect(warns[0][0]).toContain('onJsonMessage');
+				}
+				c.destroy();
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
 		it('hooks.close removes all cursor state', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });

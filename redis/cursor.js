@@ -760,7 +760,23 @@ export function createCursor(client, options = {}) {
 			message(ws, { data, platform }) {
 				if (data && data.type === 'cursor' && data.topic && data.data !== undefined) {
 					tracker.update(ws, data.topic, data.data, platform);
+					return;
 				}
+				// Client-initiated reconnect-snapshot. The cursor plugin client
+				// sends `{type:'cursor-snapshot', topic}` on every status==='open'
+				// (initial connect + reconnect). Pre-fix, this text frame had no
+				// server handler and was a dead wire frame; the snapshot path
+				// only fired through `hooks.subscribe` -> `tracker.snapshot` when
+				// the ws subscribed to the `__cursor:{topic}` channel. With this
+				// branch, the snapshot also re-emits on the explicit frame so a
+				// reconnecting tab that resubscribes via `subscribe-batch` (which
+				// the adapter dedups when the topic is already in the user data
+				// set) still gets a fresh catalog + bulk.
+				if (data && data.type === 'cursor-snapshot' && typeof data.topic === 'string') {
+					tracker.snapshot(ws, data.topic, platform);
+					return;
+				}
+				_warnCursorHooksMessageShape(data);
 			},
 			close(ws, { platform }) {
 				return tracker.remove(ws, platform);
@@ -769,4 +785,41 @@ export function createCursor(client, options = {}) {
 	};
 
 	return tracker;
+}
+
+/**
+ * One-time dev-warn dedup for `cursor.hooks.message` shape misuse. The most
+ * common cause is wiring the hook against `createMessage({ onUnhandled })`
+ * which passes raw bytes, not a parsed envelope. The fix is to switch to
+ * `createMessage({ onJsonMessage(ws, msg, platform) { ... } })` (svelte-
+ * realtime >= 0.5.9 + svelte-adapter-uws >= 0.5.3), which forwards the
+ * parsed object directly.
+ */
+let _cursorHooksMessageBadShapeWarned = false;
+
+/**
+ * @param {any} data
+ */
+function _warnCursorHooksMessageShape(data) {
+	if (_cursorHooksMessageBadShapeWarned) return;
+	_cursorHooksMessageBadShapeWarned = true;
+	const got = data instanceof ArrayBuffer
+		? 'ArrayBuffer (raw bytes -- did you wire this from createMessage({onUnhandled}) ?)'
+		: Array.isArray(data)
+			? 'Array'
+			: data === null
+				? 'null'
+				: typeof data === 'object'
+					? 'object with data.type=' + String(data.type)
+					: typeof data;
+	console.warn(
+		'[redis/cursor] hooks.message called with unexpected shape (' + got + '). ' +
+		'Expected a parsed object {type:"cursor", topic, data} or ' +
+		'{type:"cursor-snapshot", topic}. ' +
+		'If you wired this from `createMessage({ onUnhandled })` and got raw bytes, ' +
+		'switch to `createMessage({ onJsonMessage(ws, msg, platform) { ... } })` ' +
+		'which forwards the parsed JSON envelope. ' +
+		'This warning fires once per process.\n' +
+		'  See: https://svti.me/cursor-hooks-message'
+	);
 }

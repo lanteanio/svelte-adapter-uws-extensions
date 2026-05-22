@@ -522,8 +522,22 @@ export function createPresence(client, options = {}) {
 					pipe.hpexpire(topicHash, presenceTtlMs, 'FIELDS', 1, userKey);
 				}
 				if (activePlatform) {
-					const keys = [...data.keys()];
-					activePlatform.publish('__presence:' + topic, 'heartbeat', keys);
+					// Publish a `{userKey: data}` map (instead of a key-only
+					// array) so a client whose entry aged out between
+					// heartbeats can re-add it from the heartbeat alone.
+					// Pre-fix, the wire carried only `keys` and the client
+					// handler could only refresh `existing` entries; an
+					// entry the client swept (cross-replica relay latency,
+					// brief backpressure, JS thread saturation) could never
+					// be recovered without a presence_diff for that user.
+					// Older clients fall back gracefully: they see an
+					// object instead of an array and skip the legacy
+					// "refresh-existing" branch, but the next presence_diff
+					// or presence_state still reconciles them.
+					/** @type {Record<string, any>} */
+					const dataMap = {};
+					for (const [userKey, entry] of data) dataMap[userKey] = entry.data;
+					activePlatform.publish('__presence:' + topic, 'heartbeat', dataMap);
 				}
 			}
 		}
@@ -1359,6 +1373,26 @@ export function createPresence(client, options = {}) {
 					return;
 				}
 				await tracker.join(ws, topic, platform);
+			},
+			message(ws, { data, platform }) {
+				// Client-initiated reconnect-snapshot. The presence plugin
+				// client sends `{type:'presence-snapshot', topic}` on every
+				// status==='open' (initial connect + reconnect). Re-emits
+				// `presence_state` to the requesting ws via `tracker.sync`,
+				// which is the same path that fires on a fresh subscribe.
+				// Symmetric to cursor's `cursor-snapshot` text frame.
+				//
+				// Without this, board-scoped presence stayed stale across
+				// reconnects: a tab that had joined via an RPC saw no
+				// presence_diff during the disconnect window, and on
+				// reconnect its in-memory map was whatever it last knew.
+				// Global presence accidentally self-healed because most
+				// apps call `presence.join('global')` from the `open` hook
+				// which fires on every reconnect; per-board presence does
+				// not have an equivalent auto-rejoin.
+				if (data && data.type === 'presence-snapshot' && typeof data.topic === 'string') {
+					tracker.sync(ws, data.topic, platform).catch(() => { /* surfaced via breaker */ });
+				}
 			},
 			async unsubscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__presence:')) {

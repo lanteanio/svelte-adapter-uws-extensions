@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "publishConfig": {
     "tag": "latest"
   },
@@ -154,7 +154,7 @@
     "node": ">=22.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.5.2"
+    "svelte-adapter-uws": "^0.5.3"
   },
   "dependencies": {
     "ioredis": "^5.0.0"

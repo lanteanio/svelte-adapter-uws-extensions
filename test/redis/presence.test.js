@@ -492,10 +492,38 @@ describe('redis presence', () => {
 	});
 
 	describe('hooks', () => {
-		it('exposes subscribe / unsubscribe / close', () => {
+		it('exposes subscribe / unsubscribe / message / close', () => {
 			expect(typeof presence.hooks.subscribe).toBe('function');
 			expect(typeof presence.hooks.unsubscribe).toBe('function');
+			expect(typeof presence.hooks.message).toBe('function');
 			expect(typeof presence.hooks.close).toBe('function');
+		});
+
+		it('message routes {type:"presence-snapshot", topic} through tracker.sync', async () => {
+			// Establish a presence entry so the snapshot has something to send.
+			const member = mockWs({ id: '1' });
+			await presence.join(member, 'room', platform);
+			platform.reset();
+
+			const observer = mockWs({ id: 'obs' });
+			presence.hooks.message(observer, {
+				data: { type: 'presence-snapshot', topic: 'room' },
+				platform
+			});
+			await new Promise((r) => setTimeout(r, 5));
+
+			// tracker.sync emits presence_state via platform.send to the requesting ws.
+			expect(statesOf(platform)).toHaveLength(1);
+		});
+
+		it('message ignores frames that are not presence-snapshot', () => {
+			const observer = mockWs({ id: 'obs' });
+			presence.hooks.message(observer, {
+				data: { type: 'unrelated', payload: 'x' },
+				platform
+			});
+			expect(platform.published).toHaveLength(0);
+			expect(platform.sent).toHaveLength(0);
 		});
 
 		it('subscribe routes regular topics through join', async () => {
@@ -732,7 +760,7 @@ describe('redis presence', () => {
 	});
 
 	describe('heartbeat (event name unchanged)', () => {
-		it('publishes heartbeat with current keys on the timer tick', async () => {
+		it('publishes heartbeat with {userKey: data} map on the timer tick', async () => {
 			vi.useFakeTimers();
 			const local = createPresence(client, { key: 'id', heartbeat: 50 });
 			const ws = mockWs({ id: '1' });
@@ -746,7 +774,12 @@ describe('redis presence', () => {
 
 			const beats = heartbeatsOf(platform).filter((h) => h.topic === '__presence:room');
 			expect(beats.length).toBeGreaterThan(0);
-			expect(beats[0].data).toEqual(['1']);
+			// Wire shape carries `{userKey: data}` (the user object derived from
+			// `select()`) so a client whose entry aged out between heartbeats can
+			// re-add it from the heartbeat alone. Pre-change this was a
+			// key-only array `['1']`; the heartbeat could only refresh
+			// existing client entries, not recover swept ones.
+			expect(beats[0].data).toEqual({ '1': { id: '1' } });
 			local.destroy();
 		});
 
