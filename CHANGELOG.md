@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-22
+
+### Changed
+
+- **`redis/cursor.js` wire format split: user catalog separated from per-frame positions; HSET writes coalesced onto a `snapshotIntervalMs` tick (default 100ms).** Pre-fix, every cursor `update` and `bulk` frame carried `{key, user, data}` per entry. With 1000 active movers on one topic at 60Hz, the `user` half (~80-100 bytes per cursor) was resent every 16ms for every dirty cursor, multiplying the JSON-stringify cost on the 1000-entry array, the Redis pub/sub relay envelope, and the wire payload (before permessage-deflate). The per-flush HSET storm also ran one `pipe.hset` per dirty cursor per flush window, hitting ~60K HSETs/sec at that scale, even though the hash is only read by snapshot-on-attach and the subscriber-startup reconcile (both tolerant of ~100ms staleness).
+
+  Two paired fixes. **(a) Catalog channel.** Three new wire events on `__cursor:{topic}`: `catalog` (`[{key, user}, ...]`, sent on attach + subscriber-startup reconcile), `join` (`{key, user}`, emitted once per ws per topic the first time that ws updates), and the existing `update` (`{key, data}`) / `bulk` (`[{key, data}, ...]`) / `remove` (`{key}`) shapes with `user` stripped. The catalog channel carries O(joins + leaves) traffic, not O(active-cursor count x rate). Cross-replica `join` propagates via the Redis pubsub envelope so receiving replicas can re-emit the catalog event to their subscribers. The catalog/positions split also matches what `presence` already does, so future code can share the primitive instead of cloning it.
+
+  **(b) Coalesced HSET tick.** The broadcast path now queues HSET writes into a per-topic latest-wins `Map<key, {user, data, ts}>` instead of issuing them inline. A separate timer (default `snapshotIntervalMs: 100`, configurable; 0 disables and reverts to per-flush inline HSET) flushes the pending map as one multi-field `HSET key f1 v1 f2 v2 ...` per topic per tick, plus the `EXPIRE`. At 1000 movers x 60Hz x 100ms tick: HSET volume drops from ~60K/sec to ~600/sec (~100x). `HDEL` on remove stays immediate so removed cursors do not resurrect on the next snapshot tick. `list()` reads both the Redis hash and the in-memory pending map so local callers see freshly-broadcast cursors before the next snapshot tick.
+
+  **Decoupled relay.** Cross-replica pubsub relay now fires on the broadcast cadence (matching local broadcast timing), no longer gated on per-call HSET success. The breaker is the right global gate for sustained Redis failure; single transient HSET failures should not stall the wire because the next 16ms tick will retry. Pre-fix the relay was post-HSET-success, which paid one round-trip of latency to other replicas; post-fix replicas see remote cursor moves at the configured per-flush cadence (~16ms) instead of post-pipeline (~16ms + Redis RTT).
+
+  **Migration shape.** Wire format changes are coordinated with `svelte-adapter-uws` 0.5.2 (peer dep floor bumped to `^0.5.2`). New clients ignore in-band `user` on `update`/`bulk` (which the new server no longer emits) and read it from the `catalog` channel instead. Apps that consume cursor frames directly without using the official `cursor(topic)` client store need to switch their renderer to merge `catalog` (key -> user) with `positions` (key -> data) at draw time. Server-side public API unchanged - `createCursor(client, options)` takes the same options plus the new `snapshotIntervalMs` knob. 12 new tests cover the catalog/join wire path, the coalesced snapshot tick (HSET batching across multiple updates, latest-wins semantics, hdel-drops-pending), and the pending-vs-Redis list() behavior. Integration test suite still green on real Redis 7.
+
+  **Client-side `move(topic, data)` helper.** Lands transitively via `svelte-adapter-uws/plugins/cursor/client` in 0.5.2: a direct-wire send that skips the RPC pipeline entirely (no id allocation, no pending-promises map, no timeout, no devtools, no dedup) and coalesces high-frequency calls (high-DPI mice at >1 kHz) onto `requestAnimationFrame` so the wire rate caps at the display refresh. Latest-wins per topic; multi-topic callers do not clobber each other. SSR-safe (no-op outside a browser). Recommended pattern for cursor moves on the client: `import { move } from 'svelte-adapter-uws/plugins/cursor/client'; move('canvas', { x, y })`.
+
 ## [0.5.1] - 2026-05-17
 
 ### Fixed

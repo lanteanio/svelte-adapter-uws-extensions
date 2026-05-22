@@ -154,7 +154,7 @@
     "node": ">=22.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.5.1"
+    "svelte-adapter-uws": "^0.5.2"
   },
   "dependencies": {
     "ioredis": "^5.0.0"

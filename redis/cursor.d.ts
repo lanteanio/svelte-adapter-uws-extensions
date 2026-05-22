@@ -33,8 +33,19 @@ export interface RedisCursorOptions {
 	select?: (userData: any) => any;
 
 	/**
+	 * How often to flush coalesced cursor positions to Redis HSET, in ms.
+	 * The wire/relay path runs on the per-flush cadence (`topicThrottle`) and
+	 * does not wait for HSET; this timer only governs the Redis snapshot used
+	 * for new-joiner reconcile and cross-instance startup reconcile. 100ms
+	 * staleness on the reconcile path is fine for cursors.
+	 * 0 disables coalescing and reverts to per-flush HSET (legacy behavior).
+	 * @default 100
+	 */
+	snapshotIntervalMs?: number;
+
+	/**
 	 * TTL in seconds for Redis hash entries.
-	 * Entries are refreshed on every broadcast. Stale cursors from crashed
+	 * Entries are refreshed on every snapshot tick. Stale cursors from crashed
 	 * instances are cleaned up automatically after this period.
 	 * @default 30
 	 */
@@ -97,8 +108,9 @@ export interface RedisCursorTracker {
 	remove(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/**
-	 * Send all current cursor positions for a topic to a single connection.
-	 * Sends a `bulk` event on `__cursor:{topic}` with the full cursor list.
+	 * Send the current catalog (users) + positions for a topic to a single
+	 * connection as two ordered events on `__cursor:{topic}`: `catalog`
+	 * (`[{key, user}, ...]`) followed by `bulk` (`[{key, data}, ...]`).
 	 * Folded into `attach` for typical use; exposed for advanced callers
 	 * that want to resend a snapshot without re-subscribing.
 	 */

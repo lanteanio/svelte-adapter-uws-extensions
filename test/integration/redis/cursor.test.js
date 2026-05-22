@@ -258,20 +258,32 @@ describe('redis cursor (integration)', () => {
 
 			trackerA.update(wsA, 'canvas', { x: 42, y: 7 }, platformA);
 
-			// Wait for the cross-instance relay to land on B.
+			// Wait for the cross-instance join to identify alice and the
+			// position update to land on B.
 			await waitFor(() => platformB.published.some(
-				(p) => p.event === 'update' && p.data && p.data.user && p.data.user.id === 'alice'
+				(p) => p.event === 'join' && p.data && p.data.user && p.data.user.id === 'alice'
 			));
 
-			const onB = platformB.published.find(
-				(p) => p.event === 'update' && p.data && p.data.user && p.data.user.id === 'alice'
+			const joinOnB = platformB.published.find(
+				(p) => p.event === 'join' && p.data && p.data.user && p.data.user.id === 'alice'
 			);
-			expect(onB.topic).toBe('__cursor:canvas');
-			expect(onB.data.data).toEqual({ x: 42, y: 7 });
-			expect(onB.options).toEqual({ relay: false });
+			expect(joinOnB.topic).toBe('__cursor:canvas');
+			expect(joinOnB.options).toEqual({ relay: false });
+
+			const updateOnB = platformB.published.find(
+				(p) => p.event === 'update' && p.data && p.data.key === joinOnB.data.key
+			);
+			expect(updateOnB).toBeDefined();
+			expect(updateOnB.topic).toBe('__cursor:canvas');
+			expect(updateOnB.data.data).toEqual({ x: 42, y: 7 });
+			expect(updateOnB.options).toEqual({ relay: false });
 
 			// B's list() also reflects the cross-instance write via the
-			// shared Redis hash.
+			// shared Redis hash, after A's snapshot timer flushes the HSET.
+			await waitFor(async () => {
+				const l = await trackerB.list('canvas');
+				return l.some((e) => e.user && e.user.id === 'alice');
+			});
 			const list = await trackerB.list('canvas');
 			const aliceEntry = list.find((e) => e.user && e.user.id === 'alice');
 			expect(aliceEntry).toBeDefined();
@@ -357,17 +369,22 @@ describe('redis cursor (integration)', () => {
 			trackerA.update(wsA, 'canvas', { x: 42 }, platformA);
 
 			await waitFor(() => platformB.published.some(
-				(p) => p.event === 'update' && p.data?.user?.id === 'alice'
+				(p) => p.event === 'join' && p.data?.user?.id === 'alice'
 			));
 
-			const onB = platformB.published.find(
-				(p) => p.event === 'update' && p.data?.user?.id === 'alice'
+			const joinOnB = platformB.published.find(
+				(p) => p.event === 'join' && p.data?.user?.id === 'alice'
 			);
-			expect(onB.topic).toBe('__cursor:canvas');
-			expect(onB.data.data).toEqual({ x: 42 });
+			expect(joinOnB.topic).toBe('__cursor:canvas');
+
+			const updateOnB = platformB.published.find(
+				(p) => p.event === 'update' && p.data?.key === joinOnB.data.key
+			);
+			expect(updateOnB).toBeDefined();
+			expect(updateOnB.data.data).toEqual({ x: 42 });
 		});
 
-		it('attach sends a bulk snapshot reflecting cross-instance state', async () => {
+		it('attach sends catalog + bulk reflecting cross-instance state', async () => {
 			const platformA = mockPlatform();
 			const platformB = mockPlatform();
 			const trackerA = track(createCursor(client, {
@@ -386,13 +403,16 @@ describe('redis cursor (integration)', () => {
 			const wsB = mockWs({ id: 'bob' });
 			await trackerB.attach(wsB, 'canvas', platformB);
 
-			const bulk = platformB.sent.find((s) => s.ws === wsB && s.topic === '__cursor:canvas');
+			const sentToB = platformB.sent.filter((s) => s.ws === wsB && s.topic === '__cursor:canvas');
+			const catalog = sentToB.find((s) => s.event === 'catalog');
+			const bulk = sentToB.find((s) => s.event === 'bulk');
+			expect(catalog).toBeDefined();
+			expect(catalog.data.some((e) => e.user?.id === 'alice')).toBe(true);
 			expect(bulk).toBeDefined();
-			expect(bulk.event).toBe('bulk');
-			expect(bulk.data.some((e) => e.user?.id === 'alice' && e.data?.x === 42)).toBe(true);
+			expect(bulk.data.some((e) => e.data?.x === 42)).toBe(true);
 		});
 
-		it('subscriber backfill: bulk event surfaces existing remote entries on first update', async () => {
+		it('subscriber backfill: catalog + bulk surface existing remote entries on first update', async () => {
 			// Pre-seed a remote entry directly into the hash from a
 			// separate connection.
 			const remoteKey = 'remote-instance:1';
@@ -405,24 +425,38 @@ describe('redis cursor (integration)', () => {
 			c.update(ws, 'canvas', { x: 10 }, platform);
 
 			await waitFor(() => platform.published.some(
-				(p) => p.event === 'bulk' && p.options && p.options.relay === false
+				(p) => p.event === 'catalog' && p.options && p.options.relay === false
 			));
 
+			const catalog = platform.published.find(
+				(p) => p.event === 'catalog' && p.options && p.options.relay === false
+			);
 			const bulk = platform.published.find(
 				(p) => p.event === 'bulk' && p.options && p.options.relay === false
 			);
-			const remote = bulk.data.find((e) => e.key === remoteKey);
-			expect(remote).toBeDefined();
-			expect(remote.data).toEqual({ x: 77 });
+			const catalogEntry = catalog.data.find((e) => e.key === remoteKey);
+			expect(catalogEntry).toBeDefined();
+			expect(catalogEntry.user).toEqual({ id: '2' });
+			const bulkEntry = bulk.data.find((e) => e.key === remoteKey);
+			expect(bulkEntry).toBeDefined();
+			expect(bulkEntry.data).toEqual({ x: 77 });
 		});
 	});
 
 	describe('list() filters stale entries by ts vs ttl', () => {
 		it('skips an entry whose ts is older than the configured ttl window', async () => {
-			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0, ttl: 5 }));
+			// snapshotIntervalMs: 0 forces inline HSET so the hash entry is
+			// present synchronously and we can overwrite its `ts` before
+			// the test reads it back.
+			const c = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, ttl: 5
+			}));
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
-			await waitFor(async () => (await c.list('canvas')).length === 1);
+			await waitFor(async () => {
+				const all = await client.redis.hgetall(client.key('cursor:canvas'));
+				return Object.keys(all).length === 1;
+			});
 
 			// Manually overwrite the ts to be older than the ttl window
 			// without touching the hash key TTL itself.

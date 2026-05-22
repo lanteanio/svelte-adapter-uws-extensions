@@ -16,7 +16,7 @@ describe('redis cursor', () => {
 		platform = mockPlatform();
 		cursors = createCursor(client, {
 			throttle: 100,
-			topicThrottle: 0,
+			topicThrottle: 0, snapshotIntervalMs: 0,
 			select: (userData) => ({ id: userData.id, name: userData.name })
 		});
 	});
@@ -60,11 +60,96 @@ describe('redis cursor', () => {
 			expect(() => createCursor(client, { ttl: -1 })).toThrow('ttl must be a positive');
 			expect(() => createCursor(client, { ttl: 'bad' })).toThrow('ttl must be a positive');
 		});
+
+		it('throws on invalid snapshotIntervalMs', () => {
+			expect(() => createCursor(client, { snapshotIntervalMs: -1 })).toThrow('non-negative');
+			expect(() => createCursor(client, { snapshotIntervalMs: 'bad' })).toThrow('non-negative');
+		});
+	});
+
+	describe('coalesced snapshot writes', () => {
+		it('snapshotIntervalMs > 0 batches HSET writes across multiple updates', async () => {
+			vi.useFakeTimers();
+			const hsetCalls = [];
+			const origHset = client.redis.hset;
+			client.redis.hset = (...args) => {
+				hsetCalls.push(args);
+				return origHset.apply(client.redis, args);
+			};
+
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				snapshotIntervalMs: 100
+			});
+			const ws1 = mockWs({ id: '1' });
+			const ws2 = mockWs({ id: '2' });
+
+			c.update(ws1, 'canvas', { x: 1 }, platform);
+			c.update(ws2, 'canvas', { x: 2 }, platform);
+			c.update(ws1, 'canvas', { x: 11 }, platform);
+			c.update(ws1, 'canvas', { x: 12 }, platform);
+
+			// Before the snapshot timer fires, no HSETs landed.
+			expect(hsetCalls).toHaveLength(0);
+
+			// One tick later: one HSET call per topic, carrying both keys
+			// and the LATEST value per key.
+			vi.advanceTimersByTime(100);
+			await vi.runOnlyPendingTimersAsync();
+
+			expect(hsetCalls).toHaveLength(1);
+			const [key, ...fields] = hsetCalls[0];
+			expect(key).toBe('test:cursor:canvas');
+			// fields are flat [f1, v1, f2, v2]
+			const parsed = {};
+			for (let i = 0; i < fields.length; i += 2) {
+				parsed[fields[i]] = JSON.parse(fields[i + 1]);
+			}
+			const values = Object.values(parsed);
+			expect(values).toHaveLength(2);
+			const ws1Entry = values.find((v) => v.data.x === 12);
+			const ws2Entry = values.find((v) => v.data.x === 2);
+			expect(ws1Entry).toBeDefined();
+			expect(ws2Entry).toBeDefined();
+
+			client.redis.hset = origHset;
+			c.destroy();
+		});
+
+		it('snapshotIntervalMs > 0: hdel on remove drops the pending entry', async () => {
+			vi.useFakeTimers();
+			const hsetCalls = [];
+			const origHset = client.redis.hset;
+			client.redis.hset = (...args) => {
+				hsetCalls.push(args);
+				return origHset.apply(client.redis, args);
+			};
+
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				snapshotIntervalMs: 100
+			});
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			await c.remove(ws, platform);
+
+			// Snapshot tick should not resurrect the removed cursor.
+			vi.advanceTimersByTime(100);
+			await vi.runOnlyPendingTimersAsync();
+
+			expect(hsetCalls).toHaveLength(0);
+
+			client.redis.hset = origHset;
+			c.destroy();
+		});
 	});
 
 	describe('default select recursive stripping', () => {
 		it('strips nested __-prefixed keys', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', profile: { name: 'Alice', __token: 'x' } });
 			c.update(ws, 'doc', { x: 1 }, platform);
 
@@ -74,7 +159,7 @@ describe('redis cursor', () => {
 		});
 
 		it('handles circular references without crashing', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const userData = { id: '1', name: 'Alice' };
 			userData.self = userData;
 			const ws = mockWs(userData);
@@ -86,7 +171,7 @@ describe('redis cursor', () => {
 		});
 
 		it('strips sensitive-regex keys like password and token', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', password: 'secret', sessionToken: 'xyz' });
 			c.update(ws, 'doc', { x: 1 }, platform);
 
@@ -101,7 +186,7 @@ describe('redis cursor', () => {
 		it('strips nested sensitive keys even when select is identity', () => {
 			const c = createCursor(client, {
 				throttle: 0,
-				topicThrottle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
 				select: /** @type {any} */ ((ud) => ud)
 			});
 			const ws = mockWs({
@@ -120,7 +205,7 @@ describe('redis cursor', () => {
 		it('strips nested __-prefixed keys even when select picks the parent', () => {
 			const c = createCursor(client, {
 				throttle: 0,
-				topicThrottle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
 				select: (ud) => ({ id: ud.id, meta: ud.meta })
 			});
 			const ws = mockWs({
@@ -137,7 +222,7 @@ describe('redis cursor', () => {
 		it('strips constructor / prototype keys returned by a select that re-injects them', () => {
 			const c = createCursor(client, {
 				throttle: 0,
-				topicThrottle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
 				select: (ud) => ({ id: ud.id, constructor: 'forged', prototype: 'forged' })
 			});
 			const ws = mockWs({ id: '1' });
@@ -152,7 +237,7 @@ describe('redis cursor', () => {
 
 	describe('userData sanitization', () => {
 		it('strips __subscriptions and remoteAddress from userData', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({
 				id: '1',
 				name: 'Alice',
@@ -169,8 +254,8 @@ describe('redis cursor', () => {
 	});
 
 	describe('snapshot', () => {
-		it('sends current cursors as a bulk event to a single connection', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
+		it('sends current cursors as catalog + bulk events to a single connection', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
 			const ws1 = mockWs({ id: '1' });
 			const ws2 = mockWs({ id: '2' });
 
@@ -181,15 +266,20 @@ describe('redis cursor', () => {
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'canvas', platform);
 
-			expect(platform.sent).toHaveLength(1);
-			expect(platform.sent[0].topic).toBe('__cursor:canvas');
-			expect(platform.sent[0].event).toBe('bulk');
-			expect(platform.sent[0].data).toHaveLength(2);
+			expect(platform.sent).toHaveLength(2);
+			const catalog = platform.sent.find((s) => s.event === 'catalog');
+			const bulk = platform.sent.find((s) => s.event === 'bulk');
+			expect(catalog.topic).toBe('__cursor:canvas');
+			expect(catalog.data).toHaveLength(2);
+			expect(catalog.data.every((e) => e.user && !('data' in e))).toBe(true);
+			expect(bulk.topic).toBe('__cursor:canvas');
+			expect(bulk.data).toHaveLength(2);
+			expect(bulk.data.every((e) => 'data' in e && !('user' in e))).toBe(true);
 			c.destroy();
 		});
 
-		it('does not send bulk when no cursors exist', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+		it('does not send catalog/bulk when no cursors exist', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'empty-topic', platform);
 
@@ -207,7 +297,7 @@ describe('redis cursor', () => {
 		});
 
 		it('attach calls snapshot so the new connection sees existing cursors', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
 			const mover = mockWs({ id: 'mover' });
 			c.update(mover, 'canvas', { x: 10 }, platform);
 			platform.reset();
@@ -215,14 +305,19 @@ describe('redis cursor', () => {
 			const joiner = mockWs({ id: 'joiner' });
 			await c.attach(joiner, 'canvas', platform);
 
-			const bulkToJoiner = platform.sent.find((s) => s.ws === joiner && s.topic === '__cursor:canvas');
-			expect(bulkToJoiner).toBeDefined();
-			expect(bulkToJoiner.event).toBe('bulk');
-			expect(bulkToJoiner.data).toHaveLength(1);
+			const sentToJoiner = platform.sent.filter((s) => s.ws === joiner && s.topic === '__cursor:canvas');
+			const catalog = sentToJoiner.find((s) => s.event === 'catalog');
+			const bulk = sentToJoiner.find((s) => s.event === 'bulk');
+			expect(catalog).toBeDefined();
+			expect(catalog.data).toHaveLength(1);
+			expect(catalog.data[0].user).toEqual({ id: 'mover' });
+			expect(bulk).toBeDefined();
+			expect(bulk.data).toHaveLength(1);
+			expect(bulk.data[0].data).toEqual({ x: 10 });
 			c.destroy();
 		});
 
-		it('attach with no existing cursors does not send a bulk frame', async () => {
+		it('attach with no existing cursors does not send catalog or bulk', async () => {
 			const ws = mockWs({ id: '1' });
 			await cursors.attach(ws, 'empty-canvas', platform);
 
@@ -236,7 +331,7 @@ describe('redis cursor', () => {
 			// publish path treats the attached ws as a deliverable target.
 			// Mock platform records subscribes and publishes; routing is
 			// asserted via the integration test.
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const watcher = mockWs({ id: 'watcher' });
 			const mover = mockWs({ id: 'mover' });
 
@@ -281,7 +376,7 @@ describe('redis cursor', () => {
 		});
 
 		it('hooks.message dispatches cursor updates', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.hooks.message(ws, {
@@ -289,13 +384,14 @@ describe('redis cursor', () => {
 				platform
 			});
 
-			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].data.data).toEqual({ x: 42 });
+			const updates = platform.published.filter((p) => p.event === 'update');
+			expect(updates).toHaveLength(1);
+			expect(updates[0].data.data).toEqual({ x: 42 });
 			c.destroy();
 		});
 
 		it('hooks.message ignores non-cursor messages', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.hooks.message(ws, { data: { type: 'chat', text: 'hi' }, platform });
@@ -304,7 +400,7 @@ describe('redis cursor', () => {
 		});
 
 		it('hooks.close removes all cursor state', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -319,42 +415,79 @@ describe('redis cursor', () => {
 	});
 
 	describe('update - basic', () => {
-		it('first update broadcasts immediately without relay: false', () => {
+		it('first update emits join + update; neither carries relay: false', () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			cursors.update(ws, 'canvas', { x: 10, y: 20 }, platform);
 
-			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].topic).toBe('__cursor:canvas');
-			expect(platform.published[0].event).toBe('update');
-			expect(platform.published[0].data).toEqual({
+			expect(platform.published).toHaveLength(2);
+			const join = platform.published.find((p) => p.event === 'join');
+			const update = platform.published.find((p) => p.event === 'update');
+			expect(join.topic).toBe('__cursor:canvas');
+			expect(join.data).toEqual({
 				key: expect.any(String),
-				user: { id: '1', name: 'Alice' },
+				user: { id: '1', name: 'Alice' }
+			});
+			expect(update.topic).toBe('__cursor:canvas');
+			expect(update.data).toEqual({
+				key: expect.any(String),
 				data: { x: 10, y: 20 }
 			});
 			// User-initiated broadcasts should relay to sibling workers
-			expect(platform.published[0].options).toBeUndefined();
+			expect(join.options).toBeUndefined();
+			expect(update.options).toBeUndefined();
 		});
 
-		it('uses select to extract user info', () => {
+		it('uses select to extract user info on join', () => {
 			const c = createCursor(client, {
 				throttle: 0,
-				topicThrottle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
 				select: (ud) => ({ id: ud.id })
 			});
 			const ws = mockWs({ id: '1', name: 'Alice', secret: 'token' });
 			c.update(ws, 'room', { x: 0, y: 0 }, platform);
 
-			expect(platform.published[0].data.user).toEqual({ id: '1' });
-			expect(platform.published[0].data.user.secret).toBeUndefined();
+			const join = platform.published.find((p) => p.event === 'join');
+			expect(join.data.user).toEqual({ id: '1' });
+			expect(join.data.user.secret).toBeUndefined();
 			c.destroy();
 		});
 
-		it('without select, broadcasts full userData', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+		it('without select, broadcasts full userData on join', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', role: 'admin' });
 			c.update(ws, 'room', { x: 5, y: 5 }, platform);
 
-			expect(platform.published[0].data.user).toEqual({ id: '1', role: 'admin' });
+			const join = platform.published.find((p) => p.event === 'join');
+			expect(join.data.user).toEqual({ id: '1', role: 'admin' });
+			c.destroy();
+		});
+
+		it('subsequent updates on the same topic do not re-emit join', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			c.update(ws, 'canvas', { x: 2 }, platform);
+			c.update(ws, 'canvas', { x: 3 }, platform);
+
+			const joins = platform.published.filter((p) => p.event === 'join');
+			expect(joins).toHaveLength(1);
+			c.destroy();
+		});
+
+		it('emits a separate join per topic the same ws appears on', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas-a', { x: 1 }, platform);
+			c.update(ws, 'canvas-b', { x: 2 }, platform);
+
+			const joins = platform.published.filter((p) => p.event === 'join');
+			expect(joins).toHaveLength(2);
+			expect(joins.map((j) => j.topic).sort()).toEqual([
+				'__cursor:canvas-a',
+				'__cursor:canvas-b'
+			]);
 			c.destroy();
 		});
 	});
@@ -365,7 +498,7 @@ describe('redis cursor', () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			cursors.update(ws, 'canvas', { x: 0, y: 0 }, platform);
-			expect(platform.published).toHaveLength(1);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(1);
 			platform.reset();
 
 			vi.advanceTimersByTime(50);
@@ -414,33 +547,36 @@ describe('redis cursor', () => {
 
 			vi.advanceTimersByTime(100);
 			cursors.update(ws, 'canvas', { x: 50, y: 50 }, platform);
-			expect(platform.published).toHaveLength(1);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(1);
 		});
 
 		it('throttle: 0 broadcasts every update', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 0, y: 0 }, platform);
 			c.update(ws, 'canvas', { x: 1, y: 1 }, platform);
 			c.update(ws, 'canvas', { x: 2, y: 2 }, platform);
 
-			expect(platform.published).toHaveLength(3);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(3);
 			c.destroy();
 		});
 	});
 
 	describe('update - multiple topics', () => {
 		it('same ws can have cursor state on different topics', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
 			c.update(ws, 'canvas-b', { x: 2 }, platform);
 
-			expect(platform.published).toHaveLength(2);
-			expect(platform.published[0].topic).toBe('__cursor:canvas-a');
-			expect(platform.published[1].topic).toBe('__cursor:canvas-b');
+			const updates = platform.published.filter((p) => p.event === 'update');
+			expect(updates).toHaveLength(2);
+			expect(updates.map((p) => p.topic).sort()).toEqual([
+				'__cursor:canvas-a',
+				'__cursor:canvas-b'
+			]);
 			c.destroy();
 		});
 
@@ -450,7 +586,7 @@ describe('redis cursor', () => {
 
 			cursors.update(ws, 'canvas-a', { x: 0 }, platform);
 			cursors.update(ws, 'canvas-b', { x: 0 }, platform);
-			expect(platform.published).toHaveLength(2);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(2);
 		});
 
 		it('different connections have independent throttle', () => {
@@ -460,13 +596,13 @@ describe('redis cursor', () => {
 
 			cursors.update(ws1, 'canvas', { x: 0 }, platform);
 			cursors.update(ws2, 'canvas', { x: 0 }, platform);
-			expect(platform.published).toHaveLength(2);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(2);
 		});
 	});
 
 	describe('remove', () => {
 		it('removes ws from all topics and broadcasts removal', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -491,7 +627,7 @@ describe('redis cursor', () => {
 		});
 
 		it('cleans up empty topic maps', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -503,7 +639,7 @@ describe('redis cursor', () => {
 		});
 
 		it('stops polling abandoned topics after last cursor leaves', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, ttl: 30 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, ttl: 30 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -549,7 +685,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: removes cursor from only the specified topic', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -573,7 +709,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: ws can still update remaining topics after per-topic remove', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -584,13 +720,14 @@ describe('redis cursor', () => {
 
 			// Should still be able to update canvas-b
 			c.update(ws, 'canvas-b', { x: 3 }, platform);
-			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].data.data).toEqual({ x: 3 });
+			const updates = platform.published.filter((p) => p.event === 'update');
+			expect(updates).toHaveLength(1);
+			expect(updates[0].data.data).toEqual({ x: 3 });
 			c.destroy();
 		});
 
 		it('per-topic: is safe to call for a topic the ws never had', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
@@ -606,7 +743,7 @@ describe('redis cursor', () => {
 		});
 
 		it('per-topic: cleans up wsState when last topic is removed', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -620,7 +757,7 @@ describe('redis cursor', () => {
 		});
 
 		it('removes entry from Redis hash', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -642,7 +779,7 @@ describe('redis cursor', () => {
 		it('returns current cursor positions from Redis', async () => {
 			const c = createCursor(client, {
 				throttle: 0,
-				topicThrottle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
 				select: (ud) => ({ id: ud.id, name: ud.name })
 			});
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
@@ -669,7 +806,7 @@ describe('redis cursor', () => {
 
 	describe('clear', () => {
 		it('resets all local and Redis state', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
@@ -698,11 +835,10 @@ describe('redis cursor', () => {
 	});
 
 	describe('cross-instance relay', () => {
-		it('publishes updates to Redis pub/sub channel', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+		it('relays join + update events on first cursor for a topic', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
-			// Spy on redis.publish
 			const publishCalls = [];
 			const origPublish = client.redis.publish;
 			client.redis.publish = async (ch, msg) => {
@@ -713,16 +849,20 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 10, y: 20 }, platform);
 			await new Promise((r) => setTimeout(r, 0));
 
-			expect(publishCalls).toHaveLength(1);
-			expect(publishCalls[0].channel).toBe('test:cursor:events');
-			expect(publishCalls[0].message.event).toBe('update');
-			expect(publishCalls[0].message.topic).toBe('canvas');
-			expect(publishCalls[0].message.payload.data).toEqual({ x: 10, y: 20 });
+			expect(publishCalls).toHaveLength(2);
+			const join = publishCalls.find((p) => p.message.event === 'join');
+			const update = publishCalls.find((p) => p.message.event === 'update');
+			expect(join.channel).toBe('test:cursor:events');
+			expect(join.message.topic).toBe('canvas');
+			expect(join.message.payload.user).toEqual({ id: '1', name: 'Alice' });
+			expect(update.message.topic).toBe('canvas');
+			expect(update.message.payload.data).toEqual({ x: 10, y: 20 });
+			expect(update.message.payload.user).toBeUndefined();
 			c.destroy();
 		});
 
 		it('publishes remove events to Redis pub/sub channel', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -743,7 +883,7 @@ describe('redis cursor', () => {
 		});
 
 		it('stores cursor data in Redis hash', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 42, y: 99 }, platform);
@@ -759,7 +899,7 @@ describe('redis cursor', () => {
 		});
 
 		it('forwards remote updates to local platform with relay: false', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Trigger subscriber setup
@@ -771,7 +911,7 @@ describe('redis cursor', () => {
 				instanceId: 'remote-instance',
 				topic: 'canvas',
 				event: 'update',
-				payload: { key: 'remote:1', user: { id: '2', name: 'Bob' }, data: { x: 77 } }
+				payload: { key: 'remote:1', data: { x: 77 } }
 			});
 
 			// Publish through Redis (mock forwards to subscriber)
@@ -785,8 +925,31 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
+		it('forwards remote join events to local platform with relay: false', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 0 }, platform);
+			platform.reset();
+
+			const remoteJoin = JSON.stringify({
+				instanceId: 'remote-instance',
+				topic: 'canvas',
+				event: 'join',
+				payload: { key: 'remote:2', user: { id: '2', name: 'Bob' } }
+			});
+			client.redis.publish('test:cursor:events', remoteJoin);
+
+			expect(platform.published).toHaveLength(1);
+			expect(platform.published[0].topic).toBe('__cursor:canvas');
+			expect(platform.published[0].event).toBe('join');
+			expect(platform.published[0].data).toEqual({ key: 'remote:2', user: { id: '2', name: 'Bob' } });
+			expect(platform.published[0].options).toEqual({ relay: false });
+			c.destroy();
+		});
+
 		it('ignores messages from own instance (echo suppression)', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Trigger subscriber setup and get instanceId from a broadcast
@@ -805,8 +968,8 @@ describe('redis cursor', () => {
 	});
 
 	describe('subscriber backfill on startup', () => {
-		it('backfills remote cursor entries after subscriber becomes ready', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
+		it('backfills remote catalog + bulk after subscriber becomes ready', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
 
 			const remoteKey = 'remote-instance:1';
 			const remoteData = JSON.stringify({
@@ -821,29 +984,39 @@ describe('redis cursor', () => {
 
 			await new Promise((r) => setTimeout(r, 20));
 
-			const bulkEvents = platform.published.filter(
+			const catalog = platform.published.find(
+				(p) => p.event === 'catalog' && p.options && p.options.relay === false
+			);
+			const bulk = platform.published.find(
 				(p) => p.event === 'bulk' && p.options && p.options.relay === false
 			);
-			expect(bulkEvents.length).toBeGreaterThanOrEqual(1);
-			const entries = bulkEvents[0].data;
-			const remoteEntry = entries.find((e) => e.key === remoteKey);
-			expect(remoteEntry).toBeDefined();
-			expect(remoteEntry.data).toEqual({ x: 77 });
+			expect(catalog).toBeDefined();
+			expect(bulk).toBeDefined();
+			const catalogEntry = catalog.data.find((e) => e.key === remoteKey);
+			expect(catalogEntry).toBeDefined();
+			expect(catalogEntry.user).toEqual({ id: '2' });
+			const bulkEntry = bulk.data.find((e) => e.key === remoteKey);
+			expect(bulkEntry).toBeDefined();
+			expect(bulkEntry.data).toEqual({ x: 77 });
 
 			c.destroy();
 		});
 
 		it('does not backfill entries from the local instance', async () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 10 }, platform);
 			await new Promise((r) => setTimeout(r, 20));
 
-			const bulkEvents = platform.published.filter(
+			const reconcileBulk = platform.published.filter(
 				(p) => p.event === 'bulk' && p.options && p.options.relay === false
 			);
-			expect(bulkEvents).toHaveLength(0);
+			const reconcileCatalog = platform.published.filter(
+				(p) => p.event === 'catalog' && p.options && p.options.relay === false
+			);
+			expect(reconcileBulk).toHaveLength(0);
+			expect(reconcileCatalog).toHaveLength(0);
 
 			c.destroy();
 		});
@@ -868,7 +1041,7 @@ describe('redis cursor', () => {
 				return dup;
 			};
 
-			const c = createCursor(failClient, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(failClient, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// First update triggers ensureSubscriber which will fail async
@@ -900,7 +1073,7 @@ describe('redis cursor', () => {
 
 	describe('platform update', () => {
 		it('uses the latest platform for remote event forwarding', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const platform1 = mockPlatform();
 			const platform2 = mockPlatform();
 
@@ -954,7 +1127,7 @@ describe('redis cursor', () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, {
 				throttle: 0, // no per-connection throttle
-				topicThrottle: 100 // max 10 broadcasts/sec per topic
+				topicThrottle: 100, snapshotIntervalMs: 0 // max 10 broadcasts/sec per topic
 			});
 
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
@@ -963,18 +1136,20 @@ describe('redis cursor', () => {
 
 			// First update broadcasts immediately (leading edge, single entry = normal update)
 			c.update(ws1, 'canvas', { x: 1 }, platform);
-			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].event).toBe('update');
+			const positionsAfterFirst = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positionsAfterFirst).toHaveLength(1);
+			expect(positionsAfterFirst[0].event).toBe('update');
 
 			// Second and third updates within the window are coalesced
 			c.update(ws2, 'canvas', { x: 2 }, platform);
 			c.update(ws3, 'canvas', { x: 3 }, platform);
-			expect(platform.published).toHaveLength(1);
+			expect(platform.published.filter((p) => p.event === 'update' || p.event === 'bulk')).toHaveLength(1);
 
 			// After the window passes, trailing edge flushes as a single bulk event
 			vi.advanceTimersByTime(100);
-			expect(platform.published).toHaveLength(2); // 1 update + 1 bulk
-			const bulk = platform.published[1];
+			const positions = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positions).toHaveLength(2); // 1 update + 1 bulk
+			const bulk = positions[1];
 			expect(bulk.event).toBe('bulk');
 			expect(bulk.data).toHaveLength(2);
 			expect(bulk.data.map((e) => e.data.x).sort()).toEqual([2, 3]);
@@ -984,7 +1159,7 @@ describe('redis cursor', () => {
 
 		it('single coalesced entry uses normal update event, not bulk', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
@@ -1004,7 +1179,7 @@ describe('redis cursor', () => {
 
 		it('topicThrottle sends latest data per key in bulk', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
@@ -1018,8 +1193,9 @@ describe('redis cursor', () => {
 			c.update(ws2, 'canvas', { x: 50 }, platform);
 
 			vi.advanceTimersByTime(100);
-			expect(platform.published).toHaveLength(1);
-			const bulk = platform.published[0];
+			const positions = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positions).toHaveLength(1);
+			const bulk = positions[0];
 			expect(bulk.event).toBe('bulk');
 			expect(bulk.data).toHaveLength(2);
 
@@ -1032,7 +1208,7 @@ describe('redis cursor', () => {
 		});
 
 		it('topicThrottle: 0 disables aggregate throttle', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
@@ -1041,14 +1217,14 @@ describe('redis cursor', () => {
 			c.update(ws2, 'canvas', { x: 2 }, platform);
 
 			// Both should broadcast immediately (no aggregate throttle)
-			expect(platform.published).toHaveLength(2);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(2);
 
 			c.destroy();
 		});
 
 		it('different topics have independent budgets', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
@@ -1056,14 +1232,14 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas-a', { x: 1 }, platform);
 			c.update(ws, 'canvas-b', { x: 2 }, platform);
 
-			expect(platform.published).toHaveLength(2);
+			expect(platform.published.filter((p) => p.event === 'update')).toHaveLength(2);
 
 			c.destroy();
 		});
 
 		it('topicThrottle timers are cleaned up on destroy', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 100 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			c.update(ws, 'canvas', { x: 0 }, platform);
@@ -1080,7 +1256,7 @@ describe('redis cursor', () => {
 	describe('remove suppresses local broadcast when Redis fails', () => {
 		it('per-topic remove does not publish locally when hdel fails', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -1106,7 +1282,7 @@ describe('redis cursor', () => {
 
 		it('remove-all does not publish locally when pipeline fails', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -1140,7 +1316,7 @@ describe('redis cursor', () => {
 
 		it('per-topic remove publishes locally when hdel succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'doc', { x: 10 }, platform);
@@ -1162,7 +1338,7 @@ describe('redis cursor', () => {
 		it('warns about sensitive keys nested inside arrays', () => {
 			vi.useRealTimers();
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, select: (ud) => ud });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ud });
 
 			const ws = mockWs({ id: '1', profiles: [{ authToken: 'secret' }] });
 			c.update(ws, 'doc', { x: 1 }, platform);
@@ -1177,12 +1353,16 @@ describe('redis cursor', () => {
 	});
 
 	describe('write-after-broadcast consistency', () => {
-		it('does not relay cross-instance when Redis pipeline fails', async () => {
+		it('relay is decoupled from HSET success: cursor wire propagates even on pipeline failure', async () => {
+			// The cross-replica relay carries the position payload; new joiners
+			// rely on the Redis hash. The relay is best-effort and decoupled
+			// from HSET because cursors are ephemeral - the next 16ms tick will
+			// retry the HSET. The breaker handles sustained Redis failure;
+			// single transient failures should not stall the wire.
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
-			// Track relay publishes
 			const relayMessages = [];
 			const origPublish = client.redis.publish;
 			client.redis.publish = async (ch, msg) => {
@@ -1190,7 +1370,6 @@ describe('redis cursor', () => {
 				return origPublish.call(client.redis, ch, msg);
 			};
 
-			// Make pipeline fail
 			const origPipeline = client.redis.pipeline;
 			client.redis.pipeline = () => {
 				return new Proxy({}, {
@@ -1209,15 +1388,14 @@ describe('redis cursor', () => {
 
 			c.update(ws, 'canvas', { x: 10, y: 20 }, platform);
 
-			// Local broadcast should still happen
-			expect(platform.published).toHaveLength(1);
-			expect(platform.published[0].data.data).toEqual({ x: 10, y: 20 });
+			expect(platform.published.find((p) => p.event === 'update').data.data).toEqual({ x: 10, y: 20 });
 
-			// Wait for async pipeline to settle
 			await new Promise((r) => setTimeout(r, 50));
 
-			// No relay should have been sent since pipeline failed
-			expect(relayMessages).toHaveLength(0);
+			// Relay fires unconditionally; HSET failure is tracked by the breaker.
+			const updateRelay = relayMessages.find((m) => m.event === 'update');
+			expect(updateRelay).toBeDefined();
+			expect(updateRelay.payload.data).toEqual({ x: 10, y: 20 });
 
 			client.redis.pipeline = origPipeline;
 			client.redis.publish = origPublish;
@@ -1226,7 +1404,7 @@ describe('redis cursor', () => {
 
 		it('relays cross-instance when Redis pipeline succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			const relayMessages = [];
@@ -1252,7 +1430,7 @@ describe('redis cursor', () => {
 
 		it('list() returns empty when pipeline failed but local broadcast happened', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			// Make pipeline fail so data never reaches Redis
@@ -1275,12 +1453,14 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 10 }, platform);
 
 			// Local broadcast happened
-			expect(platform.published).toHaveLength(1);
+			expect(platform.published.find((p) => p.event === 'update')).toBeDefined();
 
 			// Wait for pipeline to settle
 			await new Promise((r) => setTimeout(r, 50));
 
-			// list() reads from Redis, which was never written
+			// list() reads from Redis, which was never written. With
+			// snapshotIntervalMs=0 the inline pipeline failed and there
+			// is no pending state, so list() is empty.
 			client.redis.pipeline = origPipeline;
 			const list = await c.list('canvas');
 			expect(list).toEqual([]);
@@ -1290,7 +1470,7 @@ describe('redis cursor', () => {
 
 		it('list() returns data when pipeline succeeds', async () => {
 			vi.useRealTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0 });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
 
 			c.update(ws, 'canvas', { x: 42 }, platform);
@@ -1298,6 +1478,30 @@ describe('redis cursor', () => {
 			// Wait for pipeline to complete
 			await new Promise((r) => setTimeout(r, 50));
 
+			const list = await c.list('canvas');
+			expect(list).toHaveLength(1);
+			expect(list[0].data).toEqual({ x: 42 });
+
+			c.destroy();
+		});
+
+		it('list() surfaces pending entries before the snapshot timer flushes them', async () => {
+			vi.useRealTimers();
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0,
+				snapshotIntervalMs: 10_000 // long enough that the test never sees a tick
+			});
+			const ws = mockWs({ id: '1', name: 'Alice' });
+
+			c.update(ws, 'canvas', { x: 42 }, platform);
+
+			// Hash is still empty (snapshot timer has not fired yet).
+			const all = await client.redis.hgetall('test:cursor:canvas');
+			expect(Object.keys(all)).toHaveLength(0);
+
+			// But list() surfaces the pending entry so local readers see the
+			// just-broadcast cursor instead of stale-empty state.
 			const list = await c.list('canvas');
 			expect(list).toHaveLength(1);
 			expect(list[0].data).toEqual({ x: 42 });
@@ -1312,7 +1516,7 @@ describe('redis cursor', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, breaker });
 			const ws = mockWs({ id: '1' });
 
 			const hsetCalls = [];
@@ -1324,8 +1528,9 @@ describe('redis cursor', () => {
 
 			c.update(ws, 'canvas', { x: 1 }, platform);
 
-			// Local broadcast still happens
-			expect(platform.published).toHaveLength(1);
+			// Local broadcast still happens (join + update)
+			expect(platform.published.find((p) => p.event === 'join')).toBeDefined();
+			expect(platform.published.find((p) => p.event === 'update')).toBeDefined();
 
 			// Redis was not touched
 			expect(hsetCalls).toHaveLength(0);
@@ -1339,7 +1544,7 @@ describe('redis cursor', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, breaker });
 			await expect(c.list('canvas')).rejects.toThrow(CircuitBrokenError);
 
 			c.destroy();
@@ -1349,7 +1554,7 @@ describe('redis cursor', () => {
 		it('remove does not publish locally when breaker is broken', async () => {
 			vi.useRealTimers();
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, breaker });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, breaker });
 			const ws = mockWs({ id: '1' });
 
 			c.update(ws, 'canvas', { x: 1 }, platform);

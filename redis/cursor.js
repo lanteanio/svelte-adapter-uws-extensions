@@ -6,9 +6,27 @@
  * leading/trailing edge logic as the core), then relays broadcasts through
  * Redis pub/sub so subscribers on other instances see cursor updates.
  *
+ * Wire shape (channel `__cursor:{topic}`):
+ *   - `catalog`  [{key, user}, ...]   - sent on attach + on subscriber-startup
+ *                                       reconcile. Roster of users on this topic.
+ *   - `join`     {key, user}          - emitted once per (ws, topic) the first time
+ *                                       that ws updates on the topic. Cross-replica.
+ *   - `update`   {key, data}          - single-mover position update.
+ *   - `bulk`     [{key, data}, ...]   - coalesced multi-mover positions.
+ *   - `remove`   {key}                - user is gone (catalog + positions cleared).
+ *
+ * Separating user metadata (catalog) from per-frame positions cuts the per-flush
+ * wire payload from ~100 bytes per cursor to ~16 bytes per cursor, and cuts the
+ * Redis pub/sub relay envelope by the same factor. Catalog churn is O(joins +
+ * leaves), not O(active-cursor count x rate).
+ *
  * Storage layout:
- *   - Hash `{prefix}cursor:{topic}` - field = connectionKey, value = JSON { user, data }
- *   - Channel `{prefix}cursor:events` - pub/sub for update/remove relay
+ *   - Hash `{prefix}cursor:{topic}` - field = connectionKey, value = JSON
+ *     `{user, data, ts}`. Writes are coalesced onto a `snapshotIntervalMs`
+ *     timer; the broadcast path does not write to Redis directly. New joiners
+ *     reading the hash see at most `snapshotIntervalMs`-stale data, which is
+ *     fine for cursor reconcile.
+ *   - Channel `{prefix}cursor:events` - pub/sub for join/update/bulk/remove relay.
  *
  * Hash entries expire via TTL so stale cursors from crashed instances
  * get cleaned up automatically.
@@ -25,6 +43,8 @@ import { createBusValidator } from '../shared/bus-validate.js';
 
 /** Wire-protocol event names this module emits. */
 const EVENTS = Object.freeze({
+	CATALOG: 'catalog',
+	JOIN: 'join',
 	UPDATE: 'update',
 	REMOVE: 'remove',
 	BULK: 'bulk'
@@ -43,10 +63,16 @@ const EVENTS = Object.freeze({
  *   times per-mover rate. Default 16 (60Hz) suits typical small-to-medium
  *   rooms; raise to 33 (30Hz) for high-density rooms where wire bytes matter.
  *   0 disables the tick; per-cursor `throttle` then governs broadcast rate.
+ * @property {number} [snapshotIntervalMs=100] - How often to flush coalesced
+ *   cursor positions to Redis HSET. The wire/relay path runs on the per-flush
+ *   cadence (above) and does not wait for HSET; this timer only governs the
+ *   Redis snapshot used for new-joiner reconcile and cross-instance startup
+ *   reconcile. 100ms staleness on the reconcile path is fine for cursors.
+ *   0 disables coalescing and reverts to per-flush HSET (legacy behavior).
  * @property {(userData: any) => any} [select] - Extract user-identifying data from userData.
  *   Defaults to the full userData.
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
- *   the expected gap between updates. Entries are refreshed on every broadcast.
+ *   the expected gap between updates. Entries are refreshed on every snapshot tick.
  */
 
 /**
@@ -58,17 +84,8 @@ const EVENTS = Object.freeze({
 
 /**
  * @typedef {Object} RedisCursorTracker
- * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} attach -
- *   Opt this connection into receiving cursor updates for `topic`. Subscribes
- *   the connection to the internal `__cursor:` channel via the platform-trust
- *   path (which intentionally bypasses the adapter's wire-level `__`-prefix
- *   gate) and sends the current cursor state. Mirrors `presence.join` and the
- *   pubsub bus's `bus.hooks.open` - the extension owns server-side subscriber-
- *   set membership for the topics it publishes to.
- * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => void} detach -
- *   Stop this connection from receiving cursor updates for `topic`. Safe to
- *   call on a closed connection (uWS releases automatically on disconnect, so
- *   detach is only needed when a still-connected user leaves a room).
+ * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} attach
+ * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => void} detach
  * @property {(ws: any, topic: string, data: any, platform: import('svelte-adapter-uws').Platform) => void} update
  * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} remove
  * @property {(topic: string) => Promise<CursorEntry[]>} list
@@ -86,6 +103,7 @@ const EVENTS = Object.freeze({
 export function createCursor(client, options = {}) {
 	const throttleMs = options.throttle ?? 16;
 	const topicThrottleMs = options.topicThrottle ?? 16;
+	const snapshotIntervalMs = options.snapshotIntervalMs ?? 100;
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis cursor: select must be a function');
 	}
@@ -98,6 +116,9 @@ export function createCursor(client, options = {}) {
 	if (typeof topicThrottleMs !== 'number' || !Number.isFinite(topicThrottleMs) || topicThrottleMs < 0) {
 		throw new Error('redis cursor: topicThrottle must be a non-negative number');
 	}
+	if (typeof snapshotIntervalMs !== 'number' || !Number.isFinite(snapshotIntervalMs) || snapshotIntervalMs < 0) {
+		throw new Error('redis cursor: snapshotIntervalMs must be a non-negative number');
+	}
 	if (typeof cursorTtl !== 'number' || !Number.isFinite(cursorTtl) || cursorTtl < 1) {
 		throw new Error('redis cursor: ttl must be a positive number (seconds)');
 	}
@@ -108,9 +129,6 @@ export function createCursor(client, options = {}) {
 
 	const validator = createBusValidator({
 		maxBytes: options.maxEnvelopeBytes,
-		// `__cursor:` is constructed by this module, not from the wire,
-		// so the inbound `parsed.topic` we validate is the inner topic
-		// (`mouse:roomA`, etc.) which must NOT itself be `__`-prefixed.
 		allowSystemTopics: false,
 		allowedSystemTopics: []
 	});
@@ -126,9 +144,6 @@ export function createCursor(client, options = {}) {
 
 	let connCounter = 0;
 
-	/**
-	 * Extract safe user data, stripping internal adapter keys (__subscriptions, remoteAddress).
-	 */
 	function safeUserData(ws) {
 		const raw = typeof ws.getUserData === 'function' ? ws.getUserData() : {};
 		if (!raw || typeof raw !== 'object') return {};
@@ -137,18 +152,30 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Per-ws state: their key and which topics they have cursor state on.
+	 * Per-ws state: connection key, selected user data, and which topics this ws
+	 * has already announced (`join` emitted). `topics` doubles as the
+	 * already-announced set - presence in the set means a join has fired.
 	 * @type {Map<any, { key: string, user: any, topics: Set<string> }>}
 	 */
 	const wsState = new Map();
 
 	/**
-	 * Per-topic cursor positions (local throttle state).
+	 * Per-topic local cursor state. Drives the per-(ws,topic) throttle and the
+	 * post-disconnect timer cleanup. The Redis snapshot is the cross-replica
+	 * source of truth; this map is the local-replica cache.
 	 * @type {Map<string, Map<string, { user: any, data: any, lastBroadcast: number, timer: any }>>}
 	 */
 	const topics = new Map();
 
-	// Redis subscriber for cross-instance relay
+	/**
+	 * Coalesced HSET writes. Latest-wins per (topic, key). Drained on the
+	 * `snapshotIntervalMs` timer into a single `pipe.hset(topic, f1, v1, ...)`
+	 * per topic per tick. The broadcast/relay path queues entries here but
+	 * does not await the write.
+	 * @type {Map<string, Map<string, { user: any, data: any, ts: number }>>}
+	 */
+	let redisPending = new Map();
+
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
@@ -185,35 +212,34 @@ export function createCursor(client, options = {}) {
 		});
 		subscriberReady = sub.subscribe(channel).then(async () => {
 			if (!activePlatform || activeTopics.size === 0) return;
-			// One pipelined round-trip for every active topic's snapshot
-			// instead of one independent hgetall per topic. Faster when
-			// ioredis auto-pipelining is off (the default) and roughly
-			// neutral when on.
-			const topics = [...activeTopics];
+			const topicList = [...activeTopics];
 			const pipe = redis.pipeline();
-			for (const topic of topics) pipe.hgetall(hashKey(topic));
+			for (const topic of topicList) pipe.hgetall(hashKey(topic));
 			let results;
 			try {
 				results = await pipe.exec();
 			} catch { return; }
 			if (!activePlatform) return;
 			const now = Date.now();
-			for (let i = 0; i < topics.length; i++) {
+			for (let i = 0; i < topicList.length; i++) {
 				const [, all] = results[i];
 				if (!all) continue;
-				const topic = topics[i];
-				const entries = [];
+				const topic = topicList[i];
+				const catalogEntries = [];
+				const positionEntries = [];
 				for (const key of Object.keys(all)) {
 					if (key.startsWith(instanceId + ':')) continue;
 					try {
 						const parsed = JSON.parse(all[key]);
 						if (parsed.ts && (now - parsed.ts) <= cursorTtlMs) {
-							entries.push({ key, user: parsed.user, data: parsed.data });
+							catalogEntries.push({ key, user: parsed.user });
+							positionEntries.push({ key, data: parsed.data });
 						}
 					} catch { /* skip */ }
 				}
-				if (entries.length > 0 && activePlatform) {
-					activePlatform.publish('__cursor:' + topic, EVENTS.BULK, entries, { relay: false });
+				if (catalogEntries.length > 0 && activePlatform) {
+					activePlatform.publish('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, { relay: false });
+					activePlatform.publish('__cursor:' + topic, EVENTS.BULK, positionEntries, { relay: false });
 				}
 			}
 		}).catch(() => {
@@ -228,12 +254,12 @@ export function createCursor(client, options = {}) {
 
 	const cursorTtlMs = cursorTtl * 1000;
 
-	// Track topics with local activity for periodic stale field cleanup
 	/** @type {Set<string>} */
 	const activeTopics = new Set();
 
 	const cleanupInterval = Math.max(cursorTtlMs, 10000);
 	let cleanupTimer = null;
+	let snapshotTimer = null;
 
 	function startCleanupTimer() {
 		if (cleanupTimer) return;
@@ -253,6 +279,54 @@ export function createCursor(client, options = {}) {
 			clearInterval(cleanupTimer);
 			cleanupTimer = null;
 		}
+		if (snapshotTimer && activeTopics.size === 0) {
+			clearInterval(snapshotTimer);
+			snapshotTimer = null;
+		}
+	}
+
+	function startSnapshotTimer() {
+		if (snapshotTimer || snapshotIntervalMs === 0) return;
+		snapshotTimer = setInterval(flushSnapshot, snapshotIntervalMs);
+		if (snapshotTimer.unref) snapshotTimer.unref();
+	}
+
+	function flushSnapshot() {
+		if (redisPending.size === 0) return;
+		if (b) { try { b.guard(); } catch { redisPending = new Map(); return; } }
+		const pending = redisPending;
+		redisPending = new Map();
+		const pipe = redis.pipeline();
+		let queued = 0;
+		for (const [topic, entries] of pending) {
+			if (entries.size === 0) continue;
+			const args = [];
+			for (const [key, entry] of entries) {
+				args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts }));
+			}
+			pipe.hset(hashKey(topic), ...args);
+			pipe.expire(hashKey(topic), cursorTtl);
+			queued += entries.size;
+		}
+		if (queued === 0) return;
+		pipe.exec().then(() => b?.success()).catch((err) => b?.failure(err));
+	}
+
+	function queueSnapshot(topic, key, user, data) {
+		if (snapshotIntervalMs === 0) {
+			if (b) { try { b.guard(); } catch { return; } }
+			const pipe = redis.pipeline();
+			pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: Date.now() }));
+			pipe.expire(hashKey(topic), cursorTtl);
+			pipe.exec().then(() => b?.success()).catch((err) => b?.failure(err));
+			return;
+		}
+		let topicPending = redisPending.get(topic);
+		if (!topicPending) {
+			topicPending = new Map();
+			redisPending.set(topic, topicPending);
+		}
+		topicPending.set(key, { user, data, ts: Date.now() });
 	}
 
 	function hashKey(topic) {
@@ -267,14 +341,6 @@ export function createCursor(client, options = {}) {
 					`redis cursor: local ws count exceeded ${MAX_CURSOR_WS} on this instance`
 				);
 			}
-			// Warn first on the raw select output so developers see sensitive
-			// keys their select forwarded (the warning fires once per process
-			// and is the signal that they should tighten the select). Then
-			// deep-strip for the wire: the default select is stripInternal
-			// already (idempotent re-strip is fine); a user-supplied select
-			// (e.g. an identity passthrough) might return data with nested
-			// sensitive keys, and the wire output must not carry them
-			// regardless of how select is wired.
 			const selected = select(safeUserData(ws));
 			warnSensitive(selected);
 			const user = stripInternal(selected);
@@ -292,79 +358,52 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Broadcast locally + relay to other instances via Redis.
-	 */
-	/**
 	 * Per-topic aggregate throttle state.
-	 * When topicThrottleMs > 0, excess broadcasts are coalesced and
-	 * flushed on a trailing-edge timer so total Redis load per topic
-	 * is capped regardless of connection count.
 	 * @type {Map<string, { lastFlush: number, timer: any, dirty: Map<string, { user: any, data: any, platform: any }> }>}
 	 */
 	const topicFlush = new Map();
 
+	function relay(topic, event, payload) {
+		if (b) { try { b.guard(); } catch { return; } }
+		const msg = JSON.stringify({ instanceId, topic, event, payload });
+		if (subscriberReady) {
+			subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
+		} else {
+			redis.publish(channel, msg).catch(() => {});
+		}
+	}
+
+	function emitJoin(topic, key, user, platform) {
+		const payload = { key, user };
+		platform.publish('__cursor:' + topic, EVENTS.JOIN, payload);
+		relay(topic, EVENTS.JOIN, payload);
+	}
+
 	function doBroadcast(topic, key, user, data, platform) {
 		mBroadcasts?.inc({ topic: mt(topic) });
-		const payload = { key, user, data };
+		const payload = { key, data };
 		platform.publish('__cursor:' + topic, EVENTS.UPDATE, payload);
-
-		if (b) { try { b.guard(); } catch { return; } }
-		const now = Date.now();
-		const pipe = redis.pipeline();
-		pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: now }));
-		pipe.expire(hashKey(topic), cursorTtl);
-		pipe.exec().then(() => {
-			b?.success();
-			const relayMsg = JSON.stringify({ instanceId, topic, event: EVENTS.UPDATE, payload });
-			if (subscriberReady) {
-				subscriberReady.then(() => redis.publish(channel, relayMsg).catch(() => {}));
-			} else {
-				redis.publish(channel, relayMsg).catch(() => {});
-			}
-		}).catch((err) => {
-			b?.failure(err);
-		});
+		queueSnapshot(topic, key, user, data);
+		relay(topic, EVENTS.UPDATE, payload);
 	}
 
 	/**
-	 * Flush all coalesced entries for a topic as a single "bulk" event.
-	 * The client receives one event with all cursor positions instead of
-	 * N individual events landing in the same microtask. This turns N
-	 * store updates per frame into one, and reduces Redis PUBLISH calls
-	 * from N to 1 per flush window.
-	 *
-	 * Each entry is still persisted individually to the Redis hash so
-	 * the per-key TTL and staleness detection work unchanged.
+	 * Flush all coalesced entries for a topic as a single `bulk` event.
+	 * Entries carry `{key, data}` only; `user` lives on the catalog channel.
+	 * Per-entry Redis snapshot writes are coalesced through `queueSnapshot`
+	 * onto the snapshot timer.
 	 */
 	function flushBulk(topic, dirty) {
 		const entries = [];
-		const now = Date.now();
 		let flushPlatform = null;
-
-		if (b) { try { b.guard(); } catch { return; } }
-		const pipe = redis.pipeline();
 		for (const [k, v] of dirty) {
-			entries.push({ key: k, user: v.user, data: v.data });
+			entries.push({ key: k, data: v.data });
 			flushPlatform = v.platform;
-			pipe.hset(hashKey(topic), k, JSON.stringify({ user: v.user, data: v.data, ts: now }));
+			queueSnapshot(topic, k, v.user, v.data);
 		}
-		pipe.expire(hashKey(topic), cursorTtl);
-
-		if (flushPlatform) {
-			flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
-		}
-
-		pipe.exec().then(() => {
-			b?.success();
-			if (flushPlatform) {
-				const relayMsg = JSON.stringify({ instanceId, topic, event: EVENTS.BULK, payload: entries });
-				if (subscriberReady) {
-					subscriberReady.then(() => redis.publish(channel, relayMsg).catch(() => {}));
-				} else {
-					redis.publish(channel, relayMsg).catch(() => {});
-				}
-			}
-		}).catch((err) => { b?.failure(err); });
+		if (!flushPlatform || entries.length === 0) return;
+		flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
+		relay(topic, EVENTS.BULK, entries);
 	}
 
 	function broadcast(topic, key, user, data, platform) {
@@ -373,25 +412,20 @@ export function createCursor(client, options = {}) {
 			return;
 		}
 
-		// Per-topic aggregate throttle
 		let state = topicFlush.get(topic);
 		if (!state) {
 			state = { lastFlush: 0, timer: null, dirty: new Map() };
 			topicFlush.set(topic, state);
 		}
 
-		// Always store the latest data per key
 		state.dirty.set(key, { user, data, platform });
 
 		const now = Date.now();
 
-		// Leading edge: flush immediately if window has passed
 		if (now - state.lastFlush >= topicThrottleMs) {
 			if (state.timer) { clearTimeout(state.timer); state.timer = null; }
 			state.lastFlush = now;
 			if (state.dirty.size === 1) {
-				// Single entry: use normal event so the client does not
-				// need to handle bulk for the common non-contended case.
 				const [k, v] = state.dirty.entries().next().value;
 				doBroadcast(topic, k, v.user, v.data, v.platform);
 			} else {
@@ -401,7 +435,6 @@ export function createCursor(client, options = {}) {
 			return;
 		}
 
-		// Trailing edge: schedule flush at end of window
 		if (!state.timer) {
 			state.timer = setTimeout(() => {
 				const s = topicFlush.get(topic);
@@ -430,31 +463,22 @@ export function createCursor(client, options = {}) {
 			return false;
 		}
 
-		platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key });
-
-		const msg = JSON.stringify({
-			instanceId,
-			topic,
-			event: EVENTS.REMOVE,
-			payload: { key }
-		});
-		if (subscriberReady) {
-			subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
-		} else {
-			redis.publish(channel, msg).catch(() => {});
+		// Drop any pending snapshot write for this key so we do not
+		// resurrect a removed cursor on the next snapshot tick.
+		const topicPending = redisPending.get(topic);
+		if (topicPending) {
+			topicPending.delete(key);
+			if (topicPending.size === 0) redisPending.delete(topic);
 		}
+
+		platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key });
+		relay(topic, EVENTS.REMOVE, { key });
 		return true;
 	}
 
 	/** @type {RedisCursorTracker} */
 	const tracker = {
 		async attach(ws, topic, platform) {
-			// platform.subscribe is the server-trust path; intentionally
-			// bypasses the wire-level __-prefix gate that the adapter
-			// applies to client subscribe frames. Without this call, the
-			// publishes in update() / doBroadcast() / flushTopic() fan
-			// out to an empty subscriber set and no client ever sees a
-			// cursor frame.
 			try {
 				platform.subscribe(ws, '__cursor:' + topic);
 			} catch {
@@ -474,12 +498,15 @@ export function createCursor(client, options = {}) {
 			ensureSubscriber(platform);
 
 			const state = getWsState(ws);
+			const isFirstOnTopic = !state.topics.has(topic);
 			state.topics.add(topic);
 			if (!activeTopics.has(topic) && activeTopics.size === 0) {
 				activeTopics.add(topic);
 				startCleanupTimer();
+				startSnapshotTimer();
 			} else {
 				activeTopics.add(topic);
+				startSnapshotTimer();
 			}
 
 			let topicMap = topics.get(topic);
@@ -493,6 +520,10 @@ export function createCursor(client, options = {}) {
 				topics.set(topic, topicMap);
 			}
 
+			if (isFirstOnTopic) {
+				emitJoin(topic, state.key, state.user, platform);
+			}
+
 			let entry = topicMap.get(state.key);
 			const now = Date.now();
 
@@ -501,11 +532,9 @@ export function createCursor(client, options = {}) {
 				topicMap.set(state.key, entry);
 			}
 
-			// Always store latest data
 			entry.data = data;
 			entry.user = state.user;
 
-			// Leading edge: broadcast immediately if throttle window passed
 			if (now - entry.lastBroadcast >= throttleMs) {
 				if (entry.timer) {
 					clearTimeout(entry.timer);
@@ -516,7 +545,6 @@ export function createCursor(client, options = {}) {
 				return;
 			}
 
-			// Trailing edge: schedule a broadcast for the end of the window
 			mThrottled?.inc({ topic: mt(topic) });
 			if (!entry.timer) {
 				const key = state.key;
@@ -537,7 +565,6 @@ export function createCursor(client, options = {}) {
 			if (!state) return;
 
 			if (topic !== undefined) {
-				// --- Per-topic remove ---
 				if (!state.topics.has(topic)) return;
 
 				const topicMap = topics.get(topic);
@@ -553,6 +580,7 @@ export function createCursor(client, options = {}) {
 							topics.delete(topic);
 							activeTopics.delete(topic);
 							topicFlush.delete(topic);
+							redisPending.delete(topic);
 							stopCleanupTimer();
 						}
 						const flushState = topicFlush.get(topic);
@@ -570,11 +598,8 @@ export function createCursor(client, options = {}) {
 				return;
 			}
 
-			// --- Remove from all topics ---
 			if (b) { try { b.guard(); } catch { return; } }
 
-			// Clear pending timers before the async pipeline to prevent
-			// stale broadcasts for a disconnected ws.
 			const removedTopics = [];
 			for (const t of state.topics) {
 				const topicMap = topics.get(t);
@@ -612,11 +637,17 @@ export function createCursor(client, options = {}) {
 						topics.delete(t);
 						activeTopics.delete(t);
 						topicFlush.delete(t);
+						redisPending.delete(t);
 					}
 				}
 				const flushState = topicFlush.get(t);
 				if (flushState) {
 					flushState.dirty.delete(state.key);
+				}
+				const topicPending = redisPending.get(t);
+				if (topicPending) {
+					topicPending.delete(state.key);
+					if (topicPending.size === 0) redisPending.delete(t);
 				}
 			}
 			wsState.delete(ws);
@@ -625,12 +656,14 @@ export function createCursor(client, options = {}) {
 
 		async snapshot(ws, topic, platform) {
 			const cursors = await this.list(topic);
-			if (cursors.length > 0) {
-				try {
-					platform.send(ws, '__cursor:' + topic, EVENTS.BULK, cursors);
-				} catch {
-					// WebSocket closed before send
-				}
+			if (cursors.length === 0) return;
+			const catalog = cursors.map((c) => ({ key: c.key, user: c.user }));
+			const positions = cursors.map((c) => ({ key: c.key, data: c.data }));
+			try {
+				platform.send(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog);
+				platform.send(ws, '__cursor:' + topic, EVENTS.BULK, positions);
+			} catch {
+				// WebSocket closed before send
 			}
 		},
 
@@ -653,6 +686,18 @@ export function createCursor(client, options = {}) {
 					if (!parsed.ts || (now - parsed.ts) > ttlMs) continue;
 					result.push({ key, user: parsed.user, data: parsed.data });
 				} catch { /* corrupted entry */ }
+			}
+			// Include locally-pending entries that have not yet been flushed
+			// to Redis. Without this, a list() call between a broadcast and
+			// the next snapshot tick under-reports the cursor we just saw.
+			const topicPending = redisPending.get(topic);
+			if (topicPending) {
+				const seen = new Set(result.map((r) => r.key));
+				for (const [key, entry] of topicPending) {
+					if (seen.has(key)) continue;
+					if (!entry.ts || (now - entry.ts) > ttlMs) continue;
+					result.push({ key, user: entry.user, data: entry.data });
+				}
 			}
 			return result;
 		},
@@ -679,13 +724,16 @@ export function createCursor(client, options = {}) {
 			topicFlush.clear();
 			wsState.clear();
 			activeTopics.clear();
+			redisPending = new Map();
 			stopCleanupTimer();
 			connCounter = 0;
 		},
 
 		destroy() {
-			// Clear all timers
 			if (cleanupTimer) clearInterval(cleanupTimer);
+			cleanupTimer = null;
+			if (snapshotTimer) clearInterval(snapshotTimer);
+			snapshotTimer = null;
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
 					if (entry.timer) clearTimeout(entry.timer);
