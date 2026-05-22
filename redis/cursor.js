@@ -91,6 +91,7 @@ const EVENTS = Object.freeze({
  * @property {(topic: string) => Promise<CursorEntry[]>} list
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the Redis subscriber
+ * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number }} stats - Scheduler health snapshot
  */
 
 /**
@@ -198,7 +199,29 @@ export function createCursor(client, options = {}) {
 				const parsed = JSON.parse(message);
 				if (parsed.instanceId === instanceId) return;
 				if (!validator.acceptEnvelope(parsed.topic, parsed.event)) return;
-				if (activePlatform) {
+				if (!activePlatform) return;
+
+				// Receiver-side coalescing for high-frequency cursor-position
+				// events. UPDATE / BULK enqueue into the local topic's
+				// inboundDirty map so the NEXT local flush emits one combined
+				// frame covering local + peer cursors. Pre-change, peer-
+				// relayed frames published immediately on receive, producing
+				// tight doublets at subscribers (one frame per worker per
+				// cycle, ms apart). Now one frame per subscriber per cycle
+				// regardless of worker count.
+				//
+				// CATALOG / JOIN / REMOVE stay immediate: low-frequency
+				// roster events where coalescing would add latency without
+				// smoothness benefit.
+				if (parsed.event === EVENTS.UPDATE && parsed.payload && typeof parsed.payload.key === 'string') {
+					enqueueInbound(parsed.topic, parsed.payload.key, parsed.payload.data, activePlatform);
+				} else if (parsed.event === EVENTS.BULK && Array.isArray(parsed.payload)) {
+					for (const entry of parsed.payload) {
+						if (entry && typeof entry.key === 'string') {
+							enqueueInbound(parsed.topic, entry.key, entry.data, activePlatform);
+						}
+					}
+				} else {
 					activePlatform.publish(
 						'__cursor:' + parsed.topic,
 						parsed.event,
@@ -358,10 +381,52 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Per-topic aggregate throttle state.
-	 * @type {Map<string, { lastFlush: number, timer: any, dirty: Map<string, { user: any, data: any, platform: any }> }>}
+	 * Per-topic aggregate flush state.
+	 *
+	 * - `dirty`: locally-originated cursors. Flushed locally AND relayed.
+	 * - `inboundDirty`: cursors received from peer instances via Redis pub/sub.
+	 *   Flushed locally ONLY (re-relaying would loop). Kept separate from
+	 *   `dirty` so the relay payload is structurally a subset of the local
+	 *   flush, not a per-entry origin check.
+	 * - `lastFlush`: target-anchored timestamp of the most recent flush.
+	 *   Advanced by `topicThrottleMs` per cycle (not to actual fire time) so
+	 *   a single late tick does not compound drift on subsequent cycles.
+	 *
+	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number }>}
 	 */
 	const topicFlush = new Map();
+
+	/**
+	 * Single scheduler-driven set: topics with at least one dirty entry
+	 * awaiting flush. Bounded by mover count, not topic count, so the
+	 * per-tick walk does not scan idle topics. Updated synchronously on
+	 * `broadcast()` / `enqueueInbound()` and on every tick.
+	 *
+	 * @type {Set<string>}
+	 */
+	const dirtyTopics = new Set();
+
+	/**
+	 * Single timer for the whole tracker. Always points at the next earliest
+	 * topic deadline (or null when idle). Replaces the previous per-topic
+	 * setTimeout pattern: N pending timers -> 1 pending timer regardless of
+	 * topic count. Scheduling overhead is O(dirty topics), not O(active
+	 * topics), and a single late fire affects exactly one cycle (target-
+	 * anchored, no drift compounding).
+	 *
+	 * @type {ReturnType<typeof setTimeout> | null}
+	 */
+	let tickTimer = null;
+
+	/**
+	 * Drift accounting for observability. Updated on every flush in `tick()`.
+	 * Exposed via the `stats()` accessor; optional `metrics` integration
+	 * (Prometheus histogram) is wired separately.
+	 */
+	let driftSum = 0;
+	let driftCount = 0;
+	let driftMax = 0;
+	let flushCount = 0;
 
 	function relay(topic, event, payload) {
 		if (b) { try { b.guard(); } catch { return; } }
@@ -388,24 +453,129 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
-	 * Flush all coalesced entries for a topic as a single `bulk` event.
-	 * Entries carry `{key, data}` only; `user` lives on the catalog channel.
-	 * Per-entry Redis snapshot writes are coalesced through `queueSnapshot`
-	 * onto the snapshot timer.
+	 * Flush a topic's `dirty` + `inboundDirty` maps as a single wire frame to
+	 * local subscribers, then relay the local-origin slice to peers.
+	 *
+	 * - Local subscribers see one combined frame per cycle covering this
+	 *   worker's own cursors PLUS any cursors received from peers since the
+	 *   last flush. Pre-change, peer-relayed cursors emitted as a separate
+	 *   frame immediately on receive, producing tight doublets at subscribers.
+	 * - Peers receive only the local-origin slice (relay payload is built
+	 *   from `dirty`, not from `inboundDirty`). Re-relaying inbound cursors
+	 *   would loop: filtered at the receiver via `instanceId`, but still
+	 *   wastes Redis pub/sub bandwidth.
+	 * - `queueSnapshot` runs for local-origin only. The originating worker
+	 *   owns the Redis HSET for its cursors; receivers must not re-write
+	 *   what the origin already wrote (would double the HSET storm).
+	 *
+	 * Single-entry vs. multi-entry choice mirrors the existing wire shape:
+	 * one cursor -> `update {key, data}`, many -> `bulk [{key, data}, ...]`.
+	 * Subscribers handle both as cursor-position frames.
 	 */
-	function flushBulk(topic, dirty) {
+	function flushBoth(topic, state) {
 		const entries = [];
 		let flushPlatform = null;
-		for (const [k, v] of dirty) {
+		let localCount = 0;
+
+		// Local-origin slice first so we can take a prefix for the relay.
+		for (const [k, v] of state.dirty) {
 			entries.push({ key: k, data: v.data });
 			flushPlatform = v.platform;
 			queueSnapshot(topic, k, v.user, v.data);
+			localCount++;
 		}
+		for (const [k, v] of state.inboundDirty) {
+			entries.push({ key: k, data: v.data });
+			flushPlatform ||= v.platform;
+		}
+
+		state.dirty.clear();
+		state.inboundDirty.clear();
+
 		if (!flushPlatform || entries.length === 0) return;
-		flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
-		relay(topic, EVENTS.BULK, entries);
+
+		mBroadcasts?.inc({ topic: mt(topic) });
+		flushCount++;
+
+		// Single local publish covering all entries (local + inbound).
+		if (entries.length === 1) {
+			flushPlatform.publish('__cursor:' + topic, EVENTS.UPDATE, entries[0]);
+		} else {
+			flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
+		}
+
+		// Relay LOCAL-ORIGIN slice only; never re-relay what came from peers.
+		if (localCount > 0) {
+			if (localCount === 1) {
+				relay(topic, EVENTS.UPDATE, entries[0]);
+			} else {
+				relay(topic, EVENTS.BULK, entries.slice(0, localCount));
+			}
+		}
 	}
 
+	/**
+	 * Scheduler tick. Walks `dirtyTopics`, flushes any topic whose deadline
+	 * (`lastFlush + topicThrottleMs`) has passed, and re-arms `tickTimer`
+	 * for the next earliest pending deadline. Topics whose deadline has not
+	 * yet passed stay in `dirtyTopics` for the next tick.
+	 *
+	 * Target-anchored advance: on flush, `lastFlush` is set to the deadline
+	 * (not the actual fire time) so a single late tick does not compound
+	 * drift on subsequent cycles. If we fell behind by more than one cycle
+	 * (event loop saturation > `topicThrottleMs`), `lastFlush` resets to
+	 * `now` to avoid queueing phantom catch-up fires that would all hit the
+	 * next event loop turn.
+	 */
+	function tick() {
+		tickTimer = null;
+		const now = Date.now();
+		let nextDeadline = Infinity;
+
+		for (const topic of dirtyTopics) {
+			const state = topicFlush.get(topic);
+			if (!state) { dirtyTopics.delete(topic); continue; }
+			if (state.dirty.size === 0 && state.inboundDirty.size === 0) {
+				dirtyTopics.delete(topic);
+				continue;
+			}
+			const deadline = state.lastFlush + topicThrottleMs;
+			if (deadline <= now) {
+				const drift = now - deadline;
+				driftSum += drift;
+				driftCount++;
+				if (drift > driftMax) driftMax = drift;
+
+				flushBoth(topic, state);
+				dirtyTopics.delete(topic);
+
+				// Target-anchored: advance lastFlush by the cadence amount.
+				// Multi-cycle backlog collapse to `now` so the next leading-
+				// edge check `(now - lastFlush) >= topicThrottleMs` works as
+				// expected without firing every queued cycle on this turn.
+				state.lastFlush = drift < topicThrottleMs ? deadline : now;
+			} else if (deadline < nextDeadline) {
+				nextDeadline = deadline;
+			}
+		}
+
+		if (nextDeadline !== Infinity) {
+			tickTimer = setTimeout(tick, Math.max(0, nextDeadline - Date.now()));
+		}
+		// else: scheduler goes idle until next broadcast() / enqueueInbound().
+	}
+
+	function armTick(delay) {
+		if (tickTimer !== null) return;
+		tickTimer = setTimeout(tick, delay);
+	}
+
+	/**
+	 * Schedule a local cursor for the next coalesced flush. The leading-
+	 * edge check fires synchronously when `topicThrottleMs` has elapsed
+	 * since the last flush (preserves the contract that the first call on
+	 * an idle topic publishes immediately, without a setTimeout(0) detour).
+	 */
 	function broadcast(topic, key, user, data, platform) {
 		if (topicThrottleMs <= 0) {
 			doBroadcast(topic, key, user, data, platform);
@@ -414,42 +584,64 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { lastFlush: 0, timer: null, dirty: new Map() };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0 };
 			topicFlush.set(topic, state);
 		}
-
 		state.dirty.set(key, { user, data, platform });
 
 		const now = Date.now();
-
 		if (now - state.lastFlush >= topicThrottleMs) {
-			if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+			// Leading-edge synchronous flush.
 			state.lastFlush = now;
-			if (state.dirty.size === 1) {
-				const [k, v] = state.dirty.entries().next().value;
-				doBroadcast(topic, k, v.user, v.data, v.platform);
-			} else {
-				flushBulk(topic, state.dirty);
-			}
-			state.dirty.clear();
+			flushBoth(topic, state);
+			dirtyTopics.delete(topic);
 			return;
 		}
 
-		if (!state.timer) {
-			state.timer = setTimeout(() => {
-				const s = topicFlush.get(topic);
-				if (!s) return;
-				s.timer = null;
-				s.lastFlush = Date.now();
-				if (s.dirty.size === 1) {
-					const [k, v] = s.dirty.entries().next().value;
-					doBroadcast(topic, k, v.user, v.data, v.platform);
-				} else {
-					flushBulk(topic, s.dirty);
-				}
-				s.dirty.clear();
-			}, topicThrottleMs - (now - state.lastFlush));
+		// Within window: trailing-edge flush via the scheduler tick.
+		dirtyTopics.add(topic);
+		armTick(Math.max(0, topicThrottleMs - (now - state.lastFlush)));
+	}
+
+	/**
+	 * Schedule a peer-relayed cursor for the next coalesced flush. Symmetric
+	 * to `broadcast()`: same leading/trailing edge semantics, but inbound
+	 * entries route through `state.inboundDirty` so they are visible to
+	 * local subscribers on the next flush WITHOUT being re-relayed to peers
+	 * (which would loop) and WITHOUT being written to Redis (origin owns
+	 * the HSET).
+	 *
+	 * The peer's cross-replica end-to-end latency gains up to one
+	 * `topicThrottleMs` of coalescing delay on the receiver side. Cursors
+	 * are already throttled in the 8-16ms range; adding 8-16ms is well
+	 * below the ~50-100ms human perception threshold for cursor lag. The
+	 * smoothness win (one frame per subscriber per cycle instead of two)
+	 * is the structural benefit.
+	 */
+	function enqueueInbound(topic, key, data, platform) {
+		if (topicThrottleMs <= 0) {
+			// Legacy immediate mode (matches old receiver behavior).
+			platform.publish('__cursor:' + topic, EVENTS.UPDATE, { key, data }, { relay: false });
+			return;
 		}
+
+		let state = topicFlush.get(topic);
+		if (!state) {
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: 0 };
+			topicFlush.set(topic, state);
+		}
+		state.inboundDirty.set(key, { data, platform });
+
+		const now = Date.now();
+		if (now - state.lastFlush >= topicThrottleMs) {
+			state.lastFlush = now;
+			flushBoth(topic, state);
+			dirtyTopics.delete(topic);
+			return;
+		}
+
+		dirtyTopics.add(topic);
+		armTick(Math.max(0, topicThrottleMs - (now - state.lastFlush)));
 	}
 
 	async function broadcastRemove(topic, key, platform) {
@@ -580,6 +772,7 @@ export function createCursor(client, options = {}) {
 							topics.delete(topic);
 							activeTopics.delete(topic);
 							topicFlush.delete(topic);
+							dirtyTopics.delete(topic);
 							redisPending.delete(topic);
 							stopCleanupTimer();
 						}
@@ -637,6 +830,7 @@ export function createCursor(client, options = {}) {
 						topics.delete(t);
 						activeTopics.delete(t);
 						topicFlush.delete(t);
+						dirtyTopics.delete(t);
 						redisPending.delete(t);
 					}
 				}
@@ -717,9 +911,9 @@ export function createCursor(client, options = {}) {
 					if (entry.timer) clearTimeout(entry.timer);
 				}
 			}
-			for (const [, state] of topicFlush) {
-				if (state.timer) clearTimeout(state.timer);
-			}
+			// Tracker-level scheduler timer + dirty-topic set.
+			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
+			dirtyTopics.clear();
 			topics.clear();
 			topicFlush.clear();
 			wsState.clear();
@@ -739,15 +933,45 @@ export function createCursor(client, options = {}) {
 					if (entry.timer) clearTimeout(entry.timer);
 				}
 			}
-			for (const [, state] of topicFlush) {
-				if (state.timer) clearTimeout(state.timer);
-			}
+			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
+			dirtyTopics.clear();
 			topicFlush.clear();
 			if (subscriber) {
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;
 			}
 			activePlatform = null;
+		},
+
+		/**
+		 * Snapshot of scheduler health. Always available, near-zero cost.
+		 *
+		 * - `flushes`: total tick-driven flushes since tracker creation.
+		 * - `driftMeanMs`: mean (target_deadline - actual_fire_time) across
+		 *   all tick-driven flushes. 0 means perfect cadence; values >
+		 *   `topicThrottle` indicate sustained event-loop saturation or
+		 *   CPU contention.
+		 * - `driftMaxMs`: largest single observed late fire. Useful for
+		 *   spotting one-off GC pauses vs. sustained drift.
+		 * - `dirtyTopicsCurrent`: topics with pending coalesced entries
+		 *   right now. Should hover near zero in healthy operation; growth
+		 *   means tick is falling behind.
+		 * - `activeTopicsTotal`: topics with at least one local cursor.
+		 *
+		 * Leading-edge synchronous flushes (first call on an idle topic)
+		 * are not counted in drift stats - they fire on the call thread,
+		 * not via the scheduler.
+		 *
+		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number }}
+		 */
+		stats() {
+			return {
+				flushes: flushCount,
+				driftMeanMs: driftCount > 0 ? driftSum / driftCount : 0,
+				driftMaxMs: driftMax,
+				dirtyTopicsCurrent: dirtyTopics.size,
+				activeTopicsTotal: topics.size
+			};
 		},
 
 		hooks: {

@@ -128,6 +128,32 @@ export interface RedisCursorTracker {
 	destroy(): void;
 
 	/**
+	 * Snapshot of scheduler health. Always available, near-zero cost.
+	 *
+	 * - `flushes`: total tick-driven flushes since tracker creation.
+	 * - `driftMeanMs`: mean (target_deadline - actual_fire_time) across
+	 *   all tick-driven flushes. 0 means perfect cadence; values >
+	 *   `topicThrottle` indicate sustained event-loop saturation or CPU
+	 *   contention (consider a dedicated-CPU instance, or raise
+	 *   `topicThrottle`).
+	 * - `driftMaxMs`: largest single observed late fire. Useful for
+	 *   spotting one-off GC pauses vs. sustained drift.
+	 * - `dirtyTopicsCurrent`: topics with pending coalesced entries right
+	 *   now. Should hover near zero in healthy operation.
+	 * - `activeTopicsTotal`: topics with at least one local cursor.
+	 *
+	 * Leading-edge synchronous flushes are not counted in drift stats -
+	 * they fire on the call thread, not via the scheduler.
+	 */
+	stats(): {
+		flushes: number;
+		driftMeanMs: number;
+		driftMaxMs: number;
+		dirtyTopicsCurrent: number;
+		activeTopicsTotal: number;
+	};
+
+	/**
 	 * Ready-made WebSocket hooks for cursor tracking.
 	 *
 	 * `message` handles incoming `{ type: 'cursor', topic, data }` messages.

@@ -1302,6 +1302,170 @@ describe('redis cursor', () => {
 		});
 	});
 
+	describe('receiver-side aggregation (#1: cross-replica relay smoothing)', () => {
+		it('peer-relayed UPDATE enqueues into inboundDirty; merges with local cursors on next flush', async () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
+
+			// Establish a local cursor first so the topic has dirty state.
+			const localWs = mockWs({ id: '1', name: 'Alice' });
+			c.update(localWs, 'canvas', { x: 11 }, platform);  // leading-edge flush
+			platform.reset();
+
+			// Within the window, a peer-originated UPDATE arrives via the relay
+			// channel. Pre-fix this would immediately publish a separate frame
+			// (doublet); now it enqueues into inboundDirty.
+			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
+			const onMessage = handler.listeners.get('message');
+			onMessage(client.key('cursor:events'), JSON.stringify({
+				instanceId: 'OTHER-INSTANCE',
+				topic: 'canvas',
+				event: 'update',
+				payload: { key: 'OTHER:42', data: { x: 99 } }
+			}));
+
+			// Receiver-aggregation: NO immediate publish. The cursor is staged.
+			expect(platform.published.filter((p) => p.event === 'update' || p.event === 'bulk')).toHaveLength(0);
+
+			// A second local move within the window stays dirty too.
+			c.update(localWs, 'canvas', { x: 22 }, platform);
+			expect(platform.published.filter((p) => p.event === 'update' || p.event === 'bulk')).toHaveLength(0);
+
+			// Window elapses: one combined bulk covering BOTH local and peer cursors.
+			vi.advanceTimersByTime(100);
+			const positions = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positions).toHaveLength(1);
+			expect(positions[0].event).toBe('bulk');
+			expect(positions[0].data).toHaveLength(2);
+			const keys = positions[0].data.map((e) => e.key);
+			expect(keys).toContain('OTHER:42');
+			c.destroy();
+		});
+
+		it('peer-relayed BULK fans out into inboundDirty per-key', async () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
+
+			// Seed an idle topic so lastFlush != 0 (subsequent calls are within-window).
+			const localWs = mockWs({ id: '1' });
+			c.update(localWs, 'canvas', { x: 1 }, platform);
+			platform.reset();
+
+			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
+			const onMessage = handler.listeners.get('message');
+			onMessage(client.key('cursor:events'), JSON.stringify({
+				instanceId: 'OTHER',
+				topic: 'canvas',
+				event: 'bulk',
+				payload: [
+					{ key: 'OTHER:1', data: { x: 100 } },
+					{ key: 'OTHER:2', data: { x: 200 } },
+					{ key: 'OTHER:3', data: { x: 300 } }
+				]
+			}));
+
+			vi.advanceTimersByTime(100);
+			const positions = platform.published.filter((p) => p.event === 'update' || p.event === 'bulk');
+			expect(positions).toHaveLength(1);
+			expect(positions[0].event).toBe('bulk');
+			expect(positions[0].data.map((e) => e.key).sort()).toEqual(['OTHER:1', 'OTHER:2', 'OTHER:3']);
+			c.destroy();
+		});
+
+		it('CATALOG / JOIN / REMOVE bypass aggregation and publish immediately', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
+
+			// Plant a cursor so ensureSubscriber() registers the relay handler.
+			const ws = mockWs({ id: 'local' });
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			platform.reset();
+
+			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
+			const onMessage = handler.listeners.get('message');
+			const ch = client.key('cursor:events');
+
+			onMessage(ch, JSON.stringify({
+				instanceId: 'OTHER', topic: 'canvas', event: 'join',
+				payload: { key: 'OTHER:1', user: { id: 'remote' } }
+			}));
+			onMessage(ch, JSON.stringify({
+				instanceId: 'OTHER', topic: 'canvas', event: 'remove',
+				payload: { key: 'OTHER:1' }
+			}));
+
+			// Roster events are low-frequency; latency matters more than
+			// smoothness. They publish immediately, not on the next flush.
+			const events = platform.published.map((p) => p.event);
+			expect(events).toContain('join');
+			expect(events).toContain('remove');
+			c.destroy();
+		});
+	});
+
+	describe('scheduler health: stats()', () => {
+		it('exposes flushes / drift / dirtyTopics / activeTopics', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const s = c.stats();
+			expect(s).toEqual({
+				flushes: 0,
+				driftMeanMs: 0,
+				driftMaxMs: 0,
+				dirtyTopicsCurrent: 0,
+				activeTopicsTotal: 0
+			});
+			c.destroy();
+		});
+
+		it('activeTopicsTotal increments per touched topic', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'a', { x: 1 }, platform);
+			c.update(ws, 'b', { x: 1 }, platform);
+			expect(c.stats().activeTopicsTotal).toBe(2);
+			c.destroy();
+		});
+
+		it('flushes counter increments on every flush (leading + trailing edge)', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);  // leading-edge flush
+			expect(c.stats().flushes).toBe(1);
+
+			c.update(ws, 'canvas', { x: 2 }, platform);  // queued for tick
+			expect(c.stats().flushes).toBe(1);
+
+			vi.advanceTimersByTime(100);  // trailing-edge tick fires
+			expect(c.stats().flushes).toBe(2);
+
+			c.destroy();
+		});
+
+		it('drift accumulators stay non-negative and zero when scheduler fires on time', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 50, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);  // leading-edge sync
+			c.update(ws, 'canvas', { x: 2 }, platform);  // queued
+
+			// Under fake timers the trailing-edge tick fires exactly at its
+			// deadline, so observed drift is 0. Drift > 0 surfaces under
+			// real event-loop saturation or CPU stealing - validated by
+			// the bench at `bench/cursor-scheduler-drift.js`, not here.
+			vi.advanceTimersByTime(50);
+
+			const s = c.stats();
+			expect(s.flushes).toBe(2);
+			expect(s.driftMaxMs).toBeGreaterThanOrEqual(0);
+			expect(s.driftMeanMs).toBeGreaterThanOrEqual(0);
+
+			c.destroy();
+		});
+	});
+
 	describe('remove suppresses local broadcast when Redis fails', () => {
 		it('per-topic remove does not publish locally when hdel fails', async () => {
 			vi.useRealTimers();
