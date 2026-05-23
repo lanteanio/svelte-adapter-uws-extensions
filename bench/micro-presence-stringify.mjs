@@ -1,4 +1,4 @@
-import { bench, compare } from './harness.js';
+import { bench, compare } from './micro-harness.mjs';
 
 const sample = { id: 'user-12345', name: 'Alice Example', avatar: 'https://cdn.example.com/avatar/abc.png', plan: 'pro' };
 

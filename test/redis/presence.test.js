@@ -1,5 +1,5 @@
 // Mock-suite tests for the redis presence tracker. Pins the
-// `presence_state` / `presence_diff` / `heartbeat` wire shape that
+// `state` / `diff` / `heartbeat` wire shape that
 // matches the adapter's bundled presence plugin so a single client
 // decoder handles both. Cross-instance forwarding still uses
 // 'join' / 'leave' / 'updated' on the internal pubsub channel; those
@@ -15,10 +15,10 @@ import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.j
 import { createMetrics } from '../../prometheus/index.js';
 
 function diffsOf(platform) {
-	return platform.published.filter((p) => p.event === 'presence_diff');
+	return platform.published.filter((p) => p.event === 'diff');
 }
 function statesOf(platform) {
-	return platform.sent.filter((s) => s.event === 'presence_state');
+	return platform.sent.filter((s) => s.event === 'state');
 }
 function heartbeatsOf(platform) {
 	return platform.published.filter((p) => p.event === 'heartbeat');
@@ -74,7 +74,7 @@ describe('redis presence', () => {
 	});
 
 	describe('join', () => {
-		it('sends presence_state to the joining ws as a flat snapshot', async () => {
+		it('sends state to the joining ws as a flat snapshot', async () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			await presence.join(ws, 'room', platform);
 
@@ -91,7 +91,7 @@ describe('redis presence', () => {
 			expect(ws.isSubscribed('__presence:room')).toBe(true);
 		});
 
-		it('buffers a join entry that flushes as presence_diff on next microtask', async () => {
+		it('buffers a join entry that flushes as diff on next microtask', async () => {
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			await presence.join(ws1, 'room', platform);
@@ -108,7 +108,7 @@ describe('redis presence', () => {
 			expect(diffs[0].options).toEqual({ relay: false });
 		});
 
-		it('coalesces multiple same-tick joins into one presence_diff per topic', async () => {
+		it('coalesces multiple same-tick joins into one diff per topic', async () => {
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			const ws3 = mockWs({ id: '3', name: 'Carol' });
@@ -302,7 +302,7 @@ describe('redis presence', () => {
 	});
 
 	describe('sync (sync-only observer)', () => {
-		it('sends presence_state without joining', async () => {
+		it('sends state without joining', async () => {
 			const member = mockWs({ id: '1', name: 'Alice' });
 			await presence.join(member, 'room', platform);
 			platform.reset();
@@ -512,7 +512,7 @@ describe('redis presence', () => {
 			});
 			await new Promise((r) => setTimeout(r, 5));
 
-			// tracker.sync emits presence_state via platform.send to the requesting ws.
+			// tracker.sync emits state via platform.send to the requesting ws.
 			expect(statesOf(platform)).toHaveLength(1);
 		});
 
@@ -731,7 +731,7 @@ describe('redis presence', () => {
 	});
 
 	describe('keyspace notifications', () => {
-		it('emits empty presence_state when a hash key expires', async () => {
+		it('emits empty state when a hash key expires', async () => {
 			const local = createPresence(client, { key: 'id', keyspaceNotifications: true });
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platform);
@@ -750,7 +750,7 @@ describe('redis presence', () => {
 			pmessageListener('__keyevent@*__:expired', '__keyevent@0__:expired', expiredKey);
 
 			const empties = platform.published.filter(
-				(p) => p.event === 'presence_state' && p.topic === '__presence:room'
+				(p) => p.event === 'state' && p.topic === '__presence:room'
 			);
 			expect(empties.length).toBeGreaterThan(0);
 			expect(empties[0].data).toEqual({});
@@ -1335,7 +1335,7 @@ describe('redis presence', () => {
 			const pmessage = handler.listeners.get('pmessage');
 			pmessage('__keyevent@*__:expired', '__keyevent@0__:expired', 'unrelated:key');
 
-			expect(platform.published.filter((p) => p.event === 'presence_state')).toHaveLength(0);
+			expect(platform.published.filter((p) => p.event === 'state')).toHaveLength(0);
 			local.destroy();
 		});
 
@@ -1349,7 +1349,7 @@ describe('redis presence', () => {
 			const pmessage = handler.listeners.get('pmessage');
 			pmessage('__keyevent@*__:expired', '__keyevent@0__:expired', client.key('presence:events:room'));
 
-			expect(platform.published.filter((p) => p.event === 'presence_state')).toHaveLength(0);
+			expect(platform.published.filter((p) => p.event === 'state')).toHaveLength(0);
 			local.destroy();
 		});
 	});

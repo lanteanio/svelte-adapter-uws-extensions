@@ -1,6 +1,6 @@
 // Local A/B microbenchmark harness for /simplify perf changes.
 // NOT shipped (excluded from package via the package.json files allowlist).
-// Run with: node --expose-gc test/_bench/<file>.js
+// Run with: node --expose-gc bench/micro-<name>.mjs
 
 import { performance } from 'node:perf_hooks';
 

@@ -2,7 +2,7 @@
 //   A) for-of Object.entries(all)
 //   B) for-of Object.keys(all) + indexed access
 
-import { bench, compare } from './harness.js';
+import { bench, compare } from './micro-harness.mjs';
 
 function buildHash(n) {
 	const h = {};

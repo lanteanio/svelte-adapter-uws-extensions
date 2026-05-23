@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-05-23
+
+### Changed
+
+- **`redis/presence.js` wire events renamed: `presence_state` -> `state`, `presence_diff` -> `diff`.** **Breaking** for hand-rolled clients decoding `__presence:{topic}` directly; the bundled `presence()` Svelte store in `svelte-adapter-uws` is updated in lockstep and unaffected. Mirrors the same rename in the adapter's in-memory `createPresence` so cluster and single-instance backends keep speaking one wire shape from a single browser bundle. Topic prefix already namespaces the channel - bare event names match cursor / groups / replay convention. Prometheus metric names `presence_diff_frames_total` and `presence_diff_coalesced_total` are unchanged - those are Prometheus-side identifiers, not wire events; descriptions on `presence_diff_frames_total` updated from "presence_diff frames published..." to "diff frames published..." for accuracy. Cross-instance Redis pub/sub envelope on `presence:events:{topic}` is also unchanged (`'join' | 'leave' | 'updated'` per-event shape - already bare). README wire-shape table, MIGRATION 0.4-to-0.5 decoder snippet, and `redis/presence.d.ts` discriminated-union literals all updated. Peer dependency floor bumped to `svelte-adapter-uws ^0.5.7` (see separate bullet) so a single `npm install` upgrade pulls both wire ends together.
+- **Peer dependency floor bumped to `svelte-adapter-uws ^0.5.7`** (was `^0.5.6`). Pulls the matching wire-event rename in the adapter's bundled `presence()` Svelte store so cluster and single-instance backends keep speaking one wire shape from a single browser bundle.
+
 ## [0.5.7] - 2026-05-23
 
 ### Changed

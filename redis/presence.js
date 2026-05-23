@@ -6,9 +6,9 @@
  * for cross-instance join/leave notifications.
  *
  * Wire shape clients see on `__presence:{topic}`:
- *   - `presence_state` (sent once on subscribe to a single connection)
+ *   - `state` (sent once on subscribe to a single connection)
  *       payload: `{[userKey]: data}` flat snapshot of current presence
- *   - `presence_diff` (broadcast to topic subscribers, microtask-batched)
+ *   - `diff` (broadcast to topic subscribers, microtask-batched)
  *       payload: `{joins: {[key]: data}, leaves: {[key]: data}}`
  *       Same-tick joins+leaves on the same key collapse: latest op wins.
  *   - `heartbeat` (broadcast to topic subscribers, per heartbeat interval)
@@ -148,7 +148,7 @@ return 0
 
 /**
  * Internal cross-instance Redis pub/sub envelope event names. NOT the
- * client wire shape - clients see `presence_state` / `presence_diff` /
+ * client wire shape - clients see `state` / `diff` /
  * `heartbeat`. These names live on the `presence:events:{topic}` channel
  * between instances and are routed into the local diff buffer on receive.
  */
@@ -256,7 +256,7 @@ export function createPresence(client, options = {}) {
 	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
 	const mHeartbeatLatency = m?.gauge('presence_heartbeat_latency_ms', 'Duration of the most recent heartbeat tick in milliseconds');
 	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash expiry triggered a local empty-list emit');
-	const mDiffFrames = m?.counter('presence_diff_frames_total', 'presence_diff frames published to topic subscribers', ['topic']);
+	const mDiffFrames = m?.counter('presence_diff_frames_total', 'diff frames published to topic subscribers', ['topic']);
 	const mDiffCoalesced = m?.counter('presence_diff_coalesced_total', 'Buffered diff entries overwritten by a later op in the same tick', ['topic']);
 
 	let lastHeartbeatLatency = 0;
@@ -363,7 +363,7 @@ export function createPresence(client, options = {}) {
 				else leaves[key] = data;
 			}
 			try {
-				platform.publish('__presence:' + topic, 'presence_diff', { joins, leaves }, { relay: false });
+				platform.publish('__presence:' + topic, 'diff', { joins, leaves }, { relay: false });
 				mDiffFrames?.inc({ topic: mt(topic) });
 			} catch { /* platform unavailable mid-flight */ }
 		}
@@ -533,11 +533,11 @@ export function createPresence(client, options = {}) {
 					// handler could only refresh `existing` entries; an
 					// entry the client swept (cross-replica relay latency,
 					// brief backpressure, JS thread saturation) could never
-					// be recovered without a presence_diff for that user.
+					// be recovered without a diff for that user.
 					// Older clients fall back gracefully: they see an
 					// object instead of an array and skip the legacy
-					// "refresh-existing" branch, but the next presence_diff
-					// or presence_state still reconciles them.
+					// "refresh-existing" branch, but the next diff
+					// or state still reconciles them.
 					/** @type {Record<string, any>} */
 					const dataMap = {};
 					for (const [userKey, entry] of data) dataMap[userKey] = entry.data;
@@ -590,7 +590,7 @@ export function createPresence(client, options = {}) {
 				// The per-topic hash key expires only when every field has
 				// expired (no live instances presenting any user on this
 				// topic). That is the "whole topic empty" signal we forward
-				// as an empty presence_state to local subscribers. Per-user
+				// as an empty state to local subscribers. Per-user
 				// hash keys (presence:user:{topic}:{userKey}) and the events
 				// channel are filtered out.
 				const topicPrefix = client.key('presence:topic:');
@@ -599,7 +599,7 @@ export function createPresence(client, options = {}) {
 					if (!expiredKey.startsWith(topicPrefix)) return;
 					const topic = expiredKey.slice(topicPrefix.length);
 					if (activePlatform) {
-						activePlatform.publish('__presence:' + topic, 'presence_state', {}, { relay: false });
+						activePlatform.publish('__presence:' + topic, 'state', {}, { relay: false });
 						mKeyspaceCleanups?.inc();
 					}
 				});
@@ -1223,7 +1223,7 @@ export function createPresence(client, options = {}) {
 				state[userKey] = entry.data;
 			}
 			try {
-				platform.send(ws, '__presence:' + topic, 'presence_state', state);
+				platform.send(ws, '__presence:' + topic, 'state', state);
 			} catch {
 				// WebSocket closed before send
 			}
@@ -1270,7 +1270,7 @@ export function createPresence(client, options = {}) {
 
 			try {
 				ws.subscribe(presenceTopic);
-				platform.send(ws, presenceTopic, 'presence_state', state);
+				platform.send(ws, presenceTopic, 'state', state);
 			} catch {
 				const topics = syncObservers.get(ws);
 				if (topics && topics.has(topic)) {
@@ -1396,13 +1396,13 @@ export function createPresence(client, options = {}) {
 				// Client-initiated reconnect-snapshot. The presence plugin
 				// client sends `{type:'presence-snapshot', topic}` on every
 				// status==='open' (initial connect + reconnect). Re-emits
-				// `presence_state` to the requesting ws via `tracker.sync`,
+				// `state` to the requesting ws via `tracker.sync`,
 				// which is the same path that fires on a fresh subscribe.
 				// Symmetric to cursor's `cursor-snapshot` text frame.
 				//
 				// Without this, board-scoped presence stayed stale across
 				// reconnects: a tab that had joined via an RPC saw no
-				// presence_diff during the disconnect window, and on
+				// diff during the disconnect window, and on
 				// reconnect its in-memory map was whatever it last knew.
 				// Global presence accidentally self-healed because most
 				// apps call `presence.join('global')` from the `open` hook

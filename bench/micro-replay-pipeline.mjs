@@ -4,7 +4,7 @@
 //
 // Models the common case: client missed last 10 of 1000 buffered messages.
 
-import { bench, compare } from './harness.js';
+import { bench, compare } from './micro-harness.mjs';
 
 function buildBuffer(n) {
 	const buf = [];

@@ -36,7 +36,7 @@ Both hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is 
 
 3. **`metrics().staleCleanedTotal` is now always 0.** Per-field staleness is enforced atomically by Redis HPEXPIRE rather than by an application-side cleanup script, so there is nothing to count. The field stays in the return shape for backward-compatibility. The corresponding Prometheus counter `presence_stale_cleaned_total` is no longer registered.
 
-4. **`keyspaceNotifications: true` scope is narrower.** Pre-fix, the option subscribed to whole-key `__keyevent@*__:expired` for `presence:{topic}` keys and emitted an empty `presence_state` when one fired. Same shape in 0.5 (the per-topic hash whole-key expiry only fires when every field has expired, i.e. no live instances). Per-field expiry (a single crashed instance) does NOT trigger this notification; users disappear from `list()` / `count()` results lazily. If you need explicit per-field-expiry events, subscribe to `__keyevent@*__:hexpired` separately (separate Redis CONFIG flag).
+4. **`keyspaceNotifications: true` scope is narrower.** Pre-fix, the option subscribed to whole-key `__keyevent@*__:expired` for `presence:{topic}` keys and emitted an empty `state` when one fired. Same shape in 0.5 (the per-topic hash whole-key expiry only fires when every field has expired, i.e. no live instances). Per-field expiry (a single crashed instance) does NOT trigger this notification; users disappear from `list()` / `count()` results lazily. If you need explicit per-field-expiry events, subscribe to `__keyevent@*__:hexpired` separately (separate Redis CONFIG flag).
 
 5. **Falling back to single-instance.** If you can't upgrade Redis, switch to the in-memory `createPresence` plugin from `svelte-adapter-uws/plugins/presence`. Public API is the same; you lose cross-instance presence which is the whole point of the Redis variant, but for single-instance deployments it's a clean drop-in.
 
@@ -219,19 +219,19 @@ export function leaveBoard(ws, { topic, platform }) {
 
 No `close`-hook change required: uWS releases all per-`ws` subscriptions on disconnect, so `cursors.remove(ws, platform)` in your `close` hook still handles cleanup. The legacy `cursors.hooks.subscribe` slot is now a no-op (the adapter's wire gate prevents it from ever firing); it stays exported for source-compat but new code should not rely on it.
 
-### Presence wire shape on `__presence:{topic}` migrated to `presence_state` / `presence_diff`
+### Presence wire shape on `__presence:{topic}` migrated to `state` / `diff`
 
 **Only impacts apps with hand-rolled WebSocket clients consuming the wire directly.**
 
 **What changed.** The `redis/presence` channel previously emitted `list` / `join` / `leave` / `updated` / `heartbeat` events. It now emits:
 
-- `presence_state` (sent once on subscribe to a single connection): payload is `{[userKey]: data}` - a flat snapshot.
-- `presence_diff` (broadcast to topic subscribers, microtask-batched): payload is `{joins: {[key]: data}, leaves: {[key]: data}}`. Same-tick joins+leaves on the same key collapse to the latest op; updates appear as a `joins` entry with the new data.
+- `state` (sent once on subscribe to a single connection): payload is `{[userKey]: data}` - a flat snapshot.
+- `diff` (broadcast to topic subscribers, microtask-batched): payload is `{joins: {[key]: data}, leaves: {[key]: data}}`. Same-tick joins+leaves on the same key collapse to the latest op; updates appear as a `joins` entry with the new data.
 - `heartbeat` is unchanged.
 
-The public JS API on `createPresence` is unchanged (`join`, `leave`, `sync`, `list`, `count`, `metrics`, `clear`, `destroy`, `hooks` keep their signatures). The cross-instance Redis pub/sub envelope on `presence:events:{topic}` is also unchanged. The `keyspaceNotifications: true` mode now emits an empty `presence_state` event (was an empty `list` event) on hash expiry.
+The public JS API on `createPresence` is unchanged (`join`, `leave`, `sync`, `list`, `count`, `metrics`, `clear`, `destroy`, `hooks` keep their signatures). The cross-instance Redis pub/sub envelope on `presence:events:{topic}` is also unchanged. The `keyspaceNotifications: true` mode now emits an empty `state` event (was an empty `list` event) on hash expiry.
 
-**How to migrate.** Apps with a custom WebSocket client decoding presence frames must swap their decoder from the four legacy event names to `presence_state` / `presence_diff`:
+**How to migrate.** Apps with a custom WebSocket client decoding presence frames must swap their decoder from the four legacy event names to `state` / `diff`:
 
 ```js
 // before
@@ -241,11 +241,11 @@ case 'leave':   remove(payload.key); break;
 case 'updated': set(payload.key, payload.data); break;
 
 // after
-case 'presence_state':
+case 'state':
   state.clear();
   for (const k of Object.keys(payload)) state.set(k, payload[k]);
   break;
-case 'presence_diff':
+case 'diff':
   for (const k of Object.keys(payload.joins)) state.set(k, payload.joins[k]);
   for (const k of Object.keys(payload.leaves)) state.delete(k);
   break;

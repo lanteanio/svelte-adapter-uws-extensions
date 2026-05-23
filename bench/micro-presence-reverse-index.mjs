@@ -10,7 +10,7 @@
 // For the change to be net positive, leave-time savings have to outweigh
 // the per-join overhead at realistic workloads.
 
-import { bench, compare } from './harness.js';
+import { bench, compare } from './micro-harness.mjs';
 
 function buildWorld(numWs, topicsPerWs, usersPerTopic) {
 	// Assign each ws a stable user key cycling through usersPerTopic.

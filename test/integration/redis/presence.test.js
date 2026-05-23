@@ -24,13 +24,13 @@ function wait(ms) {
 
 function joinDiffsFor(platform, key) {
 	return platform.published
-		.filter((p) => p.event === 'presence_diff')
+		.filter((p) => p.event === 'diff')
 		.filter((p) => p.data && p.data.joins && key in p.data.joins);
 }
 
 function leaveDiffsFor(platform, key) {
 	return platform.published
-		.filter((p) => p.event === 'presence_diff')
+		.filter((p) => p.event === 'diff')
 		.filter((p) => p.data && p.data.leaves && key in p.data.leaves);
 }
 
@@ -475,9 +475,9 @@ describe('redis presence (integration)', () => {
 	});
 
 	describe('cross-instance receiver routes events through the diff buffer', () => {
-		it('a remote join lands as presence_diff (not as legacy join/updated/leave events)', async () => {
-			// The wire shape on `__presence:{topic}` is presence_state /
-			// presence_diff / heartbeat. The cross-instance `presence:events:
+		it('a remote join lands as diff (not as legacy join/updated/leave events)', async () => {
+			// The wire shape on `__presence:{topic}` is state /
+			// diff / heartbeat. The cross-instance `presence:events:
 			// {topic}` channel still carries internal 'join'/'leave'/'updated'
 			// envelopes between instances; the receiver MUST translate into
 			// bufferDiff so observers on the remote instance see the diff
@@ -501,7 +501,7 @@ describe('redis presence (integration)', () => {
 			await wait(150);
 			trackerB.flushDiffs();
 
-			const diffFrames = platformB.published.filter((p) => p.event === 'presence_diff');
+			const diffFrames = platformB.published.filter((p) => p.event === 'diff');
 			const legacy = platformB.published.filter(
 				(p) => p.event === 'join' || p.event === 'updated' || p.event === 'leave' || p.event === 'list'
 			);

@@ -7,7 +7,7 @@
 //
 // Bench compares the two against the integration stack's Redis. Run as:
 //   docker compose -p svelte-bench-cursor -f test/integration/docker-compose.yml up -d --wait
-//   node --expose-gc test/_bench/cursor-reconnect.js
+//   node --expose-gc bench/micro-cursor-reconnect.mjs
 //   docker compose -p svelte-bench-cursor -f test/integration/docker-compose.yml down -v
 
 import Redis from 'ioredis';

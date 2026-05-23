@@ -38,8 +38,8 @@ export interface RedisPresenceOptions {
  * both single-instance and cluster deployments.
  */
 export type PresenceWireEvent =
-	| { event: 'presence_state'; data: Record<string, Record<string, any>> }
-	| { event: 'presence_diff'; data: { joins: Record<string, Record<string, any>>; leaves: Record<string, Record<string, any>> } }
+	| { event: 'state'; data: Record<string, Record<string, any>> }
+	| { event: 'diff'; data: { joins: Record<string, Record<string, any>>; leaves: Record<string, Record<string, any>> } }
 	| { event: 'heartbeat'; data: string[] };
 
 export interface PresenceMetricsSnapshot {
@@ -101,7 +101,7 @@ export interface RedisPresenceTracker {
 	 * Drain the pending diff buffer synchronously. The diff buffer
 	 * normally flushes on the next microtask after a join / leave /
 	 * update; call this when a test or graceful-shutdown path needs
-	 * the `presence_diff` to land before the await chain continues.
+	 * the `diff` to land before the await chain continues.
 	 */
 	flushDiffs(): void;
 
