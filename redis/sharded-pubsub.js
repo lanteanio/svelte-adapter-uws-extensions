@@ -107,16 +107,26 @@ export function createShardedBus(client, options = {}) {
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
 	const wsFollows = new WeakMap();
 
-	// One-shot warn flag for the per-tick microtask batch cap.
+	// One-shot warn flag for the per-tick batch cap.
 	let batchChannelsWarnFired = false;
 
-	// Per-channel microtask batch: coalesce SPUBLISHes for the same
-	// channel within one tick into a single pipelined call. Each entry
-	// tracks the underlying topic list so the relayed-messages counter
-	// stays accurate when batch envelopes carry many messages.
+	// Per-channel tick batch: coalesce SPUBLISHes for the same channel
+	// within one event-loop iteration into a single pipelined call. Each
+	// entry tracks the underlying topic list so the relayed-messages
+	// counter stays accurate when batch envelopes carry many messages.
+	//
+	// Why `setTimeout(0)` and not `queueMicrotask`: uWS dispatches each WS
+	// message as its own JS task, and N-API drains microtasks at the C++/JS
+	// boundary between tasks. A microtask-deferred flush fires BEFORE the
+	// next socket's handler runs, so cross-socket coalescing is impossible
+	// at the microtask level. `setTimeout(0)` lands in libuv's timers
+	// phase, which fires only after the poll phase has dispatched every
+	// ready socket message in the current iteration. Same structural
+	// choice the 0.5.7 cursor always-tick rewrite locked in.
 	/** @type {Map<string, Array<{msg: string, topics: string[]}>>} */
 	let channelBatches = new Map();
-	let relayScheduled = false;
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let relayTimer = null;
 
 	function scheduleRelay(channel, msg, topics) {
 		let arr = channelBatches.get(channel);
@@ -128,23 +138,26 @@ export function createShardedBus(client, options = {}) {
 		if (channelBatches.size >= MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK && !batchChannelsWarnFired) {
 			batchChannelsWarnFired = true;
 			console.warn(
-				'[sharded-bus] microtask batch reached ' + channelBatches.size +
-				' distinct channels in one tick. The batch is drained every microtask, ' +
+				'[sharded-bus] tick batch reached ' + channelBatches.size +
+				' distinct channels in one iteration. The batch is drained every tick, ' +
 				'so reaching this size means a publisher emitted a million distinct ' +
 				'channels in one synchronous burst - likely a topic-cardinality leak.\n' +
 				'  See: https://svti.me/sharded-bus-burst'
 			);
 		}
-		if (!relayScheduled) {
-			relayScheduled = true;
-			queueMicrotask(flushRelay);
+		if (relayTimer === null) {
+			relayTimer = setTimeout(flushRelay, 0);
+			if (relayTimer.unref) relayTimer.unref();
 		}
 	}
 
 	function flushRelay() {
 		const batches = channelBatches;
 		channelBatches = new Map();
-		relayScheduled = false;
+		if (relayTimer !== null) {
+			clearTimeout(relayTimer);
+			relayTimer = null;
+		}
 		if (b) {
 			try { b.guard(); } catch { return; }
 		}
@@ -268,7 +281,10 @@ export function createShardedBus(client, options = {}) {
 			subscriber = null;
 		}
 		channelBatches = new Map();
-		relayScheduled = false;
+		if (relayTimer !== null) {
+			clearTimeout(relayTimer);
+			relayTimer = null;
+		}
 		followCounts.clear();
 		channelRefcounts.clear();
 	}

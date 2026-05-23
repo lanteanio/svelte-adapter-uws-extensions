@@ -120,13 +120,25 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
 
-	// Microtask relay batching: coalesce Redis publishes within a single
-	// event-loop tick into one pipelined round trip. Each envelope tracks
-	// its underlying message count so the relayed-messages counter stays
-	// accurate when batch envelopes carry many messages each.
+	// Tick relay batching: coalesce Redis publishes within a single
+	// event-loop iteration into one pipelined round trip. Each envelope
+	// tracks its underlying message count so the relayed-messages counter
+	// stays accurate when batch envelopes carry many messages each.
+	//
+	// Why `setTimeout(0)` and not `queueMicrotask`: uWS dispatches each WS
+	// message as its own JS task, and N-API drains microtasks at the C++/JS
+	// boundary between tasks. A microtask-deferred flush fires BEFORE the
+	// next socket's handler runs, so cross-socket coalescing is impossible
+	// at the microtask level - N publishes from N socket handlers in the
+	// same iteration produce N Redis round-trips instead of one pipelined
+	// call. `setTimeout(0)` lands in libuv's timers phase, which fires only
+	// after the poll phase has dispatched every ready socket message in the
+	// current iteration. Same structural choice the 0.5.7 cursor always-tick
+	// rewrite locked in.
 	/** @type {Array<{msg: string, count: number}>} */
 	let relayBatch = [];
-	let relayScheduled = false;
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let relayTimer = null;
 	let relayBatchWarnFired = false;
 
 	function scheduleRelay(msg, count) {
@@ -135,23 +147,26 @@ export function createPubSubBus(client, options = {}) {
 		if (relayBatch.length >= MAX_PUBSUB_RELAY_BATCH_PER_TICK && !relayBatchWarnFired) {
 			relayBatchWarnFired = true;
 			console.warn(
-				'[pubsub] microtask relay batch reached ' + relayBatch.length +
-				' entries in one tick. The batch is drained every microtask, so a ' +
+				'[pubsub] tick relay batch reached ' + relayBatch.length +
+				' entries in one iteration. The batch is drained every tick, so a ' +
 				'caller emitted a million publishes in one synchronous burst - likely ' +
 				'a publish-in-loop without yielding.\n' +
 				'  See: https://svti.me/pubsub-burst'
 			);
 		}
-		if (!relayScheduled) {
-			relayScheduled = true;
-			queueMicrotask(flushRelay);
+		if (relayTimer === null) {
+			relayTimer = setTimeout(flushRelay, 0);
+			if (relayTimer.unref) relayTimer.unref();
 		}
 	}
 
 	function flushRelay() {
 		const batch = relayBatch;
 		relayBatch = [];
-		relayScheduled = false;
+		if (relayTimer !== null) {
+			clearTimeout(relayTimer);
+			relayTimer = null;
+		}
 		if (b) {
 			try { b.guard(); } catch { return; }
 		}
@@ -380,6 +395,11 @@ export function createPubSubBus(client, options = {}) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;
 			}
+			if (relayTimer !== null) {
+				clearTimeout(relayTimer);
+				relayTimer = null;
+			}
+			relayBatch = [];
 			if (!active || !subscriber) return;
 			active = false;
 			activePlatform = null;

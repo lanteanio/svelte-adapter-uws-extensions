@@ -447,11 +447,11 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.publish('chat', 'msg', { text: 'hi' }, { relay: false });
-			await Promise.resolve(); // flush microtask batch
+			await new Promise((r) => setTimeout(r, 5)); // flush tick batch
 			expect(publishCalls).toHaveLength(0);
 
 			wrapped.publish('chat', 'msg', { text: 'hi' });
-			await Promise.resolve(); // flush microtask batch
+			await new Promise((r) => setTimeout(r, 5)); // flush tick batch
 			expect(publishCalls).toHaveLength(1);
 		});
 
@@ -483,7 +483,7 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.topic('chat').created({ id: 1 });
-			await Promise.resolve(); // flush microtask batch
+			await new Promise((r) => setTimeout(r, 5)); // flush tick batch
 
 			expect(platform.published).toHaveLength(1);
 			expect(platform.published[0].topic).toBe('chat');
@@ -506,7 +506,7 @@ describe('redis pubsub bus', () => {
 			};
 
 			wrapped.topic('room').publish('custom-event', { val: 42 });
-			await Promise.resolve(); // flush microtask batch
+			await new Promise((r) => setTimeout(r, 5)); // flush tick batch
 
 			expect(platform.published).toHaveLength(1);
 			expect(platform.published[0].event).toBe('custom-event');

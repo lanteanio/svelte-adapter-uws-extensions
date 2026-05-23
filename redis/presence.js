@@ -8,9 +8,10 @@
  * Wire shape clients see on `__presence:{topic}`:
  *   - `state` (sent once on subscribe to a single connection)
  *       payload: `{[userKey]: data}` flat snapshot of current presence
- *   - `diff` (broadcast to topic subscribers, microtask-batched)
+ *   - `diff` (broadcast to topic subscribers, tick-batched)
  *       payload: `{joins: {[key]: data}, leaves: {[key]: data}}`
- *       Same-tick joins+leaves on the same key collapse: latest op wins.
+ *       Joins+leaves on the same key in one event-loop iteration
+ *       collapse: latest op wins.
  *   - `heartbeat` (broadcast to topic subscribers, per heartbeat interval)
  *       payload: array of currently-known user keys
  *
@@ -317,14 +318,29 @@ export function createPresence(client, options = {}) {
 
 	/**
 	 * Per-topic pending diff buffer: latest op per key wins. Joins and
-	 * leaves on the same key in the same microtask collapse so the wire
-	 * only sees the net change. Flushed once per microtask via
-	 * `scheduleFlush`. Mirrors the buffer model the adapter's bundled
-	 * presence plugin uses, so a single client decoder handles both.
+	 * leaves on the same key in one event-loop iteration collapse so the
+	 * wire only sees the net change. Flushed once per iteration via
+	 * `setTimeout(flushPendingDiffs, 0)` armed when the first dirty entry
+	 * lands. Mirrors the buffer model the adapter's bundled presence
+	 * plugin uses, so a single client decoder handles both.
+	 *
+	 * Why `setTimeout(0)` and not `queueMicrotask`: uWS dispatches each WS
+	 * message as its own JS task, and N-API drains microtasks at the C++/JS
+	 * boundary between tasks. A microtask-deferred flush fires BEFORE the
+	 * next socket's handler runs, so cross-socket coalescing is impossible
+	 * at the microtask level - a mass-join into a populated topic produces
+	 * O(N) one-entry publishes instead of one batched diff. `setTimeout(0)`
+	 * lands in libuv's timers phase, which fires only after the poll phase
+	 * has dispatched every ready socket message in the current iteration -
+	 * so all joins arriving together end up in one flush regardless of how
+	 * many task boundaries separate them. Same structural choice the
+	 * 0.5.7 cursor always-tick rewrite locked in.
+	 *
 	 * @type {Map<string, Map<string, { op: 'join' | 'leave', data: Record<string, any> }>>}
 	 */
 	const pendingDiffs = new Map();
-	let diffFlushScheduled = false;
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let diffFlushTimer = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let diffFlushPlatform = null;
 
@@ -339,14 +355,17 @@ export function createPresence(client, options = {}) {
 		}
 		entries.set(key, { op, data });
 		diffFlushPlatform = platform;
-		if (!diffFlushScheduled) {
-			diffFlushScheduled = true;
-			queueMicrotask(flushPendingDiffs);
+		if (diffFlushTimer === null) {
+			diffFlushTimer = setTimeout(flushPendingDiffs, 0);
+			if (diffFlushTimer.unref) diffFlushTimer.unref();
 		}
 	}
 
 	function flushPendingDiffs() {
-		diffFlushScheduled = false;
+		if (diffFlushTimer !== null) {
+			clearTimeout(diffFlushTimer);
+			diffFlushTimer = null;
+		}
 		const platform = diffFlushPlatform;
 		diffFlushPlatform = null;
 		if (!platform) {
@@ -1359,7 +1378,10 @@ export function createPresence(client, options = {}) {
 			syncObservers.clear();
 			syncCounts.clear();
 			pendingDiffs.clear();
-			diffFlushScheduled = false;
+			if (diffFlushTimer !== null) {
+				clearTimeout(diffFlushTimer);
+				diffFlushTimer = null;
+			}
 			diffFlushPlatform = null;
 			connCounter = 0;
 		},
@@ -1379,7 +1401,10 @@ export function createPresence(client, options = {}) {
 			keyspaceSubscribed = false;
 			activePlatform = null;
 			pendingDiffs.clear();
-			diffFlushScheduled = false;
+			if (diffFlushTimer !== null) {
+				clearTimeout(diffFlushTimer);
+				diffFlushTimer = null;
+			}
 			diffFlushPlatform = null;
 		},
 

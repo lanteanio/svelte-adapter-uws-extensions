@@ -91,10 +91,11 @@ describe('redis presence', () => {
 			expect(ws.isSubscribed('__presence:room')).toBe(true);
 		});
 
-		it('buffers a join entry that flushes as diff on next microtask', async () => {
+		it('buffers a join entry that flushes as diff on next tick', async () => {
 			const ws1 = mockWs({ id: '1', name: 'Alice' });
 			const ws2 = mockWs({ id: '2', name: 'Bob' });
 			await presence.join(ws1, 'room', platform);
+			presence.flushDiffs();
 			platform.reset();
 
 			await presence.join(ws2, 'room', platform);
@@ -332,12 +333,12 @@ describe('redis presence', () => {
 		});
 	});
 
-	describe('microtask coalescing', () => {
+	describe('tick coalescing', () => {
 		it('a same-tick join+leave on the same key from another instance collapses to leaves only', async () => {
 			// Trigger via cross-instance pubsub since two synchronous bufferDiff
-			// calls must happen WITHIN the same microtask to collapse. An
-			// awaited local join+leave pumps the microtask queue between them
-			// and flushes the buffer mid-stream.
+			// calls must happen WITHIN one event-loop iteration to collapse.
+			// An awaited local join+leave hops past the next timers phase
+			// between them and flushes the buffer mid-stream.
 			const local = mockWs({ id: 'local' });
 			await presence.join(local, 'room', platform);
 			presence.flushDiffs();
@@ -371,6 +372,44 @@ describe('redis presence', () => {
 
 		it('flushDiffs() is safe to call when there is nothing buffered', () => {
 			expect(() => presence.flushDiffs()).not.toThrow();
+		});
+
+		// Pins the structural property the 0.5.x queueMicrotask defer got wrong:
+		// uWS dispatches each WS message as its own JS task and N-API drains
+		// microtasks at the C++/JS boundary between tasks, so a microtask-
+		// deferred flush fires BEFORE the next socket's handler runs and
+		// cross-socket coalescing is impossible at the microtask level.
+		// setTimeout(0) lands in libuv's timers phase, which fires only after
+		// the poll phase has dispatched every ready socket message in the
+		// current iteration - so joins arriving in separate JS tasks (the
+		// production shape) still collapse into one diff. Mirrors the
+		// cross-task-boundary regression test for cursor's always-tick.
+		it('cross-task-boundary joins from peer instances coalesce into one diff per topic', async () => {
+			vi.useFakeTimers();
+			const local = createPresence(client, { key: 'id' });
+			const seed = mockWs({ id: 'seed' });
+			await local.join(seed, 'room', platform);
+			vi.advanceTimersByTime(1);
+			platform.reset();
+
+			const ch = client.key('presence:events:room');
+			const COUNT = 50;
+			for (let i = 0; i < COUNT; i++) {
+				client.redis.publish(ch, JSON.stringify({
+					instanceId: 'OTHER', topic: 'room', event: 'join',
+					payload: { key: 'peer-' + i, data: { id: 'peer-' + i } }
+				}));
+				await Promise.resolve();
+			}
+			vi.advanceTimersByTime(1);
+
+			const diffs = diffsOf(platform).filter((d) => d.topic === '__presence:room');
+			expect(diffs).toHaveLength(1);
+			expect(Object.keys(diffs[0].data.joins)).toHaveLength(COUNT);
+			expect(diffs[0].data.leaves).toEqual({});
+
+			local.destroy();
+			vi.useRealTimers();
 		});
 	});
 
@@ -563,6 +602,7 @@ describe('redis presence', () => {
 			// Set up subscriber by joining a ws on this instance
 			const local = mockWs({ id: 'local' });
 			await presence.join(local, 'room', platform);
+			presence.flushDiffs();
 			platform.reset();
 
 			// Simulate cross-instance join arriving on the pubsub channel
@@ -585,6 +625,7 @@ describe('redis presence', () => {
 		it('routes inbound leave from another instance through the diff buffer', async () => {
 			const local = mockWs({ id: 'local' });
 			await presence.join(local, 'room', platform);
+			presence.flushDiffs();
 			platform.reset();
 
 			const ch = client.key('presence:events:room');
@@ -605,6 +646,7 @@ describe('redis presence', () => {
 		it('routes inbound updated as a join op (latest data wins)', async () => {
 			const local = mockWs({ id: 'local' });
 			await presence.join(local, 'room', platform);
+			presence.flushDiffs();
 			platform.reset();
 
 			const ch = client.key('presence:events:room');
@@ -676,7 +718,8 @@ describe('redis presence', () => {
 			local.flushDiffs();
 
 			// Two pubsub messages dispatched synchronously by the mock; both
-			// bufferDiff calls land in the same microtask before flush fires.
+			// bufferDiff calls land in one event-loop iteration before the
+			// setTimeout(0) flush fires.
 			const ch = client.key('presence:events:room');
 			client.redis.publish(ch, JSON.stringify({
 				instanceId: 'OTHER', topic: 'room', event: 'join',
@@ -1089,6 +1132,7 @@ describe('redis presence', () => {
 			const local = createPresence(client, { key: 'id', breaker });
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platform);
+			local.flushDiffs();
 			breaker.failure(new Error('down'));
 			platform.reset();
 
