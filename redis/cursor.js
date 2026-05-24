@@ -233,6 +233,13 @@ export function createCursor(client, options = {}) {
 							enqueueInbound(parsed.topic, entry.key, entry.data, activePlatform);
 						}
 					}
+				} else if (parsed.event === EVENTS.REMOVE && parsed.payload && typeof parsed.payload.key === 'string') {
+					// Peer-relayed cursor removes are coalesced through the
+					// same tick buffer the local close path uses. Without
+					// this, a mass-disconnect on one instance produces an
+					// equally-sized O(N) immediate-publish storm on every
+					// other instance, propagating the OOM risk cluster-wide.
+					queueRemove(parsed.topic, parsed.payload.key, activePlatform);
 				} else {
 					activePlatform.publish(
 						'__cursor:' + parsed.topic,
@@ -442,6 +449,75 @@ export function createCursor(client, options = {}) {
 	let driftCount = 0;
 	let driftMax = 0;
 	let flushCount = 0;
+
+	// Pending REMOVE keys per topic, coalesced into one wire frame per
+	// subscriber per event-loop iteration. Mass-disconnect scenarios (e.g.
+	// 5K cursors closing in one tick during a stress test or browser-tab
+	// teardown of a packed board) used to fire 5K immediate publishes per
+	// topic, each fanning out to every remaining subscriber. The resulting
+	// O(N^2) uWS send queue allocations OOM-killed workers ~18s into the
+	// cleanup cascade. With this buffer, every subscriber sees one frame
+	// per topic per tick containing the full leave list, regardless of
+	// how many sockets dropped together. Symmetric to the presence
+	// `pendingDiffs` buffer.
+	//
+	// Why `setTimeout(0)` over `queueMicrotask`: uWS dispatches each WS
+	// close as its own JS task, and N-API drains microtasks at the C++/JS
+	// boundary between tasks. A microtask-deferred flush fires BEFORE the
+	// next socket's close handler runs, so cross-socket coalescing is
+	// impossible at the microtask level. `setTimeout(0)` lands in libuv's
+	// timers phase, which fires only after the poll phase has dispatched
+	// every ready socket event in the current iteration.
+	/** @type {Map<string, Set<string>>} */
+	const pendingRemoves = new Map();
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let removeFlushTimer = null;
+	/** @type {import('svelte-adapter-uws').Platform | null} */
+	let removeFlushPlatform = null;
+
+	function queueRemove(topic, key, platform) {
+		let set = pendingRemoves.get(topic);
+		if (!set) {
+			set = new Set();
+			pendingRemoves.set(topic, set);
+		}
+		set.add(key);
+		removeFlushPlatform = platform;
+		if (removeFlushTimer === null) {
+			removeFlushTimer = setTimeout(flushPendingRemoves, 0);
+			if (removeFlushTimer.unref) removeFlushTimer.unref();
+		}
+	}
+
+	function flushPendingRemoves() {
+		removeFlushTimer = null;
+		const platform = removeFlushPlatform;
+		removeFlushPlatform = null;
+		if (!platform) {
+			pendingRemoves.clear();
+			return;
+		}
+		for (const [topic, keys] of pendingRemoves) {
+			if (keys.size === 0) continue;
+			// publishBatched (adapter >= 0.5.0-next.5) bundles N events into
+			// one wire frame per subscriber. Each subscriber decodes the
+			// individual REMOVE events from the frame, so no client change
+			// is required. Fall back to per-event publishes when the
+			// adapter does not expose publishBatched.
+			if (typeof platform.publishBatched === 'function') {
+				const messages = [];
+				for (const key of keys) {
+					messages.push({ topic: '__cursor:' + topic, event: EVENTS.REMOVE, data: { key } });
+				}
+				try { platform.publishBatched(messages); } catch { /* platform unavailable mid-flight */ }
+			} else {
+				for (const key of keys) {
+					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }); } catch { /* swallow */ }
+				}
+			}
+		}
+		pendingRemoves.clear();
+	}
 
 	function relay(topic, event, payload) {
 		if (b) { try { b.guard(); } catch { return; } }
@@ -694,7 +770,7 @@ export function createCursor(client, options = {}) {
 			if (topicPending.size === 0) redisPending.delete(topic);
 		}
 
-		platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key });
+		queueRemove(topic, key, platform);
 		relay(topic, EVENTS.REMOVE, { key });
 		return true;
 	}
@@ -870,7 +946,7 @@ export function createCursor(client, options = {}) {
 			}
 
 			for (const t of removedTopics) {
-				platform.publish('__cursor:' + t, EVENTS.REMOVE, { key: state.key });
+				queueRemove(t, state.key, platform);
 				const topicMap = topics.get(t);
 				if (topicMap) {
 					topicMap.delete(state.key);
@@ -961,6 +1037,9 @@ export function createCursor(client, options = {}) {
 			}
 			// Tracker-level scheduler timer + dirty-topic set.
 			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
+			if (removeFlushTimer !== null) { clearTimeout(removeFlushTimer); removeFlushTimer = null; }
+			removeFlushPlatform = null;
+			pendingRemoves.clear();
 			dirtyTopics.clear();
 			topics.clear();
 			topicFlush.clear();
@@ -982,6 +1061,9 @@ export function createCursor(client, options = {}) {
 				}
 			}
 			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
+			if (removeFlushTimer !== null) { clearTimeout(removeFlushTimer); removeFlushTimer = null; }
+			removeFlushPlatform = null;
+			pendingRemoves.clear();
 			dirtyTopics.clear();
 			topicFlush.clear();
 			if (subscriber) {
@@ -1046,6 +1128,16 @@ export function createCursor(client, options = {}) {
 				// set) still gets a fresh catalog + bulk.
 				if (data && data.type === 'cursor-snapshot' && typeof data.topic === 'string') {
 					tracker.snapshot(ws, data.topic, platform);
+					return;
+				}
+				// Silent no-op when the caller dispatches a parsed object whose
+				// `type` is not ours. The dispatch-to-all pattern (e.g. forwarding
+				// every unhandled frame to cursor.hooks.message AND
+				// presence.hooks.message and letting each ignore frames not
+				// addressed to it) is legitimate. Only warn on shapes that
+				// indicate the wrong wiring (raw bytes, non-object) where the
+				// developer almost certainly intended a parsed envelope.
+				if (data && typeof data === 'object' && !Array.isArray(data) && typeof data.type === 'string') {
 					return;
 				}
 				_warnCursorHooksMessageShape(data);
