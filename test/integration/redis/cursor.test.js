@@ -212,7 +212,10 @@ describe('redis cursor (integration)', () => {
 				expect(got.topic).toBe('__cursor:canvas');
 				expect(got.event).toBe('update');
 				expect(got.data.data).toEqual({ x: 77 });
-				expect(got.options).toEqual({ relay: false });
+				// Cursor JSON frames carry { compress: false } (the 60Hz hot path
+				// opts out of permessage-deflate); relayed frames also carry
+				// { relay: false } so the receiving instance does not re-relay.
+				expect(got.options).toEqual({ relay: false, compress: false });
 			} finally {
 				await publisher.quit();
 			}
@@ -268,7 +271,7 @@ describe('redis cursor (integration)', () => {
 				(p) => p.event === 'join' && p.data && p.data.user && p.data.user.id === 'alice'
 			);
 			expect(joinOnB.topic).toBe('__cursor:canvas');
-			expect(joinOnB.options).toEqual({ relay: false });
+			expect(joinOnB.options).toEqual({ relay: false, compress: false });
 
 			const updateOnB = platformB.published.find(
 				(p) => p.event === 'update' && p.data && p.data.key === joinOnB.data.key
@@ -276,7 +279,7 @@ describe('redis cursor (integration)', () => {
 			expect(updateOnB).toBeDefined();
 			expect(updateOnB.topic).toBe('__cursor:canvas');
 			expect(updateOnB.data.data).toEqual({ x: 42, y: 7 });
-			expect(updateOnB.options).toEqual({ relay: false });
+			expect(updateOnB.options).toEqual({ relay: false, compress: false });
 
 			// B's list() also reflects the cross-instance write via the
 			// shared Redis hash, after A's snapshot timer flushes the HSET.
@@ -330,7 +333,10 @@ describe('redis cursor (integration)', () => {
 
 			const removeOnB = platformB.published.find((p) => p.event === 'remove');
 			expect(removeOnB.topic).toBe('__cursor:canvas');
-			expect(removeOnB.options).toEqual({ relay: false });
+			// REMOVE coalesces through platform.publishBatched (one frame per
+			// subscriber per tick), so it lands via the batched path rather than
+			// a per-event publish with { relay: false }.
+			expect(removeOnB.batched).toBe(true);
 
 			// B's list no longer contains alice.
 			const list = await trackerB.list('canvas');
@@ -357,9 +363,10 @@ describe('redis cursor (integration)', () => {
 			const wsB = mockWs({ id: 'bob' });
 
 			await trackerB.attach(wsB, 'canvas', platformB);
-			expect(platformB.subscribed.find(
-				(s) => s.ws === wsB && s.topic === '__cursor:canvas'
-			)).toBeDefined();
+			// attach uses raw uWS `ws.subscribe` (not `platform.subscribe`) to
+			// preserve the closed-ws throw contract, so membership lands in the
+			// ws's own topic set rather than platform.subscribed.
+			expect(wsB.isSubscribed('__cursor:canvas')).toBe(true);
 
 			// Ensure B's Redis subscriber is live before A publishes.
 			trackerB.update(wsB, 'canvas', { x: 0 }, platformB);

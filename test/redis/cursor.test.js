@@ -1165,6 +1165,25 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
+		it('the routed cursor codec encodes update frames to compact binary bytes (not just a capability label)', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const wp = wirePlatform();
+			c.update(mockWs({ id: '1', name: 'Alice' }), 'canvas', { x: 1, y: 2 }, wp);
+
+			const update = wp.publishedWire.find((p) => p.event === 'update');
+			expect(update).toBeDefined();
+			// Invoke the exact codec the plugin handed to publishWire: it must
+			// produce real binary bytes, and they must be smaller than the JSON
+			// envelope the frame replaces - the whole point of the binary wire.
+			const bytes = update.wire.encode('update', update.data);
+			expect(bytes).toBeInstanceOf(Uint8Array);
+			const jsonLen = new TextEncoder().encode(
+				JSON.stringify({ event: 'update', data: update.data })
+			).length;
+			expect(bytes.byteLength).toBeLessThan(jsonLen);
+			c.destroy();
+		});
+
 		it('snapshot routes through sendWire with the cursor codec', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
 			c.update(mockWs({ id: 'mover' }), 'canvas', { x: 9 }, wirePlatform());
