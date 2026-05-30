@@ -106,7 +106,7 @@ describe('redis presence', () => {
 			expect(diffs[0].topic).toBe('__presence:room');
 			expect(diffs[0].data.joins).toEqual({ '2': { id: '2', name: 'Bob' } });
 			expect(diffs[0].data.leaves).toEqual({});
-			expect(diffs[0].options).toEqual({ relay: false });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true });
 		});
 
 		it('coalesces multiple same-tick joins into one diff per topic', async () => {
@@ -619,7 +619,7 @@ describe('redis presence', () => {
 			const diffs = diffsOf(platform);
 			expect(diffs).toHaveLength(1);
 			expect(diffs[0].data.joins).toEqual({ remote: { id: 'remote', name: 'Remote' } });
-			expect(diffs[0].options).toEqual({ relay: false });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true });
 		});
 
 		it('routes inbound leave from another instance through the diff buffer', async () => {
@@ -797,7 +797,7 @@ describe('redis presence', () => {
 			);
 			expect(empties.length).toBeGreaterThan(0);
 			expect(empties[0].data).toEqual({});
-			expect(empties[0].options).toEqual({ relay: false });
+			expect(empties[0].options).toEqual({ relay: false, compress: true });
 			local.destroy();
 		});
 	});
@@ -885,6 +885,102 @@ describe('redis presence', () => {
 			await presence.leave(observer, platform, 'room-a');
 			expect(observer.isSubscribed('__presence:room-a')).toBe(false);
 			expect(observer.isSubscribed('__presence:room-b')).toBe(true);
+		});
+	});
+
+	describe('binary wire codec (presence.protocol:1)', () => {
+		// The default mock has no publishWire/sendWire, so the rest of the suite
+		// exercises the JSON fallback (byte-identical wire). This block uses a
+		// platform that DOES support the binary path and asserts the plugin routes
+		// through it with the presence codec. Byte parity of encode/decode is the
+		// adapter codec's own test (presence-codec.test.js); here we pin the wiring.
+		function wirePlatform() {
+			const p = mockPlatform();
+			p.publishedWire = [];
+			p.sentWire = [];
+			p.publishWire = (topic, event, data, wire, options) => {
+				p.publishedWire.push({ topic, event, data, wire, options });
+				return true;
+			};
+			p.sendWire = (ws, topic, event, data, wire, options) => {
+				p.sentWire.push({ ws, topic, event, data, wire, options });
+				return 1;
+			};
+			return p;
+		}
+
+		it('state snapshot routes through sendWire with the presence codec (compress:true)', async () => {
+			const wp = wirePlatform();
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', wp);
+
+			expect(wp.sent.filter((s) => s.event === 'state')).toHaveLength(0); // not the JSON path
+			const states = wp.sentWire.filter((s) => s.event === 'state');
+			expect(states).toHaveLength(1);
+			expect(states[0].wire.capability).toBe('presence.protocol:1');
+			expect(states[0].wire.schemaVersion).toBe(1);
+			expect(states[0].options).toEqual({ compress: true });
+			// The codec encodes this data to bytes (functional sanity check).
+			expect(states[0].wire.encode('state', states[0].data)).toBeInstanceOf(Uint8Array);
+		});
+
+		it('diff broadcast routes through publishWire with the presence codec (relay:false, compress:true)', async () => {
+			const wp = wirePlatform();
+			await presence.join(mockWs({ id: '1', name: 'Alice' }), 'room', wp);
+			await presence.join(mockWs({ id: '2', name: 'Bob' }), 'room', wp);
+			presence.flushDiffs();
+
+			const diffs = wp.publishedWire.filter((p) => p.event === 'diff');
+			expect(diffs.length).toBeGreaterThan(0);
+			expect(diffs[0].wire.capability).toBe('presence.protocol:1');
+			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+			expect(wp.published.filter((p) => p.event === 'diff')).toHaveLength(0); // not JSON
+		});
+
+		it('binary: false forces the JSON path (no wire codec)', async () => {
+			const c = createPresence(client, { key: 'id', binary: false });
+			const wp = wirePlatform();
+			await c.join(mockWs({ id: '1' }), 'room', wp);
+
+			expect(wp.sentWire).toHaveLength(0);
+			expect(wp.sent.filter((s) => s.event === 'state')).toHaveLength(1);
+			c.destroy();
+		});
+	});
+
+	describe('WebSocket compression policy (presence frames opt into compression)', () => {
+		// Presence frames are low-frequency (diffs coalesce per tick, heartbeat is
+		// periodic, state is on-attach), so the plugin opts INTO permessage-deflate
+		// with { compress: true } - the deliberate counterpart to the cursor
+		// plugin's compress:false. Mirrors the bundled in-memory presence plugin.
+		// (diff and state-cleanup compress:true are pinned by the diff/empties
+		// assertions above; this block covers the state-send and heartbeat sites.)
+
+		it('state snapshot send carries compress:true', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+
+			const state = statesOf(platform)[0];
+			expect(state).toBeDefined();
+			expect(state.options).toEqual({ compress: true });
+		});
+
+		it('heartbeat carries compress:true', async () => {
+			vi.useFakeTimers();
+			const local = createPresence(client, { key: 'id', heartbeat: 50 });
+			const ws = mockWs({ id: '1' });
+			await local.join(ws, 'room', platform);
+			platform.reset();
+
+			vi.advanceTimersByTime(60);
+			await Promise.resolve();
+			vi.useRealTimers();
+			await new Promise((r) => setTimeout(r, 5));
+
+			const beat = heartbeatsOf(platform).find((h) => h.topic === '__presence:room');
+			expect(beat).toBeDefined();
+			expect(beat.options).toEqual({ compress: true });
+			local.destroy();
 		});
 	});
 

@@ -41,6 +41,7 @@ import { scanAndUnlink } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError } from '../shared/errors.js';
+import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 
 export { WsClosedError };
 
@@ -130,6 +131,49 @@ export function createCursor(client, options = {}) {
 	const instanceId = randomBytes(8).toString('hex');
 	const redis = client.redis;
 	const channel = client.key('cursor:events');
+
+	// Binary wire codec (cursor.protocol:2 full-string / :3 short-id dict), built
+	// by the adapter's shared factory so the cluster variant speaks the IDENTICAL
+	// wire to the bundled in-memory cursor plugin. null when `binary: false`. The
+	// per-connection dictionary state lives in the framework (publishWire encodes
+	// per-subscriber against it), so we just hand the codec to publishWire.
+	const wireCodec = createCursorWireCodec(options);
+
+	/**
+	 * Broadcast a cursor wire event to local subscribers. Prefers the binary
+	 * publishWire (0x03 frames, uncompressed - the 60Hz hot path) and falls back
+	 * to JSON publish ({ compress: false }) when binary is off or the platform
+	 * lacks the wire methods (e.g. the unit-test mock). `opts` carries `relay`
+	 * (the cross-instance fan-out is this plugin's own Redis relay).
+	 * @param {string} fullTopic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 * @param {{ relay?: boolean }} [opts]
+	 */
+	function emit(fullTopic, event, data, platform, opts) {
+		if (wireCodec && typeof platform.publishWire === 'function') {
+			platform.publishWire(fullTopic, event, data, wireCodec, opts);
+		} else {
+			platform.publish(fullTopic, event, data, opts ? { ...opts, compress: false } : { compress: false });
+		}
+	}
+
+	/**
+	 * Single-target variant of {@link emit} (snapshot catalog + positions).
+	 * @param {any} ws
+	 * @param {string} fullTopic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 */
+	function emitTo(ws, fullTopic, event, data, platform) {
+		if (wireCodec && typeof platform.sendWire === 'function') {
+			platform.sendWire(ws, fullTopic, event, data, wireCodec);
+		} else {
+			platform.send(ws, fullTopic, event, data, { compress: false });
+		}
+	}
 
 	const validator = createBusValidator({
 		maxBytes: options.maxEnvelopeBytes,
@@ -241,10 +285,11 @@ export function createCursor(client, options = {}) {
 					// other instance, propagating the OOM risk cluster-wide.
 					queueRemove(parsed.topic, parsed.payload.key, activePlatform);
 				} else {
-					activePlatform.publish(
+					emit(
 						'__cursor:' + parsed.topic,
 						parsed.event,
 						parsed.payload,
+						activePlatform,
 						{ relay: false }
 					);
 				}
@@ -280,8 +325,8 @@ export function createCursor(client, options = {}) {
 					} catch { /* skip */ }
 				}
 				if (catalogEntries.length > 0 && activePlatform) {
-					activePlatform.publish('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, { relay: false });
-					activePlatform.publish('__cursor:' + topic, EVENTS.BULK, positionEntries, { relay: false });
+					emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform, { relay: false });
+					emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform, { relay: false });
 				}
 			}
 		}).catch(() => {
@@ -503,7 +548,10 @@ export function createCursor(client, options = {}) {
 			// one wire frame per subscriber. Each subscriber decodes the
 			// individual REMOVE events from the frame, so no client change
 			// is required. Fall back to per-event publishes when the
-			// adapter does not expose publishBatched.
+			// adapter does not expose publishBatched. publishBatched has no
+			// per-frame compress seam and always sends uncompressed, so the
+			// fallback passes { compress: false } to keep both REMOVE paths
+			// off the compressor (see emitJoin for the cursor-wide policy).
 			if (typeof platform.publishBatched === 'function') {
 				const messages = [];
 				for (const key of keys) {
@@ -512,7 +560,7 @@ export function createCursor(client, options = {}) {
 				try { platform.publishBatched(messages); } catch { /* platform unavailable mid-flight */ }
 			} else {
 				for (const key of keys) {
-					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }); } catch { /* swallow */ }
+					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }, { compress: false }); } catch { /* swallow */ }
 				}
 			}
 		}
@@ -529,16 +577,24 @@ export function createCursor(client, options = {}) {
 		}
 	}
 
+	// Cursor frames go out via emit()/emitTo() (above): the binary publishWire
+	// path (0x03 frames) for binary-capable clients, JSON publish/send with
+	// { compress: false } otherwise. Cursor is the 60Hz hot path, so it stays
+	// UNCOMPRESSED on both paths (binary publishWire defaults off; the JSON
+	// fallback opts out): uWS permessage-deflate runs once per recipient, so
+	// compressing here would cost ~1-2.5 CPU cores per topic at high subscriber
+	// counts. REMOVE stays on the JSON publishBatched path - mass-disconnect OOM
+	// safety has no binary batch equivalent, and a {key} frame saves nothing binary.
 	function emitJoin(topic, key, user, platform) {
 		const payload = { key, user };
-		platform.publish('__cursor:' + topic, EVENTS.JOIN, payload);
+		emit('__cursor:' + topic, EVENTS.JOIN, payload, platform);
 		relay(topic, EVENTS.JOIN, payload);
 	}
 
 	function doBroadcast(topic, key, user, data, platform) {
 		mBroadcasts?.inc({ topic: mt(topic) });
 		const payload = { key, data };
-		platform.publish('__cursor:' + topic, EVENTS.UPDATE, payload);
+		emit('__cursor:' + topic, EVENTS.UPDATE, payload, platform);
 		queueSnapshot(topic, key, user, data);
 		relay(topic, EVENTS.UPDATE, payload);
 	}
@@ -590,9 +646,9 @@ export function createCursor(client, options = {}) {
 
 		// Single local publish covering all entries (local + inbound).
 		if (entries.length === 1) {
-			flushPlatform.publish('__cursor:' + topic, EVENTS.UPDATE, entries[0]);
+			emit('__cursor:' + topic, EVENTS.UPDATE, entries[0], flushPlatform);
 		} else {
-			flushPlatform.publish('__cursor:' + topic, EVENTS.BULK, entries);
+			emit('__cursor:' + topic, EVENTS.BULK, entries, flushPlatform);
 		}
 
 		// Relay LOCAL-ORIGIN slice only; never re-relay what came from peers.
@@ -730,7 +786,7 @@ export function createCursor(client, options = {}) {
 	function enqueueInbound(topic, key, data, platform) {
 		if (topicThrottleMs <= 0) {
 			// Legacy immediate mode (matches old receiver behavior).
-			platform.publish('__cursor:' + topic, EVENTS.UPDATE, { key, data }, { relay: false });
+			emit('__cursor:' + topic, EVENTS.UPDATE, { key, data }, platform, { relay: false });
 			return;
 		}
 
@@ -978,8 +1034,8 @@ export function createCursor(client, options = {}) {
 			const catalog = cursors.map((c) => ({ key: c.key, user: c.user }));
 			const positions = cursors.map((c) => ({ key: c.key, data: c.data }));
 			try {
-				platform.send(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog);
-				platform.send(ws, '__cursor:' + topic, EVENTS.BULK, positions);
+				emitTo(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
+				emitTo(ws, '__cursor:' + topic, EVENTS.BULK, positions, platform);
 			} catch {
 				// WebSocket closed before send
 			}

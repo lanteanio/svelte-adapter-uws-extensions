@@ -49,6 +49,7 @@ import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
+import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 
 export { WsClosedError };
 
@@ -203,6 +204,52 @@ export function createPresence(client, options = {}) {
 	const select = options.select || stripInternal;
 	const heartbeatInterval = options.heartbeat ?? 30000;
 	const presenceTtl = options.ttl ?? 90;
+
+	// Binary wire codec (presence.protocol:1), built by the adapter's shared
+	// factory so the cluster variant speaks the IDENTICAL wire to the bundled
+	// in-memory presence plugin. null when `binary: false`. emit()/emitTo() prefer
+	// the binary publishWire/sendWire (opt-in compression: presence is
+	// low-frequency) and fall back to JSON publish/send when binary is off or the
+	// platform lacks the wire methods (e.g. the unit-test mock) - the client
+	// decodes either form transparently.
+	const wireCodec = createPresenceWireCodec(options);
+
+	/**
+	 * Broadcast a presence wire event to local subscribers. `opts` carries the
+	 * per-call `relay` flag - the cross-instance fan-out is this plugin's own
+	 * Redis relay, so local frames pass `{ relay: false }`. `compress: true` opts
+	 * into permessage-deflate (presence is low-frequency; the opposite of the
+	 * cursor 60Hz hot path).
+	 * @param {string} fullTopic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 * @param {{ relay?: boolean }} [opts]
+	 */
+	function emit(fullTopic, event, data, platform, opts) {
+		const wireOptions = opts ? { ...opts, compress: true } : { compress: true };
+		if (wireCodec && typeof platform.publishWire === 'function') {
+			platform.publishWire(fullTopic, event, data, wireCodec, wireOptions);
+		} else {
+			platform.publish(fullTopic, event, data, wireOptions);
+		}
+	}
+
+	/**
+	 * Single-target variant of {@link emit} (the `state` snapshot).
+	 * @param {any} ws
+	 * @param {string} fullTopic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 */
+	function emitTo(ws, fullTopic, event, data, platform) {
+		if (wireCodec && typeof platform.sendWire === 'function') {
+			platform.sendWire(ws, fullTopic, event, data, wireCodec, { compress: true });
+		} else {
+			platform.send(ws, fullTopic, event, data, { compress: true });
+		}
+	}
 	if (typeof heartbeatInterval !== 'number' || !Number.isFinite(heartbeatInterval) || heartbeatInterval < 1) {
 		throw new Error('redis presence: heartbeat must be a positive number (ms)');
 	}
@@ -382,7 +429,14 @@ export function createPresence(client, options = {}) {
 				else leaves[key] = data;
 			}
 			try {
-				platform.publish('__presence:' + topic, 'diff', { joins, leaves }, { relay: false });
+				// Presence WS frames opt INTO compression. They are low-frequency -
+				// diffs coalesce per tick, heartbeat is periodic, state is on-attach -
+				// so per-subscriber deflate CPU is amortized and the roster JSON
+				// compresses well. This is the deliberate counterpart to the cursor
+				// plugin's compress:false 60Hz hot path, and matches the bundled
+				// in-memory presence plugin. No-op while websocket.compression is off
+				// (the default): the adapter resolves the flag to false regardless.
+				emit('__presence:' + topic, 'diff', { joins, leaves }, platform, { relay: false });
 				mDiffFrames?.inc({ topic: mt(topic) });
 			} catch { /* platform unavailable mid-flight */ }
 		}
@@ -560,7 +614,7 @@ export function createPresence(client, options = {}) {
 					/** @type {Record<string, any>} */
 					const dataMap = {};
 					for (const [userKey, entry] of data) dataMap[userKey] = entry.data;
-					activePlatform.publish('__presence:' + topic, 'heartbeat', dataMap);
+					emit('__presence:' + topic, 'heartbeat', dataMap, activePlatform);
 				}
 			}
 		}
@@ -618,7 +672,7 @@ export function createPresence(client, options = {}) {
 					if (!expiredKey.startsWith(topicPrefix)) return;
 					const topic = expiredKey.slice(topicPrefix.length);
 					if (activePlatform) {
-						activePlatform.publish('__presence:' + topic, 'state', {}, { relay: false });
+						emit('__presence:' + topic, 'state', {}, activePlatform, { relay: false });
 						mKeyspaceCleanups?.inc();
 					}
 				});
@@ -1242,7 +1296,7 @@ export function createPresence(client, options = {}) {
 				state[userKey] = entry.data;
 			}
 			try {
-				platform.send(ws, '__presence:' + topic, 'state', state);
+				emitTo(ws, '__presence:' + topic, 'state', state, platform);
 			} catch {
 				// WebSocket closed before send
 			}
@@ -1289,7 +1343,7 @@ export function createPresence(client, options = {}) {
 
 			try {
 				ws.subscribe(presenceTopic);
-				platform.send(ws, presenceTopic, 'state', state);
+				emitTo(ws, presenceTopic, 'state', state, platform);
 			} catch {
 				const topics = syncObservers.get(ws);
 				if (topics && topics.has(topic)) {

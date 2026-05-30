@@ -100,8 +100,8 @@ export function mockPlatform() {
 				});
 			}
 		},
-		send(ws, topic, event, data) {
-			p.sent.push({ ws, topic, event, data });
+		send(ws, topic, event, data, options) {
+			p.sent.push({ ws, topic, event, data, options });
 			return 1;
 		},
 		sendCoalesced(ws, payload) {

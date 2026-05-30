@@ -246,6 +246,14 @@ export function createPubSubBus(client, options = {}) {
 				sendTo: platform.sendTo.bind(platform),
 				sendCoalesced: platform.sendCoalesced.bind(platform),
 				request: platform.request.bind(platform),
+				// Binary wire methods. Forwarded like send/sendTo (local fanout, no
+				// cross-instance relay - the plugin's own relay() handles that). Without
+				// these the wrapped seam hides the binary path and cluster-backed cursor /
+				// presence silently fall back to JSON. `undefined` when the underlying
+				// platform predates per-frame binary wire, so the plugins' typeof guard
+				// degrades gracefully.
+				publishWire: platform.publishWire ? platform.publishWire.bind(platform) : undefined,
+				sendWire: platform.sendWire ? platform.sendWire.bind(platform) : undefined,
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
 				get pressure() { return platform.pressure; },

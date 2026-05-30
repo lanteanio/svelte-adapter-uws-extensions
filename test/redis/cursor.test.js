@@ -508,6 +508,8 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.hooks.close(ws, { platform });
+			// Deferred remove-coalescing flush (setTimeout 0); drain before asserting.
+			await new Promise((r) => setTimeout(r, 0));
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
@@ -533,9 +535,10 @@ describe('redis cursor', () => {
 				key: expect.any(String),
 				data: { x: 10, y: 20 }
 			});
-			// User-initiated broadcasts should relay to sibling workers
-			expect(join.options).toBeUndefined();
-			expect(update.options).toBeUndefined();
+			// User-initiated broadcasts relay to sibling workers (no relay:false)
+			// and stay off the compressor (cursor 60Hz hot path).
+			expect(join.options).toEqual({ compress: false });
+			expect(update.options).toEqual({ compress: false });
 		});
 
 		it('uses select to extract user info on join', () => {
@@ -711,6 +714,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform);
+			await new Promise((r) => setTimeout(r, 0)); // drain deferred remove flush
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(2);
@@ -794,6 +798,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform, 'canvas-a');
+			await new Promise((r) => setTimeout(r, 0)); // drain deferred remove flush
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
@@ -1022,7 +1027,7 @@ describe('redis cursor', () => {
 			expect(platform.published[0].topic).toBe('__cursor:canvas');
 			expect(platform.published[0].data.key).toBe('remote:1');
 			expect(platform.published[0].data.data).toEqual({ x: 77 });
-			expect(platform.published[0].options).toEqual({ relay: false });
+			expect(platform.published[0].options).toEqual({ relay: false, compress: false });
 			c.destroy();
 		});
 
@@ -1045,7 +1050,7 @@ describe('redis cursor', () => {
 			expect(platform.published[0].topic).toBe('__cursor:canvas');
 			expect(platform.published[0].event).toBe('join');
 			expect(platform.published[0].data).toEqual({ key: 'remote:2', user: { id: '2', name: 'Bob' } });
-			expect(platform.published[0].options).toEqual({ relay: false });
+			expect(platform.published[0].options).toEqual({ relay: false, compress: false });
 			c.destroy();
 		});
 
@@ -1093,6 +1098,8 @@ describe('redis cursor', () => {
 			);
 			expect(catalog).toBeDefined();
 			expect(bulk).toBeDefined();
+			expect(catalog.options.compress).toBe(false);
+			expect(bulk.options.compress).toBe(false);
 			const catalogEntry = catalog.data.find((e) => e.key === remoteKey);
 			expect(catalogEntry).toBeDefined();
 			expect(catalogEntry.user).toEqual({ id: '2' });
@@ -1119,6 +1126,169 @@ describe('redis cursor', () => {
 			expect(reconcileBulk).toHaveLength(0);
 			expect(reconcileCatalog).toHaveLength(0);
 
+			c.destroy();
+		});
+	});
+
+	describe('binary wire codec (cursor.protocol)', () => {
+		// The default mock has no publishWire/sendWire, so the rest of the suite
+		// exercises the JSON fallback. This block uses a wire-capable platform and
+		// asserts the plugin routes through publishWire/sendWire with the cursor
+		// codec. Cursor is the 60Hz hot path, so binary stays uncompressed.
+		function wirePlatform() {
+			const p = mockPlatform();
+			p.publishedWire = [];
+			p.sentWire = [];
+			p.publishWire = (topic, event, data, wire, options) => {
+				p.publishedWire.push({ topic, event, data, wire, options });
+				return true;
+			};
+			p.sendWire = (ws, topic, event, data, wire, options) => {
+				p.sentWire.push({ ws, topic, event, data, wire, options });
+				return 1;
+			};
+			return p;
+		}
+
+		it('join + update route through publishWire with the cursor codec (uncompressed)', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const wp = wirePlatform();
+			c.update(mockWs({ id: '1', name: 'Alice' }), 'canvas', { x: 1, y: 2 }, wp);
+
+			const join = wp.publishedWire.find((p) => p.event === 'join');
+			const update = wp.publishedWire.find((p) => p.event === 'update');
+			expect(join).toBeDefined();
+			expect(update).toBeDefined();
+			expect(update.wire.capability).toBe('cursor.protocol:2');
+			expect(update.options).toBeUndefined(); // binary publishWire defaults off; no compress
+			expect(wp.published.filter((p) => p.event === 'update')).toHaveLength(0); // not JSON
+			c.destroy();
+		});
+
+		it('snapshot routes through sendWire with the cursor codec', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			c.update(mockWs({ id: 'mover' }), 'canvas', { x: 9 }, wirePlatform());
+			const wp = wirePlatform();
+			await c.snapshot(mockWs({ id: 'joiner' }), 'canvas', wp);
+
+			const catalog = wp.sentWire.find((s) => s.event === 'catalog');
+			const bulk = wp.sentWire.find((s) => s.event === 'bulk');
+			expect(catalog).toBeDefined();
+			expect(bulk).toBeDefined();
+			expect(catalog.wire.capability).toBe('cursor.protocol:2');
+			expect(wp.sent.filter((s) => s.event === 'catalog')).toHaveLength(0); // not JSON
+			c.destroy();
+		});
+
+		it('REMOVE stays on the JSON path (no binary batch)', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const wp = wirePlatform();
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'canvas', { x: 1 }, wp);
+			wp.publishedWire.length = 0;
+			wp.published.length = 0;
+			wp.publishedBatches.length = 0;
+
+			await c.remove(ws, wp);
+			await new Promise((r) => setTimeout(r, 0));
+
+			expect(wp.publishedWire.filter((p) => p.event === 'remove')).toHaveLength(0);
+			expect(wp.published.filter((p) => p.event === 'remove')).toHaveLength(1);
+			c.destroy();
+		});
+
+		it('binary: false forces the JSON path', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, binary: false });
+			const wp = wirePlatform();
+			c.update(mockWs({ id: '1' }), 'canvas', { x: 1 }, wp);
+
+			expect(wp.publishedWire).toHaveLength(0);
+			expect(wp.published.filter((p) => p.event === 'update')).toHaveLength(1);
+			c.destroy();
+		});
+	});
+
+	describe('WebSocket compression policy (cursor frames stay uncompressed)', () => {
+		// Every cursor WS frame opts out of permessage-deflate (compress:false) so
+		// a clustered deployment that enables websocket.compression does not
+		// per-subscriber-compress the 60Hz hot path. Full wire parity with the
+		// bundled in-memory cursor plugin. See the comment above emitJoin in
+		// redis/cursor.js for the rationale.
+
+		it('coalesced flush update and bulk carry compress:false', () => {
+			vi.useFakeTimers();
+			const c = createCursor(client, { throttle: 0, topicThrottle: 16, snapshotIntervalMs: 0 });
+			const a = mockWs({ id: 'a' });
+			const b = mockWs({ id: 'b' });
+
+			// Two movers in one cadence window -> one coalesced bulk on the tick.
+			c.update(a, 'canvas', { x: 1 }, platform);
+			c.update(b, 'canvas', { x: 2 }, platform);
+			platform.reset();
+			vi.advanceTimersByTime(16);
+			const bulk = platform.published.find((p) => p.event === 'bulk');
+			expect(bulk).toBeDefined();
+			expect(bulk.options.compress).toBe(false);
+
+			// One mover in a fresh window -> one coalesced single update on the tick.
+			vi.advanceTimersByTime(100);
+			platform.reset();
+			c.update(a, 'canvas', { x: 3 }, platform);
+			vi.advanceTimersByTime(16);
+			const update = platform.published.find((p) => p.event === 'update');
+			expect(update).toBeDefined();
+			expect(update.options.compress).toBe(false);
+
+			c.destroy();
+		});
+
+		it('snapshot send (catalog + bulk) carries compress:false', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			c.update(mockWs({ id: 'mover' }), 'canvas', { x: 9 }, platform);
+			platform.reset();
+
+			await c.snapshot(mockWs({ id: 'joiner' }), 'canvas', platform);
+
+			const catalog = platform.sent.find((s) => s.event === 'catalog');
+			const bulk = platform.sent.find((s) => s.event === 'bulk');
+			expect(catalog.options.compress).toBe(false);
+			expect(bulk.options.compress).toBe(false);
+			c.destroy();
+		});
+
+		it('remove fallback publish carries compress:false when publishBatched is unavailable', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const noBatch = mockPlatform();
+			delete noBatch.publishBatched;
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, noBatch);
+			noBatch.reset();
+
+			await c.remove(ws, noBatch);
+			await new Promise((r) => setTimeout(r, 0));
+
+			const removes = noBatch.published.filter((e) => e.event === 'remove');
+			expect(removes).toHaveLength(1);
+			expect(removes[0].options).toEqual({ compress: false });
+			c.destroy();
+		});
+
+		it('remove via publishBatched is uncompressed by construction (no per-frame seam)', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			platform.reset();
+
+			await c.remove(ws, platform);
+			await new Promise((r) => setTimeout(r, 0));
+
+			const removes = platform.published.filter((e) => e.event === 'remove');
+			expect(removes).toHaveLength(1);
+			expect(removes[0].batched).toBe(true);
+			// publishBatched takes no options; the adapter sends batched frames
+			// uncompressed regardless, so no per-frame compress flag is set here.
+			expect(removes[0].options).toBeUndefined();
 			c.destroy();
 		});
 	});
@@ -1453,6 +1623,10 @@ describe('redis cursor', () => {
 				payload: { key: 'OTHER:1' }
 			}));
 
+			// REMOVE coalesces through a setTimeout(0) flush; advance past the
+			// 0ms flush (not the 100ms cadence) to observe the immediate publish.
+			vi.advanceTimersByTime(1);
+
 			// Roster events are low-frequency; latency matters more than
 			// smoothness. They publish immediately, not on the next flush.
 			const events = platform.published.map((p) => p.event);
@@ -1715,6 +1889,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform, 'doc');
+			await new Promise((r) => setTimeout(r, 0)); // drain deferred remove flush
 
 			const removes = platform.published.filter((p) => p.event === 'remove');
 			expect(removes).toHaveLength(1);

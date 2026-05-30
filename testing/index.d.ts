@@ -55,8 +55,8 @@ export function mockRedisClient(keyPrefix?: string): MockRedisClient;
 export interface MockPlatform {
 	/** All `publish()` calls recorded as `{ topic, event, data, options }`. */
 	published: Array<{ topic: string; event: string; data: any; options?: any }>;
-	/** All `send()` calls recorded as `{ ws, topic, event, data }`. */
-	sent: Array<{ ws: any; topic: string; event: string; data: any }>;
+	/** All `send()` calls recorded as `{ ws, topic, event, data, options }`. */
+	sent: Array<{ ws: any; topic: string; event: string; data: any; options?: any }>;
 	/** All `subscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
 	subscribed: Array<{ ws: any; topic: string }>;
 	/** All `unsubscribe()` calls recorded as `{ ws, topic }`. Returns `false` (no-op) by default. */
@@ -74,7 +74,7 @@ export interface MockPlatform {
 	 */
 	replay?: unknown;
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
-	send(ws: any, topic: string, event: string, data?: any): number;
+	send(ws: any, topic: string, event: string, data?: any, options?: any): number;
 	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];
 	sendTo(filter: any, topic: string, event: string, data?: any): number;
 	subscribers(topic: string): number;
