@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.2] - 2026-05-30
+
+### Fixed
+
+- **`createIdempotencyStore` (postgres): the eager startup migration can no longer surface as an unhandled promise rejection.** The constructor kicks off `ensureTable()` so callers can `await store.ready()` before first use, and the result was wrapped in `.catch((err) => { throw err })` - which simply re-threw into a promise a caller is not required to await. If that eager migration rejected (a transient database error, a permissions problem, or the table being dropped concurrently, as a test harness does between cases), the rejection became an unhandled rejection, which can terminate the process under Node's default policy. The eager migration's failure is now non-fatal: `acquire()` / `clear()` / `purge()` each re-run `ensureTable()` and surface the error on first real use, and an explicit `await store.ready()` still observes it. No change to the happy path or to `ready()` awaiters.
+
 ## [0.6.0-next.1] - 2026-05-30
 
 ### Added
