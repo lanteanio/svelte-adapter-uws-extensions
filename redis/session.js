@@ -7,7 +7,7 @@
  * load-balancer hop. This is the Redis-backed swap. Same get / set /
  * delete / touch / clear shape; same sliding-TTL semantics.
  *
- * Pairs with B24's connection registry: when both modules are wired,
+ * Pairs with the connection registry: when both modules are wired,
  * the session provides the durable per-user state (survives
  * disconnect, persists across reconnect), while the registry provides
  * the live "where is this user right now" pointer (tracks the
@@ -22,6 +22,8 @@
  *
  * @module svelte-adapter-uws-extensions/redis/session
  */
+
+import { scanAndUnlink } from '../shared/redis-scan.js';
 
 /**
  * @typedef {Object} DistributedSessionOptions
@@ -167,29 +169,21 @@ export function createDistributedSession(client, options = {}) {
 		// SCAN-based cleanup. Cluster-wide cost scales with total session
 		// count; not a hot-path operation. Use for graceful-shutdown
 		// teardowns, test harnesses, or operator-initiated wipes.
+		//
+		// Routed through the shared scanAndUnlink helper so the wipe is
+		// correct on a Redis Cluster: it runs an independent SCAN per master
+		// node and unlinks one key at a time (session keys are independent
+		// and span hash slots, so a batched multi-key UNLINK would
+		// CROSSSLOT). On standalone it batches into a single SCAN loop with
+		// batched UNLINK, preserving the original throughput shape.
 		const pattern = client.key(keyPrefix + '*');
-		let cursor = '0';
-		do {
-			let res;
-			try {
-				res = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
-				breaker?.success();
-			} catch (err) {
-				breaker?.failure(err);
-				throw err;
-			}
-			cursor = res[0];
-			const keys = res[1] || [];
-			if (keys.length > 0) {
-				try {
-					await redis.unlink(...keys);
-					breaker?.success();
-				} catch (err) {
-					breaker?.failure(err);
-					throw err;
-				}
-			}
-		} while (cursor !== '0');
+		try {
+			await scanAndUnlink(redis, pattern);
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
 	}
 
 	return {

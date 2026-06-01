@@ -101,7 +101,7 @@ describe('redis cursor', () => {
 
 			expect(hsetCalls).toHaveLength(1);
 			const [key, ...fields] = hsetCalls[0];
-			expect(key).toBe('test:cursor:canvas');
+			expect(key).toBe('test:cursor:{canvas}');
 			// fields are flat [f1, v1, f2, v2]
 			const parsed = {};
 			for (let i = 0; i < fields.length; i += 2) {
@@ -995,7 +995,7 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 42, y: 99 }, platform);
 
 			// Read directly from Redis hash
-			const all = await client.redis.hgetall('test:cursor:canvas');
+			const all = await client.redis.hgetall('test:cursor:{canvas}');
 			const keys = Object.keys(all);
 			expect(keys).toHaveLength(1);
 
@@ -1083,7 +1083,7 @@ describe('redis cursor', () => {
 				data: { x: 77 },
 				ts: Date.now()
 			});
-			await client.redis.hset('test:cursor:canvas', remoteKey, remoteData);
+			await client.redis.hset('test:cursor:{canvas}', remoteKey, remoteData);
 
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 10 }, platform);
@@ -2083,7 +2083,7 @@ describe('redis cursor', () => {
 			c.update(ws, 'canvas', { x: 42 }, platform);
 
 			// Hash is still empty (snapshot timer has not fired yet).
-			const all = await client.redis.hgetall('test:cursor:canvas');
+			const all = await client.redis.hgetall('test:cursor:{canvas}');
 			expect(Object.keys(all)).toHaveLength(0);
 
 			// But list() surfaces the pending entry so local readers see the

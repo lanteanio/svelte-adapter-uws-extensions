@@ -8,7 +8,8 @@
  * because WebSocket objects cannot be serialized. Cross-instance publish()
  * uses Redis pub/sub to reach members on other instances.
  *
- * Storage layout:
+ * Storage layout (the group name is wrapped in braces so all keys for one
+ * group share a Redis hash tag and co-locate on a single cluster slot):
  *   - Key `{prefix}group:{name}:meta`     - hash (group metadata)
  *   - Key `{prefix}group:{name}:members`  - hash (field=memberId, value=JSON {role, instanceId, ts})
  *   - Key `{prefix}group:{name}:closed`   - string flag ("1" if closed)
@@ -163,10 +164,10 @@ export function createGroup(client, name, options = {}) {
 	const mGroupLeaves = m?.counter('group_leaves_total', 'Group leave events', ['group']);
 	const mPublishes = m?.counter('group_publishes_total', 'Group publish events', ['group']);
 
-	const metaKey = client.key('group:' + name + ':meta');
-	const membersKey = client.key('group:' + name + ':members');
-	const closedKey = client.key('group:' + name + ':closed');
-	const eventChannel = client.key('group:' + name + ':events');
+	const metaKey = client.key('group:{' + name + '}:meta');
+	const membersKey = client.key('group:{' + name + '}:members');
+	const closedKey = client.key('group:{' + name + '}:closed');
+	const eventChannel = client.key('group:{' + name + '}:events');
 	const internalTopic = '__group:' + name;
 
 	// Local member tracking (ws objects on this instance)

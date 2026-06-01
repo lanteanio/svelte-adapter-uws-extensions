@@ -37,8 +37,8 @@ describe('redis replay (stream backend)', () => {
 			await ss.publish(platform, 'chat', 'created', { id: 1 });
 			await st.publish(platform, 'chat', 'created', { id: 2 });
 
-			expect(client._sortedSets.has(client.key('replay:buf:chat'))).toBe(true);
-			expect(client._streams.has(client.key('replay:streambuf:chat'))).toBe(true);
+			expect(client._sortedSets.has(client.key('replay:buf:{chat}'))).toBe(true);
+			expect(client._streams.has(client.key('replay:streambuf:{chat}'))).toBe(true);
 		});
 	});
 
@@ -70,7 +70,7 @@ describe('redis replay (stream backend)', () => {
 		it('uses <seq>-0 stream IDs', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 			await replay.publish(platform, 'chat', 'created', { id: 2 });
-			const stream = client._streams.get(client.key('replay:streambuf:chat'));
+			const stream = client._streams.get(client.key('replay:streambuf:{chat}'));
 			expect(stream.map((e) => e.id)).toEqual(['1-0', '2-0']);
 		});
 	});
@@ -152,7 +152,7 @@ describe('redis replay (stream backend)', () => {
 			for (let i = 1; i <= 3; i++) {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
-			client._streams.delete(client.key('replay:streambuf:chat'));
+			client._streams.delete(client.key('replay:streambuf:{chat}'));
 
 			const fakeWs = {};
 			platform.reset();
@@ -188,7 +188,7 @@ describe('redis replay (stream backend)', () => {
 			for (let i = 1; i <= 3; i++) {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
-			client._streams.delete(client.key('replay:streambuf:chat'));
+			client._streams.delete(client.key('replay:streambuf:{chat}'));
 			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
 		});
 

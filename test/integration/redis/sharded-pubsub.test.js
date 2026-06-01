@@ -38,8 +38,13 @@ async function waitFor(fn, timeoutMs = 2000) {
 	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
-// Redis Cluster gap: SPUBLISH->SSUBSCRIBE round-trip does not deliver cross-bus through ioredis Cluster + the test natMap (15/18 tests time out at 30s); flushRelay also pipelines multi-channel SPUBLISH across slots (redis/sharded-pubsub.js flushRelay). Sharded pub/sub cluster delivery is a mapped gap pending diagnosis. Runs on solo (degenerates to global pub/sub).
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both backends. On a cluster, `Cluster.ssubscribe()` does not resolve
+// (the call hangs), so the bus keeps one subscriber connection per master and
+// ssubscribes each channel on the master that owns its slot - where
+// `node.ssubscribe()` works and delivers `smessage`. flushRelay routes each
+// SPUBLISH to that same owning node. On standalone there is no shard topology
+// and it degenerates to global pub/sub.
+const describeIntegration = describe;
 
 describeIntegration('redis sharded pubsub bus (integration)', () => {
 	let client;

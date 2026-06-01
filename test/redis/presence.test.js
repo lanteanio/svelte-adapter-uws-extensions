@@ -789,7 +789,7 @@ describe('redis presence', () => {
 			// Storage layout: the per-topic hash key is `presence:topic:{topic}`.
 			// Whole-key expiry fires only when every field has expired (no live
 			// instances presenting any user on this topic).
-			const expiredKey = client.key('presence:topic:room');
+			const expiredKey = client.key('presence:topic:{room}');
 			pmessageListener('__keyevent@*__:expired', '__keyevent@0__:expired', expiredKey);
 
 			const empties = platform.published.filter(
@@ -1860,7 +1860,7 @@ describe('redis presence', () => {
 				const ws = mockWs({ id: '1', name: 'Alice' });
 				await local.join(ws, 'room', lp);
 				await local.update(ws, 'room', { typing: true }, lp);
-				const stored = JSON.parse(client._hashes.get(client.key('presence:topic:room')).get('1'));
+				const stored = JSON.parse(client._hashes.get(client.key('presence:topic:{room}')).get('1'));
 				expect(stored.fields).toBeUndefined();
 			});
 

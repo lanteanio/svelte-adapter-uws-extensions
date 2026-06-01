@@ -34,8 +34,10 @@ function leaveDiffsFor(platform, key) {
 		.filter((p) => p.data && p.data.leaves && key in p.data.leaves);
 }
 
-// Redis Cluster gap: JOIN_SCRIPT/LEAVE_SCRIPT are 2-key (presence:user:{topic}:{key} + presence:topic:{topic}) with no shared {hash-tag} -> CROSSSLOT on every join/leave; the heartbeat HPEXPIRE pipeline spans slots (redis/presence.js JOIN_SCRIPT/LEAVE_SCRIPT eval + heartbeat pipe). Needs a hash-tag key redesign. Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both backends: the per-topic keys (presence:topic:{topic} and
+// presence:user:{topic}:{userKey}) share a {topic} hash tag, so the 2-key
+// JOIN / LEAVE / UPDATE Lua scripts co-locate on a single slot in a cluster.
+const describeIntegration = describe;
 
 describeIntegration('redis presence (integration)', () => {
 	let client;
@@ -78,11 +80,11 @@ describeIntegration('redis presence (integration)', () => {
 	}
 
 	function topicHashKey(topic) {
-		return client.key('presence:topic:' + topic);
+		return client.key('presence:topic:{' + topic + '}');
 	}
 
 	function userHashKey(topic, userKey) {
-		return client.key('presence:user:' + topic + ':' + userKey);
+		return client.key('presence:user:{' + topic + '}:' + userKey);
 	}
 
 	describe('Design G storage layout', () => {
@@ -148,6 +150,34 @@ describeIntegration('redis presence (integration)', () => {
 			// Both keys gone. HDEL'ing the last field deletes the hash key.
 			expect(await client.redis.exists(topicHashKey('room'))).toBe(0);
 			expect(await client.redis.exists(userHashKey('room', 'alice'))).toBe(0);
+		});
+	});
+
+	describe('leaveAll across multiple topics (one connection, many topics)', () => {
+		it('removes the connection from every topic it held on disconnect', async () => {
+			const presence = makeTracker();
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			const topics = ['room-a', 'room-b', 'room-c', 'room-d'];
+
+			for (const topic of topics) {
+				await presence.join(ws, topic, platform);
+			}
+			for (const topic of topics) {
+				expect(await client.redis.exists(topicHashKey(topic))).toBe(1);
+				expect(await client.redis.exists(userHashKey(topic, 'alice'))).toBe(1);
+			}
+
+			// leave() with no topic runs leaveAll: one batched LEAVE_SCRIPT
+			// pipeline across every topic the connection held. On a cluster the
+			// topics span slots, so this exercises the multi-slot pipeline path
+			// (each eval's two keys still co-locate via the {topic} hash tag).
+			await presence.leave(ws, platform);
+
+			for (const topic of topics) {
+				expect(await client.redis.exists(topicHashKey(topic))).toBe(0);
+				expect(await client.redis.exists(userHashKey(topic, 'alice'))).toBe(0);
+				expect(await presence.count(topic)).toBe(0);
+			}
 		});
 	});
 
@@ -402,6 +432,26 @@ describeIntegration('redis presence (integration)', () => {
 	});
 
 	describe('heartbeat (HPEXPIRE refresh, real Redis 7.4 timing)', () => {
+		it('refreshes per-field TTL across every topic a multi-topic connection holds', async () => {
+			// One connection on several topics. The heartbeat refreshes per-field
+			// TTLs across all of them every tick; on a cluster those topics span
+			// slots, so a topic whose HPEXPIRE was silently dropped (a multi-slot
+			// pipeline delivered to one node) would expire and count() -> 0.
+			const presence = makeTracker({ ttl: 2, heartbeat: 250 });
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			const topics = ['hb-a', 'hb-b', 'hb-c', 'hb-d'];
+			for (const topic of topics) await presence.join(ws, topic, platform);
+
+			// Wait past the 2s ttl: only continuous cross-node refresh keeps the
+			// fields alive this long.
+			await wait(2400);
+
+			for (const topic of topics) {
+				expect(await presence.count(topic)).toBe(1);
+			}
+		});
+
+
 		it('per-field TTL is refreshed by the heartbeat tick before it would expire', async () => {
 			// ttl:3s + heartbeat:300ms means the heartbeat fires ~10x per ttl
 			// window. After 700ms the per-field HPTTL must still be > 1s.

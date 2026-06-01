@@ -12,6 +12,12 @@
  *   - Key `{prefix}replay:seq:{topic}` - INCR counter for sequence numbers
  *   - Key `{prefix}replay:buf:{topic}` - sorted set (score = seq, member = JSON payload)
  *
+ * The topic is wrapped in a Redis hash tag (the literal braces around the
+ * topic) so both keys for one topic share a hash slot. That keeps the
+ * multi-key publish eval and the per-topic UNLINK on a single slot under
+ * Redis Cluster while leaving the key string unchanged in behavior on a
+ * standalone server.
+ *
  * @module svelte-adapter-uws-extensions/redis/replay
  */
 
@@ -118,11 +124,11 @@ export function createReplay(client, options = {}) {
 		: null;
 
 	function seqKey(topic) {
-		return client.key('replay:seq:' + topic);
+		return client.key('replay:seq:{' + topic + '}');
 	}
 
 	function bufKey(topic) {
-		return client.key('replay:buf:' + topic);
+		return client.key('replay:buf:{' + topic + '}');
 	}
 
 	const tracker = {

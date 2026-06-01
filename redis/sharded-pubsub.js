@@ -30,6 +30,7 @@ import {
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
 } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { execMultiSlot, isCluster } from '../shared/cluster.js';
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -92,8 +93,19 @@ export function createShardedBus(client, options = {}) {
 		allowedSystemTopics: []
 	});
 
+	// Sharded subscriber connections. Standalone: one duplicate. Cluster: one
+	// subscriber connection per master, with each channel ssubscribed on the
+	// master owning its slot. ioredis `Cluster.ssubscribe()` does not resolve
+	// against a cluster (the call hangs), but a direct `node.ssubscribe()` on the
+	// owning master subscribes and delivers `smessage`. The owner is resolved
+	// natMap-agnostically by node id (CLUSTER SLOTS owner id -> CLUSTER MYID).
 	/** @type {import('ioredis').Redis | null} */
-	let subscriber = null;
+	let subStandalone = null;
+	/** @type {Map<string, import('ioredis').Redis>} nodeId -> subscriber connection */
+	const subByNodeId = new Map();
+	/** @type {Array<{start: number, end: number, nodeId: string}> | null} */
+	let slotRanges = null;
+	let subReady = false;
 	let active = false;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
@@ -161,15 +173,19 @@ export function createShardedBus(client, options = {}) {
 		if (b) {
 			try { b.guard(); } catch { return; }
 		}
-		const pipe = client.redis.pipeline();
+		// Each sharded channel is owned by the shard that holds its slot, so a
+		// SPUBLISH must land on that node. A single pipeline would be delivered
+		// to one node and silently drop the channels owned elsewhere, so route
+		// each SPUBLISH per owning-node on a cluster (one pipeline on standalone).
+		const commands = [];
 		const counts = []; // for metric inc per channel
 		for (const [ch, entries] of batches) {
 			for (const { msg } of entries) {
-				pipe.spublish(ch, msg);
+				commands.push(['spublish', ch, msg]);
 			}
 			counts.push({ entries });
 		}
-		pipe.exec().then(() => {
+		execMultiSlot(client.redis, commands).then(() => {
 			for (const { entries } of counts) {
 				for (const { topics } of entries) {
 					for (let i = 0; i < topics.length; i++) {
@@ -181,14 +197,7 @@ export function createShardedBus(client, options = {}) {
 		}).catch((err) => { b?.failure(err); });
 	}
 
-	async function ensureSubscriber(platform) {
-		activePlatform = platform;
-		if (subscriber) return;
-		subscriber = client.duplicate({ enableReadyCheck: false });
-		subscriber.on('error', (err) => {
-			console.error('sharded bus subscriber error:', err.message);
-		});
-		subscriber.on('smessage', (ch, message) => {
+	function handleSMessage(ch, message) {
 			if (!validator.acceptRaw(message)) {
 				mParseErrors?.inc();
 				return;
@@ -238,7 +247,94 @@ export function createShardedBus(client, options = {}) {
 				// is observable instead of silently swallowed.
 				mParseErrors?.inc();
 			}
-		});
+	}
+
+	function subOnError(err) {
+		console.error('sharded bus subscriber error:', err.message);
+	}
+
+	// Build (or extend) the per-master subscriber connections and the slot ->
+	// owner-node-id map. Refreshed lazily and when a channel's owner is unknown.
+	async function subRefreshTopology() {
+		const masters = client.redis.nodes('master');
+		await Promise.all(masters.map(async (node) => {
+			const id = await node.cluster('MYID');
+			if (!subByNodeId.has(id)) {
+				const s = node.duplicate({ enableReadyCheck: false });
+				s.on('error', subOnError);
+				s.on('smessage', handleSMessage);
+				subByNodeId.set(id, s);
+			}
+		}));
+		const slots = await client.redis.cluster('SLOTS');
+		// Each entry: [startSlot, endSlot, [ip, port, nodeId], ...replicas].
+		slotRanges = slots.map((e) => ({ start: e[0], end: e[1], nodeId: e[2][2] }));
+	}
+
+	function subOwnerForSlot(slot) {
+		if (!slotRanges) return null;
+		for (const r of slotRanges) {
+			if (slot >= r.start && slot <= r.end) return subByNodeId.get(r.nodeId) || null;
+		}
+		return null;
+	}
+
+	// Resolve the subscriber connection that must carry a channel: the standalone
+	// connection, or the master owning the channel's slot on a cluster.
+	async function subForChannel(channel) {
+		if (!isCluster(client.redis)) return subStandalone;
+		const slot = await client.redis.cluster('KEYSLOT', channel);
+		let sub = subOwnerForSlot(slot);
+		if (!sub) {
+			await subRefreshTopology();
+			sub = subOwnerForSlot(slot);
+		}
+		return sub;
+	}
+
+	async function subEnsure() {
+		if (subReady) return;
+		if (isCluster(client.redis)) {
+			await subRefreshTopology();
+		} else {
+			subStandalone = client.duplicate({ enableReadyCheck: false });
+			subStandalone.on('error', subOnError);
+			subStandalone.on('smessage', handleSMessage);
+		}
+		subReady = true;
+	}
+
+	async function subSubscribe(channels) {
+		if (channels.length === 0) return;
+		if (!isCluster(client.redis)) {
+			await subStandalone.ssubscribe(...channels);
+			return;
+		}
+		// On a cluster, SSUBSCRIBE requires every channel in one call to share a
+		// slot (same owning node is not enough), so subscribe each channel
+		// individually on the master owning its slot. Cluster.ssubscribe would
+		// hang; node.ssubscribe on the owner works and delivers smessage.
+		await Promise.all(channels.map(async (ch) => {
+			const sub = await subForChannel(ch);
+			if (!sub) throw new Error('sharded bus: no owning node for channel ' + ch);
+			await sub.ssubscribe(ch);
+		}));
+	}
+
+	async function subUnsubscribe(channel) {
+		const sub = await subForChannel(channel);
+		if (sub) await sub.sunsubscribe(channel);
+	}
+
+	async function subClose() {
+		const all = isCluster(client.redis)
+			? [...subByNodeId.values()]
+			: (subStandalone ? [subStandalone] : []);
+		subByNodeId.clear();
+		subStandalone = null;
+		slotRanges = null;
+		subReady = false;
+		await Promise.all(all.map((s) => s.quit().catch(() => s.disconnect())));
 	}
 
 	async function activate(platform) {
@@ -264,7 +360,7 @@ export function createShardedBus(client, options = {}) {
 		}
 		b?.success();
 
-		await ensureSubscriber(platform);
+		await subEnsure();
 		active = true;
 	}
 
@@ -272,14 +368,8 @@ export function createShardedBus(client, options = {}) {
 		if (!active) return;
 		active = false;
 		activePlatform = null;
-		if (subscriber) {
-			for (const ch of subscribedChannels) {
-				await subscriber.sunsubscribe(ch).catch(() => {});
-			}
-			subscribedChannels.clear();
-			await subscriber.quit().catch(() => subscriber.disconnect());
-			subscriber = null;
-		}
+		subscribedChannels.clear();
+		await subClose();
 		channelBatches = new Map();
 		if (relayTimer !== null) {
 			clearTimeout(relayTimer);
@@ -290,7 +380,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function follow(topic) {
-		if (!subscriber) {
+		if (!subReady) {
 			throw new Error('sharded bus: activate() must be called before follow()');
 		}
 		const count = followCounts.get(topic) || 0;
@@ -318,7 +408,7 @@ export function createShardedBus(client, options = {}) {
 		subscribedChannels.add(channel);
 		b?.guard();
 		try {
-			await subscriber.ssubscribe(channel);
+			await subSubscribe([channel]);
 			b?.success();
 			mFollows?.inc();
 		} catch (err) {
@@ -349,7 +439,7 @@ export function createShardedBus(client, options = {}) {
 	 * @param {string[]} topics
 	 */
 	async function followBatch(topics) {
-		if (!subscriber) {
+		if (!subReady) {
 			throw new Error('sharded bus: activate() must be called before followBatch()');
 		}
 		if (!Array.isArray(topics)) {
@@ -390,7 +480,7 @@ export function createShardedBus(client, options = {}) {
 			// ioredis accepts multiple channels in one ssubscribe call; this
 			// collapses N new-channel subscribes into one round trip when the
 			// caller's topics span multiple shards.
-			await subscriber.ssubscribe(...channelsToSubscribe);
+			await subSubscribe(channelsToSubscribe);
 			for (const ch of channelsToSubscribe) subscribedChannels.add(ch);
 			b?.success();
 			mFollows?.inc(channelsToSubscribe.length);
@@ -432,10 +522,10 @@ export function createShardedBus(client, options = {}) {
 		}
 		channelRefcounts.delete(channel);
 
-		if (subscriber && subscribedChannels.has(channel)) {
+		if (subReady && subscribedChannels.has(channel)) {
 			subscribedChannels.delete(channel);
 			try {
-				await subscriber.sunsubscribe(channel);
+				await subUnsubscribe(channel);
 				mUnfollows?.inc();
 			} catch {
 				// SUNSUBSCRIBE failure is non-fatal - the connection

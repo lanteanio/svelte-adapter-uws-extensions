@@ -486,7 +486,7 @@ describe('redis groups', () => {
 			platform2.reset();
 
 			// Simulate a remote event via Redis pub/sub
-			const channel = client.key('group:platform-update:events');
+			const channel = client.key('group:{platform-update}:events');
 			const msg = JSON.stringify({
 				instanceId: 'remote-instance',
 				event: 'chat',
@@ -620,7 +620,7 @@ describe('redis groups', () => {
 		it('heartbeat removes stale entries from crashed instances', async () => {
 			// Use a short memberTtl so the heartbeat interval is 5s (the minimum)
 			const g = createGroup(client, 'cleanup-test', { memberTtl: 10 });
-			const membersKey = client.key('group:cleanup-test:members');
+			const membersKey = client.key('group:{cleanup-test}:members');
 
 			// Add a live member so the heartbeat runs
 			const ws = mockWs();
@@ -886,7 +886,7 @@ describe('redis groups', () => {
 	describe('member expiry', () => {
 		it('stale members are excluded from count', async () => {
 			// Manually insert a stale member entry into Redis
-			const membersKey = client.key('group:lobby:members');
+			const membersKey = client.key('group:{lobby}:members');
 			const staleData = JSON.stringify({
 				role: 'member',
 				instanceId: 'dead-instance',
@@ -904,7 +904,7 @@ describe('redis groups', () => {
 
 		it('stale members do not block joins with maxMembers', async () => {
 			const g = createGroup(client, 'expiry-test', { maxMembers: 1, memberTtl: 120 });
-			const membersKey = client.key('group:expiry-test:members');
+			const membersKey = client.key('group:{expiry-test}:members');
 
 			// Insert a stale member
 			const staleData = JSON.stringify({
@@ -1211,7 +1211,7 @@ describe('redis groups', () => {
 		it('join returns false and sets local isClosed when Lua detects closed', async () => {
 			const g = createGroup(client, 'toctou-local', { memberTtl: 120 });
 
-			await client.redis.set(client.key('group:toctou-local:closed'), '1');
+			await client.redis.set(client.key('group:{toctou-local}:closed'), '1');
 
 			const ws1 = mockWs();
 			expect(await g.join(ws1, platform)).toBe(false);

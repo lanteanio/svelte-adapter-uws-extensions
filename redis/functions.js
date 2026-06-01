@@ -21,8 +21,18 @@
 
 import { parseRedisVersion } from '../shared/redis-version.js';
 import { withBreaker } from '../shared/breaker.js';
+import { isCluster } from '../shared/cluster.js';
 
 const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
+
+// FUNCTION LOAD / FUNCTION DELETE are keyless, so on a cluster ioredis sends
+// them to a single sampled node. A library must live on every master for an
+// FCALL (routed by its keys, or to any node when keyless) to resolve, so these
+// commands fan across all masters; on a standalone Redis this is the one client.
+function functionTargets(client) {
+	const redis = client.redis;
+	return isCluster(redis) ? /** @type {any} */ (redis).nodes('master') : [redis];
+}
 
 /**
  * @typedef {Object} FunctionLibraryOptions
@@ -104,7 +114,9 @@ export function createFunctionLibrary(client, code, options = {}) {
 
 		async load() {
 			await ensureVersion();
-			await withBreaker(b, () => client.redis.function('LOAD', 'REPLACE', code));
+			await withBreaker(b, () => Promise.all(
+				functionTargets(client).map((node) => node.function('LOAD', 'REPLACE', code))
+			));
 			mLoads?.inc({ library: name });
 		},
 
@@ -130,7 +142,9 @@ export function createFunctionLibrary(client, code, options = {}) {
 		},
 
 		async delete() {
-			await withBreaker(b, () => client.redis.function('DELETE', name));
+			await withBreaker(b, () => Promise.all(
+				functionTargets(client).map((node) => node.function('DELETE', name))
+			));
 		}
 	};
 }

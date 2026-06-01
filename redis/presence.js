@@ -46,6 +46,7 @@
 import { randomBytes } from 'node:crypto';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
@@ -638,13 +639,13 @@ export function createPresence(client, options = {}) {
 
 	// Per-topic hash: one field per unique user on the topic. Backs list() / count().
 	function topicHashKey(topic) {
-		return client.key('presence:topic:' + topic);
+		return client.key('presence:topic:{' + topic + '}');
 	}
 
 	// Per-user hash for a topic: one field per instance currently presenting this
 	// user. HLEN drives the JOIN/LEAVE broadcast decision.
 	function userHashKey(topic, userKey) {
-		return client.key('presence:user:' + topic + ':' + userKey);
+		return client.key('presence:user:{' + topic + '}:' + userKey);
 	}
 
 	function indexAdd(topic, userKey, ws) {
@@ -782,14 +783,14 @@ export function createPresence(client, options = {}) {
 		// cleanup pass: per-field HPEXPIRE auto-removes fields whose owning
 		// instance stopped heartbeating, exactly the behavior the previous
 		// CLEANUP_SCRIPT simulated at every tick.
-		const pipe = redis.pipeline();
+		const commands = [];
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
 			if (data && data.size > 0) {
 				const topicHash = topicHashKey(topic);
 				for (const userKey of data.keys()) {
-					pipe.hpexpire(userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId);
-					pipe.hpexpire(topicHash, presenceTtlMs, 'FIELDS', 1, userKey);
+					commands.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
+					commands.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
 				}
 				if (activePlatform) {
 					// Publish a `{userKey: data}` map (instead of a key-only
@@ -811,7 +812,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		pipe.exec().catch(() => {});
+		execMultiSlot(redis, commands).catch(() => {});
 		lastHeartbeatLatency = Date.now() - tickStart;
 		mHeartbeatLatency?.set(lastHeartbeatLatency);
 	}, heartbeatInterval);
@@ -881,11 +882,11 @@ export function createPresence(client, options = {}) {
 				// as an empty state to local subscribers. Per-user
 				// hash keys (presence:user:{topic}:{userKey}) and the events
 				// channel are filtered out.
-				const topicPrefix = client.key('presence:topic:');
+				const topicPrefix = client.key('presence:topic:{');
 				subscriber.on('pmessage', (_pattern, _channel, expiredKey) => {
 					if (typeof expiredKey !== 'string') return;
 					if (!expiredKey.startsWith(topicPrefix)) return;
-					const topic = expiredKey.slice(topicPrefix.length);
+					const topic = expiredKey.slice(topicPrefix.length, -1); // drop the '}' closing the {topic} hash tag
 					if (activePlatform) {
 						emit('__presence:' + topic, 'state', {}, activePlatform, { relay: false });
 						mKeyspaceCleanups?.inc();
@@ -1219,7 +1220,7 @@ export function createPresence(client, options = {}) {
 		// Redis command queue. Each LEAVE_SCRIPT is now O(1) Redis-blocked
 		// Lua time, so the total Redis-blocked time scales linearly with
 		// N (the disconnect count), not with N x M (where M was the topic
-		// hash size in the pre-Design-G layout).
+		// hash size in the previous storage layout).
 		const unsubPromises = [];
 		for (const { needsUnsub, topic } of pendingLeaves) {
 			if (needsUnsub) {
@@ -1228,13 +1229,13 @@ export function createPresence(client, options = {}) {
 		}
 		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
 
-		const pipe = redis.pipeline();
+		const commands = [];
 		for (const { topic, key } of pendingLeaves) {
-			pipe.eval(
-				LEAVE_SCRIPT, 2,
+			commands.push([
+				'eval', LEAVE_SCRIPT, 2,
 				userHashKey(topic, key), topicHashKey(topic),
 				instanceId, key
-			);
+			]);
 		}
 
 		let results;
@@ -1242,7 +1243,7 @@ export function createPresence(client, options = {}) {
 		if (b) { try { b.guard(); } catch { skipPipeline = true; } }
 		if (!skipPipeline) {
 			try {
-				results = await pipe.exec();
+				results = await execMultiSlot(redis, commands);
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

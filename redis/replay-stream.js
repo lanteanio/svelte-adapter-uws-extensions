@@ -160,15 +160,15 @@ export function createStreamReplay(client, options = {}) {
 		: null;
 
 	function idmpKey(producerId, topic) {
-		return client.key('replay:idmp:' + producerId + ':' + topic);
+		return client.key('replay:idmp:' + producerId + ':{' + topic + '}');
 	}
 
 	function seqKey(topic) {
-		return client.key('replay:seq:' + topic);
+		return client.key('replay:seq:{' + topic + '}');
 	}
 
 	function bufKey(topic) {
-		return client.key('replay:streambuf:' + topic);
+		return client.key('replay:streambuf:{' + topic + '}');
 	}
 
 	const tracker = {

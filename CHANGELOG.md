@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.4] - 2026-06-02
+
+### Changed
+
+- **The Redis extensions now run correctly on a Redis Cluster - every plugin. Includes a BREAKING key-format change for the topic/name-keyed plugins.** Previously the cluster test tier skipped most plugins because their multi-key Lua scripts and pipelines hashed to different cluster slots (`CROSSSLOT`) or were silently delivered to a single node. The whole sweep is now verified against a real 6-node Redis Cluster:
+  - **Hash-tagged keys (BREAKING).** `presence`, `groups`, `replay`, `replay-stream`, and `cursor` now wrap their co-location id in a Redis hash tag, so a single entity's keys share one slot and the multi-key Lua scripts (`JOIN` / `LEAVE` / `UPDATE`, replay `PUBLISH`, groups join/close) stay atomic on a cluster: `presence:topic:{topic}` + `presence:user:{topic}:{userKey}`, `group:{name}:*`, `replay:seq:{topic}` / `replay:buf:{topic}`, `replay:streambuf:{topic}` / `replay:idmp:<producerId>:{topic}`, `cursor:{topic}`. Hash tags are inert on a standalone Redis (only the key string changes). **BREAKING:** the key strings change, so state written by an older deployment under the old key names is not read by the new code. This state is ephemeral (presence/cursor carry short per-field TTLs; replay buffers and group state are transient), so old keys age out on their own; a rolling cutover shows a brief reset. The cross-instance `*:events` pub/sub channels are unchanged (regular pub/sub broadcasts cluster-wide and needs no hash tag).
+  - **Cross-entity pipelines route per owning-node on a cluster.** Operations that batch one command per topic/user across many entities - presence heartbeat + mass-disconnect `leaveAll`; cursor subscriber-reconcile, snapshot flush, and multi-topic remove; registry heartbeat TTL refresh; sharded-pubsub `flushRelay` SPUBLISH - previously used a single pipeline. A Redis Cluster delivers a multi-slot pipeline to just one node and silently no-ops (no thrown error) the commands whose keys live elsewhere, so on a multi-master cluster some of the work never ran. These now issue each command on the node owning its keys on a cluster, while still batching into one pipeline on a standalone Redis - so the single-instance path keeps its throughput and is behavior-identical. (`registry`'s per-user keys are independent and need no hash tag; only its heartbeat pipeline changed.)
+  - **`redis/functions` loads the library on every master.** `FUNCTION LOAD` / `FUNCTION DELETE` are keyless, so a cluster delivered them to one node and an `FCALL` routed elsewhere returned "Function not found". `load()` and `delete()` now fan across every cluster master. Callers passing multiple keys to `call()` must hash-tag them to co-locate (`FCALL` is slot-routed).
+  - **`redis/sharded-pubsub` delivers on a cluster.** ioredis `Cluster.ssubscribe()` does not resolve against a cluster (the call hangs), so the bus now keeps one subscriber connection per master and `SSUBSCRIBE`s each channel on the master owning its slot (resolved by node id), where a direct `node.ssubscribe()` subscribes and delivers `smessage`. `SPUBLISH` routes to that same owning node.
+  - **`redis/session.clear()` uses the cluster-aware `scanAndUnlink`** instead of an inline `SCAN` + batched `UNLINK`, which `CROSSSLOT`ed across the independent session keys on a cluster. No key-format change; the hot CRUD path was already cluster-safe.
+
 ## [0.6.0-next.3] - 2026-06-01
 
 ### Added

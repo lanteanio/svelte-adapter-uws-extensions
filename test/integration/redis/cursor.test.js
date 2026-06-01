@@ -16,7 +16,7 @@
  *   broadcast reaches another's subscriber).
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys, isClusterBackend, countBackendKeys } from '../helpers/backend.js';
 import { createCursor } from '../../../redis/cursor.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -34,14 +34,11 @@ async function waitFor(fn, timeoutMs = 2000) {
 	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
-// Redis Cluster gap: the cursor plugin's cross-topic coalescing pipelines
-// (flushSnapshot hset+expire, subscriber-reconcile hgetall, multi-topic remove
-// hdel) batch commands across topic-hash keys in different slots -> cross-slot
-// pipeline error. Single-topic ops are cluster-safe, but the integration suite's
-// storage / clear / relay tests exercise the multi-topic and separate-connection
-// paths, so the whole file is skipped on the cluster backend. Cluster greening
-// needs a per-slot pipeline split (or a {topic} hash-tag). Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both backends: cursor keys are hash-tagged on the topic (cursor:{topic}),
+// so each topic's hash lands on one slot, and the cross-topic coalescing pipelines
+// (flushSnapshot, subscriber-reconcile, multi-topic remove) route through
+// execMultiSlot, which fans the commands per owning-node on a cluster.
+const describeIntegration = describe;
 describeIntegration('redis cursor (integration)', () => {
 	let client;
 	let platform;
@@ -84,14 +81,14 @@ describeIntegration('redis cursor (integration)', () => {
 
 			// Wait for the async pipeline to land in Redis.
 			await waitFor(async () => {
-				const all = await client.redis.hgetall(client.key('cursor:canvas'));
+				const all = await client.redis.hgetall(client.key('cursor:{canvas}'));
 				return Object.keys(all).length > 0;
 			});
 
 			// Read back from a fresh, independent connection.
 			const reader = createBackendClient({});
 			try {
-				const all = await reader.redis.hgetall(client.key('cursor:canvas'));
+				const all = await reader.redis.hgetall(client.key('cursor:{canvas}'));
 				const keys = Object.keys(all);
 				expect(keys).toHaveLength(1);
 				const stored = JSON.parse(all[keys[0]]);
@@ -125,8 +122,45 @@ describeIntegration('redis cursor (integration)', () => {
 
 			await c.remove(ws, platform);
 
-			const all = await client.redis.hgetall(client.key('cursor:canvas'));
+			const all = await client.redis.hgetall(client.key('cursor:{canvas}'));
 			expect(Object.keys(all)).toHaveLength(0);
+		});
+	});
+
+	describe('multi-topic cluster pipelines', () => {
+		it('remove() drops a connection from every topic it held (multi-slot hdel pipeline)', async () => {
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			const topics = ['mt-a', 'mt-b', 'mt-c', 'mt-d'];
+			for (const topic of topics) c.update(ws, topic, { x: 1 }, platform);
+			for (const topic of topics) {
+				await waitFor(async () => (await c.list(topic)).length === 1);
+			}
+
+			await c.remove(ws, platform);
+
+			for (const topic of topics) {
+				const all = await client.redis.hgetall(client.key('cursor:{' + topic + '}'));
+				expect(Object.keys(all)).toHaveLength(0);
+			}
+		});
+
+		it('coalesced snapshot flush writes every dirty topic (multi-slot hset+expire pipeline)', async () => {
+			// topicThrottle > 0 coalesces per-topic writes into one flush that
+			// pipelines hset+expire across all dirty topics at once.
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 40, ttl: 30 }));
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			const topics = ['fl-a', 'fl-b', 'fl-c', 'fl-d'];
+			for (const topic of topics) c.update(ws, topic, { x: 7 }, platform);
+
+			for (const topic of topics) {
+				await waitFor(async () => {
+					const all = await client.redis.hgetall(client.key('cursor:{' + topic + '}'));
+					return Object.keys(all).length === 1;
+				});
+				const ttl = await client.redis.ttl(client.key('cursor:{' + topic + '}'));
+				expect(ttl).toBeGreaterThan(0);
+			}
 		});
 	});
 
@@ -137,10 +171,10 @@ describeIntegration('redis cursor (integration)', () => {
 			c.update(ws, 'canvas', { x: 1 }, platform);
 
 			await waitFor(async () => {
-				const t = await client.redis.ttl(client.key('cursor:canvas'));
+				const t = await client.redis.ttl(client.key('cursor:{canvas}'));
 				return t > 0;
 			});
-			const ttl = await client.redis.ttl(client.key('cursor:canvas'));
+			const ttl = await client.redis.ttl(client.key('cursor:{canvas}'));
 			expect(ttl).toBeGreaterThan(0);
 			expect(ttl).toBeLessThanOrEqual(30);
 		});
@@ -158,14 +192,14 @@ describeIntegration('redis cursor (integration)', () => {
 			}
 			// Wait for all pipelines to settle.
 			await waitFor(async () => {
-				const all = await client.redis.keys(client.key('cursor:*'));
-				return all.length >= 30;
+				const all = await countBackendKeys(client, client.key('cursor:*'));
+				return all >= 30;
 			});
 
 			await c.clear();
 
-			const remaining = await client.redis.keys(client.key('cursor:*'));
-			expect(remaining).toHaveLength(0);
+			const remaining = await countBackendKeys(client, client.key('cursor:*'));
+			expect(remaining).toBe(0);
 		});
 	});
 
@@ -412,7 +446,7 @@ describeIntegration('redis cursor (integration)', () => {
 			// Pre-seed a remote entry directly into the hash from a
 			// separate connection.
 			const remoteKey = 'remote-instance:1';
-			await client.redis.hset(client.key('cursor:canvas'), remoteKey, JSON.stringify({
+			await client.redis.hset(client.key('cursor:{canvas}'), remoteKey, JSON.stringify({
 				user: { id: '2' }, data: { x: 77 }, ts: Date.now()
 			}));
 
@@ -450,17 +484,17 @@ describeIntegration('redis cursor (integration)', () => {
 			const ws = mockWs({ id: '1' });
 			c.update(ws, 'canvas', { x: 1 }, platform);
 			await waitFor(async () => {
-				const all = await client.redis.hgetall(client.key('cursor:canvas'));
+				const all = await client.redis.hgetall(client.key('cursor:{canvas}'));
 				return Object.keys(all).length === 1;
 			});
 
 			// Manually overwrite the ts to be older than the ttl window
 			// without touching the hash key TTL itself.
-			const all = await client.redis.hgetall(client.key('cursor:canvas'));
+			const all = await client.redis.hgetall(client.key('cursor:{canvas}'));
 			const onlyKey = Object.keys(all)[0];
 			const parsed = JSON.parse(all[onlyKey]);
 			parsed.ts = Date.now() - (10 * 1000); // 10s old, ttl is 5s
-			await client.redis.hset(client.key('cursor:canvas'), onlyKey, JSON.stringify(parsed));
+			await client.redis.hset(client.key('cursor:{canvas}'), onlyKey, JSON.stringify(parsed));
 
 			const list = await c.list('canvas');
 			expect(list).toEqual([]);

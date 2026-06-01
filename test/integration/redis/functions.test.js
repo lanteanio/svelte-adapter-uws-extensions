@@ -37,15 +37,21 @@ end)
 `;
 
 async function deleteLib(client, name) {
-	try {
-		await client.redis.function('DELETE', name);
-	} catch {
-		// Library was not loaded; ignore.
-	}
+	const redis = client.redis;
+	const nodes = (typeof redis.nodes === 'function') ? redis.nodes('master') : [redis];
+	await Promise.all(nodes.map(async (node) => {
+		try {
+			await node.function('DELETE', name);
+		} catch {
+			// Library was not loaded on this node; ignore.
+		}
+	}));
 }
 
-// Redis Cluster gap: FUNCTION LOAD on a Cluster client loads the library on ONE node only, so an FCALL routed to any other master returns "Function not found"; multi-key FCALL also CROSSSLOTs (redis/functions.js load + multi-key fcall). Needs per-master library load + hash-tagged keys. Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both backends: load() / delete() fan FUNCTION LOAD / FUNCTION DELETE
+// across every cluster master, so an FCALL routed to any master resolves the
+// function. The one multi-key FCALL below hash-tags its keys to co-locate them.
+const describeIntegration = describe;
 
 describeIntegration('redis function library (integration)', () => {
 	let client;
@@ -128,7 +134,7 @@ describeIntegration('redis function library (integration)', () => {
 			const lib = createFunctionLibrary(client, SAMPLE_LIB);
 			await lib.load();
 			const r = await lib.call('inttest_count_keys', {
-				keys: [client.key('a'), client.key('b'), client.key('c')]
+				keys: [client.key('{ck}a'), client.key('{ck}b'), client.key('{ck}c')]
 			});
 			expect(r).toBe(3);
 		});

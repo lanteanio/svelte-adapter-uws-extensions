@@ -8,7 +8,7 @@
  * suite at test/redis/groups.test.js stays as-is; this file is additive.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createGroup } from '../../../redis/groups.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -17,8 +17,10 @@ function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-// Redis Cluster gap: JOIN_SCRIPT is a 2-key eval (group members + closed flag) with no shared {hash-tag} -> CROSSSLOT on every join (redis/groups.js JOIN_SCRIPT eval). Needs a {name} hash-tag. Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both standalone and cluster backends. The group name is wrapped in a
+// Redis hash tag on every data key, so the multi-key JOIN_SCRIPT eval (members +
+// closed flag) and the close sequence co-locate on a single cluster slot.
+const describeIntegration = describe;
 
 describeIntegration('redis groups (integration)', () => {
 	let client;
@@ -60,7 +62,7 @@ describeIntegration('redis groups (integration)', () => {
 			const ok = await group.join(ws, platform);
 			expect(ok).toBe(true);
 
-			const fields = await client.redis.hkeys(client.key('group:lobby:members'));
+			const fields = await client.redis.hkeys(client.key('group:{lobby}:members'));
 			expect(fields).toHaveLength(1);
 
 			expect(await group.count()).toBe(1);
@@ -93,7 +95,7 @@ describeIntegration('redis groups (integration)', () => {
 
 		it('cross-instance close: a peer flag set in Redis blocks join from a fresh instance', async () => {
 			// Simulate another instance that already wrote the closed flag.
-			await client.redis.set(client.key('group:peer-closed:closed'), '1');
+			await client.redis.set(client.key('group:{peer-closed}:closed'), '1');
 
 			const group = makeGroup('peer-closed', { maxMembers: 5 });
 			const ok = await group.join(mockWs(), platform);
@@ -108,7 +110,7 @@ describeIntegration('redis groups (integration)', () => {
 
 			// Plant a stale member field (older than 1s memberTtl).
 			await client.redis.hset(
-				client.key('group:stale-room:members'),
+				client.key('group:{stale-room}:members'),
 				'dead-instance:42',
 				JSON.stringify({ role: 'member', instanceId: 'dead', ts: Date.now() - 60_000 })
 			);
@@ -120,7 +122,7 @@ describeIntegration('redis groups (integration)', () => {
 			const ok = await second.join(mockWs(), platform);
 			expect(ok).toBe(true);
 
-			const fields = await client.redis.hkeys(client.key('group:stale-room:members'));
+			const fields = await client.redis.hkeys(client.key('group:{stale-room}:members'));
 			expect(fields).not.toContain('dead-instance:42');
 			expect(fields).toHaveLength(2);
 		});
@@ -131,7 +133,7 @@ describeIntegration('redis groups (integration)', () => {
 
 			// Plant a stale member field.
 			await client.redis.hset(
-				client.key('group:count-stale:members'),
+				client.key('group:{count-stale}:members'),
 				'dead-instance:99',
 				JSON.stringify({ role: 'member', instanceId: 'dead', ts: Date.now() - 60_000 })
 			);
@@ -149,7 +151,7 @@ describeIntegration('redis groups (integration)', () => {
 
 			await group.leave(ws, platform);
 			expect(await group.count()).toBe(0);
-			const fields = await client.redis.hkeys(client.key('group:leave-test:members'));
+			const fields = await client.redis.hkeys(client.key('group:{leave-test}:members'));
 			expect(fields).toHaveLength(0);
 		});
 
@@ -158,9 +160,9 @@ describeIntegration('redis groups (integration)', () => {
 			await group.join(mockWs(), platform);
 			await group.close(platform);
 
-			const flag = await client.redis.get(client.key('group:close-test:closed'));
+			const flag = await client.redis.get(client.key('group:{close-test}:closed'));
 			expect(flag).toBe('1');
-			const exists = await client.redis.exists(client.key('group:close-test:members'));
+			const exists = await client.redis.exists(client.key('group:{close-test}:members'));
 			expect(exists).toBe(0);
 		});
 
@@ -180,7 +182,7 @@ describeIntegration('redis groups (integration)', () => {
 			await group.join(wsA, platform, 'admin');
 			await group.join(wsV, platform, 'viewer');
 
-			const all = await client.redis.hgetall(client.key('group:roles:members'));
+			const all = await client.redis.hgetall(client.key('group:{roles}:members'));
 			const roles = Object.values(all).map((v) => JSON.parse(v).role).sort();
 			expect(roles).toEqual(['admin', 'viewer']);
 		});
@@ -348,7 +350,7 @@ describeIntegration('redis groups (integration)', () => {
 			// Real production paths only insert through the script which
 			// stamps a numeric ts via Date.now(); this simulates an
 			// attacker with Redis write access.
-			const membersKey = client.key('group:members:poison-room');
+			const membersKey = client.key('group:{poison-room}:members');
 			await client.redis.hset(membersKey, 'attacker', JSON.stringify({
 				ts: 'injected', user: { id: 'evil' }
 			}));

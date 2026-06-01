@@ -11,7 +11,7 @@
  * and last-writer-wins on concurrent `set` calls.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createDistributedSession } from '../../../redis/session.js';
 
 function wait(ms) {
@@ -146,12 +146,12 @@ describe('redis distributed session (integration)', () => {
 		});
 	});
 
-	// Redis Cluster gap: session.clear() uses a single-connection SCAN (misses
-	// keys on other masters) + a batched multi-key UNLINK that CROSSSLOTs
-	// (redis/session.js clear()), unlike the cluster-aware scanAndUnlink the other
-	// plugins use. The hot CRUD path (get/set/touch/delete) is single-key and stays
-	// cluster-safe; only clear() is skipped on the cluster backend.
-	(isClusterBackend() ? describe.skip : describe)('clear (SCAN + UNLINK)', () => {
+	// clear() routes through the shared cluster-aware scanAndUnlink helper
+	// (per-master SCAN + per-key UNLINK on a cluster, batched on standalone),
+	// so this block runs against both the standalone and cluster backends.
+	// The hot CRUD path (get/set/touch/delete) is single-key and was always
+	// cluster-safe.
+	describe('clear (SCAN + UNLINK)', () => {
 		it('removes every entry under the session keyPrefix', async () => {
 			const sessions = createDistributedSession(client);
 			for (let i = 0; i < 25; i++) {

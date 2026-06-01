@@ -27,6 +27,7 @@ import { randomBytes } from 'node:crypto';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { now as cachedNow } from '../shared/time.js';
 import { assert } from '../shared/assert.js';
+import { execMultiSlot } from '../shared/cluster.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
 	MAX_REGISTRY_PENDING_REQUESTS,
@@ -552,11 +553,11 @@ export function createConnectionRegistry(client, options) {
 		if (!withBreakerGuard()) return;
 		// Refresh TTL on every locally-owned entry. A pipeline keeps this
 		// to one round trip regardless of N.
-		const pipe = redis.pipeline();
+		const commands = [];
 		for (const userId of localUsers.keys()) {
-			pipe.expire(userKey(userId), ttl);
+			commands.push(['expire', userKey(userId), ttl]);
 		}
-		pipe.exec().then(() => breaker?.success()).catch((err) => breaker?.failure(err));
+		execMultiSlot(redis, commands).then(() => breaker?.success()).catch((err) => breaker?.failure(err));
 	}
 
 	function handleInbound(envelope) {

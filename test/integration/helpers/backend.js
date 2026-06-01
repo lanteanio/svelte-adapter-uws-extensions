@@ -18,6 +18,7 @@
 import { createRedisClient } from '../../../redis/index.js';
 import { scanAndUnlink } from '../../../shared/redis-scan.js';
 import { clusterClient } from './cluster-client.js';
+import { isCluster } from '../../../shared/cluster.js';
 
 /** The active backend mode. Read lazily so vitest env injection ordering does not matter. */
 export function backendMode() {
@@ -62,6 +63,31 @@ export async function resetBackendKeys(client, pattern) {
 		}
 	}
 	throw lastErr;
+}
+
+/**
+ * Count keys matching a pattern across the backend, cluster-aware. On a cluster
+ * it scans every master node (a keyless KEYS/SCAN otherwise lands on a single
+ * sampled node and misses the rest); on standalone it is a single SCAN loop.
+ *
+ * @param {import('../../../redis/index.js').RedisClient} client
+ * @param {string} [pattern] - defaults to every key under the client's prefix
+ * @returns {Promise<number>}
+ */
+export async function countBackendKeys(client, pattern) {
+	const target = pattern || client.key('*');
+	const redis = client.redis;
+	const nodes = isCluster(redis) ? /** @type {any} */ (redis).nodes('master') : [redis];
+	let count = 0;
+	for (const node of nodes) {
+		let cursor = '0';
+		do {
+			const [next, keys] = await node.scan(cursor, 'MATCH', target, 'COUNT', 100);
+			cursor = next;
+			count += keys.length;
+		} while (cursor !== '0');
+	}
+	return count;
 }
 
 /**

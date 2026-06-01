@@ -1,3 +1,5 @@
+import { isCluster } from './cluster.js';
+
 /**
  * SCAN with COUNT 100 across the keyspace and UNLINK every match.
  * Used by `clear()` admin methods to delete all keys for a given pattern
@@ -28,10 +30,6 @@ export async function scanAndUnlink(redis, pattern) {
 	for (const node of targets) {
 		await scanOneNode(node, pattern, isCluster(redis));
 	}
-}
-
-function isCluster(redis) {
-	return redis !== null && typeof redis === 'object' && typeof (/** @type {any} */ (redis).nodes) === 'function';
 }
 
 async function scanOneNode(node, pattern, perKeyUnlink) {

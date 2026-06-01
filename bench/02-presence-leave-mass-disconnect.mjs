@@ -45,8 +45,8 @@ const TTL_MS = TTL_SEC * 1000;
 const INSTANCE = 'bench-instance-aabb';
 const PREFIX = 'bench-presence:';
 const TOPIC = 'room';
-const topicHashKey = PREFIX + 'presence:topic:' + TOPIC;
-const userHashKey = (userKey) => PREFIX + 'presence:user:' + TOPIC + ':' + userKey;
+const topicHashKey = PREFIX + 'presence:topic:{' + TOPIC + '}';
+const userHashKey = (userKey) => PREFIX + 'presence:user:{' + TOPIC + '}:' + userKey;
 
 const JOIN_SCRIPT = `
 local userKey = KEYS[1]

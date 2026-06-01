@@ -38,6 +38,7 @@ import { randomBytes } from 'node:crypto';
 import { CLEANUP_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { execMultiSlot } from '../shared/cluster.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError } from '../shared/errors.js';
@@ -300,11 +301,10 @@ export function createCursor(client, options = {}) {
 		subscriberReady = sub.subscribe(channel).then(async () => {
 			if (!activePlatform || activeTopics.size === 0) return;
 			const topicList = [...activeTopics];
-			const pipe = redis.pipeline();
-			for (const topic of topicList) pipe.hgetall(hashKey(topic));
+			const commands = topicList.map((topic) => ['hgetall', hashKey(topic)]);
 			let results;
 			try {
-				results = await pipe.exec();
+				results = await execMultiSlot(redis, commands);
 			} catch { return; }
 			if (!activePlatform) return;
 			const now = Date.now();
@@ -383,7 +383,7 @@ export function createCursor(client, options = {}) {
 		if (b) { try { b.guard(); } catch { redisPending = new Map(); return; } }
 		const pending = redisPending;
 		redisPending = new Map();
-		const pipe = redis.pipeline();
+		const commands = [];
 		let queued = 0;
 		for (const [topic, entries] of pending) {
 			if (entries.size === 0) continue;
@@ -391,12 +391,12 @@ export function createCursor(client, options = {}) {
 			for (const [key, entry] of entries) {
 				args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts }));
 			}
-			pipe.hset(hashKey(topic), ...args);
-			pipe.expire(hashKey(topic), cursorTtl);
+			commands.push(['hset', hashKey(topic), ...args]);
+			commands.push(['expire', hashKey(topic), cursorTtl]);
 			queued += entries.size;
 		}
 		if (queued === 0) return;
-		pipe.exec().then(() => b?.success()).catch((err) => b?.failure(err));
+		execMultiSlot(redis, commands).then(() => b?.success()).catch((err) => b?.failure(err));
 	}
 
 	function queueSnapshot(topic, key, user, data) {
@@ -417,7 +417,7 @@ export function createCursor(client, options = {}) {
 	}
 
 	function hashKey(topic) {
-		return client.key('cursor:' + topic);
+		return client.key('cursor:{' + topic + '}');
 	}
 
 	function getWsState(ws) {
@@ -985,16 +985,16 @@ export function createCursor(client, options = {}) {
 				}
 			}
 
-			const pipe = redis.pipeline();
+			const commands = [];
 			for (const t of removedTopics) {
-				pipe.hdel(hashKey(t), state.key);
-				pipe.publish(channel, JSON.stringify({
+				commands.push(['hdel', hashKey(t), state.key]);
+				commands.push(['publish', channel, JSON.stringify({
 					instanceId, topic: t, event: EVENTS.REMOVE, payload: { key: state.key }
-				}));
+				})]);
 			}
 
 			try {
-				await pipe.exec();
+				await execMultiSlot(redis, commands);
 				b?.success();
 			} catch (err) {
 				b?.failure(err);

@@ -281,7 +281,7 @@ describe('redis replay', () => {
 			await replay.publish(platform, 'chat', 'created', { id: 2 });
 
 			// Inject a malformed entry directly into the sorted set
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.get(bufKey).push({
 				score: 1.5,
 				member: '{invalid json'
@@ -298,7 +298,7 @@ describe('redis replay', () => {
 		it('replay() works when since() encounters corrupted entries', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.get(bufKey).push({
 				score: 1.5,
 				member: 'not-json'
@@ -326,7 +326,7 @@ describe('redis replay', () => {
 			await replay.publish(platform, 'chat', 'created', { id: 3 });
 
 			// Corrupt seq 1 by replacing its sorted set entry
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			const set = client._sortedSets.get(bufKey);
 			set[0] = { score: 1, member: '{not valid json!!!' };
 
@@ -357,7 +357,7 @@ describe('redis replay', () => {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
 
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			const set = client._sortedSets.get(bufKey);
 			// Corrupt seq 1 (index 0)
 			set[0] = { score: 1, member: '{broken' };
@@ -380,7 +380,7 @@ describe('redis replay', () => {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
 
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			const set = client._sortedSets.get(bufKey);
 			// Corrupt seq 1 and 2
 			set[0] = { score: 1, member: 'garbage' };
@@ -406,7 +406,7 @@ describe('redis replay', () => {
 			}
 
 			// Wipe the buffer but leave the seq counter intact
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.delete(bufKey);
 
 			const fakeWs = {};
@@ -438,7 +438,7 @@ describe('redis replay', () => {
 		it('does not send truncated when sinceSeq is 0 even with empty buffer', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.delete(bufKey);
 
 			const fakeWs = {};
@@ -490,7 +490,7 @@ describe('redis replay', () => {
 			for (let i = 1; i <= 3; i++) {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.delete(bufKey);
 
 			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
@@ -516,7 +516,7 @@ describe('redis replay', () => {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
 			// Corrupt seq 2 (the consumer's next-needed entry)
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			const set = client._sortedSets.get(bufKey);
 			set[1] = { score: 2, member: '{not valid json' };
 
@@ -529,7 +529,7 @@ describe('redis replay', () => {
 				await replay.publish(platform, 'chat', 'created', { id: i });
 			}
 			// Corrupt seq 1, leaving seq 2 valid as the next-needed entry
-			const bufKey = client.key('replay:buf:chat');
+			const bufKey = client.key('replay:buf:{chat}');
 			const set = client._sortedSets.get(bufKey);
 			set[0] = { score: 1, member: 'broken' };
 

@@ -22,8 +22,10 @@ import { createBackendClient, resetBackendKeys, isClusterBackend } from '../help
 import { createReplay } from '../../../redis/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
-// Redis Cluster gap: PUBLISH_SCRIPT (2-key) and IDMP_PUBLISH_SCRIPT (3-key) and clearTopic (2-key UNLINK) span slots with no shared {hash-tag} -> CROSSSLOT on every publish (redis/replay-stream.js). Needs a {topic} hash-tag. Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs on both standalone and Redis Cluster: the seq, streambuf, and idmp
+// keys all carry a {topic} hash-tag, so the multi-key Lua evals and the
+// clearTopic UNLINK co-locate on one slot instead of CROSSSLOTing.
+const describeIntegration = describe;
 
 describeIntegration('redis replay (stream backend, integration)', () => {
 	let client;
@@ -65,7 +67,7 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			await replay.publish(platform, 'chat', 'c', { id: 3 });
 
 			const entries = await client.redis.xrange(
-				client.key('replay:streambuf:chat'), '-', '+'
+				client.key('replay:streambuf:{chat}'), '-', '+'
 			);
 			expect(entries.map((e) => e[0])).toEqual(['1-0', '2-0', '3-0']);
 		});
@@ -195,7 +197,7 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			}
 			// Drop the stream but keep the seq counter; this is the
 			// "buffer evicted, consumer still has cursor" case.
-			await client.redis.unlink(client.key('replay:streambuf:chat'));
+			await client.redis.unlink(client.key('replay:streambuf:{chat}'));
 
 			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
 		});
@@ -238,8 +240,8 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			const r = createReplay(client, { storage: 'stream', size: 5, ttl: 600 });
 			await r.publish(platform, 'chat', 'created', { id: 1 });
 
-			const seqTtl = await client.redis.ttl(client.key('replay:seq:chat'));
-			const bufTtl = await client.redis.ttl(client.key('replay:streambuf:chat'));
+			const seqTtl = await client.redis.ttl(client.key('replay:seq:{chat}'));
+			const bufTtl = await client.redis.ttl(client.key('replay:streambuf:{chat}'));
 			expect(seqTtl).toBeGreaterThan(0);
 			expect(bufTtl).toBeGreaterThan(0);
 			expect(seqTtl).toBeLessThanOrEqual(600);
@@ -248,8 +250,8 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 
 		it('leaves keys with no TTL when ttl is unset', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
-			expect(await client.redis.ttl(client.key('replay:seq:chat'))).toBe(-1);
-			expect(await client.redis.ttl(client.key('replay:streambuf:chat'))).toBe(-1);
+			expect(await client.redis.ttl(client.key('replay:seq:{chat}'))).toBe(-1);
+			expect(await client.redis.ttl(client.key('replay:streambuf:{chat}'))).toBe(-1);
 		});
 	});
 
@@ -321,7 +323,7 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
 				producerId: 'p1', requestId: 'r1'
 			});
-			const idmpTtl = await client.redis.ttl(client.key('replay:idmp:p1:chat'));
+			const idmpTtl = await client.redis.ttl(client.key('replay:idmp:p1:{chat}'));
 			expect(idmpTtl).toBeGreaterThan(0);
 			expect(idmpTtl).toBeLessThanOrEqual(60);
 		});

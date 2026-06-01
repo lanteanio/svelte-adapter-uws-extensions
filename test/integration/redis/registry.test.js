@@ -80,6 +80,25 @@ describe('redis connection registry (integration)', () => {
 		expect(ttl).toBeLessThanOrEqual(90);
 	});
 
+	it('heartbeat refreshes TTL on every locally-owned user (multi-slot expire pipeline)', async () => {
+		const platform = mockPlatform();
+		const registry = makeRegistry({ ttl: 2, heartbeat: 250 });
+		const userIds = ['hb1', 'hb2', 'hb3', 'hb4'];
+		for (const userId of userIds) {
+			await registry.hooks.open(wsWithSession({ userId }, 's-' + userId), { platform });
+		}
+
+		// ttl is 2s but the heartbeat refreshes every 250ms; wait past the ttl.
+		// On a cluster the per-user keys span slots, so a single pipeline would
+		// silently drop the other-node EXPIREs and those users would expire.
+		await wait(2400);
+
+		for (const userId of userIds) {
+			expect(await client.redis.exists(client.key('conns:' + userId))).toBe(1);
+			expect(await client.redis.ttl(client.key('conns:' + userId))).toBeGreaterThan(0);
+		}
+	});
+
 	it('cross-instance request: origin -> Redis -> owner -> Redis -> origin', async () => {
 		const platformA = mockPlatform();
 		const platformB = mockPlatform();
@@ -462,8 +481,8 @@ describe('redis connection registry (integration)', () => {
 				// that the per-user hash exists under the presence:user:
 				// namespace.
 				const regHashExists = await client.redis.exists(client.key('conns:alice'));
-				const presenceTopicHashExists = await client.redis.exists(client.key('presence:topic:team:t1'));
-				const presenceUserKeys = await client.redis.keys(client.key('presence:user:team:t1:*'));
+				const presenceTopicHashExists = await client.redis.exists(client.key('presence:topic:{team:t1}'));
+				const presenceUserKeys = await client.redis.keys(client.key('presence:user:{team:t1}:*'));
 				expect(regHashExists).toBe(1);
 				expect(presenceTopicHashExists).toBe(1);
 				expect(presenceUserKeys).toHaveLength(1);

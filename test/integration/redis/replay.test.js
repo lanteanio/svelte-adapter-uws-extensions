@@ -6,12 +6,14 @@
  * suite stays at test/redis/replay.test.js; this file is additive.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createReplay } from '../../../redis/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
-// Redis Cluster gap: PUBLISH_SCRIPT is a 2-key eval (seq + buf) and clearTopic UNLINKs both keys, no shared {hash-tag} -> CROSSSLOT on every publish (redis/replay.js PUBLISH_SCRIPT eval + clearTopic). Needs a {topic} hash-tag. Runs on solo.
-const describeIntegration = isClusterBackend() ? describe.skip : describe;
+// Runs against both standalone and cluster backends. The seq and buf keys
+// share a {topic} hash tag so the 2-key publish eval and the per-topic
+// UNLINK stay on one slot under Redis Cluster.
+const describeIntegration = describe;
 
 describeIntegration('redis replay (integration)', () => {
 	let client;
@@ -279,8 +281,8 @@ describeIntegration('redis replay (integration)', () => {
 			const r = createReplay(client, { size: 5, ttl: 600 });
 			await r.publish(platform, 'chat', 'created', { id: 1 });
 
-			const seqTtl = await client.redis.ttl(client.key('replay:seq:chat'));
-			const bufTtl = await client.redis.ttl(client.key('replay:buf:chat'));
+			const seqTtl = await client.redis.ttl(client.key('replay:seq:{chat}'));
+			const bufTtl = await client.redis.ttl(client.key('replay:buf:{chat}'));
 			expect(seqTtl).toBeGreaterThan(0);
 			expect(bufTtl).toBeGreaterThan(0);
 			expect(seqTtl).toBeLessThanOrEqual(600);
@@ -289,8 +291,8 @@ describeIntegration('redis replay (integration)', () => {
 
 		it('leaves keys with no TTL when ttl is unset', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
-			expect(await client.redis.ttl(client.key('replay:seq:chat'))).toBe(-1);
-			expect(await client.redis.ttl(client.key('replay:buf:chat'))).toBe(-1);
+			expect(await client.redis.ttl(client.key('replay:seq:{chat}'))).toBe(-1);
+			expect(await client.redis.ttl(client.key('replay:buf:{chat}'))).toBe(-1);
 		});
 	});
 
