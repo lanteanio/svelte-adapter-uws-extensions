@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.3] - 2026-06-01
+
+### Added
+
+- **`redis/presence` field-level `update()` and `transient` fields, mirroring the in-memory presence plugin across the cluster.** `presence.update(ws, topic, fields, platform)` sets dynamic fields on the present user as a field-level delta - only changed fields are broadcast, in the next `diff` under `updates[key]` - and applies to the user (per dedup key), so any of a multi-tab user's connections, on any instance, may set it. Durable dynamic fields are persisted into the per-topic hash value (`{data, fields, ts}`) via a single-key `UPDATE_SCRIPT` so a cross-instance `state` read reconstructs them; a new `transient: string[]` option marks fields broadcast live but NEVER persisted and NEVER included in the `state` snapshot or heartbeat roster, so a (re)joining or swept-then-readded client never inherits a stale value (a disconnected typer leaves no stuck indicator) across the fleet. Cross-instance, a new `fields` event on the `presence:events:{topic}` channel relays the delta (durable + transient) so other instances fan it out as an `updates` diff; `JOIN_SCRIPT` now preserves stored durable fields across a newer-data overwrite, and a full leave drops them so a rejoin starts clean. Fully additive: a deployment that never calls `update()` sends the byte-identical `{joins, leaves}` diff as before, and the binary presence codec falls back to JSON for the `updates` map. Mirrors `svelte-adapter-uws`'s in-memory `presence.update` / `transient`.
+
+- **`bus.wrap()` forwards `platform.forEachSubscriber` (pubsub and sharded-pubsub).** The adapter's new per-subscriber walk primitive now survives the cluster wrap, so a plugin that walks a topic's subscribers (per-viewport cursor culling, backpressure-aware fan-out) sees it on the wrapped seam in a clustered deployment instead of `undefined`. Requires an adapter that exposes `forEachSubscriber`. Added to `PLATFORM_KEYS`, so the wrap-parity test enforces it on both buses.
+
+### Fixed
+
+- **`bus.wrap()` (sharded-pubsub) now forwards the `platform.redis` and `platform.presence` framework-convention slots, matching the pubsub bus.** The sharded wrap forwarded `replay` but silently dropped `redis` and `presence`, so a sharded-pubsub deployment lost any framework auto-routing that discovers an ioredis client or the presence registry through the wrapped platform reference (e.g. svelte-realtime's `configureCron({ bus })` path). Both are now live getters, identical to the pubsub wrap. Regression-tested in the wrap-parity suite for both buses.
+
 ## [0.6.0-next.2] - 2026-05-30
 
 ### Fixed

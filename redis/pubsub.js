@@ -260,6 +260,7 @@ export function createPubSubBus(client, options = {}) {
 				onPressure: platform.onPressure.bind(platform),
 				onPublishRate: platform.onPublishRate.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
+				forEachSubscriber: platform.forEachSubscriber.bind(platform),
 				subscribe: platform.subscribe.bind(platform),
 				unsubscribe: platform.unsubscribe.bind(platform),
 				checkSubscribe: platform.checkSubscribe.bind(platform),

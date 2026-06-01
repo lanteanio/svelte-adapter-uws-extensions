@@ -13,7 +13,7 @@
  * server can prove.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createPubSubBus } from '../../../redis/pubsub.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
@@ -36,27 +36,14 @@ describe('redis pubsub bus (integration)', () => {
 	const buses = [];
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-pubsub:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-pubsub:'
 		});
 	});
 
 	beforeEach(async () => {
 		// Wipe everything under our prefix so each test starts clean.
-		let cursor = '0';
-		do {
-			const [next, keys] = await client.redis.scan(
-				cursor, 'MATCH', client.key('*'), 'COUNT', 200
-			);
-			cursor = next;
-			if (keys.length > 0) await client.redis.unlink(...keys);
-		} while (cursor !== '0');
+		await resetBackendKeys(client);
 
 		platform = mockPlatform();
 	});
@@ -94,10 +81,7 @@ describe('redis pubsub bus (integration)', () => {
 			// Use a separate publisher client so we are simulating a sibling
 			// process publishing in - the bus's own subscriber duplicate
 			// should pick this up via the wire.
-			const publisher = createRedisClient({
-				url: process.env.INTEGRATION_REDIS_URL,
-				autoShutdown: false
-			});
+			const publisher = createBackendClient({});
 			try {
 				await publisher.redis.publish(channel, JSON.stringify({
 					instanceId: 'remote-instance',
@@ -192,10 +176,7 @@ describe('redis pubsub bus (integration)', () => {
 			await bus.activate(platform1);
 			await bus.activate(platform2);
 
-			const publisher = createRedisClient({
-				url: process.env.INTEGRATION_REDIS_URL,
-				autoShutdown: false
-			});
+			const publisher = createBackendClient({});
 			try {
 				await publisher.redis.publish(channel, JSON.stringify({
 					instanceId: 'remote',

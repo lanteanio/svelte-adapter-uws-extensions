@@ -1707,4 +1707,274 @@ describe('redis presence', () => {
 			expect(() => local.destroy()).not.toThrow();
 		});
 	});
+
+	describe('field-level update', () => {
+		it('broadcasts a changed field as an updates entry in the next diff', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			presence.flushDiffs();
+			platform.reset();
+
+			await presence.update(ws, 'room', { typing: true }, platform);
+			presence.flushDiffs();
+
+			const diffs = diffsOf(platform);
+			expect(diffs).toHaveLength(1);
+			expect(diffs[0].data.updates).toEqual({ '1': { typing: true } });
+			expect(diffs[0].data.joins).toEqual({});
+			expect(diffs[0].data.leaves).toEqual({});
+			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+		});
+
+		it('broadcasts only the fields that actually changed (per-field delta)', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { typing: true, color: 'red' }, platform);
+			presence.flushDiffs();
+			platform.reset();
+
+			await presence.update(ws, 'room', { typing: true, color: 'blue' }, platform);
+			presence.flushDiffs();
+
+			const diffs = diffsOf(platform);
+			expect(diffs).toHaveLength(1);
+			expect(diffs[0].data.updates).toEqual({ '1': { color: 'blue' } });
+		});
+
+		it('is a no-op when no field value changed', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+			presence.flushDiffs();
+			platform.reset();
+
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+			presence.flushDiffs();
+			expect(diffsOf(platform)).toHaveLength(0);
+		});
+
+		it('is a no-op for a connection not present on the topic', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.update(ws, 'room', { typing: true }, platform);
+			presence.flushDiffs();
+			expect(diffsOf(platform)).toHaveLength(0);
+		});
+
+		it('ignores __ topics and non-object field args', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			presence.flushDiffs();
+			platform.reset();
+			await presence.update(ws, '__internal', { x: 1 }, platform);
+			await presence.update(ws, 'room', null, platform);
+			await presence.update(ws, 'room', [1, 2], platform);
+			presence.flushDiffs();
+			expect(diffsOf(platform)).toHaveLength(0);
+		});
+
+		it('persists a durable field to Redis so a fresh sync sees it', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+			presence.flushDiffs();
+			platform.reset();
+
+			const observer = mockWs({ id: 'obs' });
+			await presence.sync(observer, 'room', platform);
+			const state = statesOf(platform).pop();
+			expect(state.data).toEqual({ '1': { id: '1', name: 'Alice', color: 'red' } });
+		});
+
+		it('drops durable fields on a full leave + rejoin (no stale carryover)', async () => {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+			presence.flushDiffs();
+			await presence.leave(ws, platform);
+			presence.flushDiffs();
+			platform.reset();
+
+			const ws2 = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws2, 'room', platform);
+			const state = statesOf(platform).pop();
+			expect(state.data).toEqual({ '1': { id: '1', name: 'Alice' } });
+		});
+
+		it('collapses a same-tick update into the join roster (durable rides, transient dropped)', async () => {
+			const lp = mockPlatform();
+			const local = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, name: ud.name }),
+				transient: ['typing'],
+				heartbeat: 60000,
+				ttl: 180
+			});
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await local.join(ws, 'room', lp);
+			// The join is still buffered (the next-tick auto-flush has not fired);
+			// the same-tick update collapses against it.
+			await local.update(ws, 'room', { color: 'red', typing: true }, lp);
+			local.flushDiffs();
+
+			const diffs = lp.published.filter((p) => p.event === 'diff');
+			expect(diffs).toHaveLength(1);
+			expect(diffs[0].data.joins).toEqual({ '1': { id: '1', name: 'Alice', color: 'red' } });
+			expect(diffs[0].data.updates).toBeUndefined();
+			local.destroy();
+		});
+
+		describe('with transient fields', () => {
+			let local;
+			let lp;
+			beforeEach(() => {
+				lp = mockPlatform();
+				local = createPresence(client, {
+					key: 'id',
+					select: (ud) => ({ id: ud.id, name: ud.name }),
+					transient: ['typing'],
+					heartbeat: 60000,
+					ttl: 180
+				});
+			});
+			afterEach(() => local.destroy());
+
+			it('broadcasts transient + durable live but excludes transient from a fresh state', async () => {
+				const ws = mockWs({ id: '1', name: 'Alice' });
+				await local.join(ws, 'room', lp);
+				local.flushDiffs();
+				lp.reset();
+				await local.update(ws, 'room', { typing: true, color: 'red' }, lp);
+				local.flushDiffs();
+
+				const diffs = lp.published.filter((p) => p.event === 'diff');
+				expect(diffs.pop().data.updates).toEqual({ '1': { typing: true, color: 'red' } });
+
+				lp.reset();
+				const observer = mockWs({ id: 'obs' });
+				await local.sync(observer, 'room', lp);
+				const state = lp.sent.filter((s) => s.event === 'state').pop();
+				expect(state.data).toEqual({ '1': { id: '1', name: 'Alice', color: 'red' } });
+			});
+
+			it('does not persist a transient-only update to Redis', async () => {
+				const ws = mockWs({ id: '1', name: 'Alice' });
+				await local.join(ws, 'room', lp);
+				await local.update(ws, 'room', { typing: true }, lp);
+				const stored = JSON.parse(client._hashes.get(client.key('presence:topic:room')).get('1'));
+				expect(stored.fields).toBeUndefined();
+			});
+
+			it('excludes transient from the heartbeat roster', async () => {
+				const hp = mockPlatform();
+				const hb = createPresence(client, {
+					key: 'id',
+					select: (ud) => ({ id: ud.id, name: ud.name }),
+					transient: ['typing'],
+					heartbeat: 50,
+					ttl: 180
+				});
+				const ws = mockWs({ id: '1', name: 'Alice' });
+				await hb.join(ws, 'room', hp);
+				await hb.update(ws, 'room', { typing: true, color: 'red' }, hp);
+				hp.reset();
+				await new Promise((r) => setTimeout(r, 70));
+				const hbs = hp.published.filter((p) => p.event === 'heartbeat');
+				expect(hbs.length).toBeGreaterThan(0);
+				expect(hbs[0].data).toEqual({ '1': { id: '1', name: 'Alice', color: 'red' } });
+				hb.destroy();
+			});
+		});
+
+		describe('cross-instance', () => {
+			it('routes an inbound fields event as an updates diff', async () => {
+				const localWs = mockWs({ id: 'local' });
+				await presence.join(localWs, 'room', platform);
+				presence.flushDiffs();
+				platform.reset();
+
+				const ch = client.key('presence:events:room');
+				client.redis.publish(ch, JSON.stringify({
+					instanceId: 'OTHER',
+					topic: 'room',
+					event: 'fields',
+					payload: { key: 'remote', durable: { color: 'red' }, transient: { typing: true } }
+				}));
+				await new Promise((r) => setTimeout(r, 5));
+				presence.flushDiffs();
+
+				const diffs = diffsOf(platform);
+				expect(diffs).toHaveLength(1);
+				expect(diffs[0].data.updates).toEqual({ remote: { color: 'red', typing: true } });
+			});
+
+			it('does not drop a field update that lands in the same tick as a relayed join', async () => {
+				const localWs = mockWs({ id: 'local' });
+				await presence.join(localWs, 'room', platform);
+				presence.flushDiffs();
+				platform.reset();
+
+				const ch = client.key('presence:events:room');
+				// Same tick: a relayed join, then a relayed field update for the SAME
+				// remote user this instance does not present locally. The update must
+				// merge into the relayed join roster, not be dropped by the collapse.
+				client.redis.publish(ch, JSON.stringify({
+					instanceId: 'OTHER', topic: 'room', event: 'join',
+					payload: { key: 'remote', data: { id: 'remote', name: 'Remote' } }
+				}));
+				client.redis.publish(ch, JSON.stringify({
+					instanceId: 'OTHER', topic: 'room', event: 'fields',
+					payload: { key: 'remote', durable: { color: 'red' }, transient: {} }
+				}));
+				await new Promise((r) => setTimeout(r, 5));
+				presence.flushDiffs();
+
+				const diffs = diffsOf(platform);
+				expect(diffs).toHaveLength(1);
+				expect(diffs[0].data.joins.remote).toEqual({ id: 'remote', name: 'Remote', color: 'red' });
+			});
+
+			it('relays a local update to a second instance sharing the same Redis', async () => {
+				const pa = mockPlatform();
+				const pb = mockPlatform();
+				const sel = (ud) => ({ id: ud.id, name: ud.name });
+				const a = createPresence(client, { key: 'id', select: sel, transient: ['typing'], heartbeat: 60000, ttl: 180 });
+				const b = createPresence(client, { key: 'id', select: sel, transient: ['typing'], heartbeat: 60000, ttl: 180 });
+
+				const wsA = mockWs({ id: '1', name: 'Alice' });
+				await a.join(wsA, 'room', pa);
+				a.flushDiffs();
+				const wsB = mockWs({ id: '2', name: 'Bob' });
+				await b.join(wsB, 'room', pb);
+				b.flushDiffs();
+				// Let the cross-instance join relays settle and drain them so the
+				// next assertions see only the update traffic.
+				await new Promise((r) => setTimeout(r, 5));
+				a.flushDiffs();
+				b.flushDiffs();
+				pa.reset();
+				pb.reset();
+
+				await a.update(wsA, 'room', { color: 'red', typing: true }, pa);
+				a.flushDiffs();
+				await new Promise((r) => setTimeout(r, 5));
+				b.flushDiffs();
+
+				const aDiffs = pa.published.filter((p) => p.event === 'diff');
+				expect(aDiffs.pop().data.updates).toEqual({ '1': { color: 'red', typing: true } });
+				const bDiffs = pb.published.filter((p) => p.event === 'diff');
+				expect(bDiffs.pop().data.updates).toEqual({ '1': { color: 'red', typing: true } });
+
+				// Durable color persisted to Redis by instance A; a fresh observer
+				// on instance B reads it (transient typing is never persisted).
+				pb.reset();
+				const obs = mockWs({ id: 'obs' });
+				await b.sync(obs, 'room', pb);
+				const state = pb.sent.filter((s) => s.event === 'state').pop();
+				expect(state.data['1']).toEqual({ id: '1', name: 'Alice', color: 'red' });
+
+				a.destroy();
+				b.destroy();
+			});
+		});
+	});
 });

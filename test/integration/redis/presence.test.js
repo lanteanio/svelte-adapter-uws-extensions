@@ -13,7 +13,7 @@
  * that only show up on real Redis.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { createPresence } from '../../../redis/presence.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -34,34 +34,24 @@ function leaveDiffsFor(platform, key) {
 		.filter((p) => p.data && p.data.leaves && key in p.data.leaves);
 }
 
-describe('redis presence (integration)', () => {
+// Redis Cluster gap: JOIN_SCRIPT/LEAVE_SCRIPT are 2-key (presence:user:{topic}:{key} + presence:topic:{topic}) with no shared {hash-tag} -> CROSSSLOT on every join/leave; the heartbeat HPEXPIRE pipeline spans slots (redis/presence.js JOIN_SCRIPT/LEAVE_SCRIPT eval + heartbeat pipe). Needs a hash-tag key redesign. Runs on solo.
+const describeIntegration = isClusterBackend() ? describe.skip : describe;
+
+describeIntegration('redis presence (integration)', () => {
 	let client;
 	let platform;
 	/** @type {Array<ReturnType<typeof createPresence>>} */
 	let trackers;
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-presence:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-presence:'
 		});
 	});
 
 	beforeEach(async () => {
 		// Wipe under our prefix so each test starts clean.
-		let cursor = '0';
-		do {
-			const [next, keys] = await client.redis.scan(
-				cursor, 'MATCH', client.key('*'), 'COUNT', 200
-			);
-			cursor = next;
-			if (keys.length > 0) await client.redis.unlink(...keys);
-		} while (cursor !== '0');
+		await resetBackendKeys(client);
 
 		platform = mockPlatform();
 		trackers = [];
@@ -517,6 +507,104 @@ describe('redis presence (integration)', () => {
 				expect(allJoinKeys.has(`u${i}`)).toBe(true);
 			}
 			expect(diffFrames.length).toBeLessThanOrEqual(N);
+		});
+	});
+
+	describe('field-level update - real Lua + real cross-instance pub/sub', () => {
+		it('UPDATE_SCRIPT merges a durable field into the per-topic hash value', async () => {
+			const presence = makeTracker();
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+
+			const parsed = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
+			expect(parsed.data).toEqual({ id: 'alice', name: 'Alice' });
+			expect(parsed.fields).toEqual({ color: 'red' });
+			expect(typeof parsed.ts).toBe('number');
+		});
+
+		it('a transient-only update is never persisted to Redis', async () => {
+			const presence = makeTracker({ transient: ['typing'] });
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { typing: true }, platform);
+
+			const parsed = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
+			expect(parsed.fields).toBeUndefined();
+		});
+
+		it('JOIN_SCRIPT preserves durable fields across a newer-data overwrite (real Lua)', async () => {
+			const a = makeTracker();
+			const wsA = mockWs({ id: 'alice', name: 'Alice' });
+			await a.join(wsA, 'room', platform);
+			await a.update(wsA, 'room', { color: 'red' }, platform);
+
+			// A second instance joins the SAME user with different identity data and
+			// a newer timestamp; its JOIN_SCRIPT overwrites `data` but must preserve
+			// the durable `fields` already stored.
+			const b = makeTracker();
+			await wait(2);
+			await b.join(mockWs({ id: 'alice', name: 'Albert' }), 'room', mockPlatform());
+
+			const parsed = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
+			expect(parsed.data.name).toBe('Albert');
+			expect(parsed.fields).toEqual({ color: 'red' });
+		});
+
+		it('drops durable fields on a full leave + rejoin', async () => {
+			const presence = makeTracker();
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await presence.update(ws, 'room', { color: 'red' }, platform);
+			await presence.leave(ws, platform);
+
+			expect(await client.redis.exists(topicHashKey('room'))).toBe(0);
+
+			const ws2 = mockWs({ id: 'alice', name: 'Alice' });
+			await presence.join(ws2, 'room', platform);
+			const parsed = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
+			expect(parsed.fields).toBeUndefined();
+			expect(parsed.data).toEqual({ id: 'alice', name: 'Alice' });
+		});
+
+		it('relays a field-level update to another instance over real Redis pub/sub', async () => {
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const a = makeTracker({ transient: ['typing'] });
+			const b = makeTracker({ transient: ['typing'] });
+
+			const wsA = mockWs({ id: 'alice', name: 'Alice' });
+			await a.join(wsA, 'room', platformA);
+			const wsB = mockWs({ id: 'bob', name: 'Bob' });
+			await b.join(wsB, 'room', platformB);
+
+			// Let the cross-instance join relays settle, then drain both buffers.
+			await wait(50);
+			a.flushDiffs();
+			b.flushDiffs();
+			platformA.reset();
+			platformB.reset();
+
+			await a.update(wsA, 'room', { color: 'red', typing: true }, platformA);
+			a.flushDiffs();
+			await wait(50);
+			b.flushDiffs();
+
+			// Instance B saw the update fan out to its local subscribers.
+			const bUpdate = platformB.published
+				.filter((p) => p.event === 'diff')
+				.map((p) => p.data.updates)
+				.filter(Boolean)
+				.pop();
+			expect(bUpdate).toEqual({ alice: { color: 'red', typing: true } });
+
+			// Durable color persisted to Redis (by A); a fresh observer on B reads
+			// it from the snapshot, while transient typing is excluded.
+			platformB.reset();
+			const obs = mockWs({ id: 'obs' });
+			await b.sync(obs, 'room', platformB);
+			const state = platformB.sent.filter((s) => s.event === 'state').pop();
+			expect(state.data.alice).toEqual({ id: 'alice', name: 'Alice', color: 'red' });
 		});
 	});
 });

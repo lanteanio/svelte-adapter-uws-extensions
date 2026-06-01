@@ -26,6 +26,16 @@ export interface RedisPresenceOptions {
 	 * @default false
 	 */
 	keyspaceNotifications?: boolean;
+	/**
+	 * Dynamic field names (set via `update()`) that are broadcast live but
+	 * NEVER persisted to Redis and NEVER included in the `state` snapshot or
+	 * the heartbeat roster. A (re)joining or swept-then-readded client never
+	 * inherits a possibly-stale transient value (e.g. a disconnected typer
+	 * leaves no stuck indicator). Durable `update()` fields not listed here
+	 * persist and ride the snapshot. Matches the bundled in-memory presence
+	 * plugin. Default: none (every `update()` field is durable).
+	 */
+	transient?: string[];
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -39,8 +49,8 @@ export interface RedisPresenceOptions {
  */
 export type PresenceWireEvent =
 	| { event: 'state'; data: Record<string, Record<string, any>> }
-	| { event: 'diff'; data: { joins: Record<string, Record<string, any>>; leaves: Record<string, Record<string, any>> } }
-	| { event: 'heartbeat'; data: string[] };
+	| { event: 'diff'; data: { joins: Record<string, Record<string, any>>; leaves: Record<string, Record<string, any>>; updates?: Record<string, Record<string, any>> } }
+	| { event: 'heartbeat'; data: Record<string, Record<string, any>> };
 
 export interface PresenceMetricsSnapshot {
 	/** Sum of unique-users-per-topic across all topics this instance is locally tracking. */
@@ -82,6 +92,20 @@ export interface RedisPresenceTracker {
 
 	/** Send current presence list without joining. */
 	sync(ws: any, topic: string, platform: Platform): Promise<void>;
+
+	/**
+	 * Set dynamic fields on the present user (typing, a selection range, a lock
+	 * map) as a field-level delta: only fields whose value actually changed are
+	 * merged into the user and broadcast in the next `diff` under
+	 * `updates[key]`. Durable fields are persisted to Redis so a cross-instance
+	 * `state` read includes them; fields named in the `transient` option are
+	 * broadcast live but never persisted or snapshotted. The update applies to
+	 * the user (per dedup key), so any of a multi-tab user's connections - on
+	 * any instance - may call it. A connection not present on the topic is a
+	 * silent no-op. No-op if no field actually changed. Mirrors the in-memory
+	 * `presence.update`.
+	 */
+	update(ws: any, topic: string, fields: Record<string, any>, platform: Platform): Promise<void>;
 
 	/** Get the current presence list for a topic. */
 	list(topic: string): Promise<Record<string, any>[]>;

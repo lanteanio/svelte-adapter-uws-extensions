@@ -609,12 +609,12 @@ Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bun
 | Event | When | Payload | Direction |
 |---|---|---|---|
 | `state` | Once on subscribe | `{[userKey]: data}` - flat snapshot of current presence | Server -> single connection |
-| `diff` | Microtask-batched after joins / leaves / updates | `{joins: {[key]: data}, leaves: {[key]: data}}` | Server -> topic subscribers |
-| `heartbeat` | Per heartbeat interval | `string[]` - array of currently-known user keys | Server -> topic subscribers |
+| `diff` | Microtask-batched after joins / leaves / updates | `{joins: {[key]: data}, leaves: {[key]: data}, updates?: {[key]: changedFields}}` | Server -> topic subscribers |
+| `heartbeat` | Per heartbeat interval | `{[userKey]: data}` - map of currently-known users (durable fields included, transient excluded) | Server -> topic subscribers |
 
-`diff` collapses by key per-tick: if the same user joins and leaves in the same microtask, only the latest op survives on the wire. An update (same user re-joins with different data) appears as a `joins` entry carrying the new data, since clients overwrite their `Map.set` on the same key.
+`diff` collapses by key per-tick: if the same user joins and leaves in the same microtask, only the latest op survives on the wire. An identity-data change (same user re-joins with different `select()` output) appears as a `joins` entry carrying the new data, since clients overwrite their `Map.set` on the same key. A field-level `update()` (see below) appears under `updates[key]` carrying only the changed fields, which clients merge into the existing user; an `update` that collapses against a same-tick join is folded into the join roster instead (the roster already carries the durable fields).
 
-Cross-instance traffic on the dedicated `presence:events:{topic}` Redis pub/sub channel is `{instanceId, topic, event, payload}` with `event` in `'join' | 'leave' | 'updated'`. Receivers route inbound events into their local diff buffer for client fan-out, so clients only ever see the unified `state` / `diff` shape regardless of which instance the change originated on.
+Cross-instance traffic on the dedicated `presence:events:{topic}` Redis pub/sub channel is `{instanceId, topic, event, payload}` with `event` in `'join' | 'leave' | 'updated' | 'fields'` (`fields` carries a field-level `update()` delta as `{key, durable, transient}`). Receivers route inbound events into their local diff buffer for client fan-out, so clients only ever see the unified `state` / `diff` shape regardless of which instance the change originated on.
 
 Joins are staged with full rollback on failure: local state is set up first, then the Redis hashes are written, then the WebSocket is subscribed. If any step fails (circuit breaker trips, Redis is down, WebSocket closed during an async gap), all prior steps are undone - local maps, the Redis state, and any buffered diff entry are reversed. Compensating join+leave ops on the same key in the same tick collapse to nothing on the wire.
 
@@ -662,6 +662,7 @@ export async function close(ws, { platform }) {
 | `select` | strips `__`-prefixed keys | Extract public fields from userData |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
+| `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
 | `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 
 #### API
@@ -671,6 +672,7 @@ export async function close(ws, { platform }) {
 | `join(ws, topic, platform)` | Add connection to presence |
 | `leave(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
 | `sync(ws, topic, platform)` | Send list without joining |
+| `update(ws, topic, fields, platform)` | Set dynamic fields on the present user as a field-level delta. See [Field-level updates](#field-level-updates). |
 | `list(topic)` | Get current users |
 | `count(topic)` | Count unique users |
 | `metrics()` | Synchronous snapshot: `{ totalOnline, heartbeatLatencyMs, staleCleanedTotal }`. See [Metrics snapshot](#metrics-snapshot). |
@@ -678,6 +680,32 @@ export async function close(ws, { platform }) {
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
 | `hooks` | `{ subscribe, close }` - ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
+
+#### Field-level updates
+
+`update(ws, topic, fields, platform)` sets dynamic fields on the present user (typing, a selection range, a lock map) as a field-level delta - only fields whose value actually changed are merged and broadcast, in the next `diff` under `updates[key]`. The update applies to the *user* (per dedup key), so any of a multi-tab user's connections, on any instance, may call it; a connection that is not present on the topic is a silent no-op.
+
+```js
+// typing on
+await presence.update(ws, 'room', { typing: true }, platform);
+// later: typing off + a durable color, in one delta
+await presence.update(ws, 'room', { typing: false, color: '#f0a' }, platform);
+```
+
+Fields split into two kinds:
+
+- **Durable** (the default) - persisted into the per-topic hash value (`{data, fields, ts}`), so a client that joins or reconnects later reconstructs them from the `state` snapshot, and the heartbeat roster carries them. Survives across instances; cleared only when the user fully leaves the topic.
+- **Transient** (listed in the `transient` option) - broadcast live in the `updates` diff but NEVER persisted and NEVER included in the `state` snapshot or heartbeat. A (re)joining or swept-then-readded client therefore never inherits a stale transient value - a disconnected typer leaves no stuck `typing: true` anywhere in the fleet.
+
+```js
+const presence = createPresence(redis, {
+  key: 'id',
+  select: (ud) => ({ id: ud.id, name: ud.name }),
+  transient: ['typing']   // broadcast live, never snapshotted
+});
+```
+
+Additive and wire-compatible: a deployment that never calls `update()` sends the byte-identical `{joins, leaves}` diff as before, and an old client ignores `updates`. The behavior mirrors the bundled in-memory `presence.update` / `transient` in `svelte-adapter-uws`, so the same client store handles both single-instance and clustered deployments.
 
 #### Metrics snapshot
 
@@ -3187,11 +3215,12 @@ Per-tenant prefixes add a handful of bytes to every key name and every published
 
 ## Testing
 
-This repo runs tests in two layers. Both stay green; you can run either independently.
+This repo runs tests in two layers; the integration layer additionally mirrors the Redis suites against a real Redis Cluster. All stay green; you can run each independently.
 
 ```bash
-npm test                  # mock layer (24 files, 861 tests, no services needed)
-npm run test:integration  # integration layer (real Redis 7 + Postgres 16 in Docker)
+npm test                                  # mock layer (no services needed)
+npm run test:integration                  # integration layer (real Redis 7 + Postgres 16 in Docker)
+npm run test:integration:cluster-mirror   # the same Redis suites against a real 3-master Redis Cluster
 ```
 
 ### Mock layer (`test/`)
@@ -3220,24 +3249,29 @@ Project name auto-derives from the port pair when overridden, so unique ports al
 #### Adding a new integration test
 
 1. Drop a `*.test.js` file under `test/integration/redis/` or `test/integration/postgres/`.
-2. In `beforeAll`, build a real client:
+2. In `beforeAll`, build a client. For a Redis suite use `createBackendClient` (from `test/integration/helpers/backend.js`) so the suite also runs against the cluster mirror; it is a drop-in for `createRedisClient` that resolves the standalone URL or the cluster node list from the active backend:
 
    ```js
-   import { createRedisClient } from '../../../redis/index.js';
-   // or: import { createPgClient } from '../../../postgres/index.js';
+   import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
+   // Postgres suites: import { createPgClient } from '../../../postgres/index.js';
 
    beforeAll(() => {
-     client = createRedisClient({
-       url: process.env.INTEGRATION_REDIS_URL,
-       keyPrefix: 'inttest-yourmodule:',  // namespace per test file
-       autoShutdown: false                // tests own the lifecycle
-     });
+     client = createBackendClient({ keyPrefix: 'inttest-yourmodule:' }); // namespace per file
    });
    ```
-3. In `beforeEach`, wipe state under your prefix (Redis: `SCAN MATCH prefix* + UNLINK`; Postgres: `TRUNCATE` your test tables, or use distinct channels for LISTEN/NOTIFY).
+3. In `beforeEach`, wipe state under your prefix. For Redis, call `await resetBackendKeys(client)` (a cluster-aware SCAN+UNLINK that also works on standalone); for Postgres, `TRUNCATE` your test tables or use distinct LISTEN/NOTIFY channels.
 4. In `afterAll`, `await client.quit()` / `await client.end()`.
 
 The integration layer is additive: the mock-based test for a module stays in place when you add the integration counterpart. They cover different failure modes.
+
+### Cluster mirror (`test:integration:cluster-mirror`)
+
+The Redis integration suites run a second time against a real 3-master + 3-replica Redis Cluster, through a DRY env-switched backend ([`test/integration/helpers/backend.js`](test/integration/helpers/backend.js)): the same test bodies, with `createBackendClient` resolving to an `ioredis.Cluster` when `INTEGRATION_BACKEND=cluster`. This keeps an honest map of which plugins are Redis-Cluster-safe today:
+
+- **Cluster-safe:** `fence`, `lock`, `leader`, `idempotency`, `ratelimit`, `pubsub`, `publish-rate` - single-key lease/bucket operations, or broadcast pub/sub; `clear()` fans SCAN across master nodes and unlinks per key.
+- **Not yet cluster-safe** (skipped on the cluster mirror with a documented reason; fully working on standalone Redis): `presence`, `groups`, `replay`, `replay-stream` (their core path is a multi-key Lua script over keys without a shared `{hash-tag}`, which the cluster rejects with `CROSSSLOT`); `functions` (a function library loads per node); `sharded-pubsub` (sharded `SPUBLISH`/`SSUBSCRIBE` cross-node delivery); plus the cross-topic pipelines in `cursor` and `session.clear()`. Making these cluster-ready is a key-layout (`{hash-tag}`) follow-up.
+
+If you deploy on a single Redis - or a primary with replicas - which is the common case, every plugin works. Redis Cluster support is partial and tracked; this mirror is how the map stays honest as the code evolves.
 
 ### Testing your own code
 

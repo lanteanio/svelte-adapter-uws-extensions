@@ -18,37 +18,27 @@
  * server can verify.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { createReplay } from '../../../redis/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
-describe('redis replay (stream backend, integration)', () => {
+// Redis Cluster gap: PUBLISH_SCRIPT (2-key) and IDMP_PUBLISH_SCRIPT (3-key) and clearTopic (2-key UNLINK) span slots with no shared {hash-tag} -> CROSSSLOT on every publish (redis/replay-stream.js). Needs a {topic} hash-tag. Runs on solo.
+const describeIntegration = isClusterBackend() ? describe.skip : describe;
+
+describeIntegration('redis replay (stream backend, integration)', () => {
 	let client;
 	let platform;
 	let replay;
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-replay-stream:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-replay-stream:'
 		});
 	});
 
 	beforeEach(async () => {
 		// Wipe everything under our prefix so each test starts clean.
-		let cursor = '0';
-		do {
-			const [next, keys] = await client.redis.scan(
-				cursor, 'MATCH', client.key('*'), 'COUNT', 200
-			);
-			cursor = next;
-			if (keys.length > 0) await client.redis.unlink(...keys);
-		} while (cursor !== '0');
+		await resetBackendKeys(client);
 
 		platform = mockPlatform();
 		replay = createReplay(client, { storage: 'stream', size: 5 });

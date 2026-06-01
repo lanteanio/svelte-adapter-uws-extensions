@@ -8,7 +8,7 @@
  * over real ioredis, and the merged top-N reflects the cluster view.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient } from '../helpers/backend.js';
 import { createPublishRateAggregator } from '../../../redis/publish-rate.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
@@ -21,14 +21,8 @@ describe('redis publish-rate aggregator (integration)', () => {
 	const aggs = [];
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-pubrate:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-pubrate:'
 		});
 	});
 

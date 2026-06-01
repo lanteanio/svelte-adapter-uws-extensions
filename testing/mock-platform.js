@@ -14,7 +14,7 @@ export const PLATFORM_KEYS = Object.freeze([
 	'request',
 	'connections', 'requestId',
 	'pressure', 'onPressure', 'onPublishRate',
-	'subscribers', 'subscribe', 'unsubscribe', 'checkSubscribe',
+	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
 	'topic',
 	'maxPayloadLength', 'bufferedAmount',
 	'closedWsAborts'
@@ -46,6 +46,12 @@ export function mockPlatform() {
 		// reads `platform.replay`. Default `undefined`; tests that need to
 		// drive replay paths reassign it directly.
 		replay: undefined,
+		// Framework-convention slots also forwarded by the bus wraps: an app
+		// stashes its ioredis client on `platform.redis` and the presence
+		// registry on `platform.presence`. Default `undefined`; the wrap-parity
+		// test drives the forward-when-set behavior.
+		redis: undefined,
+		presence: undefined,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
@@ -121,6 +127,10 @@ export function mockPlatform() {
 		subscribers(topic) {
 			return 0;
 		},
+		// No local subscriber set in the mock, so the default walk yields
+		// nothing. Tests that exercise a per-subscriber walk reassign this
+		// with their own iteration over recorded subscribers.
+		forEachSubscriber(topic, fn) {},
 		subscribe(ws, topic) {
 			p.subscribed.push({ ws, topic });
 			return null;

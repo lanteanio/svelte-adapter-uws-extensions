@@ -10,7 +10,7 @@
  * expires and a sibling on a separate ioredis connection takes over.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { createLeader } from '../../../redis/leader.js';
 
 function wait(ms) {
@@ -30,26 +30,13 @@ describe('redis leader (integration)', () => {
 	let client;
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-leader:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-leader:'
 		});
 	});
 
 	beforeEach(async () => {
-		let cursor = '0';
-		do {
-			const [next, keys] = await client.redis.scan(
-				cursor, 'MATCH', client.key('*'), 'COUNT', 200
-			);
-			cursor = next;
-			if (keys.length > 0) await client.redis.unlink(...keys);
-		} while (cursor !== '0');
+		await resetBackendKeys(client);
 	});
 
 	afterAll(async () => {
@@ -84,7 +71,14 @@ describe('redis leader (integration)', () => {
 	});
 
 	describe('renewal slides PEXPIRE under real TTL', () => {
-		it('PTTL stays close to leaseMs while the renewal tick runs', async () => {
+		// Redis Cluster: asserts every PTTL sample stays in a TIGHT band
+		// (> leaseMs - renewMs*~3.5) across renewals. The cluster's per-command
+		// latency variance can delay a renewal tick enough that one sample dips
+		// under the tight floor, even though the lease is being renewed correctly
+		// (PTTL never approaches 0 / expiry). The single-key lease is cluster-safe;
+		// only this tight timing-window assertion is cluster-fragile, so it is
+		// skipped on the cluster backend (the deterministic band is asserted on solo).
+		(isClusterBackend() ? it.skip : it)('PTTL stays close to leaseMs while the renewal tick runs', async () => {
 			const l = createLeader(client, { leaseMs: 1500, renewMs: 200 });
 			await waitFor(async () => l.isLeader());
 
@@ -108,9 +102,8 @@ describe('redis leader (integration)', () => {
 
 	describe('cross-instance handoff', () => {
 		it('a sibling on a separate ioredis connection takes over after the leader stops', async () => {
-			const url = process.env.INTEGRATION_REDIS_URL;
-			const clientA = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
-			const clientB = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
+			const clientA = createBackendClient({ keyPrefix: 'inttest-leader:' });
+			const clientB = createBackendClient({ keyPrefix: 'inttest-leader:' });
 			try {
 				const a = createLeader(clientA, { instanceId: 'a', leaseMs: 1500, renewMs: 200 });
 				const b = createLeader(clientB, { instanceId: 'b', leaseMs: 1500, renewMs: 200 });
@@ -135,9 +128,8 @@ describe('redis leader (integration)', () => {
 		});
 
 		it('a sibling takes over via real TTL expiry when the leader cannot release', async () => {
-			const url = process.env.INTEGRATION_REDIS_URL;
-			const clientA = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
-			const clientB = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
+			const clientA = createBackendClient({ keyPrefix: 'inttest-leader:' });
+			const clientB = createBackendClient({ keyPrefix: 'inttest-leader:' });
 			try {
 				// Short lease so the test doesn't wait long for expiry.
 				const a = createLeader(clientA, { instanceId: 'a', leaseMs: 600, renewMs: 200 });
@@ -167,9 +159,8 @@ describe('redis leader (integration)', () => {
 
 	describe('release script (compare-and-delete)', () => {
 		it('stop() does not delete the key if a sibling has taken over', async () => {
-			const url = process.env.INTEGRATION_REDIS_URL;
-			const clientA = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
-			const clientB = createRedisClient({ url, keyPrefix: 'inttest-leader:', autoShutdown: false });
+			const clientA = createBackendClient({ keyPrefix: 'inttest-leader:' });
+			const clientB = createBackendClient({ keyPrefix: 'inttest-leader:' });
 			try {
 				const a = createLeader(clientA, { instanceId: 'a', leaseMs: 5000, renewMs: 1000 });
 				await waitFor(async () => a.isLeader());

@@ -98,6 +98,30 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(wrapped.closedWsAborts).toBe(7);
 	});
 
+	it('pubsub wrap delegates forEachSubscriber to the underlying platform', () => {
+		const platform = mockPlatform();
+		const walked = [];
+		platform.forEachSubscriber = (topic, fn) => { walked.push(topic); fn({ id: 'a' }, {}); };
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+
+		const seen = [];
+		wrapped.forEachSubscriber('room:1', (ws) => seen.push(ws.id));
+		expect(walked).toEqual(['room:1']);
+		expect(seen).toEqual(['a']);
+	});
+
+	it('sharded wrap delegates forEachSubscriber to the underlying platform', () => {
+		const platform = mockPlatform();
+		const walked = [];
+		platform.forEachSubscriber = (topic, fn) => { walked.push(topic); fn({ id: 'b' }, {}); };
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+
+		const seen = [];
+		wrapped.forEachSubscriber('room:2', (ws) => seen.push(ws.id));
+		expect(walked).toEqual(['room:2']);
+		expect(seen).toEqual(['b']);
+	});
+
 	it('sharded wrap forwards maxPayloadLength / bufferedAmount / onPublishRate', () => {
 		const platform = mockPlatform();
 		// Methods are captured at wrap-construction (consistent with the
@@ -163,5 +187,45 @@ describe('Framework conventions: bus wraps preserve app-stashed properties', () 
 		const platform = mockPlatform();
 		expect('replay' in platform).toBe(true);
 		expect(platform.replay).toBeUndefined();
+	});
+
+	it('pubsub wrap forwards platform.redis as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.redis).toBeUndefined();
+
+		const client = { status: 'ready' };
+		platform.redis = client;
+		expect(wrapped.redis).toBe(client);
+	});
+
+	it('sharded wrap forwards platform.redis as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.redis).toBeUndefined();
+
+		const client = { status: 'ready' };
+		platform.redis = client;
+		expect(wrapped.redis).toBe(client);
+	});
+
+	it('pubsub wrap forwards platform.presence as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.presence).toBeUndefined();
+
+		const presence = { list: () => [] };
+		platform.presence = presence;
+		expect(wrapped.presence).toBe(presence);
+	});
+
+	it('sharded wrap forwards platform.presence as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.presence).toBeUndefined();
+
+		const presence = { list: () => [] };
+		platform.presence = presence;
+		expect(wrapped.presence).toBe(presence);
 	});
 });

@@ -8,7 +8,7 @@
  * store. This file is additive.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createRedisClient } from '../../../redis/index.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createRedisFence } from '../../../redis/fence.js';
 
 function wait(ms) {
@@ -20,26 +20,13 @@ describe('redis fence (integration)', () => {
 	let fence;
 
 	beforeAll(() => {
-		const url = process.env.INTEGRATION_REDIS_URL;
-		if (!url) {
-			throw new Error('INTEGRATION_REDIS_URL not set; global-setup did not run');
-		}
-		client = createRedisClient({
-			url,
-			keyPrefix: 'inttest-fence:',
-			autoShutdown: false
+		client = createBackendClient({
+			keyPrefix: 'inttest-fence:'
 		});
 	});
 
 	beforeEach(async () => {
-		let cursor = '0';
-		do {
-			const [next, keys] = await client.redis.scan(
-				cursor, 'MATCH', client.key('*'), 'COUNT', 200
-			);
-			cursor = next;
-			if (keys.length > 0) await client.redis.unlink(...keys);
-		} while (cursor !== '0');
+		await resetBackendKeys(client);
 
 		fence = createRedisFence(client);
 	});

@@ -587,6 +587,10 @@ export function mockRedisClient(keyPrefix = '') {
 				if (script.includes('PRESENCE_JOIN') && script.includes('HPEXPIRE')) {
 					return evalPresenceJoinG(args);
 				}
+				// Presence UPDATE (field-level durable merge into the per-topic hash value)
+				if (script.includes('PRESENCE_UPDATE')) {
+					return evalPresenceUpdate(args);
+				}
 				// Presence LEAVE (Design G: HDEL + HLEN check, no scan)
 				if (script.includes('HDEL') && script.includes('HLEN')
 					&& !script.includes('HPEXPIRE') && !script.includes('hdel')) {
@@ -833,20 +837,31 @@ export function mockRedisClient(keyPrefix = '') {
 			if (!ex) { ex = new Map(); hashFieldExpiry.set(userHashKey, ex); }
 			ex.set(instanceId, Date.now() + ttlMs);
 
-			// Newer-ts conditional set on topicHash
+			// Newer-ts conditional set on topicHash, preserving any durable
+			// fields already stored for the user (mirrors JOIN_SCRIPT's
+			// fields-preservation across a newer-data overwrite).
 			pruneExpiredFields(topicHashKey);
 			const topicHash = hashes.get(topicHashKey);
 			let shouldWrite = true;
+			let existingParsed = null;
 			if (topicHash && topicHash.has(userKeyStr)) {
 				try {
-					const parsed = JSON.parse(topicHash.get(userKeyStr));
-					const existingTs = Number(parsed.ts) || 0;
+					existingParsed = JSON.parse(topicHash.get(userKeyStr));
+					const existingTs = Number(existingParsed.ts) || 0;
 					if (newTs < existingTs) shouldWrite = false;
-				} catch { /* corrupted - allow overwrite */ }
+				} catch { existingParsed = null; /* corrupted - allow overwrite */ }
 			}
 			if (shouldWrite) {
+				let valueToWrite = topicHashValue;
+				if (existingParsed && existingParsed.fields && typeof existingParsed.fields === 'object') {
+					try {
+						const incoming = JSON.parse(topicHashValue);
+						incoming.fields = existingParsed.fields;
+						valueToWrite = JSON.stringify(incoming);
+					} catch { /* keep topicHashValue */ }
+				}
 				if (!hashes.has(topicHashKey)) hashes.set(topicHashKey, new Map());
-				hashes.get(topicHashKey).set(userKeyStr, topicHashValue);
+				hashes.get(topicHashKey).set(userKeyStr, valueToWrite);
 				clearFieldExpiry(topicHashKey, [userKeyStr]);
 			}
 			// Always refresh TTL on topicHash field (even when write was skipped
@@ -886,6 +901,37 @@ export function mockRedisClient(keyPrefix = '') {
 				return 1;
 			}
 			return 0;
+		}
+
+		// Presence UPDATE (field-level) Lua script simulation. Mirrors
+		// UPDATE_SCRIPT: merge changed DURABLE fields into the per-topic hash
+		// value's `fields`, bump ts, refresh the field TTL. Returns 1 if applied,
+		// 0 if the user is not present on the topic.
+		function evalPresenceUpdate(args) {
+			const topicHashKey = args[0];
+			const userKey = args[1];
+			const durableJson = args[2];
+			const newTs = Number(args[3]);
+			const ttlMs = Number(args[4]);
+
+			pruneExpiredFields(topicHashKey);
+			const topicHash = hashes.get(topicHashKey);
+			if (!topicHash || !topicHash.has(userKey)) return 0;
+			let parsed;
+			try { parsed = JSON.parse(topicHash.get(userKey)); } catch { return 0; }
+			if (!parsed || typeof parsed !== 'object') return 0;
+			let durable;
+			try { durable = JSON.parse(durableJson); } catch { return 0; }
+			if (!durable || typeof durable !== 'object') return 0;
+			if (!parsed.fields || typeof parsed.fields !== 'object') parsed.fields = {};
+			for (const k of Object.keys(durable)) parsed.fields[k] = durable[k];
+			parsed.ts = newTs;
+			topicHash.set(userKey, JSON.stringify(parsed));
+			clearFieldExpiry(topicHashKey, [userKey]);
+			let tex = hashFieldExpiry.get(topicHashKey);
+			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
+			tex.set(userKey, Date.now() + ttlMs);
+			return 1;
 		}
 
 		// Presence leave Lua script simulation

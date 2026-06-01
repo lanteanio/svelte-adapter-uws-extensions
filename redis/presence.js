@@ -101,14 +101,30 @@ redis.call('HSET', userKey, instanceId, newTs)
 redis.call('HPEXPIRE', userKey, ttlMs, 'FIELDS', 1, instanceId)
 
 local existing = redis.call('HGET', topicKey, userKeyStr)
+local valueToWrite = topicHashValue
 local shouldWrite = true
 if existing then
   local ok, parsed = pcall(cjson.decode, existing)
-  local existingTs = ok and parsed and tonumber(parsed.ts) or 0
-  if newTs < existingTs then shouldWrite = false end
+  if ok and type(parsed) == 'table' then
+    local existingTs = tonumber(parsed.ts) or 0
+    if newTs < existingTs then
+      shouldWrite = false
+    elseif type(parsed.fields) == 'table' then
+      -- Preserve dynamic fields (set via update()) across a newer-data
+      -- overwrite. The join value carries identity data only, but the
+      -- durable fields must survive an avatar/name change or a
+      -- cross-instance new-tab join; without this they would be wiped.
+      -- cjson round-trips nested objects faithfully (verified on Redis 7.4).
+      local okIncoming, incoming = pcall(cjson.decode, valueToWrite)
+      if okIncoming and type(incoming) == 'table' then
+        incoming.fields = parsed.fields
+        valueToWrite = cjson.encode(incoming)
+      end
+    end
+  end
 end
 if shouldWrite then
-  redis.call('HSET', topicKey, userKeyStr, topicHashValue)
+  redis.call('HSET', topicKey, userKeyStr, valueToWrite)
 end
 redis.call('HPEXPIRE', topicKey, ttlMs, 'FIELDS', 1, userKeyStr)
 
@@ -149,6 +165,53 @@ return 0
 `;
 
 /**
+ * Lua script for atomic field-level UPDATE. Merges a user's changed DURABLE
+ * dynamic fields (set via `update()`, transient fields excluded by the caller)
+ * into the per-topic hash value's `fields` object so a cross-instance `state`
+ * read (HGETALL) reconstructs them. Transient fields are never passed here -
+ * they are relay-only and must never persist, so a (re)joining client never
+ * inherits a stale transient value.
+ *
+ * KEYS[1] = topicHashKey (presence:topic:{topic})
+ * ARGV[1] = userKey (the field on the topic hash)
+ * ARGV[2] = durableFieldsJson (a non-empty JSON object of changed durable fields)
+ * ARGV[3] = ts (numeric, refreshes the stored timestamp so a stale concurrent
+ *           join cannot overwrite the merged value)
+ * ARGV[4] = ttlMs (numeric, for HPEXPIRE - HSET clears the field TTL so it is
+ *           re-armed in the same atomic block, matching JOIN_SCRIPT)
+ *
+ * Returns 1 if the merge was applied, 0 if the user is not present on the
+ * topic (already left, or never joined) - the durable value is dropped, which
+ * is correct: there is no user to carry it.
+ *
+ * Single-key (the topic hash only), so an instance's own subscribers' durable
+ * fields persist without touching the per-user ownership hash. cjson round-trips
+ * the existing value faithfully (an empty `data` object stays `{}`, verified on
+ * Redis 7.4), so the identity payload is preserved byte-for-byte.
+ */
+const UPDATE_SCRIPT = `
+local topicKey = KEYS[1]
+local userKey = ARGV[1]
+local newTs = tonumber(ARGV[3])
+local ttlMs = tonumber(ARGV[4])
+if newTs == nil or ttlMs == nil then
+  return redis.error_reply('PRESENCE_UPDATE: newTs/ttlMs must be numeric')
+end
+local existing = redis.call('HGET', topicKey, userKey)
+if not existing then return 0 end
+local ok, parsed = pcall(cjson.decode, existing)
+if not ok or type(parsed) ~= 'table' then return 0 end
+local okd, durable = pcall(cjson.decode, ARGV[2])
+if not okd or type(durable) ~= 'table' then return 0 end
+if type(parsed.fields) ~= 'table' then parsed.fields = {} end
+for k, v in pairs(durable) do parsed.fields[k] = v end
+parsed.ts = newTs
+redis.call('HSET', topicKey, userKey, cjson.encode(parsed))
+redis.call('HPEXPIRE', topicKey, ttlMs, 'FIELDS', 1, userKey)
+return 1
+`;
+
+/**
  * Internal cross-instance Redis pub/sub envelope event names. NOT the
  * client wire shape - clients see `state` / `diff` /
  * `heartbeat`. These names live on the `presence:events:{topic}` channel
@@ -157,7 +220,8 @@ return 0
 const INTERNAL_EVENTS = Object.freeze({
 	JOIN: 'join',
 	LEAVE: 'leave',
-	UPDATED: 'updated'
+	UPDATED: 'updated',
+	FIELDS: 'fields'
 });
 
 /**
@@ -167,6 +231,7 @@ const INTERNAL_EVENTS = Object.freeze({
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
  * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its per-topic presence hash key expires (instance-died scenario where every field of the hash has expired). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired). With per-field TTLs, individual field expiry does NOT emit a key-expired notification; only whole-key expiry does, which happens when every field of the topic hash has expired (no live instances presenting any user on this topic).
+ * @property {string[]} [transient] - Dynamic field names (set via `update()`) that are broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or the heartbeat roster. A (re)joining or swept-then-readded client therefore never inherits a possibly-stale transient value - a disconnected typer leaves no stuck indicator across the cluster. Identity fields (from `select`) and durable `update()` fields not listed here persist and ride the snapshot normally. Default: none (every `update()` field is durable). Matches the bundled in-memory presence plugin.
  */
 
 /**
@@ -181,6 +246,7 @@ const INTERNAL_EVENTS = Object.freeze({
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} join
  * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} leave
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} sync
+ * @property {(ws: any, topic: string, fields: Record<string, any>, platform: import('svelte-adapter-uws').Platform) => Promise<void>} update
  * @property {(topic: string) => Promise<Array<Record<string, any>>>} list
  * @property {(topic: string) => Promise<number>} count
  * @property {() => PresenceMetricsSnapshot} metrics
@@ -204,6 +270,19 @@ export function createPresence(client, options = {}) {
 	const select = options.select || stripInternal;
 	const heartbeatInterval = options.heartbeat ?? 30000;
 	const presenceTtl = options.ttl ?? 90;
+
+	// Fields tagged transient are broadcast live (in `update` diffs to whoever
+	// is subscribed the moment they change) but are NEVER persisted to Redis and
+	// EXCLUDED from the `state` snapshot and the heartbeat roster, so a
+	// (re)joining or swept-then-readded client never inherits a possibly-stale
+	// transient value. Identity fields (from `select`) are unaffected; durable
+	// dynamic fields not tagged here persist to the per-topic hash and ride the
+	// snapshot. Mirrors the bundled in-memory presence plugin exactly.
+	const transientFields = new Set(
+		Array.isArray(options.transient)
+			? options.transient.filter((f) => typeof f === 'string')
+			: []
+	);
 
 	// Binary wire codec (presence.protocol:1), built by the adapter's shared
 	// factory so the cluster variant speaks the IDENTICAL wire to the bundled
@@ -338,10 +417,54 @@ export function createPresence(client, options = {}) {
 	const localCounts = new Map();
 
 	/**
-	 * Local per-topic data cache for heartbeat updates.
-	 * @type {Map<string, Map<string, { data: Record<string, any>, serialized: string, field: string }>>}
+	 * Local per-topic data cache for heartbeat updates. `data` is the identity
+	 * (from `select`); `fields` (lazily allocated, `null` until the first
+	 * `update()` touches this user on this instance) holds the dynamic fields
+	 * set via `update()` (durable AND transient, kept for per-field change
+	 * detection). `publicData()` merges identity + durable fields, stripping
+	 * transient, for every snapshot-shaped path (heartbeat, the join roster at
+	 * flush). Mirrors the adapter's `{ data, fields }` per-user entry.
+	 * @type {Map<string, Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>>}
 	 */
 	const localData = new Map();
+
+	/**
+	 * The public presence value for a user: identity `data` merged with the
+	 * user's durable dynamic `fields`, transient fields stripped. Used by every
+	 * snapshot-shaped path (`state` reconstruction from Redis, the heartbeat
+	 * roster, the join roster at flush) so a (re)joiner never sees a transient
+	 * value. The no-`fields` user (the overwhelming common case) returns
+	 * `entry.data` with zero copy - keeping a no-`update()` deployment's wire
+	 * byte-identical to a deployment that never calls update(). Works on both a local cache entry
+	 * (`{ data, fields }`) and a parsed Redis entry (`{ data, fields, ts }`);
+	 * Redis only ever stores durable fields, so the transient strip is a no-op
+	 * there but harmless.
+	 * @param {{ data: Record<string, any>, fields?: Record<string, any> | null }} entry
+	 * @returns {Record<string, any>}
+	 */
+	function publicData(entry) {
+		if (!entry.fields) return entry.data;
+		const out = { ...entry.data };
+		for (const k of Object.keys(entry.fields)) {
+			if (!transientFields.has(k)) out[k] = entry.fields[k];
+		}
+		return out;
+	}
+
+	/**
+	 * Set a user's identity `data` on the local per-topic cache, PRESERVING any
+	 * dynamic `fields` already tracked for the user. The identity-churn paths
+	 * (join, data-change, leave-restore, rollback) re-set `data` repeatedly;
+	 * dynamic fields are user-level and orthogonal, so they must ride across
+	 * those re-sets rather than be clobbered.
+	 * @param {Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>} topicData
+	 * @param {string} key
+	 * @param {Record<string, any>} data
+	 */
+	function setLocalData(topicData, key, data) {
+		const existing = topicData.get(key);
+		topicData.set(key, existing ? { data, fields: existing.fields } : { data, fields: null });
+	}
 
 	/**
 	 * Track sync-only ws so leave() can clean up their Redis channel subscriptions.
@@ -391,6 +514,14 @@ export function createPresence(client, options = {}) {
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let diffFlushPlatform = null;
 
+	function armDiffFlush(platform) {
+		diffFlushPlatform = platform;
+		if (diffFlushTimer === null) {
+			diffFlushTimer = setTimeout(flushPendingDiffs, 0);
+			if (diffFlushTimer.unref) diffFlushTimer.unref();
+		}
+	}
+
 	function bufferDiff(topic, op, key, data, platform) {
 		let entries = pendingDiffs.get(topic);
 		if (!entries) {
@@ -400,12 +531,55 @@ export function createPresence(client, options = {}) {
 		if (entries.has(key)) {
 			mDiffCoalesced?.inc({ topic: mt(topic) });
 		}
+		// A join/leave supersedes any pending field-level update for the key:
+		// the join roster re-reads publicData (durable fields included) and a
+		// leave drops the user entirely, so a buffered update is moot.
 		entries.set(key, { op, data });
-		diffFlushPlatform = platform;
-		if (diffFlushTimer === null) {
-			diffFlushTimer = setTimeout(flushPendingDiffs, 0);
-			if (diffFlushTimer.unref) diffFlushTimer.unref();
+		armDiffFlush(platform);
+	}
+
+	/**
+	 * Buffer a field-level update for the next flush, collapsing against any op
+	 * already pending for the key, exactly like the in-memory plugin:
+	 *   - pending leave  -> drop (the user leaves this flush; the update is moot)
+	 *   - pending join   -> drop (the join roster carries durable fields via
+	 *     publicData; a transient change is correctly excluded on a fresh join)
+	 *   - pending update -> accumulate the changed fields
+	 * @param {string} topic
+	 * @param {string} key
+	 * @param {Record<string, any>} changed - durable + transient changed fields
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 */
+	function bufferUpdate(topic, key, changed, platform) {
+		let entries = pendingDiffs.get(topic);
+		if (!entries) {
+			entries = new Map();
+			pendingDiffs.set(topic, entries);
 		}
+		const prev = entries.get(key);
+		if (prev) {
+			// A pending leave wins: the user is gone this flush, so the update is moot.
+			if (prev.op === 'leave') return;
+			if (prev.op === 'join') {
+				// A LOCAL join re-reads publicData(localData) at flush, so its durable
+				// fields are already current and the update is redundant (transient is
+				// excluded on a fresh local join, matching the in-memory plugin). A
+				// RELAYED join (the user is not presented on this instance, so flush
+				// uses the buffered payload verbatim) must absorb the change, or a
+				// cross-instance field update landing in the same tick as the relayed
+				// join / updated event for that user is silently lost.
+				if (!localData.get(topic)?.get(key) && prev.data && typeof prev.data === 'object') {
+					Object.assign(prev.data, changed);
+					armDiffFlush(platform);
+				}
+				return;
+			}
+			Object.assign(prev.changed, changed);
+			armDiffFlush(platform);
+			return;
+		}
+		entries.set(key, { op: 'update', changed: { ...changed } });
+		armDiffFlush(platform);
 	}
 
 	function flushPendingDiffs() {
@@ -424,10 +598,29 @@ export function createPresence(client, options = {}) {
 			const joins = {};
 			/** @type {Record<string, Record<string, any>>} */
 			const leaves = {};
-			for (const [key, { op, data }] of entries) {
-				if (op === 'join') joins[key] = data;
-				else leaves[key] = data;
+			/** @type {Record<string, Record<string, any>> | null} */
+			let updates = null;
+			const localUsers = localData.get(topic);
+			for (const [key, e] of entries) {
+				if (e.op === 'join') {
+					// Re-read the live local entry so the join roster carries the
+					// user's latest durable fields (publicData strips transient).
+					// A relayed join for a user this instance does not present has
+					// no local entry and falls back to the relayed payload.
+					const localEntry = localUsers && localUsers.get(key);
+					joins[key] = localEntry ? publicData(localEntry) : e.data;
+				} else if (e.op === 'leave') {
+					leaves[key] = e.data;
+				} else {
+					if (!updates) updates = {};
+					updates[key] = e.changed;
+				}
 			}
+			// Keep the common `{ joins, leaves }` shape byte-identical when no
+			// field-level update is pending, so a deployment that never calls
+			// update() sees an unchanged wire. `updates` is additive: an old
+			// client ignores it.
+			const diff = updates ? { joins, leaves, updates } : { joins, leaves };
 			try {
 				// Presence WS frames opt INTO compression. They are low-frequency -
 				// diffs coalesce per tick, heartbeat is periodic, state is on-attach -
@@ -436,7 +629,7 @@ export function createPresence(client, options = {}) {
 				// plugin's compress:false 60Hz hot path, and matches the bundled
 				// in-memory presence plugin. No-op while websocket.compression is off
 				// (the default): the adapter resolves the flag to false regardless.
-				emit('__presence:' + topic, 'diff', { joins, leaves }, platform, { relay: false });
+				emit('__presence:' + topic, 'diff', diff, platform, { relay: false });
 				mDiffFrames?.inc({ topic: mt(topic) });
 			} catch { /* platform unavailable mid-flight */ }
 		}
@@ -613,7 +806,7 @@ export function createPresence(client, options = {}) {
 					// or state still reconciles them.
 					/** @type {Record<string, any>} */
 					const dataMap = {};
-					for (const [userKey, entry] of data) dataMap[userKey] = entry.data;
+					for (const [userKey, entry] of data) dataMap[userKey] = publicData(entry);
 					emit('__presence:' + topic, 'heartbeat', dataMap, activePlatform);
 				}
 			}
@@ -654,6 +847,28 @@ export function createPresence(client, options = {}) {
 						bufferDiff(topic, 'join', payload?.key, payload?.data, activePlatform);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {
 						bufferDiff(topic, 'leave', payload?.key, payload?.data, activePlatform);
+					} else if (ev === INTERNAL_EVENTS.FIELDS) {
+						// Field-level update from another instance. Fan it out to this
+						// instance's local subscribers as an `updates` diff entry
+						// (durable + transient changed fields together). If this
+						// instance also presents the user (multi-instance multi-tab),
+						// merge into the local field view so this instance's heartbeat
+						// carries the durable value and its own change detection stays
+						// consistent (transient is held but stripped by publicData).
+						const key = payload?.key;
+						if (typeof key === 'string') {
+							const durable = (payload.durable && typeof payload.durable === 'object') ? payload.durable : {};
+							const transient = (payload.transient && typeof payload.transient === 'object') ? payload.transient : {};
+							const changed = { ...durable, ...transient };
+							if (Object.keys(changed).length > 0) {
+								bufferUpdate(topic, key, changed, activePlatform);
+								const localEntry = localData.get(topic)?.get(key);
+								if (localEntry) {
+									if (!localEntry.fields) localEntry.fields = {};
+									Object.assign(localEntry.fields, durable, transient);
+								}
+							}
+						}
 					}
 				} catch {
 					// Malformed, skip
@@ -765,7 +980,7 @@ export function createPresence(client, options = {}) {
 		const topicData = localData.get(topic);
 		if (topicData) {
 			if (prevData !== undefined) {
-				topicData.set(key, { data: prevData });
+				setLocalData(topicData, key, prevData);
 			} else {
 				topicData.delete(key);
 			}
@@ -860,7 +1075,7 @@ export function createPresence(client, options = {}) {
 						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
 						if (newest && cached && !deepEqual(newest, cached.data)) {
-							topicData.set(key, { data: newest });
+							setLocalData(topicData, key, newest);
 							const ts = Date.now();
 							try {
 								await redis.eval(
@@ -869,9 +1084,9 @@ export function createPresence(client, options = {}) {
 									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 								);
 								bufferDiff(topic, 'join', key, newest, platform);
-								publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest });
+								publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: publicData(topicData.get(key)) });
 							} catch {
-								topicData.set(key, { data: cached.data });
+								setLocalData(topicData, key, cached.data);
 							}
 						}
 					}
@@ -982,7 +1197,7 @@ export function createPresence(client, options = {}) {
 		for (const { topic, key, newest, cached } of deferredRestores) {
 			const topicData = localData.get(topic);
 			if (!topicData) continue;
-			topicData.set(key, { data: newest });
+			setLocalData(topicData, key, newest);
 			const ts = Date.now();
 			try {
 				await redis.eval(
@@ -991,9 +1206,9 @@ export function createPresence(client, options = {}) {
 					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 				);
 				bufferDiff(topic, 'join', key, newest, platform);
-				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: newest }));
+				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: publicData(topicData.get(key)) }));
 			} catch {
-				topicData.set(key, { data: cached.data });
+				setLocalData(topicData, key, cached.data);
 			}
 		}
 
@@ -1227,10 +1442,10 @@ export function createPresence(client, options = {}) {
 				}
 
 				const td = localData.get(topic);
-				if (td) td.set(key, { data });
+				if (td) setLocalData(td, key, data);
 
 				bufferDiff(topic, 'join', key, data, platform);
-				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data });
+				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: td ? publicData(td.get(key)) : data });
 			}
 
 			let all;
@@ -1272,7 +1487,7 @@ export function createPresence(client, options = {}) {
 				topicData = new Map();
 				localData.set(topic, topicData);
 			}
-			topicData.set(key, { data });
+			setLocalData(topicData, key, data);
 			activeTopics.add(topic);
 
 			// Buffer join only after the operation is fully committed.
@@ -1293,7 +1508,7 @@ export function createPresence(client, options = {}) {
 			/** @type {Record<string, Record<string, any>>} */
 			const state = {};
 			for (const [userKey, entry] of entries) {
-				state[userKey] = entry.data;
+				state[userKey] = publicData(entry);
 			}
 			try {
 				emitTo(ws, '__presence:' + topic, 'state', state, platform);
@@ -1328,7 +1543,7 @@ export function createPresence(client, options = {}) {
 			/** @type {Record<string, Record<string, any>>} */
 			const state = {};
 			for (const [userKey, entry] of entries) {
-				state[userKey] = entry.data;
+				state[userKey] = publicData(entry);
 			}
 
 			let topics = syncObservers.get(ws);
@@ -1360,6 +1575,77 @@ export function createPresence(client, options = {}) {
 					}
 				}
 			}
+		},
+
+		async update(ws, topic, fields, platform) {
+			if (topic.startsWith('__')) return;
+			if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return;
+			// Resolve the user this connection represents on the topic from local
+			// state. A connection that is not present (never joined, or its join
+			// has not committed localData yet during an async gap) is a silent
+			// no-op - presence is best-effort. The update applies to the user (per
+			// dedup key), so any of a multi-tab user's connections may set it.
+			const connTopics = wsTopics.get(ws);
+			const connEntry = connTopics && connTopics.get(topic);
+			if (!connEntry) return;
+			const key = connEntry.key;
+			const topicData = localData.get(topic);
+			const entry = topicData && topicData.get(key);
+			if (!entry) return;
+			if (!entry.fields) entry.fields = {};
+			// Per-field change detection against this instance's field view. Only
+			// fields whose value actually changed are merged and broadcast (the
+			// field-level delta). Durable and transient changes are split: durable
+			// is persisted to Redis so a cross-instance state read includes it;
+			// transient is relay-only and never persisted.
+			/** @type {Record<string, any>} */
+			const changedDurable = {};
+			/** @type {Record<string, any>} */
+			const changedTransient = {};
+			let any = false;
+			for (const k of Object.keys(fields)) {
+				const v = fields[k];
+				if (!deepEqual(entry.fields[k], v)) {
+					entry.fields[k] = v;
+					if (transientFields.has(k)) changedTransient[k] = v;
+					else changedDurable[k] = v;
+					any = true;
+				}
+			}
+			if (!any) return;
+
+			// Local fan-out: buffer the update diff (durable + transient together)
+			// for this instance's subscribers. Coalesces with same-tick ops per
+			// the bufferUpdate collapse rules.
+			bufferUpdate(topic, key, { ...changedDurable, ...changedTransient }, platform);
+
+			// Persist durable fields to the per-topic hash value so a cross-instance
+			// state read (HGETALL) reconstructs them. Best-effort under the breaker:
+			// the field still relays + buffers locally if the write is skipped, and
+			// a later durable update reconciles the cross-instance read.
+			const durableKeys = Object.keys(changedDurable);
+			if (durableKeys.length > 0) {
+				let skip = false;
+				if (b) { try { b.guard(); } catch { skip = true; } }
+				if (!skip) {
+					try {
+						const ts = Date.now();
+						await redis.eval(
+							UPDATE_SCRIPT, 1, topicHashKey(topic),
+							key, JSON.stringify(changedDurable), ts, presenceTtlMs
+						);
+						b?.success();
+					} catch (err) {
+						b?.failure(err);
+					}
+				}
+			}
+
+			// Relay to other instances (durable + transient) so their local
+			// subscribers see the same field-level update. The receiving instance
+			// buffers it as an `updates` diff entry and, if it also presents the
+			// user, merges the durable value into its own field view.
+			await publishEvent(topic, INTERNAL_EVENTS.FIELDS, { key, durable: changedDurable, transient: changedTransient });
 		},
 
 		async list(topic) {
