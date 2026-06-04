@@ -30,7 +30,14 @@ import {
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
 } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { execMultiSlot, isCluster } from '../shared/cluster.js';
+import { execMultiSlot, isCluster, keySlot } from '../shared/cluster.js';
+
+// A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
+// channel's slot never resolves - the command hangs instead of returning a MOVED
+// redirect. So every shard (un)subscribe is bounded by this timeout; a timeout
+// means the resolved owner was stale, and the call is retried on the true owner
+// after a topology refresh.
+const SHARD_SUBSCRIBE_TIMEOUT_MS = 5000;
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -82,6 +89,7 @@ export function createShardedBus(client, options = {}) {
 	const mParseErrors = m?.counter('sharded_pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
 	const mFollows = m?.counter('sharded_pubsub_ssubscribes_total', 'SSUBSCRIBE calls');
 	const mUnfollows = m?.counter('sharded_pubsub_sunsubscribes_total', 'SUNSUBSCRIBE calls');
+	const mResubscribes = m?.counter('sharded_pubsub_resubscribes_total', 'Channels re-subscribed on a new owner after a cluster reshard');
 
 	function channelFor(topic) {
 		return channelPrefix + shardKey(topic);
@@ -116,6 +124,16 @@ export function createShardedBus(client, options = {}) {
 	const channelRefcounts = new Map();
 	/** @type {Set<string>} */
 	const subscribedChannels = new Set();
+	/** @type {Map<string, string>} channel -> node id it is currently ssubscribed on (cluster) */
+	const channelNode = new Map();
+	/** @type {ReturnType<typeof setTimeout> | null} debounce for the reshard reconcile sweep */
+	let reconcileTimer = null;
+	// Set when a subscriber error signals a possible reshard, so the next
+	// subscribe refreshes the slot map before resolving an owner (rather than
+	// blind-subscribing on a stale - and therefore hanging - old owner).
+	let topologyDirty = false;
+	/** @type {Promise<void> | null} in-flight topology refresh, shared by concurrent callers */
+	let topologyRefresh = null;
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
 	const wsFollows = new WeakMap();
 
@@ -251,11 +269,30 @@ export function createShardedBus(client, options = {}) {
 
 	function subOnError(err) {
 		console.error('sharded bus subscriber error:', err.message);
+		// A slot migration makes the source master drop that slot's shard
+		// subscriptions; ioredis surfaces the server-initiated unsubscribe here
+		// rather than as a clean event. Mark the slot map stale so the next
+		// subscribe refreshes before resolving, and re-establish the dropped
+		// subscriptions on their new owner.
+		if (isCluster(client.redis)) {
+			topologyDirty = true;
+			scheduleReconcile();
+		}
 	}
 
 	// Build (or extend) the per-master subscriber connections and the slot ->
 	// owner-node-id map. Refreshed lazily and when a channel's owner is unknown.
-	async function subRefreshTopology() {
+	// Single-flight: concurrent callers (a batch subscribe in a dirty window, many
+	// unknown-owner resolutions, a retry storm) share one CLUSTER SLOTS refresh
+	// instead of each issuing its own.
+	function subRefreshTopology() {
+		if (!topologyRefresh) {
+			topologyRefresh = refreshTopologyNow().finally(() => { topologyRefresh = null; });
+		}
+		return topologyRefresh;
+	}
+
+	async function refreshTopologyNow() {
 		const masters = client.redis.nodes('master');
 		await Promise.all(masters.map(async (node) => {
 			const id = await node.cluster('MYID');
@@ -269,27 +306,97 @@ export function createShardedBus(client, options = {}) {
 		const slots = await client.redis.cluster('SLOTS');
 		// Each entry: [startSlot, endSlot, [ip, port, nodeId], ...replicas].
 		slotRanges = slots.map((e) => ({ start: e[0], end: e[1], nodeId: e[2][2] }));
+		topologyDirty = false;
 	}
 
-	function subOwnerForSlot(slot) {
+	// The node id owning a slot, from the cached slot map (null if unknown). The
+	// slot is computed client-side (CRC16 of the channel's hash-tag) - identical
+	// to CLUSTER KEYSLOT but with no per-channel round trip.
+	function ownerIdForSlot(slot) {
 		if (!slotRanges) return null;
 		for (const r of slotRanges) {
-			if (slot >= r.start && slot <= r.end) return subByNodeId.get(r.nodeId) || null;
+			if (slot >= r.start && slot <= r.end) return r.nodeId;
 		}
 		return null;
 	}
 
-	// Resolve the subscriber connection that must carry a channel: the standalone
-	// connection, or the master owning the channel's slot on a cluster.
-	async function subForChannel(channel) {
-		if (!isCluster(client.redis)) return subStandalone;
-		const slot = await client.redis.cluster('KEYSLOT', channel);
-		let sub = subOwnerForSlot(slot);
-		if (!sub) {
+	// Bound a shard (un)subscribe so a stale-owner hang cannot wedge the caller
+	// forever (see SHARD_SUBSCRIBE_TIMEOUT_MS).
+	function withSubTimeout(promise, label) {
+		let timer;
+		const timeout = new Promise((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error('sharded bus: ' + label + ' timed out (stale slot owner)')),
+				SHARD_SUBSCRIBE_TIMEOUT_MS
+			);
+			if (timer.unref) timer.unref();
+		});
+		return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+	}
+
+	// Subscribe one channel on the master that currently owns its slot, recording
+	// the owner so a later reshard can be detected and reconciled. A stale cache
+	// would resolve the old owner, where ssubscribe hangs, so a timeout triggers
+	// one topology refresh + retry on the true owner.
+	async function subscribeChannelOnOwner(channel) {
+		const slot = keySlot(channel);
+		// If a reshard was signaled, the cached owner map may be stale and an
+		// ssubscribe on the old owner would hang, so refresh before resolving.
+		if (topologyDirty) await subRefreshTopology();
+		let ownerId = ownerIdForSlot(slot);
+		if (ownerId === null) {
 			await subRefreshTopology();
-			sub = subOwnerForSlot(slot);
+			ownerId = ownerIdForSlot(slot);
 		}
-		return sub;
+		let conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
+		if (!conn) throw new Error('sharded bus: no owning node for channel ' + channel);
+		try {
+			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe ' + channel);
+		} catch {
+			await subRefreshTopology();
+			ownerId = ownerIdForSlot(slot);
+			conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
+			if (!conn) throw new Error('sharded bus: no owning node for channel ' + channel);
+			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe ' + channel + ' (retry)');
+		}
+		channelNode.set(channel, ownerId);
+	}
+
+	// Re-establish every wanted channel on its current owner. A slot migration
+	// makes the source master drop that slot's shard subscriptions, so on a
+	// subscriber error this refreshes the topology and re-subscribes the channels
+	// whose owner moved. Debounced (a reshard fans out errors across connections)
+	// and refreshes first, so resolution is never stale.
+	async function subReconcile() {
+		if (!isCluster(client.redis) || !subReady) return;
+		try {
+			await subRefreshTopology();
+		} catch {
+			return; // transient; the next error reschedules
+		}
+		const moved = [];
+		for (const channel of subscribedChannels) {
+			const ownerId = ownerIdForSlot(keySlot(channel));
+			if (ownerId !== null && channelNode.get(channel) !== ownerId) moved.push(channel);
+		}
+		// Re-subscribe the moved channels in parallel for fast recovery; the
+		// topology was refreshed above, so none resolves a stale owner.
+		await Promise.all(moved.map((channel) =>
+			subscribeChannelOnOwner(channel).then(
+				() => mResubscribes?.inc(),
+				// Leave a failed one for the next sweep rather than aborting the rest.
+				(err) => console.error('sharded bus reconcile ' + channel + ': ' + err.message)
+			)
+		));
+	}
+
+	function scheduleReconcile() {
+		if (reconcileTimer !== null) return;
+		reconcileTimer = setTimeout(() => {
+			reconcileTimer = null;
+			subReconcile().catch((err) => console.error('sharded bus reconcile failed:', err.message));
+		}, 0);
+		if (reconcileTimer.unref) reconcileTimer.unref();
 	}
 
 	async function subEnsure() {
@@ -311,26 +418,36 @@ export function createShardedBus(client, options = {}) {
 			return;
 		}
 		// On a cluster, SSUBSCRIBE requires every channel in one call to share a
-		// slot (same owning node is not enough), so subscribe each channel
-		// individually on the master owning its slot. Cluster.ssubscribe would
-		// hang; node.ssubscribe on the owner works and delivers smessage.
-		await Promise.all(channels.map(async (ch) => {
-			const sub = await subForChannel(ch);
-			if (!sub) throw new Error('sharded bus: no owning node for channel ' + ch);
-			await sub.ssubscribe(ch);
-		}));
+		// slot (same owning node is not enough), and node.ssubscribe only resolves
+		// on the slot's owning master (Cluster.ssubscribe hangs), so subscribe each
+		// channel individually on its owner.
+		await Promise.all(channels.map((ch) => subscribeChannelOnOwner(ch)));
 	}
 
 	async function subUnsubscribe(channel) {
-		const sub = await subForChannel(channel);
-		if (sub) await sub.sunsubscribe(channel);
+		if (!isCluster(client.redis)) {
+			if (subStandalone) await subStandalone.sunsubscribe(channel);
+			return;
+		}
+		const ownerId = channelNode.get(channel);
+		channelNode.delete(channel);
+		const conn = ownerId !== undefined ? subByNodeId.get(ownerId) : null;
+		if (!conn) return;
+		// Best-effort: a channel whose slot already migrated is gone from this
+		// node, and sunsubscribe on a non-owner would hang, so cap and ignore.
+		await withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe ' + channel).catch(() => {});
 	}
 
 	async function subClose() {
+		if (reconcileTimer !== null) {
+			clearTimeout(reconcileTimer);
+			reconcileTimer = null;
+		}
 		const all = isCluster(client.redis)
 			? [...subByNodeId.values()]
 			: (subStandalone ? [subStandalone] : []);
 		subByNodeId.clear();
+		channelNode.clear();
 		subStandalone = null;
 		slotRanges = null;
 		subReady = false;

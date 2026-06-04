@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `redis/sharded-pubsub` recovers delivery after a live cluster reshard. When a hash slot migrates to a new master, Redis drops that slot's shard subscriptions on the old master; the bus now detects the drop and re-subscribes the affected channels on their new owner (resolved from a refreshed slot map), and every shard subscribe/unsubscribe is bounded by a timeout so a stale-owner resolution can no longer hang. A new `sharded_pubsub_resubscribes_total` metric counts reshard-driven re-subscriptions. Verified against a live `CLUSTER SETSLOT` migration on a real cluster. No change on a standalone Redis.
+- `redis/sharded-pubsub` now resolves a channel's cluster hash slot client-side (CRC16 of the hash-tag) instead of issuing a `CLUSTER KEYSLOT` round trip per channel, so `follow()` / `followBatch()` subscribe with one fewer network hop per new channel on a cluster. Behavior-identical: the slot a key maps to is fixed and topology-independent, and the client-side computation is verified against the live `CLUSTER KEYSLOT` on a real cluster. Standalone deployments are unaffected.
+- Hardened the type surface. Added the missing internal declaration file `redis/replay-stream.d.ts` (the `storage: 'stream'` replay backend, reached via `createReplay(client, { storage: 'stream' })`; the public `./redis/replay` types are unchanged), and a dependency-free `npm run check` (`scripts/check-types.js`, wired into `pretest`) that fails the build if any `exports` subpath stops resolving, a `types` condition is not a `.d.ts`, or a packaged file falls outside the `files` allowlist. No runtime change.
+
 ## [0.6.0-next.4] - 2026-06-02
 
 ### Changed

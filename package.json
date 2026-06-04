@@ -145,6 +145,8 @@
     "MIGRATION.md"
   ],
   "scripts": {
+    "check": "node scripts/check-types.js",
+    "pretest": "npm run check",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.config.integration.js",
