@@ -19,6 +19,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { createBackendClient, resetBackendKeys, isClusterBackend, countBackendKeys } from '../helpers/backend.js';
 import { createCursor } from '../../../redis/cursor.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { walkPlatform } from '../../helpers/walk-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 
 function wait(ms) {
@@ -498,6 +499,122 @@ describeIntegration('redis cursor (integration)', () => {
 
 			const list = await c.list('canvas');
 			expect(list).toEqual([]);
+		});
+	});
+
+	describe('cross-replica viewport culling and backpressure', () => {
+		// Positions delivered to one subscriber on a tracker, sorted "x,y", across
+		// both wire shapes. Per-subscriber frames land on the walk platform's sent[].
+		function deliveredPositions(p, ws) {
+			const out = [];
+			for (const e of p.sentTo(ws)) {
+				if (e.event === 'update' && e.data && e.data.data) out.push(`${e.data.data.x},${e.data.data.y}`);
+				else if (e.event === 'bulk') for (const it of e.data) out.push(`${it.data.x},${it.data.y}`);
+			}
+			return out.sort();
+		}
+
+		it('B culls a cursor that originated on A when B reporter rect excludes it; a whole-board B subscriber still receives it', async () => {
+			const platformA = mockPlatform();
+			const platformB = walkPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+			// B coalesces so the combined local+inbound flush takes the walk path,
+			// building the per-flush index over A's relayed cursor alongside B's own.
+			const trackerB = track(createCursor(client, {
+				throttle: 0, topicThrottle: 16, viewport: { enabled: true }, select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const reporter = mockWs({ id: 'bob-near' });
+			const wholeBoard = mockWs({ id: 'bob-all' });
+			platformB.addSubscriber(reporter, '__cursor:canvas');
+			platformB.addSubscriber(wholeBoard, '__cursor:canvas');
+
+			// Bring B's Redis subscriber up before A publishes.
+			trackerB.update(mockWs({ id: 'bob-seed' }), 'canvas', { x: 0, y: 0 }, platformB);
+			await wait(150);
+
+			// Reporter's rect sits near the origin; A's cursor is far outside it.
+			trackerB.viewport(reporter, 'canvas', { x: 0, y: 0, w: 100, h: 100, zoom: 1 });
+			platformB.reset();
+
+			// A moves a cursor at a far-away region.
+			trackerA.update(wsA, 'canvas', { x: 90000, y: 90000 }, platformA);
+
+			// Wait for A's relayed cursor to be delivered on B's whole-board subscriber.
+			await waitFor(() => deliveredPositions(platformB, wholeBoard).includes('90000,90000'), 5000);
+
+			// The whole-board (non-reporting) subscriber receives A's far cursor.
+			expect(deliveredPositions(platformB, wholeBoard)).toContain('90000,90000');
+			// The reporter, whose rect excludes that region, does not.
+			expect(deliveredPositions(platformB, reporter)).not.toContain('90000,90000');
+			expect(trackerB.stats().culledEntriesDropped).toBeGreaterThan(0);
+		});
+
+		it('B delivers a cursor that originated on A when it falls inside B reporter rect (no over-culling)', async () => {
+			const platformA = mockPlatform();
+			const platformB = walkPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0, topicThrottle: 16, viewport: { enabled: true }, select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const reporter = mockWs({ id: 'bob-near' });
+			platformB.addSubscriber(reporter, '__cursor:canvas');
+
+			trackerB.update(mockWs({ id: 'bob-seed' }), 'canvas', { x: 0, y: 0 }, platformB);
+			await wait(150);
+
+			// A wide rect that comfortably contains A's cursor region.
+			trackerB.viewport(reporter, 'canvas', { x: 0, y: 0, w: 2000, h: 2000, zoom: 1 });
+			platformB.reset();
+
+			trackerA.update(wsA, 'canvas', { x: 500, y: 500 }, platformA);
+
+			await waitFor(() => deliveredPositions(platformB, reporter).includes('500,500'), 5000);
+			expect(deliveredPositions(platformB, reporter)).toContain('500,500');
+		});
+
+		it('a slow B subscriber is skipped for a peer-origin cursor from A and catches up next flush', async () => {
+			const platformA = mockPlatform();
+			const platformB = walkPlatform();
+			const trackerA = track(createCursor(client, {
+				throttle: 0, topicThrottle: 0, select: (ud) => ({ id: ud.id })
+			}));
+			const trackerB = track(createCursor(client, {
+				throttle: 0, topicThrottle: 16, backpressure: { enabled: true, maxBufferedBytes: 1024 }, select: (ud) => ({ id: ud.id })
+			}));
+
+			const wsA = mockWs({ id: 'alice' });
+			const slow = mockWs({ id: 'bob-slow' });
+			const healthy = mockWs({ id: 'bob-ok' });
+			platformB.addSubscriber(slow, '__cursor:canvas');
+			platformB.addSubscriber(healthy, '__cursor:canvas');
+			platformB.setBuffered(slow, 8192); // over the 1 KiB cap
+
+			trackerB.update(mockWs({ id: 'bob-seed' }), 'canvas', { x: 0, y: 0 }, platformB);
+			await wait(150);
+			platformB.reset();
+
+			trackerA.update(wsA, 'canvas', { x: 42, y: 42 }, platformA);
+
+			// Healthy B subscriber receives A's peer-origin cursor; slow one is skipped.
+			await waitFor(() => deliveredPositions(platformB, healthy).includes('42,42'), 5000);
+			expect(deliveredPositions(platformB, healthy)).toContain('42,42');
+			expect(platformB.sentTo(slow)).toHaveLength(0);
+			expect(trackerB.stats().bpSkips).toBeGreaterThan(0);
+
+			// The slow consumer drains and catches up to the latest peer position.
+			platformB.setBuffered(slow, 0);
+			platformB.reset();
+			trackerA.update(wsA, 'canvas', { x: 99, y: 99 }, platformA);
+			await waitFor(() => deliveredPositions(platformB, slow).includes('99,99'), 5000);
+			expect(deliveredPositions(platformB, slow)).toContain('99,99');
 		});
 	});
 });

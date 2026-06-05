@@ -1151,6 +1151,10 @@ export function close(ws, { platform }) {
 |---|---|---|
 | `throttle` | `16` | Minimum ms between broadcasts per user per topic. 60Hz default matches the world-state tick so an individual cursor stays smooth at the per-peer wire rate. |
 | `topicThrottle` | `16` | World-state tick rate in ms. Each topic emits at most one bulk frame per window, carrying the latest position for every cursor that moved. Raise to 33 (30Hz) for high-density rooms; 0 disables the tick. |
+| `minMove` | `0` (off) | Drop a move at ingest when the cursor has not moved at least this far (Chebyshev distance) from the position the subscriber last saw, so sub-pixel wobble is never fanned out or relayed across instances. A debounced settle delivers the final resting position once when movement stops, so a still cursor is never stranded at a stale point. Measured against the last broadcast position, so a slow drift still delivers every `minMove` units. |
+| `position` | reads `data.x` / `data.y` | Extract the `{ x, y }` coordinate from cursor `data` for `minMove` and `viewport`. A frame with no extractable finite coordinate is always delivered. |
+| `viewport` | off | `true`, or `{ enabled, padding, cell }`. Per-subscriber viewport culling: a subscriber that reports a viewport rect receives only the cursors inside it (plus `padding` overscan, default `256`, widened when zoomed out); `cell` (default `256`) sizes the spatial index. Off by default, and a viewport-enabled topic stays on the shared fan-out until a subscriber actually reports a rect (so enabling it globally is free on rooms with no reporters). Each instance culls its own subscribers over the combined local + peer cursor set, so a cursor that originated on another instance is culled exactly like a local one; no viewport rect ever crosses Redis. |
+| `backpressure` | off | `true`, or `{ enabled, maxBufferedBytes }`. Skip a subscriber whose socket write buffer exceeds `maxBufferedBytes` (default `1048576` = 1 MiB) for the current tick; cursors are latest-value so a skipped subscriber catches up on the next tick. Bounds a slow or stalled consumer's send queue. Off by default. |
 | `select` | strips `__`-prefixed keys | Extract user data to broadcast alongside position |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound cursor envelopes larger than this before `JSON.parse` runs. The inner topic is always validated against the `__` denylist (the module constructs its own `__cursor:` wrapper prefix), so no `allowSystemTopics` knob is needed here. |
@@ -1162,10 +1166,38 @@ export function close(ws, { platform }) {
 | `attach(ws, topic, platform)` | Opt the connection into receiving cursor updates for `topic` (subscribes to `__cursor:{topic}` server-side and sends a snapshot). Required for any client to see cursor frames. |
 | `detach(ws, topic, platform)` | Stop the connection from receiving updates for `topic`. Only needed for explicit leave; uWS handles disconnect cleanup. |
 | `update(ws, topic, data, platform)` | Broadcast cursor position (throttled per user per topic) |
+| `viewport(ws, topic, rect)` | Record a subscriber's viewport rect `{ x, y, w, h, zoom }` so viewport culling delivers only the cursors inside it. Auto-handled when you route a `{ type: 'cursor-viewport', topic, rect }` frame through `cursor.hooks.message`, or call it directly. |
+| `viewportFor(ws, topic)` | The subscriber's last reported viewport rect for a topic, or `null`. |
 | `remove(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
 | `list(topic)` | Get current positions across all instances |
 | `clear()` | Reset all local and Redis state |
 | `destroy()` | Stop the Redis subscriber and clear timers |
+
+#### Reducing cursor volume
+
+For high-density boards, three opt-in reducers cut the per-peer wire volume without touching the zero-config path:
+
+- **`minMove`** drops sub-threshold jitter at ingest (see Options).
+- **`viewport`** culls each subscriber's frame to the cursors inside its reported rect. The client reports its rect with a `{ type: 'cursor-viewport', topic, rect }` frame (routed through `cursor.hooks.message`) or you call `cursors.viewport(ws, topic, rect)`; a subscriber that never reports a rect is never culled. On a cluster each instance culls its own subscribers over the combined local + peer cursor set, so a cursor from another instance is culled identically to a local one.
+- **`backpressure`** skips a subscriber whose write buffer is over the cap for a tick, bounding a slow consumer's queue.
+
+All three are off by default and combine; with none enabled the broadcast path is byte-identical to the shared world-state tick.
+
+#### Stats
+
+`cursors.stats()` returns a scheduler-health snapshot for operators:
+
+| Field | Meaning |
+|---|---|
+| `flushes` | Total world-state ticks emitted. |
+| `driftMeanMs` / `driftMaxMs` | Mean / max scheduling drift of the tick, in ms. |
+| `dirtyTopicsCurrent` | Topics with pending moves awaiting the next tick. |
+| `activeTopicsTotal` | Topics with at least one tracked cursor. |
+| `jitterDropped` | Moves dropped by the `minMove` filter. |
+| `viewportsReported` | Subscribers currently reporting a viewport rect. |
+| `perSubscriberFlushes` | Ticks delivered via the per-subscriber walk (viewport or backpressure engaged). |
+| `bpSkips` | Per-subscriber sends skipped because the socket buffer was over `maxBufferedBytes`. |
+| `culledEntriesDropped` | Cursor entries withheld from a subscriber by viewport culling. |
 
 ---
 

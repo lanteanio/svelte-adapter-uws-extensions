@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.6] - 2026-06-05
+
+### Added
+
+- **`redis/cursor` gains per-subscriber `viewport` culling and `backpressure`-aware drop, mirroring the in-memory cursor plugin across the cluster.** Two opt-in `createCursor` options cut the per-peer wire volume in high-density rooms; both ship off, so a deployment that sets neither broadcasts the byte-identical shared world-state tick as before. `viewport: true | { enabled, padding, cell }` culls each subscriber's frame to the cursors inside its reported viewport rect (plus a `padding` overscan that widens when the subscriber is zoomed out). A subscriber reports its rect with a `{ type: 'cursor-viewport', topic, rect }` frame (auto-routed through `cursor.hooks.message`) or via `cursors.viewport(ws, topic, rect)`, and a subscriber that never reports a rect is never culled. The cull runs per instance over the COMBINED local + inbound-peer cursor set, so a cursor that originated on another instance is culled exactly like a local one and no viewport rect ever crosses Redis -- the spatial index is rebuilt per tick (a flat scan below ~512 movers, a packed-cell index above) and indexes both local and peer cursors. `backpressure: true | { enabled, maxBufferedBytes }` (default 1 MiB) skips a subscriber whose socket write buffer is over the cap for a tick; cursors are latest-value, so a skipped subscriber simply renders one tick later, bounding a slow consumer's send queue. When either is enabled the flush switches to a per-subscriber walk via `platform.forEachSubscriber`; a topic stays on the shared fan-out until a subscriber actually reports a viewport (so enabling it globally is free on rooms with no reporters), and a `topicThrottle: 0` deployment is routed through the same coalesced walk so culling cannot silently no-op. A companion `position` extractor (shared with `minMove`) reads the `{ x, y }` coordinate; a frame with no extractable coordinate is always delivered. New `stats()` counters: `viewportsReported`, `perSubscriberFlushes`, `bpSkips`, `culledEntriesDropped`. Verified on a real 6-node Redis Cluster (a subscriber on one instance culls a peer cursor from another) in addition to the in-process suite.
+
 ## [0.6.0-next.5] - 2026-06-05
 
 ### Added

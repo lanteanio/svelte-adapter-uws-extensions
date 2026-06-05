@@ -56,6 +56,27 @@ const EVENTS = Object.freeze({
 });
 
 /**
+ * Mover count past which a flush builds the transient spatial index instead of
+ * bounds-testing every entry per subscriber. Below it a flat scan is cheaper
+ * than per-cell Map probes; above it the index earns a multiple-x CPU win at
+ * the thousands-of-simultaneous-movers tail. Measured against the per-instance
+ * combined mover count (this replica's local + inbound entries).
+ */
+const INDEX_CROSSOVER = 512;
+
+/**
+ * Pack a grid cell coordinate pair into one numeric key. Covers +-32k cells per
+ * axis (at the default 256-unit cell, +-8.3M board units). A key collision can
+ * only over-deliver - every pulled entry is re-tested against the exact bounds -
+ * never blank a region.
+ * @param {number} cx
+ * @param {number} cy
+ */
+function packCell(cx, cy) {
+	return ((cx & 0xffff) << 16) | (cy & 0xffff);
+}
+
+/**
  * @typedef {Object} RedisCursorOptions
  * @property {number} [throttle=16] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
@@ -88,6 +109,20 @@ const EVENTS = Object.freeze({
  *   delivers the final resting position once movement stops. 0 (default) disables the
  *   filter, broadcasting every accepted move. For integer-pixel data, `minMove: 1` drops
  *   exact-repeat frames at no visual cost. Mirrors the in-memory cursor plugin's `minMove`.
+ * @property {boolean | { enabled?: boolean, padding?: number, cell?: number }} [viewport] - Per-subscriber
+ *   viewport culling (opt-in, default off). When enabled, each subscriber that reports a
+ *   viewport rect (via a `{type:'cursor-viewport', topic, rect}` frame or `tracker.viewport`)
+ *   receives only the moving cursors inside that rect plus a `padding` overscan; a subscriber
+ *   that never reports a rect is treated as whole-board and is never culled. Culling runs
+ *   against the combined local + peer cursor set on each replica, so a peer-origin cursor is
+ *   culled identically to a local one and the rect never crosses Redis. `true` is shorthand
+ *   for `{ enabled: true }`. `padding` (default 256) is the board-unit overscan, widened by
+ *   `1/zoom` when zoomed out; `cell` (default 256) is the spatial-index cell size.
+ * @property {boolean | { enabled?: boolean, maxBufferedBytes?: number }} [backpressure] - Per-subscriber
+ *   backpressure drop (opt-in, default off). When enabled, a subscriber whose queued bytes
+ *   exceed `maxBufferedBytes` (default 1048576) is skipped for the current flush and catches
+ *   up on the next flush with the latest coalesced positions - cursors are latest-value, so a
+ *   skipped subscriber never accumulates a backlog. `true` is shorthand for `{ enabled: true }`.
  */
 
 /**
@@ -102,11 +137,13 @@ const EVENTS = Object.freeze({
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => Promise<void>} attach
  * @property {(ws: any, topic: string, platform: import('svelte-adapter-uws').Platform) => void} detach
  * @property {(ws: any, topic: string, data: any, platform: import('svelte-adapter-uws').Platform) => void} update
+ * @property {(ws: any, topic: string, rect: any) => void} viewport - Record a subscriber's viewport rect for a topic (viewport culling)
+ * @property {(ws: any, topic: string) => ({ x: number, y: number, w: number, h: number, zoom: number } | null)} viewportFor - The subscriber's last reported viewport rect for a topic, or null
  * @property {(ws: any, platform: import('svelte-adapter-uws').Platform, topic?: string) => Promise<void>} remove
  * @property {(topic: string) => Promise<CursorEntry[]>} list
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the Redis subscriber
- * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number }} stats - Scheduler health snapshot
+ * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number }} stats - Scheduler health snapshot
  */
 
 /**
@@ -194,6 +231,73 @@ export function createCursor(client, options = {}) {
 	if (typeof minMove !== 'number' || !Number.isFinite(minMove) || minMove < 0) {
 		throw new Error('redis cursor: minMove must be a non-negative number');
 	}
+
+	// Backpressure-aware per-subscriber drop (opt-in). When enabled, a topic's
+	// flush switches from the shared combined frame to a per-subscriber walk over
+	// THIS instance's local subscriber set, skipping any subscriber whose queued
+	// bytes exceed `maxBufferedBytes` for the current flush. Cursors are
+	// latest-value, so a skipped subscriber catches up on the next flush with the
+	// latest coalesced positions - it renders one cadence later, never
+	// accumulating a backlog. Off by default: the zero-config path keeps the
+	// shared combined-frame fan-out and pays nothing.
+	// `viewport: true` / `backpressure: true` are shorthand for `{ enabled: true }`
+	// with defaults. A bare object with tuning keys but no `enabled` is almost
+	// certainly a forgotten `enabled: true`, so it throws below rather than
+	// silently culling nothing.
+	const bp = options.backpressure === true ? { enabled: true } : (options.backpressure || {});
+	const vp = options.viewport === true ? { enabled: true } : (options.viewport || {});
+
+	const bpEnabled = bp.enabled === true;
+	const bpMaxBufferedBytes = bp.maxBufferedBytes ?? 1024 * 1024;
+
+	// Viewport culling (opt-in). When enabled, the per-subscriber walk sends each
+	// reporting subscriber only the moving cursors inside its last reported
+	// viewport rect (plus a padding overscan), culled against the COMBINED
+	// local + peer cursor set this flush assembles. A subscriber that never
+	// reports a rect is treated as whole-board and is never culled - the
+	// per-subscriber opt-in that makes culling safe by construction. The reported
+	// rect is in the board's own coordinate space; only the overscan is widened by
+	// 1/zoom when zoomed out so it stays roughly constant on screen.
+	const viewportEnabled = vp.enabled === true;
+	const viewportPadding = vp.padding ?? 256;
+	const viewportCell = vp.cell ?? 256;
+
+	for (const name of ['viewport', 'backpressure']) {
+		const val = options[name];
+		if (val !== undefined && val !== null && typeof val !== 'boolean' && typeof val !== 'object') {
+			throw new Error(`redis cursor: ${name} must be true or an options object`);
+		}
+	}
+	if (bp.maxBufferedBytes !== undefined && bp.enabled === undefined) {
+		throw new Error('redis cursor: backpressure.maxBufferedBytes is set but backpressure.enabled is not - did you mean { enabled: true }?');
+	}
+	if (
+		bp.maxBufferedBytes !== undefined &&
+		(!Number.isInteger(bpMaxBufferedBytes) || bpMaxBufferedBytes < 1)
+	) {
+		throw new Error('redis cursor: backpressure.maxBufferedBytes must be a positive integer');
+	}
+	if ((vp.padding !== undefined || vp.cell !== undefined) && vp.enabled === undefined) {
+		throw new Error('redis cursor: viewport.padding/cell is set but viewport.enabled is not - did you mean { enabled: true }?');
+	}
+	if (
+		vp.padding !== undefined &&
+		(typeof viewportPadding !== 'number' || !Number.isFinite(viewportPadding) || viewportPadding < 0)
+	) {
+		throw new Error('redis cursor: viewport.padding must be a non-negative number');
+	}
+	if (
+		vp.cell !== undefined &&
+		(typeof viewportCell !== 'number' || !Number.isFinite(viewportCell) || viewportCell <= 0)
+	) {
+		throw new Error('redis cursor: viewport.cell must be a positive number');
+	}
+
+	// Single boolean the flush hot path branches on. When false, the flush takes
+	// the unchanged shared combined-frame path; when true a topic with at least
+	// one reporter (or any topic, under backpressure) takes the per-subscriber
+	// walk instead.
+	const perSubscriberWalk = bpEnabled || viewportEnabled;
 
 	const instanceId = randomBytes(8).toString('hex');
 	const redis = client.redis;
@@ -540,6 +644,92 @@ export function createCursor(client, options = {}) {
 	const dirtyTopics = new Set();
 
 	/**
+	 * Per-(subscriber, topic) viewport rect, recorded from the inbound
+	 * `cursor-viewport` frame. Outer key is the subscriber's `wsState` key
+	 * (`instanceId:counter`); inner key is the topic. Read by the per-subscriber
+	 * walk, which never culls a subscriber that has not reported a rect (a
+	 * non-reporter is whole-board). Subscriber-keyed: torn down only with the
+	 * subscriber on `remove()` / `clear()` / `destroy()`, never by topic eviction
+	 * or an empty topic.
+	 * @type {Map<string, Map<string, { x: number, y: number, w: number, h: number, zoom: number }>>}
+	 */
+	const subViewport = new Map();
+
+	/**
+	 * Count of distinct subscribers currently reporting a viewport per topic.
+	 * Lets a viewport-enabled topic with zero reporters keep the shared
+	 * combined-frame fan-out instead of paying the O(local connections)
+	 * per-subscriber walk for the same bytes. Maintained alongside `subViewport`:
+	 * incremented when a `(subscriber, topic)` rect is first recorded, decremented
+	 * when the subscriber is removed, cleared in `clear()` / `destroy()`.
+	 * @type {Map<string, number>}
+	 */
+	const topicReporters = new Map();
+
+	/** Record that a subscriber started reporting a viewport for a topic. */
+	function addReporter(topic) {
+		topicReporters.set(topic, (topicReporters.get(topic) || 0) + 1);
+	}
+	/** Record that a subscriber stopped reporting a viewport for a topic. */
+	function dropReporter(topic) {
+		const n = topicReporters.get(topic);
+		if (n === undefined) return;
+		if (n <= 1) topicReporters.delete(topic);
+		else topicReporters.set(topic, n - 1);
+	}
+	/**
+	 * Whether a flush for `topic` must take the per-subscriber walk: always when
+	 * backpressure is on (it needs per-socket queue checks), and when culling is
+	 * on only once at least one subscriber has reported a viewport for the topic.
+	 * @param {string} topic
+	 */
+	function topicNeedsWalk(topic) {
+		return bpEnabled || topicReporters.get(topic) > 0;
+	}
+
+	/**
+	 * Read a subscriber's last reported viewport rect for a topic, or null if it
+	 * never reported one. The null return is the per-subscriber opt-in that keeps
+	 * culling safe by construction. Does not create `wsState`. Keyed by
+	 * `state.key` (`instanceId:counter`) because `subViewport` is state-key
+	 * indexed, so the userData passed to `forEachSubscriber` is not consulted.
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @returns {{ x: number, y: number, w: number, h: number, zoom: number } | null}
+	 */
+	function lookupViewport(ws, topic) {
+		const state = wsState.get(ws);
+		if (!state) return null;
+		const byTopic = subViewport.get(state.key);
+		return byTopic ? (byTopic.get(topic) ?? null) : null;
+	}
+
+	// Per-flush scratch for the per-subscriber walk, reused every flush so the
+	// walk allocates no new collections. `flushEntries` is the single
+	// materialization of a flush's COMBINED entries (local dirty + inbound peer
+	// dirty); `flushPos[i]` is entry i's resolved { x, y } (or null when the
+	// extractor could not place it - such an entry is always delivered);
+	// `alwaysVisible` holds those null-position indices; `flushCells` is the
+	// transient spatial index (packed cell key -> entry indices), built only past
+	// INDEX_CROSSOVER and emptied back into `cellPool` after the walk; `cullOut`
+	// is the per-subscriber slice handed to the wire; `bounds` is the reused
+	// padded-bounds object; `inDeliver` is the re-entrancy guard.
+	/** @type {Array<{ key: string, data: any }>} */
+	const flushEntries = [];
+	/** @type {Array<{ x: number, y: number } | null>} */
+	const flushPos = [];
+	/** @type {number[]} */
+	const alwaysVisible = [];
+	/** @type {Map<number, number[]>} */
+	const flushCells = new Map();
+	/** @type {number[][]} */
+	const cellPool = [];
+	/** @type {Array<{ key: string, data: any }>} */
+	const cullOut = [];
+	const bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+	let inDeliver = false;
+
+	/**
 	 * Single timer for the whole tracker. Always points at the next earliest
 	 * topic deadline (or null when idle). Replaces the previous per-topic
 	 * setTimeout pattern: N pending timers -> 1 pending timer regardless of
@@ -564,6 +754,16 @@ export function createCursor(client, options = {}) {
 	// Cursor moves dropped by the jitter filter (minMove) before they reached
 	// the flush. Always 0 when minMove is 0 (the default). Exposed via stats().
 	let jitterDropped = 0;
+
+	// Per-subscriber-walk observability (lifetime counters, like `flushCount`):
+	// `perSubscriberFlushes` is how many flushes took the per-subscriber walk
+	// rather than the shared combined frame; `bpSkips` is how often the
+	// backpressure cap bit; `culledEntriesDropped` is how many combined entries
+	// a viewport withheld from a subscriber. Counts only - no topic names, keys,
+	// or coordinates. NOT reset by clear()/destroy() (match `flushCount`).
+	let perSubscriberFlushes = 0;
+	let bpSkips = 0;
+	let culledEntriesDropped = 0;
 
 	// Pending REMOVE keys per topic, coalesced into one wire frame per
 	// subscriber per event-loop iteration. Mass-disconnect scenarios (e.g.
@@ -714,8 +914,74 @@ export function createCursor(client, options = {}) {
 		mBroadcasts?.inc({ topic: mt(topic) });
 		flushCount++;
 
-		// Single local publish covering all entries (local + inbound).
-		if (entries.length === 1) {
+		// Per-subscriber walk: engaged only when a per-subscriber reducer is on AND
+		// this topic needs the walk (backpressure always, viewport once a subscriber
+		// has reported a rect) AND the platform exposes the local subscriber walk
+		// (a minimal host or the unit mock without an iterating forEachSubscriber
+		// falls through). Each reporting subscriber gets only the combined entries
+		// inside its viewport (plus overscan); a non-reporter gets the full combined
+		// frame; a backpressured socket is skipped for this flush and catches up next
+		// cycle. Otherwise the shared combined-frame fan-out below is byte-identical
+		// to the zero-config path.
+		const walk =
+			perSubscriberWalk &&
+			topicNeedsWalk(topic) &&
+			typeof flushPlatform.forEachSubscriber === 'function' &&
+			!inDeliver;
+
+		if (walk) {
+			inDeliver = true;
+			try {
+				// Single materialization of the combined entries into shared scratch.
+				flushEntries.length = 0;
+				if (viewportEnabled) { flushPos.length = 0; alwaysVisible.length = 0; }
+				for (let i = 0; i < entries.length; i++) {
+					const e = entries[i];
+					flushEntries.push(e);
+					if (viewportEnabled) {
+						let pos = null;
+						// A buggy or slow app extractor must not crash the flush.
+						try { pos = position(e.data); } catch { pos = null; }
+						if (pos && (typeof pos.x !== 'number' || typeof pos.y !== 'number'
+							|| !Number.isFinite(pos.x) || !Number.isFinite(pos.y))) {
+							pos = null;
+						}
+						flushPos.push(pos);
+						if (pos === null) alwaysVisible.push(flushEntries.length - 1);
+					}
+				}
+				const n = flushEntries.length;
+				const fullTopic = '__cursor:' + topic;
+				const indexed = viewportEnabled && n >= INDEX_CROSSOVER;
+				if (indexed) buildFlushCells(n);
+				flushPlatform.forEachSubscriber(fullTopic, (ws) => {
+					if (bpEnabled && flushPlatform.bufferedAmount(ws) > bpMaxBufferedBytes) {
+						bpSkips++;
+						return;
+					}
+					let slice = flushEntries;
+					if (viewportEnabled) {
+						const rect = lookupViewport(ws, topic);
+						// A non-reporter (null rect) is whole-board and never culled.
+						if (rect !== null) slice = indexed ? cullIndexed(rect) : cullDirect(rect);
+					}
+					const len = slice.length;
+					// Count entries withheld by the cull, including a fully culled slice.
+					if (slice !== flushEntries) culledEntriesDropped += n - len;
+					if (len === 0) return; // nothing visible to this subscriber this flush
+					if (len === 1) {
+						emitTo(ws, fullTopic, EVENTS.UPDATE, slice[0], flushPlatform);
+					} else {
+						emitTo(ws, fullTopic, EVENTS.BULK, slice, flushPlatform);
+					}
+				});
+				perSubscriberFlushes++;
+				if (indexed) releaseFlushCells();
+			} finally {
+				inDeliver = false;
+			}
+		} else if (entries.length === 1) {
+			// Shared combined frame (local + inbound) - unchanged zero-config path.
 			emit('__cursor:' + topic, EVENTS.UPDATE, entries[0], flushPlatform);
 		} else {
 			emit('__cursor:' + topic, EVENTS.BULK, entries, flushPlatform);
@@ -729,6 +995,103 @@ export function createCursor(client, options = {}) {
 				relay(topic, EVENTS.BULK, entries.slice(0, localCount));
 			}
 		}
+	}
+
+	/**
+	 * Build the transient spatial index over this flush's positioned movers.
+	 * Bucket arrays are drawn from `cellPool` and returned by `releaseFlushCells`
+	 * after the walk, so a dense flush recycles them.
+	 * @param {number} n - flushEntries.length
+	 */
+	function buildFlushCells(n) {
+		releaseFlushCells();
+		for (let i = 0; i < n; i++) {
+			const pos = flushPos[i];
+			if (pos === null) continue; // null-pos delivered via alwaysVisible
+			const ck = packCell(Math.floor(pos.x / viewportCell), Math.floor(pos.y / viewportCell));
+			let bucket = flushCells.get(ck);
+			if (!bucket) {
+				bucket = cellPool.pop() || [];
+				bucket.length = 0;
+				flushCells.set(ck, bucket);
+			}
+			bucket.push(i);
+		}
+	}
+
+	/** Return this flush's bucket arrays to the pool and empty the index. */
+	function releaseFlushCells() {
+		for (const bucket of flushCells.values()) cellPool.push(bucket);
+		flushCells.clear();
+	}
+
+	/**
+	 * Resolve a reported rect's padded board bounds. Width/height are board units
+	 * already (the client reports the visible board region), so only the overscan
+	 * is widened by 1/zoom when zoomed out, keeping it roughly constant on screen.
+	 * Writes into the shared `bounds` object to avoid per-call alloc.
+	 * @param {{ x: number, y: number, w: number, h: number, zoom: number }} rect
+	 */
+	function rectBounds(rect) {
+		const pad = rect.zoom < 1 ? viewportPadding / rect.zoom : viewportPadding;
+		bounds.minX = rect.x - pad;
+		bounds.minY = rect.y - pad;
+		bounds.maxX = rect.x + rect.w + pad;
+		bounds.maxY = rect.y + rect.h + pad;
+		return bounds;
+	}
+
+	/**
+	 * Flat bounds test over every mover this flush. Used below INDEX_CROSSOVER,
+	 * where the combined set is small enough that building an index does not pay.
+	 * @param {{ x: number, y: number, w: number, h: number, zoom: number }} rect
+	 * @returns {Array<{ key: string, data: any }>}
+	 */
+	function cullDirect(rect) {
+		const bb = rectBounds(rect);
+		cullOut.length = 0;
+		for (let i = 0; i < flushEntries.length; i++) {
+			const pos = flushPos[i];
+			if (pos === null) { cullOut.push(flushEntries[i]); continue; }
+			if (pos.x >= bb.minX && pos.x <= bb.maxX && pos.y >= bb.minY && pos.y <= bb.maxY) {
+				cullOut.push(flushEntries[i]);
+			}
+		}
+		return cullOut;
+	}
+
+	/**
+	 * Spatial-index cull: walk only the cells the viewport covers and bounds-test
+	 * their movers. Per-subscriber cost is O(visible cells + movers in them), not
+	 * O(all movers). A viewport spanning more cells than the flush has movers sees
+	 * ~the whole board, so it delivers everything (the deliver-all clamp),
+	 * bounding worst-case cost at O(movers).
+	 * @param {{ x: number, y: number, w: number, h: number, zoom: number }} rect
+	 * @returns {Array<{ key: string, data: any }>}
+	 */
+	function cullIndexed(rect) {
+		const bb = rectBounds(rect);
+		const cx0 = Math.floor(bb.minX / viewportCell);
+		const cy0 = Math.floor(bb.minY / viewportCell);
+		const cx1 = Math.floor(bb.maxX / viewportCell);
+		const cy1 = Math.floor(bb.maxY / viewportCell);
+		if ((cx1 - cx0 + 1) * (cy1 - cy0 + 1) > flushEntries.length) return flushEntries;
+		cullOut.length = 0;
+		for (let a = 0; a < alwaysVisible.length; a++) cullOut.push(flushEntries[alwaysVisible[a]]);
+		for (let cy = cy0; cy <= cy1; cy++) {
+			for (let cx = cx0; cx <= cx1; cx++) {
+				const bucket = flushCells.get(packCell(cx, cy));
+				if (!bucket) continue;
+				for (let bi = 0; bi < bucket.length; bi++) {
+					const i = bucket[bi];
+					const pos = flushPos[i];
+					if (pos.x >= bb.minX && pos.x <= bb.maxX && pos.y >= bb.minY && pos.y <= bb.maxY) {
+						cullOut.push(flushEntries[i]);
+					}
+				}
+			}
+		}
+		return cullOut;
 	}
 
 	/**
@@ -816,7 +1179,16 @@ export function createCursor(client, options = {}) {
 	 * for cursors. Same trade-off the adapter's bundled cursor plugin makes.
 	 */
 	function broadcast(topic, key, user, data, platform) {
-		if (topicThrottleMs <= 0) {
+		// The immediate path (topicThrottle: 0) bypasses the coalesced flush, where
+		// the per-subscriber walk lives. When no reducer is engaged for this topic,
+		// keep the legacy immediate single-mover emit. When a reducer IS engaged,
+		// the move must instead go through the combined `flushBoth` walk so culling
+		// / backpressure cannot silently no-op for a `topicThrottle: 0` app. Route
+		// it through the dirty map and flush synchronously so the immediate path's
+		// synchronous-delivery contract holds while still coalescing whatever
+		// co-arrived in this loop turn into one combined frame and one walk.
+		// `&&` short-circuits, so the throttled path never runs topicNeedsWalk.
+		if (topicThrottleMs <= 0 && !(perSubscriberWalk && topicNeedsWalk(topic))) {
 			doBroadcast(topic, key, user, data, platform);
 			return;
 		}
@@ -832,6 +1204,13 @@ export function createCursor(client, options = {}) {
 		}
 		state.dirty.set(key, { user, data, platform });
 		dirtyTopics.add(topic);
+
+		if (topicThrottleMs <= 0) {
+			// Immediate path with a reducer engaged: flush the combined entries now.
+			dirtyTopics.delete(topic);
+			flushBoth(topic, state);
+			return;
+		}
 
 		const elapsed = Date.now() - state.lastFlush;
 		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
@@ -854,7 +1233,13 @@ export function createCursor(client, options = {}) {
 	 * is the structural benefit.
 	 */
 	function enqueueInbound(topic, key, data, platform) {
-		if (topicThrottleMs <= 0) {
+		// Mirror broadcast(): the immediate path bypasses the coalesced flush where
+		// the per-subscriber walk lives, so force coalescing when a reducer is
+		// engaged. A peer-origin cursor must be a first-class member of the combined
+		// entries the local walk culls against, not an un-culled immediate emit that
+		// would reach every local subscriber regardless of its viewport.
+		// `&&` short-circuits, so the throttled path never runs topicNeedsWalk.
+		if (topicThrottleMs <= 0 && !(perSubscriberWalk && topicNeedsWalk(topic))) {
 			// Legacy immediate mode (matches old receiver behavior).
 			emit('__cursor:' + topic, EVENTS.UPDATE, { key, data }, platform, { relay: false });
 			return;
@@ -867,6 +1252,15 @@ export function createCursor(client, options = {}) {
 		}
 		state.inboundDirty.set(key, { data, platform });
 		dirtyTopics.add(topic);
+
+		if (topicThrottleMs <= 0) {
+			// Immediate path with a reducer engaged: flush the combined entries now,
+			// so the peer cursor is culled per local subscriber rather than emitted
+			// un-culled to everyone.
+			dirtyTopics.delete(topic);
+			flushBoth(topic, state);
+			return;
+		}
 
 		// Symmetric with `broadcast()` always-tick: both source paths share
 		// the same `state` and the same tracker-wide tick timer, so a local
@@ -1065,7 +1459,24 @@ export function createCursor(client, options = {}) {
 			if (!state) return;
 
 			if (topic !== undefined) {
-				if (!state.topics.has(topic)) return;
+				// Drop this subscriber's viewport for the topic first, decrementing
+				// the reporter count only if a rect actually existed. A subscriber
+				// can report a viewport for a topic it never moved a cursor on (a
+				// read-only spectator), so the rect lives in `subViewport` even when
+				// the topic is absent from `state.topics`. Running this before the
+				// cursor-entry guard below keeps the rect and its reporter from
+				// outliving an explicit single-topic remove. Subscriber-keyed:
+				// removing one topic never touches the subscriber's other topics.
+				const byTopic = subViewport.get(state.key);
+				if (byTopic && byTopic.delete(topic)) {
+					dropReporter(topic);
+					if (byTopic.size === 0) subViewport.delete(state.key);
+				}
+
+				if (!state.topics.has(topic)) {
+					if (state.topics.size === 0) wsState.delete(ws);
+					return;
+				}
 
 				const topicMap = topics.get(topic);
 				if (topicMap) {
@@ -1154,6 +1565,11 @@ export function createCursor(client, options = {}) {
 					if (topicPending.size === 0) redisPending.delete(t);
 				}
 			}
+			const byTopic = subViewport.get(state.key);
+			if (byTopic) {
+				for (const t of byTopic.keys()) dropReporter(t);
+				subViewport.delete(state.key);
+			}
 			wsState.delete(ws);
 			stopCleanupTimer();
 		},
@@ -1169,6 +1585,47 @@ export function createCursor(client, options = {}) {
 			} catch {
 				// WebSocket closed before send
 			}
+		},
+
+		/**
+		 * Record this subscriber's viewport rect for a topic, from the inbound
+		 * `cursor-viewport` frame. The rect bounds which cursors the subscriber
+		 * receives once viewport culling is enabled; a subscriber that never
+		 * reports one is treated as whole-board and is never culled. Best-effort:
+		 * a malformed rect (missing or non-finite x/y/w/h, or a non-positive
+		 * w/h/zoom) is dropped silently so the subscriber stays whole-board
+		 * rather than recording a rect that culls to nothing. x/y may be negative
+		 * (board coordinates). `zoom` is optional and defaults to 1. The rect is
+		 * never relayed across Redis - it is local-replica state only.
+		 * @param {any} ws
+		 * @param {string} topic
+		 * @param {any} rect
+		 */
+		viewport(ws, topic, rect) {
+			if (!rect || typeof rect !== 'object') return;
+			const { x, y, w, h } = rect;
+			const zoom = rect.zoom === undefined ? 1 : rect.zoom;
+			if (![x, y, w, h, zoom].every((n) => typeof n === 'number' && Number.isFinite(n))) return;
+			if (w <= 0 || h <= 0 || zoom <= 0) return;
+			const state = getWsState(ws);
+			let byTopic = subViewport.get(state.key);
+			if (!byTopic) { byTopic = new Map(); subViewport.set(state.key, byTopic); }
+			// First rect this subscriber reports for the topic flips it onto the
+			// per-subscriber walk; a re-report of an existing topic does not.
+			if (!byTopic.has(topic)) addReporter(topic);
+			byTopic.set(topic, { x, y, w, h, zoom });
+		},
+
+		/**
+		 * The last viewport rect this subscriber reported for a topic, or `null`
+		 * if it never reported one. Read by the per-subscriber walk; does not
+		 * create `wsState`.
+		 * @param {any} ws
+		 * @param {string} topic
+		 * @returns {{ x: number, y: number, w: number, h: number, zoom: number } | null}
+		 */
+		viewportFor(ws, topic) {
+			return lookupViewport(ws, topic);
 		},
 
 		async list(topic) {
@@ -1231,6 +1688,18 @@ export function createCursor(client, options = {}) {
 			topics.clear();
 			topicFlush.clear();
 			wsState.clear();
+			subViewport.clear();
+			topicReporters.clear();
+			// Release per-flush walk scratch so a reset reclaims the last flush's
+			// references. The lifetime walk counters (perSubscriberFlushes/bpSkips/
+			// culledEntriesDropped) are intentionally left alone, matching flushCount.
+			flushEntries.length = 0;
+			flushPos.length = 0;
+			alwaysVisible.length = 0;
+			cullOut.length = 0;
+			cellPool.length = 0;
+			flushCells.clear();
+			inDeliver = false;
 			activeTopics.clear();
 			redisPending = new Map();
 			stopCleanupTimer();
@@ -1254,6 +1723,15 @@ export function createCursor(client, options = {}) {
 			pendingRemoves.clear();
 			dirtyTopics.clear();
 			topicFlush.clear();
+			subViewport.clear();
+			topicReporters.clear();
+			flushEntries.length = 0;
+			flushPos.length = 0;
+			alwaysVisible.length = 0;
+			cullOut.length = 0;
+			cellPool.length = 0;
+			flushCells.clear();
+			inDeliver = false;
 			if (subscriber) {
 				subscriber.quit().catch(() => subscriber.disconnect());
 				subscriber = null;
@@ -1278,12 +1756,24 @@ export function createCursor(client, options = {}) {
 		 * - `jitterDropped`: cursor moves dropped by the `minMove` jitter
 		 *   filter before they reached the flush scheduler. Always 0 when
 		 *   `minMove` is 0 (the default).
+		 * - `viewportsReported`: current count of subscribers with a recorded
+		 *   viewport rect. 0 when viewport culling is off or no subscriber has
+		 *   reported a rect yet.
+		 * - `perSubscriberFlushes`: lifetime count of flushes that took the
+		 *   per-subscriber walk (viewport culling / backpressure) instead of the
+		 *   shared combined frame. NOT reset by clear()/destroy().
+		 * - `bpSkips`: lifetime count of per-flush subscriber skips because the
+		 *   socket's queued bytes exceeded `backpressure.maxBufferedBytes`. NOT
+		 *   reset by clear()/destroy().
+		 * - `culledEntriesDropped`: lifetime count of combined entries a
+		 *   subscriber's viewport withheld from it across all flushes. NOT reset
+		 *   by clear()/destroy().
 		 *
 		 * Leading-edge synchronous flushes (first call on an idle topic)
 		 * are not counted in drift stats - they fire on the call thread,
 		 * not via the scheduler.
 		 *
-		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number }}
+		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number }}
 		 */
 		stats() {
 			return {
@@ -1292,7 +1782,11 @@ export function createCursor(client, options = {}) {
 				driftMaxMs: driftMax,
 				dirtyTopicsCurrent: dirtyTopics.size,
 				activeTopicsTotal: topics.size,
-				jitterDropped
+				jitterDropped,
+				viewportsReported: subViewport.size,
+				perSubscriberFlushes,
+				bpSkips,
+				culledEntriesDropped
 			};
 		},
 
@@ -1320,6 +1814,14 @@ export function createCursor(client, options = {}) {
 				// set) still gets a fresh catalog + bulk.
 				if (data && data.type === 'cursor-snapshot' && typeof data.topic === 'string') {
 					tracker.snapshot(ws, data.topic, platform);
+					return;
+				}
+				// Client-reported viewport rect for culling. Routes ONLY to local
+				// per-replica state (`tracker.viewport`); never relayed across Redis -
+				// each replica culls its own local subscribers against the combined
+				// local + peer cursor set, so a peer never needs the rect.
+				if (data && data.type === 'cursor-viewport' && typeof data.topic === 'string') {
+					tracker.viewport(ws, data.topic, data.rect);
 					return;
 				}
 				// Silent no-op when the caller dispatches a parsed object whose

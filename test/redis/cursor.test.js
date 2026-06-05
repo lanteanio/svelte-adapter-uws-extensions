@@ -1784,7 +1784,11 @@ describe('redis cursor', () => {
 				driftMaxMs: 0,
 				dirtyTopicsCurrent: 0,
 				activeTopicsTotal: 0,
-				jitterDropped: 0
+				jitterDropped: 0,
+				viewportsReported: 0,
+				perSubscriberFlushes: 0,
+				bpSkips: 0,
+				culledEntriesDropped: 0
 			});
 			c.destroy();
 		});
