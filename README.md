@@ -56,6 +56,7 @@ The core adapter keeps everything in-process memory. That works great for single
 - [Failure handling](#failure-handling)
 - [Circuit breaker](#circuit-breaker)
 - [Admission control](#admission-control)
+- [Upgrade admission](#upgrade-admission)
 - [Redis Functions](#redis-functions)
 
 **Operations**
@@ -2525,6 +2526,90 @@ The warner uses the broader pattern (the bare substring `"key"` is included) bec
 
 ---
 
+## URL safety (SSRF)
+
+A server-side handler that fetches a user-supplied URL -- an outbound webhook, a link preview, an avatar-from-URL import -- is a classic server-side request forgery (SSRF) target. An attacker submits a URL that points back inside the trust boundary: the cloud instance-metadata endpoint (`169.254.169.254`, which hands out IAM credentials), a loopback admin panel, or an RFC1918 service. `isSafeUrl` in [`shared/safe-url.js`](shared/safe-url.js) (re-exported from `svelte-adapter-uws-extensions/safe-url`) answers "is it safe to fetch this URL" with a single boolean, with a zero-config strict default.
+
+```js
+import { isSafeUrl } from 'svelte-adapter-uws-extensions/safe-url';
+
+// Zero-config: strict mode. false for loopback, link-local, RFC1918,
+// IPv6 ULA/link-local, and the cloud-metadata IP.
+if (!isSafeUrl(userWebhookUrl)) {
+	throw new Error('Webhook URL is not allowed');
+}
+await fetch(userWebhookUrl);
+```
+
+### What strict mode blocks
+
+| Class | Range / host | `reason` |
+| --- | --- | --- |
+| Loopback | `127.0.0.0/8`, `::1`, `localhost` | `loopback` |
+| Unspecified | `0.0.0.0/8`, `::` | `unspecified` |
+| Link-local IPv4 | `169.254.0.0/16` | `link-local` |
+| Cloud metadata | `169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal` | `metadata` |
+| RFC1918 | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | `rfc1918` |
+| IPv6 ULA | `fc00::/7` (`fc00::/8` + `fd00::/8`) | `ula` |
+| IPv6 link-local | `fe80::/10` | `link-local` |
+| Non-http(s) scheme | `file:`, `gopher:`, `ftp:`, `data:`, `redis:`, ... | `bad-scheme` |
+| Unparseable | `new URL(url)` throws | `parse-error` |
+
+IPv4-mapped / IPv4-compatible IPv6 forms (`::ffff:a.b.c.d`, `::a.b.c.d`) are unwrapped to their embedded IPv4 and re-checked against every IPv4 rule, so `::ffff:169.254.169.254` cannot smuggle the metadata IP past an IPv4-only check.
+
+### Obfuscation evasions it normalises
+
+A naive validator that matches on the raw string is bypassed by the many ways an IP can be spelled. `isSafeUrl` reads the parsed `URL.hostname` and normalises every encoding before matching:
+
+- **Decimal / octal / hex / short-form IPv4.** `http://2130706433/`, `http://0x7f000001/`, `http://0x7f.0.0.1/`, `http://0177.0.0.1/`, `http://127.1/` all classify as loopback.
+- **IPv4-mapped IPv6.** `http://[::ffff:169.254.169.254]/` classifies as `metadata`.
+- **Userinfo smuggling.** `http://expected.com@127.0.0.1/` is classified on the real authority `127.0.0.1`, not the `expected.com` userinfo.
+- **Trailing dot and case.** `http://LOCALHOST./` is loopback.
+
+### `checkUrl(url, options)` -- the reason a URL was rejected
+
+When you need to log or branch on *why*, `checkUrl` returns `{ safe, reason }` with the same checks:
+
+```js
+import { checkUrl } from 'svelte-adapter-uws-extensions/safe-url';
+
+const result = checkUrl(userWebhookUrl);
+if (!result.safe) {
+	log.warn('blocked outbound URL', { reason: result.reason });
+}
+```
+
+### Modes
+
+```js
+// Allowlist: only these hosts pass; everything else is blocked even if public.
+// The SSRF ranges still win, so an allowlist of `localhost` does NOT re-open loopback.
+isSafeUrl(url, { mode: 'allowlist', allow: ['hooks.partner.com', 'api.acme.io'] });
+
+// Off: the explicit, reviewable opt-out for a trusted environment. Returns true
+// for any parseable http(s) URL -- but still enforces the http(s) scheme gate,
+// because a file:// fetch is never an intended outbound HTTP call.
+isSafeUrl(url, { mode: 'off' });
+```
+
+### DNS rebinding (the documented gap, and how to close it)
+
+The synchronous `isSafeUrl` / `checkUrl` classify the URL's **literal** host. A numeric IP (in any encoding) is normalised and range-checked; a DNS name is classified on its literal text only. That means a public-looking name that **resolves** to a private address (a DNS-rebinding attack) passes the literal check. The validator imports no `node:dns` -- it stays pure, synchronous, and isomorphic -- and the rebinding hole is closed by the async `checkUrlResolved`, which takes a resolver you supply:
+
+```js
+import { checkUrlResolved } from 'svelte-adapter-uws-extensions/safe-url';
+import { promises as dns } from 'node:dns';
+
+const result = await checkUrlResolved(userWebhookUrl, {
+	resolve: (hostname) => dns.resolve(hostname)
+});
+// false for a name that resolves to 127.0.0.1 / 169.254.169.254 / an RFC1918 IP.
+```
+
+`checkUrlResolved` runs the literal check first (so a private literal short-circuits without a lookup), then -- only for a DNS name -- resolves and re-checks every resolved address. A resolver that throws yields `{ safe: false, reason: 'unresolved-host' }`. In `mode: 'off'` the resolver path is skipped entirely, so the opt-out bypasses the range checks uniformly for both IP literals and DNS names. Note that even with a resolver this does not fully close the time-of-check-to-time-of-use window: a name can resolve to a public IP at check time and a private IP at fetch time. For a hard guarantee, pin the resolved address and connect to it directly.
+
+---
+
 **Reliability**
 
 ## Capacity model
@@ -3012,6 +3097,147 @@ export function message(ws, { data, platform }) {
 ```
 
 Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race - the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission) section for the handshake-tier reference.
+
+---
+
+## Upgrade admission
+
+Two composable defenses for the WebSocket upgrade path, wired inside your `upgrade` hook. Both take a posture **string** you pass in, so they gate harder when the server is under pressure and stay relaxed when it is quiet. They are independent of any backend state machine - you forward whatever live posture your app has (commonly `'normal'` / `'elevated'` / `'siege'`).
+
+The adapter already ships an in-process per-IP limiter and a concurrent-upgrade gate (the zero-config defaults, which stay). These modules add cluster-wide per-IP accounting and a page-load proof-of-work credential on top.
+
+### Per-IP token bucket
+
+`createUpgradeBucket` (`svelte-adapter-uws-extensions/redis/upgrade-bucket`) is a cluster-wide per-IP bucket: an attacker spread across N workers is one IP, not N independent buckets. It reuses the same atomic Lua token bucket the [rate limiter](#rate-limiting) ships, keyed on the client IP, and **fails open** through the [circuit breaker](#circuit-breaker) so a Redis outage admits rather than locking out every client.
+
+```js
+// src/lib/server/upgrade-bucket.js
+import { redis } from './redis.js';
+import { createUpgradeBucket } from 'svelte-adapter-uws-extensions/redis/upgrade-bucket';
+
+export const bucket = createUpgradeBucket(redis, {
+  // Budget when posture is 'normal'. NAT/CGNAT deployments raise this or skip
+  // the gate, since NAT-shared IPs share a bucket.
+  perMinute: 60,
+  // Posture overrides. An omitted state inherits the next-looser state's budget.
+  elevated: { perMinute: 20 },
+  siege:    { perMinute: 5 }
+});
+```
+
+```js
+// src/hooks.ws.js
+import { bucket } from '$lib/server/upgrade-bucket';
+
+export async function upgrade({ remoteAddress, platform }) {
+  // One Redis roundtrip. Returns false to reject; the adapter maps false to a
+  // clean rejection, so this composes with your auth.
+  if (!(await bucket.admit(remoteAddress, platform.protection))) return false;
+  // ... normal auth / session work ...
+}
+```
+
+For deployments without Redis, `createLocalUpgradeBucket` is a pure in-process bucket with the same posture-keyed budgets, a hard map-size cap (default `100000` IPs) and LRU eviction, so the bucket map itself cannot become a memory-exhaustion vector under a spoofed-IP flood.
+
+```js
+import { createLocalUpgradeBucket } from 'svelte-adapter-uws-extensions/redis/upgrade-bucket';
+
+export const bucket = createLocalUpgradeBucket({ perMinute: 60, maxEntries: 100000 });
+```
+
+#### Options (`createUpgradeBucket` / `createLocalUpgradeBucket`)
+
+| Option | Default | Description |
+|---|---|---|
+| `perMinute` | *required* | Upgrades permitted per IP per minute in the `normal` posture. Positive integer. |
+| `blockDuration` | `0` | Auto-ban duration in ms once a budget is spent. 0 = no ban. |
+| `elevated` | inherits `normal` | `{ perMinute, blockDuration? }` for the `elevated` posture. |
+| `siege` | inherits `elevated` | `{ perMinute, blockDuration? }` for the `siege` posture. |
+| `breaker` | - | Fail-open circuit breaker wrapping the Redis call (`createUpgradeBucket` only). |
+| `maxEntries` | `100000` | Hard cap on the IP map before LRU eviction (`createLocalUpgradeBucket` only). |
+| `metrics` | - | Prometheus metrics registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `admit(ip, posture?)` | `true` to admit, `false` to reject. The Redis variant fails open (admits) when the backend is unavailable. |
+| `reset(ip)` | Clear the bucket for one IP. |
+| `clear()` | Reset all per-IP state. |
+
+An unknown posture string degrades to the `normal` budget, so forwarding an unexpected posture never throws on the upgrade hot path.
+
+### Capability cookie
+
+`capabilityCookie` (`svelte-adapter-uws-extensions/capability-cookie`) raises the per-request cost for a bot hitting `/ws` directly from "one TCP+TLS handshake" to "load the HTML page, run its JS, present a short-lived signed cookie". The page response sets a signed cookie (an HMAC of `sessionId | issuedAt | salt` via `node:crypto`); the upgrade hook verifies it in O(1) before any backend lookup. This stops commodity DDoS toolkits that target `/ws` directly. It does **not** stop a headless-browser attacker that actually runs the page JS - a stated limitation, not a gap.
+
+No Redis dependency: the whole point is to reject before any backend work.
+
+```js
+// src/hooks.server.js - set the cookie on the HTML page response.
+import { capabilityCookie } from 'svelte-adapter-uws-extensions/capability-cookie';
+
+export const cap = capabilityCookie({ secret: process.env.CAP_SECRET, ttlSeconds: 300 });
+
+export const handle = async ({ event, resolve }) => {
+  const response = await resolve(event);
+  cap.issue(event, response); // adds the Set-Cookie
+  return response;
+};
+```
+
+```js
+// src/hooks.ws.js - verify before any backend work.
+import { cap } from '$lib/server/cap';
+
+export function upgrade({ headers, platform }) {
+  // Optional in 'normal' (verify if present, never reject on absence) so a
+  // fresh first-time visitor is never locked out; required under pressure.
+  if (!cap.verify(headers.cookie, { required: platform.protection !== 'normal' })) {
+    return false;
+  }
+  // ... normal auth ...
+}
+```
+
+`required` keys off the live posture you pass: optional in `normal` so the zero-config first-visit case never breaks, required only when the server is actually under pressure.
+
+#### Secret rotation
+
+If the HMAC secret rotates or the cookie expires mid-session, a WS reconnect would otherwise fail. The module ships two answers, both in-scope (not a follow-on):
+
+- `cap.refresh(event, response)` re-issues the cookie from a still-valid session, re-signing under the current secret.
+- The verifier accepts cookies signed by either the current **or** the immediately-previous secret during a rotation window. Configure the old secret as `previousSecret` for the duration of the window, then drop it.
+
+```js
+const cap = capabilityCookie({
+  secret: process.env.CAP_SECRET,          // current
+  previousSecret: process.env.CAP_SECRET_PREV, // accepted during the window
+  ttlSeconds: 300
+});
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `secret` | *required* | HMAC secret. Non-empty string. |
+| `ttlSeconds` | `300` | Cookie lifetime in seconds. An expired cookie is invalid even under the current secret. |
+| `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. |
+| `cookieName` | `'sauws_cap'` | Cookie name. |
+| `secure` | `true` | Set the `Secure` attribute. |
+| `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). |
+| `path` | `'/'` | Cookie path. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `issue(event, response)` | Set the capability cookie on a fresh page response. |
+| `refresh(event, response)` | Re-issue from a still-valid presented cookie; falls back to a fresh issue. |
+| `verify(cookieHeader, { required })` | Validate a presented `Cookie` header. Accepts the current or previous secret. Returns `true` to admit. |
+
+`verify` is a single HMAC computation and a constant-time compare - no allocation beyond it, safe on the upgrade hot path.
 
 ---
 

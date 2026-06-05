@@ -63,6 +63,31 @@ export interface RedisCursorOptions {
 	 * @default 1048576 (1 MB)
 	 */
 	maxEnvelopeBytes?: number;
+
+	/**
+	 * Extract a `{x, y}` coordinate from cursor `data` for the `minMove`
+	 * jitter filter. Defaults to reading finite `data.x` / `data.y`. Return
+	 * `null` (or throw) to opt a single frame out of the filter - it is then
+	 * always delivered, never dropped. Only consulted when `minMove > 0`.
+	 * @default reads finite data.x / data.y
+	 */
+	position?: (data: any) => { x: number; y: number } | null;
+
+	/**
+	 * Minimum movement (Chebyshev distance in the units `position` returns)
+	 * from the last broadcast position before a cursor move is fanned out and
+	 * relayed across instances. A burst of sub-threshold wobble around a point
+	 * is dropped at ingest; when movement stops, a debounced settle delivers
+	 * the final resting position once (so a still cursor is never stranded at a
+	 * stale point, and an exact repeat stays dropped). Measured against what
+	 * the subscriber last saw, so a slow drift still delivers every `minMove`
+	 * units. 0 (default) disables the filter. For integer-pixel cursor data,
+	 * `minMove: 1` drops exact-repeat frames at no visual cost; raise to 2-4 to
+	 * suppress sub-pixel wobble from high-DPI input. Mirrors the in-memory
+	 * cursor plugin's `minMove`.
+	 * @default 0
+	 */
+	minMove?: number;
 }
 
 export interface CursorEntry {
@@ -166,6 +191,9 @@ export interface RedisCursorTracker {
 	 * - `dirtyTopicsCurrent`: topics with pending coalesced entries right
 	 *   now. Should hover near zero in healthy operation.
 	 * - `activeTopicsTotal`: topics with at least one local cursor.
+	 * - `jitterDropped`: cursor moves dropped by the `minMove` jitter filter
+	 *   before they reached the flush scheduler. Always 0 when `minMove` is 0
+	 *   (the default).
 	 *
 	 * Leading-edge synchronous flushes are not counted in drift stats -
 	 * they fire on the call thread, not via the scheduler.
@@ -176,6 +204,7 @@ export interface RedisCursorTracker {
 		driftMaxMs: number;
 		dirtyTopicsCurrent: number;
 		activeTopicsTotal: number;
+		jitterDropped: number;
 	};
 
 	/**

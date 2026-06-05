@@ -1,0 +1,39 @@
+export interface CapabilityCookieOptions {
+	/** HMAC secret. Required, non-empty. */
+	secret: string;
+	/** Cookie lifetime in seconds. @default 300 */
+	ttlSeconds?: number;
+	/** Immediately-previous secret, accepted during a rotation window. */
+	previousSecret?: string;
+	/** Cookie name. @default 'sauws_cap' */
+	cookieName?: string;
+	/** Set the `Secure` attribute. @default true */
+	secure?: boolean;
+	/** SameSite policy. @default 'Lax' */
+	sameSite?: 'Strict' | 'Lax' | 'None';
+	/** Cookie path. @default '/' */
+	path?: string;
+}
+
+export interface CapabilityCookieVerifyOptions {
+	/** When true, an absent cookie fails verification. @default false */
+	required?: boolean;
+}
+
+export interface CapabilityCookie {
+	/** Set the capability cookie on a fresh page response. */
+	issue(event: any, response: any): void;
+	/** Re-issue from a still-valid presented cookie; falls back to a fresh issue. */
+	refresh(event: any, response: any): void;
+	/**
+	 * Validate a presented `Cookie` header value. Accepts a cookie signed by the
+	 * current OR previous secret (rotation window). Returns `true` to admit.
+	 */
+	verify(cookieHeader: string | null | undefined, opts?: CapabilityCookieVerifyOptions): boolean;
+}
+
+/**
+ * Build a capability-cookie issuer/verifier. HMAC of `sessionId | issuedAt | salt`
+ * via `node:crypto`; no Redis dependency.
+ */
+export function capabilityCookie(options: CapabilityCookieOptions): CapabilityCookie;

@@ -1783,7 +1783,8 @@ describe('redis cursor', () => {
 				driftMeanMs: 0,
 				driftMaxMs: 0,
 				dirtyTopicsCurrent: 0,
-				activeTopicsTotal: 0
+				activeTopicsTotal: 0,
+				jitterDropped: 0
 			});
 			c.destroy();
 		});
@@ -2159,6 +2160,236 @@ describe('redis cursor', () => {
 
 			c.destroy();
 			breaker.destroy();
+		});
+	});
+
+	describe('jitter filter (minMove)', () => {
+		// Fake timers for the whole block: a sub-threshold drop arms a debounced
+		// settle timer (settleMs = throttle, or 16 when throttle is 0) and these
+		// tests assert exactly when it fires. Freezing the clock also keeps a
+		// dropped frame's settle from leaking past the test.
+		beforeEach(() => vi.useFakeTimers());
+		afterEach(() => vi.useRealTimers());
+
+		// throttle:0 + topicThrottle:0 makes every passing update a direct
+		// broadcast, so each update either broadcasts immediately or is
+		// dropped/deferred by the filter (no coalescing tick between).
+		function tracker(minMove, position) {
+			return createCursor(client, {
+				throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0,
+				minMove, position, select: (ud) => ({ id: ud.id })
+			});
+		}
+		const positions = (p) =>
+			p.published.filter((e) => e.event === 'update').map((e) => e.data.data);
+
+		it('validates minMove', () => {
+			expect(() => createCursor(client, { minMove: -1 })).toThrow('non-negative');
+			expect(() => createCursor(client, { minMove: 'x' })).toThrow('non-negative');
+			expect(() => createCursor(client, { minMove: NaN })).toThrow('non-negative');
+			expect(() => createCursor(client, { minMove: 0 })).not.toThrow();
+			expect(() => createCursor(client, { minMove: 2.5 })).not.toThrow(); // fractional ok
+		});
+
+		it('validates position is a function', () => {
+			expect(() => createCursor(client, { position: 'x' })).toThrow('function');
+			expect(() => createCursor(client, { position: (d) => d })).not.toThrow();
+		});
+
+		it('does not filter by default (minMove 0): identical repeats still broadcast', () => {
+			const c = tracker(0);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 5, y: 5 }, platform);
+			c.update(ws, 'board', { x: 5, y: 5 }, platform);
+			expect(positions(platform)).toEqual([{ x: 5, y: 5 }, { x: 5, y: 5 }]);
+			c.destroy();
+		});
+
+		it('drops exact-repeat positions with minMove >= 1, and the settle re-sends nothing', () => {
+			const c = tracker(1);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 5, y: 5 }, platform); // delivered (first)
+			c.update(ws, 'board', { x: 5, y: 5 }, platform); // exact repeat -> dropped
+			c.update(ws, 'board', { x: 5, y: 5 }, platform); // dropped
+			expect(positions(platform)).toEqual([{ x: 5, y: 5 }]);
+			vi.advanceTimersByTime(100); // the settle fires, but the rest equals the last sent
+			expect(positions(platform)).toEqual([{ x: 5, y: 5 }]); // so nothing is re-sent
+			expect(c.stats().jitterDropped).toBe(2);
+			c.destroy();
+		});
+
+		it('drops a sub-threshold move and delivers one that crosses the threshold', () => {
+			const c = tracker(2);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform);   // delivered
+			c.update(ws, 'board', { x: 1, y: 0 }, platform);   // |dx|=1 < 2 -> dropped
+			c.update(ws, 'board', { x: 0, y: 1.5 }, platform); // |dy|=1.5 < 2 (vs {0,0}) -> dropped
+			c.update(ws, 'board', { x: 2, y: 0 }, platform);   // |dx|=2 >= 2 -> delivered (cancels the pending settle)
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 2, y: 0 }]);
+			c.destroy();
+		});
+
+		it('measures against the last broadcast, not the last stored', () => {
+			const c = tracker(5);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered, last-broadcast {0,0}
+			c.update(ws, 'board', { x: 3, y: 0 }, platform); // 3 < 5 vs {0,0} -> dropped
+			c.update(ws, 'board', { x: 6, y: 0 }, platform); // 6 >= 5 vs {0,0} -> delivered
+			// If it had measured against the last STORED (3), 6-3=3 < 5 would wrongly drop.
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 6, y: 0 }]);
+			c.destroy();
+		});
+
+		it('delivers the final resting position once movement stops (settle)', () => {
+			const c = tracker(4);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered
+			c.update(ws, 'board', { x: 3, y: 0 }, platform); // 3 < 4 -> dropped (this is the final move)
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }]);   // not on the wire yet
+			vi.advanceTimersByTime(16); // movement stopped -> the settle fires
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 3, y: 0 }]); // final position delivered
+			c.destroy();
+		});
+
+		it('debounces the settle: a fresh sub-threshold move resets the quiet timer', () => {
+			const c = tracker(10);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered
+			c.update(ws, 'board', { x: 3, y: 0 }, platform); // dropped, settle armed (+16)
+			vi.advanceTimersByTime(10);                      // not yet
+			c.update(ws, 'board', { x: 5, y: 0 }, platform); // dropped, settle re-armed (+16 from here)
+			vi.advanceTimersByTime(10);                      // 20ms since the first drop; the original would have fired
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }]); // debounced: nothing yet
+			vi.advanceTimersByTime(16);                      // quiet long enough
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 5, y: 0 }]); // latest rest, delivered once
+			c.destroy();
+		});
+
+		it('a threshold-crossing move cancels a pending settle (no duplicate)', () => {
+			const c = tracker(5);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered
+			c.update(ws, 'board', { x: 3, y: 0 }, platform); // dropped, settle armed
+			c.update(ws, 'board', { x: 9, y: 0 }, platform); // 9 >= 5 -> delivered, settle canceled
+			vi.advanceTimersByTime(100);
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 9, y: 0 }]); // no stray settle frame
+			c.destroy();
+		});
+
+		it('always delivers a frame whose position cannot be extracted (null pos)', () => {
+			const c = tracker(100); // huge threshold
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { stroke: 'a' }, platform); // no x/y -> null -> delivered
+			c.update(ws, 'board', { stroke: 'b' }, platform); // null -> delivered (never filtered)
+			expect(positions(platform)).toHaveLength(2);
+			c.destroy();
+		});
+
+		it('a null-position passthrough does not corrupt the lastSentPos anchor', () => {
+			const c = tracker(3);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform);  // delivered, anchor {0,0}
+			c.update(ws, 'board', { stroke: 'a' }, platform); // null pos -> delivered, anchor stays {0,0}
+			c.update(ws, 'board', { x: 1, y: 0 }, platform);  // 1 < 3 vs {0,0} -> still dropped (anchor intact)
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { stroke: 'a' }]);
+			vi.advanceTimersByTime(16); // the {1,0} rest settles in
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { stroke: 'a' }, { x: 1, y: 0 }]);
+			c.destroy();
+		});
+
+		it('isolates lastSentPos per mover on a shared topic', () => {
+			const c = tracker(5);
+			const a = mockWs({ id: 'A' });
+			const b = mockWs({ id: 'B' });
+			c.update(a, 'board', { x: 0, y: 0 }, platform);     // A delivered, A anchor {0,0}
+			c.update(b, 'board', { x: 100, y: 100 }, platform); // B delivered (own first frame), B anchor {100,100}
+			c.update(b, 'board', { x: 101, y: 100 }, platform); // 1 < 5 vs B's {100,100} -> dropped
+			c.update(a, 'board', { x: 3, y: 0 }, platform);     // 3 < 5 vs A's {0,0} -> dropped
+			// Each small move is measured against its OWN anchor. A topic-global
+			// anchor would compare B's 101 against A's 0 (>= 5) and wrongly deliver it.
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 100, y: 100 }]);
+			expect(c.stats().jitterDropped).toBe(2);
+			c.destroy();
+		});
+
+		it('uses a custom position extractor for the threshold', () => {
+			const c = tracker(2, (d) => (Array.isArray(d.pt) ? { x: d.pt[0], y: d.pt[1] } : null));
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { pt: [0, 0] }, platform); // delivered
+			c.update(ws, 'board', { pt: [1, 0] }, platform); // 1 < 2 -> dropped
+			c.update(ws, 'board', { pt: [3, 0] }, platform); // 3 >= 2 -> delivered
+			expect(positions(platform)).toHaveLength(2);
+			c.destroy();
+		});
+
+		it('treats a non-finite extractor result as null: delivered, anchor uncorrupted', () => {
+			const c = tracker(2, (d) => ({ x: d.x, y: d.y })); // a custom extractor with no finite guard
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform);   // delivered, anchor {0,0}
+			c.update(ws, 'board', { x: NaN, y: 0 }, platform); // non-finite -> treated as null -> delivered
+			c.update(ws, 'board', { x: 1, y: 0 }, platform);   // 1 < 2 vs {0,0} -> dropped (anchor was not set to NaN)
+			expect(positions(platform)).toHaveLength(2);       // {0,0} and the NaN frame
+			expect(c.stats().jitterDropped).toBe(1);           // only the {1,0} sub-threshold move
+			c.destroy();
+		});
+
+		it('records the trailing-edge broadcast position, then settles a later sub-threshold rest', () => {
+			const c = createCursor(client, {
+				throttle: 16, topicThrottle: 0, snapshotIntervalMs: 0,
+				minMove: 2, select: (ud) => ({ id: ud.id })
+			});
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform);  // leading -> broadcast {0,0}
+			c.update(ws, 'board', { x: 10, y: 0 }, platform); // within window, 10>=2 -> arms trailing timer with {10,0}
+			vi.advanceTimersByTime(16);                       // trailing fires -> broadcast {10,0}, last-broadcast {10,0}
+			c.update(ws, 'board', { x: 11, y: 0 }, platform); // 1 < 2 vs {10,0} -> dropped (proves the anchor moved to 10)
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 10, y: 0 }]);
+			vi.advanceTimersByTime(16);                       // movement stopped -> the settle delivers {11,0}
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 11, y: 0 }]);
+			c.destroy();
+		});
+
+		it('re-anchors lastSentPos to the settled position', () => {
+			const c = tracker(5);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered, anchor {0,0}
+			c.update(ws, 'board', { x: 4, y: 0 }, platform); // 4 < 5 -> dropped, settle armed
+			vi.advanceTimersByTime(16);                      // settle delivers {4,0} and re-anchors to it
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 4, y: 0 }]);
+			c.update(ws, 'board', { x: 7, y: 0 }, platform); // 3 < 5 vs the SETTLED {4,0} -> dropped
+			// Had the settle not re-anchored, 7 vs the stale {0,0} would be >= 5 and deliver now.
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 4, y: 0 }]);
+			vi.advanceTimersByTime(16);                      // {7,0} then settles against {4,0}
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 7, y: 0 }]);
+			c.destroy();
+		});
+
+		it('settles through topicThrottle coalescing (final position flushed once)', () => {
+			const c = createCursor(client, {
+				throttle: 0, topicThrottle: 16, snapshotIntervalMs: 0,
+				minMove: 4, select: (ud) => ({ id: ud.id })
+			});
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // queued for the next coalesce tick
+			vi.advanceTimersByTime(16);                      // tick -> broadcast {0,0}, anchor {0,0}
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }]);
+			c.update(ws, 'board', { x: 2, y: 0 }, platform); // 2 < 4 vs {0,0} -> dropped, settle armed
+			vi.advanceTimersByTime(16);                      // settle fires -> queues {2,0}
+			vi.advanceTimersByTime(16);                      // coalesce tick flushes the queued {2,0}
+			expect(positions(platform)).toEqual([{ x: 0, y: 0 }, { x: 2, y: 0 }]);
+			c.destroy();
+		});
+
+		it('clears the settle timer on remove (no post-remove delivery)', async () => {
+			const c = tracker(5);
+			const ws = mockWs({ id: 'A' });
+			c.update(ws, 'board', { x: 0, y: 0 }, platform); // delivered
+			c.update(ws, 'board', { x: 3, y: 0 }, platform); // dropped, settle armed
+			await c.remove(ws, platform);
+			const before = positions(platform).length;
+			vi.advanceTimersByTime(100);
+			expect(positions(platform).length).toBe(before); // settle did not fire after remove
+			c.destroy();
 		});
 	});
 });

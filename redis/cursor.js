@@ -78,6 +78,16 @@ const EVENTS = Object.freeze({
  *   Defaults to the full userData.
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
  *   the expected gap between updates. Entries are refreshed on every snapshot tick.
+ * @property {(data: any) => ({ x: number, y: number } | null)} [position] - Extract a
+ *   `{x, y}` coordinate from cursor `data` for the `minMove` jitter filter. Defaults to
+ *   reading finite `data.x` / `data.y`. Return null (or throw) to opt a frame out of the
+ *   filter (it is always delivered). Only consulted when `minMove > 0`.
+ * @property {number} [minMove=0] - Minimum movement (Chebyshev distance in the units
+ *   `position` returns) from the last broadcast position before a cursor move is fanned
+ *   out. A burst of sub-threshold wobble is dropped at ingest, then a debounced settle
+ *   delivers the final resting position once movement stops. 0 (default) disables the
+ *   filter, broadcasting every accepted move. For integer-pixel data, `minMove: 1` drops
+ *   exact-repeat frames at no visual cost. Mirrors the in-memory cursor plugin's `minMove`.
  */
 
 /**
@@ -96,7 +106,7 @@ const EVENTS = Object.freeze({
  * @property {(topic: string) => Promise<CursorEntry[]>} list
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the Redis subscriber
- * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number }} stats - Scheduler health snapshot
+ * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number }} stats - Scheduler health snapshot
  */
 
 /**
@@ -116,6 +126,56 @@ export function createCursor(client, options = {}) {
 	const select = options.select || stripInternal;
 	const cursorTtl = options.ttl ?? 30;
 
+	// Read {x, y} out of the app's cursor `data` for the jitter filter. The
+	// default reads finite `data.x` / `data.y`; an app whose payload nests
+	// coordinates elsewhere overrides it. Returning null (or throwing) opts a
+	// single frame out of filtering - it is always delivered - so a
+	// coordinate-less or malformed frame is never silently dropped. Mirrors the
+	// in-memory cursor plugin's `position` option.
+	const position = typeof options.position === 'function'
+		? options.position
+		: (data) =>
+				data && typeof data.x === 'number' && typeof data.y === 'number'
+					&& Number.isFinite(data.x) && Number.isFinite(data.y)
+					? { x: data.x, y: data.y }
+					: null;
+
+	// Extract a finite {x, y} for the jitter filter. Wraps `position` with a
+	// finiteness guard so a non-finite or unextractable coordinate yields null
+	// (treated as "always deliver") rather than letting a NaN comparison
+	// silently fail open and corrupt the `lastSentPos` anchor. Only called when
+	// minMove > 0.
+	const finitePosition = (data) => {
+		let p = null;
+		try { p = position(data); } catch { p = null; }
+		if (p && (typeof p.x !== 'number' || typeof p.y !== 'number'
+			|| !Number.isFinite(p.x) || !Number.isFinite(p.y))) p = null;
+		return p;
+	};
+
+	// Jitter filter (opt-in). Drop a cursor move at ingest when it has not moved
+	// at least `minMove` (Chebyshev distance) from the LAST BROADCAST position,
+	// so a burst of sub-threshold wobble around a point is never fanned out (and
+	// never relayed across instances). The distance is in the units `position`
+	// returns and is measured against what the subscriber last actually saw (the
+	// last committed flush), so a slow drift still delivers every `minMove`
+	// units. When movement then stops, a debounced settle delivers the final
+	// resting position once - even if it is within `minMove` of the last
+	// broadcast - so a still cursor is never left stranded at a stale point; an
+	// exact repeat stays dropped because the settle sends nothing when the rest
+	// position equals the last broadcast. 0 (default) disables it. For
+	// integer-pixel cursor data, `minMove: 1` drops exact-repeat frames at no
+	// visual cost; raise to 2-4 to suppress sub-pixel wobble from high-DPI
+	// input. Off by default because the right threshold depends on the app's
+	// coordinate scale (1 board unit can be many on-screen pixels when zoomed in).
+	const minMove = options.minMove ?? 0;
+
+	// Debounce delay before the jitter filter flushes a settled cursor's final
+	// position. Tracks the per-cursor throttle cadence (the rate the app already
+	// accepts); falls back to one ~60 Hz frame when throttling is off. Only used
+	// when minMove > 0.
+	const settleMs = throttleMs > 0 ? throttleMs : 16;
+
 	if (typeof throttleMs !== 'number' || !Number.isFinite(throttleMs) || throttleMs < 0) {
 		throw new Error('redis cursor: throttle must be a non-negative number');
 	}
@@ -127,6 +187,12 @@ export function createCursor(client, options = {}) {
 	}
 	if (typeof cursorTtl !== 'number' || !Number.isFinite(cursorTtl) || cursorTtl < 1) {
 		throw new Error('redis cursor: ttl must be a positive number (seconds)');
+	}
+	if (options.position !== undefined && typeof options.position !== 'function') {
+		throw new Error('redis cursor: position must be a function');
+	}
+	if (typeof minMove !== 'number' || !Number.isFinite(minMove) || minMove < 0) {
+		throw new Error('redis cursor: minMove must be a non-negative number');
 	}
 
 	const instanceId = randomBytes(8).toString('hex');
@@ -221,7 +287,7 @@ export function createCursor(client, options = {}) {
 	 * Per-topic local cursor state. Drives the per-(ws,topic) throttle and the
 	 * post-disconnect timer cleanup. The Redis snapshot is the cross-replica
 	 * source of truth; this map is the local-replica cache.
-	 * @type {Map<string, Map<string, { user: any, data: any, lastBroadcast: number, timer: any }>>}
+	 * @type {Map<string, Map<string, { user: any, data: any, lastBroadcast: number, timer: any, lastSentPos?: { x: number, y: number }, settleTimer?: any }>>}
 	 */
 	const topics = new Map();
 
@@ -494,6 +560,10 @@ export function createCursor(client, options = {}) {
 	let driftCount = 0;
 	let driftMax = 0;
 	let flushCount = 0;
+
+	// Cursor moves dropped by the jitter filter (minMove) before they reached
+	// the flush. Always 0 when minMove is 0 (the default). Exposed via stats().
+	let jitterDropped = 0;
 
 	// Pending REMOVE keys per topic, coalesced into one wire frame per
 	// subscriber per event-loop iteration. Mass-disconnect scenarios (e.g.
@@ -904,6 +974,52 @@ export function createCursor(client, options = {}) {
 				topicMap.set(state.key, entry);
 			}
 
+			// Jitter filter: drop a sub-threshold wobble before it reaches the
+			// flush scheduler (and before any cross-instance relay). Measured
+			// against the last BROADCAST position (`lastSentPos`, set only on a
+			// real broadcast below) so repeated small moves never accumulate into
+			// a delivered jump. A dropped move stays as entry.data (so
+			// list()/snapshot() see the true position) and arms a debounced settle
+			// timer so the final resting position is delivered once movement stops
+			// - the cursor is never left stranded at a stale point. pos === null
+			// (no usable coordinate) always passes through.
+			let pos = null;
+			if (minMove > 0) {
+				// Re-arm point for the debounced settle: clear any pending timer; a
+				// drop below re-arms it, a real broadcast leaves it cleared.
+				if (entry.settleTimer) { clearTimeout(entry.settleTimer); entry.settleTimer = null; }
+				pos = finitePosition(data);
+				if (
+					pos && entry.lastSentPos &&
+					Math.max(Math.abs(pos.x - entry.lastSentPos.x), Math.abs(pos.y - entry.lastSentPos.y)) < minMove
+				) {
+					entry.data = data; // keep latest for a real move later + snapshot
+					entry.user = state.user;
+					jitterDropped++;
+					// Deliver the settled position once movement quiesces (debounced:
+					// each drop re-armed the timer above). Skipped while a trailing
+					// throttle broadcast is pending - that already sends the latest
+					// entry.data at the window end. On fire, send only if the rest
+					// position differs from the last broadcast, so an exact repeat
+					// (minMove: 1) stays dropped.
+					if (!entry.timer) {
+						const key = state.key;
+						entry.settleTimer = setTimeout(() => {
+							const e = topicMap.get(key);
+							if (!e) return;
+							e.settleTimer = null;
+							const p = finitePosition(e.data);
+							if (p && (!e.lastSentPos || p.x !== e.lastSentPos.x || p.y !== e.lastSentPos.y)) {
+								e.lastBroadcast = Date.now();
+								e.lastSentPos = p;
+								broadcast(topic, key, e.user, e.data, platform);
+							}
+						}, settleMs);
+					}
+					return;
+				}
+			}
+
 			entry.data = data;
 			entry.user = state.user;
 
@@ -913,6 +1029,11 @@ export function createCursor(client, options = {}) {
 					entry.timer = null;
 				}
 				entry.lastBroadcast = now;
+				// Anchor the jitter filter against this committed flush. The
+				// broadcast is deferred through topicThrottle, but this is the
+				// position the subscriber will next see, so the next move is
+				// measured against it. Set only on a real broadcast.
+				if (pos) entry.lastSentPos = pos;
 				broadcast(topic, state.key, state.user, data, platform);
 				return;
 			}
@@ -926,6 +1047,13 @@ export function createCursor(client, options = {}) {
 					if (e) {
 						e.lastBroadcast = Date.now();
 						e.timer = null;
+						// Record the position actually broadcast (the latest stored
+						// data, which may be newer than this call's), never a dropped
+						// one. Set only on a real broadcast.
+						if (minMove > 0) {
+							const p = finitePosition(e.data);
+							if (p) e.lastSentPos = p;
+						}
 						broadcast(topic, key, user, e.data, platform);
 					}
 				}, throttleMs - (now - entry.lastBroadcast));
@@ -944,6 +1072,7 @@ export function createCursor(client, options = {}) {
 					const entry = topicMap.get(state.key);
 					if (entry) {
 						if (entry.timer) clearTimeout(entry.timer);
+						if (entry.settleTimer) clearTimeout(entry.settleTimer);
 						const removed = await broadcastRemove(topic, state.key, platform);
 						if (!removed) return;
 						topicMap.delete(state.key);
@@ -981,6 +1110,7 @@ export function createCursor(client, options = {}) {
 				if (entry) {
 					if (entry.timer) clearTimeout(entry.timer);
 					entry.timer = null;
+					if (entry.settleTimer) { clearTimeout(entry.settleTimer); entry.settleTimer = null; }
 					removedTopics.push(t);
 				}
 			}
@@ -1089,6 +1219,7 @@ export function createCursor(client, options = {}) {
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
 					if (entry.timer) clearTimeout(entry.timer);
+					if (entry.settleTimer) clearTimeout(entry.settleTimer);
 				}
 			}
 			// Tracker-level scheduler timer + dirty-topic set.
@@ -1114,6 +1245,7 @@ export function createCursor(client, options = {}) {
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
 					if (entry.timer) clearTimeout(entry.timer);
+					if (entry.settleTimer) clearTimeout(entry.settleTimer);
 				}
 			}
 			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
@@ -1143,12 +1275,15 @@ export function createCursor(client, options = {}) {
 		 *   right now. Should hover near zero in healthy operation; growth
 		 *   means tick is falling behind.
 		 * - `activeTopicsTotal`: topics with at least one local cursor.
+		 * - `jitterDropped`: cursor moves dropped by the `minMove` jitter
+		 *   filter before they reached the flush scheduler. Always 0 when
+		 *   `minMove` is 0 (the default).
 		 *
 		 * Leading-edge synchronous flushes (first call on an idle topic)
 		 * are not counted in drift stats - they fire on the call thread,
 		 * not via the scheduler.
 		 *
-		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number }}
+		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number }}
 		 */
 		stats() {
 			return {
@@ -1156,7 +1291,8 @@ export function createCursor(client, options = {}) {
 				driftMeanMs: driftCount > 0 ? driftSum / driftCount : 0,
 				driftMaxMs: driftMax,
 				dirtyTopicsCurrent: dirtyTopics.size,
-				activeTopicsTotal: topics.size
+				activeTopicsTotal: topics.size,
+				jitterDropped
 			};
 		},
 

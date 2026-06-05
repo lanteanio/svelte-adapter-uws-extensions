@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.4",
+  "version": "0.6.0-next.5",
   "publishConfig": {
     "tag": "next"
   },
@@ -56,6 +56,10 @@
     "./redis/ratelimit": {
       "types": "./redis/ratelimit.d.ts",
       "default": "./redis/ratelimit.js"
+    },
+    "./redis/upgrade-bucket": {
+      "types": "./redis/upgrade-bucket.d.ts",
+      "default": "./redis/upgrade-bucket.js"
     },
     "./redis/groups": {
       "types": "./redis/groups.d.ts",
@@ -121,6 +125,10 @@
       "types": "./shared/admission.d.ts",
       "default": "./shared/admission.js"
     },
+    "./capability-cookie": {
+      "types": "./capability-cookie.d.ts",
+      "default": "./capability-cookie.js"
+    },
     "./bus-validate": {
       "types": "./shared/bus-validate.d.ts",
       "default": "./shared/bus-validate.js"
@@ -128,6 +136,10 @@
     "./sensitive": {
       "types": "./shared/sensitive.d.ts",
       "default": "./shared/sensitive.js"
+    },
+    "./safe-url": {
+      "types": "./shared/safe-url.d.ts",
+      "default": "./shared/safe-url.js"
     },
     "./testing": {
       "types": "./testing/index.d.ts",
@@ -140,6 +152,8 @@
     "prometheus",
     "shared",
     "testing",
+    "capability-cookie.js",
+    "capability-cookie.d.ts",
     "LICENSE",
     "README.md",
     "MIGRATION.md"
