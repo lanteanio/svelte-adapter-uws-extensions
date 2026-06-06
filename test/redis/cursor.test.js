@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
+import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
 import { createCursor, WsClosedError } from '../../redis/cursor.js';
 import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
 import { createMetrics } from '../../prometheus/index.js';
@@ -13,6 +14,10 @@ describe('redis cursor', () => {
 
 	beforeEach(() => {
 		vi.useRealTimers();
+		// The flush scheduler and throttle read time through the runtime clock;
+		// bind it to the global Date.now so the suites that drive virtual time via
+		// vi.useFakeTimers() advance the scheduler's deadlines too.
+		installFakeRuntimeClock();
 		client = mockRedisClient('test:');
 		platform = mockPlatform();
 		cursors = createCursor(client, {
@@ -24,6 +29,7 @@ describe('redis cursor', () => {
 
 	afterEach(() => {
 		cursors.destroy();
+		releaseRuntimeClock();
 	});
 
 	describe('createCursor', () => {

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.8] - 2026-06-07
+
+### Added
+
+- **`bus.wrap()` now forwards `platform.protection` (both `redis/pubsub` and `redis/sharded-pubsub`) as a live getter, so cluster-side admission code reads the same graduated-protection posture as the source platform instead of `undefined` on the wrapped seam.** In a clustered deployment the caller's `platform` reference IS the `bus.wrap()` result, so the per-IP upgrade bucket and the capability-cookie gate (both of which read `platform.protection` to tighten under load) were silently seeing `undefined` and treating every connection as elevated. The forwarder is a live getter (`get protection()`), so a posture transition on the source platform propagates immediately, and it falls back to `'normal'` on an adapter that predates the posture property, so an older-adapter install stays correct. `protection` is now part of `PLATFORM_KEYS`, so the wrap-parity test fails if either bus or the mock platform omits it.
+
+- **An injectable clock/RNG/timer runtime across the cluster backends, forwarded through `bus.wrap()` as `now` / `monotonic` / `hlc` / `random`.** Every wall-clock read, duration measurement, PRNG, UUID, and timer in the Redis and Postgres backends now routes through one swappable runtime module (its default binds the native primitives, no measurable cost), so the cluster clock/RNG/timers are controllable from a single point. `bus.wrap()` (both `redis/pubsub` and `redis/sharded-pubsub`) forwards `now` / `monotonic` / `hlc` / `random` as live getters alongside `protection`, so per-message cluster handlers read the same clock and RNG as the source platform; all are part of `PLATFORM_KEYS` and the wrap-parity test. Leader-election and lock identities now draw from the runtime RNG (an explicit `instanceId` option still wins). A dependency-free `scripts/check-determinism.js` check, wired into `pretest`, keeps raw native time/RNG/timer calls out of the routed source. Strictly additive; an existing deployment is unaffected.
+
 ## [0.6.0-next.7] - 2026-06-06
 
 ### Added

@@ -43,7 +43,15 @@
  * @module svelte-adapter-uws-extensions/redis/presence
  */
 
-import { randomBytes } from 'node:crypto';
+import {
+	randomBytes,
+	now,
+	monotonicNow,
+	setTimer,
+	clearTimer,
+	setIntervalTimer,
+	clearIntervalTimer
+} from '../shared/runtime.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { execMultiSlot } from '../shared/cluster.js';
@@ -518,7 +526,7 @@ export function createPresence(client, options = {}) {
 	function armDiffFlush(platform) {
 		diffFlushPlatform = platform;
 		if (diffFlushTimer === null) {
-			diffFlushTimer = setTimeout(flushPendingDiffs, 0);
+			diffFlushTimer = setTimer(flushPendingDiffs, 0);
 			if (diffFlushTimer.unref) diffFlushTimer.unref();
 		}
 	}
@@ -585,7 +593,7 @@ export function createPresence(client, options = {}) {
 
 	function flushPendingDiffs() {
 		if (diffFlushTimer !== null) {
-			clearTimeout(diffFlushTimer);
+			clearTimer(diffFlushTimer);
 			diffFlushTimer = null;
 		}
 		const platform = diffFlushPlatform;
@@ -740,8 +748,8 @@ export function createPresence(client, options = {}) {
 	// and clean up stale fields from crashed instances
 	/** @type {Set<string>} */
 	const activeTopics = new Set();
-	const heartbeatTimer = setInterval(() => {
-		const tickStart = Date.now();
+	const heartbeatTimer = setIntervalTimer(() => {
+		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
 		// Detect dead connections whose close handler never fired.
 		// Under mass disconnect, the runtime may drop close events.
@@ -768,7 +776,7 @@ export function createPresence(client, options = {}) {
 		}
 
 		if (b && !b.isHealthy) {
-			lastHeartbeatLatency = Date.now() - tickStart;
+			lastHeartbeatLatency = monotonicNow() - tickStart;
 			mHeartbeatLatency?.set(lastHeartbeatLatency);
 			return;
 		}
@@ -813,7 +821,7 @@ export function createPresence(client, options = {}) {
 			}
 		}
 		execMultiSlot(redis, commands).catch(() => {});
-		lastHeartbeatLatency = Date.now() - tickStart;
+		lastHeartbeatLatency = monotonicNow() - tickStart;
 		mHeartbeatLatency?.set(lastHeartbeatLatency);
 	}, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
@@ -909,7 +917,7 @@ export function createPresence(client, options = {}) {
 
 	async function subscribeToTopic(topic, platform) {
 		if (idleTimer) {
-			clearTimeout(idleTimer);
+			clearTimer(idleTimer);
 			idleTimer = null;
 		}
 		await ensureSubscriber(platform);
@@ -933,7 +941,7 @@ export function createPresence(client, options = {}) {
 		// subscriber alive.
 		if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
 			if (!idleTimer) {
-				idleTimer = setTimeout(() => {
+				idleTimer = setTimer(() => {
 					idleTimer = null;
 					if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
 						subscriber.quit().catch(() => subscriber.disconnect());
@@ -993,7 +1001,7 @@ export function createPresence(client, options = {}) {
 			// HPEXPIRE atomically). Per-user hash field for this instance is
 			// already present from the now-rolled-back join; the script's
 			// idempotent HSET refreshes its TTL.
-			const ts = Date.now();
+			const ts = now();
 			const value = JSON.stringify({ data: prevData, ts });
 			await redis.eval(
 				JOIN_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
@@ -1077,7 +1085,7 @@ export function createPresence(client, options = {}) {
 						const cached = topicData.get(key);
 						if (newest && cached && !deepEqual(newest, cached.data)) {
 							setLocalData(topicData, key, newest);
-							const ts = Date.now();
+							const ts = now();
 							try {
 								await redis.eval(
 									JOIN_SCRIPT, 2,
@@ -1199,7 +1207,7 @@ export function createPresence(client, options = {}) {
 			const topicData = localData.get(topic);
 			if (!topicData) continue;
 			setLocalData(topicData, key, newest);
-			const ts = Date.now();
+			const ts = now();
 			try {
 				await redis.eval(
 					JOIN_SCRIPT, 2,
@@ -1391,7 +1399,7 @@ export function createPresence(client, options = {}) {
 			// {data, ts} envelope per call since ts is fresh.
 
 			if (prevCount === 0) {
-				const ts = Date.now();
+				const ts = now();
 				const value = JSON.stringify({ data, ts });
 				try {
 					const wasEmpty = await redis.eval(
@@ -1429,7 +1437,7 @@ export function createPresence(client, options = {}) {
 				// topic data, and refreshes the per-user-hash TTL so this
 				// path counts as an implicit heartbeat for our entry.
 				try {
-					const ts = Date.now();
+					const ts = now();
 					const value = JSON.stringify({ data, ts });
 					await redis.eval(
 						JOIN_SCRIPT, 2,
@@ -1630,7 +1638,7 @@ export function createPresence(client, options = {}) {
 				if (b) { try { b.guard(); } catch { skip = true; } }
 				if (!skip) {
 					try {
-						const ts = Date.now();
+						const ts = now();
 						await redis.eval(
 							UPDATE_SCRIPT, 1, topicHashKey(topic),
 							key, JSON.stringify(changedDurable), ts, presenceTtlMs
@@ -1720,7 +1728,7 @@ export function createPresence(client, options = {}) {
 			syncCounts.clear();
 			pendingDiffs.clear();
 			if (diffFlushTimer !== null) {
-				clearTimeout(diffFlushTimer);
+				clearTimer(diffFlushTimer);
 				diffFlushTimer = null;
 			}
 			diffFlushPlatform = null;
@@ -1728,9 +1736,9 @@ export function createPresence(client, options = {}) {
 		},
 
 		destroy() {
-			clearInterval(heartbeatTimer);
+			clearIntervalTimer(heartbeatTimer);
 			if (idleTimer) {
-				clearTimeout(idleTimer);
+				clearTimer(idleTimer);
 				idleTimer = null;
 			}
 			if (subscriber) {
@@ -1743,7 +1751,7 @@ export function createPresence(client, options = {}) {
 			activePlatform = null;
 			pendingDiffs.clear();
 			if (diffFlushTimer !== null) {
-				clearTimeout(diffFlushTimer);
+				clearTimer(diffFlushTimer);
 				diffFlushTimer = null;
 			}
 			diffFlushPlatform = null;

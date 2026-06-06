@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.7",
+  "version": "0.6.0-next.8",
   "publishConfig": {
     "tag": "next"
   },
@@ -159,7 +159,7 @@
     "MIGRATION.md"
   ],
   "scripts": {
-    "check": "node scripts/check-types.js",
+    "check": "node scripts/check-types.js && node scripts/check-determinism.js",
     "pretest": "npm run check",
     "test": "vitest run",
     "test:watch": "vitest",

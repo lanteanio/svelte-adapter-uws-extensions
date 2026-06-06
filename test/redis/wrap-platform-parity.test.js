@@ -98,6 +98,106 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(wrapped.closedWsAborts).toBe(7);
 	});
 
+	it('pubsub wrap forwards protection as a live getter', () => {
+		// The adapter exposes a protection posture ('normal' | 'elevated' |
+		// 'siege') that cluster-side admission code reads off the platform.
+		// In a cluster the caller's platform reference IS the wrap result, so
+		// the wrap must surface the live posture or admission reads a stale
+		// value. Default 'normal'; a transition after wrap must propagate.
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.protection).toBe('normal');
+
+		platform.protection = 'siege';
+		expect(wrapped.protection).toBe('siege');
+	});
+
+	it('sharded wrap forwards protection as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.protection).toBe('normal');
+
+		platform.protection = 'elevated';
+		expect(wrapped.protection).toBe('elevated');
+	});
+
+	it('pubsub wrap forwards now / monotonic / random as live getters', () => {
+		// The adapter projects its injectable clock and RNG onto the Platform
+		// (`now` / `monotonic` functions, `random` object) from the runtime
+		// module. Cluster-side per-message handlers read these off the wrapped
+		// seam, so the wrap must surface them live or a seeded harness clock /
+		// RNG never reaches the cluster handlers. Same live-getter contract the
+		// protection forwarder uses: a post-wrap reassignment must propagate.
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.now).toBe(platform.now);
+		expect(wrapped.monotonic).toBe(platform.monotonic);
+		expect(wrapped.random).toBe(platform.random);
+
+		const seededNow = () => 1234;
+		const seededMonotonic = () => 5678;
+		const seededRandom = { float: () => 0.5, u32: () => 7, uuid: () => 'seed', bytes: (n) => Buffer.alloc(n) };
+		platform.now = seededNow;
+		platform.monotonic = seededMonotonic;
+		platform.random = seededRandom;
+		expect(wrapped.now).toBe(seededNow);
+		expect(wrapped.now()).toBe(1234);
+		expect(wrapped.monotonic).toBe(seededMonotonic);
+		expect(wrapped.monotonic()).toBe(5678);
+		expect(wrapped.random).toBe(seededRandom);
+		expect(wrapped.random.u32()).toBe(7);
+	});
+
+	it('sharded wrap forwards now / monotonic / random as live getters', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.now).toBe(platform.now);
+		expect(wrapped.monotonic).toBe(platform.monotonic);
+		expect(wrapped.random).toBe(platform.random);
+
+		const seededNow = () => 4321;
+		const seededMonotonic = () => 8765;
+		const seededRandom = { float: () => 0.25, u32: () => 9, uuid: () => 'seed', bytes: (n) => Buffer.alloc(n) };
+		platform.now = seededNow;
+		platform.monotonic = seededMonotonic;
+		platform.random = seededRandom;
+		expect(wrapped.now).toBe(seededNow);
+		expect(wrapped.now()).toBe(4321);
+		expect(wrapped.monotonic).toBe(seededMonotonic);
+		expect(wrapped.monotonic()).toBe(8765);
+		expect(wrapped.random).toBe(seededRandom);
+		expect(wrapped.random.u32()).toBe(9);
+	});
+
+	it('pubsub wrap forwards hlc as a live getter', () => {
+		// The adapter projects a hybrid logical clock onto the Platform. A
+		// cluster-side handler that causally stamps an event reads `hlc` off
+		// the wrapped platform, so a missing forwarder leaves cluster stamps
+		// reading `undefined`. Same live-getter contract as now / monotonic:
+		// a post-wrap reassignment must propagate by reference.
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(typeof wrapped.hlc).toBe('function');
+		expect(wrapped.hlc).toBe(platform.hlc);
+
+		const seededHlc = () => ({ wall: 1717, logical: 3, nodeId: 'seed' });
+		platform.hlc = seededHlc;
+		expect(wrapped.hlc).toBe(seededHlc);
+		expect(wrapped.hlc()).toEqual({ wall: 1717, logical: 3, nodeId: 'seed' });
+	});
+
+	it('sharded wrap forwards hlc as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(typeof wrapped.hlc).toBe('function');
+		expect(wrapped.hlc).toBe(platform.hlc);
+
+		const seededHlc = () => ({ wall: 4321, logical: 9, nodeId: 'seed' });
+		platform.hlc = seededHlc;
+		expect(wrapped.hlc).toBe(seededHlc);
+		expect(wrapped.hlc()).toEqual({ wall: 4321, logical: 9, nodeId: 'seed' });
+	});
+
 	it('pubsub wrap delegates forEachSubscriber to the underlying platform', () => {
 		const platform = mockPlatform();
 		const walked = [];

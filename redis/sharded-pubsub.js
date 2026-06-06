@@ -22,7 +22,7 @@
  * @module svelte-adapter-uws-extensions/redis/sharded-pubsub
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, setTimer, clearTimer } from '../shared/runtime.js';
 import { parseRedisVersion } from '../shared/redis-version.js';
 import { assert } from '../shared/assert.js';
 import {
@@ -176,7 +176,7 @@ export function createShardedBus(client, options = {}) {
 			);
 		}
 		if (relayTimer === null) {
-			relayTimer = setTimeout(flushRelay, 0);
+			relayTimer = setTimer(flushRelay, 0);
 			if (relayTimer.unref) relayTimer.unref();
 		}
 	}
@@ -185,7 +185,7 @@ export function createShardedBus(client, options = {}) {
 		const batches = channelBatches;
 		channelBatches = new Map();
 		if (relayTimer !== null) {
-			clearTimeout(relayTimer);
+			clearTimer(relayTimer);
 			relayTimer = null;
 		}
 		if (b) {
@@ -325,13 +325,13 @@ export function createShardedBus(client, options = {}) {
 	function withSubTimeout(promise, label) {
 		let timer;
 		const timeout = new Promise((_, reject) => {
-			timer = setTimeout(
+			timer = setTimer(
 				() => reject(new Error('sharded bus: ' + label + ' timed out (stale slot owner)')),
 				SHARD_SUBSCRIBE_TIMEOUT_MS
 			);
 			if (timer.unref) timer.unref();
 		});
-		return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+		return Promise.race([promise, timeout]).finally(() => clearTimer(timer));
 	}
 
 	// Subscribe one channel on the master that currently owns its slot, recording
@@ -392,7 +392,7 @@ export function createShardedBus(client, options = {}) {
 
 	function scheduleReconcile() {
 		if (reconcileTimer !== null) return;
-		reconcileTimer = setTimeout(() => {
+		reconcileTimer = setTimer(() => {
 			reconcileTimer = null;
 			subReconcile().catch((err) => console.error('sharded bus reconcile failed:', err.message));
 		}, 0);
@@ -440,7 +440,7 @@ export function createShardedBus(client, options = {}) {
 
 	async function subClose() {
 		if (reconcileTimer !== null) {
-			clearTimeout(reconcileTimer);
+			clearTimer(reconcileTimer);
 			reconcileTimer = null;
 		}
 		const all = isCluster(client.redis)
@@ -489,7 +489,7 @@ export function createShardedBus(client, options = {}) {
 		await subClose();
 		channelBatches = new Map();
 		if (relayTimer !== null) {
-			clearTimeout(relayTimer);
+			clearTimer(relayTimer);
 			relayTimer = null;
 		}
 		followCounts.clear();
@@ -754,6 +754,27 @@ export function createShardedBus(client, options = {}) {
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
 				get pressure() { return platform.pressure; },
+				// Forward the live protection posture through the wrapped seam so
+				// cluster-side admission code (per-IP upgrade buckets, capability
+				// cookies) reads the same level as the source platform. Live getter:
+				// a posture transition after wrap propagates. The `?? 'normal'`
+				// fallback degrades gracefully when the underlying platform predates
+				// the posture property, mirroring the closedWsAborts `?? 0` guard.
+				get protection() { return platform.protection ?? 'normal'; },
+				// Forward the injectable clock and RNG the adapter projects onto its
+				// Platform from the runtime module. Cluster-side per-message handlers
+				// read these off the wrapped seam (the caller's reference IS the wrap
+				// result), so a seeded harness clock / RNG must propagate through.
+				// Forward the reference - the projected `now` / `monotonic` functions
+				// and the `random` object - rather than rebinding, so a wrapped
+				// platform exposes the same source the adapter installed.
+				get now() { return platform.now; },
+				get monotonic() { return platform.monotonic; },
+				get random() { return platform.random; },
+				// Forward the hybrid logical clock the adapter projects onto its
+				// Platform. Cluster-side handlers that causally stamp an event read
+				// it off the wrapped platform, so the reference must propagate live.
+				get hlc() { return platform.hlc; },
 				onPressure: platform.onPressure.bind(platform),
 				onPublishRate: platform.onPublishRate.bind(platform),
 				subscribers: platform.subscribers.bind(platform),

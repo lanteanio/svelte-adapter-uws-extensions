@@ -17,9 +17,16 @@
  * @module svelte-adapter-uws-extensions/redis/lock
  */
 
-import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
-import { monotonicNow } from '../shared/time.js';
+import {
+	randomBytes,
+	randomFloat,
+	monotonicNow,
+	setTimer,
+	clearTimer,
+	setIntervalTimer,
+	clearIntervalTimer
+} from '../shared/runtime.js';
 import {
 	LEASE_RENEW_SCRIPT as HEARTBEAT_SCRIPT,
 	LEASE_RELEASE_SCRIPT as RELEASE_SCRIPT
@@ -168,11 +175,11 @@ export function createDistributedLock(client, options = {}) {
 			}
 			// Jittered backoff: spread N contending callers across the retry
 			// window so a single key-handoff does not produce an N-way SET-NX
-			// burst on the Redis socket. Math.random is the right primitive
+			// burst on the Redis socket. A uniform float is the right primitive
 			// (thundering-herd avoidance, not security-relevant). +/-25% of
 			// retryDelayMs preserves the expected wait while smearing actual
 			// delays over [0.75x, 1.25x] of the configured base.
-			const jitter = (Math.random() - 0.5) * 0.5 * retryDelayMs;
+			const jitter = (randomFloat() - 0.5) * 0.5 * retryDelayMs;
 			const delay = Math.max(0, Math.min(retryDelayMs + jitter, callMaxWaitMs - elapsed));
 			await sleepWithAbort(delay, externalSignal);
 		}
@@ -212,7 +219,7 @@ export function createDistributedLock(client, options = {}) {
 				// observe the absent key and abort cleanly.
 			}
 		}
-		const heartbeatTimer = setInterval(() => {
+		const heartbeatTimer = setIntervalTimer(() => {
 			inFlight = inFlight.then(heartbeatTick).catch(() => {});
 		}, heartbeatMs);
 		if (heartbeatTimer.unref) heartbeatTimer.unref();
@@ -220,7 +227,7 @@ export function createDistributedLock(client, options = {}) {
 		try {
 			return await fn(controller.signal);
 		} finally {
-			clearInterval(heartbeatTimer);
+			clearIntervalTimer(heartbeatTimer);
 			if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
 			// `lost === true` is set only inside the heartbeat callback,
 			// which then calls controller.abort(...). The signal must
@@ -252,18 +259,18 @@ export function createDistributedLock(client, options = {}) {
 function sleepWithAbort(ms, signal) {
 	if (ms <= 0) return Promise.resolve();
 	return new Promise((resolve, reject) => {
-		const t = setTimeout(() => {
+		const t = setTimer(() => {
 			if (signal) signal.removeEventListener('abort', onAbort);
 			resolve();
 		}, ms);
 		if (t.unref) t.unref();
 		const onAbort = () => {
-			clearTimeout(t);
+			clearTimer(t);
 			reject(signal.reason || new Error('lock: aborted while waiting'));
 		};
 		if (signal) {
 			if (signal.aborted) {
-				clearTimeout(t);
+				clearTimer(t);
 				reject(signal.reason || new Error('lock: aborted while waiting'));
 				return;
 			}

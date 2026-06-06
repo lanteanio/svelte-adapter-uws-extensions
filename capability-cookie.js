@@ -23,7 +23,8 @@
  * @module svelte-adapter-uws-extensions/capability-cookie
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { randomBytes, now } from './shared/runtime.js';
 
 /** Default cookie name. */
 const DEFAULT_COOKIE_NAME = 'sauws_cap';
@@ -251,7 +252,7 @@ export function capabilityCookie(options) {
 
 		// Expiry is independent of the secret: an expired cookie is invalid even
 		// under the current secret.
-		if (Date.now() - issuedAt > ttlMs) return null;
+		if (now() - issuedAt > ttlMs) return null;
 
 		const expectCurrent = sign(secret, sessionId, issuedAt, salt);
 		if (safeEqual(expectCurrent, presentedSig)) {
@@ -280,7 +281,7 @@ export function capabilityCookie(options) {
 	return {
 		issue(event, response) {
 			const sessionId = sessionIdFor(event);
-			appendSetCookie(response, serializeCookie(encode(sessionId, Date.now())));
+			appendSetCookie(response, serializeCookie(encode(sessionId, now())));
 		},
 
 		refresh(event, response) {
@@ -294,7 +295,7 @@ export function capabilityCookie(options) {
 			const presented = readCookie(header, cookieName);
 			const decoded = presented ? decode(presented) : null;
 			const sessionId = decoded ? decoded.sessionId : sessionIdFor(event);
-			appendSetCookie(response, serializeCookie(encode(sessionId, Date.now())));
+			appendSetCookie(response, serializeCookie(encode(sessionId, now())));
 		},
 
 		verify(cookieHeader, opts) {

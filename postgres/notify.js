@@ -12,6 +12,7 @@
  */
 
 import { createBusValidator } from '../shared/bus-validate.js';
+import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 
 /**
  * @typedef {Object} NotifyBridgeOptions
@@ -293,13 +294,13 @@ export function createNotifyBridge(client, options) {
 
 	function startPolling() {
 		if (pollTimer) return;
-		pollTimer = setInterval(() => { advisoryTick().catch(() => {}); }, pollInterval);
+		pollTimer = setIntervalTimer(() => { advisoryTick().catch(() => {}); }, pollInterval);
 		if (pollTimer.unref) pollTimer.unref();
 	}
 
 	function stopPolling() {
 		if (pollTimer) {
-			clearInterval(pollTimer);
+			clearIntervalTimer(pollTimer);
 			pollTimer = null;
 		}
 	}
@@ -307,7 +308,7 @@ export function createNotifyBridge(client, options) {
 	function scheduleReconnect() {
 		if (reconnectTimer) return;
 		mReconnects?.inc();
-		reconnectTimer = setTimeout(async () => {
+		reconnectTimer = setTimer(async () => {
 			reconnectTimer = null;
 			if (!active) return;
 			try {
@@ -362,7 +363,7 @@ export function createNotifyBridge(client, options) {
 			active = false;
 			activePlatform = null;
 			if (reconnectTimer) {
-				clearTimeout(reconnectTimer);
+				clearTimer(reconnectTimer);
 				reconnectTimer = null;
 			}
 			stopPolling();

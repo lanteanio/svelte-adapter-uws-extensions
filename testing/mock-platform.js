@@ -13,11 +13,12 @@ export const PLATFORM_KEYS = Object.freeze([
 	'send', 'sendTo', 'sendCoalesced',
 	'request',
 	'connections', 'requestId',
-	'pressure', 'onPressure', 'onPublishRate',
+	'pressure', 'protection', 'onPressure', 'onPublishRate',
 	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
 	'topic', 'topicEpoch',
 	'maxPayloadLength', 'bufferedAmount',
-	'closedWsAborts'
+	'closedWsAborts',
+	'now', 'monotonic', 'random', 'hlc'
 ]);
 
 /**
@@ -61,6 +62,11 @@ export function mockPlatform() {
 			memoryMB: 0,
 			reason: 'NONE'
 		},
+		// Mirrors the adapter's resolved protection posture default. A plain
+		// reassignable field (not a getter) - tests set p.protection directly
+		// to drive 'normal' -> 'elevated' -> 'siege' transitions and assert the
+		// wrap forwards the live value, the same pattern closedWsAborts uses.
+		protection: 'normal',
 		onPressure(cb) {
 			pressureSubscribers.add(cb);
 			return () => pressureSubscribers.delete(cb);
@@ -89,6 +95,26 @@ export function mockPlatform() {
 		// worker and keeps the parity-test surface symmetric with the
 		// adapter's real platform shape.
 		closedWsAborts: 0,
+		// Clock and RNG the adapter projects onto its Platform from the
+		// injectable runtime module, forwarded by the bus wraps so a wrapped
+		// platform exposes the same seedable source. `now` / `monotonic` are
+		// functions; `random` is the `{float, u32, uuid, bytes}` object. Plain
+		// reassignable fields - a harness swaps these to drive a seeded clock /
+		// RNG through the wrap and assert the forward stays live.
+		now: () => Date.now(),
+		monotonic: () => Date.now(),
+		random: {
+			float: () => Math.random(),
+			u32: () => (Math.random() * 0x100000000) >>> 0,
+			uuid: () => '00000000-0000-0000-0000-000000000000',
+			bytes: (n) => Buffer.alloc(n)
+		},
+		// Mirrors the adapter's projected hybrid logical clock. A plain
+		// reassignable function (not a getter) so a harness can swap in a
+		// seeded stamp and assert the bus wrap forwards the live reference,
+		// the same pattern now / monotonic / random use. Default returns a
+		// fixed stamp shape so the parity surface stays populated.
+		hlc: () => ({ wall: 0, logical: 0, nodeId: 'mock' }),
 		publish(topic, event, data, options) {
 			p.published.push({ topic, event, data, options });
 			return true;

@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { capabilityCookie } from '../capability-cookie.js';
+import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
 
 const COOKIE_NAME = 'sauws_cap';
 
@@ -40,6 +41,13 @@ function cookieValueFrom(setCookie) {
 describe('capabilityCookie', () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
+		// issue/verify read wall time through the runtime clock; bind it to the
+		// global Date.now so the expiry test's vi.spyOn(Date, 'now') drives it.
+		installFakeRuntimeClock();
+	});
+
+	afterEach(() => {
+		releaseRuntimeClock();
 	});
 
 	describe('construction validation', () => {

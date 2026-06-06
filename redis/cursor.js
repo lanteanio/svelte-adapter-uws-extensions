@@ -34,7 +34,15 @@
  * @module svelte-adapter-uws-extensions/redis/cursor
  */
 
-import { randomBytes } from 'node:crypto';
+import {
+	randomBytes,
+	now,
+	monotonicNow,
+	setTimer,
+	clearTimer,
+	setIntervalTimer,
+	clearIntervalTimer
+} from '../shared/runtime.js';
 import { CLEANUP_SCRIPT } from '../shared/scripts.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink } from '../shared/redis-scan.js';
@@ -477,7 +485,7 @@ export function createCursor(client, options = {}) {
 				results = await execMultiSlot(redis, commands);
 			} catch { return; }
 			if (!activePlatform) return;
-			const now = Date.now();
+			const nowTs = now();
 			for (let i = 0; i < topicList.length; i++) {
 				const [, all] = results[i];
 				if (!all) continue;
@@ -488,7 +496,7 @@ export function createCursor(client, options = {}) {
 					if (key.startsWith(instanceId + ':')) continue;
 					try {
 						const parsed = JSON.parse(all[key]);
-						if (parsed.ts && (now - parsed.ts) <= cursorTtlMs) {
+						if (parsed.ts && (nowTs - parsed.ts) <= cursorTtlMs) {
 							catalogEntries.push({ key, user: parsed.user });
 							positionEntries.push({ key, data: parsed.data });
 						}
@@ -520,10 +528,10 @@ export function createCursor(client, options = {}) {
 
 	function startCleanupTimer() {
 		if (cleanupTimer) return;
-		cleanupTimer = setInterval(() => {
-			const now = Date.now();
+		cleanupTimer = setIntervalTimer(() => {
+			const nowTs = now();
 			for (const topic of activeTopics) {
-				redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), now, cursorTtlMs).catch((err) => {
+				redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), nowTs, cursorTtlMs).catch((err) => {
 					console.warn('cursor cleanup: stale removal failed for topic "' + topic + '":', err.message);
 				});
 			}
@@ -533,18 +541,18 @@ export function createCursor(client, options = {}) {
 
 	function stopCleanupTimer() {
 		if (cleanupTimer && activeTopics.size === 0) {
-			clearInterval(cleanupTimer);
+			clearIntervalTimer(cleanupTimer);
 			cleanupTimer = null;
 		}
 		if (snapshotTimer && activeTopics.size === 0) {
-			clearInterval(snapshotTimer);
+			clearIntervalTimer(snapshotTimer);
 			snapshotTimer = null;
 		}
 	}
 
 	function startSnapshotTimer() {
 		if (snapshotTimer || snapshotIntervalMs === 0) return;
-		snapshotTimer = setInterval(flushSnapshot, snapshotIntervalMs);
+		snapshotTimer = setIntervalTimer(flushSnapshot, snapshotIntervalMs);
 		if (snapshotTimer.unref) snapshotTimer.unref();
 	}
 
@@ -573,7 +581,7 @@ export function createCursor(client, options = {}) {
 		if (snapshotIntervalMs === 0) {
 			if (b) { try { b.guard(); } catch { return; } }
 			const pipe = redis.pipeline();
-			pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: Date.now() }));
+			pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: now() }));
 			pipe.expire(hashKey(topic), cursorTtl);
 			pipe.exec().then(() => b?.success()).catch((err) => b?.failure(err));
 			return;
@@ -583,7 +591,7 @@ export function createCursor(client, options = {}) {
 			topicPending = new Map();
 			redisPending.set(topic, topicPending);
 		}
-		topicPending.set(key, { user, data, ts: Date.now() });
+		topicPending.set(key, { user, data, ts: now() });
 	}
 
 	function hashKey(topic) {
@@ -625,9 +633,9 @@ export function createCursor(client, options = {}) {
 	 * - `lastFlush`: target-anchored timestamp of the most recent flush.
 	 *   Advanced by `topicThrottleMs` per cycle (not to actual fire time) so
 	 *   a single late tick does not compound drift on subsequent cycles.
-	 *   Initialized to `Date.now() - topicThrottleMs` so the first broadcast
+	 *   Initialized to `monotonicNow() - topicThrottleMs` so the first broadcast
 	 *   on a new topic is "cycle ready" without polluting drift stats with
-	 *   the full `Date.now()` lateness an init of 0 would imply.
+	 *   the full `monotonicNow()` lateness an init of 0 would imply.
 	 *
 	 * @type {Map<string, { dirty: Map<string, { user: any, data: any, platform: any }>, inboundDirty: Map<string, { data: any, platform: any }>, lastFlush: number }>}
 	 */
@@ -799,7 +807,7 @@ export function createCursor(client, options = {}) {
 		set.add(key);
 		removeFlushPlatform = platform;
 		if (removeFlushTimer === null) {
-			removeFlushTimer = setTimeout(flushPendingRemoves, 0);
+			removeFlushTimer = setTimer(flushPendingRemoves, 0);
 			if (removeFlushTimer.unref) removeFlushTimer.unref();
 		}
 	}
@@ -1109,7 +1117,7 @@ export function createCursor(client, options = {}) {
 	 */
 	function tick() {
 		tickTimer = null;
-		const now = Date.now();
+		const nowTs = monotonicNow();
 		let nextDeadline = Infinity;
 
 		for (const topic of dirtyTopics) {
@@ -1120,8 +1128,8 @@ export function createCursor(client, options = {}) {
 				continue;
 			}
 			const deadline = state.lastFlush + topicThrottleMs;
-			if (deadline <= now) {
-				const drift = now - deadline;
+			if (deadline <= nowTs) {
+				const drift = nowTs - deadline;
 				driftSum += drift;
 				driftCount++;
 				if (drift > driftMax) driftMax = drift;
@@ -1130,25 +1138,25 @@ export function createCursor(client, options = {}) {
 				dirtyTopics.delete(topic);
 
 				// Target-anchored: advance lastFlush by the cadence amount.
-				// Multi-cycle backlog collapse to `now` so the next
-				// broadcast's `Date.now() - lastFlush >= topicThrottleMs`
+				// Multi-cycle backlog collapse to `nowTs` so the next
+				// broadcast's `monotonicNow() - lastFlush >= topicThrottleMs`
 				// delay computation does not fire every queued cycle on
 				// this turn.
-				state.lastFlush = drift < topicThrottleMs ? deadline : now;
+				state.lastFlush = drift < topicThrottleMs ? deadline : nowTs;
 			} else if (deadline < nextDeadline) {
 				nextDeadline = deadline;
 			}
 		}
 
 		if (nextDeadline !== Infinity) {
-			tickTimer = setTimeout(tick, Math.max(0, nextDeadline - Date.now()));
+			tickTimer = setTimer(tick, Math.max(0, nextDeadline - monotonicNow()));
 		}
 		// else: scheduler goes idle until next broadcast() / enqueueInbound().
 	}
 
 	function armTick(delay) {
 		if (tickTimer !== null) return;
-		tickTimer = setTimeout(tick, delay);
+		tickTimer = setTimer(tick, delay);
 	}
 
 	/**
@@ -1199,7 +1207,7 @@ export function createCursor(client, options = {}) {
 			// is treated as "cycle ready" with zero drift on the very first
 			// tick. Without this, `Date.now() - 0` would be a huge "lateness"
 			// that pollutes the drift stats forever.
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: Date.now() - topicThrottleMs };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: monotonicNow() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
 		state.dirty.set(key, { user, data, platform });
@@ -1212,7 +1220,7 @@ export function createCursor(client, options = {}) {
 			return;
 		}
 
-		const elapsed = Date.now() - state.lastFlush;
+		const elapsed = monotonicNow() - state.lastFlush;
 		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
 		armTick(delay);
 	}
@@ -1247,7 +1255,7 @@ export function createCursor(client, options = {}) {
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: Date.now() - topicThrottleMs };
+			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: monotonicNow() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
 		state.inboundDirty.set(key, { data, platform });
@@ -1266,7 +1274,7 @@ export function createCursor(client, options = {}) {
 		// the same `state` and the same tracker-wide tick timer, so a local
 		// broadcast and a peer-relayed inbound landing in the same loop
 		// iteration ship together as one combined frame at the next tick.
-		const elapsed = Date.now() - state.lastFlush;
+		const elapsed = monotonicNow() - state.lastFlush;
 		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
 		armTick(delay);
 	}
@@ -1361,7 +1369,7 @@ export function createCursor(client, options = {}) {
 			}
 
 			let entry = topicMap.get(state.key);
-			const now = Date.now();
+			const nowTs = monotonicNow();
 
 			if (!entry) {
 				entry = { user: state.user, data, lastBroadcast: 0, timer: null };
@@ -1381,7 +1389,7 @@ export function createCursor(client, options = {}) {
 			if (minMove > 0) {
 				// Re-arm point for the debounced settle: clear any pending timer; a
 				// drop below re-arms it, a real broadcast leaves it cleared.
-				if (entry.settleTimer) { clearTimeout(entry.settleTimer); entry.settleTimer = null; }
+				if (entry.settleTimer) { clearTimer(entry.settleTimer); entry.settleTimer = null; }
 				pos = finitePosition(data);
 				if (
 					pos && entry.lastSentPos &&
@@ -1398,13 +1406,13 @@ export function createCursor(client, options = {}) {
 					// (minMove: 1) stays dropped.
 					if (!entry.timer) {
 						const key = state.key;
-						entry.settleTimer = setTimeout(() => {
+						entry.settleTimer = setTimer(() => {
 							const e = topicMap.get(key);
 							if (!e) return;
 							e.settleTimer = null;
 							const p = finitePosition(e.data);
 							if (p && (!e.lastSentPos || p.x !== e.lastSentPos.x || p.y !== e.lastSentPos.y)) {
-								e.lastBroadcast = Date.now();
+								e.lastBroadcast = monotonicNow();
 								e.lastSentPos = p;
 								broadcast(topic, key, e.user, e.data, platform);
 							}
@@ -1417,12 +1425,12 @@ export function createCursor(client, options = {}) {
 			entry.data = data;
 			entry.user = state.user;
 
-			if (now - entry.lastBroadcast >= throttleMs) {
+			if (nowTs - entry.lastBroadcast >= throttleMs) {
 				if (entry.timer) {
-					clearTimeout(entry.timer);
+					clearTimer(entry.timer);
 					entry.timer = null;
 				}
-				entry.lastBroadcast = now;
+				entry.lastBroadcast = nowTs;
 				// Anchor the jitter filter against this committed flush. The
 				// broadcast is deferred through topicThrottle, but this is the
 				// position the subscriber will next see, so the next move is
@@ -1436,10 +1444,10 @@ export function createCursor(client, options = {}) {
 			if (!entry.timer) {
 				const key = state.key;
 				const user = state.user;
-				entry.timer = setTimeout(() => {
+				entry.timer = setTimer(() => {
 					const e = topicMap.get(key);
 					if (e) {
-						e.lastBroadcast = Date.now();
+						e.lastBroadcast = monotonicNow();
 						e.timer = null;
 						// Record the position actually broadcast (the latest stored
 						// data, which may be newer than this call's), never a dropped
@@ -1450,7 +1458,7 @@ export function createCursor(client, options = {}) {
 						}
 						broadcast(topic, key, user, e.data, platform);
 					}
-				}, throttleMs - (now - entry.lastBroadcast));
+				}, throttleMs - (nowTs - entry.lastBroadcast));
 			}
 		},
 
@@ -1482,8 +1490,8 @@ export function createCursor(client, options = {}) {
 				if (topicMap) {
 					const entry = topicMap.get(state.key);
 					if (entry) {
-						if (entry.timer) clearTimeout(entry.timer);
-						if (entry.settleTimer) clearTimeout(entry.settleTimer);
+						if (entry.timer) clearTimer(entry.timer);
+						if (entry.settleTimer) clearTimer(entry.settleTimer);
 						const removed = await broadcastRemove(topic, state.key, platform);
 						if (!removed) return;
 						topicMap.delete(state.key);
@@ -1519,9 +1527,9 @@ export function createCursor(client, options = {}) {
 				if (!topicMap) continue;
 				const entry = topicMap.get(state.key);
 				if (entry) {
-					if (entry.timer) clearTimeout(entry.timer);
+					if (entry.timer) clearTimer(entry.timer);
 					entry.timer = null;
-					if (entry.settleTimer) { clearTimeout(entry.settleTimer); entry.settleTimer = null; }
+					if (entry.settleTimer) { clearTimer(entry.settleTimer); entry.settleTimer = null; }
 					removedTopics.push(t);
 				}
 			}
@@ -1639,12 +1647,12 @@ export function createCursor(client, options = {}) {
 				throw err;
 			}
 			const result = [];
-			const now = Date.now();
+			const nowTs = now();
 			const ttlMs = cursorTtl * 1000;
 			for (const key of Object.keys(all)) {
 				try {
 					const parsed = JSON.parse(all[key]);
-					if (!parsed.ts || (now - parsed.ts) > ttlMs) continue;
+					if (!parsed.ts || (nowTs - parsed.ts) > ttlMs) continue;
 					result.push({ key, user: parsed.user, data: parsed.data });
 				} catch { /* corrupted entry */ }
 			}
@@ -1656,7 +1664,7 @@ export function createCursor(client, options = {}) {
 				const seen = new Set(result.map((r) => r.key));
 				for (const [key, entry] of topicPending) {
 					if (seen.has(key)) continue;
-					if (!entry.ts || (now - entry.ts) > ttlMs) continue;
+					if (!entry.ts || (nowTs - entry.ts) > ttlMs) continue;
 					result.push({ key, user: entry.user, data: entry.data });
 				}
 			}
@@ -1675,13 +1683,13 @@ export function createCursor(client, options = {}) {
 
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
-					if (entry.timer) clearTimeout(entry.timer);
-					if (entry.settleTimer) clearTimeout(entry.settleTimer);
+					if (entry.timer) clearTimer(entry.timer);
+					if (entry.settleTimer) clearTimer(entry.settleTimer);
 				}
 			}
 			// Tracker-level scheduler timer + dirty-topic set.
-			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
-			if (removeFlushTimer !== null) { clearTimeout(removeFlushTimer); removeFlushTimer = null; }
+			if (tickTimer !== null) { clearTimer(tickTimer); tickTimer = null; }
+			if (removeFlushTimer !== null) { clearTimer(removeFlushTimer); removeFlushTimer = null; }
 			removeFlushPlatform = null;
 			pendingRemoves.clear();
 			dirtyTopics.clear();
@@ -1707,18 +1715,18 @@ export function createCursor(client, options = {}) {
 		},
 
 		destroy() {
-			if (cleanupTimer) clearInterval(cleanupTimer);
+			if (cleanupTimer) clearIntervalTimer(cleanupTimer);
 			cleanupTimer = null;
-			if (snapshotTimer) clearInterval(snapshotTimer);
+			if (snapshotTimer) clearIntervalTimer(snapshotTimer);
 			snapshotTimer = null;
 			for (const [, topicMap] of topics) {
 				for (const [, entry] of topicMap) {
-					if (entry.timer) clearTimeout(entry.timer);
-					if (entry.settleTimer) clearTimeout(entry.settleTimer);
+					if (entry.timer) clearTimer(entry.timer);
+					if (entry.settleTimer) clearTimer(entry.settleTimer);
 				}
 			}
-			if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
-			if (removeFlushTimer !== null) { clearTimeout(removeFlushTimer); removeFlushTimer = null; }
+			if (tickTimer !== null) { clearTimer(tickTimer); tickTimer = null; }
+			if (removeFlushTimer !== null) { clearTimer(removeFlushTimer); removeFlushTimer = null; }
 			removeFlushPlatform = null;
 			pendingRemoves.clear();
 			dirtyTopics.clear();

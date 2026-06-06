@@ -26,8 +26,8 @@
  * @module svelte-adapter-uws-extensions/redis/publish-rate
  */
 
-import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
+import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { MAX_AGGREGATOR_REMOTE_INSTANCES } from '../shared/caps.js';
 
 /**
@@ -121,12 +121,12 @@ export function createPublishRateAggregator(client, options = {}) {
 	}
 
 	function pruneStale() {
-		const now = Date.now();
+		const nowTs = now();
 		for (const [id, entry] of remoteSlices) {
-			if (now - entry.ts > staleAfter) remoteSlices.delete(id);
+			if (nowTs - entry.ts > staleAfter) remoteSlices.delete(id);
 		}
 		for (const [id, entry] of remoteSubs) {
-			if (now - entry.ts > staleAfter) remoteSubs.delete(id);
+			if (nowTs - entry.ts > staleAfter) remoteSubs.delete(id);
 		}
 	}
 
@@ -159,8 +159,8 @@ export function createPublishRateAggregator(client, options = {}) {
 		const slice = snapshotLocalSlice();
 		const subs = snapshotLocalSubjects();
 		const payload = subs === null
-			? { instanceId, ts: Date.now(), slice }
-			: { instanceId, ts: Date.now(), slice, subs };
+			? { instanceId, ts: now(), slice }
+			: { instanceId, ts: now(), slice, subs };
 		const envelope = JSON.stringify(payload);
 		try {
 			await redis.publish(channel, envelope);
@@ -200,7 +200,7 @@ export function createPublishRateAggregator(client, options = {}) {
 				'publish-rate.echo-suppression',
 				{ instanceId: env.instanceId }
 			);
-			const ts = typeof env.ts === 'number' ? env.ts : Date.now();
+			const ts = typeof env.ts === 'number' ? env.ts : now();
 			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
 			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteInstancesWarnFired) {
 				remoteInstancesWarnFired = true;
@@ -227,14 +227,14 @@ export function createPublishRateAggregator(client, options = {}) {
 
 		// First broadcast on the next tick (so subscribers in this same
 		// process can't race against an in-flight subscribe).
-		publishTimer = setInterval(broadcastSlice, publishInterval);
+		publishTimer = setIntervalTimer(broadcastSlice, publishInterval);
 		if (publishTimer.unref) publishTimer.unref();
 	}
 
 	async function deactivate() {
 		activated = false;
 		if (publishTimer) {
-			clearInterval(publishTimer);
+			clearIntervalTimer(publishTimer);
 			publishTimer = null;
 		}
 		if (subscriber) {

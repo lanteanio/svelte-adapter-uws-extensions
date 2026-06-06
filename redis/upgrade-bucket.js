@@ -27,6 +27,7 @@
 
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
 import { withBreaker } from '../shared/breaker.js';
+import { now } from '../shared/runtime.js';
 
 /** Refill interval for a per-minute budget, in milliseconds. */
 const MINUTE_MS = 60000;
@@ -288,17 +289,17 @@ export function createLocalUpgradeBucket(options) {
 		async admit(ip, posture) {
 			const key = String(ip == null ? 'unknown' : ip);
 			const budget = resolve(posture);
-			const now = Date.now();
+			const nowTs = now();
 			const e = touch(key);
 
 			// Lazily initialize / refill on a fresh interval.
-			if (e.resetAt === 0 || e.resetAt <= now) {
+			if (e.resetAt === 0 || e.resetAt <= nowTs) {
 				e.tokens = budget.perMinute;
-				e.resetAt = now + MINUTE_MS;
+				e.resetAt = nowTs + MINUTE_MS;
 				e.bannedUntil = 0;
 			}
 
-			if (e.bannedUntil > now) {
+			if (e.bannedUntil > nowTs) {
 				mRejected?.inc();
 				return false;
 			}
@@ -310,7 +311,7 @@ export function createLocalUpgradeBucket(options) {
 			}
 
 			if (budget.blockDuration > 0) {
-				e.bannedUntil = now + budget.blockDuration;
+				e.bannedUntil = nowTs + budget.blockDuration;
 			}
 			mRejected?.inc();
 			return false;

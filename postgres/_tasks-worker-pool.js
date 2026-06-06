@@ -10,8 +10,8 @@
  * @module svelte-adapter-uws-extensions/postgres/_tasks-worker-pool
  */
 
-import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { randomUuid, setTimer, clearTimer } from '../shared/runtime.js';
 import { deserialiseError } from './_tasks-errors.js';
 
 const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
@@ -62,14 +62,14 @@ export function createWorkerPool(workerOption, taskName) {
 	function clearIdleTimer(worker) {
 		const t = idleTimers.get(worker);
 		if (t) {
-			clearTimeout(t);
+			clearTimer(t);
 			idleTimers.delete(worker);
 		}
 	}
 
 	function scheduleIdleTimeout(worker) {
 		if (idleTimeout === 0) return;
-		const t = setTimeout(() => {
+		const t = setTimer(() => {
 			if (idle.has(worker)) {
 				idle.delete(worker);
 				workerCount -= 1;
@@ -149,7 +149,7 @@ export function createWorkerPool(workerOption, taskName) {
 				return Promise.reject(new Error('task runner destroyed'));
 			}
 			return new Promise((resolve, reject) => {
-				const id = randomUUID();
+				const id = randomUuid();
 				const job = { id, ctx, resolve, reject };
 
 				const onAbort = () => {

@@ -23,9 +23,16 @@
  * @module svelte-adapter-uws-extensions/redis/registry
  */
 
-import { randomBytes } from 'node:crypto';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
-import { now as cachedNow } from '../shared/time.js';
+import {
+	randomBytes,
+	now as cachedNow,
+	monotonicNow,
+	setTimer,
+	clearTimer,
+	setIntervalTimer,
+	clearIntervalTimer
+} from '../shared/runtime.js';
 import { assert } from '../shared/assert.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import {
@@ -453,7 +460,7 @@ export function createConnectionRegistry(client, options) {
 		}
 
 		if (!heartbeatTimer) {
-			heartbeatTimer = setInterval(heartbeatTick, heartbeatInterval);
+			heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
 			if (heartbeatTimer.unref) heartbeatTimer.unref();
 		}
 	}
@@ -664,9 +671,9 @@ export function createConnectionRegistry(client, options) {
 			'registry.pending-entry.shape',
 			{ ref }
 		);
-		clearTimeout(slot.timer);
+		clearTimer(slot.timer);
 		pending.delete(ref);
-		const elapsed = Date.now() - slot.startTime;
+		const elapsed = monotonicNow() - slot.startTime;
 		mReplyLatency?.observe(elapsed);
 		if (env.error) {
 			mRequests?.inc({ result: 'error' });
@@ -714,10 +721,10 @@ export function createConnectionRegistry(client, options) {
 				mRequests?.inc({ result: 'offline' });
 				throw new Error(`registry.request: target user "${target}" is offline`);
 			}
-			const start = Date.now();
+			const start = monotonicNow();
 			try {
 				const reply = await activePlatform.request(ws, event, data, { timeoutMs });
-				mReplyLatency?.observe(Date.now() - start);
+				mReplyLatency?.observe(monotonicNow() - start);
 				mRequests?.inc({ result: 'ok' });
 				return reply;
 			} catch (err) {
@@ -753,20 +760,20 @@ export function createConnectionRegistry(client, options) {
 		};
 
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
+			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
 				reject(new Error(`registry.request: timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			if (timer.unref) timer.unref();
-			pending.set(ref, { resolve, reject, timer, startTime: Date.now() });
+			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
 
 			redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope))
 				.then(() => breaker?.success())
 				.catch((err) => {
 					breaker?.failure(err);
 					if (!pending.delete(ref)) return;
-					clearTimeout(timer);
+					clearTimer(timer);
 					mRequests?.inc({ result: 'error' });
 					reject(err);
 				});
@@ -1093,11 +1100,11 @@ export function createConnectionRegistry(client, options) {
 		async destroy() {
 			destroyed = true;
 			if (heartbeatTimer) {
-				clearInterval(heartbeatTimer);
+				clearIntervalTimer(heartbeatTimer);
 				heartbeatTimer = null;
 			}
 			for (const slot of pending.values()) {
-				clearTimeout(slot.timer);
+				clearTimer(slot.timer);
 				slot.reject(new Error('registry: destroyed'));
 			}
 			pending.clear();

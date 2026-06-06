@@ -18,7 +18,7 @@
  * @module svelte-adapter-uws-extensions/redis/groups
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
@@ -191,15 +191,15 @@ export function createGroup(client, name, options = {}) {
 
 	// Heartbeat: refresh timestamps on local member entries and
 	// remove stale entries from crashed instances.
-	const heartbeatTimer = setInterval(() => {
+	const heartbeatTimer = setIntervalTimer(() => {
 		if (b && !b.isHealthy) return;
-		const now = Date.now();
+		const nowTs = now();
 		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
-			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: now });
+			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: nowTs });
 			pipe.hset(membersKey, entry.memberId, memberData);
 		}
-		pipe.eval(CLEANUP_SCRIPT, 1, membersKey, now, memberTtlMs);
+		pipe.eval(CLEANUP_SCRIPT, 1, membersKey, nowTs, memberTtlMs);
 		pipe.exec().catch((err) => {
 			if (err) console.warn('groups heartbeat: pipeline failed for group "' + name + '":', err.message);
 		});
@@ -306,8 +306,8 @@ export function createGroup(client, name, options = {}) {
 			}
 
 			const memberId = instanceId + ':' + (++memberCounter);
-			const now = Date.now();
-			const memberData = JSON.stringify({ role, instanceId, ts: now });
+			const nowTs = now();
+			const memberData = JSON.stringify({ role, instanceId, ts: nowTs });
 
 			try {
 				await ensureSubscriber(platform);
@@ -322,7 +322,7 @@ export function createGroup(client, name, options = {}) {
 			try {
 				result = await redis.eval(
 					JOIN_SCRIPT, 2, membersKey, closedKey,
-					effectiveMax, memberId, memberData, now, memberTtlMs
+					effectiveMax, memberId, memberData, nowTs, memberTtlMs
 				);
 				b?.success();
 			} catch (err) {
@@ -383,7 +383,7 @@ export function createGroup(client, name, options = {}) {
 			platform.publish(internalTopic, EVENTS.JOIN, { role });
 			await publishEvent(EVENTS.JOIN, { role }).catch(() => {});
 
-			const freshNow = Date.now();
+			const freshNow = now();
 			const membersList = [];
 			for (const [, v] of Object.entries(freshAll)) {
 				try {
@@ -472,8 +472,8 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async count() {
-			const now = Date.now();
-			return withBreaker(b, () => redis.eval(COUNT_SCRIPT, 1, membersKey, now, memberTtlMs));
+			const nowTs = now();
+			return withBreaker(b, () => redis.eval(COUNT_SCRIPT, 1, membersKey, nowTs, memberTtlMs));
 		},
 
 		has(ws) {
@@ -520,7 +520,7 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		destroy() {
-			clearInterval(heartbeatTimer);
+			clearIntervalTimer(heartbeatTimer);
 			if (subscriber) {
 				const sub = subscriber;
 				subscriber = null;

@@ -21,54 +21,12 @@
  * - "How long did this take?" -> `monotonicNow()` deltas.
  * - "What time is it?" -> `now()`.
  *
+ * Both functions are backed by the injectable runtime environment in
+ * `shared/runtime.js`, which owns the cached wall clock and the
+ * monotonic source. They are re-exported here unchanged so the existing
+ * callers and their contracts stay byte-identical.
+ *
  * @module svelte-adapter-uws-extensions/shared/time
  */
 
-import { performance } from 'node:perf_hooks';
-
-let cachedNow = Date.now();
-
-const timer = setInterval(() => { cachedNow = Date.now(); }, 1000);
-if (timer.unref) timer.unref();
-
-/** Returns a cached timestamp, accurate to within ~1 second. */
-export function now() {
-	return cachedNow;
-}
-
-/**
- * Snapshot taken at module load: the wall-clock time corresponding
- * to `performance.now() === 0`. Adding `performance.now()` to this
- * gives a monotonic timestamp in the same shape as `Date.now()` (ms
- * since epoch) without the susceptibility to clock steps. Computed
- * once at module load - any tiny drift between Date.now() and
- * `performance.now()` over the process lifetime is acceptable because
- * the value is only used for deltas, not for cross-process comparison.
- */
-const processStartEpoch = Date.now() - performance.now();
-
-/**
- * Returns a monotonically-increasing timestamp in milliseconds.
- *
- * Backed by `performance.now() + processStartEpoch`. The value is
- * shaped like a wall-clock timestamp (ms since epoch) but advances
- * strictly forward regardless of system-clock adjustments. Use this
- * for lock / lease / timeout math:
- *
- * ```js
- * const start = monotonicNow();
- * await doWork();
- * const elapsed = monotonicNow() - start; // always >= 0
- * ```
- *
- * With `Date.now()`, a backward NTP step between the two calls makes
- * `elapsed` appear negative; lock retry budgets and TTL checks built
- * on that subtraction misbehave silently.
- *
- * Cost: one `performance.now()` per call (a fast syscall on most
- * platforms, ~50-200ns). Negligible against the work being measured.
- * Do NOT use in tight per-message loops where `now()` would do.
- */
-export function monotonicNow() {
-	return processStartEpoch + performance.now();
-}
+export { now, monotonicNow } from './runtime.js';

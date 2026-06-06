@@ -34,6 +34,7 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { withTransaction } from '../shared/pg-tx.js';
 import { ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -145,7 +146,7 @@ export function createReplay(client, options = {}) {
 	let cleanupTimer = null;
 	let cleanupRunning = false;
 	if (cleanupInterval > 0) {
-		cleanupTimer = setInterval(async () => {
+		cleanupTimer = setIntervalTimer(async () => {
 			if (cleanupRunning) return;
 			if (b && !b.isHealthy) return;
 			cleanupRunning = true;
@@ -486,7 +487,7 @@ export function createReplay(client, options = {}) {
 
 		destroy() {
 			if (cleanupTimer) {
-				clearInterval(cleanupTimer);
+				clearIntervalTimer(cleanupTimer);
 				cleanupTimer = null;
 			}
 		},

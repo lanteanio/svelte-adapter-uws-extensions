@@ -15,6 +15,7 @@
  */
 
 import { MAX_BREAKER_LISTENERS } from './caps.js';
+import { setTimer, clearTimer } from './runtime.js';
 
 export class CircuitBrokenError extends Error {
 	constructor() {
@@ -107,8 +108,8 @@ export function createCircuitBreaker(options = {}) {
 	}
 
 	function scheduleProbe() {
-		clearTimeout(resetTimer);
-		resetTimer = setTimeout(() => {
+		clearTimer(resetTimer);
+		resetTimer = setTimer(() => {
 			resetTimer = null;
 			probeAllowed = true;
 			transition('probing');
@@ -132,7 +133,7 @@ export function createCircuitBreaker(options = {}) {
 
 		success() {
 			if (state === 'probing') {
-				clearTimeout(resetTimer);
+				clearTimer(resetTimer);
 				resetTimer = null;
 				failures = 0;
 				transition('healthy');
@@ -153,7 +154,7 @@ export function createCircuitBreaker(options = {}) {
 		},
 
 		reset() {
-			clearTimeout(resetTimer);
+			clearTimer(resetTimer);
 			resetTimer = null;
 			failures = 0;
 			probeAllowed = false;
@@ -175,7 +176,7 @@ export function createCircuitBreaker(options = {}) {
 		},
 
 		destroy() {
-			clearTimeout(resetTimer);
+			clearTimer(resetTimer);
 			resetTimer = null;
 		}
 	};

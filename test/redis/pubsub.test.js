@@ -1007,3 +1007,102 @@ describe('redis pubsub bus', () => {
 		});
 	});
 });
+
+/**
+ * Presence-field merge parity across backends.
+ *
+ * The room presence stream carries field-level deltas as a regular pub/sub
+ * frame on the `<roomTopic>:presence` sub-topic with event `update` and data
+ * `{ key, ...fields }`. The same browser bundle merges that frame whether the
+ * room runs single-process (in-memory) or clustered (redis-backed), so the
+ * redis bus MUST relay and redeliver the frame with the field payload intact
+ * and without an echo loop. If the redis path mangled the shape, an entry's
+ * typing / selection / lock fields would diverge between backends and the
+ * shared client merge would break in the cluster only.
+ */
+describe('presence-field update frame: redis relay parity', () => {
+	let client;
+	let platform;
+	let bus;
+
+	beforeEach(() => {
+		client = mockRedisClient();
+		platform = mockPlatform();
+		bus = createPubSubBus(client);
+	});
+
+	it('relays a presence update frame with the field payload intact', async () => {
+		const calls = [];
+		const orig = client.redis.publish;
+		client.redis.publish = async (ch, msg) => {
+			calls.push({ ch, parsed: JSON.parse(msg) });
+			return orig.call(client.redis, ch, msg);
+		};
+
+		const wrapped = bus.wrap(platform);
+		wrapped.publish('room:42:presence', 'update', { key: 'u1', typing: true });
+		await new Promise((r) => setTimeout(r, 5));
+
+		// Locally delivered identically to the in-memory path (no relay marker
+		// on the origin side, full field payload preserved).
+		expect(platform.published).toHaveLength(1);
+		expect(platform.published[0]).toEqual({
+			topic: 'room:42:presence',
+			event: 'update',
+			data: { key: 'u1', typing: true },
+			options: undefined
+		});
+
+		// Relayed cross-instance as a single envelope carrying the same frame.
+		expect(calls).toHaveLength(1);
+		expect(calls[0].parsed.topic).toBe('room:42:presence');
+		expect(calls[0].parsed.event).toBe('update');
+		expect(calls[0].parsed.data).toEqual({ key: 'u1', typing: true });
+	});
+
+	it('redelivers a remote presence update frame with relay:false and identical data', async () => {
+		await bus.activate(platform);
+		platform.reset();
+
+		// A peer worker published a multi-field presence update (typing cleared,
+		// a selection range set, and a lock acquired in one frame). The receiver
+		// must hand it to the local platform byte-for-byte so the client merge
+		// shallow-merges the same fields it would in-memory.
+		const fields = {
+			key: 'u7',
+			typing: false,
+			selection: { start: 3, end: 9 },
+			'lock:title': 'u7'
+		};
+		const envelope = JSON.stringify({
+			instanceId: 'peer-worker',
+			topic: 'room:42:presence',
+			event: 'update',
+			data: fields
+		});
+		await client.redis.publish('uws:pubsub', envelope);
+
+		expect(platform.published).toHaveLength(1);
+		expect(platform.published[0]).toEqual({
+			topic: 'room:42:presence',
+			event: 'update',
+			data: fields,
+			options: { relay: false }
+		});
+	});
+
+	it('does not echo a self-published presence update back into the local platform', async () => {
+		await bus.activate(platform);
+		const wrapped = bus.wrap(platform);
+
+		wrapped.publish('room:42:presence', 'update', { key: 'me', typing: true });
+
+		// Let the relay tick fire so the self-published envelope round-trips back
+		// through the bus subscriber; without this await the echo never arrives and
+		// the assertion is a tautology. Exactly one local delivery (the direct wrap
+		// publish); the subscriber must drop the echoed envelope so the typer is not
+		// double-applied.
+		await new Promise((r) => setTimeout(r, 5));
+		expect(platform.published).toHaveLength(1);
+	});
+});

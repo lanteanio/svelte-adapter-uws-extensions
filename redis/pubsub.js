@@ -9,8 +9,8 @@
  * @module svelte-adapter-uws-extensions/redis/pubsub
  */
 
-import { randomBytes } from 'node:crypto';
 import { assert } from '../shared/assert.js';
+import { randomBytes, now, setTimer, clearTimer } from '../shared/runtime.js';
 import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 
@@ -155,7 +155,7 @@ export function createPubSubBus(client, options = {}) {
 			);
 		}
 		if (relayTimer === null) {
-			relayTimer = setTimeout(flushRelay, 0);
+			relayTimer = setTimer(flushRelay, 0);
 			if (relayTimer.unref) relayTimer.unref();
 		}
 	}
@@ -164,7 +164,7 @@ export function createPubSubBus(client, options = {}) {
 		const batch = relayBatch;
 		relayBatch = [];
 		if (relayTimer !== null) {
-			clearTimeout(relayTimer);
+			clearTimer(relayTimer);
 			relayTimer = null;
 		}
 		if (b) {
@@ -257,6 +257,27 @@ export function createPubSubBus(client, options = {}) {
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
 				get pressure() { return platform.pressure; },
+				// Forward the live protection posture through the wrapped seam so
+				// cluster-side admission code (per-IP upgrade buckets, capability
+				// cookies) reads the same level as the source platform. Live getter:
+				// a posture transition after wrap propagates. The `?? 'normal'`
+				// fallback degrades gracefully when the underlying platform predates
+				// the posture property, mirroring the closedWsAborts `?? 0` guard.
+				get protection() { return platform.protection ?? 'normal'; },
+				// Forward the injectable clock and RNG the adapter projects onto its
+				// Platform from the runtime module. Cluster-side per-message handlers
+				// read these off the wrapped seam (the caller's reference IS the wrap
+				// result), so a seeded harness clock / RNG must propagate through.
+				// Forward the reference - the projected `now` / `monotonic` functions
+				// and the `random` object - rather than rebinding, so a wrapped
+				// platform exposes the same source the adapter installed.
+				get now() { return platform.now; },
+				get monotonic() { return platform.monotonic; },
+				get random() { return platform.random; },
+				// Forward the hybrid logical clock the adapter projects onto its
+				// Platform. Cluster-side handlers that causally stamp an event read
+				// it off the wrapped platform, so the reference must propagate live.
+				get hlc() { return platform.hlc; },
 				onPressure: platform.onPressure.bind(platform),
 				onPublishRate: platform.onPublishRate.bind(platform),
 				subscribers: platform.subscribers.bind(platform),
@@ -322,7 +343,7 @@ export function createPubSubBus(client, options = {}) {
 							try { onDegraded(); } catch { /* don't propagate user errors */ }
 						}
 						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'degraded', { at: Date.now() });
+							activePlatform.publish(systemChannel, 'degraded', { at: now() });
 							mDegraded?.inc();
 						}
 					} else if (from !== 'healthy' && to === 'healthy') {
@@ -330,7 +351,7 @@ export function createPubSubBus(client, options = {}) {
 							try { onRecovered(); } catch { /* don't propagate user errors */ }
 						}
 						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'recovered', { at: Date.now() });
+							activePlatform.publish(systemChannel, 'recovered', { at: now() });
 							mRecovered?.inc();
 						}
 					}
@@ -421,7 +442,7 @@ export function createPubSubBus(client, options = {}) {
 				unsubscribeBreaker = null;
 			}
 			if (relayTimer !== null) {
-				clearTimeout(relayTimer);
+				clearTimer(relayTimer);
 				relayTimer = null;
 			}
 			relayBatch = [];

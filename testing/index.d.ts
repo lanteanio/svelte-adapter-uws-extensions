@@ -73,6 +73,13 @@ export interface MockPlatform {
 	 * drive replay paths reassign it directly (`platform.replay = createReplay(...)`).
 	 */
 	replay?: unknown;
+	/**
+	 * Mirrors the adapter's resolved protection posture
+	 * (`'normal' | 'elevated' | 'siege'`). Defaults to `'normal'`; reassign
+	 * directly to drive posture transitions and assert the bus wraps forward
+	 * the live value (`platform.protection = 'siege'`).
+	 */
+	protection: 'normal' | 'elevated' | 'siege';
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
 	send(ws: any, topic: string, event: string, data?: any, options?: any): number;
 	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];

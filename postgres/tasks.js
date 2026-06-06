@@ -41,7 +41,13 @@
  * @module svelte-adapter-uws-extensions/postgres/tasks
  */
 
-import { randomUUID } from 'node:crypto';
+import {
+	randomUuid,
+	monotonicNow,
+	setTimer,
+	setIntervalTimer,
+	clearIntervalTimer
+} from '../shared/runtime.js';
 import {
 	TaskInFlightError,
 	UnknownTaskError,
@@ -131,7 +137,7 @@ function defaultBackoff(attempt) {
 }
 
 function delay(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+	return new Promise((resolve) => setTimer(resolve, ms));
 }
 
 /**
@@ -289,7 +295,7 @@ export function createTaskRunner(client, options = {}) {
 		let heartbeatLost = false;
 
 		if (heartbeatInterval > 0) {
-			heartbeatId = setInterval(async () => {
+			heartbeatId = setIntervalTimer(async () => {
 				try {
 					if (fenceProvider) {
 						const externalOk = await fenceProvider.heartbeat(taskId, fence, fenceTtl);
@@ -297,7 +303,7 @@ export function createTaskRunner(client, options = {}) {
 							heartbeatLost = true;
 							mFenceLost?.inc({ name });
 							controller.abort(new Error('fence lost'));
-							clearInterval(heartbeatId);
+							clearIntervalTimer(heartbeatId);
 							return;
 						}
 					}
@@ -306,7 +312,7 @@ export function createTaskRunner(client, options = {}) {
 						heartbeatLost = true;
 						mFenceLost?.inc({ name });
 						controller.abort(new Error('fence lost'));
-						clearInterval(heartbeatId);
+						clearIntervalTimer(heartbeatId);
 					}
 				} catch {
 					// transient heartbeat failure: skip this tick.  If the
@@ -326,7 +332,7 @@ export function createTaskRunner(client, options = {}) {
 				attempt
 			});
 		} finally {
-			if (heartbeatId) clearInterval(heartbeatId);
+			if (heartbeatId) clearIntervalTimer(heartbeatId);
 			if (!controller.signal.aborted) controller.abort();
 		}
 	}
@@ -346,12 +352,12 @@ export function createTaskRunner(client, options = {}) {
 			await withBreaker(b, async () => {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
-					fence = randomUUID();
+					fence = randomUuid();
 					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId);
 					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate fence and rearm the existing row.
-					fence = randomUUID();
+					fence = randomUuid();
 					await sql.rearmAttempt(taskId, fence, attempt);
 					firedTransitionThisIter = 'rearm';
 				}
@@ -534,15 +540,15 @@ export function createTaskRunner(client, options = {}) {
 	}
 
 	if (recoveryInterval > 0) {
-		recoveryTimer = setInterval(recoveryTick, recoveryInterval);
+		recoveryTimer = setIntervalTimer(recoveryTick, recoveryInterval);
 		if (recoveryTimer.unref) recoveryTimer.unref();
 	}
 	if (dispatchInterval > 0) {
-		dispatchTimer = setInterval(dispatchTick, dispatchInterval);
+		dispatchTimer = setIntervalTimer(dispatchTick, dispatchInterval);
 		if (dispatchTimer.unref) dispatchTimer.unref();
 	}
 	if (cleanupInterval > 0) {
-		cleanupTimer = setInterval(cleanupTick, cleanupInterval);
+		cleanupTimer = setIntervalTimer(cleanupTick, cleanupInterval);
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
@@ -670,7 +676,7 @@ export function createTaskRunner(client, options = {}) {
 
 			await sql.ensureTable();
 
-			const taskId = randomUUID();
+			const taskId = randomUuid();
 			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId));
 			fireStateChange({
 				taskId,
@@ -698,7 +704,7 @@ export function createTaskRunner(client, options = {}) {
 			}
 
 			await sql.ensureTable();
-			const start = Date.now();
+			const start = monotonicNow();
 
 			while (true) {
 				const row = await sql.readRow(taskId);
@@ -708,11 +714,11 @@ export function createTaskRunner(client, options = {}) {
 				if (row.status === 'committed') return row.result;
 				if (row.status === 'failed') throw deserialiseError(row.error);
 
-				if (timeout > 0 && Date.now() - start >= timeout) {
+				if (timeout > 0 && monotonicNow() - start >= timeout) {
 					throw new Error(`postgres tasks: await timeout for task "${taskId}" (waited ${timeout}ms, status=${row.status})`);
 				}
 
-				const remainingTimeout = timeout > 0 ? Math.max(1, timeout - (Date.now() - start)) : pollInterval;
+				const remainingTimeout = timeout > 0 ? Math.max(1, timeout - (monotonicNow() - start)) : pollInterval;
 				await delay(Math.min(pollInterval, remainingTimeout));
 			}
 		},
@@ -779,15 +785,15 @@ export function createTaskRunner(client, options = {}) {
 		destroy() {
 			destroyed = true;
 			if (recoveryTimer) {
-				clearInterval(recoveryTimer);
+				clearIntervalTimer(recoveryTimer);
 				recoveryTimer = null;
 			}
 			if (dispatchTimer) {
-				clearInterval(dispatchTimer);
+				clearIntervalTimer(dispatchTimer);
 				dispatchTimer = null;
 			}
 			if (cleanupTimer) {
-				clearInterval(cleanupTimer);
+				clearIntervalTimer(cleanupTimer);
 				cleanupTimer = null;
 			}
 			for (const reg of handlers.values()) {
@@ -797,7 +803,7 @@ export function createTaskRunner(client, options = {}) {
 	};
 
 	function runWithoutCache(name, input, idempotencyKey, requestId) {
-		const taskId = randomUUID();
+		const taskId = randomUuid();
 		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId);
 	}
 }

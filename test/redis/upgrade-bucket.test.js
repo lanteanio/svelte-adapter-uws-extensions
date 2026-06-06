@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCircuitBreaker } from '../../shared/breaker.js';
+import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
 import {
 	createUpgradeBucket,
 	createLocalUpgradeBucket
@@ -11,7 +12,14 @@ describe('redis upgrade-bucket', () => {
 
 	beforeEach(() => {
 		vi.restoreAllMocks();
+		// The local bucket reads wall time through the runtime clock; bind it to
+		// the global Date.now so the per-test vi.spyOn(Date, 'now') drives it.
+		installFakeRuntimeClock();
 		client = mockRedisClient('test:');
+	});
+
+	afterEach(() => {
+		releaseRuntimeClock();
 	});
 
 	describe('createUpgradeBucket validation', () => {
@@ -225,6 +233,13 @@ describe('redis upgrade-bucket', () => {
 describe('createLocalUpgradeBucket', () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
+		// The local bucket reads wall time through the runtime clock; bind it to
+		// the global Date.now so the per-test vi.spyOn(Date, 'now') drives it.
+		installFakeRuntimeClock();
+	});
+
+	afterEach(() => {
+		releaseRuntimeClock();
 	});
 
 	it('returns a bucket with the expected API', () => {

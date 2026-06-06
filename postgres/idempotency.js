@@ -30,6 +30,7 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError } from '../shared/errors.js';
 
@@ -143,7 +144,7 @@ export function createIdempotencyStore(client, options = {}) {
 	let cleanupTimer = null;
 	let cleanupRunning = false;
 	if (cleanupInterval > 0) {
-		cleanupTimer = setInterval(async () => {
+		cleanupTimer = setIntervalTimer(async () => {
 			if (cleanupRunning) return;
 			if (b && !b.isHealthy) return;
 			cleanupRunning = true;
@@ -298,7 +299,7 @@ export function createIdempotencyStore(client, options = {}) {
 
 		destroy() {
 			if (cleanupTimer) {
-				clearInterval(cleanupTimer);
+				clearIntervalTimer(cleanupTimer);
 				cleanupTimer = null;
 			}
 		}

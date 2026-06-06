@@ -32,7 +32,7 @@
  * @module svelte-adapter-uws-extensions/redis/leader
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
 
 const DEFAULT_KEY = 'leader';
@@ -173,7 +173,7 @@ export function createLeader(client, options = {}) {
 	// inside tick(); the unhandled-rejection guard here is belt-and-suspenders.
 	inFlight = tick().catch(() => {});
 
-	timer = setInterval(() => {
+	timer = setIntervalTimer(() => {
 		// Chain so a slow tick never overlaps itself.
 		inFlight = inFlight.then(tick).catch(() => {});
 	}, renewMs);
@@ -197,7 +197,7 @@ export function createLeader(client, options = {}) {
 		if (stopped) return;
 		stopped = true;
 		if (timer) {
-			clearInterval(timer);
+			clearIntervalTimer(timer);
 			timer = null;
 		}
 		// Wait for any in-flight tick so we don't race with our own
