@@ -30,6 +30,7 @@ import { checkReplayAccess } from '../shared/replay-gate.js';
  * KEYS[1] = idmp cache key (hash; field = requestId, value = seq)
  * KEYS[2] = seq key
  * KEYS[3] = stream key
+ * KEYS[4] = epoch key
  * ARGV[1] = requestId
  * ARGV[2] = maxSize
  * ARGV[3] = ttl seconds (0 = no expiry; applies to seq + stream keys)
@@ -39,11 +40,16 @@ import { checkReplayAccess } from '../shared/replay-gate.js';
  * ARGV[7] = data (JSON-encoded)
  *
  * Returns {isDuplicate (1|0), seq}.
+ *
+ * The `seq == 1` reset edge bumps the epoch in the same atomic script (see
+ * PUBLISH_SCRIPT below for the rationale). The epoch key is given NO ttl, so
+ * it survives the seq key being reaped and the bump sticks across the reset.
  */
 const IDMP_PUBLISH_SCRIPT = `
 local idmpKey = KEYS[1]
 local seqKey = KEYS[2]
 local bufKey = KEYS[3]
+local epochKey = KEYS[4]
 local requestId = ARGV[1]
 local maxSize = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
@@ -61,6 +67,9 @@ if cached then
 end
 
 local seq = redis.call('incr', seqKey)
+if seq == 1 then
+  redis.call('incr', epochKey)
+end
 local id = seq .. '-0'
 redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'topic', topic, 'event', event, 'data', data)
 
@@ -83,6 +92,7 @@ return {0, seq}
  *
  * KEYS[1] = seq key
  * KEYS[2] = stream key
+ * KEYS[3] = epoch key
  * ARGV[1] = maxSize (XADD MAXLEN ~)
  * ARGV[2] = ttl seconds (0 = no expiry)
  * ARGV[3] = topic
@@ -90,10 +100,17 @@ return {0, seq}
  * ARGV[5] = data (JSON-encoded)
  *
  * Returns the new sequence number.
+ *
+ * When the seq counter reads 1 the seq space is fresh (brand-new topic or one
+ * whose seq key was reaped by TTL), so the numbering restarted: bump the epoch
+ * in the same atomic script. A resuming client holding a pre-reset epoch then
+ * mismatches and re-reads instead of trusting an offset into the restarted
+ * numbering. The epoch key is given NO ttl, so the bump survives the reaping.
  */
 const PUBLISH_SCRIPT = `
 local seqKey = KEYS[1]
 local bufKey = KEYS[2]
+local epochKey = KEYS[3]
 local maxSize = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local topic = ARGV[3]
@@ -104,6 +121,9 @@ if maxSize == nil or ttl == nil then
 end
 
 local seq = redis.call('incr', seqKey)
+if seq == 1 then
+  redis.call('incr', epochKey)
+end
 local id = seq .. '-0'
 redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'topic', topic, 'event', event, 'data', data)
 
@@ -171,6 +191,34 @@ export function createStreamReplay(client, options = {}) {
 		return client.key('replay:streambuf:{' + topic + '}');
 	}
 
+	// Per-topic seq-space generation. Same hash tag as seq:/buf: so all keys
+	// for one topic co-locate on one slot (the publish eval touches all of
+	// them). Given NO ttl: a tiny monotonic integer that survives the seq key
+	// being reaped, so a reset the resume hook must catch is never hidden by an
+	// expired epoch.
+	function epochKey(topic) {
+		return client.key('replay:epoch:{' + topic + '}');
+	}
+
+	// Last epoch this process observed for a topic, so the synchronous
+	// subscribe-ack carrier can read a recent value without awaiting Redis.
+	/** @type {Map<string, number>} */
+	const epochCache = new Map();
+
+	async function currentEpoch(topic) {
+		const val = await withBreaker(b, () => redis.get(epochKey(topic)));
+		const epoch = val ? parseInt(val, 10) : 0;
+		epochCache.set(topic, epoch);
+		return epoch;
+	}
+
+	async function bumpEpoch(topic) {
+		const next = await withBreaker(b, () => redis.incr(epochKey(topic)));
+		const epoch = typeof next === 'number' ? next : parseInt(next, 10);
+		epochCache.set(topic, epoch);
+		return epoch;
+	}
+
 	const tracker = {
 		async publishIdempotent(platform, topic, event, data, opts) {
 			if (!opts || typeof opts !== 'object') {
@@ -191,6 +239,7 @@ export function createStreamReplay(client, options = {}) {
 			const ik = idmpKey(producerId, topic);
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
+			const ek = epochKey(topic);
 
 			// Serialize BEFORE entering the storage try-block so a malformed
 			// payload (BigInt, circular reference, etc.) does not surface as
@@ -205,7 +254,7 @@ export function createStreamReplay(client, options = {}) {
 			let result;
 			try {
 				result = await withBreaker(b, () =>
-					redis.eval(IDMP_PUBLISH_SCRIPT, 3, ik, sk, bk,
+					redis.eval(IDMP_PUBLISH_SCRIPT, 4, ik, sk, bk, ek,
 						requestId, maxSize, ttl, idmpTtl, topic, event, payload)
 				);
 			} catch (err) {
@@ -234,6 +283,7 @@ export function createStreamReplay(client, options = {}) {
 		async publish(platform, topic, event, data) {
 			const sk = seqKey(topic);
 			const bk = bufKey(topic);
+			const ek = epochKey(topic);
 
 			// Serialize BEFORE entering the storage try-block. See publishIdempotent
 			// above for the rationale: a malformed payload is a caller-input bug
@@ -247,7 +297,7 @@ export function createStreamReplay(client, options = {}) {
 
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 2, sk, bk, maxSize, ttl, topic, event, payload)
+					redis.eval(PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, topic, event, payload)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
@@ -405,22 +455,72 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async clearTopic(topic) {
+			// clearTopic restarts the seq counter at 1 on the next publish, so
+			// it IS a seq-space reset and must bump the epoch. Bump BEFORE the
+			// unlink so there is never a window where seq:/buf: are gone but the
+			// epoch still reads the pre-reset value.
+			await bumpEpoch(topic);
 			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
 		},
 
-		// Returns a hook function for `hooks.ws.resume`. Loops over the
-		// client's per-topic lastSeenSeqs and gap-fills via the existing
-		// replay() pipeline, which already detects + emits truncation
-		// per topic.
+		/**
+		 * Current stored generation of a topic's seq space (baseline 0 when it
+		 * has never reset). The resume hook compares this to the client's
+		 * presented epoch.
+		 * @param {string} topic
+		 * @returns {Promise<number>}
+		 */
+		currentEpoch(topic) {
+			return currentEpoch(topic);
+		},
+
+		/**
+		 * Synchronous best-effort read of a topic's epoch from the in-process
+		 * cache, for the subscribe-ack carrier that cannot await Redis. Wire it
+		 * to `platform.topicEpoch`. Baseline 0 for a topic not yet observed.
+		 * @param {string} topic
+		 * @returns {number}
+		 */
+		cachedEpoch(topic) {
+			return epochCache.get(topic) ?? 0;
+		},
+
+		// Returns a hook function for `hooks.ws.resume`. For each topic it
+		// compares the client's presented epoch (ctx.lastSeenEpochs, threaded
+		// by the adapter; absent -> the baseline 0) to the topic's stored
+		// epoch. On a MATCH it gap-fills via the existing replay() pipeline,
+		// which already detects + emits truncation per topic. On a MISMATCH the
+		// seq space reset since the client last saw it, so it SKIPS gap-fill
+		// and emits a `rehydrate` marker on the same `__replay:{topic}` channel
+		// the client already handles, telling the client to drop its stale
+		// offset and re-read instead of being served a reset space as if it
+		// were contiguous.
 		resumeHook() {
 			return async (ws, ctx) => {
 				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
+				const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
+					? ctx.lastSeenEpochs
+					: null;
 				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
 					// Tighten the wire-supplied sinceSeq normalization to
 					// reject fractional / NaN / Infinity / non-number.
 					// Defense-in-depth alongside tracker.replay()'s own
 					// integer check.
 					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
+					// Additive: a topic the client presented NO epoch for is
+					// always a match and gap-fills exactly as before (never
+					// compared), preserving the byte-identical old path even
+					// though the first publish bumps a fresh topic's epoch from
+					// 0 to 1. Only a presented integer epoch that differs from
+					// the stored one is a reset.
+					const want = presented && Number.isInteger(presented[topic]) ? presented[topic] : null;
+					if (want !== null) {
+						const have = await currentEpoch(topic);
+						if (want !== have) {
+							ctx.platform.send(ws, '__replay:' + topic, 'rehydrate', { epoch: have });
+							continue;
+						}
+					}
 					await tracker.replay(ws, topic, seq, ctx.platform);
 				}
 			};

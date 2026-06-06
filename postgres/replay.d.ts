@@ -83,13 +83,17 @@ export interface ReplayGap {
 
 /**
  * Hook function compatible with `hooks.ws.resume` from `svelte-adapter-uws`.
- * Loops over the client's per-topic `lastSeenSeqs` and gap-fills via the
- * underlying `replay()` pipeline.
+ * For each topic in `lastSeenSeqs` it compares the client's presented epoch
+ * (`lastSeenEpochs`, threaded by the adapter; absent is the baseline 0) to the
+ * topic's stored epoch: on a match it gap-fills via the underlying `replay()`
+ * pipeline, on a mismatch it skips gap-fill and emits a `rehydrate` marker on
+ * `__replay:{topic}` so the client re-reads a reset seq space from scratch.
  */
 export type ResumeHook = (
 	ws: any,
 	ctx: {
 		lastSeenSeqs?: Record<string, number>;
+		lastSeenEpochs?: Record<string, number>;
 		platform: Platform;
 		sessionId?: string;
 	}
@@ -137,6 +141,25 @@ export interface PgReplayBuffer {
 
 	/** Clear replay data for a single topic. */
 	clearTopic(topic: string): Promise<void>;
+
+	/**
+	 * Current stored generation of a topic's seq space. A topic whose seq
+	 * space has never reset reads as the baseline `0`. Bumped whenever the
+	 * authoritative seq numbering for the topic restarts (`clearTopic`, or a
+	 * publish landing on a fresh/cleared empty seq space). The resume hook
+	 * compares this to the client's presented epoch to choose gap-fill (match)
+	 * or cold-rehydrate (mismatch).
+	 */
+	currentEpoch(topic: string): Promise<number>;
+
+	/**
+	 * Synchronous best-effort read of a topic's epoch from the in-process
+	 * cache (populated by `currentEpoch` / a bump). Returns the baseline `0`
+	 * for a topic this process has not yet observed. Wire it to the platform's
+	 * `topicEpoch(topic)` so the synchronous subscribe-ack carries the
+	 * per-topic generation a resuming client presents back.
+	 */
+	cachedEpoch(topic: string): number;
 
 	/** Stop the cleanup timer. */
 	destroy(): void;

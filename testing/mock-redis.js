@@ -1016,11 +1016,12 @@ export function mockRedisClient(keyPrefix = '') {
 			const idmpKey = args[0];
 			const seqKey = args[1];
 			const bufKey = args[2];
-			const requestId = args[3];
-			const maxSize = Number(args[4]);
-			const topic = args[7];
-			const event = args[8];
-			const dataJson = args[9];
+			const epochKey = args[3];
+			const requestId = args[4];
+			const maxSize = Number(args[5]);
+			const topic = args[8];
+			const event = args[9];
+			const dataJson = args[10];
 
 			if (!hashes.has(idmpKey)) hashes.set(idmpKey, new Map());
 			const idmp = hashes.get(idmpKey);
@@ -1031,6 +1032,11 @@ export function mockRedisClient(keyPrefix = '') {
 			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
 			store.set(seqKey, String(v));
 			const seq = v;
+
+			// Reset edge: a fresh seq space (seq == 1) bumps the epoch.
+			if (seq === 1) {
+				store.set(epochKey, String(parseInt(store.get(epochKey) || '0', 10) + 1));
+			}
 
 			const id = `${seq}-0`;
 			if (!streams.has(bufKey)) streams.set(bufKey, []);
@@ -1049,18 +1055,24 @@ export function mockRedisClient(keyPrefix = '') {
 		}
 
 		// Streams replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, maxSize, ttl, topic, event, dataJson]
+		// args layout: [seqKey, bufKey, epochKey, maxSize, ttl, topic, event, dataJson]
 		function evalStreamReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
-			const maxSize = Number(args[2]);
-			const topic = args[4];
-			const event = args[5];
-			const dataJson = args[6];
+			const epochKey = args[2];
+			const maxSize = Number(args[3]);
+			const topic = args[5];
+			const event = args[6];
+			const dataJson = args[7];
 
 			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
 			store.set(seqKey, String(v));
 			const seq = v;
+
+			// Reset edge: a fresh seq space (seq == 1) bumps the epoch.
+			if (seq === 1) {
+				store.set(epochKey, String(parseInt(store.get(epochKey) || '0', 10) + 1));
+			}
 
 			const id = `${seq}-0`;
 			if (!streams.has(bufKey)) streams.set(bufKey, []);
@@ -1076,19 +1088,25 @@ export function mockRedisClient(keyPrefix = '') {
 		}
 
 		// Replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, topic, event, dataJson, maxSize, ttl]
+		// args layout: [seqKey, bufKey, epochKey, topic, event, dataJson, maxSize, ttl]
 		function evalReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
-			const topic = args[2];
-			const event = args[3];
-			const dataJson = args[4];
-			const maxSize = Number(args[5]);
+			const epochKey = args[2];
+			const topic = args[3];
+			const event = args[4];
+			const dataJson = args[5];
+			const maxSize = Number(args[6]);
 
 			// Increment seq
 			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
 			store.set(seqKey, String(v));
 			const seq = v;
+
+			// Reset edge: a fresh seq space (seq == 1) bumps the epoch.
+			if (seq === 1) {
+				store.set(epochKey, String(parseInt(store.get(epochKey) || '0', 10) + 1));
+			}
 
 			// zadd
 			const data = JSON.parse(dataJson);

@@ -15,7 +15,7 @@ export const PLATFORM_KEYS = Object.freeze([
 	'connections', 'requestId',
 	'pressure', 'onPressure', 'onPublishRate',
 	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
-	'topic',
+	'topic', 'topicEpoch',
 	'maxPayloadLength', 'bufferedAmount',
 	'closedWsAborts'
 ]);
@@ -153,6 +153,12 @@ export function mockPlatform() {
 				increment(amount) { p.publish(t, 'increment', amount); },
 				decrement(amount) { p.publish(t, 'decrement', amount); }
 			};
+		},
+		// Mirrors the adapter's platform.topicEpoch. The mock returns the
+		// baseline 0 for every topic; a test that drives the per-topic epoch
+		// reassigns p.topicEpoch (e.g. to read a replay tracker's cache).
+		topicEpoch(_topic) {
+			return 0;
 		},
 		reset() {
 			p.published.length = 0;

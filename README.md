@@ -490,6 +490,8 @@ export const resume = replay.resumeHook();
 
 The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(ws, topic, sinceSeq, platform)` per topic. Per-topic truncation detection still happens inside `replay()` - a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
 
+The hook also detects a topic whose seq space was **reset** since the client last saw it - a `clearTopic`, a TTL-reaped seq key, or a botched reshard that drops the keys all restart the seq counter at 1. Each topic carries a generation in a shared `replay:epoch:{topic}` key (co-located with `replay:seq:`/`replay:buf:` under the same hash tag, so it travels with the slot on a reshard, and given no TTL so it outlives a reaped seq key). The client tracks the epoch it last saw per topic and presents it back on resume; the hook compares it to the stored one. On a match it gap-fills as above. On a mismatch it skips gap-fill for that topic and emits a `rehydrate` event on `__replay:{topic}`, telling the client to drop its stale offset and re-read from scratch rather than be served the new, lower seq numbering as if it continued the old one. Read the stored generation directly with `replay.currentEpoch(topic)` (async) or its in-process cache via `replay.cachedEpoch(topic)` (sync). The compare is strictly additive: a topic the client presents no epoch for is always treated as a match, so a client or deployment that never adopted the epoch resumes exactly as before.
+
 For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand:
 
 ```js
@@ -501,7 +503,7 @@ export async function resume(ws, { lastSeenSeqs, platform }) {
 }
 ```
 
-The same `resumeHook()` is available on the Postgres backend; behavior is identical.
+The same `resumeHook()` and the same reset-detection are available on the Postgres backend; the contract is uniform across all three backends (Redis sorted-set, Redis stream, and Postgres). Postgres keeps the per-topic generation in an `epoch` column on the `svti_replay_seq` row rather than a separate key, bumped atomically with the seq write, but `currentEpoch` / `cachedEpoch` / the `rehydrate` marker behave identically. See [Replay buffer (Postgres)](#replay-buffer-postgres).
 
 #### Options
 
@@ -590,8 +592,10 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 | `gap(topic, lastSeenSeq)` | Probe for a buffer gap. Returns `{ truncated, missingFrom }` |
 | `since(topic, seq)` | Messages after a sequence |
 | `replay(ws, topic, sinceSeq, platform)` | Send missed messages to one client |
+| `currentEpoch(topic)` | Stored seq-space generation (baseline `0`); bumped on every reset |
+| `cachedEpoch(topic)` | Sync read of the generation from the in-process cache |
 | `clear()` | Delete all replay data |
-| `clearTopic(topic)` | Delete replay data for one topic |
+| `clearTopic(topic)` | Delete replay data for one topic. Bumps the topic's epoch |
 
 ---
 
@@ -1215,7 +1219,7 @@ Same gap detection behavior as the Redis replay buffer: if the client's last-see
 
 The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here - one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
-`resumeHook()` is available with identical semantics to the Redis backend; see [Session resumption](#session-resumption-resumehook).
+`resumeHook()` is available with identical semantics to the Redis backend, including per-topic reset detection; see [Session resumption](#session-resumption-resumehook). Each topic carries a durable generation in an `epoch` column on the `svti_replay_seq` row, bumped atomically with the seq write whenever the seq space restarts (`clearTopic`, or a publish landing on a fresh seq counter). On resume the hook compares the client's presented epoch to the stored one: a match gap-fills, a mismatch emits a `rehydrate` event on `__replay:{topic}` so the client re-reads from scratch rather than being served the restarted numbering as if it continued the old one. The compare is strictly additive - a topic the client presents no epoch for is always a match. Read the stored generation with `replay.currentEpoch(topic)` (async) or its in-process cache via `replay.cachedEpoch(topic)` (sync). The epoch column has `DEFAULT 0` and is added by an `ADD COLUMN IF NOT EXISTS` migration, so an already-deployed table upgrades in place with no manual step.
 
 #### Setup
 
@@ -1249,8 +1253,15 @@ CREATE INDEX IF NOT EXISTS idx_svti_replay_topic_seq ON svti_replay (topic, seq)
 
 CREATE TABLE IF NOT EXISTS svti_replay_seq (
   topic TEXT PRIMARY KEY,
-  seq BIGINT NOT NULL DEFAULT 0
+  seq BIGINT NOT NULL DEFAULT 0,
+  epoch BIGINT NOT NULL DEFAULT 0
 );
+```
+
+The `epoch` column carries the per-topic seq-space generation used by `resumeHook()` for reset detection. On an already-deployed `svti_replay_seq` table from before this column existed, the auto-migration adds it idempotently:
+
+```sql
+ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;
 ```
 
 #### Options
@@ -1265,11 +1276,13 @@ CREATE TABLE IF NOT EXISTS svti_replay_seq (
 
 #### API
 
-Same as [Replay buffer (Redis)](#api-3), plus:
+Same as [Replay buffer (Redis)](#api-3) - including `currentEpoch(topic)` / `cachedEpoch(topic)` and the per-topic reset detection - plus:
 
 | Method | Description |
 |---|---|
 | `destroy()` | Stop the cleanup timer |
+
+`clearTopic(topic)` deletes the topic's data rows and bumps its epoch, but keeps the `svti_replay_seq` row (seq reset to `0`) so the epoch survives the reset and repeated clears stay monotonic. `seq(topic)` still returns `0` for a cleared topic, so the public sequence contract is unchanged; the only observable footprint difference is that a cleared topic now leaves one zero-seq counter row behind.
 
 ---
 

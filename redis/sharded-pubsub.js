@@ -764,6 +764,22 @@ export function createShardedBus(client, options = {}) {
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: platform.bufferedAmount.bind(platform),
 				get closedWsAborts() { return platform.closedWsAborts ?? 0; },
+				// The subscribe-ack epoch must carry the SAME generation domain
+				// the resume hook later compares against. When a replay tracker
+				// is wired on the source platform it owns the per-topic seq space,
+				// so its cached per-topic generation is the authority - route the
+				// ack to it. Without this bridge the ack would carry the source
+				// platform's single-worker process generation while the resume
+				// hook reads the tracker's small-integer generation, mismatching
+				// on every resume and forcing a cold re-read where gap-fill should
+				// apply. A deployment may still override the source platform's
+				// topicEpoch directly; that path is honoured when no cachedEpoch
+				// tracker is present. Read live so post-wrap wiring propagates.
+				topicEpoch(t) {
+					const r = platform.replay;
+					if (r && typeof r.cachedEpoch === 'function') return r.cachedEpoch(t);
+					return platform.topicEpoch(t);
+				},
 				// Framework conventions stashed on the source platform by
 				// app init code (e.g. `platform.replay = createReplay(...)`,
 				// `platform.redis = ioredisClient`) must survive the wrap so

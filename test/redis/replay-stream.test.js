@@ -282,6 +282,143 @@ describe('redis replay (stream backend)', () => {
 		});
 	});
 
+	describe('per-topic epoch', () => {
+		it('starts a never-published topic at the baseline epoch', async () => {
+			expect(await replay.currentEpoch('chat')).toBe(0);
+		});
+
+		it('bumps the epoch on the first publish of a fresh topic', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+			// Steady-state publishes do not move the epoch.
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+		});
+
+		it('bumps the epoch when clearTopic resets the seq space', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const before = await replay.currentEpoch('chat');
+			await replay.clearTopic('chat');
+			const after = await replay.currentEpoch('chat');
+			expect(after).toBeGreaterThan(before);
+			// Next publish restarts seq at 1 and bumps again (fresh seq space).
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.seq('chat')).toBe(1);
+			expect(await replay.currentEpoch('chat')).toBeGreaterThan(after);
+		});
+
+		it('exposes the epoch synchronously via cachedEpoch after a read', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.currentEpoch('chat');
+			expect(replay.cachedEpoch('chat')).toBe(1);
+			// A topic this process has not observed reads the baseline.
+			expect(replay.cachedEpoch('never-touched')).toBe(0);
+		});
+
+		it('gap-fills when the presented epoch matches the stored epoch', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			const epoch = await replay.currentEpoch('chat');
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, lastSeenEpochs: { chat: epoch }, platform });
+
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			expect(msgs).toHaveLength(1);
+			expect(msgs[0].data).toMatchObject({ seq: 2 });
+			expect(rehydrate).toBeUndefined();
+		});
+
+		it('cold-rehydrates when the presented epoch is stale', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const stale = await replay.currentEpoch('chat');
+			// Reset the seq space, moving the epoch past what the client holds.
+			await replay.clearTopic('chat');
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 9 }, lastSeenEpochs: { chat: stale }, platform });
+
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			// Stale epoch: rehydrate, never serve the reset seq space as contiguous.
+			expect(rehydrate).toBeDefined();
+			expect(msgs).toHaveLength(0);
+		});
+
+		it('treats an absent presented epoch as a match (old client gap-fills)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			// No lastSeenEpochs at all: the first-publish epoch bump must NOT
+			// cause a spurious rehydrate; gap-fill exactly as before.
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			const rehydrate = platform.sent.find((s) => s.event === 'rehydrate');
+			expect(msgs).toHaveLength(1);
+			expect(rehydrate).toBeUndefined();
+		});
+
+		it('decides each topic independently when one epoch is stale and one matches', async () => {
+			await replay.publish(platform, 'fresh', 'msg', { id: 1 });
+			await replay.publish(platform, 'fresh', 'msg', { id: 2 });
+			const freshEpoch = await replay.currentEpoch('fresh');
+
+			await replay.publish(platform, 'stale', 'msg', { id: 1 });
+			const staleEpoch = await replay.currentEpoch('stale');
+			await replay.clearTopic('stale');
+			await replay.publish(platform, 'stale', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { fresh: 1, stale: 9 },
+				lastSeenEpochs: { fresh: freshEpoch, stale: staleEpoch },
+				platform
+			});
+
+			const freshMsgs = platform.sent.filter((s) => s.topic === '__replay:fresh' && s.event === 'msg');
+			const freshRehydrate = platform.sent.find((s) => s.topic === '__replay:fresh' && s.event === 'rehydrate');
+			const staleMsgs = platform.sent.filter((s) => s.topic === '__replay:stale' && s.event === 'msg');
+			const staleRehydrate = platform.sent.find((s) => s.topic === '__replay:stale' && s.event === 'rehydrate');
+
+			expect(freshMsgs).toHaveLength(1);
+			expect(freshRehydrate).toBeUndefined();
+			expect(staleMsgs).toHaveLength(0);
+			expect(staleRehydrate).toBeDefined();
+		});
+
+		it('bumps the epoch on the first idempotent publish of a fresh topic', async () => {
+			const r = createReplay(client, { storage: 'stream', size: 100 });
+			const result = await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(result.seq).toBe(1);
+			expect(await r.currentEpoch('chat')).toBe(1);
+		});
+
+		it('does NOT bump the epoch on a duplicate idempotent publish', async () => {
+			const r = createReplay(client, { storage: 'stream', size: 100 });
+			await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			const after = await r.currentEpoch('chat');
+			// The duplicate short-circuits before the seq INCR, so the seq == 1
+			// epoch edge never fires a second time.
+			const dup = await r.publishIdempotent(platform, 'chat', 'msg', { id: 1 }, {
+				producerId: 'p1', requestId: 'r1'
+			});
+			expect(dup.isDuplicate).toBe(true);
+			expect(await r.currentEpoch('chat')).toBe(after);
+		});
+	});
+
 	describe('replicated durability', () => {
 		it('throws ReplicationTimeoutError when ack < minReplicas', async () => {
 			const r = createReplay(client, {

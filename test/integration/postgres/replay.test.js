@@ -376,6 +376,121 @@ describe('postgres replay (integration)', () => {
 		});
 	});
 
+	describe('per-topic epoch against real Postgres', () => {
+		it('starts at baseline 0 and bumps once on the first publish of a topic', async () => {
+			expect(await replay.currentEpoch('chat')).toBe(0);
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+		});
+
+		it('bumps the epoch and restarts seq at 1 after clearTopic', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const before = await replay.currentEpoch('chat');
+			await replay.clearTopic('chat');
+			const after = await replay.currentEpoch('chat');
+			expect(after).toBeGreaterThan(before);
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.seq('chat')).toBe(1);
+			// clearTopic keeps the seq-table row (seq reset to 0) and bumps the
+			// epoch once, so the republish takes the UPDATE branch and carries the
+			// already-bumped epoch forward rather than re-seeding it.
+			expect(await replay.currentEpoch('chat')).toBe(after);
+		});
+
+		it('keeps the epoch monotonic across repeated clears', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+			await replay.clearTopic('chat');
+			expect(await replay.currentEpoch('chat')).toBe(2);
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay.clearTopic('chat');
+			expect(await replay.currentEpoch('chat')).toBe(3);
+		});
+
+		it('gap-fills on a matching epoch and cold-rehydrates on a stale one', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			const matchEpoch = await replay.currentEpoch('chat');
+
+			// Matching epoch: ordinary gap-fill, no rehydrate.
+			platform.reset();
+			let hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, lastSeenEpochs: { chat: matchEpoch }, platform });
+			expect(platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg').map((s) => s.data.seq))
+				.toEqual([2]);
+			expect(platform.sent.find((s) => s.event === 'rehydrate')).toBeUndefined();
+
+			// Reset the seq space, then resume holding the now-stale epoch.
+			await replay.clearTopic('chat');
+			await replay.publish(platform, 'chat', 'msg', { id: 3 });
+			platform.reset();
+			hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 9 }, lastSeenEpochs: { chat: matchEpoch }, platform });
+			expect(platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate')).toBeDefined();
+			expect(platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg')).toHaveLength(0);
+		});
+
+		it('treats an absent presented epoch as a match (old client gap-fills)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+			expect(platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg')).toHaveLength(1);
+			expect(platform.sent.find((s) => s.event === 'rehydrate')).toBeUndefined();
+		});
+
+		it('decides each topic independently when one epoch is stale and one matches', async () => {
+			await replay.publish(platform, 'fresh', 'msg', { id: 1 });
+			await replay.publish(platform, 'fresh', 'msg', { id: 2 });
+			const freshEpoch = await replay.currentEpoch('fresh');
+
+			await replay.publish(platform, 'stale', 'msg', { id: 1 });
+			const staleEpoch = await replay.currentEpoch('stale');
+			await replay.clearTopic('stale');
+			await replay.publish(platform, 'stale', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { fresh: 1, stale: 9 },
+				lastSeenEpochs: { fresh: freshEpoch, stale: staleEpoch },
+				platform
+			});
+
+			expect(platform.sent.filter((s) => s.topic === '__replay:fresh' && s.event === 'msg')).toHaveLength(1);
+			expect(platform.sent.find((s) => s.topic === '__replay:fresh' && s.event === 'rehydrate')).toBeUndefined();
+			expect(platform.sent.filter((s) => s.topic === '__replay:stale' && s.event === 'msg')).toHaveLength(0);
+			expect(platform.sent.find((s) => s.topic === '__replay:stale' && s.event === 'rehydrate')).toBeDefined();
+		});
+
+		it('keeps the epoch monotonic across a data-only reap then republish', async () => {
+			// Size/TTL cleanup deletes data rows but never the seq-table row, so a
+			// reaped-then-republished topic takes the UPDATE branch (seq 0 -> 1)
+			// and the epoch keeps climbing rather than snapping back to 1. A
+			// resuming client holding the pre-reap epoch must still MATCH.
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			const epoch = await replay.currentEpoch('chat');
+
+			// Reap data rows only (the periodic-cleanup shape), leaving the seq row.
+			await client.query(`DELETE FROM ${TABLE} WHERE topic = $1`, ['chat']);
+
+			await replay.publish(platform, 'chat', 'msg', { id: 3 });
+			// Epoch is unchanged (UPDATE branch, not a fresh INSERT), so a client
+			// holding the pre-reap epoch gap-fills rather than cold-rehydrating.
+			expect(await replay.currentEpoch('chat')).toBe(epoch);
+
+			platform.reset();
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 2 }, lastSeenEpochs: { chat: epoch }, platform });
+			expect(platform.sent.find((s) => s.event === 'rehydrate')).toBeUndefined();
+			expect(platform.sent.find((s) => s.event === 'end')).toBeDefined();
+		});
+	});
+
 	describe('clearTopic / clear', () => {
 		it('clearTopic removes only that topic', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

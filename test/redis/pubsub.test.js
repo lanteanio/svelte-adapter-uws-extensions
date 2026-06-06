@@ -69,6 +69,25 @@ describe('redis pubsub bus', () => {
 			wrapped.send(ws, 'chat', 'msg', { text: 'hi' });
 			expect(platform.sent).toHaveLength(1);
 		});
+
+		it('topicEpoch() routes to the replay tracker cache when one is wired', () => {
+			// The subscribe-ack epoch must carry the same generation domain the
+			// resume hook compares against. With a replay tracker present, that
+			// is the tracker's per-topic cached generation, not the source
+			// platform's single-worker value.
+			platform.replay = { cachedEpoch: (t) => (t === 'chat' ? 7 : 3) };
+			const wrapped = bus.wrap(platform);
+			expect(wrapped.topicEpoch('chat')).toBe(7);
+			expect(wrapped.topicEpoch('other')).toBe(3);
+		});
+
+		it('topicEpoch() falls back to the source platform when no tracker is wired', () => {
+			const wrapped = bus.wrap(platform);
+			// mockPlatform.topicEpoch returns the baseline 0 by default.
+			expect(wrapped.topicEpoch('chat')).toBe(0);
+			platform.topicEpoch = () => 42;
+			expect(wrapped.topicEpoch('chat')).toBe(42);
+		});
 	});
 
 	describe('batch', () => {

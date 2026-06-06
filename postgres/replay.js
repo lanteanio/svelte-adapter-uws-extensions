@@ -17,12 +17,17 @@
  *
  *   svti_replay_seq (
  *     topic TEXT   PRIMARY KEY,
- *     seq   BIGINT NOT NULL DEFAULT 0
+ *     seq   BIGINT NOT NULL DEFAULT 0,
+ *     epoch BIGINT NOT NULL DEFAULT 0
  *   )
  *
  * Sequences are generated atomically via the _seq table using
  * INSERT ... ON CONFLICT DO UPDATE, so they are safe across multiple
- * server instances without races.
+ * server instances without races. The same row carries a per-topic epoch:
+ * a durable generation that increments whenever the seq space restarts
+ * (clearTopic, or a publish landing on a fresh/reaped counter), so a
+ * reconnecting client whose topic reset is cold-rehydrated instead of being
+ * served the restarted numbering as if it continued the old one.
  *
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
@@ -52,6 +57,8 @@ export { ReplayStorageError, ReplaySerializationError };
  * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<void>} replay
  * @property {() => Promise<void>} clear
  * @property {(topic: string) => Promise<void>} clearTopic
+ * @property {(topic: string) => Promise<number>} currentEpoch - Stored seq-space generation (baseline 0); bumped on every reset
+ * @property {(topic: string) => number} cachedEpoch - Synchronous best-effort read of the generation from the in-process cache
  * @property {() => void} destroy - Stop cleanup timer
  */
 
@@ -119,9 +126,18 @@ export function createReplay(client, options = {}) {
 		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
-				seq   BIGINT NOT NULL DEFAULT 0
+				seq   BIGINT NOT NULL DEFAULT 0,
+				epoch BIGINT NOT NULL DEFAULT 0
 			)
-		`, { table: seqTable, columns: ['topic', 'seq'] });
+		`, { table: seqTable, columns: ['topic', 'seq', 'epoch'] });
+		// Additive migration for an already-deployed seq table created before the
+		// epoch column existed. Idempotent and runs under the same migrated-once
+		// guard, so a fresh table (just created above) is a no-op and an old one
+		// gains the column with a safe default.
+		await safeCreate(client, `
+			ALTER TABLE ${seqTable}
+			  ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0
+		`);
 		migrated = true;
 	}
 
@@ -172,6 +188,34 @@ export function createReplay(client, options = {}) {
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
+	// Last epoch this process observed for a topic, so a synchronous caller (the
+	// subscribe-ack carrier, which cannot await Postgres) can read a recent
+	// value. Read-through populated by currentEpoch and refreshed by the publish
+	// / clearTopic bumps; a topic not yet seen reads as the baseline 0.
+	/** @type {Map<string, number>} */
+	const epochCache = new Map();
+
+	// Read the stored epoch for a topic. A topic whose seq space has never reset
+	// has no row yet (or epoch defaulted 0): that is the baseline and reads as 0.
+	// Read-through populates the cache. An old client presenting no epoch SKIPS
+	// this compare entirely (handled in resumeHook) - a literal compare against 0
+	// would be wrong because the first publish bumps a fresh topic 0 -> 1.
+	async function currentEpoch(topic) {
+		const res = await withBreaker(b, async () => {
+			await ensureTable();
+			return client.query({
+				name: 'replay_epoch_' + table,
+				text: `SELECT COALESCE(epoch, 0)::bigint AS epoch
+				         FROM ${seqTable}
+				        WHERE topic = $1`,
+				values: [topic]
+			});
+		});
+		const epoch = res.rows.length > 0 ? parseInt(res.rows[0].epoch, 10) : 0;
+		epochCache.set(topic, epoch);
+		return epoch;
+	}
+
 	const tracker = {
 		async publish(platform, topic, event, data) {
 			// Serialize BEFORE entering the storage try-block. A JSON.stringify
@@ -193,16 +237,16 @@ export function createReplay(client, options = {}) {
 					return client.query({
 						name: 'replay_publish_' + table,
 						text: `WITH new_seq AS (
-							INSERT INTO ${seqTable} (topic, seq)
-							     VALUES ($1, 1)
+							INSERT INTO ${seqTable} (topic, seq, epoch)
+							     VALUES ($1, 1, 1)
 							ON CONFLICT (topic)
 							  DO UPDATE SET seq = ${seqTable}.seq + 1
-							  RETURNING seq
+							  RETURNING seq, epoch
 						)
 						INSERT INTO ${table} (topic, seq, event, data)
 						SELECT $1, new_seq.seq, $2, $3
 						  FROM new_seq
-						RETURNING seq`,
+						RETURNING seq, (SELECT epoch FROM new_seq) AS epoch`,
 						values: [topic, event, payload]
 					});
 				});
@@ -214,6 +258,11 @@ export function createReplay(client, options = {}) {
 				throw new ReplayStorageError('publish', err);
 			}
 			const seq = parseInt(res.rows[0].seq, 10);
+			// Cache the epoch the CTE returned so cachedEpoch is fresh for the
+			// synchronous ack carrier without a follow-up read. The INSERT branch
+			// (fresh/cleared topic) seeds epoch 1; the UPDATE branch carries the
+			// climbed value forward.
+			if (res.rows[0].epoch != null) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
 			mPublishes?.inc({ topic: mt(topic) });
 
 			// Trim by sequence number: seqs are contiguous per topic
@@ -394,29 +443,44 @@ export function createReplay(client, options = {}) {
 		async clear() {
 			await withBreaker(b, async () => {
 				await ensureTable();
-				// Run the two DELETEs in a transaction so an interruption between
-				// them cannot leave the seqTable populated with topics whose
-				// data rows are already gone. A pooled-connection BEGIN/COMMIT
-				// is required because the default `client.query()` may check
-				// out a different connection per call.
+				// Delete every data row, but bump-and-keep each seq-table row
+				// rather than wiping it: a globally-cleared topic that is then
+				// republished must keep climbing its epoch (an INSERT branch would
+				// snap it back to 1, and a long-lived client holding the pre-clear
+				// epoch 1 could then spuriously match). Run both in a transaction
+				// so an interruption cannot leave data rows gone while the seq
+				// counters are stale. A pooled-connection BEGIN/COMMIT is required
+				// because the default `client.query()` may check out a different
+				// connection per call.
 				await withTransaction(client, async (tx) => {
 					await tx.query(`DELETE FROM ${table}`);
-					await tx.query(`DELETE FROM ${seqTable}`);
+					await tx.query(`UPDATE ${seqTable} SET seq = 0, epoch = epoch + 1`);
 				});
 			});
+			// Drop the in-process cache so cachedEpoch does not serve a stale
+			// value; the next currentEpoch read-through repopulates it.
+			epochCache.clear();
 		},
 
 		async clearTopic(topic) {
 			await withBreaker(b, async () => {
 				await ensureTable();
-				await withTransaction(client, async (tx) => {
+				const res = await withTransaction(client, async (tx) => {
 					await tx.query(
 						`DELETE FROM ${table}
 						  WHERE topic = $1`, [topic]);
-					await tx.query(
-						`DELETE FROM ${seqTable}
-						  WHERE topic = $1`, [topic]);
+					// Keep the seq-table row so the epoch survives the reset (the
+					// durable analogue of a no-ttl epoch counter). Bump epoch,
+					// reset seq to 0 so the next publish's UPDATE branch issues
+					// seq = 1 on the fresh space. Atomic with the data delete.
+					return tx.query(
+						`INSERT INTO ${seqTable} (topic, seq, epoch)
+						      VALUES ($1, 0, 1)
+						 ON CONFLICT (topic)
+						   DO UPDATE SET seq = 0, epoch = ${seqTable}.epoch + 1
+						   RETURNING epoch`, [topic]);
 				});
+				if (res.rows.length > 0) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
 			});
 		},
 
@@ -427,15 +491,69 @@ export function createReplay(client, options = {}) {
 			}
 		},
 
+		/**
+		 * Current stored generation of a topic's seq space. A topic whose seq
+		 * space has never reset reads as the baseline 0. Used by the resume
+		 * hook to compare against the client's presented epoch.
+		 * @param {string} topic
+		 * @returns {Promise<number>}
+		 */
+		currentEpoch(topic) {
+			return currentEpoch(topic);
+		},
+
+		/**
+		 * Synchronous best-effort read of a topic's epoch from the in-process
+		 * cache (populated by currentEpoch / the publish and clearTopic bumps).
+		 * For the subscribe-ack carrier, which cannot await Postgres; wire it to
+		 * `platform.topicEpoch` so the ack carries the per-topic generation a
+		 * resuming client then presents back. Returns the baseline 0 for a topic
+		 * not yet observed.
+		 * @param {string} topic
+		 * @returns {number}
+		 */
+		cachedEpoch(topic) {
+			return epochCache.get(topic) ?? 0;
+		},
+
 		// Returns a hook function for `hooks.ws.resume`. Loops over the
-		// client's per-topic lastSeenSeqs and gap-fills via the existing
-		// replay() pipeline, which already detects + emits truncation
-		// per topic.
+		// client's per-topic lastSeenSeqs. For each topic it compares the
+		// client's presented epoch (ctx.lastSeenEpochs, threaded by the
+		// adapter; absent -> the baseline 0) to the topic's stored epoch. On a
+		// MATCH it gap-fills via the existing replay() pipeline, which already
+		// detects + emits truncation per topic. On a MISMATCH the seq space
+		// reset since the client last saw it, so it SKIPS gap-fill for that
+		// topic and emits a `rehydrate` marker on the same `__replay:{topic}`
+		// channel the client already handles for `truncated`/`denied`, telling
+		// the client to drop its stale offset and re-read from scratch instead
+		// of being served a reset seq space as if it were contiguous.
 		resumeHook() {
 			return async (ws, ctx) => {
 				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
+				const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
+					? ctx.lastSeenEpochs
+					: null;
 				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
-					const seq = typeof sinceSeq === 'number' && sinceSeq >= 0 ? sinceSeq : 0;
+					// Normalize wire-supplied sinceSeq. Reject non-integers
+					// (fractional, NaN, Infinity, non-number) by falling through
+					// to 0 (resume from start). Negative values also fall through;
+					// tracker.replay() validates internally as defense-in-depth.
+					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
+					// Additive: a topic the client presented NO epoch for (old
+					// client, or one that never received an epoch) is always a
+					// match and gap-fills exactly as before - never compared
+					// against the stored epoch, so the byte-identical old path is
+					// preserved even though the first publish bumps a fresh
+					// topic's epoch 0 -> 1. Only a presented integer epoch that
+					// differs from the stored one is a reset.
+					const want = presented && Number.isInteger(presented[topic]) ? presented[topic] : null;
+					if (want !== null) {
+						const have = await currentEpoch(topic);
+						if (want !== have) {
+							ctx.platform.send(ws, '__replay:' + topic, 'rehydrate', { epoch: have });
+							continue;
+						}
+					}
 					await tracker.replay(ws, topic, seq, ctx.platform);
 				}
 			};

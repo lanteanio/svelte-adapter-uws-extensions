@@ -395,6 +395,136 @@ describe('postgres replay', () => {
 		});
 	});
 
+	describe('per-topic epoch', () => {
+		it('starts a never-published topic at the baseline epoch', async () => {
+			expect(await replay.currentEpoch('chat')).toBe(0);
+		});
+
+		it('bumps the epoch on the first publish of a fresh topic', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+			// Steady-state publishes do not move the epoch.
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+		});
+
+		it('bumps the epoch when clearTopic resets the seq space', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const before = await replay.currentEpoch('chat');
+			await replay.clearTopic('chat');
+			const after = await replay.currentEpoch('chat');
+			expect(after).toBeGreaterThan(before);
+			// Next publish restarts seq at 1 but does NOT re-bump: clearTopic keeps
+			// the seq-table row (seq reset to 0), so the publish takes the UPDATE
+			// branch and carries the already-bumped epoch forward. The bump is done
+			// once, atomically, by clearTopic - this is the durable single-bump
+			// guarantee that keeps repeated clears monotonic.
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.seq('chat')).toBe(1);
+			expect(await replay.currentEpoch('chat')).toBe(after);
+		});
+
+		it('keeps the epoch monotonic across repeated clears', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.currentEpoch('chat')).toBe(1);
+			await replay.clearTopic('chat');
+			expect(await replay.currentEpoch('chat')).toBe(2);
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay.clearTopic('chat');
+			expect(await replay.currentEpoch('chat')).toBe(3);
+			await replay.publish(platform, 'chat', 'msg', { id: 3 });
+			await replay.clearTopic('chat');
+			expect(await replay.currentEpoch('chat')).toBe(4);
+		});
+
+		it('exposes the epoch synchronously via cachedEpoch after a read', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.currentEpoch('chat');
+			expect(replay.cachedEpoch('chat')).toBe(1);
+			// A topic this process has not observed reads the baseline.
+			expect(replay.cachedEpoch('never-touched')).toBe(0);
+		});
+
+		it('gap-fills when the presented epoch matches the stored epoch', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			const epoch = await replay.currentEpoch('chat');
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, lastSeenEpochs: { chat: epoch }, platform });
+
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			expect(msgs).toHaveLength(1);
+			expect(msgs[0].data).toMatchObject({ seq: 2 });
+			expect(rehydrate).toBeUndefined();
+		});
+
+		it('cold-rehydrates when the presented epoch is stale', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const stale = await replay.currentEpoch('chat');
+			// Reset the seq space, moving the epoch past what the client holds.
+			await replay.clearTopic('chat');
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 9 }, lastSeenEpochs: { chat: stale }, platform });
+
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			// Stale epoch: rehydrate, never serve the reset seq space as contiguous.
+			expect(rehydrate).toBeDefined();
+			expect(msgs).toHaveLength(0);
+		});
+
+		it('treats an absent presented epoch as a match (old client gap-fills)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+
+			// No lastSeenEpochs at all: the first-publish epoch bump must NOT
+			// cause a spurious rehydrate; gap-fill exactly as before.
+			const hook = replay.resumeHook();
+			await hook({}, { lastSeenSeqs: { chat: 1 }, platform });
+
+			const msgs = platform.sent.filter((s) => s.topic === '__replay:chat' && s.event === 'msg');
+			const rehydrate = platform.sent.find((s) => s.event === 'rehydrate');
+			expect(msgs).toHaveLength(1);
+			expect(rehydrate).toBeUndefined();
+		});
+
+		it('decides each topic independently when one epoch is stale and one matches', async () => {
+			await replay.publish(platform, 'fresh', 'msg', { id: 1 });
+			await replay.publish(platform, 'fresh', 'msg', { id: 2 });
+			const freshEpoch = await replay.currentEpoch('fresh');
+
+			await replay.publish(platform, 'stale', 'msg', { id: 1 });
+			const staleEpoch = await replay.currentEpoch('stale');
+			await replay.clearTopic('stale');
+			await replay.publish(platform, 'stale', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { fresh: 1, stale: 9 },
+				lastSeenEpochs: { fresh: freshEpoch, stale: staleEpoch },
+				platform
+			});
+
+			const freshMsgs = platform.sent.filter((s) => s.topic === '__replay:fresh' && s.event === 'msg');
+			const freshRehydrate = platform.sent.find((s) => s.topic === '__replay:fresh' && s.event === 'rehydrate');
+			const staleMsgs = platform.sent.filter((s) => s.topic === '__replay:stale' && s.event === 'msg');
+			const staleRehydrate = platform.sent.find((s) => s.topic === '__replay:stale' && s.event === 'rehydrate');
+
+			expect(freshMsgs).toHaveLength(1);
+			expect(freshRehydrate).toBeUndefined();
+			expect(staleMsgs).toHaveLength(0);
+			expect(staleRehydrate).toBeDefined();
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
@@ -417,7 +547,7 @@ describe('postgres replay', () => {
 			expect(await replay.seq('todos')).toBe(1);
 		});
 
-		it('clear runs both DELETEs inside a BEGIN/COMMIT transaction', async () => {
+		it('clear deletes data and bumps every epoch inside one BEGIN/COMMIT transaction', async () => {
 			// Spy on pool.connect() to capture the transaction-control statements.
 			const seen = [];
 			const origConnect = client.pool.connect.bind(client.pool);
@@ -439,10 +569,14 @@ describe('postgres replay', () => {
 			}
 			expect(seen[0]).toBe('BEGIN');
 			expect(seen[seen.length - 1]).toBe('COMMIT');
-			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(2);
+			// The data rows are deleted and the seq-table rows are bump-and-kept
+			// (UPDATE ... epoch + 1), not deleted, so the epoch survives a global
+			// clear and a republished topic keeps climbing.
+			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
+			expect(seen.some((s) => s.startsWith('UPDATE') && s.includes('epoch + 1'))).toBe(true);
 		});
 
-		it('clearTopic runs both DELETEs inside a BEGIN/COMMIT transaction', async () => {
+		it('clearTopic deletes data and bumps the epoch inside one BEGIN/COMMIT transaction', async () => {
 			const seen = [];
 			const origConnect = client.pool.connect.bind(client.pool);
 			client.pool.connect = async () => {
@@ -463,7 +597,10 @@ describe('postgres replay', () => {
 			}
 			expect(seen[0]).toBe('BEGIN');
 			expect(seen[seen.length - 1]).toBe('COMMIT');
-			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(2);
+			// The data row is deleted; the seq-table row is kept (seq reset to 0,
+			// epoch bumped) via an upsert so the epoch survives the reset.
+			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
+			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('epoch + 1'))).toBe(true);
 		});
 	});
 

@@ -23,6 +23,16 @@ export function mockPgClient() {
 	/** @type {Map<string, number>} topic -> seq */
 	const seqCounters = new Map();
 
+	/**
+	 * topic -> epoch. Lives on the same logical row as seqCounters (the
+	 * svti_replay_seq row), mirroring the durable `epoch` column. A
+	 * never-published topic has no entry and reads 0; the first publish of a
+	 * fresh seq space and every clearTopic bump it by 1, and the row survives
+	 * data cleanup so a reaped-then-republished topic keeps climbing.
+	 * @type {Map<string, number>}
+	 */
+	const epochCounters = new Map();
+
 	/** @type {Map<string, {status: string, result: any, expires_at: number}>} */
 	const idemRows = new Map();
 
@@ -638,12 +648,63 @@ export function mockPgClient() {
 				return { rows: [], rowCount: before };
 			}
 
-			// CTE publish: atomic seq increment + insert in one query
+			// Epoch read-through: SELECT COALESCE(epoch, 0) FROM *_seq WHERE topic = $1.
+			// A topic with no seq row reads the baseline 0.
+			if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {
+				const topic = values[0];
+				if (seqCounters.has(topic) || epochCounters.has(topic)) {
+					return { rows: [{ epoch: String(epochCounters.get(topic) || 0) }], rowCount: 1 };
+				}
+				return { rows: [], rowCount: 0 };
+			}
+
+			// clearTopic upsert: keep the seq-table row, reset seq to 0, bump epoch.
+			// INSERT ... ON CONFLICT DO UPDATE SET seq = 0, epoch = epoch + 1 RETURNING epoch.
+			if (
+				sql.includes('INSERT INTO') &&
+				sql.includes('_seq') &&
+				sql.includes('ON CONFLICT') &&
+				sql.includes('epoch + 1') &&
+				sql.includes('RETURNING epoch')
+			) {
+				const topic = values[0];
+				const next = (epochCounters.get(topic) || 0) + 1;
+				epochCounters.set(topic, next);
+				// Keep the row with seq reset to 0 so the next publish's UPDATE
+				// branch issues seq = 1 (and carries the climbed epoch forward).
+				seqCounters.set(topic, 0);
+				return { rows: [{ epoch: String(next) }], rowCount: 1 };
+			}
+
+			// clear (global): bump every topic's epoch and zero its seq, keeping
+			// rows. UPDATE *_seq SET seq = 0, epoch = epoch + 1.
+			if (sql.startsWith('UPDATE') && sql.includes('_seq') && sql.includes('epoch + 1')) {
+				for (const topic of seqCounters.keys()) {
+					seqCounters.set(topic, 0);
+					epochCounters.set(topic, (epochCounters.get(topic) || 0) + 1);
+				}
+				return { rows: [], rowCount: seqCounters.size };
+			}
+
+			// CTE publish: atomic seq increment + insert in one query.
+			// The reset edge is the INSERT branch (a topic with no seq row, i.e.
+			// brand-new or fully cleared): seq starts at 1 and epoch is seeded to
+			// 1. An existing row takes the UPDATE branch (seq + 1) and carries its
+			// epoch forward unchanged, so steady-state publishes never move the
+			// epoch.
 			if (sql.includes('WITH new_seq') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
 				const topic = values[0];
+				const hadRow = seqCounters.has(topic);
 				const current = seqCounters.get(topic) || 0;
 				const next = current + 1;
 				seqCounters.set(topic, next);
+				let epoch;
+				if (!hadRow) {
+					epoch = 1;
+					epochCounters.set(topic, epoch);
+				} else {
+					epoch = epochCounters.get(topic) || 0;
+				}
 				const row = {
 					svti_replay_id: nextId++,
 					topic,
@@ -653,7 +714,7 @@ export function mockPgClient() {
 					created_at: new Date()
 				};
 				rows.push(row);
-				return { rows: [{ seq: String(next) }], rowCount: 1 };
+				return { rows: [{ seq: String(next), epoch: String(epoch) }], rowCount: 1 };
 			}
 
 			// INSERT INTO *_seq (atomic sequence generation)
