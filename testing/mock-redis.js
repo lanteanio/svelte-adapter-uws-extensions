@@ -1,8 +1,32 @@
+import { wallEpoch, randomU32 } from '../shared/runtime.js';
+import { keySlot } from '../shared/cluster.js';
+
 /**
  * In-memory mock that implements the subset of ioredis used by the extensions.
  * No real Redis connection needed.
+ *
+ * Clock determinism: every wall-clock read in this double goes through the
+ * injectable runtime seam (`wallEpoch` from ../shared/runtime.js), never
+ * `Date.now()`. Under the native default that returns the real wall clock; under
+ * a seeded simulation harness that overrides `clock.wallEpoch` it returns the
+ * virtual clock, so a replay advances field TTLs, stream ids, rate-limit
+ * windows, and the TIME command in lockstep with the rest of the system. The
+ * RNG used for TIME's sub-millisecond jitter routes through the same seam
+ * (`randomU32`), so a seed reproduces it.
+ *
+ * @param {string} [keyPrefix]
+ * @param {{ cluster?: boolean, nodeCount?: number }} [options] - When
+ *   `cluster` is true the double models a multi-master cluster topology: a
+ *   pipeline or transaction that spans more than one node's slots silently
+ *   no-ops the off-node commands (the ioredis multi-slot hazard), so a
+ *   cross-slot batch that would break in production is catchable in a unit test.
+ *   `nodeCount` (default 3) sets how many masters the slot space is split across.
  */
-export function mockRedisClient(keyPrefix = '') {
+export function mockRedisClient(keyPrefix = '', options = {}) {
+	const clusterMode = options.cluster === true;
+	const nodeCount = Number.isInteger(options.nodeCount) && options.nodeCount > 0
+		? options.nodeCount
+		: 3;
 	const store = new Map();       // key -> value (string)
 	const sortedSets = new Map();  // key -> [{score, member}]
 	const hashes = new Map();      // key -> Map<field, value>
@@ -12,13 +36,101 @@ export function mockRedisClient(keyPrefix = '') {
 	const functionLibraries = new Map(); // libname -> code
 	const registeredFunctions = new Map(); // funcName -> (keys, args) => unknown
 
+	// The server clock for this double. Reads the EXACT wall-clock seam
+	// (`wallEpoch`), not the ~1Hz-cached `now()`: a Redis server's clock is
+	// precise, and the integration-tier callers (the clock-skew sampler) compare
+	// against the same exact seam, so a coarse cached read would inject phantom
+	// drift. Under the native default `wallEpoch()` is the real wall clock; under
+	// a seeded simulation harness that overrides `clock.wallEpoch` it is the
+	// virtual clock. Every wall-clock-dependent path in the double (field TTL
+	// pruning, HEXPIRE/HTTL, XADD stream ids, the TIME command, and the rate-limit
+	// / ban evaluators) reads through here, so they all advance in lockstep with
+	// the rest of the system under replay.
+	function serverNowMs() {
+		return wallEpoch();
+	}
+
+	// Redis TIME reply for the current server clock: [unixSeconds, microseconds]
+	// as strings, exactly the shape real Redis (and ioredis) return. The eval
+	// path that needs a clock-skew-safe timestamp recombines it the same way the
+	// real Lua does (`tonumber(t[1]) * 1000 + floor(tonumber(t[2]) / 1000)`),
+	// which round-trips back to serverNowMs() at millisecond resolution.
+	//
+	// Real Redis TIME has microsecond resolution; the seam clock here is only
+	// millisecond-resolution, so the sub-millisecond micros are filled from the
+	// injectable RNG seam (`randomU32`). Two reads inside the same virtual
+	// millisecond therefore differ in their sub-ms micros yet reproduce exactly
+	// under a fixed seed. The jitter is bounded to [0, 999] micros so it can
+	// never round up into the millisecond component the recombination keeps.
+	function timeReply() {
+		const ms = serverNowMs();
+		const seconds = Math.floor(ms / 1000);
+		const subMs = randomU32() % 1000;
+		const micros = (ms % 1000) * 1000 + subMs;
+		return [String(seconds), String(micros)];
+	}
+
+	// Millisecond timestamp derived through the TIME command, recombined exactly
+	// as the real token-bucket / ban Lua does:
+	//   `tonumber(t[1]) * 1000 + floor(tonumber(t[2]) / 1000)`.
+	// Scripts that the real Lua clocks with `redis.call('TIME')` MUST source their
+	// `now` here, not from a raw wall read, so the mirrored-JS path matches the
+	// Lua bit-for-bit (the sub-ms jitter in TIME is discarded by floor(/1000), so
+	// this round-trips back to serverNowMs() at millisecond resolution).
+	function evalTimeNowMs() {
+		const t = timeReply();
+		return Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+	}
+
+	// Cluster topology model. Real Redis Cluster assigns the 16384 hash slots as
+	// contiguous ranges across the masters, so a key's owning node is a pure
+	// function of its slot. We split the slot space into `nodeCount` equal
+	// contiguous ranges - any slot->node function works for modeling the hazard
+	// as long as same-slot keys always land on the same node, which contiguous
+	// ranges guarantee. The exact range boundaries are topology-dependent in a
+	// real cluster, but the property the hazard test depends on - "two keys on
+	// different slots CAN live on different nodes, two keys on the same slot
+	// never do" - holds for this mapping.
+	const SLOTS_PER_NODE = Math.ceil(16384 / nodeCount);
+	function nodeForSlot(slot) {
+		return Math.floor(slot / SLOTS_PER_NODE);
+	}
+
+	// The keys a command touches, used only to resolve its owning cluster node.
+	// Most commands key on their first argument; eval/evalsha take their keys
+	// from the slice after numKeys; a handful are keyless (routed to any node).
+	function commandKeys(method, args) {
+		const m = String(method).toLowerCase();
+		if (m === 'eval' || m === 'evalsha') {
+			const numKeys = Number(args[1]) || 0;
+			return args.slice(2, 2 + numKeys).map(String);
+		}
+		// Keyless commands: no slot, so they run on whichever node the batch
+		// landed on (never no-op'd by the multi-slot hazard).
+		const keyless = new Set([
+			'publish', 'spublish', 'subscribe', 'psubscribe', 'ssubscribe',
+			'unsubscribe', 'punsubscribe', 'sunsubscribe', 'time', 'wait',
+			'info', 'scan', 'ping', 'function', 'multi', 'exec'
+		]);
+		if (keyless.has(m)) return [];
+		return args.length > 0 ? [String(args[0])] : [];
+	}
+
+	// The cluster node a single command is routed to, or null when the command
+	// has no key (keyless commands ride along with the batch's target node).
+	function nodeForCommand(method, args) {
+		const keys = commandKeys(method, args);
+		if (keys.length === 0) return null;
+		return nodeForSlot(keySlot(keys[0]));
+	}
+
 	// Lazy expiry of TTL'd hash fields. Real Redis 7.4+ expires fields at
 	// background-task time; the mock checks at read time. Idempotent.
 	function pruneExpiredFields(key) {
 		const ex = hashFieldExpiry.get(key);
 		if (!ex) return;
 		const h = hashes.get(key);
-		const now = Date.now();
+		const now = serverNowMs();
 		let droppedAny = false;
 		for (const [field, expireAt] of ex) {
 			if (expireAt <= now) {
@@ -64,7 +176,7 @@ export function mockRedisClient(keyPrefix = '') {
 		const { condition, fields } = parseHashFieldExpireArgs(rest);
 		const h = hashes.get(key);
 		const out = [];
-		const newExpireAt = Date.now() + ttlMs;
+		const newExpireAt = serverNowMs() + ttlMs;
 		for (const field of fields) {
 			if (!h || !h.has(field)) {
 				out.push(-2);
@@ -97,7 +209,7 @@ export function mockRedisClient(keyPrefix = '') {
 		const h = hashes.get(key);
 		const ex = hashFieldExpiry.get(key);
 		const out = [];
-		const now = Date.now();
+		const now = serverNowMs();
 		for (const field of fields) {
 			if (!h || !h.has(field)) { out.push(-2); continue; }
 			const expireAt = ex?.get(field);
@@ -261,7 +373,11 @@ export function mockRedisClient(keyPrefix = '') {
 
 				let resolvedId;
 				if (idArg === '*') {
-					const ms = Date.now();
+					// Auto-id timestamp comes from the server clock seam, so a
+					// seeded harness produces the same stream ids on replay. The
+					// sequence disambiguation (same-ms collisions) stays
+					// deterministic, matching real Redis XADD * semantics.
+					const ms = serverNowMs();
 					const last = stream[stream.length - 1];
 					if (last) {
 						const [lastMs, lastSeq] = last.id.split('-').map(Number);
@@ -515,6 +631,16 @@ export function mockRedisClient(keyPrefix = '') {
 				return r._info ?? '# Server\nredis_version:7.4.0\n';
 			},
 
+			// Redis TIME command. Returns [unixSeconds, microseconds] as strings,
+			// the exact shape real Redis (and ioredis's `.time()`) return, sourced
+			// from the server clock seam. The clock-skew sampler (redis/clock-skew.js)
+			// and any caller that wants a clock-skew-safe timestamp read this; under
+			// a seeded simulation harness it returns the virtual clock, so skew is
+			// reproducible or deliberately injectable with no real Redis.
+			async time() {
+				return timeReply();
+			},
+
 			// Redis Functions. The mock does NOT execute Lua; it stores
 			// loaded library code by name, and tests register handlers
 			// via the wrapped client's `_registerFunction(name, handler)`
@@ -561,7 +687,18 @@ export function mockRedisClient(keyPrefix = '') {
 				return handler(keys, args);
 			},
 
-			// Eval - dispatches based on script content
+			// Eval - dispatches based on script content.
+			//
+			// Lua atomicity contract: a real Redis EVAL runs the whole script
+			// as one indivisible unit - no other command can interleave between
+			// its internal redis.call()s. This double upholds the same contract
+			// by dispatching to a fully SYNCHRONOUS evaluator: each evalXxx()
+			// helper completes all its reads and writes against the in-memory
+			// maps with no `await` in between, so even though eval() is declared
+			// `async` (to match ioredis's promise-returning surface) the script
+			// body never yields the microtask queue mid-execution. No concurrent
+			// command can observe a half-applied script. Keep every evaluator
+			// synchronous; introducing an `await` inside one would break this.
 			async eval(script, numKeys, ...args) {
 				// Ban script (atomic ban with Redis TIME)
 				if (script.includes('defaultPoints') && script.includes('defaultInterval')) {
@@ -655,42 +792,23 @@ export function mockRedisClient(keyPrefix = '') {
 				return ['0', matched];
 			},
 
-			// Pipeline support for batched commands
+			// Pipeline support for batched commands. The collected commands run
+			// through the shared batch executor (see execBatch below), which in
+			// cluster mode models the ioredis multi-slot hazard.
 			pipeline() {
-				const commands = [];
-				const p = new Proxy({}, {
-					get(_, method) {
-						if (method === 'exec') {
-							return async () => {
-								const results = [];
-								for (const { method: m, args } of commands) {
-									try {
-										const result = await r[m](...args);
-										results.push([null, result]);
-									} catch (err) {
-										results.push([err, null]);
-									}
-								}
-								return results;
-							};
-						}
-						return (...args) => {
-							commands.push({ method, args });
-							return p;
-						};
-					}
-				});
-				return p;
+				return makeBatch();
 			},
 
-			// MULTI / EXEC transaction support. The mock implementation is
-			// structurally identical to `pipeline()` since the mock does not
-			// model Redis-side atomicity (a real Redis MULTI wraps the
-			// commands in a transaction). Tests that need to verify the
-			// transaction shape (e.g. assert that all three writes land or
-			// none) should run against the integration tier instead.
+			// MULTI / EXEC transaction support. A real Redis MULTI on a cluster is
+			// still confined to a single node, so it carries the SAME multi-slot
+			// hazard as a pipeline: a transaction referencing keys on more than one
+			// node no-ops the off-node commands. The mock therefore shares the batch
+			// executor with pipeline(); in cluster mode a cross-node MULTI surfaces
+			// the off-node drops, and in standalone mode all commands run (the mock
+			// does not model Redis-side rollback - tests that need true
+			// transactional all-or-nothing semantics belong on the integration tier).
 			multi() {
-				return r.pipeline();
+				return makeBatch();
 			},
 
 			// Lifecycle
@@ -723,6 +841,75 @@ export function mockRedisClient(keyPrefix = '') {
 			_listeners: listeners
 		};
 
+		// Execute a collected batch in ioredis pipeline shape: an array of
+		// [err, value] tuples index-aligned with the commands.
+		//
+		// In standalone (default) mode every command runs - the mock has a single
+		// keyspace, so there is no node to be off. In cluster mode the batch models
+		// the ioredis multi-slot hazard: a single pipeline / transaction is
+		// delivered to ONE node (the node owning the first keyed command's slot).
+		// Every command whose key belongs to a different node is silently NO-OP'd -
+		// it never touches the store, and its result slot carries a MOVED
+		// placeholder error (never a thrown rejection), exactly as a real cluster
+		// pipeline surfaces it. A same-slot (or same-node) batch runs in full; a
+		// cross-slot batch that spans nodes leaves the off-node writes unapplied, so
+		// the regression is catchable here instead of only against a live cluster.
+		//
+		// Every command runs synchronously relative to the others (the `await`s here
+		// only resolve the already-synchronous in-memory ops), so a batch applies as
+		// an ordered unit with no foreign command interleaving mid-batch.
+		async function execBatch(commands) {
+			let targetNode = null;
+			if (clusterMode) {
+				for (const { method, args } of commands) {
+					const node = nodeForCommand(method, args);
+					if (node !== null) { targetNode = node; break; }
+				}
+			}
+			const results = [];
+			for (const { method: m, args } of commands) {
+				if (clusterMode && targetNode !== null) {
+					const node = nodeForCommand(m, args);
+					if (node !== null && node !== targetNode) {
+						// Off-node command: the cluster delivered the whole pipeline to
+						// targetNode, which does not own this slot, so it is dropped
+						// with a MOVED reply rather than run.
+						const slot = keySlot(commandKeys(m, args)[0]);
+						results.push([
+							new Error('MOVED ' + slot + ' mock-node-' + node),
+							undefined
+						]);
+						continue;
+					}
+				}
+				try {
+					const result = await r[m](...args);
+					results.push([null, result]);
+				} catch (err) {
+					results.push([err, null]);
+				}
+			}
+			return results;
+		}
+
+		// Build a pipeline/transaction collector. Chained command calls accumulate;
+		// exec() runs them through execBatch.
+		function makeBatch() {
+			const commands = [];
+			const p = new Proxy({}, {
+				get(_, method) {
+					if (method === 'exec') {
+						return () => execBatch(commands);
+					}
+					return (...args) => {
+						commands.push({ method, args });
+						return p;
+					};
+				}
+			});
+			return p;
+		}
+
 		// Rate limit Lua script simulation
 		function evalRateLimit(args) {
 			const key = args[0];
@@ -730,7 +917,10 @@ export function mockRedisClient(keyPrefix = '') {
 			const interval = Number(args[2]);
 			const cost = Number(args[3]);
 			const blockDuration = Number(args[4]);
-			const now = Date.now(); // Simulates Redis TIME command
+			// Mirror the real Lua: obtain the timestamp via the TIME command
+			// (clock-skew-safe) rather than a raw wall read, so this matches
+			// CONSUME_SCRIPT and follows the seam clock under a harness.
+			const now = evalTimeNowMs();
 
 			if (!hashes.has(key)) hashes.set(key, new Map());
 			const h = hashes.get(key);
@@ -782,7 +972,8 @@ export function mockRedisClient(keyPrefix = '') {
 			const duration = Number(args[1]);
 			const defaultPoints = Number(args[2]);
 			const defaultInterval = Number(args[3]);
-			const now = Date.now();
+			// BAN_SCRIPT clocks itself with redis.call('TIME'); mirror that.
+			const now = evalTimeNowMs();
 
 			if (!hashes.has(key)) hashes.set(key, new Map());
 			const h = hashes.get(key);
@@ -835,7 +1026,7 @@ export function mockRedisClient(keyPrefix = '') {
 			clearFieldExpiry(userHashKey, [instanceId]);
 			let ex = hashFieldExpiry.get(userHashKey);
 			if (!ex) { ex = new Map(); hashFieldExpiry.set(userHashKey, ex); }
-			ex.set(instanceId, Date.now() + ttlMs);
+			ex.set(instanceId, serverNowMs() + ttlMs);
 
 			// Newer-ts conditional set on topicHash, preserving any durable
 			// fields already stored for the user (mirrors JOIN_SCRIPT's
@@ -868,7 +1059,7 @@ export function mockRedisClient(keyPrefix = '') {
 			// for newer-ts, to keep the field alive on heartbeat).
 			let tex = hashFieldExpiry.get(topicHashKey);
 			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
-			tex.set(userKeyStr, Date.now() + ttlMs);
+			tex.set(userKeyStr, serverNowMs() + ttlMs);
 
 			return wasEmpty ? 1 : 0;
 		}
@@ -930,7 +1121,7 @@ export function mockRedisClient(keyPrefix = '') {
 			clearFieldExpiry(topicHashKey, [userKey]);
 			let tex = hashFieldExpiry.get(topicHashKey);
 			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
-			tex.set(userKey, Date.now() + ttlMs);
+			tex.set(userKey, serverNowMs() + ttlMs);
 			return 1;
 		}
 
@@ -1298,6 +1489,14 @@ export function mockRedisClient(keyPrefix = '') {
 		},
 		_unregisterFunction(funcName) {
 			registeredFunctions.delete(funcName);
-		}
+		},
+		// Cluster-mode introspection. `_cluster` reports whether the multi-slot
+		// hazard is modeled; `_slotOf` and `_nodeOf` expose the same slot->node
+		// mapping the batch executor uses, so a test can build a key pair that is
+		// guaranteed same-node (a batch that must succeed) or cross-node (a batch
+		// whose off-node commands must no-op).
+		_cluster: clusterMode,
+		_slotOf(key) { return keySlot(String(key)); },
+		_nodeOf(key) { return Math.floor(keySlot(String(key)) / Math.ceil(16384 / nodeCount)); }
 	};
 }

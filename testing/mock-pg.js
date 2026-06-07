@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { wallEpoch, randomUuid, microtask } from '../shared/runtime.js';
 
 /**
  * In-memory mock that implements the PgClient interface.
@@ -6,6 +6,9 @@ import { randomUUID } from 'node:crypto';
  *   - the svti_replay table + svti_replay_seq counter
  *   - the svti_idempotency key/value/expires_at table
  *   - the svti_tasks task-runner state machine
+ *   - the svti_jobs queue (FOR UPDATE SKIP LOCKED claim)
+ *   - pg_try_advisory_lock / pg_advisory_unlock session locks
+ *   - LISTEN / NOTIFY delivery via dedicated clients
  *
  * SQL is dispatched by shape, not by table name, so custom table names
  * passed via options work as long as the column shape is recognisable.
@@ -13,6 +16,14 @@ import { randomUUID } from 'node:crypto';
  *   - replay:        `topic`, `seq`
  *   - idempotency:   `expires_at` (without prefix), `WHERE svti_idempotency_key = $1`
  *   - tasks:         `fence_expires_at`, `svti_tasks_id`, `gen_random_uuid()`
+ *
+ * The clock and ids follow the injectable runtime seam (now / randomUuid),
+ * so a seeded harness that swaps in a virtual clock and a seeded RNG makes
+ * every TTL window, fence id, and created_at timestamp the double produces
+ * reproducible. Row locks (advisory + SKIP LOCKED) and NOTIFY/LISTEN
+ * delivery let the double surface concurrency behaviour - double-claim
+ * races and cross-connection lock contention - that the previous naive
+ * slice-based stub silently hid.
  */
 export function mockPgClient() {
 	/** @type {Array<{svti_replay_id: number, topic: string, seq: number, event: string, data: any, created_at: Date}>} */
@@ -36,777 +47,937 @@ export function mockPgClient() {
 	/** @type {Map<string, {status: string, result: any, expires_at: number}>} */
 	const idemRows = new Map();
 
-	/** @type {Map<string, {id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number}>} */
+	/** @type {Map<string, {id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number, _ins: number}>} */
 	const taskRows = new Map();
+	// Monotonic insertion counter. A virtual clock can stamp several rows with
+	// the same created_at, so created_at alone is not a total order; `_ins`
+	// breaks ties deterministically in insertion order (the durable analogue is
+	// the BIGSERIAL primary key Postgres assigns each INSERT).
+	let taskInsSeq = 1;
 
 	/** @type {Map<number, {id: number, queue: string, payload: any, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
 	const jobRows = new Map();
 	let jobNextId = 1;
 
-	function idemNow() {
-		return Date.now();
+	// ----- Advisory locks (session-scoped, like Postgres pg_advisory_lock).
+	//
+	// Keyed by lock id; the value is the holder's connection identity so a
+	// SECOND connection that asks for an already-held lock is refused. Locks
+	// taken on the shared client (connId 0) and on dedicated clients
+	// (createClient(), connId >= 1) live in the same map, so contention is
+	// queryable across claimers exactly as it is in real Postgres. A
+	// connection's end() releases every lock it still holds.
+	/** @type {Map<number, number>} lockId -> holderConnId */
+	const advisoryLocks = new Map();
+	let nextConnId = 1;
+
+	// ----- Row-lock model for FOR UPDATE SKIP LOCKED.
+	//
+	// A claim CTE that locks a row marks it here under the claiming
+	// connection's identity. A concurrent claimer SKIPS any row another
+	// connection currently holds (SKIP LOCKED), so two claimers never return
+	// the same row. The lock is released when the holding connection commits,
+	// rolls back, or releases - the shared autocommit client releases its
+	// locks at the end of each query() call (every statement is its own
+	// transaction), while a pinned pool connection holds them across the
+	// BEGIN..COMMIT window. Keyed `"<kind>:<rowKey>"` so task rows and job
+	// rows never collide.
+	/** @type {Map<string, number>} lockKey -> holderConnId */
+	const rowLocks = new Map();
+
+	// ----- LISTEN / NOTIFY.
+	//
+	// Each LISTEN registers the issuing dedicated client on a channel. NOTIFY
+	// enqueues the payload to every currently-registered listener and flushes
+	// it on a microtask, so delivery is asynchronous (as the pg driver's
+	// 'notification' event is) but ordered FIFO per channel. The shape mirrors
+	// notify.js's dedicated-client bridge: createClient() returns an object
+	// with on('notification', fn) / query('LISTEN ...') / connect() / end().
+	/** @type {Map<string, Set<object>>} channel -> set of dedicated clients listening */
+	const channelListeners = new Map();
+
+	function deliverNotification(channel, payload) {
+		const listeners = channelListeners.get(channel);
+		if (!listeners || listeners.size === 0) return;
+		// Snapshot so a listener that UNLISTENs during delivery does not
+		// mutate the set we are iterating. Per-channel FIFO is preserved
+		// because each NOTIFY schedules its own flush in call order.
+		const snapshot = [...listeners];
+		// Schedule via the runtime seam so a virtual timer wheel can drive
+		// delivery deterministically; under the native default this is a plain
+		// microtask, matching the pg driver's async 'notification' dispatch.
+		microtask(() => {
+			for (const conn of snapshot) {
+				if (!channelListeners.get(channel)?.has(conn)) continue;
+				conn._emit('notification', { channel, payload, processId: 0 });
+			}
+		});
 	}
 
-	const client = {
-		// `pool.connect()` returns a pinned-connection wrapper. The mock
-		// does not model Postgres-side transaction semantics (statements
-		// queued between BEGIN and COMMIT just go through the same query
-		// dispatch); production atomicity is verified at the integration
-		// tier. BEGIN / COMMIT / ROLLBACK are accepted as no-ops so the
-		// shared `withTransaction` helper works against this mock.
-		pool: {
-			async connect() {
-				return {
-					query: (textOrObj, values) => client.query(textOrObj, values),
-					release: () => {}
-				};
-			}
-		},
+	// The double's clock. Reads the exact wall-clock epoch through the runtime
+	// seam, so it has the same millisecond precision Postgres `now()` /
+	// CURRENT_TIMESTAMP carry (the 1Hz-cached `now()` helper would quantize TTL
+	// windows and created_at ordering to whole seconds), while a seeded harness
+	// that installs a virtual clock via setRuntimeEnv still drives every TTL,
+	// fence expiry, and timestamp this double produces.
+	function now() {
+		return wallEpoch();
+	}
 
-		async query(textOrObj, values) {
-			if (typeof textOrObj === 'object' && textOrObj !== null) {
-				values = textOrObj.values || [];
-				textOrObj = textOrObj.text;
-			}
-			if (!values) values = [];
-			const sql = textOrObj.trim().replace(/\s+/g, ' ');
+	function idemNow() {
+		return now();
+	}
 
-			// Transaction-control statements: accepted as no-ops by the mock.
-			// The mock does not model atomicity; rely on the integration tier
-			// for that assertion.
-			if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+	/**
+	 * Run the SQL dispatch for one statement. `connId` is the identity of the
+	 * connection issuing the statement (0 = the shared autocommit client,
+	 * >= 1 = a pinned pool connection or a dedicated LISTEN client). `inTx`
+	 * is true while a pinned connection is between BEGIN and COMMIT/ROLLBACK,
+	 * which is what keeps its row locks held across the transaction window.
+	 */
+	function runQuery(textOrObj, values, connId, conn, txState) {
+		if (typeof textOrObj === 'object' && textOrObj !== null) {
+			values = textOrObj.values || [];
+			textOrObj = textOrObj.text;
+		}
+		if (!values) values = [];
+		const sql = textOrObj.trim().replace(/\s+/g, ' ');
+
+		// Transaction-control statements. On the shared autocommit client these
+		// are no-ops (the mock does not model atomicity; the integration tier
+		// asserts that). On a pinned pool connection they open / close the
+		// row-lock window: locks a claim CTE takes inside BEGIN..COMMIT stay
+		// held until COMMIT or ROLLBACK, so a concurrent claimer skips them.
+		if (sql === 'BEGIN') {
+			if (txState) txState.inTx = true;
+			return { rows: [], rowCount: 0 };
+		}
+		if (sql === 'COMMIT' || sql === 'ROLLBACK') {
+			if (txState) {
+				txState.inTx = false;
+				releaseRowLocks(connId);
+			}
+			return { rows: [], rowCount: 0 };
+		}
+
+		// LISTEN / UNLISTEN: register or drop this dedicated client on a
+		// channel. The bridge issues `LISTEN "channel"` (delimited identifier),
+		// so strip the surrounding double-quotes to recover the raw name.
+		if (sql.startsWith('LISTEN ')) {
+			const channel = unquoteIdent(sql.slice('LISTEN '.length).trim());
+			if (!channelListeners.has(channel)) channelListeners.set(channel, new Set());
+			if (conn) channelListeners.get(channel).add(conn);
+			return { rows: [], rowCount: 0 };
+		}
+		if (sql.startsWith('UNLISTEN ')) {
+			const channel = unquoteIdent(sql.slice('UNLISTEN '.length).trim());
+			channelListeners.get(channel)?.delete(conn);
+			return { rows: [], rowCount: 0 };
+		}
+
+		// NOTIFY channel, 'payload' and the pg_notify(channel, payload)
+		// function form. Delivery is enqueued to every current listener.
+		if (sql.startsWith('NOTIFY ')) {
+			const rest = sql.slice('NOTIFY '.length);
+			const comma = rest.indexOf(',');
+			const channel = unquoteIdent((comma === -1 ? rest : rest.slice(0, comma)).trim());
+			const payload = comma === -1 ? '' : unquoteLiteral(rest.slice(comma + 1).trim());
+			deliverNotification(channel, payload);
+			return { rows: [], rowCount: 0 };
+		}
+		if (/^SELECT\s+pg_notify\s*\(/i.test(sql)) {
+			const channel = values[0];
+			const payload = values[1] ?? '';
+			deliverNotification(channel, payload);
+			return { rows: [], rowCount: 0 };
+		}
+
+		// Advisory locks. pg_try_advisory_lock($1) claims the lock for this
+		// connection when free (or already self-held) and returns true; it
+		// returns false when another connection holds it. pg_advisory_unlock
+		// releases it (true if this connection held it, false otherwise).
+		if (sql.includes('pg_try_advisory_lock')) {
+			const lockId = values[0];
+			const holder = advisoryLocks.get(lockId);
+			const acquired = holder === undefined || holder === connId;
+			if (acquired) advisoryLocks.set(lockId, connId);
+			return { rows: [{ acquired }], rowCount: 1 };
+		}
+		if (sql.includes('pg_advisory_unlock')) {
+			const lockId = values[0];
+			const released = advisoryLocks.get(lockId) === connId;
+			if (released) advisoryLocks.delete(lockId);
+			return { rows: [{ pg_advisory_unlock: released }], rowCount: 1 };
+		}
+
+		// CREATE TABLE
+		if (sql.startsWith('CREATE TABLE')) {
+			tableCreated = true;
+			return { rows: [], rowCount: 0 };
+		}
+
+		// CREATE INDEX
+		if (sql.startsWith('CREATE INDEX')) {
+			return { rows: [], rowCount: 0 };
+		}
+
+		// ALTER TABLE - no-op: the mock's row shapes are dynamic so any
+		// added column is automatically accepted by INSERT / SELECT branches
+		// that reference it.
+		if (sql.startsWith('ALTER TABLE')) {
+			return { rows: [], rowCount: 0 };
+		}
+
+		// ----- Idempotency dispatch (matched first; markers: `expires_at`, `WHERE key`)
+
+		// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING status
+		if (
+			sql.startsWith('INSERT INTO') &&
+			sql.includes('ON CONFLICT (svti_idempotency_key)') &&
+			sql.includes('expires_at')
+		) {
+			const key = values[0];
+			const acquireTtlSec = Number(values[1]);
+			const expiresAt = idemNow() + acquireTtlSec * 1000;
+			const existing = idemRows.get(key);
+			if (!existing) {
+				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
+				return { rows: [{ status: 'pending' }], rowCount: 1 };
+			}
+			if (existing.expires_at < idemNow()) {
+				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
+				return { rows: [{ status: 'pending' }], rowCount: 1 };
+			}
+			return { rows: [], rowCount: 0 };
+		}
+
+		// Read: SELECT status, result FROM ... WHERE svti_idempotency_key = $1 AND expires_at >= now()
+		if (
+			sql.startsWith('SELECT status, result FROM') &&
+			sql.includes('WHERE svti_idempotency_key = $1') &&
+			sql.includes('expires_at')
+		) {
+			const key = values[0];
+			const row = idemRows.get(key);
+			if (!row || row.expires_at < idemNow()) {
 				return { rows: [], rowCount: 0 };
 			}
+			return { rows: [{ status: row.status, result: row.result }], rowCount: 1 };
+		}
 
-			// CREATE TABLE
-			if (sql.startsWith('CREATE TABLE')) {
-				tableCreated = true;
-				return { rows: [], rowCount: 0 };
+		// Commit: UPDATE ... SET status = 'committed', result = $2::jsonb, expires_at = ...
+		// (Idempotency-specific: WHERE svti_idempotency_key = $1.  Task commits match a different branch below.)
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes("status = 'committed'") &&
+			sql.includes('WHERE svti_idempotency_key = $1')
+		) {
+			const key = values[0];
+			const result = typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1];
+			const ttlSec = Number(values[2]);
+			const row = idemRows.get(key);
+			if (row) {
+				row.status = 'committed';
+				row.result = result;
+				row.expires_at = idemNow() + ttlSec * 1000;
 			}
+			return { rows: [], rowCount: row ? 1 : 0 };
+		}
 
-			// CREATE INDEX
-			if (sql.startsWith('CREATE INDEX')) {
-				return { rows: [], rowCount: 0 };
-			}
-
-			// ALTER TABLE - no-op: the mock's row shapes are dynamic so any
-			// added column is automatically accepted by INSERT / SELECT branches
-			// that reference it.
-			if (sql.startsWith('ALTER TABLE')) {
-				return { rows: [], rowCount: 0 };
-			}
-
-			// ----- Idempotency dispatch (matched first; markers: `expires_at`, `WHERE key`)
-
-			// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING status
-			if (
-				sql.startsWith('INSERT INTO') &&
-				sql.includes('ON CONFLICT (svti_idempotency_key)') &&
-				sql.includes('expires_at')
-			) {
-				const key = values[0];
-				const acquireTtlSec = Number(values[1]);
-				const expiresAt = idemNow() + acquireTtlSec * 1000;
-				const existing = idemRows.get(key);
-				if (!existing) {
-					idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
-					return { rows: [{ status: 'pending' }], rowCount: 1 };
+		// Cleanup: DELETE FROM ... WHERE expires_at < now()
+		if (sql.startsWith('DELETE FROM') && sql.includes('expires_at < now()')) {
+			let removed = 0;
+			const cutoff = idemNow();
+			for (const [k, v] of idemRows) {
+				if (v.expires_at < cutoff) {
+					idemRows.delete(k);
+					removed++;
 				}
-				if (existing.expires_at < idemNow()) {
-					idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
-					return { rows: [{ status: 'pending' }], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
 			}
+			return { rows: [], rowCount: removed };
+		}
 
-			// Read: SELECT status, result FROM ... WHERE svti_idempotency_key = $1 AND expires_at >= now()
-			if (
-				sql.startsWith('SELECT status, result FROM') &&
-				sql.includes('WHERE svti_idempotency_key = $1') &&
-				sql.includes('expires_at')
-			) {
-				const key = values[0];
-				const row = idemRows.get(key);
-				if (!row || row.expires_at < idemNow()) {
-					return { rows: [], rowCount: 0 };
-				}
-				return { rows: [{ status: row.status, result: row.result }], rowCount: 1 };
-			}
+		// Abort / purge: DELETE FROM ... WHERE svti_idempotency_key = $1
+		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE svti_idempotency_key = $1')) {
+			const key = values[0];
+			const had = idemRows.delete(key);
+			return { rows: [], rowCount: had ? 1 : 0 };
+		}
 
-			// Commit: UPDATE ... SET status = 'committed', result = $2::jsonb, expires_at = ...
-			// (Idempotency-specific: WHERE svti_idempotency_key = $1.  Task commits match a different branch below.)
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes("status = 'committed'") &&
-				sql.includes('WHERE svti_idempotency_key = $1')
-			) {
-				const key = values[0];
-				const result = typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1];
-				const ttlSec = Number(values[2]);
-				const row = idemRows.get(key);
-				if (row) {
-					row.status = 'committed';
-					row.result = result;
-					row.expires_at = idemNow() + ttlSec * 1000;
-				}
-				return { rows: [], rowCount: row ? 1 : 0 };
-			}
+		// Idempotency clear (default table name).  Custom table names
+		// fall through to the replay-table catch-all and would clear
+		// replay rows instead - tests should use the default name.
+		if (sql.startsWith('DELETE FROM svti_idempotency') && !sql.includes('WHERE')) {
+			const before = idemRows.size;
+			idemRows.clear();
+			return { rows: [], rowCount: before };
+		}
 
-			// Cleanup: DELETE FROM ... WHERE expires_at < now()
-			if (sql.startsWith('DELETE FROM') && sql.includes('expires_at < now()')) {
-				let removed = 0;
-				const now = idemNow();
-				for (const [k, v] of idemRows) {
-					if (v.expires_at < now) {
-						idemRows.delete(k);
-						removed++;
-					}
-				}
-				return { rows: [], rowCount: removed };
-			}
+		// ----- Task runner dispatch (markers: `fence_expires_at`, `svti_tasks_id`)
 
-			// Abort / purge: DELETE FROM ... WHERE svti_idempotency_key = $1
-			if (sql.startsWith('DELETE FROM') && sql.includes('WHERE svti_idempotency_key = $1')) {
-				const key = values[0];
-				const had = idemRows.delete(key);
-				return { rows: [], rowCount: had ? 1 : 0 };
-			}
+		// Task INSERT (run path): row creation with fresh fence, status='running'
+		if (
+			sql.startsWith('INSERT INTO') &&
+			sql.includes('svti_tasks_id') &&
+			sql.includes('fence_expires_at') &&
+			sql.includes('svti_idempotency_key') &&
+			!sql.includes('gen_random_uuid()')
+		) {
+			const fenceTtlSec = Number(values[6]);
+			const ts = now();
+			taskRows.set(values[0], {
+				id: values[0],
+				name: values[1],
+				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
+				idempotency_key: values[3],
+				request_id: values[4] ?? null,
+				status: 'running',
+				result: null,
+				error: null,
+				fence: values[5],
+				fence_expires_at: ts + fenceTtlSec * 1000,
+				attempts: 1,
+				created_at: ts,
+				updated_at: ts,
+				_ins: taskInsSeq++
+			});
+			return { rows: [], rowCount: 1 };
+		}
 
-			// Idempotency clear (default table name).  Custom table names
-			// fall through to the replay-table catch-all and would clear
-			// replay rows instead - tests should use the default name.
-			if (sql.startsWith('DELETE FROM svti_idempotency') && !sql.includes('WHERE')) {
-				const before = idemRows.size;
-				idemRows.clear();
-				return { rows: [], rowCount: before };
-			}
+		// Task INSERT (enqueue path): status='pending', server-generated fence, attempts=0
+		if (
+			sql.startsWith('INSERT INTO') &&
+			sql.includes('svti_tasks_id') &&
+			sql.includes('fence_expires_at') &&
+			sql.includes('svti_idempotency_key') &&
+			sql.includes("'pending'") &&
+			sql.includes('gen_random_uuid()')
+		) {
+			const ts = now();
+			taskRows.set(values[0], {
+				id: values[0],
+				name: values[1],
+				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
+				idempotency_key: values[3],
+				request_id: values[4] ?? null,
+				status: 'pending',
+				result: null,
+				error: null,
+				fence: randomUuid(),
+				fence_expires_at: ts,
+				attempts: 0,
+				created_at: ts,
+				updated_at: ts,
+				_ins: taskInsSeq++
+			});
+			return { rows: [], rowCount: 1 };
+		}
 
-			// ----- Task runner dispatch (markers: `fence_expires_at`, `svti_tasks_id`)
-
-			// Task INSERT (run path): row creation with fresh fence, status='running'
-			if (
-				sql.startsWith('INSERT INTO') &&
-				sql.includes('svti_tasks_id') &&
-				sql.includes('fence_expires_at') &&
-				sql.includes('svti_idempotency_key') &&
-				!sql.includes('gen_random_uuid()')
-			) {
-				const fenceTtlSec = Number(values[6]);
-				const now = Date.now();
-				taskRows.set(values[0], {
-					id: values[0],
-					name: values[1],
-					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
-					idempotency_key: values[3],
-					request_id: values[4] ?? null,
-					status: 'running',
-					result: null,
-					error: null,
-					fence: values[5],
-					fence_expires_at: now + fenceTtlSec * 1000,
-					attempts: 1,
-					created_at: now,
-					updated_at: now
-				});
+		// Task heartbeat: extend fence_expires_at while owning the fence
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes('fence_expires_at = now() +') &&
+			sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'') &&
+			!sql.includes("status = 'committed'") &&
+			!sql.includes("status = 'failed'")
+		) {
+			const taskId = values[0];
+			const fence = values[1];
+			const ttlSec = Number(values[2]);
+			const row = taskRows.get(taskId);
+			if (row && row.fence === fence && row.status === 'running') {
+				row.fence_expires_at = now() + ttlSec * 1000;
+				row.updated_at = now();
 				return { rows: [], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Task INSERT (enqueue path): status='pending', server-generated fence, attempts=0
-			if (
-				sql.startsWith('INSERT INTO') &&
-				sql.includes('svti_tasks_id') &&
-				sql.includes('fence_expires_at') &&
-				sql.includes('svti_idempotency_key') &&
-				sql.includes("'pending'") &&
-				sql.includes('gen_random_uuid()')
-			) {
-				const now = Date.now();
-				taskRows.set(values[0], {
-					id: values[0],
-					name: values[1],
-					input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
-					idempotency_key: values[3],
-					request_id: values[4] ?? null,
-					status: 'pending',
-					result: null,
-					error: null,
-					fence: randomUUID(),
-					fence_expires_at: now,
-					attempts: 0,
-					created_at: now,
-					updated_at: now
-				});
+		// Task commit: conditional set status='committed' guarded by fence
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes("status = 'committed'") &&
+			sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
+		) {
+			const taskId = values[0];
+			const fence = values[1];
+			const result = typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2];
+			const row = taskRows.get(taskId);
+			if (row && row.fence === fence && row.status === 'running') {
+				row.status = 'committed';
+				row.result = result;
+				row.updated_at = now();
 				return { rows: [], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Task heartbeat: extend fence_expires_at while owning the fence
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes('fence_expires_at = now() +') &&
-				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'') &&
-				!sql.includes("status = 'committed'") &&
-				!sql.includes("status = 'failed'")
-			) {
-				const taskId = values[0];
-				const fence = values[1];
-				const ttlSec = Number(values[2]);
-				const row = taskRows.get(taskId);
-				if (row && row.fence === fence && row.status === 'running') {
-					row.fence_expires_at = Date.now() + ttlSec * 1000;
-					row.updated_at = Date.now();
-					return { rows: [], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
+		// Task fail: conditional set status='failed' guarded by fence
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes("status = 'failed'") &&
+			sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
+		) {
+			const taskId = values[0];
+			const fence = values[1];
+			const error = typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2];
+			const row = taskRows.get(taskId);
+			if (row && row.fence === fence && row.status === 'running') {
+				row.status = 'failed';
+				row.error = error;
+				row.updated_at = now();
+				return { rows: [], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Task commit: conditional set status='committed' guarded by fence
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes("status = 'committed'") &&
-				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
-			) {
-				const taskId = values[0];
-				const fence = values[1];
-				const result = typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2];
-				const row = taskRows.get(taskId);
-				if (row && row.fence === fence && row.status === 'running') {
-					row.status = 'committed';
-					row.result = result;
-					row.updated_at = Date.now();
-					return { rows: [], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
+		// Task rearm: unconditionally rotate the fence (used for retries)
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes('fence = $2') &&
+			sql.includes('attempts = $4') &&
+			sql.includes('WHERE svti_tasks_id = $1')
+		) {
+			const taskId = values[0];
+			const fence = values[1];
+			const ttlSec = Number(values[2]);
+			const attempts = Number(values[3]);
+			const row = taskRows.get(taskId);
+			if (row) {
+				row.fence = fence;
+				row.fence_expires_at = now() + ttlSec * 1000;
+				row.attempts = attempts;
+				row.updated_at = now();
+				return { rows: [], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Task fail: conditional set status='failed' guarded by fence
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes("status = 'failed'") &&
-				sql.includes('WHERE svti_tasks_id = $1 AND fence = $2 AND status = \'running\'')
-			) {
-				const taskId = values[0];
-				const fence = values[1];
-				const error = typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2];
-				const row = taskRows.get(taskId);
-				if (row && row.fence === fence && row.status === 'running') {
-					row.status = 'failed';
-					row.error = error;
-					row.updated_at = Date.now();
-					return { rows: [], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
+		// Task read: status, result, error, attempts, request_id
+		if (
+			sql.startsWith('SELECT status, result, error, attempts, request_id FROM') &&
+			sql.includes('WHERE svti_tasks_id = $1')
+		) {
+			const taskId = values[0];
+			const row = taskRows.get(taskId);
+			if (!row) return { rows: [], rowCount: 0 };
+			return {
+				rows: [{
+					status: row.status,
+					result: row.result,
+					error: row.error,
+					attempts: row.attempts,
+					request_id: row.request_id ?? null
+				}],
+				rowCount: 1
+			};
+		}
+
+		// Task claim-pending: dispatch sweep for enqueued rows. Models FOR
+		// UPDATE SKIP LOCKED: rows another connection currently holds are
+		// invisible, so two concurrent claimers get disjoint sets. Ordering is
+		// deterministic (FIFO by created_at, then row id as a stable tie-break).
+		if (sql.includes('WITH claimed') && sql.includes("WHERE status = 'pending'")) {
+			const limit = Number(values[0]);
+			const ttlSec = Number(values[1]);
+			const ts = now();
+			const pending = [];
+			for (const row of taskRows.values()) {
+				if (row.status !== 'pending') continue;
+				if (isRowLockedByOther('task', row.id, connId)) continue;
+				pending.push(row);
 			}
-
-			// Task rearm: unconditionally rotate the fence (used for retries)
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes('fence = $2') &&
-				sql.includes('attempts = $4') &&
-				sql.includes('WHERE svti_tasks_id = $1')
-			) {
-				const taskId = values[0];
-				const fence = values[1];
-				const ttlSec = Number(values[2]);
-				const attempts = Number(values[3]);
-				const row = taskRows.get(taskId);
-				if (row) {
-					row.fence = fence;
-					row.fence_expires_at = Date.now() + ttlSec * 1000;
-					row.attempts = attempts;
-					row.updated_at = Date.now();
-					return { rows: [], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
-			}
-
-			// Task read: status, result, error, attempts, request_id
-			if (
-				sql.startsWith('SELECT status, result, error, attempts, request_id FROM') &&
-				sql.includes('WHERE svti_tasks_id = $1')
-			) {
-				const taskId = values[0];
-				const row = taskRows.get(taskId);
-				if (!row) return { rows: [], rowCount: 0 };
-				return {
-					rows: [{
-						status: row.status,
-						result: row.result,
-						error: row.error,
-						attempts: row.attempts,
-						request_id: row.request_id ?? null
-					}],
-					rowCount: 1
-				};
-			}
-
-			// Task claim-pending: dispatch sweep for enqueued rows
-			if (sql.includes('WITH claimed') && sql.includes("WHERE status = 'pending'")) {
-				const limit = Number(values[0]);
-				const ttlSec = Number(values[1]);
-				const now = Date.now();
-				const pending = [];
-				for (const row of taskRows.values()) {
-					if (row.status === 'pending') pending.push(row);
-				}
-				pending.sort((a, b) => a.created_at - b.created_at);
-				const claimed = pending.slice(0, limit);
-				const out = [];
-				for (const row of claimed) {
-					row.status = 'running';
-					row.fence = randomUUID();
-					row.fence_expires_at = now + ttlSec * 1000;
-					row.attempts += 1;
-					row.updated_at = now;
-					out.push({
-						id: row.id,
-						name: row.name,
-						input: row.input,
-						idempotency_key: row.idempotency_key,
-						request_id: row.request_id ?? null,
-						fence: row.fence,
-						attempts: row.attempts
-					});
-				}
-				return { rows: out, rowCount: out.length };
-			}
-
-			// Task reclaim: stuck-row sweep with CTE + gen_random_uuid()
-			if (sql.includes('WITH claimed') && sql.includes('gen_random_uuid()')) {
-				const limit = Number(values[0]);
-				const ttlSec = Number(values[1]);
-				const now = Date.now();
-				const stuck = [];
-				for (const row of taskRows.values()) {
-					if (row.status === 'running' && row.fence_expires_at < now) {
-						stuck.push(row);
-					}
-				}
-				stuck.sort((a, b) => a.fence_expires_at - b.fence_expires_at);
-				const claimed = stuck.slice(0, limit);
-				const out = [];
-				for (const row of claimed) {
-					row.fence = randomUUID();
-					row.fence_expires_at = now + ttlSec * 1000;
-					row.attempts += 1;
-					row.updated_at = now;
-					out.push({
-						id: row.id,
-						name: row.name,
-						input: row.input,
-						idempotency_key: row.idempotency_key,
-						request_id: row.request_id ?? null,
-						fence: row.fence,
-						attempts: row.attempts
-					});
-				}
-				return { rows: out, rowCount: out.length };
-			}
-
-			// Task list: SELECT svti_tasks_id AS id, name, input, status, ... ORDER BY created_at DESC
-			if (
-				sql.startsWith('SELECT svti_tasks_id AS id') &&
-				sql.includes('ORDER BY created_at DESC') &&
-				sql.includes('LIMIT')
-			) {
-				let rows = [...taskRows.values()];
-				let valueIdx = 0;
-				if (sql.includes('name = $')) {
-					const filterName = values[valueIdx++];
-					rows = rows.filter((r) => r.name === filterName);
-				}
-				if (sql.includes('status = $')) {
-					const filterStatus = values[valueIdx++];
-					rows = rows.filter((r) => r.status === filterStatus);
-				}
-				rows.sort((a, b) => b.created_at - a.created_at);
-				const limit = Number(values[valueIdx++]);
-				const offset = Number(values[valueIdx++]);
-				const sliced = rows.slice(offset, offset + limit);
-				const out = sliced.map((r) => ({
-					id: r.id,
-					name: r.name,
-					input: r.input,
-					status: r.status,
-					result: r.result,
-					error: r.error,
-					attempts: r.attempts,
-					request_id: r.request_id ?? null,
-					created_at: new Date(r.created_at),
-					updated_at: new Date(r.updated_at),
-					fence_expires_at: new Date(r.fence_expires_at)
-				}));
-				return { rows: out, rowCount: out.length };
-			}
-
-			// Task counts: SELECT status, COUNT(*)::int AS n ... GROUP BY status
-			if (
-				sql.startsWith('SELECT status, COUNT(*)::int AS n') &&
-				sql.includes('GROUP BY status')
-			) {
-				let rows = [...taskRows.values()];
-				if (sql.includes('WHERE name = $1')) {
-					rows = rows.filter((r) => r.name === values[0]);
-				}
-				const counts = {};
-				for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
-				const out = Object.entries(counts).map(([status, n]) => ({ status, n }));
-				return { rows: out, rowCount: out.length };
-			}
-
-			// Task takeover: expire fence_expires_at, RETURNING fence
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes("fence_expires_at = now() - interval '1 second'") &&
-				sql.includes("status = 'running'") &&
-				sql.includes('RETURNING fence')
-			) {
-				const taskId = values[0];
-				const row = taskRows.get(taskId);
-				if (!row || row.status !== 'running') return { rows: [], rowCount: 0 };
-				const previousFence = row.fence;
-				row.fence_expires_at = Date.now() - 1000;
-				row.updated_at = Date.now();
-				return { rows: [{ fence: previousFence }], rowCount: 1 };
-			}
-
-			// Task cleanup: delete terminal rows older than rowTtl
-			if (
-				sql.startsWith('DELETE FROM') &&
-				sql.includes("status IN ('committed', 'failed')") &&
-				sql.includes('updated_at <')
-			) {
-				const ttlSec = Number(values[0]);
-				const cutoff = Date.now() - ttlSec * 1000;
-				let removed = 0;
-				for (const [k, v] of taskRows) {
-					if ((v.status === 'committed' || v.status === 'failed') && v.updated_at < cutoff) {
-						taskRows.delete(k);
-						removed++;
-					}
-				}
-				return { rows: [], rowCount: removed };
-			}
-
-			// Task clear (default table name)
-			if (sql.startsWith('DELETE FROM svti_tasks') && !sql.includes('WHERE')) {
-				const before = taskRows.size;
-				taskRows.clear();
-				return { rows: [], rowCount: before };
-			}
-
-			// ----- Job queue dispatch (markers: `queue` column, no `svti_tasks_id`/`status`)
-
-			// Job enqueue: INSERT INTO svti_jobs (queue, payload, request_id) VALUES ($1, $2, $3) RETURNING svti_jobs_id AS id
-			if (
-				sql.startsWith('INSERT INTO') &&
-				sql.includes('(queue, payload, request_id)') &&
-				sql.includes('RETURNING svti_jobs_id AS id')
-			) {
-				const id = jobNextId++;
-				jobRows.set(id, {
-					id,
-					queue: values[0],
-					payload: typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1],
-					request_id: values[2] ?? null,
-					claimed_at: null,
-					claimed_until: null,
-					attempts: 0,
-					created_at: new Date()
+			pending.sort(byCreatedThenIns);
+			const claimed = pending.slice(0, limit);
+			const out = [];
+			for (const row of claimed) {
+				lockRow('task', row.id, connId);
+				row.status = 'running';
+				row.fence = randomUuid();
+				row.fence_expires_at = ts + ttlSec * 1000;
+				row.attempts += 1;
+				row.updated_at = ts;
+				out.push({
+					id: row.id,
+					name: row.name,
+					input: row.input,
+					idempotency_key: row.idempotency_key,
+					request_id: row.request_id ?? null,
+					fence: row.fence,
+					attempts: row.attempts
 				});
-				return { rows: [{ id }], rowCount: 1 };
 			}
+			// Autocommit: the shared client releases the row locks at the end of
+			// the statement (each query is its own transaction). A pinned
+			// connection holds them until its COMMIT / ROLLBACK.
+			if (!txState || !txState.inTx) releaseRowLocks(connId);
+			return { rows: out, rowCount: out.length };
+		}
 
-			// Job claim: WITH claimed AS (SELECT svti_jobs_id FROM svti_jobs WHERE queue=$1 AND (claimed_at IS NULL OR claimed_until < now()) ...) UPDATE ... RETURNING ...
-			if (sql.includes('WITH claimed') && sql.includes('claimed_at IS NULL OR claimed_until')) {
-				const queue = values[0];
-				const limit = Number(values[1]);
-				const visibilityMs = Number(values[2]);
-				const now = Date.now();
-				const candidates = [];
-				for (const row of jobRows.values()) {
-					if (row.queue !== queue) continue;
-					if (row.claimed_at === null || (row.claimed_until !== null && row.claimed_until < now)) {
-						candidates.push(row);
-					}
+		// Task reclaim: stuck-row sweep with CTE + gen_random_uuid(). Same
+		// SKIP LOCKED row-lock model as claim-pending above.
+		if (sql.includes('WITH claimed') && sql.includes('gen_random_uuid()')) {
+			const limit = Number(values[0]);
+			const ttlSec = Number(values[1]);
+			const ts = now();
+			const stuck = [];
+			for (const row of taskRows.values()) {
+				if (!(row.status === 'running' && row.fence_expires_at < ts)) continue;
+				if (isRowLockedByOther('task', row.id, connId)) continue;
+				stuck.push(row);
+			}
+			stuck.sort((a, b) => a.fence_expires_at - b.fence_expires_at || a._ins - b._ins);
+			const claimed = stuck.slice(0, limit);
+			const out = [];
+			for (const row of claimed) {
+				lockRow('task', row.id, connId);
+				row.fence = randomUuid();
+				row.fence_expires_at = ts + ttlSec * 1000;
+				row.attempts += 1;
+				row.updated_at = ts;
+				out.push({
+					id: row.id,
+					name: row.name,
+					input: row.input,
+					idempotency_key: row.idempotency_key,
+					request_id: row.request_id ?? null,
+					fence: row.fence,
+					attempts: row.attempts
+				});
+			}
+			if (!txState || !txState.inTx) releaseRowLocks(connId);
+			return { rows: out, rowCount: out.length };
+		}
+
+		// Task list: SELECT svti_tasks_id AS id, name, input, status, ... ORDER BY created_at DESC
+		if (
+			sql.startsWith('SELECT svti_tasks_id AS id') &&
+			sql.includes('ORDER BY created_at DESC') &&
+			sql.includes('LIMIT')
+		) {
+			let listed = [...taskRows.values()];
+			let valueIdx = 0;
+			if (sql.includes('name = $')) {
+				const filterName = values[valueIdx++];
+				listed = listed.filter((r) => r.name === filterName);
+			}
+			if (sql.includes('status = $')) {
+				const filterStatus = values[valueIdx++];
+				listed = listed.filter((r) => r.status === filterStatus);
+			}
+			// Newest first; insertion order breaks created_at ties so rows
+			// stamped with the same virtual-clock instant stay deterministic.
+			listed.sort((a, b) => b.created_at - a.created_at || b._ins - a._ins);
+			const limit = Number(values[valueIdx++]);
+			const offset = Number(values[valueIdx++]);
+			const sliced = listed.slice(offset, offset + limit);
+			const out = sliced.map((r) => ({
+				id: r.id,
+				name: r.name,
+				input: r.input,
+				status: r.status,
+				result: r.result,
+				error: r.error,
+				attempts: r.attempts,
+				request_id: r.request_id ?? null,
+				created_at: new Date(r.created_at), // determinism-allow: r.created_at is a seam-sourced (now()) epoch ms
+				updated_at: new Date(r.updated_at), // determinism-allow: r.updated_at is a seam-sourced (now()) epoch ms
+				fence_expires_at: new Date(r.fence_expires_at) // determinism-allow: derived from a seam-sourced epoch ms
+			}));
+			return { rows: out, rowCount: out.length };
+		}
+
+		// Task counts: SELECT status, COUNT(*)::int AS n ... GROUP BY status
+		if (
+			sql.startsWith('SELECT status, COUNT(*)::int AS n') &&
+			sql.includes('GROUP BY status')
+		) {
+			let counted = [...taskRows.values()];
+			if (sql.includes('WHERE name = $1')) {
+				counted = counted.filter((r) => r.name === values[0]);
+			}
+			const counts = {};
+			for (const r of counted) counts[r.status] = (counts[r.status] || 0) + 1;
+			const out = Object.entries(counts).map(([status, n]) => ({ status, n }));
+			return { rows: out, rowCount: out.length };
+		}
+
+		// Task takeover: expire fence_expires_at, RETURNING fence
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes("fence_expires_at = now() - interval '1 second'") &&
+			sql.includes("status = 'running'") &&
+			sql.includes('RETURNING fence')
+		) {
+			const taskId = values[0];
+			const row = taskRows.get(taskId);
+			if (!row || row.status !== 'running') return { rows: [], rowCount: 0 };
+			const previousFence = row.fence;
+			row.fence_expires_at = now() - 1000;
+			row.updated_at = now();
+			return { rows: [{ fence: previousFence }], rowCount: 1 };
+		}
+
+		// Task cleanup: delete terminal rows older than rowTtl
+		if (
+			sql.startsWith('DELETE FROM') &&
+			sql.includes("status IN ('committed', 'failed')") &&
+			sql.includes('updated_at <')
+		) {
+			const ttlSec = Number(values[0]);
+			const cutoff = now() - ttlSec * 1000;
+			let removed = 0;
+			for (const [k, v] of taskRows) {
+				if ((v.status === 'committed' || v.status === 'failed') && v.updated_at < cutoff) {
+					taskRows.delete(k);
+					removed++;
 				}
-				candidates.sort((a, b) => a.id - b.id);
-				const claimed = candidates.slice(0, limit);
-				const out = [];
-				for (const row of claimed) {
-					row.claimed_at = now;
-					row.claimed_until = now + visibilityMs;
-					row.attempts += 1;
-					out.push({
-						id: row.id,
-						queue: row.queue,
-						payload: row.payload,
-						request_id: row.request_id ?? null,
-						attempts: row.attempts,
-						created_at: row.created_at
-					});
+			}
+			return { rows: [], rowCount: removed };
+		}
+
+		// Task clear (default table name)
+		if (sql.startsWith('DELETE FROM svti_tasks') && !sql.includes('WHERE')) {
+			const before = taskRows.size;
+			taskRows.clear();
+			return { rows: [], rowCount: before };
+		}
+
+		// ----- Job queue dispatch (markers: `queue` column, no `svti_tasks_id`/`status`)
+
+		// Job enqueue: INSERT INTO svti_jobs (queue, payload, request_id) VALUES ($1, $2, $3) RETURNING svti_jobs_id AS id
+		if (
+			sql.startsWith('INSERT INTO') &&
+			sql.includes('(queue, payload, request_id)') &&
+			sql.includes('RETURNING svti_jobs_id AS id')
+		) {
+			const id = jobNextId++;
+			jobRows.set(id, {
+				id,
+				queue: values[0],
+				payload: typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1],
+				request_id: values[2] ?? null,
+				claimed_at: null,
+				claimed_until: null,
+				attempts: 0,
+				created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
+			});
+			return { rows: [{ id }], rowCount: 1 };
+		}
+
+		// Job claim: WITH claimed AS (SELECT svti_jobs_id FROM svti_jobs WHERE queue=$1 AND (claimed_at IS NULL OR claimed_until < now()) ...) UPDATE ... RETURNING ...
+		// Models FOR UPDATE SKIP LOCKED: a row another connection currently
+		// holds is skipped, so two concurrent claimers get disjoint rows.
+		if (sql.includes('WITH claimed') && sql.includes('claimed_at IS NULL OR claimed_until')) {
+			const queue = values[0];
+			const limit = Number(values[1]);
+			const visibilityMs = Number(values[2]);
+			const ts = now();
+			const candidates = [];
+			for (const row of jobRows.values()) {
+				if (row.queue !== queue) continue;
+				if (!(row.claimed_at === null || (row.claimed_until !== null && row.claimed_until < ts))) continue;
+				if (isRowLockedByOther('job', row.id, connId)) continue;
+				candidates.push(row);
+			}
+			candidates.sort((a, b) => a.id - b.id);
+			const claimed = candidates.slice(0, limit);
+			const out = [];
+			for (const row of claimed) {
+				lockRow('job', row.id, connId);
+				row.claimed_at = ts;
+				row.claimed_until = ts + visibilityMs;
+				row.attempts += 1;
+				out.push({
+					id: row.id,
+					queue: row.queue,
+					payload: row.payload,
+					request_id: row.request_id ?? null,
+					attempts: row.attempts,
+					created_at: row.created_at
+				});
+			}
+			if (!txState || !txState.inTx) releaseRowLocks(connId);
+			return { rows: out, rowCount: out.length };
+		}
+
+		// Job complete: DELETE FROM svti_jobs WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
+		if (
+			sql.startsWith('DELETE FROM') &&
+			sql.includes('svti_jobs_id = ANY($1::bigint[])') &&
+			sql.includes('RETURNING queue')
+		) {
+			const ids = values[0];
+			const out = [];
+			for (const id of ids) {
+				const row = jobRows.get(Number(id));
+				if (row) {
+					out.push({ queue: row.queue });
+					jobRows.delete(Number(id));
 				}
-				return { rows: out, rowCount: out.length };
 			}
+			return { rows: out, rowCount: out.length };
+		}
 
-			// Job complete: DELETE FROM svti_jobs WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
-			if (
-				sql.startsWith('DELETE FROM') &&
-				sql.includes('svti_jobs_id = ANY($1::bigint[])') &&
-				sql.includes('RETURNING queue')
-			) {
-				const ids = values[0];
-				const out = [];
-				for (const id of ids) {
-					const row = jobRows.get(Number(id));
-					if (row) {
-						out.push({ queue: row.queue });
-						jobRows.delete(Number(id));
-					}
+		// Job fail: UPDATE svti_jobs SET claimed_at = NULL, claimed_until = NULL WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes('claimed_at = NULL') &&
+			sql.includes('claimed_until = NULL') &&
+			sql.includes('RETURNING queue')
+		) {
+			const ids = values[0];
+			const out = [];
+			for (const id of ids) {
+				const row = jobRows.get(Number(id));
+				if (row) {
+					row.claimed_at = null;
+					row.claimed_until = null;
+					out.push({ queue: row.queue });
 				}
-				return { rows: out, rowCount: out.length };
 			}
+			return { rows: out, rowCount: out.length };
+		}
 
-			// Job fail: UPDATE svti_jobs SET claimed_at = NULL, claimed_until = NULL WHERE svti_jobs_id = ANY($1::bigint[]) RETURNING queue
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes('claimed_at = NULL') &&
-				sql.includes('claimed_until = NULL') &&
-				sql.includes('RETURNING queue')
-			) {
-				const ids = values[0];
-				const out = [];
-				for (const id of ids) {
-					const row = jobRows.get(Number(id));
-					if (row) {
-						row.claimed_at = null;
-						row.claimed_until = null;
-						out.push({ queue: row.queue });
-					}
+		// Job extend: UPDATE svti_jobs SET claimed_until = claimed_until + ... WHERE svti_jobs_id = ANY($1::bigint[]) AND claimed_at IS NOT NULL
+		if (
+			sql.startsWith('UPDATE') &&
+			sql.includes('claimed_until = claimed_until +') &&
+			sql.includes('claimed_at IS NOT NULL')
+		) {
+			const ids = values[0];
+			const additionalMs = Number(values[1]);
+			let count = 0;
+			for (const id of ids) {
+				const row = jobRows.get(Number(id));
+				if (row && row.claimed_at !== null) {
+					row.claimed_until = (row.claimed_until ?? now()) + additionalMs;
+					count++;
 				}
-				return { rows: out, rowCount: out.length };
 			}
+			return { rows: [], rowCount: count };
+		}
 
-			// Job extend: UPDATE svti_jobs SET claimed_until = claimed_until + ... WHERE svti_jobs_id = ANY($1::bigint[]) AND claimed_at IS NOT NULL
-			if (
-				sql.startsWith('UPDATE') &&
-				sql.includes('claimed_until = claimed_until +') &&
-				sql.includes('claimed_at IS NOT NULL')
-			) {
-				const ids = values[0];
-				const additionalMs = Number(values[1]);
-				let count = 0;
-				for (const id of ids) {
-					const row = jobRows.get(Number(id));
-					if (row && row.claimed_at !== null) {
-						row.claimed_until = (row.claimed_until ?? Date.now()) + additionalMs;
-						count++;
-					}
+		// Job pending count for one queue
+		if (
+			sql.includes('pending_count') &&
+			sql.includes('queue = $1') &&
+			sql.includes('claimed_at IS NULL')
+		) {
+			const queue = values[0];
+			let count = 0;
+			for (const row of jobRows.values()) {
+				if (row.queue === queue && row.claimed_at === null) count++;
+			}
+			return { rows: [{ pending_count: count }], rowCount: 1 };
+		}
+
+		// Job pending count across all queues
+		if (sql.includes('pending_count') && sql.includes('claimed_at IS NULL')) {
+			let count = 0;
+			for (const row of jobRows.values()) {
+				if (row.claimed_at === null) count++;
+			}
+			return { rows: [{ pending_count: count }], rowCount: 1 };
+		}
+
+		// Job clear scoped to a queue
+		if (sql.startsWith('DELETE FROM svti_jobs') && sql.includes('WHERE queue = $1')) {
+			const queue = values[0];
+			let removed = 0;
+			for (const [id, row] of jobRows) {
+				if (row.queue === queue) {
+					jobRows.delete(id);
+					removed++;
 				}
-				return { rows: [], rowCount: count };
 			}
+			return { rows: [], rowCount: removed };
+		}
 
-			// Job pending count for one queue
-			if (
-				sql.includes('pending_count') &&
-				sql.includes('queue = $1') &&
-				sql.includes('claimed_at IS NULL')
-			) {
-				const queue = values[0];
-				let count = 0;
-				for (const row of jobRows.values()) {
-					if (row.queue === queue && row.claimed_at === null) count++;
-				}
-				return { rows: [{ pending_count: count }], rowCount: 1 };
+		// Job clear all
+		if (sql.startsWith('DELETE FROM svti_jobs') && !sql.includes('WHERE')) {
+			const before = jobRows.size;
+			jobRows.clear();
+			return { rows: [], rowCount: before };
+		}
+
+		// Epoch read-through: SELECT COALESCE(epoch, 0) FROM *_seq WHERE topic = $1.
+		// A topic with no seq row reads the baseline 0.
+		if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {
+			const topic = values[0];
+			if (seqCounters.has(topic) || epochCounters.has(topic)) {
+				return { rows: [{ epoch: String(epochCounters.get(topic) || 0) }], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Job pending count across all queues
-			if (sql.includes('pending_count') && sql.includes('claimed_at IS NULL')) {
-				let count = 0;
-				for (const row of jobRows.values()) {
-					if (row.claimed_at === null) count++;
-				}
-				return { rows: [{ pending_count: count }], rowCount: 1 };
-			}
+		// clearTopic upsert: keep the seq-table row, reset seq to 0, bump epoch.
+		// INSERT ... ON CONFLICT DO UPDATE SET seq = 0, epoch = epoch + 1 RETURNING epoch.
+		if (
+			sql.includes('INSERT INTO') &&
+			sql.includes('_seq') &&
+			sql.includes('ON CONFLICT') &&
+			sql.includes('epoch + 1') &&
+			sql.includes('RETURNING epoch')
+		) {
+			const topic = values[0];
+			const next = (epochCounters.get(topic) || 0) + 1;
+			epochCounters.set(topic, next);
+			// Keep the row with seq reset to 0 so the next publish's UPDATE
+			// branch issues seq = 1 (and carries the climbed epoch forward).
+			seqCounters.set(topic, 0);
+			return { rows: [{ epoch: String(next) }], rowCount: 1 };
+		}
 
-			// Job clear scoped to a queue
-			if (sql.startsWith('DELETE FROM svti_jobs') && sql.includes('WHERE queue = $1')) {
-				const queue = values[0];
-				let removed = 0;
-				for (const [id, row] of jobRows) {
-					if (row.queue === queue) {
-						jobRows.delete(id);
-						removed++;
-					}
-				}
-				return { rows: [], rowCount: removed };
-			}
-
-			// Job clear all
-			if (sql.startsWith('DELETE FROM svti_jobs') && !sql.includes('WHERE')) {
-				const before = jobRows.size;
-				jobRows.clear();
-				return { rows: [], rowCount: before };
-			}
-
-			// Epoch read-through: SELECT COALESCE(epoch, 0) FROM *_seq WHERE topic = $1.
-			// A topic with no seq row reads the baseline 0.
-			if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {
-				const topic = values[0];
-				if (seqCounters.has(topic) || epochCounters.has(topic)) {
-					return { rows: [{ epoch: String(epochCounters.get(topic) || 0) }], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
-			}
-
-			// clearTopic upsert: keep the seq-table row, reset seq to 0, bump epoch.
-			// INSERT ... ON CONFLICT DO UPDATE SET seq = 0, epoch = epoch + 1 RETURNING epoch.
-			if (
-				sql.includes('INSERT INTO') &&
-				sql.includes('_seq') &&
-				sql.includes('ON CONFLICT') &&
-				sql.includes('epoch + 1') &&
-				sql.includes('RETURNING epoch')
-			) {
-				const topic = values[0];
-				const next = (epochCounters.get(topic) || 0) + 1;
-				epochCounters.set(topic, next);
-				// Keep the row with seq reset to 0 so the next publish's UPDATE
-				// branch issues seq = 1 (and carries the climbed epoch forward).
+		// clear (global): bump every topic's epoch and zero its seq, keeping
+		// rows. UPDATE *_seq SET seq = 0, epoch = epoch + 1.
+		if (sql.startsWith('UPDATE') && sql.includes('_seq') && sql.includes('epoch + 1')) {
+			for (const topic of seqCounters.keys()) {
 				seqCounters.set(topic, 0);
-				return { rows: [{ epoch: String(next) }], rowCount: 1 };
+				epochCounters.set(topic, (epochCounters.get(topic) || 0) + 1);
 			}
+			return { rows: [], rowCount: seqCounters.size };
+		}
 
-			// clear (global): bump every topic's epoch and zero its seq, keeping
-			// rows. UPDATE *_seq SET seq = 0, epoch = epoch + 1.
-			if (sql.startsWith('UPDATE') && sql.includes('_seq') && sql.includes('epoch + 1')) {
-				for (const topic of seqCounters.keys()) {
-					seqCounters.set(topic, 0);
-					epochCounters.set(topic, (epochCounters.get(topic) || 0) + 1);
-				}
-				return { rows: [], rowCount: seqCounters.size };
+		// CTE publish: atomic seq increment + insert in one query.
+		// The reset edge is the INSERT branch (a topic with no seq row, i.e.
+		// brand-new or fully cleared): seq starts at 1 and epoch is seeded to
+		// 1. An existing row takes the UPDATE branch (seq + 1) and carries its
+		// epoch forward unchanged, so steady-state publishes never move the
+		// epoch.
+		if (sql.includes('WITH new_seq') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
+			const topic = values[0];
+			const hadRow = seqCounters.has(topic);
+			const current = seqCounters.get(topic) || 0;
+			const next = current + 1;
+			seqCounters.set(topic, next);
+			let epoch;
+			if (!hadRow) {
+				epoch = 1;
+				epochCounters.set(topic, epoch);
+			} else {
+				epoch = epochCounters.get(topic) || 0;
 			}
+			const row = {
+				svti_replay_id: nextId++,
+				topic,
+				seq: next,
+				event: values[1],
+				data: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
+				created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
+			};
+			rows.push(row);
+			return { rows: [{ seq: String(next), epoch: String(epoch) }], rowCount: 1 };
+		}
 
-			// CTE publish: atomic seq increment + insert in one query.
-			// The reset edge is the INSERT branch (a topic with no seq row, i.e.
-			// brand-new or fully cleared): seq starts at 1 and epoch is seeded to
-			// 1. An existing row takes the UPDATE branch (seq + 1) and carries its
-			// epoch forward unchanged, so steady-state publishes never move the
-			// epoch.
-			if (sql.includes('WITH new_seq') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
-				const topic = values[0];
-				const hadRow = seqCounters.has(topic);
-				const current = seqCounters.get(topic) || 0;
-				const next = current + 1;
-				seqCounters.set(topic, next);
-				let epoch;
-				if (!hadRow) {
-					epoch = 1;
-					epochCounters.set(topic, epoch);
-				} else {
-					epoch = epochCounters.get(topic) || 0;
-				}
-				const row = {
-					svti_replay_id: nextId++,
-					topic,
-					seq: next,
-					event: values[1],
-					data: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
-					created_at: new Date()
-				};
-				rows.push(row);
-				return { rows: [{ seq: String(next), epoch: String(epoch) }], rowCount: 1 };
+		// INSERT INTO *_seq (atomic sequence generation)
+		if (sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
+			const topic = values[0];
+			const current = seqCounters.get(topic) || 0;
+			const next = current + 1;
+			seqCounters.set(topic, next);
+			return { rows: [{ seq: String(next) }], rowCount: 1 };
+		}
+
+		// INSERT
+		if (sql.startsWith('INSERT INTO')) {
+			const row = {
+				svti_replay_id: nextId++,
+				topic: values[0],
+				seq: parseInt(values[1], 10),
+				event: values[2],
+				data: typeof values[3] === 'string' ? JSON.parse(values[3]) : values[3],
+				created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
+			};
+			rows.push(row);
+			return { rows: [row], rowCount: 1 };
+		}
+
+		// SELECT COALESCE(seq, 0) FROM _seq table
+		if (sql.includes('current_seq') && sql.includes('_seq')) {
+			const topic = values[0];
+			const seq = seqCounters.get(topic);
+			if (seq !== undefined) {
+				return { rows: [{ current_seq: String(seq) }], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// INSERT INTO *_seq (atomic sequence generation)
-			if (sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
-				const topic = values[0];
-				const current = seqCounters.get(topic) || 0;
-				const next = current + 1;
-				seqCounters.set(topic, next);
-				return { rows: [{ seq: String(next) }], rowCount: 1 };
+		// SELECT COALESCE(MAX(seq)
+		if (sql.includes('MAX(seq)')) {
+			const topic = values[0];
+			const topicRows = rows.filter((r) => r.topic === topic);
+			const maxSeq = topicRows.reduce((max, r) => Math.max(max, r.seq), 0);
+			return { rows: [{ max_seq: String(maxSeq) }], rowCount: 1 };
+		}
+
+		// SELECT COUNT
+		if (sql.includes('COUNT(*)')) {
+			const topic = values[0];
+			const message_count = rows.filter((r) => r.topic === topic).length;
+			return { rows: [{ message_count }], rowCount: 1 };
+		}
+
+		// SELECT seq FROM ... WHERE topic = $1 AND seq >= $2 ORDER BY seq ASC LIMIT 1 (gap probe)
+		if (sql.startsWith('SELECT seq FROM') && sql.includes('seq >=') && sql.includes('LIMIT 1')) {
+			const topic = values[0];
+			const target = parseInt(values[1], 10);
+			const matches = rows
+				.filter((r) => r.topic === topic && r.seq >= target)
+				.sort((a, b) => a.seq - b.seq);
+			if (matches.length > 0) {
+				return { rows: [{ seq: String(matches[0].seq) }], rowCount: 1 };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// INSERT
-			if (sql.startsWith('INSERT INTO')) {
-				const row = {
-					svti_replay_id: nextId++,
-					topic: values[0],
-					seq: parseInt(values[1], 10),
-					event: values[2],
-					data: typeof values[3] === 'string' ? JSON.parse(values[3]) : values[3],
-					created_at: new Date()
-				};
-				rows.push(row);
-				return { rows: [row], rowCount: 1 };
-			}
+		// SELECT seq, topic, event, data ... WHERE topic = $1 AND seq > $2
+		if (sql.includes('SELECT seq, topic, event, data')) {
+			const topic = values[0];
+			const since = parseInt(values[1], 10);
+			const result = rows
+				.filter((r) => r.topic === topic && r.seq > since)
+				.sort((a, b) => a.seq - b.seq)
+				.map((r) => ({
+					seq: String(r.seq),
+					topic: r.topic,
+					event: r.event,
+					data: r.data
+				}));
+			return { rows: result, rowCount: result.length };
+		}
 
-			// SELECT COALESCE(seq, 0) FROM _seq table
-			if (sql.includes('current_seq') && sql.includes('_seq')) {
-				const topic = values[0];
-				const seq = seqCounters.get(topic);
-				if (seq !== undefined) {
-					return { rows: [{ current_seq: String(seq) }], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
-			}
+		// Seq-based inline trim: DELETE WHERE topic = $1 AND seq <= $2
+		if (sql.includes('DELETE FROM') && sql.includes('seq <=') && !sql.includes('OFFSET') && !sql.includes('cutoff_seq')) {
+			const topic = values[0];
+			const cutoffSeq = parseInt(values[1], 10);
+			const before = rows.length;
+			rows = rows.filter((r) => r.topic !== topic || r.seq > cutoffSeq);
+			return { rows: [], rowCount: before - rows.length };
+		}
 
-			// SELECT COALESCE(MAX(seq)
-			if (sql.includes('MAX(seq)')) {
-				const topic = values[0];
-				const topicRows = rows.filter((r) => r.topic === topic);
-				const maxSeq = topicRows.reduce((max, r) => Math.max(max, r.seq), 0);
-				return { rows: [{ max_seq: String(maxSeq) }], rowCount: 1 };
-			}
-
-			// SELECT COUNT
-			if (sql.includes('COUNT(*)')) {
-				const topic = values[0];
-				const message_count = rows.filter((r) => r.topic === topic).length;
-				return { rows: [{ message_count }], rowCount: 1 };
-			}
-
-			// SELECT seq FROM ... WHERE topic = $1 AND seq >= $2 ORDER BY seq ASC LIMIT 1 (gap probe)
-			if (sql.startsWith('SELECT seq FROM') && sql.includes('seq >=') && sql.includes('LIMIT 1')) {
-				const topic = values[0];
-				const target = parseInt(values[1], 10);
-				const matches = rows
-					.filter((r) => r.topic === topic && r.seq >= target)
-					.sort((a, b) => a.seq - b.seq);
-				if (matches.length > 0) {
-					return { rows: [{ seq: String(matches[0].seq) }], rowCount: 1 };
-				}
-				return { rows: [], rowCount: 0 };
-			}
-
-			// SELECT seq, topic, event, data ... WHERE topic = $1 AND seq > $2
-			if (sql.includes('SELECT seq, topic, event, data')) {
-				const topic = values[0];
-				const since = parseInt(values[1], 10);
-				const result = rows
-					.filter((r) => r.topic === topic && r.seq > since)
-					.sort((a, b) => a.seq - b.seq)
-					.map((r) => ({
-						seq: String(r.seq),
-						topic: r.topic,
-						event: r.event,
-						data: r.data
-					}));
-				return { rows: result, rowCount: result.length };
-			}
-
-			// Seq-based inline trim: DELETE WHERE topic = $1 AND seq <= $2
-			if (sql.includes('DELETE FROM') && sql.includes('seq <=') && !sql.includes('OFFSET') && !sql.includes('cutoff_seq')) {
-				const topic = values[0];
-				const cutoffSeq = parseInt(values[1], 10);
+		// Range-based inline trim: DELETE WHERE topic = $1 AND seq <= (SELECT ... OFFSET $2 LIMIT 1)
+		if (sql.includes('DELETE FROM') && sql.includes('seq <=') && sql.includes('OFFSET')) {
+			const topic = values[0];
+			const offset = parseInt(values[1], 10);
+			const topicRows = rows
+				.filter((r) => r.topic === topic)
+				.sort((a, b) => b.seq - a.seq);
+			if (offset < topicRows.length) {
+				const cutoffSeq = topicRows[offset].seq;
 				const before = rows.length;
 				rows = rows.filter((r) => r.topic !== topic || r.seq > cutoffSeq);
 				return { rows: [], rowCount: before - rows.length };
 			}
+			return { rows: [], rowCount: 0 };
+		}
 
-			// Range-based inline trim: DELETE WHERE topic = $1 AND seq <= (SELECT ... OFFSET $2 LIMIT 1)
-			if (sql.includes('DELETE FROM') && sql.includes('seq <=') && sql.includes('OFFSET')) {
-				const topic = values[0];
-				const offset = parseInt(values[1], 10);
+		// Range-based periodic cleanup: DELETE using OFFSET-based cutoff per topic
+		if (sql.includes('DELETE FROM') && sql.includes('cutoff_seq') && sql.includes('DISTINCT topic')) {
+			const offset = parseInt(values[0], 10);
+			const topics = [...new Set(rows.map((r) => r.topic))];
+			let totalRemoved = 0;
+			for (const topic of topics) {
 				const topicRows = rows
 					.filter((r) => r.topic === topic)
 					.sort((a, b) => b.seq - a.seq);
@@ -814,72 +985,183 @@ export function mockPgClient() {
 					const cutoffSeq = topicRows[offset].seq;
 					const before = rows.length;
 					rows = rows.filter((r) => r.topic !== topic || r.seq > cutoffSeq);
-					return { rows: [], rowCount: before - rows.length };
+					totalRemoved += before - rows.length;
 				}
-				return { rows: [], rowCount: 0 };
 			}
+			return { rows: [], rowCount: totalRemoved };
+		}
 
-			// Range-based periodic cleanup: DELETE using OFFSET-based cutoff per topic
-			if (sql.includes('DELETE FROM') && sql.includes('cutoff_seq') && sql.includes('DISTINCT topic')) {
-				const offset = parseInt(values[0], 10);
-				const topics = [...new Set(rows.map((r) => r.topic))];
-				let totalRemoved = 0;
-				for (const topic of topics) {
-					const topicRows = rows
-						.filter((r) => r.topic === topic)
-						.sort((a, b) => b.seq - a.seq);
-					if (offset < topicRows.length) {
-						const cutoffSeq = topicRows[offset].seq;
-						const before = rows.length;
-						rows = rows.filter((r) => r.topic !== topic || r.seq > cutoffSeq);
-						totalRemoved += before - rows.length;
-					}
-				}
-				return { rows: [], rowCount: totalRemoved };
-			}
+		// DELETE FROM table WHERE topic = $1 AND svti_replay_id NOT IN (... LIMIT $2)
+		if (sql.includes('DELETE FROM') && sql.includes('NOT IN') && sql.includes('LIMIT')) {
+			const topic = values[0];
+			const limit = parseInt(values[1], 10);
+			const topicRows = rows
+				.filter((r) => r.topic === topic)
+				.sort((a, b) => b.seq - a.seq);
+			const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.svti_replay_id));
+			const before = rows.length;
+			rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.svti_replay_id));
+			return { rows: [], rowCount: before - rows.length };
+		}
 
-			// DELETE FROM table WHERE topic = $1 AND svti_replay_id NOT IN (... LIMIT $2)
-			if (sql.includes('DELETE FROM') && sql.includes('NOT IN') && sql.includes('LIMIT')) {
-				const topic = values[0];
-				const limit = parseInt(values[1], 10);
-				const topicRows = rows
-					.filter((r) => r.topic === topic)
-					.sort((a, b) => b.seq - a.seq);
-				const keepIds = new Set(topicRows.slice(0, limit).map((r) => r.svti_replay_id));
-				const before = rows.length;
-				rows = rows.filter((r) => r.topic !== topic || keepIds.has(r.svti_replay_id));
-				return { rows: [], rowCount: before - rows.length };
-			}
+		// DELETE FROM *_seq WHERE topic = $1
+		if (sql.includes('DELETE FROM') && sql.includes('_seq') && sql.includes('WHERE topic')) {
+			const topic = values[0];
+			seqCounters.delete(topic);
+			return { rows: [], rowCount: 1 };
+		}
 
-			// DELETE FROM *_seq WHERE topic = $1
-			if (sql.includes('DELETE FROM') && sql.includes('_seq') && sql.includes('WHERE topic')) {
-				const topic = values[0];
-				seqCounters.delete(topic);
-				return { rows: [], rowCount: 1 };
-			}
+		// DELETE FROM table WHERE topic = $1
+		if (sql.includes('DELETE FROM') && sql.includes('WHERE topic')) {
+			const topic = values[0];
+			const before = rows.length;
+			rows = rows.filter((r) => r.topic !== topic);
+			return { rows: [], rowCount: before - rows.length };
+		}
 
-			// DELETE FROM table WHERE topic = $1
-			if (sql.includes('DELETE FROM') && sql.includes('WHERE topic')) {
-				const topic = values[0];
-				const before = rows.length;
-				rows = rows.filter((r) => r.topic !== topic);
-				return { rows: [], rowCount: before - rows.length };
-			}
-
-			// DELETE FROM *_seq (clear all sequences)
-			if (sql.includes('DELETE FROM') && sql.includes('_seq')) {
-				seqCounters.clear();
-				return { rows: [], rowCount: 0 };
-			}
-
-			// DELETE FROM table (clear all)
-			if (sql.startsWith('DELETE FROM')) {
-				const before = rows.length;
-				rows = [];
-				return { rows: [], rowCount: before };
-			}
-
+		// DELETE FROM *_seq (clear all sequences)
+		if (sql.includes('DELETE FROM') && sql.includes('_seq')) {
+			seqCounters.clear();
 			return { rows: [], rowCount: 0 };
+		}
+
+		// DELETE FROM table (clear all)
+		if (sql.startsWith('DELETE FROM')) {
+			const before = rows.length;
+			rows = [];
+			return { rows: [], rowCount: before };
+		}
+
+		return { rows: [], rowCount: 0 };
+	}
+
+	// ----- Row-lock helpers (SKIP LOCKED model). ------------------------------
+
+	function lockKey(kind, rowKey) {
+		return kind + ':' + rowKey;
+	}
+
+	function isRowLockedByOther(kind, rowKey, connId) {
+		const holder = rowLocks.get(lockKey(kind, rowKey));
+		return holder !== undefined && holder !== connId;
+	}
+
+	function lockRow(kind, rowKey, connId) {
+		rowLocks.set(lockKey(kind, rowKey), connId);
+	}
+
+	function releaseRowLocks(connId) {
+		for (const [k, holder] of rowLocks) {
+			if (holder === connId) rowLocks.delete(k);
+		}
+	}
+
+	// FIFO order for pending-task claims: oldest created_at first, insertion
+	// order as a stable tie-break so claims are deterministic under a virtual
+	// clock that can stamp several rows with the same now() value.
+	function byCreatedThenIns(a, b) {
+		return a.created_at - b.created_at || a._ins - b._ins;
+	}
+
+	// Strip a delimited SQL identifier ("name" -> name, ""x"" -> "x"). Bare
+	// identifiers pass through unchanged.
+	function unquoteIdent(token) {
+		if (token.length >= 2 && token[0] === '"' && token[token.length - 1] === '"') {
+			return token.slice(1, -1).replace(/""/g, '"');
+		}
+		return token;
+	}
+
+	// Strip a single-quoted SQL string literal ('x' -> x, ''y'' -> 'y').
+	function unquoteLiteral(token) {
+		if (token.length >= 2 && token[0] === "'" && token[token.length - 1] === "'") {
+			return token.slice(1, -1).replace(/''/g, "'");
+		}
+		return token;
+	}
+
+	// Build a dedicated client (the LISTEN/NOTIFY connection notify.js opens
+	// via createClient()). It carries its own connection identity so its
+	// advisory locks and row locks are distinct from the pool's, and an
+	// onNotification listener registry mirroring the pg.Client event surface.
+	function makeDedicatedClient() {
+		const connId = nextConnId++;
+		const listeners = new Map();
+		let open = false;
+		const dedicated = {
+			_connId: connId,
+			_emit(event, arg) {
+				const fns = listeners.get(event);
+				if (!fns) return;
+				for (const fn of [...fns]) fn(arg);
+			},
+			on(event, fn) {
+				if (!listeners.has(event)) listeners.set(event, new Set());
+				listeners.get(event).add(fn);
+				return dedicated;
+			},
+			removeListener(event, fn) {
+				listeners.get(event)?.delete(fn);
+				return dedicated;
+			},
+			async connect() {
+				open = true;
+			},
+			query(textOrObj, vals) {
+				return Promise.resolve(runQuery(textOrObj, vals, connId, dedicated, null));
+			},
+			async end() {
+				open = false;
+				// Session end releases this connection's advisory + row locks
+				// and drops it from every channel it was listening on, matching
+				// Postgres session-scoped semantics.
+				releaseConn(connId);
+				for (const set of channelListeners.values()) set.delete(dedicated);
+				listeners.clear();
+			},
+			_isOpen() { return open; }
+		};
+		return dedicated;
+	}
+
+	function releaseConn(connId) {
+		for (const [lockId, holder] of advisoryLocks) {
+			if (holder === connId) advisoryLocks.delete(lockId);
+		}
+		releaseRowLocks(connId);
+	}
+
+	const client = {
+		// `pool.connect()` returns a pinned-connection wrapper. The pinned
+		// connection has its own connection identity, so row locks a claim CTE
+		// takes inside its BEGIN..COMMIT window stay held against concurrent
+		// claimers until the transaction ends (release() also drops them, in
+		// case a caller forgets to COMMIT/ROLLBACK). The shared autocommit
+		// `client.query()` path (connId 0) releases its locks per statement.
+		pool: {
+			async connect() {
+				const connId = nextConnId++;
+				const txState = { inTx: false };
+				return {
+					query: (textOrObj, vals) =>
+						Promise.resolve(runQuery(textOrObj, vals, connId, null, txState)),
+					release: () => {
+						txState.inTx = false;
+						releaseRowLocks(connId);
+					}
+				};
+			}
+		},
+
+		async query(textOrObj, values) {
+			// The shared client is autocommit: connId 0, no transaction window,
+			// so each statement's row locks are released the moment it returns.
+			return runQuery(textOrObj, values, 0, null, null);
+		},
+
+		// Dedicated LISTEN/NOTIFY connection (notify.js opens one via this).
+		createClient() {
+			return makeDedicatedClient();
 		},
 
 		async end() {},
@@ -890,7 +1172,29 @@ export function mockPgClient() {
 		_getIdemRows() { return idemRows; },
 		_getTaskRows() { return taskRows; },
 		_getJobRows() { return jobRows; },
-		_reset() { rows = []; nextId = 1; tableCreated = false; seqCounters.clear(); idemRows.clear(); taskRows.clear(); jobRows.clear(); jobNextId = 1; }
+		_getAdvisoryLocks() { return advisoryLocks; },
+		_getRowLocks() { return rowLocks; },
+		_getChannelListeners() { return channelListeners; },
+		// Fire a NOTIFY as if a foreign session emitted it (the trigger /
+		// pg_notify side notify.js does not own). Delivers to every dedicated
+		// client currently LISTENing on the channel.
+		_notify(channel, payload) { deliverNotification(channel, payload); },
+		_reset() {
+			rows = [];
+			nextId = 1;
+			tableCreated = false;
+			seqCounters.clear();
+			epochCounters.clear();
+			idemRows.clear();
+			taskRows.clear();
+			taskInsSeq = 1;
+			jobRows.clear();
+			jobNextId = 1;
+			advisoryLocks.clear();
+			rowLocks.clear();
+			channelListeners.clear();
+			nextConnId = 1;
+		}
 	};
 	return client;
 }

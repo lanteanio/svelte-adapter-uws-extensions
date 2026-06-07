@@ -53,9 +53,9 @@ const ALLOW_FILES = new Set(['runtime.js']);
 // call sites are migrated.
 const ENFORCED = new Set([
 	// Cluster runtime source routed through the runtime module. Forward-slash
-	// paths so the set reads the same on Windows and POSIX. The test doubles
-	// (testing/mock-redis.js, testing/mock-pg.js, testing/mock-platform.js) are
-	// deliberately absent - they stay in warn until promoted to simulator grade.
+	// paths so the set reads the same on Windows and POSIX. The seam-clean test
+	// doubles (testing/mock-redis.js, testing/mock-pg.js) are enforced too;
+	// testing/mock-platform.js stays in warn until its raw reads are routed.
 	'shared/breaker.js',
 	'shared/platform-fallback.js',
 	'capability-cookie.js',
@@ -88,7 +88,9 @@ const ENFORCED = new Set([
 	'postgres/_tasks-sql.js',
 	'postgres/_tasks-errors.js',
 	'postgres/_worker-harness.js',
-	'postgres/index.js'
+	'postgres/index.js',
+	'testing/mock-redis.js',
+	'testing/mock-pg.js'
 ]);
 
 // Path segments that are never framework runtime source.

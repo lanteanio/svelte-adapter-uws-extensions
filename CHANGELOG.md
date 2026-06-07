@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.11] - 2026-06-07
+
+### Added
+
+- **The in-memory Redis test double now follows the injectable runtime clock, implements the Redis `TIME` command, and can model the cluster multi-slot pipeline hazard.** Field TTLs, `HEXPIRE`/`HTTL` countdowns, `XADD *` stream ids, and the token-bucket / ban rate-limit windows all advance with the virtual clock under a seeded harness (and with real wall time by default), so a deterministic run replays them exactly; the rate-limit evaluators now obtain their timestamp the same way the real Lua does (via `redis.call('TIME')`), fixing a drift where the double read a raw wall clock instead. A new opt-in cluster mode (`mockRedisClient(prefix, { cluster: true })`) makes a pipeline or transaction spanning more than one node silently no-op the off-node commands - exactly like ioredis against a real Redis Cluster - so a cross-slot regression is catchable in a plain unit test. The mirrored-JS Lua evaluators are validated against a real Redis in the integration suite (a new parity test runs the script on both the double and real `EVAL` on identical inputs and asserts they agree).
+
+- **The in-memory Postgres test double now routes its clock, UUIDs, and notification scheduling through the injectable runtime seam, and models advisory-lock contention, `FOR UPDATE SKIP LOCKED` row-lock fairness, and `LISTEN`/`NOTIFY` delivery.** A seeded harness replays every TTL, fence, and timestamp exactly; `pg_try_advisory_lock` / `pg_advisory_unlock` now contend across connections (one holder wins, another is refused), concurrent `SKIP LOCKED` claimers receive disjoint rows instead of silently double-claiming, and `LISTEN`/`NOTIFY` delivers per-channel FIFO against dedicated clients - while the existing replay sequence and epoch semantics, and all current behaviour, stay intact.
+
+### Fixed
+
+- **`createPublishRateAggregator` now ages out a stale sibling slice reliably, including under sub-second `staleAfter` windows.** The cross-instance staleness check and the broadcast-envelope timestamp read the 1Hz-cached `now()`, which quantizes the elapsed-time delta to ~1 second - so a `staleAfter` shorter than a second could fail to prune a sibling that had stopped broadcasting, and the staleness math was coarse in general. Both now read the exact wall clock (`wallEpoch()`): still wall-clock (required, since the timestamp is stamped on another instance and a monotonic clock is per-process), but precise. The default `staleAfter` is 12 seconds, so a default deployment was unaffected; this matters for tight windows and makes the comparison exact in all cases.
+
 ## [0.6.0-next.10] - 2026-06-07
 
 ### Security

@@ -41,14 +41,28 @@ export interface MockRedisClient extends RedisClient {
 	readonly _sortedSets: Map<string, Array<{ score: number; member: string }>>;
 	/** Direct access to hashes (key -> Map<field, value>). */
 	readonly _hashes: Map<string, Map<string, string>>;
+	/** True when constructed with `{ cluster: true }` (multi-slot hazard modeling). */
+	readonly _cluster: boolean;
+	/** Resolve a key's Redis Cluster hash slot. */
+	_slotOf(key: string): number;
+	/** Resolve a key's owning node index under the modeled cluster topology. */
+	_nodeOf(key: string): number;
 }
 
 /**
  * Create an in-memory Redis client mock.
- * Supports strings, hashes, sorted sets, pub/sub, pipelines, scan,
- * and Lua script evaluation for all extension scripts.
+ *
+ * Supports strings, hashes, sorted sets, pub/sub, pipelines, scan, the Redis
+ * `TIME` command, and Lua script evaluation for all extension scripts. Its clock
+ * follows the injectable runtime seam, so a deterministic harness can replay
+ * TTLs and time-derived script output. Pass `{ cluster: true }` to model the
+ * ioredis multi-slot pipeline hazard (a batch spanning more than one node
+ * silently no-ops the off-node commands).
  */
-export function mockRedisClient(keyPrefix?: string): MockRedisClient;
+export function mockRedisClient(
+	keyPrefix?: string,
+	options?: { cluster?: boolean; nodeCount?: number }
+): MockRedisClient;
 
 // - Mock Platform ------------------------------------------------------------
 
@@ -153,6 +167,14 @@ export interface MockPgClient {
 	_getRows(): any[];
 	/** Get sequence counters by topic (Postgres replay mock). */
 	_getSeqCounters(): Map<string, number>;
+	/** Held advisory locks (lock id -> holder connection id). */
+	_getAdvisoryLocks(): Map<string, number>;
+	/** Held row locks (kind + row key -> holder connection id). */
+	_getRowLocks(): Map<string, number>;
+	/** Registered LISTEN channels (channel -> set of listening clients). */
+	_getChannelListeners(): Map<string, Set<any>>;
+	/** Test helper: emit a NOTIFY on a channel to its registered listeners. */
+	_notify(channel: string, payload?: string): void;
 	/** Reset all state. */
 	_reset(): void;
 }

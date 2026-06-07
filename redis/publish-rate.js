@@ -27,7 +27,7 @@
  */
 
 import { assert } from '../shared/assert.js';
-import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { randomBytes, wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { MAX_AGGREGATOR_REMOTE_INSTANCES } from '../shared/caps.js';
 
 /**
@@ -121,7 +121,11 @@ export function createPublishRateAggregator(client, options = {}) {
 	}
 
 	function pruneStale() {
-		const nowTs = now();
+		// Exact wall clock (not the 1Hz-cached `now`): the slice `ts` is stamped on
+		// another instance and compared here, so it must be wall-clock (monotonic is
+		// per-process and meaningless across instances) AND precise enough to honor a
+		// sub-second staleAfter - the cached clock quantizes the delta to ~1s.
+		const nowTs = wallEpoch();
 		for (const [id, entry] of remoteSlices) {
 			if (nowTs - entry.ts > staleAfter) remoteSlices.delete(id);
 		}
@@ -159,8 +163,8 @@ export function createPublishRateAggregator(client, options = {}) {
 		const slice = snapshotLocalSlice();
 		const subs = snapshotLocalSubjects();
 		const payload = subs === null
-			? { instanceId, ts: now(), slice }
-			: { instanceId, ts: now(), slice, subs };
+			? { instanceId, ts: wallEpoch(), slice }
+			: { instanceId, ts: wallEpoch(), slice, subs };
 		const envelope = JSON.stringify(payload);
 		try {
 			await redis.publish(channel, envelope);
@@ -200,7 +204,7 @@ export function createPublishRateAggregator(client, options = {}) {
 				'publish-rate.echo-suppression',
 				{ instanceId: env.instanceId }
 			);
-			const ts = typeof env.ts === 'number' ? env.ts : now();
+			const ts = typeof env.ts === 'number' ? env.ts : wallEpoch();
 			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
 			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteInstancesWarnFired) {
 				remoteInstancesWarnFired = true;
