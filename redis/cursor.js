@@ -1583,6 +1583,18 @@ export function createCursor(client, options = {}) {
 		},
 
 		async snapshot(ws, topic, platform) {
+			// Authorize against the REAL topic before emitting the roster/positions
+			// to this socket. The cursor-snapshot message reaches this directly
+			// (hooks.message), so without this gate it is an un-authorized read of
+			// __cursor:{topic} state, around the wire-level `__`-subscribe block.
+			// The authorized subscribe path (attach -> here) re-checks harmlessly.
+			// Optional-chained (checkSubscribe was added to the platform later);
+			// the snapshot is low-frequency so the await is off the hot path.
+			if (platform && typeof platform.checkSubscribe === 'function') {
+				let denial;
+				try { denial = await platform.checkSubscribe(ws, topic); } catch { return; }
+				if (denial) return;
+			}
 			const cursors = await this.list(topic);
 			if (cursors.length === 0) return;
 			const catalog = cursors.map((c) => ({ key: c.key, user: c.user }));

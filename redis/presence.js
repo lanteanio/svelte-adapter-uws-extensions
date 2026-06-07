@@ -1028,13 +1028,25 @@ export function createPresence(client, options = {}) {
 
 	async function leaveTopic(ws, platform, topic) {
 		const connTopics = wsTopics.get(ws);
-		if (connTopics && connTopics.has(topic)) {
+		// Peel one role at a time: a participant leave removes ONLY the participant
+		// role (a co-resident sync-observer of the same topic survives, so its
+		// roster does not freeze); an observer-only leave removes the observer role.
+		const wasParticipant = !!(connTopics && connTopics.has(topic));
+		if (wasParticipant) {
 			const { key, data } = connTopics.get(topic);
 			connTopics.delete(topic);
 			if (connTopics.size === 0) wsTopics.delete(ws);
 			indexRemove(topic, key, ws);
 
-			try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+			// Release the wire subscription only if this socket is not ALSO a
+			// sync-observer of the topic. A participant leaving must not evict a
+			// co-resident observer role (whose roster would then freeze); the
+			// observer is released on its own __presence: unsubscribe path or on
+			// socket close. The Redis topic-level subscription is separately
+			// refcounted below via syncCounts.
+			if (!syncObservers.get(ws)?.has(topic)) {
+				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+			}
 
 			const counts = localCounts.get(topic);
 			if (counts) {
@@ -1103,21 +1115,29 @@ export function createPresence(client, options = {}) {
 			}
 		}
 
-		const syncTopics = syncObservers.get(ws);
-		if (syncTopics && syncTopics.has(topic)) {
-			syncTopics.delete(topic);
-			if (syncTopics.size === 0) syncObservers.delete(ws);
+		// Observer-only leave: the socket holds no participant role on this topic,
+		// so remove its sync-observer role and release the wire (no participant
+		// remains to keep it). Guarded by !wasParticipant so a participant leave
+		// does NOT fall through and tear down a co-resident observer - the reported
+		// roster-freeze bug. This per-topic observer teardown is what the public
+		// leave(ws, topic) and the __presence: unsubscribe hook rely on.
+		if (!wasParticipant) {
+			const syncTopics = syncObservers.get(ws);
+			if (syncTopics && syncTopics.has(topic)) {
+				syncTopics.delete(topic);
+				if (syncTopics.size === 0) syncObservers.delete(ws);
 
-			try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 
-			const count = (syncCounts.get(topic) || 1) - 1;
-			if (count <= 0) {
-				syncCounts.delete(topic);
-				if (!localCounts.has(topic)) {
-					await unsubscribeFromTopic(topic);
+				const count = (syncCounts.get(topic) || 1) - 1;
+				if (count <= 0) {
+					syncCounts.delete(topic);
+					if (!localCounts.has(topic)) {
+						await unsubscribeFromTopic(topic);
+					}
+				} else {
+					syncCounts.set(topic, count);
 				}
-			} else {
-				syncCounts.set(topic, count);
 			}
 		}
 	}
@@ -1533,6 +1553,19 @@ export function createPresence(client, options = {}) {
 
 		async sync(ws, topic, platform) {
 			b?.guard();
+			// Authorize against the REAL topic before granting tap-channel
+			// membership (mirrors in-memory presence sync + the cursor snapshot):
+			// the presence-snapshot message is otherwise an un-authorized path to
+			// join __presence:{topic} and read its roster, around the wire-level
+			// `__`-subscribe block. Gate it on the same check a wire-subscribe to
+			// `topic` would run, before even opening the cross-instance Redis
+			// subscription. Optional-chained (checkSubscribe was added to the
+			// platform later); the snapshot is low-frequency so the await is fine.
+			if (platform && typeof platform.checkSubscribe === 'function') {
+				let denial;
+				try { denial = await platform.checkSubscribe(ws, topic); } catch { return; }
+				if (denial) return;
+			}
 			try {
 				await subscribeToTopic(topic, platform);
 			} catch (err) {
@@ -1794,7 +1827,13 @@ export function createPresence(client, options = {}) {
 						syncTopics.delete(realTopic);
 						if (syncTopics.size === 0) syncObservers.delete(ws);
 
-						try { ws.unsubscribe(topic); } catch { /* closed */ }
+						// Release the wire subscription only if this socket is not
+						// also a participant of the topic (symmetric to leaveTopic's
+						// participant guard), so an observer leaving does not evict a
+						// co-resident participant role.
+						if (!wsTopics.get(ws)?.has(realTopic)) {
+							try { ws.unsubscribe(topic); } catch { /* closed */ }
+						}
 
 						const count = (syncCounts.get(realTopic) || 1) - 1;
 						if (count <= 0) {

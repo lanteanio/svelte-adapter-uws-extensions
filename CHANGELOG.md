@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.10] - 2026-06-07
+
+### Security
+
+- **Redis presence and cursor snapshot handshakes now authorize against the underlying topic before joining the tap channel.** Mirrors the adapter fix: the `presence-snapshot` / `cursor-snapshot` message path subscribed a socket to `__presence:` / `__cursor:{topic}` (presence) or emitted its current state (cursor) with no authorization, so a client could read a cluster tap channel for a topic it was not allowed to subscribe to. Both now run `platform.checkSubscribe(ws, topic)` and drop a denied request without subscribing or emitting.
+
+### Fixed
+
+- **Redis presence no longer freezes a sync-observer's roster when a co-resident participant leaves.** A socket that is both a participant (`presence.join`) and a sync-observer (`presence-snapshot`) of a topic kept its `__presence:{topic}` subscription torn out when the participant role left, so the observer stopped receiving roster diffs and heartbeats. `leaveTopic` now peels one role at a time and unsubscribes the socket only when neither role remains (the symmetric per-topic observer leave is preserved).
+
 ## [0.6.0-next.9] - 2026-06-07
 
 ### Added

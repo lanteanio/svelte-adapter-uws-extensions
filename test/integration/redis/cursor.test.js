@@ -617,4 +617,26 @@ describeIntegration('redis cursor (integration)', () => {
 			expect(deliveredPositions(platformB, slow)).toContain('99,99');
 		});
 	});
+
+	describe('tap-channel authz (real Redis)', () => {
+		it('denies a cursor-snapshot for a topic the client cannot subscribe to', async () => {
+			const c = track(createCursor(client, { throttle: 0, topicThrottle: 0 }));
+			const writer = mockWs({ id: 'w', name: 'Writer' });
+			c.update(writer, 'secret', { x: 1, y: 2 }, platform);
+			await waitFor(async () => (await c.list('secret')).length === 1);
+
+			// Denied: checkSubscribe forbids 'secret', so the snapshot reads + emits
+			// nothing - no roster/position leak to an unauthorized client.
+			const attacker = mockWs({ id: 'a' });
+			const ap = { ...mockPlatform(), checkSubscribe: async (_ws, topic) => (topic === 'secret' ? 'FORBIDDEN' : null) };
+			await c.snapshot(attacker, 'secret', ap);
+			expect(ap.sent).toHaveLength(0);
+
+			// An authorized topic still emits the catalog + positions.
+			c.update(writer, 'public', { x: 3 }, platform);
+			await waitFor(async () => (await c.list('public')).length === 1);
+			await c.snapshot(attacker, 'public', ap);
+			expect(ap.sent.some((s) => s.event === 'catalog')).toBe(true);
+		});
+	});
 });

@@ -657,4 +657,45 @@ describeIntegration('redis presence (integration)', () => {
 			expect(state.data.alice).toEqual({ id: 'alice', name: 'Alice', color: 'red' });
 		});
 	});
+
+	describe('dual-role teardown + tap-channel authz (real Redis)', () => {
+		it('a participant leaving a topic does not evict a co-resident sync-observer', async () => {
+			const a = makeTracker();
+			// One socket is BOTH a participant (join) and a sync-observer
+			// (presence-snapshot) of the same topic. Both run against real Redis
+			// (JOIN_SCRIPT + the cross-instance subscribeToTopic + syncCounts).
+			const dual = mockWs({ id: 'dual', name: 'Dual' });
+			await a.join(dual, 'board', platform);
+			await a.sync(dual, 'board', platform);
+			expect(dual.isSubscribed('__presence:board')).toBe(true);
+
+			// Participant leaves (real LEAVE_SCRIPT runs); the observer role must
+			// survive so its roster keeps updating.
+			await a.leave(dual, platform, 'board');
+			expect(dual.isSubscribed('__presence:board')).toBe(true);
+
+			// A subsequent join still produces a diff on the channel the observer
+			// is subscribed to (proving the wire + cross-instance subscription
+			// survived the participant leave).
+			platform.reset();
+			const other = mockWs({ id: 'other', name: 'Other' });
+			await a.join(other, 'board', platform);
+			a.flushDiffs();
+			expect(joinDiffsFor(platform, 'other').length).toBeGreaterThan(0);
+		});
+
+		it('denies a presence-snapshot for a topic the client cannot subscribe to', async () => {
+			const a = makeTracker();
+			const attacker = mockWs({ id: 'attacker' });
+			// checkSubscribe gates the snapshot on the real topic's authorization.
+			const denyPlatform = { ...platform, checkSubscribe: async (_ws, t) => (t === 'board' ? 'FORBIDDEN' : null) };
+
+			await a.sync(attacker, 'board', denyPlatform);
+			expect(attacker.isSubscribed('__presence:board')).toBe(false); // not subscribed, no roster read
+
+			// An authorized topic still works.
+			await a.sync(attacker, 'lobby', denyPlatform);
+			expect(attacker.isSubscribed('__presence:lobby')).toBe(true);
+		});
+	});
 });

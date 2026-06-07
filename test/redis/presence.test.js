@@ -886,6 +886,35 @@ describe('redis presence', () => {
 			expect(observer.isSubscribed('__presence:room-a')).toBe(false);
 			expect(observer.isSubscribed('__presence:room-b')).toBe(true);
 		});
+
+		it('keeps a sync-observer subscribed when a co-resident participant leaves (dual-role)', async () => {
+			// The reported bug: one socket is BOTH a participant (join) and a
+			// sync-observer (presence-snapshot) of the same topic. Leaving the
+			// participant role must NOT evict the observer's subscription, or the
+			// observer's roster freezes with the departed user still shown.
+			const dual = mockWs({ id: 'dual' });
+			await presence.join(dual, 'board', platform);
+			await presence.sync(dual, 'board', platform);
+			expect(dual.isSubscribed('__presence:board')).toBe(true);
+
+			// Participant leaves (the real-topic unsubscribe path).
+			await presence.leave(dual, platform, 'board');
+
+			// Observer role intact -> still subscribed -> still receives diffs.
+			expect(dual.isSubscribed('__presence:board')).toBe(true);
+			expect(await presence.count('board')).toBe(0); // participant role is gone
+		});
+
+		it('denies a presence-snapshot for a topic the client cannot subscribe to (authz, no roster leak)', async () => {
+			const attacker = mockWs({ id: 'a' });
+			const denyPlatform = { ...platform, checkSubscribe: async (_ws, t) => (t === 'board' ? 'FORBIDDEN' : null) };
+			await presence.sync(attacker, 'board', denyPlatform);
+			expect(attacker.isSubscribed('__presence:board')).toBe(false); // not subscribed
+
+			// An authorized topic still works.
+			await presence.sync(attacker, 'lobby', denyPlatform);
+			expect(attacker.isSubscribed('__presence:lobby')).toBe(true);
+		});
 	});
 
 	describe('binary wire codec (presence.protocol:1)', () => {
