@@ -198,6 +198,81 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(wrapped.hlc()).toEqual({ wall: 4321, logical: 9, nodeId: 'seed' });
 	});
 
+	it('pubsub wrap falls back to native clock / RNG / HLC when the platform omits them', () => {
+		// The peer-dependency floor admits adapters that predate the injectable
+		// runtime projection, where now / monotonic / random / hlc are undefined.
+		// A cluster-side handler reading them off the wrapped seam must still get a
+		// working clock / RNG / HLC - sourced from this package's own runtime - so
+		// the wrap degrades gracefully instead of throwing 'undefined is not a
+		// function'. Simulate such an adapter by deleting the projected members.
+		const platform = mockPlatform();
+		delete platform.now;
+		delete platform.monotonic;
+		delete platform.random;
+		delete platform.hlc;
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+
+		expect(typeof wrapped.now).toBe('function');
+		expect(typeof wrapped.now()).toBe('number');
+		expect(typeof wrapped.monotonic).toBe('function');
+		expect(typeof wrapped.monotonic()).toBe('number');
+		expect(typeof wrapped.random.float()).toBe('number');
+		expect(typeof wrapped.random.u32()).toBe('number');
+		expect(typeof wrapped.random.uuid()).toBe('string');
+		expect(wrapped.random.bytes(4)).toHaveLength(4);
+
+		const stamp = wrapped.hlc();
+		expect(typeof stamp.wall).toBe('number');
+		expect(typeof stamp.logical).toBe('number');
+		expect(typeof stamp.nodeId).toBe('string');
+		// The fallback HLC keeps the (wall, logical) pair strictly increasing
+		// even within a coarse clock tick, the adapter's non-decreasing contract.
+		const a = wrapped.hlc();
+		const b = wrapped.hlc();
+		expect(b.wall > a.wall || (b.wall === a.wall && b.logical > a.logical)).toBe(true);
+	});
+
+	it('sharded wrap falls back to native clock / RNG / HLC when the platform omits them', () => {
+		const platform = mockPlatform();
+		delete platform.now;
+		delete platform.monotonic;
+		delete platform.random;
+		delete platform.hlc;
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+
+		expect(typeof wrapped.now).toBe('function');
+		expect(typeof wrapped.now()).toBe('number');
+		expect(typeof wrapped.monotonic).toBe('function');
+		expect(typeof wrapped.monotonic()).toBe('number');
+		expect(typeof wrapped.random.float()).toBe('number');
+		expect(typeof wrapped.random.u32()).toBe('number');
+		expect(typeof wrapped.random.uuid()).toBe('string');
+		expect(wrapped.random.bytes(4)).toHaveLength(4);
+
+		const stamp = wrapped.hlc();
+		expect(typeof stamp.wall).toBe('number');
+		expect(typeof stamp.logical).toBe('number');
+		expect(typeof stamp.nodeId).toBe('string');
+	});
+
+	it('pubsub wrap prefers the platform clock / RNG / HLC over the fallback when present', () => {
+		// The fallback must never shadow a projected member. A seeded harness
+		// value set on the platform has to win, so the live reference still flows
+		// to cluster handlers (the whole point of forwarding it live).
+		const platform = mockPlatform();
+		const seededNow = () => 999;
+		const seededRandom = { float: () => 0.1, u32: () => 3, uuid: () => 'seed', bytes: (n) => Buffer.alloc(n) };
+		const seededHlc = () => ({ wall: 7, logical: 1, nodeId: 'seed' });
+		platform.now = seededNow;
+		platform.random = seededRandom;
+		platform.hlc = seededHlc;
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+
+		expect(wrapped.now).toBe(seededNow);
+		expect(wrapped.random).toBe(seededRandom);
+		expect(wrapped.hlc).toBe(seededHlc);
+	});
+
 	it('pubsub wrap delegates forEachSubscriber to the underlying platform', () => {
 		const platform = mockPlatform();
 		const walked = [];

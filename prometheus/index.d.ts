@@ -5,6 +5,31 @@ export interface MetricsOptions {
 	mapTopic?: (topic: string) => string;
 	/** Default histogram buckets. @default [1, 5, 10, 25, 50, 100, 250, 500, 1000] */
 	defaultBuckets?: number[];
+	/** Default per-metric series (labelset) cap. Pass `Infinity` to disable. @default 10000 */
+	maxSeries?: number;
+	/** Default maximum number of buckets a histogram may declare. Pass `Infinity` to disable. @default 32 */
+	maxBuckets?: number;
+}
+
+/** Options-object form of the counter/gauge factory third argument. */
+export interface MetricOptions {
+	/** Label names for this metric. */
+	labelNames?: string[];
+	/** Per-metric series (labelset) cap; overrides the registry default. */
+	maxSeries?: number;
+}
+
+/** Options-object form of the histogram factory third argument. */
+export interface HistogramOptions extends MetricOptions {
+	/** Bucket upper bounds. */
+	buckets?: number[];
+	/**
+	 * Allow negative observations (off by default; Prometheus convention -
+	 * negative values corrupt `_sum` and break bucket monotonicity).
+	 */
+	allowNegative?: boolean;
+	/** Maximum number of buckets this histogram may declare; overrides the registry default. */
+	maxBuckets?: number;
 }
 
 export interface Counter {
@@ -34,18 +59,27 @@ export interface Histogram {
 }
 
 export interface MetricsRegistry {
-	/** Create a counter metric. */
-	counter(name: string, help: string, labelNames?: string[]): Counter;
-	/** Create a gauge metric. */
-	gauge(name: string, help: string, labelNames?: string[]): Gauge;
+	/** Create a counter metric (positional form). */
+	counter(name: string, help: string, labelNames?: string[], maxSeries?: number): Counter;
+	/** Create a counter metric (options form). */
+	counter(name: string, help: string, options: MetricOptions): Counter;
+	/** Create a gauge metric (positional form). */
+	gauge(name: string, help: string, labelNames?: string[], maxSeries?: number): Gauge;
+	/** Create a gauge metric (options form). */
+	gauge(name: string, help: string, options: MetricOptions): Gauge;
 	/**
 	 * Create a histogram metric. Observations must be non-negative by
 	 * default (Prometheus convention; negative values corrupt `_sum` and
 	 * break histogram bucket monotonicity). Pass `allowNegative = true`
 	 * to opt in for signed-observation use cases (latency skew, profit
 	 * & loss, temperature deltas).
+	 *
+	 * The seven-positional form is unwieldy when you only want a later
+	 * argument; prefer the options form `histogram(name, help, { maxBuckets })`.
 	 */
-	histogram(name: string, help: string, labelNames?: string[], buckets?: number[], allowNegative?: boolean): Histogram;
+	histogram(name: string, help: string, labelNames?: string[], buckets?: number[], allowNegative?: boolean, maxSeries?: number, maxBuckets?: number): Histogram;
+	/** Create a histogram metric (options form). */
+	histogram(name: string, help: string, options: HistogramOptions): Histogram;
 	/** Serialize all metrics in Prometheus text exposition format. */
 	serialize(): string;
 	/** uWebSockets.js HTTP handler for the /metrics endpoint. */

@@ -1834,6 +1834,79 @@ Both use the same backing Lua scripts and the same lease semantics; they differ 
 
 ---
 
+## Clock-skew sampling
+
+A background sampler that measures this instance's wall clock against the Redis server clock and exposes it as the `platform_clock_skew_ms` gauge. Features that order or expire events across workers - HLC stamps, lease TTLs, replay windows - assume the fleet's wall clocks agree to within a small bound. A drifting clock is silent until it corrupts ordering; this sampler makes the drift observable before it does. Opt-in and zero-config: nothing wires it automatically.
+
+#### Setup
+
+```js
+// src/lib/server/clock-skew.js
+import { redis } from './redis.js';
+import { metrics } from './metrics.js';
+import { createClockSkewSampler } from 'svelte-adapter-uws-extensions/redis/clock-skew';
+
+export const clockSkew = createClockSkewSampler(redis, {
+  metrics,
+  onTrip: (ms) => console.error(`[clock] skew ${ms}ms exceeds threshold - check NTP on this host`)
+});
+```
+
+#### Use
+
+```js
+// src/hooks.ws.js
+import { clockSkew } from '$lib/server/clock-skew';
+
+export async function shutdown() {
+  await clockSkew.stop();
+}
+```
+
+It starts sampling on construction; there is nothing to call on the hot path. Read the latest value with `clockSkew.current()` (signed milliseconds, positive = local clock ahead of Redis, `null` before the first sample) or force a one-off reading with `await clockSkew.sample()`.
+
+#### How it works
+
+1. **Sample.** Every `intervalMs` (default 30s), issue Redis `TIME` `samples` times (default 5). Each read brackets the call with two local wall-clock reads and estimates the local time at the server instant as their midpoint (round-trip compensation, the standard NTP first-order estimate assuming symmetric latency).
+2. **Reduce.** Take the median of the per-read skew estimates, so a single jittery round-trip cannot move the gauge.
+3. **Publish.** Set `platform_clock_skew_ms` to the signed median and fire `onWarn` / `onTrip` if the absolute skew crosses the thresholds. A failed sample keeps the last good value (no misleading zero) and surfaces via `onError`.
+
+It reads the exact wall clock through the package's runtime seam - not the coarsely-cached clock the hot path uses, whose ~1 Hz refresh lag would otherwise register as phantom skew on a perfectly synchronized host. Because both the local clock and (in a simulation harness) the Redis double's `TIME` resolve through that seam, the skew is reproducible or deliberately injectable under a seeded harness. The timer is `unref`'d, so the sampler never holds the event loop open.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `intervalMs` | `30000` | How often to sample, in milliseconds. |
+| `samples` | `5` | Redis `TIME` reads per sample; reduced by median to reject jitter. Must be `>= 1`. |
+| `warnMs` | `100` | Absolute skew (ms) at or above which `onWarn` fires (and below `tripMs`). |
+| `tripMs` | `500` | Absolute skew (ms) at or above which `onTrip` fires. |
+| `immediate` | `true` | Take the first sample at construction instead of waiting one interval. |
+| `onSkew` | - | Called after every successful sample with the signed median skew. |
+| `onWarn` | - | Called when `warnMs <= |skew| < tripMs`. |
+| `onTrip` | - | Called when `|skew| >= tripMs`. |
+| `onError` | - | Called when a sample fails (Redis error). The last good gauge value is retained. |
+| `breaker` | - | Optional circuit breaker. Sample failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
+| `metrics` | - | Optional Prometheus metrics registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `current()` | The most recent signed skew in milliseconds, or `null` before the first successful sample. |
+| `sample()` | Run one sample immediately and return the signed median skew (or `null` on failure). Also updates the gauge and fires callbacks. |
+| `stop()` | Stop the interval and await any in-flight sample. Idempotent. Never throws. |
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `platform_clock_skew_ms` | Gauge of the signed clock skew of this instance's wall clock relative to the Redis server clock (positive = local ahead). The median of several round-trip-compensated Redis `TIME` reads. |
+
+> On a Redis Cluster client, `TIME` carries no key and is routed to an arbitrary node, so successive reads may sample different nodes. For a coarse drift gauge that is fine; pin to one node upstream if you need per-node attribution.
+
+---
+
 ## Distributed session
 
 Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; this is the Redis-backed swap for multi-instance deployments where a session created on instance A must be readable from instance B after a load-balancer hop.

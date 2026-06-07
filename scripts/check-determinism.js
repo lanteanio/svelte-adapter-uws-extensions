@@ -57,8 +57,10 @@ const ENFORCED = new Set([
 	// (testing/mock-redis.js, testing/mock-pg.js, testing/mock-platform.js) are
 	// deliberately absent - they stay in warn until promoted to simulator grade.
 	'shared/breaker.js',
+	'shared/platform-fallback.js',
 	'capability-cookie.js',
 	'redis/cursor.js',
+	'redis/clock-skew.js',
 	'redis/presence.js',
 	'redis/groups.js',
 	'redis/publish-rate.js',

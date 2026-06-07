@@ -529,33 +529,58 @@ export function createMetrics(options = {}) {
 		};
 	}
 
+	// The metric factories accept EITHER positional args or a single options
+	// object as the third argument. The histogram's seven-positional form
+	// (`histogram(name, help, labelNames, buckets, allowNegative, maxSeries,
+	// maxBuckets)`) forces a caller who only wants `maxBuckets` to thread four
+	// placeholders; the options form (`histogram(name, help, { maxBuckets })`) is
+	// self-documenting. A `labelNames` array - or an omitted third arg - keeps
+	// the positional form, so every existing positional call is unchanged. The
+	// options form supersedes any trailing positional args.
+	function resolveMetricArgs(labelNames, positional) {
+		if (labelNames != null && typeof labelNames === 'object' && !Array.isArray(labelNames)) {
+			const o = labelNames;
+			return {
+				labelNames: o.labelNames,
+				buckets: o.buckets,
+				allowNegative: o.allowNegative,
+				maxSeries: o.maxSeries,
+				maxBuckets: o.maxBuckets
+			};
+		}
+		return { labelNames, ...positional };
+	}
+
 	function counter(name, help, labelNames, maxSeries) {
+		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Counter)) throw new Error(`metric "${fullName}" already registered as a different type`);
 			return existing;
 		}
-		const c = new Counter(fullName, help, labelNames, maxSeries ?? defaultMaxSeries);
+		const c = new Counter(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		attachDropHook(c);
 		registry.set(fullName, c);
 		return c;
 	}
 
 	function gauge(name, help, labelNames, maxSeries) {
+		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Gauge)) throw new Error(`metric "${fullName}" already registered as a different type`);
 			return existing;
 		}
-		const g = new Gauge(fullName, help, labelNames, maxSeries ?? defaultMaxSeries);
+		const g = new Gauge(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		attachDropHook(g);
 		registry.set(fullName, g);
 		return g;
 	}
 
 	function histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
+		const a = resolveMetricArgs(labelNames, { buckets, allowNegative, maxSeries, maxBuckets });
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
@@ -565,11 +590,11 @@ export function createMetrics(options = {}) {
 		const h = new Histogram(
 			fullName,
 			help,
-			labelNames,
-			buckets || defaultBuckets,
-			allowNegative,
-			maxSeries ?? defaultMaxSeries,
-			maxBuckets ?? defaultMaxBuckets
+			a.labelNames,
+			a.buckets || defaultBuckets,
+			a.allowNegative,
+			a.maxSeries ?? defaultMaxSeries,
+			a.maxBuckets ?? defaultMaxBuckets
 		);
 		attachDropHook(h);
 		registry.set(fullName, h);

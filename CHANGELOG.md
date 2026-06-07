@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.9] - 2026-06-07
+
+### Added
+
+- **The Prometheus metric factories (`counter` / `gauge` / `histogram`) now accept an options object as the third argument, alongside the existing positional form.** The seven-positional histogram signature (`histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets)`) forced a caller who only wanted, say, `maxBuckets` to thread four placeholders; `histogram(name, help, { maxBuckets })` is self-documenting. A `labelNames` array (or an omitted third argument) keeps the positional form, so every existing call is unchanged - this is strictly additive. The TypeScript definitions gain the options overloads and complete the previously-missing `maxSeries` / `maxBuckets` on the histogram positional form and on `MetricsOptions`.
+
+- **`redis/clock-skew` (`createClockSkewSampler`): a background sampler that measures this instance's wall clock against the Redis server clock and exposes it as the `platform_clock_skew_ms` gauge.** Features that order or expire events across workers (HLC stamps, lease TTLs, replay windows) assume the fleet's wall clocks agree to within a small bound; a drifting clock is silent until it corrupts ordering. The sampler periodically issues Redis `TIME`, compares it to the local wall clock with round-trip compensation, takes the median of several reads to reject network jitter, and publishes the signed skew (positive = local clock ahead of Redis). Crossing the `warnMs` (default 100) or `tripMs` (default 500) thresholds fires optional `onWarn` / `onTrip` callbacks for alerting; `current()` exposes the last reading and `stop()` halts it. It reads the EXACT wall clock through the runtime seam (not the coarse ~1 Hz cached clock, whose lag alone would register as phantom skew), so a simulation harness driving the seam clock - with a Redis double whose `TIME` returns the same virtual clock - reproduces or injects skew deterministically. Zero-config and opt-in: nothing wires it automatically, and it is `unref`'d so it never holds the event loop open. Exported at `svelte-adapter-uws-extensions/redis/clock-skew`.
+
+### Changed
+
+- **`safe-url` (`isSafeUrl` / `checkUrl` / `checkUrlResolved`) is now re-exported from `svelte-adapter-uws/safe-url` rather than implemented here.** The public `svelte-adapter-uws-extensions/safe-url` entry is unchanged for consumers; the SSRF validator now has a single canonical copy in the adapter (the layer both this package and `svelte-realtime` depend on), so the logic cannot drift between packages. Requires `svelte-adapter-uws >= 0.6.0-next.15` (the release that adds `./safe-url`).
+
+### Fixed
+
+- **`bus.wrap()` now degrades gracefully when wrapping an adapter platform that predates the injectable clock/RNG/HLC projection, instead of surfacing `undefined` for `now` / `monotonic` / `random` / `hlc`.** The package's peer-dependency floor admits older adapters where those members are not projected onto the Platform; a cluster-side per-message handler that read `wrapped.now()` / `wrapped.random.u32()` / `wrapped.hlc()` off such a platform would throw. Both wraps (`redis/pubsub` and `redis/sharded-pubsub`) now fall back to this package's own runtime seam (`now` / `monotonic` directly, a `{ float, u32, uuid, bytes }` object for `random`, and a process-local hybrid logical clock of the same `{ wall, logical, nodeId }` shape for `hlc`), so the wrapped surface is always populated and stays seedable in a simulation harness. The forwarders remain live getters, so a projected member (or a seeded harness override) on the source platform still wins; the fallback only fills the gap. No deployment-order coupling: an extensions install no longer requires a co-deployed adapter that projects the runtime surface.
+
 ## [0.6.0-next.8] - 2026-06-07
 
 ### Added

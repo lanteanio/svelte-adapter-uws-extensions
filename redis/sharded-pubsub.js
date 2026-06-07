@@ -22,7 +22,8 @@
  * @module svelte-adapter-uws-extensions/redis/sharded-pubsub
  */
 
-import { randomBytes, setTimer, clearTimer } from '../shared/runtime.js';
+import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
+import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { parseRedisVersion } from '../shared/redis-version.js';
 import { assert } from '../shared/assert.js';
 import {
@@ -765,16 +766,24 @@ export function createShardedBus(client, options = {}) {
 				// Platform from the runtime module. Cluster-side per-message handlers
 				// read these off the wrapped seam (the caller's reference IS the wrap
 				// result), so a seeded harness clock / RNG must propagate through.
-				// Forward the reference - the projected `now` / `monotonic` functions
-				// and the `random` object - rather than rebinding, so a wrapped
-				// platform exposes the same source the adapter installed.
-				get now() { return platform.now; },
-				get monotonic() { return platform.monotonic; },
-				get random() { return platform.random; },
+				// Forward the live reference - the projected `now` / `monotonic`
+				// functions and the `random` object - rather than rebinding, so a
+				// wrapped platform exposes the same source the adapter installed. The
+				// `?? <native>` fallback degrades gracefully when the underlying
+				// platform predates the projection (the peer-dependency floor admits
+				// such adapters): a cluster handler still gets a working clock / RNG
+				// from this package's own runtime seam instead of reading `undefined`,
+				// and that seam stays seedable in a simulation harness. Same
+				// live-getter + nullish-fallback contract the protection forwarder uses.
+				get now() { return platform.now ?? now; },
+				get monotonic() { return platform.monotonic ?? monotonicNow; },
+				get random() { return platform.random ?? fallbackRandom; },
 				// Forward the hybrid logical clock the adapter projects onto its
 				// Platform. Cluster-side handlers that causally stamp an event read
-				// it off the wrapped platform, so the reference must propagate live.
-				get hlc() { return platform.hlc; },
+				// it off the wrapped platform, so the reference must propagate live;
+				// the fallback is a process-local HLC of the same shape for adapters
+				// that predate the projection.
+				get hlc() { return platform.hlc ?? fallbackHlc; },
 				onPressure: platform.onPressure.bind(platform),
 				onPublishRate: platform.onPublishRate.bind(platform),
 				subscribers: platform.subscribers.bind(platform),

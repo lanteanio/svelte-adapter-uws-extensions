@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.8",
+  "version": "0.6.0-next.9",
   "publishConfig": {
     "tag": "next"
   },
@@ -68,6 +68,10 @@
     "./redis/cursor": {
       "types": "./redis/cursor.d.ts",
       "default": "./redis/cursor.js"
+    },
+    "./redis/clock-skew": {
+      "types": "./redis/clock-skew.d.ts",
+      "default": "./redis/clock-skew.js"
     },
     "./redis/idempotency": {
       "types": "./redis/idempotency.d.ts",
@@ -171,7 +175,7 @@
     "node": ">=22.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.6"
+    "svelte-adapter-uws": "^0.6.0-next.15"
   },
   "dependencies": {
     "ioredis": "^5.0.0"
@@ -180,7 +184,7 @@
     "pg": "^8.0.0"
   },
   "devDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.6",
+    "svelte-adapter-uws": "^0.6.0-next.15",
     "vitest": "^4.0.18",
     "ws": "^8.0.0"
   },

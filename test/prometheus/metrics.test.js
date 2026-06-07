@@ -476,6 +476,57 @@ describe('prometheus metrics', () => {
 		});
 	});
 
+	describe('options-object factory form', () => {
+		it('counter accepts an options object as the third argument', () => {
+			const m = createMetrics();
+			const c = m.counter('reqs', 'Requests', { labelNames: ['path'] });
+			c.inc({ path: '/a' }, 3);
+			expect(m.serialize()).toContain('reqs{path="/a"} 3');
+		});
+
+		it('gauge accepts an options object as the third argument', () => {
+			const m = createMetrics();
+			const g = m.gauge('temp', 'Temperature', { labelNames: ['room'] });
+			g.set({ room: 'kitchen' }, 21);
+			expect(m.serialize()).toContain('temp{room="kitchen"} 21');
+		});
+
+		it('histogram accepts an options object, no positional placeholders', () => {
+			const m = createMetrics();
+			const h = m.histogram('lat', 'Latency', { buckets: [10, 100], allowNegative: true });
+			h.observe(-5);
+			h.observe(50);
+			const out = m.serialize();
+			expect(out).toContain('# TYPE lat histogram');
+			expect(out).toContain('lat_bucket{le="10"} 1');
+		});
+
+		it('options.maxSeries is honoured (caps labelsets like the positional form)', () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const m = createMetrics();
+			const c = m.counter('capped', 'Capped', { labelNames: ['k'], maxSeries: 1 });
+			c.inc({ k: 'a' });
+			c.inc({ k: 'b' }); // dropped: over the cap
+			const out = m.serialize();
+			expect(out).toContain('capped{k="a"} 1');
+			expect(out).not.toContain('capped{k="b"}');
+			warnSpy.mockRestore();
+		});
+
+		it('options.maxBuckets is honoured for histograms', () => {
+			const m = createMetrics();
+			expect(() => m.histogram('h', 'help', { buckets: [1, 2, 3], maxBuckets: 2 }))
+				.toThrow('maxBuckets');
+		});
+
+		it('positional form is unchanged (no regression)', () => {
+			const m = createMetrics();
+			const c = m.counter('legacy', 'Legacy', ['path'], 5);
+			c.inc({ path: '/x' });
+			expect(m.serialize()).toContain('legacy{path="/x"} 1');
+		});
+	});
+
 	describe('serialize', () => {
 		it('returns empty string for empty registry', () => {
 			const m = createMetrics();
