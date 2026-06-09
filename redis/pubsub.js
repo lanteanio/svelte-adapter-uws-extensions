@@ -380,11 +380,16 @@ export function createPubSubBus(client, options = {}) {
 				}
 				try {
 					const parsed = JSON.parse(message);
-					assert(
-						typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string',
-						'pubsub.envelope.shape',
-						{ ch }
-					);
+					// A forged or byte-corrupted envelope with a non-string instanceId
+					// must drop the same way in every run mode. `assert` throws in test
+					// mode but only logs-and-counts in production (throwing in a pubsub
+					// callback could corrupt state), so a bare assert would fall through
+					// in production and deliver an unidentifiable frame. Drop explicitly,
+					// keeping the production shape signal.
+					if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
+						assert(false, 'pubsub.envelope.shape', { ch });
+						return;
+					}
 					// Skip messages from this instance (echo suppression).
 					// One check per envelope; batched envelopes carry one
 					// instanceId for the whole batch.

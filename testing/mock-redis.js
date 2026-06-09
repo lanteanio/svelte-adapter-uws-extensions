@@ -1,4 +1,4 @@
-import { wallEpoch, randomU32 } from '../shared/runtime.js';
+import { wallEpoch, randomU32, setTimer } from '../shared/runtime.js';
 import { keySlot } from '../shared/cluster.js';
 
 /**
@@ -27,6 +27,16 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 	const nodeCount = Number.isInteger(options.nodeCount) && options.nodeCount > 0
 		? options.nodeCount
 		: 3;
+	// Optional seeded fault engine for cross-instance pub/sub delivery (a
+	// simulation harness passes one). When set, each PUBLISH delivery to a
+	// subscriber is drawn independently and deferred on the seam timer
+	// (drop / delay / reorder / duplicate / corrupt). Absent (the default, and
+	// every native / integration caller) => delivery stays synchronous and inline,
+	// so existing behaviour is unchanged. The engine exposes `plan(payload) ->
+	// [{ delayMs, payload }]` (the adapter's createFaultEngine shape).
+	const relayFaultEngine = (options.faultEngine && typeof options.faultEngine.plan === 'function')
+		? options.faultEngine
+		: null;
 	const store = new Map();       // key -> value (string)
 	const sortedSets = new Map();  // key -> [{score, member}]
 	const hashes = new Map();      // key -> Map<field, value>
@@ -563,9 +573,24 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			// Pub/sub
 			async publish(channel, message) {
 				for (const handler of pubsubHandlers) {
-					if (handler.channels.has(channel)) {
-						const msgListener = handler.listeners.get('message');
-						if (msgListener) msgListener(channel, message);
+					if (!handler.channels.has(channel)) continue;
+					const msgListener = handler.listeners.get('message');
+					if (!msgListener) continue;
+					if (relayFaultEngine) {
+						// Each subscriber's delivery is drawn independently and deferred on
+						// the seam timer, modeling cross-instance pub/sub unreliability. The
+						// timers are refed so a delayed / reordered relay still lands before
+						// the run quiesces. A byte-flipped payload reaches the subscriber
+						// as-is and then either fails JSON.parse, is dropped by the bus
+						// envelope-shape / validator gate, or parses to a valid-but-mutated
+						// envelope that is delivered - all reproducible under a seed.
+						const plan = relayFaultEngine.plan(message);
+						for (const d of plan) {
+							const payload = d.payload;
+							setTimer(() => { try { msgListener(channel, payload); } catch { /* receiver errors are not the publisher's */ } }, d.delayMs);
+						}
+					} else {
+						msgListener(channel, message);
 					}
 				}
 				return 1;

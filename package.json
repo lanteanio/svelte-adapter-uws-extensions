@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.11",
+  "version": "0.6.0-next.12",
   "publishConfig": {
     "tag": "next"
   },
@@ -17,6 +17,10 @@
   },
   "type": "module",
   "exports": {
+    "./sim": {
+      "types": "./sim.d.ts",
+      "default": "./sim.js"
+    },
     "./redis": {
       "types": "./redis/index.d.ts",
       "default": "./redis/index.js"
@@ -156,6 +160,8 @@
     "prometheus",
     "shared",
     "testing",
+    "sim.js",
+    "sim.d.ts",
     "capability-cookie.js",
     "capability-cookie.d.ts",
     "LICENSE",
@@ -175,7 +181,7 @@
     "node": ">=22.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.15"
+    "svelte-adapter-uws": "^0.6.0-next.19"
   },
   "dependencies": {
     "ioredis": "^5.0.0"
@@ -184,7 +190,7 @@
     "pg": "^8.0.0"
   },
   "devDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.15",
+    "svelte-adapter-uws": "^0.6.0-next.19",
     "vitest": "^4.0.18",
     "ws": "^8.0.0"
   },

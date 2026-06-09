@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.12] - 2026-06-08
+
+### Added
+
+- **`svelte-adapter-uws-extensions/sim`: deterministic simulation backends that drive a redis or postgres-backed multi-instance deployment under the adapter's virtual clock, so a seed reproduces a clustered store-backed run bit-for-bit.** `runRedisSim(config)` and `runPgSim(config)` build N in-memory server instances that share one shared store double (`mockRedisClient` / `mockPgClient`) and one virtual clock; the cross-instance relay flows through the REAL plugin code - the redis pub/sub bus (`createPubSubBus` wrap/activate) and the postgres LISTEN/NOTIFY bridge - against the shared double, so the harness exercises production relay semantics rather than a reimplementation. `relayFaults` applies drop / delay / reorder / duplicate / corrupt to the cross-instance channel; `replayRedisSim` / `replayPgSim` re-run a seed and self-gate that the same per-instance frames, structural state, metrics, virtual time, and scheduler steps reproduce. The redis runner wires `replay` (cross-instance resume over the shared ring) and `presence` (cross-instance roster convergence) via a declarative `plugins` list; the pg runner wires `replay` (resume over the shared durable ring) and exposes the shared client so a scenario can drive advisory-lock leader election and `FOR UPDATE SKIP LOCKED` claims. Dev/test infrastructure - it ships in the package but pulls in no new runtime dependency.
+
+- **The in-memory Redis and Postgres test doubles gain an opt-in `{ faultEngine }` option that fault-gates cross-instance delivery.** When a seeded fault engine is passed (the simulation harness does this), each pub/sub subscriber delivery (`mockRedisClient`) and each `LISTEN`/`NOTIFY` delivery (`mockPgClient`) is drawn independently and deferred on the runtime-seam timer (drop / delay / reorder / duplicate / corrupt), modeling store unreliability deterministically. Absent the option (the default, and every existing caller) delivery is unchanged, so the existing unit, integration, and Lua-parity suites are unaffected.
+
+### Fixed
+
+- **The redis pub/sub bus now drops a malformed cross-instance envelope the same way in every run mode.** An envelope that parsed as JSON but carried a non-string `instanceId` was dropped in test mode (where the shape assertion throws) but, in production (where the assertion only logs, since throwing inside a pub/sub callback could corrupt state), fell through and could deliver an unidentifiable frame. The bus now drops such an envelope explicitly while keeping the production shape signal, so a forged or byte-corrupted frame is rejected consistently. No effect on well-formed traffic.
+
 ## [0.6.0-next.11] - 2026-06-07
 
 ### Added

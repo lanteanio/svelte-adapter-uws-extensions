@@ -1,4 +1,4 @@
-import { wallEpoch, randomUuid, microtask } from '../shared/runtime.js';
+import { wallEpoch, randomUuid, microtask, setTimer } from '../shared/runtime.js';
 
 /**
  * In-memory mock that implements the PgClient interface.
@@ -25,7 +25,17 @@ import { wallEpoch, randomUuid, microtask } from '../shared/runtime.js';
  * races and cross-connection lock contention - that the previous naive
  * slice-based stub silently hid.
  */
-export function mockPgClient() {
+export function mockPgClient(options = {}) {
+	// Optional seeded fault engine for cross-instance LISTEN/NOTIFY delivery (a
+	// simulation harness passes one). When set, each notification delivery to a
+	// listener is drawn independently and deferred on the seam timer
+	// (drop / delay / reorder / duplicate / corrupt). Absent (the default, and
+	// every native / integration caller) => delivery stays the ordered microtask
+	// flush, so existing behaviour is unchanged. Same `plan(payload)` shape as the
+	// adapter's createFaultEngine.
+	const notifyFaultEngine = (options.faultEngine && typeof options.faultEngine.plan === 'function')
+		? options.faultEngine
+		: null;
 	/** @type {Array<{svti_replay_id: number, topic: string, seq: number, event: string, data: any, created_at: Date}>} */
 	let rows = [];
 	let nextId = 1;
@@ -103,6 +113,25 @@ export function mockPgClient() {
 		// mutate the set we are iterating. Per-channel FIFO is preserved
 		// because each NOTIFY schedules its own flush in call order.
 		const snapshot = [...listeners];
+		if (notifyFaultEngine) {
+			// Fault-gated delivery: each listener's notification is drawn
+			// independently and deferred on the seam timer (refed so a delayed /
+			// reordered notify still lands before the run quiesces). A byte-flipped
+			// payload reaches the listener as-is and then either fails the notify
+			// bridge's JSON.parse, is dropped by its envelope/validator gate, or
+			// parses to a valid-but-mutated envelope that is delivered.
+			for (const conn of snapshot) {
+				const plan = notifyFaultEngine.plan(payload);
+				for (const d of plan) {
+					const p = d.payload;
+					setTimer(() => {
+						if (!channelListeners.get(channel)?.has(conn)) return;
+						conn._emit('notification', { channel, payload: p, processId: 0 });
+					}, d.delayMs);
+				}
+			}
+			return;
+		}
 		// Schedule via the runtime seam so a virtual timer wheel can drive
 		// delivery deterministically; under the native default this is a plain
 		// microtask, matching the pg driver's async 'notification' dispatch.

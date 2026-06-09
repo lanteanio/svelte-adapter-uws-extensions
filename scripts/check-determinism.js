@@ -90,7 +90,8 @@ const ENFORCED = new Set([
 	'postgres/_worker-harness.js',
 	'postgres/index.js',
 	'testing/mock-redis.js',
-	'testing/mock-pg.js'
+	'testing/mock-pg.js',
+	'sim.js'
 ]);
 
 // Path segments that are never framework runtime source.
