@@ -2768,17 +2768,17 @@ Aggregate-memory protection still belongs to the adapter's `upgradeAdmission.max
 
 ## Production assertions
 
-Critical invariants across the extensions are checked at runtime via a two-tier assertion helper that mirrors the adapter's `0.5.0-next.8` shape. Two helpers, `assert(cond, category, context)` and `devAssert(cond, message, context)`, live in `shared/assert.js` and fire at ~10 invariant sites today (envelope shape on inbound pubsub frames, registry session-shadow consistency, registry events-channel payload type, secondary-index consistency, lock heartbeat-vs-signal-aborted invariant, etc).
+Critical invariants across the extensions are checked at runtime via a tiered assertion helper that mirrors the adapter's shape. Three helpers - `assert(cond, category, context)`, `fatal(cond, category, context)`, and `devAssert(cond, message, context)` - live in `shared/assert.js`. `assert` fires at ~10 invariant sites today (envelope shape on inbound pubsub frames, registry session-shadow consistency, registry events-channel payload type, secondary-index consistency, lock heartbeat-vs-signal-aborted invariant, etc).
 
 #### How violations surface
 
-| Mode | `assert` behavior | `devAssert` behavior |
-|---|---|---|
-| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** - a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | full no-op |
-| **Test** (`process.env.VITEST` or `NODE_ENV === 'test'`) | counter++, log, and throws so vitest surfaces the failure as a test error | log only, never throws |
-| **Development** (otherwise) | counter++, log, no throw | log only |
+| Mode | `assert` behavior (SOFT) | `fatal` behavior (HARD) | `devAssert` behavior |
+|---|---|---|---|
+| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** - a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | counter++, `[extensions/fatal]` log, then a **deferred `process.exit(78)`** scheduled after the current callback frame unwinds (never a synchronous exit inside a callback) | full no-op |
+| **Test** (`process.env.VITEST` or `NODE_ENV === 'test'`) | counter++, log, and throws so vitest surfaces the failure as a test error | counter++, log, and throws (the deferred exit is suppressed so the runner is not killed) | log only, never throws |
+| **Development** (otherwise) | counter++, log, no throw | counter++, log, then deferred `process.exit(78)` | log only |
 
-`devAssert` is for cosmetic / DX hints (schema-mismatch warnings, etc); `assert` is for invariants whose violation indicates corrupted internal state. The DX framing matches the adapter's: hard assertions never fire on healthy code; if they fire, something is genuinely wrong, and the metric + log surface it without taking the worker down.
+`devAssert` is for cosmetic / DX hints (schema-mismatch warnings, etc); `assert` is for invariants whose violation indicates corrupted-but-recoverable internal state; `fatal` is the hard tier for genuinely unrecoverable state, where continuing would propagate the corruption (it terminates the worker with exit code 78 so a supervisor can restart it from a clean slate). The deferred exit is injectable via `setFatalSink` / `resetFatalSink` so a simulation harness can capture fatals instead of exiting. The DX framing matches the adapter's: hard assertions never fire on healthy code; if they fire, something is genuinely wrong.
 
 #### Wiring the metric
 
@@ -2790,7 +2790,7 @@ const metrics = createMetrics();
 wireAssertionMetrics(metrics);
 ```
 
-After wiring, every `assert` violation increments `extensions_assertion_violations_total{category}`. The label cardinality is bounded by the number of distinct categories declared in the source - not user-input-driven.
+After wiring, every `assert` violation increments `extensions_assertion_violations_total{category,severity="soft"}` and every `fatal` violation increments `extensions_assertion_violations_total{category,severity="fatal"}`. The label cardinality is bounded by the number of distinct categories declared in the source (times the two severities) - not user-input-driven.
 
 If a counter goes non-zero in production: file an issue with the category name, the log entries, and a description of the workload. The category names follow the convention `<module>.<invariant>` (e.g. `registry.session-shadow.consistency`, `pubsub.envelope.shape`).
 

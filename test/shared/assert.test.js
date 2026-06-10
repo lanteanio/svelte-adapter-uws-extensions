@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
 	assert,
+	fatal,
+	setFatalSink,
+	resetFatalSink,
 	devAssert,
 	getAssertionCounters,
 	wireAssertionMetrics,
@@ -163,8 +166,8 @@ describe('shared/assert', () => {
 			expect(() => assert(false, 'wire.other')).toThrow();
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/extensions_assertion_violations_total\{category="wire.test"\}\s+2/);
-			expect(out).toMatch(/extensions_assertion_violations_total\{category="wire.other"\}\s+1/);
+			expect(out).toMatch(/extensions_assertion_violations_total\{category="wire.test",severity="soft"\}\s+2/);
+			expect(out).toMatch(/extensions_assertion_violations_total\{category="wire.other",severity="soft"\}\s+1/);
 		});
 
 		it('does not increment when assert passes', async () => {
@@ -188,8 +191,8 @@ describe('shared/assert', () => {
 
 			const out1 = await m1.serialize();
 			const out2 = await m2.serialize();
-			expect(out1).not.toMatch(/replace\.test"\}\s+1/);
-			expect(out2).toMatch(/extensions_assertion_violations_total\{category="replace.test"\}\s+1/);
+			expect(out1).not.toMatch(/replace\.test"/);
+			expect(out2).toMatch(/extensions_assertion_violations_total\{category="replace.test",severity="soft"\}\s+1/);
 		});
 
 		it('survives a counter.inc throwing without losing the assertion violation', async () => {
@@ -204,6 +207,93 @@ describe('shared/assert', () => {
 			expect(() => assert(false, 'flaky.metrics')).toThrow();
 			// The in-memory counter should still have advanced.
 			expect(getAssertionCounters().get('flaky.metrics')).toBe(1);
+		});
+
+		it('labels a fatal violation severity="fatal" on the same counter', async () => {
+			const metrics = createMetrics();
+			wireAssertionMetrics(metrics);
+			const exit = vi.fn();
+			setFatalSink({ exit });
+			const originalVitest = process.env.VITEST;
+			const originalNodeEnv = process.env.NODE_ENV;
+			try {
+				delete process.env.VITEST;
+				process.env.NODE_ENV = 'production';
+				fatal(false, 'wire.fatal', { reason: 'corrupt' });
+			} finally {
+				if (originalVitest === undefined) delete process.env.VITEST;
+				else process.env.VITEST = originalVitest;
+				if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+				else process.env.NODE_ENV = originalNodeEnv;
+			}
+			const out = await metrics.serialize();
+			expect(out).toMatch(/extensions_assertion_violations_total\{category="wire.fatal",severity="fatal"\}\s+1/);
+		});
+	});
+
+	describe('fatal', () => {
+		it('is a no-op when the condition is true', () => {
+			expect(() => fatal(true, 'fatal.passes')).not.toThrow();
+			expect(getAssertionCounters().size).toBe(0);
+		});
+
+		it('throws in test mode when the condition is false', () => {
+			expect(() => fatal(false, 'fatal.fails-in-test')).toThrow(/extensions fatal/);
+		});
+
+		it('increments the same counter map as assert (one namespace)', () => {
+			expect(() => assert(false, 'fatal.shared')).toThrow();
+			expect(() => fatal(false, 'fatal.shared')).toThrow();
+			expect(getAssertionCounters().get('fatal.shared')).toBe(2);
+		});
+
+		it('logs a structured line with severity: fatal and strips PII', () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			expect(() => fatal(false, 'fatal.log', { topic: 'room', password: 'leaked' })).toThrow();
+			const line = errSpy.mock.calls[0][0];
+			expect(line).toMatch(/^\[extensions\/fatal\]/);
+			const parsed = JSON.parse(line.slice('[extensions/fatal] '.length));
+			expect(parsed.severity).toBe('fatal');
+			expect(parsed.category).toBe('fatal.log');
+			expect(parsed.context).toHaveProperty('topic');
+			expect(parsed.context).not.toHaveProperty('password');
+			errSpy.mockRestore();
+		});
+
+		it('setFatalSink rejects a sink without an exit function', () => {
+			expect(() => setFatalSink(null)).toThrow(/exit/);
+			expect(() => setFatalSink({})).toThrow(/exit/);
+		});
+
+		it('in production, defers exit(78) through the injectable sink without killing the process', async () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			const exit = vi.fn();
+			setFatalSink({ exit });
+			const originalVitest = process.env.VITEST;
+			const originalNodeEnv = process.env.NODE_ENV;
+			try {
+				delete process.env.VITEST;
+				process.env.NODE_ENV = 'production';
+				expect(() => fatal(false, 'fatal.defer', { topic: 'room' })).not.toThrow();
+				// Not exited synchronously; metric + log already flushed.
+				expect(exit).not.toHaveBeenCalled();
+				expect(getAssertionCounters().get('fatal.defer')).toBe(1);
+				expect(errSpy).toHaveBeenCalledTimes(1);
+				// Deferred via microtask: fires after the current frame.
+				await Promise.resolve();
+				expect(exit).toHaveBeenCalledTimes(1);
+				expect(exit).toHaveBeenCalledWith(78);
+			} finally {
+				if (originalVitest === undefined) delete process.env.VITEST;
+				else process.env.VITEST = originalVitest;
+				if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+				else process.env.NODE_ENV = originalNodeEnv;
+				errSpy.mockRestore();
+			}
+		});
+
+		it('resetFatalSink restores the default sink', () => {
+			expect(() => resetFatalSink()).not.toThrow();
 		});
 	});
 });

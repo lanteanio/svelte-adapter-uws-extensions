@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.13] - 2026-06-10
+
+### Added
+
+- **A hard-tier `fatal(cond, category, context)` companion to `assert`, plus the shared invariant predicates and an in-process consistency auditor.** `fatal` (exported from `svelte-adapter-uws-extensions/assert`) shares the same counter Map and the same bound Prometheus counter as `assert` - one metric namespace - for genuinely unrecoverable state: on violation in production it schedules a DEFERRED `process.exit(78)` after the current callback frame unwinds (a synchronous exit inside a Redis pubsub callback risks the half-applied state `assert` already guards against), and in test mode it throws so the runner sees it without dying. The deferred exit is injectable via `setFatalSink` / `resetFatalSink` so a simulation harness captures fatals instead of exiting. `shared/invariants.js` exports the named predicate set (`checkSubscriptionBookkeeping`, `checkTotalSubscriptions`, `checkTopicsHaveSubscribers`, `runInvariants`) that operates on a plain, structure-only state snapshot (no payload bytes, no user data), and `shared/auditor.js` exports `createConsistencyAuditor` - a per-instance background check that runs those predicates on a slow, unref'd, RNG-jittered timer (default 5s) over a bounded round-robin window, NEVER on the hot path; violations route to the soft `assert` by default, with an opt-in hard tier that escalates to `fatal` only when a violation persists across two consecutive audits. Purely additive.
+
+### Changed
+
+- **`extensions_assertion_violations_total` now carries a `severity` label** (`severity="soft"` for `assert`, `severity="fatal"` for `fatal`) so a dashboard can separate observational soft violations from hard-tier terminations. Queries against the bare metric name are unaffected; a query that pinned `{category="..."}` without `severity` now matches the labelled series.
+
 ## [0.6.0-next.12] - 2026-06-08
 
 ### Added

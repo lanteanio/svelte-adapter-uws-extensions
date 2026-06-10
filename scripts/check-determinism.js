@@ -58,6 +58,9 @@ const ENFORCED = new Set([
 	// testing/mock-platform.js stays in warn until its raw reads are routed.
 	'shared/breaker.js',
 	'shared/platform-fallback.js',
+	'shared/assert.js',
+	'shared/invariants.js',
+	'shared/auditor.js',
 	'capability-cookie.js',
 	'redis/cursor.js',
 	'redis/clock-skew.js',
