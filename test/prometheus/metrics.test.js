@@ -49,6 +49,40 @@ describe('prometheus metrics', () => {
 			expect(output).toContain('app_requests_total');
 			expect(output).toContain('app_errors_total');
 		});
+
+		it('returns the same instrument when a name re-registers with the same labels', () => {
+			const m = createMetrics();
+			const a = m.counter('shared_total', 'Shared', ['reason']);
+			const b = m.counter('shared_total', 'Shared', ['reason']);
+			expect(b).toBe(a);
+
+			const g1 = m.gauge('shared_value', 'Shared gauge');
+			const g2 = m.gauge('shared_value', 'Shared gauge');
+			expect(g2).toBe(g1);
+		});
+
+		it('treats label order as irrelevant for re-registration identity', () => {
+			const m = createMetrics();
+			const a = m.counter('ordered_total', 'Ordered', ['a', 'b']);
+			const b = m.counter('ordered_total', 'Ordered', ['b', 'a']);
+			expect(b).toBe(a);
+		});
+
+		it('throws when a name re-registers with a different label shape', () => {
+			// Silently returning the existing instrument would defer the
+			// failure to the first emit (validateLabels enforces the
+			// registered set); the collision must surface at registration.
+			const m = createMetrics();
+			m.counter('clash_total', 'Clash', ['reason']);
+			expect(() => m.counter('clash_total', 'Clash')).toThrow('different labels');
+			expect(() => m.counter('clash_total', 'Clash', ['other'])).toThrow('different labels');
+
+			m.gauge('clash_value', 'Clash gauge');
+			expect(() => m.gauge('clash_value', 'Clash gauge', ['lane'])).toThrow('different labels');
+
+			m.histogram('clash_seconds', 'Clash histogram', ['path']);
+			expect(() => m.histogram('clash_seconds', 'Clash histogram', ['route'])).toThrow('different labels');
+		});
 	});
 
 	describe('counter', () => {

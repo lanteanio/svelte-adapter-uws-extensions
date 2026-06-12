@@ -551,12 +551,31 @@ export function createMetrics(options = {}) {
 		return { labelNames, ...positional };
 	}
 
+	// Same-name re-registration must also be same-SHAPE: silently returning an
+	// instrument whose labelNames differ from the caller's would make every
+	// subsequent emit from that caller throw (validateLabels enforces the
+	// registered set), surfacing at the first emit in production instead of at
+	// startup. Mirrors the existing different-type throw.
+	function assertSameLabelNames(existing, requested, fullName) {
+		const a = existing.labelNames && existing.labelNames.length ? [...existing.labelNames].sort() : [];
+		const b = requested && requested.length ? [...requested].sort() : [];
+		let same = a.length === b.length;
+		for (let i = 0; same && i < a.length; i++) same = a[i] === b[i];
+		if (!same) {
+			throw new Error(
+				`metric "${fullName}" already registered with different labels ` +
+				`(existing: ${a.join(',') || '<none>'}; requested: ${b.join(',') || '<none>'})`
+			);
+		}
+	}
+
 	function counter(name, help, labelNames, maxSeries) {
 		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Counter)) throw new Error(`metric "${fullName}" already registered as a different type`);
+			assertSameLabelNames(existing, a.labelNames, fullName);
 			return existing;
 		}
 		const c = new Counter(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
@@ -571,6 +590,7 @@ export function createMetrics(options = {}) {
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Gauge)) throw new Error(`metric "${fullName}" already registered as a different type`);
+			assertSameLabelNames(existing, a.labelNames, fullName);
 			return existing;
 		}
 		const g = new Gauge(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
@@ -585,6 +605,7 @@ export function createMetrics(options = {}) {
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Histogram)) throw new Error(`metric "${fullName}" already registered as a different type`);
+			assertSameLabelNames(existing, a.labelNames, fullName);
 			return existing;
 		}
 		const h = new Histogram(

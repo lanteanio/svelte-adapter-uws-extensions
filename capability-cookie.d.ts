@@ -1,3 +1,5 @@
+import type { MetricsRegistry } from './prometheus/index.js';
+
 export interface CapabilityCookieOptions {
 	/** HMAC secret. Required, non-empty. */
 	secret: string;
@@ -13,6 +15,15 @@ export interface CapabilityCookieOptions {
 	sameSite?: 'Strict' | 'Lax' | 'None';
 	/** Cookie path. @default '/' */
 	path?: string;
+	/**
+	 * Prometheus metrics registry. Registers
+	 * `capability_cookie_misses_total{reason}` with reasons `missing` (cookie
+	 * absent while `required`) and `invalid` (cookie presented but failed to
+	 * verify - bad signature, malformed, or expired). Expired is deliberately
+	 * not its own reason: expiry is checked before the signature, so the
+	 * split would be forgeable by the sender.
+	 */
+	metrics?: MetricsRegistry;
 }
 
 export interface CapabilityCookieVerifyOptions {

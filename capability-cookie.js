@@ -137,6 +137,7 @@ function appendSetCookie(response, value) {
  * @property {boolean} [secure=true] - Set the `Secure` attribute.
  * @property {'Strict' | 'Lax' | 'None'} [sameSite='Lax'] - SameSite policy.
  * @property {string} [path='/'] - Cookie path.
+ * @property {import('./prometheus/index.js').MetricsRegistry} [metrics] - Prometheus registry; registers `capability_cookie_misses_total{reason}`.
  */
 
 /**
@@ -197,6 +198,32 @@ export function capabilityCookie(options) {
 	const sameSite = options.sameSite ?? 'Lax';
 	const path = options.path ?? '/';
 	const ttlMs = ttlSeconds * 1000;
+
+	const m = options.metrics;
+	const rawMisses = m?.counter(
+		'capability_cookie_misses_total',
+		'Capability cookie verifications that failed (missing while required, or presented but invalid)',
+		['reason']
+	);
+	// Contain emits: verify() runs on the upgrade hot path and must return a
+	// boolean, never throw. A registry that fails at emit time (the contract
+	// admits any registry-shaped object) logs once and goes silent;
+	// registration above stays uncontained so a broken registry fails at
+	// startup, loudly.
+	let missesWarned = false;
+	const mMisses = rawMisses == null ? undefined : {
+		/** @param {Record<string, string>} labels */
+		inc(labels) {
+			try {
+				rawMisses.inc(labels);
+			} catch (err) {
+				if (!missesWarned) {
+					missesWarned = true;
+					console.error('capability-cookie: metrics instrument threw; suppressing further errors from it:', err);
+				}
+			}
+		}
+	};
 
 	/**
 	 * Resolve a stable session id for the request. Reuses an existing
@@ -304,10 +331,20 @@ export function capabilityCookie(options) {
 			if (value == null) {
 				// Absent cookie: a hard fail only when the caller marked it required
 				// (typically under elevated/siege posture). Optional otherwise, so a
-				// quiet site never locks out a first-time visitor.
+				// quiet site never locks out a first-time visitor - and no metric
+				// either, or every first visit would count as a miss.
+				if (required) mMisses?.inc({ reason: 'missing' });
 				return !required;
 			}
-			return decode(value) !== null;
+			// A presented cookie that fails to verify is a signal in every
+			// posture, so it counts regardless of `required`. Expired cookies
+			// from idle real users land here too (`refresh()` on page responses
+			// keeps live users out of this bucket); expiry is deliberately not
+			// its own reason - decode checks it before the signature, so the
+			// split would be forgeable by the sender.
+			const ok = decode(value) !== null;
+			if (!ok) mMisses?.inc({ reason: 'invalid' });
+			return ok;
 		}
 	};
 }

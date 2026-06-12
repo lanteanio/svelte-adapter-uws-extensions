@@ -2549,6 +2549,23 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `admission_accepted_total` | counter | `class` | `shouldAccept` calls that returned `true` |
 | `admission_rejected_total` | counter | `class`, `reason` | `shouldAccept` calls that returned `false`, labeled with the pressure reason that caused rejection |
 
+**Per-IP upgrade bucket**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `upgrade_bucket_admitted_total` | counter | | Upgrades admitted by the per-IP bucket |
+| `upgrade_bucket_rejected_total` | counter | | Upgrades rejected by the per-IP bucket |
+| `upgrade_bucket_fail_open_total` | counter | | Upgrades admitted because the Redis bucket was unavailable |
+| `upgrade_bucket_evicted_total` | counter | | LRU evictions under the entry cap (local variant) |
+
+**Capability cookie**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `capability_cookie_misses_total` | counter | `reason` | Failed verifications: `missing` (absent while required) or `invalid` (presented but failed to verify; includes expired) |
+
+The adapter's own upgrade-path counters and gauges (`upgrade_admitted_total`, `upgrade_rejected_total{reason}`, `upgrade_inflight`, `waiting_room_queue_depth`, `protection_posture_state`, `protection_posture_transitions_total{from,to}`) register through the same registry when you pass it to `adapter({ websocket: { metrics } })` - see the adapter README's admission section. One registry, one `/metrics` endpoint, the whole admission stack on one dashboard.
+
 **Job queue**
 
 | Metric | Type | Labels | Description |
@@ -3346,6 +3363,7 @@ const cap = capabilityCookie({
 | `secure` | `true` | Set the `Secure` attribute. |
 | `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). |
 | `path` | `'/'` | Cookie path. |
+| `metrics` | - | Prometheus registry. Registers `capability_cookie_misses_total{reason}`: `missing` counts an absent cookie only when `required` (a first visit in normal posture is not a miss), `invalid` counts every presented cookie that fails to verify, required or not. Expired cookies land under `invalid` - expiry is checked before the signature, so a separate `expired` reason would be forgeable by the sender; `refresh()` on page responses keeps live users out of that bucket. |
 
 #### API
 

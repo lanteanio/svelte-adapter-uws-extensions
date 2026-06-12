@@ -296,4 +296,111 @@ describe('capabilityCookie', () => {
 			expect(other.verify(cookieValueFrom(res.setCookies[0]), { required: true })).toBe(false);
 		});
 	});
+
+	describe('metrics', () => {
+		/** Recording registry matching the options.metrics contract. */
+		function fakeRegistry() {
+			const counters = new Map();
+			return {
+				counters,
+				counter(name) {
+					let c = counters.get(name);
+					if (!c) {
+						c = {
+							series: new Map(),
+							inc(labels) {
+								const key = labels ? JSON.stringify(labels) : '';
+								this.series.set(key, (this.series.get(key) || 0) + 1);
+							}
+						};
+						counters.set(name, c);
+					}
+					return c;
+				},
+				gauge() { return { set() {} }; },
+				misses(reason) {
+					const c = counters.get('capability_cookie_misses_total');
+					return c ? (c.series.get(JSON.stringify({ reason })) || 0) : 0;
+				}
+			};
+		}
+
+		it('counts an absent cookie as missing only when required', () => {
+			const metrics = fakeRegistry();
+			const cap = capabilityCookie({ secret: 's', metrics });
+
+			// Optional posture: a first-time visitor is not a miss.
+			expect(cap.verify(null, { required: false })).toBe(true);
+			expect(metrics.misses('missing')).toBe(0);
+
+			// Required posture: the absence is the rejection.
+			expect(cap.verify(null, { required: true })).toBe(false);
+			expect(cap.verify('unrelated=1', { required: true })).toBe(false);
+			expect(metrics.misses('missing')).toBe(2);
+			expect(metrics.misses('invalid')).toBe(0);
+		});
+
+		it('counts a presented-but-bad cookie as invalid regardless of required', () => {
+			const metrics = fakeRegistry();
+			const cap = capabilityCookie({ secret: 'topsecret', metrics });
+			const res = mockResponse();
+			cap.issue(mockEvent(), res);
+			let header = cookieValueFrom(res.setCookies[0]);
+			const last = header.slice(-1) === 'A' ? 'B' : 'A';
+			header = header.slice(0, -1) + last;
+
+			expect(cap.verify(header, { required: false })).toBe(false);
+			expect(cap.verify(header, { required: true })).toBe(false);
+			expect(metrics.misses('invalid')).toBe(2);
+			expect(metrics.misses('missing')).toBe(0);
+		});
+
+		it('counts an expired cookie as invalid, never as its own reason', () => {
+			const metrics = fakeRegistry();
+			const cap = capabilityCookie({ secret: 's', ttlSeconds: 60, metrics });
+			const t0 = Date.now();
+			vi.spyOn(Date, 'now').mockReturnValue(t0);
+
+			const res = mockResponse();
+			cap.issue(mockEvent(), res);
+			const header = cookieValueFrom(res.setCookies[0]);
+
+			Date.now.mockReturnValue(t0 + 61000);
+			expect(cap.verify(header, { required: true })).toBe(false);
+			expect(metrics.misses('invalid')).toBe(1);
+			expect(metrics.counters.get('capability_cookie_misses_total').series.size).toBe(1);
+		});
+
+		it('does not count a valid verification', () => {
+			const metrics = fakeRegistry();
+			const cap = capabilityCookie({ secret: 's', metrics });
+			const res = mockResponse();
+			cap.issue(mockEvent(), res);
+
+			expect(cap.verify(cookieValueFrom(res.setCookies[0]), { required: true })).toBe(true);
+			expect(metrics.misses('missing')).toBe(0);
+			expect(metrics.misses('invalid')).toBe(0);
+		});
+
+		it('registers the counter once at construction with the reason label', () => {
+			const metrics = fakeRegistry();
+			capabilityCookie({ secret: 's', metrics });
+			expect(metrics.counters.has('capability_cookie_misses_total')).toBe(true);
+		});
+
+		it('contains a throwing emit: verify still returns its boolean and warns once', () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			try {
+				const cap = capabilityCookie({
+					secret: 's',
+					metrics: { counter: () => ({ inc() { throw new Error('emit boom'); } }) }
+				});
+				expect(cap.verify(null, { required: true })).toBe(false);
+				expect(cap.verify(COOKIE_NAME + '=garbage', { required: false })).toBe(false);
+				expect(errSpy).toHaveBeenCalledTimes(1);
+			} finally {
+				errSpy.mockRestore();
+			}
+		});
+	});
 });

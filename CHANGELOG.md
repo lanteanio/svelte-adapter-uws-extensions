@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.14] - 2026-06-12
+
+### Added
+
+- **`capabilityCookie` accepts a `metrics` registry and counts failed verifications.** Pass the same registry the other modules take (`metrics: createMetrics()`) and the module registers `capability_cookie_misses_total{reason}`: `missing` increments when the cookie is absent while `required` (an absent cookie in normal posture is a first visit, not a miss, and stays uncounted), `invalid` increments whenever a presented cookie fails to verify - bad signature, malformed, or expired - whether or not it was required, since a presented-but-bad cookie is a signal in every posture. Expired is deliberately not its own reason: expiry is checked before the signature, so a separate label would be forgeable by the sender. Verification behaviour is unchanged; without the option the verify path gains a single undefined check, and a registry that throws on emit logs once and is silenced so `verify()` always returns its boolean.
+
+### Fixed
+
+- **`createMetrics()` now rejects a same-name re-registration with a different label shape at registration time.** Registration was idempotent by name only: a second `counter('x', ...)` with different `labelNames` silently returned the existing instrument, and every subsequent emit from that caller then threw label-validation errors - surfacing at the first emit in production instead of at startup. A label-shape collision now throws the same way a type collision always has (label order does not matter; same name + same label set still returns the existing instrument).
+
 ## [0.6.0-next.13] - 2026-06-10
 
 ### Added
