@@ -12,10 +12,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
 import { createJobQueue } from '../../../postgres/jobs.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
+import { waitPgMs } from '../helpers/backend-clock.js';
 
 describe('postgres jobs (integration)', () => {
 	let client;
@@ -202,11 +199,11 @@ describe('postgres jobs (integration)', () => {
 			const first = await queue.claim('vis', { visibilityTimeoutMs: 500 });
 			expect(first).toHaveLength(1);
 
-			// Wait far past the 500ms visibility. Docker-on-Windows clock
-			// drift between Postgres now() and the JS event loop can be
-			// startling under full-suite load, so the slack is deliberately
-			// large rather than just-enough.
-			await wait(3000);
+			// Wait far past the 500ms visibility on Postgres's OWN clock
+			// (now()): claimed_until is compared against now(), so a
+			// backend-clock wait is immune to host/VM clock drift under
+			// full-suite load.
+			await waitPgMs(client, 3000);
 
 			const reclaim = await queue.claim('vis');
 			expect(reclaim).toHaveLength(1);
@@ -219,7 +216,10 @@ describe('postgres jobs (integration)', () => {
 			const [job] = await queue.claim('ext', { visibilityTimeoutMs: 200 });
 			await queue.extend(job.id, 5000);
 
-			await wait(300);
+			// Let the ORIGINAL 200ms visibility pass on Postgres's OWN clock
+			// (now()) so the claim below would reclaim the row if extend had
+			// not pushed the deadline - drift-immune.
+			await waitPgMs(client, 300);
 			const second = await queue.claim('ext');
 			expect(second).toEqual([]);
 		});

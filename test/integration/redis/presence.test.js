@@ -14,6 +14,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../redis/presence.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -334,9 +335,11 @@ describeIntegration('redis presence (integration)', () => {
 			expect(await presence.count('room')).toBe(2);
 			expect((await presence.list('room')).map((u) => u.id).sort()).toEqual(['alice', 'ghost']);
 
-			// Wait past TTL. No application-side cleanup needed - Redis expires
-			// the ghost field by background task.
-			await wait(700);
+			// Wait past the TTL on Redis's OWN clock (TIME), where the
+			// HPEXPIRE deadline lives - immune to host/VM clock drift. No
+			// application-side cleanup needed - Redis expires the ghost field
+			// by background task.
+			await waitRedisMs(client, 700);
 
 			expect(await presence.count('room')).toBe(1);
 			expect((await presence.list('room')).map((u) => u.id)).toEqual(['alice']);
@@ -442,9 +445,11 @@ describeIntegration('redis presence (integration)', () => {
 			const topics = ['hb-a', 'hb-b', 'hb-c', 'hb-d'];
 			for (const topic of topics) await presence.join(ws, topic, platform);
 
-			// Wait past the 2s ttl: only continuous cross-node refresh keeps the
-			// fields alive this long.
-			await wait(2400);
+			// Wait past the 2s ttl on Redis's OWN clock (TIME), where the
+			// per-field deadlines decay: only continuous cross-node refresh
+			// keeps the fields alive this long, and the backend-clock wait
+			// guarantees the window really elapsed despite host/VM drift.
+			await waitRedisMs(client, 2400);
 
 			for (const topic of topics) {
 				expect(await presence.count(topic)).toBe(1);
@@ -458,7 +463,9 @@ describeIntegration('redis presence (integration)', () => {
 			const presence = makeTracker({ ttl: 3, heartbeat: 300 });
 			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
 
-			await wait(700);
+			// Decay the window on Redis's OWN clock so the HPTTL math below
+			// holds regardless of host/VM clock drift.
+			await waitRedisMs(client, 700);
 
 			const topicTtl = await client.redis.hpttl(
 				topicHashKey('room'), 'FIELDS', 1, 'alice'

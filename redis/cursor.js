@@ -14,6 +14,13 @@
  *   - `update`   {key, data}          - single-mover position update.
  *   - `bulk`     [{key, data}, ...]   - coalesced multi-mover positions.
  *   - `remove`   {key}                - user is gone (catalog + positions cleared).
+ *   - `time`     {t}                  - server wall clock, leads every snapshot reply.
+ *                                       Single-target; never relayed.
+ *   - `you`      {key}                - the receiving connection's own roster key,
+ *                                       sent once per (connection, topic) before its
+ *                                       first join and in every snapshot reply between
+ *                                       `time` and `catalog`. Single-target; never
+ *                                       relayed (each replica names its own sockets).
  *
  * Separating user metadata (catalog) from per-frame positions cuts the per-flush
  * wire payload from ~100 bytes per cursor to ~16 bytes per cursor, and cuts the
@@ -63,7 +70,8 @@ const EVENTS = Object.freeze({
 	UPDATE: 'update',
 	REMOVE: 'remove',
 	BULK: 'bulk',
-	TIME: 'time'
+	TIME: 'time',
+	YOU: 'you'
 });
 
 /**
@@ -1320,9 +1328,9 @@ export function createCursor(client, options = {}) {
 			try {
 				ws.subscribe('__cursor:' + topic);
 			} catch {
-				// No state to roll back (no `wsState` entry exists yet; that
-				// is only created on `update`). Throw so the caller can
-				// distinguish a no-op-and-rollback from a successful attach;
+				// No state to roll back (the throw fires before snapshot()
+				// could allocate this connection's identity). Throw so the
+				// caller can distinguish a no-op-and-rollback from a successful attach;
 				// without this the RPC metric reports `status=ok` for
 				// connections that never received cursor frames.
 				mAttachesAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
@@ -1373,6 +1381,17 @@ export function createCursor(client, options = {}) {
 			}
 
 			if (isFirstOnTopic) {
+				// Tell the mover which roster key is its own BEFORE the join
+				// broadcast announces that key to everyone (the mover included),
+				// so the client can attribute the join - and every later frame -
+				// to itself. Single-target via emitTo, so the event stays on
+				// this replica by construction and never enters the Redis relay:
+				// the key only means something to the connection it names. The
+				// binary codec declines the event, so it rides the JSON fallback
+				// even on a binary-capable connection, and an older client's
+				// merge ignores it as an unknown event. `state.topics` is the
+				// once-per-(ws, topic) gate, the same one that gates the join.
+				emitTo(ws, '__cursor:' + topic, EVENTS.YOU, { key: state.key }, platform);
 				emitJoin(topic, state.key, state.user, platform);
 			}
 
@@ -1613,6 +1632,20 @@ export function createCursor(client, options = {}) {
 			// regardless of which replica originated a move.
 			try {
 				emitTo(ws, '__cursor:' + topic, EVENTS.TIME, { t: wallEpoch() }, platform);
+			} catch {
+				// WebSocket closed before send
+			}
+			// The requester's own roster key, ahead of the roster it appears in
+			// (or will appear in on its first move) - sent even for an empty
+			// board. getWsState only allocates the connection key - the join
+			// broadcast (and its Redis relay) still keys off `state.topics` on
+			// the first move - so a pure viewer is never announced to others by
+			// snapshotting. Snapshot-then-move keeps one identity: the key
+			// handed out here is the instance-scoped key the later join
+			// broadcasts. Single-target via emitTo; never relayed.
+			const requesterKey = getWsState(ws).key;
+			try {
+				emitTo(ws, '__cursor:' + topic, EVENTS.YOU, { key: requesterKey }, platform);
 			} catch {
 				// WebSocket closed before send
 			}

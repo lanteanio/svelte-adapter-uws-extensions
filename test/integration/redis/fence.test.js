@@ -9,11 +9,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createRedisFence } from '../../../redis/fence.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
 
 describe('redis fence (integration)', () => {
 	let client;
@@ -84,10 +81,11 @@ describe('redis fence (integration)', () => {
 		it('returns false when the key has expired between acquire and heartbeat', async () => {
 			// Acquire with 1-second TTL, wait well past it, then heartbeat
 			// must report lost. SET EX has 1-second precision so expiry can
-			// land anywhere in the next second; the slack covers that plus
-			// Docker-on-Windows clock drift under full-suite load.
+			// land anywhere in the next second; the wait elapses on Redis's
+			// OWN clock (TIME), where the EX deadline lives, so it is immune
+			// to host/VM clock drift under full-suite load.
 			await fence.acquire('task-1', 'fence-a', 1);
-			await wait(3000);
+			await waitRedisMs(client, 3000);
 			const ok = await fence.heartbeat('task-1', 'fence-a', 30);
 			expect(ok).toBe(false);
 		});

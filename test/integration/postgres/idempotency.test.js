@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
 import { createIdempotencyStore } from '../../../postgres/idempotency.js';
+import { waitPgMs } from '../helpers/backend-clock.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
@@ -219,10 +220,11 @@ describe('postgres idempotency (integration)', () => {
 				expect(first.acquired).toBe(true);
 				// Owner crashes; do not commit/abort.
 
-				// Wait well past the 1s acquireTtl. The slack absorbs clock
-				// drift between Postgres now() and the JS event loop on
-				// Docker-on-Windows under full-suite load.
-				await wait(3000);
+				// Wait well past the 1s acquireTtl on Postgres's OWN clock
+				// (now()): the expires_at deadline lives in Postgres, so a
+				// backend-clock wait is immune to host/VM clock drift under
+				// full-suite load.
+				await waitPgMs(client, 3000);
 
 				const second = await s.acquire('stuck');
 				expect(second.acquired).toBe(true);
@@ -240,7 +242,9 @@ describe('postgres idempotency (integration)', () => {
 				await first.commit('temp');
 				expect((await s.acquire('ephemeral')).result).toBe('temp');
 
-				await wait(3000);
+				// Wait well past the 1s ttl on Postgres's OWN clock (now()),
+				// where the expires_at deadline lives - drift-immune.
+				await waitPgMs(client, 3000);
 
 				const fresh = await s.acquire('ephemeral');
 				expect(fresh.acquired).toBe(true);
@@ -306,11 +310,19 @@ describe('postgres idempotency (integration)', () => {
 				);
 				expect(count.rows[0].n).toBe(2);
 
-				await wait(3000);
-
-				count = await client.query(
-					`SELECT COUNT(*)::int AS n FROM ${TABLE} WHERE svti_idempotency_key LIKE 'sweep:%'`
-				);
+				// The rows expire on Postgres's clock (expires_at vs now()) and
+				// the sweep deletes them on a host-side interval timer, so poll
+				// the table until the sweep has run - with a generous host
+				// timeout - instead of sleeping a fixed window that host/VM
+				// clock drift could undercut.
+				const deadline = Date.now() + 20_000;
+				for (;;) {
+					count = await client.query(
+						`SELECT COUNT(*)::int AS n FROM ${TABLE} WHERE svti_idempotency_key LIKE 'sweep:%'`
+					);
+					if (count.rows[0].n === 0 || Date.now() >= deadline) break;
+					await wait(50);
+				}
 				expect(count.rows[0].n).toBe(0);
 			} finally {
 				s.destroy();

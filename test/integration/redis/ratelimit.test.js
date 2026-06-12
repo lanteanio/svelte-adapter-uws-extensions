@@ -9,11 +9,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createRateLimit } from '../../../redis/ratelimit.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
 
 function fakeWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -97,7 +94,10 @@ describe('redis ratelimit (integration)', () => {
 			expect((await limiter.consume(ws)).allowed).toBe(true);
 			expect((await limiter.consume(ws)).allowed).toBe(false);
 
-			await wait(700);
+			// The refill window is computed from Redis TIME inside the Lua
+			// script, so the wait elapses on Redis's OWN clock - immune to
+			// host/VM clock drift under full-suite load.
+			await waitRedisMs(client, 700);
 			const r = await limiter.consume(ws);
 			expect(r.allowed).toBe(true);
 			expect(r.remaining).toBe(1);
@@ -141,7 +141,9 @@ describe('redis ratelimit (integration)', () => {
 			const ws = fakeWs({ ip: '8.8.8.8' });
 			await limiter.ban('8.8.8.8', 800);
 			expect((await limiter.consume(ws)).allowed).toBe(false);
-			await wait(1000);
+			// The ban deadline is stamped from Redis TIME, so wait it out on
+			// Redis's OWN clock - immune to host/VM clock drift.
+			await waitRedisMs(client, 1000);
 			expect((await limiter.consume(ws)).allowed).toBe(true);
 		});
 	});

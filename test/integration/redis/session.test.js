@@ -12,11 +12,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createDistributedSession } from '../../../redis/session.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
 
 describe('redis distributed session (integration)', () => {
 	let client;
@@ -78,8 +75,11 @@ describe('redis distributed session (integration)', () => {
 
 			// Read repeatedly across what would otherwise be the original
 			// expiry window. Each get refreshes; final PTTL is still positive.
+			// The gaps elapse on Redis's OWN clock (TIME) - where the PX
+			// deadline decays - so the window genuinely burns down between
+			// reads regardless of host/VM clock drift.
 			for (let i = 0; i < 6; i++) {
-				await wait(150);
+				await waitRedisMs(client, 150);
 				expect(await sessions.get('tok')).toEqual({ v: 1 });
 			}
 			const pttl = await client.redis.pttl(client.key('sess:tok'));
@@ -94,8 +94,10 @@ describe('redis distributed session (integration)', () => {
 			});
 			await sessions.set('tok', { v: 1 });
 
-			// Burn some of the original TTL.
-			await wait(120);
+			// Burn some of the original TTL on Redis's OWN clock, where the
+			// PTTL decays - drift-immune, so `before - after > 0` below cannot
+			// flake on a stalled Docker VM clock.
+			await waitRedisMs(client, 120);
 			const before = await client.redis.pttl(client.key('sess:tok'));
 			await sessions.get('tok');
 			const after = await client.redis.pttl(client.key('sess:tok'));
@@ -109,7 +111,9 @@ describe('redis distributed session (integration)', () => {
 		it('touch returns true and refreshes PEXPIRE while the entry exists', async () => {
 			const sessions = createDistributedSession(client, { ttlMs: 30_000 });
 			await sessions.set('tok', { v: 1 });
-			await wait(80);
+			// Burn TTL on Redis's OWN clock so `after > before` below cannot
+			// flake when the host clock outruns a stalled Docker VM clock.
+			await waitRedisMs(client, 80);
 			const before = await client.redis.pttl(client.key('sess:tok'));
 
 			expect(await sessions.touch('tok')).toBe(true);
@@ -124,8 +128,9 @@ describe('redis distributed session (integration)', () => {
 			const sessions = createDistributedSession(client, { ttlMs: 100 });
 			await sessions.set('short', { v: 1 });
 
-			// Wait past the PX so the key is genuinely gone.
-			await wait(250);
+			// Wait past the PX on Redis's OWN clock (TIME), where the expiry
+			// deadline lives - immune to host/VM clock drift.
+			await waitRedisMs(client, 250);
 			expect(await client.redis.exists(client.key('sess:short'))).toBe(0);
 			expect(await sessions.touch('short')).toBe(false);
 		});

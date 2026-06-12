@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
 import { createTaskRunner } from '../../../postgres/tasks.js';
+import { waitPgMs } from '../helpers/backend-clock.js';
 
 const echoUrl = new URL('../../helpers/workers/echo.js', import.meta.url);
 const throwsUrl = new URL('../../helpers/workers/throws.js', import.meta.url);
@@ -152,12 +153,15 @@ describe('postgres tasks async path (integration)', () => {
 		it('claims pending rows in created_at order (oldest first)', async () => {
 			// Stagger inserts well beyond clock resolution so created_at
 			// ordering is unambiguous, and use batchSize=1 so the claim CTE
-			// emits one row per tick.
+			// emits one row per tick. created_at is stamped by Postgres
+			// now(), so the stagger elapses on Postgres's OWN clock - a host
+			// sleep could cover ~0ms of backend time under VM clock drift
+			// and collapse the ordering.
 			const enqueuer = makeRunner();
 			const ids = [];
 			for (let i = 0; i < 3; i++) {
 				ids.push(await enqueuer.enqueue('echo', { input: i }));
-				await wait(60);
+				await waitPgMs(client, 60);
 			}
 
 			const dispatcher = makeRunner({

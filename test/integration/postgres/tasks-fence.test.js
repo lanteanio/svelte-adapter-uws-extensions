@@ -88,10 +88,11 @@ describe('postgres tasks fence semantics (integration)', () => {
 	describe('heartbeat extends fence_expires_at', () => {
 		it('moves fence_expires_at into the future on each heartbeat tick', async () => {
 			// fenceTtl=2 sets expiry to now()+2s on insert; heartbeat
-			// rewrites it to now()+2s every tick. Fire several ticks across
-			// 800ms and confirm the column value advanced relative to the
-			// initial value (i.e. the heartbeat did rewrite it, not just
-			// hold steady).
+			// rewrites it to now()+2s every tick. Both stamps come from
+			// Postgres now(), so poll the column until a heartbeat has
+			// visibly advanced it past the value captured at handler entry
+			// (generous host timeout) instead of sleeping a fixed host
+			// window that host/VM clock drift could undercut.
 			const runner = makeRunner({ fenceTtl: 2, heartbeatInterval: 150 });
 
 			let initialExpiry;
@@ -100,10 +101,11 @@ describe('postgres tasks fence semantics (integration)', () => {
 				const before = await client.query(`SELECT fence_expires_at FROM ${TABLE} LIMIT 1`);
 				initialExpiry = before.rows[0].fence_expires_at;
 
-				await wait(800);
-
-				const after = await client.query(`SELECT fence_expires_at FROM ${TABLE} LIMIT 1`);
-				observedExpiry = after.rows[0].fence_expires_at;
+				await waitFor(async () => {
+					const after = await client.query(`SELECT fence_expires_at FROM ${TABLE} LIMIT 1`);
+					observedExpiry = after.rows[0].fence_expires_at;
+					return observedExpiry.getTime() > initialExpiry.getTime();
+				}, 10_000);
 
 				return 'done';
 			});

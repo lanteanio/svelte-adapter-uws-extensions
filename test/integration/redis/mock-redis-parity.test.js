@@ -10,13 +10,10 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../../shared/runtime.js';
 import { mockRedisClient } from '../../../testing/mock-redis.js';
 import { CONSUME_SCRIPT } from '../../../redis/token-bucket-script.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
 
 describe('mock-redis Lua parity against real Redis (integration)', () => {
 	let client;
@@ -106,9 +103,11 @@ describe('mock-redis Lua parity against real Redis (integration)', () => {
 			await dbl.redis.eval(CONSUME_SCRIPT, 1, 'rl:refill', ...args),
 			await client.redis.eval(CONSUME_SCRIPT, 1, realKey, ...args)
 		);
-		// Let the interval elapse in real time, then re-pin the double to the new
-		// real clock so both observe the refill.
-		await wait(260);
+		// Let the interval elapse on Redis's OWN clock (TIME) - the same clock
+		// the script's refill window is stamped from, so this is immune to
+		// host/VM clock drift - then re-pin the double to the new real clock
+		// so both observe the refill.
+		await waitRedisMs(client, 260);
 		await pinDoubleToRealClock();
 		const realRes = await client.redis.eval(CONSUME_SCRIPT, 1, realKey, ...args);
 		const dblRes = await dbl.redis.eval(CONSUME_SCRIPT, 1, 'rl:refill', ...args);

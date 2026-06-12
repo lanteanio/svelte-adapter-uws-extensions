@@ -124,8 +124,9 @@ export interface RedisCursorTracker {
 	 *
 	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
 	 *   has already closed by the time the underlying `ws.subscribe` runs.
-	 *   No state to roll back (`wsState` is only created on `update`); callers
-	 *   do not need to compensate. The follow-up `snapshot()` call is skipped
+	 *   No state to roll back (the throw fires before `snapshot()` could
+	 *   allocate the connection's identity); callers do not need to
+	 *   compensate. The follow-up `snapshot()` call is skipped
 	 *   when this throws. Snapshot-send failures on an already-subscribed
 	 *   connection are NOT thrown - cursor frames are self-recovering via
 	 *   the next bulk tick. Note: this module uses the uWS-native
@@ -158,9 +159,12 @@ export interface RedisCursorTracker {
 	remove(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/**
-	 * Send the current catalog (users) + positions for a topic to a single
-	 * connection as two ordered events on `__cursor:{topic}`: `catalog`
-	 * (`[{key, user}, ...]`) followed by `bulk` (`[{key, data}, ...]`).
+	 * Send the current state for a topic to a single connection as ordered
+	 * events on `__cursor:{topic}`: `time` (`{t}`, the server clock seed),
+	 * `you` (`{key}`, the connection's own roster key - allocated here
+	 * without announcing a join, so a pure viewer is never broadcast to
+	 * others), then `catalog` (`[{key, user}, ...]`) followed by `bulk`
+	 * (`[{key, data}, ...]`). An empty board still receives `time` + `you`.
 	 * Folded into `attach` for typical use; exposed for advanced callers
 	 * that want to resend a snapshot without re-subscribing.
 	 */

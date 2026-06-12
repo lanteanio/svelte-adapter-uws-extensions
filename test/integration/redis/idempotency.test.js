@@ -9,11 +9,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createIdempotencyStore } from '../../../redis/idempotency.js';
-
-function wait(ms) {
-	return new Promise((r) => setTimeout(r, ms));
-}
 
 describe('redis idempotency (integration)', () => {
 	let client;
@@ -108,10 +105,10 @@ describe('redis idempotency (integration)', () => {
 			const store = createIdempotencyStore(client, { acquireTtl: 1 });
 			await store.acquire('expire-me');
 
-			// Wait well past the 1-second TTL. The slack absorbs clock drift
-			// between the Redis EX timer and the JS event loop on Docker-on-
-			// Windows under full-suite load.
-			await wait(3000);
+			// Wait well past the 1-second TTL on Redis's OWN clock (TIME): the
+			// EX deadline lives in Redis, so a backend-clock wait is immune to
+			// host/VM clock drift under full-suite load.
+			await waitRedisMs(client, 3000);
 
 			const next = await store.acquire('expire-me');
 			expect(next.acquired).toBe(true);

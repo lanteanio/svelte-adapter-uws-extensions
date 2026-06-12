@@ -274,10 +274,12 @@ describe('redis cursor', () => {
 			await c.snapshot(receiver, 'canvas', platform);
 
 			// The server time event (the smoothing clock seed) leads, then the
-			// roster and the positions.
-			expect(platform.sent).toHaveLength(3);
+			// requester's own roster key, then the roster and the positions.
+			expect(platform.sent).toHaveLength(4);
 			expect(platform.sent[0].event).toBe('time');
 			expect(typeof platform.sent[0].data.t).toBe('number');
+			expect(platform.sent[1].event).toBe('you');
+			expect(typeof platform.sent[1].data.key).toBe('string');
 			const catalog = platform.sent.find((s) => s.event === 'catalog');
 			const bulk = platform.sent.find((s) => s.event === 'bulk');
 			expect(catalog.topic).toBe('__cursor:canvas');
@@ -289,15 +291,167 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('sends only the time seed when no cursors exist', async () => {
+		it('sends only the time seed and the self key when no cursors exist', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'empty-topic', platform);
 
-			// A fresh subscriber on an empty board still gets its clock seed;
-			// catalog/bulk stay suppressed.
-			expect(platform.sent).toHaveLength(1);
+			// A fresh subscriber on an empty board still gets its clock seed
+			// and its own roster key; catalog/bulk stay suppressed.
+			expect(platform.sent).toHaveLength(2);
 			expect(platform.sent[0].event).toBe('time');
+			expect(platform.sent[1].event).toBe('you');
+			expect(typeof platform.sent[1].data.key).toBe('string');
+			c.destroy();
+		});
+	});
+
+	describe('self identity (you)', () => {
+		it('first move emits you to the mover before the join broadcast, with the broadcast key', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			const ws = mockWs({ id: '1' });
+
+			// Unified call log: send (single-target) and publish (broadcast) land
+			// in separate mock arrays, so record both streams in arrival order to
+			// pin the you-before-join wire ordering.
+			const order = [];
+			const origSend = platform.send;
+			const origPublish = platform.publish;
+			platform.send = (...args) => { order.push('send:' + args[2]); return origSend(...args); };
+			platform.publish = (...args) => { order.push('publish:' + args[1]); return origPublish(...args); };
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+
+			expect(order).toEqual(['send:you', 'publish:join', 'publish:update']);
+
+			// Single-target, addressed to the mover, payload is exactly { key }
+			// and the key is the one the join and update frames broadcast.
+			expect(platform.sent).toHaveLength(1);
+			const you = platform.sent[0];
+			expect(you.ws).toBe(ws);
+			expect(you.topic).toBe('__cursor:canvas');
+			const join = platform.published.find((p) => p.event === 'join');
+			const update = platform.published.find((p) => p.event === 'update');
+			expect(you.data).toEqual({ key: join.data.key });
+			expect(update.data.key).toBe(join.data.key);
+			c.destroy();
+		});
+
+		it('you fires once per (connection, topic): repeat moves stay silent, a new topic re-fires', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			const ws = mockWs({ id: '1' });
+
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			c.update(ws, 'canvas', { x: 2 }, platform);
+			c.update(ws, 'canvas', { x: 3 }, platform);
+			expect(platform.sent.filter((s) => s.event === 'you')).toHaveLength(1);
+
+			c.update(ws, 'board', { x: 1 }, platform);
+			const yous = platform.sent.filter((s) => s.event === 'you');
+			expect(yous).toHaveLength(2);
+			expect(yous[1].topic).toBe('__cursor:board');
+			// Same connection, same key on every topic.
+			expect(yous[1].data.key).toBe(yous[0].data.key);
+			c.destroy();
+		});
+
+		it('each connection receives its own key', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			const ws1 = mockWs({ id: '1' });
+			const ws2 = mockWs({ id: '2' });
+
+			c.update(ws1, 'canvas', { x: 1 }, platform);
+			c.update(ws2, 'canvas', { x: 2 }, platform);
+
+			const yous = platform.sent.filter((s) => s.event === 'you');
+			expect(yous).toHaveLength(2);
+			expect(yous[0].ws).toBe(ws1);
+			expect(yous[1].ws).toBe(ws2);
+			expect(yous[0].data.key).not.toBe(yous[1].data.key);
+			c.destroy();
+		});
+
+		it('snapshot reply is ordered [time, you, catalog, bulk]; empty board is [time, you]', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			c.update(mockWs({ id: 'mover' }), 'canvas', { x: 9 }, platform);
+			platform.reset();
+
+			const viewer = mockWs({ id: 'viewer' });
+			await c.snapshot(viewer, 'canvas', platform);
+			expect(platform.sent.map((s) => s.event)).toEqual(['time', 'you', 'catalog', 'bulk']);
+
+			platform.reset();
+			await c.snapshot(mockWs({ id: 'other' }), 'empty-board', platform);
+			expect(platform.sent.map((s) => s.event)).toEqual(['time', 'you']);
+			c.destroy();
+		});
+
+		it('snapshot allocates the identity without announcing a join; the later first move broadcasts the same key', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			const viewer = mockWs({ id: 'viewer' });
+
+			await c.snapshot(viewer, 'canvas', platform);
+			const snapshotYou = platform.sent.find((s) => s.event === 'you');
+			expect(snapshotYou).toBeDefined();
+			// A pure viewer is never announced to the roster by snapshotting.
+			expect(platform.published.filter((p) => p.event === 'join')).toHaveLength(0);
+
+			platform.reset();
+			c.update(viewer, 'canvas', { x: 1 }, platform);
+			const join = platform.published.find((p) => p.event === 'join');
+			expect(join.data.key).toBe(snapshotYou.data.key);
+			// The first move re-sends you (the once-per-(ws, topic) move gate is
+			// independent of the snapshot path) with the same key - additive and
+			// idempotent for the client.
+			const moveYou = platform.sent.find((s) => s.event === 'you');
+			expect(moveYou.data.key).toBe(snapshotYou.data.key);
+			c.destroy();
+		});
+
+		it('you never crosses the Redis relay channel', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ({ id: ud.id }) });
+			const relayed = [];
+			const origPublish = client.redis.publish.bind(client.redis);
+			client.redis.publish = async (channel, message) => {
+				relayed.push({ channel, message });
+				return origPublish(channel, message);
+			};
+
+			const ws = mockWs({ id: '1' });
+			c.update(ws, 'canvas', { x: 1 }, platform);
+			await c.snapshot(mockWs({ id: 'viewer' }), 'canvas', platform);
+			// relay() defers behind the subscriber-setup promise on first use.
+			await new Promise((r) => setTimeout(r, 10));
+
+			const events = relayed
+				.filter((f) => f.channel === 'test:cursor:events')
+				.map((f) => JSON.parse(f.message).event);
+			expect(events).toContain('join');
+			expect(events).toContain('update');
+			expect(events).not.toContain('you');
+			expect(events).not.toContain('time');
+			c.destroy();
+		});
+
+		it('you rides sendWire when the platform is wire-capable, like every other single-target frame', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const wp = mockPlatform();
+			wp.sentWire = [];
+			wp.sendWire = (ws, topic, event, data, wire, options) => {
+				wp.sentWire.push({ ws, topic, event, data, wire, options });
+				return 1;
+			};
+			wp.publishWire = () => true;
+
+			c.update(mockWs({ id: '1' }), 'canvas', { x: 1 }, wp);
+
+			// The codec declines 'you' (unknown event -> null), so the adapter's
+			// sendWire delivers it as the JSON fallback; the plugin still routes
+			// the frame through the wire seam with the cursor codec attached.
+			const you = wp.sentWire.find((s) => s.event === 'you');
+			expect(you).toBeDefined();
+			expect(you.wire.encode('you', you.data)).toBeNull();
+			expect(wp.sent.filter((s) => s.event === 'you')).toHaveLength(0);
 			c.destroy();
 		});
 	});
@@ -335,12 +489,13 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('attach with no existing cursors sends only the time seed', async () => {
+		it('attach with no existing cursors sends only the time seed and the self key', async () => {
 			const ws = mockWs({ id: '1' });
 			await cursors.attach(ws, 'empty-canvas', platform);
 
-			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent).toHaveLength(2);
 			expect(platform.sent[0].event).toBe('time');
+			expect(platform.sent[1].event).toBe('you');
 		});
 
 		it('attach + update on a remote ws delivers an update on the local subscriber set', async () => {

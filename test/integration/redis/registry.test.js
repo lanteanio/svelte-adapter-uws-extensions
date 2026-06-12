@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createConnectionRegistry } from '../../../redis/registry.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -88,10 +89,12 @@ describe('redis connection registry (integration)', () => {
 			await registry.hooks.open(wsWithSession({ userId }, 's-' + userId), { platform });
 		}
 
-		// ttl is 2s but the heartbeat refreshes every 250ms; wait past the ttl.
-		// On a cluster the per-user keys span slots, so a single pipeline would
-		// silently drop the other-node EXPIREs and those users would expire.
-		await wait(2400);
+		// ttl is 2s but the heartbeat refreshes every 250ms; wait past the ttl
+		// on Redis's OWN clock (TIME), where the key TTLs decay, so the window
+		// really elapsed despite host/VM clock drift. On a cluster the
+		// per-user keys span slots, so a single pipeline would silently drop
+		// the other-node EXPIREs and those users would expire.
+		await waitRedisMs(client, 2400);
 
 		for (const userId of userIds) {
 			expect(await client.redis.exists(client.key('conns:' + userId))).toBe(1);

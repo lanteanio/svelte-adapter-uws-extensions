@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.16",
+  "version": "0.6.0-next.17",
   "publishConfig": {
     "tag": "next"
   },
@@ -181,7 +181,7 @@
     "node": ">=22.0.0"
   },
   "peerDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.23"
+    "svelte-adapter-uws": "^0.6.0-next.24"
   },
   "dependencies": {
     "ioredis": "^5.0.0"
@@ -190,7 +190,7 @@
     "pg": "^8.0.0"
   },
   "devDependencies": {
-    "svelte-adapter-uws": "^0.6.0-next.23",
+    "svelte-adapter-uws": "^0.6.0-next.24",
     "vitest": "^4.0.18",
     "ws": "^8.0.0"
   },

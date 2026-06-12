@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.17] - 2026-06-12
+
+### Changed
+
+- **The `svelte-adapter-uws` peer floor moved to `^0.6.0-next.24`** - the adapter release carrying the smooth plugin (prediction/reconciliation) and the `publishWire` sender-exclusion option this package's bus wraps forward; the pass-through is now pinned by regression tests for both the pub/sub and sharded wraps.
+
+### Added
+
+- **The redis cursor plugin now tells every connection which roster key is its own, matching the adapter cursor plugin's self-identity event.** Each connection receives a single-target `you` event (`{ key }`) once per (connection, topic) immediately before its first `join` broadcast, and in every snapshot reply between the `time` seed and the `catalog` - an empty board still answers with `time` + `you`, snapshot-then-move keeps one identity, and a pure viewer is never announced to the roster by snapshotting. The event is additive and JSON-only (the shared binary codec declines it, like `time`), so an older client's merge ignores it as an unknown event, and it never crosses the Redis relay: each replica names its own sockets, and the marker is delivered only by the replica that owns the connection. Cluster deployments now feed the client's self surface (`cursor(topic)`'s `self` readable, the canvas handle's `self` getter, and the `hideSelf` render filter) exactly like a single-instance deployment.
+
 ## [0.6.0-next.16] - 2026-06-12
 
 ### Changed

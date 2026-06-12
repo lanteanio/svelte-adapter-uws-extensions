@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { waitRedisMs, redisNowMs } from '../helpers/backend-clock.js';
 import {
 	createDistributedLock,
 	LockAcquireTimeoutError,
@@ -128,10 +129,12 @@ describe('redis distributed lock (integration)', () => {
 			});
 			let observed = false;
 			await lock.withLock('long-running', async () => {
-				// Hold past the original TTL window. If the heartbeat were not
-				// refreshing PEXPIRE, the key would have elapsed and our
+				// Hold past the original TTL window, measured on Redis's OWN
+				// clock (TIME) where the PEXPIRE decays, so the window really
+				// elapsed despite host/VM clock drift. If the heartbeat were
+				// not refreshing PEXPIRE, the key would have elapsed and our
 				// release script's compare-and-delete would no-op.
-				await wait(900);
+				await waitRedisMs(client, 900);
 				const pttl = await client.redis.pttl(client.key('lock:long-running'));
 				expect(pttl).toBeGreaterThan(0);
 				expect(pttl).toBeLessThanOrEqual(400);
@@ -223,7 +226,10 @@ describe('redis distributed lock (integration)', () => {
 
 			const lock = createDistributedLock(client, { retryDelayMs: 20, maxWaitMs: 2000 });
 
-			const start = Date.now();
+			// The elapsed wait is measured on the Redis clock - the same clock
+			// the foreign PX lives on - so a host/VM clock step can neither
+			// shrink nor stretch the bound being asserted.
+			const start = await redisNowMs(client.redis);
 			let ranFn = false;
 			await lock.withLock('freeing', async () => {
 				ranFn = true;
@@ -231,7 +237,7 @@ describe('redis distributed lock (integration)', () => {
 				expect(v).toMatch(/^[0-9a-f]{32}$/);
 				expect(v).not.toBe('foreign-fence');
 			});
-			const elapsed = Date.now() - start;
+			const elapsed = (await redisNowMs(client.redis)) - start;
 
 			expect(ranFn).toBe(true);
 			// We waited for the foreign TTL (~200ms) but well under maxWaitMs.

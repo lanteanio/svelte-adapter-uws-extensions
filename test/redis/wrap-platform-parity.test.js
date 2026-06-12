@@ -297,6 +297,55 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		expect(seen).toEqual(['b']);
 	});
 
+	it('pubsub wrap passes publishWire options (excludeWs sender exclusion) through to the platform', () => {
+		// The adapter's publishWire accepts { excludeWs } to withhold a publish
+		// from the originating socket. The wrap forwards publishWire by
+		// reference, so the options argument - the codec too - must reach the
+		// underlying platform intact or sender exclusion silently dies in a
+		// cluster, where the caller's platform reference IS the wrap result.
+		// publishWire is captured at wrap construction (same bind pattern as
+		// send / sendCoalesced), so attach the recorder BEFORE wrapping.
+		const platform = mockPlatform();
+		const calls = [];
+		platform.publishWire = (topic, event, data, wire, options) => {
+			calls.push({ topic, event, data, wire, options });
+			return true;
+		};
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+
+		const sender = { id: 'sender' };
+		const codec = { capability: 'cursor.protocol:2', encode: () => null };
+		wrapped.publishWire('room:1', 'update', { key: 'k', data: { x: 1 } }, codec, { excludeWs: sender });
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0].topic).toBe('room:1');
+		expect(calls[0].event).toBe('update');
+		expect(calls[0].wire).toBe(codec);
+		expect(calls[0].options).toEqual({ excludeWs: sender });
+		expect(calls[0].options.excludeWs).toBe(sender);
+	});
+
+	it('sharded wrap passes publishWire options (excludeWs sender exclusion) through to the platform', () => {
+		const platform = mockPlatform();
+		const calls = [];
+		platform.publishWire = (topic, event, data, wire, options) => {
+			calls.push({ topic, event, data, wire, options });
+			return true;
+		};
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+
+		const sender = { id: 'sender' };
+		const codec = { capability: 'cursor.protocol:2', encode: () => null };
+		wrapped.publishWire('room:2', 'update', { key: 'k', data: { x: 2 } }, codec, { excludeWs: sender });
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0].topic).toBe('room:2');
+		expect(calls[0].event).toBe('update');
+		expect(calls[0].wire).toBe(codec);
+		expect(calls[0].options).toEqual({ excludeWs: sender });
+		expect(calls[0].options.excludeWs).toBe(sender);
+	});
+
 	it('sharded wrap forwards maxPayloadLength / bufferedAmount / onPublishRate', () => {
 		const platform = mockPlatform();
 		// Methods are captured at wrap-construction (consistent with the

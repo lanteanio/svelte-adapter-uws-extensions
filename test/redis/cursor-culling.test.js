@@ -68,9 +68,11 @@ describe('redis cursor viewport culling and backpressure', () => {
 			const mover = mockWs({ id: 'M' });
 			c.update(mover, 'board', { x: 1, y: 2 }, platform);
 
-			// Shared fan-out: join + update on published[]; nothing per-subscriber.
+			// Shared fan-out: join + update on published[]; the only single-target
+			// frame is the mover's own you marker, never a per-subscriber position.
 			expect(platform.published.map((e) => e.event)).toEqual(['join', 'update']);
-			expect(platform.sent).toHaveLength(0);
+			expect(platform.sent.map((e) => e.event)).toEqual(['you']);
+			expect(platform.sent[0].ws).toBe(mover);
 			expect(walkSpy).not.toHaveBeenCalled();
 			expect(bufferedSpy).not.toHaveBeenCalled();
 			c.destroy();
@@ -173,7 +175,9 @@ describe('redis cursor viewport culling and backpressure', () => {
 			c.update(mockWs({ id: 'M' }), 'board', { x: 99999, y: 99999 }, platform);
 
 			expect(platform.published.map((e) => e.event)).toEqual(['join', 'update']);
-			expect(platform.sent).toHaveLength(0);
+			// The mover's single-target you marker is the only send; no position
+			// frame went per-subscriber.
+			expect(platform.sent.map((e) => e.event)).toEqual(['you']);
 			expect(walkSpy).not.toHaveBeenCalled();
 			expect(c.stats().perSubscriberFlushes).toBe(0);
 			c.destroy();
@@ -472,9 +476,11 @@ describe('redis cursor viewport culling and backpressure', () => {
 			delete platform.forEachSubscriber;
 			const a = mockWs({ id: 'A' });
 			expect(() => c.update(a, 'board', { x: 1, y: 1 }, platform)).not.toThrow();
-			// Fell back to the shared publish fan-out (join + update on published[]).
+			// Fell back to the shared publish fan-out (join + update on published[]);
+			// the only single-target frame is the mover's own you marker.
 			expect(platform.published.map((e) => e.event)).toEqual(['join', 'update']);
-			expect(platform.sent).toHaveLength(0);
+			expect(platform.sent.map((e) => e.event)).toEqual(['you']);
+			expect(platform.sent[0].ws).toBe(a);
 			c.destroy();
 		});
 	});
