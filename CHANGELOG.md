@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0-next.15] - 2026-06-12
+### Added
+
+- **The redis cursor snapshot reply now leads with a server `time` event, mirroring the adapter's smoothing clock seed.** A subscriber requesting a snapshot receives `time` (the replica's wall clock, sent even for an empty board) before `catalog` + `bulk`, pairing the request into a measurable round trip for the client-side server-clock estimator behind `cursor(topic, { canvas, smooth })`. The event rides the codec's JSON fallback as an additive envelope an older client's merge ignores as an unknown event. Each replica stamps with its own clock - the same clock that stamps the position frames it re-encodes locally through `publishWire` - so a client's time axis is consistent regardless of which replica originated a move, and the per-socket estimator reset on reconnect covers a load balancer moving the connection between replicas. The stamped position wire itself (`cursor.protocol:4`, schemaVersion 3) arrives through the shared `createCursorWireCodec` factory with the adapter upgrade - no further change here.
 
 ### Fixed
 

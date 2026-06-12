@@ -273,7 +273,11 @@ describe('redis cursor', () => {
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'canvas', platform);
 
-			expect(platform.sent).toHaveLength(2);
+			// The server time event (the smoothing clock seed) leads, then the
+			// roster and the positions.
+			expect(platform.sent).toHaveLength(3);
+			expect(platform.sent[0].event).toBe('time');
+			expect(typeof platform.sent[0].data.t).toBe('number');
 			const catalog = platform.sent.find((s) => s.event === 'catalog');
 			const bulk = platform.sent.find((s) => s.event === 'bulk');
 			expect(catalog.topic).toBe('__cursor:canvas');
@@ -285,12 +289,15 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('does not send catalog/bulk when no cursors exist', async () => {
+		it('sends only the time seed when no cursors exist', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const receiver = mockWs({ id: 'new' });
 			await c.snapshot(receiver, 'empty-topic', platform);
 
-			expect(platform.sent).toHaveLength(0);
+			// A fresh subscriber on an empty board still gets its clock seed;
+			// catalog/bulk stay suppressed.
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0].event).toBe('time');
 			c.destroy();
 		});
 	});
@@ -328,11 +335,12 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('attach with no existing cursors does not send catalog or bulk', async () => {
+		it('attach with no existing cursors sends only the time seed', async () => {
 			const ws = mockWs({ id: '1' });
 			await cursors.attach(ws, 'empty-canvas', platform);
 
-			expect(platform.sent).toHaveLength(0);
+			expect(platform.sent).toHaveLength(1);
+			expect(platform.sent[0].event).toBe('time');
 		});
 
 		it('attach + update on a remote ws delivers an update on the local subscriber set', async () => {

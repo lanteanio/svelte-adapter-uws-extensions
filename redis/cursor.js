@@ -38,6 +38,7 @@ import {
 	randomBytes,
 	now,
 	monotonicNow,
+	wallEpoch,
 	setTimer,
 	clearTimer,
 	setIntervalTimer,
@@ -61,7 +62,8 @@ const EVENTS = Object.freeze({
 	JOIN: 'join',
 	UPDATE: 'update',
 	REMOVE: 'remove',
-	BULK: 'bulk'
+	BULK: 'bulk',
+	TIME: 'time'
 });
 
 /**
@@ -1600,6 +1602,19 @@ export function createCursor(client, options = {}) {
 				let denial;
 				try { denial = await platform.checkSubscribe(ws, topic); } catch { return; }
 				if (denial) return;
+			}
+			// Server time first - even for an empty board - so the requester's
+			// smoothing clock is seeded before the first stamped position frame
+			// and the request/reply round trip is measurable. Rides the codec's
+			// JSON fallback (the codec declines the event), an additive envelope
+			// an older client's merge ignores as an unknown event. This replica
+			// stamps with ITS clock, the same clock that stamps the position
+			// frames it re-encodes, so the client's time axis is consistent
+			// regardless of which replica originated a move.
+			try {
+				emitTo(ws, '__cursor:' + topic, EVENTS.TIME, { t: wallEpoch() }, platform);
+			} catch {
+				// WebSocket closed before send
 			}
 			const cursors = await this.list(topic);
 			if (cursors.length === 0) return;
