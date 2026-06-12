@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0-next.14] - 2026-06-12
+## [0.6.0-next.15] - 2026-06-12
+
+### Fixed
+
+- **Sockets subscribed server-side by the redis plugins now receive stateful-codec binary publishes.** The adapter's `platform.publishWire` per-subscriber walk delivers by the connection's subscription registry, but the redis cursor attach, presence join/sync, and groups join established membership with the native socket call only - so once any binary-capable client subscribed a topic, those members silently received nothing from that topic's binary publishes (JSON-only deployments were unaffected). Every site now mirrors membership into the registry through the new `shared/ws-subscriptions.js` helpers (`addWsSubscription` / `removeWsSubscription`, resolved via the shared `Symbol.for` slot), with symmetric removal on every presence leave/clear path and every groups leave/close path; the cursor `detach` already routed through the registry-aware `platform.unsubscribe`. Each call site's existing closed-socket throw/catch contract is untouched - the registry ops never throw.
 
 ### Added
 

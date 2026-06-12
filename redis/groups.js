@@ -22,6 +22,7 @@ import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../share
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
+import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -237,6 +238,7 @@ export function createGroup(client, name, options = {}) {
 						subscribedPlatform.publish(internalTopic, EVENTS.CLOSE, parsed.data, { relay: false });
 						for (const [ws] of localMembers) {
 							try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+							removeWsSubscription(ws, internalTopic);
 						}
 						localMembers.clear();
 						if (onClose) onClose();
@@ -353,6 +355,7 @@ export function createGroup(client, name, options = {}) {
 
 			try {
 				ws.subscribe(internalTopic);
+				addWsSubscription(ws, internalTopic);
 			} catch {
 				localMembers.delete(ws);
 				try {
@@ -369,6 +372,7 @@ export function createGroup(client, name, options = {}) {
 			} catch (err) {
 				localMembers.delete(ws);
 				try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+				removeWsSubscription(ws, internalTopic);
 				try {
 					await redis.hdel(membersKey, memberId);
 				} catch (rollbackErr) {
@@ -425,6 +429,7 @@ export function createGroup(client, name, options = {}) {
 
 			localMembers.delete(ws);
 			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+			removeWsSubscription(ws, internalTopic);
 
 			mGroupLeaves?.inc({ group: name });
 			const leavePayload = { role: entry.role };
@@ -490,6 +495,7 @@ export function createGroup(client, name, options = {}) {
 					await publishEvent(EVENTS.CLOSE, null);
 					for (const [ws] of localMembers) {
 						try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+						removeWsSubscription(ws, internalTopic);
 					}
 					localMembers.clear();
 					await redis.del(membersKey);
@@ -506,6 +512,7 @@ export function createGroup(client, name, options = {}) {
 
 				for (const [ws] of localMembers) {
 					try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+					removeWsSubscription(ws, internalTopic);
 				}
 				localMembers.clear();
 

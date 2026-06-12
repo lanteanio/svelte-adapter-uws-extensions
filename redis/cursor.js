@@ -50,6 +50,7 @@ import { execMultiSlot } from '../shared/cluster.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError } from '../shared/errors.js';
+import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 
 export { WsClosedError };
@@ -1325,6 +1326,11 @@ export function createCursor(client, options = {}) {
 				mAttachesAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
 				throw new WsClosedError('cursor.attach', topic);
 			}
+			// Mirror into the subscription registry so the adapter's binary
+			// publish walk delivers to this member (native membership alone is
+			// invisible to it). detach() routes through platform.unsubscribe,
+			// which is already registry-aware.
+			addWsSubscription(ws, '__cursor:' + topic);
 			// snapshot() itself swallows ws-closed during platform.send (the
 			// state is already committed; clients recover via the next bulk
 			// frame). Intentional asymmetry with subscribe failure above.
