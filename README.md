@@ -1092,6 +1092,28 @@ export async function close(ws, { platform }) {
 
 ---
 
+## CRDT documents (cluster coordinator)
+
+`createCrdtCluster` makes `svelte-realtime`'s `live.doc` / `live.map` / `live.array` documents work across a cluster. On a single process documents are correct without it; behind a load balancer two editors of one document land on different instances, and without coordination the instances never converge and each overwrites the others' persisted snapshot. Wire the coordinator onto the platform the same way as the other Redis plugins and the realtime layer detects it and routes through it automatically:
+
+```js
+// hooks.server.js (or wherever you wire the Redis bus)
+import { createCrdtCluster } from 'svelte-adapter-uws-extensions/redis/crdt';
+
+platform.crdt = createCrdtCluster(redis);   // bus.wrap forwards it; realtime picks it up
+```
+
+What it does:
+
+- **Per-instance replicas, no extra hop.** Every instance keeps its own replica of each locally-subscribed document and serves its own subscribers directly. There is no per-document owner that every edit round-trips through, and no single point of failure for serving reads.
+- **Relay everything, converge everywhere.** Each applied update relays over a Redis channel (`{prefix}crdt:events`); every other instance applies the opaque bytes to its own replica and fans them out to its own subscribers. The merge is commutative and idempotent, so order and overlap do not matter - every replica converges.
+- **One writer per topic.** Snapshot persistence is gated by a per-topic lease (`SET NX PX` + compare-and-pexpire renew), so exactly one instance writes a topic's snapshot at a time and divergent-snapshot clobber is impossible. The holder's replica is the most converged (it receives every relayed update); the lease rotates when the holder goes quiet or dies.
+- **Cold-join freshness.** A persisted snapshot is only as fresh as the last debounced store, so a cold-loading instance loads the snapshot AND broadcasts a state-vector sync request; any instance holding the topic replies with exactly the structs the joiner lacks. Applying both is safe (idempotent merge), closing the staleness gap whenever a live peer exists.
+
+> **Trust model (read this before a shared-Redis deployment):** the relay channel carries **document content in cleartext** between trusted instances. Two consequences, both the same trust boundary the pub/sub bus and the cursor/presence relays already assume - but documents raise the stakes because they are persistent collaborative state, not ephemeral cursors: (1) a relayed update is applied without re-running the per-document guard (a peer authorized its client's write before relaying), so anyone who can publish forged frames on the channel can inject edits; (2) anyone who can subscribe to the channel can read document updates, and a forged sync request pulls a document's full state on demand. The coordinator hardens the channel with a pre-parse size cap and an envelope-shape check and namespaces it under your key prefix, but it cannot make a shared Redis private. **Run the document relay on a Redis you control** (dedicated instance, ACL, or network isolation) - exactly as you would for any bus carrying application data.
+
+Options: `persistLeaseMs` (default 6000ms; keep it above the document's `debounceWait`), `maxEnvelopeBytes` (relay size cap, default 1 MB), `breaker`, `onError`. Requires `svelte-realtime >= 0.6.0-next.9` on `svelte-adapter-uws >= 0.6.0-next.25`.
+
 ## Cursor
 
 Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.18] - 2026-06-13
+
+### Added
+
+- **`redis/crdt`: cluster coordination for conflict-free documents (`svelte-realtime` `live.doc` / `live.map` / `live.array`).** Without it, `live.doc` runs single-instance: clients editing one document on different instances behind a load balancer never converge and each instance clobbers the others' persisted snapshot. `createCrdtCluster(client)` is the transport layer that makes documents cluster-correct - attach it as `platform.crdt = createCrdtCluster(redisClient)` exactly like the other Redis plugins (`bus.wrap` forwards it through a new `crdt` getter), and the realtime layer detects it and routes through it automatically. The model: every instance keeps its own document replica and serves its own subscribers with no extra hop; every applied update relays over a Redis channel so every instance's replica converges (the merge is commutative and idempotent, so order and overlap are free); snapshot persistence is gated by a per-topic lease so exactly one instance writes a topic's snapshot at a time and divergent-snapshot clobber is impossible; and a cold-joining instance loads the persisted snapshot AND broadcasts a state-vector sync request, so a live peer fills the gap between the snapshot and now. The relay channel carries opaque update bytes between trusted instances (a peer authorized its client's write before relaying, the same peer-trust model the cursor and presence relays use) and is hardened with the shared bus validator (pre-parse size cap + envelope-shape check) under the app's key prefix. Options: `persistLeaseMs` (default 6000, set above the document `debounceWait`), `maxEnvelopeBytes`, `breaker`, `onError`. Verified on a real Redis server and a real 6-node cluster (relay convergence across connections, the cold-join sync roundtrip, and per-topic lease exclusivity + TTL handoff). Requires the document surface from `svelte-realtime >= 0.6.0-next.9` on `svelte-adapter-uws >= 0.6.0-next.25`.
+
 ## [0.6.0-next.17] - 2026-06-12
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.6.0-next.17",
+  "version": "0.6.0-next.18",
   "publishConfig": {
     "tag": "next"
   },
@@ -28,6 +28,10 @@
     "./redis/pubsub": {
       "types": "./redis/pubsub.d.ts",
       "default": "./redis/pubsub.js"
+    },
+    "./redis/crdt": {
+      "types": "./redis/crdt.d.ts",
+      "default": "./redis/crdt.js"
     },
     "./redis/sharded-pubsub": {
       "types": "./redis/sharded-pubsub.d.ts",
