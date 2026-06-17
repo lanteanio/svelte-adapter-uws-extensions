@@ -61,6 +61,10 @@ import { WsClosedError } from '../shared/errors.js';
 import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
+import { makeKeys } from './presence/keys.js';
+import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
+import { createLocalIndex } from './presence/local-index.js';
+import { createDiffBuffer } from './presence/diff-buffer.js';
 
 export { WsClosedError };
 
@@ -123,6 +127,11 @@ export function createPresence(client, options = {}) {
 			? options.transient.filter((f) => typeof f === 'string')
 			: []
 	);
+
+	// publicData() projects a participant's public view (identity + durable
+	// fields, transient fields stripped); it closes over transientFields, so
+	// data.js curries it via makePublicData.
+	const publicData = makePublicData(transientFields);
 
 	// Binary wire codec (presence.protocol:1), built by the adapter's shared
 	// factory so the cluster variant speaks the IDENTICAL wire to the bundled
@@ -240,14 +249,11 @@ export function createPresence(client, options = {}) {
 	 */
 	const wsTopics = new Map();
 
-	/**
-	 * Reverse index from `topic + '|' + userKey` to the set of ws connections
-	 * tracking that (topic, key) on this instance. Mirrors `wsTopics` so the
-	 * leave path can find another live connection for the same user without
-	 * scanning every ws on the instance.
-	 * @type {Map<string, Set<any>>}
-	 */
-	const topicKeyToWs = new Map();
+	// Reverse index from (topic, key) to the ws connections tracking it on this
+	// instance, so the leave path can recover another live connection for the
+	// same user without scanning every ws. Lives in local-index.js and reads the
+	// shared wsTopics map for findOtherWsData.
+	const { indexAdd, indexRemove, findOtherWsData } = createLocalIndex(wsTopics);
 
 	/**
 	 * Local per-topic reference count per user key.
@@ -269,44 +275,6 @@ export function createPresence(client, options = {}) {
 	const localData = new Map();
 
 	/**
-	 * The public presence value for a user: identity `data` merged with the
-	 * user's durable dynamic `fields`, transient fields stripped. Used by every
-	 * snapshot-shaped path (`state` reconstruction from Redis, the heartbeat
-	 * roster, the join roster at flush) so a (re)joiner never sees a transient
-	 * value. The no-`fields` user (the overwhelming common case) returns
-	 * `entry.data` with zero copy - keeping a no-`update()` deployment's wire
-	 * byte-identical to a deployment that never calls update(). Works on both a local cache entry
-	 * (`{ data, fields }`) and a parsed Redis entry (`{ data, fields, ts }`);
-	 * Redis only ever stores durable fields, so the transient strip is a no-op
-	 * there but harmless.
-	 * @param {{ data: Record<string, any>, fields?: Record<string, any> | null }} entry
-	 * @returns {Record<string, any>}
-	 */
-	function publicData(entry) {
-		if (!entry.fields) return entry.data;
-		const out = { ...entry.data };
-		for (const k of Object.keys(entry.fields)) {
-			if (!transientFields.has(k)) out[k] = entry.fields[k];
-		}
-		return out;
-	}
-
-	/**
-	 * Set a user's identity `data` on the local per-topic cache, PRESERVING any
-	 * dynamic `fields` already tracked for the user. The identity-churn paths
-	 * (join, data-change, leave-restore, rollback) re-set `data` repeatedly;
-	 * dynamic fields are user-level and orthogonal, so they must ride across
-	 * those re-sets rather than be clobbered.
-	 * @param {Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>} topicData
-	 * @param {string} key
-	 * @param {Record<string, any>} data
-	 */
-	function setLocalData(topicData, key, data) {
-		const existing = topicData.get(key);
-		topicData.set(key, existing ? { data, fields: existing.fields } : { data, fields: null });
-	}
-
-	/**
 	 * Track sync-only ws so leave() can clean up their Redis channel subscriptions.
 	 * @type {Map<any, Set<string>>}
 	 */
@@ -326,196 +294,22 @@ export function createPresence(client, options = {}) {
 	 */
 	const hgetallInflight = new Map();
 
-	/**
-	 * Per-topic pending diff buffer: latest op per key wins. Joins and
-	 * leaves on the same key in one event-loop iteration collapse so the
-	 * wire only sees the net change. Flushed once per iteration via
-	 * `setTimeout(flushPendingDiffs, 0)` armed when the first dirty entry
-	 * lands. Mirrors the buffer model the adapter's bundled presence
-	 * plugin uses, so a single client decoder handles both.
-	 *
-	 * Why `setTimeout(0)` and not `queueMicrotask`: uWS dispatches each WS
-	 * message as its own JS task, and N-API drains microtasks at the C++/JS
-	 * boundary between tasks. A microtask-deferred flush fires BEFORE the
-	 * next socket's handler runs, so cross-socket coalescing is impossible
-	 * at the microtask level - a mass-join into a populated topic produces
-	 * O(N) one-entry publishes instead of one batched diff. `setTimeout(0)`
-	 * lands in libuv's timers phase, which fires only after the poll phase
-	 * has dispatched every ready socket message in the current iteration -
-	 * so all joins arriving together end up in one flush regardless of how
-	 * many task boundaries separate them. Same structural choice the
-	 * 0.5.7 cursor always-tick rewrite locked in.
-	 *
-	 * @type {Map<string, Map<string, { op: 'join' | 'leave', data: Record<string, any> }>>}
-	 */
-	const pendingDiffs = new Map();
-	/** @type {ReturnType<typeof setTimeout> | null} */
-	let diffFlushTimer = null;
-	/** @type {import('svelte-adapter-uws').Platform | null} */
-	let diffFlushPlatform = null;
+	// Per-topic diff coalescer: join/leave/update ops collapse per key within
+	// one event-loop iteration and flush once via a deferred setTimer(_, 0).
+	// Lives in diff-buffer.js; disposeDiffBuffer() is the clear()/destroy() teardown.
+	const { bufferDiff, bufferUpdate, flushPendingDiffs, dispose: disposeDiffBuffer } = createDiffBuffer({
+		emit,
+		localData,
+		publicData,
+		mt,
+		mDiffCoalesced,
+		mDiffFrames
+	});
 
-	function armDiffFlush(platform) {
-		diffFlushPlatform = platform;
-		if (diffFlushTimer === null) {
-			diffFlushTimer = setTimer(flushPendingDiffs, 0);
-			if (diffFlushTimer.unref) diffFlushTimer.unref();
-		}
-	}
-
-	function bufferDiff(topic, op, key, data, platform) {
-		let entries = pendingDiffs.get(topic);
-		if (!entries) {
-			entries = new Map();
-			pendingDiffs.set(topic, entries);
-		}
-		if (entries.has(key)) {
-			mDiffCoalesced?.inc({ topic: mt(topic) });
-		}
-		// A join/leave supersedes any pending field-level update for the key:
-		// the join roster re-reads publicData (durable fields included) and a
-		// leave drops the user entirely, so a buffered update is moot.
-		entries.set(key, { op, data });
-		armDiffFlush(platform);
-	}
-
-	/**
-	 * Buffer a field-level update for the next flush, collapsing against any op
-	 * already pending for the key, exactly like the in-memory plugin:
-	 *   - pending leave  -> drop (the user leaves this flush; the update is moot)
-	 *   - pending join   -> drop (the join roster carries durable fields via
-	 *     publicData; a transient change is correctly excluded on a fresh join)
-	 *   - pending update -> accumulate the changed fields
-	 * @param {string} topic
-	 * @param {string} key
-	 * @param {Record<string, any>} changed - durable + transient changed fields
-	 * @param {import('svelte-adapter-uws').Platform} platform
-	 */
-	function bufferUpdate(topic, key, changed, platform) {
-		let entries = pendingDiffs.get(topic);
-		if (!entries) {
-			entries = new Map();
-			pendingDiffs.set(topic, entries);
-		}
-		const prev = entries.get(key);
-		if (prev) {
-			// A pending leave wins: the user is gone this flush, so the update is moot.
-			if (prev.op === 'leave') return;
-			if (prev.op === 'join') {
-				// A LOCAL join re-reads publicData(localData) at flush, so its durable
-				// fields are already current and the update is redundant (transient is
-				// excluded on a fresh local join, matching the in-memory plugin). A
-				// RELAYED join (the user is not presented on this instance, so flush
-				// uses the buffered payload verbatim) must absorb the change, or a
-				// cross-instance field update landing in the same tick as the relayed
-				// join / updated event for that user is silently lost.
-				if (!localData.get(topic)?.get(key) && prev.data && typeof prev.data === 'object') {
-					Object.assign(prev.data, changed);
-					armDiffFlush(platform);
-				}
-				return;
-			}
-			Object.assign(prev.changed, changed);
-			armDiffFlush(platform);
-			return;
-		}
-		entries.set(key, { op: 'update', changed: { ...changed } });
-		armDiffFlush(platform);
-	}
-
-	function flushPendingDiffs() {
-		if (diffFlushTimer !== null) {
-			clearTimer(diffFlushTimer);
-			diffFlushTimer = null;
-		}
-		const platform = diffFlushPlatform;
-		diffFlushPlatform = null;
-		if (!platform) {
-			pendingDiffs.clear();
-			return;
-		}
-		for (const [topic, entries] of pendingDiffs) {
-			/** @type {Record<string, Record<string, any>>} */
-			const joins = {};
-			/** @type {Record<string, Record<string, any>>} */
-			const leaves = {};
-			/** @type {Record<string, Record<string, any>> | null} */
-			let updates = null;
-			const localUsers = localData.get(topic);
-			for (const [key, e] of entries) {
-				if (e.op === 'join') {
-					// Re-read the live local entry so the join roster carries the
-					// user's latest durable fields (publicData strips transient).
-					// A relayed join for a user this instance does not present has
-					// no local entry and falls back to the relayed payload.
-					const localEntry = localUsers && localUsers.get(key);
-					joins[key] = localEntry ? publicData(localEntry) : e.data;
-				} else if (e.op === 'leave') {
-					leaves[key] = e.data;
-				} else {
-					if (!updates) updates = {};
-					updates[key] = e.changed;
-				}
-			}
-			// Keep the common `{ joins, leaves }` shape byte-identical when no
-			// field-level update is pending, so a deployment that never calls
-			// update() sees an unchanged wire. `updates` is additive: an old
-			// client ignores it.
-			const diff = updates ? { joins, leaves, updates } : { joins, leaves };
-			try {
-				// Presence WS frames opt INTO compression. They are low-frequency -
-				// diffs coalesce per tick, heartbeat is periodic, state is on-attach -
-				// so per-subscriber deflate CPU is amortized and the roster JSON
-				// compresses well. This is the deliberate counterpart to the cursor
-				// plugin's compress:false 60Hz hot path, and matches the bundled
-				// in-memory presence plugin. No-op while websocket.compression is off
-				// (the default): the adapter resolves the flag to false regardless.
-				emit('__presence:' + topic, 'diff', diff, platform, { relay: false });
-				mDiffFrames?.inc({ topic: mt(topic) });
-			} catch { /* platform unavailable mid-flight */ }
-		}
-		pendingDiffs.clear();
-	}
-
-	// Per-topic hash: one field per unique user on the topic. Backs list() / count().
-	function topicHashKey(topic) {
-		return client.key('presence:topic:{' + topic + '}');
-	}
-
-	// Per-user hash for a topic: one field per instance currently presenting this
-	// user. HLEN drives the JOIN/LEAVE broadcast decision.
-	function userHashKey(topic, userKey) {
-		return client.key('presence:user:{' + topic + '}:' + userKey);
-	}
-
-	function indexAdd(topic, userKey, ws) {
-		const k = topic + '|' + userKey;
-		let set = topicKeyToWs.get(k);
-		if (!set) {
-			set = new Set();
-			topicKeyToWs.set(k, set);
-		}
-		set.add(ws);
-	}
-
-	function indexRemove(topic, userKey, ws) {
-		const k = topic + '|' + userKey;
-		const set = topicKeyToWs.get(k);
-		if (!set) return;
-		set.delete(ws);
-		if (set.size === 0) topicKeyToWs.delete(k);
-	}
-
-	function findOtherWsData(topic, userKey, exceptWs) {
-		const set = topicKeyToWs.get(topic + '|' + userKey);
-		if (!set) return null;
-		let newest = null;
-		for (const ws of set) {
-			if (ws === exceptWs) continue;
-			const entry = wsTopics.get(ws)?.get(topic);
-			if (entry && entry.key === userKey) newest = entry.data;
-		}
-		return newest;
-	}
+	// Redis key + channel builders. The {topic} hash-tag colocation that keeps a
+	// topic's two keys on one cluster slot lives in keys.js (kept in lockstep with
+	// the KEYS arity documented in lua.js).
+	const { topicHashKey, userHashKey, eventChannel } = makeKeys(client);
 
 	function coalesceHgetall(topic) {
 		const key = topicHashKey(topic);
@@ -527,52 +321,11 @@ export function createPresence(client, options = {}) {
 		return pending;
 	}
 
-	function eventChannel(topic) {
-		return client.key('presence:events:' + topic);
-	}
-
-	/**
-	 * Shallow-then-deep equality check for presence data objects.
-	 * Avoids redundant Redis writes and broadcasts when a user's
-	 * data has not actually changed.
-	 */
-	function deepEqual(a, b) {
-		if (a === b) return true;
-		if (a == null || b == null) return a === b;
-		if (typeof a !== 'object' || typeof b !== 'object') return false;
-		const keysA = Object.keys(a);
-		const keysB = Object.keys(b);
-		if (keysA.length !== keysB.length) return false;
-		for (let i = 0; i < keysA.length; i++) {
-			const k = keysA[i];
-			if (!deepEqual(a[k], b[k])) return false;
-		}
-		return true;
-	}
-
 	function resolveKey(data) {
 		if (data && keyField in data && data[keyField] != null) {
 			return String(data[keyField]);
 		}
 		return '__conn:' + (++connCounter);
-	}
-
-	/**
-	 * Parse the per-topic hash HGETALL result into a Map<userKey, {data, ts}>.
-	 * Staleness filtering and cross-instance deduplication are no longer
-	 * needed: the new storage layout uses one field per userKey (Redis
-	 * collapses cross-instance writes via HSET on the same field), and per-
-	 * field HPEXPIRE removes stale entries before HGETALL sees them. So this
-	 * is now just a JSON-parse + drop-corrupted loop.
-	 */
-	function parseEntries(all) {
-		const seen = new Map();
-		for (const userKey of Object.keys(all)) {
-			try {
-				seen.set(userKey, JSON.parse(all[userKey]));
-			} catch { /* corrupted entry */ }
-		}
-		return seen;
 	}
 
 	// Heartbeat: refresh timestamps on local entries, TTL on hash keys,
@@ -1601,12 +1354,7 @@ export function createPresence(client, options = {}) {
 			activeTopics.clear();
 			syncObservers.clear();
 			syncCounts.clear();
-			pendingDiffs.clear();
-			if (diffFlushTimer !== null) {
-				clearTimer(diffFlushTimer);
-				diffFlushTimer = null;
-			}
-			diffFlushPlatform = null;
+			disposeDiffBuffer();
 			connCounter = 0;
 		},
 
@@ -1624,12 +1372,7 @@ export function createPresence(client, options = {}) {
 			subscribedChannels.clear();
 			keyspaceSubscribed = false;
 			activePlatform = null;
-			pendingDiffs.clear();
-			if (diffFlushTimer !== null) {
-				clearTimer(diffFlushTimer);
-				diffFlushTimer = null;
-			}
-			diffFlushPlatform = null;
+			disposeDiffBuffer();
 		},
 
 		hooks: {
