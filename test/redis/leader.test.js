@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createLeader } from '../../redis/leader.js';
-import { createMetrics } from '../../prometheus/index.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createLeader } from '../../src/redis/leader.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

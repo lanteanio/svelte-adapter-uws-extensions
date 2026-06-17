@@ -9,8 +9,8 @@
  * table prefix per test so files do not collide with each other.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createReplay } from '../../../postgres/replay.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createReplay } from '../../../src/postgres/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 describe('postgres replay (integration)', () => {

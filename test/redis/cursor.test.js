@@ -3,9 +3,9 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
-import { createCursor, WsClosedError } from '../../redis/cursor.js';
-import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
-import { createMetrics } from '../../prometheus/index.js';
+import { createCursor, WsClosedError } from '../../src/redis/cursor.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 describe('redis cursor', () => {
 	let client;

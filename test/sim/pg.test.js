@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runPgSim, replayPgSim } from '../../sim.js';
+import { runPgSim, replayPgSim } from '../../src/sim.js';
 
 const ticksOn = (result, instance, topic = 'room', event = 'tick') =>
 	result.clusterFrames[instance].clients.flat().filter((f) => f && f.event === event && f.topic === topic);

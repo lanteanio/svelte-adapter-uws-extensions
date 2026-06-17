@@ -44,7 +44,7 @@ vi.mock('node:worker_threads', () => {
 	return { Worker: MockWorker };
 });
 
-const { createWorkerPool } = await import('../../postgres/_tasks-worker-pool.js');
+const { createWorkerPool } = await import('../../src/postgres/_tasks-worker-pool.js');
 const wt = await import('node:worker_threads');
 const MockWorker = /** @type {any} */ (wt.Worker);
 

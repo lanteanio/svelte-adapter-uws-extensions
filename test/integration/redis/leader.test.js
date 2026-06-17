@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
-import { createLeader } from '../../../redis/leader.js';
+import { createLeader } from '../../../src/redis/leader.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));

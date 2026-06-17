@@ -14,7 +14,7 @@ import {
 	setRuntimeEnv,
 	resetRuntimeEnv,
 	getRuntimeEnv
-} from '../../shared/runtime.js';
+} from '../../src/shared/runtime.js';
 
 // Always restore the native environment between cases so an override in one
 // test can never leak into another.

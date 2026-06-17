@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createPublishRateAggregator } from '../../redis/publish-rate.js';
-import { createMetrics } from '../../prometheus/index.js';
+import { createPublishRateAggregator } from '../../src/redis/publish-rate.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 describe('redis publish-rate aggregator', () => {
 	let client;

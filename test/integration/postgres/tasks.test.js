@@ -8,9 +8,9 @@
  * covers pure JS validation; this file covers what the mock cannot fake.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createTaskRunner, UnknownTaskError, TaskInFlightError } from '../../../postgres/tasks.js';
-import { createIdempotencyStore } from '../../../postgres/idempotency.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createTaskRunner, UnknownTaskError, TaskInFlightError } from '../../../src/postgres/tasks.js';
+import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));

@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createConnectionRegistry } from '../../redis/registry.js';
-import { createMetrics } from '../../prometheus/index.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createConnectionRegistry } from '../../src/redis/registry.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 
 function wsWithSession(userData, sessionId) {

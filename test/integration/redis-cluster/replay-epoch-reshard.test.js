@@ -15,8 +15,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { clusterClient } from '../helpers/cluster-client.js';
-import { createReplay } from '../../../redis/replay.js';
-import { keySlot } from '../../../shared/cluster.js';
+import { createReplay } from '../../../src/redis/replay.js';
+import { keySlot } from '../../../src/shared/cluster.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 

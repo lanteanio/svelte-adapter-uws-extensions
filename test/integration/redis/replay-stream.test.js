@@ -19,7 +19,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
-import { createReplay } from '../../../redis/replay.js';
+import { createReplay } from '../../../src/redis/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 // Runs on both standalone and Redis Cluster: the seq, streambuf, and idmp

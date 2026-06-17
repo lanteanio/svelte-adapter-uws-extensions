@@ -1,1 +1,1 @@
-export { mockRedisClient } from '../../testing/mock-redis.js';
+export { mockRedisClient } from '../../src/testing/mock-redis.js';

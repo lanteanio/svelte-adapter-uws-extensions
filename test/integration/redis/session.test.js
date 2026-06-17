@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createDistributedSession } from '../../../redis/session.js';
+import { createDistributedSession } from '../../../src/redis/session.js';
 
 describe('redis distributed session (integration)', () => {
 	let client;

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createAdmissionControl } from '../../shared/admission.js';
+import { createAdmissionControl } from '../../src/shared/admission.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 
 describe('admission control', () => {
@@ -155,7 +155,7 @@ describe('admission control', () => {
 
 	describe('metrics integration', () => {
 		it('counts accepted and rejected calls per class', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const ac = createAdmissionControl({
 				classes: {
@@ -262,7 +262,7 @@ describe('admission control', () => {
 		});
 
 		it('records admission_rejected_total with reason="CLUSTER_TOP_PUBLISHER"', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const ac = createAdmissionControl({
 				classes: { hot: { clusterTopPublisher: { threshold: 100 } } },

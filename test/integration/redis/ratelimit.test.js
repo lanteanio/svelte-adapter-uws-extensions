@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createRateLimit } from '../../../redis/ratelimit.js';
+import { createRateLimit } from '../../../src/redis/ratelimit.js';
 
 function fakeWs(userData = {}) {
 	return { getUserData: () => userData };

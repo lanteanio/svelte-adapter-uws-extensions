@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createRateLimit } from '../../redis/ratelimit.js';
+import { createRateLimit } from '../../src/redis/ratelimit.js';
 
 function mockWs(userData = {}) {
 	return { getUserData: () => userData };

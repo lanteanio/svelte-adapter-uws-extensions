@@ -10,8 +10,8 @@
  * test/postgres/jobs.test.js; this file is additive.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createJobQueue } from '../../../postgres/jobs.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createJobQueue } from '../../../src/postgres/jobs.js';
 import { waitPgMs } from '../helpers/backend-clock.js';
 
 describe('postgres jobs (integration)', () => {

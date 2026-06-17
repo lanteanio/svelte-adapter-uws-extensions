@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isSafeUrl, checkUrl, checkUrlResolved } from '../../shared/safe-url.js';
+import { isSafeUrl, checkUrl, checkUrlResolved } from '../../src/shared/safe-url.js';
 
 describe('shared/safe-url: blocked ranges (strict mode, the zero-config default)', () => {
 	it('blocks IPv4 loopback 127.0.0.0/8 and allows the just-outside member', () => {

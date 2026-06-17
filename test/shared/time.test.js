@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { now, monotonicNow } from '../../shared/time.js';
+import { now, monotonicNow } from '../../src/shared/time.js';
 
 describe('shared/time', () => {
 	describe('now()', () => {

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createTaskRunner } from '../../postgres/tasks.js';
-import { createRedisFence } from '../../redis/fence.js';
+import { createTaskRunner } from '../../src/postgres/tasks.js';
+import { createRedisFence } from '../../src/redis/fence.js';
 
 describe('postgres tasks (Redis fence provider)', () => {
 	let pg;

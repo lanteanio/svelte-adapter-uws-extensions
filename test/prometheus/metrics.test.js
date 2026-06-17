@@ -4,18 +4,18 @@ import {
 	wirePublishRateMetrics,
 	wireClusterPublishRateMetrics,
 	connectionMetricsHook
-} from '../../prometheus/index.js';
+} from '../../src/prometheus/index.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createPubSubBus } from '../../redis/pubsub.js';
-import { createPresence } from '../../redis/presence.js';
-import { createReplay as createRedisReplay } from '../../redis/replay.js';
-import { createRateLimit } from '../../redis/ratelimit.js';
-import { createGroup } from '../../redis/groups.js';
-import { createCursor } from '../../redis/cursor.js';
-import { createReplay as createPgReplay } from '../../postgres/replay.js';
-import { createNotifyBridge } from '../../postgres/notify.js';
+import { createPubSubBus } from '../../src/redis/pubsub.js';
+import { createPresence } from '../../src/redis/presence.js';
+import { createReplay as createRedisReplay } from '../../src/redis/replay.js';
+import { createRateLimit } from '../../src/redis/ratelimit.js';
+import { createGroup } from '../../src/redis/groups.js';
+import { createCursor } from '../../src/redis/cursor.js';
+import { createReplay as createPgReplay } from '../../src/postgres/replay.js';
+import { createNotifyBridge } from '../../src/postgres/notify.js';
 
 function mockWs(userData = {}) {
 	const subscriptions = new Set();

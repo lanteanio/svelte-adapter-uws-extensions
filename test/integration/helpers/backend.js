@@ -15,10 +15,10 @@
 // shared hash tag) surface as real errors the cluster-mirror run maps and
 // documents - "map the gaps first": you cannot fix a cluster bug you have not
 // surfaced.
-import { createRedisClient } from '../../../redis/index.js';
-import { scanAndUnlink } from '../../../shared/redis-scan.js';
+import { createRedisClient } from '../../../src/redis/index.js';
+import { scanAndUnlink } from '../../../src/shared/redis-scan.js';
 import { clusterClient } from './cluster-client.js';
-import { isCluster } from '../../../shared/cluster.js';
+import { isCluster } from '../../../src/shared/cluster.js';
 
 /** The active backend mode. Read lazily so vitest env injection ordering does not matter. */
 export function backendMode() {
@@ -38,7 +38,7 @@ export function isClusterBackend() {
  * in `beforeEach` instead of a bare `client.redis.scan()` loop so the cluster
  * mirror's gap map reflects plugin behavior, not test-harness cleanup that only
  * swept one node.
- * @param {import('../../../redis/index.js').RedisClient} client
+ * @param {import('../../../src/redis/index.js').RedisClient} client
  * @param {string} [pattern] - defaults to every key under the client's prefix
  */
 export async function resetBackendKeys(client, pattern) {
@@ -70,7 +70,7 @@ export async function resetBackendKeys(client, pattern) {
  * it scans every master node (a keyless KEYS/SCAN otherwise lands on a single
  * sampled node and misses the rest); on standalone it is a single SCAN loop.
  *
- * @param {import('../../../redis/index.js').RedisClient} client
+ * @param {import('../../../src/redis/index.js').RedisClient} client
  * @param {string} [pattern] - defaults to every key under the client's prefix
  * @returns {Promise<number>}
  */
@@ -100,7 +100,7 @@ export async function countBackendKeys(client, pattern) {
  * INTEGRATION_REDIS_URL directly.
  *
  * @param {{ keyPrefix?: string, options?: import('ioredis').RedisOptions }} [opts]
- * @returns {import('../../../redis/index.js').RedisClient}
+ * @returns {import('../../../src/redis/index.js').RedisClient}
  */
 export function createBackendClient(opts = {}) {
 	const keyPrefix = opts.keyPrefix || '';

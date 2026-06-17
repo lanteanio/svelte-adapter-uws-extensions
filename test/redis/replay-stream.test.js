@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../redis/replay.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 describe('redis replay (stream backend)', () => {
 	let client;
@@ -614,7 +614,7 @@ describe('redis replay (stream backend)', () => {
 		});
 
 		it('exposes Prometheus counters for hits and writes', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const tracked = createReplay(client, { storage: 'stream', metrics });
 

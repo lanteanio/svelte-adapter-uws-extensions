@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createGroup } from '../../redis/groups.js';
-import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
+import { createGroup } from '../../src/redis/groups.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 
 describe('redis groups', () => {
 	let client;

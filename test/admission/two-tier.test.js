@@ -7,7 +7,7 @@
 // tier sheds at the layer it owns.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createAdmissionControl } from '../../shared/admission.js';
+import { createAdmissionControl } from '../../src/shared/admission.js';
 
 let uWS;
 try {

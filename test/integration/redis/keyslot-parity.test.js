@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createBackendClient, isClusterBackend } from '../helpers/backend.js';
-import { keySlot } from '../../../shared/cluster.js';
+import { keySlot } from '../../../src/shared/cluster.js';
 
 describe.runIf(isClusterBackend())('keySlot parity with CLUSTER KEYSLOT (cluster only)', () => {
 	let client;

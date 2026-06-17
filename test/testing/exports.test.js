@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import * as extensionsTesting from '../../testing/index.js';
+import * as extensionsTesting from '../../src/testing/index.js';
 import * as adapterTesting from 'svelte-adapter-uws/testing';
 
 const passthroughs = [

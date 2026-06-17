@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { safeCreate, assertSafeTableName } from '../../shared/pg-migrate.js';
+import { safeCreate, assertSafeTableName } from '../../src/shared/pg-migrate.js';
 
 /**
  * Minimal mock pg client surface. Tests inject `queryHandler` to

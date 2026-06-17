@@ -21,8 +21,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
-import { createShardedBus } from '../../../redis/sharded-pubsub.js';
-import { createPublishRateAggregator } from '../../../redis/publish-rate.js';
+import { createShardedBus } from '../../../src/redis/sharded-pubsub.js';
+import { createPublishRateAggregator } from '../../../src/redis/publish-rate.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 function wait(ms) {

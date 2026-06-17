@@ -15,7 +15,7 @@
 // that bound exists to fail loudly on a dead backend, not to time the wait,
 // so it is floored generously enough to ride out a multi-second VM clock
 // stall on a short window.
-import { isCluster } from '../../../shared/cluster.js';
+import { isCluster } from '../../../src/shared/cluster.js';
 
 const POLL_MS = 50;
 const MIN_TIMEOUT_MS = 10_000;
@@ -34,7 +34,7 @@ function hostWait(ms) {
  * the sample is pinned to the first master so consecutive readings measure
  * one clock, never a mix of nodes.
  *
- * @param {import('../../../redis/index.js').RedisClient | import('ioredis').Redis} client
+ * @param {import('../../../src/redis/index.js').RedisClient | import('ioredis').Redis} client
  * @returns {Promise<number>}
  */
 export async function redisNowMs(client) {
@@ -53,7 +53,7 @@ export async function redisNowMs(client) {
  * On a Cluster client the samples are pinned to a single master node so the
  * elapsed time is measured against one clock, not a mix of nodes.
  *
- * @param {import('../../../redis/index.js').RedisClient | import('ioredis').Redis} client
+ * @param {import('../../../src/redis/index.js').RedisClient | import('ioredis').Redis} client
  *   The suites' RedisClient wrapper ({ redis, key, ... }) or a raw ioredis
  *   connection - both shapes are accepted.
  * @param {number} ms - Backend-clock milliseconds to let elapse.

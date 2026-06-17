@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { setRuntimeEnv, resetRuntimeEnv } from '../../shared/runtime.js';
-import { createMetrics } from '../../prometheus/index.js';
-import { createClockSkewSampler } from '../../redis/clock-skew.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+import { createClockSkewSampler } from '../../src/redis/clock-skew.js';
 
 // A minimal RedisClient shape: only `.redis.time()` is exercised by the sampler.
 function fakeClient(timeFn) {

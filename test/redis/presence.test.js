@@ -10,9 +10,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createPresence, WsClosedError } from '../../redis/presence.js';
-import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
-import { createMetrics } from '../../prometheus/index.js';
+import { createPresence, WsClosedError } from '../../src/redis/presence.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 function diffsOf(platform) {
 	return platform.published.filter((p) => p.event === 'diff');

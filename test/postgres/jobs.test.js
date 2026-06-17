@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
-import { createJobQueue } from '../../postgres/jobs.js';
-import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
+import { createJobQueue } from '../../src/postgres/jobs.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 
 describe('postgres job queue', () => {
 	let client;
@@ -313,7 +313,7 @@ describe('postgres job queue', () => {
 
 	describe('metrics', () => {
 		it('counts enqueue, claim, complete, fail per queue', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const q = createJobQueue(client, { metrics });
 

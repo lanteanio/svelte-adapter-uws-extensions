@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
-import { createTaskRunner } from '../../postgres/tasks.js';
+import { createTaskRunner } from '../../src/postgres/tasks.js';
 
 describe('postgres tasks (enqueue / await / dispatch)', () => {
 	let client;

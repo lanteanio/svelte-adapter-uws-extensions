@@ -9,9 +9,9 @@
  * real redis.eval agree on identical inputs.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { setRuntimeEnv, resetRuntimeEnv } from '../../shared/runtime.js';
-import { mockRedisClient } from '../../testing/mock-redis.js';
-import { CONSUME_SCRIPT } from '../../redis/token-bucket-script.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { mockRedisClient } from '../../src/testing/mock-redis.js';
+import { CONSUME_SCRIPT } from '../../src/redis/token-bucket-script.js';
 
 // A fixed virtual epoch; round so seconds * 1000 reconstructs it exactly.
 const FIXED_MS = 1_700_000_000_000;

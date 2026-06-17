@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createConsistencyAuditor } from '../../shared/auditor.js';
+import { createConsistencyAuditor } from '../../src/shared/auditor.js';
 
 function constantSnapshot(snap) {
 	return () => ({ ...snap, total: (snap.connections || []).length });

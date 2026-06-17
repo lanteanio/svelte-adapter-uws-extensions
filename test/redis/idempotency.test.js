@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createIdempotencyStore } from '../../redis/idempotency.js';
+import { createIdempotencyStore } from '../../src/redis/idempotency.js';
 
 describe('redis idempotency', () => {
 	let client;

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../redis/replay.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 describe('redis replay', () => {
 	let client;
@@ -925,7 +925,7 @@ describe('redis replay', () => {
 		});
 
 		it('exposes Prometheus counters for replication outcomes', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const r = createReplay(client, {
 				durability: 'replicated',
@@ -985,7 +985,7 @@ describe('redis replay', () => {
 		});
 
 		it('counts the fallback in replay_storage_fallbacks_total but not replay_publishes_total', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const r = createReplay(client, { localFanoutOnStorageFailure: true, metrics });
 			const { restore } = failEval(client);

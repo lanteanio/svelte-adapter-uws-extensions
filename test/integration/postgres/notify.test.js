@@ -9,8 +9,8 @@
  * listener invocation; this file uses real Postgres delivery semantics.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createNotifyBridge } from '../../../postgres/notify.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createNotifyBridge } from '../../../src/postgres/notify.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 function wait(ms) {

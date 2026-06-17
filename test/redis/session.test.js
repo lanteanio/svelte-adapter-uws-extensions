@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createDistributedSession } from '../../redis/session.js';
-import { createMetrics } from '../../prometheus/index.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createDistributedSession } from '../../src/redis/session.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 describe('redis distributed session', () => {
 	let client;

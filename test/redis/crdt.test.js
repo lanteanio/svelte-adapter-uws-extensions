@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createCrdtCluster } from '../../redis/crdt.js';
+import { createCrdtCluster } from '../../src/redis/crdt.js';
 
 /** Let the deferred subscribe + publish + synchronous delivery settle. */
 const settle = async () => {

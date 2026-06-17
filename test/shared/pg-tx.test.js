@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { withTransaction } from '../../shared/pg-tx.js';
+import { withTransaction } from '../../src/shared/pg-tx.js';
 
 function makeMockClient() {
 	const queries = [];

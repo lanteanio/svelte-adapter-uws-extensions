@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mockPgClient } from '../../testing/mock-pg.js';
-import { createIdempotencyStore } from '../../postgres/idempotency.js';
-import { setRuntimeEnv, resetRuntimeEnv } from '../../shared/runtime.js';
+import { mockPgClient } from '../../src/testing/mock-pg.js';
+import { createIdempotencyStore } from '../../src/postgres/idempotency.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 // Install a virtual clock the test fully controls. The double reads the wall
 // epoch through the runtime seam, so overriding `wallEpoch` drives every TTL

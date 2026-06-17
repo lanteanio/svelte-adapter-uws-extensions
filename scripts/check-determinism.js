@@ -11,9 +11,9 @@
  * Modes:
  *   - default: WARN. Prints a per-file summary of raw call sites and exits 0, so
  *     the guard can land before every call site is routed through the module.
- *   - a file listed in ENFORCED must be clean: a raw call in it FAILS (exit 1).
- *     ENFORCED grows as each area is migrated, turning the warning into a
- *     ratchet that cannot regress.
+ *   - any file under src/ must be clean: a raw call in it FAILS (exit 1). The
+ *     ratchet is a subtree prefix (ENFORCE_EXCEPT carves out dev-only doubles),
+ *     so a relocated or new module under src/ is enforced automatically.
  *   - `--strict`: treat every finding as an error (the end state, once the whole
  *     surface is migrated).
  *   - `--verbose`: list every finding, not just per-file counts.
@@ -48,54 +48,21 @@ const verbose = process.argv.includes('--verbose');
 // vs shared/) does not matter.
 const ALLOW_FILES = new Set(['runtime.js']);
 
-// Files already routed through the runtime module that MUST stay clean. A raw
-// primitive reappearing in one of these fails the build. Populated per area as
-// call sites are migrated.
-const ENFORCED = new Set([
-	// Cluster runtime source routed through the runtime module. Forward-slash
-	// paths so the set reads the same on Windows and POSIX. The seam-clean test
-	// doubles (testing/mock-redis.js, testing/mock-pg.js) are enforced too;
-	// testing/mock-platform.js stays in warn until its raw reads are routed.
-	'shared/breaker.js',
-	'shared/platform-fallback.js',
-	'shared/assert.js',
-	'shared/invariants.js',
-	'shared/auditor.js',
-	'capability-cookie.js',
-	'redis/cursor.js',
-	'redis/clock-skew.js',
-	'redis/presence.js',
-	'redis/groups.js',
-	'redis/publish-rate.js',
-	'redis/pubsub.js',
-	'redis/sharded-pubsub.js',
-	'redis/registry.js',
-	'redis/upgrade-bucket.js',
-	'redis/lock.js',
-	'redis/leader.js',
-	'redis/replay.js',
-	'redis/replay-stream.js',
-	'redis/fence.js',
-	'redis/functions.js',
-	'redis/idempotency.js',
-	'redis/ratelimit.js',
-	'redis/session.js',
-	'redis/index.js',
-	'redis/token-bucket-script.js',
-	'postgres/tasks.js',
-	'postgres/replay.js',
-	'postgres/notify.js',
-	'postgres/idempotency.js',
-	'postgres/jobs.js',
-	'postgres/_tasks-worker-pool.js',
-	'postgres/_tasks-sql.js',
-	'postgres/_tasks-errors.js',
-	'postgres/_worker-harness.js',
-	'postgres/index.js',
-	'testing/mock-redis.js',
-	'testing/mock-pg.js',
-	'sim.js'
+// Enforcement is a subtree prefix: every framework source file under src/ must
+// stay clean (the runtime module in ALLOW_FILES is exempt by basename, and any
+// dev-only test double in ENFORCE_EXCEPT is too). The ratchet is structural - a
+// relocated or newly added module under src/ is enforced automatically, with no
+// per-file list to maintain.
+const ENFORCE_EXCEPT = new Set([
+	// The unit-test platform double seeds ids/timestamps for fixtures; it is a
+	// testing helper, never replayed by the deterministic harness, so its raw
+	// reads are legitimate. The other testing doubles route through the seam.
+	'src/testing/mock-platform.js'
 ]);
+
+function isEnforced(rel) {
+	return rel.startsWith('src/') && !ENFORCE_EXCEPT.has(rel);
+}
 
 // Path segments that are never framework runtime source.
 const SKIP_SEGMENTS = new Set([
@@ -145,7 +112,10 @@ function walk(dir, out) {
 			if (SKIP_SEGMENTS.has(entry)) continue;
 			walk(abs, out);
 		} else if ((abs.endsWith('.js') || abs.endsWith('.mjs')) && !shouldSkipPath(rel)) {
-			out.push(rel);
+			// Normalize to forward slashes so the src/ prefix rule (and the printed
+			// report) read the same on Windows and POSIX; a raw backslash path would
+			// silently skip enforcement on Windows.
+			out.push(rel.split('\\').join('/'));
 		}
 	}
 }
@@ -213,7 +183,7 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 console.log(`check-determinism: ${pkg.name}@${pkg.version}`);
 console.log(`  ${files.length} framework source file(s) scanned, ${all.length} raw native-primitive call site(s) found.`);
 
-const errors = all.filter((f) => strict || ENFORCED.has(f.rel));
+const errors = all.filter((f) => strict || isEnforced(f.rel));
 const warnings = all.filter((f) => !errors.includes(f));
 
 // Per-file summary so pretest output stays bounded; --verbose lists each site.

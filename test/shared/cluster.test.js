@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { keySlot, isCluster, execMultiSlot } from '../../shared/cluster.js';
+import { keySlot, isCluster, execMultiSlot } from '../../src/shared/cluster.js';
 
 describe('keySlot', () => {
 	it('matches the CRC-16/XMODEM conformance vector Redis uses', () => {

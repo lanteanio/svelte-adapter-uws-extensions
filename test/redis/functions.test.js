@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createFunctionLibrary } from '../../redis/functions.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createFunctionLibrary } from '../../src/redis/functions.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const SAMPLE_LIB = `#!lua name=ws-presence
 redis.register_function('cleanup', function(keys, args) return 0 end)
@@ -208,7 +208,7 @@ describe('redis function library', () => {
 
 	describe('metrics', () => {
 		it('counts loads, calls, and errors', async () => {
-			const { createMetrics } = await import('../../prometheus/index.js');
+			const { createMetrics } = await import('../../src/prometheus/index.js');
 			const metrics = createMetrics();
 			const lib = createFunctionLibrary(client, SAMPLE_LIB, { metrics });
 

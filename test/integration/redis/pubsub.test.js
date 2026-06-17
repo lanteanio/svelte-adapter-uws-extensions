@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
-import { createPubSubBus } from '../../../redis/pubsub.js';
+import { createPubSubBus } from '../../../src/redis/pubsub.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 function wait(ms) {

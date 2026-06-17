@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
-import { createGroup } from '../../../redis/groups.js';
+import { createGroup } from '../../../src/redis/groups.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 

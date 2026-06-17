@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
-import { createIdempotencyStore } from '../../postgres/idempotency.js';
+import { createIdempotencyStore } from '../../src/postgres/idempotency.js';
 
 describe('postgres idempotency', () => {
 	let client;

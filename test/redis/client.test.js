@@ -13,7 +13,7 @@ vi.mock('ioredis', () => {
 	return { default: MockRedis };
 });
 
-const { createRedisClient } = await import('../../redis/index.js');
+const { createRedisClient } = await import('../../src/redis/index.js');
 
 describe('createRedisClient', () => {
 	it('returns a client with the expected API', () => {

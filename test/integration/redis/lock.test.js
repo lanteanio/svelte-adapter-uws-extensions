@@ -16,7 +16,7 @@ import {
 	createDistributedLock,
 	LockAcquireTimeoutError,
 	LockLostError
-} from '../../../redis/lock.js';
+} from '../../../src/redis/lock.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));

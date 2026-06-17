@@ -10,8 +10,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { clusterClient } from '../helpers/cluster-client.js';
-import { createShardedBus } from '../../../redis/sharded-pubsub.js';
-import { keySlot } from '../../../shared/cluster.js';
+import { createShardedBus } from '../../../src/redis/sharded-pubsub.js';
+import { keySlot } from '../../../src/shared/cluster.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));

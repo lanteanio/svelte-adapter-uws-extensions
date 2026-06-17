@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scanAndUnlink } from '../../shared/redis-scan.js';
+import { scanAndUnlink } from '../../src/shared/redis-scan.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 
 describe('scanAndUnlink', () => {

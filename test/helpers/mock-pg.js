@@ -1,1 +1,1 @@
-export { mockPgClient } from '../../testing/mock-pg.js';
+export { mockPgClient } from '../../src/testing/mock-pg.js';

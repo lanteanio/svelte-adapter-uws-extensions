@@ -15,8 +15,8 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { createPgClient } from '../../../postgres/index.js';
-import { createTaskRunner } from '../../../postgres/tasks.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createTaskRunner } from '../../../src/postgres/tasks.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));

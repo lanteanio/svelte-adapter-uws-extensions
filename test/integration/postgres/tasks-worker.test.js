@@ -11,8 +11,8 @@
  * covers the joint behavior with real DB transitions.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createTaskRunner } from '../../../postgres/tasks.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createTaskRunner } from '../../../src/postgres/tasks.js';
 
 const echoUrl = new URL('../../helpers/workers/echo.js', import.meta.url);
 const slowUrl = new URL('../../helpers/workers/slow.js', import.meta.url);

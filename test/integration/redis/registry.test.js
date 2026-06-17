@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createConnectionRegistry } from '../../../redis/registry.js';
+import { createConnectionRegistry } from '../../../src/redis/registry.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
@@ -402,7 +402,7 @@ describe('redis connection registry (integration)', () => {
 			// presence:* and presence:events:*. Pin that the two namespaces
 			// do not conflict by running both end-to-end over the same
 			// client and verifying both deliver as expected.
-			const { createPresence } = await import('../../../redis/presence.js');
+			const { createPresence } = await import('../../../src/redis/presence.js');
 
 			const platformA = mockPlatform();
 			const platformB = mockPlatform();

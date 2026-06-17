@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
-import { createCrdtCluster } from '../../../redis/crdt.js';
+import { createCrdtCluster } from '../../../src/redis/crdt.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));

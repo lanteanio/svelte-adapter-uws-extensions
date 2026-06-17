@@ -5,7 +5,7 @@ import {
 	checkTopicsHaveSubscribers,
 	runInvariants,
 	defaultInvariants
-} from '../../shared/invariants.js';
+} from '../../src/shared/invariants.js';
 
 describe('checkSubscriptionBookkeeping', () => {
 	it('returns null when every connection agrees', () => {

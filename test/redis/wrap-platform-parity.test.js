@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { mockPlatform, PLATFORM_KEYS } from '../../testing/mock-platform.js';
-import { createPubSubBus } from '../../redis/pubsub.js';
-import { createShardedBus } from '../../redis/sharded-pubsub.js';
+import { mockPlatform, PLATFORM_KEYS } from '../../src/testing/mock-platform.js';
+import { createPubSubBus } from '../../src/redis/pubsub.js';
+import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
 
 /**
  * Parity contract: every member listed in `PLATFORM_KEYS` (the canonical

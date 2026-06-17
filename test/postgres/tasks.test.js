@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
-import { createTaskRunner, TaskInFlightError, UnknownTaskError } from '../../postgres/tasks.js';
-import { createIdempotencyStore } from '../../postgres/idempotency.js';
+import { createTaskRunner, TaskInFlightError, UnknownTaskError } from '../../src/postgres/tasks.js';
+import { createIdempotencyStore } from '../../src/postgres/idempotency.js';
 
 describe('postgres tasks', () => {
 	let client;

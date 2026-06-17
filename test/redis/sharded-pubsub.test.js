@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createShardedBus } from '../../redis/sharded-pubsub.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 describe('redis sharded bus', () => {
 	let client;

@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend, countBackendKeys } from '../helpers/backend.js';
-import { createCursor } from '../../../redis/cursor.js';
+import { createCursor } from '../../../src/redis/cursor.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { walkPlatform } from '../../helpers/walk-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';

@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
-import { createReplay } from '../../../redis/replay.js';
+import { createReplay } from '../../../src/redis/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
 // Runs against both standalone and cluster backends. The seq and buf keys

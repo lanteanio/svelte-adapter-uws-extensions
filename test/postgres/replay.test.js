@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../postgres/replay.js';
+import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../src/postgres/replay.js';
 
 describe('postgres replay', () => {
 	let client;

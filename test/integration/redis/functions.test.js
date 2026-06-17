@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
-import { createFunctionLibrary } from '../../../redis/functions.js';
+import { createFunctionLibrary } from '../../../src/redis/functions.js';
 
 const LIB_NAME = 'inttest_fnlib';
 

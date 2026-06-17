@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
 import {
 	createUpgradeBucket,
 	createLocalUpgradeBucket
-} from '../../redis/upgrade-bucket.js';
+} from '../../src/redis/upgrade-bucket.js';
 
 describe('redis upgrade-bucket', () => {
 	let client;

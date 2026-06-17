@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { capabilityCookie } from '../capability-cookie.js';
+import { capabilityCookie } from '../src/capability-cookie.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
 
 const COOKIE_NAME = 'sauws_cap';

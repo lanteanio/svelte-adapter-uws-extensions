@@ -4,9 +4,9 @@ import {
 	createDistributedLock,
 	LockAcquireTimeoutError,
 	LockLostError
-} from '../../redis/lock.js';
-import { createMetrics } from '../../prometheus/index.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+} from '../../src/redis/lock.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

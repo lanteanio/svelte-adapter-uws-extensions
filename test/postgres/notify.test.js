@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createNotifyBridge } from '../../postgres/notify.js';
-import { createCircuitBreaker } from '../../shared/breaker.js';
+import { createNotifyBridge } from '../../src/postgres/notify.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 /**
  * Cluster-scoped mock that simulates Postgres advisory-lock state across

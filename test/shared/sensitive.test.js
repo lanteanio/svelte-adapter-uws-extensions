@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { redactConnectionUrl, stripInternal } from '../../shared/sensitive.js';
+import { redactConnectionUrl, stripInternal } from '../../src/shared/sensitive.js';
 
 describe('shared/sensitive: redactConnectionUrl', () => {
 	it('replaces the password segment with *** for redis URLs', () => {

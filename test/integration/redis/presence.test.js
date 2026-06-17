@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createPresence } from '../../../redis/presence.js';
+import { createPresence } from '../../../src/redis/presence.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 

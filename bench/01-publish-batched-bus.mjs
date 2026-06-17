@@ -22,9 +22,9 @@
  */
 
 import { performance } from 'node:perf_hooks';
-import { createRedisClient } from '../redis/index.js';
-import { createPubSubBus } from '../redis/pubsub.js';
-import { mockPlatform } from '../testing/mock-platform.js';
+import { createRedisClient } from '../src/redis/index.js';
+import { createPubSubBus } from '../src/redis/pubsub.js';
+import { mockPlatform } from '../src/testing/mock-platform.js';
 
 const URL = process.env.BENCH_REDIS_URL || process.env.INTEGRATION_REDIS_URL || 'redis://localhost:56379';
 const ITERATIONS = parseInt(process.env.BENCH_ITERATIONS || '500', 10);

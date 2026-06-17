@@ -14,8 +14,8 @@
  *     UPDATE used by inline handlers
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createTaskRunner } from '../../../postgres/tasks.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createTaskRunner } from '../../../src/postgres/tasks.js';
 import { waitPgMs } from '../helpers/backend-clock.js';
 
 const echoUrl = new URL('../../helpers/workers/echo.js', import.meta.url);

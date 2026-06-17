@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runRedisSim, replayRedisSim } from '../../sim.js';
+import { runRedisSim, replayRedisSim } from '../../src/sim.js';
 
 // Decoded data frames a client received for a topic+event.
 const ticksOn = (result, instance, topic = 'room', event = 'tick') =>

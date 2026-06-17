@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { clusterClient } from '../helpers/cluster-client.js';
-import { scanAndUnlink } from '../../../shared/redis-scan.js';
+import { scanAndUnlink } from '../../../src/shared/redis-scan.js';
 
 describe('scanAndUnlink (cluster)', () => {
 	/** @type {import('ioredis').Cluster} */

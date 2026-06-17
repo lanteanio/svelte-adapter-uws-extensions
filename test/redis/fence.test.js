@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { createRedisFence } from '../../redis/fence.js';
+import { createRedisFence } from '../../src/redis/fence.js';
 
 describe('redis fence', () => {
 	let client;

@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createIdempotencyStore } from '../../../redis/idempotency.js';
+import { createIdempotencyStore } from '../../../src/redis/idempotency.js';
 
 describe('redis idempotency (integration)', () => {
 	let client;

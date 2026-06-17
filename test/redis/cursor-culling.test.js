@@ -3,7 +3,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { walkPlatform } from '../helpers/walk-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { createCursor as createCursorRaw } from '../../redis/cursor.js';
+import { createCursor as createCursorRaw } from '../../src/redis/cursor.js';
 
 // Full topic the cursor plugin scopes every wire frame to.
 const CURSOR = '__cursor:board';

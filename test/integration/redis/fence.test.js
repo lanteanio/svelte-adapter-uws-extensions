@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createRedisFence } from '../../../redis/fence.js';
+import { createRedisFence } from '../../../src/redis/fence.js';
 
 describe('redis fence (integration)', () => {
 	let client;

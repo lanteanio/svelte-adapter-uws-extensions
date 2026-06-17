@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createCircuitBreaker, CircuitBrokenError } from '../../shared/breaker.js';
+import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
-import { createPubSubBus } from '../../redis/pubsub.js';
-import { createPresence } from '../../redis/presence.js';
-import { createReplay, ReplayStorageError } from '../../redis/replay.js';
-import { createRateLimit } from '../../redis/ratelimit.js';
-import { createGroup } from '../../redis/groups.js';
-import { createCursor } from '../../redis/cursor.js';
+import { createPubSubBus } from '../../src/redis/pubsub.js';
+import { createPresence } from '../../src/redis/presence.js';
+import { createReplay, ReplayStorageError } from '../../src/redis/replay.js';
+import { createRateLimit } from '../../src/redis/ratelimit.js';
+import { createGroup } from '../../src/redis/groups.js';
+import { createCursor } from '../../src/redis/cursor.js';
 
 function mockWs(userData = {}) {
 	const subscriptions = new Set();
@@ -550,7 +550,7 @@ describe('circuit breaker', () => {
 				async end() {}
 			};
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });
-			const { createReplay: createPgReplay } = await import('../../postgres/replay.js');
+			const { createReplay: createPgReplay } = await import('../../src/postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
 
 			breaker.failure();
@@ -578,7 +578,7 @@ describe('circuit breaker', () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			breaker.failure();
 
-			const { createReplay: createPgReplay, ReplayStorageError: PgReplayStorageError } = await import('../../postgres/replay.js');
+			const { createReplay: createPgReplay, ReplayStorageError: PgReplayStorageError } = await import('../../src/postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
 
 			const err = await replay.publish(platform, 'chat', 'msg', {}).catch((e) => e);
@@ -635,7 +635,7 @@ describe('circuit breaker', () => {
 		});
 
 		it('pubsub: relay metrics only count on successful publish', async () => {
-			const metrics = (await import('../../prometheus/index.js')).createMetrics();
+			const metrics = (await import('../../src/prometheus/index.js')).createMetrics();
 			const failClient = mockRedisClient();
 			failClient.redis.publish = async () => { throw new Error('publish failed'); };
 
@@ -661,7 +661,7 @@ describe('circuit breaker', () => {
 				async end() {}
 			};
 			const breaker = createCircuitBreaker({ failureThreshold: 5 });
-			const { createReplay: createPgReplay } = await import('../../postgres/replay.js');
+			const { createReplay: createPgReplay } = await import('../../src/postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
 
 			await expect(replay.publish(platform, 'chat', 'msg', {})).rejects.toThrow('DDL failed');

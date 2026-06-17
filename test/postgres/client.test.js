@@ -10,7 +10,7 @@ vi.mock('pg', () => {
 	return { default: { Pool: MockPool } };
 });
 
-const { createPgClient } = await import('../../postgres/index.js');
+const { createPgClient } = await import('../../src/postgres/index.js');
 
 describe('createPgClient', () => {
 	it('returns a client with the expected API', () => {

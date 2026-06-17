@@ -10,8 +10,8 @@
  * all line up with the SQL the module ships.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createPgClient } from '../../../postgres/index.js';
-import { createIdempotencyStore } from '../../../postgres/idempotency.js';
+import { createPgClient } from '../../../src/postgres/index.js';
+import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 import { waitPgMs } from '../helpers/backend-clock.js';
 
 function wait(ms) {

@@ -1,1 +1,1 @@
-export { mockPlatform } from '../../testing/mock-platform.js';
+export { mockPlatform } from '../../src/testing/mock-platform.js';

@@ -8,8 +8,8 @@ import {
 	getAssertionCounters,
 	wireAssertionMetrics,
 	_resetCountersForTesting
-} from '../../shared/assert.js';
-import { createMetrics } from '../../prometheus/index.js';
+} from '../../src/shared/assert.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 describe('shared/assert', () => {
 	beforeEach(() => {
