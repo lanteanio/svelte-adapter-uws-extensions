@@ -82,3 +82,42 @@ describe('runPgSim - advisory-lock leader election (cross-instance contention)',
 		expect(b.count).toBe(1);
 	});
 });
+
+describe('runPgSim - cross-instance convergence invariant', () => {
+	it('a clean multi-instance run converges (no divergence reported)', async () => {
+		const r = await runPgSim({ instances: 4, clients: 2, topics: ['room'], seed: 'pg-converge-clean' });
+		// Every instance LISTENing on the shared channel fanned out the same notify run,
+		// so the per-instance delivered-seq projections agree and the check is silent.
+		expect(r.invariantViolations).toEqual([]);
+		expect((await replayPgSim(r)).reproduced).toBe(true);
+	});
+
+	it('detects and reproduces a real divergence when a partial NOTIFY drop shorts one instance', async () => {
+		const r = await runPgSim({ instances: 4, clients: 1, topics: ['room'], seed: 'pgcv4', relayFaults: { drop: 0.4, maxJitterMs: 20 } });
+		const divs = r.invariantViolations.filter((v) => v.category === 'cluster.state-divergence');
+		expect(divs).toHaveLength(1);
+		expect(divs[0].context.topics).toEqual(['room']);
+		expect(divs[0].context.instances).toEqual([2]);
+		expect(divs[0].context.expectedHash).not.toBe(divs[0].context.divergentHash);
+		const replay = await replayPgSim(r);
+		expect(replay.reproduced).toBe(true);
+		expect(replay.invariantViolations).toEqual(r.invariantViolations);
+	});
+
+	it('a clean pg replay run never reports a replay seq-regression', async () => {
+		async function replayScenario(api) {
+			for (let n = 0; n < 5; n++) await api.instance(0).replay.publish(api.instance(0).platform, 'room', 'tick', { n });
+			await api.advance();
+			const epoch = await api.instance(1).replay.currentEpoch('room');
+			const late = api.instance(1).connect();
+			await api.advance();
+			late.subscribe('room');
+			await api.advance();
+			late.send({ type: 'resume', sessionId: 's1', lastSeenSeqs: { room: 0 }, lastSeenEpochs: { room: epoch } });
+			await api.advance();
+		}
+		const r = await runPgSim({ instances: 2, clients: 0, topics: ['room'], plugins: ['replay'], seed: 'pg-seq-clean', scenario: replayScenario });
+		expect(r.invariantViolations.filter((v) => v.category === 'redis.replay.seq-regression')).toEqual([]);
+		expect((await replayPgSim(r)).reproduced).toBe(true);
+	});
+});

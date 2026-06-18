@@ -3,6 +3,9 @@ import {
 	checkSubscriptionBookkeeping,
 	checkTotalSubscriptions,
 	checkTopicsHaveSubscribers,
+	checkRedisReplaySeqRegression,
+	checkSharedStoreConvergence,
+	computeStateHash,
 	runInvariants,
 	defaultInvariants
 } from '../../src/shared/invariants.js';
@@ -94,5 +97,134 @@ describe('runInvariants / defaultInvariants', () => {
 			checkTotalSubscriptions,
 			checkTopicsHaveSubscribers
 		]);
+	});
+});
+
+describe('checkRedisReplaySeqRegression', () => {
+	it('returns null when every delivered seq is at or below the ring head', () => {
+		const snap = { replaySeqs: [
+			{ topic: 'a', deliveredSeq: 3, ringHeadSeq: 3 },
+			{ topic: 'b', deliveredSeq: 1, ringHeadSeq: 5 }
+		] };
+		expect(checkRedisReplaySeqRegression(snap)).toBeNull();
+	});
+
+	it('treats a never-delivered (0) seq as in range', () => {
+		expect(checkRedisReplaySeqRegression({ replaySeqs: [{ topic: 'a', deliveredSeq: 0, ringHeadSeq: 0 }] })).toBeNull();
+	});
+
+	it('flags the first topic whose delivered seq runs ahead of the ring head', () => {
+		const snap = { replaySeqs: [
+			{ topic: 'a', deliveredSeq: 2, ringHeadSeq: 2 },
+			{ topic: 'b', deliveredSeq: 9, ringHeadSeq: 4 }
+		] };
+		expect(checkRedisReplaySeqRegression(snap)).toEqual({
+			category: 'redis.replay.seq-regression',
+			context: { topic: 'b', deliveredSeq: 9, ringHeadSeq: 4 }
+		});
+	});
+
+	it('is a no-op on a snapshot without the replaySeqs rows', () => {
+		expect(checkRedisReplaySeqRegression({})).toBeNull();
+		expect(checkRedisReplaySeqRegression({ replaySeqs: null })).toBeNull();
+	});
+});
+
+describe('computeStateHash', () => {
+	it('is a stable golden value for a fixed projection', () => {
+		// Locked vectors so a change to the fold (which would silently desync the
+		// cross-instance convergence comparison) fails loudly. The algorithm mirrors
+		// the adapter's internal computeStateHash bit-for-bit.
+		expect(computeStateHash({ topicSeqs: { room: 2 } })).toBe(2866720852);
+		expect(computeStateHash({ topicSeqs: { room: 3 } })).toBe(2883498471);
+		expect(computeStateHash({ topicSeqs: {} })).toBe(4103227121);
+	});
+
+	it('treats a missing projection the same as an empty one', () => {
+		expect(computeStateHash(undefined)).toBe(computeStateHash({ topicSeqs: {} }));
+		expect(computeStateHash({})).toBe(computeStateHash({ topicSeqs: {} }));
+	});
+
+	it('is order-independent over the topic entries', () => {
+		expect(computeStateHash({ topicSeqs: { a: 1, room: 2 } }))
+			.toBe(computeStateHash({ topicSeqs: { room: 2, a: 1 } }));
+	});
+
+	it('moves when any seq moves', () => {
+		expect(computeStateHash({ topicSeqs: { room: 2 } }))
+			.not.toBe(computeStateHash({ topicSeqs: { room: 3 } }));
+	});
+
+	it('distinguishes an extra zero-seq topic from its absence (count-seeded)', () => {
+		expect(computeStateHash({ topicSeqs: { room: 2 } }))
+			.not.toBe(computeStateHash({ topicSeqs: { room: 2, ghost: 0 } }));
+	});
+
+	it('returns an unsigned 32-bit integer', () => {
+		const h = computeStateHash({ topicSeqs: { x: 7, y: 9 } });
+		expect(Number.isInteger(h)).toBe(true);
+		expect(h).toBeGreaterThanOrEqual(0);
+		expect(h).toBeLessThanOrEqual(0xffffffff);
+	});
+});
+
+describe('checkSharedStoreConvergence', () => {
+	it('returns null when every participating instance delivered the same per-topic run', () => {
+		const instances = [
+			{ id: 0, topicSeqs: { room: 2 } },
+			{ id: 1, topicSeqs: { room: 2 } },
+			{ id: 2, topicSeqs: { room: 2 } }
+		];
+		expect(checkSharedStoreConvergence(instances)).toBeNull();
+	});
+
+	it('ignores an instance with no delivered run (a total-drop or publisher-only instance)', () => {
+		// Instance 1 delivered nothing for the topic, so it never participates and is
+		// not a divergence against the instances that did.
+		const instances = [
+			{ id: 0, topicSeqs: { room: 2 } },
+			{ id: 1, topicSeqs: {} }
+		];
+		expect(checkSharedStoreConvergence(instances)).toBeNull();
+	});
+
+	it('only compares instances that share the exact topic set', () => {
+		// Different topic sets bucket apart, so they are never compared - a publisher
+		// of one topic does not diverge against a subscriber of another.
+		const instances = [
+			{ id: 0, topicSeqs: { a: 1 } },
+			{ id: 1, topicSeqs: { b: 1 } }
+		];
+		expect(checkSharedStoreConvergence(instances)).toBeNull();
+	});
+
+	it('reports the minority instance when one trailed the shared run', () => {
+		const instances = [
+			{ id: 0, topicSeqs: { room: 2 } },
+			{ id: 1, topicSeqs: { room: 2 } },
+			{ id: 2, topicSeqs: { room: 1 } }
+		];
+		const v = checkSharedStoreConvergence(instances);
+		expect(v.category).toBe('cluster.state-divergence');
+		expect(v.context.topics).toEqual(['room']);
+		expect(v.context.instances).toEqual([2]);
+		expect(v.context.expectedHash).toBe(computeStateHash({ topicSeqs: { room: 2 } }));
+		expect(v.context.divergentHash).toBe(computeStateHash({ topicSeqs: { room: 1 } }));
+	});
+
+	it('picks a deterministic offender on an even split (largest-id group last)', () => {
+		const instances = [
+			{ id: 0, topicSeqs: { room: 2 } },
+			{ id: 5, topicSeqs: { room: 1 } }
+		];
+		const v = checkSharedStoreConvergence(instances);
+		expect(v.category).toBe('cluster.state-divergence');
+		// On a size tie the group holding the largest id sorts last and is reported.
+		expect(v.context.instances).toEqual([5]);
+	});
+
+	it('is a no-op on an empty instance list', () => {
+		expect(checkSharedStoreConvergence([])).toBeNull();
+		expect(checkSharedStoreConvergence(undefined)).toBeNull();
 	});
 });

@@ -138,3 +138,192 @@ export function runInvariants(snap, predicates = defaultInvariants) {
 	}
 	return out;
 }
+
+// - Redis-backed self-consistency predicates ---------------------------------
+
+/**
+ * Replay seq-ordering invariant: an instance must never have delivered a topic
+ * seq past the highest seq the shared ring has actually published. The resume
+ * path serves a client every entry above its lastSeenSeq, so a delivered seq
+ * that runs ahead of the ring head means the instance projected a position the
+ * durable store cannot back - it would skip the ring's real tail on the next
+ * resume. The shape is `{ topic, deliveredSeq, ringHeadSeq }` per topic the
+ * instance observed; a `deliveredSeq` of 0 (never delivered) is always in range.
+ *
+ * The snapshot is built per instance from its OWN delivered frames (the max seq
+ * its clients received on each replay channel) and the SHARED ring head read
+ * from the store, so the comparison crosses the local view against the shared
+ * authority - it is not a same-source tautology.
+ *
+ * @param {{ replaySeqs?: Array<{ topic: string, deliveredSeq: number, ringHeadSeq: number }> }} snap
+ * @returns {Violation}
+ */
+export function checkRedisReplaySeqRegression(snap) {
+	const rows = snap && snap.replaySeqs;
+	if (!Array.isArray(rows)) return null;
+	for (const row of rows) {
+		if (!row) continue;
+		const delivered = row.deliveredSeq;
+		const head = row.ringHeadSeq;
+		if (typeof delivered !== 'number' || typeof head !== 'number') continue;
+		if (delivered > head) {
+			return {
+				category: 'redis.replay.seq-regression',
+				context: { topic: row.topic, deliveredSeq: delivered, ringHeadSeq: head }
+			};
+		}
+	}
+	return null;
+}
+
+// - Structural state hash ----------------------------------------------------
+
+// FNV-1a 32-bit string fold. Module-private and deliberately self-contained (the
+// few lines are trivial) so this file keeps its dependency-free,
+// safe-to-import-anywhere posture. Fully deterministic - charCodeAt + Math.imul
+// over a fixed string, no clock/RNG/locale input.
+/** @param {number} h @param {string} str @returns {number} */
+function fnvStr(h, str) {
+	for (let i = 0; i < str.length; i++) {
+		h ^= str.charCodeAt(i);
+		h = Math.imul(h, 16777619);
+	}
+	return h >>> 0;
+}
+
+const FNV_OFFSET = 2166136261 >>> 0;
+
+/**
+ * Fold a structure-only state projection into a single unsigned 32-bit integer
+ * that is stable across runs and processes and order-independent over its input.
+ * The algorithm is identical to the adapter's `computeStateHash` so a projection
+ * built on either side hashes the same way; the canonical definition is
+ * triplicated here the way the predicates are, keeping this module dependency-free.
+ *
+ * INPUT CONTRACT: `{ topicSeqs }` where `topicSeqs` is a `Record<string, number>`
+ * mapping a topic string to the highest non-negative seq that topic was observed
+ * at. It is a PLAIN, already-extracted object; the caller does the extraction.
+ * Any other property on the input object is ignored, so two inputs that agree on
+ * `topicSeqs` hash identically regardless of what else they carry.
+ *
+ * PRIVACY (structure only): the returned value carries no recoverable
+ * identifiers. Topic strings are folded into the hash but never appear verbatim
+ * in the integer; nothing else is read. No payload bytes, no event names, no
+ * data values, no presence data, no connection/user keys contribute.
+ *
+ * ORDERING: insertion order must not change the result. Each `[topic, seq]` entry
+ * is reduced to a per-entry FNV digest folding the topic STRING and the integer
+ * seq (rendered with `String(seq)`, with a `:` separator so a topic/seq boundary
+ * cannot collide). The per-entry digests are combined with unsigned 32-bit
+ * modular addition, which is commutative and associative, so any iteration order
+ * yields the same accumulator. The accumulator starts from a count-seeded base so
+ * a state with the same digests but a different number of topics cannot collide.
+ *
+ * This is a structural divergence DETECTOR, not a cryptographic commitment: a
+ * 32-bit fold has a birthday bound, but a real divergence almost always moves a
+ * seq integer, which moves that entry's digest.
+ *
+ * @param {{ topicSeqs?: Record<string, number> }} projection
+ * @returns {number} unsigned 32-bit hash
+ */
+export function computeStateHash(projection) {
+	const topicSeqs = (projection && projection.topicSeqs) || {};
+	const topics = Object.keys(topicSeqs);
+	let acc = fnvStr(FNV_OFFSET, 't:' + topics.length);
+	for (const topic of topics) {
+		let e = fnvStr(FNV_OFFSET, topic);
+		e = fnvStr(e, ':' + String(topicSeqs[topic]));
+		acc = (acc + e) >>> 0;
+	}
+	return acc >>> 0;
+}
+
+/**
+ * Cross-instance shared-store convergence check. Every instance that subscribes
+ * to a topic backed by the shared store (the pub/sub relay, the durable replay
+ * ring, the LISTEN/NOTIFY bridge) should end with the SAME delivered-seq run for
+ * that topic, because the store is the single authority the relay replicates
+ * from. So a compact per-topic max-seq projection of two such instances should
+ * hash identically. An instance whose projection hash differs received a
+ * different seq run - its local index/cache drifted from the shared store, or
+ * the relay dropped, duplicated, or misordered one instance's stream below the
+ * others.
+ *
+ * It reads the seq each instance ACTUALLY DELIVERED to its own clients, not the
+ * shared store directly: reading the shared object from every instance would be
+ * a tautology (one object, trivially equal). Reading the independently-delivered
+ * per-instance streams is what makes the comparison meaningful - a relay that
+ * shorts one instance moves only that instance's projection.
+ *
+ * Each instance projects `topicSeqs[topic] = max(seq)` over its clients' delivered
+ * frames, grouped on the routing topic. Only instances with a non-empty projection
+ * participate, and they are bucketed by their exact topic set, so a publisher-only
+ * instance (or one a total drop fault shut out entirely) with no delivered run is
+ * never compared against subscribers - a legitimate per-instance difference, not a
+ * divergence.
+ *
+ * Within a bucket of instances sharing the same topic set the per-instance hashes
+ * are grouped by value; a bucket with more than one distinct hash is a divergence.
+ * The canonical group order puts the largest group first (the convergent majority)
+ * and, on a size tie, sorts the group holding the numerically-largest instance id
+ * last, so the reported offender (the last group) is deterministic. The violation
+ * context lists the bucket topic set verbatim for diagnosability - diagnostic data,
+ * not the privacy-bearing hash. Returns the first divergence or null.
+ *
+ * @param {Array<{ id: number, topicSeqs: Record<string, number> }>} instances
+ *   each instance's already-extracted per-topic delivered max-seq projection
+ * @returns {{ category: string, context: any } | null}
+ */
+export function checkSharedStoreConvergence(instances) {
+	/** @type {Array<{ id: number, topics: string[], hash: number }>} */
+	const projected = [];
+	for (const inst of instances || []) {
+		const topicSeqs = (inst && inst.topicSeqs) || {};
+		const topics = Object.keys(topicSeqs).sort();
+		if (topics.length === 0) continue; // no delivered run: this instance does not participate
+		const sorted = {};
+		for (const t of topics) sorted[t] = topicSeqs[t];
+		projected.push({ id: inst.id, topics, hash: computeStateHash({ topicSeqs: sorted }) });
+	}
+
+	// Bucket participating instances by their exact topic set, then look for a
+	// bucket carrying more than one distinct hash. The bucket key is the JSON of
+	// the sorted topic list (unambiguous - no delimiter a topic could contain),
+	// and the list is carried alongside so the violation context uses it directly.
+	/** @type {Map<string, { topics: string[], members: Array<{ id: number, hash: number }> }>} */
+	const buckets = new Map();
+	for (const p of projected) {
+		const key = JSON.stringify(p.topics);
+		let bucket = buckets.get(key);
+		if (!bucket) { bucket = { topics: p.topics, members: [] }; buckets.set(key, bucket); }
+		bucket.members.push({ id: p.id, hash: p.hash });
+	}
+	for (const { topics, members } of buckets.values()) {
+		/** @type {Map<number, number[]>} hash -> instance ids */
+		const byHash = new Map();
+		for (const m of members) {
+			let ids = byHash.get(m.hash);
+			if (!ids) { ids = []; byHash.set(m.hash, ids); }
+			ids.push(m.id);
+		}
+		if (byHash.size <= 1) continue; // converged within this bucket
+
+		const groups = [...byHash].map(([hash, ids]) => {
+			const sorted = ids.slice().sort((a, b) => a - b);
+			return { hash, ids: sorted, max: sorted[sorted.length - 1] };
+		});
+		groups.sort((a, b) => (b.ids.length - a.ids.length) || (a.max - b.max));
+		const majority = groups[0];
+		const minority = groups[groups.length - 1];
+		return {
+			category: 'cluster.state-divergence',
+			context: {
+				topics,
+				expectedHash: majority.hash,
+				divergentHash: minority.hash,
+				instances: minority.ids
+			}
+		};
+	}
+	return null;
+}

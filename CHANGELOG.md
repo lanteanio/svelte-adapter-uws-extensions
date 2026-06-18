@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The redis/postgres simulator (`svelte-adapter-uws-extensions/sim`) now runs structural invariants on every run and reports any violation in `result.invariantViolations`.** Previously both `runRedisSim` and `runPgSim` carried an empty invariant hook, so a seed could reproduce a multi-instance store-backed run without ever checking that the run was internally consistent. Three checks now run: a per-instance subscription-bookkeeping check after every scheduler step (each instance's fan-out subscription set must agree with its cap-counted set); a cross-instance convergence check at quiescence (every instance that subscribed to a shared-store-backed topic must have received the same delivered seq run for it, so their per-topic delivered-seq projections hash identically - a relay/notify drop, duplicate, reorder, or corrupt that shorts one instance moves only that instance's projection and is reported as `cluster.state-divergence`); and a replay seq-ordering check (no instance may have delivered a replay-ring seq past the shared ring head, `redis.replay.seq-regression`). The projections are structure-only (per-topic counts and seqs folded through an order-independent 32-bit hash; no payload bytes, event names, data values, or user keys). Because the existing `replayRedisSim` / `replayPgSim` self-gate already compares `invariantViolations` byte-for-byte, every new violation is automatically covered by the determinism gate: a clean run reports none and reproduces, and a fault-induced divergence reports the same violation on replay.
+
 ## [0.6.0-next.18] - 2026-06-13
 
 ### Added

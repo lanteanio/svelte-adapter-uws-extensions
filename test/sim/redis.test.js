@@ -129,7 +129,12 @@ describe('runRedisSim - convergence under faults', () => {
 
 	it('reproduces a run under relay corrupt faults (byte-flipped frames drop mode-invariantly)', async () => {
 		const r = await runRedisSim({ instances: 3, seed: 'corrupt-1', relayFaults: { corrupt: 0.6 } });
-		expect(r.invariantViolations).toEqual([]);
+		// A corrupt relay frame fails to decode on the receiving instance, so its
+		// per-topic delivered-seq run can legitimately trail the others - a real
+		// cross-instance divergence the convergence check reports. The per-instance
+		// bookkeeping invariants must still be clean.
+		const bookkeeping = r.invariantViolations.filter((v) => v.category !== 'cluster.state-divergence');
+		expect(bookkeeping).toEqual([]);
 		expect((await replayRedisSim(r)).reproduced).toBe(true);
 	});
 
@@ -138,5 +143,50 @@ describe('runRedisSim - convergence under faults', () => {
 			const r = await runRedisSim({ instances: 3, seed, relayFaults: { drop: 0.2, reorder: 0.5, maxJitterMs: 25 } });
 			expect((await replayRedisSim(r)).reproduced).toBe(true);
 		}
+	});
+});
+
+describe('runRedisSim - cross-instance convergence invariant', () => {
+	it('a clean multi-instance run converges (no divergence reported)', async () => {
+		const r = await runRedisSim({ instances: 4, clients: 2, topics: ['room'], seed: 'converge-clean' });
+		// Every instance subscribed to the same topic received the same delivered seq
+		// run from the shared relay, so the convergence check is silent.
+		expect(r.invariantViolations).toEqual([]);
+		// And a clean run is its own reproducer.
+		expect((await replayRedisSim(r)).reproduced).toBe(true);
+	});
+
+	it('detects and reproduces a real divergence when a partial drop shorts one instance', async () => {
+		const r = await runRedisSim({ instances: 4, clients: 1, topics: ['room'], seed: 'cv0', relayFaults: { drop: 0.4, maxJitterMs: 20 } });
+		const divs = r.invariantViolations.filter((v) => v.category === 'cluster.state-divergence');
+		// The drop shorts exactly one instance's delivered run for the shared topic.
+		expect(divs).toHaveLength(1);
+		expect(divs[0].context.topics).toEqual(['room']);
+		expect(divs[0].context.instances).toEqual([1]);
+		expect(divs[0].context.expectedHash).not.toBe(divs[0].context.divergentHash);
+		// The whole run - including the recorded divergence - reproduces bit-for-bit,
+		// so the self-gate covers the new violation automatically.
+		const replay = await replayRedisSim(r);
+		expect(replay.reproduced).toBe(true);
+		expect(replay.invariantViolations).toEqual(r.invariantViolations);
+	});
+
+	it('a clean replay run never reports a replay seq-regression', async () => {
+		// The resume scenario gap-fills instance B from the ring instance A wrote; the
+		// delivered replay seqs stay at or below the shared ring head on every instance.
+		async function replayScenario(api) {
+			for (let n = 0; n < 5; n++) api.instance(0).replay.publish(api.instance(0).platform, 'room', 'tick', { n });
+			await api.advance();
+			const epoch = await api.instance(1).replay.currentEpoch('room');
+			const late = api.instance(1).connect();
+			await api.advance();
+			late.subscribe('room');
+			await api.advance();
+			late.send({ type: 'resume', sessionId: 's1', lastSeenSeqs: { room: 0 }, lastSeenEpochs: { room: epoch } });
+			await api.advance();
+		}
+		const r = await runRedisSim({ instances: 2, clients: 0, topics: ['room'], plugins: ['replay'], seed: 'seq-clean', scenario: replayScenario });
+		expect(r.invariantViolations.filter((v) => v.category === 'redis.replay.seq-regression')).toEqual([]);
+		expect((await replayRedisSim(r)).reproduced).toBe(true);
 	});
 });

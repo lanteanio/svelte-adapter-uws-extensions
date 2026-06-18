@@ -24,6 +24,7 @@ import {
 } from 'svelte-adapter-uws/sim';
 import { createTestServer } from 'svelte-adapter-uws/testing';
 import { setRuntimeEnv as extSetRuntimeEnv, resetRuntimeEnv as extResetRuntimeEnv } from './shared/runtime.js';
+import { checkSubscriptionBookkeeping, checkRedisReplaySeqRegression, checkSharedStoreConvergence } from './shared/invariants.js';
 import { mockRedisClient } from './testing/mock-redis.js';
 import { mockPgClient } from './testing/mock-pg.js';
 import { createPubSubBus } from './redis/pubsub.js';
@@ -116,6 +117,123 @@ function buildRedisInstance(client, names, opts, userHandler) {
 		if (ph.message) handler.message = ph.message;
 	}
 	return { plugins, handler };
+}
+
+// The per-connection subscription registry slot the adapter dispatch stamps.
+// `Symbol.for` so this resolves the SAME registry across the bundled module
+// instances (the cross-package slot-key convention).
+const WS_SUBSCRIPTIONS = Symbol.for('adapter-uws.ws.subscriptions');
+
+/**
+ * Build the structure-only invariant snapshot for one instance from its live
+ * in-memory connections: per-connection subscribed set (the fan-out set) and
+ * cap-counted bookkeeping set, so `checkSubscriptionBookkeeping` reads them.
+ * Carries NO payload or user data. `bookkeeping` is null when the registry slot
+ * is not a Set, so the shape check fires identically to production.
+ * @param {any} server the createTestServer result
+ * @returns {{ connections: Array<{ id: unknown, subscribed: string[], bookkeeping: string[] | null }> }}
+ */
+function instanceInvariantSnapshot(server) {
+	const connections = [];
+	for (const ws of server.wsConnections) {
+		let subscribed = [];
+		try { subscribed = ws.getTopics(); } catch { subscribed = []; }
+		let bookkeeping = null;
+		try {
+			const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
+			if (subs instanceof Set) bookkeeping = [...subs];
+		} catch { bookkeeping = null; }
+		connections.push({ id: ws._simId, subscribed, bookkeeping });
+	}
+	return { connections };
+}
+
+/**
+ * Project one instance's delivered per-topic max seq from the decoded frames its
+ * clients received. The convergent observable is the monotonic the originator
+ * stamps into the envelope body: the pub/sub scenario stamps `data.n` and the
+ * replay scenario stamps `data.seq`, so the projection reads whichever numeric
+ * monotonic the body carries (seq preferred), grouped on the UNcorrupted routing
+ * topic (a corrupt fault mangles the body but never the routing key, so it cannot
+ * move the projection; a body that fails to decode or carries no numeric monotonic
+ * simply does not advance its topic's max). Structure only - the seq integer and
+ * the topic string, never the payload data.
+ *
+ * @param {Array<{ raw: Array<{ routingTopic?: string | null }>, decoded: any[] }>} clientFrames
+ * @returns {Record<string, number>} topic -> highest delivered monotonic
+ */
+function deliveredTopicSeqs(clientFrames) {
+	/** @type {Record<string, number>} */
+	const topicSeqs = {};
+	for (const c of clientFrames) {
+		const raw = c.raw || [];
+		const decoded = c.decoded || [];
+		for (let i = 0; i < raw.length; i++) {
+			const f = raw[i];
+			if (!f || f.routingTopic == null) continue; // only a topic publish carries a routing key
+			const body = decoded[i];
+			if (!body) continue;
+			const data = body.data;
+			let seq = null;
+			if (data && typeof data === 'object') {
+				if (typeof data.seq === 'number') seq = data.seq;
+				else if (typeof data.n === 'number') seq = data.n;
+			}
+			if (seq == null) continue;
+			const t = f.routingTopic;
+			if (!(t in topicSeqs) || seq > topicSeqs[t]) topicSeqs[t] = seq;
+		}
+	}
+	return topicSeqs;
+}
+
+/**
+ * Per-instance replay seq-ordering check. For each instance running the replay
+ * plugin, read the shared ring head per topic (through the live plugin, which
+ * queries the shared store) and the highest seq that instance actually delivered
+ * on each `__replay:{topic}` channel, then feed the pair to the seq-regression
+ * predicate. The delivered seq comes from the instance's OWN frames and the head
+ * from the SHARED store, so the comparison crosses the local view against the
+ * shared authority - never a same-source tautology. Records a violation through
+ * the supplied sink. No-op for an instance without a replay plugin.
+ *
+ * @param {Array<{ id: number, plugins: any }>} instancesArr
+ * @param {Array<{ instanceId: number, facade: any }>} allClients
+ * @param {(v: { category: string, context: any } | null) => void} record
+ */
+async function collectReplaySeqRegression(instancesArr, allClients, record) {
+	for (const inst of instancesArr) {
+		const replay = inst.plugins && inst.plugins.replay;
+		if (!replay || typeof replay.seq !== 'function') continue;
+
+		// Highest seq this instance delivered per replay topic, parsed from the
+		// `__replay:{topic}` 'msg' frames its clients received. Structure only -
+		// the seq integer and the derived topic, never the payload data.
+		/** @type {Map<string, number>} */
+		const deliveredByTopic = new Map();
+		for (const c of allClients) {
+			if (c.instanceId !== inst.id) continue;
+			for (const body of c.facade.json()) {
+				if (!body || body.event !== 'msg' || typeof body.topic !== 'string') continue;
+				if (!body.topic.startsWith('__replay:')) continue;
+				const data = body.data;
+				if (!data || typeof data.seq !== 'number') continue;
+				const topic = body.topic.slice('__replay:'.length);
+				const prev = deliveredByTopic.get(topic);
+				if (prev === undefined || data.seq > prev) deliveredByTopic.set(topic, data.seq);
+			}
+		}
+		if (deliveredByTopic.size === 0) continue;
+
+		const replaySeqs = [];
+		for (const [topic, deliveredSeq] of deliveredByTopic) {
+			const ringHeadSeq = await replay.seq(topic);
+			replaySeqs.push({ topic, deliveredSeq, ringHeadSeq });
+		}
+		// Sort for a deterministic, byte-stable evaluation order across runs.
+		replaySeqs.sort((a, b) => (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+		record(checkRedisReplaySeqRegression({ replaySeqs }));
+	}
 }
 
 /**
@@ -217,7 +335,22 @@ export async function runRedisSim(config = {}) {
 			instancesArr.push({ id: i, app, server, bus, wrapped, plugins, clients: [] });
 		}
 
-		function checkInvariants() { /* per-plugin invariants land here */ }
+		/** @type {Array<{ category: string, context: any }>} */
+		const violations = [];
+		const seen = new Set();
+		function recordViolation(v) {
+			if (!v) return;
+			const key = v.category + ':' + JSON.stringify(v.context);
+			if (!seen.has(key)) { seen.add(key); violations.push(v); }
+		}
+		// Per-step self-consistency: each instance's fan-out subscription set must
+		// agree with its cap-counted bookkeeping set. Run after every scheduler step
+		// so the earliest interleaving that breaks it is the one recorded.
+		function checkInvariants() {
+			for (const inst of instancesArr) {
+				recordViolation(checkSubscriptionBookkeeping(instanceInvariantSnapshot(inst.server)));
+			}
+		}
 
 		const api = {
 			now: () => scheduler.now(),
@@ -254,6 +387,28 @@ export async function runRedisSim(config = {}) {
 		const scenario = config.scenario || defaultRedisScenario;
 		await scenario(api, { instances, clients, topics });
 		totalSteps += await scheduler.run({ maxSteps, onStep: checkInvariants });
+		checkInvariants();
+
+		// Quiescent cross-instance convergence: every instance that subscribed to a
+		// topic backed by the shared store should have received the same delivered
+		// seq run for it, so their per-topic delivered-seq projections hash
+		// identically. A relay drop/dup/reorder that shorts one instance moves only
+		// that instance's projection - a real, seed-reproducible signal, not a
+		// tautology over the one shared store object.
+		const redisProjections = instancesArr.map((inst) => ({
+			id: inst.id,
+			topicSeqs: deliveredTopicSeqs(
+				allClients.filter((c) => c.instanceId === inst.id)
+					.map((c) => ({ raw: c.facade.frames(), decoded: c.facade.json() }))
+			)
+		}));
+		recordViolation(checkSharedStoreConvergence(redisProjections));
+
+		// Quiescent replay seq-ordering: no instance may have delivered a replay-ring
+		// seq past the shared ring head. Read the ring head per topic from the shared
+		// store (through the live plugin, before teardown) and compare against the max
+		// seq the instance delivered on each `__replay:{topic}` channel.
+		await collectReplaySeqRegression(instancesArr, allClients, recordViolation);
 
 		const clusterFrames = instancesArr.map((inst) => ({
 			instance: inst.id,
@@ -280,7 +435,7 @@ export async function runRedisSim(config = {}) {
 			},
 			steps: totalSteps,
 			virtualTimeMs: scheduler.now() - startEpoch,
-			invariantViolations: [],
+			invariantViolations: violations,
 			metrics: { instances, clients: allClients.length, framesDelivered: totalFrames },
 			clusterFrames,
 			finalState,
@@ -397,7 +552,22 @@ export async function runPgSim(config = {}) {
 			instancesArr.push({ id: i, app, server, bridge, platform, plugins, clients: [] });
 		}
 
-		function checkInvariants() { /* per-plugin invariants land here */ }
+		/** @type {Array<{ category: string, context: any }>} */
+		const violations = [];
+		const seen = new Set();
+		function recordViolation(v) {
+			if (!v) return;
+			const key = v.category + ':' + JSON.stringify(v.context);
+			if (!seen.has(key)) { seen.add(key); violations.push(v); }
+		}
+		// Per-step self-consistency: each instance's fan-out subscription set must
+		// agree with its cap-counted bookkeeping set. Run after every scheduler step
+		// so the earliest interleaving that breaks it is the one recorded.
+		function checkInvariants() {
+			for (const inst of instancesArr) {
+				recordViolation(checkSubscriptionBookkeeping(instanceInvariantSnapshot(inst.server)));
+			}
+		}
 
 		const api = {
 			now: () => scheduler.now(),
@@ -440,6 +610,27 @@ export async function runPgSim(config = {}) {
 		const scenario = config.scenario || defaultPgScenario;
 		await scenario(api, { instances, clients, topics });
 		totalSteps += await scheduler.run({ maxSteps, onStep: checkInvariants });
+		checkInvariants();
+
+		// Quiescent cross-instance convergence: every instance that subscribed to a
+		// topic fed by the shared LISTEN/NOTIFY bridge should have received the same
+		// delivered seq run for it, so their per-topic delivered-seq projections hash
+		// identically. A NOTIFY drop/dup/reorder that shorts one instance moves only
+		// that instance's projection - a real, seed-reproducible signal, not a
+		// tautology over the one shared store object.
+		const pgProjections = instancesArr.map((inst) => ({
+			id: inst.id,
+			topicSeqs: deliveredTopicSeqs(
+				allClients.filter((c) => c.instanceId === inst.id)
+					.map((c) => ({ raw: c.facade.frames(), decoded: c.facade.json() }))
+			)
+		}));
+		recordViolation(checkSharedStoreConvergence(pgProjections));
+
+		// Quiescent replay seq-ordering: no instance may have delivered a replay seq
+		// past the shared durable ring head (read through the live plugin before
+		// teardown), compared against the max seq delivered on `__replay:{topic}`.
+		await collectReplaySeqRegression(instancesArr, allClients, recordViolation);
 
 		const clusterFrames = instancesArr.map((inst) => ({
 			instance: inst.id,
@@ -465,7 +656,7 @@ export async function runPgSim(config = {}) {
 			},
 			steps: totalSteps,
 			virtualTimeMs: scheduler.now() - startEpoch,
-			invariantViolations: [],
+			invariantViolations: violations,
 			metrics: { instances, clients: allClients.length, framesDelivered: totalFrames },
 			clusterFrames,
 			finalState,
