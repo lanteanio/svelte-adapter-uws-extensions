@@ -176,6 +176,41 @@ export function checkRedisReplaySeqRegression(snap) {
 	return null;
 }
 
+/**
+ * Presence local-index consistency invariant: on each instance a topic's local
+ * member-count map (`localCounts`, which drives the leave-broadcast decision) and
+ * the local reverse index (`topic|key -> ws`, which the leave path reads to find a
+ * surviving connection) must track the SAME set of distinct users. Both are
+ * mutated in the SAME synchronous frame on join (index add + count increment),
+ * leave, and rollback - so the two per-topic distinct-key cardinalities must
+ * always agree at any point an audit can observe (the audit runs between frames).
+ * A mismatch is a genuine bookkeeping divergence: a code path that touched one
+ * structure without the other, the kind that drives a wrong cluster-wide leave or
+ * join broadcast. (The local DATA map is deliberately NOT compared here: a join
+ * defers its data commit past the count increment, so count > data is a legitimate
+ * in-flight-join transient, not a divergence.) The snapshot is structure-only:
+ * per-topic cardinalities and a metric-sanitized topic label, never a user key or
+ * any presence data.
+ *
+ * @param {{ presenceTopics?: Array<{ topic: string, countKeys: number, indexKeys: number }> }} snap
+ * @returns {Violation}
+ */
+export function checkRedisPresenceLocalIndex(snap) {
+	const rows = snap && snap.presenceTopics;
+	if (!Array.isArray(rows)) return null;
+	for (const row of rows) {
+		if (!row) continue;
+		if (typeof row.countKeys !== 'number' || typeof row.indexKeys !== 'number') continue;
+		if (row.countKeys !== row.indexKeys) {
+			return {
+				category: 'redis.presence.local-index-desync',
+				context: { topic: row.topic, countKeys: row.countKeys, indexKeys: row.indexKeys }
+			};
+		}
+	}
+	return null;
+}
+
 // - Structural state hash ----------------------------------------------------
 
 // FNV-1a 32-bit string fold. Module-private and deliberately self-contained (the

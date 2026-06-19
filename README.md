@@ -669,6 +669,7 @@ export async function close(ws, { platform }) {
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
 | `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
+| `consistencyAuditIntervalMs` | `5000` | Interval in ms for the per-instance consistency auditor, a slow unref'd background check that this instance's per-topic member-count map and local reverse index agree on their distinct-user cardinality. Never runs on the hot path. A desync logs and counts under `redis.presence.local-index-desync` (soft); only one that persists across two consecutive audits of the same bounded window escalates to a deferred process restart. Set `0` to disable entirely. |
 
 #### API
 

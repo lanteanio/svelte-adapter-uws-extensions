@@ -4,6 +4,7 @@ import {
 	checkTotalSubscriptions,
 	checkTopicsHaveSubscribers,
 	checkRedisReplaySeqRegression,
+	checkRedisPresenceLocalIndex,
 	checkSharedStoreConvergence,
 	computeStateHash,
 	runInvariants,
@@ -127,6 +128,37 @@ describe('checkRedisReplaySeqRegression', () => {
 	it('is a no-op on a snapshot without the replaySeqs rows', () => {
 		expect(checkRedisReplaySeqRegression({})).toBeNull();
 		expect(checkRedisReplaySeqRegression({ replaySeqs: null })).toBeNull();
+	});
+});
+
+describe('checkRedisPresenceLocalIndex', () => {
+	it('returns null when every topic agrees on its count and index cardinality', () => {
+		const snap = { presenceTopics: [
+			{ topic: 'room', countKeys: 3, indexKeys: 3 },
+			{ topic: 'lobby', countKeys: 0, indexKeys: 0 }
+		] };
+		expect(checkRedisPresenceLocalIndex(snap)).toBeNull();
+	});
+
+	it('flags the first topic whose count map and local index disagree', () => {
+		const snap = { presenceTopics: [
+			{ topic: 'room', countKeys: 2, indexKeys: 2 },
+			{ topic: 'lobby', countKeys: 1, indexKeys: 0 }
+		] };
+		expect(checkRedisPresenceLocalIndex(snap)).toEqual({
+			category: 'redis.presence.local-index-desync',
+			context: { topic: 'lobby', countKeys: 1, indexKeys: 0 }
+		});
+	});
+
+	it('skips rows whose cardinalities are not both numbers', () => {
+		expect(checkRedisPresenceLocalIndex({ presenceTopics: [{ topic: 'x', countKeys: 1 }] })).toBeNull();
+		expect(checkRedisPresenceLocalIndex({ presenceTopics: [null, { topic: 'y', countKeys: 2, indexKeys: 2 }] })).toBeNull();
+	});
+
+	it('is a no-op on a snapshot without the presenceTopics rows', () => {
+		expect(checkRedisPresenceLocalIndex({})).toBeNull();
+		expect(checkRedisPresenceLocalIndex({ presenceTopics: null })).toBeNull();
 	});
 });
 

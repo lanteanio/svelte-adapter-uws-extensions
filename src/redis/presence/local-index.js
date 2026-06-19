@@ -19,7 +19,9 @@
  * @returns {{
  *   indexAdd: (topic: string, userKey: string, ws: any) => void,
  *   indexRemove: (topic: string, userKey: string, ws: any) => void,
- *   findOtherWsData: (topic: string, userKey: string, exceptWs: any) => (Record<string, any> | null)
+ *   findOtherWsData: (topic: string, userKey: string, exceptWs: any) => (Record<string, any> | null),
+ *   topicKeyCount: (topic: string) => number,
+ *   clear: () => void
  * }}
  */
 export function createLocalIndex(wsTopics) {
@@ -32,12 +34,24 @@ export function createLocalIndex(wsTopics) {
 	 */
 	const topicKeyToWs = new Map();
 
+	/**
+	 * Per-topic count of distinct user keys currently in the index (the number of
+	 * `topic + '|' + userKey` entries for that topic). Maintained alongside
+	 * `topicKeyToWs` so the consistency auditor reads it in O(1) per topic without
+	 * scanning. It moves in lockstep with the presence tracker's per-topic
+	 * member-count map: both are updated in the same synchronous frame on join,
+	 * leave, and rollback, so the two cardinalities must always agree.
+	 * @type {Map<string, number>}
+	 */
+	const topicKeyCounts = new Map();
+
 	function indexAdd(topic, userKey, ws) {
 		const k = topic + '|' + userKey;
 		let set = topicKeyToWs.get(k);
 		if (!set) {
 			set = new Set();
 			topicKeyToWs.set(k, set);
+			topicKeyCounts.set(topic, (topicKeyCounts.get(topic) || 0) + 1);
 		}
 		set.add(ws);
 	}
@@ -47,7 +61,12 @@ export function createLocalIndex(wsTopics) {
 		const set = topicKeyToWs.get(k);
 		if (!set) return;
 		set.delete(ws);
-		if (set.size === 0) topicKeyToWs.delete(k);
+		if (set.size === 0) {
+			topicKeyToWs.delete(k);
+			const n = (topicKeyCounts.get(topic) || 0) - 1;
+			if (n > 0) topicKeyCounts.set(topic, n);
+			else topicKeyCounts.delete(topic);
+		}
 	}
 
 	function findOtherWsData(topic, userKey, exceptWs) {
@@ -62,5 +81,26 @@ export function createLocalIndex(wsTopics) {
 		return newest;
 	}
 
-	return { indexAdd, indexRemove, findOtherWsData };
+	/**
+	 * Distinct local user keys currently indexed for a topic (O(1)). The presence
+	 * consistency auditor compares this against the per-topic member-count map.
+	 * @param {string} topic
+	 * @returns {number}
+	 */
+	function topicKeyCount(topic) {
+		return topicKeyCounts.get(topic) || 0;
+	}
+
+	/**
+	 * Drop the entire index. The presence tracker's `clear()` resets its
+	 * member-count and data maps in one shot; the index MUST be reset alongside
+	 * them or `topicKeyCount` would keep reporting stale per-topic keys after a
+	 * clear (and the consistency auditor would then see a phantom divergence).
+	 */
+	function clear() {
+		topicKeyToWs.clear();
+		topicKeyCounts.clear();
+	}
+
+	return { indexAdd, indexRemove, findOtherWsData, topicKeyCount, clear };
 }

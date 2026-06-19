@@ -67,6 +67,10 @@ import { createLocalIndex } from './presence/local-index.js';
 import { createDiffBuffer } from './presence/diff-buffer.js';
 import { createSubscriber } from './presence/subscriber.js';
 import { createPresenceState } from './presence/state.js';
+import { buildPresenceAuditSnapshot } from './presence/audit-snapshot.js';
+import { assert, fatal } from '../shared/assert.js';
+import { createConsistencyAuditor } from '../shared/auditor.js';
+import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 
 export { WsClosedError };
 
@@ -131,7 +135,7 @@ export function createPresence(client, options = {}) {
 	}
 
 	// Local reverse index (topic, key) -> ws connections; reads the shared wsTopics map.
-	const { indexAdd, indexRemove, findOtherWsData } = createLocalIndex(wsTopics);
+	const { indexAdd, indexRemove, findOtherWsData, topicKeyCount, clear: clearIndex } = createLocalIndex(wsTopics);
 
 	// Per-topic diff coalescer; disposeDiffBuffer() is the clear()/destroy() teardown.
 	const { bufferDiff, bufferUpdate, flushPendingDiffs, dispose: disposeDiffBuffer } = createDiffBuffer({
@@ -608,6 +612,39 @@ export function createPresence(client, options = {}) {
 		throw new WsClosedError('presence.join', topic);
 	}
 
+	// Per-instance consistency auditor: a slow, unref'd, seam-jittered background
+	// check that this instance's local member-count map and local reverse index
+	// track the same distinct-user set per topic. Both are mutated in the same
+	// synchronous frame on join, leave, and rollback, so a mismatch is a genuine
+	// bookkeeping divergence (the local DATA map is deliberately NOT compared - a
+	// join defers its data commit past the count increment, so count > data is a
+	// legitimate in-flight transient, not a divergence). It NEVER runs on the hot
+	// path (join / leave / sync / heartbeat pay nothing); the only cost is the
+	// bookkeeping they already do. Default on (5000ms); set
+	// `consistencyAuditIntervalMs: 0` to disable entirely (no timer scheduled). A
+	// desync logs + increments the assertion counter (the soft tier); only one
+	// that PERSISTS across two consecutive audits of the same window escalates to
+	// the hard tier (a deferred process restart), so a healthy or transient state
+	// is never killed. At scale, when an instance tracks more topics than the
+	// per-tick window, the round-robin window rotates and the persistence gate only
+	// completes once the whole population fits one window - escalation is strictly
+	// harder at scale, never a false kill.
+	const consistencyAuditIntervalMs = Number.isFinite(options.consistencyAuditIntervalMs)
+		? options.consistencyAuditIntervalMs
+		: 5000;
+	let consistencyAuditor = null;
+	if (consistencyAuditIntervalMs > 0) {
+		consistencyAuditor = createConsistencyAuditor({
+			snapshot: ({ offset, limit }) => buildPresenceAuditSnapshot({ localCounts, topicKeyCount, mt, offset, limit }),
+			assert,
+			fatal,
+			predicates: [checkRedisPresenceLocalIndex],
+			hardCategories: ['redis.presence.local-index-desync'],
+			intervalMs: consistencyAuditIntervalMs
+		});
+		consistencyAuditor.start();
+	}
+
 	/** @type {RedisPresenceTracker} */
 	const tracker = {
 		async join(ws, topic, platform) {
@@ -1051,6 +1088,7 @@ export function createPresence(client, options = {}) {
 			wsTopics.clear();
 			localCounts.clear();
 			localData.clear();
+			clearIndex();
 			activeTopics.clear();
 			syncObservers.clear();
 			syncCounts.clear();
@@ -1060,9 +1098,16 @@ export function createPresence(client, options = {}) {
 
 		destroy() {
 			clearIntervalTimer(heartbeatTimer);
+			if (consistencyAuditor) consistencyAuditor.stop();
 			subscriberCtx.dispose();
 			disposeDiffBuffer();
 		},
+
+		// Internal: the per-instance consistency auditor (null when disabled via
+		// `consistencyAuditIntervalMs: 0`). Exposed for tests to drive a single
+		// audit pass deterministically against live state; not part of the public
+		// contract.
+		_consistencyAuditor: consistencyAuditor,
 
 		hooks: {
 			async subscribe(ws, topic, { platform }) {
