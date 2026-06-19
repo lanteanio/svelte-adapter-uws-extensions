@@ -1115,6 +1115,29 @@ What it does:
 
 Options: `persistLeaseMs` (default 6000ms; keep it above the document's `debounceWait`), `maxEnvelopeBytes` (relay size cap, default 1 MB), `breaker`, `onError`. Requires `svelte-realtime >= 0.6.0-next.9` on `svelte-adapter-uws >= 0.6.0-next.25`.
 
+---
+
+## Smooth entities (cluster coordinator)
+
+`createSmoothCluster` makes `svelte-realtime`'s server-authoritative `live.smooth` entities (prediction / reconciliation) work across a cluster. On a single process they are correct without it; behind a load balancer the clients of one topic land on different instances, and without coordination each instance ticks its own authority - double-applying commands and double-firing one-shot events. Wire the coordinator onto the platform the same way as the other Redis plugins and the realtime layer detects it and routes through it automatically:
+
+```js
+// hooks.server.js (or wherever you wire the Redis bus)
+import { createSmoothCluster } from 'svelte-adapter-uws-extensions/redis/smooth';
+
+platform.smooth = createSmoothCluster(redis);   // bus.wrap forwards it; realtime picks it up
+```
+
+Why it is a single-owner relay (and not a converge-everywhere one like documents): the smooth authority's `apply(state, command)` step is single-writer, order-dependent, and NOT idempotent (it reseeds per command and fires one-shot events), so a naive N-instance fan-out would double-apply and double-fire. What it does:
+
+- **One owner per topic.** Tick ownership is a per-topic Redis lease (`smooth:owner:<topic>`, `SET NX PX` + compare-and-pexpire renew + compare-and-delete release). Exactly one instance ticks a topic's authority; it renews while it holds live entities and releases when its last local subscriber leaves. On owner death the lease expires, another instance acquires a fresh authority, and clients re-sync - the same outcome as a single-instance server restart.
+- **Commands forward; sync correlates.** A non-owner relays a client's command batch to the owner as one envelope (fire-and-forget, intra-batch order preserved). A cold-joining client's sync is a correlation-id request the owner answers with a targeted catalog reply.
+- **Broadcasts fan out, acks target, events dedupe.** The owner relays each update / event / remove once over a Redis channel (`{prefix}smooth:events`) and every instance re-emits it to its own local subscribers; an ack is relayed only to the instance the commanding client is on. One-shot events carry a per-topic monotonic sequence so a receiving instance drops a redelivered or lease-overlap-duplicated event (author-exclusion alone is insufficient across instances).
+
+> **Trust model (read this before a shared-Redis deployment):** the relay channel carries **entity state and client commands in cleartext** between trusted instances - the same trust boundary the pub/sub bus and the cursor / presence / document relays already assume. A forwarded command is enqueued without re-running the per-topic guard (the forwarding peer authorized its client's command first), so anyone who can publish forged frames can drive an authority; anyone who can subscribe can read entity state, and a forged sync request pulls a topic's catalog on demand. The coordinator hardens the channel with a pre-parse size cap and an envelope-shape check and namespaces it under your key prefix, but it cannot make a shared Redis private. **Run the relay on a Redis you control** (dedicated instance, ACL, or network isolation) - exactly as you would for any bus carrying application data.
+
+Options: `leaseMs` (per-topic ownership-lease TTL, default 10000ms; the realtime layer renews at ~TTL/3 while it holds live entities), `maxEnvelopeBytes` (relay size cap, default 1 MB), `breaker`, `onError`. The clustered `live.smooth` layer that detects `platform.smooth` ships in a subsequent `svelte-realtime` release; until it lands the coordinator is forward-compatible and inert (wiring it has no effect).
+
 ## Cursor
 
 Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.

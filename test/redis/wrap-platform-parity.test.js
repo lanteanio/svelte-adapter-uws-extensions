@@ -452,4 +452,50 @@ describe('Framework conventions: bus wraps preserve app-stashed properties', () 
 		platform.presence = presence;
 		expect(wrapped.presence).toBe(presence);
 	});
+
+	it('pubsub wrap forwards platform.crdt as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.crdt).toBeUndefined();
+
+		const crdt = { onMessage: () => {} };
+		platform.crdt = crdt;
+		expect(wrapped.crdt).toBe(crdt);
+	});
+
+	it('sharded wrap forwards platform.crdt as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.crdt).toBeUndefined();
+
+		const crdt = { onMessage: () => {} };
+		platform.crdt = crdt;
+		expect(wrapped.crdt).toBe(crdt);
+	});
+
+	it('pubsub wrap forwards platform.smooth as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.smooth).toBeUndefined();
+
+		const smooth = { onMessage: () => {} };
+		platform.smooth = smooth;
+		expect(wrapped.smooth).toBe(smooth);
+	});
+
+	it('sharded wrap forwards platform.smooth as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.smooth).toBeUndefined();
+
+		const smooth = { onMessage: () => {} };
+		platform.smooth = smooth;
+		expect(wrapped.smooth).toBe(smooth);
+	});
+
+	it('mockPlatform exposes a smooth slot defaulting to undefined', () => {
+		const platform = mockPlatform();
+		expect('smooth' in platform).toBe(true);
+		expect(platform.smooth).toBeUndefined();
+	});
 });

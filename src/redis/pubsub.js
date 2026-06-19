@@ -323,6 +323,7 @@ export function createPubSubBus(client, options = {}) {
 				get redis() { return platform.redis; },
 				get presence() { return platform.presence; },
 				get crdt() { return platform.crdt; },
+				get smooth() { return platform.smooth; },
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

@@ -53,6 +53,10 @@ export function mockPlatform() {
 		// test drives the forward-when-set behavior.
 		redis: undefined,
 		presence: undefined,
+		// Framework-convention slot: svelte-realtime's clustered `live.smooth`
+		// reads `platform.smooth` (the cross-instance smooth coordinator). Default
+		// `undefined`; the wrap-parity test drives the forward-when-set behavior.
+		smooth: undefined,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
