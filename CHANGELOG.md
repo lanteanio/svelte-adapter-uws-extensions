@@ -5,6 +5,12 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.20] - 2026-06-20
+
+### Added
+
+- **`redis/smooth`: an opt-in warm-handoff snapshot for cluster smooth entities.** `createSmoothCluster` gains `writeSnapshot(wireTopic, payload)` and `readSnapshot(wireTopic)` plus a `snapshotTtlMs` option (default 3x `leaseMs`). They back `svelte-realtime`'s `live.smooth({ snapshot: true })` opt-in: the topic owner debounce-persists its entity catalog under `smooth:snap:<topic>` while it ticks, and the instance that takes over after the owner dies reads the snapshot on acquire and resumes each entity from its last state instead of resetting it to `initial` (which for a game entity means snapping back to spawn on a failover). Both are best-effort - breaker-guarded like the relays, single-key and prefix-tagged (cluster-safe), never throwing - and the snapshot self-expires via `snapshotTtlMs`: each owner write refreshes the TTL, so a live owner's snapshot never lapses and a dead topic's clears itself a few lease periods after the last write. Owner-only by contract (the realtime layer calls `writeSnapshot` only while it owns the tick), and `bus.wrap` forwards them with the coordinator. Inert until a `svelte-realtime` layer that enables the opt-in (`>= 0.6.0-next.12`) calls them; the default `live.smooth` path never does, so existing deployments are unchanged.
+
 ## [0.6.0-next.19] - 2026-06-20
 
 ### Added

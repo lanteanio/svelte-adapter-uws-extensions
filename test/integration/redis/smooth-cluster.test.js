@@ -263,4 +263,44 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		expect(b.authState(T, 'q')).toBe(4);
 		expect(a.appliedUpdates.filter((u) => u.key === 'q').map((u) => u.state)).toEqual([4]);
 	});
+
+	it('persists a topic snapshot one connection can read after another wrote it', async () => {
+		const a = track(createSmoothCluster(client));
+		const b = track(createSmoothCluster(client));
+		const T = '__smooth:snap:1';
+		const catalog = [
+			{ key: 'p1', state: { x: 3, y: 7 } },
+			{ key: 'p2', state: { x: -1, y: 0 } }
+		];
+		await a.writeSnapshot(T, catalog);
+		expect(await b.readSnapshot(T)).toEqual(catalog); // a different connection reads it
+		expect(await b.readSnapshot('__smooth:snap:absent')).toBeNull();
+	});
+
+	it('expires a snapshot after snapshotTtlMs (real PX, not testable on the mock)', async () => {
+		const a = track(createSmoothCluster(client, { snapshotTtlMs: 300 }));
+		const T = '__smooth:snap:ttl';
+		await a.writeSnapshot(T, [{ key: 'p', state: { v: 1 } }]);
+		expect(await a.readSnapshot(T)).toEqual([{ key: 'p', state: { v: 1 } }]); // present now
+		await wait(450);
+		expect(await a.readSnapshot(T)).toBeNull(); // self-expired
+	});
+
+	it('warm handoff: a fresh owner recovers the previous owner snapshot across a TTL lapse', async () => {
+		const a = track(createSmoothCluster(client, { leaseMs: 300 }));
+		const b = track(createSmoothCluster(client, { leaseMs: 300 }));
+		const T = '__smooth:snap:handoff';
+		const catalog = [{ key: 'p1', state: { x: 9 } }, { key: 'p2', state: { x: 4 } }];
+
+		// A owns the topic and debounce-persists its catalog.
+		expect(await a.acquireOwner(T)).toBe(true);
+		await a.writeSnapshot(T, catalog);
+
+		// A goes quiet; its lease lapses and B takes over with a fresh authority.
+		await wait(450);
+		expect(await b.acquireOwner(T)).toBe(true);
+
+		// The fresh owner recovers the previous owner's state instead of starting empty.
+		expect(await b.readSnapshot(T)).toEqual(catalog);
+	});
 });

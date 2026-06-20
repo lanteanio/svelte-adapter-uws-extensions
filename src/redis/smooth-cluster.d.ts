@@ -12,6 +12,13 @@ export interface SmoothClusterOptions {
 	leaseMs?: number;
 	/** Reject inbound relay envelopes larger than this BEFORE JSON.parse. Default 1048576. */
 	maxEnvelopeBytes?: number;
+	/**
+	 * TTL (ms) for a topic's warm-handoff snapshot (written by the owner when
+	 * `live.smooth({ snapshot: true })` is set). Each owner write refreshes it,
+	 * so a live owner's snapshot never expires and a dead owner's self-expires
+	 * this long after its last write. Default 3x leaseMs.
+	 */
+	snapshotTtlMs?: number;
 	/** Optional circuit breaker; when open, outbound relays are skipped. */
 	breaker?: CircuitBreaker;
 	/** Observe a relay-subscriber failure (the subscriber tears down so a later relay re-subscribes). */
@@ -83,6 +90,19 @@ export interface SmoothCluster {
 	 * never throws; resolves null when unowned or on error.
 	 */
 	currentOwner(wireTopic: string): Promise<string | null>;
+	/**
+	 * Persist a topic's catalog as its warm-handoff snapshot (owner-only by
+	 * contract; the realtime layer calls it only while it owns the tick).
+	 * Best-effort and fire-and-forget: breaker-guarded, never throws, expires
+	 * after `snapshotTtlMs`.
+	 */
+	writeSnapshot(wireTopic: string, payload: unknown): Promise<void>;
+	/**
+	 * Read a topic's warm-handoff snapshot (the catalog the previous owner
+	 * persisted), or null when absent / on error. A fresh owner calls it on
+	 * acquire to seed entities from their last state instead of `initial`.
+	 */
+	readSnapshot(wireTopic: string): Promise<unknown>;
 	/** Tear down the relay subscriber. Idempotent. */
 	destroy(): void;
 }

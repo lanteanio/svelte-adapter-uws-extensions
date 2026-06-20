@@ -220,3 +220,65 @@ describe('createSmoothCluster per-topic ownership lease', () => {
 		expect(await a.currentOwner('__smooth:room:1')).toBeNull();
 	});
 });
+
+describe('createSmoothCluster snapshot (warm handoff)', () => {
+	let client;
+	let a;
+	let b;
+
+	beforeEach(() => {
+		client = mockRedisClient('smoothsnap:');
+		a = createSmoothCluster(client);
+		b = createSmoothCluster(client);
+	});
+	afterEach(() => {
+		a.destroy();
+		b.destroy();
+	});
+
+	it('round-trips a catalog payload from the writing owner to a reader', async () => {
+		const catalog = [
+			{ key: 'player-1', state: { x: 3, y: 7, hp: 90 } },
+			{ key: 'player-2', state: { x: -1, y: 0, hp: 100 } }
+		];
+		await a.writeSnapshot('__smooth:room:1', catalog);
+		// A different coordinator (the would-be new owner) reads it back verbatim.
+		expect(await b.readSnapshot('__smooth:room:1')).toEqual(catalog);
+	});
+
+	it('readSnapshot returns null for a topic that was never written', async () => {
+		expect(await a.readSnapshot('__smooth:room:absent')).toBeNull();
+	});
+
+	it('snapshots are per-topic and a later write replaces the earlier one', async () => {
+		await a.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 1 } }]);
+		await a.writeSnapshot('__smooth:room:2', [{ key: 'p', state: { v: 2 } }]);
+		await a.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 3 } }]); // overwrite room:1
+		expect(await b.readSnapshot('__smooth:room:1')).toEqual([{ key: 'p', state: { v: 3 } }]);
+		expect(await b.readSnapshot('__smooth:room:2')).toEqual([{ key: 'p', state: { v: 2 } }]);
+	});
+
+	it('a destroyed coordinator neither writes nor reads', async () => {
+		await a.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 1 } }]);
+		a.destroy();
+		// A destroyed write is a no-op (does not throw, does not change the value).
+		await a.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 999 } }]);
+		expect(await a.readSnapshot('__smooth:room:1')).toBeNull(); // destroyed read -> null
+		expect(await b.readSnapshot('__smooth:room:1')).toEqual([{ key: 'p', state: { v: 1 } }]); // unchanged
+	});
+
+	it('an open circuit breaker skips the write and read (the warm handoff degrades, not the authority)', async () => {
+		const open = { guard() { throw new Error('breaker open'); } };
+		const guarded = createSmoothCluster(client, { breaker: open });
+		// A control coordinator seeds a value the guarded one must neither clobber nor read.
+		await a.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 1 } }]);
+		await guarded.writeSnapshot('__smooth:room:1', [{ key: 'p', state: { v: 2 } }]); // skipped
+		expect(await guarded.readSnapshot('__smooth:room:1')).toBeNull(); // read skipped -> null
+		expect(await a.readSnapshot('__smooth:room:1')).toEqual([{ key: 'p', state: { v: 1 } }]); // write was skipped
+		guarded.destroy();
+	});
+
+	// NOTE: SET PX TTL is a no-op in the mock (the flag is accepted and ignored),
+	// so snapshot expiry is asserted only against real Redis in
+	// test/integration/redis/smooth-cluster.test.js.
+});

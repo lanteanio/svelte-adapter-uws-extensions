@@ -86,6 +86,10 @@ function positive(v, fallback) {
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound relay
  *   envelopes larger than this BEFORE JSON.parse. Defends against a bus-side
  *   DoS on shared-Redis deployments.
+ * @property {number} [snapshotTtlMs] - TTL (ms) for a topic's warm-handoff
+ *   snapshot, written by the owner when `live.smooth({ snapshot: true })` is set.
+ *   Each owner write refreshes it, so a live owner's snapshot never expires; a
+ *   dead owner's self-expires this long after its last write. Default 3x leaseMs.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional
  *   circuit breaker; when open, outbound relays are skipped (the local
  *   authority is unaffected - cross-instance traffic resumes when it closes).
@@ -109,6 +113,10 @@ export function createSmoothCluster(client, options = {}) {
 	const channel = client.key('smooth:events');
 	const instanceId = randomBytes(8).toString('hex');
 	const leaseMs = positive(options.leaseMs, 10000);
+	// Warm-handoff snapshot TTL. Each owner write refreshes it, so a live
+	// owner's snapshot never expires; a dead owner's self-expires a few lease
+	// periods after its last write (default 3x the lease).
+	const snapshotTtlMs = positive(options.snapshotTtlMs, leaseMs * 3);
 	// The validator's size cap (`acceptRaw`) is the only piece used here. The
 	// envelope-topic gate (`acceptEnvelope`) is deliberately NOT used: the
 	// entity wire topic is `__smooth:`-prefixed and that gate rejects `__`
@@ -203,6 +211,11 @@ export function createSmoothCluster(client, options = {}) {
 	/** Lease key for a topic's tick ownership. */
 	function ownerKey(wireTopic) {
 		return client.key('smooth:owner:' + wireTopic);
+	}
+
+	/** Snapshot key for a topic's warm-handoff state (one string blob per topic). */
+	function snapKey(wireTopic) {
+		return client.key('smooth:snap:' + wireTopic);
 	}
 
 	return {
@@ -373,6 +386,44 @@ export function createSmoothCluster(client, options = {}) {
 			if (destroyed) return null;
 			try {
 				return await redis.get(ownerKey(wireTopic));
+			} catch {
+				return null;
+			}
+		},
+
+		/**
+		 * Persist a topic's catalog as its warm-handoff snapshot so a sibling
+		 * that takes over after this owner dies can seed entities from their last
+		 * state instead of resetting them to `initial`. Owner-only by contract:
+		 * the realtime layer calls this only while it owns the topic's tick.
+		 * Fire-and-forget and best-effort - breaker-guarded, never throws, and
+		 * expires after `snapshotTtlMs` (refreshed on every write).
+		 * @param {string} wireTopic
+		 * @param {any} payload - the owner's catalog (`Array<{ key, state }>`).
+		 * @returns {Promise<void>}
+		 */
+		async writeSnapshot(wireTopic, payload) {
+			if (destroyed) return;
+			if (b) { try { b.guard(); } catch { return; } }
+			try {
+				await redis.set(snapKey(wireTopic), JSON.stringify(payload), 'PX', snapshotTtlMs);
+			} catch { /* best-effort: the warm handoff is an optimization, not a correctness guarantee */ }
+		},
+
+		/**
+		 * Read a topic's warm-handoff snapshot (the catalog the previous owner
+		 * persisted), or null when absent, expired, or on a Redis/parse error. A
+		 * fresh owner calls this on acquire to seed entities from their last known
+		 * state. Best-effort: never throws.
+		 * @param {string} wireTopic
+		 * @returns {Promise<any>}
+		 */
+		async readSnapshot(wireTopic) {
+			if (destroyed) return null;
+			if (b) { try { b.guard(); } catch { return null; } }
+			try {
+				const raw = await redis.get(snapKey(wireTopic));
+				return raw == null ? null : JSON.parse(raw);
 			} catch {
 				return null;
 			}
