@@ -364,9 +364,8 @@ export function createStreamReplay(client, options = {}) {
 		async since(topic, since) {
 			// Reject malformed since values defensively. Negative since
 			// fell through to `'-'` (XRANGE from start of stream) and
-			// returned the entire buffer; the audit treated this as a
-			// data-leak vector for buggy host code that forwards client
-			// input unchecked. Authorization is handled upstream in
+			// returned the entire buffer - a data-leak vector for buggy
+			// host code that forwards client input unchecked. Authorization is handled upstream in
 			// replay() via checkSubscribe; since() is a direct caller
 			// API and needs its own gate.
 			if (!Number.isInteger(since) || since < 0) return [];

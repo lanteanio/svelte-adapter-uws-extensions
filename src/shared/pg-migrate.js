@@ -66,7 +66,7 @@ export async function safeCreate(client, ddl, expectedColumns) {
  * with a message that identifies the table and the missing columns by
  * name. Does NOT check column types or extra columns: extras are normal
  * for forward-migrated tables, and type-drift is a rarer / more complex
- * scenario the audit explicitly scoped out.
+ * case this validator deliberately does not check.
  *
  * @param {{ query(text: string, values?: unknown[]): Promise<{ rows: { column_name: string }[] }> }} client
  * @param {{ table: string, columns: string[] }} expected
