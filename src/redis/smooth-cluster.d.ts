@@ -39,6 +39,8 @@ export interface SmoothClusterHandlers {
 	onAck?: (wireTopic: string, identity: string, payload: unknown) => void;
 	/** Owner: drop the departed client's surrogate and broadcast the entity removal. */
 	onLeave?: (wireTopic: string, identity: string, originInstance: string) => void;
+	/** Owner: resolve a forwarded shot against its ring. `payload` carries the edge-measured durations (`{ cmd, reach, rewindAge, detect? }`). */
+	onShoot?: (wireTopic: string, identity: string, originInstance: string, payload: unknown) => void;
 }
 
 /**
@@ -56,6 +58,8 @@ export interface SmoothCluster {
 	onMessage(handlers: SmoothClusterHandlers): void;
 	/** Forward a client's command batch to the topic's owner (fire-and-forget, one envelope). */
 	relayCommand(wireTopic: string, identity: string, originInstance: string, batch: unknown[]): void;
+	/** Forward a client's shot to the topic's owner (fire-and-forget; the hit rides the owner's event broadcast back). `payload` carries edge-measured durations, never an absolute stamp. */
+	relayShoot(wireTopic: string, shooterIdentity: string, originInstance: string, payload: unknown): void;
 	/** Ask the topic's owner for the entity catalog (correlation request answered via `sendSyncReply`). */
 	requestSync(wireTopic: string, identity: string, originInstance: string, corr: string): void;
 	/** Answer a sync request with the catalog, targeted at the requester. */

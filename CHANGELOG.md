@@ -5,6 +5,12 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.21] - 2026-06-22
+
+### Added
+
+- **`redis/smooth`: forward a non-owner's shot to the topic owner (`relayShoot` / `onShoot`).** `createSmoothCluster` gains `relayShoot(wireTopic, shooterIdentity, originInstance, payload)`, the shot analog of `relayCommand`: the instance a shooter is connected to forwards its `view.shoot` to the single instance that owns the topic's tick (which holds the authoritative lag-compensation ring), and the owner registers an `onShoot` handler to resolve it. It is fire-and-forget like a command - the authoritative hit rides the owner's existing event broadcast back to every instance, so a forwarded shot needs no correlated reply. The payload carries only edge-measured DURATIONS (a reach window width and a rewind age) plus the opaque shot command, never an absolute timestamp, so the owner rebuilds the rewind on its own ring axis without subtracting a clock it does not author - the inter-instance hop is never folded into the rewind window (which would grant free reach-back). It rides the same trusted relay channel, pre-parse size cap, and `__smooth:`-topic shape check as the other relays, and `bus.wrap` forwards it with the coordinator. Inert until a `svelte-realtime` layer that measures and forwards shots (`>= 0.6.0-next.22`) is wired: an older realtime never registers `onShoot` and never calls `relayShoot`, so existing deployments are unchanged.
+
 ## [0.6.0-next.20] - 2026-06-20
 
 ### Added

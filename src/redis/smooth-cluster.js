@@ -69,6 +69,7 @@ const KIND_SYNC_REPLY = 'srep';
 const KIND_BROADCAST = 'bc';
 const KIND_ACK = 'ack';
 const KIND_LEAVE = 'leave';
+const KIND_SHOOT = 'shoot';
 
 /** Coerce a positive-number option, else the default. */
 function positive(v, fallback) {
@@ -128,12 +129,12 @@ export function createSmoothCluster(client, options = {}) {
 	 * @type {{
 	 *   onCommand: Function | null, onSync: Function | null,
 	 *   onSyncReply: Function | null, onBroadcast: Function | null,
-	 *   onAck: Function | null, onLeave: Function | null
+	 *   onAck: Function | null, onLeave: Function | null, onShoot: Function | null
 	 * }}
 	 */
 	let handlers = {
 		onCommand: null, onSync: null, onSyncReply: null,
-		onBroadcast: null, onAck: null, onLeave: null
+		onBroadcast: null, onAck: null, onLeave: null, onShoot: null
 	};
 	/** @type {any} */
 	let subscriber = null;
@@ -198,6 +199,14 @@ export function createSmoothCluster(client, options = {}) {
 				if (handlers.onLeave && typeof parsed.id === 'string') {
 					handlers.onLeave(topic, parsed.id, parsed.o);
 				}
+			} else if (kind === KIND_SHOOT) {
+				// A non-owner forwarded a client's shot; only the owner resolves it.
+				// The payload carries the edge-measured DURATIONS (reach width + a
+				// rewind age), never an absolute stamp, so the owner rebuilds the
+				// rewind on its own ring axis without subtracting a foreign clock.
+				if (handlers.onShoot && typeof parsed.id === 'string' && parsed.p && typeof parsed.p === 'object') {
+					handlers.onShoot(topic, parsed.id, parsed.o, parsed.p);
+				}
 			}
 		});
 		subscriberReady = sub.subscribe(channel).catch((err) => {
@@ -231,7 +240,8 @@ export function createSmoothCluster(client, options = {}) {
 		 *   - onBroadcast(wireTopic, event, data, excludeIdentity, seq, ownerInstance): every instance re-emits to local subscribers (seq-deduped per owner).
 		 *   - onAck(wireTopic, identity, payload): the commanding client's instance delivers the ack to its local socket.
 		 *   - onLeave(wireTopic, identity, originInstance): owner drops the surrogate and broadcasts the remove.
-		 * @param {{ onCommand?: Function, onSync?: Function, onSyncReply?: Function, onBroadcast?: Function, onAck?: Function, onLeave?: Function }} h
+		 *   - onShoot(wireTopic, identity, originInstance, payload): owner resolves a forwarded shot against its ring (the payload carries edge-measured durations).
+		 * @param {{ onCommand?: Function, onSync?: Function, onSyncReply?: Function, onBroadcast?: Function, onAck?: Function, onLeave?: Function, onShoot?: Function }} h
 		 */
 		onMessage(h) {
 			handlers = {
@@ -240,7 +250,8 @@ export function createSmoothCluster(client, options = {}) {
 				onSyncReply: typeof h.onSyncReply === 'function' ? h.onSyncReply : null,
 				onBroadcast: typeof h.onBroadcast === 'function' ? h.onBroadcast : null,
 				onAck: typeof h.onAck === 'function' ? h.onAck : null,
-				onLeave: typeof h.onLeave === 'function' ? h.onLeave : null
+				onLeave: typeof h.onLeave === 'function' ? h.onLeave : null,
+				onShoot: typeof h.onShoot === 'function' ? h.onShoot : null
 			};
 			ensureSubscriber();
 		},
@@ -257,6 +268,23 @@ export function createSmoothCluster(client, options = {}) {
 		 */
 		relayCommand(wireTopic, identity, originInstance, batch) {
 			publish({ i: instanceId, k: KIND_COMMAND, t: wireTopic, id: identity, o: originInstance, b: batch });
+		},
+
+		/**
+		 * Forward a client's shot to the topic's owner (fire-and-forget; the
+		 * authoritative hit rides the owner's existing event broadcast back to
+		 * every instance, so a shot needs no correlated reply). Only the owner's
+		 * onShoot handler acts on it. The payload carries the EDGE-measured
+		 * durations (`reach` width + a rewind `age`), never an absolute timestamp,
+		 * so the owner rebuilds the rewind on its own ring axis without subtracting
+		 * a clock it does not author.
+		 * @param {string} wireTopic
+		 * @param {string} shooterIdentity - the firing client's stable identity (its entity lives on the owner).
+		 * @param {string} originInstance - the instance the client is connected to.
+		 * @param {any} payload - `{ cmd, reach, rewindAge, detect? }`, all edge-measured.
+		 */
+		relayShoot(wireTopic, shooterIdentity, originInstance, payload) {
+			publish({ i: instanceId, k: KIND_SHOOT, t: wireTopic, id: shooterIdentity, o: originInstance, p: payload });
 		},
 
 		/**
@@ -435,7 +463,7 @@ export function createSmoothCluster(client, options = {}) {
 			destroyed = true;
 			handlers = {
 				onCommand: null, onSync: null, onSyncReply: null,
-				onBroadcast: null, onAck: null, onLeave: null
+				onBroadcast: null, onAck: null, onLeave: null, onShoot: null
 			};
 			if (subscriber) {
 				const s = subscriber;

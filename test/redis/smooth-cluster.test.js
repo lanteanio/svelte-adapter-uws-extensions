@@ -26,15 +26,17 @@ function recorder() {
 	const broadcasts = [];
 	const acks = [];
 	const leaves = [];
+	const shoots = [];
 	return {
-		commands, syncs, syncReplies, broadcasts, acks, leaves,
+		commands, syncs, syncReplies, broadcasts, acks, leaves, shoots,
 		handlers: {
 			onCommand: (wireTopic, identity, originInstance, batch) => commands.push({ wireTopic, identity, originInstance, batch }),
 			onSync: (wireTopic, identity, originInstance, corr) => syncs.push({ wireTopic, identity, originInstance, corr }),
 			onSyncReply: (wireTopic, corr, payload) => syncReplies.push({ wireTopic, corr, payload }),
 			onBroadcast: (wireTopic, event, data, excludeIdentity, seq, ownerInstance) => broadcasts.push({ wireTopic, event, data, excludeIdentity, seq, ownerInstance }),
 			onAck: (wireTopic, identity, payload) => acks.push({ wireTopic, identity, payload }),
-			onLeave: (wireTopic, identity, originInstance) => leaves.push({ wireTopic, identity, originInstance })
+			onLeave: (wireTopic, identity, originInstance) => leaves.push({ wireTopic, identity, originInstance }),
+			onShoot: (wireTopic, identity, originInstance, payload) => shoots.push({ wireTopic, identity, originInstance, payload })
 		}
 	};
 }
@@ -72,6 +74,22 @@ describe('createSmoothCluster relay', () => {
 			{ wireTopic: '__smooth:room:1', identity: 'player-1', originInstance: a.instanceId, batch: [{ id: 1 }, { id: 2 }] }
 		]);
 		expect(ra.commands).toEqual([]); // sender does not receive its own relay
+	});
+
+	it('forwards a shot to the OTHER instance (durations payload) and echo-suppresses its own', async () => {
+		const payload = { cmd: { aim: 0.5 }, reach: 120, rewindAge: 47, detect: { minUplink: 10, maxUplink: 12, divergence: 2 } };
+		b.relayShoot('__smooth:room:1', 'shooter-9', b.instanceId, payload);
+		await settle();
+		expect(ra.shoots).toEqual([
+			{ wireTopic: '__smooth:room:1', identity: 'shooter-9', originInstance: b.instanceId, payload }
+		]);
+		expect(rb.shoots).toEqual([]); // the forwarding edge does not receive its own relay
+	});
+
+	it('ignores a forwarded shot with a non-object payload', async () => {
+		a.relayShoot('__smooth:room:1', 'shooter-9', a.instanceId, 'not-an-object');
+		await settle();
+		expect(rb.shoots).toEqual([]);
 	});
 
 	it('routes a sync request to peers and a correlated, targeted reply back to the requester only', async () => {
