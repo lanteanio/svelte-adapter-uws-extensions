@@ -12,20 +12,29 @@ export interface CircuitBreakerOptions {
 }
 
 export interface CircuitBreaker {
-	/** Current state. */
+	/**
+	 * State is partitioned by an optional string `key`, so one key (e.g. a tenant) can
+	 * break without tripping the others. The default key `''` is the single global
+	 * breaker - every method is byte-identical for callers that pass no key.
+	 */
+	/** State of the default (`''`) key. */
 	readonly state: 'healthy' | 'broken' | 'probing';
-	/** True only when state is healthy. */
+	/** True only when the default key's state is healthy. */
 	readonly isHealthy: boolean;
-	/** Current consecutive failure count. */
+	/** Default key's consecutive failure count. */
 	readonly failures: number;
-	/** Throws CircuitBrokenError if the circuit is broken. */
-	guard(): void;
-	/** Record a successful operation. May transition to healthy. */
-	success(): void;
-	/** Record a failed operation. May transition to broken. */
-	failure(err?: any): void;
-	/** Force back to healthy state. */
-	reset(): void;
+	/** State for a given key (default `''`). */
+	stateOf(key?: string): 'healthy' | 'broken' | 'probing';
+	/** Failure count for a given key (default `''`). */
+	failuresOf(key?: string): number;
+	/** Throws CircuitBrokenError if the circuit for `key` (default `''`) is broken. */
+	guard(key?: string): void;
+	/** Record a successful operation for `key`. May transition to healthy. */
+	success(key?: string): void;
+	/** Record a failed operation for `key`. May transition to broken. */
+	failure(err?: any, key?: string): void;
+	/** Force `key` (default `''`) back to healthy state. */
+	reset(key?: string): void;
 	/**
 	 * Register a state-transition listener. Multiple subscribers are
 	 * supported and the constructor-time `onStateChange` callback (if
@@ -40,9 +49,10 @@ export interface CircuitBreaker {
 
 /**
  * Run an async operation through a breaker. Guards before, records
- * success/failure after. Pass null/undefined breaker to skip.
+ * success/failure after. Pass null/undefined breaker to skip. The optional `key`
+ * partitions the breaker state (default `''` = the global breaker).
  */
-export function withBreaker<T>(breaker: CircuitBreaker | null | undefined, fn: () => Promise<T>): Promise<T>;
+export function withBreaker<T>(breaker: CircuitBreaker | null | undefined, fn: () => Promise<T>, key?: string): Promise<T>;
 
 /**
  * Create a circuit breaker.

@@ -42,6 +42,13 @@ return 1
  * @property {number} interval - Refill interval in milliseconds. Must be positive.
  * @property {number} [blockDuration=0] - Auto-ban duration in ms when exhausted. 0 = no ban.
  * @property {'ip' | 'connection' | ((ws: any) => string)} [keyBy='ip'] - Key extraction mode.
+ * @property {(ws: any) => (string | null | undefined)} [tenant] - Optional per-connection
+ *   tenant resolver. When set, the bucket key is scoped by the returned tenant id, so two
+ *   tenants sharing an IP / connection / custom key get independent buckets and a tenant's
+ *   admin ops (`reset` / `ban` / `unban` / `clear`) touch only that tenant. Return
+ *   null/undefined for an unscoped connection. Omit for a single-tenant deploy (byte-identical
+ *   to before). The id should be a delimiter-safe slug - it is joined to the key with a NUL,
+ *   so it stays unambiguous even when the key is an IPv6 address.
  */
 
 /**
@@ -54,10 +61,10 @@ return 1
 /**
  * @typedef {Object} RedisRateLimiter
  * @property {(ws: any, cost?: number) => Promise<ConsumeResult>} consume
- * @property {(key: string) => Promise<void>} reset
- * @property {(key: string, duration?: number) => Promise<void>} ban
- * @property {(key: string) => Promise<void>} unban
- * @property {() => Promise<void>} clear
+ * @property {(key: string, tenant?: string | null) => Promise<void>} reset
+ * @property {(key: string, duration?: number, tenant?: string | null) => Promise<void>} ban
+ * @property {(key: string, tenant?: string | null) => Promise<void>} unban
+ * @property {(tenant?: string | null) => Promise<void>} clear
  */
 
 /**
@@ -72,7 +79,7 @@ export function createRateLimit(client, options) {
 		throw new Error('redis ratelimit: options object is required');
 	}
 
-	const { points, interval, blockDuration = 0, keyBy = 'ip' } = options;
+	const { points, interval, blockDuration = 0, keyBy = 'ip', tenant } = options;
 
 	if (!Number.isInteger(points) || points <= 0) {
 		throw new Error('redis ratelimit: points must be a positive integer');
@@ -86,6 +93,9 @@ export function createRateLimit(client, options) {
 	if (keyBy !== 'ip' && keyBy !== 'connection' && typeof keyBy !== 'function') {
 		throw new Error("redis ratelimit: keyBy must be 'ip', 'connection', or a function");
 	}
+	if (tenant !== undefined && typeof tenant !== 'function') {
+		throw new Error('redis ratelimit: tenant must be a function (ws) => id | null');
+	}
 
 	const redis = client.redis;
 
@@ -96,9 +106,15 @@ export function createRateLimit(client, options) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed');
-	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied');
-	const mBans = m?.counter('ratelimit_bans_total', 'Bans applied');
+	// When a tenant resolver is set, label the rate-limit counters by tenant so an
+	// operator can see per-tenant allow/deny/ban rates. Opt-in (no resolver -> no
+	// label, byte-identical series); the label is bounded by the metric's default
+	// max-series cardinality cap, so a tenant burst cannot blow up the registry.
+	const labelTenants = typeof tenant === 'function';
+	const tlabels = labelTenants ? ['tenant_id'] : undefined;
+	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed', tlabels);
+	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied', tlabels);
+	const mBans = m?.counter('ratelimit_bans_total', 'Bans applied', tlabels);
 
 	// Per-connection keying uses a WeakMap to avoid leaks
 	const wsKeys = new WeakMap();
@@ -129,8 +145,18 @@ export function createRateLimit(client, options) {
 		return 'unknown';
 	}
 
-	function bucketKey(key) {
-		return client.key(SCRIPT_VERSION + ':ratelimit:' + key);
+	// The tenant segment (when a `tenant` resolver is set) is FIRST and NUL-delimited,
+	// so a validated id stays unambiguous even when the key is an IPv6 address (colons).
+	// Null tenant -> no segment, byte-identical to the single-tenant key space. The id is
+	// rejected if it contains the NUL delimiter (the one char that would let two distinct
+	// tenants collide on one bucket); this is the injection-safety the realtime tier
+	// validates at its own boundary, enforced here too so the property does not silently
+	// depend on the caller's resolver. The check short-circuits on the null (default) path.
+	function bucketKey(key, tenantId) {
+		if (tenantId && tenantId.indexOf('\0') !== -1) {
+			throw new Error('redis ratelimit: tenant id must not contain a NUL byte (it is the bucket-key delimiter)');
+		}
+		return client.key(SCRIPT_VERSION + ':ratelimit:' + (tenantId ? tenantId + '\0' : '') + key);
 	}
 
 	return {
@@ -139,16 +165,18 @@ export function createRateLimit(client, options) {
 				throw new Error('redis ratelimit: cost must be a positive integer');
 			}
 			const key = resolveKey(ws);
+			const tenantId = tenant ? tenant(ws) : null;
 
 			const result = await withBreaker(b, () =>
-				redis.eval(CONSUME_SCRIPT, 1, bucketKey(key), points, interval, cost, blockDuration)
+				redis.eval(CONSUME_SCRIPT, 1, bucketKey(key, tenantId), points, interval, cost, blockDuration)
 			);
 
 			const allowed = result[0] === 1;
+			const labels = labelTenants ? { tenant_id: tenantId || '' } : undefined;
 			if (allowed) {
-				mAllowed?.inc();
+				mAllowed?.inc(labels);
 			} else {
-				mDenied?.inc();
+				mDenied?.inc(labels);
 			}
 
 			return {
@@ -158,24 +186,28 @@ export function createRateLimit(client, options) {
 			};
 		},
 
-		async reset(key) {
-			await withBreaker(b, () => redis.del(bucketKey(key)));
+		async reset(key, tenantId) {
+			await withBreaker(b, () => redis.del(bucketKey(key, tenantId)));
 		},
 
-		async ban(key, duration) {
+		async ban(key, duration, tenantId) {
 			const dur = duration ?? (blockDuration || 60000);
 			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');
-			const bk = bucketKey(key);
+			const bk = bucketKey(key, tenantId);
 			await withBreaker(b, () => redis.eval(BAN_SCRIPT, 1, bk, dur, points, interval));
-			mBans?.inc();
+			mBans?.inc(labelTenants ? { tenant_id: tenantId || '' } : undefined);
 		},
 
-		async unban(key) {
-			await withBreaker(b, () => redis.hset(bucketKey(key), 'bannedUntil', 0));
+		async unban(key, tenantId) {
+			await withBreaker(b, () => redis.hset(bucketKey(key, tenantId), 'bannedUntil', 0));
 		},
 
-		async clear() {
-			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:*')));
+		// No tenant -> clears the whole key space (every tenant's buckets too, since the
+		// glob `*` spans the NUL-delimited tenant segments). Pass a tenant id to clear
+		// only that tenant's buckets.
+		async clear(tenantId) {
+			const suffix = tenantId ? tenantId + '\0*' : '*';
+			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:' + suffix)));
 		}
 	};
 }

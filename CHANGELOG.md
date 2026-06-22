@@ -5,6 +5,15 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.22] - 2026-06-22
+
+### Added
+
+- **Multi-tenancy support across `redis/ratelimit`, `shared/breaker`, and the rate-limit metrics (all opt-in, byte-identical when unused).** Three additive pieces so a multi-tenant deploy can isolate per-tenant rate limits, faults, and metrics:
+  - `createRateLimit(client, { tenant })` takes an optional `(ws) => id | null` resolver that scopes the Redis bucket key by tenant. The tenant segment is joined to the key with a NUL so it stays unambiguous even when the key is an IPv6 address, and two tenants sharing an IP / connection / custom key get independent buckets. A tenant id containing the NUL delimiter is rejected (the injection-safety the realtime tier validates, enforced here too). `reset` / `ban` / `unban` accept a trailing optional tenant id and `clear(tenantId)` drops only that tenant's buckets (no tenant -> clears all). Omit the resolver and the bucket key, the single-key Lua, and the `clear()` SCAN glob are byte-identical to before.
+  - `createCircuitBreaker` state is now partitioned by an optional key: `guard` / `success` / `failure` / `reset` / `stateOf` / `failuresOf` accept a key and `withBreaker(b, fn, key)` threads it, so a caller protecting a tenant-specific resource can break one tenant without tripping the others. The default key `''` is the single global breaker, so every existing (no-key) call site - including the shared-infra Redis operations - is byte-identical. The shared-infra call sites deliberately stay global: a Redis/Postgres outage is cluster-wide, so a global breaker is the correct thundering-herd protection there; the keyed state is for callers protecting a per-tenant resource. The per-key state map is bounded (the oldest non-default key is evicted past a cap), so a keyed caller cannot grow it without bound.
+  - When a `tenant` resolver is set on a rate limiter, its `ratelimit_allowed_total` / `ratelimit_denied_total` / `ratelimit_bans_total` counters carry a `tenant_id` label, so an operator sees per-tenant allow/deny/ban rates. The label is bounded by the metric's default max-series cardinality cap and is absent (byte-identical series) when no resolver is set.
+
 ## [0.6.0-next.21] - 2026-06-22
 
 ### Added

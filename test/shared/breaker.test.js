@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
+import { createCircuitBreaker, CircuitBrokenError, withBreaker } from '../../src/shared/breaker.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
@@ -21,6 +21,68 @@ function mockWs(userData = {}) {
 }
 
 describe('circuit breaker', () => {
+	describe('per-key isolation', () => {
+		it('one key can break without tripping another key or the default', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 2 });
+			breaker.failure(undefined, 'a');
+			breaker.failure(undefined, 'a');
+			expect(breaker.stateOf('a')).toBe('broken');
+			expect(() => breaker.guard('a')).toThrow(CircuitBrokenError);
+			// Key 'b' and the default '' key are untouched.
+			expect(breaker.stateOf('b')).toBe('healthy');
+			expect(breaker.state).toBe('healthy'); // default key
+			expect(() => breaker.guard('b')).not.toThrow();
+			expect(() => breaker.guard()).not.toThrow();
+			breaker.destroy();
+		});
+
+		it('reset(key) clears only that key', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.failure(undefined, 'a');
+			breaker.failure(undefined, 'b');
+			expect(breaker.stateOf('a')).toBe('broken');
+			expect(breaker.stateOf('b')).toBe('broken');
+			breaker.reset('a');
+			expect(breaker.stateOf('a')).toBe('healthy');
+			expect(breaker.stateOf('b')).toBe('broken'); // untouched
+			breaker.destroy();
+		});
+
+		it('withBreaker(b, fn, key) partitions failures by key', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const boom = () => Promise.reject(new Error('x'));
+			await expect(withBreaker(breaker, boom, 'a')).rejects.toThrow('x');
+			expect(breaker.stateOf('a')).toBe('broken');
+			expect(breaker.stateOf('b')).toBe('healthy');
+			// A guarded op on the healthy key 'b' runs; on the broken key 'a' it fails fast.
+			await expect(withBreaker(breaker, async () => 'ok', 'b')).resolves.toBe('ok');
+			await expect(withBreaker(breaker, async () => 'ok', 'a')).rejects.toThrow(CircuitBrokenError);
+			breaker.destroy();
+		});
+
+		it('no key -> the single global breaker (byte-identical)', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 2 });
+			breaker.failure();
+			breaker.failure();
+			expect(breaker.state).toBe('broken');
+			expect(breaker.failures).toBe(2);
+			expect(breaker.stateOf('')).toBe('broken'); // same slot as the no-key default
+			breaker.destroy();
+		});
+
+		it('caps the per-key state map, evicting the oldest non-default key', () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			breaker.failure(undefined, 'k0'); // k0 is the oldest non-default key, now broken
+			expect(breaker.stateOf('k0')).toBe('broken');
+			// Touch enough fresh keys to exceed MAX_BREAKER_KEYS (10000); the oldest
+			// non-default key (k0) is evicted and recreates healthy on next access, so
+			// the map cannot grow without bound from a keyed caller.
+			for (let i = 1; i <= 10001; i++) breaker.stateOf('k' + i);
+			expect(breaker.stateOf('k0')).toBe('healthy');
+			breaker.destroy();
+		});
+	});
+
 	describe('state machine', () => {
 		it('starts healthy', () => {
 			const breaker = createCircuitBreaker();

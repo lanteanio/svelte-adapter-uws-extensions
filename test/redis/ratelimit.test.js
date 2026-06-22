@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createRateLimit } from '../../src/redis/ratelimit.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 function mockWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -46,6 +47,77 @@ describe('redis ratelimit', () => {
 
 		it('throws on invalid keyBy', () => {
 			expect(() => createRateLimit(client, { points: 5, interval: 1000, keyBy: 'bad' })).toThrow('keyBy');
+		});
+
+		it('throws on a non-function tenant resolver', () => {
+			expect(() => createRateLimit(client, { points: 5, interval: 1000, tenant: 'bad' })).toThrow('tenant must be a function');
+		});
+	});
+
+	describe('tenant scoping', () => {
+		it('scopes the bucket key by the tenant resolver (NUL-delimited, IPv6-safe)', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
+			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'a' }));
+			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'b' }));
+			const rlKeys = [...client._hashes.keys()].filter((k) => k.includes('ratelimit')).sort();
+			expect(rlKeys).toEqual(['test:v1:ratelimit:a\x001.2.3.4', 'test:v1:ratelimit:b\x001.2.3.4']);
+		});
+
+		it('gives two tenants on the SAME ip independent buckets', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000, tenant: (ws) => ws.getUserData().org });
+			expect((await lim.consume(mockWs({ ip: '9.9.9.9', org: 'a' }))).allowed).toBe(true);
+			// B is not exhausted by A - separate bucket.
+			expect((await lim.consume(mockWs({ ip: '9.9.9.9', org: 'b' }))).allowed).toBe(true);
+			// A's own bucket (points:1) is now exhausted.
+			expect((await lim.consume(mockWs({ ip: '9.9.9.9', org: 'a' }))).allowed).toBe(false);
+		});
+
+		it('clear(tenant) drops only that tenant; clear() drops all', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
+			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'a' }));
+			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'b' }));
+			await lim.clear('a');
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v1:ratelimit:b\x001.1.1.1']);
+			await lim.clear();
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual([]);
+		});
+
+		it('reset(key, tenant) targets the tenant-scoped bucket', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
+			await lim.consume(mockWs({ ip: '5.5.5.5', org: 'a' }));
+			await lim.consume(mockWs({ ip: '5.5.5.5', org: 'b' }));
+			await lim.reset('5.5.5.5', 'a');
+			const rlKeys = [...client._hashes.keys()].filter((k) => k.includes('ratelimit'));
+			expect(rlKeys).toEqual(['test:v1:ratelimit:b\x005.5.5.5']);
+		});
+
+		it('no tenant resolver -> byte-identical bare key', async () => {
+			await limiter.consume(mockWs({ ip: '2.2.2.2' }));
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v1:ratelimit:2.2.2.2']);
+		});
+
+		it('rejects a tenant id containing the NUL delimiter (injection-safety)', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: () => 'a\0b' });
+			await expect(lim.consume(mockWs({ ip: '1.2.3.4' }))).rejects.toThrow('NUL byte');
+		});
+
+		it('labels the rate-limit counters by tenant_id when a resolver is set', async () => {
+			const metrics = createMetrics();
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org, metrics });
+			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'a' }));
+			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'b' }));
+			const out = metrics.serialize();
+			expect(out).toContain('ratelimit_allowed_total{tenant_id="a"} 1');
+			expect(out).toContain('ratelimit_allowed_total{tenant_id="b"} 1');
+		});
+
+		it('no tenant resolver -> counters carry no tenant_id label (byte-identical metrics)', async () => {
+			const metrics = createMetrics();
+			const lim = createRateLimit(client, { points: 5, interval: 1000, metrics });
+			await lim.consume(mockWs({ ip: '2.2.2.2' }));
+			const out = metrics.serialize();
+			expect(out).toContain('ratelimit_allowed_total 1');
+			expect(out).not.toContain('tenant_id');
 		});
 	});
 

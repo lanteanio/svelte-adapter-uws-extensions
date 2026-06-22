@@ -101,6 +101,14 @@ export const MAX_TASK_HANDLERS = 10_000;
 export const MAX_BREAKER_LISTENERS = 10_000;
 
 /**
+ * Distinct per-key state slots on a single breaker (the default `''` global key
+ * plus one per caller-supplied key, e.g. a tenant). A backstop against unbounded
+ * growth if a caller ever keys the breaker by an untrusted/unbounded value; the
+ * intended key sources (tenant ids) are bounded well below this.
+ */
+export const MAX_BREAKER_KEYS = 10_000;
+
+/**
  * Defense-in-depth cap on the idempotency-store key after framework-level
  * namespacing. Matches the worst-case `rpc:<path>:<256-char-user-key>` /
  * `task:<name>:<256-char-user-key>` shape with headroom; framework

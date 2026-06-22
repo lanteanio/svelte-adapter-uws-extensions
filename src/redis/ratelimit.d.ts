@@ -11,6 +11,14 @@ export interface RedisRateLimitOptions {
 	blockDuration?: number;
 	/** Key extraction mode. @default 'ip' */
 	keyBy?: 'ip' | 'connection' | ((ws: any) => string);
+	/**
+	 * Optional per-connection tenant resolver. When set, the bucket key is scoped by
+	 * the returned tenant id (joined to the key with a NUL, so it stays unambiguous even
+	 * for IPv6 keys), so two tenants sharing an IP / connection / custom key get
+	 * independent buckets. Return null/undefined for an unscoped connection; omit for a
+	 * single-tenant deploy (byte-identical).
+	 */
+	tenant?: (ws: any) => string | null | undefined;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -29,14 +37,14 @@ export interface ConsumeResult {
 export interface RedisRateLimiter {
 	/** Attempt to consume tokens. */
 	consume(ws: any, cost?: number): Promise<ConsumeResult>;
-	/** Clear the bucket for a key. */
-	reset(key: string): Promise<void>;
-	/** Manually ban a key. */
-	ban(key: string, duration?: number): Promise<void>;
-	/** Remove a ban. */
-	unban(key: string): Promise<void>;
-	/** Reset all state. */
-	clear(): Promise<void>;
+	/** Clear the bucket for a key (optionally scoped to a tenant). */
+	reset(key: string, tenant?: string | null): Promise<void>;
+	/** Manually ban a key (optionally scoped to a tenant). */
+	ban(key: string, duration?: number, tenant?: string | null): Promise<void>;
+	/** Remove a ban (optionally scoped to a tenant). */
+	unban(key: string, tenant?: string | null): Promise<void>;
+	/** Reset all state, or only one tenant's buckets when a tenant id is given. */
+	clear(tenant?: string | null): Promise<void>;
 }
 
 /**
