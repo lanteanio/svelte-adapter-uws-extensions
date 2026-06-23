@@ -5,6 +5,12 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`runRedisSimSwarm(config)` and `runPgSimSwarm(config)` on `svelte-adapter-uws-extensions/sim`: seed-swarm the store-backed cluster sim.** Mirror the adapter's `runSimSwarm` contract for the redis pub/sub and postgres LISTEN/NOTIFY tiers - a seed range (`count`/`startSeed`) or explicit `seeds`, returning a `summary` (total / passed / failed / `firstFailingSeed` / `ok`) plus a compact per-seed `runs[]` with an 8-hex structural `fingerprint` (the "unseed" determinism canary). A `buggify` knob (`off` / `on` / `random` + `faultProfile` + `buggifyProbability`) layers faults onto the cross-instance **relay** (the bus / NOTIFY channel) rather than the per-instance wire, so the swarm asserts the cluster stays convergent and consistent under a reordering/duplicating/delaying relay; `checkRatio` replays a deterministic fraction and flags any run that fails to reproduce as a determinism regression. Self-contained (no new adapter dependency) so the package builds and tests against the published adapter. Note: lossy faults (`drop`/`corrupt`) legitimately diverge and remain the domain of the divergence-detection tests, not the swarm pass/fail.
+
 ## [0.6.0-next.22] - 2026-06-22
 
 ### Added

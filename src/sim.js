@@ -685,3 +685,157 @@ export async function replayPgSim(reproducer) {
 		result.steps === reproducer.steps;
 	return result;
 }
+
+// - Seed swarm ---------------------------------------------------------------
+// Mirrors the adapter's runSimSwarm contract for the store-backed tier. Kept
+// self-contained (not importing a shared engine from the adapter) so the
+// package builds and tests against the published adapter without waiting on a
+// new adapter export - the cross-instance relay is the tier that most needs
+// chaos coverage, so it owns its own swarm.
+
+/**
+ * Structural fingerprint of a store-backed run (the "unseed"): an 8-hex-char
+ * FNV-1a digest of the byte-stable result fields. The extensions result carries
+ * no fatals/schedulerUncaught, so those are absent here. Same seed -> same
+ * fingerprint; a change for a fixed seed means determinism regressed.
+ * @param {any} result a runRedisSim / runPgSim result
+ */
+function runFingerprint(result) {
+	const canonical = JSON.stringify({
+		finalState: result.finalState,
+		invariantViolations: result.invariantViolations,
+		clusterFrames: result.clusterFrames ?? null,
+		metrics: result.metrics,
+		virtualTimeMs: result.virtualTimeMs
+	});
+	let h = 2166136261 >>> 0;
+	for (let i = 0; i < canonical.length; i++) {
+		h ^= canonical.charCodeAt(i);
+		h = Math.imul(h, 16777619);
+	}
+	return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * The shared swarm loop for runRedisSimSwarm / runPgSimSwarm. `runOne(config)`
+ * runs one seed, `replayOne(result)` re-runs it for the determinism re-check.
+ * `buggify` layers `faultProfile` onto the run's RELAY faults (the
+ * cross-instance bus / NOTIFY channel - the distinct chaos for this tier),
+ * never the per-instance wire faults, which the adapter swarm already covers.
+ *
+ * @param {object} config
+ * @param {(cfg: object) => Promise<any>} runOne
+ * @param {(result: any) => Promise<any>} replayOne
+ */
+async function swarm(config, runOne, replayOne) {
+	const base = config.base || {};
+	const buggify = config.buggify || 'off';
+	const buggifyProbability = config.buggifyProbability ?? 0.25;
+	const checkRatio = config.checkRatio ?? 0;
+	const faultProfile = config.faultProfile || {};
+
+	let seeds;
+	if (Array.isArray(config.seeds)) {
+		seeds = config.seeds.map(String);
+	} else {
+		const startSeed = Number.isInteger(config.startSeed) ? config.startSeed : 1;
+		const count = Number.isInteger(config.count) ? config.count : 50;
+		seeds = [];
+		for (let i = 0; i < count; i++) seeds.push(String(startSeed + i));
+	}
+
+	const runs = [];
+	const failingSeeds = [];
+	const determinismFailingSeeds = [];
+	let determinismChecks = 0;
+	let gitCommit = config.gitCommit ?? base.gitCommit ?? null;
+
+	for (let i = 0; i < seeds.length; i++) {
+		const seed = seeds[i];
+
+		let buggified = buggify === 'on';
+		if (buggify === 'random') buggified = createSeededRng(seed + ':buggify').float() < buggifyProbability;
+		const relayFaults = buggified ? { ...(base.relayFaults || {}), ...faultProfile } : (base.relayFaults || {});
+
+		const result = await runOne({ ...base, seed, relayFaults });
+		if (gitCommit === null && result.gitCommit) gitCommit = result.gitCommit;
+
+		const failed = (result.invariantViolations || []).length > 0;
+
+		let reproduced = null;
+		if (checkRatio > 0 && createSeededRng(seed + ':check').float() < checkRatio) {
+			determinismChecks++;
+			reproduced = (await replayOne(result)).reproduced === true;
+			if (!reproduced) determinismFailingSeeds.push(seed);
+		}
+
+		const run = {
+			seed,
+			ok: !failed && reproduced !== false,
+			buggified,
+			fingerprint: runFingerprint(result),
+			violations: (result.invariantViolations || []).length,
+			fatals: (result.fatals || []).length,
+			uncaught: (result.schedulerUncaught || []).length,
+			violationCategories: [...new Set((result.invariantViolations || []).map((v) => v.category))].sort(),
+			reproduced
+		};
+		runs.push(run);
+		if (failed) failingSeeds.push(seed);
+		if (config.onResult) config.onResult(run, i);
+	}
+
+	const determinismFailures = determinismFailingSeeds.length;
+	return {
+		summary: {
+			total: seeds.length,
+			passed: runs.filter((r) => r.ok).length,
+			failed: failingSeeds.length,
+			firstFailingSeed: failingSeeds.length ? failingSeeds[0] : null,
+			failingSeeds,
+			buggify,
+			buggified: runs.filter((r) => r.buggified).length,
+			determinismChecks,
+			determinismFailures,
+			determinismFailingSeeds,
+			gitCommit,
+			ok: failingSeeds.length === 0 && determinismFailures === 0
+		},
+		runs
+	};
+}
+
+/**
+ * Run a swarm of seeds against the redis-backed cluster sim. Same contract as
+ * the adapter's runSimSwarm: a seed range (`count`/`startSeed`) or explicit
+ * `seeds`, a `buggify` knob (off/on/random + `faultProfile` layered onto the
+ * redis pub/sub relay), `checkRatio` for a determinism re-check, and an
+ * `onResult` progress callback. Returns `{ summary, runs }`.
+ *
+ * @param {{
+ *   seeds?: Array<string | number>, count?: number, startSeed?: number,
+ *   base?: import('./sim.d.ts').SimRedisConfig,
+ *   buggify?: 'off' | 'on' | 'random', faultProfile?: object,
+ *   buggifyProbability?: number, checkRatio?: number, gitCommit?: string,
+ *   onResult?: (run: any, index: number) => void
+ * }} [config]
+ */
+export function runRedisSimSwarm(config = {}) {
+	return swarm(config, runRedisSim, replayRedisSim);
+}
+
+/**
+ * Run a swarm of seeds against the postgres LISTEN/NOTIFY cluster sim. Same
+ * contract as runRedisSimSwarm; `faultProfile` is layered onto the NOTIFY relay.
+ *
+ * @param {{
+ *   seeds?: Array<string | number>, count?: number, startSeed?: number,
+ *   base?: import('./sim.d.ts').SimPgConfig,
+ *   buggify?: 'off' | 'on' | 'random', faultProfile?: object,
+ *   buggifyProbability?: number, checkRatio?: number, gitCommit?: string,
+ *   onResult?: (run: any, index: number) => void
+ * }} [config]
+ */
+export function runPgSimSwarm(config = {}) {
+	return swarm(config, runPgSim, replayPgSim);
+}

@@ -134,6 +134,76 @@ export function replayRedisSim(reproducer: SimResult): Promise<SimResult>;
 export function runPgSim(config?: SimPgConfig): Promise<SimResult>;
 export function replayPgSim(reproducer: SimResult): Promise<SimResult>;
 
+/** One run's compact outcome within a swarm (fatals/uncaught are always 0 for
+ *  the store-backed tier; the field is kept for cross-tier shape parity). */
+export interface SimSwarmRun {
+	seed: string;
+	ok: boolean;
+	buggified: boolean;
+	fingerprint: string;
+	violations: number;
+	fatals: number;
+	uncaught: number;
+	violationCategories: string[];
+	reproduced: boolean | null;
+}
+
+export interface SimSwarmSummary {
+	total: number;
+	passed: number;
+	failed: number;
+	firstFailingSeed: string | null;
+	failingSeeds: string[];
+	buggify: 'off' | 'on' | 'random';
+	buggified: number;
+	determinismChecks: number;
+	determinismFailures: number;
+	determinismFailingSeeds: string[];
+	gitCommit: string | null;
+	ok: boolean;
+}
+
+export interface SimSwarmResult {
+	summary: SimSwarmSummary;
+	runs: SimSwarmRun[];
+}
+
+export interface SimRedisSwarmConfig {
+	/** Explicit seed list; takes precedence over count/startSeed. */
+	seeds?: Array<string | number>;
+	/** Number of consecutive integer seeds (default 50). */
+	count?: number;
+	/** First integer seed when using `count` (default 1). */
+	startSeed?: number;
+	/** Base SimRedisConfig applied to every run (`seed`/`relayFaults` overridden per run). */
+	base?: SimRedisConfig;
+	/** Fault-enablement: 'off' (default), 'on', or 'random' (per-seed seeded coin). */
+	buggify?: 'off' | 'on' | 'random';
+	/** Fault profile layered onto the redis pub/sub relay when a run is buggified. */
+	faultProfile?: SimFaults;
+	buggifyProbability?: number;
+	checkRatio?: number;
+	gitCommit?: string;
+	onResult?: (run: SimSwarmRun, index: number) => void;
+}
+
+export interface SimPgSwarmConfig {
+	seeds?: Array<string | number>;
+	count?: number;
+	startSeed?: number;
+	base?: SimPgConfig;
+	buggify?: 'off' | 'on' | 'random';
+	/** Fault profile layered onto the LISTEN/NOTIFY relay when a run is buggified. */
+	faultProfile?: SimFaults;
+	buggifyProbability?: number;
+	checkRatio?: number;
+	gitCommit?: string;
+	onResult?: (run: SimSwarmRun, index: number) => void;
+}
+
+export function runRedisSimSwarm(config?: SimRedisSwarmConfig): Promise<SimSwarmResult>;
+export function runPgSimSwarm(config?: SimPgSwarmConfig): Promise<SimSwarmResult>;
+
 export const DEFAULT_REDIS_SEED: string;
 export const DEFAULT_PG_SEED: string;
 
