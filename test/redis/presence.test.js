@@ -2007,3 +2007,47 @@ describe('redis presence', () => {
 		});
 	});
 });
+
+describe('redis presence - client presence-update message frame', () => {
+	let client;
+	let platform;
+	let presence;
+
+	beforeEach(() => {
+		client = mockRedisClient('test:');
+		platform = mockPlatform();
+		presence = createPresence(client, {
+			key: 'id',
+			select: (userData) => ({ id: userData.id, name: userData.name }),
+			heartbeat: 60000,
+			ttl: 180
+		});
+	});
+
+	afterEach(() => {
+		presence.destroy();
+	});
+
+	it('routes an inbound presence-update frame to update()', async () => {
+		const ws = mockWs({ id: '1', name: 'Alice' });
+		await presence.join(ws, 'room', platform);
+		presence.flushDiffs();
+
+		const spy = vi.spyOn(presence, 'update');
+		presence.hooks.message(ws, {
+			data: { type: 'presence-update', topic: 'room', fields: { typing: true } },
+			platform
+		});
+		expect(spy).toHaveBeenCalledWith(ws, 'room', { typing: true }, platform);
+		await Promise.resolve();
+		spy.mockRestore();
+	});
+
+	it('ignores a presence-update frame with no fields object', () => {
+		const ws = mockWs({ id: '1', name: 'Alice' });
+		const spy = vi.spyOn(presence, 'update');
+		presence.hooks.message(ws, { data: { type: 'presence-update', topic: 'room' }, platform });
+		expect(spy).not.toHaveBeenCalled();
+		spy.mockRestore();
+	});
+});

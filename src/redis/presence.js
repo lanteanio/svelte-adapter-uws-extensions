@@ -1137,6 +1137,12 @@ export function createPresence(client, options = {}) {
 				if (data && data.type === 'presence-snapshot' && typeof data.topic === 'string') {
 					tracker.sync(ws, data.topic, platform).catch(() => { /* surfaced via breaker */ });
 				}
+				if (data && data.type === 'presence-update' && typeof data.topic === 'string' && data.fields && typeof data.fields === 'object') {
+					// Client-pushed field update (mirrors the in-memory presence
+					// plugin). `update` self-gates on membership and field shape, then
+					// splits durable/transient and relays the change cross-instance.
+					tracker.update(ws, data.topic, data.fields, platform).catch(() => { /* surfaced via breaker */ });
+				}
 			},
 			async unsubscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__presence:')) {
