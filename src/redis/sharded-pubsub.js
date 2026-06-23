@@ -235,6 +235,22 @@ export function createShardedBus(client, options = {}) {
 					return;
 				}
 				if (!activePlatform) return;
+				// Coalesced relay: re-coalesce onto local subscribers (latest-value-
+				// wins per ws+key), mirroring the publishing instance's sendCoalesced.
+				// Precedes the batch/single branches so a coalesced frame is never
+				// broadcast.
+				if (parsed.coalesced === true) {
+					if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+						mParseErrors?.inc();
+						return;
+					}
+					const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
+					mReceived?.inc({ topic: mt(parsed.topic) });
+					activePlatform.forEachSubscriber(parsed.topic, (ws) => {
+						activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+					});
+					return;
+				}
 				if (Array.isArray(parsed.batch)) {
 					const local = [];
 					for (let i = 0; i < parsed.batch.length; i++) {
@@ -742,6 +758,15 @@ export function createShardedBus(client, options = {}) {
 				},
 				send: platform.send.bind(platform),
 				sendTo: platform.sendTo.bind(platform),
+				// Relay-only coalesce (mirrors the pubsub bus): the local sendCoalesced
+				// fan-out already ran on the publishing instance; this carries the
+				// latest value to OTHER instances on the topic's shard channel, where
+				// each re-coalesces onto its own subscribers. Echo-suppressed by
+				// instanceId.
+				relayCoalesced(topic, event, data, coalesceKey) {
+					const channel = channelFor(topic);
+					scheduleRelay(channel, JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), [topic]);
+				},
 				sendCoalesced: platform.sendCoalesced.bind(platform),
 				request: platform.request.bind(platform),
 				// Binary wire methods. Forwarded like send/sendTo (local fanout, no

@@ -306,6 +306,31 @@ describe('redis sharded bus', () => {
 			await busB.deactivate();
 		});
 
+		it('cross-instance: receiver re-coalesces a coalesced envelope onto local subscribers', async () => {
+			const busA = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const busB = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			const wsX = { id: 'x' };
+			platformB.forEachSubscriber = (topic, fn) => { if (topic === 'chat:room1') fn(wsX); };
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+
+			const wrapped = busA.wrap(platformA);
+			wrapped.relayCoalesced('chat:room1', 'tick', { v: 9 }, 'k1');
+			await new Promise((r) => setTimeout(r, 5));
+
+			// B re-coalesced onto its local subscriber; never broadcast via publish.
+			expect(platformB.sentCoalesced).toHaveLength(1);
+			expect(platformB.sentCoalesced[0]).toEqual({ ws: wsX, key: 'chat:room1\0k1', topic: 'chat:room1', event: 'tick', data: { v: 9 } });
+			expect(platformB.published).toHaveLength(0);
+
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
 		it('echo-suppresses the whole batched envelope on instanceId match', async () => {
 			const bus = createShardedBus(client);
 			await bus.activate(platform);

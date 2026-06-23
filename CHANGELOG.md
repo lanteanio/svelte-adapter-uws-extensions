@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.24] - 2026-06-23
+
+### Fixed
+
+- **The pub/sub and sharded buses now relay `coalesceBy` streams cross-instance.** `bus.wrap` gains `relayCoalesced(topic, event, data, coalesceKey)` (relay-only - the publishing instance has already fanned out locally via `sendCoalesced`), and the receiver re-coalesces the latest value onto its own subscribers via `forEachSubscriber` + `sendCoalesced` (a new `coalesced` envelope type, echo-suppressed by `instanceId`, never broadcast). This closes a silent cross-instance gap: a clustered `live.stream({ coalesceBy })` topic (prices, cursors, presence) previously delivered only to the publishing instance's subscribers. Mirrored across `redis/pubsub` and `redis/sharded-pubsub`. Needs `svelte-realtime >= 0.6.0-next.26` to emit the relay.
+
 ## [0.6.0-next.23] - 2026-06-23
 
 ### Added

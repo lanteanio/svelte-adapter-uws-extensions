@@ -271,6 +271,64 @@ describe('redis pubsub bus', () => {
 		});
 	});
 
+	describe('coalesced relay (cluster coalesceBy)', () => {
+		it('relayCoalesced relays a coalesced envelope carrying the coalesceKey', async () => {
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+
+			wrapped.relayCoalesced('prices', 'tick', { p: 5 }, 'btc');
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(calls).toHaveLength(1);
+			expect(calls[0]).toMatchObject({ coalesced: true, topic: 'prices', event: 'tick', data: { p: 5 }, coalesceKey: 'btc' });
+			expect(calls[0].instanceId).toBeDefined();
+		});
+
+		it('receiver re-coalesces an inbound coalesced envelope onto local subscribers (no broadcast)', async () => {
+			await bus.activate(platform);
+			platform.reset();
+			const wsA = { id: 'a' };
+			const wsB = { id: 'b' };
+			platform.forEachSubscriber = (topic, fn) => { if (topic === 'prices') { fn(wsA); fn(wsB); } };
+
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: 'other-instance',
+				coalesced: true,
+				topic: 'prices',
+				event: 'tick',
+				data: { p: 5 },
+				coalesceKey: 'btc'
+			}));
+
+			expect(platform.sentCoalesced).toHaveLength(2);
+			expect(platform.sentCoalesced[0]).toEqual({ ws: wsA, key: 'prices\0btc', topic: 'prices', event: 'tick', data: { p: 5 } });
+			expect(platform.sentCoalesced[1].ws).toBe(wsB);
+			// A coalesced frame must never be broadcast via publish.
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('receiver echo-suppresses an own-instance coalesced envelope', async () => {
+			await bus.activate(platform);
+			const wrapped = bus.wrap(platform);
+			const calls = [];
+			const orig = client.redis.publish;
+			client.redis.publish = async (ch, msg) => { calls.push(JSON.parse(msg)); return orig.call(client.redis, ch, msg); };
+			wrapped.relayCoalesced('prices', 'tick', { p: 1 }, 'btc');
+			await new Promise((r) => setTimeout(r, 5));
+			const ownId = calls[0].instanceId;
+
+			platform.reset();
+			platform.forEachSubscriber = (topic, fn) => fn({ id: 'x' });
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: ownId, coalesced: true, topic: 'prices', event: 'tick', data: { p: 1 }, coalesceKey: 'btc'
+			}));
+
+			expect(platform.sentCoalesced).toHaveLength(0);
+		});
+	});
+
 	describe('wrap - new platform passthroughs', () => {
 		it('exposes publishBatched, sendCoalesced, request, requestId, pressure, onPressure', () => {
 			const wrapped = bus.wrap(platform);

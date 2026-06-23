@@ -245,6 +245,14 @@ export function createPubSubBus(client, options = {}) {
 				},
 				send: platform.send.bind(platform),
 				sendTo: platform.sendTo.bind(platform),
+				// Relay-only coalesce: realtime's coalesceBy branch has already fanned
+				// out to THIS instance's sockets via sendCoalesced; this carries the
+				// latest value to OTHER instances, which re-coalesce it onto their own
+				// subscribers. Echo-suppressed by instanceId, so the publishing
+				// instance never double-delivers.
+				relayCoalesced(topic, event, data, coalesceKey) {
+					scheduleRelay(JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), 1);
+				},
 				sendCoalesced: platform.sendCoalesced.bind(platform),
 				request: platform.request.bind(platform),
 				// Binary wire methods. Forwarded like send/sendTo (local fanout, no
@@ -397,6 +405,23 @@ export function createPubSubBus(client, options = {}) {
 					// instanceId for the whole batch.
 					if (parsed.instanceId === instanceId) {
 						mEchoSuppressed?.inc();
+						return;
+					}
+					// Coalesced relay: re-coalesce the latest value onto this
+					// instance's local subscribers (latest-value-wins per ws+key),
+					// mirroring the publishing instance's sendCoalesced fan-out. Must
+					// precede the batch/single branches - a plain publish would
+					// broadcast and defeat the per-key coalesce.
+					if (parsed.coalesced === true) {
+						if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+							mParseErrors?.inc();
+							return;
+						}
+						const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
+						mReceived?.inc();
+						activePlatform.forEachSubscriber(parsed.topic, (ws) => {
+							activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+						});
 						return;
 					}
 					// relay: false prevents the adapter from IPC-relaying to
