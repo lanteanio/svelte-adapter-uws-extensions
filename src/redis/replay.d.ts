@@ -270,3 +270,56 @@ export interface RedisReplayBuffer {
  * Create a Redis-backed replay buffer.
  */
 export function createReplay(client: RedisClient, options?: RedisReplayOptions): RedisReplayBuffer;
+
+export interface MigrateReplayOptions {
+	/**
+	 * Migrate exactly these topics. Omitted: discover every sorted-set replay
+	 * buffer via a cluster-aware `SCAN` and migrate all of them.
+	 */
+	topics?: string[];
+	/**
+	 * `MAXLEN ~` cap applied to the target stream. Match the `size` the
+	 * deployment passes to `createReplay`.
+	 * @default 1000
+	 */
+	size?: number;
+	/**
+	 * When the target stream already has entries: `false` skips the topic
+	 * (`reason: 'target-exists'`); `true` UNLINKs the target first and
+	 * re-migrates (recovery from a crashed run).
+	 * @default false
+	 */
+	force?: boolean;
+	/** Compute and report the plan without writing anything. @default false */
+	dryRun?: boolean;
+}
+
+export interface MigrateReplayResult {
+	/**
+	 * Topics whose buffer was migrated. `entries` is the number of source
+	 * entries written to the stream (before any `MAXLEN ~` trim); `highWaterSeq`
+	 * is the largest seq migrated (`0` for an empty source).
+	 */
+	migrated: Array<{ topic: string; entries: number; highWaterSeq: number }>;
+	/**
+	 * Topics that were not migrated. `reason` is `'target-exists'` (already
+	 * migrated, no `force`) or `'error'` (the topic's migration threw; `error`
+	 * carries the message and the rest of the batch still ran).
+	 */
+	skipped: Array<{ topic: string; reason: 'target-exists' | 'error'; error?: string }>;
+}
+
+/**
+ * Migrate one or more topics' replay buffers from the sorted-set backend to the
+ * stream backend (`storage: 'stream'`).
+ *
+ * The `replay:seq:{topic}` and `replay:epoch:{topic}` keys are shared between
+ * both backends, so this copies only the message buffer (`replay:buf:{topic}`
+ * sorted set -> `replay:streambuf:{topic}` stream) and leaves the counters and
+ * the source sorted set untouched (delete the source yourself after verifying).
+ * Opt-in (entry IDs change shape), idempotent per topic, and cluster-portable.
+ */
+export function migrateReplayToStream(
+	client: RedisClient,
+	options?: MigrateReplayOptions
+): Promise<MigrateReplayResult>;

@@ -1227,7 +1227,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Streams idempotent replay publish Lua script simulation
-		// args layout: [idmpKey, seqKey, bufKey, requestId, maxSize, ttl, idmpTtl, topic, event, dataJson]
+		// args layout: [idmpKey, seqKey, bufKey, epochKey, requestId, maxSize, ttl, idmpTtl, event, dataJson]
 		function evalIdmpStreamReplayPublish(numKeys, args) {
 			const idmpKey = args[0];
 			const seqKey = args[1];
@@ -1235,9 +1235,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const epochKey = args[3];
 			const requestId = args[4];
 			const maxSize = Number(args[5]);
-			const topic = args[8];
-			const event = args[9];
-			const dataJson = args[10];
+			const event = args[8];
+			const dataJson = args[9];
 
 			if (!hashes.has(idmpKey)) hashes.set(idmpKey, new Map());
 			const idmp = hashes.get(idmpKey);
@@ -1259,7 +1258,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const stream = streams.get(bufKey);
 			stream.push({
 				id,
-				fields: [['topic', topic], ['event', event], ['data', dataJson]]
+				fields: [['event', event], ['data', dataJson]]
 			});
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);
@@ -1271,15 +1270,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Streams replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, epochKey, maxSize, ttl, topic, event, dataJson]
+		// args layout: [seqKey, bufKey, epochKey, maxSize, ttl, event, dataJson]
 		function evalStreamReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
 			const epochKey = args[2];
 			const maxSize = Number(args[3]);
-			const topic = args[5];
-			const event = args[6];
-			const dataJson = args[7];
+			const event = args[5];
+			const dataJson = args[6];
 
 			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
 			store.set(seqKey, String(v));
@@ -1295,7 +1293,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const stream = streams.get(bufKey);
 			stream.push({
 				id,
-				fields: [['topic', topic], ['event', event], ['data', dataJson]]
+				fields: [['event', event], ['data', dataJson]]
 			});
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);

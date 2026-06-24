@@ -35,11 +35,17 @@ import { checkReplayAccess } from '../shared/replay-gate.js';
  * ARGV[2] = maxSize
  * ARGV[3] = ttl seconds (0 = no expiry; applies to seq + stream keys)
  * ARGV[4] = idmpTtl seconds (0 = no expiry on the dedup cache)
- * ARGV[5] = topic
- * ARGV[6] = event
- * ARGV[7] = data (JSON-encoded)
+ * ARGV[5] = event
+ * ARGV[6] = data (JSON-encoded)
  *
  * Returns {isDuplicate (1|0), seq}.
+ *
+ * The entry stores only the `event` and `data` fields. The topic is NOT
+ * stored: it is already encoded in the per-topic stream key, so writing it
+ * into every entry is a redundant per-entry value (Redis stream SAMEFIELDS
+ * dedups the field NAMES but never the VALUES). The read path recovers the
+ * topic from the key. Legacy entries written before this change still carry
+ * a `topic` field; the reader falls back to it when present.
  *
  * The `seq == 1` reset edge bumps the epoch in the same atomic script (see
  * PUBLISH_SCRIPT below for the rationale). The epoch key is given NO ttl, so
@@ -54,9 +60,8 @@ local requestId = ARGV[1]
 local maxSize = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
 local idmpTtl = tonumber(ARGV[4])
-local topic = ARGV[5]
-local event = ARGV[6]
-local data = ARGV[7]
+local event = ARGV[5]
+local data = ARGV[6]
 if maxSize == nil or ttl == nil or idmpTtl == nil then
   return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl must be numeric')
 end
@@ -71,7 +76,7 @@ if seq == 1 then
   redis.call('incr', epochKey)
 end
 local id = seq .. '-0'
-redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'topic', topic, 'event', event, 'data', data)
+redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'event', event, 'data', data)
 
 redis.call('hset', idmpKey, requestId, seq)
 if idmpTtl > 0 then
@@ -95,11 +100,15 @@ return {0, seq}
  * KEYS[3] = epoch key
  * ARGV[1] = maxSize (XADD MAXLEN ~)
  * ARGV[2] = ttl seconds (0 = no expiry)
- * ARGV[3] = topic
- * ARGV[4] = event
- * ARGV[5] = data (JSON-encoded)
+ * ARGV[3] = event
+ * ARGV[4] = data (JSON-encoded)
  *
  * Returns the new sequence number.
+ *
+ * The entry stores only `event` and `data`; the topic lives in the per-topic
+ * stream key, so storing it per entry is a redundant value the reader recovers
+ * from the key. Legacy entries still carry a `topic` field; the reader falls
+ * back to it when present.
  *
  * When the seq counter reads 1 the seq space is fresh (brand-new topic or one
  * whose seq key was reaped by TTL), so the numbering restarted: bump the epoch
@@ -113,9 +122,8 @@ local bufKey = KEYS[2]
 local epochKey = KEYS[3]
 local maxSize = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
-local topic = ARGV[3]
-local event = ARGV[4]
-local data = ARGV[5]
+local event = ARGV[3]
+local data = ARGV[4]
 if maxSize == nil or ttl == nil then
   return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl must be numeric')
 end
@@ -125,7 +133,7 @@ if seq == 1 then
   redis.call('incr', epochKey)
 end
 local id = seq .. '-0'
-redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'topic', topic, 'event', event, 'data', data)
+redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'event', event, 'data', data)
 
 if ttl > 0 then
   redis.call('expire', seqKey, ttl)
@@ -255,7 +263,7 @@ export function createStreamReplay(client, options = {}) {
 			try {
 				result = await withBreaker(b, () =>
 					redis.eval(IDMP_PUBLISH_SCRIPT, 4, ik, sk, bk, ek,
-						requestId, maxSize, ttl, idmpTtl, topic, event, payload)
+						requestId, maxSize, ttl, idmpTtl, event, payload)
 				);
 			} catch (err) {
 				throw new ReplayStorageError('publishIdempotent', err);
@@ -297,7 +305,7 @@ export function createStreamReplay(client, options = {}) {
 
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, topic, event, payload)
+					redis.eval(PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, event, payload)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
@@ -377,7 +385,10 @@ export function createStreamReplay(client, options = {}) {
 				try {
 					result.push({
 						seq: seqFromId(id),
-						topic: fields.topic,
+						// Versioned read: new entries omit the topic field (it is
+						// the per-topic key), so recover it from the `topic` param;
+						// legacy entries written before that change still carry it.
+						topic: fields.topic ?? topic,
 						event: fields.event,
 						data: JSON.parse(fields.data)
 					});

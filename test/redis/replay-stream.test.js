@@ -806,4 +806,55 @@ describe('redis replay (stream backend)', () => {
 			expect(msgFrames).toHaveLength(0);
 		});
 	});
+
+	describe('per-entry topic field (dropped; versioned read)', () => {
+		it('a new-format publish stores only event + data, and since() recovers the topic from the key', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+
+			// The stored entry carries no topic field - it is the per-topic key.
+			const stream = client._streams.get(client.key('replay:streambuf:{chat}'));
+			const fieldNames = stream[0].fields.map(([k]) => k);
+			expect(fieldNames).toEqual(['event', 'data']);
+			expect(fieldNames).not.toContain('topic');
+
+			// since() still returns the topic, recovered from the param.
+			const [msg] = await replay.since('chat', 0);
+			expect(msg).toEqual({ seq: 1, topic: 'chat', event: 'created', data: { id: 1 } });
+		});
+
+		it('reads a LEGACY entry that still carries a topic field (backward-compatible)', async () => {
+			// A pre-change entry wrote the topic into the entry; the reader honors
+			// the stored value via the fields.topic ?? topic fallback.
+			await client.redis.xadd(
+				client.key('replay:streambuf:{chat}'),
+				'1-0', 'topic', 'chat', 'event', 'created', 'data', '{"id":1}'
+			);
+			const [msg] = await replay.since('chat', 0);
+			expect(msg).toEqual({ seq: 1, topic: 'chat', event: 'created', data: { id: 1 } });
+		});
+
+		it('a legacy entry returns the STORED topic field when present', async () => {
+			// Only legacy entries carry the field, so the fallback prefers it: a
+			// legacy entry round-trips exactly as it was written.
+			await client.redis.xadd(
+				client.key('replay:streambuf:{room}'),
+				'1-0', 'topic', 'legacy-topic', 'event', 'e', 'data', 'null'
+			);
+			const [msg] = await replay.since('room', 0);
+			expect(msg.topic).toBe('legacy-topic');
+			expect(msg.data).toBe(null);
+		});
+
+		it('decodes a stream that mixes a legacy entry and a new-format entry', async () => {
+			const key = client.key('replay:streambuf:{chat}');
+			await client.redis.xadd(key, '1-0', 'topic', 'chat', 'event', 'old', 'data', '{"n":1}');
+			await client.redis.xadd(key, '2-0', 'event', 'new', 'data', '{"n":2}');
+
+			const all = await replay.since('chat', 0);
+			expect(all).toEqual([
+				{ seq: 1, topic: 'chat', event: 'old', data: { n: 1 } },
+				{ seq: 2, topic: 'chat', event: 'new', data: { n: 2 } }
+			]);
+		});
+	});
 });

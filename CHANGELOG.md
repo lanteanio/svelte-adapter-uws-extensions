@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.27] - 2026-06-24
+
+### Added
+
+- **`migrateReplayToStream(client, options?)` on `svelte-adapter-uws-extensions/redis/replay`: a one-time migration of a topic's replay buffer from the default sorted-set storage to the stream storage (`storage: 'stream'`).** Both backends share the `replay:seq:{topic}` and `replay:epoch:{topic}` keys, so the helper copies only the message buffer (the `replay:buf:{topic}` sorted set into the `replay:streambuf:{topic}` stream) and leaves the seq high-water and the reset epoch untouched - resume-by-seq and resume-by-epoch keep working across the switch with no extra bookkeeping. It reads the source in seq order and re-emits each entry under its original seq as a `<seq>-0` stream ID, so sequence numbers are preserved exactly. Non-destructive (the source sorted set is left in place for you to delete after verifying - the two backends use different key prefixes, so they never collide), idempotent per topic (a re-run skips a topic whose target stream already has entries; `force: true` UNLINKs and re-migrates to recover from a crashed run), and discrete-command (no Lua) so it runs correctly on Redis Cluster - topic discovery enumerates every master with a cluster-aware `SCAN` when `topics` is omitted. Options: `topics` (an explicit list, else discover all), `size` (the target `MAXLEN ~` cap, default 1000), `force`, and `dryRun` (report the plan without writing). Returns `{ migrated: [{ topic, entries, highWaterSeq }], skipped: [{ topic, reason }] }`. Corrupt or degenerate source members are skipped (matching the backends' own skip-corrupt behaviour) rather than aborting the topic.
+
+### Changed
+
+- **The stream replay backend (`storage: 'stream'`) no longer writes a per-entry `topic` field; each entry stores only `event` and `data`.** The topic is already encoded in the per-topic stream key (`replay:streambuf:{topic}`), so writing it into every entry was a redundant value paid on every publish: Redis stream listpack `SAMEFIELDS` encoding dedups identical field *names* across entries but never the *values*, so the repeated topic string was real per-entry bytes with no offsetting dedup. The read path now recovers the topic from the key, and entries written by older versions that still carry a `topic` field are read back unchanged (the field's presence discriminates the format - no version flag, no migration needed for existing buffers). The memory effect is workload-dependent: meaningful for small envelope-dominated events (where the topic string is a real fraction of the entry), negligible for large payloads. The wire shape `since()` and `replay()` return to consumers is unchanged.
+
 ## [0.6.0-next.26] - 2026-06-24
 
 ### Fixed

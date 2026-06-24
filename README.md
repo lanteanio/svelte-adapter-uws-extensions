@@ -530,9 +530,38 @@ const replay = createReplay(redis, {
 });
 ```
 
-Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) but different buf-key prefixes (`replay:buf:{topic}` for sorted-set, `replay:streambuf:{topic}` for stream), so they can coexist on the same Redis without WRONGTYPE collisions. A single topic should pick one backend at startup and stay there - there is no built-in migration helper for switching an existing topic from one backend to the other (greenfield deployments don't need it; if you have one in flight and need to migrate, drain consumers, copy entries with a one-off script, and switch).
+Both backends use the same seq-counter key (`{prefix}replay:seq:{topic}`) and the same epoch key (`{prefix}replay:epoch:{topic}`), but different buf-key prefixes (`replay:buf:{topic}` for sorted-set, `replay:streambuf:{topic}` for stream), so they can coexist on the same Redis without WRONGTYPE collisions. A single topic should pick one backend at startup and stay there; to switch an existing topic, use [`migrateReplayToStream`](#migrating-a-sorted-set-buffer-to-stream-storage).
+
+Each stream entry stores only the `event` and `data` fields. The topic is not stored per entry - it is already the per-topic stream key, so writing it into every entry would be a redundant value (Redis stream `SAMEFIELDS` dedups field *names* but never *values*). The reader recovers the topic from the key, and entries written by older versions that still carry a `topic` field are read back unchanged.
 
 The stream backend works on Redis 5+; listpack encoding is the Redis 7+ default that delivers the memory win.
+
+#### Migrating a sorted-set buffer to stream storage
+
+`migrateReplayToStream(client, options?)` copies an existing topic's buffer from the default sorted-set storage to the stream storage. Because both backends share the `replay:seq:{topic}` and `replay:epoch:{topic}` keys, it copies only the message buffer - the seq high-water and the reset epoch are already correct for the stream backend, so resume-by-seq and resume-by-epoch keep working across the switch.
+
+```js
+import { createReplay, migrateReplayToStream } from 'svelte-adapter-uws-extensions/redis/replay';
+
+// Migrate every sorted-set topic, capping each target stream at 10000 entries.
+const { migrated, skipped } = await migrateReplayToStream(redis, { size: 10000 });
+// migrated: [{ topic, entries, highWaterSeq }, ...]
+// skipped:  [{ topic, reason: 'target-exists' | 'error', error? }, ...]
+
+// Then point the deployment at the stream backend:
+const replay = createReplay(redis, { storage: 'stream', size: 10000 });
+```
+
+It is non-destructive (the source sorted set is left in place - delete it yourself after verifying), idempotent per topic (a re-run skips a topic whose target stream already has entries), and discrete-command so it works on Redis Cluster.
+
+| Option | Default | Description |
+|---|---|---|
+| `topics` | (all) | Migrate exactly these topics. Omitted: discover every sorted-set buffer via a cluster-aware `SCAN`. |
+| `size` | `1000` | `MAXLEN ~` cap for the target stream. Match the `size` you pass to `createReplay`. |
+| `force` | `false` | When the target already has entries, `UNLINK` it and re-migrate (recovery from a crashed run) instead of skipping. |
+| `dryRun` | `false` | Report the plan without writing anything. |
+
+A run that crashes mid-topic leaves a partial target stream; re-run with `force` (or pass that topic in `topics`) to repair it. The entry IDs change shape (a sorted-set score becomes a `<seq>-0` stream ID), so this is an opt-in switch rather than a transparent format change - migrate, verify, then point `createReplay` at `storage: 'stream'`.
 
 #### Idempotent publish (stream backend only)
 

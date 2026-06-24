@@ -27,6 +27,7 @@ import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, 
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
+export { migrateReplayToStream } from './replay-migrate.js';
 
 /**
  * @typedef {Object} RedisReplayOptions
