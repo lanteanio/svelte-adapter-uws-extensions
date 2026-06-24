@@ -13,6 +13,8 @@ export interface RedisIdempotencyOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+	/** Cap on the JSON-encoded byte length of a committed result; `commit()` rejects with `IdempotencyResultTooLargeError` past this. `Infinity` disables. @default 262144 (256 KB) */
+	maxResultBytes?: number;
 }
 
 export interface IdempotencySlotAcquired {

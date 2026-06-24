@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.26] - 2026-06-24
+
+### Fixed
+
+- **`createIdempotencyStore({ maxResultBytes })` is now typed (Redis + Postgres).** The result-size cap has been validated + enforced at runtime (and documented in JSDoc + README) since it shipped, but was missing from the `RedisIdempotencyOptions` / `PgIdempotencyOptions` type - so a TypeScript app got a type error setting it. Added `maxResultBytes?: number` to both interfaces. No runtime change.
+
 ## [0.6.0-next.25] - 2026-06-24
 
 ### Added
