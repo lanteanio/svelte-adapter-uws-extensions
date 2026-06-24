@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createRateLimit } from '../../src/redis/ratelimit.js';
 import { createMetrics } from '../../src/prometheus/index.js';
@@ -381,6 +381,91 @@ describe('redis ratelimit', () => {
 			expect(r1.allowed).toBe(true);
 			expect(r1.remaining).toBe(4);
 			expect((await limiter.consume(ws2)).allowed).toBe(true);
+		});
+	});
+
+	describe('proxy-collapse warning (keyBy: ip)', () => {
+		let warnSpy;
+		let savedAddressHeaders;
+
+		// Snapshot AND clear every env name isAddressHeaderConfigured() matches (the
+		// unprefixed ADDRESS_HEADER and any *_ADDRESS_HEADER envPrefix form), so the
+		// positive-warning tests are deterministic regardless of a CI/dev shell that
+		// injects a prefixed address-header var. Restored verbatim afterwards.
+		function addressHeaderKeys() {
+			return Object.keys(process.env).filter((k) => k === 'ADDRESS_HEADER' || k.endsWith('_ADDRESS_HEADER'));
+		}
+
+		beforeEach(() => {
+			savedAddressHeaders = {};
+			for (const k of addressHeaderKeys()) {
+				savedAddressHeaders[k] = process.env[k];
+				delete process.env[k];
+			}
+			warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		});
+
+		afterEach(() => {
+			for (const k of addressHeaderKeys()) delete process.env[k];
+			for (const [k, v] of Object.entries(savedAddressHeaders)) process.env[k] = v;
+		});
+
+		it('warns once on the first denial keyed on a private/loopback address with ADDRESS_HEADER unset', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000 });
+			const ws = mockWs({ remoteAddress: '172.17.0.1' });
+			await lim.consume(ws);
+			const denied = await lim.consume(ws);
+			expect(denied.allowed).toBe(false);
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(warnSpy.mock.calls[0][0]).toContain('172.17.0.1');
+			expect(warnSpy.mock.calls[0][0]).toContain('ADDRESS_HEADER');
+		});
+
+		it('fires at most once (latched) across further denials', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000 });
+			const ws = mockWs({ remoteAddress: '10.0.0.5' });
+			for (let i = 0; i < 4; i++) await lim.consume(ws);
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it('does not warn on an allowed consume', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60000 });
+			const r = await lim.consume(mockWs({ remoteAddress: '127.0.0.1' }));
+			expect(r.allowed).toBe(true);
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
+		it('does not warn when the keyed address is public', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000 });
+			const ws = mockWs({ remoteAddress: '8.8.8.8' });
+			await lim.consume(ws);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
+		it('does not warn when ADDRESS_HEADER is configured', async () => {
+			process.env.ADDRESS_HEADER = 'x-forwarded-for';
+			const lim = createRateLimit(client, { points: 1, interval: 60000 });
+			const ws = mockWs({ remoteAddress: '10.0.0.1' });
+			await lim.consume(ws);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
+		it('does not warn in connection mode (no IP keying)', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000, keyBy: 'connection' });
+			const ws = mockWs({ remoteAddress: '10.0.0.1' });
+			await lim.consume(ws);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
+		it('does not warn with a custom keyBy function', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000, keyBy: () => 'room:a' });
+			const ws = mockWs({ remoteAddress: '10.0.0.1' });
+			await lim.consume(ws);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			expect(warnSpy).not.toHaveBeenCalled();
 		});
 	});
 });

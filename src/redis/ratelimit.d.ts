@@ -9,7 +9,17 @@ export interface RedisRateLimitOptions {
 	interval: number;
 	/** Auto-ban duration in ms when exhausted. 0 = no ban. @default 0 */
 	blockDuration?: number;
-	/** Key extraction mode. @default 'ip' */
+	/**
+	 * Key extraction mode. @default 'ip'
+	 *
+	 * In 'ip' mode (the default) the bucket key is `userData.remoteAddress`, which the adapter
+	 * resolves from ADDRESS_HEADER / XFF_DEPTH. Behind an address-rewriting proxy (docker
+	 * userland-proxy, an L4 load balancer, a non-XFF proxy) with ADDRESS_HEADER unset, every
+	 * client arrives as the same gateway address and the per-IP bucket collapses into one shared
+	 * global bucket. Set ADDRESS_HEADER (and XFF_DEPTH) so the real client IP is resolved, or pass
+	 * an explicit keyBy. The limiter logs a one-shot warning the first time it denies on a
+	 * loopback/private key while ADDRESS_HEADER is unset.
+	 */
 	keyBy?: 'ip' | 'connection' | ((ws: any) => string);
 	/**
 	 * Optional per-connection tenant resolver. When set, the bucket key is scoped by

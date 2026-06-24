@@ -1014,6 +1014,8 @@ export async function message(ws, { data, platform }) {
 | `blockDuration` | `0` | Auto-ban duration in ms (0 = no ban) |
 | `keyBy` | `'ip'` | `'ip'`, `'connection'`, or a function |
 
+> **`keyBy: 'ip'` behind a proxy.** In `'ip'` mode (the default) the bucket key is `userData.remoteAddress`, which the adapter resolves from `ADDRESS_HEADER` / `XFF_DEPTH`. If the server sits behind an address-rewriting proxy (a docker userland-proxy, an L4 load balancer, a non-XFF proxy) and `ADDRESS_HEADER` is unset, every client arrives as the same gateway address and the per-IP bucket collapses into one shared global bucket. Set `ADDRESS_HEADER` (and `XFF_DEPTH` for an X-Forwarded-For chain) so the real client IP is resolved, or pass an explicit `keyBy`. The limiter logs a one-shot warning the first time it denies on a loopback/private key while `ADDRESS_HEADER` is unset.
+
 #### API
 
 All methods are async (they hit Redis). The API otherwise matches the core plugin:
@@ -2415,7 +2417,28 @@ export const cursors = createCursor(redis, { metrics });
 
 #### Mounting the endpoint
 
-With uWebSockets.js:
+In SvelteKit, wire the registry into the adapter so its own upgrade-path counters (`upgrade_admitted_total`, `upgrade_rejected_total{reason}`, `upgrade_inflight`, ...) register into the same registry, then scrape it from a route via `platform.metrics`:
+
+```js
+// svelte.config.js -- point the adapter at the metrics MODULE by path (a string),
+// not an inline registry object: adapter options are serialized into the build, so
+// a live object passed here never reaches the bundled runtime (silent no-op).
+adapter({ websocket: { metrics: './src/lib/server/metrics.js' } });
+```
+
+```js
+// src/routes/metrics/+server.js -- scrape via platform.metrics, the registry the
+// adapter exposes on the platform. Do NOT re-import the metrics module in the route:
+// in a production build that can resolve to a second, empty copy.
+export const GET = ({ platform }) =>
+  new Response(platform.metrics.serialize(), {
+    headers: { 'content-type': 'text/plain; version=0.0.4' }
+  });
+```
+
+The module-path `websocket.metrics` wiring (and `platform.metrics`) requires `svelte-adapter-uws >= 0.6.0-next.33`.
+
+On a standalone uWebSockets.js server you hold the raw `app`, so mount the bundled handler directly:
 
 ```js
 app.get('/metrics', metrics.handler);
@@ -2612,7 +2635,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 |---|---|---|---|
 | `capability_cookie_misses_total` | counter | `reason` | Failed verifications: `missing` (absent while required) or `invalid` (presented but failed to verify; includes expired) |
 
-The adapter's own upgrade-path counters and gauges (`upgrade_admitted_total`, `upgrade_rejected_total{reason}`, `upgrade_inflight`, `waiting_room_queue_depth`, `protection_posture_state`, `protection_posture_transitions_total{from,to}`) register through the same registry when you pass it to `adapter({ websocket: { metrics } })` - see the adapter README's admission section. One registry, one `/metrics` endpoint, the whole admission stack on one dashboard.
+The adapter's own upgrade-path counters and gauges (`upgrade_admitted_total`, `upgrade_rejected_total{reason}`, `upgrade_inflight`, `waiting_room_queue_depth`, `protection_posture_state`, `protection_posture_transitions_total{from,to}`) register through the same registry when you point the adapter at the metrics module by path - `adapter({ websocket: { metrics: './src/lib/server/metrics.js' } })`, see [Mounting the endpoint](#mounting-the-endpoint) and the adapter README's admission section. (Passing an inline registry object here is a silent no-op: adapter options are serialized into the build, so a live object never crosses into the bundled runtime. Requires `svelte-adapter-uws >= 0.6.0-next.33`.) One registry, one `/metrics` endpoint, the whole admission stack on one dashboard.
 
 **Job queue**
 

@@ -13,6 +13,7 @@
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
+import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
 
 const BAN_SCRIPT = `
@@ -42,6 +43,13 @@ return 1
  * @property {number} interval - Refill interval in milliseconds. Must be positive.
  * @property {number} [blockDuration=0] - Auto-ban duration in ms when exhausted. 0 = no ban.
  * @property {'ip' | 'connection' | ((ws: any) => string)} [keyBy='ip'] - Key extraction mode.
+ *   In 'ip' mode (the default) the bucket key is `userData.remoteAddress`, which the adapter
+ *   resolves from ADDRESS_HEADER / XFF_DEPTH. Behind an address-rewriting proxy (docker
+ *   userland-proxy, an L4 load balancer, a non-XFF proxy) with ADDRESS_HEADER unset, every
+ *   client arrives as the same gateway address and the per-IP bucket collapses into one shared
+ *   global bucket. Set ADDRESS_HEADER (and XFF_DEPTH) so the real client IP is resolved, or pass
+ *   an explicit keyBy. The limiter logs a one-shot warning the first time it denies on a
+ *   loopback/private key while ADDRESS_HEADER is unset (the signature of that collapse).
  * @property {(ws: any) => (string | null | undefined)} [tenant] - Optional per-connection
  *   tenant resolver. When set, the bucket key is scoped by the returned tenant id, so two
  *   tenants sharing an IP / connection / custom key get independent buckets and a tenant's
@@ -120,6 +128,31 @@ export function createRateLimit(client, options) {
 	const wsKeys = new WeakMap();
 	let connCounter = 0;
 
+	// One-shot proxy-collapse diagnostic. In the default 'ip' mode the bucket key
+	// is the resolved remote address; behind an address-rewriting proxy with no
+	// ADDRESS_HEADER configured, every client collapses onto the gateway address
+	// and this per-IP limiter quietly becomes one shared global bucket. The first
+	// time we deny on a loopback/private key with no proxy header set (the
+	// signature of that collapse) we warn once. Read the env once here - it is
+	// fixed before the server starts. Purely diagnostic; never changes a verdict.
+	const ipMode = keyBy === 'ip';
+	const addressHeaderSet = isAddressHeaderConfigured();
+	let warnedProxyCollapse = false;
+
+	function maybeWarnProxyCollapse(key) {
+		if (warnedProxyCollapse || !ipMode || addressHeaderSet) return;
+		if (!isPrivateOrLoopbackAddress(key)) return;
+		warnedProxyCollapse = true;
+		console.warn(
+			`redis ratelimit: denied a request keyed on the private/loopback address "${key}" ` +
+			"while keyBy:'ip' and ADDRESS_HEADER is unset. If this server sits behind an " +
+			'address-rewriting proxy (docker userland-proxy, an L4 load balancer, a non-XFF proxy), ' +
+			'every client arrives as the same gateway address and this per-IP rate limiter collapses ' +
+			'into one shared global bucket. Set ADDRESS_HEADER (and XFF_DEPTH) so the adapter resolves ' +
+			'the real client IP, or pass an explicit keyBy. This warning fires once.'
+		);
+	}
+
 	/**
 	 * Resolve the rate limit key for a WebSocket connection.
 	 *
@@ -177,6 +210,7 @@ export function createRateLimit(client, options) {
 				mAllowed?.inc(labels);
 			} else {
 				mDenied?.inc(labels);
+				maybeWarnProxyCollapse(key);
 			}
 
 			return {

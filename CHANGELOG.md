@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.25] - 2026-06-24
+
+### Added
+
+- **`redis/ratelimit` warns once when a per-IP limiter is collapsing behind a proxy.** In the default `keyBy: 'ip'` mode the bucket key is `userData.remoteAddress`, which the adapter resolves from `ADDRESS_HEADER` / `XFF_DEPTH`. Behind an address-rewriting proxy (a docker userland-proxy, an L4 load balancer, a non-XFF proxy) with `ADDRESS_HEADER` unset, every client arrives as the same gateway address and the per-IP bucket silently collapses into one shared global bucket. The limiter now logs a one-shot warning the first time it denies a request keyed on a loopback/private address while `ADDRESS_HEADER` is unset (the signature of that collapse), pointing at `ADDRESS_HEADER` / `XFF_DEPTH` or an explicit `keyBy`. It is purely diagnostic (never changes a verdict) and stays silent for public-IP keys, a configured proxy header, `keyBy: 'connection'`, or a custom `keyBy`. No adapter dependency.
+
+### Changed
+
+- **Docs: the metrics registry is wired into the adapter by module path, not inline, and scraped via `platform.metrics`.** The README showed the registry passed inline to the adapter (`adapter({ websocket: { metrics } })`), which is a silent no-op in a production build: adapter options are serialized into the bundle, so a live object never crosses into the runtime. The `createMetrics()` registry is unchanged; only the wiring moves. Point the adapter at the metrics module by path (`adapter({ websocket: { metrics: './src/lib/server/metrics.js' } })`) and read `platform.metrics` in the scrape route (re-importing the metrics module in the route can resolve to a separate, empty copy). Requires `svelte-adapter-uws >= 0.6.0-next.33`.
+
 ## [0.6.0-next.24] - 2026-06-23
 
 ### Fixed
