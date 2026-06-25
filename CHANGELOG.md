@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.29] - 2026-06-25
+
+### Added
+
+- **`redis/session` gains a WebSocket lifecycle layer: `create()`, `withHooks()`, and `of(ws)` (plus `identify` / `maxAgeMs` / `onLoadError` options).** The store was load-it-yourself: extract the token, `get`, stash it, `set` on disconnect. These wire that into the adapter `hooks.ws` so the common case is a few lines, and they are designed security-first:
+  - **`create(data)`** mints a NEW session server-side and returns a 256-bit CSPRNG token (via the runtime RNG seam, whose default is `node:crypto`). Call it at login (or the adapter's `authenticate` hook) and set the returned token as an `httpOnly` + `secure` + `sameSite` cookie.
+  - **`withHooks(userHooks)`** returns `{ upgrade, close }` to spread into your WS handler, composing with your own hooks: your `upgrade` runs first (a `false` rejection short-circuits with no session load), the session is loaded and attached to `ws.userData`, and `close` persists it then runs your `close`. An `upgradeResponse()` wrapper is preserved. The load is **LOAD-ONLY** - an unknown client-presented token is a clean anonymous connection, never an auto-created one, which closes the session-fixation hole by construction (tokens are only ever minted by `create()`).
+  - **`of(ws)`** returns the live, mutable session data (or `null` when anonymous / the socket has closed). One Redis read per connection (at upgrade), one write (on close): `of(ws)` is a pure in-memory read, no per-message round-trip, and `getUserData()` throwing on a closed socket is handled.
+  - **`identify: (ctx) => token`** reads the token from the upgrade context (a cookie - the only place it is available, since the upgrade hook runs before the socket exists). **`maxAgeMs`** adds an absolute session timeout on top of the sliding TTL (forces periodic re-auth; the stale key is reaped). **`onLoadError`** controls behavior when the store is unreachable at connect: `'reject'` (default) fails closed and refuses the upgrade rather than admitting an unauthenticated connection; `'anonymous'` fails open. The raw `get` / `set` / `touch` / `delete` / `clear` surface is unchanged; the lifecycle layer stores a wrapped record (data + creation time) and should not be mixed with raw `set` / `get` on the same token.
+
 ## [0.6.0-next.28] - 2026-06-24
 
 ### Added

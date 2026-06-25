@@ -2039,8 +2039,46 @@ Every `set` resets the TTL to `ttlMs`. By default `get` and `touch` also extend 
 | `keyPrefix` | `'sess:'` | Prefix prepended (after the client `keyPrefix`) to every session key. |
 | `ttlMs` | `86_400_000` (24h) | Sliding TTL window in milliseconds. |
 | `refreshOnGet` | `true` | Whether `get(token)` extends the TTL on a hit. |
+| `identify` | - | `(ctx) => token` for the lifecycle layer below: extract the token from the WS upgrade context (a cookie). Absent or falsy => anonymous connection. |
+| `maxAgeMs` | - | Absolute session lifetime (ms), independent of the sliding `ttlMs`. A session older than this loads as anonymous (forces re-auth regardless of activity). Off by default. |
+| `onLoadError` | `'reject'` | What `withHooks` does when the store is unreachable at connect (or `identify` throws): `'reject'` fails closed (refuse the upgrade), `'anonymous'` fails open. An unknown/expired token is never an error - always a clean anonymous connection. |
 | `breaker` | - | Optional circuit breaker for the Redis ops. |
 | `metrics` | - | Optional Prometheus metrics registry. |
+
+#### Lifecycle wiring (`create` / `withHooks` / `of`)
+
+The methods above are the low-level token API. For the common case - load the session on connect, read/write it per message, persist on disconnect - wire it into the adapter `hooks.ws` and skip the boilerplate:
+
+```js
+// session store
+export const sessions = createDistributedSession(redis, {
+  identify: (ctx) => ctx.cookies.sid,   // where the token lives
+  maxAgeMs: 12 * 60 * 60 * 1000,        // optional absolute cap (security)
+  // onLoadError defaults to 'reject' (fail closed if Redis is down at connect)
+});
+
+// at login - mint a token server-side and set it as a hardened cookie
+const token = await sessions.create({ userId: 42, role: 'admin' });
+cookies.set('sid', token, { httpOnly: true, secure: true, sameSite: 'lax', path: '/' });
+
+// src/hooks.ws.js - one line, composes with your own auth hooks
+export const { upgrade, close } = sessions.withHooks({
+  upgrade(ctx) { /* your auth; return false to reject */ },  // optional
+  close(ws, ctx) { /* your cleanup */ },                      // optional
+});
+
+// any message handler
+const s = sessions.of(ws);   // live, mutable, in-memory; null when anonymous
+if (s) s.lastSeen = Date.now();   // persisted once, on disconnect
+```
+
+- **One Redis read per connection, one write.** The session loads at upgrade onto `ws.userData` and `of(ws)` is a pure memory read - no per-message round-trip. The mutated object is flushed once, on `close`.
+- **Composition.** `withHooks` runs your `upgrade` first; a `false` rejection short-circuits with no session load. Your `close` runs after the session is persisted. An `upgradeResponse()` wrapper from your upgrade is preserved.
+- **Security - load-only, no fixation.** `withHooks` only ever *loads* a session; an unknown client-presented token is a clean anonymous connection, never an auto-created one. Sessions are minted exclusively server-side by `create()`, which generates a 256-bit CSPRNG token. Never trusting a client token is what closes the [session-fixation](https://owasp.org/www-community/attacks/Session_fixation_attack) hole. Set the minted token as an `httpOnly` + `secure` + `sameSite` cookie (refresh it via the adapter's `authenticate` hook, which rides a normal HTTP response - a `Set-Cookie` on the 101 upgrade is dropped by some strict proxies).
+- **`maxAgeMs`** adds an absolute timeout on top of the sliding TTL: a session older than the cap loads as anonymous and the stale key is reaped, forcing periodic re-authentication.
+- **Fail-closed by default.** If Redis is unreachable at connect, `onLoadError: 'reject'` (default) refuses the upgrade rather than admitting an unauthenticated connection; switch to `'anonymous'` to prioritize availability over the auth signal.
+- **Revocation.** `delete(token)` revokes server-side - the next connection loads anonymous. A connection already open holds its session in memory, so for immediate revocation also close that socket.
+- **Layering note.** The lifecycle layer stores a wrapped record (data + creation time) so `maxAgeMs` works; `create` / `withHooks` / `of` use it consistently. `delete` / `touch` / `clear` are shape-agnostic and serve both layers, but do not mix raw `set` / `get` with `create()` on the same token.
 
 #### Pairing with the bundled Session plugin
 
@@ -2084,6 +2122,8 @@ export async function message(ws) {
 | `session_set_total` | Counter of set calls. |
 | `session_delete_total{result="present|absent"}` | Counter of delete calls. `present` = the entry existed; `absent` = the token was already gone (idempotent logout). |
 | `session_touch_total{result="present|absent"}` | Counter of touch calls. `absent` = the entry was missing or already expired. |
+| `session_create_total` | Counter of sessions minted via `create()`. |
+| `session_lifecycle_total{result="loaded|anonymous|rejected"}` | Counter of `withHooks` connection loads: `loaded` = a session was attached; `anonymous` = no/unknown token (load-only, nothing created); `rejected` = the upgrade was refused (`onLoadError: 'reject'` with the store unreachable, or `identify` threw). |
 
 #### `clear()` and operational notes
 

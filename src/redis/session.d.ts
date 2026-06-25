@@ -1,6 +1,17 @@
+import type { UpgradeContext, CloseContext } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+
+/**
+ * The subset of the adapter `hooks.ws` handler that `withHooks` composes with.
+ * Your `upgrade` runs first (returning `false` rejects the connection and skips
+ * the session load); your `close` runs after the session is persisted.
+ */
+export interface SessionWsHooks {
+	upgrade?(ctx: UpgradeContext): unknown;
+	close?(ws: any, ctx: CloseContext): void | Promise<void>;
+}
 
 export interface DistributedSessionOptions {
 	/**
@@ -23,6 +34,34 @@ export interface DistributedSessionOptions {
 	 * @default true
 	 */
 	refreshOnGet?: boolean;
+
+	/**
+	 * Extract the session token from the WebSocket upgrade context (typically a
+	 * cookie). Required for `withHooks` / `of` to load a session; without it -
+	 * or when it returns a falsy/non-string value - the connection is anonymous.
+	 * Runs at the HTTP upgrade, where the cookie is available (there is no
+	 * socket yet, which is why this takes the ctx, not a ws).
+	 */
+	identify?: (ctx: UpgradeContext) => string | null | undefined;
+
+	/**
+	 * Absolute session lifetime in milliseconds, independent of the sliding
+	 * `ttlMs`. A session older than this (by its server-minted creation time) is
+	 * treated as expired on load and the connection becomes anonymous, forcing
+	 * re-authentication regardless of activity. Off by default. Only the
+	 * lifecycle layer (`create` / `withHooks` / `of`) stamps and enforces it.
+	 */
+	maxAgeMs?: number;
+
+	/**
+	 * What `withHooks` does when the session store is unreachable (Redis down,
+	 * breaker open) at connect, or `identify` throws. `'reject'` (default) fails
+	 * closed - the upgrade is refused; `'anonymous'` fails open - the connection
+	 * proceeds with no session. An unknown or expired token is NOT an error: it
+	 * is always a clean anonymous connection (load-only never creates a session).
+	 * @default 'reject'
+	 */
+	onLoadError?: 'reject' | 'anonymous';
 
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
@@ -66,6 +105,38 @@ export interface DistributedSession<T = unknown> {
 	 * test harnesses, or operator-initiated wipes.
 	 */
 	clear(): Promise<void>;
+
+	/**
+	 * Mint a NEW session server-side and return its opaque 256-bit CSPRNG token.
+	 * Call at login (or in the adapter's `authenticate` hook) and set the
+	 * returned token as an httpOnly + secure + sameSite cookie; `identify` then
+	 * reads it on connect. Minting tokens only server-side - never trusting a
+	 * client-presented token - is what makes the lifecycle immune to session
+	 * fixation. Stores a wrapped record (data + creation time); use the lifecycle
+	 * layer (`create` / `withHooks` / `of`) consistently rather than mixing raw
+	 * `set` / `get` on a minted token.
+	 */
+	create(data?: T): Promise<string>;
+
+	/**
+	 * Compose session load + persist into the adapter `hooks.ws`. Returns
+	 * `{ upgrade, close }` to spread into your WS handler. Your own `upgrade`
+	 * runs first (a `false` rejection short-circuits with no session load) and
+	 * your `close` runs after the session is persisted. The session is loaded
+	 * LOAD-ONLY (an unknown token never creates one) and attached to the
+	 * connection for `of(ws)`; on close the (mutated) session is persisted once.
+	 */
+	withHooks(userHooks?: SessionWsHooks): {
+		upgrade(ctx: UpgradeContext): Promise<unknown>;
+		close(ws: any, ctx: CloseContext): Promise<void>;
+	};
+
+	/**
+	 * The live, mutable session data for a connection wired via `withHooks`, or
+	 * `null` for an anonymous connection (no/unknown token) or a closed socket.
+	 * Mutate the returned object in place; it is persisted once, on disconnect.
+	 */
+	of(ws: any): T | null;
 }
 
 /**
