@@ -59,6 +59,7 @@ const DEFAULT_CHANNEL = 'uws:pressure:rates';
 const DEFAULT_PUBLISH_INTERVAL_MS = 5000;
 const DEFAULT_STALE_AFTER_MS = 12000;
 const DEFAULT_TOP_N = 20;
+const DEFAULT_TOPIC_RATE_PER_SEC = 5000;
 
 export function createPublishRateAggregator(client, options = {}) {
 	if (!client || !client.redis) {
@@ -76,6 +77,17 @@ export function createPublishRateAggregator(client, options = {}) {
 	const topN = options.topN ?? DEFAULT_TOP_N;
 	if (!Number.isInteger(topN) || topN < 1) {
 		throw new Error('publish-rate: topN must be a positive integer');
+	}
+	// Cluster-wide per-topic messages/sec threshold for onPublishRate crossings.
+	// Mirrors the adapter's pressure.topicPublishRatePerSec (default 5000); the
+	// difference is that this rate is the cluster-wide SUM across instances. Set
+	// false to disable crossing callbacks.
+	const topicRateThreshold = options.topicPublishRatePerSec === false
+		? null
+		: (options.topicPublishRatePerSec ?? DEFAULT_TOPIC_RATE_PER_SEC);
+	if (topicRateThreshold !== null &&
+		(typeof topicRateThreshold !== 'number' || !Number.isFinite(topicRateThreshold) || topicRateThreshold < 0)) {
+		throw new Error('publish-rate: topicPublishRatePerSec must be a non-negative number or false');
 	}
 	const subjects = options.subjects;
 	if (subjects !== undefined && typeof subjects !== 'function') {
@@ -112,6 +124,14 @@ export function createPublishRateAggregator(client, options = {}) {
 	let publishTimer = null;
 	let activated = false;
 	let remoteInstancesWarnFired = false;
+
+	/**
+	 * onPublishRate subscribers. Each holds a callback and the set of topics it
+	 * has already seen at or above the configured `topicPublishRatePerSec`, so a
+	 * topic fires once on the rising edge and re-arms only after it drops below.
+	 * @type {Array<{ callback: (events: ClusterTopicRate[]) => void, over: Set<string> }>}
+	 */
+	const rateSubscribers = [];
 
 	if (mInstanceCount) {
 		mInstanceCount.collect(() => {
@@ -230,8 +250,9 @@ export function createPublishRateAggregator(client, options = {}) {
 		await subscriber.subscribe(channel);
 
 		// First broadcast on the next tick (so subscribers in this same
-		// process can't race against an in-flight subscribe).
-		publishTimer = setIntervalTimer(broadcastSlice, publishInterval);
+		// process can't race against an in-flight subscribe). Each tick also
+		// evaluates threshold crossings over the freshly-merged view.
+		publishTimer = setIntervalTimer(tick, publishInterval);
 		if (publishTimer.unref) publishTimer.unref();
 	}
 
@@ -248,15 +269,23 @@ export function createPublishRateAggregator(client, options = {}) {
 		}
 		remoteSlices.clear();
 		remoteSubs.clear();
+		// Reset each subscriber's over-set: after the merged view is torn down,
+		// a re-activate should treat a still-hot topic as a fresh crossing
+		// rather than suppress it against a stale pre-deactivate over-set.
+		for (const sub of rateSubscribers) sub.over = new Set();
 		activePlatform = null;
 	}
 
 	/**
-	 * Compute the cluster-wide top publishers by merging the local slice
-	 * (read fresh from platform.pressure.topPublishers) with the cached
-	 * remote slices, dropping stale ones.
+	 * Merge the local slice (read fresh from platform.pressure.topPublishers)
+	 * with the cached remote slices (stale dropped) into the full cluster-wide
+	 * list, sorted descending by messagesPerSec. UNCAPPED: the top-N cap is
+	 * applied by computeTopPublishers for the display / storage-bounded
+	 * consumers; crossing detection needs the full set so a topic that stays
+	 * above the threshold but is pushed out of the top-N display by hotter
+	 * topics is not spuriously re-armed and re-fired.
 	 */
-	function computeTopPublishers() {
+	function computeMerged() {
 		pruneStale();
 
 		/** @type {Map<string, { topic: string, messagesPerSec: number, bytesPerSec: number, instances: Set<string> }>} */
@@ -296,6 +325,14 @@ export function createPublishRateAggregator(client, options = {}) {
 			});
 		}
 		result.sort((a, b) => b.messagesPerSec - a.messagesPerSec);
+		return result;
+	}
+
+	// Top-N-capped view for the display / storage-bounded consumers (the
+	// topPublishers getter and rateOf). Crossing detection uses computeMerged
+	// (uncapped) instead, so the edge-trigger contract holds beyond the top-N.
+	function computeTopPublishers() {
+		const result = computeMerged();
 		return result.length > topN ? result.slice(0, topN) : result;
 	}
 
@@ -336,6 +373,66 @@ export function createPublishRateAggregator(client, options = {}) {
 		return total;
 	}
 
+	/**
+	 * Register a callback that fires when one or more topics cross the configured
+	 * cluster-wide `topicPublishRatePerSec` threshold. Mirrors the adapter's
+	 * `platform.onPublishRate(cb)` (per-instance) at the cluster layer. Evaluated
+	 * once per broadcast tick over the merged view, edge-triggered: a topic fires
+	 * the tick it rises to or above the threshold and does not fire again until
+	 * it drops below and rises once more. The callback receives the array of
+	 * `ClusterTopicRate` entries that crossed on this tick; a throwing callback is
+	 * contained (logged, never breaks the timer or a sibling). Returns an
+	 * unsubscribe function. No-op (never fires) when `topicPublishRatePerSec` is
+	 * `false`.
+	 *
+	 * @param {(events: ClusterTopicRate[]) => void} callback
+	 * @returns {() => void}
+	 */
+	function onPublishRate(callback) {
+		if (typeof callback !== 'function') {
+			throw new Error('publish-rate: onPublishRate callback must be a function');
+		}
+		const sub = { callback, over: new Set() };
+		rateSubscribers.push(sub);
+		return function unsubscribe() {
+			const i = rateSubscribers.indexOf(sub);
+			if (i !== -1) rateSubscribers.splice(i, 1);
+		};
+	}
+
+	// Edge-triggered crossing detection over the merged view. Runs once per
+	// broadcast tick (never on the per-message receive path), no-op when no
+	// subscriber is registered or the threshold is disabled.
+	function evaluateCrossings() {
+		if (rateSubscribers.length === 0 || topicRateThreshold === null) return;
+		// UNCAPPED merged view (see computeMerged): a topic above threshold but
+		// outside the top-N display must still be tracked, or the edge-trigger
+		// would re-fire it when top-N churn pushes it out and back in.
+		const overNow = computeMerged().filter((t) => t.messagesPerSec >= topicRateThreshold);
+		const overTopics = new Set(overNow.map((t) => t.topic));
+		// Snapshot subscribers so a callback that (un)subscribes mid-loop cannot
+		// perturb this tick. A subscriber's over-set is updated BEFORE its callback
+		// runs, so a throwing callback does not re-fire the same crossing next tick.
+		for (const sub of rateSubscribers.slice()) {
+			const crossings = overNow.filter((t) => !sub.over.has(t.topic));
+			sub.over = overTopics;
+			if (crossings.length > 0) {
+				try {
+					sub.callback(crossings);
+				} catch (err) {
+					console.error('[publish-rate] onPublishRate callback threw:', err?.message ?? err);
+				}
+			}
+		}
+	}
+
+	// One scheduler tick: broadcast this instance's slice, then evaluate
+	// threshold crossings over the freshly-merged view.
+	async function tick() {
+		await broadcastSlice();
+		evaluateCrossings();
+	}
+
 	return {
 		instanceId,
 		activate,
@@ -343,7 +440,10 @@ export function createPublishRateAggregator(client, options = {}) {
 		get topPublishers() { return computeTopPublishers(); },
 		rateOf,
 		subscribersOf,
+		onPublishRate,
 		/** Force an immediate broadcast tick. Useful in tests; bypasses the timer. */
-		_broadcastNow() { return broadcastSlice(); }
+		_broadcastNow() { return broadcastSlice(); },
+		/** Force an immediate crossing evaluation over the current merged view. Tests only. */
+		_evaluateCrossingsNow() { return evaluateCrossings(); }
 	};
 }

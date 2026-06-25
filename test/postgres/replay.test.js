@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../src/postgres/replay.js';
@@ -763,6 +763,35 @@ describe('postgres replay', () => {
 
 			replay1.destroy();
 			replay2.destroy();
+		});
+	});
+
+	describe('storage failure fallback (localFanout) log-correlation', () => {
+		it('warns once carrying requestId on the localFanout fallback, then suppresses', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true, cleanupInterval: 0 });
+			const origQuery = client.query.bind(client);
+			client.query = async (textOrObj, values) => {
+				const name = typeof textOrObj === 'object' ? textOrObj.name : '';
+				if (name && name.startsWith('replay_publish_')) throw new Error('db down');
+				return origQuery(textOrObj, values);
+			};
+			const warns = [];
+			const spy = vi.spyOn(console, 'warn').mockImplementation((msg) => warns.push(msg));
+			try {
+				platform.requestId = 'req-pg';
+				await r.publish(platform, 'chat', 'msg', { id: 1 });
+				await r.publish(platform, 'chat', 'msg', { id: 2 });
+			} finally {
+				spy.mockRestore();
+				client.query = origQuery;
+			}
+			expect(platform.published).toHaveLength(2); // both fell back to local publish
+			expect(warns).toHaveLength(1);
+			expect(warns[0]).toContain('[postgres replay]');
+			expect(warns[0]).toContain('requestId=req-pg');
+			// The raw topic is deliberately not logged (it can embed user ids).
+			expect(warns[0]).not.toContain('chat');
+			r.destroy();
 		});
 	});
 

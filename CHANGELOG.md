@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.28] - 2026-06-24
+
+### Added
+
+- **`createPublishRateAggregator(...).onPublishRate(callback)` plus a `topicPublishRatePerSec` option: an event-push hook for cluster-wide publish-rate threshold crossings.** The aggregator already merges every instance's slice into a cluster-wide top-N and the `clusterTopPublisher` admission rule reads it to shed continuously; this adds the missing push side, and mirrors the adapter's per-instance `platform.onPublishRate(cb)` at the cluster layer (same callback shape). The callback fires when one or more topics cross the configured cluster-wide `topicPublishRatePerSec` threshold (default 5000; the cluster-wide SUM across instances; set `false` to disable). Evaluation runs once per broadcast tick over the merged view and is **edge-triggered**: a topic fires the tick it rises to or above the threshold and re-arms only after it drops below and rises again, so a persistently-hot topic fires once rather than on every tick - and the check is over the full merged set, not the top-N display, so a still-hot topic pushed out of the top-N by hotter topics is not spuriously re-fired. The callback receives the array of crossing `{topic, messagesPerSec, bytesPerSec, contributingInstances}` entries; multiple subscribers are independent, a throwing callback is contained (logged, never breaks the broadcast timer or a sibling subscriber), and the returned function unsubscribes. Useful for alerting, autoscaling signals, or targeted backpressure on a topic that goes cluster-wide hot. Pure memory evaluation; no extra Redis traffic.
+
+### Changed
+
+- **The replay buffers now emit a one-time correlation warning when a storage failure is swallowed by `localFanoutOnStorageFailure`.** When `localFanoutOnStorageFailure: true` is set and a publish's storage write fails, the buffer silently falls back to a local-only `platform.publish` (durability degraded). It now also logs a single `console.warn` the first time that happens per buffer instance, carrying `platform.requestId` (when present) as a correlation anchor and pointing at the `replay_storage_fallbacks_total` metric for the ongoing volume. The warning is latched (warn-once, not per-event) so a sustained outage cannot spam the log, and the raw topic is deliberately omitted from the message (it can embed user ids; the metric carries the sanitized topic label). Applies to all three backends with this fallback - the Redis sorted-set and stream `redis/replay`, and `postgres/replay`. No effect on the default path (`localFanoutOnStorageFailure` is off by default, where a storage failure throws `ReplayStorageError` instead).
+
 ## [0.6.0-next.27] - 2026-06-24
 
 ### Added

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
@@ -675,6 +675,25 @@ describe('redis replay (stream backend)', () => {
 			expect(platform.published).toEqual([
 				{ topic: 'chat', event: 'msg', data: { id: 1 } }
 			]);
+		});
+
+		it('warns once carrying requestId on the localFanout fallback, then suppresses', async () => {
+			const r = createReplay(client, { storage: 'stream', localFanoutOnStorageFailure: true });
+			client.redis.eval = async () => { throw new Error('redis down'); };
+			const warns = [];
+			const spy = vi.spyOn(console, 'warn').mockImplementation((msg) => warns.push(msg));
+			try {
+				platform.requestId = 'req-st';
+				await r.publish(platform, 'chat', 'msg', { id: 1 });
+				await r.publish(platform, 'chat', 'msg', { id: 2 });
+			} finally {
+				spy.mockRestore();
+			}
+			expect(warns).toHaveLength(1);
+			expect(warns[0]).toContain('[redis stream replay]');
+			expect(warns[0]).toContain('requestId=req-st');
+			// The raw topic is deliberately not logged (it can embed user ids).
+			expect(warns[0]).not.toContain('chat');
 		});
 
 		it('publishIdempotent always throws ReplayStorageError, even with localFanoutOnStorageFailure: true', async () => {

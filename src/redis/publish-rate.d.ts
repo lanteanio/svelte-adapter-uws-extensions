@@ -38,6 +38,16 @@ export interface PublishRateAggregatorOptions {
 	topN?: number;
 
 	/**
+	 * Cluster-wide per-topic messages/sec threshold for `onPublishRate`
+	 * crossing callbacks. Mirrors the adapter's
+	 * `pressure.topicPublishRatePerSec`, except the rate compared here is the
+	 * cluster-wide SUM across instances. Set `false` to disable crossing
+	 * callbacks entirely. Does not affect `topPublishers` / `rateOf`.
+	 * @default 5000
+	 */
+	topicPublishRatePerSec?: number | false;
+
+	/**
 	 * Optional contributor for cluster-wide subscriber counts. Called
 	 * fresh on every broadcast tick to gather this instance's per-topic
 	 * subscriber list. Sorted descending by `count` and capped at `topN`
@@ -100,6 +110,25 @@ export interface PublishRateAggregator {
 	 * here when an aggregator is wired.
 	 */
 	subscribersOf(topic: string): number;
+
+	/**
+	 * Register a callback that fires when one or more topics cross the
+	 * configured cluster-wide `topicPublishRatePerSec` threshold. Mirrors the
+	 * adapter's per-instance `platform.onPublishRate(cb)` at the cluster layer.
+	 * Evaluated once per broadcast tick over the merged view, edge-triggered: a
+	 * topic fires the tick it rises to or above the threshold and re-arms only
+	 * after it drops below and rises again, so a persistently-hot topic fires
+	 * once rather than every tick. The callback receives the `ClusterTopicRate`
+	 * entries that crossed on this tick; a throwing callback is contained
+	 * (logged, never breaks the timer or sibling subscribers). Returns an
+	 * unsubscribe function. No-op (never fires) when `topicPublishRatePerSec`
+	 * is `false`.
+	 *
+	 * Pairs with the cluster `topPublisher` admission rule: the rule sheds at
+	 * the cluster layer continuously, while this is the event-push hook for
+	 * acting on a crossing (alerting, scaling, targeted backpressure).
+	 */
+	onPublishRate(callback: (events: ClusterTopicRate[]) => void): () => void;
 }
 
 /**

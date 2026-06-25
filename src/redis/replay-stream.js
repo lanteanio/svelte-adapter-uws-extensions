@@ -227,6 +227,13 @@ export function createStreamReplay(client, options = {}) {
 		return epoch;
 	}
 
+	// Latch so the storage-fallback degradation warns ONCE per tracker, not per
+	// event (the per-publish volume under a sustained outage is the
+	// replay_storage_fallbacks_total metric). The one warn carries the first
+	// degraded publish's requestId as a correlation anchor; the raw topic is
+	// omitted (it can embed user ids - the metric carries the sanitized label).
+	let warnedStorageFallback = false;
+
 	const tracker = {
 		async publishIdempotent(platform, topic, event, data, opts) {
 			if (!opts || typeof opts !== 'object') {
@@ -310,6 +317,15 @@ export function createStreamReplay(client, options = {}) {
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
+					if (!warnedStorageFallback) {
+						warnedStorageFallback = true;
+						console.warn(
+							'[redis stream replay] storage failed; falling back to local publish, durability degraded' +
+							(platform?.requestId ? ' (requestId=' + platform.requestId + ')' : '') +
+							'. Further occurrences are suppressed; see the replay_storage_fallbacks_total metric. Cause: ' +
+							(err?.message ?? err)
+						);
+					}
 					return platform.publish(topic, event, data);
 				}
 				throw new ReplayStorageError('publish', err);

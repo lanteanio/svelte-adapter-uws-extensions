@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
@@ -982,6 +982,26 @@ describe('redis replay', () => {
 			]);
 
 			restore();
+		});
+
+		it('warns once carrying requestId on the localFanout fallback, then suppresses', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true });
+			const { restore } = failEval(client);
+			const warns = [];
+			const spy = vi.spyOn(console, 'warn').mockImplementation((msg) => warns.push(msg));
+			try {
+				platform.requestId = 'req-ss';
+				await r.publish(platform, 'chat', 'created', { id: 1 });
+				await r.publish(platform, 'chat', 'created', { id: 2 });
+			} finally {
+				spy.mockRestore();
+				restore();
+			}
+			expect(warns).toHaveLength(1);
+			expect(warns[0]).toContain('[redis replay]');
+			expect(warns[0]).toContain('requestId=req-ss');
+			// The raw topic is deliberately not logged (it can embed user ids).
+			expect(warns[0]).not.toContain('chat');
 		});
 
 		it('counts the fallback in replay_storage_fallbacks_total but not replay_publishes_total', async () => {

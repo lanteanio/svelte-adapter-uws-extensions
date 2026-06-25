@@ -573,4 +573,198 @@ describe('redis publish-rate aggregator', () => {
 			await agg.deactivate();
 		});
 	});
+
+	describe('onPublishRate (cluster threshold crossings)', () => {
+		function setRates(pairs) {
+			platform._setPressure({
+				...platform.pressure,
+				topPublishers: pairs.map(([topic, mps]) => ({ topic, messagesPerSec: mps, bytesPerSec: mps * 10 }))
+			});
+		}
+
+		it('validates the callback and the threshold option', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			expect(() => agg.onPublishRate(null)).toThrow(/callback/);
+			expect(() => agg.onPublishRate(123)).toThrow(/callback/);
+			await agg.deactivate();
+			expect(() => createPublishRateAggregator(client, { topicPublishRatePerSec: -1 })).toThrow(/topicPublishRatePerSec/);
+			expect(() => createPublishRateAggregator(client, { topicPublishRatePerSec: 'x' })).toThrow(/topicPublishRatePerSec/);
+		});
+
+		it('fires on the rising edge with the crossing events', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			const fired = [];
+			agg.onPublishRate((events) => fired.push(events));
+
+			setRates([['chat:room1', 100], ['audit:org1', 50]]); // only chat:room1 >= 80
+			agg._evaluateCrossingsNow();
+
+			expect(fired).toHaveLength(1);
+			expect(fired[0].map((e) => e.topic)).toEqual(['chat:room1']);
+			expect(fired[0][0]).toMatchObject({ topic: 'chat:room1', messagesPerSec: 100, contributingInstances: 1 });
+			await agg.deactivate();
+		});
+
+		it('does not fire again while the topic stays above (edge-triggered)', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			let count = 0;
+			agg.onPublishRate(() => count++);
+
+			setRates([['chat:room1', 100]]);
+			agg._evaluateCrossingsNow();
+			agg._evaluateCrossingsNow();
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1);
+			await agg.deactivate();
+		});
+
+		it('re-fires after the topic drops below then rises again', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			let count = 0;
+			agg.onPublishRate(() => count++);
+
+			setRates([['chat:room1', 100]]);
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1);
+
+			setRates([['chat:room1', 10]]); // drop below -> re-arm, no fire
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1);
+
+			setRates([['chat:room1', 200]]); // rise again -> fire
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(2);
+			await agg.deactivate();
+		});
+
+		it('fires independently for multiple subscribers on the same aggregator', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			const a = [];
+			const b = [];
+			agg.onPublishRate((e) => a.push(...e.map((x) => x.topic)));
+			agg.onPublishRate((e) => b.push(...e.map((x) => x.topic)));
+
+			setRates([['hot', 100], ['cold', 10]]);
+			agg._evaluateCrossingsNow();
+			expect(a).toEqual(['hot']);
+			expect(b).toEqual(['hot']);
+			await agg.deactivate();
+		});
+
+		it('a subscriber registered after a topic is already hot fires for it on its first tick', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			setRates([['hot', 100]]);
+
+			const first = [];
+			agg.onPublishRate((e) => first.push(...e.map((x) => x.topic)));
+			agg._evaluateCrossingsNow();
+			expect(first).toEqual(['hot']);
+
+			// A late subscriber catches the already-hot topic on its own first tick;
+			// the first subscriber must NOT re-fire for it.
+			const late = [];
+			agg.onPublishRate((e) => late.push(...e.map((x) => x.topic)));
+			agg._evaluateCrossingsNow();
+			expect(late).toEqual(['hot']);
+			expect(first).toEqual(['hot']);
+			await agg.deactivate();
+		});
+
+		it('unsubscribe stops further callbacks', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			let count = 0;
+			const off = agg.onPublishRate(() => count++);
+
+			setRates([['a', 100]]);
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1);
+
+			off();
+			setRates([['a', 10]]);
+			agg._evaluateCrossingsNow();
+			setRates([['a', 100]]);
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1); // unsubscribed: no further fires
+			await agg.deactivate();
+		});
+
+		it('contains a throwing callback so sibling subscribers still fire', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			let good = 0;
+			agg.onPublishRate(() => { throw new Error('boom'); });
+			agg.onPublishRate(() => { good++; });
+
+			setRates([['a', 100]]);
+			expect(() => agg._evaluateCrossingsNow()).not.toThrow();
+			expect(good).toBe(1);
+			await agg.deactivate();
+		});
+
+		it('never fires when topicPublishRatePerSec is false', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: false });
+			await agg.activate(platform);
+			let count = 0;
+			agg.onPublishRate(() => count++);
+
+			setRates([['a', 1e9]]);
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(0);
+			await agg.deactivate();
+		});
+
+		it('does not re-fire a continuously-hot topic that churns in and out of the top-N display', async () => {
+			// topN default 20. 'hot' stays above the threshold the whole time, but
+			// its RANK moves out of the top-20 display (and back) as other topics
+			// surge. The edge contract (fire once) must hold over the full merged
+			// view, not the capped display - so 'hot' must fire exactly once.
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 10 }); // topN = 20
+			await agg.activate(platform);
+			let hotFires = 0;
+			agg.onPublishRate((events) => {
+				if (events.some((e) => e.topic === 'hot')) hotFires++;
+			});
+			const others = (rate) => Array.from({ length: 20 }, (_, i) => ['o' + i, rate]);
+
+			// Tick 1: hot is the hottest (in the top-20).
+			setRates([['hot', 100], ...others(50)]);
+			agg._evaluateCrossingsNow();
+
+			// Tick 2: hot drops to just-above-threshold while 20 others surge,
+			// pushing hot to rank 21 - OUT of the top-20 display but STILL above 10.
+			setRates([['hot', 11], ...others(100)]);
+			agg._evaluateCrossingsNow();
+
+			// Tick 3: hot is hottest again, back in the top-20.
+			setRates([['hot', 100], ...others(50)]);
+			agg._evaluateCrossingsNow();
+
+			expect(hotFires).toBe(1); // fired on tick 1, never spuriously re-fired
+			await agg.deactivate();
+		});
+
+		it('re-arms across a deactivate/activate cycle', async () => {
+			const agg = createPublishRateAggregator(client, { topicPublishRatePerSec: 80 });
+			await agg.activate(platform);
+			let count = 0;
+			agg.onPublishRate(() => count++);
+
+			setRates([['a', 100]]);
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(1);
+
+			await agg.deactivate();
+			await agg.activate(platform);
+			setRates([['a', 100]]); // still hot after reactivate -> fresh crossing
+			agg._evaluateCrossingsNow();
+			expect(count).toBe(2);
+			await agg.deactivate();
+		});
+	});
 });
