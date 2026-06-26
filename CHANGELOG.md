@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.33] - 2026-06-26
+
+### Added
+
+- **`./redis/alarm-store` and `./postgres/alarm-store`: durable stores for `live.alarm`.** `createAlarmStore(client)` persists each room's pending alarm so it survives a process restart and fires once cluster-wide. Wire it into svelte-realtime (`>= 0.6.0-next.45`) with `configureAlarm({ store: createAlarmStore(client), leader: () => leader.isLeader() })`; the realtime layer owns the in-memory timers + the leader-gated recovery poll, and the store is a pure data-access object (`set(topic, at, meta)` / `delete(topic)` / `due(now)`) with no background loop. Single-fire is guaranteed by the atomic claim: `delete(topic)` returns whether THIS call removed the row (Redis `ZREM` count / Postgres `DELETE ... RETURNING` rowCount), so the precise in-memory timer and the recovery poll can never double-fire. The Redis store keeps a due-index ZSET + a meta hash co-located on one slot via an `{alarms}` hash tag (asserted at construction so a custom `client.key()` cannot silently split the claim across nodes); the Postgres store uses an auto-migrated `svti_alarms(topic, fire_at, meta, tenant)` table indexed on `fire_at`. The two backends are drop-in interchangeable behind the same seam.
+
 ## [0.6.0-next.32] - 2026-06-26
 
 ### Added

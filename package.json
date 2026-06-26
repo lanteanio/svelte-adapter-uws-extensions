@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.32",
+	"version": "0.6.0-next.33",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -41,6 +41,10 @@
 			"types": "./src/redis/topic-broadcast.d.ts",
 			"default": "./src/redis/topic-broadcast.js"
 		},
+		"./redis/alarm-store": {
+			"types": "./src/redis/alarm-store.d.ts",
+			"default": "./src/redis/alarm-store.js"
+		},
 		"./redis/sharded-pubsub": {
 			"types": "./src/redis/sharded-pubsub.d.ts",
 			"default": "./src/redis/sharded-pubsub.js"
@@ -72,6 +76,10 @@
 		"./postgres/dead-letter": {
 			"types": "./src/postgres/dead-letter.d.ts",
 			"default": "./src/postgres/dead-letter.js"
+		},
+		"./postgres/alarm-store": {
+			"types": "./src/postgres/alarm-store.d.ts",
+			"default": "./src/postgres/alarm-store.js"
 		},
 		"./postgres/notify": {
 			"types": "./src/postgres/notify.d.ts",

@@ -1208,6 +1208,29 @@ How it stays correct AND fast (no multi-second floor on a primitive that usually
 
 Options: `keyPrefix` (stacks with the client prefix; for two coordinators on one client), `requestTimeoutMs` (default whole-fan-out budget, default 5000ms), `heartbeat` (presence refresh, default 10000ms), `presenceTtlMs` (live window, default `heartbeat * 3`), `maxEnvelopeBytes` (relay size cap, default 1 MB), `breaker`, `metrics`, `onError`. Needs `svelte-adapter-uws >= 0.6.0-next.39` for the underlying `requestTopic`; the realtime layer detects `platform.topicBroadcast` and routes through it automatically (`svelte-realtime >= 0.6.0-next.42`).
 
+## Durable alarm store
+
+`createAlarmStore` makes `svelte-realtime`'s `live.alarm` survive a process restart and fire once cluster-wide. By default an alarm is an in-memory timer (it survives the room going idle within the process, but not a restart). This store persists each room's pending alarm so the realtime recovery poll can re-fire one an instance left behind when it restarted. Redis and Postgres backends, drop-in interchangeable behind the same seam:
+
+```js
+// hooks.server.js init - durable + cluster single-fire
+import { createAlarmStore } from 'svelte-adapter-uws-extensions/redis/alarm-store';
+// or: from 'svelte-adapter-uws-extensions/postgres/alarm-store'
+import { configureAlarm } from 'svelte-realtime/server';
+
+configureAlarm({
+  store: createAlarmStore(redis),
+  leader: () => leader.isLeader()   // reuse the same leader cron uses
+});
+```
+
+How it stays single-fire: the realtime layer owns the in-memory timers + a leader-gated recovery poll, and this store is a pure data-access object - no background loop of its own. `delete(topic)` is the atomic claim: it returns whether THIS call removed the row, so the precise in-memory timer and the recovery poll can never both fire the same alarm.
+
+- **Redis.** A due-index ZSET (`{alarms}:due`, scored by the deadline) + a meta hash (`{alarms}:meta`), co-located on one slot via the `{alarms}` hash tag so the claim (`ZREM` + `HDEL`) is atomic on a cluster. The two keys are asserted same-slot at construction, so a custom `client.key()` cannot silently split the claim.
+- **Postgres.** An auto-migrated `svti_alarms(topic, fire_at, meta, tenant)` table indexed on `fire_at`; the claim is `DELETE ... RETURNING`, and `due(now)` is a `fire_at <= now ORDER BY fire_at LIMIT` range scan.
+
+Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres; default `svti_alarms`), `dueBatch` (max alarms swept per poll, default 100), `autoMigrate` (Postgres, default true), `breaker`, `metrics`. Needs `svelte-realtime >= 0.6.0-next.45` for the recovery poll that reads `due`.
+
 ## Cursor
 
 Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
