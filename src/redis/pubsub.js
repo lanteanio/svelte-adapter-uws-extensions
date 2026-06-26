@@ -99,6 +99,10 @@ export function createPubSubBus(client, options = {}) {
 	if (onRecovered !== undefined && typeof onRecovered !== 'function') {
 		throw new Error('pubsub bus: onRecovered must be a function');
 	}
+	const degradationPolicy = options.degradationPolicy;
+	if (degradationPolicy !== undefined && (degradationPolicy === null || typeof degradationPolicy.onDegraded !== 'function' || typeof degradationPolicy.onRecovered !== 'function')) {
+		throw new Error('pubsub bus: degradationPolicy must be a createDegradationPolicy() result');
+	}
 	if (systemChannel && typeof systemChannel !== 'string') {
 		throw new Error('pubsub bus: systemChannel must be a string, null, or false');
 	}
@@ -382,7 +386,13 @@ export function createPubSubBus(client, options = {}) {
 							try { onDegraded(); } catch { /* don't propagate user errors */ }
 						}
 						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'degraded', { at: now() });
+							// A degradation policy ships the precomputed client mitigation
+							// alongside the event + de-herds the push (jitterMs), so the
+							// resulting client retries/fallbacks spread across the cooldown.
+							let out = null;
+							if (degradationPolicy) { try { out = degradationPolicy.onDegraded({ from, to }); } catch { /* a policy must never break the emit */ } }
+							const data = out && out.mitigation ? { at: now(), mitigation: out.mitigation } : { at: now() };
+							activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { jitterMs: out.jitterMs } : undefined);
 							mDegraded?.inc();
 						}
 					} else if (from !== 'healthy' && to === 'healthy') {
@@ -390,7 +400,10 @@ export function createPubSubBus(client, options = {}) {
 							try { onRecovered(); } catch { /* don't propagate user errors */ }
 						}
 						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'recovered', { at: now() });
+							let out = null;
+							if (degradationPolicy) { try { out = degradationPolicy.onRecovered({ from, to }); } catch { /* a policy must never break the emit */ } }
+							const data = out && out.recovery ? { at: now(), recovery: out.recovery } : { at: now() };
+							activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { jitterMs: out.jitterMs } : undefined);
 							mRecovered?.inc();
 						}
 					}

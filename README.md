@@ -297,6 +297,7 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 | `systemChannel` | `'__realtime'` | Topic for auto-emitted `degraded` / `recovered` events. `null` or `false` to disable. Requires a `breaker` |
 | `onDegraded` | - | Server-side handler invoked once when the breaker leaves the healthy state |
 | `onRecovered` | - | Server-side handler invoked once when the breaker returns to the healthy state |
+| `degradationPolicy` | - | A `createDegradationPolicy()` result (from `svelte-adapter-uws-extensions/degradation`). When the breaker degrades, the bus ships the policy's precomputed client mitigation alongside the `degraded` event and de-herds the push, so clients act on the recommendation spread across the cooldown instead of all retrying at t+0. See [Proactive degradation policy](#proactive-degradation-policy) |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. |
 | `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped; the configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so the bus's own degraded / recovered events still flow. Closes the bus-injection class in shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
@@ -310,6 +311,29 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 | `bus.hooks` | Ready-made WebSocket hooks. `open(ws, ctx)` activates the Redis subscriber (idempotent) AND subscribes `ws` to the bus's `systemChannel` so `degraded` / `recovered` events are delivered. Destructure for one-line `hooks.ws.js` wiring: `export const { open } = bus.hooks;` |
 | `bus.activate(platform)` | Start the Redis subscriber (idempotent). Equivalent to the subscriber half of `bus.hooks.open`; prefer `bus.hooks.open` for new code |
 | `bus.deactivate()` | Stop the subscriber |
+
+### Proactive degradation policy
+
+When the breaker trips, the bus already emits a `degraded` event - but on its own each client just learns "something is degraded" and typically retries immediately, the worst response under load. A degradation policy precomputes the recommended client action for the failure and ships it WITH the event, de-herded so the resulting client retries spread across the cooldown:
+
+```js
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
+import { createDegradationPolicy } from 'svelte-adapter-uws-extensions/degradation';
+
+const bus = createPubSubBus(redis, {
+  breaker,
+  degradationPolicy: createDegradationPolicy({
+    mitigation: {
+      rpcs: ['orders/create'],     // treat these as unavailable while degraded
+      retryAfterMs: 8000,          // how long the client should hold off
+      bannerCopy: 'Saving is paused while we recover - back shortly.'
+    }
+    // jitterMs defaults to min(retryAfterMs / 4, 5000); override to tune the spread
+  })
+});
+```
+
+The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store so the client renders the banner and schedules the retry with zero per-failure app code. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
 
 ---
 

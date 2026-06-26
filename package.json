@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.34",
+	"version": "0.6.0-next.35",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -152,6 +152,10 @@
 		"./breaker": {
 			"types": "./src/shared/breaker.d.ts",
 			"default": "./src/shared/breaker.js"
+		},
+		"./degradation": {
+			"types": "./src/shared/degradation.d.ts",
+			"default": "./src/shared/degradation.js"
 		},
 		"./assert": {
 			"types": "./src/shared/assert.d.ts",

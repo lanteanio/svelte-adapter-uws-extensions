@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0-next.34] - 2026-06-26
+## [0.6.0-next.35] - 2026-06-26
+
+### Added
+
+- **`./degradation`: `createDegradationPolicy()` - proactive mitigation push on circuit-breaker degrade.** The pub/sub bus already emits a `degraded` event when its breaker trips; on its own each client just learns "something is degraded" and typically retries immediately - the worst response under load. A policy precomputes the recommended client action for the failure (`{ streams, rpcs, retryAfterMs, bannerCopy }`) and the bus ships it ALONGSIDE the event and pushes it with the de-herd window, so the resulting client cache-reads / retries / fallbacks spread across the cooldown instead of collapsing to t+0. Wire it with `createPubSubBus(client, { breaker, degradationPolicy: createDegradationPolicy({ mitigation: { retryAfterMs: 8000, bannerCopy: 'Read-only mode' } }) })`. The de-herd window defaults to `min(retryAfterMs / 4, 5000)` (override with `jitterMs`); a function form `mitigation: (transition) => envelope` covers dynamic policies; an optional `recovery` envelope + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit (it just ships without a mitigation), and with no policy the event is byte-identical to before. svelte-realtime `>= 0.6.0-next.47` surfaces the mitigation via its new `degradation` store. Needs the de-herd publish from `svelte-adapter-uws >= 0.6.0-next.40`.
 
 ### Added
 

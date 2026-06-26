@@ -2,6 +2,7 @@ import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+import type { DegradationPolicy } from '../shared/degradation.js';
 
 export interface PubSubBusOptions {
 	/** Redis channel name for pub/sub messages. @default 'uws:pubsub' */
@@ -30,6 +31,14 @@ export interface PubSubBusOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+	/**
+	 * A `createDegradationPolicy()` result. When the breaker degrades, the bus ships the
+	 * policy's precomputed client mitigation alongside the `degraded` event and de-herds
+	 * the push, so connected clients act on the recommendation (go read-only, retry after
+	 * N ms, show a banner) spread across the cooldown instead of all retrying at t+0.
+	 * Requires a `breaker`.
+	 */
+	degradationPolicy?: DegradationPolicy;
 
 	/**
 	 * Reject inbound bus envelopes larger than this many bytes before
