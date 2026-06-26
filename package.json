@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.30",
+	"version": "0.6.0-next.31",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -64,6 +64,10 @@
 		"./postgres/replay": {
 			"types": "./src/postgres/replay.d.ts",
 			"default": "./src/postgres/replay.js"
+		},
+		"./postgres/dead-letter": {
+			"types": "./src/postgres/dead-letter.d.ts",
+			"default": "./src/postgres/dead-letter.js"
 		},
 		"./postgres/notify": {
 			"types": "./src/postgres/notify.d.ts",

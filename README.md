@@ -1307,6 +1307,15 @@ It implements the same interface as the in-memory store (`add` / `get` / `remove
 
 The whole (bounded, low-volume) collection is co-located on one Redis Cluster slot via a `{dlq}` hash tag, so every operation stays single-slot.
 
+A Postgres variant backs the same store in a `svti_dead_letter` table for deployments that keep durable state in Postgres:
+
+```js
+import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-letter';
+configureWebhooks({ deadLetter: createDeadLetter(pgClient, { max: 1000 }) });
+```
+
+Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`) and `autoMigrate` (default `true`); the table is auto-created on first use, and both bounds are enforced on write.
+
 ---
 
 **Postgres extensions**

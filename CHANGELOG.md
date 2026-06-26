@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.31] - 2026-06-26
+
+### Added
+
+- **`./postgres/dead-letter`: a Postgres-backed dead-letter store for svelte-realtime's outbound-webhook DLQ.** The Postgres counterpart to `./redis/dead-letter` - same interface (`add` / `get` / `remove` / `count` / `list` / `summary` / `clear`), backed by a `svti_dead_letter` table (auto-created when `autoMigrate`), for deployments that keep durable state in Postgres rather than Redis. Wire it with `configureWebhooks({ deadLetter: createDeadLetter(pgClient) })` (needs `svelte-realtime >= 0.6.0-next.40`). Bounded by `max` (oldest evicted first, by id) and an optional `ttlMs`, both enforced on write; all queries are circuit-breaker-wrapped, and an optional metrics registry gets a `dead_letter_added_total{topic}` counter.
+
 ## [0.6.0-next.30] - 2026-06-26
 
 ### Added
