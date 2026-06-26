@@ -200,7 +200,15 @@ export function createPubSubBus(client, options = {}) {
 					const result = platform.publish(topic, event, data, options);
 
 					if (!options || options.relay !== false) {
-						scheduleRelay(JSON.stringify({ instanceId, topic, event, data }), 1);
+						// Carry the de-herd window across the cluster so subscribers on
+						// OTHER nodes also stagger; the receiving worker re-stamps `j` on
+						// its local frame. Omitted when absent so the relay wire is
+						// byte-identical for the common (non-jittered) publish.
+						const env = { instanceId, topic, event, data };
+						if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
+							/** @type {any} */ (env).j = options.jitterMs;
+						}
+						scheduleRelay(JSON.stringify(env), 1);
 					}
 
 					return result;
@@ -463,7 +471,10 @@ export function createPubSubBus(client, options = {}) {
 							return;
 						}
 						mReceived?.inc();
-						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+						// Re-apply the de-herd window (carried as `j`) so this node's
+						// subscribers stagger too; `relay: false` stops the re-relay.
+						activePlatform.publish(parsed.topic, parsed.event, parsed.data,
+							parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
 					}
 				} catch {
 					// Malformed envelope; counted so a stream of bad messages

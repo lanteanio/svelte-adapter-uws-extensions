@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0-next.33] - 2026-06-26
+## [0.6.0-next.34] - 2026-06-26
+
+### Added
+
+- **The pub/sub bus now carries the `{ jitterMs }` de-herd window across the cluster.** When `ctx.publish(..., { jitterMs })` (svelte-realtime `>= 0.6.0-next.46`) staggers a thundering-herd broadcast, the window must reach subscribers on every node, not just the originating worker - otherwise the other nodes' clients all stampede at t+0. Both bus variants (`createPubSubBus` and the sharded `createShardedPubSub`) now relay the window as a compact `j` field and re-apply it on the receiving worker, so each node's clients roll their own delay. Omitted when absent, so the relay wire for a normal publish is byte-identical.
 
 ### Added
 

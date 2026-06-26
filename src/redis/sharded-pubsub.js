@@ -275,7 +275,7 @@ export function createShardedBus(client, options = {}) {
 						return;
 					}
 					mReceived?.inc({ topic: mt(parsed.topic) });
-					activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+					activePlatform.publish(parsed.topic, parsed.event, parsed.data, parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
 				}
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
@@ -704,7 +704,14 @@ export function createShardedBus(client, options = {}) {
 					const result = platform.publish(topic, event, data, opts);
 					if (!opts || opts.relay !== false) {
 						const channel = channelFor(topic);
-						scheduleRelay(channel, JSON.stringify({ instanceId, topic, event, data }), [topic]);
+						// Carry the de-herd window across the cluster (the receiving
+						// worker re-stamps `j`); omitted when absent so the common
+						// publish's relay wire is byte-identical.
+						const env = { instanceId, topic, event, data };
+						if (opts && typeof opts.jitterMs === 'number' && opts.jitterMs > 0) {
+							/** @type {any} */ (env).j = opts.jitterMs;
+						}
+						scheduleRelay(channel, JSON.stringify(env), [topic]);
 					}
 					return result;
 				},
