@@ -997,7 +997,23 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 - **User reconnects to a different instance mid-request.** The origin's pending entry waits on the OLD instance's reply channel. The user's new connection won't reply on that channel; the request times out. Any late reply from the old instance after teardown lands on a missing pending entry and is silently dropped (`push_late_replies_total` increments).
 - **Owning instance crashes between request publish and local `platform.request`.** Same shape as above - request times out. The Redis entry remains until the TTL expires (sliding heartbeat cleared by the dead instance), after which subsequent `request(...)` calls see `result="offline"` from the lookup.
 - **Self-targeting** (the origin instance owns the user). Short-circuits to a local `platform.request(ws, ...)` without round-tripping Redis. One conditional in the dispatcher; not a special case at the API surface.
-- **Anonymous connections.** `identify(ws)` returning `null` / `undefined` makes the open / close hooks no-op. Anonymous users are not addressable through the registry by design.
+- **Anonymous connections.** `identify(ws)` returning `null` / `undefined` makes the open / close hooks no-op. Anonymous users are not addressable through the registry by design (unless they carry an app session - see below).
+
+#### Routing by app session {#registry-request-session}
+
+Pass a `sessionIdentify(ws)` option and the registry also tracks a `sessionId -> instance` owner map (a `sess:{sessionId}` hash beside `conns:{userId}`), so `requestSession(sessionId, ...)` routes to whichever instance currently owns that session - the resume-aware counterpart of `request(userId, ...)`. It backs svelte-realtime's `live.push({ sessionId })` cluster routing.
+
+```js
+export const registry = createConnectionRegistry(redis, {
+  identify: (ws) => ws.getUserData()?.userId,
+  sessionIdentify: (ws) => ws.getUserData()?.sid   // opt-in
+});
+
+// From any instance, reach the exact session wherever it lives:
+const reply = await registry.requestSession('sess-abc', 'reauth-required', { reason: 'rotated' });
+```
+
+The session map is **independent of userId**: a connection may carry a userId, a session, both, or neither, and an anonymous-but-sessioned connection (no userId) still registers and is reachable by session. It is **opt-in** - with no `sessionIdentify` option the registry writes no `sess:` keys and the userId path is unchanged. Resume-aware by the same last-open-wins lifecycle as the userId path. Wire it into svelte-realtime with `live.configurePush({ remoteRegistry: registry })` - the realtime layer detects `requestSession` and routes `live.push({ sessionId })` / `live.notify({ sessionId })` cluster-wide; without it the sessionId target stays single-instance.
 
 ---
 
@@ -1170,6 +1186,27 @@ Why it is a single-owner relay (and not a converge-everywhere one like documents
 Options: `leaseMs` (per-topic ownership-lease TTL, default 10000ms; the realtime layer renews at ~TTL/3 while it holds live entities), `maxEnvelopeBytes` (relay size cap, default 1 MB), `snapshotTtlMs` (warm-handoff snapshot TTL, default 3x `leaseMs`), `breaker`, `onError`. The realtime layer detects `platform.smooth` and routes through it automatically (`svelte-realtime >= 0.6.0-next.11`).
 
 **Warm handoff (opt-in).** `createSmoothCluster` also exposes `writeSnapshot(topic, catalog)` / `readSnapshot(topic)`, the persistence behind `svelte-realtime`'s `live.smooth({ snapshot: true })`. With the opt-in on, the topic owner debounce-writes its catalog to `smooth:snap:<topic>` while it ticks, and the instance that takes over after the owner dies reads it on acquire and resumes each entity from its last state instead of resetting to `initial`. Best-effort (breaker-guarded, single-key, prefix-tagged) and self-expiring via `snapshotTtlMs` - a live owner's snapshot never lapses because each write refreshes the TTL, and a dead topic's clears itself. Off unless the realtime layer enables it (`svelte-realtime >= 0.6.0-next.12`); the default `live.smooth` path never calls these.
+
+## Topic broadcast-with-reply
+
+`createTopicBroadcast` makes `svelte-realtime`'s `live.push({ topic })` / `live.notify({ topic })` work across a cluster. The adapter's `platform.requestTopic` fans a request out to every LOCAL subscriber of a topic and aggregates the replies; behind a load balancer a topic's subscribers span instances, so a single-instance fan-out reaches only the subscribers on the calling worker. This coordinator fans the request out to every instance, has each serve its own subscribers, and aggregates all replies back at the origin. Wire it onto the platform like the other Redis plugins and the realtime layer detects it automatically:
+
+```js
+// hooks.server.js (or wherever you wire the Redis bus)
+import { createTopicBroadcast } from 'svelte-adapter-uws-extensions/redis/topic-broadcast';
+
+platform.topicBroadcast = createTopicBroadcast(redis);   // bus.wrap forwards it; realtime picks it up
+```
+
+How it stays correct AND fast (no multi-second floor on a primitive that usually resolves in milliseconds):
+
+- **Fan-in over one shared channel.** Unlike the smooth relay (one owner answers) a topic broadcast is scatter-gather - the request rides a single channel every instance subscribes to (`{prefix}topic-broadcast:events`), each instance answers with its own local aggregate (an empty array when it has no subscribers), and the origin collects them all. Correlation-id envelopes, echo-suppressed by instance id, replies targeted at the origin.
+- **Correct early-completion via instance presence.** Each coordinator records itself in a heartbeated Redis sorted set (single-slot via a `{...}` hash tag). The origin **always publishes** the request - presence decides only WHEN to stop waiting, never WHETHER to ask - and finishes as soon as every live instance has answered, falling back to the `timeoutMs` budget only when a recorded instance goes quiet. A peer whose presence write has not yet landed still receives the broadcast and is collected, so a just-joined instance is not dropped.
+- **Partial-success throughout.** A subscriber or instance that does not answer in time simply does not contribute; it never fails the whole call.
+
+> **Trust model:** like the other relays the channel carries the per-subscriber replies in cleartext between trusted instances, hardened with a pre-parse size cap and namespaced under your key prefix but not made private. Run it on a Redis you control.
+
+Options: `keyPrefix` (stacks with the client prefix; for two coordinators on one client), `requestTimeoutMs` (default whole-fan-out budget, default 5000ms), `heartbeat` (presence refresh, default 10000ms), `presenceTtlMs` (live window, default `heartbeat * 3`), `maxEnvelopeBytes` (relay size cap, default 1 MB), `breaker`, `metrics`, `onError`. Needs `svelte-adapter-uws >= 0.6.0-next.39` for the underlying `requestTopic`; the realtime layer detects `platform.topicBroadcast` and routes through it automatically (`svelte-realtime >= 0.6.0-next.42`).
 
 ## Cursor
 

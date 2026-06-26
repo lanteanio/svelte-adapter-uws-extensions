@@ -259,6 +259,146 @@ describe('redis connection registry', () => {
 		});
 	});
 
+	describe('requestSession: app-session cluster routing', () => {
+		const sessionIdentify = (ws) => ws.getUserData()?.sid;
+
+		it('short-circuits to local platform.request when this instance owns the session', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify
+			});
+			const ws = wsWithSession({ userId: 'u-1', sid: 'sess-A' }, 's-1');
+			await r.hooks.open(ws, { platform });
+			platform.request = async (target, event, data) => ({ here: target === ws, event, data });
+
+			const reply = await r.requestSession('sess-A', 'confirm', { op: 'go' });
+			expect(reply.here).toBe(true);
+			expect(reply.event).toBe('confirm');
+			expect(reply.data).toEqual({ op: 'go' });
+			await r.destroy();
+		});
+
+		it('rejects when the session is offline', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: () => null,
+				sessionIdentify
+			});
+			await expect(r.requestSession('nobody', 'event')).rejects.toThrow(/offline/);
+			await r.destroy();
+		});
+
+		it('registers an anonymous-but-sessioned connection (no userId) and routes to it', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: () => null, // anonymous: never registers a userId
+				sessionIdentify
+			});
+			const ws = wsWithSession({ sid: 'sess-anon' }, 's-9');
+			await r.hooks.open(ws, { platform });
+			// No userId was registered...
+			expect(await r.lookup('anything')).toBeNull();
+			// ...but the app session is owned and reachable.
+			const entry = await r.lookupSession('sess-anon');
+			expect(entry).toMatchObject({ instanceId: r.instanceId });
+			platform.request = async () => ({ ok: true });
+			expect((await r.requestSession('sess-anon', 'ping')).ok).toBe(true);
+			await r.destroy();
+		});
+
+		it('routes to the owning instance and resolves with the reply (cross-instance)', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify
+			});
+			const ws = wsWithSession({ userId: 'u-1', sid: 'sess-X' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			platformOwner.request = async (targetWs, event, data) => ({ ok: true, event, data, sameWs: targetWs === ws });
+
+			// `registry` (the beforeEach origin) does not own the session and need
+			// not even track sessions itself - it routes via the Redis owner map.
+			const reply = await registry.requestSession('sess-X', 'confirm', { id: 7 });
+			expect(reply).toEqual({ ok: true, event: 'confirm', data: { id: 7 }, sameWs: true });
+			await owner.destroy();
+		});
+
+		it('propagates a handler error from the owning instance (cross-instance)', async () => {
+			const platformOwner = mockPlatform();
+			const owner = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify
+			});
+			const ws = wsWithSession({ userId: 'u-1', sid: 'sess-Y' }, 's-1');
+			await owner.hooks.open(ws, { platform: platformOwner });
+			platformOwner.request = async () => { throw new Error('session kaboom'); };
+
+			await expect(registry.requestSession('sess-Y', 'event')).rejects.toThrow(/session kaboom/);
+			await owner.destroy();
+		});
+
+		it('drains the session on close so it becomes offline', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify
+			});
+			const ws = wsWithSession({ userId: 'u-1', sid: 'sess-Z' }, 's-1');
+			await r.hooks.open(ws, { platform });
+			expect(await r.lookupSession('sess-Z')).not.toBeNull();
+			await r.hooks.close(ws, { platform });
+			expect(await r.lookupSession('sess-Z')).toBeNull();
+			await expect(r.requestSession('sess-Z', 'event')).rejects.toThrow(/offline/);
+			await r.destroy();
+		});
+
+		it('is opt-in: no sessionIdentify means no session tracking', async () => {
+			// The default `registry` (beforeEach) has no sessionIdentify.
+			const ws = wsWithSession({ userId: 'u-1', sid: 'sess-untracked' }, 's-1');
+			await registry.hooks.open(ws, { platform });
+			expect(await registry.lookupSession('sess-untracked')).toBeNull();
+		});
+	});
+
+	describe('same-instance reconnect (resume race)', () => {
+		it('a stale userId close after a same-instance resume does not unbind the live socket', async () => {
+			const wsA = wsWithSession({ userId: 'u-1' }, 's-A');
+			await registry.hooks.open(wsA, { platform });
+			// Resume on a new socket: same user, same instance, fresh transport session.
+			const wsB = wsWithSession({ userId: 'u-1' }, 's-B');
+			await registry.hooks.open(wsB, { platform });
+			// The OLD socket's close arrives late (open(B) preceded close(A)).
+			await registry.hooks.close(wsA, { platform });
+
+			// The user must still be reachable on wsB, in Redis AND locally.
+			const entry = await registry.lookup('u-1');
+			expect(entry).toMatchObject({ instanceId: registry.instanceId, sessionId: 's-B' });
+			platform.request = async (target) => ({ live: target === wsB });
+			expect((await registry.request('u-1', 'ping')).live).toBe(true);
+		});
+
+		it('a normal userId close (no resume) still drains the user', async () => {
+			const ws = wsWithSession({ userId: 'u-1' }, 's-A');
+			await registry.hooks.open(ws, { platform });
+			await registry.hooks.close(ws, { platform });
+			expect(await registry.lookup('u-1')).toBeNull();
+		});
+
+		it('a stale app-session close after a same-instance resume keeps the session reachable', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify: (ws) => ws.getUserData()?.sid
+			});
+			const wsA = wsWithSession({ userId: 'u-1', sid: 'sess-A' }, 's-A');
+			await r.hooks.open(wsA, { platform });
+			const wsB = wsWithSession({ userId: 'u-1', sid: 'sess-A' }, 's-B');
+			await r.hooks.open(wsB, { platform });
+			await r.hooks.close(wsA, { platform });
+
+			expect(await r.lookupSession('sess-A')).not.toBeNull();
+			platform.request = async (target) => ({ live: target === wsB });
+			expect((await r.requestSession('sess-A', 'ping')).live).toBe(true);
+			await r.destroy();
+		});
+	});
+
 	describe('request: timeout handling', () => {
 		it('rejects with a timeout error when no reply arrives', async () => {
 			// Plant an entry with no live owning subscriber.

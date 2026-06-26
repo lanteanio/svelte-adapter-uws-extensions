@@ -255,6 +255,13 @@ export function createPubSubBus(client, options = {}) {
 				},
 				sendCoalesced: platform.sendCoalesced.bind(platform),
 				request: platform.request.bind(platform),
+				// Single-instance topic broadcast-with-reply. Forwarded as-is (no
+				// cross-instance fan-out here): the realtime layer uses this to serve
+				// THIS instance's subscribers, and routes the cluster fan-out through
+				// the `topicBroadcast` coordinator below. `undefined` when the
+				// underlying platform predates requestTopic, so realtime's typeof guard
+				// degrades to single-instance.
+				requestTopic: platform.requestTopic ? platform.requestTopic.bind(platform) : undefined,
 				// Binary wire methods. Forwarded like send/sendTo (local fanout, no
 				// cross-instance relay - the plugin's own relay() handles that). Without
 				// these the wrapped seam hides the binary path and cluster-backed cursor /
@@ -332,6 +339,11 @@ export function createPubSubBus(client, options = {}) {
 				get presence() { return platform.presence; },
 				get crdt() { return platform.crdt; },
 				get smooth() { return platform.smooth; },
+				// The topic-broadcast cluster coordinator (createTopicBroadcast),
+				// attached by app init like the other plugins. Live getter so
+				// post-wrap assignment propagates; realtime detects it on the wrapped
+				// seam to fan `live.push({ topic })` across instances.
+				get topicBroadcast() { return platform.topicBroadcast; },
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

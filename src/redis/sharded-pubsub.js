@@ -769,6 +769,10 @@ export function createShardedBus(client, options = {}) {
 				},
 				sendCoalesced: platform.sendCoalesced.bind(platform),
 				request: platform.request.bind(platform),
+				// Single-instance topic broadcast-with-reply, forwarded as-is so the
+				// realtime layer can serve THIS instance's subscribers; the cluster
+				// fan-out rides the `topicBroadcast` coordinator (getter below).
+				requestTopic: platform.requestTopic ? platform.requestTopic.bind(platform) : undefined,
 				// Binary wire methods. Forwarded like send/sendTo (local fanout, no
 				// cross-instance relay - the plugin's own relay() handles that). Without
 				// these the wrapped seam hides the binary path and cluster-backed cursor /
@@ -846,6 +850,9 @@ export function createShardedBus(client, options = {}) {
 				get presence() { return platform.presence; },
 				get crdt() { return platform.crdt; },
 				get smooth() { return platform.smooth; },
+				// The topic-broadcast cluster coordinator; live getter so realtime
+				// detects it on the wrapped seam to fan live.push({ topic }) cluster-wide.
+				get topicBroadcast() { return platform.topicBroadcast; },
 				topic(t) {
 					return {
 						publish(event, data) { wrapped.publish(t, event, data); },

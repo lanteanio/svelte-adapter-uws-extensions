@@ -324,9 +324,19 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			async zadd(key, score, member) {
 				if (!sortedSets.has(key)) sortedSets.set(key, []);
 				const set = sortedSets.get(key);
-				set.push({ score: Number(score), member });
+				// Real Redis ZADD upserts: a sorted set holds unique members, so an
+				// existing member's score is updated in place rather than duplicated.
+				// Returns the count of NEW members added (0 on a pure update).
+				const existing = set.find((e) => String(e.member) === String(member));
+				let added = 0;
+				if (existing) {
+					existing.score = Number(score);
+				} else {
+					set.push({ score: Number(score), member });
+					added = 1;
+				}
 				set.sort((a, b) => a.score - b.score);
-				return 1;
+				return added;
 			},
 			async zcard(key) {
 				const set = sortedSets.get(key);
@@ -371,6 +381,19 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (!set) return 0;
 				const removed = set.splice(start, stop - start + 1);
 				return removed.length;
+			},
+			async zremrangebyscore(key, min, max) {
+				const set = sortedSets.get(key);
+				if (!set) return 0;
+				// Inclusive bounds only (the exclusive `(` prefix is treated as
+				// inclusive; 1ms of slack is immaterial against a multi-second TTL).
+				const lo = min === '-inf' ? -Infinity : Number(typeof min === 'string' && min[0] === '(' ? min.slice(1) : min);
+				const hi = max === '+inf' ? Infinity : Number(typeof max === 'string' && max[0] === '(' ? max.slice(1) : max);
+				let removed = 0;
+				for (let i = set.length - 1; i >= 0; i--) {
+					if (set[i].score >= lo && set[i].score <= hi) { set.splice(i, 1); removed++; }
+				}
+				return removed;
 			},
 			async zrem(key, ...members) {
 				const set = sortedSets.get(key);

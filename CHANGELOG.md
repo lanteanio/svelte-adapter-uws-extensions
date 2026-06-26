@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.32] - 2026-06-26
+
+### Added
+
+- **`./redis/topic-broadcast`: a cluster coordinator for topic broadcast-with-reply (`live.push({ topic })` / `live.notify({ topic })`).** The adapter's `platform.requestTopic` fans a request to every LOCAL subscriber of a topic and aggregates the replies; in a cluster those subscribers span instances. `createTopicBroadcast(client)` fans the request out to every instance over one shared channel, has each serve its own subscribers, and aggregates all replies back at the origin. Attach it like the other plugins (`platform.topicBroadcast = createTopicBroadcast(redis)`); `bus.wrap` forwards it and svelte-realtime (`>= 0.6.0-next.42`) detects it to route `live.push({ topic })` cluster-wide. Completion is correct AND fast: each coordinator records itself in a heartbeated Redis sorted set (single-slot via a `{...}` hash tag), so the origin finishes as soon as every live instance has answered rather than waiting out the whole `timeoutMs` - while still ALWAYS publishing (presence decides when to stop, never whether to ask), so a peer whose presence write has not yet landed is not dropped. Partial-success throughout: a slow subscriber/instance simply does not contribute. Needs `svelte-adapter-uws >= 0.6.0-next.39` for the underlying `requestTopic`.
+- **`./redis/registry`: cluster-routed request/reply keyed by app session id (`requestSession`), the resume-aware counterpart of `request(userId, ...)`.** Pass a `sessionIdentify(ws)` option and the registry also tracks a `sessionId -> instance` owner map (a `sess:{sessionId}` hash beside the existing `conns:{userId}`), so `registry.requestSession(sessionId, event, data)` routes to whichever instance currently owns that session - resume-aware by the same last-open-wins lifecycle as the userId path. Independent of `identify`: an anonymous-but-sessioned connection (no userId) still registers and is reachable. svelte-realtime (`>= 0.6.0-next.42`) calls it from `live.push({ sessionId })` / `live.notify({ sessionId })` when the registry exposes it, so the sessionId target routes cluster-wide instead of staying single-instance. Opt-in: with no `sessionIdentify` option nothing changes (no `sess:` keys, userId path untouched).
+- **`bus.wrap(platform)` now forwards `requestTopic` and `topicBroadcast`** (both the in-memory `redis/pubsub` and `redis/sharded-pubsub` wraps), so a cluster-wrapped platform exposes the single-instance fan-out primitive and the cluster coordinator to the realtime layer. `undefined` when the underlying platform predates them, so the realtime typeof guard degrades to single-instance.
+
+### Fixed
+
+- **`./redis/registry`: a same-instance reconnect no longer makes the just-connected socket unreachable.** When a user (or session) reconnected on a new socket on the SAME instance and the new socket's `open` ran before the old socket's `close`, the stale close drained the live binding from the local map AND deleted the user's Redis owner row, so `lookup` / `request` reported the user offline despite the live connection. The close hook now skips when this socket is no longer the user's current local binding (mirroring the realtime push registry's `entry.ws === ws` guard and the app-session drain), so a fast laptop-then-phone or refresh-driven reconnect stays reachable. Cross-instance migration is unaffected (the close still runs and is correctly ignored by the new owner's `applyCloseEvent` owner check).
+
 ## [0.6.0-next.31] - 2026-06-26
 
 ### Added

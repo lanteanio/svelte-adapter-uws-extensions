@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.31",
+	"version": "0.6.0-next.32",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -36,6 +36,10 @@
 		"./redis/smooth": {
 			"types": "./src/redis/smooth-cluster.d.ts",
 			"default": "./src/redis/smooth-cluster.js"
+		},
+		"./redis/topic-broadcast": {
+			"types": "./src/redis/topic-broadcast.d.ts",
+			"default": "./src/redis/topic-broadcast.js"
 		},
 		"./redis/sharded-pubsub": {
 			"types": "./src/redis/sharded-pubsub.d.ts",

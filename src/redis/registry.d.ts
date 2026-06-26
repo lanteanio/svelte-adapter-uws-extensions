@@ -11,6 +11,19 @@ export interface RegistryOptions {
 	identify(ws: any): string | null | undefined;
 
 	/**
+	 * Opt-in: extract an app session id from a WebSocket so
+	 * `requestSession(sessionId, ...)` can route to whichever instance
+	 * currently owns that session, cluster-wide. Independent of `identify`
+	 * - a connection may carry a userId, a session, both, or neither.
+	 * Return `null` / `undefined` to skip a given connection.
+	 *
+	 * Omit the option entirely to disable session tracking: no `sess:`
+	 * keys are written, the heartbeat does no extra work, and the userId
+	 * path is byte-identical to a registry that never knew about sessions.
+	 */
+	sessionIdentify?(ws: any): string | null | undefined;
+
+	/**
 	 * Extract per-user attributes captured at registration time. Used by
 	 * `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped
 	 * broadcasts. Shallow values only - string, number, boolean.
@@ -78,6 +91,13 @@ export interface ConnectionRegistry {
 	lookup(userId: string): Promise<RegistryEntry | null>;
 
 	/**
+	 * Resolve an app session id to its current owning instance, or `null`
+	 * if the session is offline. Only meaningful when the registry was
+	 * created with a `sessionIdentify` option.
+	 */
+	lookupSession(sessionId: string): Promise<{ instanceId: string; ts: number } | null>;
+
+	/**
 	 * Cluster-routed request/reply. Looks up the owning instance, forwards
 	 * the request envelope on the per-instance push channel, and resolves
 	 * with the reply when the owning instance answers via the origin's own
@@ -100,6 +120,34 @@ export interface ConnectionRegistry {
 	 * ```
 	 */
 	request<TReply = unknown>(
+		target: string,
+		event: string,
+		data?: unknown,
+		options?: { timeoutMs?: number }
+	): Promise<TReply>;
+
+	/**
+	 * Cluster-routed request/reply keyed by an app session id - the
+	 * resume-aware counterpart of `request(userId, ...)`. Looks up which
+	 * instance owns the session, short-circuits to a local
+	 * `platform.request` when that is this instance, else forwards a
+	 * `request-session` envelope on the owner's push channel and awaits
+	 * the reply.
+	 *
+	 * Requires the registry to have been created with a `sessionIdentify`
+	 * option; without it no session is ever recorded and every target
+	 * reports offline.
+	 *
+	 * Rejects on the session being offline, the request timing out, or the
+	 * owning instance reporting a handler error - same surface as
+	 * `request`.
+	 *
+	 * @example
+	 * ```js
+	 * const reply = await registry.requestSession('sess-abc', 'confirm', { op: 'delete' });
+	 * ```
+	 */
+	requestSession<TReply = unknown>(
 		target: string,
 		event: string,
 		data?: unknown,

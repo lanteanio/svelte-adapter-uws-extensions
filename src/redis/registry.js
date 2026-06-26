@@ -12,9 +12,13 @@
  *   - Hash `{prefix}conns:{userId}` with fields `instanceId`, `sessionId`, `ts`.
  *     Most-recent-connection-wins - a second device replaces the first.
  *     Sliding TTL refreshed on every `hooks.open` and on the heartbeat tick.
+ *   - Hash `{prefix}sess:{sessionId}` with fields `instanceId`, `ts` (only when a
+ *     `sessionIdentify` option is supplied). The resume-aware owner map for
+ *     `requestSession(sessionId, ...)`; last-open-wins, same sliding TTL.
  *
  * Wire envelopes on `{prefix}__push:{instanceId}`:
  *   - `{type:'request', ref, sessionId, event, data, replyTo, timeoutMs}`
+ *   - `{type:'request-session', ref, sessionId, event, data, replyTo, timeoutMs}`
  *   - `{type:'reply', ref, data}` or `{type:'reply', ref, error}`
  *
  * Self-targeting (the origin instance owns the user) short-circuits to a
@@ -62,6 +66,7 @@ return 0
 /**
  * @typedef {Object} RegistryOptions
  * @property {(ws: any) => string | null | undefined} identify - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them.
+ * @property {(ws: any) => string | null | undefined} [sessionIdentify] - Opt-in: extract an app session id from a WebSocket so `requestSession(sessionId, ...)` can route cluster-wide. Independent of `identify` - a connection may carry a userId, a session, both, or neither. Return `null` / `undefined` to skip. Omit entirely to disable session tracking (no `sess:` keys, userId path unchanged).
  * @property {(ws: any) => Record<string, string | number | boolean> | null | undefined} [attributes] - Extract per-user attributes captured at registration time. Used by `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped broadcasts. Shallow values only (string / number / boolean); compound queries are deliberately out of scope.
  * @property {string} [keyPrefix=''] - Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`.
  * @property {number} [ttl=90] - Expiry on registry entries in seconds. Should be greater than `heartbeat * 3` so a missed beat doesn't drop a live user.
@@ -82,7 +87,9 @@ return 0
  * @typedef {Object} ConnectionRegistry
  * @property {string} instanceId - Stable id for this instance, also the name of its push channel.
  * @property {(userId: string) => Promise<RegistryEntry | null>} lookup - Resolve a userId to its current owning instance, or null if offline.
- * @property {<T = unknown>(target: string, event: string, data?: unknown, options?: { timeoutMs?: number }) => Promise<T>} request - Cluster-routed request/reply. Resolves with the reply, rejects on timeout / offline / handler error.
+ * @property {(sessionId: string) => Promise<{ instanceId: string, ts: number } | null>} lookupSession - Resolve an app session id to its current owning instance, or null if offline.
+ * @property {<T = unknown>(target: string, event: string, data?: unknown, options?: { timeoutMs?: number }) => Promise<T>} request - Cluster-routed request/reply by userId. Resolves with the reply, rejects on timeout / offline / handler error.
+ * @property {<T = unknown>(target: string, event: string, data?: unknown, options?: { timeoutMs?: number }) => Promise<T>} requestSession - Cluster-routed request/reply by app session id (resume-aware). Requires the `sessionIdentify` option. Resolves with the reply, rejects on timeout / offline / handler error.
  * @property {() => number} size - Count of users registered to THIS instance (local view, scrape-time).
  * @property {{ open: (ws: any, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, close: (ws: any, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void> }} hooks
  * @property {() => Promise<void>} destroy - Stop the heartbeat and Redis subscriber.
@@ -129,6 +136,16 @@ export function createConnectionRegistry(client, options) {
 	if (attributes !== undefined && typeof attributes !== 'function') {
 		throw new Error('registry: attributes must be a function returning a flat object of string|number|boolean');
 	}
+	// Opt-in app-session identity. When provided, the registry ALSO tracks a
+	// `sessionId -> instance` ownership map (independent of userId) so
+	// `requestSession(sessionId, ...)` can route to whichever instance currently
+	// owns a given app session - the resume-aware counterpart of `request(userId)`.
+	// Absent (the default), nothing changes: no `sess:` keys, no extra writes, and
+	// the userId path is byte-identical to a registry that never knew about sessions.
+	const sessionIdentify = options.sessionIdentify;
+	if (sessionIdentify !== undefined && typeof sessionIdentify !== 'function') {
+		throw new Error('registry: sessionIdentify must be a function returning a string sessionId or null');
+	}
 	const keyPrefix = options.keyPrefix == null ? '' : String(options.keyPrefix);
 	const ttl = options.ttl ?? DEFAULT_TTL_SEC;
 	if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl < 1) {
@@ -162,6 +179,9 @@ export function createConnectionRegistry(client, options) {
 	function userKey(userId) {
 		return client.key(keyPrefix + 'conns:' + userId);
 	}
+	function sessionKey(sessionId) {
+		return client.key(keyPrefix + 'sess:' + sessionId);
+	}
 	function pushChannel(targetInstanceId) {
 		return client.key(keyPrefix + '__push:' + targetInstanceId);
 	}
@@ -183,6 +203,17 @@ export function createConnectionRegistry(client, options) {
 	 * @type {Map<string, string>}
 	 */
 	const localUsers = new Map();
+
+	/**
+	 * Local app-session -> ws map (only populated when `sessionIdentify` is set).
+	 * Source of truth for the self-targeting short-circuit and the inbound
+	 * `request-session` resolution; the heartbeat refreshes each entry's `sess:`
+	 * TTL. Kept separate from `sessionToWs` (which is keyed by the adapter's
+	 * transport session id and stays strictly userId-driven) so the userId path's
+	 * `localUsers.size === sessionToWs.size` invariant is untouched.
+	 * @type {Map<string, any>}
+	 */
+	const appSessionToWs = new Map();
 
 	/**
 	 * In-flight outbound requests: ref -> { resolve, reject, timer, startTime }.
@@ -395,6 +426,71 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
+	/**
+	 * Record this instance as the owner of an app session. Stores
+	 * `{instanceId, ts}` under `sess:{sessionId}` with a sliding TTL - no
+	 * transport id is stored because the inbound `request-session` path resolves
+	 * the socket by app-session id (via `appSessionToWs`) on the owning instance.
+	 * Most-recent-open-wins: a session that resumes on a new socket (anywhere in
+	 * the cluster) overwrites the owner field, exactly like the userId entry.
+	 */
+	async function setSessionEntry(sessionId) {
+		const key = sessionKey(sessionId);
+		try {
+			const tx = redis.multi();
+			tx.hset(key, 'instanceId', instanceId, 'ts', cachedNow());
+			tx.expire(key, ttl);
+			await tx.exec();
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+	}
+
+	async function lookupSession(sessionId) {
+		if (!withBreakerGuard()) return null;
+		try {
+			const result = await redis.hgetall(sessionKey(sessionId));
+			breaker?.success();
+			if (!result || !result.instanceId) return null;
+			return { instanceId: result.instanceId, ts: Number(result.ts) || 0 };
+		} catch (err) {
+			breaker?.failure(err);
+			return null;
+		}
+	}
+
+	async function deleteSessionIfOurs(sessionId) {
+		const key = sessionKey(sessionId);
+		try {
+			await redis.eval(COMPARE_AND_DELETE, 1, key, instanceId);
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			// Best-effort; sliding TTL backstops a missed delete.
+		}
+	}
+
+	async function registerAppSession(sessionId, ws) {
+		// Per-instance cap (shares the session budget with the userId path): skip
+		// past it so a connection storm or a sessionIdentify returning unique
+		// per-call values can't exhaust process memory. The session is unroutable
+		// from this instance until a later open finds headroom below the cap.
+		if (!appSessionToWs.has(sessionId) && appSessionToWs.size >= MAX_REGISTRY_SESSIONS_PER_INSTANCE) {
+			return;
+		}
+		// Last-write-wins resume: a session reconnecting (same id, new socket) flips
+		// the local entry to the live ws, mirroring the userId multi-device rule.
+		appSessionToWs.set(sessionId, ws);
+		try {
+			await setSessionEntry(sessionId);
+		} catch {
+			// Best-effort: the local map is populated so the session is reachable
+			// from this instance until the heartbeat retries the TTL write.
+		}
+	}
+
 	async function refreshTtl(userId) {
 		const key = userKey(userId);
 		try {
@@ -556,13 +652,16 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function heartbeatTick() {
-		if (destroyed || localUsers.size === 0) return;
+		if (destroyed || (localUsers.size === 0 && appSessionToWs.size === 0)) return;
 		if (!withBreakerGuard()) return;
-		// Refresh TTL on every locally-owned entry. A pipeline keeps this
-		// to one round trip regardless of N.
+		// Refresh TTL on every locally-owned entry (users + app sessions). A
+		// pipeline keeps this to one round trip regardless of N.
 		const commands = [];
 		for (const userId of localUsers.keys()) {
 			commands.push(['expire', userKey(userId), ttl]);
+		}
+		for (const sessionId of appSessionToWs.keys()) {
+			commands.push(['expire', sessionKey(sessionId), ttl]);
 		}
 		execMultiSlot(redis, commands).then(() => breaker?.success()).catch((err) => breaker?.failure(err));
 	}
@@ -571,6 +670,7 @@ export function createConnectionRegistry(client, options) {
 		if (!envelope || typeof envelope !== 'object') return;
 		switch (envelope.type) {
 			case 'request': handleInboundRequest(envelope); break;
+			case 'request-session': handleInboundSessionRequest(envelope); break;
 			case 'reply': handleInboundReply(envelope); break;
 			case 'coalesced': handleInboundCoalesced(envelope); break;
 			case 'send': handleInboundSend(envelope); break;
@@ -643,6 +743,31 @@ export function createConnectionRegistry(client, options) {
 		const { ref, sessionId, event, data, replyTo, timeoutMs } = env;
 		if (typeof ref !== 'string' || typeof event !== 'string' || typeof replyTo !== 'string') return;
 		const ws = sessionToWs.get(sessionId);
+		if (!ws || !activePlatform) {
+			await sendReplyEnvelope(replyTo, ref, undefined, 'offline');
+			return;
+		}
+		try {
+			const reply = await activePlatform.request(ws, event, data, { timeoutMs });
+			await sendReplyEnvelope(replyTo, ref, reply, null);
+		} catch (err) {
+			const message = (err && err.message) ? err.message : 'handler error';
+			await sendReplyEnvelope(replyTo, ref, undefined, message);
+		}
+	}
+
+	/**
+	 * Owner-side handler for a routed `requestSession`. Resolves the socket by
+	 * app-session id against this instance's local `appSessionToWs` map (the
+	 * session migrated here on its last open), then runs the local
+	 * `platform.request` and answers on the origin's push channel. The reply
+	 * travels as a normal `reply` envelope, so `handleInboundReply` resolves it
+	 * unchanged - the session path reuses the userId path's whole reply machinery.
+	 */
+	async function handleInboundSessionRequest(env) {
+		const { ref, sessionId, event, data, replyTo, timeoutMs } = env;
+		if (typeof ref !== 'string' || typeof sessionId !== 'string' || typeof event !== 'string' || typeof replyTo !== 'string') return;
+		const ws = appSessionToWs.get(sessionId);
 		if (!ws || !activePlatform) {
 			await sendReplyEnvelope(replyTo, ref, undefined, 'offline');
 			return;
@@ -764,6 +889,96 @@ export function createConnectionRegistry(client, options) {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
 				reject(new Error(`registry.request: timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
+			if (timer.unref) timer.unref();
+			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
+
+			redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope))
+				.then(() => breaker?.success())
+				.catch((err) => {
+					breaker?.failure(err);
+					if (!pending.delete(ref)) return;
+					clearTimer(timer);
+					mRequests?.inc({ result: 'error' });
+					reject(err);
+				});
+		});
+	}
+
+	/**
+	 * Cluster-routed request/reply keyed by an app session id - the resume-aware
+	 * counterpart of `request(userId, ...)`. Looks up which instance owns the
+	 * session, short-circuits to a local `platform.request` when that is this
+	 * instance, else forwards a `request-session` envelope on the owner's push
+	 * channel and awaits the reply on this instance's own channel. Requires the
+	 * registry to have been created with a `sessionIdentify` option (otherwise no
+	 * session was ever recorded and every target reports offline).
+	 *
+	 * @param {string} target - the app session id.
+	 * @param {string} event
+	 * @param {unknown} [data]
+	 * @param {{ timeoutMs?: number }} [opts]
+	 */
+	async function requestSession(target, event, data, opts = {}) {
+		if (typeof target !== 'string' || target.length === 0) {
+			throw new Error('registry.requestSession: target must be a non-empty sessionId string');
+		}
+		if (typeof event !== 'string' || event.length === 0) {
+			throw new Error('registry.requestSession: event must be a non-empty string');
+		}
+		const timeoutMs = opts.timeoutMs ?? defaultRequestTimeoutMs;
+
+		const entry = await lookupSession(target);
+		if (!entry) {
+			mRequests?.inc({ result: 'offline' });
+			throw new Error(`registry.requestSession: target session "${target}" is offline`);
+		}
+
+		// Self-targeting: the session migrated onto this instance; resolve locally.
+		if (entry.instanceId === instanceId) {
+			const ws = appSessionToWs.get(target);
+			if (!ws || !activePlatform) {
+				mRequests?.inc({ result: 'offline' });
+				throw new Error(`registry.requestSession: target session "${target}" is offline`);
+			}
+			const start = monotonicNow();
+			try {
+				const reply = await activePlatform.request(ws, event, data, { timeoutMs });
+				mReplyLatency?.observe(monotonicNow() - start);
+				mRequests?.inc({ result: 'ok' });
+				return reply;
+			} catch (err) {
+				mRequests?.inc({ result: 'error' });
+				throw err;
+			}
+		}
+
+		// Cross-instance: publish the request, await the reply on our push channel.
+		await ensureSubscriber(activePlatform);
+		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
+			mRequests?.inc({ result: 'error' });
+			throw new Error(
+				'registry.requestSession: pending requests exceeded ' +
+				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
+			);
+		}
+
+		const ref = randomBytes(12).toString('hex');
+		const envelope = {
+			type: 'request-session',
+			ref,
+			sessionId: target,
+			event,
+			data,
+			replyTo: instanceId,
+			timeoutMs
+		};
+
+		return new Promise((resolve, reject) => {
+			const timer = setTimer(() => {
+				if (!pending.delete(ref)) return;
+				mRequests?.inc({ result: 'timeout' });
+				reject(new Error(`registry.requestSession: timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			if (timer.unref) timer.unref();
 			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
@@ -1008,7 +1223,9 @@ export function createConnectionRegistry(client, options) {
 	const tracker = /** @type {ConnectionRegistry} */ ({
 		instanceId,
 		lookup,
+		lookupSession,
 		request,
+		requestSession,
 		send,
 		sendCoalesced,
 		sendTo,
@@ -1016,6 +1233,21 @@ export function createConnectionRegistry(client, options) {
 		hooks: {
 			async open(ws, ctx) {
 				await ensureSubscriber(ctx?.platform);
+
+				// App-session registration (opt-in via `sessionIdentify`, independent
+				// of userId so an anonymous-but-sessioned connection still gets
+				// cluster `requestSession` routing). Reads the session id straight off
+				// the ws - it needs neither a userId nor the transport session id, so
+				// it runs before the userId block's early-return. Skipped entirely when
+				// no `sessionIdentify` was configured, leaving the userId path untouched.
+				if (sessionIdentify) {
+					let sessionId;
+					try { sessionId = sessionIdentify(ws); } catch { sessionId = null; }
+					if (sessionId != null && sessionId !== '') {
+						await registerAppSession(sessionId, ws);
+					}
+				}
+
 				// Closed-WS race: the ws may have closed during the
 				// `await ensureSubscriber` above. `identify(ws)` and the
 				// subsequent `ws.getUserData()` both throw on a freed
@@ -1071,9 +1303,34 @@ export function createConnectionRegistry(client, options) {
 				}
 			},
 			async close(ws, _ctx) {
+				// App-session drain (opt-in; independent of userId). The ws-identity
+				// guard means a session that already resumed on a newer socket is not
+				// deregistered by the older socket's late close - last-write-wins.
+				if (sessionIdentify) {
+					let sessionId;
+					try { sessionId = sessionIdentify(ws); } catch { sessionId = null; }
+					if (sessionId != null && sessionId !== '' && appSessionToWs.get(sessionId) === ws) {
+						appSessionToWs.delete(sessionId);
+						await deleteSessionIfOurs(sessionId);
+					}
+				}
+
 				const userId = identify(ws);
 				if (!userId) return;
 				const sessionId = localUsers.get(userId);
+				// Same-instance reconnect guard: if the user's current local binding
+				// points at a DIFFERENT (newer) socket, this is a stale close after a
+				// resume - the new socket's open already flipped both local maps AND the
+				// Redis row to itself, so the old socket's close must NOT run, or it
+				// would unbind the live socket and delete its registry row (a fresh
+				// laptop-then-phone reconnect would go dark). A user with no local entry
+				// at all is not a resume; fall through to the best-effort Redis cleanup
+				// as before. Mirrors the app-session guard above and the realtime push
+				// registry's `entry.ws === ws` check; cross-instance migration is
+				// unaffected (this instance still owns its local ws, so it drains and
+				// publishes a close that the new owner's applyCloseEvent owner-check
+				// correctly ignores).
+				if (sessionId && sessionToWs.get(sessionId) !== ws) return;
 				if (sessionId) {
 					localUsers.delete(userId);
 					sessionToWs.delete(sessionId);
@@ -1110,6 +1367,7 @@ export function createConnectionRegistry(client, options) {
 			pending.clear();
 			localUsers.clear();
 			sessionToWs.clear();
+			appSessionToWs.clear();
 			userToInstance.clear();
 			userIdAttrs.clear();
 			secondaryIndex.clear();
