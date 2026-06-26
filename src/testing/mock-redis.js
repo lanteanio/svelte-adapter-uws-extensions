@@ -341,6 +341,17 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (s > e) return [];
 				return set.slice(s, e + 1).map((entry) => entry.member);
 			},
+			async zrevrange(key, start, stop) {
+				const set = sortedSets.get(key);
+				if (!set) return [];
+				// Highest score first (descending); ties keep ascending insertion order reversed.
+				const rev = set.slice().reverse();
+				const len = rev.length;
+				const s = start < 0 ? Math.max(0, len + start) : Math.min(start, len);
+				const e = stop < 0 ? len + stop : Math.min(stop, len - 1);
+				if (s > e) return [];
+				return rev.slice(s, e + 1).map((entry) => entry.member);
+			},
 			async zrangebyscore(key, min, max, ...extra) {
 				const set = sortedSets.get(key);
 				if (!set) return [];
@@ -360,6 +371,16 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (!set) return 0;
 				const removed = set.splice(start, stop - start + 1);
 				return removed.length;
+			},
+			async zrem(key, ...members) {
+				const set = sortedSets.get(key);
+				if (!set) return 0;
+				const want = new Set(members.map((m) => String(m)));
+				let removed = 0;
+				for (let i = set.length - 1; i >= 0; i--) {
+					if (want.has(String(set[i].member))) { set.splice(i, 1); removed++; }
+				}
+				return removed;
 			},
 
 			// Stream ops
@@ -514,6 +535,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const result = {};
 				for (const [k, v] of h) result[k] = v;
 				return result;
+			},
+			async hvals(key) {
+				pruneExpiredFields(key);
+				const h = hashes.get(key);
+				return h ? [...h.values()] : [];
 			},
 			async hexists(key, field) {
 				pruneExpiredFields(key);

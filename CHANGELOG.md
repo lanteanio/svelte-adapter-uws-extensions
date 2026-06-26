@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.30] - 2026-06-26
+
+### Added
+
+- **`./redis/dead-letter`: a Redis-backed dead-letter store for svelte-realtime's outbound-webhook DLQ.** `createDeadLetter(client, { max, ttlMs, breaker, metrics })` implements the same interface as svelte-realtime's in-memory dead-letter store (`add` / `get` / `remove` / `count` / `list` / `summary` / `clear`), but persists undeliverable webhook events in Redis so they survive restarts and are shared across every instance in a cluster. Wire it with `configureWebhooks({ deadLetter: createDeadLetter(redisClient) })` (needs `svelte-realtime >= 0.6.0-next.40`, which awaits the store interface). The whole bounded collection is co-located on one slot via a `{dlq}` hash tag - a webhook DLQ is low-volume and capped, so every multi-key operation stays single-slot under Redis Cluster with no cross-slot hazard. Bounded by `max` (oldest evicted first, default 1000) with an optional `ttlMs`; all Redis I/O is circuit-breaker-wrapped, and an optional metrics registry gets a `dead_letter_added_total{topic}` counter.
+
 ## [0.6.0-next.29] - 2026-06-25
 
 ### Added

@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.29",
+	"version": "0.6.0-next.30",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -48,6 +48,10 @@
 		"./redis/replay": {
 			"types": "./src/redis/replay.d.ts",
 			"default": "./src/redis/replay.js"
+		},
+		"./redis/dead-letter": {
+			"types": "./src/redis/dead-letter.d.ts",
+			"default": "./src/redis/dead-letter.js"
 		},
 		"./redis/presence": {
 			"types": "./src/redis/presence.d.ts",

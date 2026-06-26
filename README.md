@@ -1284,6 +1284,31 @@ All three are off by default and combine; with none enabled the broadcast path i
 
 ---
 
+## Dead-letter store (Redis)
+
+A Redis-backed store for `svelte-realtime`'s outbound-webhook dead-letter queue. When an outbound webhook exhausts its retries, `svelte-realtime` retains the undeliverable event so an operator can inspect and replay it; by default that store is in-memory (per-instance). Use this one to make it **durable and shared across the cluster** - the dead-lettered events survive restarts and any instance's admin route can list and replay them.
+
+```js
+import { createDeadLetter } from 'svelte-adapter-uws-extensions/redis/dead-letter';
+import { configureWebhooks } from 'svelte-realtime/server';
+
+// hooks.ws.js init({ platform }) (or realtime({ webhooks: { deadLetter: createDeadLetter(redisClient) } }))
+configureWebhooks({ deadLetter: createDeadLetter(redisClient, { max: 1000 }) });
+```
+
+It implements the same interface as the in-memory store (`add` / `get` / `remove` / `count` / `list` / `summary` / `clear`), so the admin `/__realtime/dlq` commands and `replayDeadLetter()` work unchanged. Needs `svelte-realtime >= 0.6.0-next.40` (which awaits the store interface).
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `max` | `1000` | Max retained records; the oldest is evicted first. |
+| `ttlMs` | `0` | Drop records older than this many ms on write (0 = no TTL). |
+| `breaker` | - | Circuit breaker for fault isolation (`createCircuitBreaker`). |
+| `metrics` | - | Registry for the `dead_letter_added_total{topic}` counter. |
+
+The whole (bounded, low-volume) collection is co-located on one Redis Cluster slot via a `{dlq}` hash tag, so every operation stays single-slot.
+
+---
+
 **Postgres extensions**
 
 ## Replay buffer (Postgres)
