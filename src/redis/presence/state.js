@@ -16,6 +16,7 @@
 
 import { randomBytes } from '../../shared/runtime.js';
 import { stripInternal, createSensitiveWarner } from '../../shared/sensitive.js';
+import { hashFieldTTLSupport } from '../../shared/redis-version.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { makeKeys } from './keys.js';
 import { makePublicData } from './data.js';
@@ -111,30 +112,32 @@ export function createPresenceState(client, options = {}) {
 
 	const keyspaceNotifications = options.keyspaceNotifications === true;
 
-	// Per-field hash TTL (HPEXPIRE / HEXPIRE) requires Redis 7.4+. Defer the
-	// version probe to first use so createPresence() can stay synchronous and
-	// fast; the probe runs once, caches its result, and rejects any further
-	// redis call with a clear error if the server is too old. Mirrors the
-	// gating pattern createShardedBus uses for SPUBLISH / SSUBSCRIBE.
+	// Per-field hash TTL (HPEXPIRE / HEXPIRE) requires Redis 7.4+ or Valkey 9.0+.
+	// Valkey pins redis_version at 7.2.4 and reports its real version in
+	// valkey_version, so the probe is server-aware (see hashFieldTTLSupport).
+	// Deferred to first use so createPresence() stays synchronous and fast; the
+	// probe runs once, caches its result, and rejects any further redis call with
+	// a clear error if the server is too old. Mirrors the gating pattern
+	// createShardedBus uses for SPUBLISH / SSUBSCRIBE. (Name kept for the existing
+	// internal callers; it now accepts Valkey 9.0+ too.)
 	let featureProbe = null;
 	function ensureRedis74() {
 		if (!featureProbe) {
 			featureProbe = redis.info('server').then((info) => {
-				const m = /redis_version:(\d+)\.(\d+)/.exec(info || '');
-				if (!m) return; // can't parse - assume compatible
-				const major = Number(m[1]);
-				const minor = Number(m[2]);
-				if (major < 7 || (major === 7 && minor < 4)) {
+				const support = hashFieldTTLSupport(info);
+				if (support.supported === false) {
 					throw new Error(
-						'redis presence: requires Redis 7.4+ for per-field TTL (HEXPIRE); ' +
-						'got ' + m[1] + '.' + m[2] + '. Upgrade Redis or use the in-memory ' +
+						'redis presence: requires Redis 7.4+ or Valkey 9.0+ for per-field TTL (HEXPIRE/HPEXPIRE); ' +
+						'got ' + support.server + ' ' + support.version + '. Upgrade the server or use the in-memory ' +
 						'createPresence plugin from svelte-adapter-uws/plugins/presence.'
 					);
 				}
+				// null (unparseable) falls through - assume compatible rather than
+				// locking out an unrecognized server.
 			}).catch((err) => {
 				// Reset on transient INFO failures so we re-probe on next call.
 				// Hard errors (version mismatch) re-throw verbatim from the await.
-				if (err && /requires Redis 7\.4\+/.test(err.message)) throw err;
+				if (err && /per-field TTL/.test(err.message)) throw err;
 				featureProbe = null;
 				throw err;
 			});
@@ -151,7 +154,7 @@ export function createPresenceState(client, options = {}) {
 	const mHeartbeats = m?.counter('presence_heartbeats_total', 'Heartbeat refresh cycles');
 	const mTotalOnline = m?.gauge('presence_total_online', 'Unique users present per topic on this instance', ['topic']);
 	const mHeartbeatLatency = m?.gauge('presence_heartbeat_latency_ms', 'Duration of the most recent heartbeat tick in milliseconds');
-	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash expiry triggered a local empty-list emit');
+	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash removal triggered a local empty-list emit');
 	const mDiffFrames = m?.counter('presence_diff_frames_total', 'diff frames published to topic subscribers', ['topic']);
 	const mDiffCoalesced = m?.counter('presence_diff_coalesced_total', 'Buffered diff entries overwritten by a later op in the same tick', ['topic']);
 

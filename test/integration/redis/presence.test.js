@@ -1,16 +1,23 @@
 /**
- * Integration tests for redis/presence against a real Redis 7.4+ server.
+ * Integration tests for redis/presence against a real Redis 7.4+ (or
+ * Valkey 9.0+) server, selected by INTEGRATION_REDIS_URL.
  *
  * Exercises the JOIN_SCRIPT / LEAVE_SCRIPT Lua bodies plus the per-field
  * HPEXPIRE TTL primitive that the in-memory mock can only approximate.
  * Covers the new Design G storage layout (per-user hash + per-topic hash
- * keyed by userKey, no compound fields), real Redis-7.4-side field expiry
+ * keyed by userKey, no compound fields), real server-side field expiry
  * timing, multi-tab dedup, cross-instance broadcast semantics, and the
- * activation gate that rejects pre-7.4 servers.
+ * activation gate that rejects servers without per-field hash TTL.
+ *
+ * Validated against a real Valkey 9.0.4 server (point INTEGRATION_REDIS_URL
+ * at it): this suite passes identically to Redis 7.4, and Valkey's hash-field
+ * expiry fires the same keyspace-event sequence as Redis 7.4 - `hexpired` then
+ * `del` when a hash's last field lapses, notably NOT `expired`, and identical
+ * on both servers.
  *
  * The mock-based suite at test/redis/presence.test.js covers the public-
- * API contract end-to-end; this file is additive and asserts properties
- * that only show up on real Redis.
+ * API contract end-to-end (including the Valkey version gate); this file is
+ * additive and asserts properties that only show up on a real server.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
@@ -370,6 +377,44 @@ describeIntegration('redis presence (integration)', () => {
 			const list = await presence.list('room');
 			expect(list).toHaveLength(1);
 			expect(list[0].name).toBe('Alice (newer)');
+		});
+	});
+
+	describe('keyspace-notification cleanup (real del on topic-hash expiry)', () => {
+		// Keyspace notifications + CONFIG SET are per-node concerns; keep this to
+		// the standalone backend (the cluster mirror exercises a different stack).
+		const itStandalone = isClusterBackend() ? it.skip : it;
+
+		itStandalone('emits an empty snapshot to local subscribers when a topic empties via field TTL', async () => {
+			// The cleanup psubscribes `__keyevent@*__:del` - key deletion is the
+			// generic (`g`) class on BOTH Redis 7.4 and Valkey 9.0, so one flag
+			// works everywhere. (The hash-field-expiry event `hexpired` is class
+			// `h` on Redis but `x` on Valkey, which is why we key on the deletion.)
+			await client.redis.config('SET', 'notify-keyspace-events', 'Eg');
+
+			const presence = makeTracker({ keyspaceNotifications: true });
+			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
+
+			// Force the topic field to expire shortly - as if the presenting
+			// instance stopped heartbeating. Its lapse removes the per-topic hash's
+			// last field, so the server deletes the key, fires a `del` keyevent, and
+			// the cleanup emits an empty snapshot to this instance's subscribers.
+			await client.redis.hpexpire(topicHashKey('room'), 300, 'FIELDS', 1, 'alice');
+
+			await waitRedisMs(client, 500); // past the TTL on the server's own clock
+			await wait(300); // del delivery + the async existence re-check + the emit
+
+			const emptyStates = platform.published.filter(
+				(p) =>
+					p.event === 'state' &&
+					p.topic === '__presence:room' &&
+					p.data &&
+					Object.keys(p.data).length === 0
+			);
+			expect(emptyStates.length).toBeGreaterThan(0);
+			// And the topic hash is genuinely gone (the cleanup did not fire on a
+			// still-populated key).
+			expect(await client.redis.exists(topicHashKey('room'))).toBe(0);
 		});
 	});
 

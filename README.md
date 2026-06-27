@@ -79,7 +79,7 @@ The three ecosystem packages move together. Bump them as a group:
 | `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
 |---|---|---|---|
 | `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
-| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ for `createPresence` (per-field HEXPIRE). See `MIGRATION.md` if upgrading from 0.4. |
+| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). See `MIGRATION.md` if upgrading from 0.4. |
 
 Mixed-version installs are rejected at install time with a peer-dep warning.
 
@@ -654,9 +654,9 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 ## Presence
 
-Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub.
+Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub. Valkey (BSD-3) is the recommended cache backend; everything here is wire-compatible with both.
 
-**Requires Redis 7.4+.** Uses the per-field hash TTL primitive (`HEXPIRE` family) so staleness is enforced atomically by Redis rather than by an application-side cleanup script. `createPresence` runs `INFO server` on first use and throws on older servers; fall back to the in-memory `createPresence` from `svelte-adapter-uws/plugins/presence` for single-instance deployments on older Redis.
+**Requires Redis 7.4+ or Valkey 9.0+.** Uses the per-field hash TTL primitive (`HEXPIRE` family) so staleness is enforced atomically by the server rather than by an application-side cleanup script. Redis shipped these commands in 7.4; Valkey shipped them in 9.0 (and pins `redis_version` at `7.2.4` forever while reporting its real version in `valkey_version`, so the activation probe is server-aware - a Valkey 9.0 server is accepted even though its `redis_version` reads `7.2.4`). `createPresence` runs `INFO server` on first use and throws on older servers; fall back to the in-memory `createPresence` from `svelte-adapter-uws/plugins/presence` for single-instance deployments on older servers.
 
 > **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorization model](#authorization-model).
 
@@ -680,7 +680,7 @@ Joins are staged with full rollback on failure: local state is set up first, the
 
 Leaves use an atomic Lua script (`LEAVE_SCRIPT`) that does `HDEL instanceId` on the per-user hash and an O(1) `HLEN` check. If zero remaining, it also `HDEL`s the userKey from the per-topic hash and returns 1; the application broadcasts a leave. Mass disconnect of N users is therefore O(N) Redis-blocked Lua time, regardless of the topic's total user count.
 
-Crashed-instance cleanup is implicit: the heartbeat refreshes per-field TTLs via `HPEXPIRE` on every tick, so an instance that stops heartbeating loses its presence entries field-by-field as Redis expires them. The previous heartbeat-driven CLEANUP_SCRIPT pass is no longer needed - Redis 7.4+ does the work in its background expiry task. Zombie cleanup of locally-dead WebSockets still runs on the heartbeat interval: each tick probes every tracked WebSocket via `getBufferedAmount()` and synchronously purges any whose call throws before the HPEXPIRE refresh runs.
+Crashed-instance cleanup is implicit: the heartbeat refreshes per-field TTLs via `HPEXPIRE` on every tick, so an instance that stops heartbeating loses its presence entries field-by-field as Redis expires them. The previous heartbeat-driven CLEANUP_SCRIPT pass is no longer needed - the server (Redis 7.4+ / Valkey 9.0+) does the work in its background expiry task. Zombie cleanup of locally-dead WebSockets still runs on the heartbeat interval: each tick probes every tracked WebSocket via `getBufferedAmount()` and synchronously purges any whose call throws before the HPEXPIRE refresh runs.
 
 #### Setup
 
@@ -721,7 +721,7 @@ export async function close(ws, { platform }) {
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
-| `keyspaceNotifications` | `false` | Subscribe to Redis `__keyevent@*__:expired`. When a presence hash key expires (instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
+| `keyspaceNotifications` | `false` | Subscribe to the server's `__keyevent@*__:del`. When a per-topic presence hash is removed (its last field's TTL lapsed - the instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 | `consistencyAuditIntervalMs` | `5000` | Interval in ms for the per-instance consistency auditor, a slow unref'd background check that this instance's per-topic member-count map and local reverse index agree on their distinct-user cardinality. Never runs on the hot path. A desync logs and counts under `redis.presence.local-index-desync` (soft); only one that persists across two consecutive audits of the same bounded window escalates to a deferred process restart. Set `0` to disable entirely. |
 
 #### API
@@ -789,7 +789,7 @@ Two additional counters track the diff-protocol behavior:
 
 By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `diff` with the user in `leaves`. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
 
-`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:expired`. When the presence hash key for a topic expires (which happens once no instance is heartbeating the topic anymore - typically because the only tracker crashed), this instance emits an empty `state` event on `__presence:<topic>` so local subscribers can replace their entire local map with "no one here."
+`keyspaceNotifications: true` closes that gap by `psubscribe`-ing to `__keyevent@*__:del`. The per-topic hash carries only per-field TTLs (no whole-key TTL), so the server removes the key the moment its last field's TTL lapses - i.e. once no instance is heartbeating the topic anymore (typically because the only tracker crashed). On that deletion this instance emits an empty `state` event on `__presence:<topic>` so local subscribers can replace their entire local map with "no one here." A deletion can race a fresh join that re-creates the key, so the handler re-checks that the key is still gone before emitting - a re-populated topic is never wrongly cleared.
 
 ```js
 const presence = createPresence(redis, {
@@ -798,15 +798,15 @@ const presence = createPresence(redis, {
 });
 ```
 
-**Operator burden:** Redis must be configured to publish keyspace events:
+**Operator burden:** the server must be configured to publish keyevent notifications for deletions:
 
 ```
-CONFIG SET notify-keyspace-events Ex
+CONFIG SET notify-keyspace-events Eg
 ```
 
-(or any flagset that includes both `K`/`E` and `x` - e.g. `Ex`, `KEA`, etc.) If the `psubscribe` call fails because keyspace events are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
+(or any flagset that includes both `K`/`E` and the generic class `g` - e.g. `Eg`, `KEA`.) Key deletion is the generic (`g`) class on BOTH Redis 7.4+ and Valkey 9.0+, so one flag works on either server. If the `psubscribe` call fails because keyevents are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
 
-**Scope:** this hooks into whole-key expiry of `presence:topic:{topic}`, which fires once every field has expired (no live instances presenting any user on this topic). Per-field expiry from individual crashed instances is handled atomically by Redis 7.4+ `HEXPIRE` and does NOT trigger this notification - the user just disappears from `list()` / `count()` results without an explicit "user left" event. Apps that need an explicit "user left" event for crashed instances either accept the eventual-consistency story (subscribers see the user disappear on the next presence query) or wire a sweeper that subscribes to `__keyevent@*__:hexpired` (per-field expiry events, separate flag from whole-key `:expired`).
+**Scope:** this fires when the per-topic hash `presence:topic:{topic}` is deleted - which the server does the instant its last field's TTL lapses (no live instances presenting any user on this topic). Per-field expiry that still leaves other users on the topic does NOT fire it (the topic is not empty); those stale entries simply drop out of `list()` / `count()` on the next query. Portability note: the hash-field-expiry event itself (`hexpired`) is class `h` on Redis but class `x` on Valkey, so this cleanup deliberately keys on the resulting key deletion (`del`, class `g` on both) rather than the field-expiry event.
 
 #### Zero-config hooks
 
@@ -2753,7 +2753,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `presence_stale_cleaned_total` | counter | | Stale entries removed by cleanup |
 | `presence_total_online` | gauge | `topic` | Unique users present per topic on this instance |
 | `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms |
-| `presence_keyspace_cleanups_total` | counter | | Topic hash expiries that triggered an empty-list emit (keyspace mode only) |
+| `presence_keyspace_cleanups_total` | counter | | Topic hash removals that triggered an empty-list emit (keyspace mode only) |
 
 **Replay buffer (Redis and Postgres)**
 

@@ -73,6 +73,32 @@ describe('redis presence', () => {
 		});
 	});
 
+	describe('per-field-TTL version gate (Redis 7.4+ / Valkey 9.0+)', () => {
+		// The gate probes INFO once on first use. Valkey pins redis_version at
+		// 7.2.4 forever and reports its real version in valkey_version, so the
+		// probe must be server-aware or it false-negatives a Valkey 9.0 server
+		// that has HPEXPIRE.
+		it('accepts a Valkey 9.0 server even though it pins redis_version at 7.2.4', async () => {
+			client.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:9.0.0\n';
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			// Reaching the snapshot send means the gate let the join through.
+			expect(statesOf(platform)).toHaveLength(1);
+		});
+
+		it('rejects a Valkey older than 9.0 (no per-field hash TTL before 9.0)', async () => {
+			client.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:8.1.0\n';
+			const ws = mockWs({ id: '2', name: 'Bob' });
+			await expect(presence.join(ws, 'room', platform)).rejects.toThrow(/got valkey 8\.1/);
+		});
+
+		it('rejects a Redis older than 7.4', async () => {
+			client.redis._info = '# Server\nredis_version:7.2.4\n';
+			const ws = mockWs({ id: '3', name: 'Cara' });
+			await expect(presence.join(ws, 'room', platform)).rejects.toThrow(/got redis 7\.2/);
+		});
+	});
+
 	describe('join', () => {
 		it('sends state to the joining ws as a flat snapshot', async () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
@@ -774,7 +800,9 @@ describe('redis presence', () => {
 	});
 
 	describe('keyspace notifications', () => {
-		it('emits empty state when a hash key expires', async () => {
+		const flush = () => new Promise((r) => setTimeout(r, 10));
+
+		it('emits empty state when a topic hash is removed (its last field expired)', async () => {
 			const local = createPresence(client, { key: 'id', keyspaceNotifications: true });
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platform);
@@ -787,10 +815,12 @@ describe('redis presence', () => {
 			expect(typeof pmessageListener).toBe('function');
 
 			// Storage layout: the per-topic hash key is `presence:topic:{topic}`.
-			// Whole-key expiry fires only when every field has expired (no live
-			// instances presenting any user on this topic).
-			const expiredKey = client.key('presence:topic:{room}');
-			pmessageListener('__keyevent@*__:expired', '__keyevent@0__:expired', expiredKey);
+			// The server removes it when its last field's TTL lapses, firing a
+			// `del` keyevent. Mirror that removal, then deliver the event.
+			const topicKey = client.key('presence:topic:{room}');
+			await client.redis.del(topicKey);
+			pmessageListener('__keyevent@*__:del', '__keyevent@0__:del', topicKey);
+			await flush(); // the handler re-checks existence (async) before emitting
 
 			const empties = platform.published.filter(
 				(p) => p.event === 'state' && p.topic === '__presence:room'
@@ -798,6 +828,29 @@ describe('redis presence', () => {
 			expect(empties.length).toBeGreaterThan(0);
 			expect(empties[0].data).toEqual({});
 			expect(empties[0].options).toEqual({ relay: false, compress: true });
+			local.destroy();
+		});
+
+		it('does NOT emit when the deleted key still exists (a join raced the delete)', async () => {
+			const local = createPresence(client, { key: 'id', keyspaceNotifications: true });
+			const ws = mockWs({ id: '1' });
+			await local.join(ws, 'room', platform);
+			platform.reset();
+
+			const subscriberHandler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
+			const pmessageListener = subscriberHandler.listeners.get('pmessage');
+
+			// Deliver a `del` for the topic key WITHOUT removing it - a fresh join
+			// re-created it before the event was processed. The existence re-check
+			// finds the key present, so no (wrong) empty snapshot is emitted.
+			const topicKey = client.key('presence:topic:{room}');
+			pmessageListener('__keyevent@*__:del', '__keyevent@0__:del', topicKey);
+			await flush();
+
+			const empties = platform.published.filter(
+				(p) => p.event === 'state' && p.topic === '__presence:room'
+			);
+			expect(empties.length).toBe(0);
 			local.destroy();
 		});
 	});
@@ -1494,7 +1547,7 @@ describe('redis presence', () => {
 			local.destroy();
 		});
 
-		it('ignores expiry events for keys outside the presence prefix', async () => {
+		it('ignores del events for keys outside the per-topic prefix', async () => {
 			const local = createPresence(client, { key: 'id', keyspaceNotifications: true });
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platform);
@@ -1502,13 +1555,17 @@ describe('redis presence', () => {
 
 			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
 			const pmessage = handler.listeners.get('pmessage');
-			pmessage('__keyevent@*__:expired', '__keyevent@0__:expired', 'unrelated:key');
+			// An arbitrary key and a per-user presence hash both fail the
+			// `presence:topic:{` gate, so neither triggers a topic cleanup.
+			pmessage('__keyevent@*__:del', '__keyevent@0__:del', 'unrelated:key');
+			pmessage('__keyevent@*__:del', '__keyevent@0__:del', client.key('presence:user:{room}:1'));
+			await new Promise((r) => setTimeout(r, 10));
 
 			expect(platform.published.filter((p) => p.event === 'state')).toHaveLength(0);
 			local.destroy();
 		});
 
-		it('ignores expiry events for the events sub-prefix (avoids double-firing)', async () => {
+		it('ignores del events for the events sub-prefix (avoids double-firing)', async () => {
 			const local = createPresence(client, { key: 'id', keyspaceNotifications: true });
 			const ws = mockWs({ id: '1' });
 			await local.join(ws, 'room', platform);
@@ -1516,7 +1573,8 @@ describe('redis presence', () => {
 
 			const handler = client._pubsubHandlers[client._pubsubHandlers.length - 1];
 			const pmessage = handler.listeners.get('pmessage');
-			pmessage('__keyevent@*__:expired', '__keyevent@0__:expired', client.key('presence:events:room'));
+			pmessage('__keyevent@*__:del', '__keyevent@0__:del', client.key('presence:events:room'));
+			await new Promise((r) => setTimeout(r, 10));
 
 			expect(platform.published.filter((p) => p.event === 'state')).toHaveLength(0);
 			local.destroy();

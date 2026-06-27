@@ -92,29 +92,45 @@ export function createSubscriber({ client, instanceId, keyspaceNotifications, bu
 				}
 			});
 			if (keyspaceNotifications) {
-				// The per-topic hash key expires only when every field has
-				// expired (no live instances presenting any user on this
-				// topic). That is the "whole topic empty" signal we forward
-				// as an empty state to local subscribers. Per-user
-				// hash keys (presence:user:{topic}:{userKey}) and the events
-				// channel are filtered out.
+				// The per-topic hash has no whole-key TTL; it is REMOVED (a `del`
+				// keyevent) the moment its last field's per-field TTL (HPEXPIRE)
+				// lapses - i.e. when the last instance presenting any user on the
+				// topic has stopped heartbeating. That removal is the "whole topic
+				// empty" signal we forward as an empty state to local subscribers.
+				// Per-user hash keys (presence:user:{topic}:{userKey}) and the
+				// events channel are filtered out by the prefix.
+				//
+				// We listen for `del`, not `expired`/`hexpired`: a hash that loses
+				// its last field via TTL is deleted, and key deletion is a `del`
+				// event in the generic (`g`) class on BOTH Redis 7.4 and Valkey 9.0
+				// - one portable flag. The hash-field-expiry event itself
+				// (`hexpired`) is class `h` on Redis but class `x` on Valkey, so
+				// keying on it would need a server-specific flagset.
+				//
+				// A `del` can race a fresh join that recreates the key (and an
+				// explicit last-leave also deletes it, but the leave path already
+				// emitted its diff), so we re-check existence: emit the empty
+				// snapshot only when the key is actually gone. If it exists again a
+				// user is present and the join's own diff carries the truth.
 				const topicPrefix = client.key('presence:topic:{');
-				subscriber.on('pmessage', (_pattern, _channel, expiredKey) => {
-					if (typeof expiredKey !== 'string') return;
-					if (!expiredKey.startsWith(topicPrefix)) return;
-					const topic = expiredKey.slice(topicPrefix.length, -1); // drop the '}' closing the {topic} hash tag
-					if (activePlatform) {
+				subscriber.on('pmessage', (_pattern, _channel, deletedKey) => {
+					if (typeof deletedKey !== 'string') return;
+					if (!deletedKey.startsWith(topicPrefix)) return;
+					if (!activePlatform) return;
+					const topic = deletedKey.slice(topicPrefix.length, -1); // drop the '}' closing the {topic} hash tag
+					client.redis.exists(deletedKey).then((stillThere) => {
+						if (stillThere || !activePlatform) return;
 						emit('__presence:' + topic, 'state', {}, activePlatform, { relay: false });
 						mKeyspaceCleanups?.inc();
-					}
+					}).catch(() => {});
 				});
 				try {
-					await subscriber.psubscribe('__keyevent@*__:expired');
+					await subscriber.psubscribe('__keyevent@*__:del');
 					keyspaceSubscribed = true;
 				} catch (err) {
 					console.warn(
 						'[redis/presence] keyspace notifications: psubscribe failed - ' +
-						'enable on Redis with `CONFIG SET notify-keyspace-events Ex` (or any flagset including `K`/`E` and `x`): ' +
+						'enable on the server with `CONFIG SET notify-keyspace-events Eg` (or any flagset including `K`/`E` and `g`): ' +
 						err.message + '\n' +
 						'  See: https://svti.me/redis-keyspace'
 					);

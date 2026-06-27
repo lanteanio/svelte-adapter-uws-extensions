@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.37] - 2026-06-27
+
+### Fixed
+
+- **`createPresence` now activates on Valkey 9.0+.** The per-field hash TTL (`HEXPIRE`/`HPEXPIRE`) activation probe gated on `redis_version >= 7.4`, but Valkey pins `redis_version` at `7.2.4` forever and reports its real version in `valkey_version` (with `server_name:valkey`). Valkey added the `HEXPIRE` family in 9.0, so a Valkey 9.0+ server - which HAS the commands - was wrongly rejected with "requires Redis 7.4+". The probe is now server-aware: it accepts Redis 7.4+ OR Valkey 9.0+, and the error names the actual server and version. The major-version gates for `createShardedBus` / `createFunctionLibrary` need only major >= 7, which Valkey's pinned `7.2.4` already satisfies, so those were already correct. Validated end to end against a real Valkey 9.0.4 server: the presence integration suite passes identically to Redis 7.4, and Valkey's hash-field-expiry keyspace-event sequence matches Redis 7.4 exactly. Valkey (BSD-3) is now a documented, recommended cache backend for the Redis-backed plugins.
+- **Presence keyspace cleanup (`keyspaceNotifications: true`) now fires on a real server.** The opt-in proactive cleanup - which emits an empty `state` to a topic's local subscribers when the topic empties because its presenting instance(s) stopped heartbeating - subscribed to `__keyevent@*__:expired`. But the per-topic hash carries only per-field TTLs (`HPEXPIRE`), never a whole-key TTL, so its removal fires a `del` keyevent, NOT `expired` - on BOTH Redis 7.4 and Valkey 9.0. The cleanup therefore never fired on a real server (a mock unit test had fabricated the `:expired` event, masking it). It now subscribes to `__keyevent@*__:del` and re-checks that the key is actually gone before emitting (so a delete racing a fresh join cannot wrongly clear a re-populated topic). Key deletion is the generic (`g`) notification class on both Redis and Valkey, so `CONFIG SET notify-keyspace-events Eg` works on either - unlike the hash-field-expiry event `hexpired`, which is class `h` on Redis but `x` on Valkey. Validated end to end against real Redis 7.4 and Valkey 9.0. The feature is opt-in (default off); deployments that do not use it are byte-identical.
+
 ## [0.6.0-next.36] - 2026-06-27
 
 ### Added

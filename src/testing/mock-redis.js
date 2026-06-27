@@ -294,6 +294,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			async unlink(...keys) {
 				return r.del(...keys);
 			},
+			async exists(...keys) {
+				// Real EXISTS counts every existing key argument (duplicates count).
+				let count = 0;
+				for (const key of keys) {
+					if (store.has(key) || sortedSets.has(key) || hashes.has(key) || streams.has(key)) count++;
+				}
+				return count;
+			},
 			async expire(key) {
 				// Real Redis EXPIRE returns 1 if the timeout was set, 0 if
 				// the key does not exist. TTL itself is not simulated; tests
