@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.38] - 2026-06-27
+
+### Added
+
+- **Shared stateless wire codecs now fan out across the Redis bus.** A wire codec marked `shared: true` (the byte-identical "world snapshot" tier, where every binary subscriber gets the same frame) already fans out via native cohort topics on a single instance and across worker threads. The Redis-bus cluster now mirrors that: publishing a shared codec through the wrapped platform's `publishWire` relays the logical `{capability, event, data}` as JSON over the bus, and every other instance re-derives its codec by capability and re-runs `publishWire` locally - its own native cohort split, its own per-process server-wide wire-id, its own subscribers. The binary frame and the wire-id never cross the bus (they are per-process; a connection only ever talks to its home instance), so only a small JSON envelope travels - the same shape the cursor/presence relays already use. To re-derive the codec on a receiving instance, `bus.wrap` now forwards `registerWireCodec` (a shared-codec author calls `platform.registerWireCodec(codec)` at activate on every instance; an instance that has not registered the codec falls back to a correct JSON delivery). Stateful codecs (`cursor.protocol`, `presence.protocol`) carry `shared` falsy and keep their own per-plugin relay, so they are unchanged and never double-relay. Net result: a `shared: true` codec behaves identically on single-instance, worker-thread, and Redis-bus deployments with no per-codec relay wiring. Works through both `createPubSubBus` and `createShardedBus` (on the topic's shard channel). Pairs with `svelte-adapter-uws >= 0.6.0-next.42`.
+
+### Fixed
+
+- **`createPubSubBus` inbound handler now drops a frame that arrives during shutdown instead of mislabeling it.** The subscriber message handler dereferenced the platform in every branch; during `deactivate()` (which nulls the platform before the UNSUBSCRIBE round-trip resolves) an in-flight frame could hit a null platform and be miscounted as a parse error. It now drops cleanly after echo-suppression, matching the sharded bus.
+- **`createShardedBus` inbound handler now drops a shape-invalid envelope explicitly.** The envelope-shape check was a bare `assert` (which only throws in test mode), so a forged object envelope missing `instanceId` could fall through to the dispatch branches in production. It now drops and returns on a shape failure, matching `createPubSubBus`.
+
 ## [0.6.0-next.37] - 2026-06-27
 
 ### Fixed

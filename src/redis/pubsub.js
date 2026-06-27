@@ -113,6 +113,14 @@ export function createPubSubBus(client, options = {}) {
 		allowedSystemTopics: systemChannel ? [systemChannel] : []
 	});
 
+	// Wire codecs registered on THIS instance, keyed by capability. A
+	// `shared: true` stateless codec relays its logical event over the bus; a
+	// receiving instance re-derives the codec from this map and re-runs its own
+	// native cohort split locally (the codec object never crosses the bus, only
+	// the capability token). Populated by the wrap's registerWireCodec.
+	/** @type {Map<string, any>} */
+	const wireCodecs = new Map();
+
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
 
@@ -274,14 +282,42 @@ export function createPubSubBus(client, options = {}) {
 				// underlying platform predates requestTopic, so realtime's typeof guard
 				// degrades to single-instance.
 				requestTopic: platform.requestTopic ? platform.requestTopic.bind(platform) : undefined,
-				// Binary wire methods. Forwarded like send/sendTo (local fanout, no
-				// cross-instance relay - the plugin's own relay() handles that). Without
-				// these the wrapped seam hides the binary path and cluster-backed cursor /
-				// presence silently fall back to JSON. `undefined` when the underlying
-				// platform predates per-frame binary wire, so the plugins' typeof guard
-				// degrades gracefully.
-				publishWire: platform.publishWire ? platform.publishWire.bind(platform) : undefined,
+				// Binary wire methods. Forwarded for local fan-out. A STATELESS
+				// `shared: true` codec additionally relays its logical event across the
+				// cluster: the byte-identical 0x03 frame's only per-connection-varying
+				// byte is a per-process server-wide wire-id, so the frame and id never
+				// cross the bus - each receiving instance re-derives the codec by
+				// capability and runs its OWN native cohort split with its own id and
+				// subscribers (mirrors the adapter's worker-thread relay). Stateful
+				// codecs (cursor/presence) carry `shared` falsy and drive their own
+				// per-plugin relay, so they never double-relay here. `undefined` when the
+				// underlying platform predates per-frame binary wire, so the plugins'
+				// typeof guard degrades gracefully.
+				publishWire: platform.publishWire ? (topic, event, data, wire, options) => {
+					const result = platform.publishWire(topic, event, data, wire, options);
+					if (wire && wire.shared === true && (!options || options.relay !== false)) {
+						// excludeWs is NOT carried: the excluded socket is local to this
+						// origin instance; other instances have no such socket and fan out
+						// fully (the adapter relays on its excludeWs walk path too).
+						const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
+						if (options && options.compress === true) env.compress = true;
+						scheduleRelay(JSON.stringify(env), 1);
+					}
+					return result;
+				} : undefined,
 				sendWire: platform.sendWire ? platform.sendWire.bind(platform) : undefined,
+				// Register a shared/stateful codec by capability on THIS instance.
+				// Stores the codec object locally (so an inbound shared relay can
+				// re-encode binary without the codec crossing the bus) AND forwards to
+				// the underlying platform so the adapter's intra-process worker-thread
+				// relay registry is populated. A shared-codec author must register at
+				// activate on every instance for a pure-subscriber instance to re-encode
+				// binary (an unregistered instance degrades a shared relay to JSON,
+				// which is still a correct delivery). Version-gated like publishWire.
+				registerWireCodec: platform.registerWireCodec ? (wire) => {
+					if (wire && typeof wire.capability === 'string') wireCodecs.set(wire.capability, wire);
+					platform.registerWireCodec(wire);
+				} : undefined,
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
 				get pressure() { return platform.pressure; },
@@ -440,6 +476,12 @@ export function createPubSubBus(client, options = {}) {
 						mEchoSuppressed?.inc();
 						return;
 					}
+					// A message can still arrive on the subscriber socket during the
+					// deactivate window (activePlatform is nulled before the UNSUBSCRIBE
+					// round-trip resolves). Drop it cleanly rather than dereferencing a
+					// null platform in a branch below (which the outer catch would
+					// swallow as a spurious parse error). Mirrors the sharded handler.
+					if (!activePlatform) return;
 					// Coalesced relay: re-coalesce the latest value onto this
 					// instance's local subscribers (latest-value-wins per ws+key),
 					// mirroring the publishing instance's sendCoalesced fan-out. Must
@@ -460,6 +502,29 @@ export function createPubSubBus(client, options = {}) {
 					// relay: false prevents the adapter from IPC-relaying to
 					// sibling workers, since each worker has its own Redis
 					// subscriber already receiving this envelope.
+					// Shared binary fan-out relay: a stateless `shared: true` codec
+					// published on another instance. Re-derive the codec by capability
+					// and re-run publishWire locally so THIS instance does its own
+					// native cohort split (its own server-wide wire-id, its own
+					// subscribers); relay: false stops a re-relay loop. Falls back to a
+					// plain JSON publish when the codec is not registered here (a
+					// pure-subscriber instance that never registered it) - still a
+					// correct delivery. Precedes the batch/single branches.
+					if (parsed.wire === true) {
+						if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
+							mParseErrors?.inc();
+							return;
+						}
+						mReceived?.inc();
+						const codec = wireCodecs.get(parsed.capability);
+						if (codec && typeof activePlatform.publishWire === 'function') {
+							activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
+								parsed.compress === true ? { relay: false, compress: true } : { relay: false });
+						} else {
+							activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+						}
+						return;
+					}
 					if (Array.isArray(parsed.batch)) {
 						const local = [];
 						for (let i = 0; i < parsed.batch.length; i++) {

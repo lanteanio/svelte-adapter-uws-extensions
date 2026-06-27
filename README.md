@@ -436,6 +436,8 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 
 If you don't have a concrete cluster + fine-grained-topics use case, `createPubSubBus` is simpler and sufficient.
 
+**Binary wire across the cluster.** Both buses forward the adapter's binary wire methods (`publishWire` / `sendWire` / `registerWireCodec`), so the cluster-backed cursor and presence plugins keep their compact binary frames instead of falling back to JSON. A stateless codec marked `shared: true` (the byte-identical world-snapshot tier, where every binary subscriber gets the same frame) additionally fans out cluster-wide automatically: a shared `publishWire` relays only the logical `{capability, event, data}` as JSON over the bus, and each receiving instance re-derives the codec by capability and runs its own native fan-out locally with its own per-process wire-id - the binary frame never crosses the bus. Register the codec on every instance with `platform.registerWireCodec(codec)` at activate so a relay-receiving instance can re-encode (an unregistered instance falls back to a correct JSON delivery). A `shared: true` codec therefore behaves identically on a single instance, across worker threads, and across a Redis-bus cluster, with no per-codec relay wiring.
+
 ---
 
 ## Replay buffer (Redis)
