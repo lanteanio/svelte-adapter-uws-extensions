@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.36] - 2026-06-27
+
 ### Added
 
 - **`./forget-store`: `createForgetStore(stores)` + per-store `purgeUser` - the durable layer for svelte-realtime's `live.forget` right-to-erasure.** `createForgetStore({ registry, idempotency, presence, cursor, session, ... })` composes the backend stores you already wired into the single duck-typed `{ purgeUser }` that svelte-realtime's `configureForget({ store })` consumes. It fans out with `Promise.allSettled` so EVERY store is attempted even if one fails, then rejects if any failed (svelte-realtime surfaces that as `FORGET_STORE_FAILED` - an incomplete erasure to retry), and returns a per-store removal-count breakdown. Each store gained a `purgeUser(tenantId, userId)`:
