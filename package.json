@@ -157,6 +157,10 @@
 			"types": "./src/shared/degradation.d.ts",
 			"default": "./src/shared/degradation.js"
 		},
+		"./forget-store": {
+			"types": "./src/shared/forget-store.d.ts",
+			"default": "./src/shared/forget-store.js"
+		},
 		"./assert": {
 			"types": "./src/shared/assert.d.ts",
 			"default": "./src/shared/assert.js"

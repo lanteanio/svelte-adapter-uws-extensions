@@ -31,6 +31,12 @@ export interface PgReplayOptions {
 	 * @default false
 	 */
 	localFanoutOnStorageFailure?: boolean;
+	/**
+	 * Right-to-erasure: extract a buffered event's authoring userId at publish
+	 * time into a `user_id` column so `live.forget` can `DELETE WHERE user_id`.
+	 * Without it, buffered events are not user-purgeable.
+	 */
+	forgetUserId?: (event: { topic: string; event: string; data: unknown }) => string | null | undefined;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -141,6 +147,13 @@ export interface PgReplayBuffer {
 
 	/** Clear replay data for a single topic. */
 	clearTopic(topic: string): Promise<void>;
+
+	/**
+	 * Right-to-erasure: delete a user's buffered events from every topic (needs
+	 * `forgetUserId`). Leaves the seq space intact (holes read as truncation on
+	 * resume). A no-op without the extractor.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
 	 * Current stored generation of a topic's seq space. A topic whose seq

@@ -55,6 +55,14 @@ export function createDeadLetter(client, options = {}) {
 	if (options.ttlMs !== undefined && (!Number.isInteger(options.ttlMs) || options.ttlMs < 0)) {
 		throw new Error(`postgres dead-letter: ttlMs must be a non-negative integer, got ${options.ttlMs}`);
 	}
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('postgres dead-letter: forgetUserId must be a function (record) => userId');
+	}
+	// Right-to-erasure: a DLQ record's payload is app-defined, so the store cannot
+	// find a user's records on its own. When set, this extracts the owning userId
+	// from the record at write time into a user_id column so `live.forget` can drop
+	// the user's undelivered payloads. Unset => not user-purgeable.
+	const forgetUserId = options.forgetUserId;
 	const table = options.table || 'svti_dead_letter';
 	const pkCol = table + '_id';
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
@@ -85,6 +93,9 @@ export function createDeadLetter(client, options = {}) {
 		`, { table, columns: [pkCol, 'webhook_id', 'topic', 'event', 'data', 'attempts', 'error', 'failed_at'] });
 		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_topic ON ${table} (topic)`);
 		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_failed_at ON ${table} (failed_at)`);
+		// Right-to-erasure column (added via ALTER so existing tables forward-migrate).
+		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
+		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
 		migrated = true;
 	}
 
@@ -108,10 +119,14 @@ export function createDeadLetter(client, options = {}) {
 		async add(rec) {
 			await ensureTable();
 			const failedAt = typeof rec.failedAt === 'number' ? rec.failedAt : 0;
+			let userId = null;
+			if (forgetUserId) {
+				try { const u = forgetUserId(rec); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
+			}
 			const res = await withBreaker(b, () => client.query(
-				`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${pkCol}`,
-				[rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt]
+				`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${pkCol}`,
+				[rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId]
 			));
 			// Size trim: keep the newest `max` rows (by id). The OFFSET subquery
 			// returns the (max+1)-th newest id, or NULL when under the cap (a no-op).
@@ -178,6 +193,20 @@ export function createDeadLetter(client, options = {}) {
 				oldest: t.oldest == null ? null : Number(t.oldest),
 				newest: t.newest == null ? null : Number(t.newest)
 			};
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): delete every record stamped with this
+		 * user's id (requires a `forgetUserId` extractor; a no-op otherwise).
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} records removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			await ensureTable();
+			const res = await withBreaker(b, () => client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]));
+			return res.rowCount || 0;
 		},
 
 		async clear() {

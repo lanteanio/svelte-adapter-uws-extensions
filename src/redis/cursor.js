@@ -50,7 +50,7 @@ import {
 	clearTimer,
 } from '../shared/runtime.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError } from '../shared/errors.js';
@@ -847,6 +847,60 @@ export function createCursor(client, options = {}) {
 				}
 			}
 			return result;
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): remove a user's cursors from every
+		 * topic across the cluster. The cursor hash FIELD is an ephemeral
+		 * connection key (not the userId), so this scans `cursor:{*}`, HGETALLs
+		 * each topic hash, and matches the userId against `value.user` (the
+		 * select() output): a bare string equal to the userId, or an object whose
+		 * `id`/`userId` equals it. Matched fields are HDELeted and a REMOVE is
+		 * broadcast (via removeKeysBatch, cluster-correct) so subscribers drop the
+		 * cursor. A select() output that does not surface the userId as a string or
+		 * an id/userId field is not addressable here (document your select shape).
+		 * `tenantId` is accepted for the uniform contract; cursor keys carry no
+		 * tenant segment.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} cursor entries removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			const prefix = client.key('cursor:{');
+			let keys;
+			try { keys = await scanKeys(redis, hashKey('*')); } catch { return 0; }
+			let n = 0;
+			for (const fullKey of keys) {
+				if (!fullKey.startsWith(prefix) || !fullKey.endsWith('}')) continue;
+				const topic = fullKey.slice(prefix.length, fullKey.length - 1);
+				let all;
+				try { all = await redis.hgetall(fullKey); } catch { continue; }
+				if (!all) continue;
+				for (const field of Object.keys(all)) {
+					let parsed;
+					try { parsed = JSON.parse(all[field]); } catch { continue; }
+					const u = parsed && parsed.user;
+					const matches = typeof u === 'string'
+						? u === userId
+						: !!(u && typeof u === 'object' && (u.id === userId || u.userId === userId));
+					if (!matches) continue;
+					// Drop any pending snapshot + local entry first so a flush cannot
+					// resurrect the cursor, then HDEL + broadcast REMOVE cluster-wide.
+					dropKeyPending(topic, field);
+					const tm = topics.get(topic);
+					if (tm) {
+						const e = tm.get(field);
+						if (e) {
+							if (e.timer) clearTimer(e.timer);
+							if (e.settleTimer) clearTimer(e.settleTimer);
+							tm.delete(field);
+						}
+					}
+					if (await removeKeysBatch([topic], field)) n++;
+				}
+			}
+			return n;
 		},
 
 		async clear() {

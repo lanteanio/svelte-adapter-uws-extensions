@@ -19,7 +19,7 @@
  * @module svelte-adapter-uws-extensions/redis/replay-stream
  */
 
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -171,6 +171,12 @@ export function createStreamReplay(client, options = {}) {
 	if (typeof defaultIdempotencyTtl !== 'number' || !Number.isInteger(defaultIdempotencyTtl) || defaultIdempotencyTtl < 0) {
 		throw new Error(`redis stream replay: idempotencyTtl must be a non-negative integer, got ${defaultIdempotencyTtl}`);
 	}
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('redis stream replay: forgetUserId must be a function ({ topic, event, data }) => userId');
+	}
+	// Right-to-erasure: maps a buffered event to its authoring userId so
+	// `live.forget` can XDEL the user's stream entries. Unset => not purgeable.
+	const forgetUserId = options.forgetUserId;
 	const redis = client.redis;
 
 	const b = options.breaker;
@@ -487,6 +493,43 @@ export function createStreamReplay(client, options = {}) {
 			// epoch still reads the pre-reset value.
 			await bumpEpoch(topic);
 			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): XDEL a user's buffered events from
+		 * every topic stream. Scans `replay:streambuf:{*}`, XRANGEs each, maps each
+		 * entry through `forgetUserId` (the topic is recovered from the stream key),
+		 * and XDELs the matches. Leaves the seq space intact (the holes read as
+		 * truncation on resume -> a full rehydrate, the safe outcome). A no-op
+		 * without a `forgetUserId` extractor.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} buffered events removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			const prefix = client.key('replay:streambuf:{');
+			let keys;
+			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
+			let n = 0;
+			for (const bk of keys) {
+				const topic = bk.startsWith(prefix) && bk.endsWith('}') ? bk.slice(prefix.length, bk.length - 1) : undefined;
+				let entries;
+				try { entries = await redis.xrange(bk, '-', '+'); } catch { continue; }
+				const toDel = [];
+				for (const [id, flat] of entries) {
+					const fields = fieldsToObject(flat);
+					let data;
+					try { data = JSON.parse(fields.data); } catch { continue; }
+					let uid;
+					try { uid = forgetUserId({ topic: fields.topic ?? topic, event: fields.event, data }); } catch { continue; }
+					if (uid === userId) toDel.push(id);
+				}
+				if (toDel.length > 0) {
+					try { await redis.xdel(bk, ...toDel); n += toDel.length; } catch { /* best-effort */ }
+				}
+			}
+			return n;
 		},
 
 		/**

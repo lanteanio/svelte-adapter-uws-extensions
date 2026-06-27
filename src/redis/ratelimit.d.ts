@@ -49,6 +49,12 @@ export interface RedisRateLimiter {
 	consume(ws: any, cost?: number): Promise<ConsumeResult>;
 	/** Clear the bucket for a key (optionally scoped to a tenant). */
 	reset(key: string, tenant?: string | null): Promise<void>;
+	/**
+	 * Right-to-erasure: clear a user's bucket. Meaningful only when `keyBy`
+	 * resolves to the userId; a no-op for ip/connection buckets. Counters-only,
+	 * so no PII is involved.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Manually ban a key (optionally scoped to a tenant). */
 	ban(key: string, duration?: number, tenant?: string | null): Promise<void>;
 	/** Remove a ban (optionally scoped to a tenant). */

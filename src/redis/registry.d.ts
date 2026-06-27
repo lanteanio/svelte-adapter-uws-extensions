@@ -91,6 +91,15 @@ export interface ConnectionRegistry {
 	lookup(userId: string): Promise<RegistryEntry | null>;
 
 	/**
+	 * Right-to-erasure: delete a user's connection entry (conns:{userId})
+	 * unconditionally, clear this instance's in-memory maps, and broadcast a
+	 * forget event so every replica drops the user. Keyed by raw userId, so
+	 * `tenantId` is accepted for the uniform store contract but does not scope.
+	 * Returns durable rows removed (0 or 1).
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
+
+	/**
 	 * Resolve an app session id to its current owning instance, or `null`
 	 * if the session is offline. Only meaningful when the registry was
 	 * created with a `sessionIdentify` option.

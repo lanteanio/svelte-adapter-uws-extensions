@@ -41,10 +41,16 @@ export type IdempotencySlot<T = unknown> =
 	| IdempotencySlotResult<T>;
 
 export interface RedisIdempotencyStore {
-	/** Try to claim ownership of a key. Returns one of three slot shapes. */
-	acquire<T = unknown>(key: string): Promise<IdempotencySlot<T>>;
+	/**
+	 * Try to claim ownership of a key. Returns one of three slot shapes. The
+	 * optional `meta` records the committing user for `live.forget` right-to-
+	 * erasure (the realtime idempotent wrapper supplies it).
+	 */
+	acquire<T = unknown>(key: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. */
 	purge(key: string): Promise<void>;
+	/** Right-to-erasure: delete every cached result this user committed. */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Drop every key under this store's prefix. */
 	clear(): Promise<void>;
 	/**

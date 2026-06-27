@@ -3637,6 +3637,36 @@ const cap = capabilityCookie({
 
 ---
 
+## Right to erasure (`live.forget` durable layer)
+
+svelte-realtime's `live.forget(userId)` erases a user from the framework's in-memory state on its own; to erase the user's DURABLE rows across a cluster, compose the backend stores you already wired into one store via `createForgetStore` and hand it to `configureForget`.
+
+```js
+import { createForgetStore } from 'svelte-adapter-uws-extensions/forget-store';
+import { configureForget } from 'svelte-realtime/server';
+
+configureForget({
+  store: createForgetStore({ registry, idempotency, presence, cursor, session }),
+  platform   // the Redis handle the presence purge needs
+});
+```
+
+`createForgetStore` attempts every store even if one fails, then rejects if any failed (svelte-realtime maps that to `FORGET_STORE_FAILED` - retry the erasure), and returns a per-store removal-count breakdown. Each store exposes `purgeUser(tenantId, userId)`:
+
+- **Connection registry, idempotency, rate-limit, presence, cursor** are keyed by (or derive) the userId directly, so `purgeUser` works with no extra configuration. Registry deletes `conns:{userId}` unconditionally and broadcasts a `forget` event so every replica drops the user; presence and cursor scan their per-topic keys cluster-correctly (per-node scans, `execMultiSlot`).
+- **Stores whose payload is app-defined** - the distributed session, the dead-letter DLQ, the replay buffer, and the Postgres task runner - cannot see the userId inside your value, so each takes an optional `forgetUserId(payload) => userId`:
+
+```js
+const session = createDistributedSession(redis, { forgetUserId: (data) => data.userId });
+const dlq     = createDeadLetter(redis,         { forgetUserId: (rec) => rec.data?.userId });
+const replay  = createReplay(redis,             { forgetUserId: ({ data }) => data.userId });
+const tasks   = createTaskRunner(pg,            { forgetUserId: (input) => input.userId });
+```
+
+With the extractor, the session indexes each token per user at write time, the Redis DLQ / replay buffers scan their bounded collections at purge time, and the Postgres dead-letter / replay / task stores stamp a `user_id` column at write time and `DELETE WHERE` (tables forward-migrate via `ADD COLUMN IF NOT EXISTS`). Without it, those stores are a documented no-op. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
+
+---
+
 ## Redis Functions
 
 `createFunctionLibrary` (`svelte-adapter-uws-extensions/redis/functions`) is a thin wrapper over Redis 7+ `FUNCTION LOAD` / `FCALL`. Versioned, hot-reloadable server-side scripts: ship a new library version and `load()` swaps it in atomically without an app redeploy.

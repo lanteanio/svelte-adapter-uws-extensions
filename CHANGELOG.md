@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`./forget-store`: `createForgetStore(stores)` + per-store `purgeUser` - the durable layer for svelte-realtime's `live.forget` right-to-erasure.** `createForgetStore({ registry, idempotency, presence, cursor, session, ... })` composes the backend stores you already wired into the single duck-typed `{ purgeUser }` that svelte-realtime's `configureForget({ store })` consumes. It fans out with `Promise.allSettled` so EVERY store is attempted even if one fails, then rejects if any failed (svelte-realtime surfaces that as `FORGET_STORE_FAILED` - an incomplete erasure to retry), and returns a per-store removal-count breakdown. Each store gained a `purgeUser(tenantId, userId)`:
+  - **Connection registry** deletes `conns:{userId}` unconditionally (an admin erasure must remove an offline / cross-instance user, not just one this node owns), clears all in-memory maps, and broadcasts a new `forget` event so every replica drops the user from its own index.
+  - **Idempotency (Redis + Postgres)** records the committing user (Redis: a per-user HASH index with a sliding TTL; Postgres: `user_id` / `tenant_id` columns threaded through `acquire`) and deletes the user's entries. `acquire` gains an optional `(key, ttlSec, meta)` form, backward compatible.
+  - **Rate-limit** clears the user-derived bucket (a no-op for ip/connection keys; counters-only, no PII).
+  - **Presence** scans `presence:user:{*}:{userId}` per node and, for each topic, DELetes the per-user hash + HDELs the topic hash (one `execMultiSlot` per topic) + broadcasts a leave.
+  - **Cursor** scans `cursor:{*}`, matches the userId against each entry's `value.user`, and HDELs + broadcasts REMOVE.
+  - **Opaque-payload stores** (session, dead-letter, replay, task inputs) take an optional `forgetUserId(payload)` extractor - the store cannot see the userId inside an app-defined value, so you supply how to read it: session indexes the token per user at write time; the Redis dead-letter / replay buffers scan their bounded collections at purge time; the Postgres dead-letter / replay / tasks stamp a `user_id` column at write time and `DELETE WHERE`. Without the extractor those stores are a documented no-op (not user-purgeable). Postgres tables forward-migrate via `ADD COLUMN IF NOT EXISTS`.
+  - CRDT documents are intentionally NOT purgeable here: merged edits in a shared document are not surgically erasable, so use svelte-realtime's `onForget` hook to delete app-owned documents.
+
+  Cluster-correct throughout (per-node scans + `execMultiSlot`, never a cross-slot pipeline). Pairs with `svelte-realtime >= 0.6.0-next.51`.
+
 ## [0.6.0-next.35] - 2026-06-26
 
 ### Added

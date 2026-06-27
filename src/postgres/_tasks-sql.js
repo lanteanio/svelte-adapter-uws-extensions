@@ -59,6 +59,15 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		await safeCreate(client, `
 			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
 		`);
+		// Right-to-erasure column: a task input may carry the enqueuing user's PII,
+		// so row DELETE is the only clean erasure. Stamped from the runner's
+		// forgetUserId extractor; ADD COLUMN IF NOT EXISTS forward-migrates.
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT
+		`);
+		await safeCreate(client, `
+			CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)
+		`);
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
 			    ON ${table} (fence_expires_at)
@@ -72,14 +81,14 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		migrated = true;
 	}
 
-	async function insertAttempt(taskId, name, input, idempotencyKey, fence, requestId) {
+	async function insertAttempt(taskId, name, input, idempotencyKey, fence, requestId, userId) {
 		await client.query({
 			name: 'tasks_insert_' + table,
 			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at)
+			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, user_id)
 			       VALUES
-			          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null, fence, fenceTtl]
+			          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval, $8)`,
+			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null, fence, fenceTtl, userId ?? null]
 		});
 	}
 
@@ -241,14 +250,14 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		return res.rows[0] ? res.rows[0].fence : null;
 	}
 
-	async function insertPending(taskId, name, input, idempotencyKey, requestId) {
+	async function insertPending(taskId, name, input, idempotencyKey, requestId, userId) {
 		await client.query({
 			name: 'tasks_enqueue_' + table,
 			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, attempts)
+			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, user_id, status, fence, fence_expires_at, attempts)
 			       VALUES
-			          ($1, $2, $3::jsonb, $4, $5, 'pending', gen_random_uuid(), now(), 0)`,
-			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null]
+			          ($1, $2, $3::jsonb, $4, $5, $6, 'pending', gen_random_uuid(), now(), 0)`,
+			values: [taskId, name, JSON.stringify(input ?? null), idempotencyKey ?? null, requestId ?? null, userId ?? null]
 		});
 	}
 
@@ -310,6 +319,16 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		return res.rowCount;
 	}
 
+	// Right-to-erasure: delete every task row stamped with this user's id.
+	async function deleteByUser(userId) {
+		const res = await client.query({
+			name: 'tasks_delete_user_' + table,
+			text: `DELETE FROM ${table} WHERE user_id = $1`,
+			values: [userId]
+		});
+		return res.rowCount || 0;
+	}
+
 	return {
 		ensureTable,
 		insertAttempt,
@@ -324,6 +343,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		insertPending,
 		claimPending,
 		reclaimStuck,
-		deleteOldTerminal
+		deleteOldTerminal,
+		deleteByUser
 	};
 }

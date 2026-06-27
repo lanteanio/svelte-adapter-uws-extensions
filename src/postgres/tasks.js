@@ -208,6 +208,17 @@ export function createTaskRunner(client, options = {}) {
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 3600000;
 	const rowTtl = options.rowTtl || 7 * 24 * 3600;
 	const autoMigrate = options.autoMigrate !== false;
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('postgres tasks: forgetUserId must be a function (input, name) => userId');
+	}
+	// Right-to-erasure: a task input may carry the enqueuing user's PII. When set,
+	// this extracts the owning userId at insert time into a user_id column so
+	// `live.forget` can drop the user's task rows. Unset => not user-purgeable.
+	const forgetUserId = options.forgetUserId;
+	const _taskUserId = (input, name) => {
+		if (!forgetUserId) return null;
+		try { const u = forgetUserId(input, name); return typeof u === 'string' && u.length > 0 ? u : null; } catch { return null; }
+	};
 	const idempotency = options.idempotency || null;
 	const fenceProvider = options.fence || null;
 	if (fenceProvider !== null) {
@@ -353,7 +364,7 @@ export function createTaskRunner(client, options = {}) {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUuid();
-					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId);
+					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId, _taskUserId(input, name));
 					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate fence and rearm the existing row.
@@ -677,7 +688,7 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 
 			const taskId = randomUuid();
-			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId));
+			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId, _taskUserId(input, name)));
 			fireStateChange({
 				taskId,
 				name,
@@ -761,6 +772,19 @@ export function createTaskRunner(client, options = {}) {
 			}
 			await sql.ensureTable();
 			return withBreaker(b, () => sql.countByStatus({ name: filterName ?? null }));
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): delete every task row stamped with this
+		 * user's id (requires a `forgetUserId` extractor; a no-op otherwise).
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} task rows removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			await sql.ensureTable();
+			return withBreaker(b, () => sql.deleteByUser(userId));
 		},
 
 		async takeover(taskId) {

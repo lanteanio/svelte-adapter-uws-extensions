@@ -159,6 +159,14 @@ export interface RedisCursorTracker {
 	remove(ws: any, platform: Platform, topic?: string): Promise<void>;
 
 	/**
+	 * Right-to-erasure: remove a user's cursors from every topic across the
+	 * cluster, matching the userId against `value.user` (a string equal to the
+	 * userId, or an object whose `id`/`userId` equals it). Returns cursor
+	 * entries removed.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
+
+	/**
 	 * Send the current state for a topic to a single connection as ordered
 	 * events on `__cursor:{topic}`: `time` (`{t}`, the server clock seed),
 	 * `you` (`{key}`, the connection's own roster key - allocated here

@@ -86,6 +86,15 @@ export function createReplay(client, options = {}) {
 		throw new Error(`postgres replay: localFanoutOnStorageFailure must be a boolean, got ${options.localFanoutOnStorageFailure}`);
 	}
 	const localFanoutOnStorageFailure = options.localFanoutOnStorageFailure === true;
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('postgres replay: forgetUserId must be a function ({ topic, event, data }) => userId');
+	}
+	// Right-to-erasure: a buffered event payload is app-defined, so the store
+	// cannot tell whose event it is. When set, this extracts the authoring userId
+	// at publish time into a user_id column so `live.forget` can drop the
+	// forgotten user's buffered events (else a resume/gap-fill replays them).
+	// Unset => buffered events are not user-purgeable.
+	const forgetUserId = options.forgetUserId;
 
 	const table = options.table || 'svti_replay';
 	const seqTable = table + '_seq';
@@ -124,6 +133,9 @@ export function createReplay(client, options = {}) {
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
+		// Right-to-erasure column (ALTER so existing buffers forward-migrate).
+		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
+		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
 		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
@@ -238,6 +250,10 @@ export function createReplay(client, options = {}) {
 			} catch (err) {
 				throw new ReplaySerializationError('publish', err);
 			}
+			let userId = null;
+			if (forgetUserId) {
+				try { const u = forgetUserId({ topic, event, data }); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
+			}
 			let res;
 			try {
 				res = await withBreaker(b, async () => {
@@ -251,11 +267,11 @@ export function createReplay(client, options = {}) {
 							  DO UPDATE SET seq = ${seqTable}.seq + 1
 							  RETURNING seq, epoch
 						)
-						INSERT INTO ${table} (topic, seq, event, data)
-						SELECT $1, new_seq.seq, $2, $3
+						INSERT INTO ${table} (topic, seq, event, data, user_id)
+						SELECT $1, new_seq.seq, $2, $3, $4
 						  FROM new_seq
 						RETURNING seq, (SELECT epoch FROM new_seq) AS epoch`,
-						values: [topic, event, payload]
+						values: [topic, event, payload, userId]
 					});
 				});
 			} catch (err) {
@@ -455,6 +471,24 @@ export function createReplay(client, options = {}) {
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
 			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): delete every buffered event stamped
+		 * with this user's id (requires a `forgetUserId` extractor; a no-op
+		 * otherwise). Leaves the seq counters untouched - a hole in the buffer is
+		 * already handled by the truncation-detection path on resume.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} buffered events removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			return withBreaker(b, async () => {
+				await ensureTable();
+				const res = await client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
+				return res.rowCount || 0;
+			});
 		},
 
 		async clear() {

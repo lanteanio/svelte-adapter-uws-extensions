@@ -11,6 +11,12 @@ export interface RedisDeadLetterOptions {
 	breaker?: CircuitBreaker;
 	/** Prometheus registry for the `dead_letter_added_total` counter. */
 	metrics?: MetricsRegistry;
+	/**
+	 * Right-to-erasure: map a record to its owning userId so `live.forget` can
+	 * drop the user's undelivered payloads (scanned at purge time over the bounded
+	 * collection). Without it, records are not user-purgeable.
+	 */
+	forgetUserId?: (record: DeadLetterRecord) => string | null | undefined;
 }
 
 /** A retained, undeliverable outbound-webhook event. */
@@ -38,6 +44,8 @@ export interface RedisDeadLetterStore {
 	count(filter?: { topic?: string }): Promise<number>;
 	list(filter?: { topic?: string; limit?: number }): Promise<DeadLetterRecord[]>;
 	summary(): Promise<{ total: number; byTopic: Record<string, number>; oldest: number | null; newest: number | null }>;
+	/** Right-to-erasure: drop every record belonging to a user (needs `forgetUserId`). */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
 }
 

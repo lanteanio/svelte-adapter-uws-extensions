@@ -47,6 +47,15 @@ export function createDeadLetter(client, options = {}) {
 	if (options.ttlMs !== undefined && (!Number.isInteger(options.ttlMs) || options.ttlMs < 0)) {
 		throw new Error(`redis dead-letter: ttlMs must be a non-negative integer, got ${options.ttlMs}`);
 	}
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('redis dead-letter: forgetUserId must be a function (record) => userId');
+	}
+	// Right-to-erasure: a DLQ record's payload is app-defined, so the store cannot
+	// tell whose record it is. When set, this maps a record to its owning userId
+	// so `live.forget` can drop the user's undelivered payloads. The DLQ is one
+	// bounded collection on a single slot, so the extractor runs at purge time
+	// over a full scan (no write-path index needed). Unset => not user-purgeable.
+	const forgetUserId = options.forgetUserId;
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
 
@@ -175,6 +184,37 @@ export function createDeadLetter(client, options = {}) {
 				if (newest === null || rec.failedAt > newest) newest = rec.failedAt;
 			}
 			return { total, byTopic, oldest, newest };
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): drop every DLQ record belonging to a
+		 * user. Scans the bounded single-slot collection, maps each record through
+		 * `forgetUserId`, and HDELs + ZREMs the matches in one MULTI (the three
+		 * keys share the {dlq} slot). A no-op without a `forgetUserId` extractor.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} records removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			return withBreaker(b, async () => {
+				const all = await redis.hgetall(recsKey);
+				if (!all) return 0;
+				const ids = [];
+				for (const id of Object.keys(all)) {
+					const rec = parseRecord(id, all[id]);
+					if (!rec) continue;
+					let uid;
+					try { uid = forgetUserId(rec); } catch { continue; }
+					if (uid === userId) ids.push(id);
+				}
+				if (ids.length === 0) return 0;
+				const tx = redis.multi();
+				tx.hdel(recsKey, ...ids);
+				tx.zrem(orderKey, ...ids);
+				await tx.exec();
+				return ids.length;
+			});
 		},
 
 		async clear() {

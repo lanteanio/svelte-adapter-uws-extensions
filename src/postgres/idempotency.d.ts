@@ -23,10 +23,16 @@ export interface PgIdempotencyOptions {
 }
 
 export interface PgIdempotencyStore {
-	/** Try to claim ownership of an idempotency key. Returns one of three slot shapes. */
-	acquire<T = unknown>(idempotencyKey: string): Promise<IdempotencySlot<T>>;
+	/**
+	 * Try to claim ownership of an idempotency key. Returns one of three slot
+	 * shapes. The optional `meta` records the committing user (denormalized into
+	 * user_id/tenant_id columns) for `live.forget` right-to-erasure.
+	 */
+	acquire<T = unknown>(idempotencyKey: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. */
 	purge(idempotencyKey: string): Promise<void>;
+	/** Right-to-erasure: delete every row this user owns (DELETE WHERE tenant_id, user_id). */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Drop every row in the store's table. */
 	clear(): Promise<void>;
 	/**

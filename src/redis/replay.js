@@ -22,7 +22,7 @@
  */
 
 import { createStreamReplay } from './replay-stream.js';
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -116,9 +116,16 @@ export function createReplay(client, options = {}) {
 	if (options.storage !== undefined && options.storage !== 'sortedset' && options.storage !== 'stream') {
 		throw new Error(`redis replay: storage must be 'sortedset' or 'stream', got ${options.storage}`);
 	}
+	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
+		throw new Error('redis replay: forgetUserId must be a function ({ topic, event, data }) => userId');
+	}
 	if (options.storage === 'stream') {
 		return createStreamReplay(client, options);
 	}
+	// Right-to-erasure: a buffered event payload is app-defined; when set this maps
+	// an event to its authoring userId so `live.forget` drops the user's buffered
+	// events at purge time (per-topic buffers are bounded, so a scan is cheap).
+	const forgetUserId = options.forgetUserId;
 
 	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis replay', options);
@@ -408,6 +415,40 @@ export function createReplay(client, options = {}) {
 			// contiguity).
 			await bumpEpoch(topic);
 			await withBreaker(b, () => redis.unlink(seqKey(topic), bufKey(topic)));
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): drop a user's buffered events from
+		 * every topic. Scans `replay:buf:{*}`, parses each ZSET member ({seq, topic,
+		 * event, data}), maps it through `forgetUserId`, and ZREMs the matches.
+		 * Leaves the seq space intact - the resulting seq holes read as truncation
+		 * on resume (a full rehydrate), which is the safe outcome. A no-op without a
+		 * `forgetUserId` extractor.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} buffered events removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			let keys;
+			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
+			let n = 0;
+			for (const bk of keys) {
+				let members;
+				try { members = await redis.zrange(bk, 0, -1); } catch { continue; }
+				const toRemove = [];
+				for (const member of members) {
+					let parsed;
+					try { parsed = JSON.parse(member); } catch { continue; }
+					let uid;
+					try { uid = forgetUserId({ topic: parsed.topic, event: parsed.event, data: parsed.data }); } catch { continue; }
+					if (uid === userId) toRemove.push(member);
+				}
+				if (toRemove.length > 0) {
+					try { await redis.zrem(bk, ...toRemove); n += toRemove.length; } catch { /* best-effort */ }
+				}
+			}
+			return n;
 		},
 
 		/**

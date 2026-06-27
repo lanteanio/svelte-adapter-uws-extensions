@@ -57,8 +57,9 @@ const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
 
 /**
  * @typedef {Object} PgIdempotencyStore
- * @property {(key: string) => Promise<import('../redis/idempotency.js').IdempotencySlot>} acquire
+ * @property {(key: string, ttlSec?: number, meta?: { user?: string, tenant?: string | null }) => Promise<import('../redis/idempotency.js').IdempotencySlot>} acquire
  * @property {(key: string) => Promise<void>} purge
+ * @property {(tenantId: string | null, userId: string) => Promise<number>} purgeUser - Right-to-erasure: delete this user's rows.
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the cleanup timer.
  */
@@ -116,6 +117,18 @@ export function createIdempotencyStore(client, options = {}) {
 		`, { table, columns: ['svti_idempotency_key', 'status', 'result', 'expires_at'] });
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table} (expires_at)
+		`);
+		// Right-to-erasure columns: the committed result JSONB may itself be
+		// PII, and the opaque PK cannot be substring-matched, so `live.forget`
+		// purges by these denormalized columns instead. BOTH are needed - a
+		// userId alone cannot disambiguate one user across tenants. The realtime
+		// idempotent wrapper supplies them via acquire's `meta`; legacy rows
+		// stay NULL (unforgettable until they expire, same as a pre-upgrade
+		// deployment). ADD COLUMN IF NOT EXISTS forward-migrates existing tables.
+		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
+		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tenant_id TEXT`);
+		await safeCreate(client, `
+			CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (tenant_id, user_id)
 		`);
 		migrated = true;
 	}
@@ -195,23 +208,26 @@ export function createIdempotencyStore(client, options = {}) {
 		};
 	}
 
-	async function attemptAcquire(idempotencyKey) {
+	async function attemptAcquire(idempotencyKey, userId, tenantId) {
 		// Insert a fresh pending row, OR take over an existing row whose
 		// expires_at has passed (crashed owner / expired cached result).
 		// `xmax = 0` distinguishes a fresh insert from a takeover but we
 		// only need to know "did we end up owning this row" - both paths
-		// return at least one row.
+		// return at least one row. user_id/tenant_id ride along (right-to-erasure);
+		// a takeover re-stamps them so the columns track the current owner.
 		const ins = await client.query({
 			name: 'idem_acquire_' + table,
-			text: `INSERT INTO ${table} (svti_idempotency_key, status, result, expires_at)
-			       VALUES ($1, 'pending', NULL, now() + ($2 || ' seconds')::interval)
+			text: `INSERT INTO ${table} (svti_idempotency_key, status, result, expires_at, user_id, tenant_id)
+			       VALUES ($1, 'pending', NULL, now() + ($2 || ' seconds')::interval, $3, $4)
 			       ON CONFLICT (svti_idempotency_key) DO UPDATE
 			         SET status = 'pending',
 			             result = NULL,
-			             expires_at = now() + ($2 || ' seconds')::interval
+			             expires_at = now() + ($2 || ' seconds')::interval,
+			             user_id = EXCLUDED.user_id,
+			             tenant_id = EXCLUDED.tenant_id
 			         WHERE ${table}.expires_at < now()
 			       RETURNING status`,
-			values: [idempotencyKey, acquireTtl]
+			values: [idempotencyKey, acquireTtl, userId ?? null, tenantId ?? null]
 		});
 
 		if (ins.rowCount > 0) {
@@ -236,18 +252,24 @@ export function createIdempotencyStore(client, options = {}) {
 	}
 
 	return {
-		async acquire(idempotencyKey) {
+		async acquire(idempotencyKey, _ttlSec, meta) {
 			validateKey(idempotencyKey);
+			// Right-to-erasure: the realtime idempotent wrapper passes the raw
+			// (user, tenant) so the row records who it belongs to. The 2nd arg is
+			// the per-call ttl the in-memory store honours; Postgres uses the
+			// store-level ttl, so it is ignored here.
+			const userId = meta && typeof meta.user === 'string' ? meta.user : null;
+			const tenantId = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
 
 			b?.guard();
 			let outcome;
 			try {
 				await ensureTable();
-				outcome = await attemptAcquire(idempotencyKey);
+				outcome = await attemptAcquire(idempotencyKey, userId, tenantId);
 				if (outcome === null) {
 					// Race: row was deleted between the conflict and the read.
 					// One retry catches it; if it still happens, treat as pending.
-					outcome = await attemptAcquire(idempotencyKey);
+					outcome = await attemptAcquire(idempotencyKey, userId, tenantId);
 					if (outcome === null) {
 						outcome = { acquired: false, pending: true };
 					}
@@ -283,6 +305,28 @@ export function createIdempotencyStore(client, options = {}) {
 					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
 					values: [idempotencyKey]
 				});
+			});
+		},
+
+		/**
+		 * Right-to-erasure: delete every cached/pending row this user owns.
+		 * `tenantId` disambiguates the user across tenants (a userId alone is
+		 * insufficient); pass `null` for the single-tenant default. `IS NOT
+		 * DISTINCT FROM` makes the NULL tenant match NULL-stamped rows.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} rows deleted
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			return withBreaker(b, async () => {
+				await ensureTable();
+				const res = await client.query({
+					name: 'idem_purge_user_' + table,
+					text: `DELETE FROM ${table} WHERE user_id = $2 AND tenant_id IS NOT DISTINCT FROM $1`,
+					values: [tenantId ?? null, userId]
+				});
+				return res.rowCount || 0;
 			});
 		},
 

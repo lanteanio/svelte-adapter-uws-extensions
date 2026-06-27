@@ -88,8 +88,9 @@ const PENDING_SENTINEL = '__idem_pending__';
 
 /**
  * @typedef {Object} RedisIdempotencyStore
- * @property {(key: string) => Promise<IdempotencySlot>} acquire
+ * @property {(key: string, ttlSec?: number, meta?: { user?: string, tenant?: string | null }) => Promise<IdempotencySlot>} acquire
  * @property {(key: string) => Promise<void>} purge
+ * @property {(tenantId: string | null, userId: string) => Promise<number>} purgeUser - Right-to-erasure: delete this user's cached results.
  * @property {() => Promise<void>} clear
  */
 
@@ -136,6 +137,18 @@ export function createIdempotencyStore(client, options = {}) {
 		return client.key(keyPrefix + userKey);
 	}
 
+	// Right-to-erasure reverse index: a Redis HASH per (tenant, user) whose FIELDS
+	// are the FULL cache keys that user committed, so `live.forget` can delete
+	// exactly a user's entries instead of substring-matching the opaque key (a
+	// collision could over-delete or miss). A hash (vs a set) keeps it portable
+	// and lets the whole index expire as one key. The store has no sweep loop
+	// (pure EX TTL), so the index carries its own sliding TTL (refreshed on each
+	// write) and any stale field whose cache key already expired is a no-op DEL
+	// on purge.
+	function byUserKey(tenantId, userId) {
+		return client.key(keyPrefix + 'byuser:' + (tenantId || '') + '\0' + userId);
+	}
+
 	function validateKey(userKey) {
 		if (typeof userKey !== 'string' || userKey.length === 0) {
 			throw new Error('redis idempotency: key must be a non-empty string');
@@ -146,9 +159,13 @@ export function createIdempotencyStore(client, options = {}) {
 	}
 
 	return {
-		async acquire(userKey) {
+		async acquire(userKey, _ttlSec, meta) {
 			validateKey(userKey);
 			const k = fullKey(userKey);
+			// The realtime idempotent wrapper passes the raw (user, tenant) so this
+			// committed key can be recorded under the user for right-to-erasure.
+			const forgetUser = meta && typeof meta.user === 'string' ? meta.user : null;
+			const forgetTenant = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
 
 			const raw = await withBreaker(b, () =>
 				redis.eval(ACQUIRE_SCRIPT, 1, k, PENDING_SENTINEL, acquireTtl)
@@ -174,6 +191,19 @@ export function createIdempotencyStore(client, options = {}) {
 							throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
 						}
 						await withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
+						// Record this key under the user for forget (best-effort -
+						// the index is a convenience; a failure here must not fail
+						// the commit, so it rides its own try/catch). The SADD +
+						// sliding EXPIRE are one key, so single-slot and safe.
+						if (forgetUser !== null) {
+							const idxKey = byUserKey(forgetTenant, forgetUser);
+							try {
+								const tx = redis.multi();
+								tx.hset(idxKey, k, '1');
+								tx.expire(idxKey, ttl);
+								await tx.exec();
+							} catch { /* index best-effort; the cache entry is committed */ }
+						}
 						mCommits?.inc();
 					},
 					async abort() {
@@ -202,6 +232,31 @@ export function createIdempotencyStore(client, options = {}) {
 		async purge(userKey) {
 			validateKey(userKey);
 			await withBreaker(b, () => redis.del(fullKey(userKey)));
+		},
+
+		/**
+		 * Right-to-erasure: delete every cached result this user committed, found
+		 * via the byuser SET index. Each cache key is deleted individually so the
+		 * cluster routes each DEL to its own slot (a single cross-slot pipeline
+		 * would silently no-op). `tenantId` disambiguates the user across tenants.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} cache entries removed
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			return withBreaker(b, async () => {
+				const idxKey = byUserKey(tenantId, userId);
+				const keys = await redis.hkeys(idxKey);
+				if (!keys || keys.length === 0) {
+					await redis.del(idxKey);
+					return 0;
+				}
+				// Per-key DEL: each key routes to its own slot under cluster mode.
+				const results = await Promise.all(keys.map((k) => redis.del(k)));
+				await redis.del(idxKey);
+				return results.reduce((n, r) => n + (r > 0 ? 1 : 0), 0);
+			});
 		},
 
 		async clear() {

@@ -114,6 +114,14 @@ export interface RedisPresenceTracker {
 	count(topic: string): Promise<number>;
 
 	/**
+	 * Right-to-erasure: remove a user from every presence topic across the
+	 * cluster (DEL the per-user hash + HDEL the topic hash + broadcast a leave).
+	 * Matches when the configured `key` field makes the presence key equal the
+	 * userId. Returns the number of topics the user was removed from.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
+
+	/**
 	 * Snapshot of local presence health metrics. Synchronous; reads
 	 * in-memory state only. The same numbers are exposed as Prometheus
 	 * gauges (`presence_total_online`, `presence_heartbeat_latency_ms`)

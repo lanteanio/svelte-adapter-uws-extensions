@@ -63,6 +63,13 @@ export interface DistributedSessionOptions {
 	 */
 	onLoadError?: 'reject' | 'anonymous';
 
+	/**
+	 * Right-to-erasure: extract the owning userId from session data at write time
+	 * so `live.forget` can revoke every session a user holds. Without it, sessions
+	 * are not user-purgeable (the token is opaque to the store).
+	 */
+	forgetUserId?: (data: T) => string | null | undefined;
+
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
 }
@@ -104,6 +111,8 @@ export interface DistributedSession<T = unknown> {
 	 * Not a hot-path operation; use for graceful-shutdown teardowns,
 	 * test harnesses, or operator-initiated wipes.
 	 */
+	/** Right-to-erasure: revoke every session a user holds (needs `forgetUserId`). */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
 
 	/**

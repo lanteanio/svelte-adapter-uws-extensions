@@ -109,6 +109,12 @@ export interface TaskRunnerOptions {
 	rowTtl?: number;
 	/** Auto-create the table on first use. @default true */
 	autoMigrate?: boolean;
+	/**
+	 * Right-to-erasure: extract the enqueuing user's id from a task's input at
+	 * insert time into a `user_id` column so `live.forget` can `DELETE WHERE
+	 * user_id`. Without it, task rows are not user-purgeable.
+	 */
+	forgetUserId?: (input: unknown, name: string) => string | null | undefined;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -281,6 +287,9 @@ export interface TaskRunner {
 	 * zero, so callers don't have to normalise.
 	 */
 	counts(options?: { name?: string }): Promise<TaskCounts>;
+
+	/** Right-to-erasure: delete every task row stamped with a user's id (needs `forgetUserId`). */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
 	 * Force a running attempt to abort. Expires the Postgres fence AND

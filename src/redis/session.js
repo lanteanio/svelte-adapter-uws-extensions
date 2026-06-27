@@ -97,6 +97,15 @@ export function createDistributedSession(client, options = {}) {
 	if (identify !== undefined && typeof identify !== 'function') {
 		throw new Error('session: identify must be a function (ctx) => token');
 	}
+	// Right-to-erasure: a session value is app-defined, so the store cannot find
+	// a user's tokens on its own. When set, this extracts the owning userId from
+	// the session data at write time and records the token in a per-user index so
+	// `live.forget` can revoke every session a user holds. Unset => sessions are
+	// not user-purgeable (the token is opaque).
+	const forgetUserId = options.forgetUserId;
+	if (forgetUserId !== undefined && typeof forgetUserId !== 'function') {
+		throw new Error('session: forgetUserId must be a function (data) => userId');
+	}
 	const maxAgeMs = options.maxAgeMs;
 	if (maxAgeMs !== undefined && (typeof maxAgeMs !== 'number' || !Number.isFinite(maxAgeMs) || maxAgeMs < 1)) {
 		throw new Error('session: maxAgeMs must be a positive number (ms)');
@@ -119,6 +128,29 @@ export function createDistributedSession(client, options = {}) {
 
 	function fullKey(token) {
 		return client.key(keyPrefix + token);
+	}
+
+	// Per-user token index (a HASH whose fields are the user's tokens) for
+	// right-to-erasure. Keyed by raw userId - session tokens are globally unique,
+	// so the index relies on globally-unique userIds (the same trade as the
+	// connection registry). Carries its own sliding TTL since the store has no
+	// sweep loop; a stale field whose token already expired is a no-op DEL.
+	function byUserKey(userId) {
+		return client.key(keyPrefix + 'byuser:' + userId);
+	}
+	async function indexToken(data, token) {
+		if (!forgetUserId) return;
+		let uid;
+		try { uid = forgetUserId(data); } catch { return; }
+		if (typeof uid !== 'string' || uid.length === 0) return;
+		const idxKey = byUserKey(uid);
+		try {
+			const tx = redis.multi();
+			tx.hset(idxKey, token, '1');
+			tx.pexpire(idxKey, ttlMs);
+			await tx.exec();
+			breaker?.success();
+		} catch (err) { breaker?.failure(err); /* index best-effort; the session is written */ }
 	}
 
 	function validateToken(token) {
@@ -174,6 +206,7 @@ export function createDistributedSession(client, options = {}) {
 			breaker?.failure(err);
 			throw err;
 		}
+		await indexToken(data, token);
 	}
 
 	async function touch(token) {
@@ -274,6 +307,7 @@ export function createDistributedSession(client, options = {}) {
 			breaker?.failure(err);
 			throw err;
 		}
+		await indexToken(data, token);
 	}
 
 	/**
@@ -393,6 +427,33 @@ export function createDistributedSession(client, options = {}) {
 		return session ? session.data : null;
 	}
 
+	/**
+	 * Right-to-erasure (`live.forget`): revoke every session a user holds. Reads
+	 * the per-user token index (maintained when a `forgetUserId` extractor is
+	 * configured) and UNLINKs each token, then drops the index. A no-op when no
+	 * extractor is wired - session values are opaque to the store, so without one
+	 * a user's tokens are not addressable. `tenantId` is accepted for the uniform
+	 * store contract; the index is keyed by raw userId.
+	 * @param {string | null} tenantId
+	 * @param {string} userId
+	 * @returns {Promise<number>} sessions revoked
+	 */
+	async function purgeUser(tenantId, userId) {
+		if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+		const idxKey = byUserKey(userId);
+		let tokens;
+		try { tokens = await redis.hkeys(idxKey); breaker?.success(); }
+		catch (err) { breaker?.failure(err); return 0; }
+		if (!tokens || tokens.length === 0) {
+			try { await redis.unlink(idxKey); } catch { /* best-effort */ }
+			return 0;
+		}
+		// Per-token UNLINK: each token key routes to its own slot under cluster.
+		const results = await Promise.all(tokens.map((t) => redis.unlink(fullKey(t)).catch(() => 0)));
+		try { await redis.unlink(idxKey); } catch { /* best-effort */ }
+		return results.reduce((n, r) => n + (Number(r) > 0 ? 1 : 0), 0);
+	}
+
 	return {
 		get,
 		set,
@@ -400,6 +461,7 @@ export function createDistributedSession(client, options = {}) {
 		delete: del,
 		clear,
 		create,
+		purgeUser,
 		withHooks,
 		of
 	};

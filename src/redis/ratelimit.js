@@ -224,6 +224,23 @@ export function createRateLimit(client, options) {
 			await withBreaker(b, () => redis.del(bucketKey(key, tenantId)));
 		},
 
+		/**
+		 * Right-to-erasure (`live.forget`): clear a user's rate-limit bucket. Only
+		 * meaningful when the configured `keyBy` resolves to the userId (then the
+		 * bucket key IS the userId); a harmless no-op (DEL of an absent key) when
+		 * buckets are keyed by ip/connection. Buckets are counters-only and
+		 * short-lived, so this never exposes PII - it is completeness, not erasure
+		 * of stored data.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} buckets removed (0 or 1)
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			const removed = await withBreaker(b, () => redis.del(bucketKey(userId, tenantId)));
+			return typeof removed === 'number' && removed > 0 ? removed : 0;
+		},
+
 		async ban(key, duration, tenantId) {
 			const dur = duration ?? (blockDuration || 60000);
 			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');

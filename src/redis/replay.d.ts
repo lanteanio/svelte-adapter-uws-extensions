@@ -67,6 +67,12 @@ export interface RedisReplayOptions {
 	 * @default false
 	 */
 	localFanoutOnStorageFailure?: boolean;
+	/**
+	 * Right-to-erasure: map a buffered event to its authoring userId so
+	 * `live.forget` can drop the user's buffered events (scanned per topic at
+	 * purge time). Without it, buffered events are not user-purgeable.
+	 */
+	forgetUserId?: (event: { topic: string; event: string; data: unknown }) => string | null | undefined;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -232,6 +238,13 @@ export interface RedisReplayBuffer {
 
 	/** Clear the buffer for a single topic. */
 	clearTopic(topic: string): Promise<void>;
+
+	/**
+	 * Right-to-erasure: drop a user's buffered events from every topic (needs
+	 * `forgetUserId`). The resulting seq holes read as truncation on resume (a
+	 * full rehydrate). A no-op without the extractor.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
 	 * Current stored generation of a topic's seq space. A topic whose seq

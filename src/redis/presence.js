@@ -53,7 +53,7 @@ import {
 	clearIntervalTimer
 } from '../shared/runtime.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
@@ -1065,6 +1065,62 @@ export function createPresence(client, options = {}) {
 
 		flushDiffs() {
 			flushPendingDiffs();
+		},
+
+		/**
+		 * Right-to-erasure (`live.forget`): remove a user from every presence topic
+		 * across the cluster. Scans `presence:user:{*}:{userId}` (the per-user hash
+		 * carries the userKey OUTSIDE the {topic} tag), and for each topic DELetes
+		 * the whole per-user hash (every instance's entry, not just this one) +
+		 * HDELs the topic-hash field + publishes a leave so subscribers drop the
+		 * roster entry. The two keys share the {topic} slot, so the DEL+HDEL is one
+		 * execMultiSlot round trip per topic.
+		 *
+		 * Matches when the configured `keyField` makes the presence key equal the
+		 * userId (the default `id` case); a custom key that is not the userId is
+		 * not addressable here. Presence keys are not tenant-segmented, so
+		 * `tenantId` is accepted for the uniform store contract but does not scope.
+		 * An actively-present forgotten user on a PEER instance may keep a stale
+		 * in-memory roster entry until they disconnect; the durable Redis state is
+		 * erased and a leave is broadcast.
+		 *
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} topics the user was removed from
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			const prefix = client.key('presence:user:{');
+			const suffix = '}:' + userId;
+			let keys;
+			try {
+				keys = await scanKeys(redis, prefix + '*' + suffix);
+			} catch { return 0; }
+			let n = 0;
+			for (const k of keys) {
+				if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
+				const topic = k.slice(prefix.length, k.length - suffix.length);
+				try {
+					await execMultiSlot(redis, [
+						['del', userHashKey(topic, userId)],
+						['hdel', topicHashKey(topic), userId]
+					]);
+					b?.success();
+				} catch (err) {
+					b?.failure(err);
+					continue;
+				}
+				// Drop local-instance state for the user on this topic.
+				const counts = localCounts.get(topic);
+				if (counts) { counts.delete(userId); if (counts.size === 0) { localCounts.delete(topic); activeTopics.delete(topic); } }
+				const td = localData.get(topic);
+				if (td) { td.delete(userId); if (td.size === 0) localData.delete(topic); }
+				const sc = syncCounts.get(topic);
+				if (sc) { sc.delete(userId); if (sc.size === 0) syncCounts.delete(topic); }
+				try { await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key: userId, data: null }); } catch { /* leave broadcast best-effort */ }
+				n++;
+			}
+			return n;
 		},
 
 		async clear() {

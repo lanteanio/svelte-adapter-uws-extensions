@@ -314,6 +314,26 @@ export function createConnectionRegistry(client, options) {
 		userToInstance.delete(userId);
 	}
 
+	// Right-to-erasure (`live.forget`): clear EVERY in-memory trace of a user on
+	// this instance, UNCONDITIONALLY - unlike applyCloseEvent there is no owner
+	// guard, because a forget must erase the user from every replica's index
+	// regardless of which instance currently owns the live socket. Drains the
+	// cluster index (userToInstance/userIdAttrs/secondaryIndex) plus the local
+	// owner shadow (localUsers + its paired sessionToWs entry). App-session maps
+	// are keyed by app-session id (no userId link) and are ws-bound, so they
+	// clear on the user's own disconnect.
+	function applyForgetEvent(userId) {
+		const prevAttrs = userIdAttrs.get(userId);
+		if (prevAttrs) unindexUser(userId, prevAttrs);
+		userIdAttrs.delete(userId);
+		userToInstance.delete(userId);
+		const sessionId = localUsers.get(userId);
+		if (sessionId !== undefined) {
+			localUsers.delete(userId);
+			sessionToWs.delete(sessionId);
+		}
+	}
+
 	/**
 	 * Coerce attribute values to strings for index-key consistency. Numbers
 	 * and booleans round-trip via `String()`; objects/arrays/null are
@@ -639,7 +659,7 @@ export function createConnectionRegistry(client, options) {
 		const { type, userId, instanceId: ownerInstanceId } = envelope;
 		if (typeof userId !== 'string' || typeof ownerInstanceId !== 'string') return;
 		assert(
-			type === 'open' || type === 'close',
+			type === 'open' || type === 'close' || type === 'forget',
 			'registry.events.payload-type',
 			{ type }
 		);
@@ -648,6 +668,8 @@ export function createConnectionRegistry(client, options) {
 			applyOpenEvent(userId, ownerInstanceId, attrs);
 		} else if (type === 'close') {
 			applyCloseEvent(userId, ownerInstanceId);
+		} else if (type === 'forget') {
+			applyForgetEvent(userId);
 		}
 	}
 
@@ -1230,6 +1252,35 @@ export function createConnectionRegistry(client, options) {
 		sendCoalesced,
 		sendTo,
 		size() { return localUsers.size; },
+		/**
+		 * Right-to-erasure (`live.forget`): purge a user's connection registry
+		 * entry. DELetes the durable `conns:{userId}` row UNCONDITIONALLY (an
+		 * admin erasure must remove a user this instance does not own - NOT the
+		 * ownership-gated close path), clears this instance's in-memory maps, and
+		 * broadcasts a `forget` event so every other replica drops the user from
+		 * its own cluster index. The registry keys by raw userId with no tenant
+		 * segment (globally-unique userIds), so `tenantId` is accepted for the
+		 * uniform store contract but does not scope the registry.
+		 * @param {string | null} tenantId
+		 * @param {string} userId
+		 * @returns {Promise<number>} durable rows removed (0 or 1)
+		 */
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			applyForgetEvent(userId);
+			let n = 0;
+			if (withBreakerGuard()) {
+				try {
+					const removed = await redis.del(userKey(userId));
+					n = typeof removed === 'number' && removed > 0 ? removed : 0;
+					breaker?.success();
+				} catch (err) {
+					breaker?.failure(err);
+				}
+			}
+			await publishEvent({ type: 'forget', userId, instanceId });
+			return n;
+		},
 		hooks: {
 			async open(ws, ctx) {
 				await ensureSubscriber(ctx?.platform);

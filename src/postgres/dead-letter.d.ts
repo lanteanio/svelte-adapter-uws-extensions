@@ -15,6 +15,12 @@ export interface PgDeadLetterOptions {
 	breaker?: CircuitBreaker;
 	/** Prometheus registry for the `dead_letter_added_total` counter. */
 	metrics?: MetricsRegistry;
+	/**
+	 * Right-to-erasure: extract a record's owning userId at write time into a
+	 * `user_id` column so `live.forget` can `DELETE WHERE user_id`. Without it,
+	 * records are not user-purgeable.
+	 */
+	forgetUserId?: (record: DeadLetterRecord) => string | null | undefined;
 }
 
 /** A retained, undeliverable outbound-webhook event. */
@@ -42,6 +48,8 @@ export interface PgDeadLetterStore {
 	count(filter?: { topic?: string }): Promise<number>;
 	list(filter?: { topic?: string; limit?: number }): Promise<DeadLetterRecord[]>;
 	summary(): Promise<{ total: number; byTopic: Record<string, number>; oldest: number | null; newest: number | null }>;
+	/** Right-to-erasure: delete every record stamped with a user's id (needs `forgetUserId`). */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
 }
 
