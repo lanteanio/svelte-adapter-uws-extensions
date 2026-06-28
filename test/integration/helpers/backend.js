@@ -91,6 +91,23 @@ export async function countBackendKeys(client, pattern) {
 }
 
 /**
+ * Set a server CONFIG parameter on every master, cluster-aware. CONFIG is a
+ * per-node command and keyspace notifications fire on the node that owns the key,
+ * so on a cluster the parameter must be set on each master (a single
+ * `cluster.config('SET', ...)` lands on one sampled node and leaves the others
+ * unconfigured); on solo it is the one node.
+ *
+ * @param {import('../../../src/redis/index.js').RedisClient} client
+ * @param {string} param
+ * @param {string} value
+ */
+export async function setBackendConfig(client, param, value) {
+	const redis = client.redis;
+	const nodes = isCluster(redis) ? /** @type {any} */ (redis).nodes('master') : [redis];
+	await Promise.all(nodes.map((node) => node.config('SET', param, value)));
+}
+
+/**
  * Construct a RedisClient-shaped backend for an integration suite.
  *
  * Drop-in for the suites' previous `createRedisClient({ url, keyPrefix,

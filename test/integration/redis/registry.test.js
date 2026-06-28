@@ -11,7 +11,7 @@
  * pins what only a real server can prove.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys, countBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createConnectionRegistry } from '../../../src/redis/registry.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
@@ -390,12 +390,12 @@ describe('redis connection registry (integration)', () => {
 		});
 	});
 
-	// Redis Cluster gap: this composes the registry with presence.join, whose
-	// JOIN_SCRIPT is a 2-key eval without a shared {hash-tag} and CROSSSLOTs on the
-	// cluster (see the presence cluster gap). The registry's own single-key state +
-	// pub/sub routing is cluster-safe; only the presence-composition block is skipped
-	// on the cluster backend.
-	(isClusterBackend() ? describe.skip : describe)('composition with presence (no key / channel collision)', () => {
+	// Composes the registry with presence.join. The presence JOIN_SCRIPT's two keys
+	// (presence:user:{topic}:{userKey} and presence:topic:{topic}) share a {topic}
+	// hash tag, so they co-locate on one slot and the 2-key eval stays on a single
+	// node (no CROSSSLOT). The registry's own state is single-key and its routing is
+	// cluster-wide pub/sub, so this composition runs on both backends.
+	describe('composition with presence (no key / channel collision)', () => {
 		it('registry attrs route a sendTo to a user who is also in a presence room on the owning instance', async () => {
 			// Both modules share one RedisClient (same keyPrefix). Registry
 			// owns conns:* and __push:* / __registry-events; presence owns
@@ -485,10 +485,14 @@ describe('redis connection registry (integration)', () => {
 				// namespace.
 				const regHashExists = await client.redis.exists(client.key('conns:alice'));
 				const presenceTopicHashExists = await client.redis.exists(client.key('presence:topic:{team:t1}'));
-				const presenceUserKeys = await client.redis.keys(client.key('presence:user:{team:t1}:*'));
+				// Count the per-user hash keys cluster-aware: a bare KEYS has no key
+				// argument, so on a cluster ioredis sends it to one sampled node and
+				// would miss the slot that owns the {team:t1}-tagged keys; countBackendKeys
+				// scans every master. On solo it is an ordinary single-node scan.
+				const presenceUserKeyCount = await countBackendKeys(client, client.key('presence:user:{team:t1}:*'));
 				expect(regHashExists).toBe(1);
 				expect(presenceTopicHashExists).toBe(1);
-				expect(presenceUserKeys).toHaveLength(1);
+				expect(presenceUserKeyCount).toBe(1);
 			} finally {
 				presenceA.destroy();
 				presenceB.destroy();

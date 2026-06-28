@@ -66,14 +66,13 @@ describe('redis distributed lock (integration)', () => {
 	});
 
 	describe('cross-instance mutual exclusion', () => {
-		// Redis Cluster: this asserts a FIXED acquire order (A then B) between two
-		// racing connections. On the cluster, connect/redirect latency variance makes
-		// which connection wins the contended key first nondeterministic, so the
-		// strict ordering assertion flakes. Mutual exclusion itself holds (the two
-		// critical sections never interleave); only the order assumption is
-		// cluster-fragile, so this one test is skipped on the cluster backend. The
-		// single-key lock is otherwise cluster-safe (the rest of this suite runs).
-		(isClusterBackend() ? it.skip : it)('serializes two physically separate ioredis connections on the same key', async () => {
+		// Runs on both backends. On solo the 5ms head start makes A acquire first, so
+		// the order is fixed (A then B). On a cluster, connect/redirect latency makes
+		// which connection wins the contended key first nondeterministic, so we assert
+		// the weaker-but-true invariant the lock actually guarantees: MUTUAL EXCLUSION
+		// - the two critical sections serialize in one order or the other, never
+		// interleave. The single-key lock is cluster-safe either way.
+		it('serializes two physically separate ioredis connections on the same key', async () => {
 			const clientA = createBackendClient({ keyPrefix: 'inttest-lock:' });
 			const clientB = createBackendClient({ keyPrefix: 'inttest-lock:' });
 			try {
@@ -94,7 +93,17 @@ describe('redis distributed lock (integration)', () => {
 				});
 
 				await Promise.all([a, b]);
-				expect(order).toEqual(['a-start', 'a-end', 'b-start', 'b-end']);
+				if (isClusterBackend()) {
+					// Either serialization is valid; the only illegal outcome is an
+					// interleave (e.g. ['a-start','b-start',...]) which would mean the
+					// lock failed to exclude.
+					expect([
+						['a-start', 'a-end', 'b-start', 'b-end'],
+						['b-start', 'b-end', 'a-start', 'a-end']
+					]).toContainEqual(order);
+				} else {
+					expect(order).toEqual(['a-start', 'a-end', 'b-start', 'b-end']);
+				}
 			} finally {
 				await Promise.all([clientA.quit(), clientB.quit()]);
 			}

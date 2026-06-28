@@ -82,12 +82,12 @@ describe('redis ratelimit (integration)', () => {
 	});
 
 	describe('refill on real wall-clock time', () => {
-		// Redis Cluster: a real-wall-clock refill assertion on a 500ms interval.
-		// The cluster's higher per-command latency variance can shift the observed
-		// refill boundary past the test's tight window even though the bucket Lua
-		// (single-key, cluster-safe) refills correctly - the behavior is asserted
-		// deterministically on the solo tier. Skipped on the cluster backend.
-		(isClusterBackend() ? it.skip : it)('refills after the interval elapses (real time, no clock mock)', async () => {
+		// Runs on both backends: the bucket Lua is single-key (cluster-safe) and its
+		// refill window is computed from Redis TIME, so a backend-clock wait elapses
+		// it deterministically. The post-refill wait margin is widened on the cluster
+		// (900ms vs 700ms past the 500ms interval) to ride out the higher per-command
+		// latency variance.
+		it('refills after the interval elapses (real time, no clock mock)', async () => {
 			const limiter = createRateLimit(client, { points: 2, interval: 500 });
 			const ws = fakeWs({ ip: '1.2.3.4' });
 			expect((await limiter.consume(ws)).allowed).toBe(true);
@@ -97,7 +97,7 @@ describe('redis ratelimit (integration)', () => {
 			// The refill window is computed from Redis TIME inside the Lua
 			// script, so the wait elapses on Redis's OWN clock - immune to
 			// host/VM clock drift under full-suite load.
-			await waitRedisMs(client, 700);
+			await waitRedisMs(client, isClusterBackend() ? 900 : 700);
 			const r = await limiter.consume(ws);
 			expect(r.allowed).toBe(true);
 			expect(r.remaining).toBe(1);

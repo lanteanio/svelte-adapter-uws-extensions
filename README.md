@@ -3887,18 +3887,30 @@ The mocks live at `testing/mock-redis.js` and `testing/mock-pg.js` and are expor
 
 Exercises the same modules against real services in `docker compose`. Picks up cases the mocks can only approximate: Lua atomicity inside Redis EVAL, Postgres LISTEN/NOTIFY cross-connection delivery, real TTL/EXPIRE behaviour, partial-index plans on the job queue.
 
-The compose stack at [`test/integration/docker-compose.yml`](test/integration/docker-compose.yml) binds non-default host ports so it does not clash with a locally running Postgres/Redis: **Postgres on `55432`**, **Redis on `56379`**. `test/integration/global-setup.js` runs `docker compose up -d --wait` before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL` for the tests to read, and tears the stack down with `docker compose down -v` afterwards.
+Each command is **one backend running one suite**. The Redis-backed plugins (`redis/**`) and the Postgres-backed plugins (`postgres/**`) are independent - neither suite opens the other's connection - so they have separate commands and start only the container they need:
+
+| Command | Suite | Backend |
+| --- | --- | --- |
+| `npm run test:integration:redis` | `redis/**` | standalone Redis |
+| `npm run test:integration:postgres` | `postgres/**` | standalone Postgres |
+| `npm run test:integration:valkey` | `redis/**` | standalone Valkey |
+| `npm run test:integration:cluster` | `redis-cluster/**` | Redis Cluster (native) |
+| `npm run test:integration:cluster-mirror` | `redis/**` | Redis Cluster |
+| `npm run test:integration:valkey-cluster` | `redis-cluster/**` | Valkey Cluster (native) |
+| `npm run test:integration:valkey-cluster-mirror` | `redis/**` | Valkey Cluster |
+| `npm run test:integration` | umbrella - runs `:redis` then `:postgres` | both |
+
+The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; the Postgres plugins have no alternative backend to test against, so `test:integration:postgres` is simply their single command (no solo/variant split). All commands share the compose stack at [`test/integration/docker-compose.yml`](test/integration/docker-compose.yml) (Redis on `56379`, Postgres on `55432` - non-default host ports so they do not clash with a locally running server). Each per-backend `global-setup-*.js` runs `docker compose up -d --wait <service>` (just the one it needs) before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL`, and tears the stack down with `docker compose down -v` afterwards.
 
 The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine:
 
 ```bash
 INTEGRATION_REDIS_HOST_PORT=56380 \
-INTEGRATION_POSTGRES_HOST_PORT=55433 \
 INTEGRATION_COMPOSE_PROJECT=my-slice \
-npm run test:integration
+npm run test:integration:redis
 ```
 
-Project name auto-derives from the port pair when overridden, so unique ports also mean unique container names.
+Project name auto-derives from the port when overridden, so unique ports also mean unique container names.
 
 #### Adding a new integration test
 
@@ -3920,12 +3932,17 @@ The integration layer is additive: the mock-based test for a module stays in pla
 
 ### Cluster mirror (`test:integration:cluster-mirror`)
 
-The Redis integration suites run a second time against a real 3-master + 3-replica Redis Cluster, through a DRY env-switched backend ([`test/integration/helpers/backend.js`](test/integration/helpers/backend.js)): the same test bodies, with `createBackendClient` resolving to an `ioredis.Cluster` when `INTEGRATION_BACKEND=cluster`. This keeps an honest map of which plugins are Redis-Cluster-safe today:
+The Redis integration suites run a second time against a real 3-master + 3-replica Redis Cluster, through a DRY env-switched backend ([`test/integration/helpers/backend.js`](test/integration/helpers/backend.js)): the same test bodies, with `createBackendClient` resolving to an `ioredis.Cluster` when `INTEGRATION_BACKEND=cluster`. This keeps an honest, continuously-verified map of cluster behaviour, and **every Redis-backed plugin now runs green on the mirror** - the whole `redis/**` suite passes with zero skips on both the Redis Cluster and the Valkey Cluster.
 
-- **Cluster-safe:** `fence`, `lock`, `leader`, `idempotency`, `ratelimit`, `pubsub`, `publish-rate` - single-key lease/bucket operations, or broadcast pub/sub; `clear()` fans SCAN across master nodes and unlinks per key.
-- **Not yet cluster-safe** (skipped on the cluster mirror with a documented reason; fully working on standalone Redis): `presence`, `groups`, `replay`, `replay-stream` (their core path is a multi-key Lua script over keys without a shared `{hash-tag}`, which the cluster rejects with `CROSSSLOT`); `functions` (a function library loads per node); `sharded-pubsub` (sharded `SPUBLISH`/`SSUBSCRIBE` cross-node delivery); plus the cross-topic pipelines in `cursor` and `session.clear()`. Making these cluster-ready is a key-layout (`{hash-tag}`) follow-up.
+Getting there took a key-layout pass so a cluster routes each operation correctly:
 
-If you deploy on a single Redis - or a primary with replicas - which is the common case, every plugin works. Redis Cluster support is partial and tracked; this mirror is how the map stays honest as the code evolves.
+- **Single-key / broadcast plugins** (`fence`, `lock`, `leader`, `idempotency`, `ratelimit`, `pubsub`, `publish-rate`) were cluster-safe from the start - single-key lease/bucket operations or broadcast pub/sub.
+- **Multi-key plugins** (`presence`, `groups`, `replay`, `replay-stream`, `cursor`) co-locate each entity's keys on one slot via a `{hash-tag}`, so their multi-key Lua scripts no longer `CROSSSLOT`; cross-entity pipelines fan out per owning node via `execMultiSlot`.
+- **Node-scoped plugins** load/subscribe per node: `functions` loads the library on every master, `sharded-pubsub` keeps a subscriber per master (and `SSUBSCRIBE`s each channel on its slot owner), and the `presence` keyspace-cleanup `psubscribe`s the del keyevent on every master (keyspace events are node-local).
+
+A handful of timing-band assertions (a tight PTTL/refill/lease window, an acquire-order race) use backend-adaptive bounds on the cluster, where per-command latency variance is higher; the behaviour itself is asserted on every tier.
+
+Every plugin works on a single Redis, a primary with replicas, and a Redis or Valkey Cluster; this mirror is how that stays true as the code evolves.
 
 ### Testing your own code
 

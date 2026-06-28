@@ -20,7 +20,7 @@
  * additive and asserts properties that only show up on a real server.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys, setBackendConfig } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../src/redis/presence.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
@@ -381,16 +381,15 @@ describeIntegration('redis presence (integration)', () => {
 	});
 
 	describe('keyspace-notification cleanup (real del on topic-hash expiry)', () => {
-		// Keyspace notifications + CONFIG SET are per-node concerns; keep this to
-		// the standalone backend (the cluster mirror exercises a different stack).
-		const itStandalone = isClusterBackend() ? it.skip : it;
-
-		itStandalone('emits an empty snapshot to local subscribers when a topic empties via field TTL', async () => {
+		it('emits an empty snapshot to local subscribers when a topic empties via field TTL', async () => {
 			// The cleanup psubscribes `__keyevent@*__:del` - key deletion is the
 			// generic (`g`) class on BOTH Redis 7.4 and Valkey 9.0, so one flag
 			// works everywhere. (The hash-field-expiry event `hexpired` is class
 			// `h` on Redis but `x` on Valkey, which is why we key on the deletion.)
-			await client.redis.config('SET', 'notify-keyspace-events', 'Eg');
+			// Keyspace notifications are per-node, so enable them on every master:
+			// on a cluster the del fires on whichever node owns presence:topic:{room}
+			// and the tracker psubscribes every master to catch it.
+			await setBackendConfig(client, 'notify-keyspace-events', 'Eg');
 
 			const presence = makeTracker({ keyspaceNotifications: true });
 			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);

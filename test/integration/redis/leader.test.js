@@ -71,28 +71,27 @@ describe('redis leader (integration)', () => {
 	});
 
 	describe('renewal slides PEXPIRE under real TTL', () => {
-		// Redis Cluster: asserts every PTTL sample stays in a TIGHT band
-		// (> leaseMs - renewMs*~3.5) across renewals. The cluster's per-command
-		// latency variance can delay a renewal tick enough that one sample dips
-		// under the tight floor, even though the lease is being renewed correctly
-		// (PTTL never approaches 0 / expiry). The single-key lease is cluster-safe;
-		// only this tight timing-window assertion is cluster-fragile, so it is
-		// skipped on the cluster backend (the deterministic band is asserted on solo).
-		(isClusterBackend() ? it.skip : it)('PTTL stays close to leaseMs while the renewal tick runs', async () => {
+		// Runs on both backends. The lease is single-key (cluster-safe) and renewed
+		// continuously, so PTTL never approaches expiry. The PTTL floor is widened on
+		// the cluster (400ms vs 800ms): a renewal tick can be latency-delayed enough
+		// for one sample to dip under the tight solo band even though the renewal is
+		// working - the floor still proves the lease is sliding well clear of zero.
+		it('PTTL stays close to leaseMs while the renewal tick runs', async () => {
 			const l = createLeader(client, { leaseMs: 1500, renewMs: 200 });
 			await waitFor(async () => l.isLeader());
 
 			// Sample PTTL at three points spread across multiple renewals.
 			// Without renewal, PTTL would monotonically decrease toward 0;
-			// with renewal, every sample should be > leaseMs - renewMs * 2.
+			// with renewal, every sample stays well clear of expiry.
 			const samples = [];
 			for (let i = 0; i < 5; i++) {
 				await wait(250);
 				samples.push(await client.redis.pttl(client.key('leader')));
 			}
 
+			const floor = isClusterBackend() ? 400 : 800;
 			for (const pttl of samples) {
-				expect(pttl).toBeGreaterThan(800);
+				expect(pttl).toBeGreaterThan(floor);
 				expect(pttl).toBeLessThanOrEqual(1500);
 			}
 

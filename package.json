@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.38",
+	"version": "0.6.0-next.39",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -201,9 +201,14 @@
 		"pretest": "npm run check",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"test:integration": "vitest run --config vitest.config.integration.js",
+		"test:integration": "npm run test:integration:redis && npm run test:integration:postgres",
+		"test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
+		"test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",
+		"test:integration:valkey": "vitest run --config vitest.config.integration.valkey.js",
 		"test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js",
-		"test:integration:cluster-mirror": "vitest run --config vitest.config.integration.cluster-mirror.js"
+		"test:integration:cluster-mirror": "vitest run --config vitest.config.integration.cluster-mirror.js",
+		"test:integration:valkey-cluster": "vitest run --config vitest.config.integration.valkey-cluster.js",
+		"test:integration:valkey-cluster-mirror": "vitest run --config vitest.config.integration.valkey-cluster-mirror.js"
 	},
 	"engines": {
 		"node": ">=22.0.0"

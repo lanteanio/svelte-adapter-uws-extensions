@@ -61,6 +61,7 @@
 import { randomBytes } from '../shared/runtime.js';
 import { createBusValidator, isValidBusTopic } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
+import { isCluster, keySlot } from '../shared/cluster.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_COMMAND = 'cmd';
@@ -142,13 +143,82 @@ export function createSmoothCluster(client, options = {}) {
 	let subscriberReady = null;
 	let destroyed = false;
 
+	const onCluster = isCluster(redis);
+	// On a cluster, every publish goes through the SINGLE master that owns the
+	// relay channel's slot. ioredis routes a keyless PUBLISH to a varying node, and
+	// the cluster bus then delivers those publishes to a subscriber OUT OF ORDER
+	// across nodes (verified empirically on Redis 7.4 and Valkey 9). The receive
+	// side dedups broadcasts by a per-owner monotonic seq, so a late-arriving
+	// lower-seq broadcast is dropped as a duplicate - which loses a one-shot event
+	// (updates still converge latest-wins, but an event fires zero times). Pinning
+	// every publish to one node makes that node serialize them, so a subscriber's
+	// single bus link delivers them in order. Regular PUBLISH still fans out
+	// cluster-wide from that node, so this fixes ordering without narrowing reach.
+	// Standalone keeps its single ordered connection unchanged.
+	/** @type {Promise<any> | null} resolves to the connection to PUBLISH through (cluster only) */
+	let pubTarget = null;
+	let degradedPubWarned = false;
+
+	function resolvePubTarget() {
+		if (pubTarget) return pubTarget;
+		pubTarget = (async () => {
+			try {
+				const slot = keySlot(channel);
+				const ranges = await redis.cluster('SLOTS');
+				let ownerId = null;
+				for (const e of ranges) {
+					if (slot >= e[0] && slot <= e[1]) { ownerId = e[2][2]; break; }
+				}
+				if (ownerId !== null) {
+					for (const node of redis.nodes('master')) {
+						try { if ((await node.cluster('MYID')) === ownerId) return node; } catch { /* try next master */ }
+					}
+				}
+			} catch { /* fall through to the degraded fallback */ }
+			// Unresolved (transient SLOTS error, or a freshly-resharded owner ioredis
+			// has not discovered yet). Re-resolve on the next publish.
+			pubTarget = null;
+			// Degraded fallback: still pin to a SINGLE node so a burst stays in order.
+			// A keyless cluster PUBLISH would route to a varying node and the bus would
+			// reorder it, silently dropping the receiver's lower-seq one-shot events -
+			// the exact failure this pinning prevents - so any one master beats the
+			// cluster client. Only a total master-less outage (no delivery anyway)
+			// falls through to redis.
+			try {
+				const masters = redis.nodes('master');
+				if (masters.length) {
+					if (!degradedPubWarned) {
+						degradedPubWarned = true;
+						console.warn('[redis/smooth] relay channel owner unresolved (cluster topology in flux); pinning publishes to a fallback master to keep broadcast order.');
+					}
+					return masters[0];
+				}
+			} catch { /* not a cluster / no nodes(): use the client below */ }
+			return redis;
+		})();
+		return pubTarget;
+	}
+
 	/** Publish one envelope, after the subscriber is up so we never miss a reply we caused. */
 	function publish(obj) {
 		if (destroyed) return;
 		if (b) { try { b.guard(); } catch { return; } }
 		const msg = JSON.stringify(obj);
-		if (subscriberReady) subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
-		else redis.publish(channel, msg).catch(() => {});
+		if (!onCluster) {
+			// Standalone: one connection, PUBLISH delivered in order.
+			if (subscriberReady) subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
+			else redis.publish(channel, msg).catch(() => {});
+			return;
+		}
+		// Cluster: route through the pinned owner so publishes arrive in order.
+		const send = () => resolvePubTarget().then((t) => t.publish(channel, msg).catch(() => {
+			// The pinned node may have gone (failover / reshard); drop the cache so
+			// the next publish re-resolves the current owner. PUBLISH from any live
+			// node still reaches every subscriber.
+			if (t !== redis) pubTarget = null;
+		}));
+		if (subscriberReady) subscriberReady.then(send);
+		else send();
 	}
 
 	/** Bring up the relay subscriber once; idempotent. */

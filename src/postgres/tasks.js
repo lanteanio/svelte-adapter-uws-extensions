@@ -263,16 +263,13 @@ export function createTaskRunner(client, options = {}) {
 	// (dashboards, status pages) can `await runner.ready()` without
 	// triggering a no-op task. Subsequent ensureTable() calls inside the
 	// state machine are no-ops via the migrated flag in createTaskSql.
-	const readyPromise = autoMigrate
-		? sql.ensureTable().catch((err) => {
-			// Swallow at the construction site so an unhandled rejection
-			// can't crash the worker; callers awaiting ready() see the
-			// real error via the rethrow below.
-			readyError = err;
-			throw err;
-		})
-		: Promise.resolve();
-	let readyError = null;
+	const readyPromise = autoMigrate ? sql.ensureTable() : Promise.resolve();
+	// Attach a no-op catch so a runner that is only enqueued-to (and never awaits
+	// ready()) cannot surface a construction-time migration failure as an unhandled
+	// rejection that crashes the process. ready() returns the ORIGINAL readyPromise
+	// (below), so a caller that DOES await it still observes the real error. Mirrors
+	// the idempotency store's construction-time migration guard.
+	readyPromise.catch(() => {});
 
 	/**
 	 * Centralized state-change emitter. Errors thrown from the listener

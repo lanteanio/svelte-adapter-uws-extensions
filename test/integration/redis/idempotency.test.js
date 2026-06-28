@@ -8,7 +8,7 @@
  * test/redis/idempotency.test.js stays as-is; this file is additive.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createIdempotencyStore } from '../../../src/redis/idempotency.js';
 
@@ -96,12 +96,10 @@ describe('redis idempotency (integration)', () => {
 			expect(ttl).toBeLessThanOrEqual(7200);
 		});
 
-		// Redis Cluster: relies on a 1s acquire-TTL sentinel expiring within a tight
-		// real-time window before the next acquire. The cluster's per-command latency
-		// variance can make the expiry boundary land unpredictably relative to the
-		// re-acquire even though the single-key ACQUIRE_SCRIPT (cluster-safe) is
-		// correct - asserted deterministically on the solo tier. Skipped on cluster.
-		(isClusterBackend() ? it.skip : it)('a pending sentinel that expires lets the next caller re-acquire', async () => {
+		// Runs on both backends: the single-key ACQUIRE_SCRIPT is cluster-safe and the
+		// 3s backend-clock wait (waitRedisMs reads Redis TIME) is a 3x margin over the
+		// 1s sentinel TTL, well past any cluster per-command latency variance.
+		it('a pending sentinel that expires lets the next caller re-acquire', async () => {
 			const store = createIdempotencyStore(client, { acquireTtl: 1 });
 			await store.acquire('expire-me');
 

@@ -225,17 +225,38 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		const T = '__smooth:e2e:1';
 		const a = instance();
 		const b = instance();
-		await wait(100); // let both relay subscribers attach
 
 		// A owns T; B is a non-owner holding a local client 'p'.
 		expect(await a.acquire(T)).toBe(true);
 		expect(await b.acquire(T)).toBe(false);
 
+		// Warm up the relay path with a round-trip before asserting: a bare delay
+		// races the (slower) cluster pub/sub subscriber attach, so a forward
+		// published before A's subscriber is listening is dropped (pub/sub does not
+		// queue). RE-forward a throwaway command with a FRESH id each poll until it
+		// round-trips (B forward -> A applies -> broadcast -> B), proving both
+		// subscribers are attached. The fresh id is load-bearing: the owner's
+		// drop-stale guard would dedup a re-sent id, so a single lost round-trip
+		// could never recover; a new id each attempt re-applies and re-broadcasts.
+		// Then reset the receive-side arrays so the warmup never pollutes the
+		// assertions.
+		let warmupId = 0;
+		await waitFor(async () => {
+			b.forward(T, '__warmup', [{ id: ++warmupId, delta: 0 }]);
+			await wait(40);
+			return b.appliedUpdates.some((u) => u.key === '__warmup');
+		});
+		b.appliedUpdates.length = 0;
+		b.firedEvents.length = 0;
+
 		// B forwards two commands for 'p' -> A (owner) applies each once and relays
 		// the authoritative update + event back; B receives them deduped.
 		b.forward(T, 'p', [{ id: 1, delta: 5 }]);
 		b.forward(T, 'p', [{ id: 2, delta: 3 }]);
-		await waitFor(() => b.appliedUpdates.length >= 2);
+		// Two round-trips (each forward -> A applies -> broadcast -> B); a slightly
+		// higher ceiling than the default absorbs a rare cluster delivery spike under
+		// full-suite connection load. Resolves as soon as both updates land.
+		await waitFor(() => b.appliedUpdates.length >= 2, 4000);
 		expect(a.authState(T, 'p')).toBe(8);                                  // applied once each: 5 + 3
 		expect(b.appliedUpdates[b.appliedUpdates.length - 1].state).toBe(8);  // converged on B
 
