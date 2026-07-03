@@ -14,7 +14,60 @@
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
+import { wallEpoch } from '../shared/runtime.js';
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
+
+// Upper bound on in-process floor buckets so a keyed flood during an outage
+// cannot exhaust memory; least-recently-touched entries are evicted first.
+const FLOOR_MAX_ENTRIES = 10000;
+
+/**
+ * In-process token bucket mirroring CONSUME_SCRIPT's semantics (init at full,
+ * ban check, interval refill, consume, ban-on-exhaust) so a verdict decided
+ * on the floor matches what Redis would have said for a single instance.
+ * State is per process: while degraded, N instances allow up to N times the
+ * configured budget in the worst case, which is the deliberate trade against
+ * denying everything (fail closed) or counting nothing (fail open).
+ *
+ * @param {number} maxPoints
+ * @param {number} interval
+ * @param {number} blockDuration
+ * @returns {(key: string, cost: number) => ConsumeResult}
+ */
+function createLocalFloorBucket(maxPoints, interval, blockDuration) {
+	/** @type {Map<string, { points: number, resetAt: number, bannedUntil: number }>} */
+	const buckets = new Map();
+	return function consumeLocal(key, cost) {
+		const nowMs = wallEpoch();
+		let entry = buckets.get(key);
+		if (entry !== undefined) {
+			// Reinsert on touch: insertion order then doubles as LRU order.
+			buckets.delete(key);
+		} else {
+			entry = { points: maxPoints, resetAt: nowMs + interval, bannedUntil: 0 };
+		}
+		buckets.set(key, entry);
+		if (buckets.size > FLOOR_MAX_ENTRIES) {
+			buckets.delete(buckets.keys().next().value);
+		}
+		if (entry.bannedUntil > nowMs) {
+			return { allowed: false, remaining: 0, resetMs: entry.bannedUntil - nowMs };
+		}
+		if (entry.resetAt <= nowMs) {
+			entry.points = maxPoints;
+			entry.resetAt = nowMs + interval;
+		}
+		if (entry.points >= cost) {
+			entry.points -= cost;
+			return { allowed: true, remaining: entry.points, resetMs: entry.resetAt - nowMs };
+		}
+		if (blockDuration > 0) {
+			entry.bannedUntil = nowMs + blockDuration;
+			return { allowed: false, remaining: 0, resetMs: blockDuration };
+		}
+		return { allowed: false, remaining: Math.max(0, entry.points), resetMs: entry.resetAt - nowMs };
+	};
+}
 
 const BAN_SCRIPT = `
 local key = KEYS[1]
@@ -57,6 +110,16 @@ return 1
  *   null/undefined for an unscoped connection. Omit for a single-tenant deploy (byte-identical
  *   to before). The id should be a delimiter-safe slug - it is joined to the key with a NUL,
  *   so it stays unambiguous even when the key is an IPv6 address.
+ * @property {boolean | { points?: number, interval?: number }} [localFloorOnStorageFailure=false] -
+ *   Opt-in degraded mode for `consume()`: when Redis is unreachable (or the breaker is open),
+ *   decide on an in-process token bucket with the same semantics instead of rejecting the
+ *   promise. `true` reuses the configured points/interval; the object form sets a tighter
+ *   per-instance budget (e.g. `points / instanceCount` keeps the fleet-wide allowance
+ *   roughly constant while degraded). Floor state is per process and per instance, so N
+ *   instances allow up to N times the floor budget in the worst case; it never leaks back
+ *   into Redis. Admin ops (`reset` / `ban` / `unban` / `clear` / `purgeUser`) are operator
+ *   actions and still reject while the store is down - only the request-path verdict
+ *   degrades. Off (today's reject-to-caller behavior) unless set.
  */
 
 /**
@@ -105,6 +168,24 @@ export function createRateLimit(client, options) {
 		throw new Error('redis ratelimit: tenant must be a function (ws) => id | null');
 	}
 
+	const floorOpt = options.localFloorOnStorageFailure;
+	let consumeFloor = null;
+	if (floorOpt !== undefined && floorOpt !== false) {
+		if (floorOpt !== true && (typeof floorOpt !== 'object' || floorOpt === null)) {
+			throw new Error('redis ratelimit: localFloorOnStorageFailure must be a boolean or { points?, interval? }');
+		}
+		const floorPoints = floorOpt === true ? points : (floorOpt.points ?? points);
+		const floorInterval = floorOpt === true ? interval : (floorOpt.interval ?? interval);
+		if (!Number.isInteger(floorPoints) || floorPoints <= 0) {
+			throw new Error('redis ratelimit: localFloorOnStorageFailure.points must be a positive integer');
+		}
+		if (typeof floorInterval !== 'number' || !Number.isFinite(floorInterval) || floorInterval <= 0) {
+			throw new Error('redis ratelimit: localFloorOnStorageFailure.interval must be a positive number');
+		}
+		consumeFloor = createLocalFloorBucket(floorPoints, floorInterval, blockDuration);
+	}
+	let warnedStorageFloor = false;
+
 	const redis = client.redis;
 
 	// Version prefix for Redis keys. Different script versions use different
@@ -123,6 +204,9 @@ export function createRateLimit(client, options) {
 	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed', tlabels);
 	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied', tlabels);
 	const mBans = m?.counter('ratelimit_bans_total', 'Bans applied', tlabels);
+	const mFloor = consumeFloor !== null
+		? m?.counter('ratelimit_storage_fallbacks_total', 'Rate-limit verdicts decided by the in-process floor while the store was unreachable')
+		: undefined;
 
 	// Per-connection keying uses a WeakMap to avoid leaks
 	const wsKeys = new WeakMap();
@@ -199,25 +283,40 @@ export function createRateLimit(client, options) {
 			}
 			const key = resolveKey(ws);
 			const tenantId = tenant ? tenant(ws) : null;
+			// Resolved before the try so a tenant-id validation throw surfaces
+			// to the caller and can never be mistaken for a storage failure.
+			const bk = bucketKey(key, tenantId);
 
-			const result = await withBreaker(b, () =>
-				redis.eval(CONSUME_SCRIPT, 1, bucketKey(key, tenantId), points, interval, cost, blockDuration)
-			);
+			let verdict;
+			try {
+				const result = await withBreaker(b, () =>
+					redis.eval(CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration)
+				);
+				verdict = { allowed: result[0] === 1, remaining: result[1], resetMs: result[2] };
+			} catch (err) {
+				if (consumeFloor === null) throw err;
+				mFloor?.inc();
+				if (!warnedStorageFloor) {
+					warnedStorageFloor = true;
+					console.warn(
+						'redis ratelimit: store unreachable; deciding on the in-process floor. ' +
+						'Limits hold per instance while degraded (N instances allow up to N times ' +
+						'the floor budget); cross-instance state resumes when the store recovers. ' +
+						'This warning fires once.'
+					);
+				}
+				verdict = consumeFloor(bk, cost);
+			}
 
-			const allowed = result[0] === 1;
 			const labels = labelTenants ? { tenant_id: tenantId || '' } : undefined;
-			if (allowed) {
+			if (verdict.allowed) {
 				mAllowed?.inc(labels);
 			} else {
 				mDenied?.inc(labels);
 				maybeWarnProxyCollapse(key);
 			}
 
-			return {
-				allowed,
-				remaining: result[1],
-				resetMs: result[2]
-			};
+			return verdict;
 		},
 
 		async reset(key, tenantId) {

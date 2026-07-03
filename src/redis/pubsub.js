@@ -387,6 +387,11 @@ export function createPubSubBus(client, options = {}) {
 				get presence() { return platform.presence; },
 				get crdt() { return platform.crdt; },
 				get smooth() { return platform.smooth; },
+				// Clock-fence convention (attachClockFence): layers that stamp
+				// or order by this instance's clock read it to stand down while
+				// the clock is fenced. Live getter so post-wrap attachment
+				// propagates.
+				get clockFence() { return platform.clockFence; },
 				// The topic-broadcast cluster coordinator (createTopicBroadcast),
 				// attached by app init like the other plugins. Live getter so
 				// post-wrap assignment propagates; realtime detects it on the wrapped

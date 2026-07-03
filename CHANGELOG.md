@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.40] - 2026-07-03
+
+### Added
+
+- **`localFloorOnStorageFailure` on the Redis rate limiter - degraded verdicts instead of rejected promises.** `consume()` used to reject to the caller whenever Redis was unreachable or the breaker was open, making every caller invent its own outage posture. With the opt-in floor, the verdict is decided on an in-process token bucket with the same semantics (init at full, interval refill, `blockDuration` bans), bounded at 10k LRU-evicted entries. `true` reuses the configured points/interval; `{ points?, interval? }` sets a tighter per-instance budget (e.g. `points / instanceCount` keeps the fleet-wide allowance roughly constant while degraded - the honest worst case is N instances allowing N times the floor budget). Floor state never leaks back into Redis; admin ops (`reset`/`ban`/`unban`/`clear`/`purgeUser`) are operator actions and still reject while the store is down. Floor-decided verdicts count in `ratelimit_storage_fallbacks_total` and the first one logs a one-shot warning. Off by default: today's reject-to-caller behavior is unchanged unless set.
+- **Clock-skew self-fencing (`fence` option) + the `platform.clockFence` convention.** The skew sampler could only measure: `onTrip` fired and nothing else happened, leaving a drifted clock free to keep corrupting whatever it stamps. With `fence` set, the sampler holds a FENCED state with hysteresis - entered after 2 consecutive trip-level samples (one bad sample never sheds authority), released after 3 consecutive below-warn samples, with the warn..trip band holding the current state and failed samples changing nothing. Surface: `fenced()`, an `onFence(fenced)` transition callback, and a `platform_clock_fenced` gauge. `attachClockFence(platform, sampler)` installs it as `platform.clockFence`, both bus wraps forward it as a live getter, and clustered `live.smooth` (svelte-realtime >= 0.6.0-next.63) consumes it by standing its topic authority down through the shipped lease-takeover path. `onFence` is also the escalation hook for a hard shed (exit under a supervisor, flip a health check).
+
+### Fixed
+
+- **Capability-cookie verification is timing-uniform across failure causes.** `decode()` returned before any HMAC for a malformed or expired cookie but computed one or two HMACs for a wrong signature - a timing oracle separating "expired or malformed" from "wrong secret" even though the returned boolean is uniform. The signature is now verified FIRST (the constant-work step) with expiry checked after, and malformed inputs burn one dummy sign-and-compare before failing, so a rejection's cause is no longer separable by the presence or absence of HMAC work. Behavior is unchanged: the same cookies verify, the same cookies fail, and the single `invalid` metric reason stays (an `expired` split would be sender-forgeable).
+
 ## [0.6.0-next.39] - 2026-06-28
 
 ### Fixed

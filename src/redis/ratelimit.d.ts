@@ -29,6 +29,20 @@ export interface RedisRateLimitOptions {
 	 * single-tenant deploy (byte-identical).
 	 */
 	tenant?: (ws: any) => string | null | undefined;
+	/**
+	 * Opt-in degraded mode for `consume()`: when Redis is unreachable (or the
+	 * breaker is open), decide on an in-process token bucket with the same
+	 * semantics instead of rejecting the promise. `true` reuses the configured
+	 * points/interval; the object form sets a tighter per-instance budget
+	 * (e.g. `points / instanceCount` keeps the fleet-wide allowance roughly
+	 * constant while degraded). Floor state is per process, so N instances
+	 * allow up to N times the floor budget in the worst case. Admin ops
+	 * (`reset` / `ban` / `unban` / `clear` / `purgeUser`) still reject while
+	 * the store is down - only the request-path verdict degrades. When a
+	 * metrics registry is configured, floor-decided verdicts count in
+	 * `ratelimit_storage_fallbacks_total`. @default false
+	 */
+	localFloorOnStorageFailure?: boolean | { points?: number; interval?: number };
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */

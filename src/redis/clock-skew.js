@@ -47,6 +47,18 @@ const DEFAULT_TRIP_MS = 500;
  * @property {(skewMs: number) => void} [onWarn] - Called when `warnMs <= |skew| < tripMs`.
  * @property {(skewMs: number) => void} [onTrip] - Called when `|skew| >= tripMs`.
  * @property {(err: Error) => void} [onError] - Called when a sample fails (Redis error). The last good gauge value is retained.
+ * @property {boolean | { tripSamples?: number, releaseSamples?: number }} [fence=false] -
+ *   Opt-in self-fencing: turn the trip threshold from an alert into a state.
+ *   The sampler enters the FENCED state after `tripSamples` (default 2)
+ *   consecutive trip-level samples - one bad sample must never shed authority
+ *   - and releases after `releaseSamples` (default 3) consecutive below-warn
+ *   samples (warn-level samples hold the current state; the hysteresis gap is
+ *   deliberate). While fenced, `fenced()` reads true; consumers that stamp or
+ *   order by this instance's clock should stand down and let a healthy
+ *   instance take over (`attachClockFence` + the smooth authority gate consume
+ *   it that way). A failed sample never changes fence state - losing the
+ *   measurement is not evidence of drift.
+ * @property {(fenced: boolean) => void} [onFence] - Called on every fence-state transition.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  */
@@ -54,6 +66,7 @@ const DEFAULT_TRIP_MS = 500;
 /**
  * @typedef {Object} ClockSkewSampler
  * @property {() => number | null} current - The most recent signed skew in milliseconds, or `null` before the first successful sample.
+ * @property {() => boolean} fenced - Whether the sampler is in the FENCED state (always false when the `fence` option is off).
  * @property {() => Promise<number | null>} sample - Run one sample immediately and return the signed median skew (or `null` on failure). Also updates the gauge and fires callbacks.
  * @property {() => Promise<void>} stop - Stop the interval and await any in-flight sample. Idempotent. Never throws.
  */
@@ -124,26 +137,60 @@ export function createClockSkewSampler(client, options = {}) {
 	if (!Number.isFinite(warnMs) || warnMs < 0 || !Number.isFinite(tripMs) || tripMs < 0) {
 		throw new Error('clock-skew: warnMs and tripMs must be non-negative numbers (ms)');
 	}
-	for (const name of ['onSkew', 'onWarn', 'onTrip', 'onError']) {
+	for (const name of ['onSkew', 'onWarn', 'onTrip', 'onError', 'onFence']) {
 		if (options[name] !== undefined && typeof options[name] !== 'function') {
 			throw new Error(`clock-skew: ${name} must be a function`);
+		}
+	}
+	const fenceOpt = options.fence;
+	let fenceEnabled = false;
+	let fenceTripSamples = 2;
+	let fenceReleaseSamples = 3;
+	if (fenceOpt !== undefined && fenceOpt !== false) {
+		if (fenceOpt !== true && (typeof fenceOpt !== 'object' || fenceOpt === null)) {
+			throw new Error('clock-skew: fence must be a boolean or { tripSamples?, releaseSamples? }');
+		}
+		fenceEnabled = true;
+		if (fenceOpt !== true) {
+			fenceTripSamples = fenceOpt.tripSamples ?? 2;
+			fenceReleaseSamples = fenceOpt.releaseSamples ?? 3;
+			if (!Number.isInteger(fenceTripSamples) || fenceTripSamples < 1
+				|| !Number.isInteger(fenceReleaseSamples) || fenceReleaseSamples < 1) {
+				throw new Error('clock-skew: fence tripSamples and releaseSamples must be positive integers');
+			}
 		}
 	}
 
 	const redis = client.redis;
 	const breaker = options.breaker;
-	const { onSkew, onWarn, onTrip, onError } = options;
+	const { onSkew, onWarn, onTrip, onError, onFence } = options;
 
 	const m = options.metrics;
 	const mSkew = m?.gauge(
 		'platform_clock_skew_ms',
 		'Signed clock skew of this instance wall clock relative to the Redis server clock, in milliseconds (positive = local clock ahead of Redis). The median of several round-trip-compensated Redis TIME reads.'
 	);
+	const mFenced = fenceEnabled ? m?.gauge(
+		'platform_clock_fenced',
+		'Whether this instance has self-fenced on clock skew (1 = fenced: stamping/ordering authority stood down until the skew clears)'
+	) : undefined;
+	mFenced?.set(0);
 
 	let lastSkew = null;
 	let stopped = false;
 	let timer = null;
 	let inFlight = null;
+	let fenced = false;
+	let tripStreak = 0;
+	let calmStreak = 0;
+
+	/** @param {boolean} next */
+	function setFenced(next) {
+		if (fenced === next) return;
+		fenced = next;
+		mFenced?.set(next ? 1 : 0);
+		if (onFence) { try { onFence(next); } catch { /* swallow */ } }
+	}
 
 	/** Run one sample. Resolves to the signed median skew, or null on failure. */
 	async function sample() {
@@ -175,6 +222,24 @@ export function createClockSkewSampler(client, options = {}) {
 				if (onTrip) { try { onTrip(skew); } catch { /* swallow */ } }
 			} else if (abs >= warnMs) {
 				if (onWarn) { try { onWarn(skew); } catch { /* swallow */ } }
+			}
+			if (fenceEnabled) {
+				// Enter on consecutive trips, release on consecutive calm
+				// (below-warn) samples; a warn-level sample holds the current
+				// state, so the warn..trip band is the hysteresis gap.
+				if (abs >= tripMs) {
+					tripStreak++;
+					calmStreak = 0;
+					if (tripStreak >= fenceTripSamples) setFenced(true);
+				} else {
+					tripStreak = 0;
+					if (abs < warnMs) {
+						calmStreak++;
+						if (calmStreak >= fenceReleaseSamples) setFenced(false);
+					} else {
+						calmStreak = 0;
+					}
+				}
 			}
 			return skew;
 		} catch (err) {
@@ -213,7 +278,29 @@ export function createClockSkewSampler(client, options = {}) {
 
 	return {
 		current: () => lastSkew,
+		fenced: () => fenced,
 		sample,
 		stop
 	};
+}
+
+/**
+ * Attach a sampler's fence surface to the platform as the `clockFence`
+ * convention, so framework layers that stamp or order by this instance's
+ * clock (the smooth authority renewal gate today) can stand down while the
+ * clock is untrustworthy. `bus.wrap` forwards it, so the wrapped platform a
+ * clustered app hands to the framework carries it too.
+ *
+ * @param {any} platform
+ * @param {ClockSkewSampler} sampler
+ */
+export function attachClockFence(platform, sampler) {
+	if (!platform || typeof platform !== 'object') {
+		throw new Error('clock-skew: attachClockFence requires a platform object');
+	}
+	if (!sampler || typeof sampler.fenced !== 'function') {
+		throw new Error('clock-skew: attachClockFence requires a sampler with a fenced() surface (set the fence option)');
+	}
+	platform.clockFence = { fenced: sampler.fenced };
+	return platform;
 }

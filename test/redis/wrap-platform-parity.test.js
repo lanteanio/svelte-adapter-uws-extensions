@@ -463,6 +463,26 @@ describe('Framework conventions: bus wraps preserve app-stashed properties', () 
 		expect(wrapped.crdt).toBe(crdt);
 	});
 
+	it('pubsub wrap forwards platform.clockFence as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createPubSubBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.clockFence).toBeUndefined();
+
+		const clockFence = { fenced: () => true };
+		platform.clockFence = clockFence;
+		expect(wrapped.clockFence).toBe(clockFence);
+	});
+
+	it('sharded wrap forwards platform.clockFence as a live getter', () => {
+		const platform = mockPlatform();
+		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);
+		expect(wrapped.clockFence).toBeUndefined();
+
+		const clockFence = { fenced: () => true };
+		platform.clockFence = clockFence;
+		expect(wrapped.clockFence).toBe(clockFence);
+	});
+
 	it('sharded wrap forwards platform.crdt as a live getter', () => {
 		const platform = mockPlatform();
 		const wrapped = createShardedBus(mockRedisClient('test:')).wrap(platform);

@@ -179,3 +179,128 @@ describe('clock-skew sampler', () => {
 		expect(() => createClockSkewSampler(client, { onSkew: 42 })).toThrow(/onSkew/);
 	});
 });
+
+describe('clock-skew fence', () => {
+	// A client whose per-call skew is scripted: shift[i] is subtracted from the
+	// local clock for read i, so each sample() sees the scripted skew.
+	function scriptedClient(shifts) {
+		let i = 0;
+		return fakeClient(async () => {
+			const shift = shifts[Math.min(i++, shifts.length - 1)];
+			if (shift instanceof Error) throw shift;
+			return timeReplyFor(LOCAL_MS - shift);
+		});
+	}
+
+	it('fenced() is false and no fence gauge registers when the option is off', async () => {
+		pinLocalClock(LOCAL_MS);
+		const metrics = createMetrics();
+		const sampler = createClockSkewSampler(
+			scriptedClient([900]), { metrics, samples: 1, immediate: false }
+		);
+		await sampler.sample();
+		await sampler.stop();
+		expect(sampler.fenced()).toBe(false);
+		expect(metrics.serialize()).not.toContain('platform_clock_fenced');
+	});
+
+	it('enters the fence only after consecutive trip-level samples', async () => {
+		pinLocalClock(LOCAL_MS);
+		const transitions = [];
+		const metrics = createMetrics();
+		const sampler = createClockSkewSampler(
+			scriptedClient([900, 900]),
+			{ metrics, samples: 1, immediate: false, fence: true, onFence: (f) => transitions.push(f) }
+		);
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(false); // one bad sample never sheds authority
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(true);
+		expect(transitions).toEqual([true]);
+		expect(metrics.serialize()).toContain('platform_clock_fenced 1');
+		await sampler.stop();
+	});
+
+	it('a single trip between calm samples never fences', async () => {
+		pinLocalClock(LOCAL_MS);
+		const sampler = createClockSkewSampler(
+			scriptedClient([900, 10, 900, 10]),
+			{ samples: 1, immediate: false, fence: true }
+		);
+		for (let i = 0; i < 4; i++) await sampler.sample();
+		expect(sampler.fenced()).toBe(false);
+		await sampler.stop();
+	});
+
+	it('releases only after consecutive below-warn samples; warn-level holds the fence', async () => {
+		pinLocalClock(LOCAL_MS);
+		const transitions = [];
+		const sampler = createClockSkewSampler(
+			// 2x trip -> fenced; then warn-level (holds); then 3x calm -> released.
+			scriptedClient([900, 900, 200, 10, 10, 10]),
+			{ samples: 1, immediate: false, fence: true, onFence: (f) => transitions.push(f) }
+		);
+		await sampler.sample();
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(true);
+		await sampler.sample(); // warn band: fence holds, calm streak resets
+		expect(sampler.fenced()).toBe(true);
+		await sampler.sample();
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(true); // two calm samples are not enough
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(false);
+		expect(transitions).toEqual([true, false]);
+		await sampler.stop();
+	});
+
+	it('a failed sample never changes fence state', async () => {
+		pinLocalClock(LOCAL_MS);
+		const sampler = createClockSkewSampler(
+			scriptedClient([900, new Error('redis down'), 900]),
+			{ samples: 1, immediate: false, fence: true }
+		);
+		await sampler.sample(); // trip 1
+		await sampler.sample(); // error: not evidence either way
+		expect(sampler.fenced()).toBe(false);
+		await sampler.sample(); // trip 2: the error preserved the streak, it did not reset it
+		expect(sampler.fenced()).toBe(true);
+		await sampler.stop();
+	});
+
+	it('honors custom streak thresholds and validates them', async () => {
+		pinLocalClock(LOCAL_MS);
+		const sampler = createClockSkewSampler(
+			scriptedClient([900]),
+			{ samples: 1, immediate: false, fence: { tripSamples: 1 } }
+		);
+		await sampler.sample();
+		expect(sampler.fenced()).toBe(true);
+		await sampler.stop();
+
+		const client = scriptedClient([0]);
+		expect(() => createClockSkewSampler(client, { fence: 'yes' })).toThrow(/fence/);
+		expect(() => createClockSkewSampler(client, { fence: { tripSamples: 0 } })).toThrow(/tripSamples/);
+		expect(() => createClockSkewSampler(client, { onFence: 42 })).toThrow(/onFence/);
+	});
+});
+
+describe('attachClockFence', () => {
+	it('attaches the fence surface as platform.clockFence', async () => {
+		pinLocalClock(LOCAL_MS);
+		const sampler = createClockSkewSampler(
+			fakeClient(async () => timeReplyFor(LOCAL_MS - 900)),
+			{ samples: 1, immediate: false, fence: { tripSamples: 1 } }
+		);
+		const { attachClockFence } = await import('../../src/redis/clock-skew.js');
+		const platform = {};
+		attachClockFence(platform, sampler);
+		expect(platform.clockFence.fenced()).toBe(false);
+		await sampler.sample();
+		expect(platform.clockFence.fenced()).toBe(true);
+		await sampler.stop();
+
+		expect(() => attachClockFence(null, sampler)).toThrow(/platform/);
+		expect(() => attachClockFence({}, {})).toThrow(/fenced/);
+	});
+});

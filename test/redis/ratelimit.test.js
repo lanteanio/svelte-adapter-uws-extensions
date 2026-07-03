@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createRateLimit } from '../../src/redis/ratelimit.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 function mockWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -466,6 +468,145 @@ describe('redis ratelimit', () => {
 			await lim.consume(ws);
 			expect((await lim.consume(ws)).allowed).toBe(false);
 			expect(warnSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('localFloorOnStorageFailure', () => {
+		/** A client whose every Redis call fails, as during an outage. */
+		function downClient() {
+			return {
+				redis: { eval: () => Promise.reject(new Error('redis down')) },
+				key: (s) => 'test:' + s
+			};
+		}
+
+		let warnSpy;
+		let wallMs;
+
+		beforeEach(() => {
+			warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			wallMs = 1_000_000;
+			setRuntimeEnv({ clock: {
+				now: () => wallMs,
+				monotonic: () => wallMs,
+				wallEpoch: () => wallMs
+			} });
+		});
+
+		afterEach(() => {
+			resetRuntimeEnv();
+		});
+
+		it('rejects to the caller by default (floor off)', async () => {
+			const lim = createRateLimit(downClient(), { points: 5, interval: 1000 });
+			await expect(lim.consume(mockWs({ ip: '1.2.3.4' }))).rejects.toThrow('redis down');
+		});
+
+		it('validates the option shape', () => {
+			expect(() => createRateLimit(downClient(), { points: 5, interval: 1000, localFloorOnStorageFailure: 'yes' }))
+				.toThrow('localFloorOnStorageFailure');
+			expect(() => createRateLimit(downClient(), { points: 5, interval: 1000, localFloorOnStorageFailure: { points: 0 } }))
+				.toThrow('positive integer');
+			expect(() => createRateLimit(downClient(), { points: 5, interval: 1000, localFloorOnStorageFailure: { interval: -1 } }))
+				.toThrow('positive number');
+		});
+
+		it('decides on the in-process bucket while the store is down', async () => {
+			const lim = createRateLimit(downClient(), { points: 2, interval: 60000, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			const denied = await lim.consume(ws);
+			expect(denied.allowed).toBe(false);
+			expect(denied.resetMs).toBeGreaterThan(0);
+		});
+
+		it('keeps distinct keys on distinct floor buckets', async () => {
+			const lim = createRateLimit(downClient(), { points: 1, interval: 60000, localFloorOnStorageFailure: true });
+			expect((await lim.consume(mockWs({ ip: '1.1.1.1' }))).allowed).toBe(true);
+			expect((await lim.consume(mockWs({ ip: '2.2.2.2' }))).allowed).toBe(true);
+			expect((await lim.consume(mockWs({ ip: '1.1.1.1' }))).allowed).toBe(false);
+		});
+
+		it('refills the floor bucket after the interval', async () => {
+			const lim = createRateLimit(downClient(), { points: 1, interval: 60000, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			wallMs += 60001;
+			expect((await lim.consume(ws)).allowed).toBe(true);
+		});
+
+		it('applies blockDuration bans on the floor', async () => {
+			const lim = createRateLimit(downClient(), { points: 1, interval: 1000, blockDuration: 120000, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			const banned = await lim.consume(ws);
+			expect(banned.allowed).toBe(false);
+			expect(banned.resetMs).toBe(120000);
+			// The interval refill alone does not lift a ban.
+			wallMs += 5000;
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			wallMs += 120001;
+			expect((await lim.consume(ws)).allowed).toBe(true);
+		});
+
+		it('honors a tighter per-instance floor budget', async () => {
+			const lim = createRateLimit(downClient(), {
+				points: 10, interval: 60000,
+				localFloorOnStorageFailure: { points: 1 }
+			});
+			const ws = mockWs({ ip: '1.2.3.4' });
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+		});
+
+		it('counts floor verdicts in the fallback metric alongside allow/deny', async () => {
+			const metrics = createMetrics();
+			const lim = createRateLimit(downClient(), { points: 1, interval: 60000, metrics, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await lim.consume(ws);
+			await lim.consume(ws);
+			const out = metrics.serialize();
+			expect(out).toContain('ratelimit_storage_fallbacks_total 2');
+			expect(out).toContain('ratelimit_allowed_total 1');
+			expect(out).toContain('ratelimit_denied_total 1');
+		});
+
+		it('warns once, not per verdict', async () => {
+			const lim = createRateLimit(downClient(), { points: 5, interval: 1000, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await lim.consume(ws);
+			await lim.consume(ws);
+			const floorWarns = warnSpy.mock.calls.filter(
+				(c) => String(c[0]).includes('in-process floor')
+			);
+			expect(floorWarns.length).toBe(1);
+		});
+
+		it('covers the breaker-open fast path, not only the eval rejection', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+			const lim = createRateLimit(downClient(), { points: 5, interval: 1000, breaker, localFloorOnStorageFailure: true });
+			const ws = mockWs({ ip: '1.2.3.4' });
+			// First call fails through eval and trips the breaker; the second
+			// is rejected synchronously by the open breaker. Both degrade.
+			expect((await lim.consume(ws)).allowed).toBe(true);
+			expect(breaker.isHealthy).toBe(false);
+			expect((await lim.consume(ws)).allowed).toBe(true);
+		});
+
+		it('still surfaces a tenant-id validation error, never floors it', async () => {
+			const lim = createRateLimit(downClient(), {
+				points: 5, interval: 1000,
+				tenant: () => 'a\0b',
+				localFloorOnStorageFailure: true
+			});
+			await expect(lim.consume(mockWs({ ip: '1.2.3.4' }))).rejects.toThrow('NUL');
+		});
+
+		it('leaves admin ops rejecting while the store is down', async () => {
+			const lim = createRateLimit(downClient(), { points: 5, interval: 1000, localFloorOnStorageFailure: true });
+			await expect(lim.ban('1.2.3.4')).rejects.toThrow('redis down');
 		});
 	});
 });

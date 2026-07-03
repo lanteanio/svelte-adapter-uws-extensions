@@ -1084,6 +1084,9 @@ export async function message(ws, { data, platform }) {
 | `interval` | *required* | Refill interval in ms |
 | `blockDuration` | `0` | Auto-ban duration in ms (0 = no ban) |
 | `keyBy` | `'ip'` | `'ip'`, `'connection'`, or a function |
+| `localFloorOnStorageFailure` | `false` | Degraded mode for `consume()`: decide on an in-process token bucket while Redis is unreachable (or the breaker is open) instead of rejecting the promise. `true` reuses `points`/`interval`; `{ points?, interval? }` sets a tighter per-instance budget. |
+
+> **Degraded verdicts.** Without the floor, a Redis outage rejects every `consume()` promise and the caller decides (usually fail-closed). With it, limits keep being enforced per instance with the same semantics (refill, `blockDuration` bans) - the worst case is N instances allowing N times the floor budget until the store recovers, which is why a tighter per-instance budget (`points / instanceCount`) is offered. Floor state never leaks back into Redis; admin ops (`reset` / `ban` / `unban` / `clear`) still reject while degraded. Floor-decided verdicts count in `ratelimit_storage_fallbacks_total` when a metrics registry is configured, and the first degraded verdict logs a one-shot warning.
 
 > **`keyBy: 'ip'` behind a proxy.** In `'ip'` mode (the default) the bucket key is `userData.remoteAddress`, which the adapter resolves from `ADDRESS_HEADER` / `XFF_DEPTH`. If the server sits behind an address-rewriting proxy (a docker userland-proxy, an L4 load balancer, a non-XFF proxy) and `ADDRESS_HEADER` is unset, every client arrives as the same gateway address and the per-IP bucket collapses into one shared global bucket. Set `ADDRESS_HEADER` (and `XFF_DEPTH` for an X-Forwarded-For chain) so the real client IP is resolved, or pass an explicit `keyBy`. The limiter logs a one-shot warning the first time it denies on a loopback/private key while `ADDRESS_HEADER` is unset.
 
@@ -2085,6 +2088,8 @@ It reads the exact wall clock through the package's runtime seam - not the coars
 | `onWarn` | - | Called when `warnMs <= |skew| < tripMs`. |
 | `onTrip` | - | Called when `|skew| >= tripMs`. |
 | `onError` | - | Called when a sample fails (Redis error). The last good gauge value is retained. |
+| `fence` | `false` | Opt-in self-fencing: `true` or `{ tripSamples?: 2, releaseSamples?: 3 }`. Turns the trip threshold from an alert into a state (see below). |
+| `onFence` | - | Called on every fence-state transition with the new boolean state. |
 | `breaker` | - | Optional circuit breaker. Sample failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
 | `metrics` | - | Optional Prometheus metrics registry. |
 
@@ -2093,14 +2098,31 @@ It reads the exact wall clock through the package's runtime seam - not the coars
 | Method | Description |
 |---|---|
 | `current()` | The most recent signed skew in milliseconds, or `null` before the first successful sample. |
+| `fenced()` | Whether the sampler is in the FENCED state (always `false` with the `fence` option off). |
 | `sample()` | Run one sample immediately and return the signed median skew (or `null` on failure). Also updates the gauge and fires callbacks. |
 | `stop()` | Stop the interval and await any in-flight sample. Idempotent. Never throws. |
+
+#### Self-fencing (`fence`)
+
+Measurement alone leaves a drifted clock free to keep corrupting whatever it stamps. With `fence` set, the sampler holds a FENCED state with hysteresis: it enters after `tripSamples` (default 2) **consecutive** trip-level samples - one bad sample never sheds authority - and releases after `releaseSamples` (default 3) consecutive below-warn samples; a warn-level sample holds the current state, so the warn..trip band is the deliberate hysteresis gap. A failed sample never changes fence state (losing the measurement is not evidence of drift).
+
+Wire it to the platform once and the framework consumes it:
+
+```js
+import { createClockSkewSampler, attachClockFence } from 'svelte-adapter-uws-extensions/redis/clock-skew';
+
+const skew = createClockSkewSampler(redis, { metrics, fence: true });
+attachClockFence(platform, skew); // platform.clockFence = { fenced }
+```
+
+`bus.wrap` forwards `platform.clockFence`, and clustered `live.smooth` reads it at every authority tick: a fenced owner stands down exactly as if it had crashed - it releases its ownership lease (so a healthy-clocked sibling claims immediately) and stops stamping, riding the already-shipped takeover machinery instead of a new failure mode. Single-instance deployments have no sibling to hand off to; there the fence surfaces only through the gauge and `onFence` - which is also the escalation hook if you want a hard shed (`onFence: (f) => { if (f) process.exit(1); }` under a supervisor that restarts, or flip your load balancer's health check).
 
 #### Metrics
 
 | Metric | Description |
 |---|---|
 | `platform_clock_skew_ms` | Gauge of the signed clock skew of this instance's wall clock relative to the Redis server clock (positive = local ahead). The median of several round-trip-compensated Redis `TIME` reads. |
+| `platform_clock_fenced` | Gauge (0/1): whether this instance has self-fenced on clock skew (registered only with the `fence` option on). |
 
 > On a Redis Cluster client, `TIME` carries no key and is routed to an arbitrary node, so successive reads may sample different nodes. For a coarse drift gauge that is fine; pin to one node upstream if you need per-node attribution.
 

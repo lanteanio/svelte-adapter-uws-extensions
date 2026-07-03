@@ -40,6 +40,20 @@ export interface ClockSkewSamplerOptions {
 	 * retained.
 	 */
 	onError?: (err: Error) => void;
+	/**
+	 * Opt-in self-fencing: turn the trip threshold from an alert into a state.
+	 * The sampler enters the FENCED state after `tripSamples` (default 2)
+	 * consecutive trip-level samples and releases after `releaseSamples`
+	 * (default 3) consecutive below-warn samples; warn-level samples hold the
+	 * current state (deliberate hysteresis). While fenced, `fenced()` reads
+	 * true and the `platform_clock_fenced` gauge reads 1; consumers that stamp
+	 * or order by this instance's clock stand down (`attachClockFence` + the
+	 * clustered `live.smooth` authority gate consume it that way). A failed
+	 * sample never changes fence state. @default false
+	 */
+	fence?: boolean | { tripSamples?: number; releaseSamples?: number };
+	/** Called on every fence-state transition. */
+	onFence?: (fenced: boolean) => void;
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
 }
@@ -51,6 +65,11 @@ export interface ClockSkewSampler {
 	 */
 	current(): number | null;
 	/**
+	 * Whether the sampler is in the FENCED state. Always `false` when the
+	 * `fence` option is off.
+	 */
+	fenced(): boolean;
+	/**
 	 * Run one sample immediately and return the signed median skew (or `null` on
 	 * failure). Also updates the gauge and fires callbacks.
 	 */
@@ -60,6 +79,19 @@ export interface ClockSkewSampler {
 	 */
 	stop(): Promise<void>;
 }
+
+/**
+ * Attach a sampler's fence surface to the platform as `platform.clockFence`,
+ * so framework layers that stamp or order by this instance's clock (the
+ * clustered `live.smooth` authority renewal gate today) stand down while the
+ * clock is untrustworthy. `bus.wrap` forwards it, so the wrapped platform a
+ * clustered app hands to the framework carries it too. Requires a sampler
+ * constructed with the `fence` option. Returns the platform.
+ */
+export function attachClockFence(
+	platform: object,
+	sampler: ClockSkewSampler
+): object;
 
 /**
  * Create a clock-skew sampler that measures this instance's wall clock against

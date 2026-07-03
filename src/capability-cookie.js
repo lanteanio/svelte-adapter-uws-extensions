@@ -262,36 +262,43 @@ export function capabilityCookie(options) {
 	 *
 	 * @param {string} value
 	 */
+	// A malformed cookie exits before any real verification; burn one
+	// signature + compare over fixed inputs first so "unparseable" is not
+	// separable from "wrong signature" by the missing HMAC's timing.
+	function burnAndFail() {
+		safeEqual(sign(secret, '', 0, ''), 'x');
+		return null;
+	}
+
 	function decode(value) {
 		if (typeof value !== 'string') return null;
 		const parts = value.split('.');
-		if (parts.length !== 4) return null;
+		if (parts.length !== 4) return burnAndFail();
 		const [sidB64, issuedRaw, salt, presentedSig] = parts;
 
 		let sessionId;
 		try {
 			sessionId = unb64u(sidB64);
 		} catch {
-			return null;
+			return burnAndFail();
 		}
 		const issuedAt = Number(issuedRaw);
-		if (!Number.isInteger(issuedAt) || issuedAt <= 0) return null;
+		if (!Number.isInteger(issuedAt) || issuedAt <= 0) return burnAndFail();
 
-		// Expiry is independent of the secret: an expired cookie is invalid even
-		// under the current secret.
-		if (now() - issuedAt > ttlMs) return null;
-
+		// Signature FIRST: authentication is the constant-work step, so every
+		// parseable cookie costs the same HMAC work whether it turns out to be
+		// expired or forged - the check order no longer separates the two by
+		// timing. Expiry stays independent of the secret: an expired cookie is
+		// invalid even when signed with the current key.
 		const expectCurrent = sign(secret, sessionId, issuedAt, salt);
-		if (safeEqual(expectCurrent, presentedSig)) {
-			return { sessionId, issuedAt };
-		}
-		if (previousSecret) {
+		let authentic = safeEqual(expectCurrent, presentedSig);
+		if (!authentic && previousSecret) {
 			const expectPrev = sign(previousSecret, sessionId, issuedAt, salt);
-			if (safeEqual(expectPrev, presentedSig)) {
-				return { sessionId, issuedAt };
-			}
+			authentic = safeEqual(expectPrev, presentedSig);
 		}
-		return null;
+		if (!authentic) return null;
+		if (now() - issuedAt > ttlMs) return null;
+		return { sessionId, issuedAt };
 	}
 
 	function serializeCookie(value) {
@@ -340,8 +347,9 @@ export function capabilityCookie(options) {
 			// posture, so it counts regardless of `required`. Expired cookies
 			// from idle real users land here too (`refresh()` on page responses
 			// keeps live users out of this bucket); expiry is deliberately not
-			// its own reason - decode checks it before the signature, so the
-			// split would be forgeable by the sender.
+			// its own reason - `issuedAt` is sender-supplied, so an "expired"
+			// bucket would be forgeable, and decode's rejection is uniform
+			// (signature-first, same HMAC work) across every failure cause.
 			const ok = decode(value) !== null;
 			if (!ok) mMisses?.inc({ reason: 'invalid' });
 			return ok;

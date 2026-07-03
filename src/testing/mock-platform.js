@@ -57,6 +57,10 @@ export function mockPlatform() {
 		// reads `platform.smooth` (the cross-instance smooth coordinator). Default
 		// `undefined`; the wrap-parity test drives the forward-when-set behavior.
 		smooth: undefined,
+		// Framework-convention slot: layers that stamp or order by this
+		// instance's clock read `platform.clockFence` (attachClockFence) to
+		// stand down while the clock is fenced. Default undefined = no fence.
+		clockFence: undefined,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
