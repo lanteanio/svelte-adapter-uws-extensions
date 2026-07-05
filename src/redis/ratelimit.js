@@ -16,6 +16,10 @@ import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
 import { wallEpoch } from '../shared/runtime.js';
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
+import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
+
+export { createEmergencyScaleOps as createRateLimitEmergency } from './emergency-scale.js';
+export { createCompositeRateLimit } from './composite-ratelimit.js';
 
 // Upper bound on in-process floor buckets so a keyed flood during an outage
 // cannot exhaust memory; least-recently-touched entries are evicted first.
@@ -32,19 +36,25 @@ const FLOOR_MAX_ENTRIES = 10000;
  * @param {number} maxPoints
  * @param {number} interval
  * @param {number} blockDuration
+ * @param {(() => number) | null} [getScale] - emergency scale source (the
+ *   limiter's cached reader), so an incident clamp keeps applying on the
+ *   floor path while the store is unreachable. Same effective-budget math as
+ *   the Lua: max(1, floor(maxPoints * scale)) with a mid-window clamp.
  * @returns {(key: string, cost: number) => ConsumeResult}
  */
-function createLocalFloorBucket(maxPoints, interval, blockDuration) {
+export function createLocalFloorBucket(maxPoints, interval, blockDuration, getScale) {
 	/** @type {Map<string, { points: number, resetAt: number, bannedUntil: number }>} */
 	const buckets = new Map();
 	return function consumeLocal(key, cost) {
 		const nowMs = wallEpoch();
+		const scale = getScale ? getScale() : 1;
+		const effMax = scale > 0 && scale !== 1 ? Math.max(1, Math.floor(maxPoints * scale)) : maxPoints;
 		let entry = buckets.get(key);
 		if (entry !== undefined) {
 			// Reinsert on touch: insertion order then doubles as LRU order.
 			buckets.delete(key);
 		} else {
-			entry = { points: maxPoints, resetAt: nowMs + interval, bannedUntil: 0 };
+			entry = { points: effMax, resetAt: nowMs + interval, bannedUntil: 0 };
 		}
 		buckets.set(key, entry);
 		if (buckets.size > FLOOR_MAX_ENTRIES) {
@@ -54,8 +64,11 @@ function createLocalFloorBucket(maxPoints, interval, blockDuration) {
 			return { allowed: false, remaining: 0, resetMs: entry.bannedUntil - nowMs };
 		}
 		if (entry.resetAt <= nowMs) {
-			entry.points = maxPoints;
+			entry.points = effMax;
 			entry.resetAt = nowMs + interval;
+		}
+		if (entry.points > effMax) {
+			entry.points = effMax;
 		}
 		if (entry.points >= cost) {
 			entry.points -= cost;
@@ -182,11 +195,18 @@ export function createRateLimit(client, options) {
 		if (typeof floorInterval !== 'number' || !Number.isFinite(floorInterval) || floorInterval <= 0) {
 			throw new Error('redis ratelimit: localFloorOnStorageFailure.interval must be a positive number');
 		}
-		consumeFloor = createLocalFloorBucket(floorPoints, floorInterval, blockDuration);
+		consumeFloor = createLocalFloorBucket(floorPoints, floorInterval, blockDuration, () => emergencyScale.current());
 	}
 	let warnedStorageFloor = false;
 
 	const redis = client.redis;
+
+	// The fleet-wide emergency factor: read through a lazily-refreshed cache
+	// (at most one background GET per refresh window, never per check) and
+	// applied inside the consume script as an effective-budget argument. The
+	// same cached value feeds the floor path above, so a clamp survives a
+	// store outage. Neutral (1) when the key is absent - zero-config.
+	const emergencyScale = createEmergencyScaleReader(client, options.emergency);
 
 	// Version prefix for Redis keys. Different script versions use different
 	// key spaces so rolling deployments with algorithm changes don't produce
@@ -290,7 +310,7 @@ export function createRateLimit(client, options) {
 			let verdict;
 			try {
 				const result = await withBreaker(b, () =>
-					redis.eval(CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration)
+					redis.eval(CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
 				);
 				verdict = { allowed: result[0] === 1, remaining: result[1], resetMs: result[2] };
 			} catch (err) {
@@ -358,6 +378,15 @@ export function createRateLimit(client, options) {
 		async clear(tenantId) {
 			const suffix = tenantId ? tenantId + '\0*' : '*';
 			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:' + suffix)));
-		}
+		},
+
+		// Operator surface for the fleet-wide emergency factor. `set(0.2)`
+		// tightens every limiter sharing this Redis to 20% of its configured
+		// budget within the readers' refresh window (~1s); `set` applies a
+		// one-hour TTL by default so a forgotten incident clamp expires on its
+		// own. Shared across every limiter instance on the same client - any
+		// instance (or the standalone createRateLimitEmergency export) can
+		// flip it.
+		emergency: createEmergencyScaleOps(client)
 	};
 }

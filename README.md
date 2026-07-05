@@ -787,6 +787,48 @@ Two additional counters track the diff-protocol behavior:
 | `presence_diff_frames_total{topic="..."}` | `diff` frames published to topic subscribers. Compared against `presence_joins_total` + `presence_leaves_total` it tells you how much per-tick coalescing the buffer is doing - the bigger the gap, the more bandwidth saved versus per-event broadcast. |
 | `presence_diff_coalesced_total{topic="..."}` | Buffered diff entries overwritten by a later op in the same tick. A non-zero rate confirms the same-key collapse is working (e.g. a user reconnecting fast enough to leave-then-join in one tick). Zero is also a valid state under steady traffic. |
 
+#### Self-preservation (mass-disconnect guard)
+
+A correlated mass disconnect - an upstream network blip, a proxy restart, a
+load-balancer hiccup - kills a large share of an instance's sockets in the
+same instant. Those users are not gone; they are already reconnecting. Without
+a guard, the next heartbeat tick would broadcast a leave for every one of them
+and every roster in the fleet would flap empty and refill seconds later.
+
+The guard is ON by default: when one heartbeat tick finds **`threshold`**
+(default 15%) or more of the tracked sockets simultaneously dead - and at
+least **`minPopulation`** (default 8) sockets are tracked, so a small
+population cannot read as a ratio - the tick treats it as a network event and
+**holds** those evictions: no leave is broadcast, and the held members'
+cluster TTLs keep being refreshed, so a reconnecting client lands on an
+unbroken roster entry instead of a leave/join flap. A held socket whose user
+never reconnects is evicted for real when its hold expires (**`holdMaxMs`**,
+default 90000). Individually-dying sockets below the threshold evict
+immediately, exactly as before.
+
+```js
+const presence = createPresence(redis, {
+  key: 'id',
+  selfPreservation: {           // true (defaults) | false | options
+    threshold: 0.15,
+    minPopulation: 8,
+    holdMaxMs: 90000,
+    onChange: (active, { held, total }) => log.warn('presence self-preservation', { active, held, total })
+  }
+});
+
+presence.selfPreservation();    // { enabled, active, since, held } - sync, poll-safe
+```
+
+The deliberate trade: during a real mass departure that somehow arrives as
+silent socket deaths (not clean closes - those bypass the guard entirely),
+rosters show the departed for up to `holdMaxMs` longer. Stale-for-a-minute
+beats flapping the whole fleet, and `selfPreservation: false` restores
+unconditional immediate eviction. Observability: the
+`presence_self_preservation_active` / `presence_self_preservation_held` gauges,
+the `presence_self_preservation_activations_total` counter, the `onChange`
+callback, and the synchronous accessor.
+
 #### Keyspace cleanup mode
 
 By default a sync-only observer (a connection that called `presence.sync()` to watch a room without joining it) only learns about leaves when the tracking instance broadcasts a `diff` with the user in `leaves`. If the tracking instance crashes, the broadcast never fires and the observer's UI shows stale data until the page is reloaded.
@@ -1101,6 +1143,64 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 | `ban(key, duration?)` | Manually ban a key |
 | `unban(key)` | Remove a ban |
 | `clear()` | Reset all state |
+
+#### Emergency scale (incident switch)
+
+One shared factor retunes EVERY limiter on the same Redis - the application
+limiters, the composite limiter below, and the upgrade-admission bucket - within
+about a second, with no config rollout and no restart:
+
+```js
+// During an incident: tighten every limit to 20% of its configured budget.
+await limiter.emergency.set(0.2);            // expires after 1h by default
+await limiter.emergency.set(0.2, { ttlMs: 0 }); // persistent (clear explicitly)
+await limiter.emergency.clear();             // back to neutral
+await limiter.emergency.get();               // currently stored factor (1 = neutral)
+```
+
+```js
+// Ops script without a limiter instance: same shared key.
+import { createRateLimitEmergency } from 'svelte-adapter-uws-extensions/redis/ratelimit';
+await createRateLimitEmergency(redis).set(0.5);
+```
+
+How it behaves:
+
+- **Effective budget = `max(1, floor(points * factor))`**, applied at check time. `0.2` tightens every limit to 20%; `2` doubles them. A bucket already holding more points than the tightened budget is clamped down immediately - a mid-window tighten applies now, not at the next refill.
+- **Zero per-check cost.** Each instance reads the factor through a lazily-refreshed cache (at most one background `GET` per `refreshMs` window, default 1000ms) and passes it into the same one-roundtrip consume script as a plain argument. Propagation is bounded by the refresh window (~1s), and the cached read - not a key inside the script - is what keeps the check single-key and Redis Cluster slot-safe.
+- **Survives the store going down.** The cached factor keeps applying on the in-process floor paths, so an incident clamp does not silently vanish exactly when Redis is unreachable. A blip on the refresh read keeps the last-known factor (fail sticky), and a corrupt stored value reads as neutral rather than denying all traffic.
+- **Forgotten clamps expire.** `set()` applies a one-hour TTL by default; pass `{ ttlMs: 0 }` only when you want a standing factor.
+
+#### Composite limits (`createCompositeRateLimit`)
+
+A request is often bounded along several axes at once - the account it acts
+for, the endpoint it hits, the action it performs. Checking those as separate
+limiters races: a burst can pass one check on every in-flight request before
+the other counters increment. The composite limiter consults every dimension
+in ONE atomic script, most-strict-wins:
+
+```js
+import { createCompositeRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
+
+const limits = createCompositeRateLimit(redis, {
+  dimensions: {
+    account: { points: 100, interval: 60000, keyBy: (ws) => ws.getUserData().userId },
+    action:  { points: 10,  interval: 1000,  keyBy: () => 'send-message' },
+    ip:      { points: 300, interval: 60000, keyBy: 'ip' }
+  }
+});
+
+const { allowed, tripped, remaining, resetMs } = await limits.consume(ws);
+if (!allowed) {
+  // tripped names the dimension that denied ('account' | 'action' | 'ip')
+}
+```
+
+- **All or nothing.** A request is admitted only when EVERY dimension has budget, and consumes from all of them atomically - or from none, so a deny never skews the other counters. The verdict names the tripped dimension (declaration order decides when several would trip) and `remaining` reports every dimension's balance.
+- **`keyBy` is required per dimension** - each dimension must count along its own axis; there is no shared default that could silently collapse the composite into one budget checked N times.
+- **Per-dimension `blockDuration`** auto-bans just the dimension that tripped; `reset` / `ban` / `unban` take the dimension name; `clear(tenant?)` scopes to one tenant's space.
+- **Redis Cluster:** every dimension key for a check shares one hash tag (per tenant), which is what makes the multi-key script legal - and means one tenant's composite buckets live on one shard. That is the standard trade for atomic multi-scope limiting; size budgets so a single hot tenant's check rate fits one shard.
+- The emergency factor above scales every dimension, and `localFloorOnStorageFailure: true` gives the same all-or-nothing verdicts on in-process buckets while the store is down.
 
 ---
 

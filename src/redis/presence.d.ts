@@ -36,6 +36,28 @@ export interface RedisPresenceOptions {
 	 * plugin. Default: none (every `update()` field is durable).
 	 */
 	transient?: string[];
+	/**
+	 * Fleet-level self-preservation guard for correlated mass disconnects
+	 * (on by default). When one heartbeat tick finds `threshold` (default
+	 * 15%) or more of this instance's tracked sockets simultaneously dead -
+	 * and at least `minPopulation` (default 8) sockets are tracked, so a
+	 * small population cannot read as a ratio - that is treated as a network
+	 * event, not that many users leaving at once: those evictions are HELD
+	 * (cluster TTLs kept refreshed, no leave broadcast) for up to `holdMaxMs`
+	 * (default 90000), giving clients time to reconnect without a leave/join
+	 * flap across every roster. A held socket whose user never reconnects is
+	 * evicted when its hold expires. Individually-dying sockets below the
+	 * threshold evict immediately, exactly as before. `onChange(active,
+	 * { held, total })` fires on activation and release. Set `false` to
+	 * restore unconditional immediate eviction.
+	 * @default true
+	 */
+	selfPreservation?: boolean | {
+		threshold?: number;
+		minPopulation?: number;
+		holdMaxMs?: number;
+		onChange?: (active: boolean, info: { held: number; total: number }) => void;
+	};
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -128,6 +150,16 @@ export interface RedisPresenceTracker {
 	 * when a metrics registry is attached.
 	 */
 	metrics(): PresenceMetricsSnapshot;
+
+	/**
+	 * Live state of the mass-disconnect self-preservation guard: whether the
+	 * hold is active, since when (epoch ms), and how many dead sockets it
+	 * is currently holding from eviction. Synchronous - safe to poll from a
+	 * health endpoint or render as a degraded-banner source. Also exposed as
+	 * the gauges `presence_self_preservation_active` / `_held` and the
+	 * counter `presence_self_preservation_activations_total`.
+	 */
+	selfPreservation(): { enabled: boolean; active: boolean; since: number | null; held: number };
 
 	/**
 	 * Drain the pending diff buffer synchronously. The diff buffer

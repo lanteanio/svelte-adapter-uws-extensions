@@ -107,6 +107,44 @@ export function createPresenceState(client, options = {}) {
 	}
 	const presenceTtlMs = presenceTtl * 1000;
 
+	// Fleet-level self-preservation guard (on by default). When one heartbeat
+	// tick finds a large fraction of this instance's tracked sockets
+	// simultaneously dead, that is a network event (an upstream blip, a
+	// proxy restart), not that many users leaving at once: instead of
+	// broadcasting a leave storm and flapping every roster, the tick HOLDS
+	// those evictions - keeping the members' cluster TTLs refreshed - for up
+	// to `holdMaxMs`, giving clients time to reconnect and their roster
+	// entries to survive the gap. Individually-dying sockets (below the
+	// threshold, or when the population is too small to read a ratio from)
+	// evict exactly as before. `selfPreservation: false` restores the
+	// previous evict-immediately behavior.
+	const spOpt = options.selfPreservation;
+	/** @type {{ threshold: number, minPopulation: number, holdMaxMs: number, onChange: Function | null } | null} */
+	let selfPreservation = { threshold: 0.15, minPopulation: 8, holdMaxMs: 90000, onChange: null };
+	if (spOpt === false) {
+		selfPreservation = null;
+	} else if (spOpt !== undefined && spOpt !== true) {
+		if (typeof spOpt !== 'object' || spOpt === null) {
+			throw new Error('redis presence: selfPreservation must be true, false, or { threshold?, minPopulation?, holdMaxMs?, onChange? }');
+		}
+		const threshold = spOpt.threshold ?? 0.15;
+		if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0 || threshold > 1) {
+			throw new Error('redis presence: selfPreservation.threshold must be a number in (0, 1]');
+		}
+		const minPopulation = spOpt.minPopulation ?? 8;
+		if (!Number.isInteger(minPopulation) || minPopulation < 2) {
+			throw new Error('redis presence: selfPreservation.minPopulation must be an integer >= 2');
+		}
+		const holdMaxMs = spOpt.holdMaxMs ?? 90000;
+		if (typeof holdMaxMs !== 'number' || !Number.isFinite(holdMaxMs) || holdMaxMs <= 0) {
+			throw new Error('redis presence: selfPreservation.holdMaxMs must be a positive number (ms)');
+		}
+		if (spOpt.onChange !== undefined && typeof spOpt.onChange !== 'function') {
+			throw new Error('redis presence: selfPreservation.onChange must be a function (active, info) => void');
+		}
+		selfPreservation = { threshold, minPopulation, holdMaxMs, onChange: spOpt.onChange ?? null };
+	}
+
 	const instanceId = randomBytes(8).toString('hex');
 	const redis = client.redis;
 
@@ -157,6 +195,9 @@ export function createPresenceState(client, options = {}) {
 	const mKeyspaceCleanups = m?.counter('presence_keyspace_cleanups_total', 'Topics whose hash removal triggered a local empty-list emit');
 	const mDiffFrames = m?.counter('presence_diff_frames_total', 'diff frames published to topic subscribers', ['topic']);
 	const mDiffCoalesced = m?.counter('presence_diff_coalesced_total', 'Buffered diff entries overwritten by a later op in the same tick', ['topic']);
+	const mSelfPreserveActive = m?.gauge('presence_self_preservation_active', 'Whether the mass-disconnect self-preservation hold is active on this instance (0/1)');
+	const mSelfPreserveHeld = m?.gauge('presence_self_preservation_held', 'Dead sockets currently held from eviction by the self-preservation guard');
+	const mSelfPreserveActivations = m?.counter('presence_self_preservation_activations_total', 'Times the self-preservation hold activated');
 
 	const warnSensitive = createSensitiveWarner('redis/presence');
 
@@ -247,6 +288,10 @@ export function createPresenceState(client, options = {}) {
 		mKeyspaceCleanups,
 		mDiffFrames,
 		mDiffCoalesced,
+		mSelfPreserveActive,
+		mSelfPreserveHeld,
+		mSelfPreserveActivations,
+		selfPreservation,
 		warnSensitive,
 		wsTopics,
 		localCounts,

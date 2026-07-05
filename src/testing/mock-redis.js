@@ -786,6 +786,12 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('defaultPoints') && script.includes('defaultInterval')) {
 					return evalBanScript(args);
 				}
+				// Composite multi-dimension rate limit (all-or-nothing consume).
+				// Dispatched before the single-bucket token bucket: both scripts
+				// mention bannedUntil, the marker disambiguates.
+				if (script.includes('COMPOSITE_CONSUME')) {
+					return evalCompositeRateLimit(numKeys, args);
+				}
 				// Rate limit script (token bucket)
 				if (script.includes('bannedUntil')) {
 					return evalRateLimit(args);
@@ -995,10 +1001,17 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		// Rate limit Lua script simulation
 		function evalRateLimit(args) {
 			const key = args[0];
-			const maxPoints = Number(args[1]);
+			let maxPoints = Number(args[1]);
 			const interval = Number(args[2]);
 			const cost = Number(args[3]);
 			const blockDuration = Number(args[4]);
+			// ARGV[5]: emergency scale factor (optional). Mirror the Lua:
+			// effective budget max(1, floor(maxPoints * scale)) + a mid-window
+			// clamp below.
+			const scale = args.length > 5 ? Number(args[5]) : 1;
+			if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
+				maxPoints = Math.max(1, Math.floor(maxPoints * scale));
+			}
 			// Mirror the real Lua: obtain the timestamp via the TIME command
 			// (clock-skew-safe) rather than a raw wall read, so this matches
 			// CONSUME_SCRIPT and follows the seam clock under a harness.
@@ -1026,6 +1039,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				resetAt = now + interval;
 			}
 
+			if (pts > maxPoints) {
+				pts = maxPoints;
+			}
+
 			if (pts >= cost) {
 				pts -= cost;
 				h.set('points', String(pts));
@@ -1046,6 +1063,103 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			h.set('resetAt', String(resetAt));
 			h.set('bannedUntil', String(bannedUntil));
 			return [0, Math.max(0, pts), resetAt - now];
+		}
+
+		// Composite multi-dimension rate limit simulation. Mirrors
+		// COMPOSITE_CONSUME_SCRIPT: load/refill/clamp every dimension without
+		// writing, deny on the first tripped dimension (writing only its
+		// auto-ban), or consume from all of them.
+		// args: [key_1..key_N, n, cost, scale, (maxPoints, interval, blockDuration) x N]
+		function evalCompositeRateLimit(numKeys, args) {
+			const keys = args.slice(0, numKeys);
+			const argv = args.slice(numKeys);
+			const n = Number(argv[0]);
+			const cost = Number(argv[1]);
+			let scale = Number(argv[2]);
+			if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+			const now = evalTimeNowMs();
+
+			const pts = [];
+			const resetAt = [];
+			const banned = [];
+			const maxPts = [];
+			const intervalOf = [];
+			const blockOf = [];
+			let tripped = 0;
+			let retryMs = 0;
+
+			for (let i = 0; i < n; i++) {
+				let maxPoints = Number(argv[3 + i * 3]);
+				const interval = Number(argv[4 + i * 3]);
+				const blockDuration = Number(argv[5 + i * 3]);
+				if (scale !== 1) {
+					maxPoints = Math.max(1, Math.floor(maxPoints * scale));
+				}
+				maxPts[i] = maxPoints;
+				intervalOf[i] = interval;
+				blockOf[i] = blockDuration;
+
+				const h = hashes.get(keys[i]);
+				let p = h && h.has('points') ? Number(h.get('points')) : null;
+				let r = h && h.has('resetAt') ? Number(h.get('resetAt')) : null;
+				let b = h && h.has('bannedUntil') ? Number(h.get('bannedUntil')) : null;
+				if (p === null) {
+					p = maxPoints;
+					r = now + interval;
+					b = 0;
+				}
+				if (r <= now) {
+					p = maxPoints;
+					r = now + interval;
+				}
+				if (p > maxPoints) {
+					p = maxPoints;
+				}
+				pts[i] = p;
+				resetAt[i] = r;
+				banned[i] = b;
+
+				if (tripped === 0) {
+					if (b > now) {
+						tripped = i + 1;
+						retryMs = b - now;
+					} else if (p < cost) {
+						tripped = i + 1;
+						retryMs = blockDuration > 0 ? blockDuration : r - now;
+					}
+				}
+			}
+
+			if (tripped !== 0) {
+				const t = tripped - 1;
+				if (blockOf[t] > 0 && banned[t] <= now) {
+					if (!hashes.has(keys[t])) hashes.set(keys[t], new Map());
+					const h = hashes.get(keys[t]);
+					h.set('points', String(pts[t]));
+					h.set('resetAt', String(resetAt[t]));
+					h.set('bannedUntil', String(now + blockOf[t]));
+				}
+				const out = [0, tripped, retryMs];
+				for (let i = 0; i < n; i++) {
+					out.push(banned[i] > now ? 0 : Math.max(0, pts[i]));
+				}
+				return out;
+			}
+
+			let minReset = null;
+			for (let i = 0; i < n; i++) {
+				pts[i] -= cost;
+				if (!hashes.has(keys[i])) hashes.set(keys[i], new Map());
+				const h = hashes.get(keys[i]);
+				h.set('points', String(pts[i]));
+				h.set('resetAt', String(resetAt[i]));
+				h.set('bannedUntil', String(banned[i]));
+				const untilReset = resetAt[i] - now;
+				if (minReset === null || untilReset < minReset) minReset = untilReset;
+			}
+			const out = [1, 0, minReset];
+			for (let i = 0; i < n; i++) out.push(pts[i]);
+			return out;
 		}
 
 		// Ban Lua script simulation

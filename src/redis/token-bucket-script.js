@@ -11,6 +11,13 @@
  * ARGV[2] = interval (ms)
  * ARGV[3] = cost
  * ARGV[4] = blockDuration (ms)
+ * ARGV[5] = emergency scale factor (optional; default 1). The caller reads
+ *           the shared factor via its cached reader and passes it as a plain
+ *           argument - an ARGV, not a KEYS entry, so the script stays
+ *           single-key and Redis Cluster slot-safe. The effective budget is
+ *           max(1, floor(maxPoints * scale)); a bucket already holding more
+ *           points than the scaled budget is clamped down immediately, so a
+ *           mid-window tighten applies now, not at the next refill.
  *
  * Uses Redis TIME internally for clock-skew-safe timestamps.
  *
@@ -27,6 +34,11 @@ local cost = tonumber(ARGV[3])
 local blockDuration = tonumber(ARGV[4])
 if maxPoints == nil or interval == nil or cost == nil or blockDuration == nil then
   return redis.error_reply('CONSUME: maxPoints/interval/cost/blockDuration must be numeric')
+end
+local scale = tonumber(ARGV[5])
+if scale ~= nil and scale > 0 and scale ~= 1 then
+  maxPoints = math.floor(maxPoints * scale)
+  if maxPoints < 1 then maxPoints = 1 end
 end
 
 -- Use Redis server time to avoid clock skew between app server and Redis
@@ -54,6 +66,12 @@ end
 if resetAt <= now then
   points = maxPoints
   resetAt = now + interval
+end
+
+-- A tightened emergency budget applies mid-window: never hold more points
+-- than the (scaled) budget allows right now.
+if points > maxPoints then
+  points = maxPoints
 end
 
 -- Try to consume

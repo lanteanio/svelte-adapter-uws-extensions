@@ -47,6 +47,7 @@ import {
 	randomBytes,
 	now,
 	monotonicNow,
+	wallEpoch,
 	setTimer,
 	clearTimer,
 	setIntervalTimer,
@@ -118,7 +119,8 @@ export function createPresence(client, options = {}) {
 		keyField, select, heartbeatInterval, presenceTtlMs, transientFields, publicData,
 		emit, emitTo, instanceId, redis, keyspaceNotifications, ensureRedis74, b, mt,
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
-		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, warnSensitive, wsTopics, localCounts,
+		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, mSelfPreserveActive, mSelfPreserveHeld,
+		mSelfPreserveActivations, selfPreservation, warnSensitive, wsTopics, localCounts,
 		localData, syncObservers, syncCounts, topicHashKey, userHashKey, eventChannel,
 		coalesceHgetall
 	} = ctx;
@@ -151,6 +153,17 @@ export function createPresence(client, options = {}) {
 	// and clean up stale fields from crashed instances
 	/** @type {Set<string>} */
 	const activeTopics = new Set();
+	// Self-preservation hold state: dead sockets whose eviction is deferred
+	// because they died as part of a suspected network event (a large
+	// fraction of the tracked population failing the probe in one tick).
+	// While held, a socket stays in wsTopics/localData, so the refresh loop
+	// below keeps its cluster TTLs alive - the roster survives the blip and
+	// the user's reconnect lands on an unbroken entry instead of a
+	// leave/join flap. Keyed by ws; value is the hold start (monotonic ms).
+	/** @type {Map<any, number>} */
+	const spHeld = new Map();
+	let spActive = false;
+	let spSince = 0;
 	const heartbeatTimer = setIntervalTimer(() => {
 		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
@@ -161,12 +174,65 @@ export function createPresence(client, options = {}) {
 		// refresh loop below never touches it.
 		if (subscriberCtx.activePlatform) {
 			const dead = [];
+			let total = 0;
 			for (const [ws] of wsTopics) {
+				total++;
 				try { ws.getBufferedAmount(); } catch { dead.push(ws); }
 			}
-			for (const ws of dead) {
-				// Full leave (sync Step 1 + async Step 2 fire-and-forget)
-				tracker.leave(ws, subscriberCtx.activePlatform).catch(() => {});
+			if (selfPreservation === null) {
+				for (const ws of dead) {
+					// Full leave (sync Step 1 + async Step 2 fire-and-forget)
+					tracker.leave(ws, subscriberCtx.activePlatform).catch(() => {});
+				}
+			} else {
+				// A socket held earlier that has since left the tracked map
+				// (a late close handler ran, or clear() swept it) needs no
+				// eviction from here.
+				for (const ws of spHeld.keys()) {
+					if (!wsTopics.has(ws)) spHeld.delete(ws);
+				}
+				const fresh = [];
+				for (const ws of dead) {
+					if (!spHeld.has(ws)) fresh.push(ws);
+				}
+				// A dead socket never revives (the probe throwing means the
+				// native handle is gone), so the guard's protection is TIME:
+				// hold the leave storm while the users behind a correlated
+				// mass drop reconnect on new sockets. The activation test is
+				// per-tick simultaneity - a slow trickle of individual deaths
+				// never reads as a network event. Hold timing runs on the
+				// wall clock (the operator-facing axis the hold window is
+				// specified in), not the tick-latency monotonic read.
+				const nowWall = wallEpoch();
+				if (!spActive
+					&& total >= selfPreservation.minPopulation
+					&& fresh.length / total >= selfPreservation.threshold) {
+					spActive = true;
+					spSince = nowWall;
+					mSelfPreserveActivations?.inc();
+					try { selfPreservation.onChange?.(true, { held: fresh.length, total }); } catch { /* app hook must not break the tick */ }
+				}
+				if (spActive) {
+					for (const ws of fresh) spHeld.set(ws, nowWall);
+					for (const [ws, heldAt] of spHeld) {
+						if (nowWall - heldAt >= selfPreservation.holdMaxMs) {
+							// The hold window elapsed with no reconnect visible
+							// to us: this one really left. Evict for real.
+							spHeld.delete(ws);
+							tracker.leave(ws, subscriberCtx.activePlatform).catch(() => {});
+						}
+					}
+					if (spHeld.size === 0) {
+						spActive = false;
+						try { selfPreservation.onChange?.(false, { held: 0, total }); } catch { /* app hook must not break the tick */ }
+					}
+				} else {
+					for (const ws of fresh) {
+						tracker.leave(ws, subscriberCtx.activePlatform).catch(() => {});
+					}
+				}
+				mSelfPreserveActive?.set(spActive ? 1 : 0);
+				mSelfPreserveHeld?.set(spHeld.size);
 			}
 		}
 
@@ -1063,6 +1129,22 @@ export function createPresence(client, options = {}) {
 			};
 		},
 
+		/**
+		 * Live state of the mass-disconnect self-preservation guard: whether
+		 * the hold is active, since when (epoch ms), and how many dead
+		 * sockets it is currently holding from eviction. Always inactive when
+		 * the guard is disabled. Synchronous - safe to poll from a health
+		 * endpoint or render as a degraded banner source.
+		 */
+		selfPreservation() {
+			return {
+				enabled: selfPreservation !== null,
+				active: spActive,
+				since: spActive ? spSince : null,
+				held: spHeld.size
+			};
+		},
+
 		flushDiffs() {
 			flushPendingDiffs();
 		},
@@ -1150,6 +1232,8 @@ export function createPresence(client, options = {}) {
 			syncCounts.clear();
 			disposeDiffBuffer();
 			connCounter = 0;
+			spHeld.clear();
+			spActive = false;
 		},
 
 		destroy() {

@@ -18,6 +18,12 @@ export interface UpgradeBucketOptions {
 	elevated?: UpgradeBudget;
 	/** Budget override for the 'siege' posture. Inherits the resolved 'elevated' when omitted. */
 	siege?: UpgradeBudget;
+	/**
+	 * Tuning for the fleet-wide emergency scale reader (the same shared
+	 * factor the application rate limiter honors also scales upgrade
+	 * admission). @default { refreshMs: 1000 }
+	 */
+	emergency?: { refreshMs?: number };
 	/** Fail-open circuit breaker wrapping the Redis call. */
 	breaker?: CircuitBreaker;
 	/** Prometheus metrics registry. */

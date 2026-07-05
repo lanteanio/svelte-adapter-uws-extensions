@@ -28,6 +28,7 @@
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
 import { withBreaker } from '../shared/breaker.js';
 import { now } from '../shared/runtime.js';
+import { createEmergencyScaleReader } from './emergency-scale.js';
 
 /** Refill interval for a per-minute budget, in milliseconds. */
 const MINUTE_MS = 60000;
@@ -146,6 +147,12 @@ export function createUpgradeBucket(client, options) {
 
 	const redis = client.redis;
 
+	// The fleet-wide emergency factor also scales upgrade admission: an
+	// incident clamp that tightens every application limiter but leaves the
+	// front door wide open would be half a defense. Same cached reader, same
+	// effective-budget math, neutral when the key is absent.
+	const emergencyScale = createEmergencyScaleReader(client, options.emergency);
+
 	// Version prefix isolates Lua-script key spaces across deploys, matching the
 	// application rate limiter so a rolling change never reads a stale layout.
 	const SCRIPT_VERSION = 'v1';
@@ -175,7 +182,8 @@ export function createUpgradeBucket(client, options) {
 						budget.perMinute,
 						MINUTE_MS,
 						1,
-						budget.blockDuration
+						budget.blockDuration,
+						emergencyScale.current()
 					)
 				);
 			} catch {
