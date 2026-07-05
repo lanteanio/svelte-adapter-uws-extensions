@@ -889,6 +889,10 @@ export function createShardedBus(client, options = {}) {
 				subscribe: platform.subscribe.bind(platform),
 				unsubscribe: platform.unsubscribe.bind(platform),
 				checkSubscribe: platform.checkSubscribe.bind(platform),
+				// Forwarded so a framework arming wire-subscribe authorization at init
+				// reaches the real adapter flag through the wrapped platform. Version-
+				// gated: an older adapter without it degrades to a no-op.
+				authorizeWireSubscribe: platform.authorizeWireSubscribe ? platform.authorizeWireSubscribe.bind(platform) : undefined,
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: platform.bufferedAmount.bind(platform),
 				get closedWsAborts() { return platform.closedWsAborts ?? 0; },

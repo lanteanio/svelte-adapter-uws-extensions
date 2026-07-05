@@ -15,6 +15,7 @@ export const PLATFORM_KEYS = Object.freeze([
 	'connections', 'requestId',
 	'pressure', 'protection', 'onPressure', 'onPublishRate',
 	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
+	'authorizeWireSubscribe',
 	'topic', 'topicEpoch',
 	'maxPayloadLength', 'bufferedAmount',
 	'closedWsAborts',
@@ -37,6 +38,7 @@ export function mockPlatform() {
 		subscribed: [],
 		unsubscribed: [],
 		checkedSubscribe: [],
+		wireSubscribeAuthorized: false,
 		connections: 0,
 		requestId: '',
 		// Mirror the adapter's default. `1024 * 1024` (1 MB) is the
@@ -177,6 +179,9 @@ export function mockPlatform() {
 			p.checkedSubscribe.push({ ws, topic });
 			return null;
 		},
+		authorizeWireSubscribe() {
+			p.wireSubscribeAuthorized = true;
+		},
 		topic(t) {
 			return {
 				publish(event, data) { p.publish(t, event, data); },
@@ -203,6 +208,7 @@ export function mockPlatform() {
 			p.subscribed.length = 0;
 			p.unsubscribed.length = 0;
 			p.checkedSubscribe.length = 0;
+			p.wireSubscribeAuthorized = false;
 		}
 	};
 	return p;

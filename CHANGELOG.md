@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.41] - 2026-07-05
+
+### Added
+
+- **The pub/sub bus now forwards `platform.authorizeWireSubscribe()` through the wrapped platform.** The adapter gained an opt-in wire-subscribe authorization policy (a client's raw `subscribe` frame is honored only for a topic the server already authorized for that connection); a framework arms it once at init via `platform.authorizeWireSubscribe()`. In a clustered deployment the framework holds the bus-wrapped platform, so the wrap (and the sharded-bus wrap) now forward this method to the real adapter. Version-gated (`? : undefined`): against an older adapter without the method the wrap simply omits it and the framework's optional-chained call is a no-op. The mock platform's parity surface (`PLATFORM_KEYS`) gains `authorizeWireSubscribe` so the CI wrap-parity test keeps both wraps honest.
+
 ## [0.6.0-next.40] - 2026-07-03
 
 ### Added
