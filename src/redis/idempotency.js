@@ -27,6 +27,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError } from '../shared/errors.js';
@@ -168,7 +169,7 @@ export function createIdempotencyStore(client, options = {}) {
 			const forgetTenant = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
 
 			const raw = await withBreaker(b, () =>
-				redis.eval(ACQUIRE_SCRIPT, 1, k, PENDING_SENTINEL, acquireTtl)
+				evalCached(redis, ACQUIRE_SCRIPT, 1, k, PENDING_SENTINEL, acquireTtl)
 			);
 
 			const status = raw[0];

@@ -17,6 +17,8 @@
  * @module svelte-adapter-uws-extensions/redis/fence
  */
 
+import { evalCached } from '../shared/eval-cached.js';
+
 /**
  * Lua: refresh the fence's TTL only if our value still owns the key.
  *
@@ -129,14 +131,14 @@ export function createRedisFence(client, options = {}) {
 			const key = fullKey(taskId);
 			validateFence(fence);
 			validateTtl(ttlSec);
-			const r = await redis.eval(HEARTBEAT_SCRIPT, 1, key, fence, ttlSec * 1000);
+			const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, key, fence, ttlSec * 1000);
 			return Number(r) === 1;
 		},
 
 		async release(taskId, fence) {
 			const key = fullKey(taskId);
 			validateFence(fence);
-			await redis.eval(RELEASE_SCRIPT, 1, key, fence);
+			await evalCached(redis, RELEASE_SCRIPT, 1, key, fence);
 		}
 	};
 }

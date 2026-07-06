@@ -19,6 +19,7 @@
  */
 
 import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
@@ -322,7 +323,7 @@ export function createGroup(client, name, options = {}) {
 			b?.guard();
 			let result;
 			try {
-				result = await redis.eval(
+				result = await evalCached(redis, 
 					JOIN_SCRIPT, 2, membersKey, closedKey,
 					effectiveMax, memberId, memberData, nowTs, memberTtlMs
 				);
@@ -478,7 +479,7 @@ export function createGroup(client, name, options = {}) {
 
 		async count() {
 			const nowTs = now();
-			return withBreaker(b, () => redis.eval(COUNT_SCRIPT, 1, membersKey, nowTs, memberTtlMs));
+			return withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, nowTs, memberTtlMs));
 		},
 
 		has(ws) {

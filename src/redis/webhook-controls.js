@@ -24,6 +24,7 @@
  */
 
 import { withBreaker } from '../shared/breaker.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { monotonicNow } from '../shared/runtime.js';
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
 
@@ -76,7 +77,7 @@ export function createRetryBudget(client, options = {}) {
 			const bk = client.key('whbudget:{' + String(key ?? '') + '}');
 			// CONSUME_SCRIPT returns [allowed, remaining, resetMs]; cost 1, no ban
 			// (blockDuration 0), no emergency scale.
-			const res = await withBreaker(b, () => redis.eval(CONSUME_SCRIPT, 1, bk, capacity, intervalMs, 1, 0));
+			const res = await withBreaker(b, () => evalCached(redis, CONSUME_SCRIPT, 1, bk, capacity, intervalMs, 1, 0));
 			return Array.isArray(res) && Number(res[0]) === 1;
 		}
 	};

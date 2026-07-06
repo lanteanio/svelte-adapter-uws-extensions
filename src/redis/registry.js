@@ -28,6 +28,7 @@
  */
 
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+import { evalCached } from '../shared/eval-cached.js';
 import {
 	randomBytes,
 	now as cachedNow,
@@ -438,7 +439,7 @@ export function createConnectionRegistry(client, options) {
 	async function deleteIfOurs(userId) {
 		const key = userKey(userId);
 		try {
-			await redis.eval(COMPARE_AND_DELETE, 1, key, instanceId);
+			await evalCached(redis, COMPARE_AND_DELETE, 1, key, instanceId);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -484,7 +485,7 @@ export function createConnectionRegistry(client, options) {
 	async function deleteSessionIfOurs(sessionId) {
 		const key = sessionKey(sessionId);
 		try {
-			await redis.eval(COMPARE_AND_DELETE, 1, key, instanceId);
+			await evalCached(redis, COMPARE_AND_DELETE, 1, key, instanceId);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);

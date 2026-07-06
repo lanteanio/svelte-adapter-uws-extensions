@@ -20,6 +20,7 @@
  */
 
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -275,7 +276,7 @@ export function createStreamReplay(client, options = {}) {
 			let result;
 			try {
 				result = await withBreaker(b, () =>
-					redis.eval(IDMP_PUBLISH_SCRIPT, 4, ik, sk, bk, ek,
+					evalCached(redis, IDMP_PUBLISH_SCRIPT, 4, ik, sk, bk, ek,
 						requestId, maxSize, ttl, idmpTtl, event, payload)
 				);
 			} catch (err) {
@@ -318,7 +319,7 @@ export function createStreamReplay(client, options = {}) {
 
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, event, payload)
+					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, event, payload)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {

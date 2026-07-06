@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.44] - 2026-07-06
+
+### Changed
+
+- **Hot Lua scripts now run through EVALSHA instead of shipping their full body every call.** Every direct `redis.eval(...)` call across the Redis plugins (the per-message rate limiter, presence, replay, groups, locks, leases, idempotency, CRDT, cursor cleanup, and the webhook controls) now routes through a shared `evalCached` helper that registers each unique script once via ioredis `defineCommand` and sends only its ~40-byte SHA per call, letting ioredis handle the EVALSHA send, the automatic NOSCRIPT reload, and per-node script loading on a Redis Cluster. Results, arguments, and error behavior are identical - a pure wire/parse optimization whose benefit grows with call frequency and script size (the rate-limiter CONSUME script is the hottest target). The helper works on any client shape - the `createRedisClient` wrapper or a raw `new Redis.Cluster(...)` a cluster deployment builds itself - and keeps its script cache per instance. One pipelined cleanup path (group member sweep) stays on plain `eval`. No API change and no configuration.
+
 ## [0.6.0-next.43] - 2026-07-06
 
 ### Added

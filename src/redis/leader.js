@@ -33,6 +33,7 @@
  */
 
 import { randomBytes, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
 
 const DEFAULT_KEY = 'leader';
@@ -141,7 +142,7 @@ export function createLeader(client, options = {}) {
 		if (stopped) return;
 		try {
 			if (_isLeader) {
-				const r = await redis.eval(LEASE_RENEW_SCRIPT, 1, fullKey, instanceId, leaseMs);
+				const r = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, fullKey, instanceId, leaseMs);
 				breaker?.success();
 				if (Number(r) === 1) {
 					mRenewals?.inc({ key_class: keyClass });
@@ -206,7 +207,7 @@ export function createLeader(client, options = {}) {
 
 		if (_isLeader) {
 			try {
-				await redis.eval(LEASE_RELEASE_SCRIPT, 1, fullKey, instanceId);
+				await evalCached(redis, LEASE_RELEASE_SCRIPT, 1, fullKey, instanceId);
 				breaker?.success();
 			} catch (err) {
 				// Best-effort: a release failure leaves the key in place

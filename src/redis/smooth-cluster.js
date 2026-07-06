@@ -59,6 +59,7 @@
  */
 
 import { randomBytes } from '../shared/runtime.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator, isValidBusTopic } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
 import { isCluster, keySlot } from '../shared/cluster.js';
@@ -435,7 +436,7 @@ export function createSmoothCluster(client, options = {}) {
 			const r = await redis.set(key, instanceId, 'NX', 'PX', leaseMs);
 			if (r === 'OK') return true; // newly acquired (free or expired)
 			// Held by someone: renew only if it is ours (compare-and-pexpire).
-			const renew = await redis.eval(LEASE_RENEW_SCRIPT, 1, key, instanceId, leaseMs);
+			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, leaseMs);
 			return Number(renew) === 1;
 		},
 
@@ -451,7 +452,7 @@ export function createSmoothCluster(client, options = {}) {
 		 */
 		async renewOwner(wireTopic) {
 			if (destroyed) return false;
-			const renew = await redis.eval(LEASE_RENEW_SCRIPT, 1, ownerKey(wireTopic), instanceId, leaseMs);
+			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, ownerKey(wireTopic), instanceId, leaseMs);
 			return Number(renew) === 1;
 		},
 
@@ -467,7 +468,7 @@ export function createSmoothCluster(client, options = {}) {
 		async releaseOwner(wireTopic) {
 			if (destroyed) return false;
 			try {
-				const released = await redis.eval(LEASE_RELEASE_SCRIPT, 1, ownerKey(wireTopic), instanceId);
+				const released = await evalCached(redis, LEASE_RELEASE_SCRIPT, 1, ownerKey(wireTopic), instanceId);
 				return Number(released) === 1;
 			} catch {
 				return false;

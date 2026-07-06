@@ -474,10 +474,14 @@ describe('redis ratelimit', () => {
 	describe('localFloorOnStorageFailure', () => {
 		/** A client whose every Redis call fails, as during an outage. */
 		function downClient() {
-			return {
-				redis: { eval: () => Promise.reject(new Error('redis down')) },
-				key: (s) => 'test:' + s
-			};
+			const down = () => Promise.reject(new Error('redis down'));
+			// evalCached (the shared helper) registers the script via defineCommand
+			// then invokes the generated command; a down backend rejects the call
+			// but defineCommand itself is local. Mirror that so the failure surfaces
+			// as the backend error, not a missing method.
+			const redis = { eval: down };
+			redis.defineCommand = (name) => { redis[name] = down; };
+			return { redis, key: (s) => 'test:' + s };
 		}
 
 		let warnSpy;

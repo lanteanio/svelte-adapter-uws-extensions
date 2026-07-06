@@ -54,6 +54,7 @@ import {
 	clearIntervalTimer
 } from '../shared/runtime.js';
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -362,7 +363,7 @@ export function createPresence(client, options = {}) {
 			// idempotent HSET refreshes its TTL.
 			const ts = now();
 			const value = JSON.stringify({ data: prevData, ts });
-			await redis.eval(
+			await evalCached(redis, 
 				JOIN_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
 				instanceId, key, value, ts, presenceTtlMs
 			).catch(() => {});
@@ -370,7 +371,7 @@ export function createPresence(client, options = {}) {
 			// This was the first local presence for this user on this topic.
 			// LEAVE_SCRIPT removes our instance's entry on the per-user hash
 			// and clears the per-topic hash field if HLEN dropped to zero.
-			await redis.eval(
+			await evalCached(redis, 
 				LEAVE_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
 				instanceId, key
 			).catch(() => {});
@@ -433,7 +434,7 @@ export function createPresence(client, options = {}) {
 					if (b) { try { b.guard(); } catch { skipLeaveRedis = true; } }
 					if (!skipLeaveRedis) {
 						try {
-							userGone = await redis.eval(
+							userGone = await evalCached(redis, 
 								LEAVE_SCRIPT, 2,
 								userHashKey(topic, key), topicHashKey(topic),
 								instanceId, key
@@ -459,7 +460,7 @@ export function createPresence(client, options = {}) {
 							setLocalData(topicData, key, newest);
 							const ts = now();
 							try {
-								await redis.eval(
+								await evalCached(redis, 
 									JOIN_SCRIPT, 2,
 									userHashKey(topic, key), topicHashKey(topic),
 									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
@@ -592,7 +593,7 @@ export function createPresence(client, options = {}) {
 			setLocalData(topicData, key, newest);
 			const ts = now();
 			try {
-				await redis.eval(
+				await evalCached(redis, 
 					JOIN_SCRIPT, 2,
 					userHashKey(topic, key), topicHashKey(topic),
 					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
@@ -818,7 +819,7 @@ export function createPresence(client, options = {}) {
 				const ts = now();
 				const value = JSON.stringify({ data, ts });
 				try {
-					const wasEmpty = await redis.eval(
+					const wasEmpty = await evalCached(redis, 
 						JOIN_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key, value, ts, presenceTtlMs
@@ -840,7 +841,7 @@ export function createPresence(client, options = {}) {
 					// ws closed during the eval. Roll back our Redis write so
 					// the per-user hash entry does not linger past TTL, then
 					// surface the abort to the caller.
-					await redis.eval(
+					await evalCached(redis, 
 						LEAVE_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key
@@ -855,7 +856,7 @@ export function createPresence(client, options = {}) {
 				try {
 					const ts = now();
 					const value = JSON.stringify({ data, ts });
-					await redis.eval(
+					await evalCached(redis, 
 						JOIN_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key, value, ts, presenceTtlMs
@@ -899,7 +900,7 @@ export function createPresence(client, options = {}) {
 			// local cleanup and leave events. Just clean the Redis state.
 			if (!wsTopics.has(ws)) {
 				if (didRedisWrite) {
-					redis.eval(
+					evalCached(redis, 
 						LEAVE_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key
@@ -1073,7 +1074,7 @@ export function createPresence(client, options = {}) {
 				if (!skip) {
 					try {
 						const ts = now();
-						await redis.eval(
+						await evalCached(redis, 
 							UPDATE_SCRIPT, 1, topicHashKey(topic),
 							key, JSON.stringify(changedDurable), ts, presenceTtlMs
 						);

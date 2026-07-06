@@ -26,6 +26,7 @@
  */
 
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { now } from '../shared/runtime.js';
 import { createEmergencyScaleReader } from './emergency-scale.js';
@@ -175,7 +176,7 @@ export function createUpgradeBucket(client, options) {
 			let result;
 			try {
 				result = await withBreaker(b, () =>
-					redis.eval(
+					evalCached(redis, 
 						CONSUME_SCRIPT,
 						1,
 						bucketKey(key),

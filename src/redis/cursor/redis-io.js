@@ -15,6 +15,7 @@
  */
 
 import { now, setIntervalTimer, clearIntervalTimer } from '../../shared/runtime.js';
+import { evalCached } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
@@ -134,7 +135,7 @@ export function createRedisIo({
 		cleanupTimer = setIntervalTimer(() => {
 			const nowTs = now();
 			for (const topic of activeTopics) {
-				redis.eval(CLEANUP_SCRIPT, 1, hashKey(topic), nowTs, cursorTtlMs).catch((err) => {
+				evalCached(redis, CLEANUP_SCRIPT, 1, hashKey(topic), nowTs, cursorTtlMs).catch((err) => {
 					console.warn('cursor cleanup: stale removal failed for topic "' + topic + '":', err.message);
 				});
 			}

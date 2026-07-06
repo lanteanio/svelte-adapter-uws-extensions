@@ -33,6 +33,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { wallEpoch } from '../shared/runtime.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
@@ -386,7 +387,7 @@ export function createCompositeRateLimit(client, options) {
 				const argv = [dimList.length, cost, emergencyScale.current()];
 				for (const d of dimList) argv.push(d.points, d.interval, d.blockDuration);
 				const result = await withBreaker(b, () =>
-					redis.eval(COMPOSITE_CONSUME_SCRIPT, keys.length, ...keys, ...argv)
+					evalCached(redis, COMPOSITE_CONSUME_SCRIPT, keys.length, ...keys, ...argv)
 				);
 				const trippedIdx = Number(result[1]);
 				const remaining = {};

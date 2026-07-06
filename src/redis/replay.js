@@ -22,6 +22,7 @@
  */
 
 import { createStreamReplay } from './replay-stream.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplication } from '../shared/replay-helpers.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -222,7 +223,7 @@ export function createReplay(client, options = {}) {
 
 			try {
 				await withBreaker(b, () =>
-					redis.eval(PUBLISH_SCRIPT, 3, sk, bk, ek, topic, event, payload, maxSize, ttl)
+					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, topic, event, payload, maxSize, ttl)
 				);
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {

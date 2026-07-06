@@ -48,6 +48,7 @@
  */
 
 import { randomBytes } from '../shared/runtime.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT } from '../shared/lease-scripts.js';
 
@@ -206,7 +207,7 @@ export function createCrdtCluster(client, options = {}) {
 			const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
 			if (r === 'OK') return true; // newly acquired
 			// Held by someone: renew only if it is ours (compare-and-pexpire).
-			const renew = await redis.eval(LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
+			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
 			return Number(renew) === 1;
 		},
 

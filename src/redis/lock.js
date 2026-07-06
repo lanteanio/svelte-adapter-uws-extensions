@@ -18,6 +18,7 @@
  */
 
 import { assert } from '../shared/assert.js';
+import { evalCached } from '../shared/eval-cached.js';
 import {
 	randomBytes,
 	randomFloat,
@@ -204,7 +205,7 @@ export function createDistributedLock(client, options = {}) {
 		async function heartbeatTick() {
 			if (lost) return;
 			try {
-				const r = await redis.eval(HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
+				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
 				breaker?.success();
 				if (Number(r) !== 1) {
 					lost = true;
@@ -241,7 +242,7 @@ export function createDistributedLock(client, options = {}) {
 			);
 			if (!lost) {
 				try {
-					await redis.eval(RELEASE_SCRIPT, 1, fullK, fenceToken);
+					await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);
 					breaker?.success();
 				} catch (err) {
 					breaker?.failure(err);

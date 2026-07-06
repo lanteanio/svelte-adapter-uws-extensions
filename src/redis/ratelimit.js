@@ -12,6 +12,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
 import { wallEpoch } from '../shared/runtime.js';
@@ -310,7 +311,7 @@ export function createRateLimit(client, options) {
 			let verdict;
 			try {
 				const result = await withBreaker(b, () =>
-					redis.eval(CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
+					evalCached(redis, CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
 				);
 				verdict = { allowed: result[0] === 1, remaining: result[1], resetMs: result[2] };
 			} catch (err) {
@@ -364,7 +365,7 @@ export function createRateLimit(client, options) {
 			const dur = duration ?? (blockDuration || 60000);
 			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');
 			const bk = bucketKey(key, tenantId);
-			await withBreaker(b, () => redis.eval(BAN_SCRIPT, 1, bk, dur, points, interval));
+			await withBreaker(b, () => evalCached(redis, BAN_SCRIPT, 1, bk, dur, points, interval));
 			mBans?.inc(labelTenants ? { tenant_id: tenantId || '' } : undefined);
 		},
 
