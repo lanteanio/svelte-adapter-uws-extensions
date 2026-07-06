@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.43] - 2026-07-06
+
+### Added
+
+- **`redis/webhook-controls` - cluster-shared outbound-webhook delivery controls (retry budget + endpoint ejection).** svelte-realtime's outbound webhooks can now ration retries and eject a failing endpoint (svelte-realtime `0.6.0-next.72` / svelte-adapter-uws `0.6.0-next.61`); the adapter ships single-instance defaults, and this adds their Redis-backed cluster substitutes so a fleet shares one budget and one view of a down endpoint instead of each instance deciding alone. `createRetryBudget(redisClient, { capacity, intervalMs })` is a windowed token bucket per endpoint (reusing the audited token-bucket script the rate limiter uses); `createWebhookBreaker(redisClient, { failureThreshold, resetMs })` counts failures in a shared per-endpoint counter and opens the circuit once the combined fleet count crosses the threshold, healing after a half-open probe delivery succeeds. Both are keyed by the webhook registration id so one endpoint cannot trip or starve another, and both survive a leader transition (the state lives in Redis, not in the departed instance). Wire them with `configureWebhooks({ budget: createRetryBudget(client), breaker: createWebhookBreaker(client) })`. The breaker's `guard` is synchronous (the delivery path calls it inline) and reads a local view each `failure`/`success` round-trip refreshes from the shared counter; a backend blip degrades to no throttling / no ejection, never a broken delivery path.
+
 ## [0.6.0-next.42] - 2026-07-06
 
 ### Added
