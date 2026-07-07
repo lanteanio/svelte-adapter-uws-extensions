@@ -16,7 +16,14 @@ import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
 import { wallEpoch } from '../shared/runtime.js';
-import { CONSUME_SCRIPT } from './token-bucket-script.js';
+import {
+	CONSUME_SCRIPT,
+	PEEK_SCRIPT,
+	SLIDING_SCRIPT,
+	SLIDING_PEEK_SCRIPT,
+	GCRA_SCRIPT,
+	GCRA_PEEK_SCRIPT
+} from './token-bucket-script.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
 
 export { createEmergencyScaleOps as createRateLimitEmergency } from './emergency-scale.js';
@@ -27,12 +34,21 @@ export { createCompositeRateLimit } from './composite-ratelimit.js';
 const FLOOR_MAX_ENTRIES = 10000;
 
 /**
- * In-process token bucket mirroring CONSUME_SCRIPT's semantics (init at full,
- * ban check, interval refill, consume, ban-on-exhaust) so a verdict decided
- * on the floor matches what Redis would have said for a single instance.
- * State is per process: while degraded, N instances allow up to N times the
- * configured budget in the worst case, which is the deliberate trade against
- * denying everything (fail closed) or counting nothing (fail open).
+ * @typedef {Object} FloorBucket
+ * @property {(key: string, cost: number) => ConsumeResult} consume - Spend on
+ *   the in-process bucket (mutates state).
+ * @property {(key: string, cost: number) => ConsumeResult} peek - Report the
+ *   verdict a consume would return without mutating, initializing, or touching
+ *   any bucket (the read-only floor path for `peek()` during a store outage).
+ */
+
+/**
+ * In-process fixed-window bucket mirroring CONSUME_SCRIPT's semantics (init at
+ * full, ban check, interval refill, consume, ban-on-exhaust) so a verdict
+ * decided on the floor matches what Redis would have said for a single
+ * instance. State is per process: while degraded, N instances allow up to N
+ * times the configured budget in the worst case, which is the deliberate trade
+ * against denying everything (fail closed) or counting nothing (fail open).
  *
  * @param {number} maxPoints
  * @param {number} interval
@@ -41,47 +57,275 @@ const FLOOR_MAX_ENTRIES = 10000;
  *   limiter's cached reader), so an incident clamp keeps applying on the
  *   floor path while the store is unreachable. Same effective-budget math as
  *   the Lua: max(1, floor(maxPoints * scale)) with a mid-window clamp.
+ * @returns {FloorBucket}
+ */
+export function createWindowFloor(maxPoints, interval, blockDuration, getScale) {
+	/** @type {Map<string, { points: number, resetAt: number, bannedUntil: number }>} */
+	const buckets = new Map();
+	function effMaxNow() {
+		const scale = getScale ? getScale() : 1;
+		return scale > 0 && scale !== 1 ? Math.max(1, Math.floor(maxPoints * scale)) : maxPoints;
+	}
+	return {
+		consume(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			let entry = buckets.get(key);
+			if (entry !== undefined) {
+				// Reinsert on touch: insertion order then doubles as LRU order.
+				buckets.delete(key);
+			} else {
+				entry = { points: effMax, resetAt: nowMs + interval, bannedUntil: 0 };
+			}
+			buckets.set(key, entry);
+			if (buckets.size > FLOOR_MAX_ENTRIES) {
+				buckets.delete(buckets.keys().next().value);
+			}
+			if (entry.bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: entry.bannedUntil - nowMs };
+			}
+			if (entry.resetAt <= nowMs) {
+				entry.points = effMax;
+				entry.resetAt = nowMs + interval;
+			}
+			if (entry.points > effMax) {
+				entry.points = effMax;
+			}
+			if (entry.points >= cost) {
+				entry.points -= cost;
+				return { allowed: true, remaining: entry.points, resetMs: entry.resetAt - nowMs };
+			}
+			if (blockDuration > 0) {
+				entry.bannedUntil = nowMs + blockDuration;
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			return { allowed: false, remaining: Math.max(0, entry.points), resetMs: entry.resetAt - nowMs };
+		},
+		peek(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			const stored = buckets.get(key);
+			let points, resetAt, bannedUntil;
+			if (stored === undefined) {
+				points = effMax; resetAt = nowMs + interval; bannedUntil = 0;
+			} else {
+				points = stored.points; resetAt = stored.resetAt; bannedUntil = stored.bannedUntil;
+			}
+			if (bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: bannedUntil - nowMs };
+			}
+			if (resetAt <= nowMs) {
+				points = effMax; resetAt = nowMs + interval;
+			}
+			if (points > effMax) points = effMax;
+			if (points >= cost) {
+				return { allowed: true, remaining: points - cost, resetMs: resetAt - nowMs };
+			}
+			if (blockDuration > 0) {
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			return { allowed: false, remaining: Math.max(0, points), resetMs: resetAt - nowMs };
+		}
+	};
+}
+
+/**
+ * Backward-compatible alias for the fixed-window floor's consume function (the
+ * shape callers imported before the peek-capable floor landed).
+ * @param {number} maxPoints
+ * @param {number} interval
+ * @param {number} blockDuration
+ * @param {(() => number) | null} [getScale]
  * @returns {(key: string, cost: number) => ConsumeResult}
  */
 export function createLocalFloorBucket(maxPoints, interval, blockDuration, getScale) {
-	/** @type {Map<string, { points: number, resetAt: number, bannedUntil: number }>} */
+	return createWindowFloor(maxPoints, interval, blockDuration, getScale).consume;
+}
+
+/**
+ * In-process sliding-window-counter floor mirroring SLIDING_SCRIPT. Same
+ * effective-budget math and window roll as the Lua, evaluated on the exact
+ * wall-clock seam.
+ *
+ * @param {number} maxPoints
+ * @param {number} interval
+ * @param {number} blockDuration
+ * @param {(() => number) | null} [getScale]
+ * @returns {FloorBucket}
+ */
+export function createSlidingFloor(maxPoints, interval, blockDuration, getScale) {
+	/** @type {Map<string, { curr: number, prev: number, windowStart: number, bannedUntil: number }>} */
 	const buckets = new Map();
-	return function consumeLocal(key, cost) {
-		const nowMs = wallEpoch();
+	function effMaxNow() {
 		const scale = getScale ? getScale() : 1;
-		const effMax = scale > 0 && scale !== 1 ? Math.max(1, Math.floor(maxPoints * scale)) : maxPoints;
-		let entry = buckets.get(key);
-		if (entry !== undefined) {
-			// Reinsert on touch: insertion order then doubles as LRU order.
-			buckets.delete(key);
-		} else {
-			entry = { points: effMax, resetAt: nowMs + interval, bannedUntil: 0 };
+		return scale > 0 && scale !== 1 ? Math.max(1, Math.floor(maxPoints * scale)) : maxPoints;
+	}
+	function evict() {
+		if (buckets.size > FLOOR_MAX_ENTRIES) buckets.delete(buckets.keys().next().value);
+	}
+	return {
+		consume(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			const stored = buckets.get(key);
+			if (stored !== undefined) buckets.delete(key);
+			let curr, prev, windowStart, bannedUntil;
+			if (stored === undefined) {
+				curr = 0; prev = 0; windowStart = nowMs - (nowMs % interval); bannedUntil = 0;
+			} else {
+				curr = stored.curr; prev = stored.prev; windowStart = stored.windowStart; bannedUntil = stored.bannedUntil;
+			}
+			const entry = { curr, prev, windowStart, bannedUntil };
+			buckets.set(key, entry);
+			evict();
+			if (bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: bannedUntil - nowMs };
+			}
+			const winStartNow = nowMs - (nowMs % interval);
+			const elapsed = winStartNow - windowStart;
+			if (elapsed >= interval * 2) { prev = 0; curr = 0; windowStart = winStartNow; }
+			else if (elapsed >= interval) { prev = curr; curr = 0; windowStart = winStartNow; }
+			if (curr > effMax) curr = effMax;
+			const into = nowMs - windowStart;
+			let prevWeight = (interval - into) / interval;
+			if (prevWeight < 0) prevWeight = 0;
+			if (prevWeight > 1) prevWeight = 1;
+			const weighted = curr + prev * prevWeight;
+			const resetMs = windowStart + interval - nowMs;
+			if (weighted + cost <= effMax) {
+				curr = curr + cost;
+				entry.curr = curr; entry.prev = prev; entry.windowStart = windowStart; entry.bannedUntil = bannedUntil;
+				return { allowed: true, remaining: Math.max(0, Math.floor(effMax - weighted - cost)), resetMs };
+			}
+			if (blockDuration > 0) {
+				bannedUntil = nowMs + blockDuration;
+				entry.curr = curr; entry.prev = prev; entry.windowStart = windowStart; entry.bannedUntil = bannedUntil;
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			entry.curr = curr; entry.prev = prev; entry.windowStart = windowStart; entry.bannedUntil = bannedUntil;
+			return { allowed: false, remaining: Math.max(0, Math.floor(effMax - weighted)), resetMs };
+		},
+		peek(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			const stored = buckets.get(key);
+			let curr, prev, windowStart, bannedUntil;
+			if (stored === undefined) {
+				curr = 0; prev = 0; windowStart = nowMs - (nowMs % interval); bannedUntil = 0;
+			} else {
+				curr = stored.curr; prev = stored.prev; windowStart = stored.windowStart; bannedUntil = stored.bannedUntil;
+			}
+			if (bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: bannedUntil - nowMs };
+			}
+			const winStartNow = nowMs - (nowMs % interval);
+			const elapsed = winStartNow - windowStart;
+			if (elapsed >= interval * 2) { prev = 0; curr = 0; windowStart = winStartNow; }
+			else if (elapsed >= interval) { prev = curr; curr = 0; windowStart = winStartNow; }
+			if (curr > effMax) curr = effMax;
+			const into = nowMs - windowStart;
+			let prevWeight = (interval - into) / interval;
+			if (prevWeight < 0) prevWeight = 0;
+			if (prevWeight > 1) prevWeight = 1;
+			const weighted = curr + prev * prevWeight;
+			const resetMs = windowStart + interval - nowMs;
+			if (weighted + cost <= effMax) {
+				return { allowed: true, remaining: Math.max(0, Math.floor(effMax - weighted - cost)), resetMs };
+			}
+			if (blockDuration > 0) {
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			return { allowed: false, remaining: Math.max(0, Math.floor(effMax - weighted)), resetMs };
 		}
-		buckets.set(key, entry);
-		if (buckets.size > FLOOR_MAX_ENTRIES) {
-			buckets.delete(buckets.keys().next().value);
-		}
-		if (entry.bannedUntil > nowMs) {
-			return { allowed: false, remaining: 0, resetMs: entry.bannedUntil - nowMs };
-		}
-		if (entry.resetAt <= nowMs) {
-			entry.points = effMax;
-			entry.resetAt = nowMs + interval;
-		}
-		if (entry.points > effMax) {
-			entry.points = effMax;
-		}
-		if (entry.points >= cost) {
-			entry.points -= cost;
-			return { allowed: true, remaining: entry.points, resetMs: entry.resetAt - nowMs };
-		}
-		if (blockDuration > 0) {
-			entry.bannedUntil = nowMs + blockDuration;
-			return { allowed: false, remaining: 0, resetMs: blockDuration };
-		}
-		return { allowed: false, remaining: Math.max(0, entry.points), resetMs: entry.resetAt - nowMs };
 	};
 }
+
+/**
+ * In-process GCRA / leaky-bucket floor mirroring GCRA_SCRIPT. The emission
+ * interval is recomputed from the scaled budget each check, so a tightened
+ * emergency clamp applies immediately with no stored-points clamp.
+ *
+ * @param {number} maxPoints
+ * @param {number} interval
+ * @param {number} blockDuration
+ * @param {(() => number) | null} [getScale]
+ * @returns {FloorBucket}
+ */
+export function createGcraFloor(maxPoints, interval, blockDuration, getScale) {
+	/** @type {Map<string, { tat: number, bannedUntil: number }>} */
+	const buckets = new Map();
+	function effMaxNow() {
+		const scale = getScale ? getScale() : 1;
+		return scale > 0 && scale !== 1 ? Math.max(1, Math.floor(maxPoints * scale)) : maxPoints;
+	}
+	function evict() {
+		if (buckets.size > FLOOR_MAX_ENTRIES) buckets.delete(buckets.keys().next().value);
+	}
+	return {
+		consume(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			const emission = interval / effMax;
+			const burst = interval;
+			const stored = buckets.get(key);
+			if (stored !== undefined) buckets.delete(key);
+			const tat = stored === undefined ? null : stored.tat;
+			let bannedUntil = stored === undefined ? 0 : stored.bannedUntil;
+			const entry = { tat: tat === null ? nowMs : tat, bannedUntil };
+			buckets.set(key, entry);
+			evict();
+			if (bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: bannedUntil - nowMs };
+			}
+			const tatEff = (tat === null || tat <= nowMs) ? nowMs : tat;
+			const newTat = tatEff + emission * cost;
+			const allowAt = newTat - burst;
+			if (nowMs >= allowAt) {
+				entry.tat = newTat; entry.bannedUntil = bannedUntil;
+				return { allowed: true, remaining: Math.max(0, Math.floor((nowMs - allowAt) / emission)), resetMs: Math.floor(newTat - nowMs) };
+			}
+			if (blockDuration > 0) {
+				bannedUntil = nowMs + blockDuration;
+				entry.tat = tatEff; entry.bannedUntil = bannedUntil;
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			entry.tat = tatEff; entry.bannedUntil = bannedUntil;
+			return { allowed: false, remaining: Math.max(0, Math.floor((nowMs - (tatEff - burst)) / emission)), resetMs: Math.ceil(allowAt - nowMs) };
+		},
+		peek(key, cost) {
+			const nowMs = wallEpoch();
+			const effMax = effMaxNow();
+			const emission = interval / effMax;
+			const burst = interval;
+			const stored = buckets.get(key);
+			const tat = stored === undefined ? null : stored.tat;
+			const bannedUntil = stored === undefined ? 0 : stored.bannedUntil;
+			if (bannedUntil > nowMs) {
+				return { allowed: false, remaining: 0, resetMs: bannedUntil - nowMs };
+			}
+			const tatEff = (tat === null || tat <= nowMs) ? nowMs : tat;
+			const newTat = tatEff + emission * cost;
+			const allowAt = newTat - burst;
+			if (nowMs >= allowAt) {
+				return { allowed: true, remaining: Math.max(0, Math.floor((nowMs - allowAt) / emission)), resetMs: Math.floor(newTat - nowMs) };
+			}
+			if (blockDuration > 0) {
+				return { allowed: false, remaining: 0, resetMs: blockDuration };
+			}
+			return { allowed: false, remaining: Math.max(0, Math.floor((nowMs - (tatEff - burst)) / emission)), resetMs: Math.ceil(allowAt - nowMs) };
+		}
+	};
+}
+
+// Per refill mode: the consume + peek Lua and the in-process floor factory. The
+// key infix keeps each mode in its own key space so switching modes never reads
+// a foreign-layout hash. `window` keeps the original 'ratelimit:' infix
+// (byte-identical to prior releases); the two smooth modes get their own.
+const REFILL_MODES = {
+	window: { consume: CONSUME_SCRIPT, peek: PEEK_SCRIPT, infix: 'ratelimit:', floor: createWindowFloor },
+	sliding: { consume: SLIDING_SCRIPT, peek: SLIDING_PEEK_SCRIPT, infix: 'ratelimits:', floor: createSlidingFloor },
+	gcra: { consume: GCRA_SCRIPT, peek: GCRA_PEEK_SCRIPT, infix: 'ratelimitg:', floor: createGcraFloor }
+};
 
 const BAN_SCRIPT = `
 local key = KEYS[1]
@@ -134,6 +378,12 @@ return 1
  *   into Redis. Admin ops (`reset` / `ban` / `unban` / `clear` / `purgeUser`) are operator
  *   actions and still reject while the store is down - only the request-path verdict
  *   degrades. Off (today's reject-to-caller behavior) unless set.
+ * @property {'window' | 'sliding' | 'gcra'} [refill='window'] - Refill algorithm.
+ *   'window' (default) is the fixed-window counter, byte-identical to prior releases;
+ *   it admits up to ~2x points across a window edge (the whole bucket refills at once).
+ *   'sliding' is a sliding-window-counter and 'gcra' is a leaky-bucket/GCRA - both remove
+ *   that boundary burst. Each mode uses its own key space, so switching modes never reads a
+ *   foreign-layout bucket.
  */
 
 /**
@@ -146,6 +396,9 @@ return 1
 /**
  * @typedef {Object} RedisRateLimiter
  * @property {(ws: any, cost?: number) => Promise<ConsumeResult>} consume
+ * @property {(ws: any, cost?: number) => Promise<ConsumeResult>} peek - Read-only: the verdict
+ *   a consume(ws, cost) WOULD return, without spending, initializing the bucket, or moving the
+ *   allowed/denied counters.
  * @property {(key: string, tenant?: string | null) => Promise<void>} reset
  * @property {(key: string, duration?: number, tenant?: string | null) => Promise<void>} ban
  * @property {(key: string, tenant?: string | null) => Promise<void>} unban
@@ -182,8 +435,14 @@ export function createRateLimit(client, options) {
 		throw new Error('redis ratelimit: tenant must be a function (ws) => id | null');
 	}
 
+	const refill = options.refill ?? 'window';
+	if (!Object.prototype.hasOwnProperty.call(REFILL_MODES, refill)) {
+		throw new Error("redis ratelimit: refill must be 'window', 'sliding', or 'gcra'");
+	}
+	const mode = REFILL_MODES[refill];
+
 	const floorOpt = options.localFloorOnStorageFailure;
-	let consumeFloor = null;
+	let floor = null;
 	if (floorOpt !== undefined && floorOpt !== false) {
 		if (floorOpt !== true && (typeof floorOpt !== 'object' || floorOpt === null)) {
 			throw new Error('redis ratelimit: localFloorOnStorageFailure must be a boolean or { points?, interval? }');
@@ -196,7 +455,9 @@ export function createRateLimit(client, options) {
 		if (typeof floorInterval !== 'number' || !Number.isFinite(floorInterval) || floorInterval <= 0) {
 			throw new Error('redis ratelimit: localFloorOnStorageFailure.interval must be a positive number');
 		}
-		consumeFloor = createLocalFloorBucket(floorPoints, floorInterval, blockDuration, () => emergencyScale.current());
+		// The floor mirrors the selected refill algorithm so a degraded verdict
+		// matches what Redis would have said in the same mode.
+		floor = mode.floor(floorPoints, floorInterval, blockDuration, () => emergencyScale.current());
 	}
 	let warnedStorageFloor = false;
 
@@ -225,7 +486,7 @@ export function createRateLimit(client, options) {
 	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed', tlabels);
 	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied', tlabels);
 	const mBans = m?.counter('ratelimit_bans_total', 'Bans applied', tlabels);
-	const mFloor = consumeFloor !== null
+	const mFloor = floor !== null
 		? m?.counter('ratelimit_storage_fallbacks_total', 'Rate-limit verdicts decided by the in-process floor while the store was unreachable')
 		: undefined;
 
@@ -294,7 +555,7 @@ export function createRateLimit(client, options) {
 		if (tenantId && tenantId.indexOf('\0') !== -1) {
 			throw new Error('redis ratelimit: tenant id must not contain a NUL byte (it is the bucket-key delimiter)');
 		}
-		return client.key(SCRIPT_VERSION + ':ratelimit:' + (tenantId ? tenantId + '\0' : '') + key);
+		return client.key(SCRIPT_VERSION + ':' + mode.infix + (tenantId ? tenantId + '\0' : '') + key);
 	}
 
 	return {
@@ -311,11 +572,11 @@ export function createRateLimit(client, options) {
 			let verdict;
 			try {
 				const result = await withBreaker(b, () =>
-					evalCached(redis, CONSUME_SCRIPT, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
+					evalCached(redis, mode.consume, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
 				);
 				verdict = { allowed: result[0] === 1, remaining: result[1], resetMs: result[2] };
 			} catch (err) {
-				if (consumeFloor === null) throw err;
+				if (floor === null) throw err;
 				mFloor?.inc();
 				if (!warnedStorageFloor) {
 					warnedStorageFloor = true;
@@ -326,7 +587,7 @@ export function createRateLimit(client, options) {
 						'This warning fires once.'
 					);
 				}
-				verdict = consumeFloor(bk, cost);
+				verdict = floor.consume(bk, cost);
 			}
 
 			const labels = labelTenants ? { tenant_id: tenantId || '' } : undefined;
@@ -338,6 +599,36 @@ export function createRateLimit(client, options) {
 			}
 
 			return verdict;
+		},
+
+		/**
+		 * Read-only verdict: what a consume(ws, cost) WOULD return right now,
+		 * without spending, initializing the bucket, or moving the allowed/denied
+		 * counters. Enables a "spend only on failure" gate (peek to admit every
+		 * request; consume to charge a point only when the request fails). During a
+		 * store outage with the local floor enabled, decides on the in-process
+		 * floor read-only (no floor mutation); without a floor it rejects like
+		 * consume.
+		 * @param {any} ws
+		 * @param {number} [cost=1]
+		 * @returns {Promise<ConsumeResult>}
+		 */
+		async peek(ws, cost = 1) {
+			if (typeof cost !== 'number' || !Number.isInteger(cost) || cost < 1) {
+				throw new Error('redis ratelimit: cost must be a positive integer');
+			}
+			const key = resolveKey(ws);
+			const tenantId = tenant ? tenant(ws) : null;
+			const bk = bucketKey(key, tenantId);
+			try {
+				const result = await withBreaker(b, () =>
+					evalCached(redis, mode.peek, 1, bk, points, interval, cost, blockDuration, emergencyScale.current())
+				);
+				return { allowed: result[0] === 1, remaining: result[1], resetMs: result[2] };
+			} catch (err) {
+				if (floor === null) throw err;
+				return floor.peek(bk, cost);
+			}
 		},
 
 		async reset(key, tenantId) {
@@ -375,10 +666,10 @@ export function createRateLimit(client, options) {
 
 		// No tenant -> clears the whole key space (every tenant's buckets too, since the
 		// glob `*` spans the NUL-delimited tenant segments). Pass a tenant id to clear
-		// only that tenant's buckets.
+		// only that tenant's buckets. Scoped to this limiter's refill-mode key space.
 		async clear(tenantId) {
 			const suffix = tenantId ? tenantId + '\0*' : '*';
-			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':ratelimit:' + suffix)));
+			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':' + mode.infix + suffix)));
 		},
 
 		// Operator surface for the fleet-wide emergency factor. `set(0.2)`

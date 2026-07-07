@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.45] - 2026-07-07
+
+### Added
+
+- **`createRateLimit` gains a read-only `peek(ws, cost?)` and a `refill` mode (`'window'` | `'sliding'` | `'gcra'`).** `peek` returns the exact verdict a `consume(ws, cost)` would return - `{ allowed, remaining, resetMs }`, an active ban included - without spending, initializing the bucket, or moving `ratelimit_allowed_total` / `ratelimit_denied_total`, each via its own read-only Lua script. It composes into a documented "spend only on failure" recipe: gate every request with `peek` and call `consume` to charge a point only when the request actually fails, so successes never spend budget. `refill` selects the algorithm behind the limiter: `'window'` (default) is the fixed-window counter, **byte-identical to prior releases**, which admits up to ~2x `points` across a window edge (the whole bucket refills at once - the classic fixed-window boundary burst, now documented); `'sliding'` (sliding-window-counter) and `'gcra'` (leaky-bucket / GCRA, which additionally paces admissions to one per `interval / points` ms) remove that boundary burst. Every mode is one atomic single-key roundtrip, honors the same `blockDuration` bans and the fleet-wide emergency scale, and uses its own Redis key space so switching modes never reads a foreign-layout bucket; the opt-in in-process floor mirrors the selected mode (and `peek` decides read-only on the floor during a store outage). Default deployments are unchanged - `refill` defaults to `'window'` and `peek` is purely additive.
+- **`createCompositeRateLimit` gains a read-only `peek(ws, cost?)`.** It checks every dimension and reports the same `{ allowed, tripped, remaining, resetMs }` a `consume` would return - naming the tripped dimension - without writing to any dimension bucket or moving a counter, and decides read-only on the in-process floor during a store outage. Composite dimensions remain fixed-window (per-dimension refill modes are intentionally not offered; use single-dimension `createRateLimit` with `refill` where a smooth mode matters).
+
 ## [0.6.0-next.44] - 2026-07-06
 
 ### Changed

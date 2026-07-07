@@ -613,4 +613,113 @@ describe('redis ratelimit', () => {
 			await expect(lim.ban('1.2.3.4')).rejects.toThrow('redis down');
 		});
 	});
+
+	describe('peek (read-only)', () => {
+		it('does not create the bucket hash when absent', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			const r = await limiter.peek(ws);
+			expect(r.allowed).toBe(true);
+			expect(r.remaining).toBe(4); // what a consume would leave
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual([]);
+		});
+
+		it('does not mutate an existing bucket', async () => {
+			const ws = mockWs({ ip: '1.2.3.4' });
+			await limiter.consume(ws, 2); // remaining 3
+			const key = 'test:v1:ratelimit:1.2.3.4';
+			const before = new Map(client._hashes.get(key));
+			const r = await limiter.peek(ws);
+			expect(r.remaining).toBe(2); // 3 - 1, without spending
+			const after = client._hashes.get(key);
+			expect(after.get('points')).toBe(before.get('points'));
+			expect(after.get('resetAt')).toBe(before.get('resetAt'));
+			expect(after.get('bannedUntil')).toBe(before.get('bannedUntil'));
+		});
+
+		it('verdict equals what the next consume returns', async () => {
+			// Freeze the clock so peek and the following consume compute resetMs
+			// against the same now (a real tick between them differs by ~1ms).
+			vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+			const ws = mockWs({ ip: '9.9.9.9' });
+			await limiter.consume(ws, 4); // remaining 1
+			const peeked = await limiter.peek(ws);
+			const consumed = await limiter.consume(ws);
+			expect(peeked).toEqual(consumed);
+		});
+
+		it('reflects an active ban', async () => {
+			const ws = mockWs({ ip: '3.3.3.3' });
+			await limiter.ban('3.3.3.3', 5000);
+			const r = await limiter.peek(ws);
+			expect(r.allowed).toBe(false);
+			expect(r.resetMs).toBeGreaterThan(0);
+		});
+
+		it('is tenant-scoped', async () => {
+			const lim = createRateLimit(client, { points: 1, interval: 60000, tenant: (ws) => ws.getUserData().org });
+			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'a' })); // a exhausted
+			expect((await lim.peek(mockWs({ ip: '1.1.1.1', org: 'a' }))).allowed).toBe(false);
+			expect((await lim.peek(mockWs({ ip: '1.1.1.1', org: 'b' }))).allowed).toBe(true);
+		});
+
+		it('respects cost', async () => {
+			const ws = mockWs({ ip: '4.4.4.4' });
+			await limiter.consume(ws, 4); // remaining 1
+			expect((await limiter.peek(ws, 1)).allowed).toBe(true);
+			expect((await limiter.peek(ws, 2)).allowed).toBe(false);
+		});
+
+		it('does not move the allowed/denied counters', async () => {
+			const metrics = createMetrics();
+			const lim = createRateLimit(client, { points: 1, interval: 60000, metrics });
+			const ws = mockWs({ ip: '2.2.2.2' });
+			await lim.consume(ws); // allowed -> allowed_total 1
+			await lim.consume(ws); // denied  -> denied_total 1
+			// Peeks (one that would allow, one that would deny) must move neither.
+			await lim.peek(mockWs({ ip: '5.5.5.5' }));
+			await lim.peek(ws);
+			const out = metrics.serialize();
+			expect(out).toContain('ratelimit_allowed_total 1');
+			expect(out).toContain('ratelimit_denied_total 1');
+		});
+
+		it('throws on invalid cost', async () => {
+			await expect(limiter.peek(mockWs({ ip: '1.2.3.4' }), 0)).rejects.toThrow('positive integer');
+		});
+	});
+
+	describe('failure-limiter recipe (peek to gate, consume to spend on failure)', () => {
+		it('successes never spend; N failures exhaust the budget and then the gate blocks', async () => {
+			const lim = createRateLimit(client, { points: 3, interval: 60000 });
+			const ws = mockWs({ ip: '7.7.7.7' });
+			async function attempt(fails) {
+				const gate = await lim.peek(ws);
+				if (!gate.allowed) return 'blocked';
+				if (fails) await lim.consume(ws); // charge a point only on failure
+				return fails ? 'failed' : 'ok';
+			}
+			for (let i = 0; i < 10; i++) expect(await attempt(false)).toBe('ok');
+			expect(await attempt(true)).toBe('failed');
+			expect(await attempt(true)).toBe('failed');
+			expect(await attempt(true)).toBe('failed');
+			// Budget spent by the three failures: the gate now blocks even a success.
+			expect(await attempt(false)).toBe('blocked');
+		});
+	});
+
+	describe("refill: 'window' is the default", () => {
+		it('shares the byte-identical key space with the default (no refill option)', async () => {
+			const def = createRateLimit(client, { points: 3, interval: 60000 });
+			const win = createRateLimit(client, { points: 3, interval: 60000, refill: 'window' });
+			await def.consume(mockWs({ ip: '1.2.3.4' }));
+			expect([...client._hashes.keys()]).toContain('test:v1:ratelimit:1.2.3.4');
+			// A window-mode consume on the SAME ip shares that bucket.
+			const r = await win.consume(mockWs({ ip: '1.2.3.4' }));
+			expect(r.remaining).toBe(1); // 3 - 1(def) - 1(win)
+		});
+
+		it('rejects an unknown refill mode', () => {
+			expect(() => createRateLimit(client, { points: 3, interval: 1000, refill: 'bogus' })).toThrow('refill');
+		});
+	});
 });

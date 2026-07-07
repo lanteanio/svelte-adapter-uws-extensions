@@ -288,4 +288,97 @@ return {1, 0, 0}
 			).rejects.toThrow(/CONSUME/);
 		});
 	});
+
+	describe('peek (read-only) on the wire', () => {
+		it('creates no bucket when absent and mutates nothing on an existing bucket', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60_000 });
+			const ws = fakeWs({ ip: 'peek-1' });
+			const r = await lim.peek(ws);
+			expect(r.allowed).toBe(true);
+			expect(r.remaining).toBe(4); // what a consume would leave
+			// A read-only peek never writes the hash.
+			expect(await client.redis.exists(client.key('v1:ratelimit:peek-1'))).toBe(0);
+
+			await lim.consume(ws, 2); // remaining 3
+			const before = await client.redis.hgetall(client.key('v1:ratelimit:peek-1'));
+			const p = await lim.peek(ws);
+			expect(p.remaining).toBe(2);
+			const after = await client.redis.hgetall(client.key('v1:ratelimit:peek-1'));
+			expect(after).toEqual(before); // byte-for-byte unchanged
+		});
+
+		it('verdict equals the next consume', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60_000 });
+			const ws = fakeWs({ ip: 'peek-2' });
+			await lim.consume(ws, 4); // 1 left
+			const peeked = await lim.peek(ws);
+			const consumed = await lim.consume(ws);
+			expect(peeked.allowed).toBe(consumed.allowed);
+			expect(peeked.remaining).toBe(consumed.remaining);
+		});
+
+		it('reflects an active ban read-only', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60_000 });
+			const ws = fakeWs({ ip: 'peek-3' });
+			await lim.ban('peek-3', 5000);
+			const p = await lim.peek(ws);
+			expect(p.allowed).toBe(false);
+			expect(p.resetMs).toBeGreaterThan(0);
+		});
+	});
+
+	describe('refill modes on the wire (real Redis TIME)', () => {
+		it('each mode lands on its own versioned key space', async () => {
+			const s = createRateLimit(client, { points: 3, interval: 60_000, refill: 'sliding' });
+			const g = createRateLimit(client, { points: 3, interval: 60_000, refill: 'gcra' });
+			await s.consume(fakeWs({ ip: 'mode-1' }));
+			await g.consume(fakeWs({ ip: 'mode-1' }));
+			expect(await client.redis.exists(client.key('v1:ratelimits:mode-1'))).toBe(1);
+			expect(await client.redis.exists(client.key('v1:ratelimitg:mode-1'))).toBe(1);
+		});
+
+		// The boundary-burst characterization the doc claims: the fixed window
+		// releases nothing until its edge and then a whole budget at once, so a
+		// straddling burst admits up to ~2x points; the smooth modes never do.
+		it("window admits more than points across its reset edge (the ~2x boundary burst)", async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000 });
+			const ws = fakeWs({ ip: 'burst-w' });
+			await lim.consume(ws); // starts the window: reset ~1s out, 4 left
+			await waitRedisMs(client, 800); // still window 1
+			let firstHalf = 0;
+			for (let i = 0; i < 4; i++) if ((await lim.consume(ws)).allowed) firstHalf++;
+			await waitRedisMs(client, 400); // past the reset edge
+			let secondHalf = 0;
+			for (let i = 0; i < 5; i++) if ((await lim.consume(ws)).allowed) secondHalf++;
+			expect(firstHalf).toBe(4);
+			expect(secondHalf).toBe(5);
+			// More than one budget landed in the ~1.2s span straddling the edge.
+			expect(firstHalf + secondHalf).toBeGreaterThan(5);
+		});
+
+		it('sliding does not admit a second full budget mid-window (no boundary burst)', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, refill: 'sliding' });
+			const ws = fakeWs({ ip: 'burst-s' });
+			let a = 0;
+			for (let i = 0; i < 5; i++) if ((await lim.consume(ws)).allowed) a++;
+			expect(a).toBe(5);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			await waitRedisMs(client, 550); // about half the previous window has aged out
+			let b = 0;
+			for (let i = 0; i < 5; i++) if ((await lim.consume(ws)).allowed) b++;
+			expect(b).toBeLessThan(5); // never a full second budget in this span
+		});
+
+		it('gcra frees roughly one token per interval/points ms (smooth spacing)', async () => {
+			const lim = createRateLimit(client, { points: 4, interval: 1000, refill: 'gcra' }); // emission 250ms
+			const ws = fakeWs({ ip: 'space-g' });
+			let a = 0;
+			for (let i = 0; i < 4; i++) if ((await lim.consume(ws)).allowed) a++;
+			expect(a).toBe(4);
+			expect((await lim.consume(ws)).allowed).toBe(false);
+			await waitRedisMs(client, 300); // one emission (250ms) has elapsed
+			expect((await lim.consume(ws)).allowed).toBe(true); // exactly one token freed
+			expect((await lim.consume(ws)).allowed).toBe(false); // and only one
+		});
+	});
 });

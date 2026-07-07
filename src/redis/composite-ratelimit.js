@@ -170,6 +170,99 @@ return out
 `;
 
 /**
+ * Read-only companion to COMPOSITE_CONSUME_SCRIPT: the verdict a consume WOULD
+ * return across every dimension without writing anything (not even the tripped
+ * dimension's auto-ban) and without moving any counter. Same result shape;
+ * on allow the reported remaining is pts[i] - cost (what a consume would leave).
+ *
+ * KEYS / ARGV are identical to COMPOSITE_CONSUME_SCRIPT.
+ */
+const COMPOSITE_PEEK_SCRIPT = `
+-- COMPOSITE_PEEK
+local n = tonumber(ARGV[1])
+local cost = tonumber(ARGV[2])
+local scale = tonumber(ARGV[3])
+if n == nil or cost == nil then
+  return redis.error_reply('COMPOSITE_PEEK: n/cost must be numeric')
+end
+if scale == nil or scale <= 0 then scale = 1 end
+
+local rtime = redis.call('TIME')
+local now = tonumber(rtime[1]) * 1000 + math.floor(tonumber(rtime[2]) / 1000)
+
+local pts = {}
+local resetAt = {}
+local banned = {}
+local tripped = 0
+local retryMs = 0
+
+for i = 1, n do
+  local base = 4 + (i - 1) * 3
+  local maxPoints = tonumber(ARGV[base])
+  local interval = tonumber(ARGV[base + 1])
+  local blockDuration = tonumber(ARGV[base + 2])
+  if maxPoints == nil or interval == nil or blockDuration == nil then
+    return redis.error_reply('COMPOSITE_PEEK: dimension args must be numeric')
+  end
+  if scale ~= 1 then
+    maxPoints = math.floor(maxPoints * scale)
+    if maxPoints < 1 then maxPoints = 1 end
+  end
+
+  local vals = redis.call('hmget', KEYS[i], 'points', 'resetAt', 'bannedUntil')
+  local p = tonumber(vals[1])
+  local r = tonumber(vals[2])
+  local b = tonumber(vals[3])
+  if p == nil then
+    p = maxPoints
+    r = now + interval
+    b = 0
+  end
+  if r <= now then
+    p = maxPoints
+    r = now + interval
+  end
+  if p > maxPoints then
+    p = maxPoints
+  end
+  pts[i] = p
+  resetAt[i] = r
+  banned[i] = b
+
+  if tripped == 0 then
+    if b > now then
+      tripped = i
+      retryMs = b - now
+    elseif p < cost then
+      tripped = i
+      if blockDuration > 0 then
+        retryMs = blockDuration
+      else
+        retryMs = r - now
+      end
+    end
+  end
+end
+
+if tripped ~= 0 then
+  local out = {0, tripped, retryMs}
+  for i = 1, n do
+    if banned[i] > now then out[3 + i] = 0 else out[3 + i] = math.max(0, pts[i]) end
+  end
+  return out
+end
+
+local minReset = nil
+for i = 1, n do
+  local untilReset = resetAt[i] - now
+  if minReset == nil or untilReset < minReset then minReset = untilReset end
+end
+local out = {1, 0, minReset}
+for i = 1, n do out[3 + i] = pts[i] - cost end
+return out
+`;
+
+/**
  * @typedef {Object} CompositeDimension
  * @property {number} points - Budget per interval for this dimension. Positive integer.
  * @property {number} interval - Refill interval in milliseconds. Positive.
@@ -366,6 +459,57 @@ export function createCompositeRateLimit(client, options) {
 		return { allowed: true, tripped: null, remaining, resetMs: minReset };
 	}
 
+	// Read-only floor: the verdict consumeFloorComposite would return during a
+	// store outage, computed on a rolled snapshot WITHOUT mutating, creating, or
+	// banning any in-process bucket.
+	function peekFloorComposite(keys, cost) {
+		const nowMs = wallEpoch();
+		const scale = emergencyScale.current();
+		const states = [];
+		let tripped = 0;
+		let retryMs = 0;
+		for (let i = 0; i < dimList.length; i++) {
+			const d = dimList[i];
+			const effMax = scale > 0 && scale !== 1 ? Math.max(1, Math.floor(d.points * scale)) : d.points;
+			const buckets = /** @type {Map<string, any>} */ (floorBuckets.get(d.name));
+			const stored = buckets.get(keys[i]);
+			let points, resetAt, bannedUntil;
+			if (stored === undefined) {
+				points = effMax; resetAt = nowMs + d.interval; bannedUntil = 0;
+			} else {
+				points = stored.points; resetAt = stored.resetAt; bannedUntil = stored.bannedUntil;
+			}
+			if (bannedUntil <= nowMs && resetAt <= nowMs) {
+				points = effMax; resetAt = nowMs + d.interval;
+			}
+			if (points > effMax) points = effMax;
+			states.push({ points, resetAt, bannedUntil });
+			if (tripped === 0) {
+				if (bannedUntil > nowMs) {
+					tripped = i + 1;
+					retryMs = bannedUntil - nowMs;
+				} else if (points < cost) {
+					tripped = i + 1;
+					retryMs = d.blockDuration > 0 ? d.blockDuration : resetAt - nowMs;
+				}
+			}
+		}
+		const remaining = {};
+		if (tripped !== 0) {
+			for (let i = 0; i < dimList.length; i++) {
+				remaining[dimList[i].name] = states[i].bannedUntil > nowMs ? 0 : Math.max(0, states[i].points);
+			}
+			return { allowed: false, tripped: dimList[tripped - 1].name, remaining, resetMs: retryMs };
+		}
+		let minReset = Infinity;
+		for (let i = 0; i < dimList.length; i++) {
+			remaining[dimList[i].name] = states[i].points - cost;
+			const untilReset = states[i].resetAt - nowMs;
+			if (untilReset < minReset) minReset = untilReset;
+		}
+		return { allowed: true, tripped: null, remaining, resetMs: minReset };
+	}
+
 	return {
 		/**
 		 * Consult every dimension atomically. Consumes from all of them only
@@ -418,6 +562,43 @@ export function createCompositeRateLimit(client, options) {
 				mDenied?.inc({ dimension: verdict.tripped || '' });
 			}
 			return verdict;
+		},
+
+		/**
+		 * Read-only multi-dimension check: the verdict a consume(ws, cost) WOULD
+		 * return without writing to any dimension bucket and without moving any
+		 * counter. Same result shape as consume; the tripped dimension is reported
+		 * without consuming. During a store outage with the local floor enabled it
+		 * decides on the in-process floor read-only; without a floor it rejects.
+		 * @param {any} ws
+		 * @param {number} [cost=1]
+		 * @returns {Promise<CompositeConsumeResult>}
+		 */
+		async peek(ws, cost = 1) {
+			if (typeof cost !== 'number' || !Number.isInteger(cost) || cost < 1) {
+				throw new Error('redis composite ratelimit: cost must be a positive integer');
+			}
+			const tenantId = tenant ? tenant(ws) : null;
+			const keys = dimList.map((d) => dimBucketKey(tenantId, d.name, resolveDimKey(d.keyBy, ws)));
+			try {
+				const argv = [dimList.length, cost, emergencyScale.current()];
+				for (const d of dimList) argv.push(d.points, d.interval, d.blockDuration);
+				const result = await withBreaker(b, () =>
+					evalCached(redis, COMPOSITE_PEEK_SCRIPT, keys.length, ...keys, ...argv)
+				);
+				const trippedIdx = Number(result[1]);
+				const remaining = {};
+				for (let i = 0; i < dimList.length; i++) remaining[dimList[i].name] = Number(result[3 + i]);
+				return {
+					allowed: Number(result[0]) === 1,
+					tripped: trippedIdx > 0 ? dimList[trippedIdx - 1].name : null,
+					remaining,
+					resetMs: Number(result[2])
+				};
+			} catch (err) {
+				if (floorBuckets === null) throw err;
+				return peekFloorComposite(keys, cost);
+			}
 		},
 
 		/**

@@ -2,6 +2,25 @@ import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
+/**
+ * Refill algorithm for a rate limiter.
+ *
+ * - `'window'` (default) - fixed-window counter, byte-identical to prior
+ *   releases. The whole bucket refills at once at the window edge, so it admits
+ *   up to ~2x `points` across an edge (the classic fixed-window boundary burst:
+ *   a full budget just before the edge plus a full budget just after). Choose a
+ *   smooth mode below when that burst matters.
+ * - `'sliding'` - sliding-window-counter: weights the previous window by its
+ *   remaining overlap, so admission does not jump at the edge.
+ * - `'gcra'` - leaky-bucket / GCRA: meters a smooth emission of one token every
+ *   `interval / points` ms, tolerating a burst of up to `points`. No window
+ *   edge, so no boundary burst.
+ *
+ * Each mode uses its own Redis key space, so switching modes never reads a
+ * foreign-layout bucket.
+ */
+export type RefillMode = 'window' | 'sliding' | 'gcra';
+
 export interface RedisRateLimitOptions {
 	/** Tokens available per interval. Must be a positive integer. */
 	points: number;
@@ -43,6 +62,15 @@ export interface RedisRateLimitOptions {
 	 * `ratelimit_storage_fallbacks_total`. @default false
 	 */
 	localFloorOnStorageFailure?: boolean | { points?: number; interval?: number };
+	/**
+	 * Refill algorithm. @default 'window'
+	 *
+	 * `'window'` is the fixed-window counter, byte-identical to prior releases;
+	 * it admits up to ~2x `points` across a window edge because the whole bucket
+	 * refills at once. `'sliding'` (sliding-window-counter) and `'gcra'`
+	 * (leaky-bucket / GCRA) remove that boundary burst. See {@link RefillMode}.
+	 */
+	refill?: RefillMode;
 	/**
 	 * Tuning for the fleet-wide emergency scale reader. The factor is read
 	 * through a lazily-refreshed cache (at most one background GET per
@@ -89,6 +117,14 @@ export interface RateLimitEmergency {
 export interface RedisRateLimiter {
 	/** Attempt to consume tokens. */
 	consume(ws: any, cost?: number): Promise<ConsumeResult>;
+	/**
+	 * Read-only: the verdict a `consume(ws, cost)` WOULD return right now,
+	 * without spending, initializing the bucket, or moving
+	 * `ratelimit_allowed_total` / `ratelimit_denied_total`. Enables a "spend only
+	 * on failure" gate - peek to admit every request, then `consume` to charge a
+	 * point only when the request fails.
+	 */
+	peek(ws: any, cost?: number): Promise<ConsumeResult>;
 	/** Clear the bucket for a key (optionally scoped to a tenant). */
 	reset(key: string, tenant?: string | null): Promise<void>;
 	/**
@@ -172,6 +208,13 @@ export interface CompositeRateLimitOptions {
 export interface CompositeRateLimiter {
 	/** Consult every dimension atomically; consume from all or none. */
 	consume(ws: any, cost?: number): Promise<CompositeConsumeResult>;
+	/**
+	 * Read-only multi-dimension check: the verdict a `consume(ws, cost)` WOULD
+	 * return without writing to any dimension bucket and without moving any
+	 * counter. Same result shape as `consume`; the tripped dimension is reported
+	 * without consuming.
+	 */
+	peek(ws: any, cost?: number): Promise<CompositeConsumeResult>;
 	/** Clear one dimension bucket. */
 	reset(dimension: string, key: string, tenant?: string | null): Promise<void>;
 	/** Ban one key on one dimension. */

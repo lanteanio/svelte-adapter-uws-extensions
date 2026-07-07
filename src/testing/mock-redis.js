@@ -786,11 +786,34 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('defaultPoints') && script.includes('defaultInterval')) {
 					return evalBanScript(args);
 				}
+				// Read-only / alternate-refill rate-limit scripts. EVERY rate-limit
+				// script mentions bannedUntil and would otherwise route to the
+				// SPENDING evaluator below; each carries a unique marker comment so a
+				// read-only peek or a sliding/gcra consume is dispatched to the
+				// matching evaluator FIRST (before COMPOSITE_CONSUME and bannedUntil).
+				if (script.includes('-- PEEK_WINDOW')) {
+					return evalPeekRateLimit(args);
+				}
+				if (script.includes('-- SLIDING_PEEK')) {
+					return evalSlidingRateLimit(args, true);
+				}
+				if (script.includes('-- SLIDING_CONSUME')) {
+					return evalSlidingRateLimit(args, false);
+				}
+				if (script.includes('-- GCRA_PEEK')) {
+					return evalGcraRateLimit(args, true);
+				}
+				if (script.includes('-- GCRA_CONSUME')) {
+					return evalGcraRateLimit(args, false);
+				}
+				if (script.includes('-- COMPOSITE_PEEK')) {
+					return evalCompositeRateLimit(numKeys, args, true);
+				}
 				// Composite multi-dimension rate limit (all-or-nothing consume).
 				// Dispatched before the single-bucket token bucket: both scripts
 				// mention bannedUntil, the marker disambiguates.
 				if (script.includes('COMPOSITE_CONSUME')) {
-					return evalCompositeRateLimit(numKeys, args);
+					return evalCompositeRateLimit(numKeys, args, false);
 				}
 				// Rate limit script (token bucket)
 				if (script.includes('bannedUntil')) {
@@ -1065,12 +1088,143 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			return [0, Math.max(0, pts), resetAt - now];
 		}
 
+		// Read-only fixed-window peek simulation (PEEK_SCRIPT). Reports the verdict
+		// a consume would return WITHOUT writing or creating the hash and WITHOUT
+		// moving any counter.
+		function evalPeekRateLimit(args) {
+			const key = args[0];
+			let maxPoints = Number(args[1]);
+			const interval = Number(args[2]);
+			const cost = Number(args[3]);
+			const blockDuration = Number(args[4]);
+			const scale = args.length > 5 ? Number(args[5]) : 1;
+			if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
+				maxPoints = Math.max(1, Math.floor(maxPoints * scale));
+			}
+			const now = evalTimeNowMs();
+			const h = hashes.get(key); // read-only: never create the hash
+			let points = h && h.has('points') ? Number(h.get('points')) : null;
+			let resetAt = h && h.has('resetAt') ? Number(h.get('resetAt')) : null;
+			let bannedUntil = h && h.has('bannedUntil') ? Number(h.get('bannedUntil')) : null;
+			if (points === null) {
+				points = maxPoints;
+				resetAt = now + interval;
+				bannedUntil = 0;
+			}
+			if (bannedUntil > now) return [0, 0, bannedUntil - now];
+			if (resetAt <= now) { points = maxPoints; resetAt = now + interval; }
+			if (points > maxPoints) points = maxPoints;
+			if (points >= cost) return [1, points - cost, resetAt - now];
+			if (blockDuration > 0) return [0, 0, blockDuration];
+			return [0, Math.max(0, points), resetAt - now];
+		}
+
+		// Sliding-window-counter simulation (SLIDING_SCRIPT / SLIDING_PEEK_SCRIPT).
+		// `peekOnly` suppresses every write (and never creates the hash), so a peek
+		// is a pure read.
+		function evalSlidingRateLimit(args, peekOnly) {
+			const key = args[0];
+			let maxPoints = Number(args[1]);
+			const interval = Number(args[2]);
+			const cost = Number(args[3]);
+			const blockDuration = Number(args[4]);
+			const scale = args.length > 5 ? Number(args[5]) : 1;
+			if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
+				maxPoints = Math.max(1, Math.floor(maxPoints * scale));
+			}
+			const now = evalTimeNowMs();
+			const winStartNow = now - (now % interval);
+			const existing = hashes.get(key);
+			let curr = existing && existing.has('curr') ? Number(existing.get('curr')) : null;
+			let prev = existing && existing.has('prev') ? Number(existing.get('prev')) : null;
+			let windowStart = existing && existing.has('windowStart') ? Number(existing.get('windowStart')) : null;
+			let bannedUntil = existing && existing.has('bannedUntil') ? Number(existing.get('bannedUntil')) : null;
+			if (bannedUntil === null) bannedUntil = 0;
+			if (curr === null) { curr = 0; prev = 0; windowStart = winStartNow; }
+			if (bannedUntil > now) return [0, 0, bannedUntil - now];
+			const elapsed = winStartNow - windowStart;
+			if (elapsed >= interval * 2) { prev = 0; curr = 0; windowStart = winStartNow; }
+			else if (elapsed >= interval) { prev = curr; curr = 0; windowStart = winStartNow; }
+			if (curr > maxPoints) curr = maxPoints;
+			const into = now - windowStart;
+			let prevWeight = (interval - into) / interval;
+			if (prevWeight < 0) prevWeight = 0;
+			if (prevWeight > 1) prevWeight = 1;
+			const weighted = curr + prev * prevWeight;
+			const resetMs = windowStart + interval - now;
+			function persist() {
+				if (peekOnly) return;
+				if (!hashes.has(key)) hashes.set(key, new Map());
+				const h = hashes.get(key);
+				h.set('curr', String(curr));
+				h.set('prev', String(prev));
+				h.set('windowStart', String(windowStart));
+				h.set('bannedUntil', String(bannedUntil));
+			}
+			if (weighted + cost <= maxPoints) {
+				curr = curr + cost;
+				persist();
+				return [1, Math.floor(Math.max(0, maxPoints - weighted - cost)), resetMs];
+			}
+			if (blockDuration > 0) {
+				bannedUntil = now + blockDuration;
+				persist();
+				return [0, 0, blockDuration];
+			}
+			persist();
+			return [0, Math.floor(Math.max(0, maxPoints - weighted)), resetMs];
+		}
+
+		// GCRA / leaky-bucket simulation (GCRA_SCRIPT / GCRA_PEEK_SCRIPT). `peekOnly`
+		// suppresses every write (and never creates the hash).
+		function evalGcraRateLimit(args, peekOnly) {
+			const key = args[0];
+			let maxPoints = Number(args[1]);
+			const interval = Number(args[2]);
+			const cost = Number(args[3]);
+			const blockDuration = Number(args[4]);
+			const scale = args.length > 5 ? Number(args[5]) : 1;
+			if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
+				maxPoints = Math.max(1, Math.floor(maxPoints * scale));
+			}
+			const now = evalTimeNowMs();
+			const emission = interval / maxPoints;
+			const burst = interval;
+			const existing = hashes.get(key);
+			const tat = existing && existing.has('tat') ? Number(existing.get('tat')) : null;
+			let bannedUntil = existing && existing.has('bannedUntil') ? Number(existing.get('bannedUntil')) : null;
+			if (bannedUntil === null) bannedUntil = 0;
+			if (bannedUntil > now) return [0, 0, bannedUntil - now];
+			const tatEff = (tat !== null && tat > now) ? tat : now;
+			const newTat = tatEff + emission * cost;
+			const allowAt = newTat - burst;
+			function persist(tatVal) {
+				if (peekOnly) return;
+				if (!hashes.has(key)) hashes.set(key, new Map());
+				const h = hashes.get(key);
+				h.set('tat', String(tatVal));
+				h.set('bannedUntil', String(bannedUntil));
+			}
+			if (now >= allowAt) {
+				persist(newTat);
+				return [1, Math.max(0, Math.floor((now - allowAt) / emission)), Math.floor(newTat - now)];
+			}
+			if (blockDuration > 0) {
+				bannedUntil = now + blockDuration;
+				persist(tatEff);
+				return [0, 0, blockDuration];
+			}
+			return [0, Math.max(0, Math.floor((now - (tatEff - burst)) / emission)), Math.ceil(allowAt - now)];
+		}
+
 		// Composite multi-dimension rate limit simulation. Mirrors
 		// COMPOSITE_CONSUME_SCRIPT: load/refill/clamp every dimension without
 		// writing, deny on the first tripped dimension (writing only its
-		// auto-ban), or consume from all of them.
+		// auto-ban), or consume from all of them. With `peekOnly` it mirrors
+		// COMPOSITE_PEEK_SCRIPT instead: identical verdict math, zero writes (not
+		// even the tripped ban), and on allow it reports pts[i]-cost as remaining.
 		// args: [key_1..key_N, n, cost, scale, (maxPoints, interval, blockDuration) x N]
-		function evalCompositeRateLimit(numKeys, args) {
+		function evalCompositeRateLimit(numKeys, args, peekOnly) {
 			const keys = args.slice(0, numKeys);
 			const argv = args.slice(numKeys);
 			const n = Number(argv[0]);
@@ -1132,7 +1286,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 			if (tripped !== 0) {
 				const t = tripped - 1;
-				if (blockOf[t] > 0 && banned[t] <= now) {
+				if (!peekOnly && blockOf[t] > 0 && banned[t] <= now) {
 					if (!hashes.has(keys[t])) hashes.set(keys[t], new Map());
 					const h = hashes.get(keys[t]);
 					h.set('points', String(pts[t]));
@@ -1149,11 +1303,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			let minReset = null;
 			for (let i = 0; i < n; i++) {
 				pts[i] -= cost;
-				if (!hashes.has(keys[i])) hashes.set(keys[i], new Map());
-				const h = hashes.get(keys[i]);
-				h.set('points', String(pts[i]));
-				h.set('resetAt', String(resetAt[i]));
-				h.set('bannedUntil', String(banned[i]));
+				if (!peekOnly) {
+					if (!hashes.has(keys[i])) hashes.set(keys[i], new Map());
+					const h = hashes.get(keys[i]);
+					h.set('points', String(pts[i]));
+					h.set('resetAt', String(resetAt[i]));
+					h.set('bannedUntil', String(banned[i]));
+				}
 				const untilReset = resetAt[i] - now;
 				if (minReset === null || untilReset < minReset) minReset = untilReset;
 			}

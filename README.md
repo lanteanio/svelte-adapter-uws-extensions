@@ -1126,7 +1126,8 @@ export async function message(ws, { data, platform }) {
 | `interval` | *required* | Refill interval in ms |
 | `blockDuration` | `0` | Auto-ban duration in ms (0 = no ban) |
 | `keyBy` | `'ip'` | `'ip'`, `'connection'`, or a function |
-| `localFloorOnStorageFailure` | `false` | Degraded mode for `consume()`: decide on an in-process token bucket while Redis is unreachable (or the breaker is open) instead of rejecting the promise. `true` reuses `points`/`interval`; `{ points?, interval? }` sets a tighter per-instance budget. |
+| `refill` | `'window'` | Refill algorithm: `'window'` (fixed-window counter), `'sliding'` (sliding-window-counter), or `'gcra'` (leaky-bucket / GCRA). See [Refill modes](#refill-modes). |
+| `localFloorOnStorageFailure` | `false` | Degraded mode for `consume()`: decide on an in-process token bucket while Redis is unreachable (or the breaker is open) instead of rejecting the promise. `true` reuses `points`/`interval`; `{ points?, interval? }` sets a tighter per-instance budget. The floor mirrors the selected `refill` mode. |
 
 > **Degraded verdicts.** Without the floor, a Redis outage rejects every `consume()` promise and the caller decides (usually fail-closed). With it, limits keep being enforced per instance with the same semantics (refill, `blockDuration` bans) - the worst case is N instances allowing N times the floor budget until the store recovers, which is why a tighter per-instance budget (`points / instanceCount`) is offered. Floor state never leaks back into Redis; admin ops (`reset` / `ban` / `unban` / `clear`) still reject while degraded. Floor-decided verdicts count in `ratelimit_storage_fallbacks_total` when a metrics registry is configured, and the first degraded verdict logs a one-shot warning.
 
@@ -1139,10 +1140,39 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 | Method | Description |
 |---|---|
 | `consume(ws, cost?)` | Attempt to consume tokens. `cost` must be a positive integer. |
+| `peek(ws, cost?)` | Read-only: the verdict a `consume(ws, cost)` **would** return - `{ allowed, remaining, resetMs }` - without spending, initializing the bucket, or moving the allowed/denied counters. |
 | `reset(key)` | Clear the bucket for a key |
 | `ban(key, duration?)` | Manually ban a key |
 | `unban(key)` | Remove a ban |
 | `clear()` | Reset all state |
+
+#### Refill modes
+
+`refill` selects the algorithm behind the limiter. Every mode is one atomic single-key roundtrip and shares the same `points` / `interval` / `blockDuration` / `keyBy` / `tenant` / emergency-scale behaviour; they differ only in how the budget refills. Each mode uses its own Redis key space, so switching modes never reads a foreign-layout bucket.
+
+| `refill` | Behaviour |
+|---|---|
+| `'window'` (default) | Fixed-window counter. **Byte-identical to prior releases.** The whole bucket refills at once at the window edge, so it can admit up to **~2x `points` across an edge** - a full budget just before the edge plus a full budget just after (the classic fixed-window boundary burst). |
+| `'sliding'` | Sliding-window-counter: weights the previous window by its remaining overlap, so admission does not jump at the edge. No boundary burst. |
+| `'gcra'` | Leaky-bucket / GCRA: meters a smooth emission of one token every `interval / points` ms, tolerating a burst of up to `points`. No window edge, so no boundary burst. |
+
+> **The fixed-window boundary burst.** In `'window'` mode a client can send a full `points` worth of traffic in the last instant of one window and another full `points` in the first instant of the next - up to ~2x the nominal rate concentrated across the edge - because the counter refills the whole bucket at once. That is fine for coarse anti-abuse metering (and it is what every prior release did). When you need the rate held smooth across window edges, choose `'sliding'` or `'gcra'`; `'gcra'` additionally paces admissions to one per `interval / points` ms.
+
+#### Spend only on failure (a recipe)
+
+`peek` plus `consume` compose into a failure limiter - admit every request, but charge a point only when the request actually fails (e.g. a rejected auth probe). Successful requests never spend budget; a burst of failures exhausts it and the gate closes:
+
+```js
+export async function message(ws, { data, platform }) {
+  // Gate on the read-only verdict - this spends nothing.
+  if (!(await limiter.peek(ws)).allowed) return; // over the failure budget: drop
+
+  const ok = await handle(data);
+  if (!ok) await limiter.consume(ws); // charge a point only on failure
+}
+```
+
+`peek` reports the exact verdict the matching `consume` would return (including an active ban), so the gate is accurate without a wasted write; it never initializes the bucket and never moves `ratelimit_allowed_total` / `ratelimit_denied_total`.
 
 #### Emergency scale (incident switch)
 
@@ -1199,8 +1229,9 @@ if (!allowed) {
 - **All or nothing.** A request is admitted only when EVERY dimension has budget, and consumes from all of them atomically - or from none, so a deny never skews the other counters. The verdict names the tripped dimension (declaration order decides when several would trip) and `remaining` reports every dimension's balance.
 - **`keyBy` is required per dimension** - each dimension must count along its own axis; there is no shared default that could silently collapse the composite into one budget checked N times.
 - **Per-dimension `blockDuration`** auto-bans just the dimension that tripped; `reset` / `ban` / `unban` take the dimension name; `clear(tenant?)` scopes to one tenant's space.
+- **`peek(ws, cost?)`** is the read-only companion: it reports the same `{ allowed, tripped, remaining, resetMs }` a `consume` would return, checking every dimension without writing to any bucket or moving a counter (the tripped dimension is named without consuming anywhere).
 - **Redis Cluster:** every dimension key for a check shares one hash tag (per tenant), which is what makes the multi-key script legal - and means one tenant's composite buckets live on one shard. That is the standard trade for atomic multi-scope limiting; size budgets so a single hot tenant's check rate fits one shard.
-- The emergency factor above scales every dimension, and `localFloorOnStorageFailure: true` gives the same all-or-nothing verdicts on in-process buckets while the store is down.
+- The emergency factor above scales every dimension, and `localFloorOnStorageFailure: true` gives the same all-or-nothing verdicts on in-process buckets while the store is down. Composite dimensions are fixed-window; per-dimension `refill` modes are not offered (use single-dimension `createRateLimit` with `refill` where a smooth mode matters).
 
 ---
 
