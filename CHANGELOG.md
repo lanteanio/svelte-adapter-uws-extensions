@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.46] - 2026-07-08
+
+### Changed
+
+- **The Redis and Postgres replay buffers now stamp their authoritative storage sequence onto the live broadcast frame, so a resuming client dedups against the exact seq space the buffer replays - across a restart and, with a shared buffer, across instances.** Each replay `publish` already computes an authoritative per-topic seq (the Redis Lua `INCR`, the Postgres `INSERT ... ON CONFLICT DO UPDATE` CTE) and stores it in the buffer, but it then fanned out the live frame via a bare `platform.publish(topic, event, data)`, so the adapter stamped its own per-worker counter instead. A client that reconnected and gap-filled against the buffer's seq space was therefore deduping against a different space than the live stream carried, which could duplicate or drop events. The buffer seq is now threaded through as `platform.publish(..., { seq })` (the `seq: number` primitive the adapter added in 0.6.0-next.63) on the sorted-set, stream, and Postgres backends alike; the degraded local-fanout fallback (used when storage is down and `localFanoutOnStorageFailure` is set) stays counter-stamped since it has no authoritative seq. The `publish` / `publishIdempotent` signatures and return values are unchanged.
+- **The Redis pub/sub relay now carries an authoritative numeric seq across the cluster, fixing cross-instance sequence non-monotonicity.** A publish that carried a `seq: number` was relayed to other instances without it, so the receiving instance re-stamped a fresh local seq - which read as non-monotonic to a subscriber that had already seen the origin's higher seq. The relay envelope now carries the seq (as an internal `s` field, omitted for the common counter-stamped publish so the wire stays byte-identical) and the receiving instance re-applies it, so every instance stamps the same authoritative seq for a given frame. Requires `svelte-adapter-uws >= 0.6.0-next.63` (the peer-dependency floor is raised accordingly).
+
+### Added
+
+- **`svelte-adapter-uws-extensions/safe-url` now re-exports `classifyAddress(ip)` and `isAddressSafe(ip)`,** the address-level SSRF classifiers the adapter added in 0.6.0-next.64, alongside the existing `isSafeUrl` / `checkUrl` / `checkUrlResolved`. The extensions entry single-sources the whole surface from the adapter, so a consumer of the extensions package can classify a bare IP (a resolved DNS result, a forwarded-for hop, a socket peer) directly instead of wrapping it in a throwaway URL. `classifyAddress` returns the blocked reason (`loopback`, `rfc1918`, `link-local`, `metadata`, `ula`, `unspecified`) or `null` for a real public IP, and `not-an-ip` for a DNS name so a hostname can never masquerade as a safe address; `isAddressSafe` is the boolean gate.
+
 ## [0.6.0-next.45] - 2026-07-07
 
 ### Added

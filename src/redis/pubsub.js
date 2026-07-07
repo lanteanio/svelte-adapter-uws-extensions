@@ -220,6 +220,14 @@ export function createPubSubBus(client, options = {}) {
 						if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
 							/** @type {any} */ (env).j = options.jitterMs;
 						}
+						// Carry an authoritative numeric seq across the cluster so a
+						// subscriber on ANOTHER node dedups against the SAME seq space (the
+						// replay buffer's) instead of a fresh local counter, which would read
+						// as cross-instance non-monotonic on resume. Omitted for the common
+						// counter-stamped publish (byte-identical relay wire).
+						if (options && typeof options.seq === 'number') {
+							/** @type {any} */ (env).s = options.seq;
+						}
 						scheduleRelay(JSON.stringify(env), 1);
 					}
 
@@ -559,10 +567,13 @@ export function createPubSubBus(client, options = {}) {
 							return;
 						}
 						mReceived?.inc();
-						// Re-apply the de-herd window (carried as `j`) so this node's
-						// subscribers stagger too; `relay: false` stops the re-relay.
-						activePlatform.publish(parsed.topic, parsed.event, parsed.data,
-							parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
+						// Re-apply the de-herd window (carried as `j`) and the authoritative
+						// seq (carried as `s`) so this node's subscribers stagger AND dedup
+						// against the origin's seq space; `relay: false` stops the re-relay.
+						const opts = { relay: false };
+						if (parsed.j !== undefined) opts.jitterMs = parsed.j;
+						if (typeof parsed.s === 'number') opts.seq = parsed.s;
+						activePlatform.publish(parsed.topic, parsed.event, parsed.data, opts);
 					}
 				} catch {
 					// Malformed envelope; counted so a stream of bad messages

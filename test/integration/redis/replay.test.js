@@ -47,6 +47,13 @@ describeIntegration('redis replay (integration)', () => {
 			expect(await replay.seq('chat')).toBe(2);
 			expect(await replay.seq('todos')).toBe(1);
 			expect(platform.published).toHaveLength(3);
+			// The authoritative Lua-INCR seq is threaded onto the LIVE frame (not just
+			// stored), so a resuming client dedups against the same seq space the
+			// buffer replays - across a restart or, with the shared Redis buffer,
+			// across instances.
+			expect(platform.published[0].options?.seq).toBe(1); // chat #1
+			expect(platform.published[1].options?.seq).toBe(2); // chat #2
+			expect(platform.published[2].options?.seq).toBe(1); // todos #1
 		});
 
 		it('Lua-built envelope round-trips through since() with correct shape', async () => {

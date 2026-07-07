@@ -298,7 +298,11 @@ export function createStreamReplay(client, options = {}) {
 				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
-			await platform.publish(topic, event, data);
+			// Thread the authoritative stream seq onto the live frame (see the
+			// sortedset replay for the full rationale) so a resuming client dedups
+			// against the same seq space the buffer stores. seq comes from the Lua
+			// INCR, so it is a valid positive integer; guarded for safety.
+			await platform.publish(topic, event, data, Number.isInteger(seq) && seq >= 1 ? { seq } : undefined);
 			return { seq, isDuplicate: false };
 		},
 
@@ -317,10 +321,11 @@ export function createStreamReplay(client, options = {}) {
 				throw new ReplaySerializationError('publish', err);
 			}
 
+			let seq;
 			try {
-				await withBreaker(b, () =>
+				seq = Number(await withBreaker(b, () =>
 					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, maxSize, ttl, event, payload)
-				);
+				));
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
@@ -343,7 +348,11 @@ export function createStreamReplay(client, options = {}) {
 				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
-			return platform.publish(topic, event, data);
+			// Thread the authoritative stream seq onto the live frame; the degraded
+			// local-fanout fallback above stays counter-stamped (no authoritative seq).
+			return Number.isInteger(seq) && seq >= 1
+				? platform.publish(topic, event, data, { seq })
+				: platform.publish(topic, event, data);
 		},
 
 		async seq(topic) {

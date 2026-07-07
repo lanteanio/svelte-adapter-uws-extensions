@@ -1,251 +1,251 @@
 {
-	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.45",
-	"publishConfig": {
-		"tag": "next"
-	},
-	"description": "Redis and Postgres extensions for svelte-adapter-uws - distributed pub/sub, replay buffers, presence tracking, rate limiting, groups, and DB change notifications",
-	"author": "Kevin Radziszewski",
-	"license": "MIT",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/lanteanio/svelte-adapter-uws-extensions.git"
-	},
-	"homepage": "https://github.com/lanteanio/svelte-adapter-uws-extensions#readme",
-	"bugs": {
-		"url": "https://github.com/lanteanio/svelte-adapter-uws-extensions/issues"
-	},
-	"type": "module",
-	"exports": {
-		"./sim": {
-			"types": "./src/sim.d.ts",
-			"default": "./src/sim.js"
-		},
-		"./redis": {
-			"types": "./src/redis/index.d.ts",
-			"default": "./src/redis/index.js"
-		},
-		"./redis/pubsub": {
-			"types": "./src/redis/pubsub.d.ts",
-			"default": "./src/redis/pubsub.js"
-		},
-		"./redis/crdt": {
-			"types": "./src/redis/crdt.d.ts",
-			"default": "./src/redis/crdt.js"
-		},
-		"./redis/smooth": {
-			"types": "./src/redis/smooth-cluster.d.ts",
-			"default": "./src/redis/smooth-cluster.js"
-		},
-		"./redis/topic-broadcast": {
-			"types": "./src/redis/topic-broadcast.d.ts",
-			"default": "./src/redis/topic-broadcast.js"
-		},
-		"./redis/alarm-store": {
-			"types": "./src/redis/alarm-store.d.ts",
-			"default": "./src/redis/alarm-store.js"
-		},
-		"./redis/sharded-pubsub": {
-			"types": "./src/redis/sharded-pubsub.d.ts",
-			"default": "./src/redis/sharded-pubsub.js"
-		},
-		"./redis/functions": {
-			"types": "./src/redis/functions.d.ts",
-			"default": "./src/redis/functions.js"
-		},
-		"./redis/replay": {
-			"types": "./src/redis/replay.d.ts",
-			"default": "./src/redis/replay.js"
-		},
-		"./redis/dead-letter": {
-			"types": "./src/redis/dead-letter.d.ts",
-			"default": "./src/redis/dead-letter.js"
-		},
-		"./redis/webhook-controls": {
-			"types": "./src/redis/webhook-controls.d.ts",
-			"default": "./src/redis/webhook-controls.js"
-		},
-		"./redis/presence": {
-			"types": "./src/redis/presence.d.ts",
-			"default": "./src/redis/presence.js"
-		},
-		"./postgres": {
-			"types": "./src/postgres/index.d.ts",
-			"default": "./src/postgres/index.js"
-		},
-		"./postgres/replay": {
-			"types": "./src/postgres/replay.d.ts",
-			"default": "./src/postgres/replay.js"
-		},
-		"./postgres/dead-letter": {
-			"types": "./src/postgres/dead-letter.d.ts",
-			"default": "./src/postgres/dead-letter.js"
-		},
-		"./postgres/alarm-store": {
-			"types": "./src/postgres/alarm-store.d.ts",
-			"default": "./src/postgres/alarm-store.js"
-		},
-		"./postgres/notify": {
-			"types": "./src/postgres/notify.d.ts",
-			"default": "./src/postgres/notify.js"
-		},
-		"./redis/ratelimit": {
-			"types": "./src/redis/ratelimit.d.ts",
-			"default": "./src/redis/ratelimit.js"
-		},
-		"./redis/upgrade-bucket": {
-			"types": "./src/redis/upgrade-bucket.d.ts",
-			"default": "./src/redis/upgrade-bucket.js"
-		},
-		"./redis/groups": {
-			"types": "./src/redis/groups.d.ts",
-			"default": "./src/redis/groups.js"
-		},
-		"./redis/cursor": {
-			"types": "./src/redis/cursor.d.ts",
-			"default": "./src/redis/cursor.js"
-		},
-		"./redis/clock-skew": {
-			"types": "./src/redis/clock-skew.d.ts",
-			"default": "./src/redis/clock-skew.js"
-		},
-		"./redis/idempotency": {
-			"types": "./src/redis/idempotency.d.ts",
-			"default": "./src/redis/idempotency.js"
-		},
-		"./redis/fence": {
-			"types": "./src/redis/fence.d.ts",
-			"default": "./src/redis/fence.js"
-		},
-		"./redis/lock": {
-			"types": "./src/redis/lock.d.ts",
-			"default": "./src/redis/lock.js"
-		},
-		"./redis/leader": {
-			"types": "./src/redis/leader.d.ts",
-			"default": "./src/redis/leader.js"
-		},
-		"./redis/session": {
-			"types": "./src/redis/session.d.ts",
-			"default": "./src/redis/session.js"
-		},
-		"./redis/registry": {
-			"types": "./src/redis/registry.d.ts",
-			"default": "./src/redis/registry.js"
-		},
-		"./redis/publish-rate": {
-			"types": "./src/redis/publish-rate.d.ts",
-			"default": "./src/redis/publish-rate.js"
-		},
-		"./postgres/idempotency": {
-			"types": "./src/postgres/idempotency.d.ts",
-			"default": "./src/postgres/idempotency.js"
-		},
-		"./postgres/tasks": {
-			"types": "./src/postgres/tasks.d.ts",
-			"default": "./src/postgres/tasks.js"
-		},
-		"./postgres/jobs": {
-			"types": "./src/postgres/jobs.d.ts",
-			"default": "./src/postgres/jobs.js"
-		},
-		"./prometheus": {
-			"types": "./src/prometheus/index.d.ts",
-			"default": "./src/prometheus/index.js"
-		},
-		"./breaker": {
-			"types": "./src/shared/breaker.d.ts",
-			"default": "./src/shared/breaker.js"
-		},
-		"./degradation": {
-			"types": "./src/shared/degradation.d.ts",
-			"default": "./src/shared/degradation.js"
-		},
-		"./forget-store": {
-			"types": "./src/shared/forget-store.d.ts",
-			"default": "./src/shared/forget-store.js"
-		},
-		"./assert": {
-			"types": "./src/shared/assert.d.ts",
-			"default": "./src/shared/assert.js"
-		},
-		"./admission": {
-			"types": "./src/shared/admission.d.ts",
-			"default": "./src/shared/admission.js"
-		},
-		"./capability-cookie": {
-			"types": "./src/capability-cookie.d.ts",
-			"default": "./src/capability-cookie.js"
-		},
-		"./bus-validate": {
-			"types": "./src/shared/bus-validate.d.ts",
-			"default": "./src/shared/bus-validate.js"
-		},
-		"./sensitive": {
-			"types": "./src/shared/sensitive.d.ts",
-			"default": "./src/shared/sensitive.js"
-		},
-		"./safe-url": {
-			"types": "./src/shared/safe-url.d.ts",
-			"default": "./src/shared/safe-url.js"
-		},
-		"./testing": {
-			"types": "./src/testing/index.d.ts",
-			"default": "./src/testing/index.js"
-		}
-	},
-	"files": [
-		"src",
-		"LICENSE",
-		"README.md",
-		"MIGRATION.md"
-	],
-	"scripts": {
-		"check": "node scripts/check-types.js && node scripts/check-determinism.js && node scripts/check-slugs.js",
-		"pretest": "npm run check",
-		"test": "vitest run",
-		"test:watch": "vitest",
-		"test:integration": "npm run test:integration:redis && npm run test:integration:postgres",
-		"test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
-		"test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",
-		"test:integration:valkey": "vitest run --config vitest.config.integration.valkey.js",
-		"test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js",
-		"test:integration:cluster-mirror": "vitest run --config vitest.config.integration.cluster-mirror.js",
-		"test:integration:valkey-cluster": "vitest run --config vitest.config.integration.valkey-cluster.js",
-		"test:integration:valkey-cluster-mirror": "vitest run --config vitest.config.integration.valkey-cluster-mirror.js"
-	},
-	"engines": {
-		"node": ">=22.0.0"
-	},
-	"peerDependencies": {
-		"svelte-adapter-uws": "^0.6.0-next.24"
-	},
-	"dependencies": {
-		"ioredis": "^5.0.0"
-	},
-	"optionalDependencies": {
-		"pg": "^8.0.0"
-	},
-	"devDependencies": {
-		"svelte-adapter-uws": "^0.6.0-next.24",
-		"vitest": "^4.0.18",
-		"ws": "^8.0.0"
-	},
-	"keywords": [
-		"svelte",
-		"sveltekit",
-		"uwebsockets",
-		"redis",
-		"postgres",
-		"pubsub",
-		"websocket",
-		"presence",
-		"replay",
-		"ratelimit",
-		"groups",
-		"cursor",
-		"notify",
-		"prometheus",
-		"metrics"
-	]
+  "name": "svelte-adapter-uws-extensions",
+  "version": "0.6.0-next.46",
+  "publishConfig": {
+    "tag": "next"
+  },
+  "description": "Redis and Postgres extensions for svelte-adapter-uws - distributed pub/sub, replay buffers, presence tracking, rate limiting, groups, and DB change notifications",
+  "author": "Kevin Radziszewski",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanteanio/svelte-adapter-uws-extensions.git"
+  },
+  "homepage": "https://github.com/lanteanio/svelte-adapter-uws-extensions#readme",
+  "bugs": {
+    "url": "https://github.com/lanteanio/svelte-adapter-uws-extensions/issues"
+  },
+  "type": "module",
+  "exports": {
+    "./sim": {
+      "types": "./src/sim.d.ts",
+      "default": "./src/sim.js"
+    },
+    "./redis": {
+      "types": "./src/redis/index.d.ts",
+      "default": "./src/redis/index.js"
+    },
+    "./redis/pubsub": {
+      "types": "./src/redis/pubsub.d.ts",
+      "default": "./src/redis/pubsub.js"
+    },
+    "./redis/crdt": {
+      "types": "./src/redis/crdt.d.ts",
+      "default": "./src/redis/crdt.js"
+    },
+    "./redis/smooth": {
+      "types": "./src/redis/smooth-cluster.d.ts",
+      "default": "./src/redis/smooth-cluster.js"
+    },
+    "./redis/topic-broadcast": {
+      "types": "./src/redis/topic-broadcast.d.ts",
+      "default": "./src/redis/topic-broadcast.js"
+    },
+    "./redis/alarm-store": {
+      "types": "./src/redis/alarm-store.d.ts",
+      "default": "./src/redis/alarm-store.js"
+    },
+    "./redis/sharded-pubsub": {
+      "types": "./src/redis/sharded-pubsub.d.ts",
+      "default": "./src/redis/sharded-pubsub.js"
+    },
+    "./redis/functions": {
+      "types": "./src/redis/functions.d.ts",
+      "default": "./src/redis/functions.js"
+    },
+    "./redis/replay": {
+      "types": "./src/redis/replay.d.ts",
+      "default": "./src/redis/replay.js"
+    },
+    "./redis/dead-letter": {
+      "types": "./src/redis/dead-letter.d.ts",
+      "default": "./src/redis/dead-letter.js"
+    },
+    "./redis/webhook-controls": {
+      "types": "./src/redis/webhook-controls.d.ts",
+      "default": "./src/redis/webhook-controls.js"
+    },
+    "./redis/presence": {
+      "types": "./src/redis/presence.d.ts",
+      "default": "./src/redis/presence.js"
+    },
+    "./postgres": {
+      "types": "./src/postgres/index.d.ts",
+      "default": "./src/postgres/index.js"
+    },
+    "./postgres/replay": {
+      "types": "./src/postgres/replay.d.ts",
+      "default": "./src/postgres/replay.js"
+    },
+    "./postgres/dead-letter": {
+      "types": "./src/postgres/dead-letter.d.ts",
+      "default": "./src/postgres/dead-letter.js"
+    },
+    "./postgres/alarm-store": {
+      "types": "./src/postgres/alarm-store.d.ts",
+      "default": "./src/postgres/alarm-store.js"
+    },
+    "./postgres/notify": {
+      "types": "./src/postgres/notify.d.ts",
+      "default": "./src/postgres/notify.js"
+    },
+    "./redis/ratelimit": {
+      "types": "./src/redis/ratelimit.d.ts",
+      "default": "./src/redis/ratelimit.js"
+    },
+    "./redis/upgrade-bucket": {
+      "types": "./src/redis/upgrade-bucket.d.ts",
+      "default": "./src/redis/upgrade-bucket.js"
+    },
+    "./redis/groups": {
+      "types": "./src/redis/groups.d.ts",
+      "default": "./src/redis/groups.js"
+    },
+    "./redis/cursor": {
+      "types": "./src/redis/cursor.d.ts",
+      "default": "./src/redis/cursor.js"
+    },
+    "./redis/clock-skew": {
+      "types": "./src/redis/clock-skew.d.ts",
+      "default": "./src/redis/clock-skew.js"
+    },
+    "./redis/idempotency": {
+      "types": "./src/redis/idempotency.d.ts",
+      "default": "./src/redis/idempotency.js"
+    },
+    "./redis/fence": {
+      "types": "./src/redis/fence.d.ts",
+      "default": "./src/redis/fence.js"
+    },
+    "./redis/lock": {
+      "types": "./src/redis/lock.d.ts",
+      "default": "./src/redis/lock.js"
+    },
+    "./redis/leader": {
+      "types": "./src/redis/leader.d.ts",
+      "default": "./src/redis/leader.js"
+    },
+    "./redis/session": {
+      "types": "./src/redis/session.d.ts",
+      "default": "./src/redis/session.js"
+    },
+    "./redis/registry": {
+      "types": "./src/redis/registry.d.ts",
+      "default": "./src/redis/registry.js"
+    },
+    "./redis/publish-rate": {
+      "types": "./src/redis/publish-rate.d.ts",
+      "default": "./src/redis/publish-rate.js"
+    },
+    "./postgres/idempotency": {
+      "types": "./src/postgres/idempotency.d.ts",
+      "default": "./src/postgres/idempotency.js"
+    },
+    "./postgres/tasks": {
+      "types": "./src/postgres/tasks.d.ts",
+      "default": "./src/postgres/tasks.js"
+    },
+    "./postgres/jobs": {
+      "types": "./src/postgres/jobs.d.ts",
+      "default": "./src/postgres/jobs.js"
+    },
+    "./prometheus": {
+      "types": "./src/prometheus/index.d.ts",
+      "default": "./src/prometheus/index.js"
+    },
+    "./breaker": {
+      "types": "./src/shared/breaker.d.ts",
+      "default": "./src/shared/breaker.js"
+    },
+    "./degradation": {
+      "types": "./src/shared/degradation.d.ts",
+      "default": "./src/shared/degradation.js"
+    },
+    "./forget-store": {
+      "types": "./src/shared/forget-store.d.ts",
+      "default": "./src/shared/forget-store.js"
+    },
+    "./assert": {
+      "types": "./src/shared/assert.d.ts",
+      "default": "./src/shared/assert.js"
+    },
+    "./admission": {
+      "types": "./src/shared/admission.d.ts",
+      "default": "./src/shared/admission.js"
+    },
+    "./capability-cookie": {
+      "types": "./src/capability-cookie.d.ts",
+      "default": "./src/capability-cookie.js"
+    },
+    "./bus-validate": {
+      "types": "./src/shared/bus-validate.d.ts",
+      "default": "./src/shared/bus-validate.js"
+    },
+    "./sensitive": {
+      "types": "./src/shared/sensitive.d.ts",
+      "default": "./src/shared/sensitive.js"
+    },
+    "./safe-url": {
+      "types": "./src/shared/safe-url.d.ts",
+      "default": "./src/shared/safe-url.js"
+    },
+    "./testing": {
+      "types": "./src/testing/index.d.ts",
+      "default": "./src/testing/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md",
+    "MIGRATION.md"
+  ],
+  "scripts": {
+    "check": "node scripts/check-types.js && node scripts/check-determinism.js && node scripts/check-slugs.js",
+    "pretest": "npm run check",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "npm run test:integration:redis && npm run test:integration:postgres",
+    "test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
+    "test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",
+    "test:integration:valkey": "vitest run --config vitest.config.integration.valkey.js",
+    "test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js",
+    "test:integration:cluster-mirror": "vitest run --config vitest.config.integration.cluster-mirror.js",
+    "test:integration:valkey-cluster": "vitest run --config vitest.config.integration.valkey-cluster.js",
+    "test:integration:valkey-cluster-mirror": "vitest run --config vitest.config.integration.valkey-cluster-mirror.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "peerDependencies": {
+    "svelte-adapter-uws": ">=0.6.0-next.63"
+  },
+  "dependencies": {
+    "ioredis": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.0.0"
+  },
+  "devDependencies": {
+    "svelte-adapter-uws": "^0.6.0-next.24",
+    "vitest": "^4.0.18",
+    "ws": "^8.0.0"
+  },
+  "keywords": [
+    "svelte",
+    "sveltekit",
+    "uwebsockets",
+    "redis",
+    "postgres",
+    "pubsub",
+    "websocket",
+    "presence",
+    "replay",
+    "ratelimit",
+    "groups",
+    "cursor",
+    "notify",
+    "prometheus",
+    "metrics"
+  ]
 }

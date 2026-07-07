@@ -40,11 +40,14 @@ describe('redis replay', () => {
 	});
 
 	describe('publish', () => {
-		it('calls platform.publish with the same arguments', async () => {
+		it('calls platform.publish with the same arguments plus the authoritative seq', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
+			// The topic/event/data are forwarded unchanged; the buffer's authoritative
+			// seq is threaded as the publish option so the live frame carries the same
+			// seq the buffer replays.
 			expect(platform.published).toEqual([
-				{ topic: 'chat', event: 'created', data: { id: 1 } }
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: 1 } }
 			]);
 		});
 
@@ -831,7 +834,7 @@ describe('redis replay', () => {
 				topic: 'chat',
 				event: 'created',
 				data: { id: 1 },
-				options: undefined
+				options: { seq: 1 }
 			});
 		});
 

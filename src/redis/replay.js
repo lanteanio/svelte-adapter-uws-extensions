@@ -221,10 +221,11 @@ export function createReplay(client, options = {}) {
 				throw new ReplaySerializationError('publish', err);
 			}
 
+			let seq;
 			try {
-				await withBreaker(b, () =>
+				seq = Number(await withBreaker(b, () =>
 					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, topic, event, payload, maxSize, ttl)
-				);
+				));
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
@@ -247,7 +248,17 @@ export function createReplay(client, options = {}) {
 				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
-			return platform.publish(topic, event, data);
+			// Thread the authoritative buffer seq (the Lua INCR result) onto the live
+			// frame so a resuming client gap-fills against the SAME seq space the
+			// buffer stores - across a restart, or across instances via the shared
+			// Redis buffer - instead of the adapter's per-worker counter, which would
+			// diverge and cause duplicate/dropped events on resume. Guard on a valid
+			// positive integer (the adapter poisons its convergence tracker on 0/NaN);
+			// the degraded local-fanout fallback above stays counter-stamped since it
+			// has no authoritative seq.
+			return Number.isInteger(seq) && seq >= 1
+				? platform.publish(topic, event, data, { seq })
+				: platform.publish(topic, event, data);
 		},
 
 		async seq(topic) {

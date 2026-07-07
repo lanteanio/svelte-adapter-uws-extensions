@@ -83,6 +83,12 @@ describe('postgres replay (integration)', () => {
 			expect(await replay.seq('chat')).toBe(2);
 			expect(await replay.seq('todos')).toBe(1);
 			expect(platform.published).toHaveLength(3);
+			// The authoritative CTE seq is threaded onto the LIVE frame (not just
+			// stored), so a resuming client dedups against the same seq space the
+			// buffer replays - the whole point of the cross-instance seq authority.
+			expect(platform.published[0].options?.seq).toBe(1); // chat #1
+			expect(platform.published[1].options?.seq).toBe(2); // chat #2
+			expect(platform.published[2].options?.seq).toBe(1); // todos #1
 		});
 
 		it('round-trips jsonb data through since() with the right shape', async () => {

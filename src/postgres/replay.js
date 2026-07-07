@@ -320,7 +320,15 @@ export function createReplay(client, options = {}) {
 				}
 			}
 
-			return platform.publish(topic, event, data);
+			// Thread the authoritative CTE seq onto the live frame so a resuming
+			// client dedups against the same per-topic contiguous seq space the table
+			// stores (across a restart, or across instances via the shared table)
+			// instead of the adapter's per-worker counter. seq is a contiguous
+			// positive integer from the CTE; guarded for safety. The degraded
+			// local-fanout fallback above stays counter-stamped (no authoritative seq).
+			return Number.isInteger(seq) && seq >= 1
+				? platform.publish(topic, event, data, { seq })
+				: platform.publish(topic, event, data);
 		},
 
 		async seq(topic) {

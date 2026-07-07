@@ -43,10 +43,12 @@ describe('redis replay (stream backend)', () => {
 	});
 
 	describe('publish', () => {
-		it('calls platform.publish with the same arguments', async () => {
+		it('calls platform.publish with the same arguments plus the authoritative seq', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			// topic/event/data forwarded unchanged; the stream's authoritative seq is
+			// threaded as the publish option so the live frame matches the buffer.
 			expect(platform.published).toEqual([
-				{ topic: 'chat', event: 'created', data: { id: 1 } }
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: 1 } }
 			]);
 		});
 
