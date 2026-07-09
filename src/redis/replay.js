@@ -24,7 +24,7 @@
 import { createStreamReplay } from './replay-stream.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
-import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplication, createResumeHook } from '../shared/replay-helpers.js';
+import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplicationGrouped, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -262,7 +262,7 @@ export function createReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
+				await awaitReplicationGrouped(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			// Thread the authoritative buffer seq (the Lua INCR result) onto the live

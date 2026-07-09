@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.49] - 2026-07-09
+
+### Changed
+
+- **Replicated-durability publishes group-commit their `WAIT`.** With `durability: 'replicated'`, every replay publish paid its own second round trip - a `WAIT minReplicas timeout` after the write - so a publish burst paid N WAITs for information one command already carries: Redis's WAIT acknowledges every write the client sent before it was issued. Concurrent publishes on one client now share WAIT round trips: a publish whose write has completed joins the pending window, one WAIT settles the whole window, and a burst of N costs one or two WAITs instead of N. The grouping is correctness-first: a publish that arrives while a WAIT is already in flight joins the NEXT window (its write may have landed after the in-flight WAIT sampled the replication offset, so being settled by it would claim a durability that was never checked), windows are keyed by the exact `(minReplicas, timeoutMs)` pair so distinct configurations never share a guarantee or a latency bound, an under-acked window rejects every waiter in it with the same `ReplicationTimeoutError` a solo WAIT would have thrown, and each waiter keeps its own metrics and breaker accounting. A lone publish pays exactly the single WAIT it always did - nothing is ever held back to fill a window, so no publish gains latency. Applies to both the sorted-set and stream backends (they share the grouping on a shared client). The Postgres backend is deliberately unchanged: its publish is already a single atomic statement with no second durability round trip, and client-side transaction batching would trade per-publish atomicity and latency for an fsync amortization the path does not pay for.
+
 ## [0.6.0-next.48] - 2026-07-09
 
 ### Added

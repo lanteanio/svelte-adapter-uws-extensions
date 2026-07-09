@@ -146,6 +146,91 @@ export async function awaitReplication(redis, minReplicas, timeoutMs, b, mReplic
 }
 
 /**
+ * Group-commit state per redis client: concurrent replicated publishes share
+ * WAIT round trips instead of each paying their own. Keyed by the client
+ * (WeakMap - a dropped client frees its state) and, inside it, by the
+ * `minReplicas:timeoutMs` pair, so every window is homogeneous and each
+ * waiter gets exactly the guarantee and the latency bound it configured.
+ * @type {WeakMap<object, Map<string, { inflight: boolean, queue: Array<{ resolve: () => void, reject: (err: any) => void, b: any, mReplications: any, mReplicationTimeouts: any }> }>>}
+ */
+const waitGroups = new WeakMap();
+
+/**
+ * Group-committed `WAIT`: the publish-path form of `awaitReplication`.
+ *
+ * Redis's WAIT acknowledges every write this client sent BEFORE the WAIT was
+ * issued, so one WAIT can confirm a whole burst: a caller whose write has
+ * completed joins the pending window, and the window's single WAIT settles
+ * everyone in it. A caller that arrives while a WAIT is already in flight
+ * joins the NEXT window (its write may have landed after the in-flight WAIT
+ * sampled the replication offset, so being settled by it would claim a
+ * durability that was never checked). Under a publish burst of N this is one
+ * or two WAIT round trips instead of N; a lone publish pays exactly the one
+ * WAIT it always did, with no added latency for anyone (waiters piggyback,
+ * nothing is held back to fill a window).
+ *
+ * Per-waiter accounting is preserved: each caller's own metrics increment and
+ * its own breaker records the failure, and an `ack < minReplicas` outcome
+ * rejects every waiter in the window with the same ReplicationTimeoutError
+ * a solo WAIT would have thrown.
+ *
+ * @param {import('ioredis').Redis} redis
+ * @param {number} minReplicas
+ * @param {number} timeoutMs
+ * @param {import('./breaker.js').CircuitBreaker | undefined} b
+ * @param {{ inc(): void } | null | undefined} mReplications
+ * @param {{ inc(): void } | null | undefined} mReplicationTimeouts
+ * @returns {Promise<void>}
+ */
+export function awaitReplicationGrouped(redis, minReplicas, timeoutMs, b, mReplications, mReplicationTimeouts) {
+	let groups = waitGroups.get(redis);
+	if (!groups) {
+		groups = new Map();
+		waitGroups.set(redis, groups);
+	}
+	const key = minReplicas + ':' + timeoutMs;
+	let g = groups.get(key);
+	if (!g) {
+		g = { inflight: false, queue: [] };
+		groups.set(key, g);
+	}
+	return new Promise((resolve, reject) => {
+		g.queue.push({ resolve, reject, b, mReplications, mReplicationTimeouts });
+		if (!g.inflight) {
+			g.inflight = true;
+			_drainWaitWindows(redis, minReplicas, timeoutMs, g);
+		}
+	});
+}
+
+async function _drainWaitWindows(redis, minReplicas, timeoutMs, g) {
+	while (g.queue.length > 0) {
+		const window = g.queue;
+		g.queue = [];
+		let ack;
+		let err = null;
+		try {
+			ack = await redis.wait(minReplicas, timeoutMs);
+		} catch (e) {
+			err = e;
+		}
+		for (const w of window) {
+			if (err !== null) {
+				w.b?.failure(err);
+				w.reject(err);
+			} else if (ack < minReplicas) {
+				w.mReplicationTimeouts?.inc();
+				w.reject(new ReplicationTimeoutError(ack, minReplicas, timeoutMs));
+			} else {
+				w.mReplications?.inc();
+				w.resolve();
+			}
+		}
+	}
+	g.inflight = false;
+}
+
+/**
  * Shared `hooks.ws.resume` hook body for the replay stores. Loops over the
  * client's per-topic lastSeenSeqs. For each topic it compares the client's
  * presented epoch (ctx.lastSeenEpochs, threaded by the adapter; absent ->

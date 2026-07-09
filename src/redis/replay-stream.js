@@ -21,7 +21,7 @@
 
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
-import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
+import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
@@ -312,7 +312,7 @@ export function createStreamReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
+				await awaitReplicationGrouped(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			// Thread the authoritative stream seq onto the live frame (see the
@@ -362,7 +362,7 @@ export function createStreamReplay(client, options = {}) {
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (replicated) {
-				await awaitReplication(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
+				await awaitReplicationGrouped(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
 			// Thread the authoritative stream seq onto the live frame; the degraded

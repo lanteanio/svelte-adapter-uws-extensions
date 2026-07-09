@@ -908,6 +908,100 @@ describe('redis replay', () => {
 			breaker.destroy();
 		});
 
+		it('coalesces a concurrent publish burst onto shared WAIT round trips', async () => {
+			const releases = [];
+			let waitCalls = 0;
+			const origWait = client.redis.wait;
+			client.redis.wait = (n, t) => {
+				waitCalls++;
+				return new Promise((res) => releases.push(() => res(2)));
+			};
+			const r = createReplay(client, { durability: 'replicated', minReplicas: 2, replicationTimeoutMs: 500 });
+
+			const burst = Promise.all(
+				Array.from({ length: 8 }, (_, i) => r.publish(platform, 'chat', 'created', { id: i }))
+			);
+			// Let every publish complete its write and reach the WAIT stage: the
+			// first opens window 1; the other seven arrive while it is in flight
+			// and share window 2.
+			while (releases.length < 1) await new Promise((res) => setTimeout(res, 0));
+			await new Promise((res) => setTimeout(res, 10));
+			releases[0]();
+			while (releases.length < 2) await new Promise((res) => setTimeout(res, 0));
+			releases[1]();
+			await burst;
+
+			expect(waitCalls).toBe(2); // not 8
+			expect(platform.published).toHaveLength(8);
+			client.redis.wait = origWait;
+		});
+
+		it('a publish arriving mid-WAIT settles with the NEXT window, never the in-flight one', async () => {
+			const releases = [];
+			const origWait = client.redis.wait;
+			client.redis.wait = () => new Promise((res) => releases.push(() => res(2)));
+			const r = createReplay(client, { durability: 'replicated', minReplicas: 2, replicationTimeoutMs: 500 });
+
+			let aDone = false;
+			let bDone = false;
+			const a = r.publish(platform, 'chat', 'created', { id: 'a' }).then(() => { aDone = true; });
+			while (releases.length < 1) await new Promise((res) => setTimeout(res, 0));
+			// A's WAIT is in flight; B's write may land after that WAIT sampled
+			// the replication offset, so B must not be settled by it.
+			const bp = r.publish(platform, 'chat', 'created', { id: 'b' }).then(() => { bDone = true; });
+			await new Promise((res) => setTimeout(res, 10));
+			releases[0]();
+			await a;
+			expect(aDone).toBe(true);
+			expect(bDone).toBe(false); // still awaiting window 2
+			while (releases.length < 2) await new Promise((res) => setTimeout(res, 0));
+			releases[1]();
+			await bp;
+			expect(bDone).toBe(true);
+			client.redis.wait = origWait;
+		});
+
+		it('an under-acked window rejects EVERY waiter in it with ReplicationTimeoutError', async () => {
+			const releases = [];
+			const origWait = client.redis.wait;
+			client.redis.wait = () => new Promise((res) => releases.push((ack) => res(ack)));
+			const r = createReplay(client, { durability: 'replicated', minReplicas: 2, replicationTimeoutMs: 500 });
+
+			const a = r.publish(platform, 'chat', 'created', { id: 'a' });
+			while (releases.length < 1) await new Promise((res) => setTimeout(res, 0));
+			// b and c share window 2.
+			const bp = r.publish(platform, 'chat', 'created', { id: 'b' });
+			const cp = r.publish(platform, 'chat', 'created', { id: 'c' });
+			await new Promise((res) => setTimeout(res, 10));
+			releases[0](2); // window 1 acks fine
+			await a;
+			while (releases.length < 2) await new Promise((res) => setTimeout(res, 0));
+			releases[1](1); // window 2 under-acked
+			await expect(bp).rejects.toBeInstanceOf(ReplicationTimeoutError);
+			await expect(cp).rejects.toBeInstanceOf(ReplicationTimeoutError);
+			client.redis.wait = origWait;
+		});
+
+		it('distinct (minReplicas, timeout) configs never share a window', async () => {
+			const seen = [];
+			const origWait = client.redis.wait;
+			client.redis.wait = (n, t) => { seen.push([Number(n), Number(t)]); return Promise.resolve(5); };
+			const strict = createReplay(client, { durability: 'replicated', minReplicas: 3, replicationTimeoutMs: 250 });
+			const lax = createReplay(client, { durability: 'replicated', minReplicas: 1, replicationTimeoutMs: 900 });
+
+			await Promise.all([
+				strict.publish(platform, 'chat', 'created', { id: 1 }),
+				lax.publish(platform, 'todos', 'created', { id: 2 })
+			]);
+			expect(seen).toContainEqual([3, 250]);
+			expect(seen).toContainEqual([1, 900]);
+			// No call may carry a mixed pair.
+			for (const [n, t] of seen) {
+				expect([[3, 250], [1, 900]]).toContainEqual([n, t]);
+			}
+			client.redis.wait = origWait;
+		});
+
 		it('does NOT count a breaker failure when WAIT times out (just acks < min)', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 5 });
 			const r = createReplay(client, {
