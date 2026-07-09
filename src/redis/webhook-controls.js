@@ -96,24 +96,29 @@ export function createRetryBudget(client, options = {}) {
  * half-open probe; a probe success closes the circuit, a probe failure re-opens
  * it. `failure`/`success` return a promise that never rejects (a backend blip
  * degrades to no ejection, never a broken delivery path) - awaitable in tests,
- * ignored by the delivery caller.
+ * ignored by the delivery caller. `probeConcurrency` bounds the half-open
+ * probes admitted per reset window (default one, the prior fixed behavior).
  *
  * @param {import('./index.js').RedisClient} client
- * @param {{ failureThreshold?: number, resetMs?: number, breaker?: object }} [options]
+ * @param {{ failureThreshold?: number, resetMs?: number, probeConcurrency?: number, breaker?: object }} [options]
  */
 export function createWebhookBreaker(client, options = {}) {
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetMs = options.resetMs ?? 30000;
+	const probeConcurrency = options.probeConcurrency ?? 1;
 	if (!Number.isInteger(failureThreshold) || failureThreshold < 1) {
 		throw new Error('redis webhook breaker: failureThreshold must be a positive integer');
 	}
 	if (!Number.isInteger(resetMs) || resetMs < 1) {
 		throw new Error('redis webhook breaker: resetMs must be a positive integer');
 	}
+	if (!Number.isInteger(probeConcurrency) || probeConcurrency < 1) {
+		throw new Error('redis webhook breaker: probeConcurrency must be a positive integer');
+	}
 	const redis = client.redis;
 	const b = options.breaker;
 
-	/** Local view for the synchronous guard: key -> { open, until, probing }. */
+	/** Local view for the synchronous guard: key -> { open, until, probes }. */
 	const local = new Map();
 	function view(key) {
 		const k = String(key ?? '');
@@ -123,7 +128,7 @@ export function createWebhookBreaker(client, options = {}) {
 				const oldest = local.keys().next().value;
 				if (oldest !== undefined) local.delete(oldest);
 			}
-			v = { open: false, until: 0, probing: false };
+			v = { open: false, until: 0, probes: 0 };
 			local.set(k, v);
 		}
 		return v;
@@ -132,13 +137,13 @@ export function createWebhookBreaker(client, options = {}) {
 		const v = view(key);
 		v.open = true;
 		v.until = monotonicNow() + resetMs;
-		v.probing = false;
+		v.probes = 0;
 	}
 	function closeLocal(key) {
 		const v = view(key);
 		v.open = false;
 		v.until = 0;
-		v.probing = false;
+		v.probes = 0;
 	}
 
 	const failKey = (key) => client.key('whbreaker:fail:' + String(key ?? ''));
@@ -147,7 +152,7 @@ export function createWebhookBreaker(client, options = {}) {
 		stateOf(key) {
 			const v = local.get(String(key ?? ''));
 			if (!v || !v.open) return 'healthy';
-			if (v.probing) return 'probing';
+			if (v.probes > 0) return 'probing';
 			return monotonicNow() >= v.until ? 'probing' : 'broken';
 		},
 
@@ -155,8 +160,8 @@ export function createWebhookBreaker(client, options = {}) {
 			const v = local.get(String(key ?? ''));
 			if (!v || !v.open) return; // healthy or not-yet-seen -> allow
 			if (monotonicNow() < v.until) throw new WebhookCircuitOpenError(key); // still open
-			if (v.probing) throw new WebhookCircuitOpenError(key); // a probe is already out
-			v.probing = true; // reset window elapsed: allow exactly one probe
+			if (v.probes >= probeConcurrency) throw new WebhookCircuitOpenError(key); // probe budget spent
+			v.probes++; // reset window elapsed: admit a bounded probe
 		},
 
 		success(key) {
@@ -166,7 +171,7 @@ export function createWebhookBreaker(client, options = {}) {
 
 		failure(_err, key) {
 			const v = local.get(String(key ?? ''));
-			const wasProbing = !!(v && v.probing);
+			const wasProbing = !!(v && v.probes > 0);
 			return withBreaker(b, () => redis.incr(failKey(key)))
 				.then((n) => withBreaker(b, () => redis.pexpire(failKey(key), resetMs)).then(() => {
 					// A failed half-open probe re-opens regardless of count; otherwise

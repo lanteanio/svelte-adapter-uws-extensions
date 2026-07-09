@@ -144,3 +144,74 @@ export async function awaitReplication(redis, minReplicas, timeoutMs, b, mReplic
 	}
 	mReplications?.inc();
 }
+
+/**
+ * Shared `hooks.ws.resume` hook body for the replay stores. Loops over the
+ * client's per-topic lastSeenSeqs. For each topic it compares the client's
+ * presented epoch (ctx.lastSeenEpochs, threaded by the adapter; absent ->
+ * the baseline 0) to the topic's stored epoch. On a MATCH it gap-fills via
+ * the store's replay() pipeline, which already detects + emits truncation
+ * per topic. On a MISMATCH the seq space reset since the client last saw
+ * it, so it SKIPS gap-fill for that topic and emits a `rehydrate` marker on
+ * the same `__replay:{topic}` channel the client already handles for
+ * `truncated`/`denied`, telling the client to drop its stale offset and
+ * re-read from scratch instead of being served a reset seq space as if it
+ * were contiguous.
+ *
+ * Additive epoch semantics: a topic the client presented NO epoch for (old
+ * client, or one that never received an epoch) is always a match and
+ * gap-fills exactly as before - never compared against the stored epoch, so
+ * the byte-identical old path is preserved even though the first publish
+ * bumps a fresh topic's epoch 0 -> 1. Only a presented integer epoch that
+ * differs from the stored one is a reset.
+ *
+ * Resume is the reconnect-storm hot path, so the store round-trips are
+ * batched: every needed epoch read goes through ONE `currentEpochs` call
+ * (one pipeline/query round trip instead of one per topic), and the
+ * per-topic gap-fills run CONCURRENTLY (a client resuming N topics pays one
+ * replay latency, not the sum). Each topic's own frame order is preserved
+ * by its replay call, and topics are independent per-topic channels, so
+ * cross-topic interleaving on the socket is free. A gap-fill rejection
+ * propagates (Promise.all - the sibling fills still run to completion with
+ * their rejections observed).
+ *
+ * @param {{
+ *   currentEpochs: (topics: string[]) => Promise<Map<string, number>>,
+ *   replay: (ws: any, topic: string, sinceSeq: number, platform: any) => Promise<any>
+ * }} store
+ * @returns {(ws: any, ctx: any) => Promise<void>}
+ */
+export function createResumeHook({ currentEpochs, replay }) {
+	return async (ws, ctx) => {
+		if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
+		const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
+			? ctx.lastSeenEpochs
+			: null;
+		const entries = Object.entries(ctx.lastSeenSeqs);
+		const epochTopics = [];
+		if (presented !== null) {
+			for (const [topic] of entries) {
+				if (Number.isInteger(presented[topic])) epochTopics.push(topic);
+			}
+		}
+		const have = epochTopics.length > 0 ? await currentEpochs(epochTopics) : null;
+		const fills = [];
+		for (const [topic, sinceSeq] of entries) {
+			// Normalize wire-supplied sinceSeq. Reject non-integers (fractional,
+			// NaN, Infinity, non-number) by falling through to 0 (resume from
+			// start). Negative values also fall through; the store's replay()
+			// validates internally as defense-in-depth.
+			const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
+			const want = presented && Number.isInteger(presented[topic]) ? presented[topic] : null;
+			if (want !== null) {
+				const haveEpoch = /** @type {Map<string, number>} */ (have).get(topic) ?? 0;
+				if (want !== haveEpoch) {
+					ctx.platform.send(ws, '__replay:' + topic, 'rehydrate', { epoch: haveEpoch });
+					continue;
+				}
+			}
+			fills.push(replay(ws, topic, seq, ctx.platform));
+		}
+		await Promise.all(fills);
+	};
+}

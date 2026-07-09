@@ -7,6 +7,11 @@ export interface CircuitBreakerOptions {
 	failureThreshold?: number;
 	/** Ms before transitioning from broken to probing. @default 30000 */
 	resetTimeout?: number;
+	/**
+	 * In-flight probes admitted per probing window; the first success closes
+	 * the circuit, any failure re-opens it. @default 1
+	 */
+	probeConcurrency?: number;
 	/** Called on state transitions. */
 	onStateChange?: (from: string, to: string) => void;
 }

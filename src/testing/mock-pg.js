@@ -830,6 +830,19 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: before };
 		}
 
+		// Batched epoch read (resume hook): SELECT topic, COALESCE(epoch, 0)
+		// FROM *_seq WHERE topic = ANY($1). Topics with no seq row are simply
+		// absent from the result (the store reads them as the baseline 0).
+		if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = ANY($1)')) {
+			const rows = [];
+			for (const topic of values[0] || []) {
+				if (seqCounters.has(topic) || epochCounters.has(topic)) {
+					rows.push({ topic, epoch: String(epochCounters.get(topic) || 0) });
+				}
+			}
+			return { rows, rowCount: rows.length };
+		}
+
 		// Epoch read-through: SELECT COALESCE(epoch, 0) FROM *_seq WHERE topic = $1.
 		// A topic with no seq row reads the baseline 0.
 		if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {

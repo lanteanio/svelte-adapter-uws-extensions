@@ -9,7 +9,8 @@
  * Three states:
  *   - healthy:  everything works, requests go through
  *   - broken:   too many failures, requests fail fast
- *   - probing:  one request is allowed through to test if the backend is back
+ *   - probing:  a bounded number of probe requests (probeConcurrency, default
+ *                one) is allowed through to test if the backend is back
  *
  * @module svelte-adapter-uws-extensions/breaker
  */
@@ -28,6 +29,7 @@ export class CircuitBrokenError extends Error {
  * @typedef {Object} CircuitBreakerOptions
  * @property {number} [failureThreshold=5] - Consecutive failures before breaking
  * @property {number} [resetTimeout=30000] - Ms before transitioning from broken to probing
+ * @property {number} [probeConcurrency=1] - In-flight probes admitted per probing window; the first success closes the circuit, any failure re-opens it
  * @property {(from: string, to: string) => void} [onStateChange] - Called on state transitions
  */
 
@@ -92,6 +94,7 @@ export async function withBreaker(b, fn, key) {
 export function createCircuitBreaker(options = {}) {
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetTimeout = options.resetTimeout ?? 30000;
+	const probeConcurrency = options.probeConcurrency ?? 1;
 	const onStateChange = options.onStateChange ?? null;
 
 	if (!Number.isInteger(failureThreshold) || failureThreshold < 1) {
@@ -100,10 +103,13 @@ export function createCircuitBreaker(options = {}) {
 	if (typeof resetTimeout !== 'number' || !Number.isFinite(resetTimeout) || resetTimeout < 0) {
 		throw new Error('circuit breaker: resetTimeout must be a non-negative number');
 	}
+	if (!Number.isInteger(probeConcurrency) || probeConcurrency < 1) {
+		throw new Error('circuit breaker: probeConcurrency must be a positive integer');
+	}
 
 	// Per-key state. The default key '' is the single global breaker - every existing
 	// (no-key) caller hits exactly this one slot, so behavior is byte-identical.
-	/** @type {Map<string, { state: string, failures: number, probeAllowed: boolean, resetTimer: any }>} */
+	/** @type {Map<string, { state: string, failures: number, probeBudget: number, resetTimer: any }>} */
 	const states = new Map();
 	function stateFor(key) {
 		const k = key || '';
@@ -124,7 +130,7 @@ export function createCircuitBreaker(options = {}) {
 					}
 				}
 			}
-			s = { state: 'healthy', failures: 0, probeAllowed: false, resetTimer: null };
+			s = { state: 'healthy', failures: 0, probeBudget: 0, resetTimer: null };
 			states.set(k, s);
 		}
 		return s;
@@ -146,7 +152,7 @@ export function createCircuitBreaker(options = {}) {
 		clearTimer(s.resetTimer);
 		s.resetTimer = setTimer(() => {
 			s.resetTimer = null;
-			s.probeAllowed = true;
+			s.probeBudget = probeConcurrency;
 			transition(s, 'probing');
 		}, resetTimeout);
 		if (s.resetTimer.unref) s.resetTimer.unref();
@@ -162,8 +168,8 @@ export function createCircuitBreaker(options = {}) {
 		guard(key) {
 			const s = stateFor(key);
 			if (s.state === 'healthy') return;
-			if (s.state === 'probing' && s.probeAllowed) {
-				s.probeAllowed = false;
+			if (s.state === 'probing' && s.probeBudget > 0) {
+				s.probeBudget--;
 				return;
 			}
 			throw new CircuitBrokenError();
@@ -175,6 +181,7 @@ export function createCircuitBreaker(options = {}) {
 				clearTimer(s.resetTimer);
 				s.resetTimer = null;
 				s.failures = 0;
+				s.probeBudget = 0;
 				transition(s, 'healthy');
 			} else if (s.state === 'healthy') {
 				s.failures = 0;
@@ -185,6 +192,7 @@ export function createCircuitBreaker(options = {}) {
 			const s = stateFor(key);
 			if (s.failures < failureThreshold) s.failures++;
 			if (s.state === 'probing') {
+				s.probeBudget = 0;
 				transition(s, 'broken');
 				scheduleProbe(s);
 			} else if (s.state === 'healthy' && s.failures >= failureThreshold) {
@@ -198,7 +206,7 @@ export function createCircuitBreaker(options = {}) {
 			clearTimer(s.resetTimer);
 			s.resetTimer = null;
 			s.failures = 0;
-			s.probeAllowed = false;
+			s.probeBudget = 0;
 			transition(s, 'healthy');
 		},
 

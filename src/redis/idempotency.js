@@ -191,20 +191,25 @@ export function createIdempotencyStore(client, options = {}) {
 							// store in a coherent state.
 							throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
 						}
-						await withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
-						// Record this key under the user for forget (best-effort -
-						// the index is a convenience; a failure here must not fail
-						// the commit, so it rides its own try/catch). The SADD +
+						// The forget index rides CONCURRENTLY with the SET so the common
+						// authenticated commit costs one round-trip of latency, not two.
+						// It cannot share the SET's MULTI/pipeline: the cache key and the
+						// byuser key hash to different slots, and a cross-slot batch fails
+						// on Redis Cluster. Best-effort as before (a failure must not fail
+						// the commit), and a field left behind by a failed SET is already
+						// tolerated - a stale field is a no-op DEL on purge. The HSET +
 						// sliding EXPIRE are one key, so single-slot and safe.
+						const committed = withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
+						let index = null;
 						if (forgetUser !== null) {
 							const idxKey = byUserKey(forgetTenant, forgetUser);
-							try {
-								const tx = redis.multi();
-								tx.hset(idxKey, k, '1');
-								tx.expire(idxKey, ttl);
-								await tx.exec();
-							} catch { /* index best-effort; the cache entry is committed */ }
+							const tx = redis.multi();
+							tx.hset(idxKey, k, '1');
+							tx.expire(idxKey, ttl);
+							index = tx.exec().catch(() => { /* index best-effort; the cache entry is committed */ });
 						}
+						await committed;
+						if (index !== null) await index;
 						mCommits?.inc();
 					},
 					async abort() {

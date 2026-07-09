@@ -36,7 +36,7 @@ import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
 import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { withTransaction } from '../shared/pg-tx.js';
-import { ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
+import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
 export { ReplayStorageError, ReplaySerializationError };
 
@@ -227,6 +227,35 @@ export function createReplay(client, options = {}) {
 		const epoch = res.rows.length > 0 ? parseInt(res.rows[0].epoch, 10) : 0;
 		epochCache.set(topic, epoch);
 		return epoch;
+	}
+
+	// Batched epoch read for the resume hook: one query for every topic the
+	// client presented an epoch for, instead of one round trip per topic. A
+	// topic with no row reads as the baseline 0, matching currentEpoch.
+	async function currentEpochs(topics) {
+		const res = await withBreaker(b, async () => {
+			await ensureTable();
+			return client.query({
+				name: 'replay_epochs_' + table,
+				text: `SELECT topic, COALESCE(epoch, 0)::bigint AS epoch
+				         FROM ${seqTable}
+				        WHERE topic = ANY($1)`,
+				values: [topics]
+			});
+		});
+		const out = new Map();
+		for (const row of res.rows) {
+			const epoch = parseInt(row.epoch, 10);
+			epochCache.set(row.topic, epoch);
+			out.set(row.topic, epoch);
+		}
+		for (const topic of topics) {
+			if (!out.has(topic)) {
+				epochCache.set(topic, 0);
+				out.set(topic, 0);
+			}
+		}
+		return out;
 	}
 
 	// Latch so the storage-fallback degradation warns ONCE per tracker, not per
@@ -575,47 +604,14 @@ export function createReplay(client, options = {}) {
 			return epochCache.get(topic) ?? 0;
 		},
 
-		// Returns a hook function for `hooks.ws.resume`. Loops over the
-		// client's per-topic lastSeenSeqs. For each topic it compares the
-		// client's presented epoch (ctx.lastSeenEpochs, threaded by the
-		// adapter; absent -> the baseline 0) to the topic's stored epoch. On a
-		// MATCH it gap-fills via the existing replay() pipeline, which already
-		// detects + emits truncation per topic. On a MISMATCH the seq space
-		// reset since the client last saw it, so it SKIPS gap-fill for that
-		// topic and emits a `rehydrate` marker on the same `__replay:{topic}`
-		// channel the client already handles for `truncated`/`denied`, telling
-		// the client to drop its stale offset and re-read from scratch instead
-		// of being served a reset seq space as if it were contiguous.
+		// Returns a hook function for `hooks.ws.resume`. Shared body (epoch
+		// match/rehydrate semantics + batched epoch reads + concurrent
+		// per-topic gap-fills): `createResumeHook` in shared/replay-helpers.js.
 		resumeHook() {
-			return async (ws, ctx) => {
-				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
-				const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
-					? ctx.lastSeenEpochs
-					: null;
-				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
-					// Normalize wire-supplied sinceSeq. Reject non-integers
-					// (fractional, NaN, Infinity, non-number) by falling through
-					// to 0 (resume from start). Negative values also fall through;
-					// tracker.replay() validates internally as defense-in-depth.
-					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
-					// Additive: a topic the client presented NO epoch for (old
-					// client, or one that never received an epoch) is always a
-					// match and gap-fills exactly as before - never compared
-					// against the stored epoch, so the byte-identical old path is
-					// preserved even though the first publish bumps a fresh
-					// topic's epoch 0 -> 1. Only a presented integer epoch that
-					// differs from the stored one is a reset.
-					const want = presented && Number.isInteger(presented[topic]) ? presented[topic] : null;
-					if (want !== null) {
-						const have = await currentEpoch(topic);
-						if (want !== have) {
-							ctx.platform.send(ws, '__replay:' + topic, 'rehydrate', { epoch: have });
-							continue;
-						}
-					}
-					await tracker.replay(ws, topic, seq, ctx.platform);
-				}
-			};
+			return createResumeHook({
+				currentEpochs,
+				replay: (ws, topic, seq, platform) => tracker.replay(ws, topic, seq, platform)
+			});
 		}
 	};
 	return tracker;

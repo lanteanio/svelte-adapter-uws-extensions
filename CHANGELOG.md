@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.48] - 2026-07-09
+
+### Added
+
+- **Circuit breakers gain a `probeConcurrency` option (default 1 - the prior fixed behavior).** Both the shared `createCircuitBreaker` and the fleet-level `createWebhookBreaker` hard-capped the half-open state at exactly one in-flight probe: correct re-flood protection, but a single probe hitting an unlucky timeout re-opens the circuit for a full reset window even though the backend is back. The cap is now a knob: N probes are admitted per probing window, the first success closes the circuit, and any probe failure re-opens it AND clears the remaining budget so a leftover slot can never leak a request through a re-opened circuit. The default is unchanged, so every existing deployment keeps the exactly-one-probe behavior.
+
+### Changed
+
+- **Three shipped hot paths stopped paying avoidable round trips and recomputation.** (1) The idempotency commit on the common authenticated path (a result SET plus the right-to-erasure index write) now dispatches both concurrently instead of serially - one round trip of commit latency instead of two. They cannot share a pipeline (the cache key and the per-user index key hash to different slots, and a cross-slot batch fails on Redis Cluster), the SET keeps its breaker-guarded must-throw contract, the index stays best-effort, and an index field left behind by a failed SET was already tolerated by design (a stale field is a no-op DEL on purge). (2) The replay resume hook - the reconnect-storm path - batched: a client resuming N topics used to pay a serial epoch GET plus a serial gap-fill per topic; the epoch reads now go out as ONE round trip (a pipeline on standalone Redis, per-node fan-out on Cluster, one `ANY($1)` query on Postgres) and the per-topic gap-fills run concurrently, so a resume costs one replay latency instead of the sum. The epoch match/rehydrate semantics are unchanged and now live in one shared implementation (`createResumeHook`) instead of three per-store copies. (3) The publish-rate aggregator's merged cluster view was rebuilt and re-sorted on EVERY `rateOf`/`topPublishers` read - an admission rule consulting many topics inside one evaluation re-did the O(instances x topN) merge each time; the view is now memoized and recomputed only when a sibling slice arrives, a stale instance is pruned, or the adapter publishes a fresh local pressure sample. Results, ordering, and staleness bounds are unchanged on all three.
+
 ## [0.6.0-next.47] - 2026-07-09
 
 ### Changed

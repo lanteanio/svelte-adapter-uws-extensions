@@ -21,7 +21,8 @@
 
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
-import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError } from '../shared/replay-helpers.js';
+import { parseReplayOptions, awaitReplication, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
+import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
 
@@ -225,6 +226,22 @@ export function createStreamReplay(client, options = {}) {
 		const epoch = val ? parseInt(val, 10) : 0;
 		epochCache.set(topic, epoch);
 		return epoch;
+	}
+
+	// Batched epoch read for the resume hook: one pipeline round trip on
+	// standalone, per-node fan-out on Cluster (each epoch key is single-slot;
+	// the BATCH may cross slots, which is exactly what execMultiSlot handles).
+	async function currentEpochs(topics) {
+		const res = await withBreaker(b, () => execMultiSlot(redis, topics.map((t) => ['get', epochKey(t)])));
+		const out = new Map();
+		for (let i = 0; i < topics.length; i++) {
+			const [err, val] = res[i];
+			if (err) throw err;
+			const epoch = val ? parseInt(val, 10) : 0;
+			epochCache.set(topics[i], epoch);
+			out.set(topics[i], epoch);
+		}
+		return out;
 	}
 
 	async function bumpEpoch(topic) {
@@ -564,45 +581,14 @@ export function createStreamReplay(client, options = {}) {
 			return epochCache.get(topic) ?? 0;
 		},
 
-		// Returns a hook function for `hooks.ws.resume`. For each topic it
-		// compares the client's presented epoch (ctx.lastSeenEpochs, threaded
-		// by the adapter; absent -> the baseline 0) to the topic's stored
-		// epoch. On a MATCH it gap-fills via the existing replay() pipeline,
-		// which already detects + emits truncation per topic. On a MISMATCH the
-		// seq space reset since the client last saw it, so it SKIPS gap-fill
-		// and emits a `rehydrate` marker on the same `__replay:{topic}` channel
-		// the client already handles, telling the client to drop its stale
-		// offset and re-read instead of being served a reset space as if it
-		// were contiguous.
+		// Returns a hook function for `hooks.ws.resume`. Shared body (epoch
+		// match/rehydrate semantics + batched epoch reads + concurrent
+		// per-topic gap-fills): `createResumeHook` in shared/replay-helpers.js.
 		resumeHook() {
-			return async (ws, ctx) => {
-				if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
-				const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
-					? ctx.lastSeenEpochs
-					: null;
-				for (const [topic, sinceSeq] of Object.entries(ctx.lastSeenSeqs)) {
-					// Tighten the wire-supplied sinceSeq normalization to
-					// reject fractional / NaN / Infinity / non-number.
-					// Defense-in-depth alongside tracker.replay()'s own
-					// integer check.
-					const seq = Number.isInteger(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
-					// Additive: a topic the client presented NO epoch for is
-					// always a match and gap-fills exactly as before (never
-					// compared), preserving the byte-identical old path even
-					// though the first publish bumps a fresh topic's epoch from
-					// 0 to 1. Only a presented integer epoch that differs from
-					// the stored one is a reset.
-					const want = presented && Number.isInteger(presented[topic]) ? presented[topic] : null;
-					if (want !== null) {
-						const have = await currentEpoch(topic);
-						if (want !== have) {
-							ctx.platform.send(ws, '__replay:' + topic, 'rehydrate', { epoch: have });
-							continue;
-						}
-					}
-					await tracker.replay(ws, topic, seq, ctx.platform);
-				}
-			};
+			return createResumeHook({
+				currentEpochs,
+				replay: (ws, topic, seq, platform) => tracker.replay(ws, topic, seq, platform)
+			});
 		}
 	};
 	return tracker;

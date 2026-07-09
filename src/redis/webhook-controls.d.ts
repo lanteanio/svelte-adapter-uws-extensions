@@ -42,6 +42,8 @@ export interface RedisWebhookBreakerOptions {
 	failureThreshold?: number;
 	/** Ms an open circuit waits before allowing a half-open probe (default 30000). */
 	resetMs?: number;
+	/** Half-open probes admitted per reset window (default 1). */
+	probeConcurrency?: number;
 	/** Backend circuit breaker for Redis fault isolation (shared `createCircuitBreaker`). */
 	breaker?: object;
 }

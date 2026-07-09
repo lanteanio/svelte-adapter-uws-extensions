@@ -125,6 +125,20 @@ export function createPublishRateAggregator(client, options = {}) {
 	let activated = false;
 	let remoteInstancesWarnFired = false;
 
+	// Merged-view memo. computeMerged runs on EVERY rateOf/topPublishers read
+	// (the admission hot path can query many topics inside one evaluation), yet
+	// its inputs only change when a sibling slice arrives, a stale entry is
+	// pruned, or the adapter publishes a fresh local pressure sample (which
+	// assigns a NEW topPublishers array reference - the reference is stable
+	// within a sampling window). Key the cache on those signals and the
+	// O(instances x topN) merge + sort runs once per change, not once per
+	// lookup. The cached array and its entries are shared read-only views;
+	// every mutating consumer path copies (computeTopPublishers slices).
+	let mergedCache = null;
+	let mergedCacheLocalRef = undefined;
+	let mergedRev = 0;
+	let mergedCacheRev = -1;
+
 	/**
 	 * onPublishRate subscribers. Each holds a callback and the set of topics it
 	 * has already seen at or above the configured `topicPublishRatePerSec`, so a
@@ -147,7 +161,10 @@ export function createPublishRateAggregator(client, options = {}) {
 		// sub-second staleAfter - the cached clock quantizes the delta to ~1s.
 		const nowTs = wallEpoch();
 		for (const [id, entry] of remoteSlices) {
-			if (nowTs - entry.ts > staleAfter) remoteSlices.delete(id);
+			if (nowTs - entry.ts > staleAfter) {
+				remoteSlices.delete(id);
+				mergedRev++;
+			}
 		}
 		for (const [id, entry] of remoteSubs) {
 			if (nowTs - entry.ts > staleAfter) remoteSubs.delete(id);
@@ -226,6 +243,7 @@ export function createPublishRateAggregator(client, options = {}) {
 			);
 			const ts = typeof env.ts === 'number' ? env.ts : wallEpoch();
 			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
+			mergedRev++;
 			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteInstancesWarnFired) {
 				remoteInstancesWarnFired = true;
 				console.warn(
@@ -269,6 +287,7 @@ export function createPublishRateAggregator(client, options = {}) {
 		}
 		remoteSlices.clear();
 		remoteSubs.clear();
+		mergedRev++;
 		// Reset each subscriber's over-set: after the merged view is torn down,
 		// a re-activate should treat a still-hot topic as a fresh crossing
 		// rather than suppress it against a stale pre-deactivate over-set.
@@ -287,6 +306,13 @@ export function createPublishRateAggregator(client, options = {}) {
 	 */
 	function computeMerged() {
 		pruneStale();
+
+		// Memo hit: nothing arrived, nothing pruned, and the adapter has not
+		// published a new local sample (same topPublishers array reference).
+		const localRef = activePlatform?.pressure?.topPublishers;
+		if (mergedCache !== null && mergedCacheRev === mergedRev && mergedCacheLocalRef === localRef) {
+			return mergedCache;
+		}
 
 		/** @type {Map<string, { topic: string, messagesPerSec: number, bytesPerSec: number, instances: Set<string> }>} */
 		const merged = new Map();
@@ -325,26 +351,36 @@ export function createPublishRateAggregator(client, options = {}) {
 			});
 		}
 		result.sort((a, b) => b.messagesPerSec - a.messagesPerSec);
+		mergedCache = result;
+		mergedCacheRev = mergedRev;
+		mergedCacheLocalRef = localRef;
 		return result;
 	}
 
 	// Top-N-capped view for the display / storage-bounded consumers (the
-	// topPublishers getter and rateOf). Crossing detection uses computeMerged
-	// (uncapped) instead, so the edge-trigger contract holds beyond the top-N.
+	// topPublishers getter). Crossing detection uses computeMerged (uncapped)
+	// instead, so the edge-trigger contract holds beyond the top-N. Always a
+	// fresh array (slice) so a caller can never mutate the memoized view.
 	function computeTopPublishers() {
 		const result = computeMerged();
-		return result.length > topN ? result.slice(0, topN) : result;
+		return result.slice(0, Math.min(result.length, topN));
 	}
 
 	/**
 	 * Lookup helper for the admission rule and other per-topic queries.
 	 * Returns the cluster-wide messagesPerSec for a topic, summed across
 	 * contributing instances, or 0 if the topic is not in the merged
-	 * top-N. Pure memory lookup; no Redis traffic on the hot path.
+	 * top-N. Pure memory lookup; no Redis traffic on the hot path. Reads the
+	 * memoized merged view in place (the top-N view is its first N entries -
+	 * it is sorted descending), so a many-topic admission evaluation inside
+	 * one sampling window costs one merge, not one per topic.
 	 */
 	function rateOf(topic) {
-		const merged = computeTopPublishers();
-		for (const t of merged) if (t.topic === topic) return t.messagesPerSec;
+		const merged = computeMerged();
+		const n = Math.min(merged.length, topN);
+		for (let i = 0; i < n; i++) {
+			if (merged[i].topic === topic) return merged[i].messagesPerSec;
+		}
 		return 0;
 	}
 

@@ -50,6 +50,8 @@ describe('redis createWebhookBreaker', () => {
 	it('validates its options', () => {
 		expect(() => createWebhookBreaker(client, { failureThreshold: 0 })).toThrow(/failureThreshold/);
 		expect(() => createWebhookBreaker(client, { resetMs: 0 })).toThrow(/resetMs/);
+		expect(() => createWebhookBreaker(client, { probeConcurrency: 0 })).toThrow(/probeConcurrency/);
+		expect(() => createWebhookBreaker(client, { probeConcurrency: 1.5 })).toThrow(/probeConcurrency/);
 	});
 
 	it('stays healthy below the threshold', async () => {
@@ -113,5 +115,30 @@ describe('redis createWebhookBreaker', () => {
 		expect(() => br.guard('k')).toThrow(WebhookCircuitOpenError); // 1000 < 2000
 		clock = 2000;
 		expect(() => br.guard('k')).not.toThrow();
+	});
+
+	it('probeConcurrency admits that many half-open probes per reset window', async () => {
+		const br = createWebhookBreaker(client, { failureThreshold: 1, resetMs: 1000, probeConcurrency: 2 });
+		await br.failure(new Error('x'), 'k'); // opens, until = 1000
+		clock = 1000;
+		expect(() => br.guard('k')).not.toThrow(); // probe 1
+		expect(br.stateOf('k')).toBe('probing');
+		expect(() => br.guard('k')).not.toThrow(); // probe 2
+		expect(() => br.guard('k')).toThrow(WebhookCircuitOpenError); // budget spent
+		await br.success('k'); // first probe reply closes the circuit
+		expect(br.stateOf('k')).toBe('healthy');
+		expect(() => br.guard('k')).not.toThrow();
+	});
+
+	it('probeConcurrency: a failed probe re-opens and clears the remaining budget', async () => {
+		const br = createWebhookBreaker(client, { failureThreshold: 1, resetMs: 1000, probeConcurrency: 2 });
+		await br.failure(new Error('x'), 'k'); // open, until 1000
+		clock = 1000;
+		br.guard('k'); // probe 1 out, one budget slot left
+		await br.failure(new Error('x'), 'k'); // probe failed -> re-open, until 2000
+		// The leftover slot must not leak a request through the re-opened circuit.
+		expect(() => br.guard('k')).toThrow(WebhookCircuitOpenError);
+		clock = 2000;
+		expect(() => br.guard('k')).not.toThrow(); // fresh window, fresh budget
 	});
 });

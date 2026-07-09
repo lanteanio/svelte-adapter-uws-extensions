@@ -148,6 +148,55 @@ describe('circuit breaker', () => {
 			breaker.destroy();
 		});
 
+		it('probeConcurrency admits that many concurrent probes, then throws', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50, probeConcurrency: 3 });
+			breaker.failure();
+
+			await new Promise((r) => setTimeout(r, 80));
+			expect(breaker.state).toBe('probing');
+
+			expect(() => breaker.guard()).not.toThrow();
+			expect(() => breaker.guard()).not.toThrow();
+			expect(() => breaker.guard()).not.toThrow();
+			// The probe budget is spent.
+			expect(() => breaker.guard()).toThrow(CircuitBrokenError);
+			breaker.destroy();
+		});
+
+		it('probeConcurrency: the first probe success closes the circuit', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50, probeConcurrency: 2 });
+			breaker.failure();
+
+			await new Promise((r) => setTimeout(r, 80));
+			breaker.guard();
+			breaker.guard();
+			breaker.success(); // first probe reply wins
+
+			expect(breaker.state).toBe('healthy');
+			expect(() => breaker.guard()).not.toThrow();
+			breaker.destroy();
+		});
+
+		it('probeConcurrency: a probe failure re-opens and zeroes the remaining budget', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50, probeConcurrency: 2 });
+			breaker.failure();
+
+			await new Promise((r) => setTimeout(r, 80));
+			breaker.guard(); // one probe out, one budget slot left
+			breaker.failure();
+
+			expect(breaker.state).toBe('broken');
+			// The leftover budget slot must not leak a request through while broken.
+			expect(() => breaker.guard()).toThrow(CircuitBrokenError);
+			breaker.destroy();
+		});
+
+		it('validates probeConcurrency', () => {
+			expect(() => createCircuitBreaker({ probeConcurrency: 0 })).toThrow('positive integer');
+			expect(() => createCircuitBreaker({ probeConcurrency: 1.5 })).toThrow('positive integer');
+			expect(() => createCircuitBreaker({ probeConcurrency: 'two' })).toThrow('positive integer');
+		});
+
 		it('transitions from probing to healthy on success', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });
 			breaker.failure();
