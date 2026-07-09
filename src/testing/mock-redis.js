@@ -45,6 +45,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 	const pubsubHandlers = [];     // {channel, handler}
 	const functionLibraries = new Map(); // libname -> code
 	const registeredFunctions = new Map(); // funcName -> (keys, args) => unknown
+	const evalShapedCommands = new Set(); // defineCommand names: (numKeys, ...keys, ...argv)
 
 	// The server clock for this double. Reads the EXACT wall-clock seam
 	// (`wallEpoch`), not the ~1Hz-cached `now()`: a Redis server's clock is
@@ -114,6 +115,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		if (m === 'eval' || m === 'evalsha') {
 			const numKeys = Number(args[1]) || 0;
 			return args.slice(2, 2 + numKeys).map(String);
+		}
+		// A defineCommand-registered script command has the eval SHAPE minus the
+		// script argument: numKeys leads, then the keys. Without this the generic
+		// fallback below would read numKeys as the key and mis-slot the command
+		// (a cluster-mode pipeline would then no-op it with a phantom MOVED).
+		if (evalShapedCommands.has(m)) {
+			const numKeys = Number(args[0]) || 0;
+			return args.slice(1, 1 + numKeys).map(String);
 		}
 		// Keyless commands: no slot, so they run on whichever node the batch
 		// landed on (never no-op'd by the multi-slot hazard).
@@ -944,6 +953,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 			defineCommand(name, { lua }) {
 				r[name] = async (numKeys, ...args) => r.eval(lua, numKeys, ...args);
+				// Record the eval shape so commandKeys slots a pipelined call of
+				// this command correctly (numKeys leads, then the keys).
+				evalShapedCommands.add(String(name).toLowerCase());
 			},
 
 			_subscribedChannels: subscribedChannels,

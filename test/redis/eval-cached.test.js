@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { evalCached } from '../../src/shared/eval-cached.js';
+import { evalCached, evalCachedName } from '../../src/shared/eval-cached.js';
 import { CONSUME_SCRIPT } from '../../src/redis/token-bucket-script.js';
 
 /** A fake ioredis instance that records defineCommand + command invocations. */
@@ -67,5 +67,45 @@ describe('evalCached (cached-script eval helper)', () => {
 		expect(viaEval[0]).toBe(1);
 		expect(viaCached[0]).toBe(1);
 		expect(viaCached[1]).toBe(viaEval[1]); // same remaining for a fresh bucket
+	});
+});
+
+describe('evalCachedName (the pipeline form)', () => {
+	it('returns a stable name per script, sharing the evalCached registry', async () => {
+		const { inst, defined } = fakeRedis();
+		const name = evalCachedName(inst, 'SCRIPT_A');
+		expect(evalCachedName(inst, 'SCRIPT_A')).toBe(name);
+		await evalCached(inst, 'SCRIPT_A', 1, 'k'); // same script: no second define
+		expect(defined).toHaveLength(1);
+		expect(evalCachedName(inst, 'SCRIPT_B')).not.toBe(name);
+	});
+
+	it('a pipelined cached command runs the script through the Redis double', async () => {
+		const client = mockRedisClient('test:');
+		const name = evalCachedName(client.redis, CONSUME_SCRIPT);
+		const pipe = client.redis.pipeline();
+		pipe.set(client.key('marker'), '1');
+		pipe[name](1, client.key('bucket'), 5, 60000, 1, 0);
+		const results = await pipe.exec();
+		expect(results).toHaveLength(2);
+		expect(results[1][0]).toBe(null); // no error
+		expect(results[1][1][0]).toBe(1); // allowed - the script actually ran
+	});
+
+	it('a pipelined cached command slots by its KEY on a cluster, not by numKeys', async () => {
+		const client = mockRedisClient('test:', { cluster: true });
+		const name = evalCachedName(client.redis, CONSUME_SCRIPT);
+		// One key, one slot: the hset and the script call target the SAME key, so
+		// the whole batch is same-slot and nothing may be no-op'd with a MOVED.
+		// Before the eval-shape registration the generic key fallback read numKeys
+		// (the literal 1) as the key and mis-slotted the command.
+		const key = client.key('{tag}bucket');
+		const pipe = client.redis.pipeline();
+		pipe.hset(key, 'f', 'v');
+		pipe[name](1, key, 5, 60000, 1, 0);
+		const results = await pipe.exec();
+		expect(results[0][0]).toBe(null);
+		expect(results[1][0]).toBe(null); // same slot: never a phantom MOVED
+		expect(results[1][1][0]).toBe(1);
 	});
 });

@@ -30,13 +30,17 @@ function registryFor(redis) {
 }
 
 /**
+ * Register `script` as a cached command on `redis` (idempotent per instance,
+ * same registry {@link evalCached} uses) and return the defined command NAME.
+ * This form exists for the PIPELINE case: ioredis exposes defined commands on
+ * pipelines built AFTER the definition, so a caller registers the name once up
+ * front and then invokes `pipe[name](numKeys, ...keysAndArgs)` inside each
+ * batch - the ~40-byte SHA ships per batch instead of the script body.
  * @param {any} redis an ioredis Redis or Cluster instance (or the test double)
  * @param {string} script the Lua source
- * @param {number} numKeys number of KEYS arguments
- * @param {...any} args the KEYS then ARGV values
- * @returns {Promise<any>} the script's reply
+ * @returns {string} the defined command name
  */
-export function evalCached(redis, script, numKeys, ...args) {
+export function evalCachedName(redis, script) {
 	const reg = registryFor(redis);
 	let name = reg.commands.get(script);
 	if (name === undefined) {
@@ -44,5 +48,16 @@ export function evalCached(redis, script, numKeys, ...args) {
 		redis.defineCommand(name, { lua: script });
 		reg.commands.set(script, name);
 	}
-	return redis[name](numKeys, ...args);
+	return name;
+}
+
+/**
+ * @param {any} redis an ioredis Redis or Cluster instance (or the test double)
+ * @param {string} script the Lua source
+ * @param {number} numKeys number of KEYS arguments
+ * @param {...any} args the KEYS then ARGV values
+ * @returns {Promise<any>} the script's reply
+ */
+export function evalCached(redis, script, numKeys, ...args) {
+	return redis[evalCachedName(redis, script)](numKeys, ...args);
 }

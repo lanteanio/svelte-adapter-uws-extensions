@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.47] - 2026-07-09
+
+### Changed
+
+- **The last full-script Lua eval on a hot cadence now rides the cached EVALSHA path: the groups heartbeat's stale-member cleanup.** Every Redis plugin routes its scripts through the shared cached-script helper (the ~40-byte SHA-backed command ships per call instead of the script body) - except one call site: the groups heartbeat pipelined its cleanup script as a raw `eval`, re-sending the full script text every heartbeat tick for every group. The helper gains a pipeline form (`evalCachedName` returns the registered command name, sharing the same per-instance registry, so a caller registers once up front and invokes the name inside each batch), and the heartbeat uses it. The Redis test double's `defineCommand` now also records the eval shape of registered commands so its cluster-mode pipeline models their key slot correctly (previously the generic fallback would have read the leading `numKeys` argument as the key and no-op'd the command with a phantom `MOVED`) - a fidelity fix in the double, no behavior change for real Redis. Script semantics, cadence, and results are unchanged; only the per-heartbeat bytes drop.
+
 ## [0.6.0-next.46] - 2026-07-08
 
 ### Changed

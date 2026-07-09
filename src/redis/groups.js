@@ -19,7 +19,7 @@
  */
 
 import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
-import { evalCached } from '../shared/eval-cached.js';
+import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
@@ -192,7 +192,11 @@ export function createGroup(client, name, options = {}) {
 	}
 
 	// Heartbeat: refresh timestamps on local member entries and
-	// remove stale entries from crashed instances.
+	// remove stale entries from crashed instances. The cleanup script rides the
+	// pipeline as a CACHED command (registered before the first pipeline is
+	// built, so every batch carries the SHA-backed name, not the script body -
+	// this was the one remaining per-call full-script eval on a hot cadence).
+	const cleanupCmd = evalCachedName(redis, CLEANUP_SCRIPT);
 	const heartbeatTimer = setIntervalTimer(() => {
 		if (b && !b.isHealthy) return;
 		const nowTs = now();
@@ -201,7 +205,7 @@ export function createGroup(client, name, options = {}) {
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: nowTs });
 			pipe.hset(membersKey, entry.memberId, memberData);
 		}
-		pipe.eval(CLEANUP_SCRIPT, 1, membersKey, nowTs, memberTtlMs);
+		pipe[cleanupCmd](1, membersKey, nowTs, memberTtlMs);
 		pipe.exec().catch((err) => {
 			if (err) console.warn('groups heartbeat: pipeline failed for group "' + name + '":', err.message);
 		});
