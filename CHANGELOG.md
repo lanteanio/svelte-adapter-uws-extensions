@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.51] - 2026-07-10
+
+### Documentation
+
+- **Persisted-envelope versioning rule.** The replay README now states the forward-compatibility contract for stored history: every backend persists self-describing JSON independent of the frozen binary wire protocol, an absent version field reads as version 1, and a future schema evolution adds a `v` field plus read-time upcasting on top of that rule - so history persisted today (including unbounded `ttl: 0` retention) stays readable without migration.
+
 ## [0.6.0-next.50] - 2026-07-10
 
 ### Added
