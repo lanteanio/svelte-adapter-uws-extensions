@@ -850,4 +850,193 @@ describe('postgres replay', () => {
 			client.query = origQuery;
 		});
 	});
+
+	describe('publishBatch', () => {
+		it('persists a single-topic burst with contiguous seqs in caller order', async () => {
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } },
+				{ topic: 'chat', event: 'updated', data: { id: 1, done: true } }
+			]);
+
+			expect(await replay.seq('chat')).toBe(3);
+			const stored = await replay.since('chat', 0);
+			expect(stored).toEqual([
+				{ seq: 1, topic: 'chat', event: 'created', data: { id: 1 } },
+				{ seq: 2, topic: 'chat', event: 'created', data: { id: 2 } },
+				{ seq: 3, topic: 'chat', event: 'updated', data: { id: 1, done: true } }
+			]);
+		});
+
+		it('broadcasts once via platform.publishBatched with per-message authoritative seqs', async () => {
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'todos', event: 'created', data: { id: 9 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } }
+			]);
+
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages).toEqual([
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: 1 } },
+				{ topic: 'todos', event: 'created', data: { id: 9 }, options: { seq: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 }, options: { seq: 2 } }
+			]);
+		});
+
+		it('keeps per-topic counters independent across a multi-topic batch', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 0 });
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'todos', event: 'created', data: { id: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } },
+				{ topic: 'todos', event: 'created', data: { id: 2 } }
+			]);
+
+			expect(await replay.seq('chat')).toBe(3);
+			expect(await replay.seq('todos')).toBe(2);
+		});
+
+		it('interleaves with single publish preserving one contiguous seq space', async () => {
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } }
+			]);
+			await replay.publish(platform, 'chat', 'created', { id: 3 });
+			await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 4 } }]);
+
+			const stored = await replay.since('chat', 0);
+			expect(stored.map((m) => m.seq)).toEqual([1, 2, 3, 4]);
+			expect(stored.map((m) => m.data.id)).toEqual([1, 2, 3, 4]);
+		});
+
+		it('seeds epoch 1 on a fresh topic and carries the epoch across clearTopic', async () => {
+			await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 1 } }]);
+			expect(await replay.currentEpoch('chat')).toBe(1);
+
+			await replay.clearTopic('chat');
+			await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 2 } }]);
+			// clearTopic bumps the epoch and resets seq; the batch UPDATE branch
+			// must carry the bumped epoch forward, not re-seed 1.
+			expect(await replay.currentEpoch('chat')).toBe(2);
+			expect(await replay.seq('chat')).toBe(1);
+		});
+
+		it('trims each topic that exceeds maxSize after the batch', async () => {
+			// size is 5 (beforeEach); an 8-message burst leaves only the newest 5.
+			const messages = [];
+			for (let i = 1; i <= 8; i++) messages.push({ topic: 'chat', event: 'created', data: { id: i } });
+			await replay.publishBatch(platform, messages);
+
+			const stored = await replay.since('chat', 0);
+			expect(stored.map((m) => m.seq)).toEqual([4, 5, 6, 7, 8]);
+		});
+
+		it('rejects the whole batch fail-closed when one payload cannot serialize', async () => {
+			let caught;
+			try {
+				await replay.publishBatch(platform, [
+					{ topic: 'chat', event: 'created', data: { id: 1 } },
+					{ topic: 'chat', event: 'created', data: { id: 2n } }
+				]);
+			} catch (err) { caught = err; }
+
+			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught.op).toBe('publishBatch');
+			expect(await replay.seq('chat')).toBe(0);
+			expect(platform.published).toHaveLength(0);
+			expect(platform.publishedBatches).toHaveLength(0);
+		});
+
+		it('validates message shape before any storage work', async () => {
+			await expect(replay.publishBatch(platform, [{ topic: '', event: 'x' }])).rejects.toThrow('non-empty string topic');
+			await expect(replay.publishBatch(platform, [{ topic: 'chat' }])).rejects.toThrow('string event');
+			await expect(replay.publishBatch(platform, 'nope')).rejects.toThrow('expects an array');
+		});
+
+		it('no-ops an empty batch', async () => {
+			expect(await replay.publishBatch(platform, [])).toBe(true);
+			expect(platform.published).toHaveLength(0);
+			expect(platform.publishedBatches).toHaveLength(0);
+		});
+
+		it('falls back to unstamped local fan-out when storage fails with localFanoutOnStorageFailure', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true, cleanupInterval: 0 });
+			const origQuery = client.query.bind(client);
+			client.query = async (textOrObj, values) => {
+				const name = typeof textOrObj === 'object' ? textOrObj.name : '';
+				if (name && name.startsWith('replay_publishbatch_')) throw new Error('db down');
+				return origQuery(textOrObj, values);
+			};
+			const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const result = await r.publishBatch(platform, [
+					{ topic: 'chat', event: 'created', data: { id: 1 } },
+					{ topic: 'chat', event: 'created', data: { id: 2 } }
+				]);
+				expect(result).toBe(true);
+			} finally {
+				spy.mockRestore();
+				client.query = origQuery;
+				r.destroy();
+			}
+			// Degraded fan-out carries no authoritative seq.
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages).toEqual([
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } }
+			]);
+			expect(await replay.seq('chat')).toBe(0);
+		});
+
+		it('throws ReplayStorageError on storage failure without the fallback', async () => {
+			const origQuery = client.query.bind(client);
+			client.query = async (textOrObj, values) => {
+				const name = typeof textOrObj === 'object' ? textOrObj.name : '';
+				if (name && name.startsWith('replay_publishbatch_')) throw new Error('db down');
+				return origQuery(textOrObj, values);
+			};
+			let caught;
+			try {
+				await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 1 } }]);
+			} catch (err) { caught = err; }
+			client.query = origQuery;
+
+			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught.op).toBe('publishBatch');
+			expect(platform.published).toHaveLength(0);
+		});
+
+		it('falls back to per-message publish when the platform lacks publishBatched', async () => {
+			const bare = mockPlatform();
+			delete bare.publishBatched;
+			await replay.publishBatch(bare, [
+				{ topic: 'chat', event: 'created', data: { id: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 } }
+			]);
+
+			expect(bare.published).toEqual([
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: 1 } },
+				{ topic: 'chat', event: 'created', data: { id: 2 }, options: { seq: 2 } }
+			]);
+		});
+
+		it('extracts user_id per message via forgetUserId', async () => {
+			const r = createReplay(client, {
+				cleanupInterval: 0,
+				forgetUserId: ({ data }) => data?.author
+			});
+			try {
+				await r.publishBatch(platform, [
+					{ topic: 'chat', event: 'created', data: { id: 1, author: 'u1' } },
+					{ topic: 'chat', event: 'created', data: { id: 2 } }
+				]);
+				const purged = await r.purgeUser(null, 'u1');
+				expect(purged).toBe(1);
+				const stored = await r.since('chat', 0);
+				expect(stored.map((m) => m.data.id)).toEqual([2]);
+			} finally {
+				r.destroy();
+			}
+		});
+	});
 });

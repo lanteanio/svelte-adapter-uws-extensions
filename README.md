@@ -2257,6 +2257,122 @@ attachClockFence(platform, skew); // platform.clockFence = { fenced }
 
 > On a Redis Cluster client, `TIME` carries no key and is routed to an arbitrary node, so successive reads may sample different nodes. For a coarse drift gauge that is fine; pin to one node upstream if you need per-node attribution.
 
+## Cluster clock
+
+Where the clock-skew sampler *measures*, the cluster clock is a *time source*: multi-source fused time with a non-decreasing clamp, a cluster-consistent reading anchored on the shared Redis server clock, and an optional leader-stamped timestamp authority for clustered event ordering. Opt-in and zero-config beyond a Redis client; NTP and leader mode are opt-in on top.
+
+#### Setup
+
+```js
+// src/lib/server/clock.js
+import { redis } from './redis.js';
+import { metrics } from './metrics.js';
+import { createClusterClock, attachClusterClock } from 'svelte-adapter-uws-extensions/redis/clock';
+
+export const clock = createClusterClock(redis, {
+  metrics,
+  onTrip: (ms) => console.error(`[clock] ${ms}ms off the cluster reference - check NTP on this host`)
+});
+// Optional platform convention (bus.wrap forwards it, like clockFence):
+// attachClusterClock(platform, clock); // platform.clusterClock = { now, consistent, stamp, ready, tripped }
+```
+
+#### The three readings
+
+| Reading | What it is | Use it for |
+|---|---|---|
+| `clock.now()` | The robust local wall estimate: the median of the available sources {local wall, Redis-corrected, NTP-corrected}, clamped so a returned value never regresses. One wrong source cannot swing the median when three vote. | Local timestamps that must be robust and never step backward. |
+| `clock.consistent()` | The local wall clock corrected onto the shared Redis server clock, clamped non-decreasing. Every instance's `consistent()` converges to the same reference within round-trip error. | Cross-instance lease/expiry/window math - the property a per-instance `now()` cannot give. |
+| `clock.stamp()` | The event-timestamp authority. In leader mode only the leader assigns timestamps from its own clock; followers reproduce it through the shared reference (below). Without a leader: `consistent()`. | Ordering events published from many instances in one time domain. |
+
+The first sample runs at construction - the automatic startup drift check: a local clock more than `warnMs` (default 100 ms) off the Redis reference fires `onWarn` immediately, past `tripMs` (default 500 ms) fires `onTrip` and flips `tripped()`.
+
+#### Leader-stamped timestamps
+
+In clustered mode each instance's wall clock drifts independently, so "worker A stamped 12:00:00.001, worker B stamped 12:00:00.000, A's event was earlier" bugs are structural. With a leader handle, one instance owns the timestamp domain:
+
+```js
+import { createLeader } from 'svelte-adapter-uws-extensions/redis/leader';
+import { createClusterClock } from 'svelte-adapter-uws-extensions/redis/clock';
+
+const leader = createLeader(redis, { key: 'clock-leader' });
+const clock = createClusterClock(redis, { leader });
+
+const ts = clock.stamp(); // leader-authoritative epoch ms on every instance
+```
+
+The leader publishes its clock as an *offset relative to the shared Redis reference* (refreshed every sampling round, expiring after `leaderTtlMs`); a follower applies that offset to its own Redis-corrected reading - both sides compensate their network skew independently and meet at the reference, so no per-stamp round trip exists. A follower whose cached offset goes stale falls back to `consistent()`; a (re)elected leader stamps from its own clock immediately.
+
+#### NTP third source
+
+```js
+import { createNtpSource } from 'svelte-adapter-uws-extensions/redis/ntp-source';
+
+const clock = createClusterClock(redis, {
+  ntp: createNtpSource({ host: 'pool.ntp.org' })
+});
+```
+
+Off by default. One SNTP read per sampling round joins the median, so a lone wrong source - a stepped local clock, a drifting Redis host - is outvoted. A failed NTP read drops the source from the median until it reads again (stale offsets never keep voting) and surfaces via `onError`. Built on `node:dgram`: no new dependency. When two sources disagree by `driftThresholdMs` (default 100 ms) or more, `onDrift` fires with a structured `{ driftMs, sources }` event and the `platform_clock_drift_ms` gauge moves.
+
+#### Admission trip
+
+A clock skewed past its trip threshold is about to mint stale leases and corrupted orderings. Wire it into [admission control](#admission-control) so the machine stops admitting new work until the skew clears:
+
+```js
+import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
+
+const admission = createAdmissionControl({
+  classes: {
+    critical: ['MEMORY'],
+    upgrades: { clockTripped: true }
+  },
+  clock
+});
+
+// e.g. in the upgrade hook:
+if (!admission.shouldAccept('upgrades', platform)) return res.writeStatus('503').end();
+```
+
+Rejections count under `admission_rejected_total{reason="CLOCK_TRIPPED"}`. Any object with a `tripped(): boolean` surface satisfies the `clock` option.
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `intervalMs` | `30000` | Background sampling cadence. |
+| `samples` | `5` | Redis `TIME` reads per round, median-reduced to reject jitter. |
+| `warnMs` / `tripMs` | `100` / `500` | Redis-skew thresholds for `onWarn` / `onTrip` and `tripped()`. |
+| `driftThresholdMs` | `100` | Max pairwise source disagreement at or above which `onDrift` fires. |
+| `immediate` | `true` | Take the startup sample at construction (the automatic drift check). |
+| `ntp` | - | Optional third source from `createNtpSource`. |
+| `leader` | - | Leader handle (`createLeader(...)` or any `{ isLeader() }`) enabling leader-stamped `stamp()`. |
+| `leaderKey` | `'clock:leader-offset'` | Key the leader publishes its offset under. |
+| `leaderTtlMs` | `intervalMs * 3` | Freshness bound for the published offset and a follower's cache. |
+| `onSample` / `onWarn` / `onTrip` / `onDrift` / `onError` | - | Round callbacks; failures retain the last good state. |
+| `breaker` / `metrics` | - | Circuit breaker for the Redis reads; Prometheus registry. |
+
+#### API
+
+| Method | Description |
+|---|---|
+| `now()` / `consistent()` / `stamp()` | The three readings above; each independently clamped non-decreasing. |
+| `ready()` | `true` once the first successful sample landed. |
+| `skew()` | Most recent signed Redis skew (ms), `null` before the first sample. |
+| `tripped()` | `true` while the last sampled skew is at or past `tripMs`. |
+| `drift()` | Most recent max pairwise source disagreement (ms). |
+| `sample()` | Run one round now (returns the signed Redis skew, `null` on failure). |
+| `stop()` | Stop the interval and await any in-flight round. Idempotent. |
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| `platform_clock_skew_ms` | Gauge of the signed skew against the Redis reference (shared with the clock-skew sampler; registry-deduplicated). |
+| `platform_clock_drift_ms` | Gauge of the max pairwise disagreement between this instance's clock sources. High drift means at least one source is wrong. |
+
+> The cluster clock and the clock-skew sampler can run side by side: the sampler stays the minimal observability tool (gauge, warn/trip alerts, the fence hysteresis `live.smooth` consumes); the clock is the time source. Determinism: every wall read goes through the runtime seam and both the mock Redis `TIME` and the NTP transport are injectable, so simulations reproduce or inject skew exactly.
+
 ---
 
 ## Distributed session

@@ -296,4 +296,58 @@ describe('admission control', () => {
 			expect(ac.shouldAccept('hot', platform, { topic: 'hot' })).toBe(false);
 		});
 	});
+
+	describe('clockTripped rule', () => {
+		it('requires a clock when the rule is configured', () => {
+			expect(() => createAdmissionControl({
+				classes: { upgrades: { clockTripped: true } }
+			})).toThrow('no clock was passed');
+		});
+
+		it('rejects only the exact clockTripped rule shape, not arbitrary objects', () => {
+			expect(() => createAdmissionControl({
+				classes: { upgrades: { clockTripped: 'yes' } },
+				clock: { tripped: () => false }
+			})).toThrow('rule must be');
+		});
+
+		it('rejects while the clock is tripped and admits when it clears', () => {
+			let tripped = true;
+			const ac = createAdmissionControl({
+				classes: { upgrades: { clockTripped: true } },
+				clock: { tripped: () => tripped }
+			});
+			expect(ac.shouldAccept('upgrades', platform)).toBe(false);
+			tripped = false;
+			expect(ac.shouldAccept('upgrades', platform)).toBe(true);
+		});
+
+		it('counts rejections under the CLOCK_TRIPPED reason', async () => {
+			const { createMetrics } = await import('../../src/prometheus/index.js');
+			const metrics = createMetrics();
+			const ac = createAdmissionControl({
+				classes: { upgrades: { clockTripped: true } },
+				clock: { tripped: () => true },
+				metrics
+			});
+			ac.shouldAccept('upgrades', platform);
+			const out = await metrics.serialize();
+			expect(out).toMatch(/admission_rejected_total\{class="upgrades",reason="CLOCK_TRIPPED"\}\s+1/);
+		});
+
+		it('coexists with the other rule shapes', () => {
+			const ac = createAdmissionControl({
+				classes: {
+					critical: ['MEMORY'],
+					upgrades: { clockTripped: true }
+				},
+				clock: { tripped: () => true }
+			});
+			platform._setPressure({
+				active: false, subscriberRatio: 0, publishRate: 0, memoryMB: 0, reason: 'NONE'
+			});
+			expect(ac.shouldAccept('critical', platform)).toBe(true);
+			expect(ac.shouldAccept('upgrades', platform)).toBe(false);
+		});
+	});
 });

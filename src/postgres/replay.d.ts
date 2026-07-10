@@ -80,6 +80,13 @@ export interface BufferedMessage {
 	data: unknown;
 }
 
+/** One message in a `publishBatch()` burst. */
+export interface ReplayBatchMessage {
+	topic: string;
+	event: string;
+	data?: unknown;
+}
+
 export interface ReplayGap {
 	/** True when the buffer no longer holds the next sequence the consumer needs. */
 	truncated: boolean;
@@ -111,6 +118,20 @@ export interface PgReplayBuffer {
 	 * sequence number, then calls platform.publish() as normal.
 	 */
 	publish(platform: Platform, topic: string, event: string, data?: unknown): Promise<boolean>;
+
+	/**
+	 * Publish a burst of messages (one or more topics) through the buffer in a
+	 * SINGLE Postgres round trip. One atomic UNNEST statement bumps each
+	 * topic's seq counter and inserts all rows; per-topic sequence numbers are
+	 * contiguous and follow caller order, exactly as if each message had gone
+	 * through `publish()` individually. Broadcasts live via
+	 * `platform.publishBatched()` (per-message `platform.publish()` when the
+	 * adapter lacks it), stamping each frame with its authoritative seq.
+	 *
+	 * Fail-closed: one unserializable payload rejects the whole batch with
+	 * nothing persisted. An empty array is a no-op returning `true`.
+	 */
+	publishBatch(platform: Platform, messages: ReplayBatchMessage[]): Promise<boolean>;
 
 	/** Get the current sequence number for a topic. Returns 0 if unknown. */
 	seq(topic: string): Promise<number>;

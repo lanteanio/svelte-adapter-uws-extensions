@@ -519,4 +519,134 @@ describe('postgres replay (integration)', () => {
 			expect(await replay.since('chat', 0)).toEqual([]);
 		});
 	});
+
+	describe('publishBatch (UNNEST CTE against real Postgres)', () => {
+		it('a 50-message single-topic batch produces gap-free seqs 1..50', async () => {
+			const messages = [];
+			for (let i = 1; i <= 50; i++) messages.push({ topic: 'chat', event: 'created', data: { id: i } });
+			const big = createReplay(client, { table: TABLE, size: 100, cleanupInterval: 0 });
+			try {
+				await big.publishBatch(platform, messages);
+				const stored = await big.since('chat', 0);
+				expect(stored.map((m) => m.seq)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+				expect(stored.map((m) => m.data.id)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+			} finally {
+				big.destroy();
+			}
+		});
+
+		it('multi-topic ordinality: interleaved topics stay contiguous per topic in caller order', async () => {
+			// Only real Postgres validates the WITH ORDINALITY + row_number()
+			// window arithmetic; the mock reimplements it.
+			await replay.publishBatch(platform, [
+				{ topic: 'a', event: 'e', data: { v: 'a1' } },
+				{ topic: 'b', event: 'e', data: { v: 'b1' } },
+				{ topic: 'a', event: 'e', data: { v: 'a2' } },
+				{ topic: 'c', event: 'e', data: { v: 'c1' } },
+				{ topic: 'b', event: 'e', data: { v: 'b2' } },
+				{ topic: 'a', event: 'e', data: { v: 'a3' } }
+			]);
+
+			expect((await replay.since('a', 0)).map((m) => [m.seq, m.data.v])).toEqual([[1, 'a1'], [2, 'a2'], [3, 'a3']]);
+			expect((await replay.since('b', 0)).map((m) => [m.seq, m.data.v])).toEqual([[1, 'b1'], [2, 'b2']]);
+			expect((await replay.since('c', 0)).map((m) => [m.seq, m.data.v])).toEqual([[1, 'c1']]);
+
+			// The broadcast batch carries each message's authoritative seq.
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages.map((m) => [m.topic, m.options.seq]))
+				.toEqual([['a', 1], ['b', 1], ['a', 2], ['c', 1], ['b', 2], ['a', 3]]);
+		});
+
+		it('concurrent batches from two instances on one topic produce a contiguous union', async () => {
+			// Proves the single-statement atomicity under real row locks: the
+			// seq-table bump serializes the batches, so each gets its own
+			// contiguous run and the union is gap-free.
+			const other = createReplay(client, { table: TABLE, size: 100, cleanupInterval: 0 });
+			const big = createReplay(client, { table: TABLE, size: 100, cleanupInterval: 0 });
+			try {
+				const mk = (tag) => Array.from({ length: 10 }, (_, i) => ({ topic: 'chat', event: 'e', data: { tag, i } }));
+				await Promise.all([
+					big.publishBatch(platform, mk('x')),
+					other.publishBatch(platform, mk('y')),
+					big.publishBatch(platform, mk('z'))
+				]);
+
+				const stored = await big.since('chat', 0);
+				expect(stored.map((m) => m.seq)).toEqual(Array.from({ length: 30 }, (_, i) => i + 1));
+				// Each batch's run is internally caller-ordered and contiguous.
+				for (const tag of ['x', 'y', 'z']) {
+					const run = stored.filter((m) => m.data.tag === tag);
+					expect(run.map((m) => m.data.i)).toEqual(Array.from({ length: 10 }, (_, i) => i));
+					expect(run[9].seq - run[0].seq).toBe(9);
+				}
+			} finally {
+				other.destroy();
+				big.destroy();
+			}
+		});
+
+		it('mixed batch and single publish share one contiguous seq space', async () => {
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'e', data: { id: 1 } },
+				{ topic: 'chat', event: 'e', data: { id: 2 } }
+			]);
+			await replay.publish(platform, 'chat', 'e', { id: 3 });
+			await replay.publishBatch(platform, [{ topic: 'chat', event: 'e', data: { id: 4 } }]);
+
+			const stored = await replay.since('chat', 0);
+			expect(stored.map((m) => [m.seq, m.data.id])).toEqual([[1, 1], [2, 2], [3, 3], [4, 4]]);
+		});
+
+		it('epoch edges match the single path: fresh seeds 1, clearTopic bump is carried', async () => {
+			await replay.publishBatch(platform, [{ topic: 'chat', event: 'e', data: { id: 1 } }]);
+			expect(await replay.currentEpoch('chat')).toBe(1);
+
+			await replay.clearTopic('chat');
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'e', data: { id: 2 } },
+				{ topic: 'chat', event: 'e', data: { id: 3 } }
+			]);
+			expect(await replay.currentEpoch('chat')).toBe(2);
+			expect((await replay.since('chat', 0)).map((m) => m.seq)).toEqual([1, 2]);
+		});
+
+		it('round-trips jsonb through the text[]::jsonb cast (unicode, arrays, null)', async () => {
+			await replay.publishBatch(platform, [
+				{ topic: 'chat', event: 'e', data: { text: 'Grüße aus Köln', arr: [1, true, null], nested: { a: 'ß' } } },
+				{ topic: 'chat', event: 'e' }
+			]);
+			const stored = await replay.since('chat', 0);
+			expect(stored[0].data).toEqual({ text: 'Grüße aus Köln', arr: [1, true, null], nested: { a: 'ß' } });
+			expect(stored[1].data).toBeNull();
+		});
+
+		it('trims each over-cap topic on the real table after a batch', async () => {
+			// size is 5 (beforeEach): an 8-message burst leaves the newest 5.
+			const messages = [];
+			for (let i = 1; i <= 8; i++) messages.push({ topic: 'chat', event: 'e', data: { id: i } });
+			messages.push({ topic: 'todos', event: 'e', data: { id: 1 } });
+			await replay.publishBatch(platform, messages);
+
+			expect((await replay.since('chat', 0)).map((m) => m.seq)).toEqual([4, 5, 6, 7, 8]);
+			expect((await replay.since('todos', 0)).map((m) => m.seq)).toEqual([1]);
+		});
+
+		it('purges batch-written rows by user_id via forgetUserId', async () => {
+			const r = createReplay(client, {
+				table: TABLE, size: 100, cleanupInterval: 0,
+				forgetUserId: ({ data }) => data?.author
+			});
+			try {
+				await r.publishBatch(platform, [
+					{ topic: 'chat', event: 'e', data: { id: 1, author: 'u1' } },
+					{ topic: 'chat', event: 'e', data: { id: 2, author: 'u2' } },
+					{ topic: 'chat', event: 'e', data: { id: 3, author: 'u1' } }
+				]);
+				expect(await r.purgeUser(null, 'u1')).toBe(2);
+				expect((await r.since('chat', 0)).map((m) => m.data.id)).toEqual([2]);
+			} finally {
+				r.destroy();
+			}
+		});
+	});
 });

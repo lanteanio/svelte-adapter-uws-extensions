@@ -926,6 +926,9 @@ export function createShardedBus(client, options = {}) {
 				// Clock-fence convention (attachClockFence); live getter so
 				// post-wrap attachment propagates.
 				get clockFence() { return platform.clockFence; },
+				// Cluster-clock convention (attachClusterClock); live getter so
+				// post-wrap attachment propagates.
+				get clusterClock() { return platform.clusterClock; },
 				// The topic-broadcast cluster coordinator; live getter so realtime
 				// detects it on the wrapped seam to fan live.push({ topic }) cluster-wide.
 				get topicBroadcast() { return platform.topicBroadcast; },

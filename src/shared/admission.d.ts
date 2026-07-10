@@ -23,18 +23,36 @@ export interface ClusterTopPublisherRule {
 }
 
 /**
+ * Clock-integrity rule shape: this class is rejected while the configured
+ * clock reports `tripped()` (its skew against the shared cluster reference is
+ * at or past the trip threshold - a machine about to mint stale leases and
+ * corrupted orderings). Requires the controller to be constructed with a
+ * `clock` (typically from `redis/clock`). Rejections carry the synthetic
+ * reason `CLOCK_TRIPPED` on `admission_rejected_total`.
+ */
+export interface ClockTrippedRule {
+	clockTripped: true;
+}
+
+/**
  * A per-class rule. One of:
  * - an array of reasons - rejected when `pressure.reason` is in the list
  * - a predicate - rejected when the predicate returns true for the current snapshot
  * - a `clusterTopPublisher` object - rejected when the topic's cluster-wide rate is at threshold
+ * - a `clockTripped` object - rejected while the configured clock's skew is tripped
  */
 export type AdmissionRule =
 	| readonly PressureReason[]
 	| ((snapshot: PressureSnapshot) => boolean)
-	| ClusterTopPublisherRule;
+	| ClusterTopPublisherRule
+	| ClockTrippedRule;
 
 export interface PublishRateAggregatorLike {
 	rateOf(topic: string): number;
+}
+
+export interface ClockLike {
+	tripped(): boolean;
 }
 
 export interface AdmissionControlOptions {
@@ -49,6 +67,12 @@ export interface AdmissionControlOptions {
 	 * `clusterTopPublisher` rule shape; ignored otherwise.
 	 */
 	aggregator?: PublishRateAggregatorLike;
+	/**
+	 * Clock-integrity source (typically `createClusterClock(...)`; any
+	 * `{ tripped(): boolean }` works). Required when any class uses the
+	 * `clockTripped` rule shape; ignored otherwise.
+	 */
+	clock?: ClockLike;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 }

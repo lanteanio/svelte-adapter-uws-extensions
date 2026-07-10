@@ -120,6 +120,13 @@ export interface SimResult {
 	config: Record<string, any>;
 	steps: number;
 	virtualTimeMs: number;
+	/**
+	 * Per-step auditor violations plus the end-of-run passes, de-duplicated.
+	 * Steady-state hypothesis categories (whole-run predicates over the recorded
+	 * trajectory): `steady.time-nonmonotonic`, `steady.no-quiescence`,
+	 * `steady.delivery-nonmonotonic`, `steady.starvation`, and the terminal
+	 * `topic.zero-subscribers`. A clean run is `[]`.
+	 */
 	invariantViolations: Array<{ category: string; context: any }>;
 	metrics: { instances: number; clients: number; framesDelivered: number };
 	/** Per-instance client frames, sorted by instance. */

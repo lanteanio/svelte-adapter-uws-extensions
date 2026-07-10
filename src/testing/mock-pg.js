@@ -881,6 +881,51 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: seqCounters.size };
 		}
 
+		// Batch CTE publish: UNNEST arrays -> per-topic seq bump + multi-row
+		// insert in one statement. Mirrors the single-publish branches exactly:
+		// a topic with no seq row seeds seq=n, epoch=1 (INSERT branch); an
+		// existing row takes seq+=n and carries its epoch forward (UPDATE
+		// branch). Per-topic seqs are assigned contiguously in caller order.
+		// Returns one row per distinct topic: { topic, new_high, epoch }.
+		if (sql.includes('UNNEST') && sql.includes('ON CONFLICT') && sql.includes('new_high')) {
+			const [batchTopics, batchEvents, batchDatas, batchUserIds] = values;
+			const perTopic = new Map();
+			for (let i = 0; i < batchTopics.length; i++) {
+				const topic = batchTopics[i];
+				if (!perTopic.has(topic)) perTopic.set(topic, []);
+				perTopic.get(topic).push(i);
+			}
+			const out = [];
+			for (const [topic, indexes] of perTopic) {
+				const hadRow = seqCounters.has(topic);
+				const base = seqCounters.get(topic) || 0;
+				const high = base + indexes.length;
+				seqCounters.set(topic, high);
+				let epoch;
+				if (!hadRow) {
+					epoch = 1;
+					epochCounters.set(topic, epoch);
+				} else {
+					epoch = epochCounters.get(topic) || 0;
+				}
+				let seq = base;
+				for (const i of indexes) {
+					seq += 1;
+					rows.push({
+						svti_replay_id: nextId++,
+						topic,
+						seq,
+						event: batchEvents[i],
+						data: typeof batchDatas[i] === 'string' ? JSON.parse(batchDatas[i]) : batchDatas[i],
+						user_id: batchUserIds?.[i] ?? null,
+						created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
+					});
+				}
+				out.push({ topic, new_high: String(high), epoch: String(epoch) });
+			}
+			return { rows: out, rowCount: out.length };
+		}
+
 		// CTE publish: atomic seq increment + insert in one query.
 		// The reset edge is the INSERT branch (a topic with no seq row, i.e.
 		// brand-new or fully cleared): seq starts at 1 and epoch is seeded to
@@ -906,6 +951,7 @@ export function mockPgClient(options = {}) {
 				seq: next,
 				event: values[1],
 				data: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
+				user_id: values[3] ?? null,
 				created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
 			};
 			rows.push(row);
@@ -987,6 +1033,19 @@ export function mockPgClient(options = {}) {
 					data: r.data
 				}));
 			return { rows: result, rowCount: result.length };
+		}
+
+		// Right-to-erasure purge: DELETE FROM table WHERE user_id = $1
+		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE user_id = $1')) {
+			const userId = values[0];
+			let count = 0;
+			for (let i = rows.length - 1; i >= 0; i--) {
+				if (rows[i].user_id === userId) {
+					rows.splice(i, 1);
+					count++;
+				}
+			}
+			return { rows: [], rowCount: count };
 		}
 
 		// Seq-based inline trim: DELETE WHERE topic = $1 AND seq <= $2

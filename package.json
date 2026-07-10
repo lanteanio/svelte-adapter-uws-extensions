@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.49",
+	"version": "0.6.0-next.50",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -108,6 +108,14 @@
 		"./redis/clock-skew": {
 			"types": "./src/redis/clock-skew.d.ts",
 			"default": "./src/redis/clock-skew.js"
+		},
+		"./redis/clock": {
+			"types": "./src/redis/clock.d.ts",
+			"default": "./src/redis/clock.js"
+		},
+		"./redis/ntp-source": {
+			"types": "./src/redis/ntp-source.d.ts",
+			"default": "./src/redis/ntp-source.js"
 		},
 		"./redis/idempotency": {
 			"types": "./src/redis/idempotency.d.ts",

@@ -405,6 +405,10 @@ export function createPubSubBus(client, options = {}) {
 				// the clock is fenced. Live getter so post-wrap attachment
 				// propagates.
 				get clockFence() { return platform.clockFence; },
+				// Cluster-clock convention (attachClusterClock): cluster-consistent
+				// / leader-stamped time for layers that order or expire across
+				// instances. Live getter so post-wrap attachment propagates.
+				get clusterClock() { return platform.clusterClock; },
 				// The topic-broadcast cluster coordinator (createTopicBroadcast),
 				// attached by app init like the other plugins. Live getter so
 				// post-wrap assignment propagates; realtime detects it on the wrapped

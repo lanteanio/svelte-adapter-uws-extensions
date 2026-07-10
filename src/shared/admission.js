@@ -76,7 +76,7 @@ export function createAdmissionControl(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('admission control: options object is required');
 	}
-	const { classes, metrics, aggregator } = options;
+	const { classes, metrics, aggregator, clock } = options;
 	if (!classes || typeof classes !== 'object') {
 		throw new Error('admission control: classes is required and must be an object');
 	}
@@ -85,9 +85,10 @@ export function createAdmissionControl(options) {
 		throw new Error('admission control: classes must define at least one class');
 	}
 
-	/** @type {Map<string, Set<PressureReason> | ((snap: PressureSnapshot) => boolean) | { kind: 'clusterTopPublisher', threshold: number }>} */
+	/** @type {Map<string, Set<PressureReason> | ((snap: PressureSnapshot) => boolean) | { kind: 'clusterTopPublisher', threshold: number } | { kind: 'clockTripped' }>} */
 	const compiled = new Map();
 	let needsAggregator = false;
+	let needsClock = false;
 	for (const name of classNames) {
 		const rule = classes[name];
 		if (Array.isArray(rule)) {
@@ -111,9 +112,13 @@ export function createAdmissionControl(options) {
 			}
 			compiled.set(name, { kind: 'clusterTopPublisher', threshold: cfg.threshold });
 			needsAggregator = true;
+		} else if (rule && typeof rule === 'object' && rule.clockTripped === true) {
+			compiled.set(name, { kind: 'clockTripped' });
+			needsClock = true;
 		} else {
 			throw new Error(
-				`admission control: class "${name}" rule must be an array of reasons, a predicate function, or a {clusterTopPublisher: {threshold}} object`
+				`admission control: class "${name}" rule must be an array of reasons, a predicate function, ` +
+				'a {clusterTopPublisher: {threshold}} object, or a {clockTripped: true} object'
 			);
 		}
 	}
@@ -123,6 +128,15 @@ export function createAdmissionControl(options) {
 			throw new Error(
 				'admission control: a clusterTopPublisher rule was configured but no aggregator was passed. ' +
 				'Provide one via `createAdmissionControl({ aggregator: createPublishRateAggregator(...) })`.'
+			);
+		}
+	}
+	if (needsClock) {
+		if (!clock || typeof clock.tripped !== 'function') {
+			throw new Error(
+				'admission control: a clockTripped rule was configured but no clock was passed. ' +
+				'Provide one via `createAdmissionControl({ clock: createClusterClock(...) })` ' +
+				'(any object with a tripped() => boolean surface works).'
 			);
 		}
 	}
@@ -157,6 +171,11 @@ export function createAdmissionControl(options) {
 				const rate = aggregator.rateOf(topic);
 				blocked = rate >= rule.threshold;
 				if (blocked) blockReason = 'CLUSTER_TOP_PUBLISHER';
+			} else if (rule && rule.kind === 'clockTripped') {
+				// A clock skewed past its trip threshold is about to mint stale
+				// leases and corrupted orderings; refuse new work until it clears.
+				blocked = clock.tripped() === true;
+				if (blocked) blockReason = 'CLOCK_TRIPPED';
 			}
 			if (blocked) {
 				mRejected?.inc({ class: className, reason: blockReason });

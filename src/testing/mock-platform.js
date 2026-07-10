@@ -63,6 +63,9 @@ export function mockPlatform() {
 		// instance's clock read `platform.clockFence` (attachClockFence) to
 		// stand down while the clock is fenced. Default undefined = no fence.
 		clockFence: undefined,
+		// Framework-convention slot: cluster-consistent / leader-stamped time
+		// (attachClusterClock). Default undefined = no cluster clock.
+		clusterClock: undefined,
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {

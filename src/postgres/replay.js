@@ -265,6 +265,38 @@ export function createReplay(client, options = {}) {
 	// omitted (it can embed user ids - the metric carries the sanitized label).
 	let warnedStorageFallback = false;
 
+	function warnStorageFallbackOnce(platform, err) {
+		if (warnedStorageFallback) return;
+		warnedStorageFallback = true;
+		console.warn(
+			'[postgres replay] storage failed; falling back to local publish, durability degraded' +
+			(platform?.requestId ? ' (requestId=' + platform.requestId + ')' : '') +
+			'. Further occurrences are suppressed; see the replay_storage_fallbacks_total metric. Cause: ' +
+			(err?.message ?? err)
+		);
+	}
+
+	// Trim by sequence number: seqs are contiguous per topic (1, 2, 3, ...) so
+	// the cutoff is trivially computable. Trim failure must not block the live
+	// publish path -- the periodic cleanup will catch any excess rows later.
+	// Shared by publish and publishBatch so both reuse one prepared statement
+	// (same name requires byte-identical text).
+	async function trimTopicTo(topic, cutoff) {
+		try {
+			await client.query({
+				name: 'replay_trim_' + table,
+				text: `DELETE FROM ${table}
+				 WHERE topic = $1
+				   AND seq <= $2`,
+				values: [topic, cutoff]
+			});
+		} catch {
+			// Non-fatal: the next successful publish re-trims with a
+			// higher cutoff. With cleanupInterval: 0, persistent trim
+			// failures cause unbounded growth.
+		}
+	}
+
 	const tracker = {
 		async publish(platform, topic, event, data) {
 			// Serialize BEFORE entering the storage try-block. A JSON.stringify
@@ -306,15 +338,7 @@ export function createReplay(client, options = {}) {
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
-					if (!warnedStorageFallback) {
-						warnedStorageFallback = true;
-						console.warn(
-							'[postgres replay] storage failed; falling back to local publish, durability degraded' +
-							(platform?.requestId ? ' (requestId=' + platform.requestId + ')' : '') +
-							'. Further occurrences are suppressed; see the replay_storage_fallbacks_total metric. Cause: ' +
-							(err?.message ?? err)
-						);
-					}
+					warnStorageFallbackOnce(platform, err);
 					return platform.publish(topic, event, data);
 				}
 				throw new ReplayStorageError('publish', err);
@@ -327,26 +351,8 @@ export function createReplay(client, options = {}) {
 			if (res.rows[0].epoch != null) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
 			mPublishes?.inc({ topic: mt(topic) });
 
-			// Trim by sequence number: seqs are contiguous per topic
-			// (1, 2, 3, ...) so the cutoff is trivially computable.
-			// This avoids the previous COUNT(*) + subquery approach
-			// that was O(N) on every publish.
-			// Trim failure must not block the live publish path --
-			// the periodic cleanup will catch any excess rows later.
 			if (seq > maxSize) {
-				try {
-					await client.query({
-						name: 'replay_trim_' + table,
-						text: `DELETE FROM ${table}
-						 WHERE topic = $1
-						   AND seq <= $2`,
-						values: [topic, seq - maxSize]
-					});
-				} catch {
-					// Non-fatal: the next successful publish re-trims with a
-					// higher cutoff. With cleanupInterval: 0, persistent trim
-					// failures cause unbounded growth.
-				}
+				await trimTopicTo(topic, seq - maxSize);
 			}
 
 			// Thread the authoritative CTE seq onto the live frame so a resuming
@@ -358,6 +364,150 @@ export function createReplay(client, options = {}) {
 			return Number.isInteger(seq) && seq >= 1
 				? platform.publish(topic, event, data, { seq })
 				: platform.publish(topic, event, data);
+		},
+
+		async publishBatch(platform, messages) {
+			if (!Array.isArray(messages)) {
+				throw new Error('postgres replay: publishBatch expects an array of { topic, event, data } messages');
+			}
+			if (messages.length === 0) return true;
+
+			// Fail-closed: validate and serialize EVERY message before the
+			// storage try-block. One bad payload rejects the whole batch with
+			// nothing persisted - mirroring publish(), a caller-input bug must
+			// not trigger the localFanoutOnStorageFailure durability fallback.
+			const topics = new Array(messages.length);
+			const events = new Array(messages.length);
+			const payloads = new Array(messages.length);
+			const userIds = new Array(messages.length);
+			for (let i = 0; i < messages.length; i++) {
+				const msg = messages[i];
+				if (!msg || typeof msg.topic !== 'string' || msg.topic.length === 0 || typeof msg.event !== 'string') {
+					throw new Error('postgres replay: publishBatch messages need a non-empty string topic and a string event');
+				}
+				try {
+					payloads[i] = JSON.stringify(msg.data ?? null);
+				} catch (err) {
+					throw new ReplaySerializationError('publishBatch', err);
+				}
+				topics[i] = msg.topic;
+				events[i] = msg.event;
+				let userId = null;
+				if (forgetUserId) {
+					try { const u = forgetUserId({ topic: msg.topic, event: msg.event, data: msg.data }); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
+				}
+				userIds[i] = userId;
+			}
+
+			let res;
+			try {
+				res = await withBreaker(b, async () => {
+					await ensureTable();
+					// One statement, so it is atomic on its own (no transaction
+					// wrapper): the per-topic seq bumps and the multi-row insert
+					// commit or roll back together, and concurrent instances
+					// serialize on the seq-table row locks, keeping each batch's
+					// per-topic seq run contiguous. UNNEST arrays keep the
+					// statement text N-invariant so the prepared-statement cache
+					// holds exactly one entry regardless of batch size. Per-topic
+					// seq order follows caller order via WITH ORDINALITY +
+					// row_number(); the seq-table branches mirror the single
+					// path exactly (fresh topic: INSERT seq=n, epoch=1; existing:
+					// UPDATE seq+=n, epoch carried).
+					return client.query({
+						name: 'replay_publishbatch_' + table,
+						text: `WITH input AS (
+							SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[])
+							  WITH ORDINALITY AS t(topic, event, data, user_id, ord)
+						), counts AS (
+							SELECT topic, COUNT(*)::bigint AS n FROM input GROUP BY topic
+						), bumped AS (
+							INSERT INTO ${seqTable} (topic, seq, epoch)
+							SELECT topic, n, 1 FROM counts
+							ON CONFLICT (topic)
+							  DO UPDATE SET seq = ${seqTable}.seq + EXCLUDED.seq
+							  RETURNING topic, seq AS new_high, epoch
+						), numbered AS (
+							SELECT i.*, row_number() OVER (PARTITION BY i.topic ORDER BY i.ord) AS rn
+							  FROM input i
+						), ins AS (
+							INSERT INTO ${table} (topic, seq, event, data, user_id)
+							SELECT n.topic, b.new_high - c.n + n.rn, n.event, n.data::jsonb, n.user_id
+							  FROM numbered n
+							  JOIN bumped b ON b.topic = n.topic
+							  JOIN counts c ON c.topic = n.topic
+							RETURNING topic, seq
+						)
+						SELECT topic, new_high, epoch FROM bumped`,
+						values: [topics, events, payloads, userIds]
+					});
+				});
+			} catch (err) {
+				if (localFanoutOnStorageFailure) {
+					for (const topic of topics) mStorageFallbacks?.inc({ topic: mt(topic) });
+					warnStorageFallbackOnce(platform, err);
+					// Degraded local fan-out: no authoritative seq (mirrors the
+					// single path's counter-stamped fallback).
+					if (typeof platform.publishBatched === 'function') {
+						return platform.publishBatched(messages.map((msg) => ({
+							topic: msg.topic, event: msg.event, data: msg.data
+						}))) ?? true;
+					}
+					let ok = true;
+					for (const msg of messages) {
+						if (platform.publish(msg.topic, msg.event, msg.data) === false) ok = false;
+					}
+					return ok;
+				}
+				throw new ReplayStorageError('publishBatch', err);
+			}
+
+			// Reconstruct each message's authoritative seq from the per-topic
+			// highs: this batch's run per topic is (new_high - n + 1) .. new_high
+			// in caller order - the same contiguous seq space the table stores.
+			const highs = new Map();
+			for (const row of res.rows) {
+				const high = parseInt(row.new_high, 10);
+				highs.set(row.topic, high);
+				if (row.epoch != null) epochCache.set(row.topic, parseInt(row.epoch, 10));
+			}
+			const counts = new Map();
+			for (const topic of topics) counts.set(topic, (counts.get(topic) || 0) + 1);
+			const nextSeq = new Map();
+			for (const [topic, n] of counts) {
+				const high = highs.get(topic);
+				nextSeq.set(topic, Number.isInteger(high) ? high - n + 1 : NaN);
+			}
+			const batch = new Array(messages.length);
+			for (let i = 0; i < messages.length; i++) {
+				const topic = topics[i];
+				const seq = nextSeq.get(topic);
+				nextSeq.set(topic, seq + 1);
+				mPublishes?.inc({ topic: mt(topic) });
+				batch[i] = Number.isInteger(seq) && seq >= 1
+					? { topic, event: events[i], data: messages[i].data, options: { seq } }
+					: { topic, event: events[i], data: messages[i].data };
+			}
+
+			for (const [topic, high] of highs) {
+				if (high > maxSize) {
+					await trimTopicTo(topic, high - maxSize);
+				}
+			}
+
+			// Broadcast live in one wire-batched call when the adapter supports
+			// it (duck-typed - no peer floor bump); otherwise per-message.
+			if (typeof platform.publishBatched === 'function') {
+				return platform.publishBatched(batch) ?? true;
+			}
+			let ok = true;
+			for (const msg of batch) {
+				const r = msg.options
+					? platform.publish(msg.topic, msg.event, msg.data, msg.options)
+					: platform.publish(msg.topic, msg.event, msg.data);
+				if (r === false) ok = false;
+			}
+			return ok;
 		},
 
 		async seq(topic) {

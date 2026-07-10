@@ -25,6 +25,7 @@ import {
 import { createTestServer } from 'svelte-adapter-uws/testing';
 import { setRuntimeEnv as extSetRuntimeEnv, resetRuntimeEnv as extResetRuntimeEnv } from './shared/runtime.js';
 import { checkSubscriptionBookkeeping, checkRedisReplaySeqRegression, checkSharedStoreConvergence } from './shared/invariants.js';
+import { runSteadyState, faultClasses } from './shared/steadystate.js';
 import { mockRedisClient } from './testing/mock-redis.js';
 import { mockPgClient } from './testing/mock-pg.js';
 import { createPubSubBus } from './redis/pubsub.js';
@@ -257,6 +258,67 @@ function instanceSnapshot(server) {
 }
 
 /**
+ * End-of-run steady-state pass over the whole-run trajectory, folded into the
+ * runner's existing de-dup'd violations list (both runners share this shape).
+ * delivery-monotonic is guarded by the combined per-instance wire + relay fault
+ * classes, and by a topic published from more than one instance (two
+ * interleaved seq spaces read as non-monotonic at a subscriber). Cross-instance
+ * delivery through the store relay is DEFERRED (it lands on a later scheduler
+ * round), so the starvation check is restricted to subscribers still on the
+ * topic at end-of-run - a client that unsubscribes inside the relay window
+ * legitimately receives nothing (the same restriction the adapter's cluster
+ * runner applies). The terminal orphan-topic check reads the merged
+ * per-instance topic index.
+ *
+ * @param {{
+ *   recordViolation: (v: { category: string, context: any } | null) => void,
+ *   clockSamples: number[], drained: boolean, pending: number,
+ *   finalState: Array<{ instance: number, topicCounts: Record<string, number> }>,
+ *   publishLog: Array<{ topic: string, subscribers: string[] }>,
+ *   originators: Map<string, Set<unknown>>,
+ *   allClients: Array<{ instanceId: number, facade: any }>,
+ *   instancesArr: Array<{ id: number, server: any }>,
+ *   faults?: object, relayFaults?: object
+ * }} t
+ */
+function foldSteadyState(t) {
+	const steadyFaults = faultClasses(t.faults, t.relayFaults);
+	steadyFaults.multiOriginator = [...t.originators.values()].some((s) => s.size > 1);
+	/** @type {Record<string, number>} */
+	const mergedTopicCounts = {};
+	for (const s of t.finalState) {
+		for (const topic of Object.keys(s.topicCounts)) {
+			mergedTopicCounts[topic] = (mergedTopicCounts[topic] || 0) + s.topicCounts[topic];
+		}
+	}
+	const deliveredPairs = t.allClients.map((c) => ({
+		id: c.instanceId + ':' + (c.facade.serverWs ? c.facade.serverWs._simId : 'x'),
+		raw: c.facade.frames(),
+		decoded: c.facade.json()
+	}));
+	/** @type {Set<string>} `${instanceId}:${simId} ${topic}` still subscribed at end-of-run */
+	const endSubscribed = new Set();
+	for (const inst of t.instancesArr) {
+		for (const conn of instanceInvariantSnapshot(inst.server).connections) {
+			for (const topic of conn.subscribed) endSubscribed.add(inst.id + ':' + conn.id + ' ' + topic);
+		}
+	}
+	const eligiblePublishLog = t.publishLog.map((entry) => ({
+		topic: entry.topic,
+		subscribers: entry.subscribers.filter((subId) => endSubscribed.has(subId + ' ' + entry.topic))
+	}));
+	for (const v of runSteadyState({
+		clockSamples: t.clockSamples,
+		drained: t.drained,
+		pending: t.pending,
+		terminal: { topicCounts: mergedTopicCounts },
+		publishLog: eligiblePublishLog,
+		clients: deliveredPairs,
+		faults: steadyFaults
+	})) t.recordViolation(v);
+}
+
+/**
  * The default redis scenario: connect `clients` clients on every instance,
  * subscribe each to every topic, then publish a few events per topic FROM
  * instance 0, so the pub/sub relay carries them cross-instance.
@@ -343,6 +405,37 @@ export async function runRedisSim(config = {}) {
 			const key = v.category + ':' + JSON.stringify(v.context);
 			if (!seen.has(key)) { seen.add(key); violations.push(v); }
 		}
+		// Whole-run trajectory recorder (folded into the steady-state pass at
+		// end-of-run). Each per-step accumulator is O(1). The virtual clock is
+		// sampled once per scheduler round, dedup'd on the value (dropping an
+		// equal consecutive reading cannot hide a backward step). The publish-time
+		// subscriber set is captured across EVERY instance's native membership (a
+		// publish on one instance relays to subscribers on the others), keyed
+		// globally by `instanceId:simId` since each instance's `_simId` space
+		// restarts at 0. `originators` tracks which instances published each topic
+		// so a topic with more than one publisher (two interleaved seq spaces)
+		// suppresses the delivery-monotonic hypothesis.
+		/** @type {number[]} */
+		const clockSamples = [];
+		let lastClock = null;
+		function observeClock(nowMs) {
+			if (nowMs !== lastClock) { clockSamples.push(nowMs); lastClock = nowMs; }
+		}
+		/** @type {Array<{ topic: string, subscribers: string[] }>} */
+		const publishLog = [];
+		/** @type {Map<string, Set<unknown>>} */
+		const originators = new Map();
+		function recordPublish(fromInstanceId, topic) {
+			if (typeof topic !== 'string') return;
+			const subscribers = [];
+			for (const inst of instancesArr) {
+				for (const ws of inst.app._connections) if (ws._topics.has(topic)) subscribers.push(inst.id + ':' + ws._simId);
+			}
+			publishLog.push({ topic, subscribers });
+			let set = originators.get(topic);
+			if (!set) { set = new Set(); originators.set(topic, set); }
+			set.add(fromInstanceId);
+		}
 		// Per-step self-consistency: each instance's fan-out subscription set must
 		// agree with its cap-counted bookkeeping set. Run after every scheduler step
 		// so the earliest interleaving that breaks it is the one recorded.
@@ -350,6 +443,7 @@ export async function runRedisSim(config = {}) {
 			for (const inst of instancesArr) {
 				recordViolation(checkSubscriptionBookkeeping(instanceInvariantSnapshot(inst.server)));
 			}
+			observeClock(scheduler.now());
 		}
 
 		const api = {
@@ -368,8 +462,11 @@ export async function runRedisSim(config = {}) {
 						return facade;
 					},
 					clients: () => inst.clients.slice(),
-					publish: (t, e, d, o) => inst.wrapped.publish(t, e, d, o),
-					publishBatched: (m) => inst.wrapped.publishBatched(m),
+					publish: (t, e, d, o) => { recordPublish(i, t); return inst.wrapped.publish(t, e, d, o); },
+					publishBatched: (m) => {
+						if (Array.isArray(m)) for (const msg of m) recordPublish(i, msg && msg.topic);
+						return inst.wrapped.publishBatched(m);
+					},
 					// The bus-wrapped platform (publishing through it relays cross-instance)
 					// and the stateful plugins constructed against the shared store, so a
 					// scenario can drive replay.publish / presence directly.
@@ -386,8 +483,14 @@ export async function runRedisSim(config = {}) {
 
 		const scenario = config.scenario || defaultRedisScenario;
 		await scenario(api, { instances, clients, topics });
-		totalSteps += await scheduler.run({ maxSteps, onStep: checkInvariants });
+		// Final drain to quiescence so any deferred relay frames / timers settle.
+		// Capture the drained/pending signals here (before teardown): a healthy
+		// run reaches a fixpoint within the budget and leaves zero refed work.
+		const quiesceSteps = await scheduler.run({ maxSteps, onStep: checkInvariants });
+		totalSteps += quiesceSteps;
 		checkInvariants();
+		const drained = quiesceSteps < maxSteps;
+		const pendingAtQuiesce = scheduler.pending();
 
 		// Quiescent cross-instance convergence: every instance that subscribed to a
 		// topic backed by the shared store should have received the same delivered
@@ -416,6 +519,12 @@ export async function runRedisSim(config = {}) {
 		}));
 		const finalState = instancesArr.map((inst) => ({ instance: inst.id, ...instanceSnapshot(inst.server) }));
 		const totalFrames = allClients.reduce((s, c) => s + c.facade.frames().length, 0);
+
+		foldSteadyState({
+			recordViolation, clockSamples, drained, pending: pendingAtQuiesce,
+			finalState, publishLog, originators, allClients, instancesArr,
+			faults: config.faults, relayFaults: config.relayFaults
+		});
 
 		for (const inst of instancesArr) {
 			try { inst.plugins.presence && inst.plugins.presence.destroy && inst.plugins.presence.destroy(); } catch { /* best effort */ }
@@ -560,6 +669,34 @@ export async function runPgSim(config = {}) {
 			const key = v.category + ':' + JSON.stringify(v.context);
 			if (!seen.has(key)) { seen.add(key); violations.push(v); }
 		}
+		// Whole-run trajectory recorder (folded into the steady-state pass at
+		// end-of-run), mirroring the redis runner: dedup'd clock samples plus the
+		// publish-time subscriber set per NOTIFY, captured across every instance's
+		// native membership and keyed globally by `instanceId:simId`. The
+		// originator of an `api.notify` is the shared NOTIFY channel itself (one
+		// logical publisher), so multi-originator suppression only engages if a
+		// scenario also publishes the same topic through another door.
+		/** @type {number[]} */
+		const clockSamples = [];
+		let lastClock = null;
+		function observeClock(nowMs) {
+			if (nowMs !== lastClock) { clockSamples.push(nowMs); lastClock = nowMs; }
+		}
+		/** @type {Array<{ topic: string, subscribers: string[] }>} */
+		const publishLog = [];
+		/** @type {Map<string, Set<unknown>>} */
+		const originators = new Map();
+		function recordPublish(fromId, topic) {
+			if (typeof topic !== 'string') return;
+			const subscribers = [];
+			for (const inst of instancesArr) {
+				for (const ws of inst.app._connections) if (ws._topics.has(topic)) subscribers.push(inst.id + ':' + ws._simId);
+			}
+			publishLog.push({ topic, subscribers });
+			let set = originators.get(topic);
+			if (!set) { set = new Set(); originators.set(topic, set); }
+			set.add(fromId);
+		}
 		// Per-step self-consistency: each instance's fan-out subscription set must
 		// agree with its cap-counted bookkeeping set. Run after every scheduler step
 		// so the earliest interleaving that breaks it is the one recorded.
@@ -567,6 +704,7 @@ export async function runPgSim(config = {}) {
 			for (const inst of instancesArr) {
 				recordViolation(checkSubscriptionBookkeeping(instanceInvariantSnapshot(inst.server)));
 			}
+			observeClock(scheduler.now());
 		}
 
 		const api = {
@@ -593,6 +731,7 @@ export async function runPgSim(config = {}) {
 			},
 			/** Emit a change across the cluster via pg_notify (every instance's bridge relays it). */
 			async notify(topic, event, data) {
+				recordPublish('notify', topic);
 				await sharedClient.query('SELECT pg_notify($1, $2)', [channel, JSON.stringify({ topic, event, data })]);
 			},
 			async advance(rounds) {
@@ -609,8 +748,14 @@ export async function runPgSim(config = {}) {
 
 		const scenario = config.scenario || defaultPgScenario;
 		await scenario(api, { instances, clients, topics });
-		totalSteps += await scheduler.run({ maxSteps, onStep: checkInvariants });
+		// Final drain to quiescence so any deferred relay frames / timers settle.
+		// Capture the drained/pending signals here (before teardown): a healthy
+		// run reaches a fixpoint within the budget and leaves zero refed work.
+		const quiesceSteps = await scheduler.run({ maxSteps, onStep: checkInvariants });
+		totalSteps += quiesceSteps;
 		checkInvariants();
+		const drained = quiesceSteps < maxSteps;
+		const pendingAtQuiesce = scheduler.pending();
 
 		// Quiescent cross-instance convergence: every instance that subscribed to a
 		// topic fed by the shared LISTEN/NOTIFY bridge should have received the same
@@ -638,6 +783,12 @@ export async function runPgSim(config = {}) {
 		}));
 		const finalState = instancesArr.map((inst) => ({ instance: inst.id, ...instanceSnapshot(inst.server) }));
 		const totalFrames = allClients.reduce((s, c) => s + c.facade.frames().length, 0);
+
+		foldSteadyState({
+			recordViolation, clockSamples, drained, pending: pendingAtQuiesce,
+			finalState, publishLog, originators, allClients, instancesArr,
+			faults: config.faults, relayFaults: config.relayFaults
+		});
 
 		for (const inst of instancesArr) {
 			try { inst.plugins.replay && inst.plugins.replay.destroy && inst.plugins.replay.destroy(); } catch { /* best effort */ }
