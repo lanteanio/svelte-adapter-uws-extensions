@@ -650,14 +650,33 @@ describe('circuit breaker', () => {
 		});
 
 		it('postgres replay: clear() does not double-guard on fresh instance', async () => {
+			// The drift guard verifies columns after ensureTable, so the double
+			// answers the information_schema lookup per table (main table + the
+			// seq counter); everything else stays an empty result (this test is
+			// about the breaker).
+			const colsByTable = {
+				svti_replay: ['svti_replay_id', 'topic', 'seq', 'event', 'data', 'created_at'],
+				svti_replay_seq: ['topic', 'seq', 'epoch']
+			};
+			// verifyTableColumns calls query(textString, [table]); DDL calls pass a
+			// bare string or a {text,values} object - normalize both.
+			const answer = (textOrObj, valsArg) => {
+				const text = typeof textOrObj === 'string' ? textOrObj : textOrObj?.text;
+				const values = (typeof textOrObj === 'string' ? valsArg : textOrObj?.values) || [];
+				if (typeof text === 'string' && text.includes('information_schema.columns')) {
+					const cols = (colsByTable[values[0]] || []).map((column_name) => ({ column_name }));
+					return { rows: cols, rowCount: cols.length };
+				}
+				return { rows: [], rowCount: 0 };
+			};
 			const pgClient = {
 				pool: {
 					connect: async () => ({
-						query: async () => ({ rows: [], rowCount: 0 }),
+						query: async (t, v) => answer(t, v),
 						release: () => {}
 					})
 				},
-				async query() { return { rows: [], rowCount: 0 }; },
+				async query(t, v) { return answer(t, v); },
 				async end() {}
 			};
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });

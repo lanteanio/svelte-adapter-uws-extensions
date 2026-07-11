@@ -119,6 +119,36 @@ describe('postgres replay (integration)', () => {
 		});
 	});
 
+	describe('BIGINT sequence boundary (no INTEGER narrowing on reads)', () => {
+		// seq is stored BIGINT; a sustained hot topic crosses 2^31 in ~24.9 days
+		// at 1k events/s. Reading it back through an ::int cast raised 22003
+		// server-side before the row reached the client. Seed the counter past
+		// the INTEGER ceiling and prove the read paths return the true value.
+		const BEYOND_INT32 = 3_000_000_000; // > 2^31-1 (2147483647), < 2^53
+
+		it('seq() reads a value past the INTEGER ceiling', async () => {
+			await client.query(
+				`INSERT INTO ${TABLE}_seq (topic, seq) VALUES ($1, $2)
+				 ON CONFLICT (topic) DO UPDATE SET seq = EXCLUDED.seq`,
+				['big', BEYOND_INT32]
+			);
+			expect(await replay.seq('big')).toBe(BEYOND_INT32);
+		});
+
+		it('gap() probes the counter past the INTEGER ceiling without overflow', async () => {
+			await client.query(
+				`INSERT INTO ${TABLE}_seq (topic, seq) VALUES ($1, $2)
+				 ON CONFLICT (topic) DO UPDATE SET seq = EXCLUDED.seq`,
+				['big', BEYOND_INT32]
+			);
+			// No buffered rows at/after the client's cursor, so gap() falls through
+			// to the counter probe (the ::bigint-cast query). A client one behind
+			// the counter must be told it was truncated, not crash with 22003.
+			const behind = BEYOND_INT32 - 1;
+			expect(await replay.gap('big', behind)).toEqual({ truncated: true, missingFrom: behind + 1 });
+		});
+	});
+
 	describe('atomic CTE under concurrent publishes', () => {
 		it('20 concurrent publishes to one topic produce contiguous seqs 1..20', async () => {
 			const r = createReplay(client, { table: TABLE, size: 100, cleanupInterval: 0 });

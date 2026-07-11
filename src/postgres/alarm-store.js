@@ -71,6 +71,13 @@ export function createAlarmStore(client, options = {}) {
 	let migrated = false;
 	async function ensureTable() {
 		if (migrated || !autoMigrate) return;
+		// `topic` is the natural primary key: this is a single-row-per-topic
+		// aggregate (one pending alarm per topic), so a surrogate `_id` would add
+		// no identity and a second index. A documented divergence from the
+		// `<tablename>_id` surrogate-key convention the row-per-event tables
+		// (svti_replay, svti_jobs, svti_tasks, svti_dead_letter) follow; the
+		// idempotency table (`svti_idempotency_key`) and the replay counter
+		// (`svti_replay_seq`.topic) are the same single-row-per-key kind.
 		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${table} (
 				topic   TEXT   PRIMARY KEY,

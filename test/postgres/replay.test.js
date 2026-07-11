@@ -93,6 +93,24 @@ describe('postgres replay', () => {
 		it('returns 0 for unknown topics', async () => {
 			expect(await replay.seq('nonexistent')).toBe(0);
 		});
+
+		it('reads the counter as BIGINT, never narrowing to INTEGER', async () => {
+			// seq is stored BIGINT; a ::int cast raised 22003 server-side past
+			// 2^31 (~24.9 days at 1k events/s). The mock cannot model the cast,
+			// so guard the generated SQL directly: the counter read must cast to
+			// bigint, so a revert to ::int fails here without needing a live PG.
+			const spy = vi.spyOn(client, 'query');
+			await replay.seq('chat');
+			const seqRead = spy.mock.calls.find(([arg]) => {
+				const text = typeof arg === 'string' ? arg : arg?.text;
+				return typeof text === 'string' && text.includes('current_seq');
+			});
+			expect(seqRead, 'seq() should issue a current_seq read').toBeTruthy();
+			const text = typeof seqRead[0] === 'string' ? seqRead[0] : seqRead[0].text;
+			expect(text).toContain('::bigint');
+			expect(text).not.toContain('::int ');
+			spy.mockRestore();
+		});
 	});
 
 	describe('since', () => {

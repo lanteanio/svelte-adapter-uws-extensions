@@ -29,6 +29,17 @@ describe('shared/pg-migrate: assertSafeTableName', () => {
 		expect(() => assertSafeTableName('PG_CATALOG_table', 'mod')).toThrow('reserved Postgres schema');
 		expect(() => assertSafeTableName('information_schema_columns', 'mod')).toThrow('reserved Postgres schema');
 	});
+
+	it('rejects names long enough to collapse generated index identifiers', () => {
+		// idx_<table>_terminal_updated must fit Postgres's 63-byte identifier
+		// limit; a 42-byte name is the last that keeps every generated index
+		// name distinct. Past it, two index names can truncate to the same
+		// string and the second CREATE INDEX IF NOT EXISTS silently no-ops.
+		const at = 'a'.repeat(42);
+		const over = 'a'.repeat(43);
+		expect(() => assertSafeTableName(at, 'mod')).not.toThrow();
+		expect(() => assertSafeTableName(over, 'mod')).toThrow(/is 43 bytes; the maximum is 42/);
+	});
 });
 
 describe('shared/pg-migrate: safeCreate', () => {
@@ -109,14 +120,61 @@ describe('shared/pg-migrate: safeCreate', () => {
 			})).rejects.toThrow(/missing expected column\(s\): name, created_at/);
 		});
 
-		it('does not run verification when no error is thrown (fresh table)', async () => {
-			const client = mockClient(() => Promise.resolve({ rows: [] }));
+		it('verifies on the clean-success path too (fresh table, no 42P07)', async () => {
+			// A pre-existing table makes CREATE ... IF NOT EXISTS succeed WITHOUT
+			// raising 42P07, so verification must run on the no-error path as
+			// well - the case the old catch-only guard skipped entirely.
+			const client = {
+				query: vi.fn((text) => {
+					if (typeof text === 'string' && text.includes('information_schema')) {
+						return Promise.resolve({ rows: [{ column_name: 'id' }] });
+					}
+					return Promise.resolve({ rows: [] });
+				})
+			};
 			await safeCreate(client, 'CREATE TABLE foo (id INT)', {
 				table: 'foo',
 				columns: ['id']
 			});
-			// Only the CREATE TABLE call; no follow-up information_schema query.
-			expect(client.query).toHaveBeenCalledTimes(1);
+			// CREATE + the follow-up information_schema verification.
+			expect(client.query).toHaveBeenCalledTimes(2);
+		});
+
+		it('catches drift on a pre-existing wrong-shape table that CREATE no-ops on', async () => {
+			// The steady-state case: the table already exists with the wrong
+			// shape, so CREATE ... IF NOT EXISTS SUCCEEDS (no 42P07) and the
+			// missing column must still be caught.
+			const client = {
+				query: vi.fn((text) => {
+					if (typeof text === 'string' && text.includes('information_schema')) {
+						return Promise.resolve({ rows: [{ column_name: 'id' }] }); // 'name' absent
+					}
+					return Promise.resolve({ rows: [] }); // CREATE succeeds silently
+				})
+			};
+			await expect(safeCreate(client, 'CREATE TABLE mytable (...)', {
+				table: 'mytable',
+				columns: ['id', 'name']
+			})).rejects.toThrow(/missing expected column\(s\): name/);
+		});
+
+		it('scopes the verification query to the current schema', async () => {
+			const client = {
+				query: vi.fn((text) => {
+					if (typeof text === 'string' && text.includes('information_schema')) {
+						return Promise.resolve({ rows: [{ column_name: 'id' }] });
+					}
+					return Promise.resolve({ rows: [] });
+				})
+			};
+			await safeCreate(client, 'CREATE TABLE foo (id INT)', { table: 'foo', columns: ['id'] });
+			const verifyCall = client.query.mock.calls.find(
+				([t]) => typeof t === 'string' && t.includes('information_schema')
+			);
+			// Without a schema predicate a same-named table in ANY schema would
+			// satisfy the check; current_schema() is where an unqualified CREATE
+			// actually writes.
+			expect(verifyCall[0]).toContain('table_schema = current_schema()');
 		});
 
 		it('does not run verification for non-42P07 errors (e.g. 42710 duplicate_object on index)', async () => {

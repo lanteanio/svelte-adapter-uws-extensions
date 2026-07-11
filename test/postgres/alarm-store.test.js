@@ -16,6 +16,11 @@ function fakePg() {
 			const text = (typeof q === 'string' ? q : q.text).replace(/\s+/g, ' ').trim();
 			const values = (typeof q === 'string' ? [] : q.values) || [];
 			if (text.startsWith('CREATE TABLE') || text.startsWith('CREATE INDEX')) return { rows: [], rowCount: 0 };
+			// pg-migrate's drift guard now verifies columns after every ensureTable;
+			// the real table has exactly these, so the double reports them.
+			if (text.includes('information_schema.columns')) {
+				return { rows: ['topic', 'fire_at', 'meta', 'tenant'].map((column_name) => ({ column_name })), rowCount: 4 };
+			}
 			if (text.startsWith('INSERT INTO svti_alarms')) {
 				const [topic, fireAt, metaJson, tenant] = values;
 				rows.set(topic, { fire_at: Number(fireAt), meta: metaJson == null ? null : JSON.parse(metaJson), tenant: tenant ?? null });

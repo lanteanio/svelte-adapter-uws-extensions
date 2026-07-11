@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.53] - 2026-07-11
+
+### Fixed
+
+- **Postgres replay no longer overflows INTEGER when reading a hot topic's sequence.** The counter is stored `BIGINT` but `seq()`, `gap()`, and the replay truncation probe read it through `COALESCE(seq, 0)::int`, so Postgres raised `22003 integer out of range` server-side once a topic passed `2^31` (about 24.9 days at 1,000 events/s) - sequence inspection and gap/truncation detection then failed even though publishing kept working. The reads now cast to `::bigint`; node-postgres returns it as a string that the existing `parseInt` handles losslessly to `2^53`.
+- **Abandoned Redis groups now self-expire.** The `members` and `meta` hashes carried no key-level TTL, so a group whose every instance crashed or was destroyed leaked its member roster forever. Join and the heartbeat now stamp a `PEXPIRE` margin (`2 x memberTtl`) on both keys - refreshed while any instance holds the group open, and left to expire once none do. The `closed` tombstone is deliberately left un-expired.
+- **The schema-drift guard runs on the common path.** `safeCreate`'s column check only fired inside the `42P07` (relation-already-exists) race branch, but `CREATE TABLE IF NOT EXISTS` on a pre-existing table succeeds *without* raising `42P07`, so the steady-state "table already there with the wrong shape" case skipped verification entirely. It now verifies whenever a drift guard is supplied - on the clean-success path as well as the race - and scopes the `information_schema` lookup to `current_schema()` so a same-named table in another schema cannot mask real drift.
+
+### Changed
+
+- **Postgres table names are capped at 42 bytes.** Modules generate index names as `idx_<table>_<suffix>`; the longest suffix plus a name over the ceiling could truncate two distinct index names to the same 63-byte string, silently leaving one index uncreated. `assertSafeTableName` now rejects an over-long name with a clear error at construction rather than letting an access path vanish. Default `svti_*` names are far under the limit.
+
+### Documentation
+
+- **The primary-key convention is now recorded.** The `<tablename>_id` surrogate-key rule and its three deliberate natural-key exceptions (`svti_idempotency_key`, and the `topic` PKs on `svti_alarms` and `svti_replay_seq` - all single-row-per-key aggregates) are documented so schema review treats the divergence as intentional.
+
 ## [0.6.0-next.52] - 2026-07-11
 
 ### Fixed

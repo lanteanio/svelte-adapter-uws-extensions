@@ -136,6 +136,10 @@ export function createReplay(client, options = {}) {
 		// Right-to-erasure column (ALTER so existing buffers forward-migrate).
 		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
 		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
+		// `topic` is the natural primary key: one counter row per topic, so a
+		// surrogate `_id` would add no identity. A documented divergence from the
+		// `<tablename>_id` convention the event table (svti_replay) follows - the
+		// same single-row-per-key shape as svti_alarms and svti_idempotency.
 		await safeCreate(client, `
 			CREATE TABLE IF NOT EXISTS ${seqTable} (
 				topic TEXT   PRIMARY KEY,
@@ -515,7 +519,7 @@ export function createReplay(client, options = {}) {
 				await ensureTable();
 				return client.query({
 					name: 'replay_seq_' + table,
-					text: `SELECT COALESCE(seq, 0)::int AS current_seq
+					text: `SELECT COALESCE(seq, 0)::bigint AS current_seq
 					         FROM ${seqTable}
 					        WHERE topic = $1`,
 					values: [topic]
@@ -553,7 +557,7 @@ export function createReplay(client, options = {}) {
 
 				const seqRes = await client.query({
 					name: 'replay_seq_' + table,
-					text: `SELECT COALESCE(seq, 0)::int AS current_seq
+					text: `SELECT COALESCE(seq, 0)::bigint AS current_seq
 					         FROM ${seqTable}
 					        WHERE topic = $1`,
 					values: [topic]
@@ -631,7 +635,7 @@ export function createReplay(client, options = {}) {
 				try {
 					const seqRes = await client.query({
 						name: 'replay_seq_' + table,
-						text: `SELECT COALESCE(seq, 0)::int AS current_seq
+						text: `SELECT COALESCE(seq, 0)::bigint AS current_seq
 						         FROM ${seqTable}
 						        WHERE topic = $1`,
 						values: [topic]

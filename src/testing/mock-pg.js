@@ -41,6 +41,52 @@ export function mockPgClient(options = {}) {
 	let nextId = 1;
 	let tableCreated = false;
 
+	/**
+	 * table -> Set(column names). Populated from CREATE TABLE column lists and
+	 * ALTER TABLE ... ADD COLUMN so the double can answer the
+	 * information_schema.columns lookup that pg-migrate's drift guard now runs
+	 * on every ensureTable (real Postgres answers it; the mock must too, or the
+	 * guard reports every table as missing all its columns).
+	 * @type {Map<string, Set<string>>}
+	 */
+	const tableColumns = new Map();
+
+	/** Extract the table name and top-level column names from a CREATE TABLE DDL. */
+	function parseCreateTable(ddl) {
+		const open = ddl.indexOf('(');
+		const close = ddl.lastIndexOf(')');
+		const nameMatch = ddl.slice(0, open < 0 ? undefined : open)
+			.match(/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+		const table = nameMatch ? nameMatch[1] : null;
+		const columns = [];
+		if (open >= 0 && close > open) {
+			const body = ddl.slice(open + 1, close);
+			let depth = 0, cur = '';
+			const parts = [];
+			for (const ch of body) {
+				if (ch === '(') depth++;
+				else if (ch === ')') depth--;
+				if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += ch;
+			}
+			if (cur.trim()) parts.push(cur);
+			const constraintKw = /^(PRIMARY|UNIQUE|CONSTRAINT|CHECK|FOREIGN|EXCLUDE)\b/i;
+			for (const part of parts) {
+				const t = part.trim();
+				if (!t || constraintKw.test(t)) continue;
+				const im = t.match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
+				if (im) columns.push(im[1]);
+			}
+		}
+		return { table, columns };
+	}
+
+	function recordColumns(table, columns) {
+		if (!table) return;
+		let set = tableColumns.get(table);
+		if (!set) { set = new Set(); tableColumns.set(table, set); }
+		for (const c of columns) set.add(c);
+	}
+
 	/** @type {Map<string, number>} topic -> seq */
 	const seqCounters = new Map();
 
@@ -239,9 +285,21 @@ export function mockPgClient(options = {}) {
 			return { rows: [{ pg_advisory_unlock: released }], rowCount: 1 };
 		}
 
+		// information_schema.columns lookup - pg-migrate's drift guard. Return
+		// the columns recorded for the queried table so a correctly-migrated
+		// table verifies clean. Matched before the generic SELECT dispatch.
+		if (sql.includes('information_schema.columns')) {
+			const table = values[0];
+			const set = tableColumns.get(table);
+			const rowsOut = set ? [...set].map((column_name) => ({ column_name })) : [];
+			return { rows: rowsOut, rowCount: rowsOut.length };
+		}
+
 		// CREATE TABLE
 		if (sql.startsWith('CREATE TABLE')) {
 			tableCreated = true;
+			const parsed = parseCreateTable(sql);
+			recordColumns(parsed.table, parsed.columns);
 			return { rows: [], rowCount: 0 };
 		}
 
@@ -250,10 +308,13 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: 0 };
 		}
 
-		// ALTER TABLE - no-op: the mock's row shapes are dynamic so any
-		// added column is automatically accepted by INSERT / SELECT branches
-		// that reference it.
+		// ALTER TABLE - row shapes are dynamic so any added column is accepted
+		// by INSERT / SELECT branches; also record `ADD COLUMN` names so the
+		// information_schema drift guard sees the migrated shape.
 		if (sql.startsWith('ALTER TABLE')) {
+			const m = sql.match(/ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+			const addCols = [...sql.matchAll(/ADD COLUMN(?:\s+IF NOT EXISTS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi)].map((x) => x[1]);
+			if (m && addCols.length) recordColumns(m[1], addCols);
 			return { rows: [], rowCount: 0 };
 		}
 
@@ -1284,6 +1345,7 @@ export function mockPgClient(options = {}) {
 			rows = [];
 			nextId = 1;
 			tableCreated = false;
+			tableColumns.clear();
 			seqCounters.clear();
 			epochCounters.clear();
 			idemRows.clear();

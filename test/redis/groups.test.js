@@ -70,6 +70,20 @@ describe('redis groups', () => {
 			expect(await group.count()).toBe(1);
 		});
 
+		it('stamps a key-level TTL on the members hash so an abandoned group expires', async () => {
+			// The members hash has no engine TTL; a member joining then crashing
+			// before the first heartbeat used to leak the roster forever. Join now
+			// sets a PEXPIRE with a margin over memberTtl (heartbeat refreshes it
+			// while the group stays open, so it only fires once every instance dies).
+			const spy = vi.spyOn(client.redis, 'pexpire');
+			await group.join(mockWs(), platform);
+			const membersCall = spy.mock.calls.find(([key]) => String(key).endsWith(':members'));
+			expect(membersCall, 'join should PEXPIRE the members key').toBeTruthy();
+			// 2 * memberTtl(120s) in ms.
+			expect(membersCall[1]).toBe(240000);
+			spy.mockRestore();
+		});
+
 		it('sends members list to joining ws', async () => {
 			const ws = mockWs();
 			await group.join(ws, platform);

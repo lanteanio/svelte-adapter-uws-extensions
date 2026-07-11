@@ -143,6 +143,14 @@ export function createGroup(client, name, options = {}) {
 		throw new Error('redis group: memberTtl must be a positive number (seconds)');
 	}
 	const memberTtlMs = memberTtl * 1000;
+	// Key-level TTL margin for the members and meta hashes so a fully-abandoned
+	// group (every instance crashed or destroyed) self-expires instead of
+	// leaking its member roster forever. The heartbeat refreshes this while any
+	// instance holds the group open; it comfortably exceeds the heartbeat
+	// cadence (memberTtlMs/3 or 5s), so a live group is never reaped underneath
+	// itself. The `closed` flag is deliberately NOT expired - closing a group is
+	// a terminal decision and its tombstone must outlive the roster.
+	const keyExpiryMs = 2 * memberTtlMs;
 	const onJoin = options.onJoin ?? null;
 	const onLeave = options.onLeave ?? null;
 	const onFull = options.onFull ?? null;
@@ -206,6 +214,10 @@ export function createGroup(client, name, options = {}) {
 			pipe.hset(membersKey, entry.memberId, memberData);
 		}
 		pipe[cleanupCmd](1, membersKey, nowTs, memberTtlMs);
+		// Refresh the key-level TTL so the roster and meta persist while this
+		// instance holds the group open, and expire once every instance stops.
+		pipe.pexpire(membersKey, keyExpiryMs);
+		pipe.pexpire(metaKey, keyExpiryMs);
 		pipe.exec().catch((err) => {
 			if (err) console.warn('groups heartbeat: pipeline failed for group "' + name + '":', err.message);
 		});
@@ -345,6 +357,16 @@ export function createGroup(client, name, options = {}) {
 				if (onFull) onFull(ws, role);
 				return false;
 			}
+
+			// Stamp the key-level TTL at join time so a member that joins and
+			// then crashes before the first heartbeat still expires. Best-effort:
+			// the heartbeat re-applies it while the group stays open.
+			try {
+				const ttlPipe = redis.pipeline();
+				ttlPipe.pexpire(membersKey, keyExpiryMs);
+				if (options.meta) ttlPipe.pexpire(metaKey, keyExpiryMs);
+				await ttlPipe.exec();
+			} catch { /* best-effort; the heartbeat re-applies the TTL */ }
 
 			// Per-instance cap on local member count. Treat saturation
 			// the same as a "group full" rejection - the caller already

@@ -1,5 +1,16 @@
 const TABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
+// Modules build index names as `idx_<table>_<suffix>`; the longest suffix in
+// use is `_terminal_updated` (tasks), so `idx_` + name + `_terminal_updated`
+// is name.length + 21 bytes. Postgres truncates identifiers at 63 bytes
+// (NAMEDATALEN - 1) SILENTLY, so a table name past this ceiling can collapse
+// two distinct index names to the same truncated string - the second
+// `CREATE INDEX IF NOT EXISTS` then no-ops against the first and one index
+// never exists, with no error. Cap the name so every generated identifier
+// stays unique within the engine limit. The pattern above restricts names to
+// ASCII, so `.length` is the byte length.
+const MAX_TABLE_NAME_BYTES = 42; // 63 - 21 (the longest generated suffix)
+
 /**
  * Validate a Postgres table-name option from a factory call. Rejects
  * SQL-injectable shapes (anything outside `[a-zA-Z_][a-zA-Z0-9_]*`)
@@ -14,6 +25,13 @@ export function assertSafeTableName(table, mod) {
 	if (!TABLE_NAME_PATTERN.test(table)) {
 		throw new Error(`${mod}: invalid table name "${table}"`);
 	}
+	if (table.length > MAX_TABLE_NAME_BYTES) {
+		throw new Error(
+			`${mod}: table name "${table}" is ${table.length} bytes; the maximum is ` +
+			`${MAX_TABLE_NAME_BYTES} so generated index names stay unique within ` +
+			`Postgres's 63-byte identifier limit`
+		);
+	}
 	const lower = table.toLowerCase();
 	if (lower.startsWith('pg_') || lower.startsWith('information_schema')) {
 		throw new Error(`${mod}: table name "${table}" is in a reserved Postgres schema`);
@@ -27,12 +45,15 @@ export function assertSafeTableName(table, mod) {
  * later ones.
  *
  * Optional `expectedColumns` guards against the schema-drift case where an
- * existing table has the same name but a different shape. When the swallow
- * fires on `42P07` (relation already exists), the function queries
- * `information_schema.columns` for the named table and throws if any of
- * the expected columns is missing. Without this guard, schema-drift
- * surfaces much later as a confusing `42703` (undefined_column) error
- * from a downstream query.
+ * existing table has the same name but a different shape. When a guard is
+ * supplied the function ALWAYS verifies the resolved table against
+ * `information_schema.columns` after the DDL runs and throws if any expected
+ * column is missing. Verifying only in the `42P07` catch was the original
+ * bug: `CREATE TABLE IF NOT EXISTS` on a PRE-EXISTING table succeeds with a
+ * notice and NEVER raises `42P07`, so the steady-state "table already there
+ * with the wrong shape" case - the common one - skipped the check entirely.
+ * Without this guard, schema-drift surfaces much later as a confusing
+ * `42703` (undefined_column) error from a downstream query.
  *
  * Callers that ONLY pass `ddl` retain the original silent-swallow behavior
  * for backward compatibility. Callers that want drift detection pass
@@ -45,18 +66,22 @@ export function assertSafeTableName(table, mod) {
 export async function safeCreate(client, ddl, expectedColumns) {
 	try {
 		await client.query(ddl);
-		return;
 	} catch (err) {
 		if (err.code !== '23505' && err.code !== '42P07' && err.code !== '42710') {
 			throw err;
 		}
-		// Swallowed an "already exists" race. If the caller supplied an
-		// expected-columns guard AND the error is specifically the
-		// table-already-exists code, verify the existing table has the
-		// columns the DDL was supposed to create.
-		if (err.code === '42P07' && expectedColumns) {
-			await verifyTableColumns(client, expectedColumns);
-		}
+		// 23505 / 42710 are index / object-creation races with no table-shape
+		// implication - nothing to verify, so return. A 42P07 (relation already
+		// exists) DOES warrant a column check, so it falls through.
+		if (err.code !== '42P07') return;
+	}
+	// Reached on a clean success OR a swallowed 42P07. Verify whenever the
+	// caller supplied a drift guard: the clean-success branch is the case the
+	// old catch-only guard missed entirely - `CREATE TABLE IF NOT EXISTS` on a
+	// pre-existing (possibly wrong-shape) table succeeds with a notice and
+	// never raises 42P07.
+	if (expectedColumns) {
+		await verifyTableColumns(client, expectedColumns);
 	}
 }
 
@@ -76,8 +101,14 @@ async function verifyTableColumns(client, expected) {
 	// Parameterize the lookup. The caller's table value is also typically
 	// vetted by `assertSafeTableName` upstream of this helper, but the
 	// parameterized binding is the safer pattern regardless.
+	//
+	// Scope to `current_schema()` - the schema an unqualified `CREATE TABLE`
+	// actually writes to (the first writable entry in search_path). Without
+	// it, a same-named table in ANY other schema on the database satisfies
+	// (or pollutes) the column set, so drift on the real table could be
+	// masked by an unrelated namesake elsewhere.
 	const result = await client.query(
-		'SELECT column_name FROM information_schema.columns WHERE table_name = $1',
+		'SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()',
 		[table]
 	);
 	const actual = new Set(result.rows.map((r) => r.column_name));

@@ -176,6 +176,25 @@ export const wrapped = createPgClient({ pool });
 | `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
 | `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
 
+#### Schema conventions
+
+Primary keys follow the `<tablename>_id` surrogate-key convention for the
+row-per-event tables: `svti_replay_id`, `svti_jobs_id`, `svti_tasks_id`,
+`svti_dead_letter_id`. Three aggregates deliberately use a **natural** primary
+key instead, because each holds exactly one row per key and a surrogate would
+add identity nothing references plus a redundant index:
+
+| Table | Primary key | Why natural |
+|---|---|---|
+| `svti_idempotency` | `svti_idempotency_key` | one cached result per idempotency key |
+| `svti_alarms` | `topic` | one pending alarm per topic |
+| `svti_replay_seq` | `topic` | one seq/epoch counter row per topic |
+
+This is a recorded exception to the surrogate-key rule, not an oversight; schema
+review should treat these three as intentional. Physical table names are
+configurable per factory (`table` option), but the logical column names above
+are stable regardless of the physical name.
+
 ---
 
 ## Authorization model
