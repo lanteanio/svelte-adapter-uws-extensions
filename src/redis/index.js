@@ -107,9 +107,12 @@ export function createRedisClient(options = {}) {
 					'  See: https://svti.me/redis-duplicates'
 				);
 			}
-			const cleanup = () => duplicates.delete(dup);
-			dup.on('close', cleanup);
-			dup.on('end', cleanup);
+			// Untrack only on 'end' - the TERMINAL edge (manual quit/disconnect
+			// or retry exhaustion). 'close' also fires on every transient
+			// disconnect and is followed by 'reconnecting'; dropping the dup
+			// there would let a reconnecting subscriber outlive quit() with a
+			// live socket and retry timer.
+			dup.on('end', () => duplicates.delete(dup));
 			return dup;
 		},
 

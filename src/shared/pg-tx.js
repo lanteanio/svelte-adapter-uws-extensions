@@ -11,7 +11,10 @@
  * `withTransaction(client, fn)` checks out a single connection,
  * issues BEGIN, runs `fn(tx)` where `tx` exposes a `query` method
  * pinned to the same connection, and finally COMMITs (or ROLLBACKs
- * + re-throws on error). The connection is released regardless.
+ * + re-throws on error). The connection is released regardless; one
+ * whose transaction state could not be restored (failed BEGIN, COMMIT,
+ * or ROLLBACK) is released WITH the error so the pool destroys it
+ * instead of handing it to a later checkout.
  *
  * @module svelte-adapter-uws-extensions/shared/pg-tx
  */
@@ -33,18 +36,35 @@
  */
 export async function withTransaction(client, fn) {
 	const pgClient = await client.pool.connect();
+	// When set, the connection's transaction state is uncertain (failed
+	// BEGIN/COMMIT, or a ROLLBACK that itself failed). pg-pool destroys a
+	// client released with a truthy error instead of returning it to the
+	// pool - an uncertain connection must never serve a later checkout.
+	let unsafe;
 	try {
-		await pgClient.query('BEGIN');
+		try {
+			await pgClient.query('BEGIN');
+		} catch (err) {
+			unsafe = err;
+			throw err;
+		}
 		let result;
 		try {
 			result = await fn(pgClient);
 		} catch (err) {
-			try { await pgClient.query('ROLLBACK'); } catch { /* best-effort */ }
+			// A successful ROLLBACK cleanly aborts the transaction; the
+			// connection is reusable and only the work error propagates.
+			try { await pgClient.query('ROLLBACK'); } catch (rbErr) { unsafe = rbErr; }
 			throw err;
 		}
-		await pgClient.query('COMMIT');
+		try {
+			await pgClient.query('COMMIT');
+		} catch (err) {
+			unsafe = err;
+			throw err;
+		}
 		return result;
 	} finally {
-		pgClient.release();
+		pgClient.release(unsafe);
 	}
 }

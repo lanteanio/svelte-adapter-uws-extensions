@@ -171,6 +171,24 @@ describe('redis presence purgeUser', () => {
 		expect(await presence.purgeUser(null, 'ghost')).toBe(0);
 		presence.destroy();
 	});
+
+	it('purges a user whose topic has a live sync observer (observer refcount is topic->number, not per-user)', async () => {
+		const client = mockRedisClient('test:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, { key: 'id', select: (u) => ({ id: u.id }), heartbeat: 60000, ttl: 180 });
+		await presence.join(mockWs({ id: 'u1' }), 'room', platform);
+		await presence.sync(mockWs({ id: 'watcher' }), 'room', platform);
+
+		const n = await presence.purgeUser(null, 'u1');
+		expect(n).toBe(1);
+		expect(await presence.list('room')).toEqual([]);
+
+		// The observer's cross-instance subscription survives the purge: a
+		// fresh join on the same topic must still reach the tap channel.
+		await presence.join(mockWs({ id: 'u2' }), 'room', platform);
+		expect((await presence.list('room')).map((d) => d.id)).toEqual(['u2']);
+		presence.destroy();
+	});
 });
 
 describe('redis cursor purgeUser', () => {

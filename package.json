@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-uws-extensions",
-	"version": "0.6.0-next.51",
+	"version": "0.6.0-next.52",
 	"publishConfig": {
 		"tag": "next"
 	},
@@ -209,7 +209,7 @@
 		"MIGRATION.md"
 	],
 	"scripts": {
-		"check": "node scripts/check-types.js && node scripts/check-determinism.js && node scripts/check-slugs.js",
+		"check": "node scripts/check-types.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js",
 		"pretest": "npm run check",
 		"test": "vitest run",
 		"test:watch": "vitest",
@@ -235,7 +235,7 @@
 		"pg": "^8.0.0"
 	},
 	"devDependencies": {
-		"svelte-adapter-uws": "^0.6.0-next.24",
+		"svelte-adapter-uws": "^0.6.0-next.73",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0"
 	},

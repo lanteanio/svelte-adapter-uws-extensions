@@ -61,26 +61,58 @@ describe('shared/pg-tx', () => {
 		expect(isReleased()).toBe(true);
 	});
 
-	it('releases the connection even when ROLLBACK itself throws (best-effort)', async () => {
+	// pg-pool returns a client to the idle pool when release() gets no error
+	// and destroys it when release(err) is truthy. A connection whose
+	// transaction state is uncertain must take the destroy path.
+
+	function makeFailingClient(failOn) {
+		let releaseArg = 'never-called';
 		const client = {
 			pool: {
 				async connect() {
 					return {
 						query: async (text) => {
-							if (text === 'ROLLBACK') throw new Error('rollback failed');
-							if (text === 'WORK') throw new Error('original failure');
+							if (failOn.includes(text)) throw new Error(text + ' failed');
 							return { rows: [], rowCount: 0 };
 						},
-						release: () => {}
+						release: (err) => { releaseArg = err; }
 					};
 				}
 			}
 		};
-		// Original error is preserved despite ROLLBACK throwing.
+		return { client, getReleaseArg: () => releaseArg };
+	}
+
+	it('releases WITH the error (pool destroys) when ROLLBACK itself fails - original error preserved', async () => {
+		const { client, getReleaseArg } = makeFailingClient(['ROLLBACK', 'WORK']);
 		await expect(
 			withTransaction(client, async (tx) => {
 				await tx.query('WORK');
 			})
-		).rejects.toThrow('original failure');
+		).rejects.toThrow('WORK failed');
+		expect(getReleaseArg()).toBeInstanceOf(Error);
+		expect(getReleaseArg().message).toBe('ROLLBACK failed');
+	});
+
+	it('releases WITH the error when COMMIT fails', async () => {
+		const { client, getReleaseArg } = makeFailingClient(['COMMIT']);
+		await expect(withTransaction(client, async () => 1)).rejects.toThrow('COMMIT failed');
+		expect(getReleaseArg()).toBeInstanceOf(Error);
+	});
+
+	it('releases WITH the error when BEGIN fails', async () => {
+		const { client, getReleaseArg } = makeFailingClient(['BEGIN']);
+		await expect(withTransaction(client, async () => 1)).rejects.toThrow('BEGIN failed');
+		expect(getReleaseArg()).toBeInstanceOf(Error);
+	});
+
+	it('releases with NO error after a successful ROLLBACK (connection stays pooled)', async () => {
+		const { client, getReleaseArg } = makeFailingClient([]);
+		await expect(
+			withTransaction(client, async () => {
+				throw new Error('work error');
+			})
+		).rejects.toThrow('work error');
+		expect(getReleaseArg()).toBeUndefined();
 	});
 });

@@ -54,3 +54,10 @@ export function createIdempotencyStore(
 	client: PgClient,
 	options?: PgIdempotencyOptions
 ): PgIdempotencyStore;
+
+/**
+ * Re-exported cross-backend error: `commit(result)` rejects with this when
+ * the JSON-encoded result exceeds `maxResultBytes`. Catch on
+ * `err.code === 'IDEMPOTENCY_RESULT_TOO_LARGE'` regardless of backend.
+ */
+export { IdempotencyResultTooLargeError } from '../redis/idempotency.js';

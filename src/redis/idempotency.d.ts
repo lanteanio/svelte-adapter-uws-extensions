@@ -40,6 +40,21 @@ export type IdempotencySlot<T = unknown> =
 	| IdempotencySlotPending
 	| IdempotencySlotResult<T>;
 
+/**
+ * Thrown by `commit(result)` when the JSON-encoded result exceeds the
+ * store's `maxResultBytes` cap. Cross-backend (Redis + Postgres); catch on
+ * `err.code === 'IDEMPOTENCY_RESULT_TOO_LARGE'` regardless of backend.
+ */
+export class IdempotencyResultTooLargeError extends Error {
+	name: 'IdempotencyResultTooLargeError';
+	code: 'IDEMPOTENCY_RESULT_TOO_LARGE';
+	/** Actual JSON-encoded byte length of the result. */
+	bytes: number;
+	/** Configured cap. */
+	maxBytes: number;
+	constructor(bytes: number, maxBytes: number);
+}
+
 export interface RedisIdempotencyStore {
 	/**
 	 * Try to claim ownership of a key. Returns one of three slot shapes. The

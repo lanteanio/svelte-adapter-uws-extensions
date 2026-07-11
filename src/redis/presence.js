@@ -1198,8 +1198,8 @@ export function createPresence(client, options = {}) {
 				if (counts) { counts.delete(userId); if (counts.size === 0) { localCounts.delete(topic); activeTopics.delete(topic); } }
 				const td = localData.get(topic);
 				if (td) { td.delete(userId); if (td.size === 0) localData.delete(topic); }
-				const sc = syncCounts.get(topic);
-				if (sc) { sc.delete(userId); if (sc.size === 0) syncCounts.delete(topic); }
+				// syncCounts is a topic-level OBSERVER refcount (topic -> number),
+				// not per-user state - purging a user must leave it untouched.
 				try { await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key: userId, data: null }); } catch { /* leave broadcast best-effort */ }
 				n++;
 			}

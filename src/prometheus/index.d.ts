@@ -173,3 +173,11 @@ export function connectionMetricsHook(
 	metrics: MetricsRegistry,
 	userClose?: (ws: any, ctx: any) => void | Promise<void>
 ): (ws: any, ctx: any) => Promise<void>;
+
+/**
+ * Bind the production-assertion violation counter
+ * (`extensions_assertion_violations_total`) to a metrics registry.
+ * Re-exported from the shared assertion module - the runtime export
+ * lives on this subpath.
+ */
+export { wireAssertionMetrics } from '../shared/assert.js';

@@ -5,10 +5,15 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('ioredis', () => {
 	const MockRedis = vi.fn(function () {
+		this.listeners = {};
 		this.duplicate = vi.fn(() => new MockRedis());
 		this.quit = vi.fn(() => Promise.resolve());
 		this.disconnect = vi.fn();
-		this.on = vi.fn(() => this);
+		this.on = vi.fn((event, cb) => {
+			(this.listeners[event] ||= []).push(cb);
+			return this;
+		});
+		this._emit = (event) => { for (const cb of this.listeners[event] || []) cb(); };
 	});
 	return { default: MockRedis };
 });
@@ -57,5 +62,23 @@ describe('createRedisClient', () => {
 		await client.quit();
 		// Should only call quit once on the redis instance
 		expect(client.redis.quit).toHaveBeenCalledTimes(1);
+	});
+
+	it('a transient close does not untrack a duplicate - it still quits at shutdown', async () => {
+		const client = createRedisClient();
+		const dup = client.duplicate();
+		// ioredis emits 'close' on every transient disconnect (followed by
+		// 'reconnecting'); the duplicate is still alive and must stay owned.
+		dup._emit('close');
+		await client.quit();
+		expect(dup.quit).toHaveBeenCalled();
+	});
+
+	it('a terminal end untracks the duplicate - shutdown does not quit it again', async () => {
+		const client = createRedisClient();
+		const dup = client.duplicate();
+		dup._emit('end');
+		await client.quit();
+		expect(dup.quit).not.toHaveBeenCalled();
 	});
 });

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.52] - 2026-07-11
+
+### Fixed
+
+- **A reconnecting Redis duplicate can no longer escape shutdown.** The client factory untracked a duplicate connection on BOTH `'close'` and `'end'`, but ioredis emits `'close'` on every transient disconnect (followed by `'reconnecting'`) - only `'end'` is terminal. One network blip therefore permanently ejected a still-reconnecting subscriber from the ownership set, and `quit()` left it alive with an open socket and retry timer. Untracking now happens on `'end'` only; per-module teardown and retry exhaustion still prune the set.
+- **A Postgres connection with uncertain transaction state is destroyed, not pooled.** `withTransaction` released its connection with no argument on every path, and `pg-pool` only removes a client when `release(err)` receives an error - so a connection whose `BEGIN`/`COMMIT` failed, or whose `ROLLBACK` itself failed after a work error (transaction state unknown, possibly still idle-in-transaction), went back into the pool and could serve a later checkout. Those paths now release WITH the error so the pool destroys the client; a work error whose `ROLLBACK` succeeded still returns the (cleanly reusable) connection and the caller always sees the original error.
+- **Three shipped values are now importable by TypeScript consumers.** `wireAssertionMetrics` (exported at runtime from the `prometheus` subpath) and `IdempotencyResultTooLargeError` (exported from both idempotency subpaths) existed in JavaScript but not in the declarations, so a NodeNext TypeScript consumer got `TS2305` importing documented API.
+- **A fresh clone installs again.** The committed lockfile predated several manifest changes (it pinned an adapter prerelease older than the peer floor and lacked the CRDT dependencies), so `npm ci` failed on every fresh checkout and CI-shaped job. The lockfile is regenerated against the current manifest, with the adapter dev dependency aligned to the published head.
+- **`presence.purgeUser` no longer throws when a purged topic has a live sync observer.** The purge path treated the topic-level observer refcount map as if it held per-user collections and called `.delete(userId)` on what is a plain number - a `TypeError` for any forgotten user whose presence topic somebody was observing, which surfaced as a partial right-to-erasure failure (`FORGET_STORE_FAILED` from the composed forget store). The refcount tracks observers, not the purged user's membership, so the purge now leaves it untouched; the user's durable rows, local roster state, and leave broadcast are unaffected.
+
 ## [0.6.0-next.51] - 2026-07-10
 
 ### Documentation
