@@ -7,10 +7,19 @@ export interface PgDeadLetterOptions {
 	table?: string;
 	/** Max retained records (oldest evicted first). @default 1000 */
 	max?: number;
-	/** Drop records older than this many ms on write (0 = no TTL). @default 0 */
+	/**
+	 * Drop records older than this many ms (0 = no TTL). Enforced on each write
+	 * against the database clock, plus a periodic sweep so an idle queue still
+	 * self-cleans. @default 0
+	 */
 	ttlMs?: number;
 	/** Auto-create the table on first use. @default true */
 	autoMigrate?: boolean;
+	/**
+	 * How often the TTL sweep runs (ms). 0 disables the timer (write-time
+	 * enforcement remains). Ignored when `ttlMs` is 0. @default 60000
+	 */
+	cleanupInterval?: number;
 	/** Circuit breaker for fault isolation. */
 	breaker?: CircuitBreaker;
 	/** Prometheus registry for the `dead_letter_added_total` counter. */
@@ -51,6 +60,8 @@ export interface PgDeadLetterStore {
 	/** Right-to-erasure: delete every record stamped with a user's id (needs `forgetUserId`). */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
+	/** Stop the TTL sweep timer. */
+	destroy(): void;
 }
 
 /**

@@ -44,3 +44,49 @@ export function hashFieldTTLSupport(info) {
 	const minor = Number(m[2]);
 	return { supported: major > 7 || (major === 7 && minor >= 4), server: 'redis', version: m[1] + '.' + m[2] };
 }
+
+/**
+ * A cached, SOFT per-field-hash-TTL (HEXPIRE / HPEXPIRE) capability probe. Unlike
+ * the presence store's hard gate - which throws when the server is too old
+ * because presence has no non-HEXPIRE implementation - this is for stores whose
+ * per-field TTL is an OPTIMIZATION layered over a whole-key-EXPIRE fallback: the
+ * dedup cache, the right-to-erasure indexes. It never throws and never locks a
+ * caller out; it resolves a boolean the caller uses to pick the per-field or the
+ * fallback path.
+ *
+ * Semantics tuned for a soft gate (the inverse of `hashFieldTTLSupport`'s
+ * assume-compatible default):
+ *   - Definitively supported (Redis 7.4+/Valkey 9.0+) => `true` (use HEXPIRE).
+ *   - Definitively too old, OR an unparseable INFO (cannot confirm support) =>
+ *     `false` (use the whole-key EXPIRE fallback; never HPEXPIRE a server that
+ *     might reject it). An unrecognized-but-modern server thus forgoes the
+ *     optimization rather than risking an `ERR unknown command` on the hot path.
+ *   - A transient INFO failure leaves the result UNKNOWN and re-probes next call
+ *     (this call reads `false`, the safe fallback).
+ *
+ * `supported()` is a synchronous best-effort read (kicks the probe, returns the
+ * last known answer, `false` until the first probe resolves) for a hot path that
+ * cannot await; `ready()` awaits the in-flight probe so a call that CAN await
+ * gets the definitive answer from its first use.
+ *
+ * @param {any} redis an ioredis Redis / Cluster instance (or the test double)
+ * @returns {{ supported: () => boolean, ready: () => Promise<boolean> }}
+ */
+export function createHashFieldTTLProbe(redis) {
+	/** @type {boolean | null} null = not yet probed */
+	let known = null;
+	/** @type {Promise<void> | null} */
+	let inflight = null;
+	function trigger() {
+		if (inflight || known !== null) return;
+		inflight = Promise.resolve()
+			.then(() => redis.info('server'))
+			.then((info) => { known = hashFieldTTLSupport(info).supported === true; })
+			.catch(() => { /* transient: leave unknown so the next call re-probes */ })
+			.finally(() => { inflight = null; });
+	}
+	return {
+		supported() { trigger(); return known === true; },
+		async ready() { trigger(); if (inflight) await inflight; return known === true; }
+	};
+}

@@ -146,6 +146,63 @@ describe('redis idempotency purgeUser', () => {
 		const stillCached = await store.acquire('k-anon');
 		expect(stillCached.result).toEqual({ v: 1 });
 	});
+
+	it('purging one tenant leaves the same user in another tenant intact', async () => {
+		const a = await store.acquire('ka', undefined, { user: 'u-1', tenant: 't1' });
+		await a.commit({ v: 'a' });
+		const b = await store.acquire('kb', undefined, { user: 'u-1', tenant: 't2' });
+		await b.commit({ v: 'b' });
+
+		expect(await store.purgeUser('t1', 'u-1')).toBe(1);
+		expect((await store.acquire('kb')).result).toEqual({ v: 'b' }); // t2 untouched
+		expect((await store.acquire('ka')).acquired).toBe(true); // t1 erased -> re-runs
+	});
+});
+
+describe('redis idempotency byuser index field TTL', () => {
+	it('bounds each index field to its own cache entry lifetime (per-field TTL, Redis 7.4+)', async () => {
+		const client = mockRedisClient('test:');
+		const store = createIdempotencyStore(client, { ttl: 100 });
+		const slot = await store.acquire('k1', undefined, { user: 'u-1', tenant: 't1' });
+		await slot.commit({ ok: 1 });
+
+		const idxKey = client.key('idem:byuser:t1\0u-1');
+		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:k1'));
+		expect(ttlMs).toBeGreaterThan(0);
+		expect(ttlMs).toBeLessThanOrEqual(100 * 1000);
+	});
+
+	it('falls back to a whole-key TTL on a pre-7.4 server, and purge still works', async () => {
+		const client = mockRedisClient('test:');
+		client.redis._info = '# Server\nredis_version:6.2.0\n';
+		const store = createIdempotencyStore(client, { ttl: 100 });
+		const slot = await store.acquire('k1', undefined, { user: 'u-1', tenant: 't1' });
+		await slot.commit({ ok: 1 });
+
+		const idxKey = client.key('idem:byuser:t1\0u-1');
+		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:k1'));
+		expect(ttlMs).toBe(-1); // field present, no per-field TTL (whole-key EXPIRE path)
+		expect(await store.purgeUser('t1', 'u-1')).toBe(1);
+	});
+
+	it('uses per-field TTL on Valkey 9.0+ and the whole-key fallback below Valkey 9', async () => {
+		const modern = mockRedisClient('test:');
+		modern.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:9.0.0\n';
+		const storeModern = createIdempotencyStore(modern, { ttl: 100 });
+		const s1 = await storeModern.acquire('k', undefined, { user: 'u', tenant: 't' });
+		await s1.commit(1);
+		const [modernTtl] = await modern.redis.hpttl(modern.key('idem:byuser:t\0u'), 'FIELDS', 1, modern.key('idem:k'));
+		expect(modernTtl).toBeGreaterThan(0);
+
+		const old = mockRedisClient('test:');
+		old.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:8.1.0\n';
+		const storeOld = createIdempotencyStore(old, { ttl: 100 });
+		const s2 = await storeOld.acquire('k', undefined, { user: 'u', tenant: 't' });
+		await s2.commit(1);
+		const [oldTtl] = await old.redis.hpttl(old.key('idem:byuser:t\0u'), 'FIELDS', 1, old.key('idem:k'));
+		expect(oldTtl).toBe(-1);
+		expect(await storeOld.purgeUser('t', 'u')).toBe(1); // fallback path still purgeable
+	});
 });
 
 describe('redis presence purgeUser', () => {
@@ -238,6 +295,111 @@ describe('redis session purgeUser', () => {
 		await session.set('tok', { userId: 'u1' });
 		expect(await session.purgeUser(null, 'u1')).toBe(0);
 		expect(await session.get('tok')).toEqual({ userId: 'u1' });
+	});
+});
+
+describe('redis session byuser index field TTL', () => {
+	const extractor = (d) => d && d.userId;
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+	it('bounds each index field to its own session lifetime (per-field TTL, Redis 7.4+)', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		await session.set('tok-1', { userId: 'u1' });
+
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok-1');
+		expect(ttlMs).toBeGreaterThan(0);
+		expect(ttlMs).toBeLessThanOrEqual(10000);
+	});
+
+	it('falls back to a whole-key TTL on a pre-7.4 server, and purge still works', async () => {
+		const client = mockRedisClient('app:');
+		client.redis._info = '# Server\nredis_version:6.2.0\n';
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		await session.set('tok', { userId: 'u1' });
+
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(ttlMs).toBe(-1); // field present, no per-field TTL (whole-key PEXPIRE path)
+		expect(await session.purgeUser(null, 'u1')).toBe(1);
+	});
+
+	it('uses per-field TTL on Valkey 9.0+ and the whole-key fallback below Valkey 9', async () => {
+		const modern = mockRedisClient('app:');
+		modern.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:9.0.0\n';
+		const sessModern = createDistributedSession(modern, { forgetUserId: extractor, ttlMs: 10000 });
+		await sessModern.set('tok', { userId: 'u1' });
+		const [modernTtl] = await modern.redis.hpttl(modern.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(modernTtl).toBeGreaterThan(0);
+
+		const old = mockRedisClient('app:');
+		old.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:8.1.0\n';
+		const sessOld = createDistributedSession(old, { forgetUserId: extractor, ttlMs: 10000 });
+		await sessOld.set('tok', { userId: 'u1' });
+		const [oldTtl] = await old.redis.hpttl(old.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(oldTtl).toBe(-1);
+		expect(await sessOld.purgeUser(null, 'u1')).toBe(1);
+	});
+
+	it('touch slides the index field with the record, so a touch-kept session stays purgeable', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		await session.set('tok', { userId: 'u1' });
+		await sleep(150);
+
+		expect(await session.touch('tok')).toBe(true);
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(ttlMs).toBeGreaterThan(9900); // re-armed by touch, not decayed since set
+		expect(await session.purgeUser(null, 'u1')).toBe(1);
+	});
+
+	it('touch derives the user through a lifecycle record wrapper', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		const token = await session.create({ userId: 'u1' });
+		await sleep(150);
+
+		expect(await session.touch(token)).toBe(true);
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, token);
+		expect(ttlMs).toBeGreaterThan(9900);
+	});
+
+	it('a sliding get refreshes the index field along with the record', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		await session.set('tok', { userId: 'u1' });
+		await sleep(150);
+
+		expect(await session.get('tok')).toEqual({ userId: 'u1' });
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(ttlMs).toBeGreaterThan(9900);
+	});
+
+	it('refreshOnGet: false leaves the index field decaying on reads', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000, refreshOnGet: false });
+		await session.set('tok', { userId: 'u1' });
+		await sleep(150);
+
+		expect(await session.get('tok')).toEqual({ userId: 'u1' });
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(ttlMs).toBeLessThanOrEqual(9900); // read did not re-arm the field
+	});
+
+	it('a lifecycle load (withHooks upgrade) refreshes the index field', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, {
+			forgetUserId: extractor,
+			identify: (ctx) => ctx.token,
+			ttlMs: 10000
+		});
+		const token = await session.create({ userId: 'u1' });
+		await sleep(150);
+
+		const hooks = session.withHooks();
+		const userData = await hooks.upgrade({ token });
+		expect(userData).toBeTruthy();
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, token);
+		expect(ttlMs).toBeGreaterThan(9900);
 	});
 });
 

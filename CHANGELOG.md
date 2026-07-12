@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.54] - 2026-07-12
+
+### Changed
+
+- **Stored replay entries are version-stamped envelopes.** The sorted-set backend now persists each entry as `{v: 1, seq, event, data...}` and stops duplicating the topic into every member (the reader recovers it from the per-topic key; entries written by older versions, with or without a `topic` field, read back unchanged under the absent-version-reads-as-v1 rule). Stream entries gain the same `v` field. An entry carrying an unknown version or missing required fields is dropped on read - never mis-parsed into a wrong-shaped event - and counted by the new `replay_corruptions_total{topic}` counter so silent history corruption is observable.
+- **`publishIdempotent` dedup entries age out individually.** On Redis 7.4+ / Valkey 9.0+ each `(producerId, requestId)` field carries its own per-field TTL inside the publish script, so the dedup hash's memory bound is per entry instead of "ttl since that producer's last publish". Older servers are detected once via a soft `INFO` probe (Valkey-aware: it reads `valkey_version`, not the pinned `redis_version`) and keep the previous whole-key sliding TTL - correct on both paths, never an unknown-command error.
+
+### Fixed
+
+- **Idempotent-publish dedup survives a buffer generation reset.** The dedup cache stored a bare seq, so after `clear()` (or data loss) reset the buffer epoch, a retried `requestId` could be answered with a cached seq pointing into the previous generation - a hole or the wrong entry. The cache value now records its generation and is compared inside the same atomic script; a hit from a stale generation re-publishes fresh instead of lying, and legacy bare-seq values stay honored within their own generation.
+- **A touch-kept session can no longer escape right-to-erasure.** `get` (sliding refresh), `touch`, and a lifecycle load all refreshed the session record's TTL but not its per-user index field, so a session kept alive by activity could outlive its index entry and `purgeUser` would miss it - the erased user's session survived. Every record refresh now slides the index field too; `touch` carries no data, so it derives the owner with one extra read, incurred only when `forgetUserId` is wired. The same guarantee applies to the idempotency store's per-user index.
+- **Per-user erasure index fields expire with their entries.** The session-token and idempotency indexes used a whole-key sliding TTL, so a busy user's writes kept every index field alive - fields could long outlive the entries they pointed at. On Redis 7.4+ / Valkey 9.0+ each field now carries the exact TTL of its own session/cache entry (per-field expiry via the same soft probe as the dedup cache); older servers keep the previous whole-key behavior.
+- **Dead-letter retention no longer trusts the producer's clock.** Both backends evicted against the incoming record's `failedAt`: a stamp skewed into the future mass-evicted healthy records, one far in the past pinned expired payloads past the window, and a quiet queue never evicted at all - indefinite retention of undelivered payloads that may carry user data. Eviction now clocks off the server (`TIME` on Redis, `now()` on Postgres), the stored stamp is clamped to (0, server-now], and an idle queue self-cleans: Redis re-arms a key-TTL backstop on every add, and Postgres runs a periodic sweep (`cleanupInterval`, default 60s; stop via the new `destroy()`).
+- **Redis dead-letter paired mutations are transactional.** Add, evict, and remove each mutate a record hash and an ordering set; the pairs ran as separate commands, so a failure between them could strand a record in one structure only (phantom counts, unremovable entries). Each pair now rides a single `MULTI` on the co-located `{dlq}` slot, and `ZCARD` stays the authoritative count.
+
 ## [0.6.0-next.53] - 2026-07-11
 
 ### Fixed

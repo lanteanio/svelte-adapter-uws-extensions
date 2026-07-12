@@ -318,14 +318,21 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			expect(b.isDuplicate).toBe(false);
 		});
 
-		it('sets a TTL on the dedup hash when idempotencyTtl is non-zero', async () => {
+		it('sets a per-field TTL on the dedup entry when idempotencyTtl is non-zero', async () => {
 			const r = createReplay(client, { storage: 'stream', size: 50, idempotencyTtl: 60 });
 			await r.publishIdempotent(platform, 'chat', 'created', { id: 1 }, {
 				producerId: 'p1', requestId: 'r1'
 			});
-			const idmpTtl = await client.redis.ttl(client.key('replay:idmp:p1:{chat}'));
-			expect(idmpTtl).toBeGreaterThan(0);
-			expect(idmpTtl).toBeLessThanOrEqual(60);
+			// Redis 7.4+ / Valkey 9.0+ - the integration floor, proven by the
+			// presence HEXPIRE activation gate running in this same tier - carries
+			// the TTL on the requestId FIELD so an abandoned dedup entry self-expires
+			// individually instead of the whole hash's TTL sliding forever.
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			const [fieldTtlMs] = await client.redis.hpttl(idmpKey, 'FIELDS', 1, 'r1');
+			expect(fieldTtlMs).toBeGreaterThan(0);
+			expect(fieldTtlMs).toBeLessThanOrEqual(60_000);
+			// The per-field optimization means the hash key itself carries no TTL.
+			expect(await client.redis.ttl(idmpKey)).toBe(-1);
 		});
 	});
 

@@ -24,6 +24,7 @@
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { randomBytes, wallEpoch } from '../shared/runtime.js';
 
 // Per-connection slot for the loaded session on `ws.getUserData()`. `Symbol.for`
@@ -117,6 +118,9 @@ export function createDistributedSession(client, options = {}) {
 
 	const breaker = options.breaker;
 	const redis = client.redis;
+	// Soft capability gate for per-field index TTLs. Valkey-aware: routes off
+	// valkey_version (9.0+ has HPEXPIRE), not the pinned redis_version:7.2.4.
+	const hexpireProbe = createHashFieldTTLProbe(redis);
 
 	const m = options.metrics;
 	const mGet = m?.counter('session_get_total', 'Session get calls by hit/miss', ['result']);
@@ -133,8 +137,10 @@ export function createDistributedSession(client, options = {}) {
 	// Per-user token index (a HASH whose fields are the user's tokens) for
 	// right-to-erasure. Keyed by raw userId - session tokens are globally unique,
 	// so the index relies on globally-unique userIds (the same trade as the
-	// connection registry). Carries its own sliding TTL since the store has no
-	// sweep loop; a stale field whose token already expired is a no-op DEL.
+	// connection registry). The store has no sweep loop, so each index field
+	// expires alongside its own session record via per-field HPEXPIRE (Redis
+	// 7.4+ / Valkey 9.0+); older servers fall back to a whole-key sliding
+	// PEXPIRE. A stale field whose token already expired is a no-op DEL.
 	function byUserKey(userId) {
 		return client.key(keyPrefix + 'byuser:' + userId);
 	}
@@ -145,9 +151,11 @@ export function createDistributedSession(client, options = {}) {
 		if (typeof uid !== 'string' || uid.length === 0) return;
 		const idxKey = byUserKey(uid);
 		try {
+			const hexOk = await hexpireProbe.ready();
 			const tx = redis.multi();
 			tx.hset(idxKey, token, '1');
-			tx.pexpire(idxKey, ttlMs);
+			if (hexOk) tx.hpexpire(idxKey, ttlMs, 'FIELDS', 1, token);
+			else tx.pexpire(idxKey, ttlMs);
 			await tx.exec();
 			breaker?.success();
 		} catch (err) { breaker?.failure(err); /* index best-effort; the session is written */ }
@@ -185,6 +193,10 @@ export function createDistributedSession(client, options = {}) {
 					breaker?.failure(err);
 					// TTL refresh is best-effort; the read still succeeds.
 				}
+				// The index field must slide with the record, or a read-kept
+				// session outlives its index entry and escapes purgeUser. One
+				// extra round-trip, only incurred when erasure indexing is wired.
+				await indexToken(data, token);
 			}
 			mGet?.inc({ result: 'hit' });
 			return data;
@@ -217,6 +229,28 @@ export function createDistributedSession(client, options = {}) {
 			breaker?.success();
 			const refreshed = Number(r) === 1;
 			mTouch?.inc({ result: refreshed ? 'present' : 'absent' });
+			if (refreshed && forgetUserId) {
+				// The index field must slide with the record, or a touch-kept
+				// session outlives its index entry and escapes purgeUser. touch
+				// carries no data, so the owning user is derived with one extra
+				// GET - only incurred when erasure indexing is wired, and
+				// best-effort: an index miss must not fail the touch.
+				try {
+					const raw = await redis.get(key);
+					breaker?.success();
+					if (raw != null) {
+						let data;
+						let parsed = false;
+						try {
+							const p = JSON.parse(raw);
+							// Unwrap a lifecycle record ({ d, c }); raw-layer data passes through.
+							data = (p !== null && typeof p === 'object' && 'd' in p && 'c' in p) ? p.d : p;
+							parsed = true;
+						} catch { /* corrupt record: nothing to index */ }
+						if (parsed) await indexToken(data, token);
+					}
+				} catch (err) { breaker?.failure(err); }
+			}
 			return refreshed;
 		} catch (err) {
 			breaker?.failure(err);
@@ -293,6 +327,8 @@ export function createDistributedSession(client, options = {}) {
 		}
 		if (refreshOnGet) {
 			try { await redis.pexpire(key, ttlMs); breaker?.success(); } catch (err) { breaker?.failure(err); }
+			// Slide the index field with the record (see get()); best-effort.
+			await indexToken(rec.d, token);
 		}
 		return { data: rec.d, createdAt };
 	}

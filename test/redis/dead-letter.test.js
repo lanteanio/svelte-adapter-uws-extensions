@@ -85,12 +85,41 @@ describe('redis dead-letter store', () => {
 		expect(kept).toEqual([3, 2]); // oldest (1) evicted
 	});
 
-	it('drops records older than ttlMs on write', async () => {
-		store = createDeadLetter(client, { ttlMs: 1000 });
-		await store.add(rec({ failedAt: 100 }));   // old
-		await store.add(rec({ failedAt: 5000 }));  // newer; ref=5000, cutoff=4000 -> drops failedAt=100
-		const kept = (await store.list()).map((r) => r.failedAt);
-		expect(kept).toEqual([5000]);
+	it('drops records older than ttlMs on write, clocked by the server', async () => {
+		store = createDeadLetter(client, { ttlMs: 60_000 });
+		const now = Date.now();
+		await store.add(rec({ webhookId: 'stale', failedAt: now - 120_000 }));
+		await store.add(rec({ webhookId: 'fresh', failedAt: now - 1_000 }));
+		const kept = await store.list();
+		expect(kept.map((r) => r.webhookId)).toEqual(['fresh']);
+	});
+
+	it('a future producer stamp cannot mass-evict healthy records (server clock rules)', async () => {
+		store = createDeadLetter(client, { ttlMs: 60_000 });
+		const now = Date.now();
+		await store.add(rec({ webhookId: 'healthy', failedAt: now - 1_000 }));
+		// A skewed producer stamps an hour ahead. Under a stamp-clocked cutoff
+		// this would sweep everything older than future-ttl, i.e. the healthy
+		// record; the server clock keeps it.
+		await store.add(rec({ webhookId: 'skewed', failedAt: now + 3_600_000 }));
+		const kept = await store.list();
+		expect(kept.map((r) => r.webhookId).sort()).toEqual(['healthy', 'skewed']);
+	});
+
+	it('clamps an implausible failedAt to the server clock', async () => {
+		const before = Date.now();
+		const idFuture = await store.add(rec({ failedAt: Date.now() + 3_600_000 }));
+		const idMissing = await store.add(rec({ failedAt: undefined }));
+		const idZero = await store.add(rec({ failedAt: 0 }));
+		const after = Date.now();
+		for (const id of [idFuture, idMissing, idZero]) {
+			const got = await store.get(id);
+			expect(got.failedAt).toBeGreaterThanOrEqual(before);
+			expect(got.failedAt).toBeLessThanOrEqual(after + 1);
+		}
+		// A plausible past stamp is stored untouched.
+		const idPast = await store.add(rec({ failedAt: before - 5_000 }));
+		expect((await store.get(idPast)).failedAt).toBe(before - 5_000);
 	});
 
 	it('clears everything', async () => {

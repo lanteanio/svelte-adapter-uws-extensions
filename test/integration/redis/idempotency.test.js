@@ -201,4 +201,23 @@ describe('redis idempotency (integration)', () => {
 			expect(slot.pending).toBe(true);
 		});
 	});
+
+	describe('byuser index field TTL', () => {
+		// Proves the HPEXPIRE call shape against the real server (the mock
+		// cannot catch an argument-order mistake the server would reject).
+		// The Valkey tiers re-run this on a real Valkey 9.0+.
+		it('each index field carries a real per-field TTL bounded by the entry ttl', async () => {
+			const store = createIdempotencyStore(client, { ttl: 30 });
+			const slot = await store.acquire('idx-k', undefined, { user: 'u-idx', tenant: 't1' });
+			await slot.commit({ ok: 1 });
+
+			const idxKey = client.key('idem:byuser:t1\0u-idx');
+			const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:idx-k'));
+			expect(ttlMs).toBeGreaterThan(0);
+			expect(ttlMs).toBeLessThanOrEqual(30 * 1000);
+
+			expect(await store.purgeUser('t1', 'u-idx')).toBe(1);
+			expect((await store.acquire('idx-k')).acquired).toBe(true);
+		});
+	});
 });

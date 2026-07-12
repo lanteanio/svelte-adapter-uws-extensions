@@ -25,11 +25,13 @@ import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, Replay
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
+import { decodeStreamFields } from '../shared/replay-envelope.js';
+import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 
 /**
  * Lua script for atomic idempotent publish.
  *
- * KEYS[1] = idmp cache key (hash; field = requestId, value = seq)
+ * KEYS[1] = idmp cache key (hash; field = requestId, value = `epoch:seq`)
  * KEYS[2] = seq key
  * KEYS[3] = stream key
  * KEYS[4] = epoch key
@@ -39,15 +41,28 @@ import { checkReplayAccess } from '../shared/replay-gate.js';
  * ARGV[4] = idmpTtl seconds (0 = no expiry on the dedup cache)
  * ARGV[5] = event
  * ARGV[6] = data (JSON-encoded)
+ * ARGV[7] = hashFieldTTL supported (1 = per-field HPEXPIRE, 0 = whole-hash EXPIRE)
  *
  * Returns {isDuplicate (1|0), seq}.
  *
- * The entry stores only the `event` and `data` fields. The topic is NOT
- * stored: it is already encoded in the per-topic stream key, so writing it
- * into every entry is a redundant per-entry value (Redis stream SAMEFIELDS
- * dedups the field NAMES but never the VALUES). The read path recovers the
- * topic from the key. Legacy entries written before this change still carry
- * a `topic` field; the reader falls back to it when present.
+ * The entry stores `event`, `data`, and a `v` version discriminator. The topic
+ * is NOT stored: it is already encoded in the per-topic stream key, so writing
+ * it into every entry is a redundant per-entry value (Redis stream SAMEFIELDS
+ * dedups the field NAMES but never the VALUES). The read path recovers the topic
+ * from the key. Legacy entries written before versioning carry no `v` (read as
+ * v1) and may carry a `topic` field (ignored).
+ *
+ * Generation-safe dedup: the dedup VALUE is `epoch:seq`, not a bare seq, so a hit
+ * is verified against the CURRENT epoch. If the seq space reset (TTL reap or
+ * clearTopic) between the original publish and a retry, the cached seq belongs to
+ * a dead generation - returning it would point the client at an unrelated entry
+ * in the new numbering. On an epoch-mismatched hit the request is re-published
+ * into the current generation exactly once (and its dedup value re-stamped). A
+ * legacy bare-seq value (no `:`) is honored as-is for one idmpTtl window
+ * (backward compatible). The dedup field carries a per-field TTL (HPEXPIRE) when
+ * the server supports it (Redis 7.4+/Valkey 9.0+) so an abandoned requestId
+ * self-expires instead of the whole hash's TTL sliding forever; older servers
+ * fall back to the whole-hash EXPIRE (no per-field bound, but no regression).
  *
  * The `seq == 1` reset edge bumps the epoch in the same atomic script (see
  * PUBLISH_SCRIPT below for the rationale). The epoch key is given NO ttl, so
@@ -64,25 +79,40 @@ local ttl = tonumber(ARGV[3])
 local idmpTtl = tonumber(ARGV[4])
 local event = ARGV[5]
 local data = ARGV[6]
+local hexpire = ARGV[7] == '1'
 if maxSize == nil or ttl == nil or idmpTtl == nil then
   return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl must be numeric')
 end
 
+local curEpoch = tonumber(redis.call('get', epochKey) or '0')
 local cached = redis.call('hget', idmpKey, requestId)
 if cached then
-  return {1, tonumber(cached)}
+  local sep = string.find(cached, ':', 1, true)
+  if sep == nil then
+    return {1, tonumber(cached)}
+  end
+  local cachedEpoch = tonumber(string.sub(cached, 1, sep - 1))
+  local cachedSeq = tonumber(string.sub(cached, sep + 1))
+  if cachedEpoch == curEpoch then
+    return {1, cachedSeq}
+  end
 end
 
 local seq = redis.call('incr', seqKey)
+local epoch = curEpoch
 if seq == 1 then
-  redis.call('incr', epochKey)
+  epoch = redis.call('incr', epochKey)
 end
 local id = seq .. '-0'
-redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'event', event, 'data', data)
+redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'v', '1', 'event', event, 'data', data)
 
-redis.call('hset', idmpKey, requestId, seq)
+redis.call('hset', idmpKey, requestId, epoch .. ':' .. seq)
 if idmpTtl > 0 then
-  redis.call('expire', idmpKey, idmpTtl)
+  if hexpire then
+    redis.call('hpexpire', idmpKey, idmpTtl * 1000, 'FIELDS', 1, requestId)
+  else
+    redis.call('expire', idmpKey, idmpTtl)
+  end
 end
 
 if ttl > 0 then
@@ -107,10 +137,10 @@ return {0, seq}
  *
  * Returns the new sequence number.
  *
- * The entry stores only `event` and `data`; the topic lives in the per-topic
- * stream key, so storing it per entry is a redundant value the reader recovers
- * from the key. Legacy entries still carry a `topic` field; the reader falls
- * back to it when present.
+ * The entry stores `event`, `data`, and a `v` version discriminator; the topic
+ * lives in the per-topic stream key, so storing it per entry is a redundant
+ * value the reader recovers from the key. Legacy entries carry no `v` (read as
+ * v1) and may carry a `topic` field (ignored).
  *
  * When the seq counter reads 1 the seq space is fresh (brand-new topic or one
  * whose seq key was reaped by TTL), so the numbering restarted: bump the epoch
@@ -135,7 +165,7 @@ if seq == 1 then
   redis.call('incr', epochKey)
 end
 local id = seq .. '-0'
-redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'event', event, 'data', data)
+redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'v', '1', 'event', event, 'data', data)
 
 if ttl > 0 then
   redis.call('expire', seqKey, ttl)
@@ -181,12 +211,20 @@ export function createStreamReplay(client, options = {}) {
 	const forgetUserId = options.forgetUserId;
 	const redis = client.redis;
 
+	// Soft per-field-hash-TTL gate for the dedup cache: HPEXPIRE each
+	// requestId field on servers that support it (Redis 7.4+/Valkey 9.0+) so an
+	// abandoned dedup entry self-expires instead of the whole hash's TTL sliding
+	// forever; older servers keep the whole-hash EXPIRE fallback. Probed once,
+	// awaited on the publish path (resolved after first use), never throws.
+	const hexpireProbe = createHashFieldTTLProbe(redis);
+
 	const b = options.breaker;
 	const m = options.metrics;
 	const mt = m?.mapTopic;
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 	const mIdmpHits = m?.counter('replay_idmp_hits_total', 'publishIdempotent calls served from the dedup cache (no XADD)', ['topic']);
@@ -290,11 +328,17 @@ export function createStreamReplay(client, options = {}) {
 				throw new ReplaySerializationError('publishIdempotent', err);
 			}
 
+			// Resolve the per-field-TTL capability (cached after the first probe;
+			// the first publish awaits one INFO round trip, subsequent ones read
+			// the resolved value). Passed into the Lua so the dedup field gets an
+			// HPEXPIRE where supported and a whole-hash EXPIRE fallback otherwise.
+			const hexOk = await hexpireProbe.ready();
+
 			let result;
 			try {
 				result = await withBreaker(b, () =>
 					evalCached(redis, IDMP_PUBLISH_SCRIPT, 4, ik, sk, bk, ek,
-						requestId, maxSize, ttl, idmpTtl, event, payload)
+						requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0')
 				);
 			} catch (err) {
 				throw new ReplayStorageError('publishIdempotent', err);
@@ -430,18 +474,12 @@ export function createStreamReplay(client, options = {}) {
 			const entries = await withBreaker(b, () => redis.xrange(bufKey(topic), startId, '+'));
 			const result = [];
 			for (const [id, flat] of entries) {
-				const fields = fieldsToObject(flat);
-				try {
-					result.push({
-						seq: seqFromId(id),
-						// Versioned read: new entries omit the topic field (it is
-						// the per-topic key), so recover it from the `topic` param;
-						// legacy entries written before that change still carry it.
-						topic: fields.topic ?? topic,
-						event: fields.event,
-						data: JSON.parse(fields.data)
-					});
-				} catch { /* skip corrupted */ }
+				// Versioned read: seq from the stream id, topic from the per-topic
+				// key; an unknown version or a required-field miss is dropped as a
+				// corruption (reads as a resume gap) and counted.
+				const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				result.push(decoded);
 			}
 			return result;
 		},
@@ -470,14 +508,9 @@ export function createStreamReplay(client, options = {}) {
 
 			const missed = [];
 			for (const [id, flat] of entries) {
-				const fields = fieldsToObject(flat);
-				try {
-					missed.push({
-						seq: seqFromId(id),
-						event: fields.event,
-						data: JSON.parse(fields.data)
-					});
-				} catch { /* skip corrupted */ }
+				const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				missed.push(decoded);
 			}
 
 			let truncated = false;
@@ -540,16 +573,15 @@ export function createStreamReplay(client, options = {}) {
 			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
 			let n = 0;
 			for (const bk of keys) {
-				const topic = bk.startsWith(prefix) && bk.endsWith('}') ? bk.slice(prefix.length, bk.length - 1) : undefined;
+				const topic = bk.startsWith(prefix) && bk.endsWith('}') ? bk.slice(prefix.length, bk.length - 1) : '';
 				let entries;
 				try { entries = await redis.xrange(bk, '-', '+'); } catch { continue; }
 				const toDel = [];
 				for (const [id, flat] of entries) {
-					const fields = fieldsToObject(flat);
-					let data;
-					try { data = JSON.parse(fields.data); } catch { continue; }
+					const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
+					if (decoded === null) continue;
 					let uid;
-					try { uid = forgetUserId({ topic: fields.topic ?? topic, event: fields.event, data }); } catch { continue; }
+					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
 					if (uid === userId) toDel.push(id);
 				}
 				if (toDel.length > 0) {

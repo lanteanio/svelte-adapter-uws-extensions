@@ -629,6 +629,8 @@ The `seq` counter only advances on fresh writes, so duplicate retries do not int
 
 The dedup cache key is `{prefix}replay:idmp:{producerId}:{topic}` - topic-scoped so the same `requestId` can be reused across topics without collision. Override the TTL per call via `opts.idempotencyTtl`, or globally via `idempotencyTtl` on `createReplay`.
 
+On Redis 7.4+ / Valkey 9.0+ each dedup entry carries its own per-field TTL (`HPEXPIRE`), so the cache's memory bound is per entry - a busy producer's old request ids age out individually. On older servers the store detects this once and falls back to a whole-key sliding `EXPIRE`: still correct dedup, but the hash is then bounded by "ttl since that producer's last publish" rather than per entry.
+
 This pairs with the durable task runner (`postgres/tasks`): a task that publishes to the replay buffer can pass its task id as `requestId` so worker-crash retries don't double-publish.
 
 #### Replicated durability
@@ -1542,11 +1544,13 @@ It implements the same interface as the in-memory store (`add` / `get` / `remove
 | Option | Default | Description |
 | --- | --- | --- |
 | `max` | `1000` | Max retained records; the oldest is evicted first. |
-| `ttlMs` | `0` | Drop records older than this many ms on write (0 = no TTL). |
+| `ttlMs` | `0` | Drop records older than this many ms (0 = no TTL). Enforced on each write against the **server clock**, with a key-TTL backstop so an idle queue still self-cleans within `ttlMs` of its last write. |
 | `breaker` | - | Circuit breaker for fault isolation (`createCircuitBreaker`). |
 | `metrics` | - | Registry for the `dead_letter_added_total{topic}` counter. |
 
-The whole (bounded, low-volume) collection is co-located on one Redis Cluster slot via a `{dlq}` hash tag, so every operation stays single-slot.
+The whole (bounded, low-volume) collection is co-located on one Redis Cluster slot via a `{dlq}` hash tag, so every operation stays single-slot, and paired mutations ride a single `MULTI` so the record hash and its ordering index never diverge.
+
+Retention never trusts the producer's `failedAt` stamp: eviction clocks off Redis's own `TIME`, and an implausible stamp (missing, zero, or in the server's future) is stored as the server's now. A producer with a skewed clock can neither mass-evict healthy records nor pin its own past the window - undelivered payloads can carry user data, so `ttlMs` is a real retention bound, not advisory.
 
 A Postgres variant backs the same store in a `svti_dead_letter` table for deployments that keep durable state in Postgres:
 
@@ -1555,7 +1559,7 @@ import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-le
 configureWebhooks({ deadLetter: createDeadLetter(pgClient, { max: 1000 }) });
 ```
 
-Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`) and `autoMigrate` (default `true`); the table is auto-created on first use, and both bounds are enforced on write.
+Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention mirrors the Redis variant with the database's `now()` as the clock: both bounds run on each write, the `failedAt` stamp is clamped at insert, and a periodic sweep (stopped via `destroy()`) clears an idle queue without waiting for the next failure.
 
 ---
 
@@ -3058,6 +3062,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `replay_replication_timeouts_total` | counter | | Publishes that did not reach `minReplicas` within timeout |
 | `replay_idmp_hits_total` | counter | `topic` | `publishIdempotent` calls served from the dedup cache (no XADD) |
 | `replay_idmp_writes_total` | counter | `topic` | `publishIdempotent` calls that produced a new entry |
+| `replay_corruptions_total` | counter | `topic` | Stored entries dropped on read as corrupt or an unknown envelope version (Redis only) |
 
 **Rate limiting**
 
@@ -3955,7 +3960,9 @@ const replay  = createReplay(redis,             { forgetUserId: ({ data }) => da
 const tasks   = createTaskRunner(pg,            { forgetUserId: (input) => input.userId });
 ```
 
-With the extractor, the session indexes each token per user at write time, the Redis DLQ / replay buffers scan their bounded collections at purge time, and the Postgres dead-letter / replay / task stores stamp a `user_id` column at write time and `DELETE WHERE` (tables forward-migrate via `ADD COLUMN IF NOT EXISTS`). Without it, those stores are a documented no-op. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
+With the extractor, the session indexes each token per user at write time, the Redis DLQ / replay buffers scan their bounded collections at purge time, and the Postgres dead-letter / replay / task stores stamp a `user_id` column at write time and `DELETE WHERE` (tables forward-migrate via `ADD COLUMN IF NOT EXISTS`). Without it, those stores are a documented no-op.
+
+The session and idempotency per-user indexes stay in lockstep with their entries: each index field carries the same TTL as the session/cache entry it points at (per-field `HPEXPIRE` on Redis 7.4+ / Valkey 9.0+, with a whole-key sliding TTL fallback on older servers), and every path that slides an entry's TTL - `set`, `get`, `touch`, a lifecycle load - slides its index field too. A session kept alive by activity therefore always remains addressable by `purgeUser`, at the cost of one extra index write per refreshing read when the extractor is configured. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
 
 ---
 

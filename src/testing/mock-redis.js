@@ -1566,7 +1566,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Streams idempotent replay publish Lua script simulation
-		// args layout: [idmpKey, seqKey, bufKey, epochKey, requestId, maxSize, ttl, idmpTtl, event, dataJson]
+		// args layout: [idmpKey, seqKey, bufKey, epochKey, requestId, maxSize, ttl, idmpTtl, event, dataJson, hexpireSupported]
 		function evalIdmpStreamReplayPublish(numKeys, args) {
 			const idmpKey = args[0];
 			const seqKey = args[1];
@@ -1574,22 +1574,39 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const epochKey = args[3];
 			const requestId = args[4];
 			const maxSize = Number(args[5]);
+			const idmpTtl = Number(args[7]);
 			const event = args[8];
 			const dataJson = args[9];
+			const hexpire = String(args[10]) === '1';
 
+			// Match the real server: a per-field-expired dedup entry is gone before
+			// the HGET, so it reads as a fresh publish.
+			pruneExpiredFields(idmpKey);
 			if (!hashes.has(idmpKey)) hashes.set(idmpKey, new Map());
 			const idmp = hashes.get(idmpKey);
+			const curEpoch = parseInt(store.get(epochKey) || '0', 10);
+
 			if (idmp.has(requestId)) {
-				return [1, parseInt(idmp.get(requestId), 10)];
+				const cached = idmp.get(requestId);
+				const sep = cached.indexOf(':');
+				if (sep === -1) {
+					return [1, parseInt(cached, 10)]; // legacy bare-seq value
+				}
+				const cachedEpoch = parseInt(cached.slice(0, sep), 10);
+				const cachedSeq = parseInt(cached.slice(sep + 1), 10);
+				if (cachedEpoch === curEpoch) {
+					return [1, cachedSeq];
+				}
+				// Stale generation: fall through and re-publish into the current one.
 			}
 
-			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
-			store.set(seqKey, String(v));
-			const seq = v;
-
+			const seq = parseInt(store.get(seqKey) || '0', 10) + 1;
+			store.set(seqKey, String(seq));
+			let epoch = curEpoch;
 			// Reset edge: a fresh seq space (seq == 1) bumps the epoch.
 			if (seq === 1) {
-				store.set(epochKey, String(parseInt(store.get(epochKey) || '0', 10) + 1));
+				epoch = curEpoch + 1;
+				store.set(epochKey, String(epoch));
 			}
 
 			const id = `${seq}-0`;
@@ -1597,13 +1614,20 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const stream = streams.get(bufKey);
 			stream.push({
 				id,
-				fields: [['event', event], ['data', dataJson]]
+				fields: [['v', '1'], ['event', event], ['data', dataJson]]
 			});
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);
 			}
 
-			idmp.set(requestId, String(seq));
+			idmp.set(requestId, epoch + ':' + seq);
+			if (idmpTtl > 0 && hexpire) {
+				// Per-field HPEXPIRE (readable via pruneExpiredFields). The fallback
+				// path (whole-hash EXPIRE) is a no-op stub in this mock, like `expire`.
+				let ex = hashFieldExpiry.get(idmpKey);
+				if (!ex) { ex = new Map(); hashFieldExpiry.set(idmpKey, ex); }
+				ex.set(requestId, serverNowMs() + idmpTtl * 1000);
+			}
 
 			return [0, seq];
 		}
@@ -1632,7 +1656,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const stream = streams.get(bufKey);
 			stream.push({
 				id,
-				fields: [['event', event], ['data', dataJson]]
+				fields: [['v', '1'], ['event', event], ['data', dataJson]]
 			});
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);
@@ -1641,15 +1665,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, epochKey, topic, event, dataJson, maxSize, ttl]
+		// args layout: [seqKey, bufKey, epochKey, event, dataJson, maxSize, ttl]
 		function evalReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
 			const epochKey = args[2];
-			const topic = args[3];
-			const event = args[4];
-			const dataJson = args[5];
-			const maxSize = Number(args[6]);
+			const event = args[3];
+			const dataJson = args[4];
+			const maxSize = Number(args[5]);
 
 			// Increment seq
 			const v = parseInt(store.get(seqKey) || '0', 10) + 1;
@@ -1661,9 +1684,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				store.set(epochKey, String(parseInt(store.get(epochKey) || '0', 10) + 1));
 			}
 
-			// zadd
+			// zadd a versioned, topic-less envelope (topic lives in the key).
 			const data = JSON.parse(dataJson);
-			const payload = JSON.stringify({ seq, topic, event, data });
+			const payload = JSON.stringify({ v: 1, seq, event, data });
 			if (!sortedSets.has(bufKey)) sortedSets.set(bufKey, []);
 			const set = sortedSets.get(bufKey);
 			set.push({ score: seq, member: payload });

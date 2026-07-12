@@ -28,6 +28,7 @@
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
+import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError } from '../shared/errors.js';
@@ -125,6 +126,9 @@ export function createIdempotencyStore(client, options = {}) {
 	const ttl = options.ttl || 48 * 3600;
 	const acquireTtl = options.acquireTtl || 60;
 	const redis = client.redis;
+	// Soft capability gate for per-field index TTLs. Valkey-aware: routes off
+	// valkey_version (9.0+ has HPEXPIRE), not the pinned redis_version:7.2.4.
+	const hexpireProbe = createHashFieldTTLProbe(redis);
 
 	const b = options.breaker;
 	const m = options.metrics;
@@ -142,10 +146,11 @@ export function createIdempotencyStore(client, options = {}) {
 	// are the FULL cache keys that user committed, so `live.forget` can delete
 	// exactly a user's entries instead of substring-matching the opaque key (a
 	// collision could over-delete or miss). A hash (vs a set) keeps it portable
-	// and lets the whole index expire as one key. The store has no sweep loop
-	// (pure EX TTL), so the index carries its own sliding TTL (refreshed on each
-	// write) and any stale field whose cache key already expired is a no-op DEL
-	// on purge.
+	// and lets fields carry TTLs. The store has no sweep loop (pure EX TTL), so
+	// each index field expires with its own cache entry via per-field HPEXPIRE
+	// (Redis 7.4+ / Valkey 9.0+); older servers fall back to a whole-key sliding
+	// EXPIRE, where a busy user's writes keep every field alive - fields can then
+	// outlive their cache entries, and any stale field is a no-op DEL on purge.
 	function byUserKey(tenantId, userId) {
 		return client.key(keyPrefix + 'byuser:' + (tenantId || '') + '\0' + userId);
 	}
@@ -198,14 +203,22 @@ export function createIdempotencyStore(client, options = {}) {
 						// on Redis Cluster. Best-effort as before (a failure must not fail
 						// the commit), and a field left behind by a failed SET is already
 						// tolerated - a stale field is a no-op DEL on purge. The HSET +
-						// sliding EXPIRE are one key, so single-slot and safe.
+						// field TTL are one key, so single-slot and safe. The probe is
+						// resolved BEFORE the SET launches (cached after the first commit)
+						// so the two writes still ride concurrently.
+						const hexOk = forgetUser !== null ? await hexpireProbe.ready() : false;
 						const committed = withBreaker(b, () => redis.set(k, payload, 'EX', ttl));
 						let index = null;
 						if (forgetUser !== null) {
 							const idxKey = byUserKey(forgetTenant, forgetUser);
 							const tx = redis.multi();
 							tx.hset(idxKey, k, '1');
-							tx.expire(idxKey, ttl);
+							// Per-field TTL bounds each index field to its own cache
+							// entry's lifetime; the whole-key fallback slides instead,
+							// so on old servers a busy user's index is bounded by their
+							// LAST commit rather than per entry.
+							if (hexOk) tx.hpexpire(idxKey, ttl * 1000, 'FIELDS', 1, k);
+							else tx.expire(idxKey, ttl);
 							index = tx.exec().catch(() => { /* index best-effort; the cache entry is committed */ });
 						}
 						await committed;

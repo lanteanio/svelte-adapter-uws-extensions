@@ -22,22 +22,34 @@
  *   + index on (topic) and (failed_at)
  *
  * The collection is bounded by `max` (the oldest captured row, by id, is evicted
- * first) and an optional `ttlMs`, both enforced on write (no background timer) -
- * a webhook DLQ is low-volume, so the per-add trim is cheap and a no-op until
- * over the cap.
+ * first) and an optional `ttlMs`. Both are enforced on write - a webhook DLQ is
+ * low-volume, so the per-add trim is cheap and a no-op until over the cap - and
+ * the TTL is additionally swept by a periodic timer so an idle queue self-cleans
+ * within `ttlMs + cleanupInterval` instead of retaining payloads until the next
+ * failure.
+ *
+ * Retention clocks off the DATABASE (`now()`), never the caller-supplied
+ * `failedAt`: a skewed or hostile producer stamp can then neither mass-evict
+ * healthy records nor pin its own forever. The stored stamp is clamped to
+ * (0, db-now] at insert; an implausible stamp becomes the database's now.
  *
  * @module svelte-adapter-uws-extensions/postgres/dead-letter
  */
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 
 /**
  * @typedef {Object} PgDeadLetterOptions
  * @property {string} [table='svti_dead_letter'] - Table name.
  * @property {number} [max=1000] - Max retained records (oldest evicted first).
- * @property {number} [ttlMs=0] - Drop records older than this many ms on write (0 = no TTL).
+ * @property {number} [ttlMs=0] - Drop records older than this many ms (0 = no TTL).
+ *   Enforced on each write against the database clock, plus a periodic sweep so
+ *   an idle queue still self-cleans.
  * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
+ * @property {number} [cleanupInterval=60000] - How often the TTL sweep runs (ms).
+ *   0 disables the timer (write-time enforcement remains). Ignored when `ttlMs` is 0.
  * @property {object} [breaker] - Circuit breaker for fault isolation.
  * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
  */
@@ -68,6 +80,7 @@ export function createDeadLetter(client, options = {}) {
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
 	const autoMigrate = options.autoMigrate !== false;
+	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 60000;
 
 	assertSafeTableName(table, 'postgres dead-letter');
 
@@ -114,18 +127,49 @@ export function createDeadLetter(client, options = {}) {
 		};
 	}
 
+	let cleanupTimer = null;
+	let cleanupRunning = false;
+	if (ttlMs > 0 && cleanupInterval > 0) {
+		cleanupTimer = setIntervalTimer(async () => {
+			if (cleanupRunning) return;
+			if (b && !b.isHealthy) return;
+			cleanupRunning = true;
+			try {
+				await ensureTable();
+				await client.query(
+					`DELETE FROM ${table} WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1`,
+					[ttlMs]
+				);
+				b?.success();
+			} catch (err) {
+				b?.failure(err);
+			} finally {
+				cleanupRunning = false;
+			}
+		}, cleanupInterval);
+		if (cleanupTimer.unref) cleanupTimer.unref();
+	}
+
 	return {
 		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
 		async add(rec) {
 			await ensureTable();
-			const failedAt = typeof rec.failedAt === 'number' ? rec.failedAt : 0;
+			// The caller's stamp is display data; the database clamps it to
+			// (0, db-now] at insert so retention can trust failed_at without
+			// trusting the producer's clock.
+			const failedAt =
+				typeof rec.failedAt === 'number' && Number.isFinite(rec.failedAt) && rec.failedAt > 0
+					? Math.floor(rec.failedAt)
+					: 0;
 			let userId = null;
 			if (forgetUserId) {
 				try { const u = forgetUserId(rec); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
 			}
 			const res = await withBreaker(b, () => client.query(
 				`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${pkCol}`,
+				 VALUES ($1, $2, $3, $4, $5, $6,
+				         LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint),
+				         $8) RETURNING ${pkCol}`,
 				[rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId]
 			));
 			// Size trim: keep the newest `max` rows (by id). The OFFSET subquery
@@ -134,9 +178,12 @@ export function createDeadLetter(client, options = {}) {
 				`DELETE FROM ${table} WHERE ${pkCol} <= (SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} DESC OFFSET $1 LIMIT 1)`,
 				[max]
 			));
-			// TTL sweep (relative to the just-captured record's time, ~wall-now).
+			// TTL sweep against the database clock, never the producer stamp.
 			if (ttlMs > 0) {
-				await withBreaker(b, () => client.query(`DELETE FROM ${table} WHERE failed_at < $1`, [failedAt - ttlMs]));
+				await withBreaker(b, () => client.query(
+					`DELETE FROM ${table} WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1`,
+					[ttlMs]
+				));
 			}
 			mAdded?.inc({ topic: mt ? mt(rec.topic) : rec.topic });
 			return String(res.rows[0][pkCol]);
@@ -212,6 +259,14 @@ export function createDeadLetter(client, options = {}) {
 		async clear() {
 			await ensureTable();
 			await withBreaker(b, () => client.query(`DELETE FROM ${table}`));
+		},
+
+		/** Stop the TTL sweep timer. */
+		destroy() {
+			if (cleanupTimer) {
+				clearIntervalTimer(cleanupTimer);
+				cleanupTimer = null;
+			}
 		}
 	};
 }

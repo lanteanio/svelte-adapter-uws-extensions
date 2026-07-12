@@ -17,9 +17,17 @@
  * share one slot - every multi-key operation (add, remove, evict) stays on a
  * single node with no cross-slot hazard. A webhook DLQ is low-volume and capped,
  * so co-locating the whole collection on one slot is intentional, not a
- * bottleneck. Operations use plain commands (no Lua); the add path is a few
- * commands rather than an atomic script - a benign race between two concurrent
- * captures can only mis-trim by one under the cap, which the next add corrects.
+ * bottleneck. Paired hash+zset mutations ride a single MULTI so a record can
+ * never exist in one structure and not the other (ZCARD stays the authoritative
+ * count); the id INCR and the eviction pass remain separate commands - a benign
+ * race between two concurrent captures can only mis-trim by one under the cap,
+ * which the next add corrects.
+ *
+ * Retention clocks off the SERVER (`TIME`), never the caller-supplied
+ * `failedAt`: a skewed or hostile producer stamp can then neither mass-evict
+ * healthy records nor pin its own forever. With `ttlMs` set, each add also
+ * re-arms a PEXPIRE on all three keys as a quiet-queue backstop, so an idle
+ * DLQ self-cleans within `ttlMs` instead of retaining payloads indefinitely.
  *
  * @module svelte-adapter-uws-extensions/redis/dead-letter
  */
@@ -29,7 +37,9 @@ import { withBreaker } from '../shared/breaker.js';
 /**
  * @typedef {Object} RedisDeadLetterOptions
  * @property {number} [max=1000] - Max retained records (oldest evicted first).
- * @property {number} [ttlMs=0] - Drop records older than this many ms on write (0 = no TTL).
+ * @property {number} [ttlMs=0] - Drop records older than this many ms (0 = no TTL).
+ *   Enforced on each write against the server clock, with a key-TTL backstop so
+ *   an idle queue still self-cleans within `ttlMs` of its last write.
  * @property {object} [breaker] - Circuit breaker for fault isolation (shared `createCircuitBreaker`).
  * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
  */
@@ -79,27 +89,33 @@ export function createDeadLetter(client, options = {}) {
 	}
 
 	/**
-	 * Evict expired (TTL) and over-cap records. `ref` is the reference "now" for
-	 * the TTL cutoff - the just-captured record's failedAt, which is ~wall-now.
-	 * Best-effort: a failure here never fails the add (capture is best-effort).
+	 * Evict expired (TTL) and over-cap records. `serverNow` is the server's
+	 * clock read at add time - the ONLY eviction reference; record stamps are
+	 * display data. Each zrem+hdel pair rides one MULTI so the hash and the
+	 * order set never diverge. Best-effort: a failure here never fails the add
+	 * (capture is best-effort).
 	 */
-	async function evict(ref) {
+	async function evict(serverNow) {
 		if (ttlMs > 0) {
 			// Inclusive cutoff (drop records at least ttlMs old). 1ms of TTL
 			// precision is immaterial for a dead-letter retention window.
-			const cutoff = ref - ttlMs;
+			const cutoff = serverNow - ttlMs;
 			const expired = await withBreaker(b, () => redis.zrangebyscore(orderKey, '-inf', cutoff));
 			if (expired && expired.length) {
-				await withBreaker(b, () => redis.zrem(orderKey, ...expired));
-				await withBreaker(b, () => redis.hdel(recsKey, ...expired));
+				const tx = redis.multi();
+				tx.zrem(orderKey, ...expired);
+				tx.hdel(recsKey, ...expired);
+				await withBreaker(b, () => tx.exec());
 			}
 		}
 		const card = await withBreaker(b, () => redis.zcard(orderKey));
 		if (card > max) {
 			const over = await withBreaker(b, () => redis.zrange(orderKey, 0, card - max - 1));
 			if (over && over.length) {
-				await withBreaker(b, () => redis.zrem(orderKey, ...over));
-				await withBreaker(b, () => redis.hdel(recsKey, ...over));
+				const tx = redis.multi();
+				tx.zrem(orderKey, ...over);
+				tx.hdel(recsKey, ...over);
+				await withBreaker(b, () => tx.exec());
 			}
 		}
 	}
@@ -107,7 +123,17 @@ export function createDeadLetter(client, options = {}) {
 	return {
 		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
 		async add(rec) {
-			const failedAt = typeof rec.failedAt === 'number' ? rec.failedAt : 0;
+			// One TIME round-trip per add is fine - DLQ adds are a rare error
+			// path. The caller's failedAt is kept for display, clamped to
+			// (0, serverNow]: an implausible stamp (missing, non-finite, <= 0,
+			// or in the server's future) becomes serverNow.
+			const t = await withBreaker(b, () => redis.time());
+			const serverNow = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+			const failedAt =
+				typeof rec.failedAt === 'number' && Number.isFinite(rec.failedAt)
+					&& rec.failedAt > 0 && rec.failedAt <= serverNow
+					? rec.failedAt
+					: serverNow;
 			const json = JSON.stringify({
 				webhookId: rec.webhookId,
 				topic: rec.topic,
@@ -118,9 +144,20 @@ export function createDeadLetter(client, options = {}) {
 				failedAt
 			});
 			const id = String(await withBreaker(b, () => redis.incr(seqKey)));
-			await withBreaker(b, () => redis.hset(recsKey, id, json));
-			await withBreaker(b, () => redis.zadd(orderKey, failedAt, id));
-			await evict(failedAt);
+			const tx = redis.multi();
+			tx.hset(recsKey, id, json);
+			tx.zadd(orderKey, failedAt, id);
+			if (ttlMs > 0) {
+				// Quiet-queue backstop: with failedAt <= serverNow, every live
+				// record's eviction due time is at or before this key TTL, so
+				// nothing is dropped early - and an idle DLQ self-cleans within
+				// ttlMs even if no further add ever runs the evictor.
+				tx.pexpire(recsKey, ttlMs);
+				tx.pexpire(orderKey, ttlMs);
+				tx.pexpire(seqKey, ttlMs);
+			}
+			await withBreaker(b, () => tx.exec());
+			await evict(serverNow).catch(() => { /* capture already persisted */ });
 			mAdded?.inc({ topic: mt ? mt(rec.topic) : rec.topic });
 			return id;
 		},
@@ -133,8 +170,11 @@ export function createDeadLetter(client, options = {}) {
 
 		/** @param {string} id @returns {Promise<boolean>} */
 		async remove(id) {
-			const removed = await withBreaker(b, () => redis.hdel(recsKey, String(id)));
-			await withBreaker(b, () => redis.zrem(orderKey, String(id)));
+			const tx = redis.multi();
+			tx.hdel(recsKey, String(id));
+			tx.zrem(orderKey, String(id));
+			const res = await withBreaker(b, () => tx.exec());
+			const removed = res && res[0] && res[0][0] == null ? Number(res[0][1]) : 0;
 			return removed > 0;
 		},
 

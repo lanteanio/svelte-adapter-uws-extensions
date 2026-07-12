@@ -1,12 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createDeadLetter } from '../../src/postgres/dead-letter.js';
 
 // A focused in-memory Postgres double for exactly the queries the dead-letter
 // store issues (autoMigrate:false skips DDL). It mirrors PG semantics for those
-// queries (INSERT RETURNING id, id-ordered eviction, count/group, jsonb round
-// trip) so the store's orchestration + result mapping is verified in the default
-// suite; real-PG fidelity is the job of an integration test.
-function fakePg() {
+// queries (INSERT RETURNING id with the failed_at clamp, id-ordered eviction,
+// db-clock TTL cutoff, count/group, jsonb round trip) so the store's
+// orchestration + result mapping is verified in the default suite; real-PG
+// fidelity is the job of an integration test. `nowFn` is the database clock
+// (`extract(epoch from now()) * 1000`), controllable per test.
+function fakePg(nowFn = () => Date.now()) {
 	let rows = [];
 	let nextId = 1;
 	const hydrate = (r) => ({ ...r, data: r.data == null ? null : JSON.parse(r.data) });
@@ -15,10 +17,14 @@ function fakePg() {
 			const s = sql.replace(/\s+/g, ' ').trim();
 			if (s.startsWith('INSERT INTO svti_dead_letter')) {
 				const id = nextId++;
+				// LEAST(NULLIF($7::bigint, 0), now_ms): Postgres LEAST ignores
+				// NULLs, so 0 -> now, a future stamp -> now, a past stamp -> kept.
+				const v = Number(values[6]);
+				const failedAt = v === 0 ? nowFn() : Math.min(v, nowFn());
 				rows.push({
 					svti_dead_letter_id: id,
 					webhook_id: values[0], topic: values[1], event: values[2],
-					data: values[3], attempts: values[4], error: values[5], failed_at: values[6]
+					data: values[3], attempts: values[4], error: values[5], failed_at: failedAt
 				});
 				return { rows: [{ svti_dead_letter_id: id }], rowCount: 1 };
 			}
@@ -31,9 +37,10 @@ function fakePg() {
 				rows = rows.filter((r) => r.svti_dead_letter_id > cutoffRow.svti_dead_letter_id);
 				return { rows: [], rowCount: before - rows.length };
 			}
-			if (s === 'DELETE FROM svti_dead_letter WHERE failed_at < $1') {
+			if (s === "DELETE FROM svti_dead_letter WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1") {
+				const cutoff = nowFn() - values[0];
 				const before = rows.length;
-				rows = rows.filter((r) => r.failed_at >= values[0]);
+				rows = rows.filter((r) => r.failed_at >= cutoff);
 				return { rows: [], rowCount: before - rows.length };
 			}
 			if (s === 'DELETE FROM svti_dead_letter WHERE svti_dead_letter_id = $1') {
@@ -86,6 +93,10 @@ function fakePg() {
 
 const rec = (over = {}) => ({
 	webhookId: 'w1', topic: 'orders', event: 'created', data: { n: 1 }, attempts: 3, error: 'boom', failedAt: 100, ...over
+});
+
+afterEach(() => {
+	vi.useRealTimers();
 });
 
 describe('postgres dead-letter store', () => {
@@ -154,10 +165,56 @@ describe('postgres dead-letter store', () => {
 		expect((await store.list()).map((r) => r.failedAt)).toEqual([3, 2]);
 	});
 
-	it('drops records older than ttlMs on write', async () => {
-		store = createDeadLetter(client, { autoMigrate: false, ttlMs: 1000 });
-		await store.add(rec({ failedAt: 100 }));
-		await store.add(rec({ failedAt: 5000 })); // ref 5000, cutoff 4000 -> drops failedAt=100
-		expect((await store.list()).map((r) => r.failedAt)).toEqual([5000]);
+	it('drops records older than ttlMs on write, clocked by the database', async () => {
+		let now = 100_000;
+		client = fakePg(() => now);
+		store = createDeadLetter(client, { autoMigrate: false, ttlMs: 1000, cleanupInterval: 0 });
+		await store.add(rec({ failedAt: 99_000 }));
+		now = 100_500; // first record is now 1500ms old
+		await store.add(rec({ failedAt: 100_400 }));
+		expect((await store.list()).map((r) => r.failedAt)).toEqual([100_400]);
+	});
+
+	it('a future producer stamp cannot mass-evict healthy records (db clock rules)', async () => {
+		let now = 100_000;
+		client = fakePg(() => now);
+		store = createDeadLetter(client, { autoMigrate: false, ttlMs: 10_000, cleanupInterval: 0 });
+		await store.add(rec({ webhookId: 'healthy', failedAt: 99_000 }));
+		// A skewed producer stamps far ahead. Under a stamp-clocked cutoff this
+		// would sweep everything older than future-ttl, i.e. the healthy record.
+		await store.add(rec({ webhookId: 'skewed', failedAt: 10_000_000 }));
+		expect((await store.list()).map((r) => r.webhookId).sort()).toEqual(['healthy', 'skewed']);
+	});
+
+	it('clamps an implausible failedAt to the database clock', async () => {
+		client = fakePg(() => 50_000);
+		store = createDeadLetter(client, { autoMigrate: false });
+		const idFuture = await store.add(rec({ failedAt: 99_999_999 }));
+		const idMissing = await store.add(rec({ failedAt: undefined }));
+		const idZero = await store.add(rec({ failedAt: 0 }));
+		for (const id of [idFuture, idMissing, idZero]) {
+			expect((await store.get(id)).failedAt).toBe(50_000);
+		}
+		const idPast = await store.add(rec({ failedAt: 42_000 }));
+		expect((await store.get(idPast)).failedAt).toBe(42_000);
+	});
+
+	it('the periodic sweep clears an idle queue, and destroy() stops it', async () => {
+		vi.useFakeTimers();
+		let now = 100_000;
+		client = fakePg(() => now);
+		store = createDeadLetter(client, { autoMigrate: false, ttlMs: 1000, cleanupInterval: 500 });
+		await store.add(rec({ failedAt: 100_000 }));
+		expect(await store.count()).toBe(1);
+
+		now = 102_000; // the record ages past ttlMs with no further writes
+		await vi.advanceTimersByTimeAsync(500);
+		expect(await store.count()).toBe(0); // swept by the timer, not by an add
+
+		store.destroy();
+		await store.add(rec({ failedAt: 102_000 }));
+		now = 200_000;
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(await store.count()).toBe(1); // destroyed -> no sweep runs
 	});
 });

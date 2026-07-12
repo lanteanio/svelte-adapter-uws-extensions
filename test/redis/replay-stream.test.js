@@ -829,13 +829,14 @@ describe('redis replay (stream backend)', () => {
 	});
 
 	describe('per-entry topic field (dropped; versioned read)', () => {
-		it('a new-format publish stores only event + data, and since() recovers the topic from the key', async () => {
+		it('a new-format publish stores a version + event + data, and since() recovers the topic from the key', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
-			// The stored entry carries no topic field - it is the per-topic key.
+			// The stored entry carries a `v` version discriminator and no topic field
+			// - the topic is the per-topic key.
 			const stream = client._streams.get(client.key('replay:streambuf:{chat}'));
 			const fieldNames = stream[0].fields.map(([k]) => k);
-			expect(fieldNames).toEqual(['event', 'data']);
+			expect(fieldNames).toEqual(['v', 'event', 'data']);
 			expect(fieldNames).not.toContain('topic');
 
 			// since() still returns the topic, recovered from the param.
@@ -854,15 +855,16 @@ describe('redis replay (stream backend)', () => {
 			expect(msg).toEqual({ seq: 1, topic: 'chat', event: 'created', data: { id: 1 } });
 		});
 
-		it('a legacy entry returns the STORED topic field when present', async () => {
-			// Only legacy entries carry the field, so the fallback prefers it: a
-			// legacy entry round-trips exactly as it was written.
+		it('derives the topic from the key even when a legacy entry carries a disagreeing topic field', async () => {
+			// The key is the topic's authoritative home; a stored topic that disagrees
+			// with it is exactly the redundancy the versioned envelope removes, so the
+			// reader ignores it and returns the key-derived topic.
 			await client.redis.xadd(
 				client.key('replay:streambuf:{room}'),
 				'1-0', 'topic', 'legacy-topic', 'event', 'e', 'data', 'null'
 			);
 			const [msg] = await replay.since('room', 0);
-			expect(msg.topic).toBe('legacy-topic');
+			expect(msg.topic).toBe('room');
 			expect(msg.data).toBe(null);
 		});
 
@@ -876,6 +878,78 @@ describe('redis replay (stream backend)', () => {
 				{ seq: 1, topic: 'chat', event: 'old', data: { n: 1 } },
 				{ seq: 2, topic: 'chat', event: 'new', data: { n: 2 } }
 			]);
+		});
+	});
+
+	describe('generation-safe dedup + bounded dedup memory + versioned envelope', () => {
+		let r;
+		beforeEach(() => { r = createReplay(client, { storage: 'stream', size: 100 }); });
+
+		it('a within-generation retry dedups to the same seq', async () => {
+			const a = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			const b = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(a).toEqual({ seq: 1, isDuplicate: false });
+			expect(b).toEqual({ seq: 1, isDuplicate: true });
+		});
+
+		it('a retry after a seq-space reset re-publishes instead of returning a dead cached seq', async () => {
+			const first = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(first).toEqual({ seq: 1, isDuplicate: false });
+			// clearTopic bumps the epoch and wipes seq+stream; the dedup cache survives
+			// (idmp is a separate key), so a stale bare-seq return would point the
+			// client at an unrelated entry in the restarted numbering.
+			await r.clearTopic('chat');
+			const retry = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(retry.isDuplicate).toBe(false); // re-published into the new generation
+			// A second retry WITHIN the new generation dedups normally again.
+			const retry2 = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(retry2).toEqual({ seq: retry.seq, isDuplicate: true });
+		});
+
+		it('honors a legacy bare-seq dedup value for one window (backward compatible)', async () => {
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			await client.redis.hset(idmpKey, 'r1', '7'); // pre-versioning value, no epoch
+			const res = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(res).toEqual({ seq: 7, isDuplicate: true });
+		});
+
+		it('gives the dedup field a per-field TTL on a server that supports HEXPIRE', async () => {
+			await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1', idempotencyTtl: 100 });
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			const [ttlMs] = await client.redis.hpttl(idmpKey, 'FIELDS', 1, 'r1');
+			expect(ttlMs).toBeGreaterThan(0);
+			expect(ttlMs).toBeLessThanOrEqual(100 * 1000);
+		});
+
+		it('falls back to a whole-hash TTL (no per-field TTL) on a pre-7.4 / pre-Valkey-9 server', async () => {
+			client.redis._info = '# Server\nredis_version:6.2.0\n';
+			const rOld = createReplay(client, { storage: 'stream', size: 100 });
+			await rOld.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1', idempotencyTtl: 100 });
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			const [ttlMs] = await client.redis.hpttl(idmpKey, 'FIELDS', 1, 'r1');
+			expect(ttlMs).toBe(-1); // field present, no per-field TTL (whole-hash EXPIRE path)
+		});
+
+		it('uses per-field TTL on Valkey 9.0+ (pinned redis_version notwithstanding)', async () => {
+			client.redis._info = '# Server\nredis_version:7.2.4\nserver_name:valkey\nvalkey_version:9.0.0\n';
+			const rValkey = createReplay(client, { storage: 'stream', size: 100 });
+			await rValkey.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1', idempotencyTtl: 100 });
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			const [ttlMs] = await client.redis.hpttl(idmpKey, 'FIELDS', 1, 'r1');
+			expect(ttlMs).toBeGreaterThan(0);
+		});
+
+		it('drops a stored entry with an unknown envelope version as corruption', async () => {
+			const key = client.key('replay:streambuf:{chat}');
+			await client.redis.xadd(key, '1-0', 'v', '99', 'event', 'e', 'data', '{"n":1}');
+			await client.redis.xadd(key, '2-0', 'v', '1', 'event', 'ok', 'data', '{"n":2}');
+			expect(await r.since('chat', 0)).toEqual([{ seq: 2, topic: 'chat', event: 'ok', data: { n: 2 } }]);
+		});
+
+		it('drops a stored entry missing a required field as corruption', async () => {
+			const key = client.key('replay:streambuf:{chat}');
+			await client.redis.xadd(key, '1-0', 'v', '1', 'data', '{"n":1}'); // no event
+			expect(await r.since('chat', 0)).toEqual([]);
 		});
 	});
 });

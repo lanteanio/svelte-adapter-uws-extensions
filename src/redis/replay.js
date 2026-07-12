@@ -28,6 +28,7 @@ import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, 
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess } from '../shared/replay-gate.js';
+import { decodeSortedSetMember } from '../shared/replay-envelope.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
 
@@ -57,13 +58,19 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * KEYS[1] = seq key
  * KEYS[2] = buf key (sorted set)
  * KEYS[3] = epoch key
- * ARGV[1] = topic
- * ARGV[2] = event
- * ARGV[3] = data (JSON-encoded)
- * ARGV[4] = maxSize
- * ARGV[5] = ttl (seconds, 0 = no expiry)
+ * ARGV[1] = event
+ * ARGV[2] = data (JSON-encoded)
+ * ARGV[3] = maxSize
+ * ARGV[4] = ttl (seconds, 0 = no expiry)
  *
  * Returns the new sequence number.
+ *
+ * The stored member is a VERSIONED envelope `{"v":1,"seq":N,"event":..,"data":..}`.
+ * The topic is NOT stored: it is the per-topic buffer key, so writing it into
+ * every member is a redundant value the reader recovers from the key. The `seq`
+ * stays in the member (it is the read authority) and equals the ZSET score by
+ * construction. `v` lets a future format change be a self-describing migration;
+ * an absent `v` on a legacy member reads as v1.
  *
  * When the seq counter reads 1 the seq space is fresh: either a brand-new
  * topic or one whose seq key was reaped (TTL expiry) since the last publish.
@@ -77,11 +84,10 @@ const PUBLISH_SCRIPT = `
 local seqKey = KEYS[1]
 local bufKey = KEYS[2]
 local epochKey = KEYS[3]
-local topic = ARGV[1]
-local event = ARGV[2]
-local data = ARGV[3]
-local maxSize = tonumber(ARGV[4])
-local ttl = tonumber(ARGV[5])
+local event = ARGV[1]
+local data = ARGV[2]
+local maxSize = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
 if maxSize == nil or ttl == nil then
   return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl must be numeric')
 end
@@ -90,7 +96,7 @@ local seq = redis.call('incr', seqKey)
 if seq == 1 then
   redis.call('incr', epochKey)
 end
-local envelope = cjson.encode({seq = seq, topic = topic, event = event})
+local envelope = cjson.encode({v = 1, seq = seq, event = event})
 local payload = string.sub(envelope, 1, -2) .. ',"data":' .. data .. '}'
 redis.call('zadd', bufKey, seq, payload)
 
@@ -140,6 +146,7 @@ export function createReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 	const mStorageFallbacks = localFanoutOnStorageFailure
@@ -152,6 +159,14 @@ export function createReplay(client, options = {}) {
 
 	function bufKey(topic) {
 		return client.key('replay:buf:{' + topic + '}');
+	}
+
+	// Recover a topic from its `replay:buf:{<topic>}` key for the erasure scan,
+	// where the loop holds the key rather than the topic (the key is the topic's
+	// canonical home now that the envelope no longer stores it).
+	const bufPrefix = client.key('replay:buf:{');
+	function topicFromBufKey(key) {
+		return key.startsWith(bufPrefix) && key.endsWith('}') ? key.slice(bufPrefix.length, key.length - 1) : '';
 	}
 
 	// Per-topic seq-space generation. Wrapped in the SAME hash tag as seq:/buf:
@@ -241,7 +256,7 @@ export function createReplay(client, options = {}) {
 			let seq;
 			try {
 				seq = Number(await withBreaker(b, () =>
-					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, topic, event, payload, maxSize, ttl)
+					evalCached(redis, PUBLISH_SCRIPT, 3, sk, bk, ek, event, payload, maxSize, ttl)
 				));
 			} catch (err) {
 				if (localFanoutOnStorageFailure) {
@@ -301,16 +316,13 @@ export function createReplay(client, options = {}) {
 			}
 
 			for (let i = 0; i < raw.length; i++) {
-				try {
-					const parsed = JSON.parse(raw[i]);
-					if (parsed.seq != null) {
-						b?.success();
-						if (parsed.seq > target) {
-							return { truncated: true, missingFrom: target };
-						}
-						return { truncated: false, missingFrom: null };
-					}
-				} catch { /* skip corrupt */ }
+				const decoded = decodeSortedSetMember(raw[i], topic);
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				b?.success();
+				if (decoded.seq > target) {
+					return { truncated: true, missingFrom: target };
+				}
+				return { truncated: false, missingFrom: null };
 			}
 
 			let val;
@@ -340,9 +352,9 @@ export function createReplay(client, options = {}) {
 			const raw = await withBreaker(b, () => redis.zrangebyscore(bufKey(topic), since + 1, '+inf'));
 			const result = [];
 			for (let i = 0; i < raw.length; i++) {
-				try {
-					result.push(JSON.parse(raw[i]));
-				} catch { /* skip corrupted entry */ }
+				const decoded = decodeSortedSetMember(raw[i], topic);
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				result.push(decoded);
 			}
 			return result;
 		},
@@ -383,13 +395,10 @@ export function createReplay(client, options = {}) {
 			let oldestSeq = null;
 			if (oldestRaw) {
 				for (let i = 0; i < oldestRaw.length; i++) {
-					try {
-						const parsed = JSON.parse(oldestRaw[i]);
-						if (parsed.seq != null) {
-							oldestSeq = parsed.seq;
-							break;
-						}
-					} catch { /* skip corrupt */ }
+					const decoded = decodeSortedSetMember(oldestRaw[i], topic);
+					if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+					oldestSeq = decoded.seq;
+					break;
 				}
 			}
 			if (oldestSeq !== null && sinceSeq > 0 && oldestSeq > sinceSeq + 1) {
@@ -399,9 +408,9 @@ export function createReplay(client, options = {}) {
 
 			const missed = [];
 			for (let i = 0; i < missedRaw.length; i++) {
-				try {
-					missed.push(JSON.parse(missedRaw[i]));
-				} catch { /* skip corrupted */ }
+				const decoded = decodeSortedSetMember(missedRaw[i], topic);
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				missed.push(decoded);
 			}
 
 			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0) {
@@ -463,14 +472,15 @@ export function createReplay(client, options = {}) {
 			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
 			let n = 0;
 			for (const bk of keys) {
+				const topic = topicFromBufKey(bk);
 				let members;
 				try { members = await redis.zrange(bk, 0, -1); } catch { continue; }
 				const toRemove = [];
 				for (const member of members) {
-					let parsed;
-					try { parsed = JSON.parse(member); } catch { continue; }
+					const decoded = decodeSortedSetMember(member, topic);
+					if (decoded === null) continue;
 					let uid;
-					try { uid = forgetUserId({ topic: parsed.topic, event: parsed.event, data: parsed.data }); } catch { continue; }
+					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
 					if (uid === userId) toRemove.push(member);
 				}
 				if (toRemove.length > 0) {

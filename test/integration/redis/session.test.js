@@ -230,4 +230,33 @@ describe('redis distributed session (integration)', () => {
 			}
 		});
 	});
+
+	describe('byuser index field TTL', () => {
+		// Proves the HPEXPIRE call shape against the real server (the mock
+		// cannot catch an argument-order mistake the server would reject).
+		// The Valkey tiers re-run this on a real Valkey 9.0+.
+		it('the index field carries its own real per-field TTL and slides with touch', async () => {
+			const sessions = createDistributedSession(client, {
+				forgetUserId: (d) => d && d.userId,
+				ttlMs: 30_000
+			});
+			await sessions.set('tok-idx', { userId: 'u-idx' });
+
+			const idxKey = client.key('sess:byuser:u-idx');
+			const [ttl1] = await client.redis.hpttl(idxKey, 'FIELDS', 1, 'tok-idx');
+			expect(ttl1).toBeGreaterThan(0);
+			expect(ttl1).toBeLessThanOrEqual(30_000);
+
+			// Let the field TTL decay on the server's clock, then touch: the
+			// field must re-arm alongside the record or a touch-kept session
+			// escapes purgeUser once the field lapses.
+			await waitRedisMs(client, 600);
+			expect(await sessions.touch('tok-idx')).toBe(true);
+			const [ttl2] = await client.redis.hpttl(idxKey, 'FIELDS', 1, 'tok-idx');
+			expect(ttl2).toBeGreaterThan(30_000 - 500);
+
+			expect(await sessions.purgeUser(null, 'u-idx')).toBe(1);
+			expect(await sessions.get('tok-idx')).toBe(null);
+		});
+	});
 });
