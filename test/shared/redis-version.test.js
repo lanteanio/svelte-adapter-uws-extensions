@@ -74,10 +74,13 @@ describe('createHashFieldTTLProbe (soft gate)', () => {
 	function fakeRedis(info) {
 		let fail = false;
 		let calls = 0;
+		const listeners = {};
 		return {
 			setInfo(v) { info = v; },
 			setFail(v) { fail = v; },
 			get calls() { return calls; },
+			on(ev, fn) { (listeners[ev] ||= []).push(fn); return this; },
+			emit(ev) { (listeners[ev] || []).forEach((fn) => fn()); },
 			async info() {
 				calls++;
 				if (fail) throw new Error('CONNECTION_BROKEN');
@@ -116,6 +119,20 @@ describe('createHashFieldTTLProbe (soft gate)', () => {
 
 	it('falls back (false) on an unparseable INFO rather than risking HPEXPIRE', async () => {
 		expect(await createHashFieldTTLProbe(fakeRedis('garbage')).ready()).toBe(false);
+	});
+
+	it('re-probes after a reconnect lands on a different server (ready event + invalidate)', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		const probe = createHashFieldTTLProbe(redis);
+		expect(await probe.ready()).toBe(true); // modern primary supports HPEXPIRE
+		// A failover promotes an older replica; the reconnect fires 'ready'.
+		redis.setInfo(redisInfo('7.2.4'));
+		redis.emit('ready');
+		expect(await probe.ready()).toBe(false); // re-probed the older server -> fallback
+		// invalidate() forces the same re-detection explicitly.
+		redis.setInfo(redisInfo('7.4.0'));
+		probe.invalidate();
+		expect(await probe.ready()).toBe(true);
 	});
 
 	it('leaves the result unknown on a transient failure and re-probes next call', async () => {

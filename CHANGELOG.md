@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The per-field-TTL capability probe re-detects after a reconnect.** The soft HEXPIRE/HPEXPIRE probe cached its answer for the process lifetime, so a failover to an older server (or a rolling downgrade) left a stale "supported" verdict that made the publish path HPEXPIRE a server that rejects it. It now re-probes on every reconnect and exposes `invalidate()` for a caller that catches an unknown-command error.
+
 ## [0.6.0-next.55] - 2026-07-13
 
 ### Fixed

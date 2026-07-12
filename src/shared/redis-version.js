@@ -69,8 +69,16 @@ export function hashFieldTTLSupport(info) {
  * cannot await; `ready()` awaits the in-flight probe so a call that CAN await
  * gets the definitive answer from its first use.
  *
+ * A reconnect can land on a DIFFERENT server (a failover to an older replica, a
+ * rolling downgrade), so the cached capability must not outlive the connection
+ * that produced it - a stale `true` would make the hot publish path HPEXPIRE a
+ * server that rejects it (`ERR unknown command`). The probe drops its cached
+ * answer on every `ready` event so the next call re-probes the current server,
+ * and exposes `invalidate()` so a caller that catches an unknown-command error
+ * can force the same re-detection.
+ *
  * @param {any} redis an ioredis Redis / Cluster instance (or the test double)
- * @returns {{ supported: () => boolean, ready: () => Promise<boolean> }}
+ * @returns {{ supported: () => boolean, ready: () => Promise<boolean>, invalidate: () => void }}
  */
 export function createHashFieldTTLProbe(redis) {
 	/** @type {boolean | null} null = not yet probed */
@@ -85,8 +93,13 @@ export function createHashFieldTTLProbe(redis) {
 			.catch(() => { /* transient: leave unknown so the next call re-probes */ })
 			.finally(() => { inflight = null; });
 	}
+	function invalidate() { known = null; }
+	// Re-detect after any (re)connect; guarded so a test double / non-emitter
+	// client (which never reconnects) is a no-op.
+	if (typeof redis.on === 'function') redis.on('ready', invalidate);
 	return {
 		supported() { trigger(); return known === true; },
-		async ready() { trigger(); if (inflight) await inflight; return known === true; }
+		async ready() { trigger(); if (inflight) await inflight; return known === true; },
+		invalidate
 	};
 }
