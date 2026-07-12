@@ -175,6 +175,40 @@ describe('postgres dead-letter store', () => {
 		expect((await store.list()).map((r) => r.failedAt)).toEqual([100_400]);
 	});
 
+	it('add() still resolves when the size-trim eviction fails (row already persisted)', async () => {
+		const base = fakePg();
+		const flaky = {
+			async query(sql, values) {
+				const s = sql.replace(/\s+/g, ' ').trim();
+				if (s.startsWith('DELETE FROM svti_dead_letter WHERE svti_dead_letter_id <= (SELECT')) {
+					throw new Error('deadlock detected');
+				}
+				return base.query(sql, values);
+			}
+		};
+		store = createDeadLetter(flaky, { autoMigrate: false, max: 1 });
+		const id = await store.add(rec({ webhookId: 'kept' })); // must NOT reject
+		expect(id).toBeTruthy();
+		expect((await store.get(id)).webhookId).toBe('kept'); // INSERT persisted despite the trim failure
+	});
+
+	it('add() still resolves when the TTL eviction fails (row already persisted)', async () => {
+		const base = fakePg();
+		const flaky = {
+			async query(sql, values) {
+				const s = sql.replace(/\s+/g, ' ').trim();
+				if (s.startsWith('DELETE FROM svti_dead_letter WHERE failed_at <')) {
+					throw new Error('statement timeout');
+				}
+				return base.query(sql, values);
+			}
+		};
+		store = createDeadLetter(flaky, { autoMigrate: false, ttlMs: 1000, cleanupInterval: 0 });
+		const id = await store.add(rec({ webhookId: 'kept2', failedAt: 100 }));
+		expect(id).toBeTruthy();
+		expect((await store.get(id)).webhookId).toBe('kept2');
+	});
+
 	it('a future producer stamp cannot mass-evict healthy records (db clock rules)', async () => {
 		let now = 100_000;
 		client = fakePg(() => now);

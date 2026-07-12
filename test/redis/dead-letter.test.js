@@ -122,6 +122,17 @@ describe('redis dead-letter store', () => {
 		expect((await store.get(idPast)).failedAt).toBe(before - 5_000);
 	});
 
+	it('floors a fractional failedAt to integer ms, matching the Postgres clamp', async () => {
+		const before = Date.now();
+		// A fractional in-range stamp floors to integer ms so both backends agree.
+		const idFrac = await store.add(rec({ failedAt: 100.7 }));
+		expect((await store.get(idFrac)).failedAt).toBe(100);
+		// A sub-1ms stamp floors to 0 and clamps to the server clock (as the Postgres
+		// LEAST(NULLIF(floor, 0), now) does), instead of storing an ~1970 stamp.
+		const idTiny = await store.add(rec({ failedAt: 0.5 }));
+		expect((await store.get(idTiny)).failedAt).toBeGreaterThanOrEqual(before);
+	});
+
 	it('clears everything', async () => {
 		await store.add(rec());
 		await store.add(rec());

@@ -129,11 +129,15 @@ export function createDeadLetter(client, options = {}) {
 			// or in the server's future) becomes serverNow.
 			const t = await withBreaker(b, () => redis.time());
 			const serverNow = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+			// Floor to integer ms then clamp, matching the Postgres backend's
+			// LEAST(NULLIF(floor($7), 0), now): a fractional sub-1ms stamp floors
+			// to 0 and becomes serverNow on both backends rather than diverging.
+			const flooredFailedAt =
+				typeof rec.failedAt === 'number' && Number.isFinite(rec.failedAt) && rec.failedAt > 0
+					? Math.floor(rec.failedAt)
+					: 0;
 			const failedAt =
-				typeof rec.failedAt === 'number' && Number.isFinite(rec.failedAt)
-					&& rec.failedAt > 0 && rec.failedAt <= serverNow
-					? rec.failedAt
-					: serverNow;
+				flooredFailedAt > 0 && flooredFailedAt <= serverNow ? flooredFailedAt : serverNow;
 			const json = JSON.stringify({
 				webhookId: rec.webhookId,
 				topic: rec.topic,

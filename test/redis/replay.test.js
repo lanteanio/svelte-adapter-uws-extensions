@@ -319,6 +319,19 @@ describe('redis replay', () => {
 			expect(msgs[0].data.data).toEqual({ id: 1 });
 			expect(msgs[1].data.data).toEqual({ id: 2 });
 		});
+
+		it('counts a head-corrupt member once, not once per internal scan', async () => {
+			const { createMetrics } = await import('../../src/prometheus/index.js');
+			const metrics = createMetrics();
+			const tracked = createReplay(client, { size: 5, metrics });
+			for (let i = 1; i <= 3; i++) await tracked.publish(platform, 'chat', 'created', { id: i });
+			// Corrupt the head (seq 1); it lands in both the oldest-probe scan and the
+			// delivered (since 0) scan, so a per-scan counter double-reports one entry.
+			const bufKey = client.key('replay:buf:{chat}');
+			client._sortedSets.get(bufKey)[0] = { score: 1, member: '{broken' };
+			await tracked.replay({}, 'chat', 0, platform);
+			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="chat"\} 1/);
+		});
 	});
 
 	describe('truncation with corrupt oldest entry', () => {

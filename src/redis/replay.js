@@ -395,8 +395,12 @@ export function createReplay(client, options = {}) {
 			let oldestSeq = null;
 			if (oldestRaw) {
 				for (let i = 0; i < oldestRaw.length; i++) {
+					// Probe for the oldest valid seq (truncation detection) only. A
+					// corrupt member here is counted by the missed-range scan below when
+					// it falls in the delivered range; counting it in both loops would
+					// double-report the same entry in replay_corruptions_total.
 					const decoded = decodeSortedSetMember(oldestRaw[i], topic);
-					if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+					if (decoded === null) continue;
 					oldestSeq = decoded.seq;
 					break;
 				}

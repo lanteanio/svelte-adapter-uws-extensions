@@ -89,12 +89,20 @@ local cached = redis.call('hget', idmpKey, requestId)
 if cached then
   local sep = string.find(cached, ':', 1, true)
   if sep == nil then
-    return {1, tonumber(cached)}
-  end
-  local cachedEpoch = tonumber(string.sub(cached, 1, sep - 1))
-  local cachedSeq = tonumber(string.sub(cached, sep + 1))
-  if cachedEpoch == curEpoch then
-    return {1, cachedSeq}
+    -- Legacy bare-seq (pre-versioning) carries no epoch, so it is trustworthy
+    -- only while no reset has occurred: a clearTopic or fresh-seq publish bumps
+    -- the epoch above 0, after which the bare seq may index an unrelated entry in
+    -- the restarted numbering. curEpoch == 0 means no bump has happened - honor it
+    -- then; otherwise fall through and re-publish into the current generation.
+    if curEpoch == 0 then
+      return {1, tonumber(cached)}
+    end
+  else
+    local cachedEpoch = tonumber(string.sub(cached, 1, sep - 1))
+    local cachedSeq = tonumber(string.sub(cached, sep + 1))
+    if cachedEpoch == curEpoch then
+      return {1, cachedSeq}
+    end
   end
 end
 
@@ -439,9 +447,20 @@ export function createStreamReplay(client, options = {}) {
 			}
 
 			if (entries.length > 0) {
-				const seq = seqFromId(entries[0][0]);
+				const [id, flat] = entries[0];
+				const seq = seqFromId(id);
 				b?.success();
 				if (seq > target) {
+					return { truncated: true, missingFrom: target };
+				}
+				// seq === target, but the entry must also decode: an unknown-version
+				// or field-missing entry is dropped by replay()/since(), so reporting
+				// it as present here would call a hole the client cannot fill
+				// contiguous. A corrupt entry at target is a gap - matches the
+				// sorted-set gap() and the strict replay read path, and is counted.
+				const decoded = decodeStreamFields(fieldsToObject(flat), seq, topic);
+				if (decoded === null) {
+					mCorruptions?.inc({ topic: mt(topic) });
 					return { truncated: true, missingFrom: target };
 				}
 				return { truncated: false, missingFrom: null };

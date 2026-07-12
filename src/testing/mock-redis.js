@@ -1590,14 +1590,20 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const cached = idmp.get(requestId);
 				const sep = cached.indexOf(':');
 				if (sep === -1) {
-					return [1, parseInt(cached, 10)]; // legacy bare-seq value
+					// Legacy bare-seq (pre-versioning): honorable only while no reset
+					// has bumped the epoch (curEpoch === 0); see the Lua for the
+					// rationale. Otherwise fall through and re-publish.
+					if (curEpoch === 0) {
+						return [1, parseInt(cached, 10)];
+					}
+				} else {
+					const cachedEpoch = parseInt(cached.slice(0, sep), 10);
+					const cachedSeq = parseInt(cached.slice(sep + 1), 10);
+					if (cachedEpoch === curEpoch) {
+						return [1, cachedSeq];
+					}
+					// Stale generation: fall through and re-publish into the current one.
 				}
-				const cachedEpoch = parseInt(cached.slice(0, sep), 10);
-				const cachedSeq = parseInt(cached.slice(sep + 1), 10);
-				if (cachedEpoch === curEpoch) {
-					return [1, cachedSeq];
-				}
-				// Stale generation: fall through and re-publish into the current one.
 			}
 
 			const seq = parseInt(store.get(seqKey) || '0', 10) + 1;

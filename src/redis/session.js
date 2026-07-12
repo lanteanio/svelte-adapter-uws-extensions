@@ -239,15 +239,26 @@ export function createDistributedSession(client, options = {}) {
 					const raw = await redis.get(key);
 					breaker?.success();
 					if (raw != null) {
-						let data;
+						let p;
 						let parsed = false;
 						try {
-							const p = JSON.parse(raw);
-							// Unwrap a lifecycle record ({ d, c }); raw-layer data passes through.
-							data = (p !== null && typeof p === 'object' && 'd' in p && 'c' in p) ? p.d : p;
+							p = JSON.parse(raw);
 							parsed = true;
 						} catch { /* corrupt record: nothing to index */ }
-						if (parsed) await indexToken(data, token);
+						if (parsed) {
+							// touch cannot tell raw-layer data from a lifecycle record
+							// ({ d, c }) without reading it, and the shapes can collide
+							// (raw data may itself carry `d`/`c`). A shape guess mis-indexes
+							// the collision and lets the record's TTL slide while its index
+							// field expires - a purgeUser escape. Index against both candidate
+							// shapes instead; indexToken is a no-op when the extractor finds
+							// no owner, so whichever layer this actually is gets its index
+							// field slid and neither can escape erasure.
+							await indexToken(p, token);
+							if (p !== null && typeof p === 'object' && 'd' in p && 'c' in p) {
+								await indexToken(p.d, token);
+							}
+						}
 					}
 				} catch (err) { breaker?.failure(err); }
 			}

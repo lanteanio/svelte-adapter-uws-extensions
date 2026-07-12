@@ -200,6 +200,27 @@ describe('redis replay (stream backend)', () => {
 			}
 			expect(await replay.gap('chat', 10)).toEqual({ truncated: false, missingFrom: null });
 		});
+
+		it('reports a gap when the entry at the next seq is corrupt (decodes it, not just id-matches)', async () => {
+			// A newer node wrote seq 2 in an unknown envelope version; replay()/since()
+			// drop it on read, so gap() must not call the hole it leaves contiguous -
+			// this matches the sorted-set gap() and the strict replay read path.
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			const key = client.key('replay:streambuf:{chat}');
+			await client.redis.xadd(key, '2-0', 'v', '99', 'event', 'created', 'data', '{"id":2}');
+			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
+		});
+
+		it('counts the corrupt next-seq entry in replay_corruptions_total', async () => {
+			const { createMetrics } = await import('../../src/prometheus/index.js');
+			const metrics = createMetrics();
+			const tracked = createReplay(client, { storage: 'stream', size: 5, metrics });
+			await tracked.publish(platform, 'chat', 'created', { id: 1 });
+			const key = client.key('replay:streambuf:{chat}');
+			await client.redis.xadd(key, '2-0', 'v', '99', 'event', 'created', 'data', '{"id":2}');
+			await tracked.gap('chat', 1);
+			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="chat"\} 1/);
+		});
 	});
 
 	describe('resumeHook', () => {
@@ -911,6 +932,20 @@ describe('redis replay (stream backend)', () => {
 			await client.redis.hset(idmpKey, 'r1', '7'); // pre-versioning value, no epoch
 			const res = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
 			expect(res).toEqual({ seq: 7, isDuplicate: true });
+		});
+
+		it('does NOT honor a legacy bare-seq dedup value once a reset bumped the epoch', async () => {
+			// A pre-versioning bare value carries no generation. After a reset bumps
+			// the epoch above 0, the bare seq may point at an unrelated entry in the
+			// restarted numbering, so it must re-publish, not return the dead seq.
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			await client.redis.hset(idmpKey, 'r1', '3'); // legacy bare value, no epoch
+			await client.redis.set(client.key('replay:epoch:{chat}'), '1'); // a reset occurred
+			const retry = await r.publishIdempotent(platform, 'chat', 'e', { n: 9 }, { producerId: 'p1', requestId: 'r1' });
+			expect(retry.isDuplicate).toBe(false); // re-published into the current generation
+			// The re-stamped value now dedups normally within the current generation.
+			const again = await r.publishIdempotent(platform, 'chat', 'e', { n: 9 }, { producerId: 'p1', requestId: 'r1' });
+			expect(again).toEqual({ seq: retry.seq, isDuplicate: true });
 		});
 
 		it('gives the dedup field a per-field TTL on a server that supports HEXPIRE', async () => {

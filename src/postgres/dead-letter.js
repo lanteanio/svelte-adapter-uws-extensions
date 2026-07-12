@@ -172,18 +172,22 @@ export function createDeadLetter(client, options = {}) {
 				         $8) RETURNING ${pkCol}`,
 				[rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId]
 			));
+			// The row is committed (autocommit). Retention trims are best-effort
+			// from here: a failed size/TTL delete - or an open breaker - must not
+			// reject an add whose record already persisted, or the caller retries
+			// and double-captures. Mirrors the Redis backend's evict().catch().
 			// Size trim: keep the newest `max` rows (by id). The OFFSET subquery
 			// returns the (max+1)-th newest id, or NULL when under the cap (a no-op).
 			await withBreaker(b, () => client.query(
 				`DELETE FROM ${table} WHERE ${pkCol} <= (SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} DESC OFFSET $1 LIMIT 1)`,
 				[max]
-			));
+			)).catch(() => { /* capture already persisted */ });
 			// TTL sweep against the database clock, never the producer stamp.
 			if (ttlMs > 0) {
 				await withBreaker(b, () => client.query(
 					`DELETE FROM ${table} WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1`,
 					[ttlMs]
-				));
+				)).catch(() => { /* capture already persisted */ });
 			}
 			mAdded?.inc({ topic: mt ? mt(rec.topic) : rec.topic });
 			return String(res.rows[0][pkCol]);

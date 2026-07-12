@@ -127,6 +127,9 @@ describe('postgres replay (integration)', () => {
 		const BEYOND_INT32 = 3_000_000_000; // > 2^31-1 (2147483647), < 2^53
 
 		it('seq() reads a value past the INTEGER ceiling', async () => {
+			// Migration is lazy (first store call), so trigger it before seeding the
+			// counter directly - otherwise the ${TABLE}_seq table does not exist yet.
+			await replay.seq('big');
 			await client.query(
 				`INSERT INTO ${TABLE}_seq (topic, seq) VALUES ($1, $2)
 				 ON CONFLICT (topic) DO UPDATE SET seq = EXCLUDED.seq`,
@@ -136,6 +139,8 @@ describe('postgres replay (integration)', () => {
 		});
 
 		it('gap() probes the counter past the INTEGER ceiling without overflow', async () => {
+			// Trigger the lazy migration before seeding the counter directly.
+			await replay.seq('big');
 			await client.query(
 				`INSERT INTO ${TABLE}_seq (topic, seq) VALUES ($1, $2)
 				 ON CONFLICT (topic) DO UPDATE SET seq = EXCLUDED.seq`,

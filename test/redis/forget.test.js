@@ -363,6 +363,21 @@ describe('redis session byuser index field TTL', () => {
 		expect(ttlMs).toBeGreaterThan(9900);
 	});
 
+	it('touch slides the index for raw data that collides with the lifecycle {d,c} shape', async () => {
+		const client = mockRedisClient('app:');
+		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
+		// Raw-layer data that happens to carry top-level `d` and `c` keys. A shape
+		// guess misreads it as a lifecycle wrapper, indexes the wrong payload, and
+		// lets the record outlive its index field - a purgeUser escape.
+		await session.set('tok', { d: 'last-seen', c: 7, userId: 'u1' });
+		await sleep(150);
+
+		expect(await session.touch('tok')).toBe(true);
+		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
+		expect(ttlMs).toBeGreaterThan(9900); // re-armed by touch despite the {d,c} collision
+		expect(await session.purgeUser(null, 'u1')).toBe(1);
+	});
+
 	it('a sliding get refreshes the index field along with the record', async () => {
 		const client = mockRedisClient('app:');
 		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });

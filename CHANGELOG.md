@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.55] - 2026-07-13
+
+### Fixed
+
+- **Persisting a dead-letter record no longer fails when its retention trim does.** The Postgres backend committed the row, then ran the size-cap and TTL deletes; a transient error on either (a lock timeout, or an open circuit breaker) rejected the whole `add` even though the record was already durable, so the caller could re-capture and double-store it. The trims are now best-effort - the committed row is what `add` reports, matching the Redis backend.
+- **A touched raw session that resembles a lifecycle record no longer escapes erasure.** `touch` inferred whether a token held raw data or a lifecycle wrapper from its shape (top-level `d` and `c` keys); raw data that happened to carry both keys was misread, so `touch` slid the record's TTL but not its per-user index field, and `purgeUser` could then miss it. `touch` now re-arms the index for both shapes, so neither storage layer can outlive its index.
+- **The stream replay backend's `gap()` no longer calls a corrupt next entry contiguous.** It compared only the stored sequence id; an entry at the next sequence written in an unknown envelope version (or missing a required field) is dropped on replay, yet `gap()` reported it present - a host relying on `gap()` to decide whether to rehydrate could leave a silent hole. `gap()` now decodes that entry, reports a gap when it is corrupt (matching the sorted-set backend and the strict replay read path), and counts it in `replay_corruptions_total`.
+- **A legacy bare-sequence dedup value is no longer honored across a reset.** A `publishIdempotent` dedup entry written before generation-stamping carries no epoch; it was returned as a duplicate even after the sequence space reset, pointing the client at an unrelated entry in the restarted numbering. It is now honored only while no reset has occurred, and re-published otherwise.
+- **`replay_corruptions_total` no longer double-counts a corrupt entry at the buffer head.** The sorted-set replay scanned the head twice (an oldest-entry probe plus the delivered range); a corrupt member present in both was counted twice. The probe no longer counts - the delivered-range scan is authoritative.
+- **Both dead-letter backends store the same `failedAt` for a fractional stamp.** Redis kept a sub-millisecond `failedAt` verbatim while Postgres floored it (and coerced a sub-1ms value to the server clock), so the displayed stamp could differ between backends. Redis now floors and clamps identically.
+
 ## [0.6.0-next.54] - 2026-07-12
 
 ### Changed
