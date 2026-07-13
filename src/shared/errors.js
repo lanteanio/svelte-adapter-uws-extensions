@@ -59,6 +59,30 @@ export class IdempotencyResultTooLargeError extends Error {
 }
 
 /**
+ * Thrown by an idempotency-store `commit(result)` when the caller no longer
+ * owns the pending slot: its `acquireTtl` expired and a successor re-acquired
+ * the key before this owner committed. Committing would overwrite the
+ * successor's slot, so the store refuses and throws instead of corrupting it.
+ *
+ * Cross-backend (Redis + Postgres) so consumer code can pattern-match on
+ * `err.code === 'IDEMPOTENCY_LEASE_LOST'` regardless of which backend they
+ * wired. A handler that finishes within `acquireTtl` (the common case) never
+ * triggers it. `abort()` does NOT throw on lease loss - there is nothing of
+ * this owner's left to release - it is a silent no-op.
+ */
+export class IdempotencyLeaseLostError extends Error {
+	/**
+	 * @param {string} key - The idempotency key whose lease was lost.
+	 */
+	constructor(key) {
+		super(`idempotency: lease lost for key "${key}"; the pending slot expired and was re-acquired before commit`);
+		this.name = 'IdempotencyLeaseLostError';
+		this.code = 'IDEMPOTENCY_LEASE_LOST';
+		this.key = key;
+	}
+}
+
+/**
  * Thrown by RPC-shaped operations (`presence.join`, `cursor.attach`) when the
  * caller's websocket closes during an async gap before the operation could
  * commit, OR the websocket was already gone by the time the operation

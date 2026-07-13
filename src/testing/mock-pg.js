@@ -320,7 +320,9 @@ export function mockPgClient(options = {}) {
 
 		// ----- Idempotency dispatch (matched first; markers: `expires_at`, `WHERE key`)
 
-		// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING status
+		// Acquire: INSERT ... ON CONFLICT (svti_idempotency_key) DO UPDATE ... WHERE expires_at < now() RETURNING owner_token.
+		// A fresh insert or an expired-row takeover stamps the caller's owner_token
+		// (values[4]) and returns it so commit/abort can compare against it.
 		if (
 			sql.startsWith('INSERT INTO') &&
 			sql.includes('ON CONFLICT (svti_idempotency_key)') &&
@@ -328,15 +330,12 @@ export function mockPgClient(options = {}) {
 		) {
 			const key = values[0];
 			const acquireTtlSec = Number(values[1]);
+			const ownerToken = values[4];
 			const expiresAt = idemNow() + acquireTtlSec * 1000;
 			const existing = idemRows.get(key);
-			if (!existing) {
-				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
-				return { rows: [{ status: 'pending' }], rowCount: 1 };
-			}
-			if (existing.expires_at < idemNow()) {
-				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt });
-				return { rows: [{ status: 'pending' }], rowCount: 1 };
+			if (!existing || existing.expires_at < idemNow()) {
+				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt, owner_token: ownerToken });
+				return { rows: [{ owner_token: ownerToken }], rowCount: 1 };
 			}
 			return { rows: [], rowCount: 0 };
 		}
@@ -356,7 +355,10 @@ export function mockPgClient(options = {}) {
 		}
 
 		// Commit: UPDATE ... SET status = 'committed', result = $2::jsonb, expires_at = ...
+		//   WHERE svti_idempotency_key = $1 AND owner_token = $4.
 		// (Idempotency-specific: WHERE svti_idempotency_key = $1.  Task commits match a different branch below.)
+		// Token-guarded: a stale owner whose row a successor took over (different
+		// owner_token) matches zero rows, so the real store throws lease-lost.
 		if (
 			sql.startsWith('UPDATE') &&
 			sql.includes("status = 'committed'") &&
@@ -365,13 +367,15 @@ export function mockPgClient(options = {}) {
 			const key = values[0];
 			const result = typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1];
 			const ttlSec = Number(values[2]);
+			const ownerToken = values[3];
 			const row = idemRows.get(key);
-			if (row) {
+			if (row && row.owner_token === ownerToken) {
 				row.status = 'committed';
 				row.result = result;
 				row.expires_at = idemNow() + ttlSec * 1000;
+				return { rows: [], rowCount: 1 };
 			}
-			return { rows: [], rowCount: row ? 1 : 0 };
+			return { rows: [], rowCount: 0 };
 		}
 
 		// Cleanup: DELETE FROM ... WHERE expires_at < now()
@@ -387,7 +391,25 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: removed };
 		}
 
-		// Abort / purge: DELETE FROM ... WHERE svti_idempotency_key = $1
+		// Abort: DELETE FROM ... WHERE svti_idempotency_key = $1 AND owner_token = $2
+		// (token-guarded). Matched BEFORE purge because purge's key-only matcher is
+		// a prefix of this one; a stale owner (mismatched token) is a no-op.
+		if (
+			sql.startsWith('DELETE FROM') &&
+			sql.includes('WHERE svti_idempotency_key = $1') &&
+			sql.includes('owner_token')
+		) {
+			const key = values[0];
+			const ownerToken = values[1];
+			const row = idemRows.get(key);
+			if (row && row.owner_token === ownerToken) {
+				idemRows.delete(key);
+				return { rows: [], rowCount: 1 };
+			}
+			return { rows: [], rowCount: 0 };
+		}
+
+		// Purge: DELETE FROM ... WHERE svti_idempotency_key = $1 (key-only, unconditional).
 		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE svti_idempotency_key = $1')) {
 			const key = values[0];
 			const had = idemRows.delete(key);

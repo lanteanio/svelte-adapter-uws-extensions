@@ -274,6 +274,66 @@ describe('postgres idempotency', () => {
 		});
 	});
 
+	describe('stale owner (owner token)', () => {
+		it('a stale commit throws IdempotencyLeaseLostError and leaves the successor row intact', async () => {
+			const s = createIdempotencyStore(client, { acquireTtl: 1, cleanupInterval: 0 });
+			const now = Date.now();
+			vi.spyOn(Date, 'now').mockReturnValue(now);
+
+			const a = await s.acquire('order:99');
+			expect(a.acquired).toBe(true);
+
+			// Advance past the acquireTtl so a successor can take the row over,
+			// re-stamping the owner_token.
+			Date.now.mockReturnValue(now + 2000);
+			const b = await s.acquire('order:99');
+			expect(b.acquired).toBe(true);
+
+			// The stale owner's commit matches zero rows (its token was replaced).
+			await expect(a.commit({ from: 'A' })).rejects.toMatchObject({
+				name: 'IdempotencyLeaseLostError',
+				code: 'IDEMPOTENCY_LEASE_LOST'
+			});
+
+			// The successor's row is untouched and it can still commit its result.
+			await b.commit({ from: 'B' });
+			expect((await s.acquire('order:99')).result).toEqual({ from: 'B' });
+
+			s.destroy();
+		});
+
+		it('a stale abort is a no-op that leaves the successor row intact', async () => {
+			const s = createIdempotencyStore(client, { acquireTtl: 1, cleanupInterval: 0 });
+			const now = Date.now();
+			vi.spyOn(Date, 'now').mockReturnValue(now);
+
+			const a = await s.acquire('order:100');
+			Date.now.mockReturnValue(now + 2000);
+			const b = await s.acquire('order:100');
+			expect(b.acquired).toBe(true);
+
+			// The stale owner's abort must not delete the successor's row.
+			await expect(a.abort()).resolves.toBeUndefined();
+
+			// The successor still owns the pending row and can commit.
+			expect((await s.acquire('order:100')).pending).toBe(true);
+			await b.commit({ from: 'B' });
+			expect((await s.acquire('order:100')).result).toEqual({ from: 'B' });
+
+			s.destroy();
+		});
+
+		it('the owning caller still commits and aborts normally (token matches)', async () => {
+			const a = await store.acquire('order:101');
+			await expect(a.commit({ ok: 1 })).resolves.toBeUndefined();
+			expect((await store.acquire('order:101')).result).toEqual({ ok: 1 });
+
+			const c = await store.acquire('order:102');
+			await expect(c.abort()).resolves.toBeUndefined();
+			expect((await store.acquire('order:102')).acquired).toBe(true);
+		});
+	});
+
 	describe('ready()', () => {
 		it('resolves once the table migration completes', async () => {
 			await expect(store.ready()).resolves.toBeUndefined();

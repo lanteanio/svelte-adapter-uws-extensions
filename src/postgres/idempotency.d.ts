@@ -56,8 +56,13 @@ export function createIdempotencyStore(
 ): PgIdempotencyStore;
 
 /**
- * Re-exported cross-backend error: `commit(result)` rejects with this when
- * the JSON-encoded result exceeds `maxResultBytes`. Catch on
- * `err.code === 'IDEMPOTENCY_RESULT_TOO_LARGE'` regardless of backend.
+ * Re-exported cross-backend errors:
+ * - `IdempotencyResultTooLargeError` - `commit(result)` rejects when the
+ *   JSON-encoded result exceeds `maxResultBytes`
+ *   (`err.code === 'IDEMPOTENCY_RESULT_TOO_LARGE'`).
+ * - `IdempotencyLeaseLostError` - `commit(result)` rejects when the owner's
+ *   `acquireTtl` expired and a successor re-acquired the key first
+ *   (`err.code === 'IDEMPOTENCY_LEASE_LOST'`).
+ * Both are identical across the Redis and Postgres backends.
  */
-export { IdempotencyResultTooLargeError } from '../redis/idempotency.js';
+export { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../redis/idempotency.js';

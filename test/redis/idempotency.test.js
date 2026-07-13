@@ -299,6 +299,79 @@ describe('redis idempotency', () => {
 		});
 	});
 
+	describe('stale owner (lease token)', () => {
+		it('a stale commit throws IdempotencyLeaseLostError and leaves the successor slot intact', async () => {
+			const a = await store.acquire('order:99');
+			expect(a.acquired).toBe(true);
+
+			// Simulate the pending acquireTtl expiring: Redis drops the key.
+			client._store.delete('test:idem:order:99');
+
+			// A successor re-acquires the freed slot with a fresh owner token.
+			const b = await store.acquire('order:99');
+			expect(b.acquired).toBe(true);
+
+			// The stale owner, unaware it lost the lease, tries to commit.
+			await expect(a.commit({ from: 'A' })).rejects.toMatchObject({
+				name: 'IdempotencyLeaseLostError',
+				code: 'IDEMPOTENCY_LEASE_LOST'
+			});
+
+			// The successor's slot is untouched: it can still commit its own result.
+			await b.commit({ from: 'B' });
+			expect((await store.acquire('order:99')).result).toEqual({ from: 'B' });
+		});
+
+		it('a stale abort is a no-op that leaves the successor slot intact', async () => {
+			const a = await store.acquire('order:100');
+			client._store.delete('test:idem:order:100');
+			const b = await store.acquire('order:100');
+			expect(b.acquired).toBe(true);
+
+			// The stale owner's abort must not release the successor's slot.
+			await expect(a.abort()).resolves.toBeUndefined();
+
+			// The successor is still the pending owner and can still commit.
+			expect((await store.acquire('order:100')).pending).toBe(true);
+			await b.commit({ from: 'B' });
+			expect((await store.acquire('order:100')).result).toEqual({ from: 'B' });
+		});
+
+		it('the owning caller still commits and aborts normally (token matches)', async () => {
+			const a = await store.acquire('order:101');
+			await expect(a.commit({ ok: 1 })).resolves.toBeUndefined();
+			expect((await store.acquire('order:101')).result).toEqual({ ok: 1 });
+
+			const c = await store.acquire('order:102');
+			await expect(c.abort()).resolves.toBeUndefined();
+			expect((await store.acquire('order:102')).acquired).toBe(true);
+		});
+
+		it('a lost-lease commit does not index the key under the losing owner (no cross-user over-delete)', async () => {
+			// User A acquires with right-to-erasure metadata, then its slot expires.
+			const a = await store.acquire('order:shared', undefined, { user: 'uA', tenant: 't1' });
+			expect(a.acquired).toBe(true);
+			client._store.delete('test:idem:order:shared');
+
+			// A DIFFERENT user re-acquires the freed slot and commits its own result.
+			const b = await store.acquire('order:shared', undefined, { user: 'uB', tenant: 't1' });
+			expect(b.acquired).toBe(true);
+			await b.commit({ owner: 'B' });
+
+			// The stale owner commits late -> lease lost -> writes NOTHING, not even
+			// the forget index (the cache key now holds uB's result).
+			await expect(a.commit({ owner: 'A' })).rejects.toMatchObject({ code: 'IDEMPOTENCY_LEASE_LOST' });
+
+			// uA's erasure must not touch uB's committed result.
+			expect(await store.purgeUser('t1', 'uA')).toBe(0);
+			expect((await store.acquire('order:shared')).result).toEqual({ owner: 'B' });
+
+			// uB's own erasure still finds and removes it.
+			expect(await store.purgeUser('t1', 'uB')).toBe(1);
+			expect((await store.acquire('order:shared')).acquired).toBe(true);
+		});
+	});
+
 	describe('ready()', () => {
 		it('resolves immediately (no DDL on Redis)', async () => {
 			await expect(store.ready()).resolves.toBeUndefined();

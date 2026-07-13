@@ -1905,7 +1905,7 @@ The store exposes three states via `acquire(key)`:
 - **pending** - another caller acquired the slot and has not committed yet. Decide locally whether to return a 409, retry later, or wait.
 - **result** - a previous run committed. The cached value is returned.
 
-A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hold the key, so a crashed owner cannot deadlock retries forever. On `commit` the longer `ttl` (default 48 hours) replaces the sentinel and governs the cache lifetime.
+A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hold the key, so a crashed owner cannot deadlock retries forever. Each `acquire` stamps the pending slot with a distinct owner token, and `commit`/`abort` act only on the slot they still own (see [Lease loss](#lease-loss-commit-after-expiry)). On `commit` the longer `ttl` (default 48 hours) governs the cache lifetime.
 
 Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
 
@@ -1955,6 +1955,8 @@ CREATE TABLE IF NOT EXISTS svti_idempotency (
 );
 CREATE INDEX IF NOT EXISTS idx_svti_idempotency_expires_at ON svti_idempotency (expires_at);
 ```
+
+The migration also adds `owner_token` (lease-token safety, below) and `user_id` / `tenant_id` (right-to-erasure) via `ADD COLUMN IF NOT EXISTS`, so an existing table forward-migrates on next boot.
 
 #### Usage
 
@@ -2007,6 +2009,29 @@ export async function placeOrder(input, ctx) {
 #### Choosing acquireTtl
 
 `acquireTtl` is the upper bound on how long a single execution of the wrapped operation can run before retries see the slot as available again. Set it longer than your worst expected latency for the wrapped handler, but short enough that a crashed instance does not block retries for too long. The default (60 seconds) suits most HTTP and RPC handlers; bump it for long-running tasks (large file uploads, multi-step workflows) and trim it for tight read-heavy paths.
+
+#### Lease loss (commit after expiry)
+
+If a handler runs past its `acquireTtl`, the pending slot expires and a **successor** retry can re-acquire the same key. The original owner must not then overwrite the successor's slot on `commit` or delete it on `abort` - that would re-run an at-most-once effect or resurface a stale result. Each `acquire` mints a distinct owner token (stored in the pending slot on Redis, an `owner_token` column on Postgres), and:
+
+- **`commit()` compare-and-sets against it.** If the lease was lost, it rejects with `IdempotencyLeaseLostError` (`err.code === 'IDEMPOTENCY_LEASE_LOST'`) and writes nothing, leaving the successor's slot intact.
+- **`abort()` compare-and-deletes against it.** If the lease was lost, it is a silent no-op - there is nothing of this owner's left to release.
+
+A handler that finishes within `acquireTtl` (the common case) never sees the error. Catch it on the `code` - it is identical across the Redis and Postgres backends:
+
+```js
+try {
+  await slot.commit(result);
+} catch (err) {
+  if (err.code === 'IDEMPOTENCY_LEASE_LOST') {
+    // Our lease expired and a retry took over; it owns the outcome now.
+    return;
+  }
+  throw err;
+}
+```
+
+Keeping `acquireTtl` comfortably above the handler's worst-case latency makes lease loss rare; the token guarantee is the safety net for the tail that exceeds it.
 
 #### Pairing with the Dedup plugin
 

@@ -19,9 +19,17 @@ export interface RedisIdempotencyOptions {
 
 export interface IdempotencySlotAcquired {
 	acquired: true;
-	/** Store the result and start the long TTL. Call exactly once. */
+	/**
+	 * Store the result and start the long TTL. Call exactly once. Rejects with
+	 * `IdempotencyLeaseLostError` if this owner's `acquireTtl` expired and a
+	 * successor re-acquired the key before the commit (the common case - a
+	 * handler that finishes within `acquireTtl` - never rejects).
+	 */
 	commit(result: unknown): Promise<void>;
-	/** Release the slot so retries may re-execute. Call on error paths. */
+	/**
+	 * Release the slot so retries may re-execute. Call on error paths. A no-op
+	 * (never throws) if the lease was already lost to a successor.
+	 */
 	abort(): Promise<void>;
 }
 
@@ -53,6 +61,21 @@ export class IdempotencyResultTooLargeError extends Error {
 	/** Configured cap. */
 	maxBytes: number;
 	constructor(bytes: number, maxBytes: number);
+}
+
+/**
+ * Thrown by `commit(result)` when the caller lost its lease: the `acquireTtl`
+ * expired and a successor re-acquired the key before this owner committed.
+ * Cross-backend (Redis + Postgres); catch on
+ * `err.code === 'IDEMPOTENCY_LEASE_LOST'` regardless of backend. `abort()`
+ * never throws on lease loss - it is a silent no-op.
+ */
+export class IdempotencyLeaseLostError extends Error {
+	name: 'IdempotencyLeaseLostError';
+	code: 'IDEMPOTENCY_LEASE_LOST';
+	/** The idempotency key whose lease was lost. */
+	key: string;
+	constructor(key: string);
 }
 
 export interface RedisIdempotencyStore {

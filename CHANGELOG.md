@@ -5,6 +5,16 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.57] - 2026-07-13
+
+### Added
+
+- **`IdempotencyLeaseLostError`.** A cross-backend error (`code: 'IDEMPOTENCY_LEASE_LOST'`) that an idempotency-store `commit(result)` rejects with when the owner's `acquireTtl` expired and a successor re-acquired the key before the commit. Re-exported from both `redis/idempotency` and `postgres/idempotency` so consumers catch it on `err.code` regardless of backend.
+
+### Fixed
+
+- **An expired idempotency owner can no longer overwrite or delete its successor's slot.** The pending slot was a shared sentinel with an unconditional result-write on commit and delete on abort (Redis), and a key-only predicate on both (Postgres), so an owner whose `acquireTtl` expired - and whose slot a successor had already re-acquired - would clobber the successor's cached result on `commit` or release it on `abort`, letting an at-most-once effect run again. Each `acquire` now mints a distinct owner token (stored in the pending slot on Redis, an `owner_token` column on Postgres); `commit` compare-and-sets and `abort` compare-and-deletes against it. A stale owner's `commit()` rejects with `IdempotencyLeaseLostError` instead of corrupting the slot, and its `abort()` is a silent no-op. A handler that finishes within `acquireTtl` never sees the error.
+
 ## [0.6.0-next.56] - 2026-07-13
 
 ### Fixed

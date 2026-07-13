@@ -885,6 +885,18 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes("'NX', 'EX', ARGV[2]") && script.includes("return {0, '', 1}")) {
 					return evalIdempotencyAcquire(args);
 				}
+				// Idempotency commit (compare-and-set: SET result iff owner token matches).
+				// Matched before the fence scripts: both compare a stored value, the
+				// IDEM_COMMIT marker disambiguates.
+				if (script.includes('IDEM_COMMIT')) {
+					return evalIdempotencyCommit(args);
+				}
+				// Idempotency abort (compare-and-delete: DEL iff owner token matches).
+				// Its DEL would otherwise look like the fence-release script; the
+				// IDEM_ABORT marker keeps them distinct and is matched first.
+				if (script.includes('IDEM_ABORT')) {
+					return evalIdempotencyAbort(args);
+				}
 				// Fence heartbeat (refresh PEXPIRE iff value matches)
 				if (script.includes("redis.call('PEXPIRE'") && script.includes('v == ARGV[1]')) {
 					return evalFenceHeartbeat(args);
@@ -1773,22 +1785,54 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Idempotency acquire Lua script simulation
-		// args layout: [key, sentinel, acquireTtlSec]
+		// args layout: [key, ownerToken, acquireTtlSec, pendingPrefix]
 		// Returns: [1, '', 0] acquired, [0, '', 1] pending, [0, value, 0] cached result.
+		// Pending is detected by the prefix (each owner writes a distinct token),
+		// matching the real ACQUIRE_SCRIPT's string.sub check.
 		// TTL is not simulated; tests that exercise expiry should mutate the
 		// store directly or call the store's purge/clear surface.
 		function evalIdempotencyAcquire(args) {
 			const key = args[0];
-			const sentinel = args[1];
+			const ownerToken = args[1];
+			const prefix = args[3];
 			const existing = store.get(key);
 			if (existing === undefined) {
-				store.set(key, sentinel);
+				store.set(key, ownerToken);
 				return [1, '', 0];
 			}
-			if (existing === sentinel) {
+			if (typeof existing === 'string' && existing.startsWith(prefix)) {
 				return [0, '', 1];
 			}
 			return [0, existing, 0];
+		}
+
+		// Idempotency commit compare-and-set simulation.
+		// args layout: [key, ownerToken, value, ttlSec]
+		// Writes the value only if the stored owner token still matches (the owner
+		// still holds the slot); returns 1 on success, 0 if the lease was lost.
+		function evalIdempotencyCommit(args) {
+			const key = args[0];
+			const ownerToken = args[1];
+			const value = args[2];
+			if (store.get(key) === ownerToken) {
+				store.set(key, value);
+				return 1;
+			}
+			return 0;
+		}
+
+		// Idempotency abort compare-and-delete simulation.
+		// args layout: [key, ownerToken]
+		// Deletes the slot only if the stored owner token still matches; returns 1
+		// if released, 0 if the lease was lost (no-op).
+		function evalIdempotencyAbort(args) {
+			const key = args[0];
+			const ownerToken = args[1];
+			if (store.get(key) === ownerToken) {
+				store.delete(key);
+				return 1;
+			}
+			return 0;
 		}
 
 		// Fence heartbeat Lua script simulation

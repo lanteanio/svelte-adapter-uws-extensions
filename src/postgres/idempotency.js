@@ -30,11 +30,11 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
-import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { setIntervalTimer, clearIntervalTimer, randomUuid } from '../shared/runtime.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
-import { IdempotencyResultTooLargeError } from '../shared/errors.js';
+import { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../shared/errors.js';
 
-export { IdempotencyResultTooLargeError };
+export { IdempotencyResultTooLargeError, IdempotencyLeaseLostError };
 
 const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
 
@@ -127,6 +127,13 @@ export function createIdempotencyStore(client, options = {}) {
 		// deployment). ADD COLUMN IF NOT EXISTS forward-migrates existing tables.
 		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
 		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tenant_id TEXT`);
+			// Owner token: a distinct UUID minted per acquire and matched by
+			// commit/abort so an owner whose acquireTtl expired (and whose row a
+			// successor took over) cannot overwrite or delete the successor's row.
+			// Legacy rows stay NULL until they expire, same as the columns above; a
+			// legacy owner's commit/abort simply no-ops/throws once a successor has
+			// re-stamped a fresh token.
+			await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS owner_token TEXT`);
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (tenant_id, user_id)
 		`);
@@ -174,7 +181,7 @@ export function createIdempotencyStore(client, options = {}) {
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
-	function commitFor(idempotencyKey) {
+	function commitFor(idempotencyKey, ownerToken) {
 		return async function commit(result) {
 			const payload = JSON.stringify(result === undefined ? null : result);
 			const bytes = Buffer.byteLength(payload);
@@ -184,25 +191,34 @@ export function createIdempotencyStore(client, options = {}) {
 				// acquireTtl expiration sweeps it.
 				throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
 			}
-			await withBreaker(b, () => client.query({
+			// Token-guarded UPDATE: only commit if this owner still holds the row.
+			// A stale owner whose acquireTtl expired and whose row a successor took
+			// over matches zero rows here - refuse rather than clobber the successor.
+			const res = await withBreaker(b, () => client.query({
 				name: 'idem_commit_' + table,
 				text: `UPDATE ${table}
 				          SET status = 'committed',
 				              result = $2::jsonb,
 				              expires_at = now() + ($3 || ' seconds')::interval
-				        WHERE svti_idempotency_key = $1`,
-				values: [idempotencyKey, payload, ttl]
+				        WHERE svti_idempotency_key = $1 AND owner_token = $4`,
+				values: [idempotencyKey, payload, ttl, ownerToken]
 			}));
+			if (!res || res.rowCount === 0) {
+				throw new IdempotencyLeaseLostError(idempotencyKey);
+			}
 			mCommits?.inc();
 		};
 	}
 
-	function abortFor(idempotencyKey) {
+	function abortFor(idempotencyKey, ownerToken) {
 		return async function abort() {
+			// Token-guarded DELETE: release the row only if this owner still holds
+			// it. A token mismatch (a successor re-acquired) matches zero rows and
+			// is a silent no-op - never delete the successor's row.
 			await withBreaker(b, () => client.query({
 				name: 'idem_abort_' + table,
-				text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1`,
-				values: [idempotencyKey]
+				text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1 AND owner_token = $2`,
+				values: [idempotencyKey, ownerToken]
 			}));
 			mAborts?.inc();
 		};
@@ -215,23 +231,27 @@ export function createIdempotencyStore(client, options = {}) {
 		// only need to know "did we end up owning this row" - both paths
 		// return at least one row. user_id/tenant_id ride along (right-to-erasure);
 		// a takeover re-stamps them so the columns track the current owner.
+		// A distinct owner_token is minted here and re-stamped on takeover, so a
+		// prior owner's token no longer matches the row - its commit/abort no-op.
+		const ownerToken = randomUuid();
 		const ins = await client.query({
 			name: 'idem_acquire_' + table,
-			text: `INSERT INTO ${table} (svti_idempotency_key, status, result, expires_at, user_id, tenant_id)
-			       VALUES ($1, 'pending', NULL, now() + ($2 || ' seconds')::interval, $3, $4)
+			text: `INSERT INTO ${table} (svti_idempotency_key, status, result, expires_at, user_id, tenant_id, owner_token)
+			       VALUES ($1, 'pending', NULL, now() + ($2 || ' seconds')::interval, $3, $4, $5)
 			       ON CONFLICT (svti_idempotency_key) DO UPDATE
 			         SET status = 'pending',
 			             result = NULL,
 			             expires_at = now() + ($2 || ' seconds')::interval,
 			             user_id = EXCLUDED.user_id,
-			             tenant_id = EXCLUDED.tenant_id
+			             tenant_id = EXCLUDED.tenant_id,
+			             owner_token = EXCLUDED.owner_token
 			         WHERE ${table}.expires_at < now()
-			       RETURNING status`,
-			values: [idempotencyKey, acquireTtl, userId ?? null, tenantId ?? null]
+			       RETURNING owner_token`,
+			values: [idempotencyKey, acquireTtl, userId ?? null, tenantId ?? null, ownerToken]
 		});
 
 		if (ins.rowCount > 0) {
-			return { acquired: true };
+			return { acquired: true, ownerToken: ins.rows[0].owner_token };
 		}
 
 		const sel = await client.query({
@@ -284,8 +304,8 @@ export function createIdempotencyStore(client, options = {}) {
 				mAcquired?.inc();
 				return {
 					acquired: true,
-					commit: commitFor(idempotencyKey),
-					abort: abortFor(idempotencyKey)
+					commit: commitFor(idempotencyKey, outcome.ownerToken),
+					abort: abortFor(idempotencyKey, outcome.ownerToken)
 				};
 			}
 			if (outcome.pending) {
