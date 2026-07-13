@@ -333,6 +333,22 @@ export class UnknownTaskError extends Error {
 }
 
 /**
+ * Thrown by `run()` when this worker's fence was superseded by another worker
+ * before it could record its outcome, and the canonical terminal result did
+ * not become durable within `awaitTimeout`. The task is not lost - the winning
+ * worker owns it - but this caller cannot report a canonical value, so it
+ * throws rather than returning its stale local attempt. Retry (or
+ * `await(taskId)`) to read the canonical outcome once it lands. Catch on
+ * `err.code === 'TASK_FENCE_LOST'`.
+ */
+export class TaskFenceLostError extends Error {
+	name: 'TaskFenceLostError';
+	code: 'TASK_FENCE_LOST';
+	taskId: string;
+	taskName: string;
+}
+
+/**
  * Create a Postgres-backed durable task runner.
  */
 export function createTaskRunner(client: PgClient, options?: TaskRunnerOptions): TaskRunner;

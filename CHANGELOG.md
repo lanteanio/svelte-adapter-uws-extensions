@@ -5,6 +5,16 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.58] - 2026-07-14
+
+### Added
+
+- **`TaskFenceLostError`.** A task-runner error (`code: 'TASK_FENCE_LOST'`) that `run()` throws when this worker's fence was superseded by another worker and the canonical outcome did not become terminal within `awaitTimeout`. Exported from `postgres/tasks`.
+
+### Fixed
+
+- **A fenced-out task caller no longer returns or caches a non-canonical result.** When a worker's fence was superseded mid-run, `run()` could return the stale result it produced locally (differing from the durable row), and the idempotency store would then cache it - so a later retry with the same key got the stale value while the row held the canonical outcome. The commit-lost path now polls the durable row for the canonical terminal result (bounded by `awaitTimeout`) instead of yielding the local attempt, and the fail-lost path - which previously always threw the local error - now reports the canonical outcome too (which may be a success committed by the winning worker). If no canonical outcome becomes durable within the bound, `run()` throws `TaskFenceLostError` rather than a stale value. Background dispatch/recovery callers, whose result is discarded, do not poll.
+
 ## [0.6.0-next.57] - 2026-07-13
 
 ### Added

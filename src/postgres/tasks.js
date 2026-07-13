@@ -51,6 +51,7 @@ import {
 import {
 	TaskInFlightError,
 	UnknownTaskError,
+	TaskFenceLostError,
 	deserialiseError,
 	serialiseError
 } from './_tasks-errors.js';
@@ -60,7 +61,7 @@ import { withBreaker } from '../shared/breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS } from '../shared/caps.js';
 
-export { TaskInFlightError, UnknownTaskError };
+export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 
 /**
  * @typedef {Object} TaskStateChangeEvent
@@ -345,7 +346,40 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId) {
+	// Fence-out canonical readback. When our fence was superseded (commit/fail
+	// affected zero rows) the durable row belongs to the winning worker, so the
+	// only correct result to report is whatever that worker commits - never our
+	// stale local attempt. Reads the row; if terminal, returns { result } or
+	// throws the canonical error. When `poll` is true (a foreground run() caller
+	// that must report a value) it polls until terminal, bounded by awaitTimeout,
+	// then throws TaskFenceLostError. When `poll` is false (a background
+	// dispatch/recovery caller whose result is discarded) it reads once and
+	// returns null if the row is not yet terminal - no polling, so a fenced-out
+	// background worker never piles readback load onto the winner during a
+	// fence-expiry storm.
+	async function readCanonicalTerminal(taskId, name, poll) {
+		const start = monotonicNow();
+		while (true) {
+			const row = await sql.readRow(taskId);
+			if (row && row.status === 'committed') {
+				mRunCommit?.inc({ name });
+				return { result: row.result };
+			}
+			if (row && row.status === 'failed') {
+				mRunFail?.inc({ name });
+				throw deserialiseError(row.error);
+			}
+			// Not terminal (missing / pending / running under the new fence).
+			if (!poll) return null;
+			if (awaitTimeout > 0 && monotonicNow() - start >= awaitTimeout) {
+				throw new TaskFenceLostError(taskId, name, row ? row.status : 'missing');
+			}
+			const remaining = awaitTimeout > 0 ? Math.max(1, awaitTimeout - (monotonicNow() - start)) : awaitPollInterval;
+			await delay(Math.min(awaitPollInterval, remaining));
+		}
+	}
+
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, awaitCanonical = false) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -397,22 +431,16 @@ export function createTaskRunner(client, options = {}) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 				}
 				if (!committed) {
-					// Our fence was lost; another worker took over.  Read the
-					// row to learn the canonical outcome.
-					const row = await sql.readRow(taskId);
-					if (row && row.status === 'committed') {
-						mRunCommit?.inc({ name });
-						return row.result;
-					}
-					if (row && row.status === 'failed') {
-						mRunFail?.inc({ name });
-						throw deserialiseError(row.error);
-					}
-					// Row is still running under someone else's fence: yield
-					// the result we just produced; the canonical commit will
-					// land via that other worker. No state-change fires
-					// here - the canonical writer fires on commit.
-					mRunCommit?.inc({ name });
+					// Our fence was lost; another worker took over. The canonical
+					// outcome is whatever that worker commits - never the result we
+					// just produced (it may differ from the durable row, and via the
+					// idempotency store it would be cached).
+					const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+					if (canonical) return canonical.result;
+					// Background caller only (poll === false): the row is still
+					// running under the new fence and this result is discarded, so
+					// there is nothing more to do. No state-change fires here - the
+					// canonical writer fires on its commit.
 					return result;
 				}
 				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, result });
@@ -433,9 +461,16 @@ export function createTaskRunner(client, options = {}) {
 				if (fenceProvider) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 				}
-				if (failed) {
-					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseError(handlerError) });
+				if (!failed) {
+					// Our fence was lost before we could record the failure; another
+					// worker owns the row and its canonical outcome may even be a
+					// success. Report that, never our stale local error.
+					const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+					if (canonical) return canonical.result;
+					// Background caller only: outcome not yet terminal; discarded.
+					return result;
 				}
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseError(handlerError) });
 				mRunFail?.inc({ name });
 				throw handlerError;
 			}
@@ -825,7 +860,10 @@ export function createTaskRunner(client, options = {}) {
 
 	function runWithoutCache(name, input, idempotencyKey, requestId) {
 		const taskId = randomUuid();
-		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId);
+		// Foreground caller: must report the CANONICAL outcome (and the idempotency
+		// store caches whatever this returns), so poll the durable row on a lost
+		// fence rather than surfacing the stale local attempt.
+		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, true);
 	}
 }
 

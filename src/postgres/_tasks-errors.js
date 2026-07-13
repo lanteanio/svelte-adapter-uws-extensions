@@ -33,6 +33,27 @@ export class UnknownTaskError extends Error {
 }
 
 /**
+ * Thrown by `run()` when this worker's fence was superseded by another worker
+ * before it could record its outcome, and the canonical terminal result did
+ * not become durable within `awaitTimeout`. The task is NOT lost - the winning
+ * worker owns it - but this caller cannot report a canonical value, so it
+ * throws rather than returning its own stale local attempt (which could differ
+ * from the durable row and, via the idempotency store, be cached). Retry, or
+ * `await(taskId)`, to read the canonical outcome once it lands.
+ *
+ * Stable contract: `err.code === 'TASK_FENCE_LOST'`.
+ */
+export class TaskFenceLostError extends Error {
+	constructor(taskId, taskName, lastStatus) {
+		super(`task "${taskId}" (${taskName}) was fenced out by another worker and its canonical outcome did not become terminal within awaitTimeout (last status="${lastStatus}")`);
+		this.name = 'TaskFenceLostError';
+		this.code = 'TASK_FENCE_LOST';
+		this.taskId = taskId;
+		this.taskName = taskName;
+	}
+}
+
+/**
  * Convert an Error (or anything else) into a JSON-safe shape for storage
  * in the tasks table or transport across a worker-thread boundary.
  *

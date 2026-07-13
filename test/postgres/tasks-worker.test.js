@@ -199,12 +199,14 @@ describe('postgres tasks (worker thread executor)', () => {
 			await expect(inflight).rejects.toThrow('task runner destroyed');
 		});
 
-		it('aborts the worker handler when the fence is lost mid-run', async () => {
+		it('surfaces a mid-run fence theft as TaskFenceLostError when no successor commits', async () => {
 			const r = createTaskRunner(client, {
 				fenceTtl: 1,
 				heartbeatInterval: 100,
 				recoveryInterval: 0,
-				cleanupInterval: 0
+				cleanupInterval: 0,
+				awaitPollInterval: 20,
+				awaitTimeout: 400
 			});
 			r.register('abortable', null, { worker: abortableUrl });
 
@@ -212,18 +214,20 @@ describe('postgres tasks (worker thread executor)', () => {
 
 			// Wait for the row to be inserted and the worker to start the
 			// 5s wait loop, then rotate the row's fence so the next
-			// heartbeat tick returns rowCount=0.
+			// heartbeat tick returns rowCount=0 and aborts the worker handler.
 			await new Promise((res) => setTimeout(res, 200));
 			const rows = [...client._getTaskRows().values()];
 			expect(rows).toHaveLength(1);
 			rows[0].fence = 'stolen-fence';
 
-			// The next heartbeat (at ~300ms) detects the loss and fires
-			// the runner's signal.  The pool forwards an abort message to
-			// the worker, which aborts the handler's local controller,
-			// which causes the handler to reject.  run() rejects with the
-			// handler's rejection reason.
-			await expect(promise).rejects.toThrow(/abort/i);
+			// The next heartbeat detects the loss and aborts the worker handler;
+			// the handler rejects, but the fence is gone so the failure cannot be
+			// recorded. run() then polls the durable row for the canonical outcome
+			// rather than surfacing the local abort reason, and since the simulated
+			// successor never commits, it rejects with TaskFenceLostError once
+			// awaitTimeout elapses. (The abort mechanism itself is covered by the
+			// Redis-fence tests, which do not rotate the durable row's fence.)
+			await expect(promise).rejects.toMatchObject({ code: 'TASK_FENCE_LOST' });
 
 			r.destroy();
 		}, 5000);

@@ -2776,10 +2776,11 @@ The `signal` fires when the heartbeat detects another worker has reclaimed the r
 
 #### Errors
 
-`run()` throws three error shapes:
+`run()` throws four error shapes:
 
 - `UnknownTaskError` - no handler registered for that name in this process. Recovery does not throw on unknown names because the handler may live on a different deployment.
 - `TaskInFlightError` - the idempotency store reports the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
+- `TaskFenceLostError` (`err.code === 'TASK_FENCE_LOST'`) - this worker's fence was superseded by another worker before it could record its outcome, and the canonical result did not become terminal within `awaitTimeout`. `run()` reports the durable outcome the winning worker commits, never this worker's stale local attempt; if that outcome is not yet available it throws this rather than the local value (which the idempotency store would otherwise cache). Retry, or `await(taskId)`, to read the canonical result once it lands. On a lost fence `run()` polls the durable row up to `awaitTimeout` (default 60s) - the same bound as `await()`; `awaitTimeout: 0` polls until the winning worker's outcome lands rather than giving up.
 - The handler's own thrown error, after retries are exhausted. Errors are serialised to `{name, message, stack, code, cause}` for the failed-row record and reconstructed as a plain `Error` if a sibling caller reads the row.
 
 #### Async path: `enqueue` + `await`
