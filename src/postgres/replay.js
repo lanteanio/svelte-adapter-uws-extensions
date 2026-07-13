@@ -695,8 +695,15 @@ export function createReplay(client, options = {}) {
 				// because the default `client.query()` may check out a different
 				// connection per call.
 				await withTransaction(client, async (tx) => {
-					await tx.query(`DELETE FROM ${table}`);
+					// Lock/reset every seq-counter row FIRST - the same row a publish's
+					// INSERT ... ON CONFLICT DO UPDATE contends on. Deleting the data
+					// first left the counter unlocked, so a publish could interleave
+					// between the delete and the reset, bump the old counter, and
+					// persist a row whose seq the post-reset numbering then re-issues
+					// (a duplicate (topic, seq)). Holding the counter lock for the rest
+					// of the transaction serializes any concurrent publish behind COMMIT.
 					await tx.query(`UPDATE ${seqTable} SET seq = 0, epoch = epoch + 1`);
+					await tx.query(`DELETE FROM ${table}`);
 				});
 			});
 			// Drop the in-process cache so cachedEpoch does not serve a stale
@@ -708,19 +715,25 @@ export function createReplay(client, options = {}) {
 			await withBreaker(b, async () => {
 				await ensureTable();
 				const res = await withTransaction(client, async (tx) => {
-					await tx.query(
-						`DELETE FROM ${table}
-						  WHERE topic = $1`, [topic]);
-					// Keep the seq-table row so the epoch survives the reset (the
-					// durable analogue of a no-ttl epoch counter). Bump epoch,
-					// reset seq to 0 so the next publish's UPDATE branch issues
-					// seq = 1 on the fresh space. Atomic with the data delete.
-					return tx.query(
+					// Lock/reset the seq-table row FIRST - the same row a publish to
+					// this topic contends on via ON CONFLICT DO UPDATE. Keep the row
+					// so the epoch survives the reset (the durable analogue of a no-ttl
+					// epoch counter): bump epoch, reset seq to 0 so the next publish
+					// issues seq = 1 on the fresh space. Holding this row lock for the
+					// rest of the transaction serializes any concurrent publish behind
+					// COMMIT; deleting the data first (the old order) left a window
+					// where a publish bumped the old counter and persisted a row whose
+					// seq the reset numbering then re-issued - a duplicate (topic, seq).
+					const r = await tx.query(
 						`INSERT INTO ${seqTable} (topic, seq, epoch)
 						      VALUES ($1, 0, 1)
 						 ON CONFLICT (topic)
 						   DO UPDATE SET seq = 0, epoch = ${seqTable}.epoch + 1
 						   RETURNING epoch`, [topic]);
+					await tx.query(
+						`DELETE FROM ${table}
+						  WHERE topic = $1`, [topic]);
+					return r;
 				});
 				if (res.rows.length > 0) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
 			});

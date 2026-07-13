@@ -91,3 +91,44 @@ export async function scanAndUnlink(redis, pattern) {
 		});
 	}
 }
+
+/**
+ * Like {@link scanAndUnlink}, but a matched key for which `keep(key)` is true is
+ * handed to `onKept(node, key)` instead of being unlinked. Two passes over the
+ * keyspace: the whole first pass (`onKept` on every kept key) completes before
+ * ANY unlink in the second, so a "kept key acted on before its siblings are
+ * deleted" invariant holds across the entire keyspace, not merely within one
+ * SCAN batch.
+ *
+ * Replay `clear()` uses this to rotate (INCR) every topic's epoch key before
+ * dropping its seq/buf state, rather than deleting the epoch and letting the
+ * next publish recreate generation 1 - which would let a straddling client
+ * silently miss a whole generation. `onKept` runs on the node that owns the
+ * key, so the INCR is single-slot on Cluster.
+ *
+ * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
+ * @param {string} pattern
+ * @param {(key: string) => boolean} keep
+ * @param {(node: import('ioredis').Redis, key: string) => Promise<void> | void} onKept
+ */
+export async function scanUnlinkExcept(redis, pattern, keep, onKept) {
+	const cluster = isCluster(redis);
+	// Pass 1: act on every kept key across the whole keyspace first.
+	for (const node of scanTargets(redis)) {
+		await scanNodeBatches(node, pattern, async (keys) => {
+			for (const key of keys) if (keep(key)) await onKept(node, key);
+		});
+	}
+	// Pass 2: unlink everything except the kept keys (same batching as scanAndUnlink).
+	for (const node of scanTargets(redis)) {
+		await scanNodeBatches(node, pattern, async (keys) => {
+			const drop = keys.filter((key) => !keep(key));
+			if (drop.length === 0) return;
+			if (cluster) {
+				for (const key of drop) await node.unlink(key);
+			} else {
+				await node.unlink(...drop);
+			}
+		});
+	}
+}

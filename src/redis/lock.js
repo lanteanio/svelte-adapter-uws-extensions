@@ -1,8 +1,17 @@
 /**
- * Cluster-wide mutual-exclusion primitive for svelte-adapter-uws.
+ * Cluster-wide COOPERATIVE locking primitive for svelte-adapter-uws.
  *
- * `withLock(key, fn)` serializes access per key across every instance.
- * Distinct from `redis/fence` (B2c): fence is task-runner-specific
+ * `withLock(key, fn)` serializes access per key across every instance while
+ * every holder stays responsive to its lease. It is a TTL lease with
+ * cooperative release, NOT a hard fencing mutex: a holder that stalls past
+ * `ttlMs` (GC pause, blocked loop) loses the lease while still running, and a
+ * successor can acquire and overlap it. The `AbortSignal` tells such a holder
+ * to bail, but is advisory. For strict single-writer correctness across a
+ * stall, make the protected resource reject stale writes, or use the
+ * task runner (Postgres fence). The internal fence token guards release and
+ * heartbeat only; it is not surfaced to `fn`.
+ *
+ * Distinct from `redis/fence`: fence is task-runner-specific
  * (one fence per `taskId`, paired with the Postgres state machine);
  * this lock is a general-purpose primitive any user code can grab.
  *

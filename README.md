@@ -2016,7 +2016,7 @@ The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`
 
 ## Distributed lock
 
-Cluster-wide mutual-exclusion primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; this is the Redis-backed swap for multi-instance deployments. Distinct from `redis/fence` (B2c): the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose mutex any user code can grab.
+Cluster-wide **cooperative** locking primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; this is the Redis-backed swap for multi-instance deployments. Distinct from `redis/fence`: the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose cooperative lock any user code can grab. It gives mutual exclusion while every holder stays responsive to its lease - but it is a TTL lease with cooperative release, not a hard fencing mutex under a process stall. See [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex).
 
 > **Authorization:** `withLock(key, fn)` serializes whoever calls it under that key; it does not check whether the caller owns the resource the key represents. A wire-supplied lock key lets an attacker grab a lock on a resource they don't own and stall any legitimate owner. Derive lock keys from a trusted prefix - e.g. `\`account:${assertedAccountId(ctx, payload.accountId)}\``. See [Authorization model](#authorization-model).
 
@@ -2045,7 +2045,7 @@ await lock.withLock('order-42', async (signal) => {
 });
 ```
 
-`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide mutex on `key`. The user fn cannot forget to release - the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
+`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide cooperative lease on `key`. The user fn cannot forget to release - the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
 
 #### How it works
 
@@ -2055,6 +2055,12 @@ await lock.withLock('order-42', async (signal) => {
 4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless).
 
 The `AbortSignal` shape is the cluster-correctness story: when the heartbeat detects loss, your code learns immediately and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
+
+#### Cooperative, not a hard mutex
+
+`withLock` is a TTL lease with *cooperative* release, not a fencing mutex. The lease auto-expires after `ttlMs` so a crashed holder cannot block the cluster forever - but that same expiry means a holder that STALLS past `ttlMs` (a long GC pause, a blocked event loop, a paused debugger) loses the lease while still executing, and a successor can acquire and run the same critical section concurrently. The `AbortSignal` is how the framework tells such a holder to bail, but it is advisory: code that ignores the signal, or is blocked and never observes it, keeps running. The fence token is internal - it guards the release and heartbeat so a stale holder cannot free or refresh a new holder's key; it is not surfaced to `fn` and does not fence the resource `fn` mutates.
+
+So `withLock` gives mutual exclusion under normal operation (responsive holders, no pause longer than `ttlMs`), not a hard guarantee across a stall. When a critical section must be strictly single-writer even across a stall, the protected resource itself must reject stale writes - keep the operation idempotent, or have the sink compare a monotonically increasing version and reject anything not greater - or use `createTaskRunner`, whose Postgres fence enforces at-most-once at the database.
 
 #### Options
 
@@ -2093,7 +2099,7 @@ The `AbortSignal` shape is the cluster-correctness story: when the heartbeat det
 
 #### When to use which
 
-- **`createDistributedLock`** when business logic needs "only one instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape.
+- **`createDistributedLock`** when business logic needs "at most one responsive instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape. Cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)); when strict single-writer correctness matters across a stall, prefer `createTaskRunner`.
 - **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
 - **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal - caching the outcome is.
 - **`createLeader`** (next section) when the question is "which one of N workers should fire this scheduled job right now," not "who runs this critical section." Distinct from `withLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer.
@@ -2186,7 +2192,7 @@ GC-pause caveat: a long stop-the-world pause on the leader can cause brief overl
 #### When to use which
 
 - **`createLeader`** for "exactly one of N workers fires this scheduled job." Cluster-wide singleton observation. The primitive holds long-lived state (the lease); the consumer polls `isLeader()` synchronously at every tick.
-- **`createDistributedLock`** for "only one of N workers runs this critical section right now." Per-call mutual exclusion around a function that returns. The primitive holds the lock only while the function is running and forwards the function's return value.
+- **`createDistributedLock`** for "at most one of N workers runs this critical section right now." Per-call cooperative serialization around a function that returns. The primitive holds the lease only while the function is running and forwards the function's return value; it is cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)).
 
 Both use the same backing Lua scripts and the same lease semantics; they differ in consumer shape (long-lived observer vs. scoped serializer).
 

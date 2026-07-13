@@ -19,7 +19,7 @@
  * @module svelte-adapter-uws-extensions/redis/replay-stream
  */
 
-import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
+import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
@@ -562,7 +562,20 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async clear() {
-			await withBreaker(b, () => scanAndUnlink(redis, client.key('replay:*')));
+			// A global clear resets every topic's seq space, so - exactly like
+			// clearTopic - every topic's epoch must ROTATE, not vanish. The old
+			// blanket `replay:*` unlink deleted the epoch key too, so the next
+			// publish recreated generation 1 and a client that straddled the clear
+			// matched on resume and silently gap-filled against the restarted
+			// numbering. INCR every epoch key before dropping any seq/buf state.
+			const epochPrefix = client.key('replay:epoch:{');
+			await withBreaker(b, () => scanUnlinkExcept(
+				redis,
+				client.key('replay:*'),
+				(k) => k.startsWith(epochPrefix),
+				(node, k) => node.incr(k)
+			));
+			epochCache.clear();
 		},
 
 		async clearTopic(topic) {

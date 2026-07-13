@@ -70,21 +70,30 @@ describe('hashFieldTTLSupport', () => {
 
 describe('createHashFieldTTLProbe (soft gate)', () => {
 	// A minimal ioredis double: only `info('server')` is exercised. `fail` forces
-	// a transient rejection; `calls` counts probes so a re-probe is observable.
+	// a transient rejection; `hang` returns a promise that never settles, modeling
+	// an INFO parked on ioredis's offline queue during an outage (it neither
+	// resolves nor rejects). `calls` counts probes so a re-probe is observable.
 	function fakeRedis(info) {
 		let fail = false;
+		let hang = false;
 		let calls = 0;
 		const listeners = {};
+		const hung = []; // resolvers of in-flight hung INFOs, so a test can release them
 		return {
 			setInfo(v) { info = v; },
 			setFail(v) { fail = v; },
+			setHang(v) { hang = v; },
+			// Resolve every INFO currently parked on the "offline queue" with the
+			// current payload, modeling ioredis flushing the queue on reconnect.
+			releaseHang() { hang = false; hung.splice(0).forEach((r) => r(info)); },
 			get calls() { return calls; },
 			on(ev, fn) { (listeners[ev] ||= []).push(fn); return this; },
 			emit(ev) { (listeners[ev] || []).forEach((fn) => fn()); },
-			async info() {
+			info() {
 				calls++;
-				if (fail) throw new Error('CONNECTION_BROKEN');
-				return info;
+				if (hang) return new Promise((resolve) => { hung.push(resolve); }); // parked until released
+				if (fail) return Promise.reject(new Error('CONNECTION_BROKEN'));
+				return Promise.resolve(info);
 			}
 		};
 	}
@@ -144,5 +153,76 @@ describe('createHashFieldTTLProbe (soft gate)', () => {
 		redis.setFail(false);
 		expect(await probe.ready()).toBe(true);  // recovered: re-probed and confirmed
 		expect(redis.calls).toBe(2);
+	});
+
+	it('ready() does not stall when the probe INFO hangs on the offline queue', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true); // INFO never resolves or rejects (outage)
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 30 });
+		// Without the bound, awaiting the in-flight INFO would hang the publish path
+		// forever; the timer caps it and returns the safe fallback.
+		expect(await probe.ready()).toBe(false);
+		expect(redis.calls).toBe(1);
+	});
+
+	it('reuses a single hung probe across calls (no offline-queue pile-up)', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true);
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 20 });
+		expect(await probe.ready()).toBe(false);
+		expect(await probe.ready()).toBe(false);
+		expect(await probe.ready()).toBe(false);
+		// The one in-flight INFO is reused; a stalled probe is not re-issued per call.
+		expect(redis.calls).toBe(1);
+	});
+
+	it('a reconnect during a hung probe forces a fresh re-detection (not blocked behind it)', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true);
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 20 });
+		expect(await probe.ready()).toBe(false); // hung -> fallback, probe still pending
+		// Reconnect to a reachable server; the stale INFO is dropped so the next call
+		// re-probes instead of awaiting the one still stuck on the offline queue.
+		redis.setHang(false);
+		redis.setInfo(redisInfo('7.4.0'));
+		redis.emit('ready');
+		expect(await probe.ready()).toBe(true);
+		expect(redis.calls).toBe(2);
+	});
+
+	it('overlapping ready() calls during a hang share one probe', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true);
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 20 });
+		// Three publishes hit ready() concurrently while the server is unreachable;
+		// all fall back within the bound and only ONE INFO is issued between them.
+		const results = await Promise.all([probe.ready(), probe.ready(), probe.ready()]);
+		expect(results).toEqual([false, false, false]);
+		expect(redis.calls).toBe(1);
+	});
+
+	it('a hung probe that later resolves is picked up without a re-probe', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true);
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 20 });
+		expect(await probe.ready()).toBe(false); // bounded fallback while hung
+		expect(redis.calls).toBe(1);
+		// The SAME in-flight INFO flushes on reconnect (no invalidate) and answers.
+		redis.releaseHang();
+		expect(await probe.ready()).toBe(true);
+		expect(redis.calls).toBe(1); // reused: the resolved probe answered, no re-probe
+	});
+
+	it('supported() stays false during a hang without spinning up extra probes', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		redis.setHang(true);
+		const probe = createHashFieldTTLProbe(redis, { timeoutMs: 20 });
+		// supported() is a sync best-effort read: it kicks the probe (dispatched on a
+		// microtask) and returns the safe fallback without ever awaiting.
+		expect(probe.supported()).toBe(false);
+		expect(probe.supported()).toBe(false); // reuses the same in-flight probe
+		await new Promise((r) => setTimeout(r, 5)); // let the deferred INFO dispatch
+		expect(probe.supported()).toBe(false); // still hung -> still the safe fallback
+		expect(redis.calls).toBe(1); // one INFO across all reads, then it stays parked
 	});
 });

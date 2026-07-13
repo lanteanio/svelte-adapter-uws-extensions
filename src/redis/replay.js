@@ -23,7 +23,7 @@
 
 import { createStreamReplay } from './replay-stream.js';
 import { evalCached } from '../shared/eval-cached.js';
-import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
+import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplicationGrouped, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -445,7 +445,23 @@ export function createReplay(client, options = {}) {
 		},
 
 		async clear() {
-			await withBreaker(b, () => scanAndUnlink(redis, client.key('replay:*')));
+			// A global clear resets every topic's seq space, so - exactly like
+			// clearTopic - every topic's epoch must ROTATE, not vanish. Deleting the
+			// epoch key (the old blanket `replay:*` unlink) let the next publish
+			// recreate generation 1, so a client that straddled the clear matched on
+			// resume and silently gap-filled against the restarted numbering. INCR
+			// every epoch key before dropping any seq/buf state; the epoch key itself
+			// is preserved.
+			const epochPrefix = client.key('replay:epoch:{');
+			await withBreaker(b, () => scanUnlinkExcept(
+				redis,
+				client.key('replay:*'),
+				(k) => k.startsWith(epochPrefix),
+				(node, k) => node.incr(k)
+			));
+			// The in-process epoch cache backs the synchronous ack carrier; drop it
+			// so a read after the clear reflects the rotated generation.
+			epochCache.clear();
 		},
 
 		async clearTopic(topic) {

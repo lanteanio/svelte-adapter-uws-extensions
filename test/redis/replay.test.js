@@ -800,6 +800,46 @@ describe('redis replay', () => {
 			expect(await replay.seq('chat')).toBe(0);
 			expect(await replay.seq('todos')).toBe(1);
 		});
+
+		it('clear rotates each topic epoch instead of reusing generation 1', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			await replay.publish(platform, 'todos', 'created', { id: 1 });
+			const chatBefore = await replay.currentEpoch('chat');
+			const todosBefore = await replay.currentEpoch('todos');
+
+			await replay.clear();
+
+			// The seq space is reset (existing contract) ...
+			expect(await replay.seq('chat')).toBe(0);
+			// ... but the epoch ADVANCES rather than being deleted and recreated at 1,
+			// so a client that straddled the clear observes a new generation.
+			expect(await replay.currentEpoch('chat')).toBeGreaterThan(chatBefore);
+			expect(await replay.currentEpoch('todos')).toBeGreaterThan(todosBefore);
+		});
+
+		it('a client straddling clear() rehydrates instead of silently seeing contiguity', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			const preEpoch = await replay.currentEpoch('chat');
+
+			await replay.clear();
+			// First publish after the clear restarts seq at 1 under a new generation.
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { chat: 1 },
+				lastSeenEpochs: { chat: preEpoch },
+				platform
+			});
+
+			// Old behavior deleted the epoch key, so the post-clear publish recreated
+			// generation 1 == the client's presented epoch -> a spurious match that
+			// gap-filled against restarted numbering and delivered nothing. With the
+			// epoch rotated, the resume detects the generation change and rehydrates.
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			expect(rehydrate).toBeDefined();
+		});
 	});
 
 	describe('replicated durability', () => {

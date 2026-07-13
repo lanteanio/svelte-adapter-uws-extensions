@@ -303,6 +303,40 @@ describe('redis replay (stream backend)', () => {
 			expect(await replay.seq('chat')).toBe(0);
 			expect(await replay.seq('todos')).toBe(1);
 		});
+
+		it('clear rotates each topic epoch instead of reusing generation 1', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			await replay.publish(platform, 'todos', 'created', { id: 1 });
+			const chatBefore = await replay.currentEpoch('chat');
+			const todosBefore = await replay.currentEpoch('todos');
+
+			await replay.clear();
+
+			expect(await replay.seq('chat')).toBe(0);
+			// Epoch ADVANCES rather than being deleted and recreated at 1, so a client
+			// that straddled the clear observes a new generation on resume.
+			expect(await replay.currentEpoch('chat')).toBeGreaterThan(chatBefore);
+			expect(await replay.currentEpoch('todos')).toBeGreaterThan(todosBefore);
+		});
+
+		it('a client straddling clear() rehydrates instead of silently seeing contiguity', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			const preEpoch = await replay.currentEpoch('chat');
+
+			await replay.clear();
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			await hook({}, {
+				lastSeenSeqs: { chat: 1 },
+				lastSeenEpochs: { chat: preEpoch },
+				platform
+			});
+
+			const rehydrate = platform.sent.find((s) => s.topic === '__replay:chat' && s.event === 'rehydrate');
+			expect(rehydrate).toBeDefined();
+		});
 	});
 
 	describe('per-topic epoch', () => {

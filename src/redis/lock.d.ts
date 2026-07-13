@@ -87,9 +87,16 @@ export class LockLostError extends Error {
 
 export interface DistributedLock {
 	/**
-	 * Run `fn` while holding a cluster-wide mutex on `key`. Acquires
-	 * via `SET <key> <fenceToken> NX PX <ttlMs>` with a retry loop;
+	 * Run `fn` while holding a cluster-wide COOPERATIVE lease on `key`.
+	 * Acquires via `SET <key> <fenceToken> NX PX <ttlMs>` with a retry loop;
 	 * releases via Lua compare-and-delete on completion.
+	 *
+	 * This is a TTL lease with cooperative release, not a hard fencing mutex:
+	 * a holder that stalls past `ttlMs` loses the lease while still running and
+	 * a successor can overlap it. It gives mutual exclusion under normal
+	 * operation (responsive holders, no stall longer than `ttlMs`); for strict
+	 * single-writer correctness across a stall, make the protected resource
+	 * reject stale writes or use the task runner's Postgres fence.
 	 *
 	 * The heartbeat refreshes the TTL while `fn` is running; if the
 	 * heartbeat detects we no longer own the key, the supplied

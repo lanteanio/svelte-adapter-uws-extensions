@@ -595,6 +595,12 @@ describe('postgres replay', () => {
 			// clear and a republished topic keeps climbing.
 			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
 			expect(seen.some((s) => s.startsWith('UPDATE') && s.includes('epoch + 1'))).toBe(true);
+			// Lock order: the seq-counter reset (which locks the row a publish
+			// contends on) must run BEFORE the data delete, so a concurrent publish
+			// cannot interleave between them and duplicate a (topic, seq).
+			const clearReset = seen.findIndex((s) => s.startsWith('UPDATE') && s.includes('epoch + 1'));
+			const clearDelete = seen.findIndex((s) => s.startsWith('DELETE'));
+			expect(clearReset).toBeLessThan(clearDelete);
 		});
 
 		it('clearTopic deletes data and bumps the epoch inside one BEGIN/COMMIT transaction', async () => {
@@ -622,6 +628,12 @@ describe('postgres replay', () => {
 			// epoch bumped) via an upsert so the epoch survives the reset.
 			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
 			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('epoch + 1'))).toBe(true);
+			// Lock order: the seq-counter upsert (which locks the row a publish to
+			// this topic contends on) must run BEFORE the data delete, so a
+			// concurrent publish cannot interleave and duplicate a (topic, seq).
+			const topicReset = seen.findIndex((s) => s.startsWith('INSERT') && s.includes('epoch + 1'));
+			const topicDelete = seen.findIndex((s) => s.startsWith('DELETE'));
+			expect(topicReset).toBeLessThan(topicDelete);
 		});
 	});
 

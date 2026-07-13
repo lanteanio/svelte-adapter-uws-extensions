@@ -5,11 +5,18 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0-next.56] - 2026-07-13
 
 ### Fixed
 
 - **The per-field-TTL capability probe re-detects after a reconnect.** The soft HEXPIRE/HPEXPIRE probe cached its answer for the process lifetime, so a failover to an older server (or a rolling downgrade) left a stale "supported" verdict that made the publish path HPEXPIRE a server that rejects it. It now re-probes on every reconnect and exposes `invalidate()` for a caller that catches an unknown-command error.
+- **The per-field-TTL capability probe can no longer stall a publish during an outage.** The probe's `INFO` can sit on the client's offline queue while the server is unreachable, never resolving or rejecting - so a publish that awaited the probe hung indefinitely instead of proceeding on the whole-key fallback. The wait is now bounded: it races the probe against a timer and returns the safe fallback if the probe has not answered in time, a single in-flight probe is reused across calls so an outage cannot pile the offline queue with retries, and a reconnect drops any still-stalled probe so the next call re-detects the current server.
+- **A global replay `clear()` now rotates each topic's generation instead of recreating generation 1.** The Redis sorted-set and stream backends deleted the per-topic epoch key along with the sequence state, so the next publish restarted the generation at 1; a client that straddled the clear then matched on resume and silently gap-filled against the restarted numbering, missing a whole generation of events. `clear()` now advances every topic's epoch and preserves the epoch key - matching `clearTopic` and the Postgres backend - so a straddling client detects the new generation and rehydrates.
+- **A concurrent publish can no longer duplicate a sequence through a Postgres replay `clear()` or `clearTopic()`.** Both deleted the data rows before resetting the sequence counter, leaving a window in which a publish interleaved, bumped the old counter, and persisted a row whose sequence the post-reset numbering then re-issued - two rows sharing one `(topic, seq)`. Each now locks and resets the counter row before deleting the data, so a concurrent publish serializes behind the reset.
+
+### Documentation
+
+- **The distributed lock is documented as a cooperative lease, not a hard mutex.** `createDistributedLock` / `withLock` was labelled a cluster-wide mutex, but it is a TTL lease with cooperative (`AbortSignal`) release: a holder that stalls past its TTL loses the lease while still running, so a successor can overlap the same critical section. The docs now state this plainly and point to `createTaskRunner` (or making the protected resource reject stale writes) when strict single-writer correctness must hold across a stall.
 
 ## [0.6.0-next.55] - 2026-07-13
 
