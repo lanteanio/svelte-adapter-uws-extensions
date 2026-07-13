@@ -391,6 +391,7 @@ export function createTaskRunner(client, options = {}) {
 			let result;
 			let handlerError;
 			let firedTransitionThisIter = null; // 'insert' | 'rearm' | null
+			let rearmLost = false;
 			await withBreaker(b, async () => {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
@@ -398,9 +399,19 @@ export function createTaskRunner(client, options = {}) {
 					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId, _taskUserId(input, name));
 					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
-					// Retry within the loop: rotate fence and rearm the existing row.
-					fence = randomUuid();
-					await sql.rearmAttempt(taskId, fence, attempt);
+					// Retry within the loop: rotate the fence and rearm the existing
+					// row, but ONLY if we still hold it. A worker whose fence was
+					// taken over mid-handler must not re-steal the row back from its
+					// successor - the fence-guarded rearm matches zero rows and we
+					// stop rather than re-acquire.
+					const priorFence = fence;
+					const nextFence = randomUuid();
+					const rearmed = await sql.rearmAttempt(taskId, priorFence, nextFence, attempt);
+					if (!rearmed) {
+						rearmLost = true;
+						return;
+					}
+					fence = nextFence;
 					firedTransitionThisIter = 'rearm';
 				}
 				// else: dispatch/recovery first iteration uses the fence assigned by the
@@ -410,6 +421,16 @@ export function createTaskRunner(client, options = {}) {
 					await fenceProvider.acquire(taskId, fence, fenceTtl);
 				}
 			});
+
+			if (rearmLost) {
+				// The fence was taken over before this retry could rearm; the
+				// successor owns the row. Report its canonical outcome instead of
+				// re-running the handler (a foreground caller polls; a background
+				// dispatch/recovery caller discards the result).
+				const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+				if (canonical) return canonical.result;
+				return result;
+			}
 
 			if (firedTransitionThisIter === 'insert') {
 				fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null });

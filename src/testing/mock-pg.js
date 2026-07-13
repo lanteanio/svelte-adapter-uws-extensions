@@ -543,20 +543,22 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: 0 };
 		}
 
-		// Task rearm: unconditionally rotate the fence (used for retries)
+		// Task rearm: fence-guarded fence rotation for retries. Only rotates if
+		// this worker still holds the row (row.fence === priorFence), so a
+		// taken-over worker's retry cannot re-steal the row from its successor.
 		if (
 			sql.startsWith('UPDATE') &&
-			sql.includes('fence = $2') &&
-			sql.includes('attempts = $4') &&
-			sql.includes('WHERE svti_tasks_id = $1')
+			sql.includes('SET fence = $3') &&
+			sql.includes('WHERE svti_tasks_id = $1 AND fence = $2')
 		) {
 			const taskId = values[0];
-			const fence = values[1];
-			const ttlSec = Number(values[2]);
-			const attempts = Number(values[3]);
+			const priorFence = values[1];
+			const nextFence = values[2];
+			const ttlSec = Number(values[3]);
+			const attempts = Number(values[4]);
 			const row = taskRows.get(taskId);
-			if (row) {
-				row.fence = fence;
+			if (row && row.fence === priorFence) {
+				row.fence = nextFence;
 				row.fence_expires_at = now() + ttlSec * 1000;
 				row.attempts = attempts;
 				row.updated_at = now();

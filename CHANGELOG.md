@@ -5,6 +5,12 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.59] - 2026-07-14
+
+### Fixed
+
+- **A task-runner retry no longer re-steals a row whose fence was taken over.** `rearmAttempt` (the retry loop's fence rotation) predicated on the task id alone, so a worker whose fence was superseded mid-handler - with a retry policy configured - would rotate the fence back to itself, re-acquiring the row from the successor (a mutual-takeover churn; the fence-guarded commit/fail still kept exactly one terminal write, so no result corruption). The rearm is now fence-guarded (`AND fence = <prior fence>`): a taken-over worker matches zero rows, stops retrying, and reports the successor's canonical outcome (or `TaskFenceLostError`) instead of re-running the handler.
+
 ## [0.6.0-next.58] - 2026-07-14
 
 ### Added

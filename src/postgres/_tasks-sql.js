@@ -92,17 +92,22 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate }) 
 		});
 	}
 
-	async function rearmAttempt(taskId, fence, attempt) {
-		await client.query({
+	async function rearmAttempt(taskId, priorFence, nextFence, attempt) {
+		// Fence-guarded: only rotate the fence if this worker still holds the row
+		// (fence = priorFence). A worker whose fence was taken over mid-handler
+		// matches zero rows here, so its retry cannot re-steal the row back from
+		// the successor. Returns false on a lost fence.
+		const res = await client.query({
 			name: 'tasks_rearm_' + table,
 			text: `UPDATE ${table}
-			          SET fence = $2,
-			              fence_expires_at = now() + ($3 || ' seconds')::interval,
-			              attempts = $4,
+			          SET fence = $3,
+			              fence_expires_at = now() + ($4 || ' seconds')::interval,
+			              attempts = $5,
 			              updated_at = now()
-			        WHERE svti_tasks_id = $1`,
-			values: [taskId, fence, fenceTtl, attempt]
+			        WHERE svti_tasks_id = $1 AND fence = $2`,
+			values: [taskId, priorFence, nextFence, fenceTtl, attempt]
 		});
+		return res.rowCount > 0;
 	}
 
 	async function heartbeatFence(taskId, fence) {

@@ -136,4 +136,24 @@ describe('postgres tasks - fenced-out caller reports the canonical result', () =
 
 		idempotency.destroy();
 	});
+
+	it('a taken-over worker does not re-steal the row on retry (fence-guarded rearm)', async () => {
+		runner = createTaskRunner(pg, {
+			recoveryInterval: 0, cleanupInterval: 0,
+			awaitPollInterval: 5, awaitTimeout: 200
+		});
+		let calls = 0;
+		runner.register('t', async ({ fence }) => {
+			calls++;
+			// A successor steals the fence, then this attempt fails so the retry
+			// loop engages. The fence-guarded rearm must NOT re-acquire the row.
+			rowByFence(fence).fence = 'successor-fence';
+			throw new Error('first attempt fails');
+		}, { retry: { maxAttempts: 3, backoff: () => 0 } });
+
+		// The successor never commits; the retry cannot rearm (fence lost), so
+		// run() reports TaskFenceLostError instead of re-running and committing.
+		await expect(runner.run('t', { input: null })).rejects.toMatchObject({ code: 'TASK_FENCE_LOST' });
+		expect(calls).toBe(1);
+	});
 });
