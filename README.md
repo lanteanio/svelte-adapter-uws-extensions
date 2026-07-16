@@ -3980,7 +3980,10 @@ import { createForgetStore } from 'svelte-adapter-uws-extensions/forget-store';
 import { configureForget } from 'svelte-realtime/server';
 
 configureForget({
-  store: createForgetStore({ registry, idempotency, presence, cursor, session }),
+  store: createForgetStore(
+    { registry, idempotency, presence, cursor, session },
+    { redis }  // the same client you stash on platform.redis - opts into the cluster room-state erasure below
+  ),
   platform   // the Redis handle the presence purge needs
 });
 ```
@@ -4002,6 +4005,19 @@ With the extractor, the session indexes each token per user at write time, the R
 The Redis dead-letter store also closes the in-flight-delivery race: a webhook whose delivery was already running when `purgeUser` swept the store would otherwise re-insert the erased payload when it fails moments later. `purgeUser` writes a per-user forget tombstone (server time at purge, a window set by `forgetTombstoneMs`, default 10 minutes) before deleting, and `add` drops a record whose delivery started before that purge. The purge time and the delivery start are compared on the shared Redis server clock, so it holds across a cluster where the delivering and purging instances differ. A delivery started after the purge is unaffected. The residual: a single delivery whose total retry duration outlives the tombstone window resurrects the payload once the tombstone expires - raise `forgetTombstoneMs` above your max retry budget to close it.
 
 The session and idempotency per-user indexes stay in lockstep with their entries: each index field carries the same TTL as the session/cache entry it points at (per-field `HPEXPIRE` on Redis 7.4+ / Valkey 9.0+, with a whole-key sliding TTL fallback on older servers), and every path that slides an entry's TTL - `set`, `get`, `touch`, a lifecycle load - slides its index field too. A session kept alive by activity therefore always remains addressable by `purgeUser`, at the cost of one extra index write per refreshing read when the extractor is configured. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
+
+### Cluster room state: owner succession and presence rosters
+
+`live.forget` runs on ONE instance, but svelte-realtime's clustered room state lives in Redis for every instance: `__live-room-owner:<topic>` hashes (the owner role, the join order that decides succession, per-identity connection counts) and `__live-presence:<topic>` rosters. An erased user who owned a room through ANOTHER instance - or was merely a member there - is invisible to the forgetting instance's local purge: the room would keep the erased user as owner both live and on resume, and a leftover join-sequence field could even elect the erased user as a LATER succession's winner.
+
+Passing `{ redis }` (the same client the app stashes on `platform.redis` - a raw ioredis instance, or a wrapper exposing one on `.redis`) closes this cluster-wide. During `purgeUser` the store scans both key families (cluster-correct: one SCAN per master; an ioredis `keyPrefix` is honored), scoped to the purged tenant, and:
+
+- **force-evicts the user from every room-owner hash** with one atomic per-room script: the membership fields are removed unconditionally, and where the user held the owner role the script picks the successor by the same rule as a normal leave (the remaining member with the lowest join sequence) or clears the role when the room emptied. The ownership check runs inside the script, so a room whose owner already changed concurrently is skipped without a conflicting handoff.
+- **removes the user's presence-roster fields** from every roster, so remote-instance refs stop appearing in snapshots. A roster a still-connected remote instance later decrements self-heals to empty.
+
+With `{ redis }` the resolved shape becomes the owner-succession envelope `{ rowsAffected, ownerSuccessions }`: the counts carry two extra labels (`roomOwners`, `presenceRoster`) and each `ownerSuccessions` entry is `{ topic, owner, reason }` (`owner` null with reason `'vacated'` when the room emptied). svelte-realtime `>= 0.6.0-next.87` publishes each entry on the room's `:owner` stream through the replay buffer, so live subscribers on every replica and resumers see the successor; on older versions the erasure still runs but the counts report as 0 and no successor is announced, so pair the option with the matching realtime floor. GDPR forgets are rare, so the O(rooms) scan needs no reverse index; without `{ redis }` nothing changes - the plain breakdown stays byte-identical.
+
+Each room's eviction is independent and retry-safe: if one room hands off but a sibling room's transient error aborts the sweep, `purgeUser` still rejects (so the erasure retries) yet carries the already-committed successions on the thrown error, so svelte-realtime announces them even on the failure path. The retry re-drives only the rooms that failed - a committed room reads as already handed off and reports nothing the second time - so each succession reaches the wire exactly once and no owner change is lost under partial failure.
 
 ---
 

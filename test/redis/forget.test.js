@@ -66,6 +66,247 @@ describe('createForgetStore (composer)', () => {
 	});
 });
 
+describe('createForgetStore cluster owner eviction (owner-succession envelope)', () => {
+	// The realtime layer keeps cluster room state in Redis via platform.redis:
+	// __live-room-owner:<topic> hashes (o / q / j:<key> / n:<key>) and
+	// __live-presence:<topic> rosters (c:<key> / d:<key>). A forget must erase
+	// the user from BOTH cluster-wide - the forgetting instance may hold no
+	// local ref at all - and report each ownership change so the realtime layer
+	// can announce the successor on the room's :owner stream. These hashes are
+	// seeded directly, standing in for rooms whose members joined through OTHER
+	// instances.
+	let client; let redis;
+
+	beforeEach(() => {
+		client = mockRedisClient('app:');
+		redis = client.redis;
+	});
+
+	async function seedOwnerRoom(topic, fields) {
+		for (const [f, v] of Object.entries(fields)) {
+			await redis.hset('__live-room-owner:' + topic, f, String(v));
+		}
+	}
+
+	it('resolves the envelope and evicts a remotely-owned room with the leave-rule successor', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 3, 'j:u1': 1, 'j:u2': 2, 'j:u3': 3, 'n:u1': 1, 'n:u2': 1, 'n:u3': 1 });
+		const composed = { async purgeUser() { return 4; } };
+		const store = createForgetStore({ registry: composed }, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.rowsAffected).toEqual({ registry: 4, roomOwners: 1, presenceRoster: 0 });
+		expect(res.ownerSuccessions).toEqual([{ topic: 'room1', owner: 'u2', reason: 'succeeded' }]);
+
+		const h = await redis.hgetall('__live-room-owner:room1');
+		expect(h.o).toBe('u2');
+		expect(h['j:u1']).toBeUndefined();
+		expect(h['n:u1']).toBeUndefined();
+		expect(h['j:u2']).toBe('2');
+	});
+
+	it('breaks a join-seq tie lexicographically, mirroring the realtime leave script', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 2, 'j:u1': 1, 'j:b': 2, 'j:a': 2, 'n:u1': 1, 'n:b': 1, 'n:a': 1 });
+		const store = createForgetStore({}, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.ownerSuccessions).toEqual([{ topic: 'room1', owner: 'a', reason: 'succeeded' }]);
+	});
+
+	it('vacates an emptied room: owner null, role and allocator cleared', async () => {
+		await seedOwnerRoom('solo', { o: 'u1', q: 1, 'j:u1': 1, 'n:u1': 1 });
+		const store = createForgetStore({}, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.ownerSuccessions).toEqual([{ topic: 'solo', owner: null, reason: 'vacated' }]);
+		// o and q removed with the last membership: the hash is gone entirely,
+		// so a future room starts fresh (same as the realtime leave script).
+		expect(await redis.exists('__live-room-owner:solo')).toBe(0);
+	});
+
+	it('removes a NON-owner membership so a later succession cannot elect the erased user', async () => {
+		await seedOwnerRoom('room1', { o: 'u2', q: 3, 'j:u1': 1, 'j:u2': 2, 'j:u3': 3, 'n:u1': 1, 'n:u2': 1, 'n:u3': 1 });
+		const store = createForgetStore({}, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		// No ownership change to announce, but the membership is gone: u1 held
+		// the LOWEST join seq, so without the eviction u2's later leave would
+		// have handed the room to the erased user.
+		expect(res.ownerSuccessions).toEqual([]);
+		expect(res.rowsAffected.roomOwners).toBe(1);
+		const h = await redis.hgetall('__live-room-owner:room1');
+		expect(h['j:u1']).toBeUndefined();
+		expect(h['n:u1']).toBeUndefined();
+		expect(h.o).toBe('u2');
+	});
+
+	it('scopes the eviction to the purged tenant in both directions', async () => {
+		await seedOwnerRoom('@t/acme/roomA', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
+		await seedOwnerRoom('roomB', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
+		const store = createForgetStore({}, { redis });
+
+		const scoped = await store.purgeUser('acme', 'u1');
+		expect(scoped.ownerSuccessions).toEqual([{ topic: '@t/acme/roomA', owner: 'u2', reason: 'succeeded' }]);
+		expect((await redis.hgetall('__live-room-owner:roomB')).o).toBe('u1'); // untouched
+
+		const unscoped = await store.purgeUser(null, 'u1');
+		expect(unscoped.ownerSuccessions).toEqual([{ topic: 'roomB', owner: 'u2', reason: 'succeeded' }]);
+	});
+
+	it('erases the presence roster fields cluster-wide, leaving other members intact', async () => {
+		await redis.hset('__live-presence:room1', 'c:u1', '2');
+		await redis.hset('__live-presence:room1', 'd:u1', '{"name":"x"}');
+		await redis.hset('__live-presence:room1', 'c:u2', '1');
+		await redis.hset('__live-presence:room1', 'd:u2', '{}');
+		await redis.hset('__live-presence:@t/acme/roomA', 'c:u1', '1');
+		await redis.hset('__live-presence:@t/acme/roomA', 'd:u1', '{}');
+		const store = createForgetStore({}, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.rowsAffected.presenceRoster).toBe(2); // c:u1 + d:u1, room1 only (tenant scope)
+		const h = await redis.hgetall('__live-presence:room1');
+		expect(h['c:u1']).toBeUndefined();
+		expect(h['d:u1']).toBeUndefined();
+		expect(h['c:u2']).toBe('1');
+		expect((await redis.hgetall('__live-presence:@t/acme/roomA'))['c:u1']).toBe('1');
+	});
+
+	it('skips a room whose owner already changed (the in-script ownership check)', async () => {
+		// The dual-resolution race: a local leave on another instance handed the
+		// room off between our SCAN and the eviction script. The script sees
+		// o != userId and must not produce a second, conflicting succession.
+		await seedOwnerRoom('room1', { o: 'winner', q: 2, 'j:winner': 2, 'n:winner': 1 });
+		const store = createForgetStore({}, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.ownerSuccessions).toEqual([]);
+		expect(res.rowsAffected.roomOwners).toBe(0); // no fields of u1 existed either
+		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('winner');
+	});
+
+	it('keeps the legacy breakdown shape byte-identical without options.redis', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 1, 'j:u1': 1, 'n:u1': 1 });
+		const composed = { async purgeUser() { return 2; } };
+		const store = createForgetStore({ registry: composed });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res).toEqual({ registry: 2 });
+		expect(res.ownerSuccessions).toBeUndefined();
+		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('u1'); // untouched
+	});
+
+	it('still runs the cluster legs when a composed store fails, then rejects', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
+		const bad = { async purgeUser() { throw new Error('redis down'); } };
+		const store = createForgetStore({ bad }, { redis });
+
+		await expect(store.purgeUser(null, 'u1')).rejects.toThrow(/incomplete/);
+		// The eviction committed regardless: a retry finds the room already
+		// handed off (in-script o check) and simply re-reports nothing for it.
+		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('u2');
+	});
+
+	it('carries an already-committed succession on the error when a SIBLING room fails', async () => {
+		// The partial-failure trap: roomA's eviction commits durably while
+		// roomB's script hits a transient error (the class a cluster retries).
+		// The whole erasure is signalled incomplete so the caller retries - but
+		// the retry finds roomA already handed off and reports nothing for it, so
+		// roomA's succession would never reach the wire unless the error itself
+		// carries it. The realtime layer announces `err.ownerSuccessions`.
+		await seedOwnerRoom('roomA', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
+		await seedOwnerRoom('roomB', { o: 'u1', q: 2, 'j:u1': 1, 'j:u3': 2, 'n:u1': 1, 'n:u3': 1 });
+		const raw = redis;
+		const failKey = '__live-room-owner:roomB';
+		// Pass every command through to the mock EXCEPT the owner-eviction script
+		// targeting roomB, which rejects with a transient connection error.
+		const wrap = {
+			options: raw.options,
+			scan: (...a) => raw.scan(...a),
+			hdel: (...a) => raw.hdel(...a),
+			hgetall: (...a) => raw.hgetall(...a),
+			defineCommand(name, def) {
+				raw.defineCommand(name, def);
+				wrap[name] = (numKeys, ...args) =>
+					args[0] === failKey
+						? Promise.reject(new Error('Connection is closed'))
+						: raw[name](numKeys, ...args);
+			}
+		};
+		const store = createForgetStore({}, { redis: wrap });
+
+		const err = await store.purgeUser(null, 'u1').then(
+			() => { throw new Error('expected rejection'); },
+			(e) => e
+		);
+		expect(err.message).toMatch(/incomplete/);
+		// The committed room's succession rides on the error for announcement...
+		expect(err.ownerSuccessions).toEqual([{ topic: 'roomA', owner: 'u2', reason: 'succeeded' }]);
+		expect(err.failures).toHaveLength(1); // roomB's transient error surfaced
+		// ...roomA committed durably, roomB is untouched (a retry re-drives it).
+		expect((await raw.hgetall('__live-room-owner:roomA')).o).toBe('u2');
+		expect((await raw.hgetall('__live-room-owner:roomB')).o).toBe('u1');
+	});
+
+	it('sums a composed store sharing a built-in leg name instead of overwriting it', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 1, 'j:u1': 1, 'n:u1': 1 });
+		const composed = { async purgeUser() { return 5; } };
+		const store = createForgetStore({ roomOwners: composed }, { redis });
+
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.rowsAffected.roomOwners).toBe(6); // 5 composed + 1 evicted room
+	});
+
+	it('accepts a client wrapper and unwraps its .redis; rejects a non-redis option', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 1, 'j:u1': 1, 'n:u1': 1 });
+		const store = createForgetStore({}, { redis: client }); // wrapper, not raw
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.ownerSuccessions).toEqual([{ topic: 'room1', owner: null, reason: 'vacated' }]);
+
+		expect(() => createForgetStore({}, { redis: { not: 'redis' } })).toThrow(/ioredis/);
+	});
+
+	it('honors an ioredis-level keyPrefix: scans prefixed keys, commands stay prefix-relative', async () => {
+		// An app ioredis constructed with { keyPrefix } prepends it to command
+		// keys transparently but NOT to SCAN patterns, and SCAN returns raw
+		// (prefixed) keys. This stand-in reproduces exactly that contract over
+		// the mock so the store's prefix handling is pinned.
+		const prefix = 'p:';
+		const raw = redis;
+		const wrap = {
+			options: { keyPrefix: prefix },
+			scan: (...a) => raw.scan(...a),
+			hdel: (k, ...f) => raw.hdel(prefix + k, ...f),
+			defineCommand(name, def) {
+				raw.defineCommand('kp' + name, def);
+				wrap[name] = (numKeys, ...args) => {
+					const keys = args.slice(0, numKeys).map((k) => prefix + k);
+					return raw['kp' + name](numKeys, ...keys, ...args.slice(numKeys));
+				};
+			}
+		};
+		await raw.hset('p:__live-room-owner:room1', 'o', 'u1');
+		await raw.hset('p:__live-room-owner:room1', 'q', '2');
+		await raw.hset('p:__live-room-owner:room1', 'j:u1', '1');
+		await raw.hset('p:__live-room-owner:room1', 'j:u2', '2');
+		await raw.hset('p:__live-room-owner:room1', 'n:u1', '1');
+		await raw.hset('p:__live-room-owner:room1', 'n:u2', '1');
+		await raw.hset('p:__live-presence:room1', 'c:u1', '1');
+		await raw.hset('p:__live-presence:room1', 'd:u1', '{}');
+
+		const store = createForgetStore({}, { redis: wrap });
+		const res = await store.purgeUser(null, 'u1');
+		expect(res.ownerSuccessions).toEqual([{ topic: 'room1', owner: 'u2', reason: 'succeeded' }]);
+		expect(res.rowsAffected.presenceRoster).toBe(2);
+		expect((await raw.hgetall('p:__live-room-owner:room1')).o).toBe('u2');
+	});
+
+	it('returns the empty legacy shape for an invalid userId even with redis configured', async () => {
+		await seedOwnerRoom('room1', { o: 'u1', q: 1, 'j:u1': 1, 'n:u1': 1 });
+		const store = createForgetStore({}, { redis });
+		expect(await store.purgeUser(null, '')).toEqual({});
+		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('u1');
+	});
+});
+
 describe('connection registry purgeUser', () => {
 	let client; let platform; let registry;
 

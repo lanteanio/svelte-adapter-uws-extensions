@@ -5,6 +5,14 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.0-next.62] - 2026-07-17
+
+### Added
+
+- **`createForgetStore` can erase a user from the cluster-wide room state and report each owner succession.** `live.forget` runs on one instance, but the clustered room-owner hashes and presence rosters in Redis belong to every instance - so an erased user who owned (or had joined) a room through another instance stayed owner-of-record and roster-visible, and a leftover join-sequence field could even elect the erased user in a later succession. `createForgetStore(stores, { redis })` (the same client the app stashes on `platform.redis`) now scans both key families during `purgeUser` (one SCAN per cluster master, tenant-scoped, ioredis `keyPrefix` honored) and force-evicts the user room by room with an atomic script: membership fields removed unconditionally, and where the user held the owner role the successor is picked by the same lowest-join-sequence rule as a normal leave (or the room is vacated), with the ownership check inside the script so a concurrently-changed owner is never handed off twice. Presence-roster count/data fields are erased the same way. The resolved shape becomes the owner-succession envelope `{ rowsAffected, ownerSuccessions }` - `svelte-realtime >= 0.6.0-next.87` publishes each entry on the room's `:owner` stream through the replay buffer so every replica and every resumer sees the successor. Each room's eviction is independent: if one room commits but a sibling room's transient error aborts the sweep, `purgeUser` still rejects (the erasure is incomplete and must be retried) yet carries the already-committed successions on the thrown error, so the realtime layer announces them even on the failure path - the retry re-drives only the failed rooms, so no owner change is dropped under partial failure. Without the option the plain per-store breakdown is byte-identical to before. The `svelte-adapter-uws-extensions/testing` mock models the eviction script, so simulations exercise the same semantics.
+
 ## [0.6.0-next.61] - 2026-07-16
 
 ### Added

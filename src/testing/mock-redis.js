@@ -837,6 +837,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			// command can observe a half-applied script. Keep every evaluator
 			// synchronous; introducing an `await` inside one would break this.
 			async eval(script, numKeys, ...args) {
+				// live.forget cluster owner force-evict (membership HDEL +
+				// in-script ownership check + leave-mirrored succession).
+				// Marker-dispatched first: the script also mentions HDEL/HSET/
+				// HGETALL, which later content sniffs would misroute.
+				if (script.includes('OWNER_FORGET_EVICT')) {
+					return evalOwnerForgetEvict(args);
+				}
 				// Ban script (atomic ban with Redis TIME)
 				if (script.includes('defaultPoints') && script.includes('defaultInterval')) {
 					return evalBanScript(args);
@@ -1484,6 +1491,47 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			tex.set(userKeyStr, serverNowMs() + ttlMs);
 
 			return wasEmpty ? 1 : 0;
+		}
+
+		// live.forget owner force-evict - removes the user's membership fields,
+		// checks ownership in-script, and mirrors the realtime leave script's
+		// succession (lowest join seq, lexicographic tie-break) or vacates the
+		// emptied room. Returns [ownerOrEmpty, reason, touchedFieldCount] with
+		// reason '' when ownership did not change. Whole-key EXPIRE refreshes
+		// are not modeled (the double does not track hash-key TTLs).
+		function evalOwnerForgetEvict(args) {
+			const key = args[0];
+			const k = String(args[1]);
+			pruneExpiredFields(key);
+			const h = hashes.get(key);
+			if (!h) return ['', '', 0];
+			let removed = 0;
+			if (h.delete('j:' + k)) removed++;
+			if (h.delete('n:' + k)) removed++;
+			const o = h.get('o');
+			if (o == null || o !== k) {
+				if (h.size === 0) hashes.delete(key);
+				return [o == null ? '' : o, '', removed];
+			}
+			let best = null;
+			let bestSeq = null;
+			for (const [f, v] of h) {
+				if (!f.startsWith('j:')) continue;
+				const cand = f.slice(2);
+				const s = Number(v);
+				if (bestSeq === null || s < bestSeq || (s === bestSeq && cand < best)) {
+					best = cand;
+					bestSeq = s;
+				}
+			}
+			if (best !== null) {
+				h.set('o', best);
+				return [best, 'succeeded', removed + 1];
+			}
+			h.delete('o');
+			h.delete('q');
+			if (h.size === 0) hashes.delete(key);
+			return ['', 'vacated', removed + 1];
 		}
 
 		// Presence LEAVE (Design G) - HDEL my instanceId from per-user hash,
