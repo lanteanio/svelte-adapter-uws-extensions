@@ -38,6 +38,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		? options.faultEngine
 		: null;
 	const store = new Map();       // key -> value (string)
+	const stringExpiry = new Map(); // key -> expireAtMs (SET ... EX/PX/EXAT/PXAT)
 	const sortedSets = new Map();  // key -> [{score, member}]
 	const hashes = new Map();      // key -> Map<field, value>
 	const hashFieldExpiry = new Map(); // key -> Map<field, expireAtMs> (Redis 7.4+ HEXPIRE)
@@ -141,6 +142,34 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		const keys = commandKeys(method, args);
 		if (keys.length === 0) return null;
 		return nodeForSlot(keySlot(keys[0]));
+	}
+
+	// Lazy expiry of TTL'd string keys (SET ... EX/PX/EXAT/PXAT). Real Redis
+	// drops a key once the server clock passes its deadline; the mock checks at
+	// access time. A key stays alive while `now <= expireAt` and is gone once
+	// `now > expireAt`, matching real Redis's strict `now > when` expired test -
+	// so a read AT the exact deadline still sees the key, one ms past it does
+	// not. Idempotent.
+	//
+	// WHO prunes: the DIRECT string surface - get / incr / exists / del / set's
+	// NX/XX gate - because the callers that rely on modeled string TTL (the
+	// forget tombstone; an NX re-acquire after a lease lapses) drive a VIRTUAL
+	// clock they advance explicitly, so expiry is deterministic.
+	// WHO deliberately does NOT: the eval-path compare-and-set scripts (fence /
+	// lock heartbeat + release, idempotency acquire/commit/abort) and the
+	// PEXPIRE / EXPIRE stubs are TTL-inert. A lease's renew loop refreshes its
+	// TTL THROUGH those inert paths, and the leader/lock/fence unit tests run on
+	// REAL timers (no virtual clock); if the eval heartbeat pruned, a renew
+	// interval that briefly starved past the lease would expire a still-renewing
+	// lease and flake the test. Keeping the eval path inert makes those tests
+	// depend on their compare-and-set logic, not on wall-clock scheduling.
+	function pruneExpiredString(key) {
+		const expireAt = stringExpiry.get(key);
+		if (expireAt === undefined) return;
+		if (serverNowMs() > expireAt) {
+			store.delete(key);
+			stringExpiry.delete(key);
+		}
 	}
 
 	// Lazy expiry of TTL'd hash fields. Real Redis 7.4+ expires fields at
@@ -264,27 +293,40 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 		const r = {
 			// String ops
-			async get(key) { return store.get(key) || null; },
+			async get(key) { pruneExpiredString(key); return store.get(key) || null; },
 			async set(key, val, ...flags) {
 				// Real Redis SET accepts NX / XX / EX / PX / EXAT / PXAT / KEEPTTL
-				// flags. Mock honors the conditional gates (NX / XX) since they
-				// affect return value; TTL flags are accepted and ignored
-				// (tests that exercise expiry should mutate the store directly
-				// or simulate via test helpers).
+				// flags. The mock honors the conditional gates (NX / XX) and now
+				// also the TTL flags: an EX/PX/EXAT/PXAT deadline is recorded so the
+				// key lazily expires on the server clock (see pruneExpiredString), a
+				// plain SET clears any prior TTL, and KEEPTTL preserves it - matching
+				// real Redis. TTL flags used to be ignored, which hid the fact that a
+				// PX-bounded key (e.g. a forget tombstone or a lock lease) eventually
+				// vanishes; a simulation harness that advances the clock now sees it.
+				pruneExpiredString(key); // NX/XX must gate against post-expiry state
 				let nx = false;
 				let xx = false;
+				let keepTtl = false;
+				let expireAt; // undefined => clear any existing TTL on write
 				for (let i = 0; i < flags.length; i++) {
 					const f = String(flags[i]).toUpperCase();
 					if (f === 'NX') nx = true;
 					else if (f === 'XX') xx = true;
-					else if (f === 'EX' || f === 'PX' || f === 'EXAT' || f === 'PXAT') i++;
+					else if (f === 'KEEPTTL') keepTtl = true;
+					else if (f === 'EX') expireAt = serverNowMs() + Number(flags[++i]) * 1000;
+					else if (f === 'PX') expireAt = serverNowMs() + Number(flags[++i]);
+					else if (f === 'EXAT') expireAt = Number(flags[++i]) * 1000;
+					else if (f === 'PXAT') expireAt = Number(flags[++i]);
 				}
 				if (nx && store.has(key)) return null;
 				if (xx && !store.has(key)) return null;
 				store.set(key, String(val));
+				if (expireAt !== undefined) stringExpiry.set(key, expireAt);
+				else if (!keepTtl) stringExpiry.delete(key);
 				return 'OK';
 			},
 			async incr(key) {
+				pruneExpiredString(key); // an expired counter restarts at 0, TTL cleared
 				const v = parseInt(store.get(key) || '0', 10) + 1;
 				store.set(key, String(v));
 				return v;
@@ -292,7 +334,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			async del(...keys) {
 				let count = 0;
 				for (const k of keys) {
+					pruneExpiredString(k); // an already-expired string key counts as absent (returns 0)
 					if (store.delete(k)) count++;
+					stringExpiry.delete(k);
 					if (sortedSets.delete(k)) count++;
 					if (hashes.delete(k)) count++;
 					hashFieldExpiry.delete(k);
@@ -304,9 +348,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				return r.del(...keys);
 			},
 			async exists(...keys) {
-				// Real EXISTS counts every existing key argument (duplicates count).
+				// Real EXISTS counts every existing key argument (duplicates count);
+				// an expired string key reads as absent.
 				let count = 0;
 				for (const key of keys) {
+					pruneExpiredString(key);
 					if (store.has(key) || sortedSets.has(key) || hashes.has(key) || streams.has(key)) count++;
 				}
 				return count;

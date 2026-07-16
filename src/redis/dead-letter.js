@@ -29,10 +29,28 @@
  * re-arms a PEXPIRE on all three keys as a quiet-queue backstop, so an idle
  * DLQ self-cleans within `ttlMs` instead of retaining payloads indefinitely.
  *
+ * Right-to-erasure completeness: `purgeUser` writes a per-user forget tombstone
+ * (`{prefix}dlq:purged:<user>` = server time at purge, `forgetTombstoneMs` PX,
+ * default 10 min) BEFORE it deletes the user's records, and `add` drops a record
+ * whose delivery was in flight when that purge ran - otherwise a long-running
+ * delivery that fails AFTER a `live.forget` would resurrect the erased payload.
+ * The purge time and
+ * the delivery start are both reconciled onto the shared Redis server clock, so
+ * the check is correct across a cluster (a per-process monotonic start on its
+ * own is not comparable between instances).
+ *
  * @module svelte-adapter-uws-extensions/redis/dead-letter
  */
 
 import { withBreaker } from '../shared/breaker.js';
+import { monotonicNow } from '../shared/runtime.js';
+
+// A forget tombstone lives long enough to catch a webhook delivery that was
+// already in flight when `live.forget` ran and only fails (and would be
+// captured) AFTER the purge swept the store. Sized well above a normal retry
+// budget; a single delivery whose total duration exceeds this is a narrow,
+// documented residual. Mirrors the in-memory store's 10-minute window.
+const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 
 /**
  * @typedef {Object} RedisDeadLetterOptions
@@ -42,6 +60,10 @@ import { withBreaker } from '../shared/breaker.js';
  *   an idle queue still self-cleans within `ttlMs` of its last write.
  * @property {object} [breaker] - Circuit breaker for fault isolation (shared `createCircuitBreaker`).
  * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
+ * @property {number} [forgetTombstoneMs=600000] - How long a per-user forget
+ *   tombstone lives (its PX). A delivery whose total retry duration outlives this
+ *   resurrects the erased payload once the tombstone expires; size it above your
+ *   max retry budget. Default 10 minutes (matches the in-memory store).
  */
 
 /**
@@ -60,6 +82,9 @@ export function createDeadLetter(client, options = {}) {
 	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
 		throw new Error('redis dead-letter: forgetUserId must be a function (record) => userId');
 	}
+	if (options.forgetTombstoneMs !== undefined && (!Number.isInteger(options.forgetTombstoneMs) || options.forgetTombstoneMs <= 0)) {
+		throw new Error(`redis dead-letter: forgetTombstoneMs must be a positive integer, got ${options.forgetTombstoneMs}`);
+	}
 	// Right-to-erasure: a DLQ record's payload is app-defined, so the store cannot
 	// tell whose record it is. When set, this maps a record to its owning userId
 	// so `live.forget` can drop the user's undelivered payloads. The DLQ is one
@@ -68,6 +93,14 @@ export function createDeadLetter(client, options = {}) {
 	const forgetUserId = options.forgetUserId;
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
+	// The forget tombstone window: how long `{prefix}dlq:purged:<user>` lives
+	// (its PX). A single delivery whose total retry duration outlives this
+	// resurrects the erased payload once the tombstone expires - the documented
+	// residual. An operator whose max retry budget exceeds the 10-minute default
+	// sizes this above it so no in-flight delivery can outlast the tombstone.
+	const forgetTombstoneMs = Number.isInteger(options.forgetTombstoneMs) && options.forgetTombstoneMs > 0
+		? options.forgetTombstoneMs
+		: FORGET_TOMBSTONE_MS;
 
 	const redis = client.redis;
 	const b = options.breaker;
@@ -78,6 +111,15 @@ export function createDeadLetter(client, options = {}) {
 	const seqKey = client.key('dlq:seq:{dlq}');
 	const recsKey = client.key('dlq:recs:{dlq}');
 	const orderKey = client.key('dlq:order:{dlq}');
+
+	// Per-user forget tombstone. Keyed by the userId the `forgetUserId` extractor
+	// yields (NOT hash-tagged into the {dlq} slot: it is only ever read/written on
+	// its own, never in a multi with the collection keys). `add` looks it up under
+	// the same key, so both sides key on the bare userId - `tenantId` is accepted
+	// for signature parity but is not part of the extractor's output.
+	function purgedKey(userId) {
+		return client.key('dlq:purged:' + userId);
+	}
 
 	/** Merge the hash field key (the id) back into the parsed record. */
 	function parseRecord(id, json) {
@@ -121,7 +163,15 @@ export function createDeadLetter(client, options = {}) {
 	}
 
 	return {
-		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
+		/**
+		 * Retain an undeliverable event. Resolves the new record id, or `null` when
+		 * a forget tombstone drops it (its delivery was in flight when `live.forget`
+		 * ran). `startedAt` is the delivery start as a monotonic stamp (threaded by
+		 * svelte-realtime's `_fireWebhookOut`); used only for the forget-race check,
+		 * never stored.
+		 * @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number, startedAt?: number }} rec
+		 * @returns {Promise<string | null>}
+		 */
 		async add(rec) {
 			// One TIME round-trip per add is fine - DLQ adds are a rare error
 			// path. The caller's failedAt is kept for display, clamped to
@@ -129,6 +179,39 @@ export function createDeadLetter(client, options = {}) {
 			// or in the server's future) becomes serverNow.
 			const t = await withBreaker(b, () => redis.time());
 			const serverNow = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+
+			// Forget tombstone (right-to-erasure completeness): if this record's
+			// owning user was purged (live.forget) while this delivery was already
+			// in flight, the purge scan ran BEFORE this capture, so persisting now
+			// would resurrect the erased user's payload past a confirmed erasure.
+			// Drop it instead. The purge time and the delivery start are reconciled
+			// onto the shared Redis SERVER clock: the tombstone stores server time at
+			// purge; the delivery start is serverNow minus the delivery's monotonic
+			// duration (both stamps from THIS delivering process), so the comparison
+			// is immune to inter-instance wall-clock skew - a cross-instance monotonic
+			// startedAt on its own would be meaningless. The round-trip between the
+			// TIME read and monotonicNow() only nudges serverStart slightly earlier,
+			// biasing toward dropping (the GDPR-safe direction). An absent startedAt
+			// -> elapsed 0 -> serverStart = serverNow, so a past purge never drops it
+			// (matches the in-memory store's untraced-start fallback).
+			if (forgetUserId) {
+				let uid;
+				try { uid = forgetUserId(rec); } catch { uid = undefined; }
+				if (typeof uid === 'string' && uid.length > 0) {
+					const tomb = await withBreaker(b, () => redis.get(purgedKey(uid)));
+					if (tomb != null) {
+						const purgeTime = Number(tomb);
+						const elapsed =
+							typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
+								? Math.max(0, monotonicNow() - rec.startedAt)
+								: 0;
+						const serverStart = serverNow - elapsed;
+						if (Number.isFinite(purgeTime) && purgeTime >= serverStart) {
+							return null;
+						}
+					}
+				}
+			}
 			// Floor to integer ms then clamp, matching the Postgres backend's
 			// LEAST(NULLIF(floor($7), 0), now): a fractional sub-1ms stamp floors
 			// to 0 and becomes serverNow on both backends rather than diverging.
@@ -242,6 +325,18 @@ export function createDeadLetter(client, options = {}) {
 		async purgeUser(tenantId, userId) {
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
 			return withBreaker(b, async () => {
+				// Tombstone FIRST (server clock): a delivery already in flight when
+				// this purge runs is captured by add() only AFTER this scan returns,
+				// so record the purge time so that late add() drops it. Written even
+				// with zero matching records - the in-flight delivery may fail moments
+				// later. PX bounds it to recent erasures (a delivery outliving the
+				// window is the documented residual, sized by `forgetTombstoneMs`).
+				// Server clock (TIME), never the caller's, so add()'s server-clock
+				// comparison is skew-immune.
+				const time = await redis.time();
+				const serverNow = Number(time[0]) * 1000 + Math.floor(Number(time[1]) / 1000);
+				await redis.set(purgedKey(userId), String(serverNow), 'PX', forgetTombstoneMs);
+
 				const all = await redis.hgetall(recsKey);
 				if (!all) return 0;
 				const ids = [];

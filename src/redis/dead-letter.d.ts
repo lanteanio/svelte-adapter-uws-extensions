@@ -17,6 +17,12 @@ export interface RedisDeadLetterOptions {
 	 * collection). Without it, records are not user-purgeable.
 	 */
 	forgetUserId?: (record: DeadLetterRecord) => string | null | undefined;
+	/**
+	 * How long a per-user forget tombstone lives (its PX). A delivery whose total
+	 * retry duration outlives this resurrects the erased payload once the tombstone
+	 * expires; size it above your max retry budget. @default 600000 (10 minutes)
+	 */
+	forgetTombstoneMs?: number;
 }
 
 /** A retained, undeliverable outbound-webhook event. */
@@ -38,7 +44,14 @@ export interface DeadLetterRecord {
  * svelte-realtime >= 0.6.0-next.40.
  */
 export interface RedisDeadLetterStore {
-	add(rec: Omit<DeadLetterRecord, 'id'>): Promise<string>;
+	/**
+	 * Retain an undeliverable event; resolves the new record id, or `null` when a
+	 * forget tombstone drops it (the delivery was in flight when `live.forget`
+	 * ran). `startedAt` is the delivery start as a monotonic stamp (threaded by
+	 * svelte-realtime's `_fireWebhookOut`), used only for the forget-race check,
+	 * never stored.
+	 */
+	add(rec: Omit<DeadLetterRecord, 'id'> & { startedAt?: number }): Promise<string | null>;
 	get(id: string): Promise<DeadLetterRecord | null>;
 	remove(id: string): Promise<boolean>;
 	count(filter?: { topic?: string }): Promise<number>;

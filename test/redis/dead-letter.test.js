@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createDeadLetter } from '../../src/redis/dead-letter.js';
+import { setRuntimeEnv, resetRuntimeEnv, monotonicNow } from '../../src/shared/runtime.js';
 
 const rec = (over = {}) => ({
 	webhookId: 'w1',
@@ -23,10 +24,13 @@ describe('redis dead-letter store', () => {
 	});
 
 	describe('createDeadLetter', () => {
-		it('validates max and ttlMs', () => {
+		it('validates max, ttlMs and forgetTombstoneMs', () => {
 			expect(() => createDeadLetter(client, { max: 0 })).toThrow('positive integer');
 			expect(() => createDeadLetter(client, { max: 1.5 })).toThrow('positive integer');
 			expect(() => createDeadLetter(client, { ttlMs: -1 })).toThrow('non-negative integer');
+			expect(() => createDeadLetter(client, { forgetTombstoneMs: 0 })).toThrow('positive integer');
+			expect(() => createDeadLetter(client, { forgetTombstoneMs: 1.5 })).toThrow('positive integer');
+			expect(() => createDeadLetter(client, { forgetTombstoneMs: -100 })).toThrow('positive integer');
 		});
 		it('works with no options and exposes the async interface', () => {
 			const s = createDeadLetter(client);
@@ -140,5 +144,173 @@ describe('redis dead-letter store', () => {
 		expect(await store.count()).toBe(0);
 		expect(await store.list()).toEqual([]);
 		expect(await store.summary()).toMatchObject({ total: 0, byTopic: {} });
+	});
+});
+
+describe('redis dead-letter forget tombstone (right-to-erasure completeness)', () => {
+	let client;
+	// A single controllable virtual clock drives both the Redis server clock
+	// (redis.time() -> wallEpoch) and monotonicNow(), so the store's
+	// serverNow - (monotonicNow - startedAt) reconciliation is exercised
+	// deterministically across a simulated multi-instance timeline.
+	let clockMs;
+
+	beforeEach(() => {
+		client = mockRedisClient('test:');
+		clockMs = 1_000_000;
+		setRuntimeEnv({
+			clock: {
+				now: () => clockMs,
+				monotonic: () => clockMs,
+				wallEpoch: () => clockMs
+			}
+		});
+	});
+
+	afterEach(() => {
+		resetRuntimeEnv();
+	});
+
+	const byAuthor = (record) => (record && record.data && record.data.author) || null;
+	// The default forget-tombstone PX (createDeadLetter's FORGET_TOMBSTONE_MS).
+	const DEFAULT_WINDOW = 10 * 60 * 1000;
+	const drec = (over = {}) => ({
+		webhookId: 'w',
+		topic: 'orders',
+		event: 'created',
+		data: { author: 'u1', body: 'PII' },
+		attempts: 3,
+		error: 'x',
+		...over
+	});
+
+	it('drops a record whose delivery raced a purge, and keeps a genuinely new one', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+
+		// A delivery for u1 starts now.
+		const startedAt = monotonicNow();
+		// live.forget(u1) runs 5s later while that delivery is still in flight.
+		clockMs += 5_000;
+		expect(await s.purgeUser(null, 'u1')).toBe(0); // empty store; tombstone armed
+
+		// The in-flight delivery finally exhausts retries and is captured 10s
+		// after it started (5s after the purge).
+		clockMs += 5_000;
+		const dropped = await s.add(drec({ failedAt: clockMs, startedAt }));
+		expect(dropped).toBeNull();
+		expect(await s.count()).toBe(0);
+
+		// A genuinely NEW delivery for u1, started AFTER the purge, is kept.
+		const newStart = monotonicNow();
+		clockMs += 2_000;
+		const kept = await s.add(drec({ data: { author: 'u1', body: 'new' }, failedAt: clockMs, startedAt: newStart }));
+		expect(kept).not.toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it("a different user's in-flight delivery is unaffected by another user's tombstone", async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();
+		clockMs += 5_000;
+		await s.purgeUser(null, 'u1'); // tombstone for u1 only
+		clockMs += 5_000;
+		const other = await s.add(drec({ data: { author: 'u2', body: 'x' }, failedAt: clockMs, startedAt }));
+		expect(other).not.toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it('is skew-immune: a long delivery whose monotonic start precedes the purge is still dropped via the server clock', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();
+		clockMs += 1;                 // purge 1ms after the delivery started
+		await s.purgeUser(null, 'u1');
+		// Delivery fails 2 minutes later - a long retry budget, but comfortably
+		// inside the 10-minute tombstone window, so the drop is the SKEW property
+		// (monotonic start precedes the purge yet the server-clock reconciliation
+		// still drops it), not an artifact of riding the tombstone's expiry edge.
+		clockMs += 120_000;
+		const dropped = await s.add(drec({ attempts: 8, failedAt: clockMs, startedAt }));
+		expect(dropped).toBeNull();
+	});
+
+	it('without a forgetUserId extractor, purgeUser is a no-op and records are never tombstone-dropped', async () => {
+		const s = createDeadLetter(client); // no extractor
+		const startedAt = monotonicNow();
+		clockMs += 5_000;
+		expect(await s.purgeUser(null, 'u1')).toBe(0);
+		clockMs += 5_000;
+		const id = await s.add(drec({ failedAt: clockMs, startedAt }));
+		expect(id).not.toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it('an absent startedAt never drops (fallback treats the start as now)', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		clockMs += 5_000;
+		await s.purgeUser(null, 'u1');
+		clockMs += 5_000;
+		// No startedAt: elapsed 0 -> serverStart == serverNow, a past purge cannot
+		// be >= it, so the record is kept (matches the in-memory untraced fallback).
+		const id = await s.add(drec({ failedAt: clockMs }));
+		expect(id).not.toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it('purgeUser deletes the user\'s existing records and arms the tombstone in one call', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		clockMs += 1_000;
+		await s.add(drec({ data: { author: 'u1', body: 'a' }, failedAt: clockMs, startedAt: monotonicNow() }));
+		await s.add(drec({ data: { author: 'u2', body: 'b' }, failedAt: clockMs, startedAt: monotonicNow() }));
+		clockMs += 1_000;
+		expect(await s.purgeUser(null, 'u1')).toBe(1); // u1's record deleted
+		expect(await s.count()).toBe(1);               // u2 remains
+		// And a racing u1 delivery captured after the purge is dropped.
+		const startedBefore = 1_000_000; // before the purge
+		clockMs += 1_000;
+		const dropped = await s.add(drec({ data: { author: 'u1', body: 'raced' }, failedAt: clockMs, startedAt: startedBefore }));
+		expect(dropped).toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it('a raced delivery captured just inside the tombstone window is still dropped', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();     // delivery starts before the purge
+		clockMs += 1;
+		await s.purgeUser(null, 'u1');         // tombstone armed, PX = DEFAULT_WINDOW
+		// Capture one ms before the tombstone would PX-expire: still within the
+		// window, so the erased payload is dropped.
+		clockMs += DEFAULT_WINDOW - 2;
+		const dropped = await s.add(drec({ failedAt: clockMs, startedAt }));
+		expect(dropped).toBeNull();
+		expect(await s.count()).toBe(0);
+	});
+
+	it('documented residual: a delivery captured just past the tombstone window resurrects (tombstone PX-expired)', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();     // delivery starts before the purge
+		clockMs += 1;
+		await s.purgeUser(null, 'u1');
+		// One ms PAST the tombstone deadline: the mock now models PX, so the
+		// tombstone is gone and the drop-check finds nothing - the erased payload
+		// is re-inserted. This is the parity residual (same 10-min window as the
+		// in-memory store), documented here rather than hidden by a mock that
+		// keeps the key forever. `forgetTombstoneMs` widens the window.
+		clockMs += DEFAULT_WINDOW + 1;
+		const resurrected = await s.add(drec({ failedAt: clockMs, startedAt }));
+		expect(resurrected).not.toBeNull();
+		expect(await s.count()).toBe(1);
+	});
+
+	it('a wider forgetTombstoneMs keeps dropping where the default window would have resurrected', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor, forgetTombstoneMs: 30 * 60 * 1000 });
+		const startedAt = monotonicNow();
+		clockMs += 1;
+		await s.purgeUser(null, 'u1');
+		// Past the DEFAULT window (where the residual test resurrected) but inside
+		// the widened 30-minute window: the erased payload is still dropped.
+		clockMs += DEFAULT_WINDOW + 60_000;
+		const dropped = await s.add(drec({ failedAt: clockMs, startedAt }));
+		expect(dropped).toBeNull();
+		expect(await s.count()).toBe(0);
 	});
 });

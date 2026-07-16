@@ -5,6 +5,16 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.60] - 2026-07-16
+
+### Changed
+
+- **The `svelte-adapter-uws-extensions/testing` `mockRedisClient` double now models string-key TTL.** `SET` with `EX` / `PX` / `EXAT` / `PXAT` records a deadline on the injectable server clock, a plain `SET` clears any prior TTL, `KEEPTTL` preserves it, and `GET` / `INCR` / `EXISTS` / `SET NX|XX` observe expiry (a key is alive up to its deadline and gone one ms past it, matching real Redis). TTL flags used to be silently ignored, which hid the fact that a `PX`-bounded key - a lock lease, a forget tombstone - eventually vanishes; a simulation that advances the clock now sees it expire.
+
+### Fixed
+
+- **The Redis dead-letter store completes right-to-erasure against a delivery that raced a purge.** A webhook delivery already in flight when `live.forget` swept the store would, on failing AFTER the purge, re-insert the erased user's payload - the durable/cluster store had no defense (the in-memory store already carries a forget tombstone). `purgeUser` now writes a per-user forget tombstone (`{prefix}dlq:purged:<user>` = server time at purge, `forgetTombstoneMs` TTL, default 10 minutes) before deleting the user's records, and `add` drops (resolves `null`) a record whose delivery started before that purge. The purge time and the delivery start are reconciled onto the shared Redis server clock, so the check holds across a cluster where the delivering and purging instances differ (a per-process monotonic start alone is not comparable between instances). A delivery started after the purge, and other users, are unaffected. The residual - a single delivery whose total retry duration outlives the tombstone - is now a configurable window: raise `forgetTombstoneMs` above your max retry budget to close it.
+
 ## [0.6.0-next.59] - 2026-07-14
 
 ### Fixed

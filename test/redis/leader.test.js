@@ -165,13 +165,15 @@ describe('redis leader', () => {
 	});
 
 	describe('lease expiry', () => {
-		// The mock redis does not simulate PX-based TTL expiry; cross-worker
-		// expiry-then-handoff is exercised end-to-end in the integration
-		// suite where real Redis enforces TTL. Here we cover the
-		// self-healing recovery path: when the lease vanishes (we simulate
-		// expiry by deleting the key), the renewal loop notices via the
-		// compare-and-pexpire script returning 0, transitions to
-		// non-leader, then re-acquires on its next tick.
+		// The renew loop refreshes the lease through the eval compare-and-pexpire
+		// script and PEXPIRE, both of which the mock keeps TTL-inert, so a healthy
+		// leader's key never lapses here on wall-clock timing. Cross-worker
+		// expiry-then-handoff is exercised end-to-end in the integration suite
+		// where real Redis enforces TTL. Here we cover the self-healing recovery
+		// path deterministically: we simulate the lease vanishing by DELETING the
+		// key (rather than sleeping past a modeled PX, which would be wall-clock
+		// timing dependent), the renewal loop notices via the compare-and-pexpire
+		// script returning 0, transitions to non-leader, then re-acquires next tick.
 		it('leader re-acquires on its next tick once the lease key is gone', async () => {
 			const l = track(createLeader(client, { leaseMs: 600, renewMs: 30 }));
 			await waitFor(() => l.isLeader());
@@ -228,8 +230,9 @@ describe('redis leader', () => {
 
 			await waitFor(() => !l.isLeader(), { timeoutMs: 500 });
 
-			// Recover the connection and clear the stale key (simulating
-			// server-side TTL expiry, which the mock does not enforce).
+			// Recover the connection and clear the stale key. The renew path is
+			// TTL-inert in the mock, so we delete the key to stand in for the
+			// server-side TTL expiry deterministically (rather than on wall time).
 			client.redis.eval = origEval;
 			client.redis.set = origSet;
 			await client.redis.del('app:leader');

@@ -110,6 +110,76 @@ describe('mock-redis clock-controlled expiry through the seam', () => {
 	});
 });
 
+describe('mock-redis string-key TTL (SET EX/PX/EXAT/PXAT) follows the seam', () => {
+	it('a PX key survives right up to its deadline, then is pruned one ms past it', async () => {
+		pinClock(FIXED_MS);
+		const r = mockRedisClient().redis;
+		expect(await r.set('k', 'v', 'PX', 1000)).toBe('OK');
+		expect(await r.get('k')).toBe('v');
+
+		// Real Redis expires a string key on `now > when`, so AT the exact deadline
+		// the key is still alive (unlike the mock's hash-field prune, which drops at
+		// `now >= expireAt`). This `>` semantics is what makes the mock agree with
+		// real Redis at the forget-tombstone boundary.
+		pinClock(FIXED_MS + 1000);
+		expect(await r.get('k')).toBe('v');
+		expect(await r.exists('k')).toBe(1);
+
+		// One ms past the deadline the key is gone on the next read.
+		pinClock(FIXED_MS + 1001);
+		expect(await r.get('k')).toBeNull();
+		expect(await r.exists('k')).toBe(0);
+	});
+
+	it('EX seconds and PXAT/EXAT absolute deadlines expire on the seam clock', async () => {
+		pinClock(FIXED_MS);
+		const r = mockRedisClient().redis;
+		await r.set('ex', 'v', 'EX', 5);              // 5s relative
+		await r.set('pxat', 'v', 'PXAT', FIXED_MS + 2000); // absolute ms deadline
+		await r.set('exat', 'v', 'EXAT', Math.floor(FIXED_MS / 1000) + 3); // absolute s deadline
+
+		pinClock(FIXED_MS + 2001);
+		expect(await r.get('pxat')).toBeNull();       // 2s deadline passed
+		expect(await r.get('exat')).toBe('v');        // 3s deadline not yet
+		expect(await r.get('ex')).toBe('v');          // 5s deadline not yet
+
+		pinClock(FIXED_MS + 5001);
+		expect(await r.get('exat')).toBeNull();
+		expect(await r.get('ex')).toBeNull();
+	});
+
+	it('a plain SET clears a prior TTL; KEEPTTL preserves it', async () => {
+		pinClock(FIXED_MS);
+		const r = mockRedisClient().redis;
+
+		// Plain overwrite drops the TTL: the key is then persistent.
+		await r.set('clear', 'v1', 'PX', 1000);
+		await r.set('clear', 'v2');
+		pinClock(FIXED_MS + 10_000);
+		expect(await r.get('clear')).toBe('v2');
+
+		// KEEPTTL keeps the original deadline: the key still expires.
+		pinClock(FIXED_MS);
+		await r.set('keep', 'v1', 'PX', 1000);
+		await r.set('keep', 'v2', 'KEEPTTL');
+		pinClock(FIXED_MS + 1001);
+		expect(await r.get('keep')).toBeNull();
+	});
+
+	it('NX gates against post-expiry state: an expired key is re-settable with NX', async () => {
+		pinClock(FIXED_MS);
+		const r = mockRedisClient().redis;
+		expect(await r.set('lease', 'a', 'NX', 'PX', 1000)).toBe('OK');
+		// While alive, NX is refused.
+		expect(await r.set('lease', 'b', 'NX', 'PX', 1000)).toBeNull();
+
+		// Once the lease PX-expires, NX succeeds again (the prune runs first).
+		pinClock(FIXED_MS + 1001);
+		expect(await r.set('lease', 'c', 'NX', 'PX', 1000)).toBe('OK');
+		expect(await r.get('lease')).toBe('c');
+	});
+});
+
 describe('mock-redis stream ids are seed-reproducible', () => {
 	it('XADD * derives its id from the virtual clock', async () => {
 		pinClock(FIXED_MS);

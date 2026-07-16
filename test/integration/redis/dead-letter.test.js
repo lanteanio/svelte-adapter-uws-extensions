@@ -12,7 +12,10 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { redisNowMs, waitRedisMs } from '../helpers/backend-clock.js';
+import { monotonicNow } from '../../../src/shared/runtime.js';
 import { createDeadLetter } from '../../../src/redis/dead-letter.js';
+
+const byAuthor = (record) => (record && record.data && record.data.author) || null;
 
 const rec = (over = {}) => ({
 	webhookId: 'w1',
@@ -105,5 +108,34 @@ describe('redis dead-letter (integration)', () => {
 		await dlq.add(rec({ failedAt: await redisNowMs(client) }));
 		expect(await client.redis.pttl(client.key('dlq:recs:{dlq}'))).toBe(-1);
 		expect(await client.redis.pttl(client.key('dlq:order:{dlq}'))).toBe(-1);
+	});
+
+	it('forget tombstone drops a delivery that raced the purge (real PX, within the window)', async () => {
+		const dlq = createDeadLetter(client, { forgetUserId: byAuthor, forgetTombstoneMs: 60_000 });
+		const startedAt = monotonicNow();               // delivery already in flight
+		expect(await dlq.purgeUser(null, 'u1')).toBe(0); // empty store; tombstone armed
+		// The in-flight delivery finally exhausts retries and is captured after the
+		// purge; its server-clock start precedes the purge, so it is dropped.
+		const dropped = await dlq.add(rec({ data: { author: 'u1', body: 'PII' }, failedAt: await redisNowMs(client), startedAt }));
+		expect(dropped).toBeNull();
+		expect(await dlq.count()).toBe(0);
+		// The tombstone key carries a real PX countdown.
+		const pttl = await client.redis.pttl(client.key('dlq:purged:u1'));
+		expect(pttl).toBeGreaterThan(0);
+		expect(pttl).toBeLessThanOrEqual(60_000);
+	});
+
+	it('the tombstone PX-expires: a delivery past forgetTombstoneMs resurrects (documented residual)', async () => {
+		const dlq = createDeadLetter(client, { forgetUserId: byAuthor, forgetTombstoneMs: 200 });
+		const startedAt = monotonicNow();
+		await dlq.purgeUser(null, 'u1');
+		// Wait past the 200ms tombstone on Redis's own clock: the key expires, so
+		// the drop-check finds nothing and the raced delivery is re-inserted. This
+		// is the parity residual - a delivery outliving the window resurrects.
+		await waitRedisMs(client, 400);
+		expect(await client.redis.pttl(client.key('dlq:purged:u1'))).toBe(-2); // gone
+		const resurrected = await dlq.add(rec({ data: { author: 'u1', body: 'PII' }, failedAt: await redisNowMs(client), startedAt }));
+		expect(resurrected).not.toBeNull();
+		expect(await dlq.count()).toBe(1);
 	});
 });
