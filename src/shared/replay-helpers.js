@@ -260,11 +260,21 @@ async function _drainWaitWindows(redis, minReplicas, timeoutMs, g) {
  * propagates (Promise.all - the sibling fills still run to completion with
  * their rejections observed).
  *
+ * Covered watermark: resolves `{ [topic]: highestSeqCovered }` for every topic
+ * it gap-filled, where the value is the seq the store's `replay()` reported
+ * covering. The adapter's recovery barrier reads this return value to dedup
+ * the live frames it buffered during the resume window EXACTLY (a frame with
+ * seq <= the watermark was already delivered by the gap-fill and is skipped;
+ * anything newer flushes). A topic that was NOT gap-filled - a rehydrate
+ * mismatch, or a replay that reported nothing (denied) - is simply absent
+ * from the map, so the adapter falls back to its conservative pre-window
+ * floor for that topic (at-least-once rather than a gap).
+ *
  * @param {{
  *   currentEpochs: (topics: string[]) => Promise<Map<string, number>>,
- *   replay: (ws: any, topic: string, sinceSeq: number, platform: any) => Promise<any>
+ *   replay: (ws: any, topic: string, sinceSeq: number, platform: any) => Promise<number | undefined>
  * }} store
- * @returns {(ws: any, ctx: any) => Promise<void>}
+ * @returns {(ws: any, ctx: any) => Promise<Record<string, number> | undefined>}
  */
 export function createResumeHook({ currentEpochs, replay }) {
 	return async (ws, ctx) => {
@@ -281,6 +291,7 @@ export function createResumeHook({ currentEpochs, replay }) {
 		}
 		const have = epochTopics.length > 0 ? await currentEpochs(epochTopics) : null;
 		const fills = [];
+		const fillTopics = [];
 		for (const [topic, sinceSeq] of entries) {
 			// Normalize wire-supplied sinceSeq. Reject non-integers (fractional,
 			// NaN, Infinity, non-number) by falling through to 0 (resume from
@@ -296,7 +307,17 @@ export function createResumeHook({ currentEpochs, replay }) {
 				}
 			}
 			fills.push(replay(ws, topic, seq, ctx.platform));
+			fillTopics.push(topic);
 		}
-		await Promise.all(fills);
+		const results = await Promise.all(fills);
+		// Prototype-free so a hostile topic name (e.g. __proto__) still lands
+		// as an own property instead of being silently swallowed by the
+		// Object.prototype setter, which would drop that topic's watermark.
+		/** @type {Record<string, number>} */
+		const covered = Object.create(null);
+		for (let i = 0; i < results.length; i++) {
+			if (typeof results[i] === 'number') covered[fillTopics[i]] = /** @type {number} */ (results[i]);
+		}
+		return covered;
 	};
 }

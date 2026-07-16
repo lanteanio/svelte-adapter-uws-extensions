@@ -516,10 +516,23 @@ export function createStreamReplay(client, options = {}) {
 			}
 			if (b) b.guard();
 
-			let entries;
+			// The seq counter rides the same RTT as the range read: the
+			// empty-gap-fill truncation check and the watermark confirmation
+			// (see the return below) both need it, and resume is the
+			// reconnect-storm hot path, so it must not cost a second round
+			// trip. Both keys share the {topic} hash tag, so the pipeline
+			// stays single-slot on a cluster.
+			let entries, seqRaw;
 			try {
 				const startId = `(${sinceSeq}-0`;
-				entries = await redis.xrange(bufKey(topic), startId, '+');
+				const pipe = redis.pipeline();
+				pipe.xrange(bufKey(topic), startId, '+');
+				pipe.get(seqKey(topic));
+				const results = await pipe.exec();
+				if (results[0][0]) throw results[0][0];
+				if (results[1][0]) throw results[1][0];
+				entries = results[0][1];
+				seqRaw = results[1][1];
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -533,18 +546,12 @@ export function createStreamReplay(client, options = {}) {
 			}
 
 			let truncated = false;
+			const currentSeq = seqRaw ? parseInt(seqRaw, 10) : 0;
 			if (sinceSeq > 0) {
 				if (missed.length > 0 && missed[0].seq > sinceSeq + 1) {
 					truncated = true;
-				} else if (missed.length === 0) {
-					try {
-						const val = await redis.get(seqKey(topic));
-						const currentSeq = val ? parseInt(val, 10) : 0;
-						if (currentSeq > sinceSeq) truncated = true;
-					} catch (err) {
-						b?.failure(err);
-						throw err;
-					}
+				} else if (missed.length === 0 && currentSeq > sinceSeq) {
+					truncated = true;
 				}
 			}
 			b?.success();
@@ -559,6 +566,25 @@ export function createStreamReplay(client, options = {}) {
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
 			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			// Covered watermark for the adapter's recovery barrier: the highest seq
+			// this gap-fill actually delivered (XRANGE is id-ascending and the seq
+			// IS the stream id's ms part, so the last valid decode is the highest).
+			// Everything at or below it is already on the wire, so the barrier
+			// dedups its held live frames exactly instead of falling back to the
+			// pre-window floor.
+			if (missed.length > 0) return missed[missed.length - 1].seq;
+			if (sinceSeq === 0) return 0;
+			// Empty gap-fill: the client's claim of being current at sinceSeq is
+			// wire input, trusted only when the seq counter confirms the store
+			// ever issued that seq. An offset above the counter (corrupt client
+			// state, or a failover to a lagging replica regressing the counter
+			// with the epoch unchanged) resolves undefined instead, so the
+			// adapter falls back to its conservative pre-window floor and an
+			// in-window publish is delivered at-least-once rather than silently
+			// skipped. Not clamped to the counter: an in-window publish can bump
+			// the counter to the held frame's own seq before this read, so a
+			// clamped watermark could still swallow that frame.
+			return currentSeq >= sinceSeq ? sinceSeq : undefined;
 		},
 
 		async clear() {

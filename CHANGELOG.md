@@ -5,6 +5,16 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.61] - 2026-07-16
+
+### Added
+
+- **Replay resume now reports the covered watermark, making the replay-to-live cutover dedup exact.** The adapter buffers live frames published while an async resume is in flight (past the store read, before the connection joins live fan-out) and flushes them after cutover, deduped against what the resume covered - but the boundary is only exact when the resume reports it. All three replay backends (Redis sorted-set, Redis stream, Postgres) now resolve that report: `replay()` resolves the highest seq it delivered (or `sinceSeq` when the client was already current AND the stored seq counter confirms it; `undefined` when denied, or when the presented offset exceeds the counter - an unverifiable client claim is never trusted as a watermark), and `resumeHook()` resolves `{ [topic]: highestSeqCovered }` for every topic it gap-filled, in the same authoritative per-topic seq space the publish stamped. The counter confirmation rides the existing gap-fill round trip on both Redis backends (the seq key shares the topic's hash tag, so the read stays single-slot on a cluster), so resume - the reconnect-storm hot path - pays no extra latency for it. A publish landing inside the resume window therefore reaches the client exactly once - no gap, no duplicate - where a non-reporting resume degrades to at-least-once. A rehydrated or denied topic is absent from the map, so the adapter keeps its conservative floor there. Adapters from `0.6.0-next.77` read the report; older adapters ignore the return value, so nothing else changes.
+
+### Fixed
+
+- **The Postgres replay backend rejects a malformed resume offset instead of dumping the buffer.** `replay()` and `since()` now gate a non-integer or negative offset exactly like the Redis backends already did: `since()` returns `[]`, and `replay()` emits a bare `end` marker (and reports no watermark) rather than letting a negative bound in `seq > $2` return the entire buffer - a data-leak vector for host code that forwards client input unchecked. The adapter's own resume path always normalized these values, so only direct callers of the store API see the change.
+
 ## [0.6.0-next.60] - 2026-07-16
 
 ### Changed

@@ -537,14 +537,19 @@ The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(
 
 The hook also detects a topic whose seq space was **reset** since the client last saw it - a `clearTopic`, a TTL-reaped seq key, or a botched reshard that drops the keys all restart the seq counter at 1. Each topic carries a generation in a shared `replay:epoch:{topic}` key (co-located with `replay:seq:`/`replay:buf:` under the same hash tag, so it travels with the slot on a reshard, and given no TTL so it outlives a reaped seq key). The client tracks the epoch it last saw per topic and presents it back on resume; the hook compares it to the stored one. On a match it gap-fills as above. On a mismatch it skips gap-fill for that topic and emits a `rehydrate` event on `__replay:{topic}`, telling the client to drop its stale offset and re-read from scratch rather than be served the new, lower seq numbering as if it continued the old one. Read the stored generation directly with `replay.currentEpoch(topic)` (async) or its in-process cache via `replay.cachedEpoch(topic)` (sync). The compare is strictly additive: a topic the client presents no epoch for is always treated as a match, so a client or deployment that never adopted the epoch resumes exactly as before.
 
-For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand:
+The hook resolves the **covered watermark** - `{ [topic]: highestSeqCovered }` for every topic it gap-filled - and the adapter's replay-to-live cutover reads that return value. The adapter buffers live frames published while the resume is in flight (past the store read, before the connection joins live fan-out) and flushes them after cutover, skipping every frame the gap-fill already delivered: with the watermark the dedup boundary is exact, so a publish landing inside the resume window arrives exactly once - no gap, no duplicate. `replay()` itself resolves the same watermark for one topic: the highest seq it delivered, or `sinceSeq` when the client was already current and the stored seq counter confirms it. It resolves `undefined` when the replay was denied - and when the presented offset exceeds the counter, because the offset is client-controlled wire input and an unverifiable claim must never become a trusted watermark (frames below it would be silently skipped at the flush). A topic the hook did not gap-fill (a `rehydrate` mismatch, a denied replay, an unverifiable offset) is absent from the map, and the adapter falls back to its conservative pre-window floor for it.
+
+For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand. Keep returning the per-topic watermark so the cutover dedup stays exact:
 
 ```js
 export async function resume(ws, { lastSeenSeqs, platform }) {
+  const covered = {};
   for (const [topic, sinceSeq] of Object.entries(lastSeenSeqs)) {
-    await replay.replay(ws, topic, sinceSeq, platform);
+    const seq = await replay.replay(ws, topic, sinceSeq, platform);
+    if (typeof seq === 'number') covered[topic] = seq;
   }
   // ... your own resume work alongside replay
+  return covered;
 }
 ```
 

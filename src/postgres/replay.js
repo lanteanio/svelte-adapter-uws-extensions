@@ -55,7 +55,7 @@ export { ReplayStorageError, ReplaySerializationError };
  * @property {(topic: string) => Promise<number>} seq
  * @property {(topic: string, lastSeenSeq: number) => Promise<{truncated: boolean, missingFrom: number | null}>} gap
  * @property {(topic: string, since: number) => Promise<Array<{seq: number, topic: string, event: string, data: unknown}>>} since
- * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<void>} replay
+ * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<number | undefined>} replay
  * @property {() => Promise<void>} clear
  * @property {(topic: string) => Promise<void>} clearTopic
  * @property {(topic: string) => Promise<number>} currentEpoch - Stored seq-space generation (baseline 0); bumped on every reset
@@ -575,6 +575,11 @@ export function createReplay(client, options = {}) {
 		},
 
 		async since(topic, since) {
+			// Reject malformed since values defensively, matching the Redis
+			// backends: a negative bound in `seq > $2` returns the entire
+			// buffer - a data-leak vector for buggy host code that forwards
+			// client input unchecked.
+			if (!Number.isInteger(since) || since < 0) return [];
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
 				return client.query({
@@ -598,6 +603,14 @@ export function createReplay(client, options = {}) {
 		async replay(ws, topic, sinceSeq, platform, reqId) {
 			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
+			// Same input gate as since() and the Redis backends: a malformed
+			// sinceSeq would return the entire buffer via `seq > $2` with a
+			// negative bound. Emit a bare `end` marker so the wire protocol
+			// shape is preserved.
+			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
+				platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+				return;
+			}
 			b?.guard();
 			try {
 				await ensureTable();
@@ -628,6 +641,10 @@ export function createReplay(client, options = {}) {
 				data: row.data
 			}));
 
+			// Captured on the missed-empty path so the return below can confirm
+			// the client's sinceSeq against the counter before trusting it as
+			// the covered watermark.
+			let currentSeq = null;
 			if (sinceSeq > 0 && missed.length > 0 && missed[0].seq > sinceSeq + 1) {
 				mTruncations?.inc({ topic: mt(topic) });
 				platform.send(ws, replayTopic, 'truncated', null);
@@ -640,7 +657,7 @@ export function createReplay(client, options = {}) {
 						        WHERE topic = $1`,
 						values: [topic]
 					});
-					const currentSeq = seqRes.rows.length > 0 ? parseInt(seqRes.rows[0].current_seq, 10) : 0;
+					currentSeq = seqRes.rows.length > 0 ? parseInt(seqRes.rows[0].current_seq, 10) : 0;
 					if (currentSeq > sinceSeq) {
 						mTruncations?.inc({ topic: mt(topic) });
 						platform.send(ws, replayTopic, 'truncated', null);
@@ -662,6 +679,24 @@ export function createReplay(client, options = {}) {
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
 			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			// Covered watermark for the adapter's recovery barrier: the highest seq
+			// this gap-fill actually delivered (ORDER BY seq ASC, so the last row is
+			// the highest). Everything at or below it is already on the wire, so
+			// the barrier dedups its held live frames exactly instead of falling
+			// back to the pre-window floor.
+			if (missed.length > 0) return missed[missed.length - 1].seq;
+			if (sinceSeq === 0) return 0;
+			// Empty gap-fill: the client's claim of being current at sinceSeq is
+			// wire input, trusted only when the seq counter confirms the store
+			// ever issued that seq. An offset above the counter (corrupt client
+			// state, or a failover to a lagging standby regressing the counter
+			// with the epoch unchanged) resolves undefined instead, so the
+			// adapter falls back to its conservative pre-window floor and an
+			// in-window publish is delivered at-least-once rather than silently
+			// skipped. Not clamped to the counter: an in-window publish can bump
+			// the counter to the held frame's own seq before this read, so a
+			// clamped watermark could still swallow that frame.
+			return currentSeq >= sinceSeq ? sinceSeq : undefined;
 		},
 
 		/**

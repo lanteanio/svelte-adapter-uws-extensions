@@ -779,6 +779,124 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('covered watermark (recovery-barrier contract)', () => {
+		// The adapter's replay-to-live cutover buffers live frames published
+		// during the async resume and dedups the flush against what the resume
+		// REPORTS covering. These pin the reporting half of that contract: the
+		// hook resolves { [topic]: highestSeqCovered } for every gap-filled
+		// topic, so the adapter's dedup boundary is exact instead of falling
+		// back to its conservative pre-window floor.
+		it('replay() resolves the highest seq it delivered', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay.publish(platform, 'chat', 'msg', { id: 3 });
+			expect(await replay.replay({}, 'chat', 1, platform)).toBe(3);
+		});
+
+		it('replay() resolves sinceSeq itself when the client is current (nothing newer)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.replay({}, 'chat', 2, platform)).toBe(2);
+			// A topic with no history reports the 0 floor.
+			expect(await replay.replay({}, 'empty', 0, platform)).toBe(0);
+		});
+
+		it('replay() resolves undefined when the subscribe gate denies (nothing gap-filled)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			platform.checkSubscribe = async () => 'FORBIDDEN';
+			expect(await replay.replay({}, 'chat', 0, platform)).toBeUndefined();
+		});
+
+		it('replay() resolves undefined on a malformed sinceSeq (defense-in-depth path)', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			expect(await replay.replay({}, 'chat', -1, platform)).toBeUndefined();
+			expect(await replay.replay({}, 'chat', 1.5, platform)).toBeUndefined();
+		});
+
+		it('replay() resolves undefined when sinceSeq exceeds the seq counter (unverifiable claim)', async () => {
+			// The offset is client-controlled wire input: an inflated claim must
+			// never become a trusted watermark, or a frame published inside the
+			// resume window is silently skipped at the barrier flush. The buffer
+			// still holds valid entries here, so this also pins the counter read
+			// on the buffer-not-empty path (which truncation detection alone
+			// never needed).
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			platform.reset();
+			expect(await replay.replay({}, 'chat', 999, platform)).toBeUndefined();
+			// The wire stays protocol-shaped: no frames, no truncated marker
+			// (nothing provably trimmed), and the end marker still arrives.
+			expect(platform.sent.filter((s) => s.event === 'msg')).toHaveLength(0);
+			expect(platform.sent.find((s) => s.event === 'truncated')).toBeUndefined();
+			expect(platform.sent.find((s) => s.event === 'end')).toBeDefined();
+		});
+
+		it('replay() resolves undefined for an inflated claim on a topic with no history', async () => {
+			expect(await replay.replay({}, 'ghost', 5, platform)).toBeUndefined();
+		});
+
+		it('resumeHook omits a liar-offset topic but still reports the others', async () => {
+			await replay.publish(platform, 'honest', 'msg', { id: 1 });
+			await replay.publish(platform, 'liar', 'msg', { id: 1 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			const covered = await hook({}, { lastSeenSeqs: { honest: 0, liar: 999 }, platform });
+
+			// The liar topic is absent from the map, so the adapter falls back to
+			// its conservative pre-window floor there instead of trusting the claim.
+			expect(covered).toEqual({ honest: 1 });
+		});
+
+		it('resumeHook resolves the per-topic map for every gap-filled topic', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			await replay.publish(platform, 'todos', 'msg', { id: 1 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			const covered = await hook({}, { lastSeenSeqs: { chat: 0, todos: 1 }, platform });
+
+			// chat delivered up to 2; todos was current at its floor 1.
+			expect(covered).toEqual({ chat: 2, todos: 1 });
+		});
+
+		it('resumeHook omits a rehydrated topic from the watermark map', async () => {
+			await replay.publish(platform, 'fresh', 'msg', { id: 1 });
+			const freshEpoch = await replay.currentEpoch('fresh');
+
+			await replay.publish(platform, 'stale', 'msg', { id: 1 });
+			const staleEpoch = await replay.currentEpoch('stale');
+			await replay.clearTopic('stale');
+			await replay.publish(platform, 'stale', 'msg', { id: 2 });
+			platform.reset();
+
+			const hook = replay.resumeHook();
+			const covered = await hook({}, {
+				lastSeenSeqs: { fresh: 0, stale: 9 },
+				lastSeenEpochs: { fresh: freshEpoch, stale: staleEpoch },
+				platform
+			});
+
+			// The rehydrated topic reported nothing: the adapter must fall back to
+			// its own conservative floor there, never trust a reset seq space.
+			expect(covered).toEqual({ fresh: 1 });
+			expect('stale' in covered).toBe(false);
+		});
+
+		it('resumeHook omits a gate-denied topic but still reports the others', async () => {
+			await replay.publish(platform, 'open', 'msg', { id: 1 });
+			await replay.publish(platform, 'locked', 'msg', { id: 1 });
+			platform.reset();
+			platform.checkSubscribe = async (ws, topic) => (topic === 'locked' ? 'FORBIDDEN' : null);
+
+			const hook = replay.resumeHook();
+			const covered = await hook({}, { lastSeenSeqs: { open: 0, locked: 0 }, platform });
+
+			expect(covered).toEqual({ open: 1 });
+		});
+	});
+
 	describe('clear / clearTopic', () => {
 		it('clear resets everything', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });

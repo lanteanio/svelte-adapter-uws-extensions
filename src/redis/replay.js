@@ -47,7 +47,7 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * @property {(topic: string) => Promise<number>} seq
  * @property {(topic: string, lastSeenSeq: number) => Promise<{truncated: boolean, missingFrom: number | null}>} gap
  * @property {(topic: string, since: number) => Promise<Array<{seq: number, topic: string, event: string, data: unknown}>>} since
- * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<void>} replay
+ * @property {(ws: any, topic: string, sinceSeq: number, platform: import('svelte-adapter-uws').Platform) => Promise<number | undefined>} replay
  * @property {() => Promise<void>} clear
  * @property {(topic: string) => Promise<void>} clearTopic
  */
@@ -376,17 +376,25 @@ export function createReplay(client, options = {}) {
 			// alongside the seq>sinceSeq fetch so this is one RTT and the
 			// returned data covers only what the client actually needs.
 			// Fetch a small slice for the oldest probe so corrupt entries
-			// at the head don't hide the actual oldest valid seq.
-			let oldestRaw, missedRaw;
+			// at the head don't hide the actual oldest valid seq. The seq
+			// counter rides the same RTT: the empty-gap-fill truncation check
+			// and the watermark confirmation (see the return below) both need
+			// it, and resume is the reconnect-storm hot path, so it must not
+			// cost a second round trip. All three keys share the {topic} hash
+			// tag, so the pipeline stays single-slot on a cluster.
+			let oldestRaw, missedRaw, seqRaw;
 			try {
 				const pipe = redis.pipeline();
 				pipe.zrange(bk, 0, 9);
 				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
+				pipe.get(seqKey(topic));
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];
+				if (results[2][0]) throw results[2][0];
 				oldestRaw = results[0][1];
 				missedRaw = results[1][1];
+				seqRaw = results[2][1];
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -417,18 +425,10 @@ export function createReplay(client, options = {}) {
 				missed.push(decoded);
 			}
 
-			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0) {
-				try {
-					const val = await redis.get(seqKey(topic));
-					const currentSeq = val ? parseInt(val, 10) : 0;
-					if (currentSeq > sinceSeq) {
-						mTruncations?.inc({ topic: mt(topic) });
-						platform.send(ws, replayTopic, 'truncated', null);
-					}
-				} catch (err) {
-					b?.failure(err);
-					throw err;
-				}
+			const currentSeq = seqRaw ? parseInt(seqRaw, 10) : 0;
+			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0 && currentSeq > sinceSeq) {
+				mTruncations?.inc({ topic: mt(topic) });
+				platform.send(ws, replayTopic, 'truncated', null);
 			}
 			b?.success();
 
@@ -442,6 +442,27 @@ export function createReplay(client, options = {}) {
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
 			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			// Covered watermark for the adapter's recovery barrier: the highest seq
+			// this gap-fill actually delivered (ZRANGEBYSCORE is ascending, so the
+			// last valid decode is the highest). Everything at or below it is
+			// already on the wire, so the barrier can dedup its held live frames
+			// exactly instead of falling back to the pre-window floor. A corrupt
+			// newest entry lowers the watermark to the last seq actually SENT, so
+			// a held live frame carrying the corrupt entry's seq flushes and fills
+			// the hole rather than being wrongly skipped.
+			if (missed.length > 0) return missed[missed.length - 1].seq;
+			if (sinceSeq === 0) return 0;
+			// Empty gap-fill: the client's claim of being current at sinceSeq is
+			// wire input, trusted only when the seq counter confirms the store
+			// ever issued that seq. An offset above the counter (corrupt client
+			// state, or a failover to a lagging replica regressing the counter
+			// with the epoch unchanged) resolves undefined instead, so the
+			// adapter falls back to its conservative pre-window floor and an
+			// in-window publish is delivered at-least-once rather than silently
+			// skipped. Not clamped to the counter: an in-window publish can bump
+			// the counter to the held frame's own seq before this read, so a
+			// clamped watermark could still swallow that frame.
+			return currentSeq >= sinceSeq ? sinceSeq : undefined;
 		},
 
 		async clear() {

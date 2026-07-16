@@ -281,6 +281,36 @@ describeIntegration('redis replay (integration)', () => {
 
 			expect(platform.sent.find((s) => s.event === 'truncated')).toBeDefined();
 		});
+
+		it('resolves the covered watermark from the real ZRANGEBYSCORE read', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'chat', 'msg', { id: 'c2' });
+			await replay.publish(platform, 'todos', 'msg', { id: 't1' });
+
+			platform.reset();
+			const hook = replay.resumeHook();
+			const covered = await hook({}, { lastSeenSeqs: { chat: 0, todos: 1 }, platform });
+
+			// chat gap-filled up to 2; todos was current at its floor 1. The
+			// adapter's replay-to-live cutover dedups its held live frames against
+			// exactly these values.
+			expect(covered).toEqual({ chat: 2, todos: 1 });
+			expect(await replay.replay({}, 'chat', 1, platform)).toBe(2);
+		});
+
+		it('never trusts an offset above the real seq counter as a watermark', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 'c1' });
+			await replay.publish(platform, 'chat', 'msg', { id: 'c2' });
+
+			platform.reset();
+			// Counter is at 2; the claim of 999 is unverifiable, so replay()
+			// reports nothing and the hook omits the topic - the adapter falls
+			// back to its conservative pre-window floor instead of skipping
+			// frames below the inflated claim.
+			expect(await replay.replay({}, 'chat', 999, platform)).toBeUndefined();
+			const hook = replay.resumeHook();
+			expect(await hook({}, { lastSeenSeqs: { chat: 999 }, platform })).toEqual({});
+		});
 	});
 
 	describe('TTL (real EXPIRE applied by the Lua script)', () => {

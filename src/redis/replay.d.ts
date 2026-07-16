@@ -164,6 +164,14 @@ export interface ReplayGap {
  * topic's stored epoch: on a match it gap-fills via the underlying `replay()`
  * pipeline, on a mismatch it skips gap-fill and emits a `rehydrate` marker on
  * `__replay:{topic}` so the client re-reads a reset seq space from scratch.
+ *
+ * Resolves the covered watermark - `{ [topic]: highestSeqCovered }` for every
+ * topic it gap-filled. The adapter's recovery barrier reads this to dedup the
+ * live frames it buffered during the resume window exactly (a buffered frame
+ * with seq at or below the watermark was already delivered by the gap-fill and
+ * is skipped; anything newer flushes). A topic that was not gap-filled (a
+ * rehydrate mismatch, a denied replay) is absent from the map, so the adapter
+ * falls back to its conservative pre-window floor for that topic.
  */
 export type ResumeHook = (
 	ws: any,
@@ -173,7 +181,7 @@ export type ResumeHook = (
 		platform: Platform;
 		sessionId?: string;
 	}
-) => Promise<void>;
+) => Promise<Record<string, number> | undefined>;
 
 export interface RedisReplayBuffer {
 	/**
@@ -229,9 +237,16 @@ export interface RedisReplayBuffer {
 	 * If the buffer has been trimmed past `sinceSeq`, a `truncated` event
 	 * is sent before the messages so the client knows data was lost.
 	 *
+	 * Resolves the covered watermark: the highest seq it delivered, or
+	 * `sinceSeq` itself when nothing newer existed AND the stored seq counter
+	 * confirms the client was current (`sinceSeq` at or below the counter).
+	 * Resolves `undefined` when the replay was denied, the input was
+	 * malformed, or the presented `sinceSeq` exceeds the counter (an
+	 * unverifiable claim is never trusted as a watermark).
+	 *
 	 * @param reqId - Optional correlation ID for disambiguating concurrent replays.
 	 */
-	replay(ws: any, topic: string, sinceSeq: number, platform: Platform, reqId?: string): Promise<void>;
+	replay(ws: any, topic: string, sinceSeq: number, platform: Platform, reqId?: string): Promise<number | undefined>;
 
 	/** Clear all replay buffers. */
 	clear(): Promise<void>;
