@@ -213,6 +213,7 @@
 		"pretest": "npm run check",
 		"test": "vitest run",
 		"test:watch": "vitest",
+		"gate:cross-repo": "node scripts/cross-repo-gate.js",
 		"test:integration": "npm run test:integration:redis && npm run test:integration:postgres",
 		"test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
 		"test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",
@@ -238,6 +239,9 @@
 		"svelte-adapter-uws": "^0.6.0-next.80",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0"
+	},
+	"overrides": {
+		"cookie": "^0.7.0"
 	},
 	"keywords": [
 		"svelte",

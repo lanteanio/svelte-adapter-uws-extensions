@@ -1,6 +1,7 @@
 node_modules
 build
 coverage
+.cross-repo-gate
 .env
 .env.*
 .DS_Store
