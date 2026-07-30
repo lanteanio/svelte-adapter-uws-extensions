@@ -12,6 +12,8 @@
  */
 
 import { setTimer, clearTimer } from '../../shared/runtime.js';
+import { mergeFields, newFieldMap } from './field-policy.js';
+
 
 /**
  * Create the per-topic pending-diff buffer.
@@ -109,16 +111,16 @@ export function createDiffBuffer({ emit, localData, publicData, mt, mDiffCoalesc
 				// cross-instance field update landing in the same tick as the relayed
 				// join / updated event for that user is silently lost.
 				if (!localData.get(topic)?.get(key) && prev.data && typeof prev.data === 'object') {
-					Object.assign(prev.data, changed);
+					mergeFields(prev.data, changed);
 					armDiffFlush(platform);
 				}
 				return;
 			}
-			Object.assign(prev.changed, changed);
+			mergeFields(prev.changed, changed);
 			armDiffFlush(platform);
 			return;
 		}
-		entries.set(key, { op: 'update', changed: { ...changed } });
+		entries.set(key, { op: 'update', changed: mergeFields(newFieldMap(), changed) });
 		armDiffFlush(platform);
 	}
 
@@ -135,9 +137,9 @@ export function createDiffBuffer({ emit, localData, publicData, mt, mDiffCoalesc
 		}
 		for (const [topic, entries] of pendingDiffs) {
 			/** @type {Record<string, Record<string, any>>} */
-			const joins = {};
+			const joins = newFieldMap();
 			/** @type {Record<string, Record<string, any>>} */
-			const leaves = {};
+			const leaves = newFieldMap();
 			/** @type {Record<string, Record<string, any>> | null} */
 			let updates = null;
 			const localUsers = localData.get(topic);
@@ -152,7 +154,7 @@ export function createDiffBuffer({ emit, localData, publicData, mt, mDiffCoalesc
 				} else if (e.op === 'leave') {
 					leaves[key] = e.data;
 				} else {
-					if (!updates) updates = {};
+					if (!updates) updates = newFieldMap();
 					updates[key] = e.changed;
 				}
 			}

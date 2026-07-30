@@ -108,6 +108,7 @@ export function createPubSubBus(client, options = {}) {
 	}
 
 	const validator = createBusValidator({
+		label: 'pubsub bus',
 		maxBytes: options.maxEnvelopeBytes,
 		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: systemChannel ? [systemChannel] : []

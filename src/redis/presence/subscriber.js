@@ -21,7 +21,47 @@
 
 import { setTimer, clearTimer } from '../../shared/runtime.js';
 import { isCluster } from '../../shared/cluster.js';
+import { createBusValidator } from '../../shared/bus-validate.js';
+import { mergeFields, newFieldMap } from './field-policy.js';
 import { INTERNAL_EVENTS } from './lua.js';
+
+/**
+ * JSON object shape used by every presence event payload container.
+ * Arrays are objects in JavaScript but are not keyed presence records.
+ * @param {unknown} value
+ * @returns {value is Record<string, any>}
+ */
+function isRecord(value) {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Validate the event-specific payload before it reaches the diff buffer.
+ * The buffer deliberately trusts its callers and coerces Map keys back to
+ * object-property names at flush time, so an object-valued forged key would
+ * otherwise become "[object Object]" in a live roster diff.
+ *
+ * LEAVE permits null data: purgeUser publishes that shape when no public
+ * roster value is available. Every other identity event carries a record,
+ * and FIELDS always carries the two record maps produced by publishEvent.
+ *
+ * @param {unknown} event
+ * @param {unknown} payload
+ * @returns {boolean}
+ */
+function isValidPresencePayload(event, payload) {
+	if (!isRecord(payload) || typeof payload.key !== 'string') return false;
+	if (event === INTERNAL_EVENTS.JOIN || event === INTERNAL_EVENTS.UPDATED) {
+		return isRecord(payload.data);
+	}
+	if (event === INTERNAL_EVENTS.LEAVE) {
+		return payload.data === null || isRecord(payload.data);
+	}
+	if (event === INTERNAL_EVENTS.FIELDS) {
+		return isRecord(payload.durable) && isRecord(payload.transient);
+	}
+	return false;
+}
 
 /**
  * Create the cross-instance subscriber subsystem.
@@ -29,6 +69,7 @@ import { INTERNAL_EVENTS } from './lua.js';
  * @param {{
  *   client: import('../index.js').RedisClient,
  *   instanceId: string,
+ *   maxEnvelopeBytes: number,
  *   keyspaceNotifications: boolean,
  *   bufferDiff: (topic: string, op: string, key: any, data: any, platform: any) => void,
  *   bufferUpdate: (topic: string, key: string, changed: Record<string, any>, platform: any) => void,
@@ -38,7 +79,7 @@ import { INTERNAL_EVENTS } from './lua.js';
  *   mKeyspaceCleanups: { inc: () => void } | null | undefined
  * }} deps
  */
-export function createSubscriber({ client, instanceId, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups }) {
+export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups }) {
 	// Redis subscriber for cross-instance join/leave events
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -200,17 +241,26 @@ export function createSubscriber({ client, instanceId, keyspaceNotifications, bu
 	async function ensureSubscriber(platform) {
 		activePlatform = platform;
 		if (!subscriber) {
+			// Inbound bus guard: presence:events:* accepts messages from a
+			// shared transport, so cap raw bytes before JSON.parse like every
+			// sibling bus module.
+			const busValidator = createBusValidator({ label: 'redis presence', maxBytes: maxEnvelopeBytes });
+			const prefix = client.key('presence:events:');
 			subscriber = client.duplicate({ enableReadyCheck: false });
 			subscriber.on('error', (err) => {
 				console.error('presence subscriber error:', err.message);
 			});
 			subscriber.on('message', (ch, message) => {
+				if (!ch.startsWith(prefix)) return;
+				if (!busValidator.acceptRaw(message)) return;
 				try {
 					const parsed = JSON.parse(message);
-					if (parsed.instanceId === instanceId) return;
-					const prefix = client.key('presence:events:');
-					if (!ch.startsWith(prefix)) return;
 					const topic = ch.slice(prefix.length);
+					if (!isRecord(parsed)) return;
+					if (typeof parsed.instanceId !== 'string' || parsed.instanceId.length === 0) return;
+					if (parsed.topic !== topic || !busValidator.acceptEnvelope(parsed.topic, parsed.event)) return;
+					if (!isValidPresencePayload(parsed.event, parsed.payload)) return;
+					if (parsed.instanceId === instanceId) return;
 					if (!activePlatform) return;
 					const ev = parsed.event;
 					const payload = parsed.payload;
@@ -230,13 +280,25 @@ export function createSubscriber({ client, instanceId, keyspaceNotifications, bu
 						if (typeof key === 'string') {
 							const durable = (payload.durable && typeof payload.durable === 'object') ? payload.durable : {};
 							const transient = (payload.transient && typeof payload.transient === 'object') ? payload.transient : {};
-							const changed = { ...durable, ...transient };
+							// Filtered BEFORE the emptiness test, not after. A
+							// spread of the raw envelope is non-empty whenever it
+							// carries any key at all, including ones the policy
+							// rejects - so an all-reserved envelope passed the
+							// test and fanned an `update` diff carrying nothing
+							// out to every local subscriber.
+							const changed = mergeFields(newFieldMap(), durable);
+							mergeFields(changed, transient);
 							if (Object.keys(changed).length > 0) {
 								bufferUpdate(topic, key, changed, activePlatform);
 								const localEntry = localData.get(topic)?.get(key);
 								if (localEntry) {
-									if (!localEntry.fields) localEntry.fields = {};
-									Object.assign(localEntry.fields, durable, transient);
+									if (!localEntry.fields) localEntry.fields = newFieldMap();
+									// Same rule as the local presence-update ingress:
+									// a forged envelope must not land a field name the
+									// client path refuses, or the bus becomes a way to
+									// inject phantom fields into every roster frame.
+									mergeFields(localEntry.fields, durable);
+									mergeFields(localEntry.fields, transient);
 								}
 							}
 						}

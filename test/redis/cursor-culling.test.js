@@ -602,7 +602,7 @@ describe('redis cursor viewport culling and backpressure', () => {
 			c.destroy();
 		});
 
-		it('hooks.message routes a cursor-viewport frame to tracker.viewport for a subscribed ws and does not relay', () => {
+		it('hooks.message routes a cursor-viewport frame to tracker.viewport for a subscribed ws and does not relay', async () => {
 			const relayMessages = [];
 			const origPublish = client.redis.publish;
 			client.redis.publish = (ch, msg) => {
@@ -613,7 +613,9 @@ describe('redis cursor viewport culling and backpressure', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, viewport: { enabled: true }, select: (ud) => ({ id: ud.id }) });
 			const platform = walkPlatform();
 			const ws = mockWs({ id: 'V' });
-			ws.subscribe(CURSOR);
+			// Viewport frames are membership-gated; the real attach handshake
+			// is what subscribes the socket and grants that membership.
+			await c.attach(ws, 'board', platform);
 
 			c.hooks.message(ws, {
 				data: { type: 'cursor-viewport', topic: 'board', rect: { x: 10, y: 20, w: 640, h: 480, zoom: 2 } },

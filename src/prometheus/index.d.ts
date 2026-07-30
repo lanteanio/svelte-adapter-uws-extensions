@@ -84,6 +84,13 @@ export interface MetricsRegistry {
 	serialize(): string;
 	/** uWebSockets.js HTTP handler for the /metrics endpoint. */
 	handler(res: any, req: any): void;
+	/**
+	 * Wrap `handler` behind an authorization predicate. Compare scrape
+	 * tokens with `tokenEquals`, never `===`.
+	 */
+	authedHandler(predicate: (res: any, req: any) => boolean | Promise<boolean>): (res: any, req: any) => void | Promise<void>;
+	/** Constant-time bearer-token comparison for `authedHandler` predicates. */
+	tokenEquals(presented: unknown, expected: unknown): boolean;
 	/** Map a topic name through the cardinality control function. */
 	mapTopic(topic: string): string;
 }
@@ -92,6 +99,11 @@ export interface MetricsRegistry {
  * Create a Prometheus metrics registry.
  */
 export function createMetrics(options?: MetricsOptions): MetricsRegistry;
+/**
+ * Constant-time bearer-token comparison for `authedHandler` predicates.
+ * Also exposed as `metrics.tokenEquals` on the registry.
+ */
+export function tokenEquals(presented: unknown, expected: unknown): boolean;
 
 export interface PublishRateMetricsOptions {
 	/** Cap the gauge cardinality at the top N publishers. @default 10 */

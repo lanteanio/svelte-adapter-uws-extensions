@@ -16,6 +16,7 @@ import { createGroup } from '../../src/redis/groups.js';
 import { createCursor } from '../../src/redis/cursor.js';
 import { createReplay as createPgReplay } from '../../src/postgres/replay.js';
 import { createNotifyBridge } from '../../src/postgres/notify.js';
+import { MAX_RESUME_TOPICS } from '../../src/shared/caps.js';
 
 function mockWs(userData = {}) {
 	const subscriptions = new Set();
@@ -877,6 +878,30 @@ describe('prometheus metrics', () => {
 			client = mockRedisClient();
 			platform = mockPlatform();
 			metrics = createMetrics();
+		});
+
+		it('counts every oversized resume frame across all replay backends', async () => {
+			const lastSeenSeqs = {};
+			for (let i = 0; i <= MAX_RESUME_TOPICS; i++) lastSeenSeqs['room:' + i] = 0;
+			const denyingPlatform = {
+				checkSubscribe: async () => 'FORBIDDEN',
+				send() {}
+			};
+			const trackers = [
+				createRedisReplay(mockRedisClient('resume-metric-z:'), { metrics }),
+				createRedisReplay(mockRedisClient('resume-metric-x:'), { metrics, storage: 'stream' }),
+				createPgReplay(mockPgClient(), { metrics, cleanupInterval: 0 })
+			];
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				for (const tracker of trackers) {
+					await tracker.resumeHook()({}, { lastSeenSeqs, platform: denyingPlatform });
+				}
+				expect(metrics.serialize()).toContain('replay_resume_topic_overflows_total 3');
+			} finally {
+				warn.mockRestore();
+				for (const tracker of trackers) tracker.destroy?.();
+			}
 		});
 
 		it('counts publishes', async () => {

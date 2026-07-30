@@ -119,3 +119,43 @@ export class WsClosedError extends Error {
 		this.topic = topic;
 	}
 }
+
+/**
+ * Thrown by RPC-shaped operations (`presence.join`, `cursor.attach`) when the
+ * platform refuses the connection's access to the underlying topic - either
+ * `platform.checkSubscribe` returned a denial reason, or the platform cannot
+ * authorize at all (no `checkSubscribe`), which is refused rather than waved
+ * through. No membership is granted and nothing is emitted, so the caller
+ * has nothing to compensate.
+ *
+ * Stable contract: `err.code === 'SUBSCRIBE_DENIED'`. Catch on the code, not
+ * the class. `err.reason` carries the platform's denial reason (or
+ * `'FORBIDDEN'` when the platform could not authorize), which is the same
+ * string a wire-subscribe denial would report.
+ *
+ * Pattern in callers:
+ *
+ * ```js
+ * try {
+ *   await cursors.attach(ws, topic, platform);
+ * } catch (err) {
+ *   if (err.code === 'SUBSCRIBE_DENIED') return rpcError(err.reason);
+ *   throw err;
+ * }
+ * ```
+ */
+export class SubscribeDeniedError extends Error {
+	/**
+	 * @param {string} operation - Dotted operation path, e.g. `'cursor.attach'`.
+	 * @param {string} topic
+	 * @param {string} reason - Denial reason, e.g. `'FORBIDDEN'`.
+	 */
+	constructor(operation, topic, reason) {
+		super(`${operation}: subscribe denied for topic="${topic}" (${reason})`);
+		this.name = 'SubscribeDeniedError';
+		this.code = 'SUBSCRIBE_DENIED';
+		this.operation = operation;
+		this.topic = topic;
+		this.reason = reason;
+	}
+}

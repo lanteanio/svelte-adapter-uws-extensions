@@ -1,8 +1,8 @@
 /**
  * A/B bench for `wrapped.publishBatched` vs `wrapped.publish` loop on
- * createPubSubBus. Verifies the credo rule-4 hot-path gate for B16.
+ * createPubSubBus. Guards the hot path against a throughput regression.
  *
- * Three profiles per the B16 spec:
+ * Three profiles:
  *   1. 50 events same-topic, two instances     -- bulk-import shape (biggest win)
  *   2. 5 events overlapping topics             -- room-state-reset shape
  *   3. 3 events disjoint topics                -- control: must sit inside noise

@@ -1,4 +1,4 @@
-import type { Pool, PoolConfig, QueryResult, Client } from 'pg';
+import type { Pool, PoolClient, PoolConfig, QueryResult, Client } from 'pg';
 
 export interface PgClientOptions {
 	/** Postgres connection string. Required UNLESS `pool` is provided. */
@@ -28,6 +28,14 @@ export interface PgClient {
 	readonly pool: Pool;
 	/** Run a query. */
 	query(text: string, values?: any[]): Promise<QueryResult>;
+	/**
+	 * Acquire a dedicated connection from the pool. Prefer this over
+	 * `pool.connect()`: connection acquisition is the failure mode whose pg
+	 * error text carries the DSN, and a raw handle bypasses redaction
+	 * entirely. The returned client's `query` redacts too; `release` is
+	 * unchanged.
+	 */
+	connect(): Promise<PoolClient>;
 	/**
 	 * Create a standalone pg.Client with the same connection config (not
 	 * from the pool). Throws if neither `connectionString` was provided.

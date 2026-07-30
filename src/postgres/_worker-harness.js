@@ -21,7 +21,7 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { serialiseError } from './_tasks-errors.js';
+import { serialiseErrorForTransport } from './_tasks-errors.js';
 
 if (!parentPort) {
 	throw new Error('worker harness: must be loaded as a worker thread entry');
@@ -67,7 +67,7 @@ parentPort.on('message', async (msg) => {
 			handler = await handlerPromise;
 		} catch (err) {
 			controllers.delete(id);
-			parentPort.postMessage({ type: 'error', id, error: serialiseError(err) });
+			parentPort.postMessage({ type: 'error', id, error: serialiseErrorForTransport(err) });
 			return;
 		}
 
@@ -81,7 +81,7 @@ parentPort.on('message', async (msg) => {
 			});
 			parentPort.postMessage({ type: 'result', id, result });
 		} catch (err) {
-			parentPort.postMessage({ type: 'error', id, error: serialiseError(err) });
+			parentPort.postMessage({ type: 'error', id, error: serialiseErrorForTransport(err) });
 		} finally {
 			controllers.delete(id);
 		}

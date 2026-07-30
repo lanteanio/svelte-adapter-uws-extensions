@@ -6,9 +6,10 @@
  * owning user at purge time: `purgeUser` SCANs `replay:streambuf:{*}`, XRANGEs
  * each stream, maps each entry through `forgetUserId({topic,event,data})`, and
  * XDELs the matches, leaving the seq space intact (the holes read as truncation
- * on resume). The in-memory mock cannot exercise real SCAN + XRANGE + XDEL, so
- * the actual deletion - and that only the target user's entries go, across
- * multiple topic streams - is proven only here.
+ * on resume). The double models all three commands, so the unit suite covers
+ * this path too - but the XDEL it wraps in a best-effort `catch` is exactly the
+ * shape a double can silently no-op, so the real server stays the oracle for
+ * the deletion actually happening.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createBackendClient } from '../helpers/backend.js';
@@ -56,6 +57,40 @@ describe('redis stream replay right-to-erasure (purgeUser, integration)', () => 
 
 		// Idempotent: a second purge of the same user removes nothing.
 		expect(await store.purgeUser(null, 'alice')).toBe(0);
+	});
+
+	it('erases only the purged tenant, and reports a non-zero count doing it', async () => {
+		// The tenant rule: a scoped wire topic is `@t/<tenantId>/<topic>`, and
+		// this backend applies it by parsing the topic out of the stream key.
+		// It was the last of the four stores to get that rule, and the only one
+		// whose deletion runs through a swallowed `catch` - so the COUNT is the
+		// assertion that matters. A store that silently deleted nothing would
+		// satisfy "the other tenant survived" perfectly.
+		await store.publish(platform, '@t/acme/fs:board', 'msg', { user: 'carol', n: 1 });
+		await store.publish(platform, '@t/acme/fs:board', 'msg', { user: 'dave', n: 2 });
+		await store.publish(platform, '@t/other/fs:board', 'msg', { user: 'carol', n: 3 });
+		await store.publish(platform, 'fs:untenanted', 'msg', { user: 'carol', n: 4 });
+
+		const removed = await store.purgeUser('acme', 'carol');
+		expect(removed).toBe(1); // acme only - not other, not the untenanted topic
+
+		expect((await store.since('@t/acme/fs:board', 0)).map((m) => m.data.user)).toEqual(['dave']);
+		// The other tenant's identically-named user is untouched.
+		expect((await store.since('@t/other/fs:board', 0)).map((m) => m.data.n)).toEqual([3]);
+		// An untenanted topic is not in the `acme` scope either.
+		expect((await store.since('fs:untenanted', 0)).map((m) => m.data.n)).toEqual([4]);
+	});
+
+	it('erases the untenanted scope without reaching a tenant-scoped topic', async () => {
+		// The mirror direction: `null` means the untenanted scope, not "every
+		// scope". Getting this backwards is how a single erasure reached every
+		// tenant's buffer in the sibling stores.
+		await store.publish(platform, '@t/acme/fs:room2', 'msg', { user: 'erin', n: 1 });
+		await store.publish(platform, 'fs:plain', 'msg', { user: 'erin', n: 2 });
+
+		expect(await store.purgeUser(null, 'erin')).toBe(1);
+		expect((await store.since('fs:plain', 0))).toEqual([]);
+		expect((await store.since('@t/acme/fs:room2', 0)).map((m) => m.data.n)).toEqual([1]);
 	});
 
 	it('is a no-op without a forgetUserId extractor', async () => {

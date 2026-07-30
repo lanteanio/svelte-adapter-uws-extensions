@@ -516,6 +516,51 @@ describe('redis presence', () => {
 			expect(state.data['1']).toEqual({ id: '1', name: 'Alice' });
 			local.destroy();
 		});
+
+		it('drops personal and transport data before broadcasting or persisting it', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({
+				id: '1',
+				name: 'Alice',
+				role: 'admin',
+				authorId: 'author-7',
+				microphoneOn: true,
+				email: 'alice@example.test',
+				phoneNumber: '+49 30 123456',
+				userphone: '+49 30 654321',
+				ip: '203.0.113.10',
+				address: '203.0.113.10',
+				apiKey: 'secret-api-key',
+				profile: {
+					displayName: 'Alice A.',
+					avatarUrl: '/avatars/alice.png',
+					remoteAddress: '10.0.0.4',
+					sessionToken: 'secret-session',
+					contactphone: '+49 30 999999'
+				}
+			});
+
+			await local.join(ws, 'room', platform);
+			const stateData = statesOf(platform)[0].data['1'];
+			const stored = JSON.parse(
+				client._hashes.get(client.key('presence:topic:{room}')).get('1')
+			).data;
+			local.destroy();
+
+			const expected = {
+				id: '1',
+				name: 'Alice',
+				role: 'admin',
+				authorId: 'author-7',
+				microphoneOn: true,
+				profile: {
+					displayName: 'Alice A.',
+					avatarUrl: '/avatars/alice.png'
+				}
+			};
+			expect(stateData).toEqual(expected);
+			expect(stored).toEqual(expected);
+		});
 	});
 
 	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
@@ -1006,6 +1051,28 @@ describe('redis presence', () => {
 			expect(states[0].wire.encode('state', states[0].data)).toBeInstanceOf(Uint8Array);
 		});
 
+		it('applies the default privacy projection before binary state encoding', async () => {
+			const local = createPresence(client, { key: 'id', heartbeat: 60000, ttl: 180 });
+			const wp = wirePlatform();
+			await local.join(mockWs({
+				id: '1',
+				name: 'Alice',
+				authorId: 'author-7',
+				email: 'alice@example.test',
+				profile: { avatarUrl: '/a.png', remoteAddress: '10.0.0.4' }
+			}), 'room', wp);
+
+			const state = wp.sentWire.find((entry) => entry.event === 'state');
+			local.destroy();
+			expect(state.data['1']).toEqual({
+				id: '1',
+				name: 'Alice',
+				authorId: 'author-7',
+				profile: { avatarUrl: '/a.png' }
+			});
+			expect(state.wire.encode('state', state.data)).toBeInstanceOf(Uint8Array);
+		});
+
 		it('diff broadcast routes through publishWire with the presence codec (relay:false, compress:true)', async () => {
 			const wp = wirePlatform();
 			await presence.join(mockWs({ id: '1', name: 'Alice' }), 'room', wp);
@@ -1188,10 +1255,21 @@ describe('redis presence', () => {
 		});
 	});
 
-	describe('key resolution before select', () => {
-		it('resolves dedup key from raw data even when select strips it', async () => {
-			// select keeps only `name`; key field 'id' is stripped from select output
-			// but resolveKey reads from the raw safeData (post-sanitization, pre-select).
+	describe('key resolution from projected data', () => {
+		it('falls back cleanly when an explicit select returns a primitive', async () => {
+			const local = createPresence(client, { key: 'id', select: () => 'public-label' });
+			const ws = mockWs({ id: 'private-id' });
+			await local.join(ws, 'room', platform);
+
+			const hash = client._hashes.get(client.key('presence:topic:{room}'));
+			local.destroy();
+			expect([...hash.keys()]).toEqual(['__conn:1']);
+		});
+
+		it('does not leak a key that select omitted through roster property names', async () => {
+			// A presence key is itself broadcast and persisted as a roster/hash
+			// property. If select omits it, each connection must fall back rather
+			// than recovering the private value from raw userData behind select.
 			const local = createPresence(client, {
 				key: 'id',
 				select: (ud) => ({ name: ud.name })
@@ -1201,8 +1279,39 @@ describe('redis presence', () => {
 			await local.join(wsA, 'room', platform);
 			await local.join(wsB, 'room', platform);
 
-			expect(await local.count('room')).toBe(1);
+			expect(await local.count('room')).toBe(2);
+			expect(
+				[...client._hashes.get(client.key('presence:topic:{room}')).keys()]
+			).toEqual(['__conn:1', '__conn:2']);
 			local.destroy();
+		});
+
+		it('drops a private default key instead of persisting it as the roster key', async () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const local = createPresence(client, { key: 'email' });
+			const ws = mockWs({ email: 'alice@example.test', name: 'Alice' });
+			await local.join(ws, 'room', platform);
+
+			const hash = client._hashes.get(client.key('presence:topic:{room}'));
+			const [storedKey, storedValue] = [...hash.entries()][0];
+			local.destroy();
+			warn.mockRestore();
+
+			expect(storedKey).toBe('__conn:1');
+			expect(JSON.parse(storedValue).data).toEqual({ name: 'Alice' });
+		});
+
+		it('allows an explicit select to opt a non-secret custom key back in', async () => {
+			const local = createPresence(client, {
+				key: 'email',
+				select: (ud) => ({ email: ud.email, name: ud.name })
+			});
+			const ws = mockWs({ email: 'public-alias@example.test', name: 'Alice' });
+			await local.join(ws, 'room', platform);
+
+			const hash = client._hashes.get(client.key('presence:topic:{room}'));
+			local.destroy();
+			expect([...hash.keys()]).toEqual(['public-alias@example.test']);
 		});
 	});
 

@@ -35,6 +35,26 @@ describe('composite ratelimit peek', () => {
 		resetRuntimeEnv();
 	});
 
+	it('refuses a clear tenant id it cannot scope, like the single-dimension limiter', async () => {
+		const composite = createCompositeRateLimit(client, {
+			dimensions: DIMS,
+			tenant: (ws) => ws.getUserData().org
+		});
+		await composite.consume(mockWs({ user: 'a', ip: '1.1.1.1', org: 'acme' }));
+		await composite.consume(mockWs({ user: 'b', ip: '2.2.2.2', org: 'globex' }));
+		const keysNow = () => [...client._hashes.keys()].filter((k) => k.includes('ratelimitc')).length;
+		const before = keysNow();
+		expect(before).toBeGreaterThan(0);
+
+		// The `{tenant}` hash tag is not a barrier: braces are literal in a
+		// Redis glob, so `...:{t:*}:*` spans every tenant. Each of these
+		// reached the global branch and unlinked every tenant's buckets.
+		for (const bad of ['*', '', 0, '?', 'a[b']) {
+			await expect(composite.clear(bad)).rejects.toThrow(/composite ratelimit: clear/);
+		}
+		expect(keysNow()).toBe(before);
+	});
+
 	it('reports the same shape as consume without writing anything', async () => {
 		const composite = createCompositeRateLimit(client, { dimensions: DIMS });
 		const ws = mockWs({ user: 'alice', ip: '9.9.9.9' });

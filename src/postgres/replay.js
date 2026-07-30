@@ -33,12 +33,51 @@
  */
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
+import { createLruMap } from '../shared/lru-map.js';
 import { withBreaker } from '../shared/breaker.js';
 import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { withTransaction } from '../shared/pg-tx.js';
 import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
-import { checkReplayAccess } from '../shared/replay-gate.js';
+import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
+import { tenantTopicSql } from '../shared/tenant-topic.js';
 export { ReplayStorageError, ReplaySerializationError };
+
+/**
+ * Encode caller-supplied replay data once, before entering a storage breaker.
+ * JSON.stringify can succeed by returning undefined for top-level functions,
+ * symbols, or a toJSON that returns undefined; that is still not a JSON
+ * representation and must use the same caller-input error contract as a
+ * thrown serialization failure.
+ */
+function encodeReplayPayload(data, op, maxDataBytes) {
+	let payload;
+	try {
+		payload = JSON.stringify(data ?? null);
+	} catch (err) {
+		throw new ReplaySerializationError(op, err);
+	}
+	if (typeof payload !== 'string') {
+		throw new ReplaySerializationError(
+			op,
+			new TypeError(`postgres replay: data has no JSON representation (${typeof data})`)
+		);
+	}
+	if (Buffer.byteLength(payload) > maxDataBytes) {
+		throw new ReplaySerializationError(
+			op,
+			new Error(`postgres replay: data exceeds maxDataBytes (${maxDataBytes} bytes)`)
+		);
+	}
+	return payload;
+}
+
+/**
+ * Maximum topic names placed in one Postgres `ANY($1)` epoch lookup.
+ * MAX_RESUME_TOPICS bounds a whole frame; this smaller transport chunk keeps
+ * one accepted frame from becoming a single oversized query payload.
+ */
+const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -47,6 +86,7 @@ export { ReplayStorageError, ReplaySerializationError };
  * @property {number} [ttl=0] - TTL in seconds (0 = no expiry). Rows older than this are cleaned up periodically.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use
  * @property {number} [cleanupInterval=60000] - How often to run cleanup (ms). 0 to disable.
+ * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, including each publishBatch entry.
  */
 
 /**
@@ -86,6 +126,14 @@ export function createReplay(client, options = {}) {
 		throw new Error(`postgres replay: localFanoutOnStorageFailure must be a boolean, got ${options.localFanoutOnStorageFailure}`);
 	}
 	const localFanoutOnStorageFailure = options.localFanoutOnStorageFailure === true;
+	// Number.isInteger, not `typeof === 'number'`: NaN is a number and
+	// `NaN < 1` is false, so NaN would pass this guard and then make every
+	// `bytes > maxDataBytes` comparison false, silently disabling the very
+	// cap it configures.
+	if (options.maxDataBytes !== undefined && (!Number.isInteger(options.maxDataBytes) || options.maxDataBytes < 1)) {
+		throw new Error('postgres replay: maxDataBytes must be a positive integer (bytes)');
+	}
+	const maxDataBytes = options.maxDataBytes ?? MAX_STORE_PAYLOAD_BYTES;
 	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
 		throw new Error('postgres replay: forgetUserId must be a function ({ topic, event, data }) => userId');
 	}
@@ -112,6 +160,10 @@ export function createReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mResumeTopicOverflows = m?.counter(
+		'replay_resume_topic_overflows_total',
+		'Resume frames whose topic set exceeded MAX_RESUME_TOPICS'
+	);
 	const mStorageFallbacks = localFanoutOnStorageFailure
 		? m?.counter('replay_storage_fallbacks_total', 'Publishes that fell back to local fanout when storage failed', ['topic'])
 		: null;
@@ -210,7 +262,11 @@ export function createReplay(client, options = {}) {
 	// value. Read-through populated by currentEpoch and refreshed by the publish
 	// / clearTopic bumps; a topic not yet seen reads as the baseline 0.
 	/** @type {Map<string, number>} */
-	const epochCache = new Map();
+	const epochCache = createLruMap(MAX_REPLAY_EPOCH_CACHE_TOPICS);
+	function epochCacheSet(topic, epoch) {
+		epochCache.set(topic, epoch);
+	}
+
 
 	// Read the stored epoch for a topic. A topic whose seq space has never reset
 	// has no row yet (or epoch defaulted 0): that is the baseline and reads as 0.
@@ -229,34 +285,38 @@ export function createReplay(client, options = {}) {
 			});
 		});
 		const epoch = res.rows.length > 0 ? parseInt(res.rows[0].epoch, 10) : 0;
-		epochCache.set(topic, epoch);
+		epochCacheSet(topic, epoch);
 		return epoch;
 	}
 
 	// Batched epoch read for the resume hook: one query for every topic the
-	// client presented an epoch for, instead of one round trip per topic. A
-	// topic with no row reads as the baseline 0, matching currentEpoch.
+	// client presented an epoch for, chunked so one accepted resume frame does
+	// not become one oversized ANY($1) payload. A topic with no row reads as the
+	// baseline 0, matching currentEpoch.
 	async function currentEpochs(topics) {
-		const res = await withBreaker(b, async () => {
-			await ensureTable();
-			return client.query({
-				name: 'replay_epochs_' + table,
-				text: `SELECT topic, COALESCE(epoch, 0)::bigint AS epoch
-				         FROM ${seqTable}
-				        WHERE topic = ANY($1)`,
-				values: [topics]
-			});
-		});
 		const out = new Map();
-		for (const row of res.rows) {
-			const epoch = parseInt(row.epoch, 10);
-			epochCache.set(row.topic, epoch);
-			out.set(row.topic, epoch);
-		}
-		for (const topic of topics) {
-			if (!out.has(topic)) {
-				epochCache.set(topic, 0);
-				out.set(topic, 0);
+		for (let offset = 0; offset < topics.length; offset += EPOCH_QUERY_CHUNK_TOPICS) {
+			const chunk = topics.slice(offset, offset + EPOCH_QUERY_CHUNK_TOPICS);
+			const res = await withBreaker(b, async () => {
+				await ensureTable();
+				return client.query({
+					name: 'replay_epochs_' + table,
+					text: `SELECT topic, COALESCE(epoch, 0)::bigint AS epoch
+					         FROM ${seqTable}
+					        WHERE topic = ANY($1)`,
+					values: [chunk]
+				});
+			});
+			for (const row of res.rows) {
+				const epoch = parseInt(row.epoch, 10);
+				epochCacheSet(row.topic, epoch);
+				out.set(row.topic, epoch);
+			}
+			for (const topic of chunk) {
+				if (!out.has(topic)) {
+					epochCacheSet(topic, 0);
+					out.set(topic, 0);
+				}
 			}
 		}
 		return out;
@@ -303,18 +363,9 @@ export function createReplay(client, options = {}) {
 
 	const tracker = {
 		async publish(platform, topic, event, data) {
-			// Serialize BEFORE entering the storage try-block. A JSON.stringify
-			// throw (BigInt, circular reference, etc.) is a caller-input bug,
-			// not a transient storage failure, and must not trigger the
-			// localFanoutOnStorageFailure fallback - that would silently
-			// degrade the durability contract on payloads the user thought
-			// were being persisted.
-			let payload;
-			try {
-				payload = JSON.stringify(data ?? null);
-			} catch (err) {
-				throw new ReplaySerializationError('publish', err);
-			}
+			// Serialize and size-check before the storage try-block. Caller-input
+			// failures must not enter the breaker or trigger local fan-out.
+			const payload = encodeReplayPayload(data, 'publish', maxDataBytes);
 			let userId = null;
 			if (forgetUserId) {
 				try { const u = forgetUserId({ topic, event, data }); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
@@ -352,7 +403,7 @@ export function createReplay(client, options = {}) {
 			// synchronous ack carrier without a follow-up read. The INSERT branch
 			// (fresh/cleared topic) seeds epoch 1; the UPDATE branch carries the
 			// climbed value forward.
-			if (res.rows[0].epoch != null) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
+			if (res.rows[0].epoch != null) epochCacheSet(topic, parseInt(res.rows[0].epoch, 10));
 			mPublishes?.inc({ topic: mt(topic) });
 
 			if (seq > maxSize) {
@@ -389,11 +440,8 @@ export function createReplay(client, options = {}) {
 				if (!msg || typeof msg.topic !== 'string' || msg.topic.length === 0 || typeof msg.event !== 'string') {
 					throw new Error('postgres replay: publishBatch messages need a non-empty string topic and a string event');
 				}
-				try {
-					payloads[i] = JSON.stringify(msg.data ?? null);
-				} catch (err) {
-					throw new ReplaySerializationError('publishBatch', err);
-				}
+				// Same one-pass serialization and bound as publish().
+				payloads[i] = encodeReplayPayload(msg.data, 'publishBatch', maxDataBytes);
 				topics[i] = msg.topic;
 				events[i] = msg.event;
 				let userId = null;
@@ -473,7 +521,7 @@ export function createReplay(client, options = {}) {
 			for (const row of res.rows) {
 				const high = parseInt(row.new_high, 10);
 				highs.set(row.topic, high);
-				if (row.epoch != null) epochCache.set(row.topic, parseInt(row.epoch, 10));
+				if (row.epoch != null) epochCacheSet(row.topic, parseInt(row.epoch, 10));
 			}
 			const counts = new Map();
 			for (const topic of topics) counts.set(topic, (counts.get(topic) || 0) + 1);
@@ -600,8 +648,15 @@ export function createReplay(client, options = {}) {
 			}));
 		},
 
-		async replay(ws, topic, sinceSeq, platform, reqId) {
-			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
+		async replay(ws, topic, sinceSeq, platform, reqId, preAuthorized) {
+			// The resume hook has just run this exact gate for this exact
+			// topic. Re-running it would invoke the APP's subscribe hook a
+			// second time per resumed topic - doubling its authorization load
+			// and any side effects it has (audit rows, rate-limit tokens, a
+			// presence join). Identity-compared against the private token, not
+			// truthiness: this is a public method, so a plain boolean here
+			// would let any caller skip the gate by passing `true`.
+			if (preAuthorized !== RESUME_PREAUTHORIZED && !await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
 			// Same input gate as since() and the Redis backends: a malformed
 			// sinceSeq would return the entire buffer via `seq > $2` with a
@@ -710,9 +765,20 @@ export function createReplay(client, options = {}) {
 		 */
 		async purgeUser(tenantId, userId) {
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			// Scoped by the topic's tenant namespace, the same rule the room-owner
+			// and presence-roster legs of the SAME purge already apply. Deleting
+			// on `user_id` alone honoured the tenant argument nowhere: one
+			// `purgeUser('acme', u)` scoped the Redis legs to acme and erased that
+			// user's buffered events in every OTHER tenant too. An untenanted
+			// deployment is unaffected - no topic carries the prefix, so the null
+			// scope still matches all of them.
+			const scope = tenantTopicSql(tenantId, 2);
 			return withBreaker(b, async () => {
 				await ensureTable();
-				const res = await client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
+				const res = await client.query(
+					`DELETE FROM ${table} WHERE user_id = $1 AND ${scope.sql}`,
+					[userId, scope.value]
+				);
 				return res.rowCount || 0;
 			});
 		},
@@ -770,7 +836,7 @@ export function createReplay(client, options = {}) {
 						  WHERE topic = $1`, [topic]);
 					return r;
 				});
-				if (res.rows.length > 0) epochCache.set(topic, parseInt(res.rows[0].epoch, 10));
+				if (res.rows.length > 0) epochCacheSet(topic, parseInt(res.rows[0].epoch, 10));
 			});
 		},
 
@@ -812,7 +878,14 @@ export function createReplay(client, options = {}) {
 		resumeHook() {
 			return createResumeHook({
 				currentEpochs,
-				replay: (ws, topic, seq, platform) => tracker.replay(ws, topic, seq, platform)
+				// Forwards `reqId` and `preAuthorized` too. A 4-arity forwarder
+				// drops the flag, and `replay()` then re-runs the app's subscribe
+				// hook for every topic the hook just authorized - once more per
+				// topic, and from inside Promise.all, so with no concurrency
+				// bound at all.
+				replay: (ws, topic, seq, platform, reqId, preAuthorized) =>
+					tracker.replay(ws, topic, seq, platform, reqId, preAuthorized),
+				onTruncate: () => mResumeTopicOverflows?.inc()
 			});
 		}
 	};

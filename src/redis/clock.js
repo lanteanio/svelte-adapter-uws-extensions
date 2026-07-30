@@ -102,7 +102,8 @@ function monotoneClamp() {
  * @property {boolean} [immediate=true] - Take the first sample at construction (the automatic startup drift check).
  * @property {import('./ntp-source.js').NtpSource} [ntp] - Optional third clock source (one read per round). Off by default; a failed read drops the source from the median until it reads again.
  * @property {{ isLeader: () => boolean }} [leader] - Leader election handle (`createLeader(...)`) enabling leader-stamped `stamp()`.
- * @property {string} [leaderKey='clock:leader-offset'] - Key the leader publishes its clock offset under.
+ * @property {string} [leaderKey='clock:leader-offset'] - Key the leader publishes its clock offset under, RELATIVE to the client's key prefix (so two apps sharing one Redis cannot collide on it). Pass the bare name, not a fully-qualified key.
+ * @property {boolean} [legacyLeaderKeyFallback=false] - Read the UNPREFIXED `leaderKey` when the prefixed one is empty, for one key lifetime during a rolling upgrade off the pre-prefix layout. Off by default: the unprefixed key is shared by every app on the Redis, so a follower can otherwise adopt another app's leader offset. Only enable it while the Redis is known to host this app alone.
  * @property {number} [leaderTtlMs=3*intervalMs] - Freshness bound for both the published offset (PX) and a follower's cached copy; a staler cache falls back to `consistent()`.
  * @property {(skewMs: number) => void} [onSample] - After every successful round, with the signed median Redis skew (positive = local ahead).
  * @property {(skewMs: number) => void} [onWarn]
@@ -180,10 +181,39 @@ export function createClusterClock(client, options = {}) {
 	if (leader !== undefined && (typeof leader !== 'object' || leader === null || typeof leader.isLeader !== 'function')) {
 		throw new Error('cluster clock: leader must expose isLeader() (see redis/leader createLeader)');
 	}
-	const leaderKey = options.leaderKey !== undefined ? String(options.leaderKey) : DEFAULT_LEADER_KEY;
-	if (leaderKey.length === 0) {
+	const rawLeaderKey = options.leaderKey !== undefined ? String(options.leaderKey) : DEFAULT_LEADER_KEY;
+	if (rawLeaderKey.length === 0) {
 		throw new Error('cluster clock: leaderKey must be a non-empty string');
 	}
+	// Route through client.key so the app keyPrefix isolates this well-known
+	// key on a shared Redis. Left raw, two apps sharing one Redis collide on
+	// `clock:leader-offset` and either one shifts every follower's event
+	// ordering by an arbitrary offset.
+	//
+	// `leaderKey` is therefore RELATIVE to the client prefix, and a
+	// deployment that ran the unprefixed key keeps reading it until its
+	// TTL lapses: during a rolling upgrade old instances still write there,
+	// and a new follower that found nothing under the prefixed key would
+	// silently fall back to local time. The read path can prefer the
+	// prefixed key and fall back to the legacy one for one key lifetime,
+	// which makes the cutover a non-event. Only the prefixed key is ever
+	// written.
+	//
+	// That fallback is OPT-IN and off by default, because the unprefixed key
+	// is precisely the shared name the prefixing exists to escape: on a Redis
+	// hosting two apps, a follower that fell back would read the OTHER app's
+	// leader offset and shift every event's ordering by an arbitrary amount -
+	// the exact collision this key was prefixed to close, re-opened on the
+	// read side. Enable it only for a window where you know the Redis is
+	// yours alone. Left off, a follower ahead of its leader degrades to
+	// `consistent()` for one key lifetime, which is bounded and self-healing.
+	const leaderKey = client.key(rawLeaderKey);
+	if (options.legacyLeaderKeyFallback !== undefined && typeof options.legacyLeaderKeyFallback !== 'boolean') {
+		throw new Error('cluster clock: legacyLeaderKeyFallback must be a boolean');
+	}
+	const legacyLeaderKey = (options.legacyLeaderKeyFallback === true && leaderKey !== rawLeaderKey)
+		? rawLeaderKey
+		: null;
 	const leaderTtlMs = options.leaderTtlMs ?? intervalMs * 3;
 	if (!Number.isFinite(leaderTtlMs) || leaderTtlMs < 1) {
 		throw new Error('cluster clock: leaderTtlMs must be a positive number (ms)');
@@ -306,7 +336,11 @@ export function createClusterClock(client, options = {}) {
 					await redis.set(leaderKey, JSON.stringify({ o }), 'PX', Math.ceil(leaderTtlMs));
 					leaderOffset = null; // a (re)elected leader stamps from its own clock
 				} else {
-					const raw = await redis.get(leaderKey);
+					// Prefixed key first; the unprefixed legacy key only as a
+					// rolling-upgrade fallback, for as long as a pre-cutover
+					// leader is still the one publishing.
+					let raw = await redis.get(leaderKey);
+					if (raw == null && legacyLeaderKey !== null) raw = await redis.get(legacyLeaderKey);
 					if (raw != null) {
 						const parsed = JSON.parse(raw);
 						if (parsed && typeof parsed.o === 'number' && Number.isFinite(parsed.o)) {

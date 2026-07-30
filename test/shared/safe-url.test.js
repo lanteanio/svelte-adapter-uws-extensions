@@ -81,8 +81,13 @@ describe('shared/safe-url: blocked IPv6 ranges', () => {
 	it('blocks IPv6 link-local fe80::/10', () => {
 		expect(checkUrl('http://[fe80::1]/')).toEqual({ safe: false, reason: 'link-local' });
 		expect(checkUrl('http://[febf:ffff::1]/')).toEqual({ safe: false, reason: 'link-local' });
-		// fec0::/10 is outside fe80::/10.
-		expect(checkUrl('http://[fec0::1]/')).toEqual({ safe: true });
+	});
+
+	it('blocks deprecated site-local fec0::/10 under the ula reason', () => {
+		// Outside fe80::/10, but RFC 3879 site-local is still routed on older
+		// internal networks, so it is blocked rather than public.
+		expect(checkUrl('http://[fec0::1]/')).toEqual({ safe: false, reason: 'ula' });
+		expect(checkUrl('http://[feff:ffff::1]/')).toEqual({ safe: false, reason: 'ula' });
 	});
 
 	it('blocks the IPv6 cloud-metadata form fd00:ec2::254 with a distinct reason', () => {

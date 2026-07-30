@@ -19,7 +19,7 @@
  * @module svelte-adapter-uws-extensions/shared/ws-subscriptions
  */
 
-const WS_SUBSCRIPTIONS = Symbol.for('adapter-uws.ws.subscriptions');
+export const WS_SUBSCRIPTIONS = Symbol.for('adapter-uws.ws.subscriptions');
 
 /**
  * Mirror a native `ws.subscribe(topic)` into the connection's subscription
@@ -33,6 +33,44 @@ export function addWsSubscription(ws, topic) {
 		if (subs) subs.add(topic);
 	} catch { /* socket already closed; the registry dies with the connection */ }
 }
+
+/**
+ * Is this connection recorded as subscribed to `topic`?
+ *
+ * For a `__`-prefixed internal topic this is a SERVER-GRANTED signal, not a
+ * client-asserted one: the adapter's wire-level gate refuses client-initiated
+ * subscribes to `__` topics, so the only way the entry exists is that an
+ * authorized server path put it there. That makes it a sound membership test
+ * for the frame hot path, and it is the same signal the bundled plugins gate
+ * on. Never throws.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @returns {boolean}
+ */
+export function hasWsSubscription(ws, topic) {
+	try {
+		const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
+		return subs ? subs.has(topic) : false;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * `platform.checkSubscribe` options for an OBSERVER lane - a call that asks
+ * "may this connection SEE what it already holds?" rather than "may it be
+ * granted this?". The roster/snapshot handshakes are observer lanes; attach
+ * and join are grant-ESTABLISHING lanes and must not pass this, because
+ * requiring the grant to exist already would deny every legitimate join.
+ *
+ * It matters only in a pure-grant deployment - wire-subscribe authorization
+ * armed and no app `subscribe` hook - where the subscribe gate has no hook to
+ * consult and therefore allows every topic name, so an ungated observer lane
+ * hands any connected socket any room's roster. The peer floor implements the
+ * option, so the gate is load-bearing across the supported adapter range.
+ */
+export const OBSERVER_LANE = Object.freeze({ requireGrant: true });
 
 /**
  * Mirror a native `ws.unsubscribe(topic)` into the registry, so the binary

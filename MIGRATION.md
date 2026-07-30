@@ -1,4 +1,301 @@
-# Migration guide: svelte-adapter-uws-extensions 0.4.x to 0.5.x
+# Migration guide: svelte-adapter-uws-extensions
+
+- **[0.5.x to 0.6.x](#05x-to-06x)** - current release.
+- **[0.4.x to 0.5.x](#04x-to-05x)** - previous release.
+
+---
+
+# 0.5.x to 0.6.x
+
+Ordered by **when the change reaches you**, because that is what decides how
+much of it you can discover in staging. Three refusals fail at construction, so
+a misconfigured deployment stops at boot rather than at the first request. One
+change is data-incompatible and wants a drain window. The rest surface on a call
+that used to succeed, or not at all.
+
+Every item lists the **symptom** you will actually see and the **action**.
+
+## 1. Fails at startup
+
+These throw from a factory, so they fail on the deploy rather than in
+production traffic. Fix them before you ship.
+
+### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.87`
+
+**Symptom.** `npm ERR! ERESOLVE unable to resolve dependency tree` (or a peer
+warning under `--legacy-peer-deps`) naming `svelte-adapter-uws`, at install
+time.
+
+**Why.** The presence and cursor snapshot lanes now pass the observer-lane
+mode `{ requireGrant: true }` to `checkSubscribe`, and `0.6.0-next.87` is the
+adapter release that implements it. An older adapter silently ignores the
+option, which re-opens the pure-grant roster exposure the mode exists to
+close - so the floor is what makes the gate real.
+
+**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.87` or later in the same
+upgrade. The ecosystem packages move together (see the version table in the
+README).
+
+### `capabilityCookie` refuses a weak secret
+
+**Symptom.** `capability-cookie: secret must be at least 16 characters` or
+`... has too few distinct characters to be generated key material; it looks
+like a placeholder`, thrown from `capabilityCookie(...)` at module load.
+
+**Why.** The cookie's entire security property is that a client cannot forge the
+signature. An observer holding both the message and the tag can brute-force a
+short key offline at memory speed, and only non-emptiness was checked before -
+so `'dev'` was accepted.
+
+**Action.** Generate a real secret and put it in the environment:
+
+```
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+The floor deliberately does **not** apply to `previousSecret`, which only ever
+verifies. That is what lets you rotate *away* from a weak secret without signing
+every live session out.
+
+### `capabilityCookie` refuses a malformed `cookieName` / `path` / `sameSite`
+
+**Symptom.** `capability-cookie: cookieName must be an RFC 6265 token`, or
+`capability-cookie: path must start with "/" and contain only printable ASCII
+except whitespace, ";", "," and '"'`, thrown at construction.
+
+**Why.** All three are serialized verbatim into the `Set-Cookie` header. A name
+like `my cookie` produced a header the browser silently dropped, so the
+capability check degraded to permanently-absent with nothing logged anywhere. A
+`path` carrying NUL or a non-ASCII byte is worse: the header layer throws
+`invalid header value`, turning every issued cookie into a per-request 500.
+
+**Action.** Use an RFC 6265 token for `cookieName` (letters, digits and
+``!#$%&'*+-.^_`|~``), and percent-encode anything in `path` outside printable
+ASCII. `sameSite` is now matched case-insensitively, so `'lax'` and `'none'`
+keep working.
+
+### Every bus module refuses an invalid `maxEnvelopeBytes`
+
+**Symptom.** `<module>: maxEnvelopeBytes must be a positive integer (bytes), got
+<value>`, thrown from `createConnectionRegistry` / `createGroup` /
+`createCursor` / `createCrdtCluster` / `createPubSubBus` / `createShardedBus` /
+`createSmoothCluster` / `createTopicBroadcast` / `createNotifyBridge`.
+
+**Why.** `0`, `-1`, `NaN` and `'65536'` all fell through to the 1MB default, so
+a deployment that believed it had set a 64KB bound ran with 1MB and nothing
+reported the difference. `NaN` is the sharp one: it *is* a number, and every
+`bytes > NaN` comparison is false, which disables the cap it configures.
+
+**Action.** Pass an integer, or drop the option to take the default. If you are
+reading the value from an environment variable, `Number(process.env.X)` yields
+`NaN` for an unset one - use a fallback.
+
+## 2. Needs an operational drain
+
+### Redis idempotency key derivation changed
+
+**Symptom.** None at boot. After the upgrade, idempotency entries written by
+0.5 instances are not found by 0.6 instances, so a request that was already
+committed executes a second time.
+
+**Why.** `acquire` filtered a non-string tenant while `purgeUser` coerced it, so
+a numeric tenant indexed under one key and erased under another and the erasure
+silently missed. Both sides now coerce identically, and NUL is rejected in
+either segment (the composite key is NUL-delimited, so `('a\0b','c')` and
+`('a','b\0c')` collided and one identity's purge deleted another's results).
+
+**Action.** Pick one:
+
+- **Drain.** Stop enqueuing new idempotent work, let in-flight entries expire
+  past their TTL, then deploy. Clean, and the only option if a duplicate
+  execution is unacceptable.
+- **Accept one re-execution.** Entries written before the upgrade fall back to a
+  cache miss and run once more. Fine when your handlers are themselves
+  idempotent against the downstream.
+
+Do **not** deploy 0.6 alongside 0.5 instances sharing one Redis for longer than
+your idempotency TTL: during that window the two derive different keys for the
+same identity.
+
+## 3. Fails on a call that used to succeed
+
+### Scope arguments that cannot be scoped are refused
+
+**Symptom.** `redis ratelimit: clear tenant id must not contain NUL or glob
+metacharacters (* ? [ ] \)`, the same from `compositeRateLimit.clear`, `redis
+presence: purgeUser user id must not contain NUL or glob metacharacters`, or
+`forget-store: tenant id must be ...`.
+
+**Why.** Each of these interpolates its argument into a `SCAN MATCH` glob.
+`clear('*')` and `clear('')` wiped **every** tenant's buckets through a
+nominally tenant-scoped call.
+
+**Action.** Call `clear()` with no argument for the deliberate global sweep.
+`createForgetStore` tenant ids are `null` or up to 64 characters of
+`[a-zA-Z0-9_.:-]` - domains and namespaced ids are fine, `/` is not, and a
+non-string throws rather than being coerced.
+
+### Postgres boundary inputs are bounded
+
+**Symptom.** `postgres tasks: input is N bytes, past the 262144-byte payload
+cap`, `postgres replay: data exceeds maxDataBytes`, `postgres jobs: batchSize
+must be at most 1000`, or a job id rejected as not a digit string.
+
+**Why.** `jobs.claim` accepted any batch size while every way to finish the
+batch refused above 1000, so an oversized claim could only expire and be
+redelivered - re-running each job's side effects every cycle.
+
+**Action.** The task cap is now configurable: pass `maxPayloadBytes` to
+`createTaskRunner`. Read the note on it in the README first - an oversized
+**result** is terminal and not retried, and by then your handler has already run
+and its side effects have landed. A task that returns a report or an export sits
+under the 256KB default on an ordinary run and passes it on a large one, so
+either raise the bound to cover the largest result the task can produce, or
+return a reference (an object-store key, a row id) and keep the bytes out of the
+row. The minimum is 80 bytes, enough to retain a valid terminal error shape.
+`bigserial` ids beyond 2^53 - which pg returns as strings - are accepted.
+
+### Registry and groups throw on an oversized outbound envelope
+
+**Symptom.** `registry: outbound "send" envelope exceeds maxEnvelopeBytes` or
+`groups: "<event>" envelope exceeds maxEnvelopeBytes`, from a call that
+previously resolved.
+
+**Why.** Publishing past the bound resolved as though delivered while every peer
+dropped the frame on receipt - a silent split-brain only the sender could
+detect.
+
+**Action.** `await` these calls, or attach a `.catch`. An unhandled rejection
+terminates the worker under Node's default, and the registry's own examples were
+previously written unawaited. **Presence is deliberately the exception**: it
+warns and drops rather than throwing, because its envelopes originate on the
+connection-lifecycle path where a throw surfaces as a failed connection. That
+does mean an oversized presence envelope is reported only in the log.
+
+### `cursor.attach()` throws on a refused topic
+
+**Symptom.** `SubscribeDeniedError` with `err.code === 'SUBSCRIBE_DENIED'`.
+
+**Why.** It previously subscribed the socket and only then discovered the
+denial, leaving a refused client subscribed to the room's cursor channel and
+able to write to it.
+
+**Action.** Catch `err.code === 'SUBSCRIBE_DENIED'` in the join-room RPC that
+calls `attach`.
+
+## 4. Silent behaviour changes to audit
+
+### Redis presence/cursor defaults withhold personal and transport data
+
+**Symptom.** A field such as `email`, `phoneNumber`, `apiKey`, `ip`, `address`,
+or nested `remoteAddress` disappears from a zero-config presence roster or
+cursor catalog. If `presence.key` names a dropped field, the tracker warns and
+uses one `__conn:N` entry per connection instead of multi-tab dedup.
+
+**Why.** Those values previously reached every topic peer and the Redis
+presence/cursor hashes. A presence key is also a roster property/hash-field
+name, so resolving a dropped key from raw userData would leak the same value
+through a second channel.
+
+**Action.** Prefer an explicit allowlist containing only the identity the UI
+needs, for example `select: (ud) => ({ id: ud.id, name: ud.name })`. If a
+personal or transport field is intentionally public, return it explicitly.
+Keep `presence.key` on a non-secret selected identifier. Explicit select output
+still passes through `stripInternal` with that helper's existing documented rules.
+
+### Authorization now fails closed
+
+`presence.sync`, `cursor.snapshot` / `cursor.attach` and the replay resume gate
+previously skipped authorization entirely when the platform had no
+`checkSubscribe` - the gate disappeared rather than denying. They now deny. The
+adapter peer floor has provided `checkSubscribe` for many releases, so only a
+**custom platform** is affected; the fix there is to implement it.
+
+### `presence.hooks.subscribe` returns a denial reason
+
+It now resolves to the platform's denial reason (a string) rather than
+`undefined` when the topic is refused. If you wrap the hook, **return** its
+result - `return presence.hooks.subscribe(ws, topic, ctx)` - or the socket stays
+subscribed to a topic the platform refused. `cursor.hooks.subscribe` is the
+same. Both are typed `Promise<string | undefined>` now.
+
+### Right-to-erasure is tenant-scoped everywhere
+
+`purgeUser(tenantId, userId)` previously deleted on `user_id` alone in the Redis
+and Postgres replay buffers and dead-letter queues, so one `purgeUser('acme', u)`
+erased that user's buffered events and dead letters in **every other tenant**.
+All four now apply the rule the sibling legs already used. **A deployment that
+uses no tenants is unaffected**: no topic carries the prefix, so the untenanted
+scope still matches all of them.
+
+### `createClusterClock` prefixes `leaderKey`
+
+`leaderKey` is now relative to the client key prefix, so two apps sharing one
+Redis stop colliding on the well-known `clock:leader-offset` key. Pass the bare
+name. During a rolling upgrade, `legacyLeaderKeyFallback: true` reads the
+unprefixed key - opt-in, because the unprefixed name is the shared one the
+prefixing exists to escape. Left off, a follower ahead of its leader degrades to
+`consistent()` for one key lifetime.
+
+### Persisted task errors omit `cause`
+
+Handlers routinely attach config-bearing causes (a connection error carries its
+DSN) and the stored row is re-served to dashboards by `await()` / `list()`. Set
+`serializeErrorCause: true` on `createTaskRunner` to restore the old shape. The
+same applies to the error handed to `onStateChange`, so a listener doing
+`e.error.cause?.retryable` now reads `undefined` unless you opt in.
+
+### `deadLetter.summary().byTopic` is null-prototype
+
+Property reads are unchanged, but `byTopic.hasOwnProperty(...)`,
+`byTopic.toString()` and `byTopic instanceof Object` no longer work. Use
+`Object.hasOwn(byTopic, t)` and `Object.keys(byTopic)`. A stored topic named
+`__proto__` previously hit the prototype setter instead of counting as data.
+
+## 5. Test-only
+
+### `mockRedisClient` SCAN matches the real matcher
+
+`MATCH` now runs a port of Redis's own `stringmatchlen()` rather than a
+translation into a JavaScript regular expression. A purge-scope or
+tenant-isolation test that passed against the old matching **may now fail** -
+which is the point, since it was passing against semantics production does not
+have. Three cases changed direction: a reversed range (`[c-a]`) used to throw
+`Range out of order`, an unescaped leading `]` was read as a literal member
+where Redis closes the class, and `[a-]` is the range `a`..`]` with the
+endpoints swapped rather than the two members `a` and `-`.
+
+`mockRedisClient` also gained `xdel`, so the streams replay backend's
+right-to-erasure purge now actually erases against the double instead of
+swallowing a missing command and reporting success.
+
+### The sim swarm's fault-enablement knob is renamed `faultMode`
+
+On `runRedisSimSwarm` and `runPgSimSwarm`, three options and one summary
+counter change name. The old names are given here so a migrating caller can
+find them: <!-- vocabulary-allow: a rename note must name the superseded option so migrating callers can find it -->
+
+| Was | Now |
+|---|---|
+| `buggify` | `faultMode` | <!-- vocabulary-allow: rename table, superseded option name -->
+| `buggifyProbability` | `faultProbability` | <!-- vocabulary-allow: rename table, superseded option name -->
+| `buggified` (per-run flag and summary counter) | `faulted` | <!-- vocabulary-allow: rename table, superseded option name -->
+
+## After upgrading to 0.6
+
+Run your test suite, then check:
+
+- Anything wrapping `presence.hooks.subscribe` or `cursor.hooks.subscribe`
+  returns the hook's result.
+- Task handlers whose result size scales with input - the cap is terminal on
+  that path.
+- `registry.send` / `sendCoalesced` / `group.publish` call sites are awaited.
+- Purge-scope and tenant-isolation tests, against the corrected SCAN matcher.
+- A custom platform implements `checkSubscribe`.
+
+---
+
+# 0.4.x to 0.5.x
 
 This guide is organized by **tier**. Most apps only need to read the first two sections.
 

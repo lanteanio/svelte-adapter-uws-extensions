@@ -34,7 +34,12 @@ export interface Job {
 }
 
 export interface ClaimOptions {
-	/** Max number of jobs to return. @default 1 */
+	/**
+	 * Max number of jobs to return. Bounded at 1000 - the same limit
+	 * `complete` / `fail` / `extend` enforce, so a larger batch could only
+	 * expire and be redelivered. Values above it throw.
+	 * @default 1
+	 */
 	batchSize?: number;
 	/** Override the default visibility timeout (ms). */
 	visibilityTimeoutMs?: number;
@@ -54,6 +59,9 @@ export interface EnqueueOptions {
 	platform?: { requestId?: string };
 }
 
+/** Exact job-id input. Numbers must be safe integers; use string/bigint above 2^53. */
+export type JobIdInput = string | number | bigint;
+
 export interface JobQueue {
 	/** Insert a job; returns the job id. */
 	enqueue(queue: string, payload: unknown, opts?: EnqueueOptions): Promise<string | number>;
@@ -66,17 +74,17 @@ export interface JobQueue {
 	claim(queue: string, opts?: ClaimOptions): Promise<Job[]>;
 
 	/** Delete the claimed job(s). Use after successful processing. */
-	complete(idOrIds: (string | number) | (string | number)[]): Promise<void>;
+	complete(idOrIds: JobIdInput | JobIdInput[]): Promise<void>;
 
 	/**
 	 * Release the claim so another worker can re-claim. Use after a
 	 * recoverable processing failure when the caller wants the job
 	 * to retry.
 	 */
-	fail(idOrIds: (string | number) | (string | number)[]): Promise<void>;
+	fail(idOrIds: JobIdInput | JobIdInput[]): Promise<void>;
 
 	/** Extend the visibility deadline for jobs that need more time. */
-	extend(idOrIds: (string | number) | (string | number)[], additionalMs: number): Promise<void>;
+	extend(idOrIds: JobIdInput | JobIdInput[], additionalMs: number): Promise<void>;
 
 	/** Count of pending (unclaimed) jobs in `queue`, or across all queues if omitted. */
 	pending(queue?: string): Promise<number>;
@@ -93,7 +101,6 @@ export interface JobQueue {
  * queue. Works on vanilla Postgres 9.5+; no extensions required.
  *
  * Pairs with `createTaskRunner` as the lighter "ingest event,
- * defer work" producer; for pgmq deployments, prefer the future
- * `createPgmqWorker` primitive.
+ * defer work" producer.
  */
 export function createJobQueue(client: PgClient, options?: JobQueueOptions): JobQueue;

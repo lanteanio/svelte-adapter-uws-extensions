@@ -32,6 +32,12 @@ export interface PgReplayOptions {
 	 */
 	localFanoutOnStorageFailure?: boolean;
 	/**
+	 * Byte cap on one publish's JSON-encoded `data`. Matches the idempotency
+	 * stores' committed-result cap.
+	 * @default 262144
+	 */
+	maxDataBytes?: number;
+	/**
 	 * Right-to-erasure: extract a buffered event's authoring userId at publish
 	 * time into a `user_id` column so `live.forget` can `DELETE WHERE user_id`.
 	 * Without it, buffered events are not user-purgeable.

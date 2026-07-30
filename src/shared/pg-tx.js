@@ -35,7 +35,13 @@
  * @returns {Promise<T>}
  */
 export async function withTransaction(client, fn) {
-	const pgClient = await client.pool.connect();
+	// client.connect(), not client.pool.connect(): the wrapper redacts the
+	// connection DSN out of pg's error text, and connection acquisition is
+	// the failure mode that carries it. Falls back to the raw pool for a
+	// caller-supplied client shape that predates the wrapper.
+	const pgClient = typeof client.connect === 'function'
+		? await client.connect()
+		: await client.pool.connect();
 	// When set, the connection's transaction state is uncertain (failed
 	// BEGIN/COMMIT, or a ROLLBACK that itself failed). pg-pool destroys a
 	// client released with a truthy error instead of returning it to the

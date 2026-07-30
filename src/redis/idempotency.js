@@ -198,8 +198,31 @@ export function createIdempotencyStore(client, options = {}) {
 	// (Redis 7.4+ / Valkey 9.0+); older servers fall back to a whole-key sliding
 	// EXPIRE, where a busy user's writes keep every field alive - fields can then
 	// outlive their cache entries, and any stale field is a no-op DEL on purge.
+	// The composite index key is NUL-delimited, so neither segment may
+	// contain NUL - otherwise distinct (tenant,user) pairs collide
+	// (('a\0b','c') === ('a','b\0c')) and one identity's purgeUser deletes
+	// another's committed results. Same guard as ratelimit's bucketKey,
+	// enforced at the store boundary.
+	function validateForgetIdentity(tenantId, userId) {
+		if (tenantId != null && String(tenantId).indexOf('\0') !== -1) {
+			throw new Error('redis idempotency: tenant id must not contain a NUL byte (it is the index-key delimiter)');
+		}
+		if (typeof userId === 'string' && userId.indexOf('\0') !== -1) {
+			throw new Error('redis idempotency: user id must not contain a NUL byte (it is the index-key delimiter)');
+		}
+	}
+
+	// One coercion for both index writers. `acquire` reaches this through a
+	// `typeof === 'string'` filter on meta.tenant while `purgeUser` takes
+	// the caller's argument raw, so a non-string tenant used to write under
+	// one key and erase under another - a right-to-erasure miss of exactly
+	// the family the NUL guard above addresses.
+	function tenantSegment(tenantId) {
+		return tenantId == null ? '' : String(tenantId);
+	}
+
 	function byUserKey(tenantId, userId) {
-		return client.key(keyPrefix + 'byuser:' + (tenantId || '') + '\0' + userId);
+		return client.key(keyPrefix + 'byuser:' + tenantSegment(tenantId) + '\0' + userId);
 	}
 
 	function validateKey(userKey) {
@@ -218,7 +241,12 @@ export function createIdempotencyStore(client, options = {}) {
 			// The realtime idempotent wrapper passes the raw (user, tenant) so this
 			// committed key can be recorded under the user for right-to-erasure.
 			const forgetUser = meta && typeof meta.user === 'string' ? meta.user : null;
-			const forgetTenant = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
+			// Coerced, not typeof-filtered: purgeUser(tenant, user) coerces its
+			// argument, so dropping a non-string tenant here would index the
+			// entry under the untenanted scope while the later erasure looks
+			// for it under the tenant, and the purge would silently miss.
+			const forgetTenant = meta && meta.tenant != null ? String(meta.tenant) : null;
+			if (forgetUser !== null) validateForgetIdentity(forgetTenant, forgetUser);
 
 			// A distinct token per acquire. The pending slot stores this token so
 			// commit/abort can compare-and-set/delete against it: an owner whose
@@ -338,6 +366,7 @@ export function createIdempotencyStore(client, options = {}) {
 		 */
 		async purgeUser(tenantId, userId) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			validateForgetIdentity(tenantId, userId);
 			return withBreaker(b, async () => {
 				const idxKey = byUserKey(tenantId, userId);
 				const keys = await redis.hkeys(idxKey);

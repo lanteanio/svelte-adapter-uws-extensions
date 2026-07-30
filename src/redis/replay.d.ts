@@ -68,6 +68,13 @@ export interface RedisReplayOptions {
 	 */
 	localFanoutOnStorageFailure?: boolean;
 	/**
+	 * Byte cap on one publish's JSON-encoded `data`, enforced by both the
+	 * sorted-set and stream backends (including stream publishIdempotent).
+	 * Must be a positive integer.
+	 * @default 262144
+	 */
+	maxDataBytes?: number;
+	/**
 	 * Right-to-erasure: map a buffered event to its authoring userId so
 	 * `live.forget` can drop the user's buffered events (scanned per topic at
 	 * purge time). Without it, buffered events are not user-purgeable.

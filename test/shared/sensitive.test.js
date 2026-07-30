@@ -135,6 +135,109 @@ describe('shared/sensitive: redactConnectionUrl', () => {
 		expect(redactConnectionUrl('redis://host/path#anchor?password=notreallyaparam'))
 			.toBe('redis://host/path#anchor?password=notreallyaparam');
 	});
+
+	it('redacts EVERY url in the string, not only the first', () => {
+		// Callers pass whole messages and whole stacks, which carry the DSN
+		// more than once. Stopping at the first leaks the rest.
+		expect(redactConnectionUrl('primary postgres://u:s3cret@a/db failed, retrying postgres://u:s3cret@b/db'))
+			.toBe('primary postgres://u:***@a/db failed, retrying postgres://u:***@b/db');
+	});
+
+	it('redacts every url across the lines of a stack trace', () => {
+		const stack = [
+			'Error: connect ECONNREFUSED postgres://u:hunter2@db1:5432/app',
+			'    at Pool.connect (/app/node_modules/pg/lib/pool.js:1:1)',
+			'    at retry (/app/src/db.js:9:9) postgres://u:hunter2@db2:5432/app'
+		].join('\n');
+		const out = redactConnectionUrl(stack);
+		expect(out).not.toContain('hunter2');
+		expect(out.split('\n')).toHaveLength(3);
+		expect(out).toContain('at Pool.connect (/app/node_modules/pg/lib/pool.js:1:1)');
+	});
+
+	it('bounds the query redaction at the url token, not the rest of the string', () => {
+		// `[^&]+` matches newlines, so an unbounded query match replaces the
+		// whole remainder of a stack with `***` - losing every frame after
+		// the DSN line.
+		const stack = 'Error: postgres://db/app?password=hunter2\n    at foo (/app/a.js:1:1)\n    at bar (/app/b.js:2:2)';
+		const out = redactConnectionUrl(stack);
+		expect(out).not.toContain('hunter2');
+		expect(out).toContain('at foo (/app/a.js:1:1)');
+		expect(out).toContain('at bar (/app/b.js:2:2)');
+	});
+
+	it('still redacts a quoted url without eating the closing quote', () => {
+		expect(redactConnectionUrl('connectionString: "postgres://u:s3cret@h/db", ssl: true'))
+			.toBe('connectionString: "postgres://u:***@h/db", ssl: true');
+	});
+
+	it('redacts passwords containing legal sub-delimiter characters', () => {
+		// RFC 3986 permits !$&'()*+,;= unescaped in userinfo, and pg parses
+		// such a DSN fine. Treating any of them as the end of the URL token
+		// cuts the scan before the authority `@`, so the password segment is
+		// never located and the entire credential survives verbatim.
+		for (const pw of ["Xy'9-hunter2", 'a$b!c', 'p(w)d', 'x,y;z=1', 'q*r+s']) {
+			const out = redactConnectionUrl(`postgres://app:${pw}@db.internal:5432/main`);
+			expect(out).toBe('postgres://app:***@db.internal:5432/main');
+			expect(out).not.toContain(pw);
+		}
+	});
+
+	it('redacts every url when nothing separates them but punctuation', () => {
+		// A compact JSON config or log line is the ordinary carrier. With only
+		// whitespace ending a url, the whole run is ONE token: one authority is
+		// found, the scan resumes past both, and every later credential is
+		// re-emitted verbatim.
+		const out = redactConnectionUrl('{"primary":"postgres://u:p1@a/db","replica":"redis://u:S3CRET@b"}');
+		expect(out).not.toContain('S3CRET');
+		expect(out).not.toContain(':p1@');
+		for (const sep of ['"', '`', '<', '>', ',', ';', ')', ']', '}', '|', '&', "'"]) {
+			const r = redactConnectionUrl(`a${sep}postgres://u:AAA@h1/db${sep}redis://u:BBB@h2${sep}z`);
+			expect(r).not.toContain('AAA');
+			expect(r).not.toContain('BBB');
+		}
+	});
+
+	it('does not swallow same-line data after a query password', () => {
+		// The value runs to the next `&` or to a character that cannot appear
+		// in a query at all. Bounding it only at whitespace destroys real data
+		// to hide a credential.
+		const json = redactConnectionUrl('{"dsn":"postgres://h/db?password=hunter2","user":"bob"}');
+		expect(json).not.toContain('hunter2');
+		expect(json).toContain('"user":"bob"');
+
+		const cfg = redactConnectionUrl('connectionString: "postgres://h/db?password=hunter2", ssl: true');
+		expect(cfg).not.toContain('hunter2');
+		expect(cfg).toContain('ssl: true');
+	});
+
+	it('redacts a query password up to the quote, and no further', () => {
+		// Pinned to the EXACT value, because `not.toContain('s3c"ret')` is
+		// satisfied by a PARTIAL leak: the whole password is gone from the
+		// output only if the tail after the quote went too, and it does not.
+		//
+		// That is the deliberate trade, not a gap. `"` has to terminate a
+		// query-value scan or the quoted-DSN case above
+		// (`connectionString: "postgres://...", ssl: true`) has its closing
+		// quote and the rest of the line eaten by the redaction. A `"` is
+		// RFC-invalid unescaped in a query, so the shape that loses a few
+		// characters here is one a real DSN cannot have, while the shape that
+		// would break is one that appears in every config dump.
+		expect(redactConnectionUrl('postgres://h/db?password=s3c"ret&x=1'))
+			.toBe('postgres://h/db?password=***"ret&x=1');
+
+		// A password made only of legal query bytes is redacted whole - which
+		// is what makes the line above a statement about `"` specifically.
+		expect(redactConnectionUrl("postgres://h/db?password=s3c'ret&x=1"))
+			.toBe('postgres://h/db?password=***&x=1');
+		expect(redactConnectionUrl('postgres://h/db?password=s3cret&x=1'))
+			.toBe('postgres://h/db?password=***&x=1');
+	});
+
+	it('keeps IPv6 hosts intact when scanning multiple urls', () => {
+		expect(redactConnectionUrl('a redis://:s1@[::1]:6379 b redis://:s2@[::2]:6380'))
+			.toBe('a redis://:***@[::1]:6379 b redis://:***@[::2]:6380');
+	});
 });
 
 describe('shared/sensitive: stripInternal still works (regression check)', () => {

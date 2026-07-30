@@ -5,7 +5,7 @@
 //
 // REQUIRES A LIVE REDIS (set REDIS_URL, default redis://localhost:6379); it
 // self-skips with a message when none is reachable, so it never fails CI. This
-// is the credo-4 before/after harness to run on real iron before trusting the
+// is the before/after harness to run on real iron before trusting the
 // perf claim - the mock double cannot measure EVALSHA, only correctness.
 //
 // Run with: node bench/micro-eval-vs-evalsha.mjs

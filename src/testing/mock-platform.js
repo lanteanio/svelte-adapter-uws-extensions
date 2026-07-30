@@ -8,6 +8,8 @@
  *
  * Drift on any of those three sites fails the parity test at CI time.
  */
+import { WS_SUBSCRIPTIONS } from '../shared/ws-subscriptions.js';
+
 export const PLATFORM_KEYS = Object.freeze([
 	'publish', 'publishBatched', 'batch',
 	'send', 'sendTo', 'sendCoalesced',
@@ -38,6 +40,10 @@ export function mockPlatform() {
 		subscribed: [],
 		unsubscribed: [],
 		checkedSubscribe: [],
+		// Verdict `checkSubscribe` returns. `null` allows, matching an adapter
+		// with no app subscribe hook to consult; set a string to deny, which is
+		// how a test drives the fail-closed paths.
+		checkSubscribeDenial: null,
 		wireSubscribeAuthorized: false,
 		connections: 0,
 		requestId: '',
@@ -170,17 +176,41 @@ export function mockPlatform() {
 		// nothing. Tests that exercise a per-subscriber walk reassign this
 		// with their own iteration over recorded subscribers.
 		forEachSubscriber(topic, fn) {},
+		// subscribe/unsubscribe mirror the connection's SUBSCRIPTION REGISTRY,
+		// as the adapter's own platform does. Recording the call without
+		// touching the registry makes a revoked socket still read as
+		// subscribed, so a membership gate that consults the registry looks
+		// correct here and fails open - or closed - in production.
 		subscribe(ws, topic) {
 			p.subscribed.push({ ws, topic });
+			try {
+				const subs = ws?.getUserData?.()[WS_SUBSCRIPTIONS];
+				if (subs) subs.add(topic);
+			} catch { /* closed socket */ }
 			return null;
 		},
 		unsubscribe(ws, topic) {
 			p.unsubscribed.push({ ws, topic });
+			try {
+				const subs = ws?.getUserData?.()[WS_SUBSCRIPTIONS];
+				if (subs) subs.delete(topic);
+			} catch { /* closed socket */ }
 			return false;
 		},
-		checkSubscribe(ws, topic) {
-			p.checkedSubscribe.push({ ws, topic });
-			return null;
+		/**
+		 * Records `options` as well as `(ws, topic)`. Dropping the third
+		 * argument made the observer-lane flag unobservable, so no test in
+		 * either repo could tell a lane that asks the observer question from
+		 * one that does not - which is the whole distinction. The peer floor
+		 * reads the flag, so a call site passing it on the wrong lane (or
+		 * dropping it from the right one) changes production authorization.
+		 * @param {any} ws
+		 * @param {string} topic
+		 * @param {{ requireGrant?: boolean }} [options]
+		 */
+		checkSubscribe(ws, topic, options) {
+			p.checkedSubscribe.push({ ws, topic, options });
+			return p.checkSubscribeDenial;
 		},
 		authorizeWireSubscribe() {
 			p.wireSubscribeAuthorized = true;

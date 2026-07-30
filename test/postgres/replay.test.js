@@ -426,6 +426,26 @@ describe('postgres replay', () => {
 	});
 
 	describe('per-topic epoch', () => {
+		it('chunks resume epoch lookups instead of sending one oversized ANY array', async () => {
+			const topics = Array.from({ length: 1001 }, (_, i) => 'room:' + i);
+			const lastSeenSeqs = Object.fromEntries(topics.map((topic) => [topic, 0]));
+			// Present a deliberately stale generation so the hook stops after
+			// currentEpochs and does not issue 1001 per-topic replay reads.
+			const lastSeenEpochs = Object.fromEntries(topics.map((topic) => [topic, 1]));
+			const spy = vi.spyOn(client, 'query');
+			try {
+				await replay.resumeHook()({}, { lastSeenSeqs, lastSeenEpochs, platform });
+				const epochReads = spy.mock.calls
+					.map(([arg]) => arg)
+					.filter((arg) => arg?.name === 'replay_epochs_svti_replay');
+				expect(epochReads).toHaveLength(2);
+				expect(epochReads.map((arg) => arg.values[0].length)).toEqual([1000, 1]);
+				expect(epochReads.flatMap((arg) => arg.values[0])).toEqual(topics);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
 		it('starts a never-published topic at the baseline epoch', async () => {
 			expect(await replay.currentEpoch('chat')).toBe(0);
 		});
@@ -1159,6 +1179,62 @@ describe('postgres replay', () => {
 				expect(purged).toBe(1);
 				const stored = await r.since('chat', 0);
 				expect(stored.map((m) => m.data.id)).toEqual([2]);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('erases only the named tenant, not every tenant with that user id', async () => {
+			const r = createReplay(client, {
+				cleanupInterval: 0,
+				forgetUserId: ({ data }) => data?.author
+			});
+			try {
+				// Tenancy rides the wire topic as `@t/<tenantId>/<topic>`, which is
+				// the scope the room-owner and presence-roster legs of the SAME
+				// purge already apply. Deleting on user_id alone honoured the
+				// tenant argument nowhere, so one tenant's right-to-erasure
+				// destroyed every other tenant's rows for the same user id.
+				await r.publishBatch(platform, [
+					{ topic: '@t/acme/chat', event: 'created', data: { id: 1, author: 'u1' } },
+					{ topic: '@t/globex/chat', event: 'created', data: { id: 2, author: 'u1' } },
+					{ topic: 'chat', event: 'created', data: { id: 3, author: 'u1' } }
+				]);
+
+				expect(await r.purgeUser('acme', 'u1')).toBe(1);
+				expect((await r.since('@t/acme/chat', 0)).map((m) => m.data.id)).toEqual([]);
+				expect((await r.since('@t/globex/chat', 0)).map((m) => m.data.id)).toEqual([2]);
+				expect((await r.since('chat', 0)).map((m) => m.data.id)).toEqual([3]);
+
+				// The untenanted scope reaches the untenanted topic and nothing else.
+				expect(await r.purgeUser(null, 'u1')).toBe(1);
+				expect((await r.since('chat', 0)).map((m) => m.data.id)).toEqual([]);
+				expect((await r.since('@t/globex/chat', 0)).map((m) => m.data.id)).toEqual([2]);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('a tenant id sharing a prefix with another does not reach it', async () => {
+			const r = createReplay(client, {
+				cleanupInterval: 0,
+				forgetUserId: ({ data }) => data?.author
+			});
+			try {
+				// A validated tenant id may contain `_`, which is a LIKE wildcard
+				// matching any single character - so a LIKE-based scope would let
+				// `a_c` reach `abc`.
+				await r.publishBatch(platform, [
+					{ topic: '@t/a_c/chat', event: 'created', data: { id: 1, author: 'u1' } },
+					{ topic: '@t/abc/chat', event: 'created', data: { id: 2, author: 'u1' } },
+					{ topic: '@t/acme/chat', event: 'created', data: { id: 3, author: 'u1' } },
+					{ topic: '@t/acmecorp/chat', event: 'created', data: { id: 4, author: 'u1' } }
+				]);
+				expect(await r.purgeUser('a_c', 'u1')).toBe(1);
+				expect((await r.since('@t/abc/chat', 0)).map((m) => m.data.id)).toEqual([2]);
+				// And a tenant is not a prefix of a longer tenant's namespace.
+				expect(await r.purgeUser('acme', 'u1')).toBe(1);
+				expect((await r.since('@t/acmecorp/chat', 0)).map((m) => m.data.id)).toEqual([4]);
 			} finally {
 				r.destroy();
 			}

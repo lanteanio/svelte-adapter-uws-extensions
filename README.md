@@ -95,7 +95,7 @@ Postgres support is optional:
 npm install pg
 ```
 
-Requires `svelte-adapter-uws >= 0.2.0` as a peer dependency.
+Requires `svelte-adapter-uws >= 0.6.0-next.87` as a peer dependency.
 
 ---
 
@@ -173,6 +173,7 @@ export const wrapped = createPgClient({ pool });
 |---|---|
 | `pg.pool` | The underlying pg Pool (provided or owned). |
 | `pg.query(text, values?)` | Run a query. |
+| `pg.connect()` | Acquire a dedicated pooled connection. Prefer this over `pool.connect()`: connection acquisition is the failure whose pg error text carries the DSN, and a raw handle bypasses redaction entirely. The returned client's `query` redacts too; `release` is unchanged. |
 | `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
 | `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
 
@@ -230,7 +231,7 @@ Higher-level frameworks built on this adapter (e.g. [`svelte-realtime`](https://
 Two failure modes deserve specific call-out for distributed extensions:
 
 - **Key collisions across tenants on a shared backend.** A `lock.withLock('account:42', ...)` call on a shared Redis hits the same lock entry regardless of which app instance or which tenant issued it. If your handler builds the key from a wire field without checking ownership, an unauthorized caller can grab the lock and stall any legitimate owner. Derive keys from a trusted prefix (`account:${assertedAccountId(ctx, payload.accountId)}`), and consider per-tenant key prefixes on the client itself (`createRedisClient({ keyPrefix: \`tenant:${tenantId}:\` })`) when you operate one Redis across multiple tenants - see [shared-Redis tenancy notes](#operational-notes-for-shared-redis-tenancy) for the deployment shape.
-- **Replay / pub-sub fanout to unauthorized subscribers.** A subscribe gate is still your responsibility. The replay buffer hands history to whoever asks; the pub/sub bus broadcasts whatever publishes arrive. Gate topic-subscribe in your handler before invoking the extension.
+- **Replay / pub-sub fanout to unauthorized subscribers.** A subscribe gate is still your responsibility. The pub/sub bus broadcasts whatever publishes arrive to whoever is subscribed; `replay()` authorizes each topic through the platform's `checkSubscribe` and fails closed when the platform cannot answer - but it is your subscribe hook that makes that check say no. Gate topic-subscribe in your handler before invoking the extension.
 
 The same pattern applies to every extension in this README: read identity, decide, derive keys/topics from trusted identity prefixes, **then** invoke. An extension that "looks like an auth gate" by virtue of accepting an identity-shaped key is just substituting whatever string the caller hands it.
 
@@ -317,7 +318,7 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 | `onDegraded` | - | Server-side handler invoked once when the breaker leaves the healthy state |
 | `onRecovered` | - | Server-side handler invoked once when the breaker returns to the healthy state |
 | `degradationPolicy` | - | A `createDegradationPolicy()` result (from `svelte-adapter-uws-extensions/degradation`). When the breaker degrades, the bus ships the policy's precomputed client mitigation alongside the `degraded` event and de-herds the push, so clients act on the recommendation spread across the cooldown instead of all retrying at t+0. See [Proactive degradation policy](#proactive-degradation-policy) |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject **inbound** bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. Also available on `createConnectionRegistry`, `createGroup` and `createPresence` - and on those three it bounds the **outbound** side too, because an envelope past the bound reaches local subscribers and no remote instance, which the sender is the only side positioned to report. The bus itself does not bound outbound: it relays ordinary app publishes on the hottest path in the system, where a refusal is the app's own `platform.publish` throwing. Registry and groups throw; presence warns and drops (see its own note). Must be a positive integer - an invalid value throws at construction instead of silently selecting the default, so a bound you thought you set is a bound you have. |
 | `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped; the configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so the bus's own degraded / recovered events still flow. Closes the bus-injection class in shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 See [Notifying clients of degradation](#notifying-clients-of-degradation) for the full pattern.
@@ -440,7 +441,7 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 |---|---|---|
 | `channelPrefix` | `'uws:sharded:'` | Prefix for sharded pub/sub channels |
 | `shardKey` | `(topic) => topic` | Map a topic to a shard label. The channel is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic). |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the cluster bus with oversized payloads. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the cluster bus with oversized payloads. Must be a positive integer; an invalid value throws at construction. |
 | `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped. Closes the bus-injection class in shared-Redis deployments. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 #### When to use which bus
@@ -467,7 +468,7 @@ Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + 
 
 When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
 
-> **Authorization:** the replay buffer is identity-blind - it hands history to whoever subscribes to `__replay:{topic}`. Gate the topic-subscribe in your handler before invoking the replay extension. See [Authorization model](#authorization-model).
+> **Authorization:** `replay()` authorizes before reading the buffer: it runs `platform.checkSubscribe(ws, topic)` per topic and **fails closed** - a platform that cannot answer (no `checkSubscribe`, or an authorizer that throws) is treated as a denial. A denied topic emits a `denied` event on `__replay:{topic}` and resolves `undefined` (no watermark) instead of history. Gate the topic-subscribe in your handler as before; the replay gate is the second line that keeps a guessed topic name from yielding the buffer. See [Authorization model](#authorization-model).
 
 The same gap state is exposed as a callable: `gap(topic, lastSeenSeq)` returns `{ truncated, missingFrom }` without driving a full WebSocket replay. Useful for SSR loaders that want to decide between an incremental `since()` fetch and a full reload before the page even opens its socket.
 
@@ -533,18 +534,23 @@ import { replay } from '$lib/server/replay';
 export const resume = replay.resumeHook();
 ```
 
-The returned hook iterates the client's `lastSeenSeqs` and calls `replay.replay(ws, topic, sinceSeq, platform)` per topic. Per-topic truncation detection still happens inside `replay()` - a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
+The returned hook accepts at most `MAX_RESUME_TOPICS` (10,000) own topics from the client's `lastSeenSeqs`, stops enumerating as soon as it detects overflow, and authorizes every accepted topic before any epoch-cache or store work. An oversized frame resumes only its accepted prefix, increments the label-free `replay_resume_topic_overflows_total` counter, and emits a throttled operator warning; client-controlled topic names never become metric labels. Postgres splits accepted epoch lookups into 1,000-topic query chunks. Per-topic buffer truncation detection still happens inside `replay()` - a client whose buffer rolled gets a `truncated` event on `__replay:{topic}` so it can do a full reload for that aggregate while other topics continue with incremental gap-fill.
 
 The hook also detects a topic whose seq space was **reset** since the client last saw it - a `clearTopic`, a TTL-reaped seq key, or a botched reshard that drops the keys all restart the seq counter at 1. Each topic carries a generation in a shared `replay:epoch:{topic}` key (co-located with `replay:seq:`/`replay:buf:` under the same hash tag, so it travels with the slot on a reshard, and given no TTL so it outlives a reaped seq key). The client tracks the epoch it last saw per topic and presents it back on resume; the hook compares it to the stored one. On a match it gap-fills as above. On a mismatch it skips gap-fill for that topic and emits a `rehydrate` event on `__replay:{topic}`, telling the client to drop its stale offset and re-read from scratch rather than be served the new, lower seq numbering as if it continued the old one. Read the stored generation directly with `replay.currentEpoch(topic)` (async) or its in-process cache via `replay.cachedEpoch(topic)` (sync). The compare is strictly additive: a topic the client presents no epoch for is always treated as a match, so a client or deployment that never adopted the epoch resumes exactly as before.
 
 The hook resolves the **covered watermark** - `{ [topic]: highestSeqCovered }` for every topic it gap-filled - and the adapter's replay-to-live cutover reads that return value. The adapter buffers live frames published while the resume is in flight (past the store read, before the connection joins live fan-out) and flushes them after cutover, skipping every frame the gap-fill already delivered: with the watermark the dedup boundary is exact, so a publish landing inside the resume window arrives exactly once - no gap, no duplicate. `replay()` itself resolves the same watermark for one topic: the highest seq it delivered, or `sinceSeq` when the client was already current and the stored seq counter confirms it. It resolves `undefined` when the replay was denied - and when the presented offset exceeds the counter, because the offset is client-controlled wire input and an unverifiable claim must never become a trusted watermark (frames below it would be silently skipped at the flush). A topic the hook did not gap-fill (a `rehydrate` mismatch, a denied replay, an unverifiable offset) is absent from the map, and the adapter falls back to its conservative pre-window floor for it.
 
-For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand. Keep returning the per-topic watermark so the cutover dedup stays exact:
+For finer control - custom truncation handling, gathering several gap-fills before flushing, mixing in other resume work - compose by hand. A custom hook also assumes responsibility for bounding the hostile wire map; iterate and stop instead of materializing all entries with `Object.entries`. Keep returning the per-topic watermark so the cutover dedup stays exact:
 
 ```js
 export async function resume(ws, { lastSeenSeqs, platform }) {
-  const covered = {};
-  for (const [topic, sinceSeq] of Object.entries(lastSeenSeqs)) {
+  const covered = Object.create(null);
+  let accepted = 0;
+  for (const topic in lastSeenSeqs) {
+    if (!Object.prototype.hasOwnProperty.call(lastSeenSeqs, topic)) continue;
+    if (accepted >= 10_000) break; // use a deployment-appropriate hard cap
+    accepted++;
+    const sinceSeq = lastSeenSeqs[topic];
     const seq = await replay.replay(ws, topic, sinceSeq, platform);
     if (typeof seq === 'number') covered[topic] = seq;
   }
@@ -562,6 +568,7 @@ The same `resumeHook()` and the same reset-detection are available on the Postgr
 | `storage` | `'sortedset'` | Backend: `'sortedset'` (default) uses ZADD; `'stream'` uses XADD. See [Stream backend](#stream-backend). |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Key expiry in seconds (0 = never) |
+| `maxDataBytes` | `262144` | Per-message payload cap, applied by every replay backend (Redis sorted-set, Redis stream, Postgres) so the contract does not differ by which one a deployment runs. Rejects with `ReplaySerializationError`; on the Postgres store `publishBatch` enforces it too. Must be a positive integer - `NaN` and `0` are refused rather than silently disabling the cap. |
 | `durability` | - | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
 | `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
 | `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` blocks indefinitely (Redis WAIT semantics). |
@@ -690,6 +697,10 @@ Same API as the core `createPresence` plugin, but backed by Redis hashes. Presen
 
 > **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorization model](#authorization-model).
 
+With no `select`, the Redis presence and cursor trackers use the same recursive privacy projection. It removes adapter-internal/prototype keys, credential-shaped names, common personal-data names (email, phone, government/payment identifiers), and request transport metadata (`remoteAddress`, IP/address variants, headers, request URL/id) before the value reaches either a peer frame or Redis. Ordinary roster fields such as `authorId`, `microphoneOn`, `avatarUrl`, and `role` remain. This is a denylist safety net, not a domain privacy boundary; use an explicit allowlist `select` when the application has stricter requirements. Explicit selects can intentionally admit fields, but their result still passes through the existing [`stripInternal`](#stripinternalobj----safe-to-spread-safe-to-log) backstop with that helper's documented rules.
+
+The `key` is part of the wire and storage shape: it becomes the property/hash-field name for the roster entry. It is therefore resolved from projected data. If the default drops a configured key such as `email` or `sessionId`, presence warns and uses a per-connection `__conn:N` key instead of leaking the value through the roster key. Choose a non-secret identifier for multi-tab dedup, or use an explicit `select` only when the configured key is intentionally public.
+
 #### Wire shape
 
 Clients see three event types on `__presence:{topic}`. Mirrors the adapter's bundled `createPresence` plugin so a single client decoder handles both single-instance and cluster deployments:
@@ -746,8 +757,8 @@ export async function close(ws, { platform }) {
 
 | Option | Default | Description |
 |---|---|---|
-| `key` | `'id'` | Field for user dedup (multi-tab) |
-| `select` | strips `__`-prefixed keys | Extract public fields from userData |
+| `key` | `'id'` | Field in projected data for user dedup (multi-tab). If the default privacy projection drops it, presence warns and uses a per-connection key so the value cannot leak as the roster property name. |
+| `select` | recursive privacy projection | Extract public fields from userData. The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. Pass an explicit allowlist for app-specific privacy. |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
@@ -806,7 +817,7 @@ Additive and wire-compatible: a deployment that never calls `update()` sends the
 | `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator - a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
 | `staleCleanedTotal` | Reserved for backward compatibility. Always `0` since per-field staleness is now enforced atomically by Redis via `HPEXPIRE` rather than by an application-side cleanup script. The field stays for callers that read it.|
 
-The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge). The pre-Design-G `presence_stale_cleaned_total` counter is no longer registered.
+The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge). The former `presence_stale_cleaned_total` counter is no longer registered.
 
 Two additional counters track the diff-protocol behavior:
 
@@ -898,8 +909,14 @@ If you need custom logic (auth gating, logging), wrap the hooks:
 import { presence } from '$lib/server/presence';
 
 export async function subscribe(ws, topic, ctx) {
-  if (!ctx.platform.getUserData(ws).authenticated) return;
-  await presence.hooks.subscribe(ws, topic, ctx);
+  // Return a REASON to deny. A bare `return` yields `undefined`, which the
+  // adapter reads as ALLOW - so a gate written that way lets every
+  // unauthenticated socket straight through.
+  if (!ctx.platform.getUserData(ws).authenticated) return 'UNAUTHENTICATED';
+  // RETURN the hook's result. It resolves to the platform's denial reason
+  // when the topic is refused; discarding it subscribes the socket to a topic
+  // the platform said no to and withholds only the roster.
+  return presence.hooks.subscribe(ws, topic, ctx);
 }
 
 export const { close } = presence.hooks;
@@ -977,7 +994,7 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | Option | Default | Description |
 |---|---|---|
 | `identify` | (required) | `(ws) => userId | null`. Anonymous connections are skipped. |
-| `attributes` | - | `(ws) => Record<string, string | number | boolean>`. Required for `sendTo(...)`. Captures per-user attributes at registration time for tenant- / role- / cohort-scoped broadcasts. Numbers and booleans are coerced to strings for index-key consistency; nested objects, arrays, and `null` values are dropped (shallow values only per credo rule 1). |
+| `attributes` | - | `(ws) => Record<string, string | number | boolean>`. Required for `sendTo(...)`. Captures per-user attributes at registration time for tenant- / role- / cohort-scoped broadcasts. Numbers and booleans are coerced to strings for index-key consistency; nested objects, arrays, and `null` values are dropped (shallow values only). |
 | `keyPrefix` | `''` | Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`. |
 | `ttl` | `90` | Expiry on registry entries in seconds. Should be > `heartbeat * 3` so a missed beat doesn't drop a live user. |
 | `heartbeat` | `30000` | TTL refresh interval in ms. Each tick `EXPIRE`s every locally-owned entry. |
@@ -1026,7 +1043,7 @@ Routing follows the same shape as `request(...)`: lookup the owning instance, se
 
 Per-`(connection, key)` replacement happens on the receiver via the adapter's existing coalesce semantics, so a duplicate or out-of-order envelope from a flaky link is collapsed on arrival rather than producing a stutter on the wire. Ordering is preserved within a `(user, key)` tuple as long as the user does not move instances mid-flight; instance migration triggers one transient out-of-order moment that the per-connection coalesce collapses on the new instance.
 
-Best fit: targeted latest-value streams where the target is a *user*, not a topic. Cursor positions inside a doc, typing indicators between two users, presence-state pushes from a moderator to a single subscriber. Topic-broadcast coalesce (every subscriber sees the same stream) already works cluster-wide via `bus.wrap(platform).publish(...)` on either bus and per-receiver A1 logic; this method covers the remaining gap.
+Best fit: targeted latest-value streams where the target is a *user*, not a topic. Cursor positions inside a doc, typing indicators between two users, presence-state pushes from a moderator to a single subscriber. Topic-broadcast coalesce (every subscriber sees the same stream) already works cluster-wide via `bus.wrap(platform).publish(...)` on either bus with per-receiver aggregation; this method covers the remaining gap.
 
 #### Attribute-targeted broadcast {#registry-sendto}
 
@@ -1256,7 +1273,7 @@ if (!allowed) {
 
 - **All or nothing.** A request is admitted only when EVERY dimension has budget, and consumes from all of them atomically - or from none, so a deny never skews the other counters. The verdict names the tripped dimension (declaration order decides when several would trip) and `remaining` reports every dimension's balance.
 - **`keyBy` is required per dimension** - each dimension must count along its own axis; there is no shared default that could silently collapse the composite into one budget checked N times.
-- **Per-dimension `blockDuration`** auto-bans just the dimension that tripped; `reset` / `ban` / `unban` take the dimension name; `clear(tenant?)` scopes to one tenant's space.
+- **Per-dimension `blockDuration`** auto-bans just the dimension that tripped; `reset` / `ban` / `unban` take the dimension name; `clear(tenant?)` scopes to one tenant's space. `clear()` with no argument clears every tenant; the id must be a string (or omitted) and may not contain NUL or glob metacharacters, so a nominally tenant-scoped call cannot widen into a global wipe.
 - **`peek(ws, cost?)`** is the read-only companion: it reports the same `{ allowed, tripped, remaining, resetMs }` a `consume` would return, checking every dimension without writing to any bucket or moving a counter (the tripped dimension is named without consuming anywhere).
 - **Redis Cluster:** every dimension key for a check shares one hash tag (per tenant), which is what makes the multi-key script legal - and means one tenant's composite buckets live on one shard. That is the standard trade for atomic multi-scope limiting; size budgets so a single hot tenant's check rate fits one shard.
 - The emergency factor above scales every dimension, and `localFloorOnStorageFailure: true` gives the same all-or-nothing verdicts on in-process buckets while the store is down. Composite dimensions are fixed-window; per-dimension `refill` modes are not offered (use single-dimension `createRateLimit` with `refill` where a smooth mode matters).
@@ -1429,6 +1446,8 @@ Hash entries have a TTL so stale cursors from crashed instances get cleaned up a
 
 > **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorization model](#authorization-model).
 
+With no `select`, cursor identity uses the same recursive privacy projection described in [Presence](#presence), before both the catalog/join frame and the Redis cursor snapshot are built. An explicit `select` is the place to define the smallest identity shape your UI actually needs; its result still passes through the existing [`stripInternal`](#stripinternalobj----safe-to-spread-safe-to-log) backstop.
+
 #### Setup
 
 ```js
@@ -1446,12 +1465,19 @@ export const cursors = createCursor(redis, {
 
 Cursor publishes go to the internal `__cursor:{topic}` channel. Clients receive those frames only if the extension has subscribed them server-side - the adapter's wire-level `__`-prefix gate intentionally denies client-sent `__cursor:` subscribe frames. Call `cursors.attach(ws, topic, platform)` from your "join room" RPC (mirroring `presence.join`); without it, every `update` fans out to an empty subscriber set.
 
+`attach` authorizes first: it runs the same `platform.checkSubscribe(ws, topic)` a wire subscribe would, and throws `SubscribeDeniedError` (`err.code === 'SUBSCRIBE_DENIED'`, `err.reason` carrying the platform's denial reason) without subscribing or emitting anything. Membership granted by `attach` (or by an authorized `hooks.subscribe`) is also what gates the high-frequency `cursor` / `cursor-viewport` frames, so a socket that never attached cannot write into a room. That gate lives in `cursors.hooks.message`, so route inbound frames through it rather than calling `cursors.update()` yourself - see the handler below.
+
 ```js
 // src/lib/server/rpc.js (or wherever you handle joinBoard / leaveBoard)
 import { cursors } from '$lib/server/cursors';
 
 export async function joinBoard(ws, { topic, platform }) {
-  await cursors.attach(ws, topic, platform);   // subscribes ws + sends snapshot
+  try {
+    await cursors.attach(ws, topic, platform); // authorizes, subscribes ws, sends snapshot
+  } catch (err) {
+    if (err.code === 'SUBSCRIBE_DENIED') return { error: err.reason };
+    throw err;
+  }
 }
 
 export function leaveBoard(ws, { topic, platform }) {
@@ -1465,9 +1491,13 @@ import { cursors } from '$lib/server/cursors';
 
 export function message(ws, { data, platform }) {
   const msg = JSON.parse(Buffer.from(data).toString());
-  if (msg.type === 'cursor') {
-    cursors.update(ws, msg.topic, msg.position, platform);
-  }
+  // Route the frame through the plugin's own handler. That is where the
+  // membership gate lives: it drops a `cursor` / `cursor-viewport` frame
+  // for a topic this socket never attached to. Calling `cursors.update()`
+  // directly skips the gate, and any connected socket can then write its
+  // identity and position into any room. It also handles the client's
+  // `cursor-snapshot` reconnect frame for free.
+  cursors.hooks.message(ws, { data: msg, platform });
 }
 
 export function close(ws, { platform }) {
@@ -1486,9 +1516,9 @@ export function close(ws, { platform }) {
 | `position` | reads `data.x` / `data.y` | Extract the `{ x, y }` coordinate from cursor `data` for `minMove` and `viewport`. A frame with no extractable finite coordinate is always delivered. |
 | `viewport` | off | `true`, or `{ enabled, padding, cell }`. Per-subscriber viewport culling: a subscriber that reports a viewport rect receives only the cursors inside it (plus `padding` overscan, default `256`, widened when zoomed out); `cell` (default `256`) sizes the spatial index. Off by default, and a viewport-enabled topic stays on the shared fan-out until a subscriber actually reports a rect (so enabling it globally is free on rooms with no reporters). Each instance culls its own subscribers over the combined local + peer cursor set, so a cursor that originated on another instance is culled exactly like a local one; no viewport rect ever crosses Redis. |
 | `backpressure` | off | `true`, or `{ enabled, maxBufferedBytes }`. Skip a subscriber whose socket write buffer exceeds `maxBufferedBytes` (default `1048576` = 1 MiB) for the current tick; cursors are latest-value so a skipped subscriber catches up on the next tick. Bounds a slow or stalled consumer's send queue. Off by default. |
-| `select` | strips `__`-prefixed keys | Extract user data to broadcast alongside position |
+| `select` | recursive privacy projection | Extract user data to broadcast and persist alongside position. The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound cursor envelopes larger than this before `JSON.parse` runs. The inner topic is always validated against the `__` denylist (the module constructs its own `__cursor:` wrapper prefix), so no `allowSystemTopics` knob is needed here. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound cursor envelopes larger than this before `JSON.parse` runs. The inner topic is always validated against the `__` denylist (the module constructs its own `__cursor:` wrapper prefix), so no `allowSystemTopics` knob is needed here. Must be a positive integer; an invalid value throws at construction. |
 
 #### API
 
@@ -1578,7 +1608,7 @@ Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq
 
 Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
 
-> **Authorization:** same as the Redis replay buffer - history goes to whoever subscribes to `__replay:{topic}`. Gate topic-subscribe in your handler. See [Authorization model](#authorization-model).
+> **Authorization:** same as the Redis replay buffer - `replay()` runs `platform.checkSubscribe(ws, topic)` per topic and fails closed when the platform cannot authorize; a denied topic emits `denied` on `__replay:{topic}` and yields no history. Gate topic-subscribe in your handler. See [Authorization model](#authorization-model).
 
 The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here - one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
@@ -1728,7 +1758,7 @@ The client side needs no changes - the core `crud('messages')` store already han
 | `multiListener` | `'all'` | `'all'`: every replica opens its own LISTEN (current default). `'advisory'`: leader-elected via `pg_try_advisory_lock`. See [Single-listener mode](#single-listener-mode). |
 | `lockId` | - | Advisory lock id. Required when `multiListener: 'advisory'`. |
 | `pollInterval` | `5000` | ms between leader-election polls (advisory mode only). |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound `NOTIFY` payloads larger than this before `JSON.parse` runs. Defends against a buggy or hostile trigger flooding the bridge with oversized payloads. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound `NOTIFY` payloads larger than this before `JSON.parse` runs. Defends against a buggy or hostile trigger flooding the bridge with oversized payloads. Must be a positive integer; an invalid value throws at construction. |
 | `allowSystemTopics` | `false` | When `false` (default), parsed envelopes addressed to `__`-prefixed topics are dropped before the publish call. Closes the NOTIFY-injection class where a foreign publisher (or hostile DBA) could inject forged `__signal:*` / `__rpc` / plugin-internal frames via `pg_notify`. Apps that legitimately bridge user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 #### Single-listener mode
@@ -1879,7 +1909,7 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | Method | Description |
 |---|---|
 | `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, platform? }` - `platform.requestId` is captured automatically when `platform` is passed |
-| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. Each returned job carries `id, queue, payload, requestId, attempts, created_at` |
+| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. `batchSize` is capped at 1000, the same per-call id limit `complete` / `fail` / `extend` enforce - a larger claim could never be finished, so the batch would only expire and be redelivered. Each returned job carries `id, queue, payload, requestId, attempts, created_at` |
 | `complete(idOrIds)` | Delete the job(s) on success |
 | `fail(idOrIds)` | Release the claim for retry |
 | `extend(idOrIds, ms)` | Push back the visibility deadline |
@@ -2408,7 +2438,8 @@ Rejections count under `admission_rejected_total{reason="CLOCK_TRIPPED"}`. Any o
 | `immediate` | `true` | Take the startup sample at construction (the automatic drift check). |
 | `ntp` | - | Optional third source from `createNtpSource`. |
 | `leader` | - | Leader handle (`createLeader(...)` or any `{ isLeader() }`) enabling leader-stamped `stamp()`. |
-| `leaderKey` | `'clock:leader-offset'` | Key the leader publishes its offset under. |
+| `leaderKey` | `'clock:leader-offset'` | Key the leader publishes its offset under, **relative to the client's key prefix**. Pass the bare name; the prefix is applied for you, so two apps sharing one Redis cannot collide on this well-known key. |
+| `legacyLeaderKeyFallback` | `false` | Read the **unprefixed** `leaderKey` when the prefixed one is empty, for one key lifetime during a rolling upgrade off a build that wrote it raw. Off by default, because the unprefixed key is exactly the shared name the prefixing escapes: a follower that reads it adopts whatever other app on the same Redis is publishing there. Enable it only while you know the Redis hosts this app alone. Left off, a follower ahead of its leader degrades to `consistent()` until the leader publishes. |
 | `leaderTtlMs` | `intervalMs * 3` | Freshness bound for the published offset and a follower's cache. |
 | `onSample` / `onWarn` / `onTrip` / `onDrift` / `onError` | - | Round callbacks; failures retain the last good state. |
 | `breaker` / `metrics` | - | Circuit breaker for the Redis reads; Prometheus registry. |
@@ -2696,9 +2727,32 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | `cleanupInterval` | `3600000` | ms between cleanup sweeps. 0 disables. |
 | `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
 | `autoMigrate` | `true` | Auto-create the table on first use. Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
+| `serializeErrorCause` | `false` | Persist `error.cause` alongside name/message/stack/code on a failed task. Off by default: handlers routinely attach config-bearing causes (a connection error carries its DSN) and the stored row is re-served to dashboards by `await()` / `list()`. |
+| `maxPayloadBytes` | `262144` (256KB) | Byte ceiling on an encoded task `input` and `result`, and the point at which a persisted error is truncated to fit. Minimum 80 bytes, so a failed row can retain a valid terminal error shape. Worth setting deliberately, because the two sides fail differently - see below. |
 | `onStateChange` | - | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |
 | `breaker` | - | Circuit breaker; bypassed when broken |
 | `metrics` | - | Prometheus registry; emits `tasks_*_total` counters |
+
+**On `maxPayloadBytes`.** The input and result sides of the bound fail in
+different places, and only one of them is free:
+
+- An oversized **input** is refused by `enqueue` / `run` before a row exists.
+  Nothing has happened yet; the caller gets an error and can retry smaller.
+- An oversized **result** is **terminal and not retried**. The result is
+  deterministic, so a retry would produce the same bytes and the recovery sweep
+  would hand the handler back to a worker once per fence expiry forever. By the
+  time the cap is met the handler has already run and its side effects have
+  landed, so the task reports failure for work that actually happened.
+
+That asymmetry is why the default is a starting point rather than a setting to
+leave alone. A task that returns a report, an export, or a batch of rows can sit
+under 256KB on an ordinary run and pass it on a large one - the failure arrives
+in production, on the big customer, after the work is done. Either raise the
+bound to cover the largest result the task can produce, or return a **reference**
+(an object-store key, a row id) and keep the bytes out of the task row. The
+refusal message names the option so the lever is findable from the error alone.
+Values below 80 bytes are rejected: no smaller ceiling can retain the required
+`name` / `message` fields on a terminal error row.
 
 #### Live observation
 
@@ -2971,12 +3025,16 @@ Or use `metrics.serialize()` to get the raw text and serve it however you like.
 When same-listener mount is unavoidable (the metrics endpoint shares its port with public traffic), use `metrics.authedHandler(predicate)`:
 
 ```js
-// Token-based auth, token from env
+// Token-based auth, token from env. Compare with `metrics.tokenEquals`,
+// never `===`: comparing a secret with `===` exits at the first differing
+// byte, which is a timing oracle for the token.
 const expectedToken = process.env.METRICS_SCRAPE_TOKEN;
 app.get('/metrics', metrics.authedHandler(
-  (res, req) => req.getHeader('x-scrape-token') === expectedToken
+  (res, req) => metrics.tokenEquals(req.getHeader('x-scrape-token'), expectedToken)
 ));
 ```
+
+`metrics.tokenEquals(presented, expected)` is a constant-time string comparison (also exported as `tokenEquals` from the module). It compares fixed-width digests, so the work done does not depend on either side's length and the timing reveals nothing about the expected token - including its length. It returns `false` for any non-string input, and `false` whenever either side is the **empty string**: `process.env.METRICS_SCRAPE_TOKEN` is `''` when the variable is set-but-empty and `req.getHeader()` returns `''` for an absent header, so an empty-vs-empty comparison would otherwise authorize every unauthenticated scrape at exactly the moment you believed you had enabled auth. Set the variable to a real generated token, and treat "unset" as a deploy error rather than relying on this.
 
 The predicate receives `(res, req)` and returns truthy to allow or falsy to deny. Async predicates are awaited. Predicate exceptions are caught and treated as denial. Denials return `401 Unauthorized` with no metrics body and no internal error info leaked.
 
@@ -3095,6 +3153,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `replay_publishes_total` | counter | `topic` | Messages published |
 | `replay_messages_replayed_total` | counter | `topic` | Messages replayed to clients |
 | `replay_truncations_total` | counter | `topic` | Truncation events detected |
+| `replay_resume_topic_overflows_total` | counter | | Resume frames whose topic set exceeded `MAX_RESUME_TOPICS`; increments per frame even while the warning is throttled |
 | `replay_replications_total` | counter | | Publishes confirmed replicated within timeout (Redis only, `durability: 'replicated'` mode) |
 | `replay_replication_timeouts_total` | counter | | Publishes that did not reach `minReplicas` within timeout |
 | `replay_idmp_hits_total` | counter | `topic` | `publishIdempotent` calls served from the dedup cache (no XADD) |
@@ -3368,7 +3427,10 @@ Caps live as named constants in `shared/caps.js`. They are not currently configu
 | `MAX_GROUPS_LOCAL_MEMBERS` | 10_000_000 | reject new | treated as "group full" |
 | `MAX_TASK_HANDLERS` | 10_000 | reject new | bootstrap-time `register(name, handler)` calls |
 | `MAX_REDIS_DUPLICATES_PER_CLIENT` | 1_000 | warn-only | duplicate ioredis connections per client wrapper |
-| `MAX_AGGREGATOR_REMOTE_INSTANCES` | 10_000 | warn-only | sibling instances on the publish-rate aggregator |
+| `MAX_AGGREGATOR_REMOTE_INSTANCES` | 10_000 | reject new | publish-rate aggregator; drops the forged newcomer (with a metric) unless a genuinely stale entry can be evicted |
+| `MAX_REMOTE_SLICE_ENTRIES` | 1_000 | drop envelope | slice/subs entries accepted from one remote publish-rate instance |
+| `MAX_RESUME_TOPICS` | 10_000 | truncate | topics accepted from one client resume frame; enumeration stops on overflow, every overflow is metriced, and its operator log is throttled |
+| `MAX_REPLAY_EPOCH_CACHE_TOPICS` | 50_000 | evict LRU | per-store memoized topic epochs; sized against real deployments, not Map capacity |
 | `MAX_BREAKER_LISTENERS` | 10_000 | reject new | listeners on a single breaker |
 
 Aggregate-memory protection still belongs to the adapter's `upgradeAdmission.maxConcurrent` (see the adapter's "Layered admission" section); per-instance caps are not the right place to defend against a 10M-connection DoS.
@@ -3902,6 +3964,12 @@ An unknown posture string degrades to the `normal` budget, so forwarding an unex
 
 No Redis dependency: the whole point is to reject before any backend work.
 
+Generate the secret once and keep it out of the repo. It must be at least 32 characters and must be actual entropy - a padded placeholder is refused at startup, because an observer holds both the cookie's message and its signature and can grind a weak secret offline at memory speed:
+
+```sh
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
 ```js
 // src/hooks.server.js - set the cookie on the HTML page response.
 import { capabilityCookie } from 'svelte-adapter-uws-extensions/capability-cookie';
@@ -3950,13 +4018,13 @@ const cap = capabilityCookie({
 
 | Option | Default | Description |
 |---|---|---|
-| `secret` | *required* | HMAC secret. Non-empty string. |
+| `secret` | *required* | HMAC secret. At least 16 characters with at least 8 distinct ones - length is not entropy, and a padded placeholder is the shape a weak secret takes. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. |
 | `ttlSeconds` | `300` | Cookie lifetime in seconds. An expired cookie is invalid even under the current secret. |
-| `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. |
-| `cookieName` | `'sauws_cap'` | Cookie name. |
+| `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. Only has to be a non-empty string: the strength floor is deliberately not applied here, so a deployment can rotate *away* from a weak secret without signing every live session out. It verifies, never signs. |
+| `cookieName` | `'sauws_cap'` | Cookie name. Must be an RFC 6265 token (letters, digits and ``!#$%&'*+-.^_`|~``); anything else serializes into a header the browser silently drops, which degrades the capability check to permanently-absent with nothing logged. |
 | `secure` | `true` | Set the `Secure` attribute. |
-| `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). |
-| `path` | `'/'` | Cookie path. |
+| `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). Matched case-insensitively and normalized. |
+| `path` | `'/'` | Cookie path. Must start with `/` and contain only printable ASCII other than whitespace, `;`, `,` and `"`. Percent-encode anything outside that set: a header value is bytes, and a raw NUL or non-ASCII path makes the header layer throw on every issued cookie. |
 | `metrics` | - | Prometheus registry. Registers `capability_cookie_misses_total{reason}`: `missing` counts an absent cookie only when `required` (a first visit in normal posture is not a miss), `invalid` counts every presented cookie that fails to verify, required or not. Expired cookies land under `invalid` - expiry is checked before the signature, so a separate `expired` reason would be forgeable by the sender; `refresh()` on page responses keeps live users out of that bucket. |
 
 #### API
@@ -3989,6 +4057,8 @@ configureForget({
 ```
 
 `createForgetStore` attempts every store even if one fails, then rejects if any failed (svelte-realtime maps that to `FORGET_STORE_FAILED` - retry the erasure), and returns a per-store removal-count breakdown. Each store exposes `purgeUser(tenantId, userId)`:
+
+**`tenantId` format.** Either `null` for the untenanted scope, or a string of up to 64 characters from `[a-zA-Z0-9_.:-]` - so domains (`acme.com`) and namespaced ids (`acme:eu`) are fine. The scope is decided by a prefix match on the wire topic (`@t/<tenantId>/<topic>`), which is why `/` is refused: it would make tenant `a` and tenant `a/b` both match `@t/a/b/x`, and one tenant's erasure would reach another's rooms. A non-string is refused rather than coerced - on an erasure path a silent miss is worse than a loud failure, because the data was written under whatever representation the writer used. Stringify at the call site with that same representation.
 
 - **Connection registry, idempotency, rate-limit, presence, cursor** are keyed by (or derive) the userId directly, so `purgeUser` works with no extra configuration. Registry deletes `conns:{userId}` unconditionally and broadcasts a `forget` event so every replica drops the user; presence and cursor scan their per-topic keys cluster-correctly (per-node scans, `execMultiSlot`).
 - **Stores whose payload is app-defined** - the distributed session, the dead-letter DLQ, the replay buffer, and the Postgres task runner - cannot see the userId inside your value, so each takes an optional `forgetUserId(payload) => userId`:

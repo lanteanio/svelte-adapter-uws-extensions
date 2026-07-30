@@ -94,6 +94,41 @@ export const MAX_REDIS_DUPLICATES_PER_CLIENT = 1_000;
 /** Sibling instances broadcasting on the publish-rate aggregator channel. */
 export const MAX_AGGREGATOR_REMOTE_INSTANCES = 10_000;
 
+/**
+ * Bound on the slice/subs entries accepted from ONE remote instance per
+ * envelope (publish-rate aggregation). A legitimate instance contributes
+ * at most topN entries; anything larger is a foreign-publisher stuffing
+ * attempt.
+ */
+export const MAX_REMOTE_SLICE_ENTRIES = 1_000;
+
+/**
+ * Topics whose epoch a replay store memoizes (`epochCache`, per store).
+ * Sized against what a deployment legitimately memoizes, not against what
+ * a Map can hold: authorized resume topics and public epoch reads can still
+ * introduce client-influenced names at roughly 115 bytes each, so a
+ * ten-million bound would permit a gigabyte of resident growth and bound
+ * nothing that matters. Eviction is least-recently-used.
+ */
+export const MAX_REPLAY_EPOCH_CACHE_TOPICS = 50_000;
+
+/**
+ * Topics accepted from ONE client resume frame (`lastSeenSeqs`). A legit
+ * reconnect presents the topics it actually subscribed to; thousands of
+ * forged topics is a pre-authorization resource-growth attempt.
+ */
+export const MAX_RESUME_TOPICS = 10_000;
+
+/**
+ * Default JSON byte cap on a single stored payload: task input, task
+ * result, persisted error, and replay data. The idempotency stores have
+ * capped committed results at this figure since they shipped; the rest of
+ * the stores are held to the same number so one client-sized payload
+ * cannot write an arbitrarily large row (disk growth, plus the read-back
+ * amplification of replay()).
+ */
+export const MAX_STORE_PAYLOAD_BYTES = 256 * 1024;
+
 /** `register(name, handler)` entries on the task runner. */
 export const MAX_TASK_HANDLERS = 10_000;
 

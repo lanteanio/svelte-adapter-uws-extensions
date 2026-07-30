@@ -5,7 +5,7 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/options
  */
 
-import { stripInternal } from '../../shared/sensitive.js';
+import { projectDefaultUserData } from '../../shared/default-projection.js';
 
 /**
  * @typedef {Object} ResolvedCursorOptions
@@ -13,6 +13,7 @@ import { stripInternal } from '../../shared/sensitive.js';
  * @property {number} topicThrottleMs
  * @property {number} snapshotIntervalMs
  * @property {(userData: any) => any} select
+ * @property {boolean} sanitizeSelected
  * @property {number} cursorTtl
  * @property {(data: any) => ({ x: number, y: number } | null)} position
  * @property {(data: any) => ({ x: number, y: number } | null)} finitePosition
@@ -43,7 +44,8 @@ export function resolveCursorOptions(options = {}) {
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis cursor: select must be a function');
 	}
-	const select = options.select || stripInternal;
+	const sanitizeSelected = options.select != null;
+	const select = sanitizeSelected ? options.select : projectDefaultUserData;
 	const cursorTtl = options.ttl ?? 30;
 
 	// Read {x, y} out of the app's cursor `data` for the jitter filter. The
@@ -187,6 +189,7 @@ export function resolveCursorOptions(options = {}) {
 		topicThrottleMs,
 		snapshotIntervalMs,
 		select,
+		sanitizeSelected,
 		cursorTtl,
 		position,
 		finitePosition,

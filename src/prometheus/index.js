@@ -10,6 +10,7 @@
  *
  * @module svelte-adapter-uws-extensions/prometheus
  */
+import { timingSafeEqual, createHash } from 'node:crypto';
 
 const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const LABEL_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
@@ -43,7 +44,7 @@ function assertFinite(value, method) {
  * Default per-metric series cap. A "series" in Prometheus is one
  * (metric, labelset) combination - each unique labelset creates a new
  * sample row in `/metrics` output. Past ~10k label combinations per
- * metric, Grafana queries time out, prometheus scrape volume balloons,
+ * metric, dashboard queries time out, prometheus scrape volume balloons,
  * and the metric becomes operationally useless. This default protects
  * against unbounded-cardinality leaks (e.g. labeling by client IP,
  * user-controlled topic, or request ID without `mapTopic` containment).
@@ -287,15 +288,12 @@ class Gauge {
 const DEFAULT_BUCKETS = [1, 5, 10, 25, 50, 100, 250, 500, 1000];
 
 /**
- * De-facto bucket count cap across mature Prometheus client libraries
- * (Go's `client_golang` warns past ~100, Java's Micrometer soft-caps at
- * 64, Python's `prometheus_client` has no hard cap but practitioners
- * recommend staying under 32). 32 is generous for any realistic latency
- * / size / duration distribution; past that, each labelset's
- * per-histogram state expands linearly (each bucket is one counter +
- * one wire-format `_bucket` line at scrape time), and the percentile
- * resolution gain past 32 well-chosen buckets is marginal. Pass
- * `Infinity` to opt out per-metric or registry-wide.
+ * Default bucket-count cap. 32 is generous for any realistic latency /
+ * size / duration distribution; past that, each labelset's per-histogram
+ * state expands linearly (each bucket is one counter + one wire-format
+ * `_bucket` line at scrape time), and the percentile resolution gain
+ * past 32 well-chosen buckets is marginal. Pass `Infinity` to opt out
+ * per-metric or registry-wide.
  */
 const DEFAULT_MAX_BUCKETS = 32;
 
@@ -474,13 +472,40 @@ function recordSeriesDrop(metric) {
  * // wrap with `metrics.authedHandler(predicate)`:
  * app.get('/metrics', metrics.handler);
  * //
- * // OR (auth helper for same-listener mounts):
+ * // OR (auth helper for same-listener mounts; compare tokens in
+ * // constant time - a `===` compare on a secret is a timing oracle):
  * // const token = process.env.METRICS_SCRAPE_TOKEN;
- * // app.get('/metrics', metrics.authedHandler(
- * //   (res, req) => req.getHeader('x-scrape-token') === token
+ * // app.get('/metrics', metrics.authedHandler((res, req) =>
+ * //   metrics.tokenEquals(req.getHeader('x-scrape-token'), token)
  * // ));
  * ```
  */
+/**
+ * Constant-time bearer-token comparison for `authedHandler` predicates.
+ *
+ * Compares fixed-width SHA-256 digests rather than the raw bytes, so the work
+ * done does not depend on either side's length. Comparing raw bytes and
+ * burning a same-length dummy on a mismatch does NOT achieve that: the dummy
+ * is sized by the PRESENTED length, so the cost varies with it and the timing
+ * minimum sits exactly at the expected length - handing an attacker the
+ * secret's length before they have guessed a byte of it.
+ *
+ * An empty string on either side is always false. `process.env.X` is `''` for
+ * `X=`, and uWS `req.getHeader()` returns `''` for a header that is absent, so
+ * an empty-vs-empty comparison would authorize every unauthenticated scrape at
+ * exactly the moment an operator believes they enabled authentication.
+ *
+ * @param {unknown} presented
+ * @param {unknown} expected
+ * @returns {boolean}
+ */
+export function tokenEquals(presented, expected) {
+	if (typeof presented !== 'string' || typeof expected !== 'string') return false;
+	if (presented.length === 0 || expected.length === 0) return false;
+	const a = createHash('sha256').update(presented, 'utf8').digest();
+	const b = createHash('sha256').update(expected, 'utf8').digest();
+	return timingSafeEqual(a, b);
+}
 export function createMetrics(options = {}) {
 	const prefix = options.prefix || '';
 	if (options.mapTopic != null && typeof options.mapTopic !== 'function') {
@@ -659,10 +684,11 @@ export function createMetrics(options = {}) {
 	 *
 	 * @example
 	 * ```js
-	 * // Token-based auth from env
+	 * // Token-based auth from env. Compare in constant time - a `===`
+	 * // compare on a secret is a timing oracle.
 	 * const expectedToken = process.env.METRICS_SCRAPE_TOKEN;
 	 * app.get('/metrics', metrics.authedHandler((res, req) => {
-	 *   return req.getHeader('x-scrape-token') === expectedToken;
+	 *   return metrics.tokenEquals(req.getHeader('x-scrape-token'), expectedToken);
 	 * }));
 	 * ```
 	 *
@@ -716,6 +742,11 @@ export function createMetrics(options = {}) {
 		serialize,
 		handler,
 		authedHandler,
+		// On the registry as well as a module export: `authedHandler` is
+		// reached through the registry, so the predicate people copy reads
+		// naturally as `metrics.tokenEquals(...)` with nothing extra to
+		// import. Same function either way.
+		tokenEquals,
 		mapTopic
 	};
 }

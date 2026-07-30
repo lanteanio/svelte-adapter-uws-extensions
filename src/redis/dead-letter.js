@@ -44,6 +44,7 @@
 
 import { withBreaker } from '../shared/breaker.js';
 import { monotonicNow } from '../shared/runtime.js';
+import { topicInTenant } from '../shared/tenant-topic.js';
 
 // A forget tombstone lives long enough to catch a webhook delivery that was
 // already in flight when `live.forget` ran and only fails (and would be
@@ -298,7 +299,9 @@ export function createDeadLetter(client, options = {}) {
 		async summary() {
 			const vals = await withBreaker(b, () => redis.hvals(recsKey));
 			/** @type {Record<string, number>} */
-			const byTopic = {};
+			// Null-prototype so a stored topic named '__proto__' counts as
+			// ordinary data instead of hitting the prototype setter.
+			const byTopic = Object.create(null);
 			let oldest = null;
 			let newest = null;
 			let total = 0;
@@ -343,6 +346,9 @@ export function createDeadLetter(client, options = {}) {
 				for (const id of Object.keys(all)) {
 					const rec = parseRecord(id, all[id]);
 					if (!rec) continue;
+					// Same tenant rule as the sibling legs of this purge: a record
+					// whose topic is outside the scope belongs to another tenant.
+					if (!topicInTenant(tenantId, rec.topic)) continue;
 					let uid;
 					try { uid = forgetUserId(rec); } catch { continue; }
 					if (uid === userId) ids.push(id);

@@ -28,7 +28,8 @@
 
 import { assert } from '../shared/assert.js';
 import { randomBytes, wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
-import { MAX_AGGREGATOR_REMOTE_INSTANCES } from '../shared/caps.js';
+import { MAX_AGGREGATOR_REMOTE_INSTANCES, MAX_REMOTE_SLICE_ENTRIES } from '../shared/caps.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -99,6 +100,8 @@ export function createPublishRateAggregator(client, options = {}) {
 	const mBroadcasts = m?.counter('cluster_publish_rate_broadcasts_total', 'Slices broadcast by this instance');
 	const mReceived = m?.counter('cluster_publish_rate_received_total', 'Slices received from sibling instances');
 	const mParseErrors = m?.counter('cluster_publish_rate_parse_errors_total', 'Malformed slice envelopes dropped on receive');
+	const mRemoteEvicted = m?.counter('cluster_publish_rate_remote_evicted_total', 'Tracked sibling instances evicted to admit a newer one at the tracking bound');
+	const mRemoteDropped = m?.counter('cluster_publish_rate_remote_dropped_total', 'Slice envelopes dropped because the tracking bound is full of fresher instances');
 	const mInstanceCount = m?.gauge('cluster_publish_rate_instance_count', 'Number of sibling instances contributing slices (excluding self) at scrape time');
 
 	const instanceId = randomBytes(8).toString('hex');
@@ -121,6 +124,8 @@ export function createPublishRateAggregator(client, options = {}) {
 
 	let activePlatform = null;
 	let subscriber = null;
+	// Inbound bus guard for the aggregation channel.
+	const busValidator = createBusValidator({});
 	let publishTimer = null;
 	let activated = false;
 	let remoteInstancesWarnFired = false;
@@ -228,6 +233,8 @@ export function createPublishRateAggregator(client, options = {}) {
 		});
 		subscriber.on('message', (ch, raw) => {
 			if (ch !== channel) return;
+			// Cap raw bytes before JSON.parse, like every sibling bus module.
+			if (!busValidator.acceptRaw(raw)) { mParseErrors?.inc(); return; }
 			let env;
 			try { env = JSON.parse(raw); } catch { mParseErrors?.inc(); return; }
 			if (!env || typeof env !== 'object') { mParseErrors?.inc(); return; }
@@ -241,29 +248,78 @@ export function createPublishRateAggregator(client, options = {}) {
 				'publish-rate.echo-suppression',
 				{ instanceId: env.instanceId }
 			);
-			const ts = typeof env.ts === 'number' ? env.ts : wallEpoch();
-			remoteSlices.set(env.instanceId, { ts, slice: env.slice });
-			mergedRev++;
-			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteInstancesWarnFired) {
-				remoteInstancesWarnFired = true;
-				console.warn(
-					'[publish-rate] aggregator is tracking ' + remoteSlices.size +
-					' sibling instances. Cluster sizes past this threshold typically ' +
-					'indicate a deployment misconfig or stale-instance leak; staleAfter ' +
-					'pruning normally caps remote slice retention.\n' +
-					'  See: https://svti.me/publish-rate-aggregator'
-				);
+			// A publisher-controlled ts must not defeat staleness pruning:
+			// clamp to now so a far-future ts cannot pin a forged entry
+			// against `staleAfter` forever.
+			const now = wallEpoch();
+			const ts = typeof env.ts === 'number' ? Math.min(env.ts, now) : now;
+			if (remoteSlices.size >= MAX_AGGREGATOR_REMOTE_INSTANCES && !remoteSlices.has(env.instanceId)) {
+				// At the bound, admit a newcomer only by evicting an entry that
+				// is genuinely STALE, and drop it otherwise.
+				//
+				// Neither of the obvious rules works. Refusing every newcomer
+				// lets a flood of forged ids hold the table from cold and lock
+				// real siblings out. Always evicting the oldest is no better:
+				// `ts` is clamped to now, so a newcomer is never older than
+				// what is tracked and the eviction always fires - a flood that
+				// merely refreshes faster than `publishInterval` then evicts
+				// live siblings and the aggregate goes blind anyway.
+				// Evicting only past `staleAfter` means a live fleet is never
+				// displaced by traffic, whatever its rate.
+				//
+				// Residual: a cold table can still be filled by forged ids
+				// until their entries age out. Closing that needs authenticated
+				// bus envelopes, which is a larger design change than a bound.
+				//
+				// Entries are kept in least-recently-refreshed order (the
+				// delete-then-set below), so the candidate is the first key -
+				// no scan, which at a 10,000-entry bound would itself be a
+				// ~50us-per-envelope CPU amplifier.
+				const oldestId = remoteSlices.keys().next().value;
+				const oldest = oldestId === undefined ? undefined : remoteSlices.get(oldestId);
+				if (!oldest || (now - oldest.ts) <= staleAfter) {
+					mRemoteDropped?.inc();
+					return;
+				}
+				remoteSlices.delete(oldestId);
+				remoteSubs.delete(oldestId);
+				mRemoteEvicted?.inc();
+				if (!remoteInstancesWarnFired) {
+					remoteInstancesWarnFired = true;
+					console.warn(
+						'[publish-rate] aggregator is tracking ' + MAX_AGGREGATOR_REMOTE_INSTANCES +
+						' sibling instances; stale entries are now evicted to admit new ones and ' +
+						'envelopes past the bound are dropped. Cluster sizes past this threshold ' +
+						'typically indicate a deployment misconfig or a stale-instance leak - see the ' +
+						'cluster_publish_rate_remote_evicted_total and _remote_dropped_total counters.\n' +
+						'  See: https://svti.me/publish-rate-aggregator'
+					);
+				}
 			}
+			mReceived?.inc();
+			// Delete-then-set keeps the Map in least-recently-refreshed order,
+			// which is what makes the O(1) eviction candidate above correct.
+			remoteSlices.delete(env.instanceId);
+			// Copy only when the envelope actually exceeds the bound: the
+			// normal case is a topN-sized slice arriving once per publish
+			// interval per sibling, and an unconditional copy is pure churn.
+			const slice = env.slice.length > MAX_REMOTE_SLICE_ENTRIES
+				? env.slice.slice(0, MAX_REMOTE_SLICE_ENTRIES)
+				: env.slice;
+			remoteSlices.set(env.instanceId, { ts, slice });
+			mergedRev++;
 			if (Array.isArray(env.subs)) {
 				const subsMap = new Map();
-				for (const s of env.subs) {
+				const subs = env.subs.length > MAX_REMOTE_SLICE_ENTRIES
+					? env.subs.slice(0, MAX_REMOTE_SLICE_ENTRIES)
+					: env.subs;
+				for (const s of subs) {
 					if (!s || typeof s.topic !== 'string') continue;
 					const c = Number(s.count) || 0;
 					subsMap.set(s.topic, (subsMap.get(s.topic) || 0) + c);
 				}
 				remoteSubs.set(env.instanceId, { ts, subs: subsMap });
 			}
-			mReceived?.inc();
 		});
 		await subscriber.subscribe(channel);
 

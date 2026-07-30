@@ -4,6 +4,11 @@ import { createTaskRunner } from '../../src/postgres/tasks.js';
 
 const echoUrl = new URL('../helpers/workers/echo.js', import.meta.url);
 const throwsUrl = new URL('../helpers/workers/throws.js', import.meta.url);
+const causeUrl = new URL('../helpers/workers/throws-with-cause.js', import.meta.url);
+const uncloneableCauseUrl = new URL('../helpers/workers/throws-uncloneable-cause.js', import.meta.url);
+const uncloneableCodeUrl = new URL('../helpers/workers/throws-uncloneable-code.js', import.meta.url);
+const hostileStackUrl = new URL('../helpers/workers/throws-hostile-stack.js', import.meta.url);
+const uncloneableStackUrl = new URL('../helpers/workers/throws-uncloneable-stack.js', import.meta.url);
 const abortableUrl = new URL('../helpers/workers/abortable.js', import.meta.url);
 const slowUrl = new URL('../helpers/workers/slow.js', import.meta.url);
 const missingUrl = new URL('../helpers/workers/does-not-exist.js', import.meta.url);
@@ -111,6 +116,71 @@ describe('postgres tasks (worker thread executor)', () => {
 			expect(row.status).toBe('failed');
 			expect(row.error.message).toBe('worker handler exploded');
 			expect(row.error.code).toBe('WORKER_BOOM');
+		});
+
+		it('carries err.cause across the thread boundary, so retry predicates still work', async () => {
+			// The worker transport is in-process: nothing is persisted and
+			// nothing reaches a dashboard, so the reason `cause` is withheld
+			// on the PERSISTENCE path does not apply here. Dropping it makes
+			// `retry.on(e => e.cause?.retryable)` silently false, and the
+			// runner's `serializeErrorCause` option cannot reach the harness
+			// to put it back.
+			const seen = [];
+			runner.register('upstream', null, {
+				worker: causeUrl,
+				retry: {
+					maxAttempts: 2,
+					backoff: () => 0,
+					on: (err) => { seen.push(err.cause); return err.cause?.retryable === true; }
+				}
+			});
+
+			await expect(runner.run('upstream', { input: null })).rejects.toThrow('upstream 503');
+			expect(seen[0]).toEqual({ retryable: true, status: 503 });
+			const row = [...client._getTaskRows().values()][0];
+			expect(row.attempts).toBe(2);
+		});
+
+		it('drops an uncloneable cause rather than losing the whole reply', async () => {
+			// A handler can attach anything to `cause`. An uncloneable value
+			// would make postMessage throw inside the harness, and the pool
+			// could only resolve that by timing out.
+			runner.register('weird', null, { worker: uncloneableCauseUrl });
+			await expect(runner.run('weird', { input: null })).rejects.toThrow('bad cause');
+		});
+
+		it('survives an uncloneable code, not just an uncloneable cause', async () => {
+			// `code` is copied verbatim exactly as `cause` is, so it makes
+			// postMessage throw inside the harness the same way - and there the
+			// failure is unrecoverable: the reply is lost and the pool can only
+			// time out. The handler's own message must still reach the caller.
+			runner.register('badcode', null, { worker: uncloneableCodeUrl });
+			await expect(runner.run('badcode', { input: null })).rejects.toThrow('bad code');
+			const row = [...client._getTaskRows().values()][0];
+			expect(row.status).toBe('failed');
+			expect(row.error.message).toBe('bad code');
+		});
+
+		it('survives an uncloneable value on any field, not just cause and code', async () => {
+			// A `toJSON` makes the value pass a JSON round-trip and still fail
+			// structuredClone, so a field-by-field JSON repair does not catch
+			// it. The whole shape has to be clone-checked.
+			runner.register('badstack', null, { worker: uncloneableStackUrl });
+			await expect(runner.run('badstack', { input: null })).rejects.toThrow('the real handler failure');
+			const row = [...client._getTaskRows().values()][0];
+			expect(row.status).toBe('failed');
+			expect(row.error.message).toBe('the real handler failure');
+		});
+
+		it('reports the handler error when the error refuses to be read', async () => {
+			// Building the transport shape reads `stack`; a throwing accessor
+			// replaced the handler's failure with the getter's on BOTH the row
+			// and the caller's rejection.
+			runner.register('hostile', null, { worker: hostileStackUrl });
+			await expect(runner.run('hostile', { input: null })).rejects.toThrow('the real handler failure');
+			const row = [...client._getTaskRows().values()][0];
+			expect(row.status).toBe('failed');
+			expect(row.error.message).toBe('the real handler failure');
 		});
 
 		it('honours retry policy across worker attempts', async () => {

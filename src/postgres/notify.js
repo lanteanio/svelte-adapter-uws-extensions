@@ -112,6 +112,7 @@ export function createNotifyBridge(client, options) {
 	const quotedChannel = '"' + channel.replace(/"/g, '""') + '"';
 	const autoReconnect = options.autoReconnect !== false;
 	const validator = createBusValidator({
+		label: 'postgres notify',
 		maxBytes: options.maxEnvelopeBytes,
 		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: []

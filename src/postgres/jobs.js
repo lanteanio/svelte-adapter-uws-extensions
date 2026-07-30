@@ -2,10 +2,8 @@
  * Postgres-backed job queue for svelte-adapter-uws.
  *
  * Minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on
- * vanilla Postgres 9.5+ without any extensions. For deployments where
- * pgmq is available, a separate `createPgmqWorker` primitive (future
- * item) is the more featureful option; this primitive is for the
- * common case of standard managed Postgres without extension support.
+ * vanilla Postgres 9.5+ without any extensions, for the common case of
+ * standard managed Postgres without extension support.
  *
  * Pairs with `createTaskRunner` as the "enqueue here, task runner
  * dequeues" pattern. The task runner has full state-machine
@@ -114,6 +112,65 @@ export function createJobQueue(client, options = {}) {
 	function asArray(idOrIds) {
 		return Array.isArray(idOrIds) ? idOrIds : [idOrIds];
 	}
+	// Bound and validate id arrays at the boundary: an unbounded array makes
+	// one call pathological, and an entry Postgres cannot parse as bigint
+	// aborts the whole statement with a raw 22P02.
+	//
+	// Validated as DIGITS, not via Number(): the column is bigserial, which
+	// runs to 2^63, and pg hands those ids back as strings. A
+	// Coercing every value through Number() would admit '0x10', '1e3',
+	// '12.0' and `true` even though pg rejects them, while applying a safe-
+	// integer check to strings would reject real ids above 2^53 that came
+	// straight out of pending(). The
+	// normalized strings are what gets sent.
+	const MAX_JOB_IDS_PER_CALL = 1000;
+	const JOB_ID_RE = /^[0-9]{1,19}$/;
+	const MAX_BIGINT = 9223372036854775807n;
+	function describeJobId(id) {
+		if (typeof id === 'bigint') return String(id) + 'n';
+		try {
+			const json = JSON.stringify(id);
+			return json === undefined ? '<' + typeof id + '>' : json;
+		} catch {
+			return '<' + typeof id + '>';
+		}
+	}
+
+	function invalidJobId(id) {
+		return new Error(
+			'postgres jobs: ids must be positive integers within bigint range ' +
+			'(numbers must be safe integers; use a decimal string or bigint for larger ids), got ' +
+			describeJobId(id)
+		);
+	}
+
+	function asIdArray(idOrIds) {
+		const ids = asArray(idOrIds);
+		if (ids.length > MAX_JOB_IDS_PER_CALL) {
+			throw new Error('postgres jobs: at most ' + MAX_JOB_IDS_PER_CALL + ' ids per call, got ' + ids.length);
+		}
+		return ids.map((id) => {
+			let s = '';
+			if (typeof id === 'number') {
+				// An unsafe Number has already lost the caller's bigint identity:
+				// 9007199254740993 arrives here as 9007199254740992. Sending it
+				// can complete a different job, so larger ids must stay exact as
+				// decimal strings or bigint values.
+				if (!Number.isSafeInteger(id)) throw invalidJobId(id);
+				s = String(id);
+			} else if (typeof id === 'bigint' || typeof id === 'string') {
+				s = String(id);
+			}
+			// Digits, non-zero, and inside the bigint range. A 19-digit value
+			// above 2^63-1 is still unparseable by Postgres and would abort
+			// the whole statement with a raw 22003, which is the class of
+			// failure this guard exists to keep out.
+			if (!JOB_ID_RE.test(s) || !/[1-9]/.test(s) || BigInt(s) > MAX_BIGINT) {
+				throw invalidJobId(id);
+			}
+			return s;
+		});
+	}
 
 	return {
 		async enqueue(queue, payload, opts = {}) {
@@ -142,6 +199,17 @@ export function createJobQueue(client, options = {}) {
 			const batchSize = opts.batchSize ?? 1;
 			if (!Number.isInteger(batchSize) || batchSize < 1) {
 				throw new Error('postgres jobs: batchSize must be a positive integer');
+			}
+			// Bounded by the SAME cap the id-taking calls enforce. A larger
+			// batch is a trap rather than a feature: the rows come back
+			// claimed, and every way to finish them - complete, fail, extend -
+			// then refuses the array, so the batch can only expire and be
+			// redelivered, re-running each job's side effects on every cycle.
+			if (batchSize > MAX_JOB_IDS_PER_CALL) {
+				throw new Error(
+					`postgres jobs: batchSize must be at most ${MAX_JOB_IDS_PER_CALL} ` +
+					'(the per-call id limit shared with complete/fail/extend)'
+				);
 			}
 			const visibilityTimeoutMs = opts.visibilityTimeoutMs ?? defaultVisibilityTimeout;
 			if (typeof visibilityTimeoutMs !== 'number' || !Number.isFinite(visibilityTimeoutMs) || visibilityTimeoutMs <= 0) {
@@ -182,7 +250,7 @@ export function createJobQueue(client, options = {}) {
 		},
 
 		async complete(idOrIds) {
-			const ids = asArray(idOrIds);
+			const ids = asIdArray(idOrIds);
 			if (ids.length === 0) return;
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
@@ -200,7 +268,7 @@ export function createJobQueue(client, options = {}) {
 		},
 
 		async fail(idOrIds) {
-			const ids = asArray(idOrIds);
+			const ids = asIdArray(idOrIds);
 			if (ids.length === 0) return;
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
@@ -220,7 +288,7 @@ export function createJobQueue(client, options = {}) {
 		},
 
 		async extend(idOrIds, additionalMs) {
-			const ids = asArray(idOrIds);
+			const ids = asIdArray(idOrIds);
 			if (ids.length === 0) return;
 			if (typeof additionalMs !== 'number' || !Number.isFinite(additionalMs) || additionalMs <= 0) {
 				throw new Error('postgres jobs: additionalMs must be a positive number');

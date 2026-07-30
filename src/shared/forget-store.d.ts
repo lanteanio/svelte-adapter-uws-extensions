@@ -66,6 +66,13 @@ export interface ForgetStore {
 	 * realtime layer announces those committed successions even on the failure
 	 * path, because a retry re-drives only the failed rooms and would not
 	 * re-report an already-handed-off room.
+	 *
+	 * `tenantId` is `null` for the untenanted scope, or a string of at most 64
+	 * characters from `[a-zA-Z0-9_.:-]` - domains and namespaced ids included.
+	 * `/` is refused permanently: the scope is a prefix match on `@t/<id>/`,
+	 * so allowing it would let tenant `a` and tenant `a/b` both match
+	 * `@t/a/b/x`. A non-string throws rather than being coerced, because on an
+	 * erasure path a silent miss is worse than a loud failure.
 	 */
 	purgeUser(
 		tenantId: string | null,

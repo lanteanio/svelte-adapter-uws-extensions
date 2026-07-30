@@ -1,4 +1,4 @@
-// Local A/B microbenchmark harness for /simplify perf changes.
+// Local A/B microbenchmark harness for perf changes.
 // NOT shipped (excluded from package via the package.json files allowlist).
 // Run with: node --expose-gc bench/micro-<name>.mjs
 

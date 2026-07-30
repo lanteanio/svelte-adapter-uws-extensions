@@ -39,6 +39,7 @@
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
 import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { tenantTopicSql } from '../shared/tenant-topic.js';
 
 /**
  * @typedef {Object} PgDeadLetterOptions
@@ -255,8 +256,15 @@ export function createDeadLetter(client, options = {}) {
 		 */
 		async purgeUser(tenantId, userId) {
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			// Tenant-scoped by the topic namespace, matching the sibling legs of
+			// the same purge. See postgres/replay.js for why deleting on
+			// `user_id` alone made one tenant's erasure reach every other's.
+			const scope = tenantTopicSql(tenantId, 2);
 			await ensureTable();
-			const res = await withBreaker(b, () => client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]));
+			const res = await withBreaker(b, () => client.query(
+				`DELETE FROM ${table} WHERE user_id = $1 AND ${scope.sql}`,
+				[userId, scope.value]
+			));
 			return res.rowCount || 0;
 		},
 

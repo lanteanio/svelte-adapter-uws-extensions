@@ -53,8 +53,8 @@ import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { WsClosedError } from '../shared/errors.js';
-import { addWsSubscription } from '../shared/ws-subscriptions.js';
+import { WsClosedError, SubscribeDeniedError } from '../shared/errors.js';
+import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 import { EVENTS } from './cursor/events.js';
 import { _warnCursorHooksMessageShape } from './cursor/diagnostics.js';
@@ -63,7 +63,7 @@ import { createRemoveBuffer } from './cursor/remove-buffer.js';
 import { createRedisIo } from './cursor/redis-io.js';
 import { createScheduler } from './cursor/scheduler.js';
 
-export { WsClosedError };
+export { WsClosedError, SubscribeDeniedError };
 
 
 /**
@@ -86,7 +86,9 @@ export { WsClosedError };
  *   reconcile. 100ms staleness on the reconcile path is fine for cursors.
  *   0 disables coalescing and reverts to per-flush HSET (legacy behavior).
  * @property {(userData: any) => any} [select] - Extract user-identifying data from userData.
- *   Defaults to the full userData.
+ *   By default, recursively drops internal keys, credentials, common personal data,
+ *   and request transport metadata. An explicit function can intentionally admit
+ *   fields; its result still passes through stripInternal().
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
  *   the expected gap between updates. Entries are refreshed on every snapshot tick.
  * @property {(data: any) => ({ x: number, y: number } | null)} [position] - Extract a
@@ -149,6 +151,7 @@ export function createCursor(client, options = {}) {
 		topicThrottleMs,
 		snapshotIntervalMs,
 		select,
+		sanitizeSelected,
 		cursorTtl,
 		position,
 		finitePosition,
@@ -210,6 +213,7 @@ export function createCursor(client, options = {}) {
 	}
 
 	const validator = createBusValidator({
+		label: 'redis cursor',
 		maxBytes: options.maxEnvelopeBytes,
 		allowSystemTopics: false,
 		allowedSystemTopics: []
@@ -246,7 +250,10 @@ export function createCursor(client, options = {}) {
 	 * Per-ws state: connection key, selected user data, and which topics this ws
 	 * has already announced (`join` emitted). `topics` doubles as the
 	 * already-announced set - presence in the set means a join has fired.
-	 * @type {Map<any, { key: string, user: any, topics: Set<string> }>}
+	 * `member` is the authorized-room set: the topics this connection passed
+	 * `authorizeTopic` for. It is the gate the high-frequency cursor frames
+	 * consult, kept separate from `topics` (which tracks join announcement).
+	 * @type {Map<any, { key: string, user: any, topics: Set<string>, member: Set<string> }>}
 	 */
 	const wsState = new Map();
 
@@ -271,14 +278,15 @@ export function createCursor(client, options = {}) {
 			}
 			const selected = select(safeUserData(ws));
 			warnSensitive(selected);
-			const user = stripInternal(selected);
+			const user = sanitizeSelected ? stripInternal(selected) : selected;
 			try { JSON.stringify(user); } catch {
 				throw new Error('redis cursor: select() must return JSON-serializable data');
 			}
 			state = {
 				key: instanceId + ':' + (++connCounter),
 				user,
-				topics: new Set()
+				topics: new Set(),
+				member: new Set()
 			};
 			wsState.set(ws, state);
 		}
@@ -444,9 +452,174 @@ export function createCursor(client, options = {}) {
 		reset: resetScheduler
 	} = scheduler;
 
+	/**
+	 * Authorize this connection against the REAL topic, the same check a
+	 * wire-subscribe to `topic` would run. Returns a denial reason, or null
+	 * when the connection may read and write the topic's cursor state.
+	 *
+	 * Denies when the platform cannot authorize at all: the adapter peer
+	 * floor has provided `checkSubscribe` for many releases, so an absent
+	 * check means a custom platform, and a missing authorizer must degrade
+	 * availability rather than authorization. A throwing check is a denial
+	 * too - an authorizer that errors has not said yes.
+	 *
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @param {any} platform
+	 * @param {{ requireGrant?: boolean }} [options] - `OBSERVER_LANE` for the
+	 *   lanes that answer "may this connection SEE what it already holds?".
+	 *   Omitted on the grant-establishing lanes, where requiring the grant to
+	 *   exist already would deny every legitimate join.
+	 * @returns {Promise<string | null>}
+	 */
+	async function authorizeTopic(ws, topic, platform, options) {
+		if (!platform || typeof platform.checkSubscribe !== 'function') return 'FORBIDDEN';
+		let verdict;
+		try {
+			verdict = await platform.checkSubscribe(ws, topic, options);
+		} catch {
+			return 'FORBIDDEN';
+		}
+		// `false` is a DENIAL in the adapter's own subscribe-hook vocabulary.
+		// The shipped adapter normalizes it to 'FORBIDDEN' before we see it,
+		// but this branch exists for custom platforms, and in that threat
+		// model `false` is the likeliest deny value - reading it as allow
+		// would invert the check for exactly the callers it is here to
+		// protect.
+		if (verdict === false) return 'FORBIDDEN';
+		return verdict || null;
+	}
+
+	/**
+	 * Record that this connection is an authorized member of `topic`.
+	 * Membership is what the high-frequency `cursor` / `cursor-viewport`
+	 * frame handlers gate on, and it is granted ONLY here, downstream of
+	 * `authorizeTopic`. Kept on the plugin's own per-ws state so the gate
+	 * costs one Map lookup rather than a native `getUserData()` call per
+	 * frame.
+	 * @param {any} ws
+	 * @param {string} topic
+	 */
+	function grantMembership(ws, topic) {
+		getWsState(ws).member.add(topic);
+	}
+
+	/**
+	 * Fail-closed membership check for the frame hot path. Never allocates
+	 * per-ws state: an unknown socket is simply not a member.
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @returns {boolean}
+	 */
+	function isMember(ws, topic) {
+		const state = wsState.get(ws);
+		if (state !== undefined && state.member.has(topic)) return true;
+		// Fall back to the connection's subscription registry. `attach` is not
+		// the only authorized way onto a cursor channel: the shipped client
+		// sends `cursor-snapshot` on every reconnect, and that lane is an
+		// OBSERVER lane which must not mint a grant of its own - so a
+		// reconnecting socket that is already subscribed by an authorized
+		// server path held no plugin-side membership, and every one of its
+		// cursor frames was dropped by a bare `return`, silently, for the life
+		// of the connection.
+		//
+		// The registry is as trustworthy as the set above: the adapter's
+		// wire-level gate refuses client-initiated subscribes to `__` topics,
+		// so a `__cursor:` entry can only have been put there by the server.
+		// Checked second, so an attached socket still costs one Map lookup.
+		return hasWsSubscription(ws, '__cursor:' + topic);
+	}
+
+	/**
+	 * Drop the per-ws record once the connection has nothing left in it.
+	 *
+	 * `topics` alone is NOT the emptiness test: it is populated only by
+	 * `update()`, so an attached connection that has not moved yet has an
+	 * empty `topics` and a populated `member`. Discarding the record then
+	 * would revoke membership for every OTHER room the socket is attached
+	 * to - it stays natively subscribed and keeps receiving, but its own
+	 * frames are dropped forever, and only a re-attach recovers, under a
+	 * new identity key.
+	 * @param {any} ws
+	 * @param {{ topics: Set<string>, member: Set<string> }} state
+	 */
+	function dropWsStateIfIdle(ws, state) {
+		if (state.topics.size === 0 && state.member.size === 0) wsState.delete(ws);
+	}
+
+	/**
+	 * Emit the current roster and positions for `topic` to one socket. Split
+	 * out of `snapshot` so the attach path, which has just authorized, does
+	 * not pay for a second `checkSubscribe` round trip. Every caller MUST
+	 * have authorized first.
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @param {any} platform
+	 */
+	async function emitSnapshot(ws, topic, platform) {
+		// Server time first - even for an empty board - so the requester's
+		// smoothing clock is seeded before the first stamped position frame
+		// and the request/reply round trip is measurable. Rides the codec's
+		// JSON fallback (the codec declines the event), an additive envelope
+		// an older client's merge ignores as an unknown event. This replica
+		// stamps with ITS clock, the same clock that stamps the position
+		// frames it re-encodes, so the client's time axis is consistent
+		// regardless of which replica originated a move.
+		try {
+			emitTo(ws, '__cursor:' + topic, EVENTS.TIME, { t: wallEpoch() }, platform);
+		} catch {
+			// WebSocket closed before send
+		}
+		// The requester's own roster key, ahead of the roster it appears in
+		// (or will appear in on its first move) - sent even for an empty
+		// board. getWsState only allocates the connection key - the join
+		// broadcast (and its Redis relay) still keys off `state.topics` on
+		// the first move - so a pure viewer is never announced to others by
+		// snapshotting. Snapshot-then-move keeps one identity: the key
+		// handed out here is the instance-scoped key the later join
+		// broadcasts. Single-target via emitTo; never relayed.
+		const requesterKey = getWsState(ws).key;
+		try {
+			emitTo(ws, '__cursor:' + topic, EVENTS.YOU, { key: requesterKey }, platform);
+		} catch {
+			// WebSocket closed before send
+		}
+		// `list()` rethrows both the breaker's open-circuit throw and any
+		// Redis rejection, and every caller of emitSnapshot is reached from a
+		// fire-and-forget `hooks.message` branch. An unhandled rejection
+		// terminates the worker on Node, and the shipped cursor client sends
+		// `cursor-snapshot` on every reconnect - so one Redis outage becomes a
+		// self-amplifying crash loop as the reconnect storm re-fires the frame
+		// on each replacement worker. A snapshot that cannot be read is a
+		// missing snapshot, not a fatal error; the client recovers on the next
+		// bulk frame.
+		let cursors;
+		try {
+			cursors = await tracker.list(topic);
+		} catch {
+			return;
+		}
+		if (cursors.length === 0) return;
+		const catalog = cursors.map((c) => ({ key: c.key, user: c.user }));
+		const positions = cursors.map((c) => ({ key: c.key, data: c.data }));
+		try {
+			emitTo(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
+			emitTo(ws, '__cursor:' + topic, EVENTS.BULK, positions, platform);
+		} catch {
+			// WebSocket closed before send
+		}
+	}
+
 	/** @type {RedisCursorTracker} */
 	const tracker = {
 		async attach(ws, topic, platform) {
+			// Authorize BEFORE granting any membership. Subscribing first and
+			// checking afterwards would leave a denied connection subscribed to
+			// __cursor:{topic} (receiving every broadcast) and holding the
+			// membership the frame gate checks, so the denial would withhold
+			// only the snapshot.
+			const denial = await authorizeTopic(ws, topic, platform);
+			if (denial) throw new SubscribeDeniedError('cursor.attach', topic, denial);
 			// Raw `ws.subscribe` (uWS-native) NOT `platform.subscribe`. As of
 			// adapter 0.5.5 `platform.subscribe` swallows uWS's "closed
 			// websocket" throw and returns the same `null` sentinel it returns
@@ -471,16 +644,20 @@ export function createCursor(client, options = {}) {
 			// invisible to it). detach() routes through platform.unsubscribe,
 			// which is already registry-aware.
 			addWsSubscription(ws, '__cursor:' + topic);
-			// snapshot() itself swallows ws-closed during platform.send (the
+			grantMembership(ws, topic);
+			// emitSnapshot() itself swallows ws-closed during platform.send (the
 			// state is already committed; clients recover via the next bulk
 			// frame). Intentional asymmetry with subscribe failure above.
-			await tracker.snapshot(ws, topic, platform);
+			await emitSnapshot(ws, topic, platform);
 		},
 
 		detach(ws, topic, platform) {
 			try {
 				platform.unsubscribe(ws, '__cursor:' + topic);
 			} catch { /* closed */ }
+			// Membership ends with the subscription: a detached connection
+			// must not keep writing cursor state into the room.
+			wsState.get(ws)?.member.delete(topic);
 		},
 
 		update(ws, topic, data, platform) {
@@ -639,7 +816,7 @@ export function createCursor(client, options = {}) {
 				}
 
 				if (!state.topics.has(topic)) {
-					if (state.topics.size === 0) wsState.delete(ws);
+					dropWsStateIfIdle(ws, state);
 					return;
 				}
 
@@ -672,107 +849,99 @@ export function createCursor(client, options = {}) {
 					state.topics.delete(topic);
 				}
 
-				if (state.topics.size === 0) wsState.delete(ws);
+				dropWsStateIfIdle(ws, state);
 				return;
 			}
 
-			if (b) { try { b.guard(); } catch { return; } }
+			// No topic: the connection itself is gone, so its per-ws record has
+			// to go with it on EVERY exit from here - including the two early
+			// returns below, which fire precisely when Redis is unhealthy. The
+			// record is keyed by the ws object in a plain Map (not a WeakMap),
+			// so a skipped delete pins the closed socket and its selected user
+			// data for the life of the process, once per disconnect for as long
+			// as the outage lasts; and it now carries the `member` set, leaving
+			// an authorization record alive after the connection it authorized.
+			//
+			// The subscription registry is the OTHER half of membership, so it
+			// is cleared here too rather than left to the runtime tearing the
+			// connection down. Relying on that teardown makes revocation depend
+			// on something outside this module, and anything still holding the
+			// socket would keep reading it as a member.
+			for (const t of state.member) removeWsSubscription(ws, '__cursor:' + t);
+			try {
+				if (b) { try { b.guard(); } catch { return; } }
 
-			const removedTopics = [];
-			for (const t of state.topics) {
-				const topicMap = topics.get(t);
-				if (!topicMap) continue;
-				const entry = topicMap.get(state.key);
-				if (entry) {
-					if (entry.timer) clearTimer(entry.timer);
-					entry.timer = null;
-					if (entry.settleTimer) { clearTimer(entry.settleTimer); entry.settleTimer = null; }
-					removedTopics.push(t);
-				}
-			}
-
-			if (!(await removeKeysBatch(removedTopics, state.key))) return;
-
-			for (const t of removedTopics) {
-				queueRemove(t, state.key, platform);
-				const topicMap = topics.get(t);
-				if (topicMap) {
-					topicMap.delete(state.key);
-					if (topicMap.size === 0) {
-						topics.delete(t);
-						activeTopics.delete(t);
-						topicFlush.delete(t);
-						dirtyTopics.delete(t);
-						dropTopicPending(t);
+				const removedTopics = [];
+				for (const t of state.topics) {
+					const topicMap = topics.get(t);
+					if (!topicMap) continue;
+					const entry = topicMap.get(state.key);
+					if (entry) {
+						if (entry.timer) clearTimer(entry.timer);
+						entry.timer = null;
+						if (entry.settleTimer) { clearTimer(entry.settleTimer); entry.settleTimer = null; }
+						removedTopics.push(t);
 					}
 				}
-				const flushState = topicFlush.get(t);
-				if (flushState) {
-					flushState.dirty.delete(state.key);
+
+				if (!(await removeKeysBatch(removedTopics, state.key))) return;
+
+				for (const t of removedTopics) {
+					queueRemove(t, state.key, platform);
+					const topicMap = topics.get(t);
+					if (topicMap) {
+						topicMap.delete(state.key);
+						if (topicMap.size === 0) {
+							topics.delete(t);
+							activeTopics.delete(t);
+							topicFlush.delete(t);
+							dirtyTopics.delete(t);
+							dropTopicPending(t);
+						}
+					}
+					const flushState = topicFlush.get(t);
+					if (flushState) {
+						flushState.dirty.delete(state.key);
+					}
+					dropKeyPending(t, state.key);
 				}
-				dropKeyPending(t, state.key);
+			} finally {
+				const byTopic = subViewport.get(state.key);
+				if (byTopic) {
+					for (const t of byTopic.keys()) dropReporter(t);
+					subViewport.delete(state.key);
+				}
+				wsState.delete(ws);
+				stopCleanupTimer();
 			}
-			const byTopic = subViewport.get(state.key);
-			if (byTopic) {
-				for (const t of byTopic.keys()) dropReporter(t);
-				subViewport.delete(state.key);
-			}
-			wsState.delete(ws);
-			stopCleanupTimer();
 		},
 
 		async snapshot(ws, topic, platform) {
+			// OBSERVER lane: `{ requireGrant: true }`. Without it, a pure-grant
+			// deployment - wire-subscribe authorization armed and no app
+			// `subscribe` hook - has no hook for the gate to consult, so the
+			// check allows every topic name and this lane hands any connected
+			// socket any room's roster (member ids and names from `select()`,
+			// plus positions). The flag must NOT go on `attach`, which is the
+			// grant-ESTABLISHING lane: requiring the grant to exist there
+			// would deny every legitimate join.
+			//
+			// This lane is NOT the bundled cursor plugin's snapshot handshake.
+			// This one only reads: it emits the roster and returns without
+			// subscribing or granting, which is what makes the observer
+			// question the right one to ask. The peer floor models it - its
+			// own `cursor.snapshot()` asks the same question - so this gate is
+			// load-bearing across the supported adapter range.
+			//
 			// Authorize against the REAL topic before emitting the roster/positions
 			// to this socket. The cursor-snapshot message reaches this directly
 			// (hooks.message), so without this gate it is an un-authorized read of
 			// __cursor:{topic} state, around the wire-level `__`-subscribe block.
-			// The authorized subscribe path (attach -> here) re-checks harmlessly.
-			// Optional-chained (checkSubscribe was added to the platform later);
-			// the snapshot is low-frequency so the await is off the hot path.
-			if (platform && typeof platform.checkSubscribe === 'function') {
-				let denial;
-				try { denial = await platform.checkSubscribe(ws, topic); } catch { return; }
-				if (denial) return;
-			}
-			// Server time first - even for an empty board - so the requester's
-			// smoothing clock is seeded before the first stamped position frame
-			// and the request/reply round trip is measurable. Rides the codec's
-			// JSON fallback (the codec declines the event), an additive envelope
-			// an older client's merge ignores as an unknown event. This replica
-			// stamps with ITS clock, the same clock that stamps the position
-			// frames it re-encodes, so the client's time axis is consistent
-			// regardless of which replica originated a move.
-			try {
-				emitTo(ws, '__cursor:' + topic, EVENTS.TIME, { t: wallEpoch() }, platform);
-			} catch {
-				// WebSocket closed before send
-			}
-			// The requester's own roster key, ahead of the roster it appears in
-			// (or will appear in on its first move) - sent even for an empty
-			// board. getWsState only allocates the connection key - the join
-			// broadcast (and its Redis relay) still keys off `state.topics` on
-			// the first move - so a pure viewer is never announced to others by
-			// snapshotting. Snapshot-then-move keeps one identity: the key
-			// handed out here is the instance-scoped key the later join
-			// broadcasts. Single-target via emitTo; never relayed.
-			const requesterKey = getWsState(ws).key;
-			try {
-				emitTo(ws, '__cursor:' + topic, EVENTS.YOU, { key: requesterKey }, platform);
-			} catch {
-				// WebSocket closed before send
-			}
-			const cursors = await this.list(topic);
-			if (cursors.length === 0) return;
-			const catalog = cursors.map((c) => ({ key: c.key, user: c.user }));
-			const positions = cursors.map((c) => ({ key: c.key, data: c.data }));
-			try {
-				emitTo(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
-				emitTo(ws, '__cursor:' + topic, EVENTS.BULK, positions, platform);
-			} catch {
-				// WebSocket closed before send
-			}
+			// The authorized subscribe path (attach -> emitSnapshot) has already
+			// checked and calls the emit half directly.
+			if (await authorizeTopic(ws, topic, platform, OBSERVER_LANE)) return;
+			await emitSnapshot(ws, topic, platform);
 		},
-
 		/**
 		 * Record this subscriber's viewport rect for a topic, from the inbound
 		 * `cursor-viewport` frame. The rect bounds which cursors the subscriber
@@ -990,14 +1159,31 @@ export function createCursor(client, options = {}) {
 		},
 
 		hooks: {
-			subscribe(ws, topic, { platform }) {
+			async subscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__cursor:')) {
 					const realTopic = topic.slice('__cursor:'.length);
-					return tracker.snapshot(ws, realTopic, platform);
+					// The adapter only routes a client wire-subscribe to a `__`
+					// topic when the app opted into `allowSystemTopicSubscribe`;
+					// authorize it exactly like attach() does.
+					const denial = await authorizeTopic(ws, realTopic, platform);
+					// RETURN the denial reason - the adapter treats anything
+					// that is not `false` or a string as ALLOW, so a bare
+					// `return` here would withhold the snapshot while still
+					// subscribing the socket to the broadcast channel, which
+					// is the larger half of what the gate exists to prevent.
+					if (denial) return denial;
+					grantMembership(ws, realTopic);
+					await emitSnapshot(ws, realTopic, platform);
 				}
 			},
 			message(ws, { data, platform }) {
 				if (data && data.type === 'cursor' && data.topic && data.data !== undefined) {
+					// Membership gate: writing cursor state into a room requires
+					// an authorized attach/subscribe handshake to have granted
+					// membership first, mirroring the bundled cursor plugin's
+					// isSubscribed gate. Ungated, any connected client could
+					// inject identity and position into rooms it never joined.
+					if (typeof data.topic !== 'string' || !isMember(ws, data.topic)) return;
 					tracker.update(ws, data.topic, data.data, platform);
 					return;
 				}
@@ -1012,7 +1198,9 @@ export function createCursor(client, options = {}) {
 				// the adapter dedups when the topic is already in the user data
 				// set) still gets a fresh catalog + bulk.
 				if (data && data.type === 'cursor-snapshot' && typeof data.topic === 'string') {
-					tracker.snapshot(ws, data.topic, platform);
+					// Fire-and-forget, so the rejection needs an owner here: an
+					// unhandled one terminates the worker.
+					tracker.snapshot(ws, data.topic, platform).catch(() => { /* snapshot is best-effort */ });
 					return;
 				}
 				// Client-reported viewport rect for culling. Routes ONLY to local
@@ -1020,6 +1208,8 @@ export function createCursor(client, options = {}) {
 				// each replica culls its own local subscribers against the combined
 				// local + peer cursor set, so a peer never needs the rect.
 				if (data && data.type === 'cursor-viewport' && typeof data.topic === 'string') {
+					// Same membership gate as cursor updates.
+					if (!isMember(ws, data.topic)) return;
 					tracker.viewport(ws, data.topic, data.rect);
 					return;
 				}
@@ -1043,5 +1233,3 @@ export function createCursor(client, options = {}) {
 
 	return tracker;
 }
-
-

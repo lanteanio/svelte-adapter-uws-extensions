@@ -187,6 +187,50 @@ describe('redis cursor', () => {
 			expect(platform.published[0].data.user.sessionToken).toBeUndefined();
 			c.destroy();
 		});
+
+		it('drops personal and transport data before broadcasting or persisting it', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const ws = mockWs({
+				id: '1',
+				name: 'Alice',
+				role: 'admin',
+				authorId: 'author-7',
+				microphoneOn: true,
+				email: 'alice@example.test',
+				phoneNumber: '+49 30 123456',
+				userphone: '+49 30 654321',
+				ip: '203.0.113.10',
+				address: '203.0.113.10',
+				apiKey: 'secret-api-key',
+				profile: {
+					displayName: 'Alice A.',
+					avatarUrl: '/avatars/alice.png',
+					remoteAddress: '10.0.0.4',
+					sessionToken: 'secret-session',
+					contactphone: '+49 30 999999'
+				}
+			});
+
+			c.update(ws, 'room', { x: 5, y: 5 }, platform);
+			const join = platform.published.find((p) => p.event === 'join');
+			const storedHash = client._hashes.get(client.key('cursor:{room}'));
+			const stored = JSON.parse([...storedHash.values()][0]).user;
+			c.destroy();
+
+			const expected = {
+				id: '1',
+				name: 'Alice',
+				role: 'admin',
+				authorId: 'author-7',
+				microphoneOn: true,
+				profile: {
+					displayName: 'Alice A.',
+					avatarUrl: '/avatars/alice.png'
+				}
+			};
+			expect(join.data.user).toEqual(expected);
+			expect(stored).toEqual(expected);
+		});
 	});
 
 	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
@@ -596,9 +640,13 @@ describe('redis cursor', () => {
 			expect(typeof cursors.hooks.close).toBe('function');
 		});
 
-		it('hooks.message dispatches cursor updates', () => {
+		it('hooks.message dispatches cursor updates', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1' });
+			// Cursor frames are membership-gated, and the real attach handshake
+			// is what grants membership. Drive it rather than hand-stamping, so
+			// this stays a test of the shipped path.
+			await c.attach(ws, 'canvas', platform);
 
 			c.hooks.message(ws, {
 				data: { type: 'cursor', topic: 'canvas', data: { x: 42 } },
@@ -1334,6 +1382,34 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
+		it('applies the default privacy projection before binary join and catalog encoding', async () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const moverPlatform = wirePlatform();
+			c.update(mockWs({
+				id: '1',
+				name: 'Alice',
+				authorId: 'author-7',
+				email: 'alice@example.test',
+				profile: { avatarUrl: '/a.png', remoteAddress: '10.0.0.4' }
+			}), 'canvas', { x: 1, y: 2 }, moverPlatform);
+
+			const expected = {
+				id: '1',
+				name: 'Alice',
+				authorId: 'author-7',
+				profile: { avatarUrl: '/a.png' }
+			};
+			const join = moverPlatform.publishedWire.find((entry) => entry.event === 'join');
+			expect(join.data.user).toEqual(expected);
+
+			const snapshotPlatform = wirePlatform();
+			await c.snapshot(mockWs({ id: 'observer' }), 'canvas', snapshotPlatform);
+			const catalog = snapshotPlatform.sentWire.find((entry) => entry.event === 'catalog');
+			c.destroy();
+			expect(catalog.data[0].user).toEqual(expected);
+			expect(catalog.wire.encode('catalog', catalog.data)).toBeInstanceOf(Uint8Array);
+		});
+
 		it('the routed cursor codec encodes update frames to compact binary bytes (not just a capability label)', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const wp = wirePlatform();
@@ -1581,7 +1657,7 @@ describe('redis cursor', () => {
 		});
 	});
 
-	describe('per-topic broadcast budget (#3)', () => {
+	describe('per-topic broadcast budget', () => {
 		it('topicThrottle: all updates within one cycle ship as one combined frame', () => {
 			// Always-tick model: every broadcast queues, the tracker-wide
 			// tick fires once per cycle and emits ONE frame covering every
@@ -1716,7 +1792,7 @@ describe('redis cursor', () => {
 		});
 	});
 
-	describe('receiver-side aggregation (#1: cross-replica relay smoothing)', () => {
+	describe('receiver-side aggregation (cross-replica relay smoothing)', () => {
 		it('peer-relayed UPDATE enqueues into inboundDirty; merges with local cursors on next flush', async () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });

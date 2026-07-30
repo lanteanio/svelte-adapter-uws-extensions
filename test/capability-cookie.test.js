@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { capabilityCookie } from '../src/capability-cookie.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
 
@@ -61,15 +62,58 @@ describe('capabilityCookie', () => {
 		});
 
 		it('throws on a bad previousSecret', () => {
-			expect(() => capabilityCookie({ secret: 's', previousSecret: '' })).toThrow('previousSecret');
+			expect(() => capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', previousSecret: '' })).toThrow('previousSecret');
+		});
+
+		it('refuses a secret weak enough to brute-force offline', () => {
+			// The cookie's only security property is that a client cannot forge
+			// the signature. An observer holds both the message and the tag, so a
+			// weak secret is ground offline at memory speed with no network
+			// involved - and a placeholder like 'dev' is exactly the value that
+			// reaches production by accident.
+			for (const weak of ['s', 'dev', 'changeme', 'hunter2', 'password']) {
+				expect(() => capabilityCookie({ secret: weak })).toThrow(/at least 16 characters/);
+			}
+			// Length is not entropy.
+			expect(() => capabilityCookie({ secret: 'x'.repeat(64) })).toThrow(/too few distinct characters/);
+			expect(() => capabilityCookie({ secret: 'abababab'.repeat(8) })).toThrow(/too few distinct characters/);
+		});
+
+		it('accepts every shape a generated key actually takes', () => {
+			// The SAME 128 bits is 32 chars as hex and 24 as base64, and a
+			// 32-char floor would refuse the base64 form - a correctly
+			// provisioned deployment that then cannot boot, since
+			// capabilityCookie() runs at module scope in the documented setup.
+			const generated = [
+				randomBytes(16).toString('hex'),
+				randomBytes(32).toString('hex'),
+				randomBytes(16).toString('base64'),
+				randomBytes(20).toString('base64url'),
+				randomBytes(12).toString('hex'),
+				randomUUID()
+			];
+			for (const s of generated) {
+				expect(() => capabilityCookie({ secret: s }), s).not.toThrow();
+			}
+		});
+
+		it('lets a deployment rotate AWAY from a weak secret', () => {
+			// The floor must not apply to previousSecret. It only ever verifies,
+			// never signs, and refusing the old value would leave "keep the weak
+			// secret" and "sign every live session out" as the only options -
+			// which is how a weak secret survives.
+			expect(() => capabilityCookie({
+				secret: randomBytes(32).toString('hex'),
+				previousSecret: 'dev'
+			})).not.toThrow();
 		});
 
 		it('throws on non-positive ttlSeconds', () => {
-			expect(() => capabilityCookie({ secret: 's', ttlSeconds: 0 })).toThrow('ttlSeconds must be a positive number');
+			expect(() => capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', ttlSeconds: 0 })).toThrow('ttlSeconds must be a positive number');
 		});
 
 		it('returns the issue/refresh/verify API', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			expect(typeof cap.issue).toBe('function');
 			expect(typeof cap.refresh).toBe('function');
 			expect(typeof cap.verify).toBe('function');
@@ -78,7 +122,7 @@ describe('capabilityCookie', () => {
 
 	describe('issue', () => {
 		it('appends a signed Set-Cookie with the security attributes', () => {
-			const cap = capabilityCookie({ secret: 'topsecret', ttlSeconds: 300 });
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836', ttlSeconds: 300 });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 
@@ -93,7 +137,7 @@ describe('capabilityCookie', () => {
 		});
 
 		it('binds the cookie to a locals session id when present', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const res = mockResponse();
 			cap.issue(mockEvent({ locals: { sessionId: 'sess-abc' } }), res);
 			const value = cookieValueFrom(res.setCookies[0]);
@@ -105,7 +149,7 @@ describe('capabilityCookie', () => {
 		});
 
 		it('supports a plain setHeader-style response', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			let stored = null;
 			const res = {
 				getHeader: () => stored,
@@ -119,7 +163,7 @@ describe('capabilityCookie', () => {
 
 	describe('verify - happy path', () => {
 		it('accepts a freshly issued cookie', () => {
-			const cap = capabilityCookie({ secret: 'topsecret' });
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836' });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 			const header = cookieValueFrom(res.setCookies[0]);
@@ -128,7 +172,7 @@ describe('capabilityCookie', () => {
 		});
 
 		it('accepts the cookie alongside other cookies in the header', () => {
-			const cap = capabilityCookie({ secret: 'topsecret' });
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836' });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 			const capCookie = cookieValueFrom(res.setCookies[0]);
@@ -140,14 +184,14 @@ describe('capabilityCookie', () => {
 
 	describe('verify - required-ness keyed off posture', () => {
 		it('an absent cookie passes when not required (normal posture)', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			expect(cap.verify(null, { required: false })).toBe(true);
 			expect(cap.verify(undefined)).toBe(true);
 			expect(cap.verify('unrelated=1', { required: false })).toBe(true);
 		});
 
 		it('an absent cookie fails when required (elevated / siege posture)', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			expect(cap.verify(null, { required: true })).toBe(false);
 			expect(cap.verify('unrelated=1', { required: true })).toBe(false);
 		});
@@ -155,7 +199,7 @@ describe('capabilityCookie', () => {
 
 	describe('verify - rejection', () => {
 		it('rejects a tampered signature even when not required', () => {
-			const cap = capabilityCookie({ secret: 'topsecret' });
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836' });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 			let header = cookieValueFrom(res.setCookies[0]);
@@ -167,8 +211,8 @@ describe('capabilityCookie', () => {
 		});
 
 		it('rejects a cookie signed by an unrelated secret', () => {
-			const issuer = capabilityCookie({ secret: 'one' });
-			const verifier = capabilityCookie({ secret: 'two' });
+			const issuer = capabilityCookie({ secret: '4d1b7f0a9c3e58267abdf14c0e9b3572' });
+			const verifier = capabilityCookie({ secret: '5e2c8a1b0d4f69378bcea25d1fa04683' });
 			const res = mockResponse();
 			issuer.issue(mockEvent(), res);
 			const header = cookieValueFrom(res.setCookies[0]);
@@ -177,13 +221,13 @@ describe('capabilityCookie', () => {
 		});
 
 		it('rejects a structurally malformed cookie value', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			expect(cap.verify(COOKIE_NAME + '=not.enough.parts', { required: true })).toBe(false);
 			expect(cap.verify(COOKIE_NAME + '=garbage', { required: true })).toBe(false);
 		});
 
 		it('rejects an expired cookie', () => {
-			const cap = capabilityCookie({ secret: 's', ttlSeconds: 60 });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', ttlSeconds: 60 });
 			const t0 = Date.now();
 			vi.spyOn(Date, 'now').mockReturnValue(t0);
 
@@ -203,13 +247,13 @@ describe('capabilityCookie', () => {
 
 	describe('secret rotation window', () => {
 		it('verifier with previousSecret accepts a cookie signed by the old secret', () => {
-			const oldIssuer = capabilityCookie({ secret: 'old-secret' });
+			const oldIssuer = capabilityCookie({ secret: '6f3d9b2c1e5a074890dfb36e2ab15794' });
 			const res = mockResponse();
 			oldIssuer.issue(mockEvent(), res);
 			const oldCookie = cookieValueFrom(res.setCookies[0]);
 
 			// After rotation: current = new-secret, previous = old-secret.
-			const rotated = capabilityCookie({ secret: 'new-secret', previousSecret: 'old-secret' });
+			const rotated = capabilityCookie({ secret: '7a4e0c3d2f6b1859a1ec47f30bc268a5', previousSecret: '6f3d9b2c1e5a074890dfb36e2ab15794' });
 			expect(rotated.verify(oldCookie, { required: true })).toBe(true);
 
 			// And a cookie freshly issued under the new secret still verifies.
@@ -219,30 +263,30 @@ describe('capabilityCookie', () => {
 		});
 
 		it('drops the old secret once the rotation window closes', () => {
-			const oldIssuer = capabilityCookie({ secret: 'old-secret' });
+			const oldIssuer = capabilityCookie({ secret: '6f3d9b2c1e5a074890dfb36e2ab15794' });
 			const res = mockResponse();
 			oldIssuer.issue(mockEvent(), res);
 			const oldCookie = cookieValueFrom(res.setCookies[0]);
 
 			// previousSecret no longer configured: old cookies are now invalid.
-			const current = capabilityCookie({ secret: 'new-secret' });
+			const current = capabilityCookie({ secret: '7a4e0c3d2f6b1859a1ec47f30bc268a5' });
 			expect(current.verify(oldCookie, { required: true })).toBe(false);
 		});
 
 		it('does not accept a cookie signed by neither current nor previous', () => {
-			const strayIssuer = capabilityCookie({ secret: 'stray' });
+			const strayIssuer = capabilityCookie({ secret: '8b5f1d4e3a7c2960b2fd58041cd379b6' });
 			const res = mockResponse();
 			strayIssuer.issue(mockEvent(), res);
 			const strayCookie = cookieValueFrom(res.setCookies[0]);
 
-			const rotated = capabilityCookie({ secret: 'new', previousSecret: 'old' });
+			const rotated = capabilityCookie({ secret: 'd9a4b7c2e6f31850ab7dce49f2013c65', previousSecret: 'c1d8e3f6a9b40725d3ecfb82a6094d17' });
 			expect(rotated.verify(strayCookie, { required: true })).toBe(false);
 		});
 	});
 
 	describe('refresh', () => {
 		it('re-issues preserving the session id from a still-valid cookie', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const issueRes = mockResponse();
 			cap.issue(mockEvent({ locals: { sessionId: 'keep-me' } }), issueRes);
 			const issued = cookieValueFrom(issueRes.setCookies[0]);
@@ -259,7 +303,7 @@ describe('capabilityCookie', () => {
 		});
 
 		it('re-issues a fresh cookie when no valid cookie is presented', () => {
-			const cap = capabilityCookie({ secret: 's' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const res = mockResponse();
 			cap.refresh(mockEvent({ cookie: null }), res);
 			expect(res.setCookies).toHaveLength(1);
@@ -267,32 +311,32 @@ describe('capabilityCookie', () => {
 		});
 
 		it('a cookie refreshed across a rotation re-signs under the current secret', () => {
-			const oldIssuer = capabilityCookie({ secret: 'old' });
+			const oldIssuer = capabilityCookie({ secret: 'c1d8e3f6a9b40725d3ecfb82a6094d17' });
 			const issueRes = mockResponse();
 			oldIssuer.issue(mockEvent({ locals: { sessionId: 's1' } }), issueRes);
 			const oldCookie = cookieValueFrom(issueRes.setCookies[0]);
 
-			const rotated = capabilityCookie({ secret: 'new', previousSecret: 'old' });
+			const rotated = capabilityCookie({ secret: 'd9a4b7c2e6f31850ab7dce49f2013c65', previousSecret: 'c1d8e3f6a9b40725d3ecfb82a6094d17' });
 			const refreshRes = mockResponse();
 			rotated.refresh(mockEvent({ cookie: oldCookie }), refreshRes);
 			const refreshed = cookieValueFrom(refreshRes.setCookies[0]);
 
 			// The refreshed cookie verifies under the current secret even with the
 			// previous secret dropped.
-			const currentOnly = capabilityCookie({ secret: 'new' });
+			const currentOnly = capabilityCookie({ secret: 'd9a4b7c2e6f31850ab7dce49f2013c65' });
 			expect(currentOnly.verify(refreshed, { required: true })).toBe(true);
 		});
 	});
 
 	describe('custom cookie name', () => {
 		it('issues and verifies under a custom name', () => {
-			const cap = capabilityCookie({ secret: 's', cookieName: 'cap2' });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', cookieName: 'cap2' });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 			expect(res.setCookies[0]).toMatch(/^cap2=/);
 			expect(cap.verify(cookieValueFrom(res.setCookies[0]), { required: true })).toBe(true);
 			// The default-name verifier does not see it.
-			const other = capabilityCookie({ secret: 's' });
+			const other = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			expect(other.verify(cookieValueFrom(res.setCookies[0]), { required: true })).toBe(false);
 		});
 	});
@@ -327,7 +371,7 @@ describe('capabilityCookie', () => {
 
 		it('counts an absent cookie as missing only when required', () => {
 			const metrics = fakeRegistry();
-			const cap = capabilityCookie({ secret: 's', metrics });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', metrics });
 
 			// Optional posture: a first-time visitor is not a miss.
 			expect(cap.verify(null, { required: false })).toBe(true);
@@ -342,7 +386,7 @@ describe('capabilityCookie', () => {
 
 		it('counts a presented-but-bad cookie as invalid regardless of required', () => {
 			const metrics = fakeRegistry();
-			const cap = capabilityCookie({ secret: 'topsecret', metrics });
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836', metrics });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 			let header = cookieValueFrom(res.setCookies[0]);
@@ -357,7 +401,7 @@ describe('capabilityCookie', () => {
 
 		it('counts an expired cookie as invalid, never as its own reason', () => {
 			const metrics = fakeRegistry();
-			const cap = capabilityCookie({ secret: 's', ttlSeconds: 60, metrics });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', ttlSeconds: 60, metrics });
 			const t0 = Date.now();
 			vi.spyOn(Date, 'now').mockReturnValue(t0);
 
@@ -373,7 +417,7 @@ describe('capabilityCookie', () => {
 
 		it('does not count a valid verification', () => {
 			const metrics = fakeRegistry();
-			const cap = capabilityCookie({ secret: 's', metrics });
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', metrics });
 			const res = mockResponse();
 			cap.issue(mockEvent(), res);
 
@@ -384,7 +428,7 @@ describe('capabilityCookie', () => {
 
 		it('registers the counter once at construction with the reason label', () => {
 			const metrics = fakeRegistry();
-			capabilityCookie({ secret: 's', metrics });
+			capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', metrics });
 			expect(metrics.counters.has('capability_cookie_misses_total')).toBe(true);
 		});
 
@@ -392,7 +436,7 @@ describe('capabilityCookie', () => {
 			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			try {
 				const cap = capabilityCookie({
-					secret: 's',
+					secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c',
 					metrics: { counter: () => ({ inc() { throw new Error('emit boom'); } }) }
 				});
 				expect(cap.verify(null, { required: true })).toBe(false);

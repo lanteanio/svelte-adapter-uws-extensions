@@ -10,7 +10,7 @@
  * - Real `MAXLEN ~` listpack-approximate trim when the source is larger than the
  *   target cap (the mock trims to an exact count).
  * - Cluster-aware SCAN discovery across master nodes (the mirror tier).
- * - The credo-4 measurement gate for the topic-field trim: real `MEMORY USAGE`
+ * - The measurement gate for the topic-field trim: real `MEMORY USAGE`
  *   before/after on a topic/event/data stream vs an event/data stream. The
  *   in-memory mock cannot measure listpack bytes.
  *
@@ -119,7 +119,7 @@ describeIntegration('replay migration (sorted-set -> stream, integration)', () =
 		});
 	});
 
-	describe('topic-field trim: MEMORY USAGE before/after (credo-4 gate)', () => {
+	describe('topic-field trim: MEMORY USAGE before/after', () => {
 		async function memUsage(key) {
 			const v = await client.redis.call('MEMORY', 'USAGE', key);
 			return v == null ? null : Number(v);

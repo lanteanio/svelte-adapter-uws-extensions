@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { runRedisSimSwarm, runPgSimSwarm } from '../../src/sim.js';
 
-// buggify uses only SURVIVABLE relay faults (reorder / duplicate / jitter, no
+// faultMode uses only SURVIVABLE relay faults (reorder / duplicate / jitter, no
 // loss): quiescent cross-instance convergence holds under these, so any
-// violation a buggified run reports is a real bug. drop / corrupt legitimately
+// violation a faulted run reports is a real bug. drop / corrupt legitimately
 // diverge (a lost relay frame shorts an instance) and are covered by the
 // detection tests in redis.test.js / pg.test.js, not by the swarm pass/fail.
 const SURVIVABLE = { reorder: 0.6, duplicate: 0.3, maxJitterMs: 30 };
@@ -33,11 +33,11 @@ describe('runRedisSimSwarm', () => {
 		expect(b.summary).toEqual(a.summary);
 	});
 
-	it('buggify:on faults the relay yet convergence holds; fingerprints change vs clean', async () => {
-		const on = await runRedisSimSwarm({ count: 4, startSeed: 1, base: { instances: 3 }, buggify: 'on', faultProfile: SURVIVABLE });
+	it('faultMode:on faults the relay yet convergence holds; fingerprints change vs clean', async () => {
+		const on = await runRedisSimSwarm({ count: 4, startSeed: 1, base: { instances: 3 }, faultMode: 'on', faultProfile: SURVIVABLE });
 		const off = await runRedisSimSwarm({ count: 4, startSeed: 1, base: { instances: 3 } });
-		expect(on.runs.every((r) => r.buggified)).toBe(true);
-		expect(on.summary.buggified).toBe(4);
+		expect(on.runs.every((r) => r.faulted)).toBe(true);
+		expect(on.summary.faulted).toBe(4);
 		// Survivable faults change the cross-instance delivery order, so the
 		// structural fingerprint differs (proving the faults were applied), but no
 		// message is lost, so convergence still holds.
@@ -45,12 +45,12 @@ describe('runRedisSimSwarm', () => {
 		expect(on.summary.ok).toBe(true);
 	});
 
-	it('buggify:random faults a reproducible, non-trivial subset', async () => {
-		const a = await runRedisSimSwarm({ count: 10, startSeed: 1, base: { instances: 2 }, buggify: 'random', faultProfile: SURVIVABLE, buggifyProbability: 0.5 });
-		const b = await runRedisSimSwarm({ count: 10, startSeed: 1, base: { instances: 2 }, buggify: 'random', faultProfile: SURVIVABLE, buggifyProbability: 0.5 });
-		expect(a.summary.buggified).toBeGreaterThan(0);
-		expect(a.summary.buggified).toBeLessThan(10);
-		expect(b.runs.map((r) => r.buggified)).toEqual(a.runs.map((r) => r.buggified));
+	it('faultMode:random faults a reproducible, non-trivial subset', async () => {
+		const a = await runRedisSimSwarm({ count: 10, startSeed: 1, base: { instances: 2 }, faultMode: 'random', faultProfile: SURVIVABLE, faultProbability: 0.5 });
+		const b = await runRedisSimSwarm({ count: 10, startSeed: 1, base: { instances: 2 }, faultMode: 'random', faultProfile: SURVIVABLE, faultProbability: 0.5 });
+		expect(a.summary.faulted).toBeGreaterThan(0);
+		expect(a.summary.faulted).toBeLessThan(10);
+		expect(b.runs.map((r) => r.faulted)).toEqual(a.runs.map((r) => r.faulted));
 		expect(a.summary.ok).toBe(true);
 	});
 
@@ -73,9 +73,9 @@ describe('runPgSimSwarm', () => {
 		for (const r of runs) expect(r.fingerprint).toMatch(/^[0-9a-f]{8}$/);
 	});
 
-	it('buggify:on holds convergence under a survivable NOTIFY relay', async () => {
-		const { summary } = await runPgSimSwarm({ count: 3, startSeed: 1, base: { instances: 3 }, buggify: 'on', faultProfile: SURVIVABLE });
-		expect(summary.buggified).toBe(3);
+	it('faultMode:on holds convergence under a survivable NOTIFY relay', async () => {
+		const { summary } = await runPgSimSwarm({ count: 3, startSeed: 1, base: { instances: 3 }, faultMode: 'on', faultProfile: SURVIVABLE });
+		expect(summary.faulted).toBe(3);
 		expect(summary.ok).toBe(true);
 	});
 });

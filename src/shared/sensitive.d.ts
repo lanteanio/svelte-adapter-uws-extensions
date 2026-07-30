@@ -35,13 +35,29 @@ export const SENSITIVE_WARN_RE: RegExp;
  * its stringified index, leaking raw bytes (which may include auth
  * tokens) into log lines.
  *
- * Cycle-safe via a per-call `WeakSet`.
+ * Cycle-safe via a per-call `WeakSet`, and bounded on BOTH axes a hostile
+ * shape can grow: past `STRIP_MAX_DEPTH` levels a subtree becomes `"[deep]"`,
+ * and past `STRIP_MAX_NODES` charged slots the rest becomes `"[truncated]"`.
+ * Each container is charged its own width once, so a wide leaf reached through
+ * many references cannot be re-expanded for free.
+ *
+ * `ancestors` is the recursion accumulator. Passing your own is supported but
+ * unnecessary; if you do, note that it is a PATH set - entries are removed on
+ * the way back up - so reusing one across calls only works because every exit,
+ * including the exceptional one, unwinds its own entry.
  *
  * Returns `obj` unchanged when it is not a non-null object. Returns
  * `undefined` when called on an object already in the ancestor chain
- * (cycle break). Returns a `string` for binary-view input.
+ * (cycle break). Returns a `string` for binary-view input and for either
+ * placeholder.
  */
-export function stripInternal(obj: unknown, ancestors?: WeakSet<object>): unknown;
+export function stripInternal(obj: unknown, ancestors?: WeakSet<object>, depth?: number, budget?: { n: number }): unknown;
+
+/** Depth past which a subtree is replaced with a `"[deep]"` placeholder. */
+export const STRIP_MAX_DEPTH: number;
+
+/** Charged-slot budget past which the walk yields `"[truncated]"`. */
+export const STRIP_MAX_NODES: number;
 
 /**
  * Redact the password segment of a connection URL so the URL is safe to
@@ -61,6 +77,12 @@ export function stripInternal(obj: unknown, ancestors?: WeakSet<object>): unknow
  *   authority-terminator detection inside `[...]`.
  * - **Query-string passwords** (`postgres://host/db?password=hunter2`).
  *   Case-insensitive match on `password` / `pass` / `pwd` keys.
+ * - **Every URL in the string.** Whole messages and whole stack traces are
+ *   valid input and routinely carry the DSN more than once. Each URL runs
+ *   to the next whitespace byte, so free text after it is left alone -
+ *   punctuation such as a closing quote is NOT a terminator, because the
+ *   sub-delims `!$&'()*+,;=` are legal unescaped in a userinfo password and
+ *   stopping at one would leave the credential unredacted.
  *
  * @example
  * redactConnectionUrl('redis://:s3cret@redis.internal:6379');

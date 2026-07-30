@@ -84,6 +84,19 @@ describe('redis ratelimit', () => {
 			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual([]);
 		});
 
+		it('refuses clear(\'\') instead of widening it to every tenant', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
+			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'a' }));
+			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'b' }));
+			// '' is a string, so the type guard passes it, and it is falsy, so
+			// it lands in the no-tenant branch and scans `*`. A caller whose
+			// tenant resolver returned '' would write to the untenanted segment
+			// and then wipe every OTHER tenant's buckets.
+			await expect(lim.clear('')).rejects.toThrow(/must not be empty/);
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit')).sort())
+				.toEqual(['test:v1:ratelimit:a\x001.1.1.1', 'test:v1:ratelimit:b\x001.1.1.1']);
+		});
+
 		it('reset(key, tenant) targets the tenant-scoped bucket', async () => {
 			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
 			await lim.consume(mockWs({ ip: '5.5.5.5', org: 'a' }));

@@ -64,6 +64,14 @@ export interface RegistryOptions {
 	 */
 	requestTimeoutMs?: number;
 
+	/**
+	 * Reject inbound bus envelopes larger than this many bytes BEFORE
+	 * `JSON.parse` runs, and refuse to publish an outbound envelope past the
+	 * same bound - every peer would drop it on receipt.
+	 * @default 1048576
+	 */
+	maxEnvelopeBytes?: number;
+
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
 }
@@ -164,7 +172,7 @@ export interface ConnectionRegistry {
 	): Promise<TReply>;
 
 	/**
-	 * Cluster-routed coalesce-by-key send. Fire-and-forget: routes to the
+	 * Cluster-routed coalesce-by-key send. No reply path: routes to the
 	 * owning instance, which calls `platform.sendCoalesced(ws, message)`
 	 * locally. Per-`(connection, key)` replacement happens on the receiver
 	 * side via the adapter's existing coalesce semantics, so a duplicate
@@ -178,9 +186,15 @@ export interface ConnectionRegistry {
 	 * one transient out-of-order moment that the per-connection coalesce
 	 * collapses on the new instance.
 	 *
+	 * Rejects when the encoded envelope exceeds `maxEnvelopeBytes` - every
+	 * peer enforces the same bound on the way in, so publishing past it
+	 * would reach nobody, and the sender is the only side that can report
+	 * it. Await the call (or attach a `.catch`): an unhandled rejection
+	 * terminates the worker under Node's default.
+	 *
 	 * @example
 	 * ```js
-	 * registry.sendCoalesced('user-123', {
+	 * await registry.sendCoalesced('user-123', {
 	 *   key: 'cursor:doc-7',
 	 *   topic: 'doc:doc-7',
 	 *   event: 'cursor',
@@ -195,7 +209,7 @@ export interface ConnectionRegistry {
 
 	/**
 	 * Cluster-routed counterpart to `platform.send(ws, topic, event, data)`.
-	 * Fire-and-forget: routes to the owning instance, which calls
+	 * No reply path: routes to the owning instance, which calls
 	 * `platform.send(ws, topic, event, data)` locally.
 	 *
 	 * Self-targeting (the origin instance owns the user) short-circuits
@@ -207,10 +221,15 @@ export interface ConnectionRegistry {
 	 *  - **Mid-flight migration:** sender's envelope lands on the old owner,
 	 *    which no longer has the `ws`; drops with a
 	 *    `push_sends_total{result="late"}` increment on the receiver side.
+	 *  - **Payload past `maxEnvelopeBytes`:** rejects. Every peer enforces
+	 *    the same bound inbound, so publishing past it would reach nobody,
+	 *    and the sender is the only side that can report it. Await the call
+	 *    (or attach a `.catch`): an unhandled rejection terminates the
+	 *    worker under Node's default.
 	 *
 	 * @example
 	 * ```js
-	 * registry.send('user-123', 'notifications', 'incoming', { id: 42 });
+	 * await registry.send('user-123', 'notifications', 'incoming', { id: 42 });
 	 * ```
 	 */
 	send(target: string, topic: string, event: string, data?: unknown): Promise<void>;
@@ -238,6 +257,14 @@ export interface ConnectionRegistry {
 	 *
 	 * Throws when no `attributes` option was supplied at construction,
 	 * when criteria is empty, or when topic / event are missing.
+	 *
+	 * Delivery to matches on THIS instance happens first and is not gated on
+	 * the envelope encode - those sockets need no envelope, and on a
+	 * single-instance deployment they are every recipient. A payload past
+	 * `maxEnvelopeBytes` therefore throws AFTER the local matches were
+	 * served, and the throw means "no peer was written to", not "nothing was
+	 * delivered". Retrying with a smaller payload re-delivers to the local
+	 * matches; the refusal is counted as `push_sendto_total{result="refused"}`.
 	 *
 	 * @example
 	 * ```js

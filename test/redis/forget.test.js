@@ -470,6 +470,28 @@ describe('redis presence purgeUser', () => {
 		presence.destroy();
 	});
 
+	it('refuses a glob metacharacter in the user id instead of widening the scan', async () => {
+		const client = mockRedisClient('test:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, { key: 'id', select: (u) => ({ id: u.id }), heartbeat: 60000, ttl: 180 });
+		await presence.join(mockWs({ id: 'u1' }), 'room', platform);
+		await presence.join(mockWs({ id: 'u2' }), 'room2', platform);
+
+		// The id is interpolated into the SCAN MATCH glob, so '*' selects every
+		// user in every topic rather than one user. The exact suffix re-check
+		// keeps the DELETEs correct, which is why this has to be asserted as a
+		// refusal - a wrong-row assertion would pass without the guard.
+		await expect(presence.purgeUser(null, '*')).rejects.toThrow(/glob metacharacter/);
+		for (const bad of ['u\0x', 'u?', 'u[a]', 'u]', 'u\\x']) {
+			await expect(presence.purgeUser(null, bad)).rejects.toThrow(/redis presence: purgeUser/);
+		}
+
+		// Nothing was erased on the way to the refusal.
+		expect((await presence.list('room')).map((d) => d.id)).toEqual(['u1']);
+		expect((await presence.list('room2')).map((d) => d.id)).toEqual(['u2']);
+		presence.destroy();
+	});
+
 	it('purges a user whose topic has a live sync observer (observer refcount is topic->number, not per-user)', async () => {
 		const client = mockRedisClient('test:');
 		const platform = mockPlatform();
@@ -693,6 +715,28 @@ describe('redis replay purgeUser (sorted-set)', () => {
 		expect(await replay.purgeUser(null, 'u1')).toBe(2);
 		expect((await replay.since('room', 0)).map((e) => e.data.userId)).toEqual(['u2']);
 		expect(await replay.since('board', 0)).toEqual([]);
+	});
+
+	it('erases only the named tenant, not every tenant with that user id', async () => {
+		const client = mockRedisClient('test:');
+		const platform = mockPlatform();
+		const replay = createReplay(client, { forgetUserId: ({ data }) => data && data.userId });
+		// Tenancy rides the wire topic as `@t/<tenantId>/<topic>` - the scope the
+		// room-owner and presence-roster legs of the SAME purge already apply.
+		// Matching on user id alone honoured the tenant argument nowhere.
+		await replay.publish(platform, '@t/acme/room', 'msg', { userId: 'u1', x: 1 });
+		await replay.publish(platform, '@t/globex/room', 'msg', { userId: 'u1', x: 2 });
+		await replay.publish(platform, 'room', 'msg', { userId: 'u1', x: 3 });
+
+		expect(await replay.purgeUser('acme', 'u1')).toBe(1);
+		expect(await replay.since('@t/acme/room', 0)).toEqual([]);
+		expect((await replay.since('@t/globex/room', 0)).map((e) => e.data.x)).toEqual([2]);
+		expect((await replay.since('room', 0)).map((e) => e.data.x)).toEqual([3]);
+
+		// The untenanted scope reaches the unprefixed topic only.
+		expect(await replay.purgeUser(null, 'u1')).toBe(1);
+		expect(await replay.since('room', 0)).toEqual([]);
+		expect((await replay.since('@t/globex/room', 0)).map((e) => e.data.x)).toEqual([2]);
 	});
 });
 

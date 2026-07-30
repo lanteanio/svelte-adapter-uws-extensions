@@ -28,7 +28,10 @@ export interface RedisCursorOptions {
 	/**
 	 * Extract user-identifying data from userData.
 	 * Broadcast alongside cursor data so other clients know who the cursor belongs to.
-	 * @default identity
+	 * The default recursively drops internal keys, credentials, common personal
+	 * data, and request transport metadata. An explicit callback can intentionally
+	 * admit fields; its result still passes through `stripInternal()`.
+	 * @default privacy projection
 	 */
 	select?: (userData: any) => any;
 
@@ -111,6 +114,20 @@ export class WsClosedError extends Error {
 	topic: string;
 }
 
+/**
+ * Thrown by `attach()` when `platform.checkSubscribe` refuses the topic.
+ * Authorization runs before anything is granted, so nothing is subscribed
+ * or emitted when this throws. Catch on `err.code === 'SUBSCRIBE_DENIED'`
+ * and surface `err.reason` to the caller.
+ */
+export class SubscribeDeniedError extends Error {
+	name: 'SubscribeDeniedError';
+	code: 'SUBSCRIBE_DENIED';
+	operation: string;
+	topic: string;
+	reason: string;
+}
+
 export interface RedisCursorTracker {
 	/**
 	 * Opt this connection into receiving cursor updates for `topic`.
@@ -122,6 +139,15 @@ export interface RedisCursorTracker {
 	 * Without `attach`, the publishes in `update` fan out to an empty
 	 * subscriber set and no client ever sees a cursor frame.
 	 *
+	 * Authorization runs FIRST: nothing is subscribed, granted or emitted
+	 * when the platform refuses the topic. The membership `attach` grants is
+	 * also what gates the inbound `cursor` / `cursor-viewport` frames in
+	 * `hooks.message`, so a socket that never attached cannot write into the
+	 * room.
+	 *
+	 * @throws {SubscribeDeniedError} (`err.code === 'SUBSCRIBE_DENIED'`, with
+	 *   `err.reason` carrying the platform's denial reason) if
+	 *   `platform.checkSubscribe` refuses `topic`.
 	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
 	 *   has already closed by the time the underlying `ws.subscribe` runs.
 	 *   No state to roll back (the throw fires before `snapshot()` could
@@ -225,11 +251,19 @@ export interface RedisCursorTracker {
 	 * `message` handles incoming `{ type: 'cursor', topic, data }` messages.
 	 * `close` removes the connection's cursors from all topics.
 	 *
-	 * `subscribe` is a no-op under current adapters: the adapter's wire-level
-	 * `__`-prefix gate denies any inbound `__cursor:*` subscribe frame, so
-	 * this hook never fires. Kept for backward source-compat; new code should
-	 * call `tracker.attach(ws, topic, platform)` from the app's "join room"
-	 * RPC instead.
+	 * `subscribe` fires for an inbound `__cursor:*` subscribe frame only where
+	 * the app opted into `allowSystemTopicSubscribe`; the adapter's wire-level
+	 * `__`-prefix gate denies it otherwise. When it does fire it authorizes
+	 * the topic exactly as `attach()` does, then grants membership and emits
+	 * the snapshot. Calling `tracker.attach(ws, topic, platform)` from the
+	 * app's "join room" RPC remains the path that does not depend on that
+	 * opt-in.
+	 *
+	 * It resolves to the platform's denial reason when authorization fails,
+	 * and to `undefined` otherwise. Wrapping it means RETURNING that value:
+	 * the adapter reads anything that is not `false` or a string as ALLOW, so
+	 * swallowing it withholds the snapshot while still subscribing the socket
+	 * to the broadcast channel - the larger half of what the gate prevents.
 	 *
 	 * @example
 	 * ```js
@@ -238,7 +272,7 @@ export interface RedisCursorTracker {
 	 * ```
 	 */
 	hooks: {
-		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void> | void;
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<string | undefined>;
 		message(ws: any, ctx: { data: any; platform: Platform }): void;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};

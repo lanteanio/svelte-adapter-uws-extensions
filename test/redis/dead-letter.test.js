@@ -79,6 +79,18 @@ describe('redis dead-letter store', () => {
 		expect(sum.newest).toBe(30);
 	});
 
+	it('counts __proto__ as an ordinary topic in its proto-free summary', async () => {
+		await store.add(rec({ topic: '__proto__', failedAt: 10 }));
+		await store.add(rec({ topic: '__proto__', failedAt: 20 }));
+		await store.add(rec({ topic: 'constructor', failedAt: 30 }));
+
+		const sum = await store.summary();
+		expect(sum.total).toBe(3);
+		expect(Object.getPrototypeOf(sum.byTopic)).toBe(null);
+		expect(sum.byTopic.__proto__).toBe(2);
+		expect(sum.byTopic.constructor).toBe(1);
+	});
+
 	it('evicts the oldest beyond max', async () => {
 		store = createDeadLetter(client, { max: 2 });
 		await store.add(rec({ failedAt: 1 }));
@@ -182,6 +194,28 @@ describe('redis dead-letter forget tombstone (right-to-erasure completeness)', (
 		attempts: 3,
 		error: 'x',
 		...over
+	});
+
+	it('erases only the named tenant, not every tenant with that user id', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		// Tenancy rides the wire topic. Matching on user id alone made one
+		// tenant's right-to-erasure destroy every other tenant's dead letters
+		// for the same user id, while the sibling legs of the same purge were
+		// correctly scoped.
+		await s.add(drec({ topic: '@t/acme/orders' }));
+		await s.add(drec({ topic: '@t/globex/orders' }));
+		await s.add(drec({ topic: 'orders' }));
+		expect(await s.count()).toBe(3);
+
+		expect(await s.purgeUser('acme', 'u1')).toBe(1);
+		expect(await s.count()).toBe(2);
+
+		// The untenanted scope reaches the unprefixed topic only.
+		expect(await s.purgeUser(null, 'u1')).toBe(1);
+		expect(await s.count()).toBe(1);
+
+		expect(await s.purgeUser('globex', 'u1')).toBe(1);
+		expect(await s.count()).toBe(0);
 	});
 
 	it('drops a record whose delivery raced a purge, and keeps a genuinely new one', async () => {

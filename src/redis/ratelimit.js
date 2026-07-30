@@ -668,6 +668,37 @@ export function createRateLimit(client, options) {
 		// glob `*` spans the NUL-delimited tenant segments). Pass a tenant id to clear
 		// only that tenant's buckets. Scoped to this limiter's refill-mode key space.
 		async clear(tenantId) {
+			// The tenant id is interpolated into a SCAN MATCH glob, so it needs
+			// the same delimiter guard as bucketKey PLUS a glob-metachar guard:
+			// clear('*') would otherwise wipe every tenant's buckets through a
+			// nominally tenant-scoped call. Coerce first - the id is
+			// interpolated as a string a line below, so validating the raw
+			// argument would miss a number and throw a TypeError on anything
+			// without .indexOf.
+			if (tenantId != null && typeof tenantId !== 'string') {
+				// Rejected rather than coerced. The falsy-tenant branch below
+				// is deliberate and matches `bucketKey`, which puts a falsy
+				// tenant's buckets in the UNTENANTED segment - so widening the
+				// test to `!= null` would desync the pair and make `clear(0)`
+				// scan `0\0*` and match nothing. But `clear(0)` reading as
+				// "clear everything" is a trap either way, and a numeric tenant
+				// does not work anywhere else in this module (`bucketKey` calls
+				// `tenantId.indexOf`), so the honest answer is to refuse the type.
+				throw new Error(`redis ratelimit: clear tenant id must be a string or null/undefined, got ${typeof tenantId}`);
+			}
+			if (tenantId != null && /[\0*?[\]\\]/.test(tenantId)) {
+				throw new Error('redis ratelimit: clear tenant id must not contain NUL or glob metacharacters (* ? [ ] \\)');
+			}
+			// '' passes the type and glob guards and is then FALSY, so it falls
+			// into the global branch below and a nominally tenant-scoped call
+			// wipes every tenant. It cannot be honoured as written either: an
+			// empty tenant lands in bucketKey's untenanted segment, whose keys
+			// are exactly the ones a glob cannot separate from the tenanted
+			// ones. Refused for the same reason clear(0) is - the two real
+			// calls are clear() for everything and clear(id) for one tenant.
+			if (tenantId === '') {
+				throw new Error('redis ratelimit: clear tenant id must not be empty - call clear() with no argument to clear every tenant');
+			}
 			const suffix = tenantId ? tenantId + '\0*' : '*';
 			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':' + mode.infix + suffix)));
 		},

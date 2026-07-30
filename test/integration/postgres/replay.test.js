@@ -49,6 +49,42 @@ describe('postgres replay (integration)', () => {
 		await client.end();
 	});
 
+	describe('right-to-erasure tenant scope (real SQL)', () => {
+		// The scope predicate is `left(topic, char_length($2)) = $2`, chosen over
+		// `LIKE $2 || '%'` because a validated tenant id may contain `_`, which
+		// LIKE treats as a single-character wildcard. Only real Postgres can
+		// confirm the predicate behaves as intended - a mock that models it is
+		// modelling this assertion, not testing it.
+		it('erases only the named tenant, and treats `_` as a literal', async () => {
+			const r = createReplay(client, {
+				table: TABLE,
+				cleanupInterval: 0,
+				forgetUserId: ({ data }) => data?.author
+			});
+			try {
+				for (const topic of ['@t/acme/chat', '@t/acmecorp/chat', '@t/a_c/chat', '@t/abc/chat', 'chat']) {
+					await r.publish(platform, topic, 'created', { author: 'u1' });
+				}
+
+				expect(await r.purgeUser('acme', 'u1')).toBe(1);
+				expect(await r.since('@t/acme/chat', 0)).toHaveLength(0);
+				// A tenant must not reach a LONGER tenant sharing its prefix.
+				expect(await r.since('@t/acmecorp/chat', 0)).toHaveLength(1);
+
+				// `_` is a LIKE wildcard; under LIKE, `a_c` would also match `abc`.
+				expect(await r.purgeUser('a_c', 'u1')).toBe(1);
+				expect(await r.since('@t/abc/chat', 0)).toHaveLength(1);
+
+				// The untenanted scope reaches the untenanted topic only.
+				expect(await r.purgeUser(null, 'u1')).toBe(1);
+				expect(await r.since('chat', 0)).toHaveLength(0);
+				expect(await r.since('@t/abc/chat', 0)).toHaveLength(1);
+			} finally {
+				r.destroy();
+			}
+		});
+	});
+
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh instances racing their first publish both succeed', async () => {
 			// CREATE TABLE IF NOT EXISTS races on concurrent first calls: both

@@ -231,15 +231,18 @@ describeIntegration('redis replay (integration)', () => {
 			expect(platform.sent.find((s) => s.event === 'msg')).toBeUndefined();
 		});
 
-		it('platform without checkSubscribe falls back to current behavior (older adapter)', async () => {
+		it('denies when the platform cannot authorize at all', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
 			const fakeWs = {};
 			platform.reset();
 			platform.checkSubscribe = undefined;
 			await replay.replay(fakeWs, 'chat', 0, platform);
-			// Legacy: messages flow through.
-			expect(platform.sent.some((s) => s.event === 'msg')).toBe(true);
+			// This gate is the ONLY authorization on the resume read path, so
+			// a platform that cannot authorize has to be refused rather than
+			// waved through: degrade availability, never authorization.
+			expect(platform.sent.some((s) => s.event === 'msg')).toBe(false);
+			expect(platform.sent.some((s) => s.event === 'denied')).toBe(true);
 		});
 	});
 

@@ -845,7 +845,7 @@ export async function replayPgSim(reproducer) {
 // chaos coverage, so it owns its own swarm.
 
 /**
- * Structural fingerprint of a store-backed run (the "unseed"): an 8-hex-char
+ * Structural fingerprint of a store-backed run: an 8-hex-char
  * FNV-1a digest of the byte-stable result fields. The extensions result carries
  * no fatals/schedulerUncaught, so those are absent here. Same seed -> same
  * fingerprint; a change for a fixed seed means determinism regressed.
@@ -870,7 +870,7 @@ function runFingerprint(result) {
 /**
  * The shared swarm loop for runRedisSimSwarm / runPgSimSwarm. `runOne(config)`
  * runs one seed, `replayOne(result)` re-runs it for the determinism re-check.
- * `buggify` layers `faultProfile` onto the run's RELAY faults (the
+ * `faultMode` layers `faultProfile` onto the run's RELAY faults (the
  * cross-instance bus / NOTIFY channel - the distinct chaos for this tier),
  * never the per-instance wire faults, which the adapter swarm already covers.
  *
@@ -880,8 +880,20 @@ function runFingerprint(result) {
  */
 async function swarm(config, runOne, replayOne) {
 	const base = config.base || {};
-	const buggify = config.buggify || 'off';
-	const buggifyProbability = config.buggifyProbability ?? 0.25;
+	// The superseded option names are REFUSED, not ignored. Silently accepting
+	// one and running with faults off turns a chaos suite into a suite that
+	// exercises nothing and still reports green - the one failure mode a fault
+	// injector must never have.
+	for (const [old, current] of [['buggify', 'faultMode'], ['buggifyProbability', 'faultProbability']]) { // vocabulary-allow: a rename guard must name the superseded option in order to catch it
+		if (config[old] !== undefined) {
+			throw new Error(
+				`sim swarm: \`${old}\` was renamed to \`${current}\`. Accepting it silently ` +
+				'would run the swarm with faults disabled and still report success.'
+			);
+		}
+	}
+	const faultMode = config.faultMode || 'off';
+	const faultProbability = config.faultProbability ?? 0.25;
 	const checkRatio = config.checkRatio ?? 0;
 	const faultProfile = config.faultProfile || {};
 
@@ -904,9 +916,9 @@ async function swarm(config, runOne, replayOne) {
 	for (let i = 0; i < seeds.length; i++) {
 		const seed = seeds[i];
 
-		let buggified = buggify === 'on';
-		if (buggify === 'random') buggified = createSeededRng(seed + ':buggify').float() < buggifyProbability;
-		const relayFaults = buggified ? { ...(base.relayFaults || {}), ...faultProfile } : (base.relayFaults || {});
+		let faulted = faultMode === 'on';
+		if (faultMode === 'random') faulted = createSeededRng(seed + ':faultmode').float() < faultProbability;
+		const relayFaults = faulted ? { ...(base.relayFaults || {}), ...faultProfile } : (base.relayFaults || {});
 
 		const result = await runOne({ ...base, seed, relayFaults });
 		if (gitCommit === null && result.gitCommit) gitCommit = result.gitCommit;
@@ -923,7 +935,7 @@ async function swarm(config, runOne, replayOne) {
 		const run = {
 			seed,
 			ok: !failed && reproduced !== false,
-			buggified,
+			faulted,
 			fingerprint: runFingerprint(result),
 			violations: (result.invariantViolations || []).length,
 			fatals: (result.fatals || []).length,
@@ -944,8 +956,8 @@ async function swarm(config, runOne, replayOne) {
 			failed: failingSeeds.length,
 			firstFailingSeed: failingSeeds.length ? failingSeeds[0] : null,
 			failingSeeds,
-			buggify,
-			buggified: runs.filter((r) => r.buggified).length,
+			faultMode,
+			faulted: runs.filter((r) => r.faulted).length,
 			determinismChecks,
 			determinismFailures,
 			determinismFailingSeeds,
@@ -959,15 +971,15 @@ async function swarm(config, runOne, replayOne) {
 /**
  * Run a swarm of seeds against the redis-backed cluster sim. Same contract as
  * the adapter's runSimSwarm: a seed range (`count`/`startSeed`) or explicit
- * `seeds`, a `buggify` knob (off/on/random + `faultProfile` layered onto the
+ * `seeds`, a `faultMode` knob (off/on/random + `faultProfile` layered onto the
  * redis pub/sub relay), `checkRatio` for a determinism re-check, and an
  * `onResult` progress callback. Returns `{ summary, runs }`.
  *
  * @param {{
  *   seeds?: Array<string | number>, count?: number, startSeed?: number,
  *   base?: import('./sim.d.ts').SimRedisConfig,
- *   buggify?: 'off' | 'on' | 'random', faultProfile?: object,
- *   buggifyProbability?: number, checkRatio?: number, gitCommit?: string,
+ *   faultMode?: 'off' | 'on' | 'random', faultProfile?: object,
+ *   faultProbability?: number, checkRatio?: number, gitCommit?: string,
  *   onResult?: (run: any, index: number) => void
  * }} [config]
  */
@@ -982,8 +994,8 @@ export function runRedisSimSwarm(config = {}) {
  * @param {{
  *   seeds?: Array<string | number>, count?: number, startSeed?: number,
  *   base?: import('./sim.d.ts').SimPgConfig,
- *   buggify?: 'off' | 'on' | 'random', faultProfile?: object,
- *   buggifyProbability?: number, checkRatio?: number, gitCommit?: string,
+ *   faultMode?: 'off' | 'on' | 'random', faultProfile?: object,
+ *   faultProbability?: number, checkRatio?: number, gitCommit?: string,
  *   onResult?: (run: any, index: number) => void
  * }} [config]
  */

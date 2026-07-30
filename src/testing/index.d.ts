@@ -76,7 +76,15 @@ export interface MockPlatform {
 	/** All `unsubscribe()` calls recorded as `{ ws, topic }`. Returns `false` (no-op) by default. */
 	unsubscribed: Array<{ ws: any; topic: string }>;
 	/** All `checkSubscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
-	checkedSubscribe: Array<{ ws: any; topic: string }>;
+	/**
+	 * Every `checkSubscribe` call, including the third argument. `options`
+	 * is what distinguishes an OBSERVER lane (`{ requireGrant: true }` - may
+	 * this connection SEE this topic) from a grant-establishing one; a mock
+	 * that dropped it made that distinction untestable.
+	 */
+	checkedSubscribe: Array<{ ws: any; topic: string; options?: { requireGrant?: boolean } }>;
+	/** Verdict `checkSubscribe` returns: `null` allows, a string denies. */
+	checkSubscribeDenial: string | null;
 	connections: number;
 	requestId: string;
 	/** Mirrors the adapter default of 1 MB; reassign directly to test other caps. */

@@ -11,8 +11,13 @@ export interface CapabilityCookieOptions {
 	cookieName?: string;
 	/** Set the `Secure` attribute. @default true */
 	secure?: boolean;
-	/** SameSite policy. @default 'Lax' */
-	sameSite?: 'Strict' | 'Lax' | 'None';
+	/**
+	 * SameSite policy, matched case-insensitively and emitted in canonical
+	 * casing - `'lax'` works and is sent as `SameSite=Lax`. Only the three
+	 * RFC 6265 values are accepted; anything else throws at construction.
+	 * @default 'Lax'
+	 */
+	sameSite?: 'Strict' | 'Lax' | 'None' | (string & {});
 	/** Cookie path. @default '/' */
 	path?: string;
 	/**

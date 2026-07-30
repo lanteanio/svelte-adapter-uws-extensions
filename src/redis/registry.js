@@ -39,6 +39,7 @@ import {
 	clearIntervalTimer
 } from '../shared/runtime.js';
 import { assert } from '../shared/assert.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
@@ -72,7 +73,8 @@ return 0
  * @property {string} [keyPrefix=''] - Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`.
  * @property {number} [ttl=90] - Expiry on registry entries in seconds. Should be greater than `heartbeat * 3` so a missed beat doesn't drop a live user.
  * @property {number} [heartbeat=30000] - Refresh interval in ms.
- * @property {number} [requestTimeoutMs=5000] - Default timeout for `request(...)`.
+ * @property {number} [requestTimeoutMs=5000] - Default timeout for `request(...)` when the call supplies no `timeoutMs`. It does NOT bound a bus-supplied inbound timeout: that has its own fixed 60s ceiling, because clamping it to this default would turn a deliberate per-call `{ timeoutMs: 30000 }` into a 5s failure whenever the target socket happens to be owned by a peer.
+ * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound bus envelopes larger than this many bytes BEFORE `JSON.parse` runs, and refuse to publish outbound envelopes past the same bound (every peer would drop them on receipt). Defends against bus-side DoS in shared-Redis deployments.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker for Redis operations.
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics] - Optional Prometheus metrics registry.
  */
@@ -99,6 +101,17 @@ return 0
 const DEFAULT_TTL_SEC = 90;
 const DEFAULT_HEARTBEAT_MS = 30000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+
+/**
+ * Ceiling for a bus-supplied request timeout, independent of
+ * `requestTimeoutMs`. The two are different jobs: `requestTimeoutMs` is how
+ * long THIS instance waits by default, while this is the longest a peer may
+ * ask this instance to hold a socket busy. Clamping to the default instead
+ * would silently cap a deliberate per-call `{ timeoutMs }` override - but
+ * only when the target user happens to live on another instance, so the
+ * same call would succeed or time out depending on where a reconnect landed.
+ */
+const MAX_INBOUND_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * Create a cluster-aware connection registry.
@@ -176,6 +189,7 @@ export function createConnectionRegistry(client, options) {
 	const mCoalesced = m?.counter('push_coalesced_total', 'Cluster coalesced sends by outcome', ['result']);
 	const mSends = m?.counter('push_sends_total', 'Cluster sends by outcome', ['result']);
 	const mSendTo = m?.counter('push_sendto_total', 'Cluster attribute-targeted broadcasts by outcome', ['result']);
+	const mBusDropped = m?.counter('push_bus_dropped_total', 'Inbound bus envelopes dropped at the boundary by reason', ['reason']);
 
 	function userKey(userId) {
 		return client.key(keyPrefix + 'conns:' + userId);
@@ -183,6 +197,60 @@ export function createConnectionRegistry(client, options) {
 	function sessionKey(sessionId) {
 		return client.key(keyPrefix + 'sess:' + sessionId);
 	}
+	// A reply channel is addressed by instance id, and an instance id is
+	// exactly what `randomBytes(8).toString('hex')` produces. Anything else
+	// on an inbound `replyTo` is a foreign publisher steering this
+	// instance's RPC RESULT at a channel of its choosing: the request runs
+	// against a real local socket with attacker-chosen event and data, and
+	// the answer is published wherever it asked. Pin the shape.
+	const INSTANCE_ID_RE = /^[0-9a-f]{16}$/;
+
+	/**
+	 * Clamp a bus-supplied request timeout into this instance's own bound.
+	 * An unbounded value from the wire pins a pending slot for as long as
+	 * the sender likes.
+	 *
+	 * The bound is the GREATER of `MAX_INBOUND_REQUEST_TIMEOUT_MS` and this
+	 * instance's own `requestTimeoutMs` - never `requestTimeoutMs` alone.
+	 * That option is this instance's DEFAULT wait, and clamping to it turns
+	 * a legitimate `request(..., { timeoutMs: 30000 })` into a 5 s failure
+	 * whenever the target socket happens to be owned by a peer: the same
+	 * call, same code, outcome flipping on a reconnect.
+	 *
+	 * Taking the greater of the two is what keeps that asymmetry from
+	 * reappearing at 60 s on a deployment whose RPCs are legitimately longer.
+	 * An operator who configured a 10-minute default has already accepted a
+	 * pending slot held that long, so a peer gains nothing here it could not
+	 * get by calling this instance directly - which is why the ceiling is not
+	 * absolute. It is a floor under the bound, not a cap on the operator.
+	 * @param {unknown} ms
+	 * @returns {number}
+	 */
+	function inboundTimeoutMs(ms) {
+		if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 1) return defaultRequestTimeoutMs;
+		return Math.min(ms, Math.max(MAX_INBOUND_REQUEST_TIMEOUT_MS, defaultRequestTimeoutMs));
+	}
+
+	/**
+	 * Serialize an outbound bus envelope, refusing what the receiving side
+	 * would drop. Every peer enforces the same `maxEnvelopeBytes` on the way
+	 * in, so publishing past it reaches local subscribers and silently
+	 * nobody else. The sender is the only side in a position to report that,
+	 * so it throws rather than emitting a frame into a black hole.
+	 * @param {any} envelope
+	 * @returns {string}
+	 */
+	function encodeEnvelope(envelope) {
+		const raw = JSON.stringify(envelope);
+		if (Buffer.byteLength(raw) > maxEnvelopeBytes) {
+			throw new Error(
+				`registry: outbound "${envelope?.type ?? 'event'}" envelope exceeds maxEnvelopeBytes ` +
+				`(${maxEnvelopeBytes} bytes); every peer would drop it on receipt`
+			);
+		}
+		return raw;
+	}
+
 	function pushChannel(targetInstanceId) {
 		return client.key(keyPrefix + '__push:' + targetInstanceId);
 	}
@@ -191,6 +259,11 @@ export function createConnectionRegistry(client, options) {
 	}
 	const ownPushChannel = pushChannel(instanceId);
 	const eventsChannel = client.key(keyPrefix + '__registry-events');
+	// Inbound bus guard: both channels accept messages from a shared
+	// transport, so cap raw bytes before JSON.parse like every sibling bus
+	// module. Per-type shape checks live in the handlers.
+	const busValidator = createBusValidator({ label: 'registry', maxBytes: options.maxEnvelopeBytes });
+	const maxEnvelopeBytes = busValidator.maxBytes;
 
 	/**
 	 * Local sessionId -> ws map. Used by the receive path to resolve which
@@ -338,7 +411,7 @@ export function createConnectionRegistry(client, options) {
 	/**
 	 * Coerce attribute values to strings for index-key consistency. Numbers
 	 * and booleans round-trip via `String()`; objects/arrays/null are
-	 * dropped (shallow values only per credo rule 1).
+	 * dropped (shallow values only).
 	 *
 	 * @param {Record<string, unknown> | null | undefined} raw
 	 * @returns {Record<string, string>}
@@ -425,8 +498,19 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	async function publishEvent(envelope) {
+		// Encoded outside the try so an over-cap envelope is not reported to
+		// the breaker as a Redis fault. Index events are genuinely
+		// best-effort - callers do not await an outcome - so this one is
+		// dropped rather than thrown, but it must not open the circuit and
+		// take the heartbeat down with it.
+		let raw;
 		try {
-			await redis.publish(eventsChannel, JSON.stringify(envelope));
+			raw = encodeEnvelope(envelope);
+		} catch {
+			return;
+		}
+		try {
+			await redis.publish(eventsChannel, raw);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -549,12 +633,14 @@ export function createConnectionRegistry(client, options) {
 		});
 		subscriber.on('message', (ch, raw) => {
 			if (ch === ownPushChannel) {
+				if (!busValidator.acceptRaw(raw)) return;
 				let envelope;
 				try { envelope = JSON.parse(raw); } catch { return; }
 				handleInbound(envelope);
 				return;
 			}
 			if (ch === eventsChannel) {
+				if (!busValidator.acceptRaw(raw)) return;
 				let envelope;
 				try { envelope = JSON.parse(raw); } catch { return; }
 				handleRegistryEvent(envelope);
@@ -659,11 +745,25 @@ export function createConnectionRegistry(client, options) {
 		if (!envelope || typeof envelope !== 'object') return;
 		const { type, userId, instanceId: ownerInstanceId } = envelope;
 		if (typeof userId !== 'string' || typeof ownerInstanceId !== 'string') return;
-		assert(
-			type === 'open' || type === 'close' || type === 'forget',
-			'registry.events.payload-type',
-			{ type }
-		);
+		// An owner id becomes the routing target for that user's `sendTo` and
+		// `send` traffic, so it needs the same shape pin `replyTo` gets. A
+		// single forged `open` naming an id nobody listens on redirects a
+		// LOCALLY connected user's frames to a dead push channel, and the
+		// blackhole persists until that user reconnects.
+		if (!INSTANCE_ID_RE.test(ownerInstanceId)) {
+			mBusDropped?.inc({ reason: 'instance_id' });
+			return;
+		}
+		// Drop an unknown type quietly. This channel is reachable by anyone
+		// with bus write access, and the previous `assert` here logged once
+		// per envelope in production (an unbounded log amplifier from a
+		// single forged publisher) and THREW in test mode, inside a
+		// subscriber callback where nothing catches it. The counter carries
+		// the same signal without either failure mode.
+		if (type !== 'open' && type !== 'close' && type !== 'forget') {
+			mBusDropped?.inc({ reason: 'type' });
+			return;
+		}
 		if (type === 'open') {
 			const attrs = normalizeAttrs(envelope.attrs);
 			applyOpenEvent(userId, ownerInstanceId, attrs);
@@ -763,8 +863,16 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	async function handleInboundRequest(env) {
-		const { ref, sessionId, event, data, replyTo, timeoutMs } = env;
-		if (typeof ref !== 'string' || typeof event !== 'string' || typeof replyTo !== 'string') return;
+		const { ref, sessionId, event, data, replyTo } = env;
+		if (typeof ref !== 'string' || typeof sessionId !== 'string' || typeof event !== 'string') {
+			mBusDropped?.inc({ reason: 'shape' });
+			return;
+		}
+		if (typeof replyTo !== 'string' || !INSTANCE_ID_RE.test(replyTo)) {
+			mBusDropped?.inc({ reason: 'reply_to' });
+			return;
+		}
+		const timeoutMs = inboundTimeoutMs(env.timeoutMs);
 		const ws = sessionToWs.get(sessionId);
 		if (!ws || !activePlatform) {
 			await sendReplyEnvelope(replyTo, ref, undefined, 'offline');
@@ -788,8 +896,16 @@ export function createConnectionRegistry(client, options) {
 	 * unchanged - the session path reuses the userId path's whole reply machinery.
 	 */
 	async function handleInboundSessionRequest(env) {
-		const { ref, sessionId, event, data, replyTo, timeoutMs } = env;
-		if (typeof ref !== 'string' || typeof sessionId !== 'string' || typeof event !== 'string' || typeof replyTo !== 'string') return;
+		const { ref, sessionId, event, data, replyTo } = env;
+		if (typeof ref !== 'string' || typeof sessionId !== 'string' || typeof event !== 'string') {
+			mBusDropped?.inc({ reason: 'shape' });
+			return;
+		}
+		if (typeof replyTo !== 'string' || !INSTANCE_ID_RE.test(replyTo)) {
+			mBusDropped?.inc({ reason: 'reply_to' });
+			return;
+		}
+		const timeoutMs = inboundTimeoutMs(env.timeoutMs);
 		const ws = appSessionToWs.get(sessionId);
 		if (!ws || !activePlatform) {
 			await sendReplyEnvelope(replyTo, ref, undefined, 'offline');
@@ -836,8 +952,19 @@ export function createConnectionRegistry(client, options) {
 		const envelope = error
 			? { type: 'reply', ref, error }
 			: { type: 'reply', ref, data };
+		let raw;
 		try {
-			await redis.publish(pushChannel(replyTo), JSON.stringify(envelope));
+			raw = encodeEnvelope(envelope);
+		} catch (err) {
+			// An oversized RESULT would otherwise strand the origin on a full
+			// timeout with no idea why. Answer with the reason instead: the
+			// error envelope is small by construction, so this cannot recurse.
+			if (error) return;
+			await sendReplyEnvelope(replyTo, ref, undefined, err.message);
+			return;
+		}
+		try {
+			await redis.publish(pushChannel(replyTo), raw);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -907,6 +1034,13 @@ export function createConnectionRegistry(client, options) {
 			timeoutMs
 		};
 
+		// Encoded BEFORE the pending slot and timer exist. Encoding inside the
+		// executor still rejects the caller, but only after registering a slot
+		// and a timer that nothing then clears: the request occupies the
+		// pending bound until it fires and reports a `timeout` outcome for a
+		// request that was never sent.
+		const raw = encodeEnvelope(envelope);
+
 		return new Promise((resolve, reject) => {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
@@ -916,7 +1050,7 @@ export function createConnectionRegistry(client, options) {
 			if (timer.unref) timer.unref();
 			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
 
-			redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope))
+			redis.publish(pushChannel(entry.instanceId), raw)
 				.then(() => breaker?.success())
 				.catch((err) => {
 					breaker?.failure(err);
@@ -997,6 +1131,10 @@ export function createConnectionRegistry(client, options) {
 			timeoutMs
 		};
 
+		// Encoded before the pending slot and timer exist, for the reason
+		// spelled out in `request`.
+		const raw = encodeEnvelope(envelope);
+
 		return new Promise((resolve, reject) => {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
@@ -1006,7 +1144,7 @@ export function createConnectionRegistry(client, options) {
 			if (timer.unref) timer.unref();
 			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
 
-			redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope))
+			redis.publish(pushChannel(entry.instanceId), raw)
 				.then(() => breaker?.success())
 				.catch((err) => {
 					breaker?.failure(err);
@@ -1066,8 +1204,12 @@ export function createConnectionRegistry(client, options) {
 			event,
 			data
 		};
+		// Encoded outside the try, for the reason spelled out in `send`: an
+		// over-cap envelope caught by the Redis handler is a silent drop the
+		// caller is told nothing about.
+		const raw = encodeEnvelope(envelope);
 		try {
-			await redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope));
+			await redis.publish(pushChannel(entry.instanceId), raw);
 			breaker?.success();
 			mCoalesced?.inc({ result: 'ok' });
 		} catch (err) {
@@ -1121,8 +1263,14 @@ export function createConnectionRegistry(client, options) {
 			event,
 			data
 		};
+		// Encoded OUTSIDE the try. Inside it, an over-cap envelope is caught by
+		// the Redis-failure handler: the caller's await resolves normally while
+		// the message was never published, and the breaker is told Redis failed
+		// when it is perfectly healthy. Refusing a payload is the sender's own
+		// contract (see encodeEnvelope), so it belongs to the caller.
+		const raw = encodeEnvelope(envelope);
 		try {
-			await redis.publish(pushChannel(entry.instanceId), JSON.stringify(envelope));
+			await redis.publish(pushChannel(entry.instanceId), raw);
 			breaker?.success();
 			mSends?.inc({ result: 'ok' });
 		} catch (err) {
@@ -1193,9 +1341,20 @@ export function createConnectionRegistry(client, options) {
 		// Group matching userIds by their owning instance. Users without a
 		// recorded owner (registered locally only, before the events
 		// channel propagated) fall into the self bucket so we still deliver.
+		//
+		// A LOCALLY connected user is owned here, whatever the events channel
+		// says. The inbound side already treats `localUsers` as authoritative;
+		// the sender side reading `userToInstance` first is what let a single
+		// forged `open` - with a well-formed id, so the shape pin does not see
+		// it - route a live local user's frames to a channel nobody listens on
+		// until that user reconnects. If the local entry is instead a stale
+		// one for a user who really did migrate, the socket lookup below finds
+		// nothing and the frame is skipped, which is the same
+		// single-best-effort-miss the eventual-consistency contract already
+		// documents for that window.
 		const byOwner = new Map();
 		for (const userId of matches) {
-			const owner = userToInstance.get(userId) || instanceId;
+			const owner = localUsers.has(userId) ? instanceId : (userToInstance.get(userId) || instanceId);
 			let bucket = byOwner.get(owner);
 			if (!bucket) {
 				bucket = [];
@@ -1205,30 +1364,52 @@ export function createConnectionRegistry(client, options) {
 		}
 
 		await ensureSubscriber(activePlatform);
-		const envelope = { type: 'sendTo', criteria: norm, topic, event, data };
+
+		// Self bucket first, and never gated on the envelope encode. The
+		// encode bounds the REDIS envelope, so refusing an oversized payload
+		// before this loop also cancels delivery to sockets on THIS instance,
+		// which need no envelope at all - on a single-instance deployment
+		// that is every recipient, and sendTo fails where it used to work.
+		const localUserIds = byOwner.get(instanceId);
+		if (localUserIds && activePlatform) {
+			for (const userId of localUserIds) {
+				const sessionId = localUsers.get(userId);
+				if (!sessionId) continue;
+				const ws = sessionToWs.get(sessionId);
+				if (!ws) continue;
+				try {
+					activePlatform.send(ws, topic, event, data);
+				} catch {
+					// fire-and-forget on the wire
+				}
+			}
+		}
 
 		let publishErrored = false;
 		const remotePublishes = [];
+		// Encoded once, lazily, and only when a remote bucket actually exists.
+		// Computing it on the first remote iteration still puts the encode
+		// ahead of every publish, so an oversized payload refuses before any
+		// peer has been written to rather than after a partial fan-out the
+		// caller cannot distinguish from a complete one.
+		let raw;
 
-		for (const [owner, userIds] of byOwner) {
-			if (owner === instanceId) {
-				// Self bucket: iterate locally, no Redis hop.
-				if (!activePlatform) continue;
-				for (const userId of userIds) {
-					const sessionId = localUsers.get(userId);
-					if (!sessionId) continue;
-					const ws = sessionToWs.get(sessionId);
-					if (!ws) continue;
-					try {
-						activePlatform.send(ws, topic, event, data);
-					} catch {
-						// fire-and-forget on the wire
-					}
+		for (const owner of byOwner.keys()) {
+			if (owner === instanceId) continue;
+			if (raw === undefined) {
+				try {
+					raw = encodeEnvelope({ type: 'sendTo', criteria: norm, topic, event, data });
+				} catch (err) {
+					// Local matches were already served above, so this call both
+					// delivered and failed. Counting it is what tells an operator
+					// the two happened together - and a retry with a smaller
+					// payload will deliver to those local users a second time.
+					mSendTo?.inc({ result: 'refused' });
+					throw err;
 				}
-				continue;
 			}
 			remotePublishes.push(
-				redis.publish(pushChannel(owner), JSON.stringify(envelope))
+				redis.publish(pushChannel(owner), raw)
 					.then(() => breaker?.success())
 					.catch((err) => {
 						breaker?.failure(err);

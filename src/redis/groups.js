@@ -24,6 +24,7 @@ import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
 import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
+import { createBusValidator } from '../shared/bus-validate.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -102,6 +103,7 @@ return {1, unpack(live)}
  * @property {number} [maxMembers=Infinity] - Maximum members allowed
  * @property {Record<string, any>} [meta] - Initial group metadata
  * @property {number} [memberTtl=120] - Member entry TTL in seconds. Entries from crashed instances expire after this.
+ * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound bus envelopes larger than this many bytes BEFORE `JSON.parse` runs, and refuse to publish outbound events past the same bound (every peer would drop them on receipt). Defends against bus-side DoS in shared-Redis deployments.
  * @property {(ws: any, role: GroupRole) => void} [onJoin]
  * @property {(ws: any, role: GroupRole) => void} [onLeave]
  * @property {(ws: any, role: GroupRole) => void} [onFull]
@@ -207,6 +209,17 @@ export function createGroup(client, name, options = {}) {
 	const cleanupCmd = evalCachedName(redis, CLEANUP_SCRIPT);
 	const heartbeatTimer = setIntervalTimer(() => {
 		if (b && !b.isHealthy) return;
+		// Retry a close whose authoritative flag was unreadable when its bus
+		// event arrived, so a Redis blip delays the local close instead of
+		// losing it (this instance would otherwise keep its members
+		// subscribed and keep re-adding them to the roster below).
+		if (closeVerifyPending && subscribedPlatform) {
+			const platform = subscribedPlatform;
+			const data = pendingCloseData;
+			eventChain = eventChain
+				.then(() => verifyAndLatchClose(platform, data))
+				.catch(() => { /* retried on the next beat */ });
+		}
 		const nowTs = now();
 		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
@@ -230,6 +243,148 @@ export function createGroup(client, name, options = {}) {
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let subscribedPlatform = null;
 
+	// Inbound bus guard: the event channel accepts messages from a shared
+	// transport, so cap raw bytes before JSON.parse like every sibling bus
+	// module.
+	const busValidator = createBusValidator({ label: 'redis group', maxBytes: options.maxEnvelopeBytes });
+	const maxEnvelopeBytes = busValidator.maxBytes;
+
+	// Inbound events are applied strictly in arrival order through this
+	// chain. CLOSE must consult Redis before it may latch, and without the
+	// chain that await would let events published after the close overtake
+	// it and reach members the close had already removed.
+	let eventChain = Promise.resolve();
+
+	// Set when a CLOSE arrived but its authoritative flag could not be read.
+	// Latching an unverifiable close would let a forged bus event brick the
+	// group; dropping it would lose a real close forever. So it is held and
+	// retried on the heartbeat until Redis answers one way or the other.
+	let closeVerifyPending = false;
+	let pendingCloseData = null;
+
+	// Set by destroy(). Every await in the close path is a window in which the
+	// group can be torn down underneath it, and the platform reference these
+	// handlers carry was captured before that happened.
+	let destroyed = false;
+
+	// CLOSE coalescing state (see verifyCloseCoalesced). `closeQueued` means a
+	// verification is on the chain or running; `closeVerifyStarted` means it
+	// has begun its read, so a newly arrived CLOSE needs a follow-up rather
+	// than being folded into it.
+	let closeQueued = false;
+	let closeVerifyStarted = false;
+	let closeArrivedDuringVerify = false;
+	let coalescedCloseData = null;
+
+	function applyClose(platform, data) {
+		// `platform` was captured at dispatch, so nulling `subscribedPlatform`
+		// in destroy() does not reach it - an event already on the chain, or
+		// one sitting behind the flag read below, still arrives here with a
+		// live reference and publishes to a torn-down group. The old handler
+		// was synchronous and could not be caught out this way; making the
+		// close path async is what opened it.
+		if (destroyed) return;
+		isClosed = true;
+		closeVerifyPending = false;
+		try {
+			platform?.publish(internalTopic, EVENTS.CLOSE, data, { relay: false });
+		} catch { /* platform torn down mid-close */ }
+		for (const [ws] of localMembers) {
+			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+			removeWsSubscription(ws, internalTopic);
+		}
+		localMembers.clear();
+		if (onClose) onClose();
+	}
+
+	/**
+	 * CLOSE is authoritative in Redis, not on the bus. The closing instance
+	 * sets the flag BEFORE it publishes, so a real close verifies and a
+	 * bus-only forgery finds the flag unset and is dropped.
+	 * @param {any} platform
+	 * @param {any} data
+	 */
+	async function verifyAndLatchClose(platform, data) {
+		if (destroyed) return;
+		// The queued CLOSE is now reading, so a CLOSE arriving from here on
+		// cannot be folded into it - see the coalescing rule in the subscriber.
+		closeVerifyStarted = true;
+		if (isClosed) {
+			// Already closed by another route (a local close, or a join that
+			// found the flag set). Clear the pending retry, or the heartbeat
+			// re-enqueues this no-op onto the event chain forever and pins
+			// the payload it captured.
+			closeVerifyPending = false;
+			pendingCloseData = null;
+			return;
+		}
+		let flag;
+		try {
+			flag = await redis.get(closedKey);
+		} catch {
+			// Unverifiable: hold it for the heartbeat to retry.
+			closeVerifyPending = true;
+			pendingCloseData = data;
+			return;
+		}
+		// Re-checked AFTER the await: destroy() can land while this read is in
+		// flight, and everything below it publishes or invokes onClose.
+		if (destroyed) return;
+		closeVerifyPending = false;
+		if (flag !== '1' || isClosed) return;
+		applyClose(platform, data);
+	}
+
+	/**
+	 * Verify a CLOSE, then honour any CLOSE that arrived while it ran.
+	 *
+	 * Every inbound CLOSE used to cost its own `GET` on the serialized event
+	 * chain, so a burst of forged ones held the chain for a round trip each -
+	 * 50 of them delayed a legitimate event by 3.07s. They cannot simply be
+	 * dropped: the flag is authoritative and a real close published during the
+	 * burst has to latch. Coalescing to at most one FOLLOW-UP verification is
+	 * what makes both true. The follow-up's read happens strictly after the
+	 * arrival of every CLOSE it stands in for, so it observes at least what
+	 * each of them would have, and a burst of any size costs two reads rather
+	 * than N.
+	 * @param {any} platform
+	 * @param {any} data
+	 */
+	async function verifyCloseCoalesced(platform, data) {
+		await verifyAndLatchClose(platform, data);
+		while (closeArrivedDuringVerify && !isClosed && !destroyed) {
+			closeArrivedDuringVerify = false;
+			const followUp = coalescedCloseData;
+			closeVerifyStarted = false;
+			await verifyAndLatchClose(platform, followUp);
+		}
+		closeVerifyStarted = false;
+		closeQueued = false;
+	}
+
+	/**
+	 * @param {any} platform - Captured at dispatch: `subscribedPlatform` can
+	 *   be nulled by destroy() while this sits behind an await.
+	 * @param {any} parsed
+	 */
+	async function applyEvent(platform, parsed) {
+		// Events queued before destroy() are still on the chain, holding the
+		// platform they captured.
+		if (destroyed) return;
+		if (parsed.event === EVENTS.ROLE_FILTERED) {
+			const { event, data, role } = parsed.data ?? {};
+			for (const [ws, entry] of localMembers) {
+				if (entry.role === role) platform.send(ws, internalTopic, event, data);
+			}
+			return;
+		}
+		if (parsed.event === EVENTS.CLOSE) {
+			await verifyCloseCoalesced(platform, parsed.data);
+			return;
+		}
+		platform.publish(internalTopic, parsed.event, parsed.data, { relay: false });
+	}
+
 	async function ensureSubscriber(platform) {
 		subscribedPlatform = platform;
 		if (subscriber) return;
@@ -239,33 +394,36 @@ export function createGroup(client, name, options = {}) {
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;
+			if (!busValidator.acceptRaw(message)) return;
+			let parsed;
 			try {
-				const parsed = JSON.parse(message);
-				if (parsed.instanceId === instanceId) return;
-				if (subscribedPlatform) {
-					if (parsed.event === EVENTS.ROLE_FILTERED) {
-						const { event, data, role } = parsed.data;
-						for (const [ws, entry] of localMembers) {
-							if (entry.role === role) {
-								subscribedPlatform.send(ws, internalTopic, event, data);
-							}
-						}
-					} else if (parsed.event === EVENTS.CLOSE) {
-						isClosed = true;
-						subscribedPlatform.publish(internalTopic, EVENTS.CLOSE, parsed.data, { relay: false });
-						for (const [ws] of localMembers) {
-							try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
-							removeWsSubscription(ws, internalTopic);
-						}
-						localMembers.clear();
-						if (onClose) onClose();
-					} else {
-						subscribedPlatform.publish(internalTopic, parsed.event, parsed.data, { relay: false });
-					}
-				}
+				parsed = JSON.parse(message);
 			} catch {
-				// Malformed, skip
+				return; // malformed
 			}
+			if (!parsed || typeof parsed !== 'object' || typeof parsed.event !== 'string') return;
+			if (parsed.instanceId === instanceId) return;
+			if (destroyed) return;
+			const platform = subscribedPlatform;
+			if (!platform) return;
+			if (parsed.event === EVENTS.CLOSE) {
+				// Fold into the verification already queued or running rather
+				// than adding another round trip to the chain. If it has not
+				// started reading, its own read still happens after this
+				// message arrived and covers it; if it has, the loop in
+				// verifyCloseCoalesced schedules exactly one follow-up.
+				if (closeQueued) {
+					coalescedCloseData = parsed.data;
+					if (closeVerifyStarted) closeArrivedDuringVerify = true;
+					return;
+				}
+				closeQueued = true;
+				closeVerifyStarted = false;
+				closeArrivedDuringVerify = false;
+			}
+			eventChain = eventChain
+				.then(() => applyEvent(platform, parsed))
+				.catch(() => { /* one bad event must not break the chain */ });
 		});
 		try {
 			await sub.subscribe(eventChannel);
@@ -276,9 +434,34 @@ export function createGroup(client, name, options = {}) {
 		subscriber = sub;
 	}
 
-	async function publishEvent(event, data) {
+	/**
+	 * Hold outbound events to the bound every peer enforces on the way in.
+	 * Called BEFORE any local fan-out, so an oversized payload fails the
+	 * caller outright instead of reaching local members and silently no
+	 * remote instance - a split-brain the sender is the only side that can
+	 * detect.
+	 * @param {string} event
+	 * @param {any} data
+	 * @returns {string} The encoded envelope.
+	 */
+	function encodeEvent(event, data) {
 		const msg = JSON.stringify({ instanceId, event, data });
-		await redis.publish(eventChannel, msg);
+		if (Buffer.byteLength(msg) > maxEnvelopeBytes) {
+			throw new Error(
+				`groups: "${event}" envelope exceeds maxEnvelopeBytes (${maxEnvelopeBytes} bytes); ` +
+				'every peer instance would drop it on receipt'
+			);
+		}
+		return msg;
+	}
+
+	/** Publish an envelope already encoded (and therefore already bounded). */
+	async function publishRaw(raw) {
+		await redis.publish(eventChannel, raw);
+	}
+
+	async function publishEvent(event, data) {
+		await publishRaw(encodeEvent(event, data));
 	}
 
 	/** @type {RedisGroup} */
@@ -468,12 +651,20 @@ export function createGroup(client, name, options = {}) {
 
 		async publish(platform, event, data, role) {
 			if (isClosed) return;
+			// Encode the envelope that will ACTUALLY be published, before the
+			// local fan-out below. Checking a differently-shaped envelope
+			// would let the role-filtered wrapper (which is ~50 bytes larger)
+			// pass the check and then be dropped by every peer, delivering
+			// locally and nowhere else with the caller told nothing.
+			const raw = role == null
+				? encodeEvent(event, data)
+				: encodeEvent(EVENTS.ROLE_FILTERED, { event, data, role });
 			mPublishes?.inc({ group: name });
 
 			if (role == null) {
 				// Broadcast to all via topic
 				platform.publish(internalTopic, event, data);
-				await publishEvent(event, data).catch(() => {});
+				await publishRaw(raw).catch(() => {});
 				return;
 			}
 
@@ -485,7 +676,7 @@ export function createGroup(client, name, options = {}) {
 			}
 			// For remote instances, publish with role filter info
 			// Remote subscriber handler will filter by role locally
-			await publishEvent(EVENTS.ROLE_FILTERED, { event, data, role }).catch(() => {});
+			await publishRaw(raw).catch(() => {});
 		},
 
 		send(platform, ws, event, data) {
@@ -554,6 +745,12 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		destroy() {
+			// Set BEFORE tearing anything down, so an event already on the
+			// chain - or one behind the authoritative flag read - sees it and
+			// declines to publish or fire onClose against a dead group.
+			destroyed = true;
+			closeVerifyPending = false;
+			pendingCloseData = null;
 			clearIntervalTimer(heartbeatTimer);
 			if (subscriber) {
 				const sub = subscriber;

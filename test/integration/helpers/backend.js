@@ -6,7 +6,7 @@
 //   - 'cluster' : a real Redis Cluster (3 masters + 3 replicas) via clusterClient,
 //                 wrapped in the SAME { redis, key, duplicate, quit } shape the
 //                 suites already consume, so a single set of suites verifies both
-//                 deployments (no duplicated files - credo rule 11).
+//                 deployments (no duplicated files).
 //
 // In 'solo' mode this is byte-for-byte the construction the suites used before,
 // so the standalone tier is unchanged. In 'cluster' mode the wrapper routes

@@ -60,12 +60,13 @@ import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
-import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
+import { addWsSubscription, removeWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
+import { isReservedPresenceField, newFieldMap } from './presence/field-policy.js';
 import { createDiffBuffer } from './presence/diff-buffer.js';
 import { createSubscriber } from './presence/subscriber.js';
 import { createPresenceState } from './presence/state.js';
@@ -78,11 +79,12 @@ export { WsClosedError };
 
 /**
  * @typedef {Object} RedisPresenceOptions
- * @property {string} [key='id'] - Field in selected data for user dedup
- * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData
+ * @property {string} [key='id'] - Field in projected data for user dedup. A field dropped by the default projection falls back to a per-connection key so private data cannot leak as a roster property name.
+ * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData. By default, recursively drops internal keys, credentials, common personal data, and request transport metadata. An explicit function can intentionally admit fields; its result still passes through stripInternal().
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
  * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its per-topic presence hash key expires (instance-died scenario where every field of the hash has expired). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired). With per-field TTLs, individual field expiry does NOT emit a key-expired notification; only whole-key expiry does, which happens when every field of the topic hash has expired (no live instances presenting any user on this topic).
+ * @property {number} [maxEnvelopeBytes=1048576] - Byte ceiling for one cross-instance presence envelope, enforced before inbound JSON.parse and before outbound publish. Oversized outbound lifecycle events warn and drop rather than failing the connection operation.
  * @property {string[]} [transient] - Dynamic field names (set via `update()`) that are broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or the heartbeat roster. A (re)joining or swept-then-readded client therefore never inherits a possibly-stale transient value - a disconnected typer leaves no stuck indicator across the cluster. Identity fields (from `select`) and durable `update()` fields not listed here persist and ride the snapshot normally. Default: none (every `update()` field is durable). Matches the bundled in-memory presence plugin.
  */
 
@@ -117,8 +119,8 @@ export { WsClosedError };
 export function createPresence(client, options = {}) {
 	const ctx = createPresenceState(client, options);
 	const {
-		keyField, select, heartbeatInterval, presenceTtlMs, transientFields, publicData,
-		emit, emitTo, instanceId, redis, keyspaceNotifications, ensureRedis74, b, mt,
+		keyField, select, sanitizeSelected, heartbeatInterval, presenceTtlMs, transientFields, publicData,
+		emit, emitTo, instanceId, redis, keyspaceNotifications, maxEnvelopeBytes, ensureRedis74, b, mt,
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
 		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, mSelfPreserveActive, mSelfPreserveHeld,
 		mSelfPreserveActivations, selfPreservation, warnSensitive, wsTopics, localCounts,
@@ -131,8 +133,15 @@ export function createPresence(client, options = {}) {
 	let connCounter = 0;
 
 	function resolveKey(data) {
-		if (data && keyField in data && data[keyField] != null) {
-			return String(data[keyField]);
+		if (data && (typeof data === 'object' || typeof data === 'function') && keyField in data && data[keyField] != null) {
+			const key = String(data[keyField]);
+			// A roster key is a plain-object property name in every snapshot,
+			// diff and accumulator downstream. `__proto__` there would target
+			// the prototype instead of the roster (the entry silently vanishes
+			// from state and diffs), so a user whose keyField carries one of
+			// these falls back to a connection-scoped key, exactly as the
+			// adapter's presence plugin does.
+			if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype') return key;
 		}
 		return '__conn:' + (++connCounter);
 	}
@@ -284,7 +293,7 @@ export function createPresence(client, options = {}) {
 					// "refresh-existing" branch, but the next diff
 					// or state still reconciles them.
 					/** @type {Record<string, any>} */
-					const dataMap = {};
+					const dataMap = Object.create(null);
 					for (const [userKey, entry] of data) dataMap[userKey] = publicData(entry);
 					emit('__presence:' + topic, 'heartbeat', dataMap, subscriberCtx.activePlatform);
 				}
@@ -303,6 +312,7 @@ export function createPresence(client, options = {}) {
 	const subscriberCtx = createSubscriber({
 		client,
 		instanceId,
+		maxEnvelopeBytes,
 		keyspaceNotifications,
 		bufferDiff,
 		bufferUpdate,
@@ -316,6 +326,16 @@ export function createPresence(client, options = {}) {
 	async function publishEvent(topic, event, payload) {
 		const ch = eventChannel(topic);
 		const msg = JSON.stringify({ instanceId, topic, event, payload });
+		// Hold outbound events to the bound every peer enforces inbound.
+		// Publishing past it fans out locally and to no remote instance,
+		// which reads as a partial roster rather than as an error.
+		if (Buffer.byteLength(msg) > maxEnvelopeBytes) {
+			console.warn(
+				`presence: "${event}" envelope for topic "${topic}" exceeds maxEnvelopeBytes ` +
+				`(${maxEnvelopeBytes} bytes) and was not relayed; peers would drop it on receipt`
+			);
+			return;
+		}
 		await redis.publish(ch, msg).catch(() => {});
 	}
 
@@ -722,7 +742,6 @@ export function createPresence(client, options = {}) {
 
 			const raw = ws.getUserData();
 			const { __subscriptions, remoteAddress, ...safeData } = raw || {};
-			const key = resolveKey(safeData);
 			// Warn first on the raw select output so developers see sensitive
 			// keys their select forwarded (the warning fires once per process
 			// and is the signal that they should tighten the select). Then
@@ -732,7 +751,13 @@ export function createPresence(client, options = {}) {
 			// on the shallow safeData to keep id / name resolution unchanged.
 			const selected = select(safeData);
 			warnSensitive(selected);
-			const data = stripInternal(selected);
+			const data = sanitizeSelected ? stripInternal(selected) : selected;
+			// The key is part of every roster object's wire shape, so it must be
+			// resolved from the projected data rather than the raw connection data.
+			// A default-dropped email/session/ip therefore falls back to __conn:N
+			// instead of leaking as the roster property name. An explicit select is
+			// the deliberate opt-in path for a non-secret custom key.
+			const key = resolveKey(data);
 			let serializedData;
 			try { serializedData = JSON.stringify(data); } catch {
 				throw new Error('redis presence: select() must return JSON-serializable data');
@@ -936,7 +961,7 @@ export function createPresence(client, options = {}) {
 			// client decoder handles both implementations.
 			const entries = parseEntries(all);
 			/** @type {Record<string, Record<string, any>>} */
-			const state = {};
+			const state = Object.create(null);
 			for (const [userKey, entry] of entries) {
 				state[userKey] = publicData(entry);
 			}
@@ -952,6 +977,13 @@ export function createPresence(client, options = {}) {
 			return leaveAll(ws, platform);
 		},
 
+		/**
+		 * Emit the current roster for `topic` to one socket.
+		 * @returns {Promise<string | undefined>} The denial reason when the
+		 * platform refuses the topic, so a wire-subscribe caller can deny the
+		 * subscribe itself instead of only withholding the roster. Existing
+		 * callers that ignore the return value are unaffected.
+		 */
 		async sync(ws, topic, platform) {
 			b?.guard();
 			// Authorize against the REAL topic before granting tap-channel
@@ -960,12 +992,28 @@ export function createPresence(client, options = {}) {
 			// join __presence:{topic} and read its roster, around the wire-level
 			// `__`-subscribe block. Gate it on the same check a wire-subscribe to
 			// `topic` would run, before even opening the cross-instance Redis
-			// subscription. Optional-chained (checkSubscribe was added to the
-			// platform later); the snapshot is low-frequency so the await is fine.
-			if (platform && typeof platform.checkSubscribe === 'function') {
+			// subscription. Fail CLOSED when the platform cannot authorize
+			// entirely: the adapter peer floor has provided checkSubscribe for
+			// many releases, so an absent check means a custom platform.
+			// Degrade availability, never authorization.
+			if (!platform || typeof platform.checkSubscribe !== 'function') return 'FORBIDDEN';
+			{
 				let denial;
-				try { denial = await platform.checkSubscribe(ws, topic); } catch { return; }
-				if (denial) return;
+				// OBSERVER lane: this asks "may this connection SEE the roster
+				// it is requesting?", not "may it be granted the topic".
+				// Without the flag, a pure-grant deployment - wire-subscribe
+				// authorization armed and no app subscribe hook - has no hook
+				// for the gate to consult, so `checkSubscribe` allows every
+				// topic name and this lane hands any connected socket any
+				// room's roster. The peer floor implements the flag and its own
+				// bundled presence sync asks the same question, so this gate is
+				// load-bearing across the supported adapter range.
+				try { denial = await platform.checkSubscribe(ws, topic, OBSERVER_LANE); } catch { return 'FORBIDDEN'; }
+				// `false` is a denial in the adapter's subscribe-hook
+				// vocabulary; reading it as allow would invert the check on
+				// the custom platforms this branch exists for.
+				if (denial === false) return 'FORBIDDEN';
+				if (denial) return denial;
 			}
 			try {
 				await subscribeToTopic(topic, platform);
@@ -984,7 +1032,7 @@ export function createPresence(client, options = {}) {
 			const presenceTopic = '__presence:' + topic;
 			const entries = parseEntries(all);
 			/** @type {Record<string, Record<string, any>>} */
-			const state = {};
+			const state = Object.create(null);
 			for (const [userKey, entry] of entries) {
 				state[userKey] = publicData(entry);
 			}
@@ -1036,18 +1084,20 @@ export function createPresence(client, options = {}) {
 			const topicData = localData.get(topic);
 			const entry = topicData && topicData.get(key);
 			if (!entry) return;
-			if (!entry.fields) entry.fields = {};
+			if (!entry.fields) entry.fields = newFieldMap();
 			// Per-field change detection against this instance's field view. Only
 			// fields whose value actually changed are merged and broadcast (the
 			// field-level delta). Durable and transient changes are split: durable
 			// is persisted to Redis so a cross-instance state read includes it;
 			// transient is relay-only and never persisted.
 			/** @type {Record<string, any>} */
-			const changedDurable = {};
+			const changedDurable = newFieldMap();
 			/** @type {Record<string, any>} */
-			const changedTransient = {};
+			const changedTransient = newFieldMap();
 			let any = false;
 			for (const k of Object.keys(fields)) {
+				// One rule for every fields ingress - see field-policy.js.
+				if (isReservedPresenceField(k)) continue;
 				const v = fields[k];
 				if (!deepEqual(entry.fields[k], v)) {
 					entry.fields[k] = v;
@@ -1173,6 +1223,20 @@ export function createPresence(client, options = {}) {
 		 */
 		async purgeUser(tenantId, userId) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			// The user id is interpolated into the SCAN MATCH glob below, so a
+			// metacharacter in it WIDENS the scan instead of narrowing it:
+			// userId '*' matches every user in every topic. The exact
+			// startsWith/endsWith re-check further down keeps the deletes
+			// correct, so this is scan amplification rather than wrong-row
+			// erasure - but an unbounded SCAN over a large keyspace is its own
+			// problem, and this is the last sibling of the `clear()` pair that
+			// carries the same guard. It throws rather than returning 0 because
+			// the composite forget store settles each leg independently: a
+			// refusal reaches the operator, where a 0 reads as "nothing to
+			// erase" on a right-to-erasure path.
+			if (/[\0*?[\]\\]/.test(userId)) {
+				throw new Error('redis presence: purgeUser user id must not contain NUL or glob metacharacters (* ? [ ] \\)');
+			}
 			const prefix = client.key('presence:user:{');
 			const suffix = '}:' + userId;
 			let keys;
@@ -1254,8 +1318,11 @@ export function createPresence(client, options = {}) {
 			async subscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__presence:')) {
 					const realTopic = topic.slice('__presence:'.length);
-					await tracker.sync(ws, realTopic, platform);
-					return;
+					// Return the denial: the adapter treats anything that is
+					// not `false` or a string as ALLOW, so swallowing it would
+					// withhold the roster while still subscribing the socket
+					// to the tap channel and feeding it every later diff.
+					return await tracker.sync(ws, realTopic, platform);
 				}
 				await tracker.join(ws, topic, platform);
 			},

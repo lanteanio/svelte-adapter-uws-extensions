@@ -961,6 +961,71 @@ describe('redis connection registry', () => {
 		});
 	});
 
+	describe('attributes / sendTo: oversized envelope', () => {
+		it('still delivers to local sockets when no peer needs an envelope', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				maxEnvelopeBytes: 512
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-1', tenantId: 't42' }, 's-1');
+				await local.hooks.open(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+				platform.reset();
+
+				// The cap bounds the REDIS envelope. Every match here lives on
+				// this instance, so no envelope is built at all - encoding up
+				// front would refuse a delivery that needs nothing from Redis,
+				// and on a single-instance deployment that is every recipient.
+				const big = { blob: 'x'.repeat(4096) };
+				await expect(
+					local.sendTo({ tenantId: 't42' }, 'announcements', 'created', big)
+				).resolves.toBeUndefined();
+				expect(platform.sent).toHaveLength(1);
+				expect(platform.sent[0].data).toBe(big);
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		it('delivers locally before refusing an envelope no peer would accept', async () => {
+			const local = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				maxEnvelopeBytes: 512
+			});
+			try {
+				const ws = wsWithSession({ userId: 'u-local', tenantId: 't42' }, 's-1');
+				await local.hooks.open(ws, { platform });
+				await new Promise((r) => setImmediate(r));
+
+				await client.redis.publish(
+					client.key('__registry-events'),
+					JSON.stringify({
+						type: 'open',
+						userId: 'u-remote',
+						instanceId: 'aaaaaaaaaaaaaaa1',
+						attrs: { tenantId: 't42' }
+					})
+				);
+				await new Promise((r) => setImmediate(r));
+				platform.reset();
+
+				const big = { blob: 'x'.repeat(4096) };
+				await expect(
+					local.sendTo({ tenantId: 't42' }, 'a', 'c', big)
+				).rejects.toThrow(/maxEnvelopeBytes/);
+				// The remote bucket is genuinely undeliverable, but the local
+				// socket is reachable without touching Redis and must not be
+				// collateral damage of that refusal.
+				expect(platform.sent).toHaveLength(1);
+			} finally {
+				await local.destroy();
+			}
+		});
+	});
+
 	describe('attributes / sendTo: storage and registry events', () => {
 		it('persists attrs as a JSON-encoded field on the registry hash', async () => {
 			const local = createConnectionRegistry(client, {
@@ -1111,7 +1176,7 @@ describe('redis connection registry', () => {
 					JSON.stringify({
 						type: 'open',
 						userId: 'remote-u',
-						instanceId: 'remote-inst',
+						instanceId: 'aaaaaaaaaaaaaaa1',
 						attrs: { tenantId: 't42' }
 					})
 				);
@@ -1123,9 +1188,9 @@ describe('redis connection registry', () => {
 				const handlers = client._pubsubHandlers;
 				const probe = client.duplicate({ enableReadyCheck: false });
 				probe.on('message', (ch, raw) => {
-					if (ch === client.key('__push:remote-inst')) captured = JSON.parse(raw);
+					if (ch === client.key('__push:aaaaaaaaaaaaaaa1')) captured = JSON.parse(raw);
 				});
-				await probe.subscribe(client.key('__push:remote-inst'));
+				await probe.subscribe(client.key('__push:aaaaaaaaaaaaaaa1'));
 
 				await local.sendTo({ tenantId: 't42' }, 'announcements', 'created', { id: 1 });
 				await new Promise((r) => setImmediate(r));
@@ -1158,7 +1223,7 @@ describe('redis connection registry', () => {
 					JSON.stringify({
 						type: 'open',
 						userId: 'remote-u',
-						instanceId: 'remote-inst',
+						instanceId: 'aaaaaaaaaaaaaaa1',
 						attrs: { tenantId: 't42' }
 					})
 				);
@@ -1169,7 +1234,7 @@ describe('redis connection registry', () => {
 					JSON.stringify({
 						type: 'close',
 						userId: 'remote-u',
-						instanceId: 'remote-inst'
+						instanceId: 'aaaaaaaaaaaaaaa1'
 					})
 				);
 				await new Promise((r) => setImmediate(r));
@@ -1211,29 +1276,29 @@ describe('redis connection registry', () => {
 				const probe = client.duplicate({ enableReadyCheck: false });
 				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
 				await probe.subscribe(
-					client.key('__push:inst-A'),
-					client.key('__push:inst-B')
+					client.key('__push:aaaaaaaaaaaaaaaa'),
+					client.key('__push:bbbbbbbbbbbbbbbb')
 				);
 
-				// Initial registration on tenant 't42' / inst-A.
+				// Initial registration on tenant 't42' / aaaaaaaaaaaaaaaa.
 				await client.redis.publish(
 					client.key('__registry-events'),
 					JSON.stringify({
 						type: 'open',
 						userId: 'mover',
-						instanceId: 'inst-A',
+						instanceId: 'aaaaaaaaaaaaaaaa',
 						attrs: { tenantId: 't42' }
 					})
 				);
 				await new Promise((r) => setImmediate(r));
 
-				// Re-registration on tenant 't99' / inst-B.
+				// Re-registration on tenant 't99' / bbbbbbbbbbbbbbbb.
 				await client.redis.publish(
 					client.key('__registry-events'),
 					JSON.stringify({
 						type: 'open',
 						userId: 'mover',
-						instanceId: 'inst-B',
+						instanceId: 'bbbbbbbbbbbbbbbb',
 						attrs: { tenantId: 't99' }
 					})
 				);
@@ -1245,11 +1310,11 @@ describe('redis connection registry', () => {
 				await new Promise((r) => setImmediate(r));
 				expect(captured).toHaveLength(0);
 
-				// t99 should resolve to one envelope on inst-B's push channel.
+				// t99 should resolve to one envelope on bbbbbbbbbbbbbbbb's push channel.
 				await local.sendTo({ tenantId: 't99' }, 'topic', 'event');
 				await new Promise((r) => setImmediate(r));
 				expect(captured).toHaveLength(1);
-				expect(captured[0].ch).toBe(client.key('__push:inst-B'));
+				expect(captured[0].ch).toBe(client.key('__push:bbbbbbbbbbbbbbbb'));
 
 				const out = await metrics.serialize();
 				expect(out).toMatch(/push_sendto_total\{result="empty"\}\s+1/);
@@ -1267,21 +1332,21 @@ describe('redis connection registry', () => {
 			// Plant entries before any registry boots up.
 			await client.redis.hset(
 				client.key('conns:pre-1'),
-				'instanceId', 'inst-A',
+				'instanceId', 'aaaaaaaaaaaaaaaa',
 				'sessionId', 'pre-1-s',
 				'ts', Date.now(),
 				'attrs', JSON.stringify({ tenantId: 't42', role: 'admin' })
 			);
 			await client.redis.hset(
 				client.key('conns:pre-2'),
-				'instanceId', 'inst-A',
+				'instanceId', 'aaaaaaaaaaaaaaaa',
 				'sessionId', 'pre-2-s',
 				'ts', Date.now(),
 				'attrs', JSON.stringify({ tenantId: 't42', role: 'member' })
 			);
 			await client.redis.hset(
 				client.key('conns:pre-3'),
-				'instanceId', 'inst-B',
+				'instanceId', 'bbbbbbbbbbbbbbbb',
 				'sessionId', 'pre-3-s',
 				'ts', Date.now(),
 				'attrs', JSON.stringify({ tenantId: 't99' })
@@ -1294,7 +1359,7 @@ describe('redis connection registry', () => {
 					captured.push({ ch, env: JSON.parse(raw) });
 				}
 			});
-			await probe.subscribe(client.key('__push:inst-A'), client.key('__push:inst-B'));
+			await probe.subscribe(client.key('__push:aaaaaaaaaaaaaaaa'), client.key('__push:bbbbbbbbbbbbbbbb'));
 
 			const local = createConnectionRegistry(client, {
 				identify: (ws) => ws.getUserData()?.userId,
@@ -1312,8 +1377,8 @@ describe('redis connection registry', () => {
 				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
 				await new Promise((r) => setImmediate(r));
 
-				// Both pre-1 and pre-2 are on inst-A, so one envelope on inst-A.
-				const aEnvs = captured.filter((c) => c.ch === client.key('__push:inst-A'));
+				// Both pre-1 and pre-2 are on aaaaaaaaaaaaaaaa, so one envelope on aaaaaaaaaaaaaaaa.
+				const aEnvs = captured.filter((c) => c.ch === client.key('__push:aaaaaaaaaaaaaaaa'));
 				expect(aEnvs).toHaveLength(1);
 				expect(aEnvs[0].env).toMatchObject({
 					type: 'sendTo',
@@ -1505,9 +1570,9 @@ describe('redis connection registry', () => {
 
 				// Two remote users on instance A, one remote user on instance B.
 				for (const env of [
-					{ userId: 'r-1', instanceId: 'inst-A', attrs: { tenantId: 't42' } },
-					{ userId: 'r-2', instanceId: 'inst-A', attrs: { tenantId: 't42' } },
-					{ userId: 'r-3', instanceId: 'inst-B', attrs: { tenantId: 't42' } }
+					{ userId: 'r-1', instanceId: 'aaaaaaaaaaaaaaaa', attrs: { tenantId: 't42' } },
+					{ userId: 'r-2', instanceId: 'aaaaaaaaaaaaaaaa', attrs: { tenantId: 't42' } },
+					{ userId: 'r-3', instanceId: 'bbbbbbbbbbbbbbbb', attrs: { tenantId: 't42' } }
 				]) {
 					await client.redis.publish(
 						client.key('__registry-events'),
@@ -1520,20 +1585,20 @@ describe('redis connection registry', () => {
 				const probe = client.duplicate({ enableReadyCheck: false });
 				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
 				await probe.subscribe(
-					client.key('__push:inst-A'),
-					client.key('__push:inst-B')
+					client.key('__push:aaaaaaaaaaaaaaaa'),
+					client.key('__push:bbbbbbbbbbbbbbbb')
 				);
 
 				await local.sendTo({ tenantId: 't42' }, 'topic', 'event');
 				await new Promise((r) => setImmediate(r));
 
 				// Two distinct push channels → two envelopes (not three, since
-				// inst-A coalesces r-1 + r-2 into one).
+				// aaaaaaaaaaaaaaaa coalesces r-1 + r-2 into one).
 				expect(captured).toHaveLength(2);
 				const channels = new Set(captured.map((c) => c.ch));
 				expect(channels).toEqual(new Set([
-					client.key('__push:inst-A'),
-					client.key('__push:inst-B')
+					client.key('__push:aaaaaaaaaaaaaaaa'),
+					client.key('__push:bbbbbbbbbbbbbbbb')
 				]));
 
 				await probe.quit().catch(() => probe.disconnect());
@@ -1557,7 +1622,7 @@ describe('redis connection registry', () => {
 					JSON.stringify({
 						type: 'open',
 						userId: 'remote-u',
-						instanceId: 'inst-B',
+						instanceId: 'bbbbbbbbbbbbbbbb',
 						attrs: { tenantId: 't42' }
 					})
 				);
@@ -1566,7 +1631,7 @@ describe('redis connection registry', () => {
 				const captured = [];
 				const probe = client.duplicate({ enableReadyCheck: false });
 				probe.on('message', (ch, raw) => captured.push({ ch, env: JSON.parse(raw) }));
-				await probe.subscribe(client.key('__push:inst-B'));
+				await probe.subscribe(client.key('__push:bbbbbbbbbbbbbbbb'));
 
 				platform.sent.length = 0;
 				await local.sendTo({ tenantId: 't42' }, 'topic', 'event', { x: 1 });

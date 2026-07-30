@@ -146,7 +146,7 @@ export function replayPgSim(reproducer: SimResult): Promise<SimResult>;
 export interface SimSwarmRun {
 	seed: string;
 	ok: boolean;
-	buggified: boolean;
+	faulted: boolean;
 	fingerprint: string;
 	violations: number;
 	fatals: number;
@@ -161,8 +161,8 @@ export interface SimSwarmSummary {
 	failed: number;
 	firstFailingSeed: string | null;
 	failingSeeds: string[];
-	buggify: 'off' | 'on' | 'random';
-	buggified: number;
+	faultMode: 'off' | 'on' | 'random';
+	faulted: number;
 	determinismChecks: number;
 	determinismFailures: number;
 	determinismFailingSeeds: string[];
@@ -185,10 +185,10 @@ export interface SimRedisSwarmConfig {
 	/** Base SimRedisConfig applied to every run (`seed`/`relayFaults` overridden per run). */
 	base?: SimRedisConfig;
 	/** Fault-enablement: 'off' (default), 'on', or 'random' (per-seed seeded coin). */
-	buggify?: 'off' | 'on' | 'random';
-	/** Fault profile layered onto the redis pub/sub relay when a run is buggified. */
+	faultMode?: 'off' | 'on' | 'random';
+	/** Fault profile layered onto the redis pub/sub relay when a run is faulted. */
 	faultProfile?: SimFaults;
-	buggifyProbability?: number;
+	faultProbability?: number;
 	checkRatio?: number;
 	gitCommit?: string;
 	onResult?: (run: SimSwarmRun, index: number) => void;
@@ -199,10 +199,10 @@ export interface SimPgSwarmConfig {
 	count?: number;
 	startSeed?: number;
 	base?: SimPgConfig;
-	buggify?: 'off' | 'on' | 'random';
-	/** Fault profile layered onto the LISTEN/NOTIFY relay when a run is buggified. */
+	faultMode?: 'off' | 'on' | 'random';
+	/** Fault profile layered onto the LISTEN/NOTIFY relay when a run is faulted. */
 	faultProfile?: SimFaults;
-	buggifyProbability?: number;
+	faultProbability?: number;
 	checkRatio?: number;
 	gitCommit?: string;
 	onResult?: (run: SimSwarmRun, index: number) => void;

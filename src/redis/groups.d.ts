@@ -22,6 +22,13 @@ export interface RedisGroupOptions {
 	onClose?: () => void;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
+	/**
+	 * Reject inbound group event envelopes larger than this many bytes BEFORE
+	 * `JSON.parse` runs, and refuse to publish an outbound envelope past the
+	 * same bound - every peer would drop it on receipt.
+	 * @default 1048576
+	 */
+	maxEnvelopeBytes?: number;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
 }
@@ -42,7 +49,15 @@ export interface RedisGroup {
 	/** Remove a member. */
 	leave(ws: any, platform: Platform): Promise<void>;
 
-	/** Broadcast to all members, or filter by role. */
+	/**
+	 * Broadcast to all members, or filter by role.
+	 *
+	 * Rejects when the encoded envelope exceeds `maxEnvelopeBytes`. The
+	 * check runs BEFORE the local fan-out, so an oversized payload reaches
+	 * nobody rather than delivering locally and to no peer - a split-brain
+	 * only the sender can detect. The role-filtered envelope is the one
+	 * measured, since it is the one that gets published.
+	 */
 	publish(platform: Platform, event: string, data?: any, role?: GroupRole): Promise<void>;
 
 	/** Send to a single member (validates membership). */

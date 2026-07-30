@@ -22,13 +22,16 @@
  */
 
 import { createStreamReplay } from './replay-stream.js';
+import { MAX_REPLAY_EPOCH_CACHE_TOPICS } from '../shared/caps.js';
+import { createLruMap } from '../shared/lru-map.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplicationGrouped, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
-import { checkReplayAccess } from '../shared/replay-gate.js';
+import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { decodeSortedSetMember } from '../shared/replay-envelope.js';
+import { topicInTenant } from '../shared/tenant-topic.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
 
@@ -39,6 +42,7 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * @property {'replicated'} [durability] - Opt into per-publish replication signalling. After the write, runs `WAIT minReplicas replicationTimeoutMs`; throws `ReplicationTimeoutError` and skips the local broadcast when fewer than `minReplicas` replicas ack.
  * @property {number} [minReplicas=1] - Minimum replicas that must ack before publish is considered durable. Required when `durability: 'replicated'`.
  * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` blocks indefinitely (Redis WAIT semantics).
+ * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, shared by sorted-set and stream storage.
  */
 
 /**
@@ -135,7 +139,7 @@ export function createReplay(client, options = {}) {
 	// events at purge time (per-topic buffers are bounded, so a scan is cheap).
 	const forgetUserId = options.forgetUserId;
 
-	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, localFanoutOnStorageFailure } =
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, maxDataBytes, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis replay', options);
 
 	const redis = client.redis;
@@ -146,6 +150,10 @@ export function createReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mResumeTopicOverflows = m?.counter(
+		'replay_resume_topic_overflows_total',
+		'Resume frames whose topic set exceeded MAX_RESUME_TOPICS'
+	);
 	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
@@ -183,7 +191,11 @@ export function createReplay(client, options = {}) {
 	// Read-through populated by currentEpoch and refreshed by bumpEpoch; a topic
 	// not yet seen reads as the baseline 0.
 	/** @type {Map<string, number>} */
-	const epochCache = new Map();
+	const epochCache = createLruMap(MAX_REPLAY_EPOCH_CACHE_TOPICS);
+	function epochCacheSet(topic, epoch) {
+		epochCache.set(topic, epoch);
+	}
+
 
 	// Read the stored epoch for a topic. A topic whose seq space has never reset
 	// has no epoch key yet - that is the baseline epoch and reads as 0. An old
@@ -194,7 +206,7 @@ export function createReplay(client, options = {}) {
 	async function currentEpoch(topic) {
 		const val = await withBreaker(b, () => redis.get(epochKey(topic)));
 		const epoch = val ? parseInt(val, 10) : 0;
-		epochCache.set(topic, epoch);
+		epochCacheSet(topic, epoch);
 		return epoch;
 	}
 
@@ -208,7 +220,7 @@ export function createReplay(client, options = {}) {
 			const [err, val] = res[i];
 			if (err) throw err;
 			const epoch = val ? parseInt(val, 10) : 0;
-			epochCache.set(topics[i], epoch);
+			epochCacheSet(topics[i], epoch);
 			out.set(topics[i], epoch);
 		}
 		return out;
@@ -222,7 +234,7 @@ export function createReplay(client, options = {}) {
 	async function bumpEpoch(topic) {
 		const next = await withBreaker(b, () => redis.incr(epochKey(topic)));
 		const epoch = typeof next === 'number' ? next : parseInt(next, 10);
-		epochCache.set(topic, epoch);
+		epochCacheSet(topic, epoch);
 		return epoch;
 	}
 
@@ -251,6 +263,13 @@ export function createReplay(client, options = {}) {
 				payload = JSON.stringify(data ?? null);
 			} catch (err) {
 				throw new ReplaySerializationError('publish', err);
+			}
+			// Same bound the Postgres buffer applies. An unbounded entry feeds
+			// memory growth in the sorted set and the read-back amplification
+			// of replay(); a cap on one backend and not the other is not a
+			// contract, it is a difference in which deployment falls over.
+			if (Buffer.byteLength(payload) > maxDataBytes) {
+				throw new ReplaySerializationError('publish', new Error(`redis replay: data exceeds maxDataBytes (${maxDataBytes} bytes)`));
 			}
 
 			let seq;
@@ -359,8 +378,15 @@ export function createReplay(client, options = {}) {
 			return result;
 		},
 
-		async replay(ws, topic, sinceSeq, platform, reqId) {
-			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
+		async replay(ws, topic, sinceSeq, platform, reqId, preAuthorized) {
+			// The resume hook has just run this exact gate for this exact
+			// topic. Re-running it would invoke the APP's subscribe hook a
+			// second time per resumed topic - doubling its authorization load
+			// and any side effects it has (audit rows, rate-limit tokens, a
+			// presence join). Identity-compared against the private token, not
+			// truthiness: this is a public method, so a plain boolean here
+			// would let any caller skip the gate by passing `true`.
+			if (preAuthorized !== RESUME_PREAUTHORIZED && !await checkReplayAccess(ws, topic, platform, reqId)) return;
 			// Same input gate as `since()`: malformed sinceSeq would
 			// return the entire buffer via `sinceSeq + 1 <= 0`. Emit a
 			// bare `end` marker so the wire protocol shape is preserved.
@@ -514,6 +540,10 @@ export function createReplay(client, options = {}) {
 			let n = 0;
 			for (const bk of keys) {
 				const topic = topicFromBufKey(bk);
+				// Same tenant rule as the room-owner and presence-roster legs of
+				// the same purge. Without it one tenant's erasure reached every
+				// other tenant's buffered events for the same user id.
+				if (!topicInTenant(tenantId, topic)) continue;
 				let members;
 				try { members = await redis.zrange(bk, 0, -1); } catch { continue; }
 				const toRemove = [];
@@ -561,7 +591,14 @@ export function createReplay(client, options = {}) {
 		resumeHook() {
 			return createResumeHook({
 				currentEpochs,
-				replay: (ws, topic, seq, platform) => tracker.replay(ws, topic, seq, platform)
+				// Forwards `reqId` and `preAuthorized` too. A 4-arity forwarder
+				// drops the flag, and `replay()` then re-runs the app's subscribe
+				// hook for every topic the hook just authorized - once more per
+				// topic, and from inside Promise.all, so with no concurrency
+				// bound at all.
+				replay: (ws, topic, seq, platform, reqId, preAuthorized) =>
+					tracker.replay(ws, topic, seq, platform, reqId, preAuthorized),
+				onTruncate: () => mResumeTopicOverflows?.inc()
 			});
 		}
 	};

@@ -71,6 +71,9 @@ export function isValidBusTopic(topic) {
  *   its own `systemChannel` here (e.g. `__realtime`) so the bus can
  *   relay its own degraded/recovered events even when external `__`
  *   topics are denied.
+ * @property {string} [label='bus'] - Owning module name, used to prefix
+ *   option-validation errors so an operator sees which store refused the
+ *   value rather than a bare sentence.
  */
 
 /**
@@ -81,14 +84,33 @@ export function isValidBusTopic(topic) {
  * @param {BusValidatorOptions} [options]
  */
 export function createBusValidator(options = {}) {
-	const maxBytes = typeof options.maxBytes === 'number' && options.maxBytes > 0
-		? options.maxBytes
-		: DEFAULT_MAX_ENVELOPE_BYTES;
+	// Number.isInteger, not `typeof === 'number' && > 0`: NaN IS a number and
+	// `NaN > 0` is false, so the typeof form quietly selected the 1 MB default
+	// for `0`, `-1`, `'65536'` and `NaN` alike. A deployment that believed it
+	// had set a 64 KB bound ran with 1 MB and nothing anywhere said so - the
+	// failure mode a byte cap exists to make impossible. Presence already
+	// threw on its own copy of this option; the shared validator is where the
+	// rest of the buses get the same answer. Mirrors `parseReplayOptions`.
+	if (options.maxBytes !== undefined &&
+		(!Number.isInteger(options.maxBytes) || options.maxBytes < 1)) {
+		throw new Error(
+			`${options.label ?? 'bus'}: maxEnvelopeBytes must be a positive integer (bytes), got ${options.maxBytes}`
+		);
+	}
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_ENVELOPE_BYTES;
 	const allowSystemTopics = options.allowSystemTopics === true;
 	/** @type {Set<string>} */
 	const explicitAllow = new Set(Array.isArray(options.allowedSystemTopics) ? options.allowedSystemTopics : []);
 
 	return {
+		/**
+		 * The effective inbound byte cap. Exposed so a module can hold its
+		 * OUTBOUND payloads to the same bound it enforces on the way in -
+		 * publishing an envelope every peer will drop is a silent
+		 * split-brain, and the sender is the only side that can report it.
+		 */
+		maxBytes,
+
 		/**
 		 * Pre-parse size guard. Pass the byte length of the raw message
 		 * (not the parsed object). Returns true to proceed, false to

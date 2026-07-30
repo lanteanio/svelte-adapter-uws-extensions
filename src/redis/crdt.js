@@ -30,7 +30,7 @@
  *   - **Cold-join freshness.** A persisted snapshot is only as fresh as the
  *     last debounced store. When an instance cold-loads a topic it loads the
  *     snapshot AND broadcasts a sync request carrying its state vector; any
- *     instance holding the topic replies with exactly the structs the joiner
+ *     instance holding the topic replies with exactly the updates the joiner
  *     lacks. The joiner applies the reply on top of the snapshot - idempotent,
  *     so applying both is always safe - closing the staleness gap whenever a
  *     live peer exists.
@@ -95,6 +95,7 @@ export function createCrdtCluster(client, options = {}) {
 	const instanceId = randomBytes(8).toString('hex');
 	const persistLeaseMs = positive(options.persistLeaseMs, 6000);
 	const validator = createBusValidator({
+		label: 'crdt cluster',
 		maxBytes: options.maxEnvelopeBytes,
 		allowSystemTopics: false,
 		allowedSystemTopics: []
@@ -187,7 +188,7 @@ export function createCrdtCluster(client, options = {}) {
 			publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: sv });
 		},
 
-		/** Answer a peer's sync request with the structs it lacks (targeted). */
+		/** Answer a peer's sync request with the updates it lacks (targeted). */
 		sendSyncReply(declKey, topic, bytes, toInstance) {
 			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: bytes, to: toInstance });
 		},

@@ -2,6 +2,124 @@ import { wallEpoch, randomU32, setTimer } from '../shared/runtime.js';
 import { keySlot } from '../shared/cluster.js';
 
 /**
+ * The matcher SCAN MATCH, KEYS and PSUBSCRIBE all run through in Redis,
+ * ported operation-for-operation from `stringmatchlen()` in `util.c` rather
+ * than translated into a JS regular expression.
+ *
+ * The translation approach was wrong in three ways that a glob-shaped test
+ * reaches, all verified against a live server. A reversed range (`[c-a]`)
+ * makes the regex constructor THROW `Range out of order in character
+ * class`, turning a scan into a hard error, where Redis silently swaps the
+ * endpoints and matches. A leading `]` (`[]abc]`) is a literal member in
+ * most glob dialects but not this one: Redis breaks out of the class
+ * immediately, leaving it empty so nothing matches, and reading it as a
+ * member made the double LOOSER than production. And `[a-]` is a range from
+ * `a` to `]` with the endpoints swapped - matching `]^_`a` - not the two
+ * members `a` and `-`. The regex form also backtracked catastrophically:
+ * `*a*a*...*b` took 148 s where this form returns immediately, because the
+ * `skipLonger` flag below is what stops a failed tail re-running for every
+ * earlier `*` position.
+ *
+ * Fidelity here is load-bearing. A double that matches loosely lets a
+ * tenant-isolation or purge-completeness test pass against semantics
+ * production does not have, and reports the bug as fixed.
+ *
+ * `plen` is carried alongside `pi` rather than derived, because the port
+ * depends on the C original's habit of reading one past the pattern - where
+ * C sees its NUL terminator, this sees `undefined`, and the length is what
+ * distinguishes "the byte is `]`" from "there is no byte".
+ *
+ * @param {string} p pattern
+ * @param {number} pi index into the pattern
+ * @param {number} plen pattern bytes remaining from `pi`
+ * @param {string} s subject
+ * @param {number} si index into the subject
+ * @param {number} slen subject bytes remaining from `si`
+ * @param {{ skipLonger: boolean }} state shared across the recursion
+ * @returns {boolean}
+ */
+function matchLen(p, pi, plen, s, si, slen, state) {
+	while (plen && slen) {
+		switch (p[pi]) {
+			case '*':
+				while (plen && p[pi + 1] === '*') { pi++; plen--; }
+				if (plen === 1) return true; // trailing '*' matches the rest
+				while (slen) {
+					if (matchLen(p, pi + 1, plen - 1, s, si, slen, state)) return true;
+					if (state.skipLonger) return false;
+					si++; slen--;
+				}
+				// The tail matched at NO offset in what is left of the subject.
+				// Any earlier '*' could only try a later offset, which is a
+				// subset of what just failed, so the whole search can stop.
+				state.skipLonger = true;
+				return false;
+			case '?':
+				si++; slen--;
+				break;
+			case '[': {
+				pi++; plen--;
+				const negated = p[pi] === '^';
+				if (negated) { pi++; plen--; }
+				let match = false;
+				for (;;) {
+					if (p[pi] === '\\' && plen >= 2) {
+						pi++; plen--;
+						if (p[pi] === s[si]) match = true;
+					} else if (p[pi] === ']') {
+						break;
+					} else if (plen === 0) {
+						// Unterminated class: step back so the outer advance
+						// lands past the end rather than one beyond it.
+						pi--; plen++;
+						break;
+					} else if (plen >= 3 && p[pi + 1] === '-') {
+						let start = p.charCodeAt(pi);
+						let end = p.charCodeAt(pi + 2);
+						if (start > end) { const t = start; start = end; end = t; }
+						const c = s.charCodeAt(si);
+						pi += 2; plen -= 2;
+						if (c >= start && c <= end) match = true;
+					} else if (p[pi] === s[si]) {
+						match = true;
+					}
+					pi++; plen--;
+				}
+				if (negated) match = !match;
+				if (!match) return false;
+				si++; slen--;
+				break;
+			}
+			case '\\':
+				if (plen >= 2) { pi++; plen--; }
+				// falls through - an escaped byte compares literally
+			default:
+				if (p[pi] !== s[si]) return false;
+				si++; slen--;
+				break;
+		}
+		pi++; plen--;
+		if (slen === 0) {
+			while (p[pi] === '*') { pi++; plen--; }
+			break;
+		}
+	}
+	return plen === 0 && slen === 0;
+}
+
+/**
+ * Does `key` match a Redis glob `pattern`?
+ * @param {string} pattern
+ * @param {string} key
+ * @returns {boolean}
+ */
+function globMatch(pattern, key) {
+	const p = String(pattern);
+	const s = String(key);
+	return matchLen(p, 0, p.length, s, 0, s.length, { skipLonger: false });
+}
+
+/**
  * In-memory mock that implements the subset of ioredis used by the extensions.
  * No real Redis connection needed.
  *
@@ -43,6 +161,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 	const hashes = new Map();      // key -> Map<field, value>
 	const hashFieldExpiry = new Map(); // key -> Map<field, expireAtMs> (Redis 7.4+ HEXPIRE)
 	const streams = new Map();     // key -> [{id, fields: [[k, v], ...]}]
+	// A stream's last-id is retained independently of its entries: XDEL removes
+	// entries but does NOT rewind it, so re-adding a deleted id still fails on
+	// real Redis. Deriving it from the tail entry instead would let a purge
+	// followed by a re-publish silently reuse an id production refuses.
+	const streamLastIds = new Map(); // key -> last id ever added
 	const pubsubHandlers = [];     // {channel, handler}
 	const functionLibraries = new Map(); // libname -> code
 	const registeredFunctions = new Map(); // funcName -> (keys, args) => unknown
@@ -341,6 +464,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					if (hashes.delete(k)) count++;
 					hashFieldExpiry.delete(k);
 					if (streams.delete(k)) count++;
+					// DEL drops the stream object entirely, so unlike XDEL it
+					// DOES reset the last-id - a re-created stream starts over.
+					streamLastIds.delete(k);
 				}
 				return count;
 			},
@@ -489,15 +615,17 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const stream = streams.get(key);
 
 				let resolvedId;
+				// The retained last-id, not the tail entry: XDEL leaves the
+				// former in place, so both branches below have to consult it.
+				const lastId = streamLastIds.get(key);
 				if (idArg === '*') {
 					// Auto-id timestamp comes from the server clock seam, so a
 					// seeded harness produces the same stream ids on replay. The
 					// sequence disambiguation (same-ms collisions) stays
 					// deterministic, matching real Redis XADD * semantics.
 					const ms = serverNowMs();
-					const last = stream[stream.length - 1];
-					if (last) {
-						const [lastMs, lastSeq] = last.id.split('-').map(Number);
+					if (lastId !== undefined) {
+						const [lastMs, lastSeq] = lastId.split('-').map(Number);
 						resolvedId = ms <= lastMs
 							? `${lastMs}-${lastSeq + 1}`
 							: `${ms}-0`;
@@ -506,15 +634,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					}
 				} else {
 					resolvedId = idArg.includes('-') ? idArg : idArg + '-0';
-					if (stream.length > 0) {
-						const last = stream[stream.length - 1];
-						if (compareStreamIds(last.id, resolvedId) >= 0) {
-							throw new Error('ERR The ID specified in XADD is equal or smaller than the target stream top item');
-						}
+					if (lastId !== undefined && compareStreamIds(lastId, resolvedId) >= 0) {
+						throw new Error('ERR The ID specified in XADD is equal or smaller than the target stream top item');
 					}
 				}
 
 				stream.push({ id: resolvedId, fields });
+				streamLastIds.set(key, resolvedId);
 				if (maxLen >= 0 && stream.length > maxLen) {
 					stream.splice(0, stream.length - maxLen);
 				}
@@ -544,6 +670,27 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					if (count > 0 && out.length >= count) break;
 				}
 				return out;
+			},
+			async xdel(key, ...ids) {
+				// Absent before this: the streams replay backend's `purgeUser`
+				// wraps its XDEL in a best-effort `catch {}`, so a missing
+				// command was swallowed and the purge reported deleting nothing
+				// while claiming success - a right-to-erasure path proving
+				// itself against a double that silently did not erase.
+				const stream = streams.get(key);
+				if (!stream) return 0;
+				// A bare ms id addresses `<ms>-0`, as XADD resolves it.
+				const want = new Set(ids.map((id) => {
+					const s = String(id);
+					return s.includes('-') ? s : s + '-0';
+				}));
+				let removed = 0;
+				for (let i = stream.length - 1; i >= 0; i--) {
+					if (want.has(stream[i].id)) { stream.splice(i, 1); removed++; }
+				}
+				// `streamLastIds` deliberately untouched: real XDEL does not
+				// rewind the last-id, so re-adding a purged id still fails.
+				return removed;
 			},
 			async xlen(key) {
 				const stream = streams.get(key);
@@ -618,8 +765,18 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				pruneExpiredFields(key);
 				const h = hashes.get(key);
 				if (!h) return {};
+				// Built exactly the way ioredis builds it (Command.js
+				// `replyToObject`): a normal object, but with defineProperty
+				// for any key already present on it, so '__proto__' lands as
+				// an ordinary own data property instead of hitting the
+				// prototype setter. A null-prototype object would be SAFER
+				// than production and would hide prototype-sensitive consumer
+				// bugs, which is the opposite of what a double is for.
 				const result = {};
-				for (const [k, v] of h) result[k] = v;
+				for (const [k, v] of h) {
+					if (k in result) Object.defineProperty(result, k, { value: v, writable: true, enumerable: true, configurable: true });
+					else result[k] = v;
+				}
 				return result;
 			},
 			async hvals(key) {
@@ -906,11 +1063,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					&& !script.includes('HPEXPIRE') && !script.includes('hdel')) {
 					return evalPresenceLeaveG(args);
 				}
-				// Presence join script (hset + expire, no dedup scan) - legacy pre-Design-G
+				// Presence join script (hset + expire, no dedup scan) - legacy
 				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
 					return evalPresenceJoin(args);
 				}
-				// Presence leave script (hdel + check remaining by suffix) - legacy pre-Design-G
+				// Presence leave script (hdel + check remaining by suffix) - legacy
 				if (script.includes('hdel') && script.includes('suffix')) {
 					return evalPresenceLeave(args);
 				}
@@ -970,10 +1127,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// Simple mock: return all matching keys in one go
 				const matchIdx = args.indexOf('MATCH');
 				const pattern = matchIdx !== -1 ? args[matchIdx + 1] : '*';
-				const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
 
 				const allKeys = [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()];
-				const matched = allKeys.filter((k) => regex.test(k));
+				const matched = allKeys.filter((k) => globMatch(pattern, k));
 				return ['0', matched];
 			},
 
@@ -1585,7 +1741,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			try { durable = JSON.parse(durableJson); } catch { return 0; }
 			if (!durable || typeof durable !== 'object') return 0;
 			if (!parsed.fields || typeof parsed.fields !== 'object') parsed.fields = {};
-			for (const k of Object.keys(durable)) parsed.fields[k] = durable[k];
+			// Define rather than assign: '__proto__' must be stored as ordinary
+			// data like real Redis + cjson, not routed through the setter.
+			for (const k of Object.keys(durable)) {
+				Object.defineProperty(parsed.fields, k, { value: durable[k], writable: true, enumerable: true, configurable: true });
+			}
 			parsed.ts = newTs;
 			topicHash.set(userKey, JSON.stringify(parsed));
 			clearFieldExpiry(topicHashKey, [userKey]);
@@ -1728,6 +1888,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				id,
 				fields: [['v', '1'], ['event', event], ['data', dataJson]]
 			});
+			// This script's XADD counts toward the same retained last-id an
+			// ordinary `xadd` reads, or the two writers disagree about the top.
+			streamLastIds.set(bufKey, id);
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);
 			}
@@ -1770,6 +1933,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				id,
 				fields: [['v', '1'], ['event', event], ['data', dataJson]]
 			});
+			// This script's XADD counts toward the same retained last-id an
+			// ordinary `xadd` reads, or the two writers disagree about the top.
+			streamLastIds.set(bufKey, id);
 			if (stream.length > maxSize) {
 				stream.splice(0, stream.length - maxSize);
 			}

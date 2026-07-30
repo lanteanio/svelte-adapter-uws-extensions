@@ -664,6 +664,19 @@ export function createCompositeRateLimit(client, options) {
 		 * @param {string | null} [tenantId]
 		 */
 		async clear(tenantId) {
+			// The same admin surface, and the same three ways a nominally
+			// tenant-scoped wipe silently becomes a global one. The `{...}`
+			// hash tag is NOT a barrier: braces are literal in a Redis glob, so
+			// `...:{t:*}:*` spans every tenant.
+			if (tenantId != null && typeof tenantId !== 'string') {
+				throw new Error(`redis composite ratelimit: clear tenant id must be a string or null/undefined, got ${typeof tenantId}`);
+			}
+			if (tenantId != null && /[\0*?[\]\\]/.test(tenantId)) {
+				throw new Error('redis composite ratelimit: clear tenant id must not contain NUL or glob metacharacters (* ? [ ] \\)');
+			}
+			if (tenantId === '') {
+				throw new Error('redis composite ratelimit: clear tenant id must not be empty - call clear() with no argument to clear every tenant');
+			}
 			const pattern = tenantId
 				? client.key(SCRIPT_VERSION + ':ratelimitc:' + tagFor(tenantId) + ':*')
 				: client.key(SCRIPT_VERSION + ':ratelimitc:*');

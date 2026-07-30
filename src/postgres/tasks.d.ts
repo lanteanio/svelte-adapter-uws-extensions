@@ -17,7 +17,22 @@ export interface TaskError {
 	message: string;
 	stack?: string;
 	code?: unknown;
+	/** Present only when `serializeErrorCause: true`. */
 	cause?: unknown;
+	/**
+	 * Set when the error exceeded the payload cap and was reduced to fit.
+	 * `stack` and `cause` are dropped and `message` is clipped; past the cap
+	 * even then, `message` is replaced with a note that it was discarded.
+	 * Failing to record the row at all would leave the task `running` under
+	 * a live fence, so the terminal write always succeeds.
+	 */
+	truncated?: boolean;
+	/**
+	 * Set when the error could not be JSON-encoded at all - a BigInt or
+	 * circular `code`, a throwing accessor. `name`, `message` and a
+	 * stringified `code` are preserved where they could be read.
+	 */
+	unserialisable?: boolean;
 }
 
 export interface TaskRow {
@@ -109,6 +124,35 @@ export interface TaskRunnerOptions {
 	rowTtl?: number;
 	/** Auto-create the table on first use. @default true */
 	autoMigrate?: boolean;
+	/**
+	 * Byte ceiling on an encoded task `input` and `result`, and the point at
+	 * which a persisted error is truncated to fit.
+	 *
+	 * Worth setting deliberately, because the two sides fail differently. An
+	 * oversized INPUT is refused at `enqueue` / `run`, before anything has
+	 * happened. An oversized RESULT is terminal and NOT retried - the result
+	 * is deterministic, so a retry would produce the same bytes and the row
+	 * would be reclaimed once per fence expiry forever - but by then the
+	 * handler has run and its side effects have landed. A task that returns a
+	 * report or an export can pass the 256KB default on a large run while an
+	 * ordinary run of the same task does not.
+	 *
+	 * Raise it, or return a reference (an object key, a row id) and keep the
+	 * bytes out of the task row.
+	 *
+	 * The minimum is 80 bytes, which is the smallest terminal error shape;
+	 * lower values cannot both record a failed row and honour the ceiling.
+	 *
+	 * @default 262144 (256KB)
+	 */
+	maxPayloadBytes?: number;
+	/**
+	 * Persist `error.cause` alongside name/message/stack/code on a failed
+	 * task. Off by default: handlers routinely attach config-bearing causes
+	 * and the row is re-served to dashboards by `await()` / `list()`.
+	 * @default false
+	 */
+	serializeErrorCause?: boolean;
 	/**
 	 * Right-to-erasure: extract the enqueuing user's id from a task's input at
 	 * insert time into a `user_id` column so `live.forget` can `DELETE WHERE

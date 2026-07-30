@@ -15,7 +15,8 @@
  */
 
 import { randomBytes } from '../../shared/runtime.js';
-import { stripInternal, createSensitiveWarner } from '../../shared/sensitive.js';
+import { createSensitiveWarner } from '../../shared/sensitive.js';
+import { projectDefaultUserData, isUnsafeProjectionFieldName } from '../../shared/default-projection.js';
 import { hashFieldTTLSupport } from '../../shared/redis-version.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { makeKeys } from './keys.js';
@@ -32,7 +33,15 @@ export function createPresenceState(client, options = {}) {
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis presence: select must be a function');
 	}
-	const select = options.select || stripInternal;
+	const sanitizeSelected = options.select != null;
+	const select = sanitizeSelected ? options.select : projectDefaultUserData;
+	if (!sanitizeSelected && isUnsafeProjectionFieldName(keyField)) {
+		console.warn(
+			`redis presence: key field '${keyField}' is private or transport metadata, so the default ` +
+			'projection drops it and each connection gets its own presence entry. A presence key is ' +
+			'broadcast as a roster property: use a non-secret id, or pass an explicit select() to opt in.'
+		);
+	}
 	const heartbeatInterval = options.heartbeat ?? 30000;
 	const presenceTtl = options.ttl ?? 90;
 
@@ -149,6 +158,10 @@ export function createPresenceState(client, options = {}) {
 	const redis = client.redis;
 
 	const keyspaceNotifications = options.keyspaceNotifications === true;
+	if (options.maxEnvelopeBytes !== undefined && (!Number.isInteger(options.maxEnvelopeBytes) || options.maxEnvelopeBytes < 1)) {
+		throw new Error('redis presence: maxEnvelopeBytes must be a positive integer (bytes)');
+	}
+	const maxEnvelopeBytes = options.maxEnvelopeBytes ?? 1024 * 1024;
 
 	// Per-field hash TTL (HPEXPIRE / HEXPIRE) requires Redis 7.4+ or Valkey 9.0+.
 	// Valkey pins redis_version at 7.2.4 and reports its real version in
@@ -264,6 +277,7 @@ export function createPresenceState(client, options = {}) {
 	return {
 		keyField,
 		select,
+		sanitizeSelected,
 		heartbeatInterval,
 		presenceTtl,
 		presenceTtlMs,
@@ -275,6 +289,7 @@ export function createPresenceState(client, options = {}) {
 		instanceId,
 		redis,
 		keyspaceNotifications,
+		maxEnvelopeBytes,
 		ensureRedis74,
 		b,
 		m,

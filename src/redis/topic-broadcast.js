@@ -124,7 +124,15 @@ export function createTopicBroadcast(client, options = {}) {
 	const heartbeatMs = positive(options.heartbeat, DEFAULT_HEARTBEAT_MS);
 	const presenceTtlMs = positive(options.presenceTtlMs, heartbeatMs * PRESENCE_TTL_MULT);
 	const defaultTimeoutMs = positive(options.requestTimeoutMs, DEFAULT_TIMEOUT_MS);
-	const validator = createBusValidator({ maxBytes: options.maxEnvelopeBytes });
+	// `allowSystemTopics` is deliberate here, unlike the data-plane buses.
+	// requestTopic is a SERVER-initiated fan-out and the framework's own
+	// coordination topics are `__`-prefixed (`__signal:{userId}` and
+	// friends), so denying them at the boundary would not stop an attacker -
+	// it would break the feature, and silently: the origin blocks for the
+	// full timeout while every peer drops a request it was supposed to
+	// serve. Shape, length and control-byte validation still apply, and
+	// those are what protect the adapter's publish path.
+	const validator = createBusValidator({ label: 'topic-broadcast', maxBytes: options.maxEnvelopeBytes, allowSystemTopics: true });
 	const b = options.breaker;
 
 	const m = options.metrics;
@@ -220,7 +228,11 @@ export function createTopicBroadcast(client, options = {}) {
 	/** Another instance asked us to serve a topic request over our local subscribers. */
 	async function handleInboundRequest(env) {
 		const { ref, t: topic, e: event, d: data, i: origin, ms } = env;
-		if (typeof ref !== 'string' || typeof topic !== 'string' || typeof event !== 'string' || typeof origin !== 'string') return;
+		if (typeof ref !== 'string' || typeof event !== 'string' || typeof origin !== 'string') return;
+		// Same predicate the sender applies, so a malformed topic cannot
+		// reach the adapter's publish path (where a control byte or a
+		// backslash throws inside esc(topic)) from a foreign publisher.
+		if (!validator.acceptEnvelope(topic, event)) return;
 		let replies = [];
 		if (handler) {
 			try {
@@ -289,6 +301,17 @@ export function createTopicBroadcast(client, options = {}) {
 		 * @returns {Promise<any[]>}
 		 */
 		async broadcast(topic, event, data, opts = {}) {
+			// Validate on the way OUT with the same predicate the receivers
+			// apply on the way in. Checking only one end is what makes a
+			// rejected topic look like a slow network: every peer drops the
+			// request, `remaining` never drains, and the caller waits out the
+			// whole timeout for a local-only result. Fail fast instead.
+			if (!validator.acceptEnvelope(topic, event)) {
+				throw new Error(
+					`topic-broadcast: invalid topic or event (topic must be 1-256 chars with no control bytes, ` +
+					`'"' or '\\'; event must be 1-256 chars) - peers would drop this request on receipt`
+				);
+			}
 			const timeoutMs = positive(opts && opts.timeoutMs, defaultTimeoutMs);
 			ensureSubscriber();
 

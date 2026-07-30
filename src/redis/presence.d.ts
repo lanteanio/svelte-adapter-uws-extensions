@@ -4,9 +4,20 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisPresenceOptions {
-	/** Field in selected data for user dedup. @default 'id' */
+	/**
+	 * Field in projected data for user dedup. If the default projection drops
+	 * this field, each connection gets a fallback key so the private value is
+	 * not broadcast or persisted as a roster property name.
+	 * @default 'id'
+	 */
 	key?: string;
-	/** Extract public fields from userData. @default identity */
+	/**
+	 * Extract public fields from userData. The default recursively drops
+	 * internal keys, credentials, common personal data, and request transport
+	 * metadata. An explicit callback can intentionally admit fields; its result
+	 * still passes through `stripInternal()`.
+	 * @default privacy projection
+	 */
 	select?: (userData: any) => Record<string, any>;
 	/** Heartbeat interval in ms (refresh TTL). @default 30000 */
 	heartbeat?: number;
@@ -26,6 +37,14 @@ export interface RedisPresenceOptions {
 	 * @default false
 	 */
 	keyspaceNotifications?: boolean;
+	/**
+	 * Byte ceiling for a single cross-instance presence envelope. Every peer
+	 * enforces the same bound on the way in, so an envelope past it would
+	 * fan out locally and to nobody else - which reads as a partial roster
+	 * rather than as an error. Oversized relays are dropped with a warning
+	 * instead of being published.
+	 */
+	maxEnvelopeBytes?: number;
 	/**
 	 * Dynamic field names (set via `update()`) that are broadcast live but
 	 * NEVER persisted to Redis and NEVER included in the `state` snapshot or
@@ -112,8 +131,18 @@ export interface RedisPresenceTracker {
 	/** Remove a connection from a specific topic, or all topics if omitted. */
 	leave(ws: any, platform: Platform, topic?: string): Promise<void>;
 
-	/** Send current presence list without joining. */
-	sync(ws: any, topic: string, platform: Platform): Promise<void>;
+	/**
+	 * Send the current presence list without joining.
+	 *
+	 * Resolves to the platform's denial reason when `checkSubscribe` refuses
+	 * the topic (and to `'FORBIDDEN'` when the platform provides no
+	 * `checkSubscribe` at all - this lane fails closed), otherwise
+	 * `undefined`. Return the value from a `hooks.subscribe` wiring so the
+	 * denial reaches the adapter and the subscribe itself is refused; a
+	 * caller that discards it leaves the socket subscribed to a topic the
+	 * platform refused, with only the roster withheld.
+	 */
+	sync(ws: any, topic: string, platform: Platform): Promise<string | undefined>;
 
 	/**
 	 * Set dynamic fields on the present user (typing, a selection range, a lock
@@ -180,18 +209,27 @@ export interface RedisPresenceTracker {
 	 *
 	 * `subscribe` handles both regular topics (calls `join`) and `__presence:*`
 	 * topics (calls `sync` so the client gets the current list immediately).
-	 * `unsubscribe` removes presence from a single topic when the client
-	 * unsubscribes (requires core adapter v0.4.0+).
-	 * `close` calls `leave`.
+	 * `message` serves the client's `presence-snapshot` and `presence-update`
+	 * frames. `unsubscribe` removes presence from a single topic when the
+	 * client unsubscribes (requires core adapter v0.4.0+). `close` calls
+	 * `leave`.
+	 *
+	 * `subscribe` resolves to the platform's denial reason on a `__presence:*`
+	 * topic the caller may not observe, and to `undefined` otherwise. Wrapping
+	 * it means RETURNING that value: the adapter reads anything that is not
+	 * `false` or a string as ALLOW, so swallowing it withholds the roster
+	 * while still subscribing the socket to the tap channel and feeding it
+	 * every later diff.
 	 *
 	 * @example
 	 * ```js
 	 * import { presence } from '$lib/server/presence';
-	 * export const { subscribe, unsubscribe, close } = presence.hooks;
+	 * export const { subscribe, message, unsubscribe, close } = presence.hooks;
 	 * ```
 	 */
 	hooks: {
-		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<string | undefined>;
+		message(ws: any, ctx: { data: any; platform: Platform }): void;
 		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};

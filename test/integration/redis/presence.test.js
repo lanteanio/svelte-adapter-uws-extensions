@@ -261,7 +261,7 @@ describeIntegration('redis presence (integration)', () => {
 		});
 
 		it('the broadcast suppression scales to many cross-instance fields without scanning', async () => {
-			// Pre-Design-G: O(M_topic) Lua suffix-scan per leave. Plant 5000
+			// Legacy path: O(M_topic) Lua suffix-scan per leave. Plant 5000
 			// extra instance entries for unrelated users on the same topic hash
 			// and confirm the leave still works in O(1) on the per-user hash.
 			const presence = makeTracker();
@@ -283,7 +283,7 @@ describeIntegration('redis presence (integration)', () => {
 
 			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(1);
 			// Generous bound: even on a slow CI, an O(1) leave finishes well
-			// under 50ms. The pre-Design-G implementation would scan all
+			// under 50ms. The legacy implementation would scan all
 			// 5000 noise fields inside Lua and take noticeably longer.
 			expect(elapsed).toBeLessThan(100);
 		});

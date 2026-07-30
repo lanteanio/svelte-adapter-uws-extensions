@@ -1120,12 +1120,30 @@ export function mockPgClient(options = {}) {
 			return { rows: result, rowCount: result.length };
 		}
 
-		// Right-to-erasure purge: DELETE FROM table WHERE user_id = $1
+		// Right-to-erasure purge:
+		//   DELETE FROM table WHERE user_id = $1
+		//     [AND left(topic, char_length($2)) =  $2]   tenant scope
+		//     [AND left(topic, char_length($2)) <> $2]   untenanted scope
+		//
+		// The tenant predicate is MODELLED, not ignored. Matching only the
+		// `user_id` half would report a cross-tenant erasure as correct - the
+		// exact defect this scope exists to close - and the suite would pass
+		// against semantics production does not have.
 		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE user_id = $1')) {
 			const userId = values[0];
+			const scopedEq = sql.includes('left(topic, char_length($2)) = $2');
+			const scopedNe = sql.includes('left(topic, char_length($2)) <> $2');
+			const prefix = values[1];
+			const inScope = (r) => {
+				if (!scopedEq && !scopedNe) return true;
+				const t = r.topic;
+				if (typeof t !== 'string' || typeof prefix !== 'string') return false;
+				// `left(t, char_length(p)) = p` is exactly `t.startsWith(p)`.
+				return scopedEq ? t.startsWith(prefix) : !t.startsWith(prefix);
+			};
 			let count = 0;
 			for (let i = rows.length - 1; i >= 0; i--) {
-				if (rows[i].user_id === userId) {
+				if (rows[i].user_id === userId && inScope(rows[i])) {
 					rows.splice(i, 1);
 					count++;
 				}

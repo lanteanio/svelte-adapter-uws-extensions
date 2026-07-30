@@ -13,7 +13,7 @@
  *      overwrite a completed attempt's result. A periodic recovery sweep
  *      reclaims rows whose fence has expired and re-drives the handler.
  *   3. External-service idempotency: the `idempotencyKey` is passed
- *      through to the handler, who forwards it to Stripe / SendGrid / S3
+ *      through to the handler, who forwards it to the downstream API
  *      so the side-effect target de-duplicates across retries too.
  *
  * Schema (auto-created):
@@ -53,13 +53,13 @@ import {
 	UnknownTaskError,
 	TaskFenceLostError,
 	deserialiseError,
-	serialiseError
+	serialiseErrorSafe
 } from './_tasks-errors.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
-import { createTaskSql } from './_tasks-sql.js';
+import { createTaskSql, encodeTaskPayload, MIN_TASK_PAYLOAD_BYTES } from './_tasks-sql.js';
 import { withBreaker } from '../shared/breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
-import { MAX_TASK_HANDLERS } from '../shared/caps.js';
+import { MAX_TASK_HANDLERS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 
 export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 
@@ -194,6 +194,21 @@ export function createTaskRunner(client, options = {}) {
 			throw new Error(`postgres tasks: rowTtl must be a positive integer, got ${options.rowTtl}`);
 		}
 	}
+	// Number.isInteger for the reason `parseReplayOptions` uses it: NaN is a
+	// number and `NaN < 1` is false, so a typeof-only guard would accept it
+	// and then make every `bytes > cap` comparison false - silently removing
+	// the bound this option configures.
+	if (options.maxPayloadBytes !== undefined) {
+		if (!Number.isInteger(options.maxPayloadBytes) || options.maxPayloadBytes < 1) {
+			throw new Error(`postgres tasks: maxPayloadBytes must be a positive integer (bytes), got ${options.maxPayloadBytes}`);
+		}
+		if (options.maxPayloadBytes < MIN_TASK_PAYLOAD_BYTES) {
+			throw new Error(
+				'postgres tasks: maxPayloadBytes must be at least ' + MIN_TASK_PAYLOAD_BYTES +
+				' bytes (the smallest terminal error shape)'
+			);
+		}
+	}
 
 	const table = options.table || 'svti_tasks';
 	assertSafeTableName(table, 'postgres tasks');
@@ -208,6 +223,9 @@ export function createTaskRunner(client, options = {}) {
 	const awaitTimeout = options.awaitTimeout !== undefined ? options.awaitTimeout : 60000;
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 3600000;
 	const rowTtl = options.rowTtl || 7 * 24 * 3600;
+	// `??`, not `||`: the guard above already refused 0, and `||` would map a
+	// legitimately configured small bound onto the default.
+	const maxPayloadBytes = options.maxPayloadBytes ?? MAX_STORE_PAYLOAD_BYTES;
 	const autoMigrate = options.autoMigrate !== false;
 	if (options.forgetUserId !== undefined && typeof options.forgetUserId !== 'function') {
 		throw new Error('postgres tasks: forgetUserId must be a function (input, name) => userId');
@@ -257,7 +275,13 @@ export function createTaskRunner(client, options = {}) {
 	let cleanupRunning = false;
 	let destroyed = false;
 
-	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate });
+	// Gates `cause` on BOTH surfaces that re-serve a handler error: the
+	// persisted row and the state-change event. A cause routinely carries
+	// connection config, so withholding it from the row while handing it to
+	// every listener would defeat the opt-in.
+	const serializeErrorCause = options.serializeErrorCause === true;
+
+	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, serializeErrorCause, maxPayloadBytes });
 
 	// One-shot ready() promise: kicks off ensureTable() at construction so
 	// callers that need the table to exist before they start polling
@@ -379,7 +403,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, awaitCanonical = false) {
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, awaitCanonical = false, initialEncodedInput) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -396,7 +420,7 @@ export function createTaskRunner(client, options = {}) {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUuid();
-					await sql.insertAttempt(taskId, name, input, idempotencyKey, fence, requestId, _taskUserId(input, name));
+					await sql.insertAttempt(taskId, name, initialEncodedInput, idempotencyKey, fence, requestId, _taskUserId(input, name));
 					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate the fence and rearm the existing
@@ -447,7 +471,38 @@ export function createTaskRunner(client, options = {}) {
 			}
 
 			if (handlerError === undefined) {
-				const committed = await sql.commitRow(taskId, fence, result);
+				// A result past the payload cap is a TERMINAL outcome, not a
+				// crash. The encode happens inside commitRow's parameter list,
+				// so letting it throw from there escapes this function with the
+				// row still `running` under a live fence: the recovery sweep
+				// reclaims the expired fence and re-runs the handler, which
+				// produces the same oversized result, forever. Retrying cannot
+				// help - the result is deterministic - so the row is failed
+				// outright rather than routed through the retry ladder.
+				let encodeError;
+				let encodedResult;
+				try {
+					encodedResult = encodeTaskPayload(result === undefined ? null : result, 'result', maxPayloadBytes);
+				} catch (err) {
+					encodeError = err;
+				}
+				if (encodeError !== undefined) {
+					const failed = await sql.failRow(taskId, fence, encodeError);
+					if (fenceProvider) {
+						try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
+					}
+					if (!failed) {
+						// Fence lost before we could record it; the winning
+						// worker owns the canonical outcome.
+						const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+						if (canonical) return canonical.result;
+						throw encodeError;
+					}
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseErrorSafe(encodeError, { includeCause: serializeErrorCause }) });
+					mRunFail?.inc({ name });
+					throw encodeError;
+				}
+				const committed = await sql.commitRow(taskId, fence, encodedResult);
 				if (committed && fenceProvider) {
 					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 				}
@@ -491,7 +546,7 @@ export function createTaskRunner(client, options = {}) {
 					// Background caller only: outcome not yet terminal; discarded.
 					return result;
 				}
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseError(handlerError) });
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseErrorSafe(handlerError, { includeCause: serializeErrorCause }) });
 				mRunFail?.inc({ name });
 				throw handlerError;
 			}
@@ -687,6 +742,16 @@ export function createTaskRunner(client, options = {}) {
 				throw new UnknownTaskError(name);
 			}
 			const input = runOptions.input ?? null;
+			// Validate at the CALLER boundary, before any storage interaction:
+			// raised from inside the SQL helpers the same throw arrives
+			// wrapped as a transient storage failure, and callers retry a
+			// payload that can never fit.
+			//
+			// Keep these exact bytes for the INSERT. Stringifying a second time
+			// is not merely redundant: a stateful toJSON can return a small
+			// value here and an oversized one inside withBreaker, defeating the
+			// caller-boundary classification this check exists to provide.
+			const encodedInput = encodeTaskPayload(input, 'input', maxPayloadBytes);
 			const idempotencyKey = runOptions.idempotencyKey;
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
@@ -706,7 +771,7 @@ export function createTaskRunner(client, options = {}) {
 				const slot = await idempotency.acquire(cacheKey);
 				if (slot.acquired) {
 					try {
-						const result = await runWithoutCache(name, input, idempotencyKey, requestId);
+						const result = await runWithoutCache(name, input, encodedInput, idempotencyKey, requestId);
 						await slot.commit(result);
 						return result;
 					} catch (err) {
@@ -721,7 +786,7 @@ export function createTaskRunner(client, options = {}) {
 				return slot.result;
 			}
 
-			return runWithoutCache(name, input, idempotencyKey, requestId);
+			return runWithoutCache(name, input, encodedInput, idempotencyKey, requestId);
 		},
 
 		async enqueue(name, runOptions = {}) {
@@ -729,6 +794,16 @@ export function createTaskRunner(client, options = {}) {
 				throw new Error(`postgres tasks: invalid task name "${name}"`);
 			}
 			const input = runOptions.input ?? null;
+			// Validate at the CALLER boundary, before any storage interaction:
+			// raised from inside the SQL helpers the same throw arrives
+			// wrapped as a transient storage failure, and callers retry a
+			// payload that can never fit.
+			//
+			// Keep these exact bytes for the INSERT. Stringifying a second time
+			// is not merely redundant: a stateful toJSON can return a small
+			// value here and an oversized one inside withBreaker, defeating the
+			// caller-boundary classification this check exists to provide.
+			const encodedInput = encodeTaskPayload(input, 'input', maxPayloadBytes);
 			const idempotencyKey = runOptions.idempotencyKey;
 			if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) {
 				throw new Error(`postgres tasks: idempotencyKey must be a non-empty string`);
@@ -741,7 +816,7 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 
 			const taskId = randomUuid();
-			await withBreaker(b, () => sql.insertPending(taskId, name, input, idempotencyKey, requestId, _taskUserId(input, name)));
+			await withBreaker(b, () => sql.insertPending(taskId, name, encodedInput, idempotencyKey, requestId, _taskUserId(input, name)));
 			fireStateChange({
 				taskId,
 				name,
@@ -830,7 +905,18 @@ export function createTaskRunner(client, options = {}) {
 		/**
 		 * Right-to-erasure (`live.forget`): delete every task row stamped with this
 		 * user's id (requires a `forgetUserId` extractor; a no-op otherwise).
-		 * @param {string | null} tenantId
+		 *
+		 * `tenantId` does NOT scope this store, and is accepted only so the
+		 * method matches the uniform purge contract. Tenancy is carried on wire
+		 * topics (`@t/<tenantId>/<topic>`) and a task is keyed by NAME, not by
+		 * topic, so a task row carries no tenant dimension to filter on. The
+		 * erasure therefore spans tenants: pass a tenant-qualified value from
+		 * `forgetUserId` if a deployment needs task rows partitioned. Stated
+		 * here rather than implied, because the sibling stores DO scope and a
+		 * silent difference between them is what made one tenant's erasure
+		 * reach another's data.
+		 *
+		 * @param {string | null} tenantId - Accepted for contract symmetry; ignored.
 		 * @param {string} userId
 		 * @returns {Promise<number>} task rows removed
 		 */
@@ -879,12 +965,12 @@ export function createTaskRunner(client, options = {}) {
 		}
 	};
 
-	function runWithoutCache(name, input, idempotencyKey, requestId) {
+	function runWithoutCache(name, input, encodedInput, idempotencyKey, requestId) {
 		const taskId = randomUuid();
 		// Foreground caller: must report the CANONICAL outcome (and the idempotency
 		// store caches whatever this returns), so poll the durable row on a lost
 		// fence rather than surfacing the stale local attempt.
-		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, true);
+		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, true, encodedInput);
 	}
 }
 

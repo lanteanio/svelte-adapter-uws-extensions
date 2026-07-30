@@ -48,8 +48,22 @@ export interface ClusterClockOptions {
 	 * shared Redis reference.
 	 */
 	leader?: { isLeader: () => boolean };
-	/** Key the leader publishes its clock offset under. @default 'clock:leader-offset' */
+	/**
+	 * Key the leader publishes its clock offset under. Resolved RELATIVE to
+	 * the client key prefix; pass the bare name.
+	 * @default 'clock:leader-offset'
+	 */
 	leaderKey?: string;
+	/**
+	 * Also read the UNPREFIXED `leaderKey` when the prefixed one is absent,
+	 * for a rolling upgrade from a release that wrote it raw. Off by default:
+	 * the unprefixed key is the shared name the prefixing exists to escape,
+	 * so a follower reading it would adopt whatever other app on the same
+	 * Redis publishes there. Left off, a follower ahead of its leader
+	 * degrades to `consistent()` for one key lifetime.
+	 * @default false
+	 */
+	legacyLeaderKeyFallback?: boolean;
 	/**
 	 * Freshness bound (ms) for both the published offset (PX) and a
 	 * follower's cached copy; a staler cache falls back to `consistent()`.

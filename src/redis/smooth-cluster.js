@@ -124,7 +124,7 @@ export function createSmoothCluster(client, options = {}) {
 	// envelope-topic gate (`acceptEnvelope`) is deliberately NOT used: the
 	// entity wire topic is `__smooth:`-prefixed and that gate rejects `__`
 	// topics, so the wire topic is shape-checked with `isValidBusTopic` instead.
-	const validator = createBusValidator({ maxBytes: options.maxEnvelopeBytes });
+	const validator = createBusValidator({ label: 'smooth cluster', maxBytes: options.maxEnvelopeBytes });
 	const b = options.breaker;
 
 	/**

@@ -172,14 +172,66 @@ function appendSetCookie(response, value) {
  * }
  * ```
  */
+/**
+ * Floor for an HMAC secret.
+ *
+ * The cookie's whole security property is that a client cannot forge the
+ * signature, and a weak secret is brute-forceable OFFLINE from a single
+ * observed cookie - the attacker holds both the message and the tag, so they
+ * grind candidates at memory speed with no network involved.
+ *
+ * 16 characters, deliberately, and NOT 32: the floor has to admit every shape
+ * a correctly-provisioned deployment produces, and those differ in width for
+ * the same entropy. `randomBytes(16)` is 128 bits either way but 32 chars as
+ * hex and only 24 as base64; `randomBytes(12).toString('hex')` is 24. A
+ * 32-char rule refuses all of those, and since `capabilityCookie()` is called
+ * at module scope in the documented setup, refusing one is a process that
+ * will not boot. 16 is below every generated form and above every placeholder
+ * (`dev`, `changeme`, `hunter2`), which is the line worth drawing.
+ */
+const MIN_SECRET_LENGTH = 16;
+
+/** Distinct characters below which a value is padding, not key material. */
+const MIN_SECRET_DISTINCT = 8;
+
+/**
+ * @param {unknown} value
+ * @param {string} label
+ */
+function assertSecretStrength(value, label) {
+	if (typeof value !== 'string' || value.length === 0) {
+		throw new Error(`capability-cookie: ${label} must be a non-empty string`);
+	}
+	if (value.length < MIN_SECRET_LENGTH) {
+		throw new Error(
+			`capability-cookie: ${label} must be at least ${MIN_SECRET_LENGTH} characters ` +
+			`(got ${value.length}); generate one with ` +
+			`\`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"\``
+		);
+	}
+	// Length is not entropy: 'xxxx...' carries as much key material as 'x'
+	// however long it runs, and that is the shape a padded placeholder takes.
+	// A generated key of any common encoding clears this comfortably.
+	if (new Set(value).size < MIN_SECRET_DISTINCT) {
+		throw new Error(
+			`capability-cookie: ${label} has too few distinct characters to be generated key ` +
+			'material; it looks like a placeholder'
+		);
+	}
+}
+
 export function capabilityCookie(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('capability-cookie: options object is required');
 	}
 	const { secret, previousSecret } = options;
-	if (typeof secret !== 'string' || secret.length === 0) {
-		throw new Error('capability-cookie: secret must be a non-empty string');
-	}
+	assertSecretStrength(secret, 'secret');
+	// The floor deliberately does NOT apply to `previousSecret`. It exists to
+	// let a deployment rotate, and the single most important rotation to allow
+	// is the one away from a weak secret - refusing the old value there would
+	// leave "keep the weak secret" and "sign every live session out" as the
+	// only options, which is how a weak secret survives. It only ever VERIFIES,
+	// never signs, and the window is meant to be closed shortly after.
 	if (previousSecret !== undefined && (typeof previousSecret !== 'string' || previousSecret.length === 0)) {
 		throw new Error('capability-cookie: previousSecret must be a non-empty string when provided');
 	}
@@ -193,10 +245,60 @@ export function capabilityCookie(options) {
 	if (typeof cookieName !== 'string' || cookieName.length === 0) {
 		throw new Error('capability-cookie: cookieName must be a non-empty string');
 	}
+	// cookieName, path and sameSite are serialized verbatim into the
+	// Set-Cookie header, so they are validated at construction rather than
+	// emitted. CR/LF would split the response and ';' would smuggle an
+	// attribute, but the check is the full RFC 6265 token set for the same
+	// reason: a name like 'my cookie' or 'a=b' produces a header the browser
+	// silently drops, readCookie never matches it again, and the capability
+	// check degrades to permanently-absent with nothing logged anywhere.
+	// Failing at construction is the only place an operator can see it.
+	if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(cookieName)) {
+		throw new Error(
+			'capability-cookie: cookieName must be an RFC 6265 token (letters, digits, and !#$%&\'*+-.^_`|~); ' +
+			`got ${JSON.stringify(cookieName)}`
+		);
+	}
 
 	const secure = options.secure ?? true;
-	const sameSite = options.sameSite ?? 'Lax';
+	// Cookie attribute values are case-insensitive, so 'lax' and 'none' are
+	// as valid as 'Lax' and 'None'. Normalize rather than reject: rejecting
+	// would turn a config that worked into a startup crash, and the
+	// serialized header is identical either way.
+	const sameSiteRaw = options.sameSite ?? 'Lax';
+	// Null-prototype lookup. An object literal inherits from
+	// Object.prototype, so 'constructor' resolves to the Object constructor
+	// and '__proto__' to the prototype itself - both non-undefined, so both
+	// slip past the guard below and get serialized into the Set-Cookie
+	// header as a malformed SameSite attribute.
+	const sameSite = typeof sameSiteRaw === 'string'
+		? Object.assign(Object.create(null), { strict: 'Strict', lax: 'Lax', none: 'None' })[sameSiteRaw.toLowerCase()]
+		: undefined;
+	if (sameSite === undefined) {
+		throw new Error(`capability-cookie: sameSite must be "Strict", "Lax", or "None"; got ${JSON.stringify(sameSiteRaw)}`);
+	}
 	const path = options.path ?? '/';
+	// RFC 6265 path-value is any CHAR except CTLs and ';', and a leading '/'
+	// is what makes it a path rather than a relative string the browser
+	// resolves unpredictably. Stated as an ALLOWLIST rather than a list of
+	// forbidden bytes: the forbidden-byte form missed NUL and the C0
+	// controls, so `path: '/a\0b'` passed validation and reached the emitted
+	// header, where undici's Headers.append throws `invalid header value` -
+	// a per-request 500, which is precisely the failure this check exists to
+	// move to startup. Non-ASCII is refused for the same reason: a header
+	// value is bytes, so a path outside that range has to be percent-encoded
+	// by the caller rather than silently transcoded here.
+	//
+	// Narrower than the grammar by three characters. Whitespace, ',' and '"'
+	// are all legal path-value CHARs, but ',' is the separator a folded
+	// Set-Cookie is split on and a bare '"' derails quoted-string parsers,
+	// so each one produces a header some real client mishandles.
+	if (typeof path !== 'string' || !/^\/[\x21\x23-\x2B\x2D-\x3A\x3C-\x7E]*$/.test(path)) {
+		throw new Error(
+			'capability-cookie: path must start with "/" and contain only printable ASCII except ' +
+			`whitespace, ";", "," and '"'; got ${JSON.stringify(path)}`
+		);
+	}
 	const ttlMs = ttlSeconds * 1000;
 
 	const m = options.metrics;

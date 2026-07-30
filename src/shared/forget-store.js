@@ -54,6 +54,7 @@
 
 import { scanKeys } from './redis-scan.js';
 import { evalCached } from './eval-cached.js';
+import { topicInTenant, TENANT_TOPIC_NS } from './tenant-topic.js';
 
 // The realtime layer's cluster key shapes (room-owner.js / presence.js /
 // tenant.js). These are wire-frozen: the hashes are written through the raw
@@ -64,7 +65,6 @@ import { evalCached } from './eval-cached.js';
 // is '@t/<tenantId>/<topic>'.
 const OWNER_KEY_PREFIX = '__live-room-owner:';
 const PRESENCE_KEY_PREFIX = '__live-presence:';
-const TENANT_TOPIC_NS = '@t/';
 // Mirrors the realtime owner hash's idle TTL: a purge that touches a
 // still-populated hash refreshes the same expiry the join/leave transitions
 // apply, so the purge never shortens or removes a live room's TTL contract.
@@ -110,19 +110,72 @@ const OWNER_FORGET_EVICT_SCRIPT =
 	"redis.call('HDEL', KEYS[1], 'o', 'q')\n" +
 	"return {'', 'vacated', removed + 1}";
 
-/**
- * Whether a WIRE topic falls inside a tenant scope - the same rule as the
- * realtime layer's own purge scoping: with a tenantId, true iff the topic
- * carries that tenant's namespace prefix; with null, true iff the topic
- * carries NO tenant prefix. A null-tenant erasure can never reach another
- * tenant's rooms and vice versa.
- * @param {string | null} tenantId
- * @param {string} topic
- * @returns {boolean}
- */
-function topicInTenant(tenantId, topic) {
-	if (tenantId) return topic.startsWith(TENANT_TOPIC_NS + tenantId + '/');
-	return !topic.startsWith(TENANT_TOPIC_NS);
+// `topicInTenant` / `TENANT_TOPIC_NS` come from shared/tenant-topic.js. The
+// rule is shared rather than restated because this purge fans out across
+// several stores at once, and a store applying a different rule silently
+// widens or narrows the erasure the caller asked for - which is exactly what
+// happened while each store held its own answer.
+
+// Tenant ids reach this store from the realtime layer already validated, but
+// createForgetStore is a public API: a raw prefix scope makes tenant 'a' match
+// '@t/a/b/...' (cross-tenant reach), and ''/non-strings silently select the
+// null-tenant scope. Validate at the store boundary.
+//
+// The charset is the widest one that CANNOT break the `@t/<id>/` prefix match
+// this scope is decided by, not a stylistic house rule - so `.` and `:` are in
+// (`acme.com` and `acme:eu` are ordinary tenant ids and a thrown erasure is a
+// poor answer to one), and `/` stays out permanently: allowing it would make
+// tenant `a` and tenant `a/b` both match the topic `@t/a/b/x`, which is the
+// cross-tenant reach the guard exists for. The length bound stays for the same
+// reason it always applied - an id is a scope key, not a payload.
+//
+// `_` is safe here only because `tenantTopicSql` uses `left(topic, ...)` rather
+// than LIKE, where `_` is a single-character wildcard; see tenant-topic.js.
+const VALID_TENANT_ID = /^[a-zA-Z0-9_.:-]+$/;
+const MAX_TENANT_ID_LEN = 64;
+function validateTenantId(tenantId) {
+	if (tenantId == null) return null;
+	// Non-strings are refused rather than coerced. On an erasure path a silent
+	// miss is worse than a loud refusal: the data was written under whatever
+	// representation the WRITER used, and coercing here would report a
+	// successful purge of a scope that may never have existed.
+	if (typeof tenantId !== 'string') {
+		throw new Error(
+			'forget-store: tenant id must be null (untenanted scope) or a string - got ' +
+			typeof tenantId + '. Stringify it at the call site, using the same representation the data was written under.'
+		);
+	}
+	if (!VALID_TENANT_ID.test(tenantId) || tenantId.length > MAX_TENANT_ID_LEN) {
+		throw new Error(
+			'forget-store: tenant id must be a non-empty string of [a-zA-Z0-9_.:-], at most ' +
+			MAX_TENANT_ID_LEN + ' chars (a "/" would let one tenant\'s scope reach another\'s); got ' + JSON.stringify(tenantId)
+		);
+	}
+	return tenantId;
+}
+
+// Bound the cluster-purge fan-out: one erasure touches O(rooms) keys and a
+// raw Promise.allSettled fires one concurrent Redis command per room
+// A small worker pool keeps per-room failure isolation identical
+// while capping in-flight commands.
+const PURGE_CONCURRENCY = 16;
+async function mapBounded(items, limit, fn) {
+	const results = new Array(items.length);
+	let next = 0;
+	async function worker() {
+		while (next < items.length) {
+			const i = next++;
+			try {
+				results[i] = { status: 'fulfilled', value: await fn(items[i]) };
+			} catch (reason) {
+				results[i] = { status: 'rejected', reason };
+			}
+		}
+	}
+	const workers = [];
+	for (let i = 0; i < Math.min(limit, items.length); i++) workers.push(worker());
+	await Promise.all(workers);
+	return results;
 }
 
 /**
@@ -188,10 +241,10 @@ async function evictOwnerUser(redis, tenantId, userId) {
 	const successions = [];
 	const failures = [];
 	let touched = 0;
-	const settled = await Promise.allSettled(rooms.map(async ({ key, topic }) => {
+	const settled = await mapBounded(rooms, PURGE_CONCURRENCY, async ({ key, topic }) => {
 		const res = await evalCached(redis, OWNER_FORGET_EVICT_SCRIPT, 1, key, userId, String(OWNER_TTL_SEC));
 		return { res, topic };
-	}));
+	});
 	for (const s of settled) {
 		if (s.status === 'rejected') { failures.push(s.reason); continue; }
 		const { res, topic } = s.value;
@@ -230,8 +283,8 @@ async function purgePresenceRoster(redis, tenantId, userId) {
 	}
 	const failures = [];
 	let removed = 0;
-	const settled = await Promise.allSettled(
-		rosters.map(({ key }) => Promise.resolve(redis.hdel(key, 'c:' + userId, 'd:' + userId)))
+	const settled = await mapBounded(rosters, PURGE_CONCURRENCY, ({ key }) =>
+		redis.hdel(key, 'c:' + userId, 'd:' + userId)
 	);
 	for (const s of settled) {
 		if (s.status === 'rejected') { failures.push(s.reason); continue; }
@@ -290,6 +343,7 @@ export function createForgetStore(stores, options) {
 	return {
 		async purgeUser(tenantId, userId, cascade) {
 			if (typeof userId !== 'string' || userId.length === 0) return {};
+			tenantId = validateTenantId(tenantId);
 			const jobs = entries.map(([name, s]) =>
 				Promise.resolve(/** @type {any} */ (s).purgeUser(tenantId, userId, cascade)).then((n) => ({ name, n }))
 			);

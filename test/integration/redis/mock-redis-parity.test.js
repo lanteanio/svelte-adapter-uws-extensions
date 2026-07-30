@@ -114,4 +114,108 @@ describe('mock-redis Lua parity against real Redis (integration)', () => {
 		expect(Number(realRes[0])).toBe(1); // refilled -> allowed again
 		expectParity(dblRes, realRes);
 	});
+
+	// SCAN MATCH is the other place the double reimplements server behaviour,
+	// and it is the one that purge-scope and tenant-isolation tests run
+	// through. A double that matches LOOSELY reports those bugs as fixed, so
+	// the glob matcher gets the same real-server oracle the Lua evaluators do.
+	describe('SCAN MATCH glob', () => {
+		// Keys that put every glob metacharacter on the SUBJECT side too, so a
+		// pattern cannot pass by never meeting the character it mishandles.
+		const KEYS = [
+			'a', 'b', 'c', 'ab', 'abc', 'aXc', 'a-c', 'a]c', 'a^c', 'a\\c', 'a*c', 'a?c',
+			'A', 'Z', 'z', ']', '-', '^', '*', '?', '[', 'abd', 'aa', 'aaa', 'aab',
+			'x:1', 'x:2', 'user:1:name', 'a.c', 'a b', '_', '`', 'a_c', 'a`c'
+		];
+
+		// Every one of these was wrong under the previous regex translation, or
+		// guards a rule that is easy to get wrong when porting.
+		const PATTERNS = [
+			'*', 'a', 'a*', '*c', 'a*c', '*a*', 'a?c', '??', '???',
+			'[abc]', '[^abc]', '[a-c]', '[a-cx-z]', '[A-Za-z]', '[^a-c]',
+			// Reversed ranges: Redis swaps the endpoints. A regex translation
+			// THROWS `Range out of order`, turning a scan into a hard error.
+			'[c-a]', '[z-a]', '[Z-A]', '[^c-a]',
+			// A leading ']' closes the class in Redis - it is NOT a literal
+			// member the way most glob dialects treat it.
+			'[]abc]', '[]]', '[^]]', '[^]abc]', 'a[]c',
+			// '[a-]' is the range a..']' with the endpoints swapped, not the
+			// two members {a, -}.
+			'[a-]', '[-a]', '[^-a]', '[--a]',
+			// Escapes, unterminated classes, and metacharacters as literals.
+			'[a\\-c]', '[\\]]', '[[]', '[a', '[a-c', '[\\\\]', 'a\\*c', 'a\\?c',
+			'\\*', 'a\\\\c', 'a[b]c', '*[0-9]*', 'a**c', '**', 'x:*', '*:*', '?',
+			// '!' is not a negation character here, unlike some shells.
+			'[!abc]'
+		];
+
+		async function scanAll(redis, pattern) {
+			const found = new Set();
+			let cursor = '0';
+			do {
+				const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
+				for (const k of batch) found.add(k);
+				cursor = String(next);
+			} while (cursor !== '0');
+			return found;
+		}
+
+		it('agrees with the real server on every probed (pattern, key) pair', async () => {
+			const prefix = client.key('glob:');
+			const dbl = mockRedisClient(prefix);
+			for (const k of KEYS) {
+				await client.redis.set(prefix + k, '1');
+				await dbl.redis.set(prefix + k, '1');
+			}
+
+			// Collected rather than asserted per pair, so a failure reports the
+			// whole divergence set instead of only the first row.
+			const divergences = [];
+			for (const pattern of PATTERNS) {
+				const real = await scanAll(client.redis, prefix + pattern);
+				const mock = await scanAll(dbl.redis, prefix + pattern);
+				for (const k of KEYS) {
+					const r = real.has(prefix + k);
+					const m = mock.has(prefix + k);
+					if (r !== m) divergences.push(`${JSON.stringify(pattern)} x ${JSON.stringify(k)}: real=${r} mock=${m}`);
+				}
+			}
+			expect(divergences).toEqual([]);
+		});
+
+		it('does not throw on a reversed range, where a regex translation did', async () => {
+			// The sharpest of the three: this was not a wrong answer but an
+			// exception out of the double, so a purge scan became a hard error.
+			const prefix = client.key('rev:');
+			const dbl = mockRedisClient(prefix);
+			for (const k of ['a', 'b', 'c', 'd']) {
+				await client.redis.set(prefix + k, '1');
+				await dbl.redis.set(prefix + k, '1');
+			}
+			const real = await scanAll(client.redis, prefix + '[c-a]');
+			const mock = await scanAll(dbl.redis, prefix + '[c-a]');
+			expect(mock).toEqual(real);
+			expect([...mock].sort()).toEqual([prefix + 'a', prefix + 'b', prefix + 'c']);
+		});
+
+		it('returns promptly on the shape that backtracked catastrophically', async () => {
+			// `*a*a*...*b` against a long non-matching subject took 148s under
+			// the regex form. The port's skip-longer-matches rule is what
+			// bounds it; a wall-clock ceiling is the only way to pin that.
+			const prefix = client.key('backtrack:');
+			const dbl = mockRedisClient(prefix);
+			const subject = 'a'.repeat(64);
+			await client.redis.set(prefix + subject, '1');
+			await dbl.redis.set(prefix + subject, '1');
+
+			const pattern = prefix + '*a'.repeat(24) + '*b';
+			const t0 = process.hrtime.bigint();
+			const mock = await scanAll(dbl.redis, pattern);
+			const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+
+			expect(mock.size).toBe(0);
+			expect(await scanAll(client.redis, pattern)).toEqual(mock);
+			expect(ms).toBeLessThan(1000);
+		});
+	});
 });

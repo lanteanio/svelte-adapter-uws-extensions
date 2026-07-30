@@ -24,7 +24,10 @@ import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
-import { checkReplayAccess } from '../shared/replay-gate.js';
+import { createLruMap } from '../shared/lru-map.js';
+import { topicInTenant } from '../shared/tenant-topic.js';
+import { MAX_REPLAY_EPOCH_CACHE_TOPICS } from '../shared/caps.js';
+import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { decodeStreamFields } from '../shared/replay-envelope.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 
@@ -202,7 +205,7 @@ function seqFromId(id) {
  * @returns {import('./replay.js').RedisReplayBuffer}
  */
 export function createStreamReplay(client, options = {}) {
-	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, localFanoutOnStorageFailure } =
+	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, maxDataBytes, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis stream replay', options);
 
 	const defaultIdempotencyTtl = options.idempotencyTtl !== undefined
@@ -232,6 +235,10 @@ export function createStreamReplay(client, options = {}) {
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
+	const mResumeTopicOverflows = m?.counter(
+		'replay_resume_topic_overflows_total',
+		'Resume frames whose topic set exceeded MAX_RESUME_TOPICS'
+	);
 	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
@@ -264,8 +271,9 @@ export function createStreamReplay(client, options = {}) {
 
 	// Last epoch this process observed for a topic, so the synchronous
 	// subscribe-ack carrier can read a recent value without awaiting Redis.
-	/** @type {Map<string, number>} */
-	const epochCache = new Map();
+	// Bounded with least-recently-used eviction: authorized resume topics and
+	// public currentEpoch calls can both introduce client-influenced names.
+	const epochCache = createLruMap(MAX_REPLAY_EPOCH_CACHE_TOPICS);
 
 	async function currentEpoch(topic) {
 		const val = await withBreaker(b, () => redis.get(epochKey(topic)));
@@ -335,6 +343,9 @@ export function createStreamReplay(client, options = {}) {
 			} catch (err) {
 				throw new ReplaySerializationError('publishIdempotent', err);
 			}
+			if (Buffer.byteLength(payload) > maxDataBytes) {
+				throw new ReplaySerializationError('publishIdempotent', new Error(`redis stream replay: data exceeds maxDataBytes (${maxDataBytes} bytes)`));
+			}
 
 			// Resolve the per-field-TTL capability (cached after the first probe;
 			// the first publish awaits one INFO round trip, subsequent ones read
@@ -388,6 +399,9 @@ export function createStreamReplay(client, options = {}) {
 				payload = JSON.stringify(data ?? null);
 			} catch (err) {
 				throw new ReplaySerializationError('publish', err);
+			}
+			if (Buffer.byteLength(payload) > maxDataBytes) {
+				throw new ReplaySerializationError('publish', new Error(`redis stream replay: data exceeds maxDataBytes (${maxDataBytes} bytes)`));
 			}
 
 			let seq;
@@ -503,8 +517,15 @@ export function createStreamReplay(client, options = {}) {
 			return result;
 		},
 
-		async replay(ws, topic, sinceSeq, platform, reqId) {
-			if (!await checkReplayAccess(ws, topic, platform, reqId)) return;
+		async replay(ws, topic, sinceSeq, platform, reqId, preAuthorized) {
+			// The resume hook has just run this exact gate for this exact
+			// topic. Re-running it would invoke the APP's subscribe hook a
+			// second time per resumed topic - doubling its authorization load
+			// and any side effects it has (audit rows, rate-limit tokens, a
+			// presence join). Identity-compared against the private token, not
+			// truthiness: this is a public method, so a plain boolean here
+			// would let any caller skip the gate by passing `true`.
+			if (preAuthorized !== RESUME_PREAUTHORIZED && !await checkReplayAccess(ws, topic, platform, reqId)) return;
 			const replayTopic = '__replay:' + topic;
 			// Same input gate as since(): malformed sinceSeq would fall
 			// through to `'-'` (entire stream) via the prior ternary.
@@ -632,6 +653,12 @@ export function createStreamReplay(client, options = {}) {
 			let n = 0;
 			for (const bk of keys) {
 				const topic = bk.startsWith(prefix) && bk.endsWith('}') ? bk.slice(prefix.length, bk.length - 1) : '';
+				// Same tenant rule as the sorted-set backend and both dead-letter
+				// stores. Without it, a deployment on the STREAMS backend still
+				// had the cross-tenant erasure the sibling stores just closed -
+				// which is worse than never fixing it, because the contract now
+				// says it is fixed.
+				if (!topicInTenant(tenantId, topic)) continue;
 				let entries;
 				try { entries = await redis.xrange(bk, '-', '+'); } catch { continue; }
 				const toDel = [];
@@ -677,7 +704,14 @@ export function createStreamReplay(client, options = {}) {
 		resumeHook() {
 			return createResumeHook({
 				currentEpochs,
-				replay: (ws, topic, seq, platform) => tracker.replay(ws, topic, seq, platform)
+				// Forwards `reqId` and `preAuthorized` too. A 4-arity forwarder
+				// drops the flag, and `replay()` then re-runs the app's subscribe
+				// hook for every topic the hook just authorized - once more per
+				// topic, and from inside Promise.all, so with no concurrency
+				// bound at all.
+				replay: (ws, topic, seq, platform, reqId, preAuthorized) =>
+					tracker.replay(ws, topic, seq, platform, reqId, preAuthorized),
+				onTruncate: () => mResumeTopicOverflows?.inc()
 			});
 		}
 	};

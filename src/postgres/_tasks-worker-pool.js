@@ -135,6 +135,16 @@ export function createWorkerPool(workerOption, taskName) {
 			idle.delete(w);
 			clearIdleTimer(w);
 			workerCount -= 1;
+			// Draining only the in-flight slot is not enough. A queued job is
+			// waiting for a worker to come free, and the free-a-worker signal
+			// is the `message` handler above - which a dead worker never
+			// reaches. With no other live worker to pick them up, those jobs
+			// never settle at all: no result, no rejection, and no timeout on
+			// this path to end the wait.
+			if (workerCount === 0 && queue.length > 0) {
+				const stranded = queue.splice(0, queue.length);
+				for (const job of stranded) job.reject(err);
+			}
 		});
 		w.on('exit', () => {
 			idle.delete(w);

@@ -10,6 +10,23 @@
  *
  * @module svelte-adapter-uws-extensions/shared/replay-helpers
  */
+import { redactConnectionUrl } from './sensitive.js';
+import { MAX_RESUME_TOPICS, MAX_STORE_PAYLOAD_BYTES } from './caps.js';
+import { checkReplayAccess, RESUME_PREAUTHORIZED } from './replay-gate.js';
+import { now } from './runtime.js';
+
+/** In-flight authorization checks per resume frame. */
+const RESUME_AUTH_CONCURRENCY = 32;
+
+/**
+ * How often one resume hook may report topic-set truncation. Any socket can
+ * send the frame at will, so this cannot be per-frame - but a process-lifetime
+ * one-shot is the other extreme: a burst during startup silences every later
+ * occurrence, including from other connections, for as long as the process
+ * lives. The window is the middle: repeated enough to show a pattern in the
+ * logs, bounded enough not to be the amplifier it guards against.
+ */
+const RESUME_TRUNCATION_WARN_INTERVAL_MS = 60_000;
 
 /**
  * Thrown when `WAIT` reports fewer replicas than `minReplicas` within
@@ -36,11 +53,72 @@ export class ReplicationTimeoutError extends Error {
  */
 export class ReplayStorageError extends Error {
 	constructor(op, cause) {
-		super(`replay storage failed during ${op}: ${cause?.message ?? cause}`);
+		// The cause message can embed a connection DSN (pg auth/SSL failures,
+		// ioredis target errors); redact so the password never reaches logs.
+		super(`replay storage failed during ${op}: ${redactConnectionUrl(cause?.message ?? String(cause))}`);
 		this.name = 'ReplayStorageError';
 		this.op = op;
-		this.cause = cause;
+		// Redacted too. `util.inspect` prints `cause` - which is what
+		// console.error(err) and every structured logger's error serializer
+		// do - so attaching the raw original would hand the DSN straight
+		// back to the logs this message was just cleaned for.
+		this.cause = redactCause(cause);
 	}
+}
+
+/**
+ * A copy of `cause` with its string fields redacted, keeping the prototype
+ * so `instanceof` checks on the original error class still hold.
+ * @param {any} cause
+ */
+function redactCause(cause) {
+	if (!cause || typeof cause !== 'object') {
+		return typeof cause === 'string' ? redactConnectionUrl(cause) : cause;
+	}
+	// Return the ORIGINAL when there is nothing to redact. Copying
+	// unconditionally would break `err.cause === theErrorIThrew`, which is a
+	// reasonable thing for a caller to check, and the copy only earns its
+	// keep when it is actually hiding a credential.
+	const msg = typeof cause.message === 'string' ? cause.message : '';
+	const stk = typeof cause.stack === 'string' ? cause.stack : '';
+	if (redactConnectionUrl(msg) === msg && redactConnectionUrl(stk) === stk) return cause;
+	const safe = Object.create(Object.getPrototypeOf(cause));
+	// `message` and `stack` are re-defined below with their original hidden
+	// shape. Plain assignment would make them own ENUMERABLE properties, so
+	// an app that does `JSON.stringify(err)` into an error response would
+	// start shipping the whole server stack trace to the client - an
+	// information disclosure introduced by the redactor itself. Skipping
+	// them in the copy loop also keeps a FROZEN cause from carrying over a
+	// non-configurable descriptor that the redefine would then throw on.
+	const redefined = new Set();
+	if (typeof cause.message === 'string') redefined.add('message');
+	if (typeof cause.stack === 'string') redefined.add('stack');
+	for (const k of Reflect.ownKeys(cause)) {
+		if (redefined.has(k)) continue;
+		let desc;
+		try {
+			desc = Object.getOwnPropertyDescriptor(cause, k);
+		} catch {
+			continue;
+		}
+		if (!desc) continue;
+		if ('value' in desc && typeof desc.value === 'string') {
+			desc = { ...desc, value: redactConnectionUrl(desc.value) };
+		}
+		try { Object.defineProperty(safe, k, desc); } catch { /* never lose the cause over one property */ }
+	}
+	if (typeof cause.message === 'string') defineHidden(safe, 'message', redactConnectionUrl(cause.message));
+	if (typeof cause.stack === 'string') defineHidden(safe, 'stack', redactConnectionUrl(cause.stack));
+	return safe;
+}
+
+/**
+ * @param {object} target
+ * @param {string} key
+ * @param {any} value
+ */
+function defineHidden(target, key, value) {
+	Object.defineProperty(target, key, { value, writable: true, enumerable: false, configurable: true });
 }
 
 /**
@@ -56,10 +134,10 @@ export class ReplayStorageError extends Error {
  */
 export class ReplaySerializationError extends Error {
 	constructor(op, cause) {
-		super(`replay payload could not be serialized during ${op}: ${cause?.message ?? cause}`);
+		super(`replay payload could not be serialized during ${op}: ${redactConnectionUrl(cause?.message ?? String(cause))}`);
 		this.name = 'ReplaySerializationError';
 		this.op = op;
-		this.cause = cause;
+		this.cause = redactCause(cause);
 	}
 }
 
@@ -108,12 +186,21 @@ export function parseReplayOptions(prefix, options) {
 		typeof options.localFanoutOnStorageFailure !== 'boolean') {
 		throw new Error(`${prefix}: localFanoutOnStorageFailure must be a boolean, got ${options.localFanoutOnStorageFailure}`);
 	}
+	// Number.isInteger, not `typeof === 'number'`: NaN is a number and
+	// `NaN < 1` is false, so NaN would pass a typeof-only guard and then make
+	// every `bytes > maxDataBytes` comparison false, silently disabling the
+	// very cap it configures.
+	if (options.maxDataBytes !== undefined &&
+		(!Number.isInteger(options.maxDataBytes) || options.maxDataBytes < 1)) {
+		throw new Error(`${prefix}: maxDataBytes must be a positive integer (bytes), got ${options.maxDataBytes}`);
+	}
 	return {
 		maxSize: options.size || 1000,
 		ttl: options.ttl || 0,
 		replicated,
 		minReplicas,
 		replicationTimeoutMs,
+		maxDataBytes: options.maxDataBytes ?? MAX_STORE_PAYLOAD_BYTES,
 		localFanoutOnStorageFailure: options.localFanoutOnStorageFailure === true
 	};
 }
@@ -272,27 +359,104 @@ async function _drainWaitWindows(redis, minReplicas, timeoutMs, g) {
  *
  * @param {{
  *   currentEpochs: (topics: string[]) => Promise<Map<string, number>>,
- *   replay: (ws: any, topic: string, sinceSeq: number, platform: any) => Promise<number | undefined>
+ *   replay: (ws: any, topic: string, sinceSeq: number, platform: any, reqId?: any, preAuthorized?: symbol) => Promise<number | undefined>,
+ *   onTruncate?: () => void
  * }} store
  * @returns {(ws: any, ctx: any) => Promise<Record<string, number> | undefined>}
  */
-export function createResumeHook({ currentEpochs, replay }) {
+export function createResumeHook({ currentEpochs, replay, authorize = checkReplayAccess, onTruncate }) {
+	// Per-hook, NOT module-global. A module-level latch is shared by every
+	// store in the process and by every test file that touches one, which made
+	// the report both order-dependent and permanently silenced after whoever
+	// happened to trigger it first. `-Infinity` so the first occurrence always
+	// reports.
+	let truncationWarnedAt = -Infinity;
 	return async (ws, ctx) => {
 		if (!ctx || !ctx.lastSeenSeqs || !ctx.platform) return;
 		const presented = (ctx.lastSeenEpochs && typeof ctx.lastSeenEpochs === 'object')
 			? ctx.lastSeenEpochs
 			: null;
-		const entries = Object.entries(ctx.lastSeenSeqs);
+		// Cap the client-presented topic set: the resume frame is raw wire
+		// input and every accepted topic costs pre-authorization state and
+		// queries. Truncate rather than reject, so the legitimate prefix
+		// still resumes.
+		//
+		// Built by iterating, NOT `Object.entries(...).slice(...)`, because
+		// Object.entries materializes the whole client-supplied map first -
+		// which is the allocation spike the bound exists to prevent.
+		const entries = [];
+		let truncated = false;
+		for (const topic in ctx.lastSeenSeqs) {
+			if (!Object.prototype.hasOwnProperty.call(ctx.lastSeenSeqs, topic)) continue;
+			if (entries.length >= MAX_RESUME_TOPICS) {
+				truncated = true;
+				break;
+			}
+			entries.push([topic, ctx.lastSeenSeqs[topic]]);
+		}
+		if (truncated) {
+			// Count every overflowing frame even while its operator log is
+			// throttled. This callback is wired to a label-free counter by all
+			// three stores, so client-controlled topic names never become
+			// metric labels.
+			onTruncate?.();
+			// A silently partial `covered` map reads to the client as "these
+			// are your watermarks" when the rest were never looked at. This is
+			// an OPERATOR-side report only: the map is consumed by the adapter
+			// per topic and never forwarded, so there is nowhere in the current
+			// wire contract to hand the client an overflow marker it could act
+			// on. A client whose topic set exceeds the bound must be given a
+			// smaller one; the log is what surfaces that.
+			const nowMs = now();
+			if (nowMs - truncationWarnedAt >= RESUME_TRUNCATION_WARN_INTERVAL_MS) {
+				truncationWarnedAt = nowMs;
+				console.warn(
+					`replay resume: more than ${MAX_RESUME_TOPICS} topics presented, ${MAX_RESUME_TOPICS} accepted ` +
+					'(MAX_RESUME_TOPICS); the remainder were not inspected or resumed. Further occurrences on this ' +
+					`store are reported at most once per ${RESUME_TRUNCATION_WARN_INTERVAL_MS}ms.`
+				);
+			}
+		}
+		// Authorize BEFORE any per-topic work. Without this, an unauthorized
+		// topic name still reached currentEpochs, whose stores memoize every
+		// topic they are asked about - so a spray of forged names evicted the
+		// real topics' memoized epochs, and the next `subscribed` ack carried
+		// epoch 0 for a topic whose real epoch had climbed, sending healthy
+		// clients into a full rehydrate instead of a gap-fill. The store's
+		// own per-topic check still runs inside replay(); it passes for
+		// everything that got through here, so the client sees one denial per
+		// denied topic, not two.
+		// Bounded concurrency, not a serial loop: these checks are per-topic
+		// independent, and `platform.checkSubscribe` runs the app's subscribe
+		// hook, which is commonly DB-backed. Serially at MAX_RESUME_TOPICS a
+		// 1ms-latency authorizer takes over two minutes for one client frame,
+		// and the adapter awaits this hook inline in the message handler.
+		const authorized = [];
+		const verdicts = new Array(entries.length);
+		let next = 0;
+		async function authWorker() {
+			while (next < entries.length) {
+				const i = next++;
+				verdicts[i] = await authorize(ws, entries[i][0], ctx.platform, ctx.reqId);
+			}
+		}
+		const workers = [];
+		for (let i = 0; i < Math.min(RESUME_AUTH_CONCURRENCY, entries.length); i++) workers.push(authWorker());
+		await Promise.all(workers);
+		for (let i = 0; i < entries.length; i++) {
+			if (verdicts[i]) authorized.push(entries[i]);
+		}
+
 		const epochTopics = [];
 		if (presented !== null) {
-			for (const [topic] of entries) {
+			for (const [topic] of authorized) {
 				if (Number.isInteger(presented[topic])) epochTopics.push(topic);
 			}
 		}
 		const have = epochTopics.length > 0 ? await currentEpochs(epochTopics) : null;
 		const fills = [];
 		const fillTopics = [];
-		for (const [topic, sinceSeq] of entries) {
+		for (const [topic, sinceSeq] of authorized) {
 			// Normalize wire-supplied sinceSeq. Reject non-integers (fractional,
 			// NaN, Infinity, non-number) by falling through to 0 (resume from
 			// start). Negative values also fall through; the store's replay()
@@ -306,7 +470,7 @@ export function createResumeHook({ currentEpochs, replay }) {
 					continue;
 				}
 			}
-			fills.push(replay(ws, topic, seq, ctx.platform));
+			fills.push(replay(ws, topic, seq, ctx.platform, ctx.reqId, RESUME_PREAUTHORIZED));
 			fillTopics.push(topic);
 		}
 		const results = await Promise.all(fills);
