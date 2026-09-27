@@ -159,6 +159,10 @@ export function createShardedBus(client, options = {}) {
 	/** @type {ReturnType<typeof setTimeout> | null} pending reconcile: the debounce after a subscriber error, or a retry */
 	let reconcileTimer = null;
 	let reconcileDueAt = 0;
+	// Bumped by subClose. A topology refresh or a subscribe still awaiting Redis
+	// when the bus closes sees a different generation and stops before it opens
+	// a connection or records state that nothing would clean up.
+	let subGeneration = 0;
 	// Delay of the next retry; 0 while the last reconciliation completed.
 	let reconcileRetryMs = 0;
 	// One report per failure streak for each kind of failure, re-armed by a
@@ -446,9 +450,11 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function refreshTopologyNow() {
+		const generation = subGeneration;
 		const masters = client.redis.nodes('master');
 		await Promise.all(masters.map(async (node) => {
 			const id = await node.cluster('MYID');
+			if (generation !== subGeneration) return;
 			if (!subByNodeId.has(id)) {
 				const s = node.duplicate({ enableReadyCheck: false });
 				s.on('error', subOnError);
@@ -457,6 +463,7 @@ export function createShardedBus(client, options = {}) {
 			}
 		}));
 		const slots = await client.redis.cluster('SLOTS');
+		if (generation !== subGeneration) return;
 		// Each entry: [startSlot, endSlot, [ip, port, nodeId], ...replicas].
 		slotRanges = slots.map((e) => ({ start: e[0], end: e[1], nodeId: e[2][2] }));
 		topologyDirty = false;
@@ -492,6 +499,7 @@ export function createShardedBus(client, options = {}) {
 	// would resolve the old owner, where ssubscribe hangs, so a timeout triggers
 	// one topology refresh + retry on the true owner.
 	async function subscribeChannelOnOwner(channel) {
+		const generation = subGeneration;
 		const slot = keySlot(channel);
 		// If a reshard was signaled, the cached owner map may be stale and an
 		// ssubscribe on the old owner would hang, so refresh before resolving.
@@ -511,6 +519,16 @@ export function createShardedBus(client, options = {}) {
 			conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
 			if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
 			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot + ' (retry)');
+		}
+		// The bus closed while the subscribe was in flight: its connections are
+		// already quit.
+		if (generation !== subGeneration) return;
+		// Every topic on the channel was unfollowed meanwhile (a reconcile
+		// retry can outlive the unfollow): undo the subscribe rather than record
+		// an owner nothing will unsubscribe.
+		if (!channelRefcounts.has(channel)) {
+			withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe on slot ' + slot).catch(() => {});
+			return;
 		}
 		channelNode.set(channel, ownerId);
 	}
@@ -633,6 +651,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function subClose() {
+		subGeneration++;
 		if (reconcileTimer !== null) {
 			clearTimer(reconcileTimer);
 			reconcileTimer = null;

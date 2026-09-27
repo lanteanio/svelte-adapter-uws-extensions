@@ -694,7 +694,7 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.sharded-pubsub.reconcile.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.reconcile.failed severity=error] Sharded pub/sub reconciliation could not refresh slot ownership.`
-- **Cause:** Reading CLUSTER SLOTS, or a master's CLUSTER MYID, threw while reconciling after a subscriber error.
+- **Cause:** Reading CLUSTER SLOTS, or a master's CLUSTER MYID, threw while reconciling after a subscriber error or on a retry.
 - **Consequence:** Channels that moved during the reshard stay unsubscribed on this instance until a reconciliation succeeds. Reported once per failure streak; a reconciliation that completes re-arms it.
 - **Automatic recovery:** Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until it completes. A subscriber error retries at once.
 - **Next action:** Check cluster health and run CLUSTER SLOTS from the instance; delivery resumes on its own once the slot map can be read.

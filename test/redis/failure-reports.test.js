@@ -386,13 +386,19 @@ describe('background sweeps report their failures', () => {
 function fakeCluster() {
 	let owner = 'node-a';
 	let slotsDown = false;
+	let created = 0;
+	/** @type {Promise<void> | null} while set, CLUSTER MYID waits for it */
+	let myidGate = null;
 	/** @type {Map<string, any>} */
 	const conns = new Map();
 	const conn = (id) => {
 		const listeners = new Map();
+		created++;
 		const c = {
 			refuse: false,
 			hang: false,
+			/** @type {Promise<void> | null} while set, ssubscribe waits for it */
+			gate: null,
 			attempts: 0,
 			subscribed: new Set(),
 			on(event, fn) { listeners.set(event, fn); return c; },
@@ -400,11 +406,12 @@ function fakeCluster() {
 			emit(event, ...args) { listeners.get(event)?.(...args); },
 			async ssubscribe(channel) {
 				c.attempts++;
+				if (c.gate) await c.gate;
 				if (c.hang) return new Promise(() => {});
 				if (c.refuse) throw noperm('channel');
 				c.subscribed.add(channel);
 			},
-			async sunsubscribe() {},
+			async sunsubscribe(channel) { c.subscribed.delete(channel); },
 			async psubscribe() { if (c.refuse) throw noperm('channel'); },
 			async quit() {},
 			disconnect() {}
@@ -415,7 +422,10 @@ function fakeCluster() {
 	/** @type {Map<string, string | Error>} what CONFIG GET notify-keyspace-events answers per node */
 	const keyspaceFlags = new Map();
 	const node = (id) => ({
-		cluster: async () => id,
+		cluster: async () => {
+			if (myidGate) await myidGate;
+			return id;
+		},
 		duplicate: () => conn(id),
 		config: async () => {
 			const flags = keyspaceFlags.get(id) ?? 'Eg';
@@ -428,6 +438,13 @@ function fakeCluster() {
 		conns,
 		masters,
 		setKeyspaceFlags(id, flags) { keyspaceFlags.set(id, flags); },
+		get created() { return created; },
+		/** Hold CLUSTER MYID until the returned function is called. */
+		holdMyid() {
+			let release;
+			myidGate = new Promise((resolve) => { release = resolve; });
+			return () => { myidGate = null; release(); };
+		},
 		setOwner(id) { owner = id; },
 		setSlotsDown(down) { slotsDown = down; },
 		redis: {
@@ -604,6 +621,34 @@ describe('cluster-only failure paths', () => {
 		cluster.setOwner('node-b');
 		await settle(40);
 		expect(cluster.conns.get('node-b').subscribed.has(CHANNEL)).toBe(true);
+		await bus.deactivate();
+	});
+
+	it('opens no subscriber connection when the bus closes during a topology refresh', async () => {
+		const { cluster, bus } = await followedCluster();
+		const release = cluster.holdMyid();
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		const created = cluster.created;
+		await bus.deactivate();
+		release();
+		await settle();
+		expect(cluster.created).toBe(created);
+	});
+
+	it('undoes a resubscribe that completes after its channel was unfollowed', async () => {
+		const { cluster, bus } = await followedCluster();
+		cluster.setOwner('node-b');
+		const nodeB = cluster.conns.get('node-b');
+		let open;
+		nodeB.gate = new Promise((resolve) => { open = resolve; });
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		await bus.unfollow('user:42:inbox');
+		open();
+		await settle();
+		expect(nodeB.attempts).toBeGreaterThan(0);
+		expect(nodeB.subscribed.has(CHANNEL)).toBe(false);
 		await bus.deactivate();
 	});
 

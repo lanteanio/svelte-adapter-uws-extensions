@@ -565,7 +565,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE,
 		event: 'redis.sharded-pubsub.reconcile.failed', component: 'runtime.redis.sharded-pubsub', severity: 'error',
 		problemPrefix: 'Sharded pub/sub reconciliation could not refresh slot ownership.',
-		cause: 'Reading CLUSTER SLOTS, or a master\'s CLUSTER MYID, threw while reconciling after a subscriber error.',
+		cause: 'Reading CLUSTER SLOTS, or a master\'s CLUSTER MYID, threw while reconciling after a subscriber error or on a retry.',
 		consequence: 'Channels that moved during the reshard stay unsubscribed on this instance until a reconciliation succeeds. Reported once per failure streak; a reconciliation that completes re-arms it.',
 		automaticRecovery: 'Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until it completes. A subscriber error retries at once.',
 		nextAction: 'Check cluster health and run CLUSTER SLOTS from the instance; delivery resumes on its own once the slot map can be read.',
