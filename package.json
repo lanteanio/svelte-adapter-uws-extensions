@@ -129,6 +129,10 @@
 			"types": "./src/redis/lock.d.ts",
 			"default": "./src/redis/lock.js"
 		},
+		"./redis/lease-scripts": {
+			"types": "./src/redis/lease-scripts.d.ts",
+			"default": "./src/redis/lease-scripts.js"
+		},
 		"./redis/leader": {
 			"types": "./src/redis/leader.d.ts",
 			"default": "./src/redis/leader.js"

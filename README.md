@@ -2121,6 +2121,26 @@ export const lock = createDistributedLock(redis, {
 });
 ```
 
+#### Raw lease scripts (advanced)
+
+Most applications should use `createDistributedLock`, `createLeader`, or the
+other lease-backed primitives. Tooling that deliberately calls `redis.eval`
+can import the shared, value-guarded Lua scripts from the supported public
+subpath:
+
+```js
+import {
+  LEASE_RENEW_SCRIPT,
+  LEASE_RELEASE_SCRIPT
+} from 'svelte-adapter-uws-extensions/redis/lease-scripts';
+```
+
+`LEASE_RENEW_SCRIPT` takes one key, the expected holder value, and a TTL in
+milliseconds; `LEASE_RELEASE_SCRIPT` takes one key and the expected holder
+value. Each returns `1` only when the stored value still belongs to that holder,
+otherwise `0`. The lock, leader, and smooth-cluster primitives run these exact
+scripts, so a direct caller shares their value-guarded semantics.
+
 #### Use
 
 ```js

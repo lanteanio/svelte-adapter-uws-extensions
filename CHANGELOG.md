@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Official ecosystem links are declared at the package front door.** The README identifies the GitHub owner, canonical documentation, hosted demo, and the `svti.me` domain printed by runtime-help diagnostics.
 - **One coordinated release and rollback route across all three packages.** The README points operators to the adapter's operations pack and its coordinated release matrix before changing the adapter/realtime/extensions tuple or renaming a durable alarm path; rollback restores the complete recorded tuple.
 - **`AlarmMeta` declares the optional `alarmId`.** The Redis and Postgres alarm stores' type definitions now include the stable resolver identity svelte-realtime persists with an alarm. The stores still keep `meta` opaque; a present `alarmId` takes precedence over the legacy RPC `path` when alarms are recovered after a restart.
+- **`svelte-adapter-uws-extensions/redis/lease-scripts` entry point.** Ships the shared compare-and-renew and compare-and-release scripts behind the lock, leader, smooth-cluster and CRDT relays as `LEASE_RENEW_SCRIPT` / `LEASE_RELEASE_SCRIPT`, with declarations. The type gate checks every package import printed in the migration guide against the export map, and a packed-consumer test imports each one through Node's resolver.
 
 ### Changed
 

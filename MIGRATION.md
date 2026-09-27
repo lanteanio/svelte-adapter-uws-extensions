@@ -298,6 +298,18 @@ find them: <!-- vocabulary-allow: a rename note must name the superseded option 
 | `buggifyProbability` | `faultProbability` | <!-- vocabulary-allow: rename table, superseded option name -->
 | `buggified` (per-run flag and summary counter) | `faulted` | <!-- vocabulary-allow: rename table, superseded option name -->
 
+## 6. New, no action required
+
+### The lease Lua scripts are public at `redis/lease-scripts`
+
+**What changed.** The compare-and-renew and compare-and-release scripts shared by `createDistributedLock`, `createLeader`, the smooth-cluster relay and the CRDT relay are exported as `LEASE_RENEW_SCRIPT` and `LEASE_RELEASE_SCRIPT` from `svelte-adapter-uws-extensions/redis/lease-scripts`. That subpath is the only supported import; the implementation file under `shared/` is not in the export map and never was.
+
+**How to migrate.** No action for callers of the lock, leader, or smooth-cluster APIs. Tooling that copied the script text out of `redis/lock` to call `redis.eval` itself can import the constants instead:
+
+```js
+import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from 'svelte-adapter-uws-extensions/redis/lease-scripts';
+```
+
 ## After upgrading to 0.6
 
 Run your test suite, then check:
@@ -673,20 +685,6 @@ Type-only changes, internal refactors, niche edge cases. No action required for 
 **What changed.** The first argument of `idempotency.acquire(...)` and `idempotency.purge(...)` is now named `idempotencyKey` instead of `key`, matching the existing `idempotencyKey` option on the task runner.
 
 **How to migrate.** Function-argument rename, transparent at call sites that pass positionally. Code that destructures the parameter name from a wrapper signature should update accordingly.
-
-### `redis/lock` Lua scripts moved to `shared/lease-scripts.js`
-
-**What changed.** The lock module's `HEARTBEAT_SCRIPT` and `RELEASE_SCRIPT` are now imported from `shared/lease-scripts.js` under generic names (`LEASE_RENEW_SCRIPT`, `LEASE_RELEASE_SCRIPT`) so `redis/leader` can reuse them. Pure refactor, no behavior change.
-
-**How to migrate.** No action required for callers using the public lock API. Internal-tooling code that imported the script constants by name from `redis/lock` must update its import path and rename:
-
-```js
-// before
-import { HEARTBEAT_SCRIPT, RELEASE_SCRIPT } from 'svelte-adapter-uws-extensions/redis/lock';
-
-// after
-import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from 'svelte-adapter-uws-extensions/shared/lease-scripts';
-```
 
 ### `JOIN_SCRIPT` in groups returns `[status, ...liveMembers]`
 

@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+const migration = readFileSync(join(root, 'MIGRATION.md'), 'utf8');
 
 const errors = [];
 const checked = [];
@@ -91,6 +92,27 @@ if (pkg.exports && typeof pkg.exports === 'object') {
 	checkTarget('.', 'default', pkg.exports);
 }
 
+// Documentation is part of the public surface. Every static package import
+// printed in the migration guide must resolve through the package export map;
+// otherwise the prescribed migration can work in this source tree yet fail
+// with ERR_PACKAGE_PATH_NOT_EXPORTED for an installed consumer.
+const escapedPackageName = pkg.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const migrationImportPattern = new RegExp(
+	String.raw`(?:from\s+|import\s+|import\s*\(\s*|require\s*\(\s*)['"](${escapedPackageName}(?:\/[^'"]+)?)['"]`,
+	'g'
+);
+const migrationSpecifiers = new Set(
+	[...migration.matchAll(migrationImportPattern)].map((match) => match[1])
+);
+
+for (const specifier of migrationSpecifiers) {
+	const subpath = specifier === pkg.name ? '.' : `.${specifier.slice(pkg.name.length)}`;
+	if (!pkg.exports || typeof pkg.exports !== 'object' ||
+		!Object.prototype.hasOwnProperty.call(pkg.exports, subpath)) {
+		errors.push(`MIGRATION.md imports ${specifier}, but package exports has no ${subpath} entry`);
+	}
+}
+
 for (const field of ['types', 'typings']) {
 	if (typeof pkg[field] === 'string') checkTarget(`(package.${field})`, 'types', pkg[field]);
 }
@@ -101,6 +123,7 @@ for (const field of ['main', 'module']) {
 const declarations = checked.filter((c) => TYPE_CONDITIONS.has(c.condition));
 console.log(`check-types: ${pkg.name}@${pkg.version}`);
 console.log(`  ${checked.length} export target(s) checked, ${declarations.length} declaration file(s).`);
+console.log(`  ${migrationSpecifiers.size} migration import specifier(s) checked against package exports.`);
 
 if (errors.length) {
 	console.error(`\ncheck-types FAILED (${errors.length} problem(s)):`);
