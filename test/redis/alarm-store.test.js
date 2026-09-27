@@ -12,10 +12,10 @@ describe('redis durable alarm store', () => {
 	});
 
 	it('persists an alarm and returns it from due() once overdue', async () => {
-		await store.set('room:1', 1000, { path: 'rooms/x', tenantId: 'acme' });
+		await store.set('room:1', 1000, { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' });
 		expect(await store.due(999)).toEqual([]); // not yet due
 		const due = await store.due(1000);
-		expect(due).toEqual([{ topic: 'room:1', at: 1000, meta: { path: 'rooms/x', tenantId: 'acme' } }]);
+		expect(due).toEqual([{ topic: 'room:1', at: 1000, meta: { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' } }]);
 	});
 
 	it('delete() is the atomic claim: true once, then false', async () => {

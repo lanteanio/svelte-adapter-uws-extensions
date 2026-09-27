@@ -2,6 +2,8 @@
 
 Redis and Postgres extensions for [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws).
 
+**Official links:** [GitHub owner](https://github.com/lanteanio) | [Documentation](https://svelte-realtime.dev/) | [Live demo](https://svelte-realtime-demo.lantean.io/) | `svti.me` is the ecosystem-owned runtime-help redirect domain.
+
 The core adapter keeps everything in-process memory. That works great for single-server deployments, but the moment you scale to multiple instances you need shared state. This package provides drop-in replacements backed by Redis and Postgres, with the same API shapes you already know from the core plugins.
 
 ## What you get
@@ -13,9 +15,36 @@ The core adapter keeps everything in-process memory. That works great for single
 - **Distributed broadcast groups** - named groups with membership and roles that span instances
 - **Shared cursor state** - ephemeral positions (cursors, selections, drawing strokes) visible across instances
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
-- **Prometheus metrics** - expose extension metrics for scraping, zero overhead when disabled
+- **Prometheus metrics** - expose extension metrics for scraping, with no collection work when disabled
 
 **Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
+
+The shared [translation contract](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/translating.md)
+defines the English source locale, application-owned catalogs, stable
+machine-field boundary, placeholder rules, and bidirectional-text handling
+across all three ecosystem packages.
+
+The canonical [privacy integration contract](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/privacy-integration.md)
+records the exact no-TTL replay/dead-letter defaults, durable idempotency and
+task lifetimes, alarm lifecycle, identity-extractor requirements, and
+application-owned deletion boundaries. Complete its generated
+[host worksheet](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/privacy/v1/ropa-dpa-transfer-checklist.md)
+for every Redis/Postgres provider, replica, backup, region, and transfer.
+
+During an incident, start from the ecosystem's versioned
+[operations pack v1](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/operations/v1/README.md).
+Its failure map and Redis/durable-work runbooks state ownership, loss semantics,
+abort criteria, recovery checks, and the evidence required at handoff.
+Use its [coordinated release matrix](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/operations/v1/coordinated-release.md)
+before changing the adapter/realtime/extensions tuple or renaming a durable
+alarm path; rollback restores the complete recorded tuple.
+
+Before launch or a topology/autoscaling change, use the ecosystem's versioned
+[capacity kit v1](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/capacity/v1/README.md).
+Its open-arrival proof includes Redis/Postgres and relay telemetry in the same
+artifact as the exact deployment shape, peak p50/p95/p99 and errors, the first
+resource to saturate, and recovery under continuing traffic. Per-primitive
+microbenchmarks do not prove distributed production capacity.
 
 ---
 
@@ -1921,10 +1950,10 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | | `createJobQueue` | `createTaskRunner` |
 |---|---|---|
 | Surface | minimal: claim / complete / fail | full state machine: idempotency + fence + retry + result tracking |
-| Best fit | "ingest event, defer work" with caller-driven retry | tasks that must complete exactly once with cross-instance recovery |
+| Best fit | "ingest event, defer work" with caller-driven retry | durable result tracking and at-least-once execution with cross-instance recovery |
 | Result tracking | none (caller tracks via DB writes) | yes (`run` / `await`) |
 
-If your handler must run exactly once and you want the runtime to track the result, reach for `createTaskRunner`. If you want a lighter producer/consumer split with caller-driven retry, this is the simpler shape.
+If your handler needs durable result tracking and crash recovery, and its effects are idempotent across retries, reach for `createTaskRunner`. If you want a lighter producer/consumer split with caller-driven retry, this is the simpler shape.
 
 ---
 
@@ -2159,8 +2188,8 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 
 #### When to use which
 
-- **`createDistributedLock`** when business logic needs "at most one responsive instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that must not double-fire, transactional state machines that don't fit `createTaskRunner`'s shape. Cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)); when strict single-writer correctness matters across a stall, prefer `createTaskRunner`.
-- **`createTaskRunner`** when the work is a durable side-effect that must finish exactly once across crashes (charge customer, send email). The runner pairs a Postgres state machine with the Redis fence to guarantee at-most-one and at-least-once delivery.
+- **`createDistributedLock`** when business logic needs "at most one responsive instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that should not overlap while holders observe their leases, transactional state machines that don't fit `createTaskRunner`'s shape. Cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)); strict single-writer effects require downstream fencing or idempotency.
+- **`createTaskRunner`** when work needs durable result tracking and retries across crashes. Handler execution is at least once after lease expiry: the Postgres fence rejects a stale canonical-result commit, but it cannot undo an external effect already started by that attempt. Observe the abort signal and pass the stable `idempotencyKey` or a fencing token to the downstream system.
 - **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal - caching the outcome is.
 - **`createLeader`** (next section) when the question is "which one of N workers should fire this scheduled job right now," not "who runs this critical section." Distinct from `withLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer.
 
@@ -2616,7 +2645,7 @@ There is intentionally no `size()` method: a cluster-wide count of session keys 
 
 ## Task runner
 
-Wraps an effectful operation in a state machine that survives process crashes and naturally fans across cluster instances. Use it for background work that absolutely must finish exactly once: charging a customer, sending a transactional email, posting to a webhook, kicking off a long-running pipeline.
+Wraps an effectful operation in a state machine that survives process crashes and naturally fans across cluster instances. Use it for background work that needs durable retry and result tracking: charging a customer, sending a transactional email, posting to a webhook, or kicking off a long-running pipeline. Handler execution is at least once after a lease expires, so externally visible effects must be idempotent or fenced.
 
 **Requires Postgres 13+.** Uses the built-in `gen_random_uuid()` function (added to core in 13; older versions need the `pgcrypto` extension explicitly enabled, which the runner does not do for you).
 
@@ -2629,6 +2658,15 @@ Three guarantees:
 - **Caller-retry idempotency.** Pair the runner with the idempotency store via the `idempotency` option. When a caller passes the same `idempotencyKey` twice, the second call returns the cached result instead of re-running the handler.
 - **Worker-crash recovery.** Every attempt holds a fence UUID and a `fence_expires_at` timestamp. The conditional commit `UPDATE ... WHERE fence = $current_fence` is atomic, so a stuck attempt that comes back from the dead cannot overwrite a completed attempt's result. A periodic recovery sweep reclaims rows whose fence has expired and re-drives the handler in any live instance.
 - **External-service idempotency.** The `idempotencyKey` is forwarded to the handler, where you pass it on to Stripe / SendGrid / S3 so the side-effect target de-duplicates retries too.
+
+**Guarantee:** exactly one fenced attempt can commit the canonical task result;
+expired attempts are reclaimed and retried. **Requires:** the handler observes its
+abort signal, and every external effect uses the stable `idempotencyKey` or an
+equivalent downstream fence. An expired or paused handler may overlap its
+successor, so handler execution itself is not exactly once. **Verified:** run
+`npm exec vitest -- run test/postgres/tasks.test.js
+test/postgres/tasks-fence-lost.test.js`; the reclaim and stale-commit cases bind
+the result-state guarantee, not downstream effect uniqueness.
 
 #### Setup
 
@@ -4439,7 +4477,7 @@ The re-exported names are the exact same identities as the adapter source (`expe
 
 `createTestServer` is intentionally not re-exported - it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
 
-The adapter's `__chaos` harness on `createTestServer` covers the WS-frame outbound path (drop / delay frames going to connected clients). It does **not** reach traffic on other transports - ioredis, pg, NATS, custom HTTP backends - because each of those goes through its own client, not through the test server's outbound chokepoint. To inject faults at those wires, wrap the transport client in a chaos proxy: `createChaosState` is re-exported above and composes with any client method via a small `Proxy` wrapper. See the adapter's [Wrap your own transport for cross-wire chaos](https://github.com/lanteanio/svelte-adapter-uws#wrap-your-own-transport-for-cross-wire-chaos) section for the pattern. The `__chaos` JSDoc on the adapter's [testing.d.ts](https://github.com/lanteanio/svelte-adapter-uws/blob/main/testing.d.ts) names the WS-only scope explicitly so tests reaching for cross-wire coverage see the boundary at the type level.
+The adapter's `__chaos` harness on `createTestServer` covers the WS-frame outbound path (drop / delay frames going to connected clients). It does **not** reach traffic on other transports - ioredis, pg, NATS, custom HTTP backends - because each of those goes through its own client, not through the test server's outbound chokepoint. To inject faults at those wires, wrap the transport client in a chaos proxy: `createChaosState` is re-exported above and composes with any client method via a small `Proxy` wrapper. See the adapter's [Wrap your own transport for cross-wire chaos](https://github.com/lanteanio/svelte-adapter-uws#wrap-your-own-transport-for-cross-wire-chaos) section for the pattern. The `__chaos` JSDoc on the adapter's [testing.d.ts](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/src/testing.d.ts) names the WS-only scope explicitly so tests reaching for cross-wire coverage see the boundary at the type level.
 
 ---
 

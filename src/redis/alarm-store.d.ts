@@ -4,6 +4,8 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 
 /** Resolver metadata persisted with an alarm (opaque to the store). */
 export interface AlarmMeta {
+	/** Stable resolver identity. When present, recovery never falls back to `path`. */
+	alarmId?: string;
 	path?: string;
 	tenantId?: string | null;
 }

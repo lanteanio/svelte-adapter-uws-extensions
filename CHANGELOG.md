@@ -5,6 +5,20 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-next.64] - 2026-09-11
+
+### Added
+
+- **The README routes launch and topology changes to the ecosystem capacity kit.** Its open-arrival proof covers Redis/Postgres and relay telemetry in the same artifact as the deployment shape, peak p50/p95/p99 and errors, the first resource to saturate, and recovery under continuing traffic.
+- **Durable-store privacy defaults now join one ecosystem contract.** The adapter-owned processing inventory and host worksheet expose no-TTL replay and dead-letter defaults, 48-hour idempotency, seven-day terminal tasks, event-bounded alarms, and the `forgetUserId` / `purgeUser` prerequisites. Redis/Postgres providers, replicas, backups, regions, and transfers remain deployment-owned records instead of implied package guarantees.
+- **Official ecosystem links are declared at the package front door.** The README identifies the GitHub owner, canonical documentation, hosted demo, and the `svti.me` domain printed by runtime-help diagnostics.
+- **One coordinated release and rollback route across all three packages.** The README points operators to the adapter's operations pack and its coordinated release matrix before changing the adapter/realtime/extensions tuple or renaming a durable alarm path; rollback restores the complete recorded tuple.
+- **`AlarmMeta` declares the optional `alarmId`.** The Redis and Postgres alarm stores' type definitions now include the stable resolver identity svelte-realtime persists with an alarm. The stores still keep `meta` opaque; a present `alarmId` takes precedence over the legacy RPC `path` when alarms are recovered after a restart.
+
+### Changed
+
+- **The task runner is documented as at-least-once execution with a fenced canonical result.** The README no longer says effectful work runs exactly once: the lease fence guarantees that exactly one attempt commits the canonical result, while an expired or paused handler can overlap its successor, so every external effect must use the stable `idempotencyKey` or an equivalent downstream fence.
+
 ## [0.6.0-next.63] - 2026-07-30
 
 ### Breaking Changes

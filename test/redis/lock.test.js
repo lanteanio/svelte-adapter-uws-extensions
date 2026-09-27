@@ -301,6 +301,44 @@ describe('redis distributed lock', () => {
 	});
 
 	describe('withLock: heartbeat / lost lock', () => {
+		it('does not claim hard exclusion after a stale holder ignores its abort signal', async () => {
+			const holder = createDistributedLock(client, {
+				defaultTtlMs: 1000,
+				heartbeatMs: 5
+			});
+			const successor = createDistributedLock(client, {
+				retryDelayMs: 1,
+				maxWaitMs: 1000
+			});
+			let releaseHolder;
+			let holderRunning = false;
+			let holderSignal;
+
+			const staleRun = holder.withLock('cooperative-boundary', async (signal) => {
+				holderSignal = signal;
+				holderRunning = true;
+				await new Promise((resolve) => { releaseHolder = resolve; });
+				holderRunning = false;
+			});
+
+			while (!holderRunning) await sleep(1);
+			await client.redis.del(client.key('lock:cooperative-boundary'));
+			for (let i = 0; i < 50 && !holderSignal.aborted; i++) await sleep(2);
+
+			let observedOverlap = false;
+			try {
+				await successor.withLock('cooperative-boundary', async () => {
+					observedOverlap = holderRunning;
+				});
+			} finally {
+				releaseHolder();
+				await staleRun;
+			}
+
+			expect(holderSignal.aborted).toBe(true);
+			expect(observedOverlap).toBe(true);
+		});
+
 		it('aborts via signal when a foreign instance takes over the key', async () => {
 			const lock = createDistributedLock(client, {
 				defaultTtlMs: 1000,

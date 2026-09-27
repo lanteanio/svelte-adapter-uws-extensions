@@ -56,9 +56,9 @@ describe('postgres durable alarm store', () => {
 	});
 
 	it('persists and returns a due alarm (BIGINT fire_at parsed back to a number)', async () => {
-		await store.set('room:1', 1000, { path: 'rooms/x', tenantId: 'acme' });
+		await store.set('room:1', 1000, { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' });
 		expect(await store.due(999)).toEqual([]);
-		expect(await store.due(1000)).toEqual([{ topic: 'room:1', at: 1000, meta: { path: 'rooms/x', tenantId: 'acme' } }]);
+		expect(await store.due(1000)).toEqual([{ topic: 'room:1', at: 1000, meta: { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' } }]);
 	});
 
 	it('delete() is the atomic claim: true once, then false', async () => {

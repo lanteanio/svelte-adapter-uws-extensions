@@ -12,7 +12,7 @@
  *   svti_alarms (
  *     topic   TEXT   PRIMARY KEY,   -- the wire topic (already tenant-scoped)
  *     fire_at BIGINT NOT NULL,      -- epoch-ms deadline
- *     meta    JSONB,                -- realtime resolver metadata ({ path, tenantId })
+ *     meta    JSONB,                -- resolver metadata ({ alarmId, path, tenantId })
  *     tenant  TEXT                  -- tenantId mirrored out for ops queries / cleanup
  *   )
  *   + index on (fire_at) so the due() sweep is a range scan
@@ -43,7 +43,7 @@ const DEFAULT_DUE_BATCH = 100;
  * @typedef {Object} AlarmRow
  * @property {string} topic
  * @property {number} at
- * @property {{ path?: string, tenantId?: string | null } | null} meta
+ * @property {{ alarmId?: string, path?: string, tenantId?: string | null } | null} meta
  */
 
 /**

@@ -14,8 +14,9 @@
  *   - `{alarms}:due`  ZSET  score = `at` (epoch-ms), member = wire topic. The
  *     recovery poll reads `ZRANGEBYSCORE -inf now` to find overdue alarms.
  *   - `{alarms}:meta` HASH  field = wire topic, value = `JSON({ at, meta })`. Holds
- *     the realtime resolver metadata (the stream's RPC path) the poll needs to
- *     re-find `onAlarm` after a restart.
+ *     the realtime resolver metadata (`alarmId`, legacy RPC path and tenant) the
+ *     poll needs to re-find `onAlarm` after a restart. A present `alarmId` is
+ *     authoritative; recovery does not fall back to the path.
  *
  * Single-fire: `delete(topic)` is the atomic claim - `ZREM` returns 1 only for the
  * caller that actually removed the member, so the precise in-memory timer and the
@@ -42,7 +43,7 @@ const DEFAULT_DUE_BATCH = 100;
  * @typedef {Object} AlarmRow
  * @property {string} topic
  * @property {number} at
- * @property {{ path?: string, tenantId?: string | null } | null} meta
+ * @property {{ alarmId?: string, path?: string, tenantId?: string | null } | null} meta
  */
 
 /**
@@ -145,7 +146,7 @@ export function createAlarmStore(client, options = {}) {
 							const parsed = JSON.parse(raw);
 							if (parsed && typeof parsed.at === 'number') at = parsed.at;
 							meta = parsed && parsed.meta != null ? parsed.meta : null;
-						} catch { /* corrupt payload -> surface as a bare row, the poll GCs it */ }
+						} catch { /* corrupt payload -> surface as a bare row; recovery retains it unresolved */ }
 					}
 					out.push({ topic: topics[i], at, meta });
 				}
