@@ -30,7 +30,7 @@ function matchingIndex(localCounts) {
 describe('buildPresenceAuditSnapshot', () => {
 	it('reports per-topic count and local-index distinct-key cardinalities and the total', () => {
 		const localCounts = countsMap([['room', ['u1', 'u2']], ['lobby', ['u3']]]);
-		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: matchingIndex(localCounts), mt: (t) => t, offset: 0, limit: 10 });
+		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: matchingIndex(localCounts), offset: 0, limit: 10 });
 		expect(snap.total).toBe(2);
 		expect(snap.presenceTopics).toEqual([
 			{ topic: 'room', countKeys: 2, indexKeys: 2 },
@@ -41,7 +41,7 @@ describe('buildPresenceAuditSnapshot', () => {
 	it('advances a bounded round-robin window without materializing the population', () => {
 		const localCounts = countsMap([['a', ['u1']], ['b', ['u1']], ['c', ['u1']]]);
 		const idx = matchingIndex(localCounts);
-		const win = (offset) => buildPresenceAuditSnapshot({ localCounts, topicKeyCount: idx, mt: (t) => t, offset, limit: 2 })
+		const win = (offset) => buildPresenceAuditSnapshot({ localCounts, topicKeyCount: idx, offset, limit: 2 })
 			.presenceTopics.map((r) => r.topic);
 		expect(win(0)).toEqual(['a', 'b']);
 		expect(win(2)).toEqual(['c']);
@@ -49,11 +49,12 @@ describe('buildPresenceAuditSnapshot', () => {
 
 	it('records a desync when the local index lost a key the count map still tracks', () => {
 		const localCounts = countsMap([['room', ['u1', 'u2']]]);
-		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, mt: (t) => t, offset: 0, limit: 10 });
+		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, offset: 0, limit: 10 });
 		expect(snap.presenceTopics).toEqual([{ topic: 'room', countKeys: 2, indexKeys: 1 }]);
 		expect(checkRedisPresenceLocalIndex(snap)).toEqual({
 			category: 'redis.presence.local-index-desync',
-			context: { topic: 'room', countKeys: 2, indexKeys: 1 }
+			key: 'room',
+			context: { countKeys: 2, indexKeys: 1 }
 		});
 	});
 
@@ -64,14 +65,16 @@ describe('buildPresenceAuditSnapshot', () => {
 		// count=1, index=1, data=0 - is clean. (Comparing against data would have
 		// false-fired here.)
 		const localCounts = countsMap([['room', ['u1']]]);
-		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, mt: (t) => t, offset: 0, limit: 10 });
+		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, offset: 0, limit: 10 });
 		expect(checkRedisPresenceLocalIndex(snap)).toBeNull();
 	});
 
-	it('routes the topic through the metric-safe transform (no raw topic in the snapshot)', () => {
-		const localCounts = countsMap([['secret-room', ['u1']]]);
-		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, mt: () => '<redacted>', offset: 0, limit: 10 });
-		expect(snap.presenceTopics[0].topic).toBe('<redacted>');
+	it('keeps the topic out of the logged context, even with no metric transform configured', () => {
+		const localCounts = countsMap([['user:42:inbox', ['u1', 'u2']]]);
+		const snap = buildPresenceAuditSnapshot({ localCounts, topicKeyCount: () => 1, offset: 0, limit: 10 });
+		const violation = checkRedisPresenceLocalIndex(snap);
+		expect(JSON.stringify(violation.context)).not.toContain('user:42');
+		expect(violation.key).toBe('user:42:inbox');
 	});
 });
 
@@ -143,11 +146,29 @@ describe('presence consistency auditor (persistence gate)', () => {
 			hardCategories: ['redis.presence.local-index-desync']
 		});
 		auditor.runOnce();
-		expect(softAssert).toHaveBeenCalledWith(false, 'redis.presence.local-index-desync', { topic: 'room', countKeys: 1, indexKeys: 0 });
+		expect(softAssert).toHaveBeenCalledWith(false, 'redis.presence.local-index-desync', { countKeys: 1, indexKeys: 0 });
 		expect(fatalFn).not.toHaveBeenCalled();
 		auditor.runOnce();
-		expect(fatalFn).toHaveBeenCalledWith(false, 'redis.presence.local-index-desync', { topic: 'room', countKeys: 1, indexKeys: 0 });
+		expect(fatalFn).toHaveBeenCalledWith(false, 'redis.presence.local-index-desync', { countKeys: 1, indexKeys: 0 });
 		expect(auditor.stats.fatals).toBe(1);
+	});
+
+	it('does not escalate two different topics that desync with the same counts in consecutive audits', () => {
+		const softAssert = vi.fn();
+		const fatalFn = vi.fn();
+		let tick = 0;
+		const auditor = createConsistencyAuditor({
+			// The logged context is identical for both; only the unlogged key differs.
+			snapshot: () => ({ presenceTopics: [{ topic: tick++ === 0 ? 'user:1' : 'user:2', countKeys: 1, indexKeys: 0 }], total: 1 }),
+			assert: softAssert,
+			fatal: fatalFn,
+			predicates: [checkRedisPresenceLocalIndex],
+			hardCategories: ['redis.presence.local-index-desync']
+		});
+		auditor.runOnce();
+		auditor.runOnce();
+		expect(softAssert).toHaveBeenCalledTimes(2);
+		expect(fatalFn).not.toHaveBeenCalled();
 	});
 });
 

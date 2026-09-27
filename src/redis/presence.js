@@ -74,6 +74,8 @@ import { buildPresenceAuditSnapshot } from './presence/audit-snapshot.js';
 import { assert, fatal } from '../shared/assert.js';
 import { createConsistencyAuditor } from '../shared/auditor.js';
 import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 export { WsClosedError };
 
@@ -83,7 +85,7 @@ export { WsClosedError };
  * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData. By default, recursively drops internal keys, credentials, common personal data, and request transport metadata. An explicit function can intentionally admit fields; its result still passes through stripInternal().
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
- * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:expired` so a topic's local subscribers receive an empty `list` event the moment its per-topic presence hash key expires (instance-died scenario where every field of the hash has expired). Requires `CONFIG SET notify-keyspace-events Kx` (or any flagset including key-event + expired). With per-field TTLs, individual field expiry does NOT emit a key-expired notification; only whole-key expiry does, which happens when every field of the topic hash has expired (no live instances presenting any user on this topic).
+ * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:del` so a topic's local subscribers receive an empty `state` event the moment its per-topic presence hash is removed (instance-died scenario: the server deletes the hash when its last field's TTL lapses). Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset including `E` and `g`) on every master; Redis accepts the subscription without it, so a missing flag means the cleanup never fires. Per-field expiry that leaves other users on the topic does not fire it.
  * @property {number} [maxEnvelopeBytes=1048576] - Byte ceiling for one cross-instance presence envelope, enforced before inbound JSON.parse and before outbound publish. Oversized outbound lifecycle events warn and drop rather than failing the connection operation.
  * @property {string[]} [transient] - Dynamic field names (set via `update()`) that are broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or the heartbeat roster. A (re)joining or swept-then-readded client therefore never inherits a possibly-stale transient value - a disconnected typer leaves no stuck indicator across the cluster. Identity fields (from `select`) and durable `update()` fields not listed here persist and ride the snapshot normally. Default: none (every `update()` field is durable). Matches the bundled in-memory presence plugin.
  */
@@ -330,10 +332,9 @@ export function createPresence(client, options = {}) {
 		// Publishing past it fans out locally and to no remote instance,
 		// which reads as a partial roster rather than as an error.
 		if (Buffer.byteLength(msg) > maxEnvelopeBytes) {
-			console.warn(
-				`presence: "${event}" envelope for topic "${topic}" exceeds maxEnvelopeBytes ` +
-				`(${maxEnvelopeBytes} bytes) and was not relayed; peers would drop it on receipt`
-			);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_ENVELOPE_OVERSIZED, {
+				attributes: { event, bytes: Buffer.byteLength(msg), maxEnvelopeBytes }
+			});
 			return;
 		}
 		await redis.publish(ch, msg).catch(() => {});
@@ -722,7 +723,7 @@ export function createPresence(client, options = {}) {
 	let consistencyAuditor = null;
 	if (consistencyAuditIntervalMs > 0) {
 		consistencyAuditor = createConsistencyAuditor({
-			snapshot: ({ offset, limit }) => buildPresenceAuditSnapshot({ localCounts, topicKeyCount, mt, offset, limit }),
+			snapshot: ({ offset, limit }) => buildPresenceAuditSnapshot({ localCounts, topicKeyCount, offset, limit }),
 			assert,
 			fatal,
 			predicates: [checkRedisPresenceLocalIndex],

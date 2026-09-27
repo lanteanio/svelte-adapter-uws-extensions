@@ -3,6 +3,8 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 describe('redis replay', () => {
 	let client;
@@ -1266,10 +1268,29 @@ describe('redis replay', () => {
 				restore();
 			}
 			expect(warns).toHaveLength(1);
-			expect(warns[0]).toContain('[redis replay]');
-			expect(warns[0]).toContain('requestId=req-ss');
+			const record = registeredRecord(warns[0], EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STORAGE_FALLBACK);
+			expect(record.attributes).toEqual({ requestId: 'req-ss', error: { name: 'Error', code: null, message: 'redis down' } });
 			// The raw topic is deliberately not logged (it can embed user ids).
 			expect(warns[0]).not.toContain('chat');
+		});
+
+		it('cuts the topic keys out of a fallback report whose error repeats them', async () => {
+			const r = createReplay(client, { localFanoutOnStorageFailure: true });
+			const orig = client.redis.eval;
+			client.redis.eval = async (_script, _numKeys, ...keys) => {
+				throw new Error("backend refused '" + keys.join("', '") + "'");
+			};
+			const warns = [];
+			const spy = vi.spyOn(console, 'warn').mockImplementation((msg) => warns.push(msg));
+			try {
+				await r.publish(platform, 'user:42:inbox', 'created', { id: 1 });
+			} finally {
+				spy.mockRestore();
+				client.redis.eval = orig;
+			}
+			const record = registeredRecord(warns[0], EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STORAGE_FALLBACK);
+			expect(record.attributes.error.message).toMatch(/^backend refused '<redacted>', '<redacted>', '<redacted>'/);
+			expect(warns[0]).not.toContain('user:42');
 		});
 
 		it('counts the fallback in replay_storage_fallbacks_total but not replay_publishes_total', async () => {

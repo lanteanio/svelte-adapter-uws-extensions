@@ -13,11 +13,19 @@
 
 import { createBusValidator } from '../shared/bus-validate.js';
 import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import {
+	POSTGRES_TRACE_ATTRIBUTES,
+	normalizeTraceContext,
+	runTraceOperation,
+	traceEnabled
+} from '../shared/trace-context.js';
 
 /**
  * @typedef {Object} NotifyBridgeOptions
  * @property {string} channel - Postgres LISTEN channel name (required)
- * @property {(payload: string, channel: string) => { topic: string, event: string, data?: unknown } | null} [parse] -
+ * @property {(payload: string, channel: string) => { topic: string, event: string, data?: unknown, traceContext?: unknown, traceparent?: unknown, tracestate?: unknown } | null} [parse] -
  *   Parse the notification payload into a publish call. Return null to skip.
  *   Defaults to JSON.parse expecting { topic, event, data }.
  * @property {boolean} [autoReconnect=true] - Reconnect on connection loss
@@ -154,6 +162,8 @@ export function createNotifyBridge(client, options) {
 	let conn = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
+	// Whether activePlatform has a tracing provider, read once at activate.
+	let activeTracing = false;
 	let active = false;
 	/** @type {ReturnType<typeof setTimeout> | null} */
 	let reconnectTimer = null;
@@ -165,7 +175,13 @@ export function createNotifyBridge(client, options) {
 		try {
 			const obj = JSON.parse(payload);
 			if (!obj.topic || !obj.event) return null;
-			return { topic: obj.topic, event: obj.event, data: obj.data };
+			return {
+				topic: obj.topic,
+				event: obj.event,
+				data: obj.data,
+				traceparent: obj.traceparent,
+				tracestate: obj.tracestate
+			};
 		} catch {
 			return null;
 		}
@@ -174,12 +190,16 @@ export function createNotifyBridge(client, options) {
 	function onNotification(msg) {
 		if (msg.channel !== channel) return;
 		mReceived?.inc({ channel });
-		if (msg.payload && msg.payload.length > 7500) {
-			console.warn(
-				`[postgres/notify] payload on "${channel}" is ${msg.payload.length} bytes - ` +
-				'approaching the ~8000 byte Postgres NOTIFY limit\n' +
-				'  See: https://svti.me/pg-notify-limit'
-			);
+		// Postgres caps a NOTIFY payload at 8000 bytes, not characters. A
+		// UTF-16 unit is at most three UTF-8 bytes, so a payload of 2500 units
+		// or fewer cannot be near the cap and skips the byte count.
+		if (msg.payload && msg.payload.length > 2500) {
+			const bytes = Buffer.byteLength(msg.payload, 'utf8');
+			if (bytes > 7500) {
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_PAYLOAD_NEAR_LIMIT, {
+					attributes: { channel, bytes, limit: 8000 }
+				});
+			}
 		}
 		// Pre-parse size guard. Postgres caps NOTIFY at ~8000 bytes by
 		// default, but the user's parser may unwrap into a larger object
@@ -190,8 +210,10 @@ export function createNotifyBridge(client, options) {
 			mParseErrors?.inc({ channel });
 			return;
 		}
+		let parsed = false;
 		try {
 			const result = parse(msg.payload, msg.channel);
+			parsed = true;
 			if (result && activePlatform) {
 				if (!validator.acceptEnvelope(result.topic, result.event)) {
 					mParseErrors?.inc({ channel });
@@ -203,14 +225,27 @@ export function createNotifyBridge(client, options) {
 				// its own LISTEN, so suppress relay to avoid duplicate
 				// fan-out via the bus.
 				const publishOpts = advisory ? undefined : { relay: false };
-				activePlatform.publish(result.topic, result.event, result.data, publishOpts);
+				// With a tracing provider, delivery is a consumer operation parented
+				// on the notification's validated context, so a bus relaying this
+				// publish carries the operation onward. Without one, nothing reads a
+				// context during delivery and the trace fields are ignored.
+				if (activeTracing) {
+					const hasExplicitTrace = Object.prototype.hasOwnProperty.call(result, 'traceContext');
+					const incomingTrace = normalizeTraceContext(hasExplicitTrace ? result.traceContext : result);
+					runTraceOperation(activePlatform, 'postgres.notify.receive', 'consumer', incomingTrace, POSTGRES_TRACE_ATTRIBUTES,
+						() => activePlatform.publish(result.topic, result.event, result.data, publishOpts));
+				} else {
+					activePlatform.publish(result.topic, result.event, result.data, publishOpts);
+				}
 			} else if (!result && isDefaultParser) {
 				mParseErrors?.inc({ channel });
 			}
 		} catch (err) {
 			mParseErrors?.inc({ channel });
 			if (!isDefaultParser) {
-				console.warn(`[postgres/notify] parse error on "${channel}":`, err.message || err);
+				// A parser error can quote the payload (JSON.parse prints an excerpt
+				// of its input), so only its name and code are reported.
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_PARSE, { error: err, redact: parsed ? undefined : true, attributes: { channel } });
 			}
 		}
 	}
@@ -244,6 +279,7 @@ export function createNotifyBridge(client, options) {
 
 	function handleError(err) {
 		b?.failure(err);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_CONNECTION, { error: err, attributes: { channel } });
 		cleanup();
 		isLeader = false;
 		if (advisory) {
@@ -336,6 +372,7 @@ export function createNotifyBridge(client, options) {
 			// are forwarded through the latest platform, even if a
 			// previous activate() already started the listener.
 			activePlatform = platform;
+			activeTracing = traceEnabled(platform);
 			if (active) return;
 			active = true;
 			if (advisory) {

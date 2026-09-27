@@ -1,8 +1,36 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
+const REDIS_ATTRIBUTES = { 'messaging.system': 'redis' };
+
+// A mock Platform whose tracing provider is switched on, as the adapter's is
+// when one is configured at build time. `current()` answers the live context,
+// so the relayed envelope carries it.
+function tracedPlatform(context = null) {
+	const p = mockPlatform();
+	p.trace.enabled = true;
+	p.traceContext = context;
+	return p;
+}
+
+// Every envelope that actually reached the bus channel, as a raw subscriber
+// on its own connection sees it (single publishes and pipelined ones alike).
+async function captureChannel(client, channel = 'uws:pubsub') {
+	const envelopes = [];
+	const sub = client.duplicate();
+	sub.on('message', (ch, message) => {
+		if (ch === channel) envelopes.push(JSON.parse(message));
+	});
+	await sub.subscribe(channel);
+	return envelopes;
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 
 describe('redis pubsub bus', () => {
 	let client;
@@ -61,6 +89,15 @@ describe('redis pubsub bus', () => {
 			const wrapped = bus.wrap(platform);
 			const result = wrapped.publish('chat', 'msg', { text: 'hello' });
 			expect(result).toBe(true);
+		});
+
+		it('forwards live structural trace surfaces through the wrapped Platform', () => {
+			platform.traceContext = { traceparent: TRACE_A };
+			const wrapped = bus.wrap(platform);
+			expect(wrapped.trace).toBe(platform.trace);
+			expect(wrapped.traceContext).toEqual({ traceparent: TRACE_A });
+			platform.traceContext = { traceparent: TRACE_B };
+			expect(wrapped.traceContext).toEqual({ traceparent: TRACE_B });
 		});
 
 		it('send() delegates to original platform', () => {
@@ -430,6 +467,221 @@ describe('redis pubsub bus', () => {
 				data: { text: 'from-remote' },
 				options: { relay: false }
 			});
+		});
+
+		it('carries a traced producer context to a traced peer, outside application data', async () => {
+			const context = { traceparent: TRACE_A, tracestate: 'vendor=value' };
+			const origin = tracedPlatform(context);
+			const remote = tracedPlatform();
+			const peer = createPubSubBus(client);
+			await bus.activate(origin);
+			await peer.activate(remote);
+
+			bus.wrap(origin).publish('chat', 'msg', { traceparent: 'application-data' });
+			await settle();
+
+			const delivered = remote.published.find((entry) => entry.event === 'msg');
+			expect(delivered.data).toEqual({ traceparent: 'application-data' });
+			// Transport fields never become a publish option on the peer.
+			expect(delivered.options).toEqual({ relay: false });
+			expect(origin.traceOperations).toEqual([
+				{ name: 'redis.pubsub.publish', options: { kind: 'producer', parent: context, attributes: REDIS_ATTRIBUTES } }
+			]);
+			expect(remote.traceOperations).toEqual([
+				{ name: 'redis.pubsub.receive', options: { kind: 'consumer', parent: context, attributes: REDIS_ATTRIBUTES } }
+			]);
+			await bus.deactivate();
+			await peer.deactivate();
+		});
+
+		it('on a Platform without a tracing provider reads no trace context and relays untraced envelopes', async () => {
+			let reads = 0;
+			Object.defineProperty(platform, 'traceContext', {
+				get() { reads++; return { traceparent: TRACE_A }; },
+				configurable: true
+			});
+			platform.publishWire = () => true;
+			const envelopes = await captureChannel(client);
+			const wrapped = bus.wrap(platform);
+
+			wrapped.publish('chat', 'one', 1);
+			wrapped.publish('chat', 'two', 2, { seq: 7 });
+			wrapped.batch([{ topic: 'chat', event: 'b', data: 3 }]);
+			wrapped.publishBatched([{ topic: 'chat', event: 'pb', data: 4 }]);
+			wrapped.relayCoalesced('chat', 'c', 5, 'k');
+			wrapped.publishWire('chat', 'w', 6, { shared: true, capability: 'cap' });
+			await settle();
+
+			expect(reads).toBe(0);
+			expect(platform.traceOperations).toEqual([]);
+			expect(envelopes).toHaveLength(6);
+			for (const env of envelopes) {
+				expect(env).not.toHaveProperty('traceparent');
+				expect(env).not.toHaveProperty('tracestate');
+			}
+		});
+
+		it('on a Platform without a tracing provider ignores a carried context on receive', async () => {
+			await bus.activate(platform);
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: 'peer', topic: 'chat', event: 'msg', data: 1, traceparent: TRACE_A
+			}));
+			await settle();
+
+			expect(platform.published.filter((entry) => entry.event === 'msg')).toHaveLength(1);
+			expect(platform.traceOperations).toEqual([]);
+			expect(platform.traceRestored).toEqual([]);
+			await bus.deactivate();
+		});
+
+		it('makes batch, publishBatched and relayCoalesced one producer operation per call, local delivery included', async () => {
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			const envelopes = await captureChannel(client);
+			let depth = 0;
+			const run = origin.trace.run;
+			origin.trace.run = (name, options, fn) => {
+				depth++;
+				try { return run(name, options, fn); } finally { depth--; }
+			};
+			const localDepths = [];
+			const batch = origin.batch.bind(origin);
+			origin.batch = (messages) => { localDepths.push(depth); return batch(messages); };
+			const publishBatched = origin.publishBatched.bind(origin);
+			origin.publishBatched = (messages) => { localDepths.push(depth); return publishBatched(messages); };
+			const wrapped = bus.wrap(origin);
+
+			wrapped.batch([
+				{ topic: 'a', event: 'x', data: 1 },
+				{ topic: 'b', event: 'x', data: 2 },
+				{ topic: 'c', event: 'x', data: 3 }
+			]);
+			expect(origin.traceOperations).toHaveLength(1);
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'y', data: 1 },
+				{ topic: 'b', event: 'y', data: 2 }
+			]);
+			expect(origin.traceOperations).toHaveLength(2);
+			wrapped.relayCoalesced('a', 'z', 1, 'k');
+			expect(origin.traceOperations).toHaveLength(3);
+			await settle();
+
+			for (const op of origin.traceOperations) {
+				expect(op).toEqual({
+					name: 'redis.pubsub.publish',
+					options: { kind: 'producer', parent: { traceparent: TRACE_A }, attributes: REDIS_ATTRIBUTES }
+				});
+			}
+			expect(localDepths).toEqual([1, 1]);
+			// Three batch envelopes, one publishBatched envelope, one coalesced.
+			expect(envelopes).toHaveLength(5);
+			expect(envelopes.map((env) => env.traceparent)).toEqual([TRACE_A, TRACE_A, TRACE_A, TRACE_A, TRACE_A]);
+		});
+
+		it('opens no producer operation for a publish that does not relay', () => {
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			origin.publishWire = () => true;
+			const wrapped = bus.wrap(origin);
+
+			wrapped.publish('chat', 'local', 1, { relay: false });
+			wrapped.publishWire('chat', 'wire', 1, { shared: false, capability: 'cap' });
+			wrapped.publishWire('chat', 'wire', 1, { shared: true, capability: 'cap' }, { relay: false });
+
+			expect(origin.traceOperations).toEqual([]);
+			expect(origin.published.map((entry) => entry.event)).toEqual(['local']);
+
+			// Batches with nothing to relay open none either.
+			wrapped.batch([]);
+			wrapped.batch([{ topic: 'chat', event: 'b-local', data: 1, options: { relay: false } }]);
+			wrapped.publishBatched([{ topic: 'chat', event: 'pb-local', data: 1, options: { relay: false } }]);
+			expect(origin.traceOperations).toEqual([]);
+		});
+
+		it('delivers a traced batch locally before it reads the entries, so the platform rejects a malformed one', () => {
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			const rejection = new TypeError('platform rejects the batch');
+			const refuseMalformed = (messages) => {
+				if (!Array.isArray(messages) || messages.some((m) => !m)) throw rejection;
+				return [];
+			};
+			origin.batch = refuseMalformed;
+			origin.publishBatched = refuseMalformed;
+			const wrapped = bus.wrap(origin);
+
+			// A null entry or a non-array counts as relaying, so each takes the
+			// traced path and reaches the platform, whose own error comes back.
+			expect(() => wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }, null])).toThrow(rejection);
+			expect(() => wrapped.batch([null])).toThrow(rejection);
+			expect(() => wrapped.batch('not an array')).toThrow(rejection);
+			expect(origin.traceOperations).toHaveLength(3);
+			// publishBatched checks for an array itself, traced or not.
+			expect(() => wrapped.publishBatched('not an array')).toThrow('pubsub bus: publishBatched requires an array of messages');
+		});
+
+		it('relays a near-cap envelope without its trace context instead of letting every peer drop it', async () => {
+			const origin = createPubSubBus(client, { maxEnvelopeBytes: 600 });
+			const peer = createPubSubBus(client, { maxEnvelopeBytes: 600 });
+			const context = { traceparent: TRACE_A, tracestate: 'vendor=' + 'y'.repeat(200) };
+			const source = tracedPlatform(context);
+			const remote = tracedPlatform();
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			await origin.activate(source);
+			await peer.activate(remote);
+			const data = 'x'.repeat(400);
+			origin.wrap(source).publish('chat', 'msg', data);
+			origin.wrap(source).publish('chat', 'msg', data);
+			await settle();
+
+			const delivered = remote.published.filter((entry) => entry.event === 'msg');
+			expect(delivered.map((entry) => entry.data)).toEqual([data, data]);
+			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([null, null]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.pubsub.trace-context.omitted');
+			expect(JSON.parse(warn.mock.calls[0][0].slice(warn.mock.calls[0][0].indexOf('{'))).attributes).toEqual({ maxEnvelopeBytes: 600 });
+
+			// A payload that fits with its context keeps it.
+			origin.wrap(source).publish('chat', 'small', 'x');
+			await settle();
+			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([null, null, context]);
+			warn.mockRestore();
+			await origin.deactivate();
+			await peer.deactivate();
+		});
+
+		it('measures the envelope cap in bytes, so multi-byte data drops the trace fields in time', async () => {
+			const origin = createPubSubBus(client, { maxEnvelopeBytes: 600 });
+			const peer = createPubSubBus(client, { maxEnvelopeBytes: 600 });
+			const source = tracedPlatform({ traceparent: TRACE_A });
+			const remote = mockPlatform();
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			await origin.activate(source);
+			await peer.activate(remote);
+			// 170 three-byte characters: the plain envelope fits in 600 bytes,
+			// the traced one does not, though both are far under 600 characters.
+			const data = String.fromCharCode(0x20ac).repeat(170);
+			origin.wrap(source).publish('chat', 'msg', data);
+			await settle();
+
+			expect(remote.published.filter((entry) => entry.event === 'msg').map((entry) => entry.data)).toEqual([data]);
+			expect(warn).toHaveBeenCalledOnce();
+			warn.mockRestore();
+			await origin.deactivate();
+			await peer.deactivate();
+		});
+
+		it('does not report an envelope that is over the cap on its own as a trace omission', async () => {
+			const origin = createPubSubBus(client, { maxEnvelopeBytes: 600 });
+			const source = tracedPlatform({ traceparent: TRACE_A });
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const wrapped = origin.wrap(source);
+
+			wrapped.publish('chat', 'big', 'x'.repeat(1000));
+			expect(warn).not.toHaveBeenCalled();
+
+			// The one report is still available for a genuine omission.
+			wrapped.publish('chat', 'near', 'x'.repeat(480));
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.pubsub.trace-context.omitted');
+			warn.mockRestore();
 		});
 
 		it('suppresses echo (messages from same instance)', async () => {

@@ -384,12 +384,14 @@ describe('redis groups', () => {
 		});
 
 		it('retries failed initial meta write on getMeta', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const hostile = 'hmset failed ' + String.fromCodePoint(0x85, 0x202e, 0x5e9);
 			const origHmset = client.redis.hmset;
 			let failOnce = true;
 			client.redis.hmset = async (...args) => {
 				if (failOnce) {
 					failOnce = false;
-					throw new Error('hmset failed');
+					throw new Error(hostile);
 				}
 				return origHmset.apply(client.redis, args);
 			};
@@ -400,6 +402,15 @@ describe('redis groups', () => {
 			client.redis.hmset = origHmset;
 			const meta = await g.getMeta();
 			expect(meta.game).toBe('go');
+			expect(warnSpy).toHaveBeenCalledOnce();
+			const line = warnSpy.mock.calls[0][0];
+			expect(line).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.redis\.groups event=redis\.groups\.meta-initialize\.failed severity=warn\]/);
+			expect(line).not.toMatch(/[\u0000-\u001f\u007f-\uffff]/);
+			expect(JSON.parse(line.slice(line.indexOf('{'))).attributes).toEqual({
+				group: 'meta-retry',
+				error: { name: 'Error', code: null, message: hostile }
+			});
+			warnSpy.mockRestore();
 			g.destroy();
 		});
 

@@ -6,7 +6,7 @@ import type { MetricsRegistry } from '../prometheus/index.js';
  * On violation: increments the per-category counter on the live module-
  * level Map, increments the bound Prometheus counter (if
  * `wireAssertionMetrics` was called), and logs a structured
- * `[extensions/assert] {...}` line.
+ * package-attributed `[lantean/diagnostic ...]` line.
  *
  * Test mode (`process.env.VITEST` or `NODE_ENV === 'test'`): also throws,
  * so vitest surfaces the failure as a test error.
@@ -46,8 +46,9 @@ export function resetFatalSink(): void;
 
 /**
  * Dev-time DX hint. Full no-op when `NODE_ENV === 'production'`. On
- * violation in non-prod modes logs a warning. Does NOT throw, even in
- * test mode (matches adapter shape: dev hints should not gate test runs).
+ * violation in non-prod modes logs a severity=error diagnostic line under
+ * `event=invariant.violated` with `category=development.assertion`. Does
+ * NOT throw, even in test mode.
  */
 export function devAssert(cond: boolean, message: string, context?: Record<string, unknown>): void;
 

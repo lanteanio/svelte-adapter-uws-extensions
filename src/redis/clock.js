@@ -47,6 +47,8 @@
  */
 
 import { wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_SAMPLES = 5;
@@ -284,6 +286,7 @@ export function createClusterClock(client, options = {}) {
 			breaker?.failure(err);
 			// Keep the last good state rather than fabricating a zero.
 			if (onError) { try { onError(err); } catch { /* swallow */ } }
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CLOCK_SAMPLE, { error: err });
 			return null;
 		}
 		mSkew?.set(redisSkew);
@@ -299,6 +302,7 @@ export function createClusterClock(client, options = {}) {
 			} catch (err) {
 				ntpSkew = null;
 				if (onError) { try { onError(err); } catch { /* swallow */ } }
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CLOCK_NTP_SAMPLE, { error: err });
 			}
 		}
 
@@ -350,6 +354,7 @@ export function createClusterClock(client, options = {}) {
 				}
 			} catch (err) {
 				if (onError) { try { onError(err); } catch { /* swallow */ } }
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CLOCK_LEADER_OFFSET, { error: err });
 			}
 		}
 		return redisSkew;

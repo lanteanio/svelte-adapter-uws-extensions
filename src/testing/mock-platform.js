@@ -14,7 +14,7 @@ export const PLATFORM_KEYS = Object.freeze([
 	'publish', 'publishBatched', 'batch',
 	'send', 'sendTo', 'sendCoalesced',
 	'request',
-	'connections', 'requestId',
+	'connections', 'requestId', 'traceContext', 'trace',
 	'pressure', 'protection', 'onPressure', 'onPublishRate',
 	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
 	'authorizeWireSubscribe',
@@ -47,6 +47,31 @@ export function mockPlatform() {
 		wireSubscribeAuthorized: false,
 		connections: 0,
 		requestId: '',
+		traceContext: null,
+		// Structural trace surface. `enabled: false` mirrors an adapter with
+		// no provider configured. `traceOperations` records every run() and
+		// `traceRestored` every context handed to withContext(), so a test can
+		// assert what a consumer operation observed without a real provider.
+		traceOperations: [],
+		traceRestored: [],
+		trace: {
+			enabled: false,
+			current: () => p.traceContext,
+			extract: (carrier) => carrier ?? null,
+			inject: (carrier, context = p.traceContext) => {
+				if (context?.traceparent) carrier.traceparent = context.traceparent;
+				if (context?.tracestate) carrier.tracestate = context.tracestate;
+				return carrier;
+			},
+			run: (name, options, fn) => {
+				p.traceOperations.push({ name, options });
+				return fn(null);
+			},
+			withContext: (context, fn) => {
+				p.traceRestored.push(context);
+				return fn();
+			}
+		},
 		// Mirror the adapter's default. `1024 * 1024` (1 MB) is the
 		// post-next.19 default; tests that need a different cap can
 		// reassign p.maxPayloadLength directly.

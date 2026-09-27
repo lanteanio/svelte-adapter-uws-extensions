@@ -4,6 +4,8 @@ import { createRateLimit } from '../../src/redis/ratelimit.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 function mockWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -432,8 +434,11 @@ describe('redis ratelimit', () => {
 			const denied = await lim.consume(ws);
 			expect(denied.allowed).toBe(false);
 			expect(warnSpy).toHaveBeenCalledTimes(1);
-			expect(warnSpy.mock.calls[0][0]).toContain('172.17.0.1');
-			expect(warnSpy.mock.calls[0][0]).toContain('ADDRESS_HEADER');
+			const warning = warnSpy.mock.calls[0][0];
+			expect(warning).not.toContain('172.17.0.1');
+			expect(warning).toContain('event=redis.ratelimit.proxy-collapse-risk');
+			expect(warning).toContain('"addressClass":"private-or-loopback"');
+			expect(warning).toContain('ADDRESS_HEADER');
 		});
 
 		it('fires at most once (latched) across further denials', async () => {
@@ -595,10 +600,21 @@ describe('redis ratelimit', () => {
 			const ws = mockWs({ ip: '1.2.3.4' });
 			await lim.consume(ws);
 			await lim.consume(ws);
-			const floorWarns = warnSpy.mock.calls.filter(
-				(c) => String(c[0]).includes('in-process floor')
-			);
-			expect(floorWarns.length).toBe(1);
+			expect(warnSpy).toHaveBeenCalledOnce();
+			const record = registeredRecord(warnSpy.mock.calls[0][0], EXTENSIONS_ERROR_IDS.RATELIMIT_STORE_FLOOR);
+			expect(record.attributes).toEqual({ error: { name: 'Error', code: null, message: 'redis down' } });
+		});
+
+		it('cuts the bucket key out of an error that repeats it', async () => {
+			const client = downClient();
+			// A backend or proxy that repeats the key it refused; the key embeds the client address.
+			const refuse = (_numKeys, key) => Promise.reject(new Error("backend refused '" + key + "'"));
+			client.redis.defineCommand = (name) => { client.redis[name] = refuse; };
+			const lim = createRateLimit(client, { points: 5, interval: 1000, localFloorOnStorageFailure: true });
+			await lim.consume(mockWs({ ip: '203.0.113.9' }));
+			const record = registeredRecord(warnSpy.mock.calls[0][0], EXTENSIONS_ERROR_IDS.RATELIMIT_STORE_FLOOR);
+			expect(record.attributes.error.message).toBe("backend refused '<redacted>'");
+			expect(warnSpy.mock.calls[0][0]).not.toContain('203.0.113.9');
 		});
 
 		it('covers the breaker-open fast path, not only the eval rejection', async () => {

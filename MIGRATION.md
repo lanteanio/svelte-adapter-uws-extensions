@@ -8,10 +8,12 @@
 # 0.5.x to 0.6.x
 
 Ordered by **when the change reaches you**, because that is what decides how
-much of it you can discover in staging. Three refusals fail at construction, so
-a misconfigured deployment stops at boot rather than at the first request. One
-change is data-incompatible and wants a drain window. The rest surface on a call
-that used to succeed, or not at all.
+much of it you can discover in staging. Some changes fail at install, import or
+construction, so a misconfigured deployment stops at boot rather than at the
+first request. Two need an operational step before the deploy: a schema change
+for jobs and tasks tables you migrate yourself, and a drain window for one
+data-incompatible change. The rest surface on a call that used to succeed, or
+not at all.
 
 Every item lists the **symptom** you will actually see and the **action**.
 
@@ -93,7 +95,34 @@ reported the difference. `NaN` is the sharp one: it *is* a number, and every
 reading the value from an environment variable, `Number(process.env.X)` yields
 `NaN` for an unset one - use a fallback.
 
-## 2. Needs an operational drain
+## 2. Needs an operational step
+
+### Jobs and tasks tables gain trace columns
+
+Only for tables created or migrated outside the package, with
+`autoMigrate: false`. With the default `autoMigrate: true` the columns are
+added on first use.
+
+**Symptom.** `column "traceparent" does not exist` from `jobs.claim`, task
+`list`, and the task runner's dispatch and recovery sweeps, which report it as
+`postgres.tasks.sweep.failed` once per failure streak; from `jobs.enqueue`
+and task `run` / `enqueue` too whenever the call carries a trace context.
+
+**Why.** Jobs and tasks persist the W3C trace context of the call that
+created them, in two nullable columns.
+
+**Action.** Before deploying, run for each jobs and tasks table (defaults
+shown):
+
+```sql
+ALTER TABLE svti_jobs  ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE svti_jobs  ADD COLUMN IF NOT EXISTS tracestate  TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate  TEXT;
+```
+
+Both are nullable and idempotent to add, so 0.5 instances keep working against
+the migrated table during a rolling deploy.
 
 ### Redis idempotency key derivation changed
 
@@ -201,6 +230,73 @@ runtime and type now derive from the exported frozen `PRESSURE_REASONS` tuple.
 `PRESSURE_REASONS.filter((reason) => reason !== 'NONE')`. Explicit policies may
 instead add only the new reasons they intend to shed. Registration now accepts
 all seven values and still rejects unknown strings.
+
+### Redis rate-limit proxy diagnostics omit the keyed IP
+
+The one-shot proxy-collapse warning no longer includes the private or loopback
+address that triggered it. Collectors should route the stable
+`redis.ratelimit.proxy-collapse-risk` event and its
+`addressClass=private-or-loopback` attribute instead of extracting an IP
+from English text. Rate-limit verdicts and bucket keys are unchanged.
+
+### Thrown error messages end with a stable ID and reference route
+
+**What changed.** Errors thrown through the error registry - the connection
+registry's `request()` and `requestSession()` errors for an invalid target or
+event, an offline target, the pending cap and a cross-instance timeout, the
+invalid-target errors of `send()` and `sendCoalesced()`, and the circuit
+breaker's `CircuitBrokenError` - end with ` [EXTENSIONS-ERR-...] See:
+docs/errors.md#...`. The text before the suffix is unchanged. Other registry
+errors, including the other `send()`, `sendCoalesced()` and `sendTo()`
+validation errors, carry no suffix.
+
+**How to migrate.** Code that compares `err.message` for equality breaks
+silently. Match on `err.message.startsWith(...)`, on the stable ID, or on the
+error class and `code` instead.
+
+### Diagnostics print the adapter's canonical grammar
+
+**What changed.** Assertion lines and every operational failure this package
+reports now start with
+`[lantean/diagnostic source=svelte-adapter-uws-extensions component=... event=... severity=...]`
+followed by a fixed message and a one-line JSON record, the same grammar the
+adapter prints. Values the old prose interpolated - error text, request ids,
+counts, bounds - are fields of that record's `attributes`; raw topics and user
+ids are not logged, nor is the text of an error a custom NOTIFY parser throws,
+since it can quote the payload. Cursor cleanup and group heartbeat failures are
+reported once per failure streak rather than on every tick. The former
+`[extensions/assert]`, `[extensions/fatal]`, `[extensions/devAssert]` heads and
+every per-module prose prefix are gone: `[redis]`, `[redis replay]`,
+`[redis stream replay]`, `[postgres replay]`, `[postgres tasks]`,
+`[postgres/notify]`, `[prometheus]`, `[pubsub]`, `[sharded-bus]`,
+`[registry]`, `[redis/registry]`, `[publish-rate]`, `[redis/presence]`,
+`[redis/smooth]`, and the untagged `redis ratelimit:`, `redis composite
+ratelimit:`, `presence:`, `replay resume:`, `capability-cookie:`,
+`postgres:`, `groups ...`, `cursor ...`, `presence ...` and `sharded bus
+...` lines. `devAssert` reports at `severity=error` under
+`event=invariant.violated` with `category=development.assertion`. Operational
+failures reach the process-wide sink installed through
+`svelte-adapter-uws/observability`; assertion lines, as in the adapter, print
+to the console directly and do not reach it. Every failure event is indexed
+in `docs/errors.md`.
+
+**How to migrate.** Route on the `event=` key (or on the parsed record's
+`event` field) instead of on the old prefixes; the error reference lists every
+event. `parseDiagnostic()` from `svelte-adapter-uws/observability` parses the
+new lines as canonical records and still recognizes the old prefix families
+during the 0.6 window, so a collector that already uses it needs no change.
+A `See: https://svti.me/...` shortlink a line used to print is in its error
+reference entry. Connection errors on the Redis and Postgres connections this
+package creates are reported the same way (`redis.client.failed`,
+`redis.*.subscriber.failed`, `postgres.notify.connection.failed`) instead of
+ioredis's `[ioredis] Unhandled error event` line. Three one-shot configuration
+advisories keep their prose under a new tag: the presence private-key-field
+warning and the sensitive-`userData`-key warning now start with
+`[extensions] `, and the cursor `hooks.message` wiring warning with
+`[redis/cursor] `. Each names its own remedy and parses as a legacy record.
+The diagnostic pipeline's own last-resort lines, printed when a record cannot
+be rendered or delivered, start with `[extensions] ` and end with their
+stable ID.
 
 ### Redis presence/cursor defaults withhold personal and transport data
 
@@ -321,6 +417,9 @@ Run your test suite, then check:
 - `registry.send` / `sendCoalesced` / `group.publish` call sites are awaited.
 - Purge-scope and tenant-isolation tests, against the corrected SCAN matcher.
 - A custom platform implements `checkSubscribe`.
+- Jobs and tasks tables you migrate yourself have the `traceparent` and
+  `tracestate` columns.
+- Log routing and alerting keyed on the old prose prefixes route on `event=`.
 
 ---
 

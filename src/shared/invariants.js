@@ -29,7 +29,9 @@
  *   topicCounts?: Record<string, number>,
  *   totalSubscriptions?: number
  * }} StateSnapshot
- * @typedef {{ category: string, context: unknown } | null} Violation
+ * @typedef {{ category: string, context: unknown, key?: string } | null} Violation
+ *   `key` identifies the violating entity when the logged context
+ *   deliberately leaves it out; it is never logged.
  */
 
 /**
@@ -189,8 +191,9 @@ export function checkRedisReplaySeqRegression(snap) {
  * join broadcast. (The local DATA map is deliberately NOT compared here: a join
  * defers its data commit past the count increment, so count > data is a legitimate
  * in-flight-join transient, not a divergence.) The snapshot is structure-only:
- * per-topic cardinalities and a metric-sanitized topic label, never a user key or
- * any presence data.
+ * per-topic cardinalities and the topic, never a user key or any presence data.
+ * The logged context carries the counts alone; the topic, which can carry a user
+ * id, is the violation's unlogged key.
  *
  * @param {{ presenceTopics?: Array<{ topic: string, countKeys: number, indexKeys: number }> }} snap
  * @returns {Violation}
@@ -204,7 +207,8 @@ export function checkRedisPresenceLocalIndex(snap) {
 		if (row.countKeys !== row.indexKeys) {
 			return {
 				category: 'redis.presence.local-index-desync',
-				context: { topic: row.topic, countKeys: row.countKeys, indexKeys: row.indexKeys }
+				key: row.topic,
+				context: { countKeys: row.countKeys, indexKeys: row.indexKeys }
 			};
 		}
 	}

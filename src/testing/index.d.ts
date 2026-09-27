@@ -87,6 +87,27 @@ export interface MockPlatform {
 	checkSubscribeDenial: string | null;
 	connections: number;
 	requestId: string;
+	/** The live W3C trace context. Defaults to `null`; reassign directly. */
+	traceContext: { traceparent: string; tracestate?: string } | null;
+	/**
+	 * Structural trace surface. `enabled` defaults to `false`, an adapter
+	 * with no tracing provider; set it to `true` before wrapping or activating
+	 * to model one. `current()` answers `traceContext`, `run()` records into
+	 * `traceOperations` and calls straight through, and `withContext()`
+	 * records into `traceRestored`.
+	 */
+	trace: {
+		enabled: boolean;
+		current(): { traceparent: string; tracestate?: string } | null;
+		extract(carrier: unknown): unknown;
+		inject<T>(carrier: T, context?: { traceparent: string; tracestate?: string } | null): T;
+		run<T>(name: string, options: { kind?: string; parent?: unknown; attributes?: Record<string, string | number | boolean> }, fn: (span: null) => T): T;
+		withContext<T>(context: unknown, fn: () => T): T;
+	};
+	/** Every `trace.run()` call, as `{ name, options }`. */
+	traceOperations: Array<{ name: string; options: { kind?: string; parent?: unknown; attributes?: Record<string, string | number | boolean> } }>;
+	/** Every context handed to `trace.withContext()`. */
+	traceRestored: unknown[];
 	/** Mirrors the adapter default of 1 MB; reassign directly to test other caps. */
 	maxPayloadLength: number;
 	/**

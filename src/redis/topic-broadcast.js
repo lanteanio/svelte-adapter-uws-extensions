@@ -53,6 +53,8 @@
 import { randomBytes, now as cachedNow, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { MAX_REGISTRY_PENDING_REQUESTS } from '../shared/caps.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_REQUEST = 'treq';
@@ -151,6 +153,8 @@ export function createTopicBroadcast(client, options = {}) {
 	let subscriber = null;
 	/** @type {Promise<any> | null} */
 	let subscriberReady = null;
+	// One report per failure streak: every broadcast retries a failed subscribe.
+	let subscribeFailing = false;
 	/** @type {any} */
 	let heartbeatTimer = null;
 	let destroyed = false;
@@ -207,6 +211,7 @@ export function createTopicBroadcast(client, options = {}) {
 		if (subscriber || destroyed) return;
 		const sub = client.duplicate({ enableReadyCheck: false });
 		subscriber = sub;
+		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.TOPIC_BROADCAST_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
 			if (!validator.acceptRaw(message)) return; // size cap before parse
@@ -217,11 +222,15 @@ export function createTopicBroadcast(client, options = {}) {
 			if (parsed.k === KIND_REQUEST) handleInboundRequest(parsed);
 			else if (parsed.k === KIND_REPLY) handleInboundReply(parsed);
 		});
-		subscriberReady = sub.subscribe(channel).catch((err) => {
+		subscriberReady = sub.subscribe(channel).then(() => { subscribeFailing = false; }, (err) => {
 			// Failed subscribe: tear down so the next broadcast re-subscribes fresh.
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
 			if (subscriber === sub) { subscriber = null; subscriberReady = null; }
 			if (typeof options.onError === 'function') { try { options.onError(err); } catch { /* host handler */ } }
+			if (!subscribeFailing) {
+				subscribeFailing = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.TOPIC_BROADCAST_SUBSCRIBE, { error: err });
+			}
 		});
 	}
 

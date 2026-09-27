@@ -25,6 +25,8 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { randomBytes, now } from './shared/runtime.js';
+import { emitRegisteredFailure } from './shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from './error-registry.js';
 
 /** Default cookie name. */
 const DEFAULT_COOKIE_NAME = 'sauws_cap';
@@ -321,7 +323,7 @@ export function capabilityCookie(options) {
 			} catch (err) {
 				if (!missesWarned) {
 					missesWarned = true;
-					console.error('capability-cookie: metrics instrument threw; suppressing further errors from it:', err);
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CAPABILITY_COOKIE_METRICS, { error: err });
 				}
 			}
 		}

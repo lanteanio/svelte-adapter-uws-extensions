@@ -1,8 +1,34 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const REDIS_ATTRIBUTES = { 'messaging.system': 'redis' };
+
+// A mock Platform whose tracing provider is switched on, as the adapter's is
+// when one is configured at build time.
+function tracedPlatform(context = null) {
+	const p = mockPlatform();
+	p.trace.enabled = true;
+	p.traceContext = context;
+	return p;
+}
+
+// Every envelope that reached the given shard channels, as a raw sharded
+// subscriber on its own connection sees it.
+async function captureShards(client, channels) {
+	const envelopes = [];
+	const sub = client.duplicate();
+	sub.on('smessage', (ch, message) => {
+		if (channels.includes(ch)) envelopes.push(JSON.parse(message));
+	});
+	for (const ch of channels) await sub.ssubscribe(ch);
+	return envelopes;
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 
 describe('redis sharded bus', () => {
 	let client;
@@ -493,6 +519,201 @@ describe('redis sharded bus', () => {
 
 			await busA.deactivate();
 			await busB.deactivate();
+		});
+
+		it('carries a traced producer context to a traced peer, outside application data', async () => {
+			const busA = createShardedBus(client);
+			const busB = createShardedBus(client);
+			const platformA = tracedPlatform({ traceparent: TRACE_A });
+			const platformB = tracedPlatform();
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busA.follow('chat');
+			await busB.follow('chat');
+
+			const wrapped = busA.wrap(platformA);
+			expect(wrapped.trace).toBe(platformA.trace);
+			wrapped.publish('chat', 'msg', { traceparent: 'application-data' });
+			await settle();
+
+			const delivered = platformB.published.find((entry) => entry.event === 'msg');
+			expect(delivered.data).toEqual({ traceparent: 'application-data' });
+			// Transport fields never become a publish option on the peer.
+			expect(delivered.options).toEqual({ relay: false });
+			expect(platformA.traceOperations).toEqual([
+				{ name: 'redis.sharded-pubsub.publish', options: { kind: 'producer', parent: { traceparent: TRACE_A }, attributes: REDIS_ATTRIBUTES } }
+			]);
+			expect(platformB.traceOperations).toEqual([
+				{ name: 'redis.sharded-pubsub.receive', options: { kind: 'consumer', parent: { traceparent: TRACE_A }, attributes: REDIS_ATTRIBUTES } }
+			]);
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
+		it('on a Platform without a tracing provider reads no trace context and relays untraced envelopes', async () => {
+			const bus = createShardedBus(client);
+			let reads = 0;
+			Object.defineProperty(platform, 'traceContext', {
+				get() { reads++; return { traceparent: TRACE_A }; },
+				configurable: true
+			});
+			platform.publishWire = () => true;
+			const envelopes = await captureShards(client, ['uws:sharded:chat']);
+			const wrapped = bus.wrap(platform);
+
+			wrapped.publish('chat', 'one', 1);
+			wrapped.batch([{ topic: 'chat', event: 'b', data: 2 }]);
+			wrapped.publishBatched([{ topic: 'chat', event: 'pb', data: 3 }]);
+			wrapped.relayCoalesced('chat', 'c', 4, 'k');
+			wrapped.publishWire('chat', 'w', 5, { shared: true, capability: 'cap' });
+			await settle();
+
+			expect(reads).toBe(0);
+			expect(platform.traceOperations).toEqual([]);
+			expect(envelopes).toHaveLength(5);
+			for (const env of envelopes) {
+				expect(env).not.toHaveProperty('traceparent');
+				expect(env).not.toHaveProperty('tracestate');
+			}
+		});
+
+		it('on a Platform without a tracing provider ignores a carried context on receive', async () => {
+			const busA = createShardedBus(client);
+			const busB = createShardedBus(client);
+			const platformA = tracedPlatform({ traceparent: TRACE_A });
+			await busA.activate(platformA);
+			await busB.activate(platform);
+			await busA.follow('chat');
+			await busB.follow('chat');
+
+			busA.wrap(platformA).publish('chat', 'msg', 1);
+			await settle();
+
+			expect(platform.published.filter((entry) => entry.event === 'msg')).toHaveLength(1);
+			expect(platform.traceOperations).toEqual([]);
+			expect(platform.traceRestored).toEqual([]);
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
+		it('makes batch, publishBatched and relayCoalesced one producer operation per call across shard channels', async () => {
+			const bus = createShardedBus(client);
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			const envelopes = await captureShards(client, ['uws:sharded:a', 'uws:sharded:b', 'uws:sharded:c']);
+			const wrapped = bus.wrap(origin);
+
+			wrapped.batch([
+				{ topic: 'a', event: 'x', data: 1 },
+				{ topic: 'b', event: 'x', data: 2 },
+				{ topic: 'c', event: 'x', data: 3 }
+			]);
+			expect(origin.traceOperations).toHaveLength(1);
+			wrapped.publishBatched([
+				{ topic: 'a', event: 'y', data: 1 },
+				{ topic: 'b', event: 'y', data: 2 }
+			]);
+			expect(origin.traceOperations).toHaveLength(2);
+			wrapped.relayCoalesced('c', 'z', 1, 'k');
+			expect(origin.traceOperations).toHaveLength(3);
+			await settle();
+
+			for (const op of origin.traceOperations) {
+				expect(op).toEqual({
+					name: 'redis.sharded-pubsub.publish',
+					options: { kind: 'producer', parent: { traceparent: TRACE_A }, attributes: REDIS_ATTRIBUTES }
+				});
+			}
+			// Three batch envelopes, one publishBatched envelope per shard
+			// channel (two), one coalesced.
+			expect(envelopes).toHaveLength(6);
+			expect(envelopes.every((env) => env.traceparent === TRACE_A)).toBe(true);
+		});
+
+		it('opens no producer operation for a publish that does not relay', () => {
+			const bus = createShardedBus(client);
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			origin.publishWire = () => true;
+			const wrapped = bus.wrap(origin);
+
+			wrapped.publish('chat', 'local', 1, { relay: false });
+			wrapped.publishWire('chat', 'wire', 1, { shared: false, capability: 'cap' });
+
+			expect(origin.traceOperations).toEqual([]);
+
+			// Batches with nothing to relay open none either.
+			wrapped.batch([]);
+			wrapped.batch([{ topic: 'chat', event: 'b-local', data: 1, options: { relay: false } }]);
+			wrapped.publishBatched([{ topic: 'chat', event: 'pb-local', data: 1, options: { relay: false } }]);
+			expect(origin.traceOperations).toEqual([]);
+		});
+
+		it('delivers a traced batch locally before shardKey or the relay reads the entries', () => {
+			const order = [];
+			const bus = createShardedBus(client, { shardKey: (topic) => { order.push('shardKey'); return topic; } });
+			const origin = tracedPlatform({ traceparent: TRACE_A });
+			const rejection = new TypeError('platform rejects the batch');
+			const refuseMalformed = (messages) => {
+				order.push('local');
+				if (!Array.isArray(messages) || messages.some((m) => !m)) throw rejection;
+				return [];
+			};
+			origin.batch = refuseMalformed;
+			origin.publishBatched = refuseMalformed;
+			const wrapped = bus.wrap(origin);
+
+			wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }]);
+			expect(order).toEqual(['local', 'shardKey']);
+
+			// A null entry or a non-array counts as relaying, so each takes the
+			// traced path and reaches the platform, whose own error comes back
+			// before shardKey sees anything.
+			order.length = 0;
+			expect(() => wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }, null])).toThrow(rejection);
+			expect(() => wrapped.batch([null])).toThrow(rejection);
+			expect(() => wrapped.batch('not an array')).toThrow(rejection);
+			expect(order).toEqual(['local', 'local', 'local']);
+			// publishBatched checks for an array itself, traced or not.
+			expect(() => wrapped.publishBatched('not an array')).toThrow('sharded bus: publishBatched requires an array of messages');
+		});
+
+		it('relays near-cap shard envelopes without their trace context and reports that once', async () => {
+			const busA = createShardedBus(client, { maxEnvelopeBytes: 600 });
+			const busB = createShardedBus(client, { maxEnvelopeBytes: 600 });
+			const context = { traceparent: TRACE_A, tracestate: 'vendor=' + 'y'.repeat(200) };
+			const platformA = tracedPlatform(context);
+			const platformB = tracedPlatform();
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busA.follow('chat');
+			await busB.follow('chat');
+			const data = 'x'.repeat(400);
+			busA.wrap(platformA).publish('chat', 'msg', data);
+			busA.wrap(platformA).publish('chat', 'msg', data);
+			await settle();
+
+			const delivered = platformB.published.filter((entry) => entry.event === 'msg');
+			expect(delivered.map((entry) => entry.data)).toEqual([data, data]);
+			expect(platformB.traceOperations.map((op) => op.options.parent)).toEqual([null, null]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.sharded-pubsub.trace-context.omitted');
+			warn.mockRestore();
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
+		it('does not report a shard envelope that is over the cap on its own as a trace omission', () => {
+			const bus = createShardedBus(client, { maxEnvelopeBytes: 600 });
+			const wrapped = bus.wrap(tracedPlatform({ traceparent: TRACE_A }));
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+			wrapped.publish('chat', 'big', 'x'.repeat(1000));
+			expect(warn).not.toHaveBeenCalled();
+
+			wrapped.publish('chat', 'near', 'x'.repeat(480));
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.sharded-pubsub.trace-context.omitted');
+			warn.mockRestore();
 		});
 
 		it('suppresses echo (same instanceId)', async () => {

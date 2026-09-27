@@ -4,7 +4,12 @@ Redis and Postgres extensions for [svelte-adapter-uws](https://github.com/lantea
 
 **Official links:** [GitHub owner](https://github.com/lanteanio) | [Documentation](https://svelte-realtime.dev/) | [Live demo](https://svelte-realtime-demo.lantean.io/) | `svti.me` is the ecosystem-owned runtime-help redirect domain.
 
-The core adapter keeps everything in-process memory. That works great for single-server deployments, but the moment you scale to multiple instances you need shared state. This package provides drop-in replacements backed by Redis and Postgres, with the same API shapes you already know from the core plugins.
+The core adapter keeps everything in-process memory. That works great for
+single-server deployments, but the moment you scale to multiple instances you
+need shared state. This package provides Redis and Postgres implementations
+with the same operational contracts after construction. They are not
+constructor-identical drop-ins: each backend has an explicit factory and client
+setup because connection ownership, persistence, and failure handling differ.
 
 ## What you get
 
@@ -30,6 +35,9 @@ task lifetimes, alarm lifecycle, identity-extractor requirements, and
 application-owned deletion boundaries. Complete its generated
 [host worksheet](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/privacy/v1/ropa-dpa-transfer-checklist.md)
 for every Redis/Postgres provider, replica, backup, region, and transfer.
+
+When an operation fails, search the generated [error reference](./docs/errors.md)
+with the stable ID, event, or beginning of the emitted message.
 
 During an incident, start from the ecosystem's versioned
 [operations pack v1](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/operations/v1/README.md).
@@ -94,6 +102,7 @@ microbenchmarks do not prove distributed production capacity.
 - [Testing](#testing)
 
 **More**
+- [Error reference](./docs/errors.md)
 - [Related projects](#related-projects)
 - [License](#license)
 
@@ -108,15 +117,23 @@ The three ecosystem packages move together. Bump them as a group:
 | `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
 |---|---|---|---|
 | `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
-| `^0.5.0` | `^0.5.0` | `^0.5.0` | Current. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). See `MIGRATION.md` if upgrading from 0.4. |
+| `^0.5.8` | `^0.5.0` | `^0.5.0` | Stable. Node 22+ required. |
+| `0.6.0-next.94` | `0.6.0-next.91` | `0.6.0-next.64` | Coordinated development candidate. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). |
 
 Mixed-version installs are rejected at install time with a peer-dep warning.
 
 ## Installation
 
 ```bash
-npm install svelte-adapter-uws-extensions ioredis
+npm install svelte-adapter-uws@0.6.0-next.94 svelte-adapter-uws-extensions@0.6.0-next.64 ioredis
+npm install https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v20.69.0.tar.gz
+npm exec -- svelte-adapter-uws-preflight
 ```
+
+Continue only after `preflight OK`. This is the extensions/adapter tuple the
+test suite runs against; the preflight stops at an unsupported Node, OS,
+architecture, Linux libc, or native addon before Redis or Postgres
+configuration can disguise the actual prerequisite failure.
 
 Postgres support is optional:
 
@@ -125,6 +142,14 @@ npm install pg
 ```
 
 Requires `svelte-adapter-uws >= 0.6.0-next.91` as a peer dependency.
+The exact command above is the deterministic first-success route for this
+release.
+
+After prerequisites pass, choose the documented Redis or Postgres factory for
+the primitive you need. Existing publish/subscribe/replay call sites keep their
+familiar shapes; client creation and lifecycle remain deliberately
+backend-specific rather than being hidden behind a misleading universal
+constructor.
 
 ---
 
@@ -486,6 +511,34 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 If you don't have a concrete cluster + fine-grained-topics use case, `createPubSubBus` is simpler and sufficient.
 
 **Binary wire across the cluster.** Both buses forward the adapter's binary wire methods (`publishWire` / `sendWire` / `registerWireCodec`), so the cluster-backed cursor and presence plugins keep their compact binary frames instead of falling back to JSON. A stateless codec marked `shared: true` (the byte-identical world-snapshot tier, where every binary subscriber gets the same frame) additionally fans out cluster-wide automatically: a shared `publishWire` relays only the logical `{capability, event, data}` as JSON over the bus, and each receiving instance re-derives the codec by capability and runs its own native fan-out locally with its own per-process wire-id - the binary frame never crosses the bus. Register the codec on every instance with `platform.registerWireCodec(codec)` at activate so a relay-receiving instance can re-encode (an unregistered instance falls back to a correct JSON delivery). A `shared: true` codec therefore behaves identically on a single instance, across worker threads, and across a Redis-bus cluster, with no per-codec relay wiring.
+
+#### Distributed tracing
+
+Tracing follows the Platform's tracing provider, the same condition under
+which the adapter itself does trace work. When the Platform passed to
+`wrap(platform)` / `activate(platform)` has one, a publish runs as a producer
+operation, stores the validated W3C `traceparent` / optional `tracestate` of
+that operation on the relay envelope, and the receiving instance delivers
+locally inside a consumer operation parented on it. `batch` and
+`publishBatched` are one producer operation per call; a publish that is not
+relayed (`relay: false`, or a `publishWire` whose codec is not shared) opens
+none. The context always comes from the Platform: the buses take no
+`traceContext` publish option.
+
+Without a provider the buses do no trace work at all: a publish reads no
+context and relays the same envelope an untraced release did, and trace fields
+on an inbound envelope are ignored. Envelopes without trace fields remain
+valid, so mixed-version clusters interoperate. Trace fields stay outside
+`data`: an application payload property named `traceparent` remains ordinary
+application data and is never trusted as transport context.
+
+The trace fields are the only thing a publish adds to an envelope after the
+application sized it. Every instance drops an inbound envelope above
+`maxEnvelopeBytes` before parsing, so when a payload alone fits but would not
+with its context, the bus relays it untraced and reports
+`redis.pubsub.trace-context.omitted` (`redis.sharded-pubsub.trace-context.omitted`
+on the sharded bus) once; the message is delivered, only the correlation is
+lost.
 
 ---
 
@@ -916,7 +969,7 @@ const presence = createPresence(redis, {
 CONFIG SET notify-keyspace-events Eg
 ```
 
-(or any flagset that includes both `K`/`E` and the generic class `g` - e.g. `Eg`, `KEA`.) Key deletion is the generic (`g`) class on BOTH Redis 7.4+ and Valkey 9.0+, so one flag works on either server. If the `psubscribe` call fails because keyevents are off, the failure is logged once and the rest of the tracker keeps working without the keyspace branch.
+(or any flagset that includes both `E`, the keyevent channels, and the generic class `g` - e.g. `Eg`, `KEA`. `K` alone publishes only the keyspace channels, which this cleanup does not listen on.) Key deletion is the generic (`g`) class on BOTH Redis 7.4+ and Valkey 9.0+, so one flag works on either server. Redis accepts the `psubscribe` whether or not notifications are enabled, so a missing flag is not reported: the cleanup simply never fires. A `psubscribe` that fails - an ACL that denies `PSUBSCRIBE` or the `__keyevent@*__:del` pattern, or a dropped connection - is reported as `EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE`, and the rest of the tracker keeps working without the keyspace branch.
 
 **Scope:** this fires when the per-topic hash `presence:topic:{topic}` is deleted - which the server does the instant its last field's TTL lapses (no live instances presenting any user on this topic). Per-field expiry that still leaves other users on the topic does NOT fire it (the topic is not empty); those stale entries simply drop out of `list()` / `count()` on the next query. Portability note: the hash-field-expiry event itself (`hexpired`) is class `h` on Redis but class `x` on Valkey, so this cleanup deliberately keys on the resulting key deletion (`del`, class `g` on both) rather than the field-expiry event.
 
@@ -1205,7 +1258,7 @@ export async function message(ws, { data, platform }) {
 
 > **Degraded verdicts.** Without the floor, a Redis outage rejects every `consume()` promise and the caller decides (usually fail-closed). With it, limits keep being enforced per instance with the same semantics (refill, `blockDuration` bans) - the worst case is N instances allowing N times the floor budget until the store recovers, which is why a tighter per-instance budget (`points / instanceCount`) is offered. Floor state never leaks back into Redis; admin ops (`reset` / `ban` / `unban` / `clear`) still reject while degraded. Floor-decided verdicts count in `ratelimit_storage_fallbacks_total` when a metrics registry is configured, and the first degraded verdict logs a one-shot warning.
 
-> **`keyBy: 'ip'` behind a proxy.** In `'ip'` mode (the default) the bucket key is `userData.remoteAddress`, which the adapter resolves from `ADDRESS_HEADER` / `XFF_DEPTH`. If the server sits behind an address-rewriting proxy (a docker userland-proxy, an L4 load balancer, a non-XFF proxy) and `ADDRESS_HEADER` is unset, every client arrives as the same gateway address and the per-IP bucket collapses into one shared global bucket. Set `ADDRESS_HEADER` (and `XFF_DEPTH` for an X-Forwarded-For chain) so the real client IP is resolved, or pass an explicit `keyBy`. The limiter logs a one-shot warning the first time it denies on a loopback/private key while `ADDRESS_HEADER` is unset.
+> **`keyBy: 'ip'` behind a proxy.** In `'ip'` mode (the default) the bucket key is `userData.remoteAddress`, which the adapter resolves from `ADDRESS_HEADER` / `XFF_DEPTH`. If the server sits behind an address-rewriting proxy (a docker userland-proxy, an L4 load balancer, a non-XFF proxy) and `ADDRESS_HEADER` is unset, every client arrives as the same gateway address and the per-IP bucket collapses into one shared global bucket. Set `ADDRESS_HEADER` (and `XFF_DEPTH` for an X-Forwarded-For chain) so the real client IP is resolved, or pass an explicit `keyBy`. The limiter emits the one-shot `redis.ratelimit.proxy-collapse-risk` diagnostic on the first matching denial. It records only the private/loopback classification and configuration state; the IP value itself is omitted.
 
 #### API
 
@@ -1776,6 +1829,17 @@ Now any INSERT, UPDATE, or DELETE on the `messages` table will fire a notificati
 
 The client side needs no changes - the core `crud('messages')` store already handles `created`, `updated`, and `deleted` events.
 
+#### Distributed tracing
+
+The default parser accepts top-level W3C `traceparent` and optional
+`tracestate` fields beside `topic`, `event`, and `data`. A
+custom parser may return those carrier fields or an explicit
+`traceContext`. When the activated Platform has a tracing provider, the
+bridge validates the carrier and publishes inside a
+`postgres.notify.receive` consumer operation parented on it; without one the
+carrier is ignored. Invalid carriers are ignored without dropping the
+notification. Transport fields never become part of `data`.
+
 #### Options
 
 | Option | Default | Description |
@@ -1827,7 +1891,7 @@ export function open(ws, { platform }) {
 
 #### Limitations
 
-- **Payload is hard-limited to ~8000 bytes by Postgres** (`pg_notify` silently truncates or errors above this). This is a Postgres constraint, not a library limitation. The bridge warns at 7500 bytes. For large rows, send the row ID in the notification and let the client fetch the full row via an API call.
+- **Payload is hard-limited to ~8000 bytes by Postgres.** Above it `pg_notify` raises `payload string too long`, which aborts the transaction that sent it: with the trigger above, the application's own INSERT or UPDATE fails. This is a Postgres constraint, not a library limitation. The bridge warns at 7500 bytes. For large rows, send the row ID in the notification and let the client fetch the full row via an API call.
 - Only fires from triggers. Changes made outside your app (manual SQL, migrations) are invisible unless you add triggers for those tables too.
 - This is not logical replication. It is simpler, works on every Postgres provider, and needs no extensions or superuser access.
 
@@ -1864,11 +1928,16 @@ export const jobs = createJobQueue(pg, {
 const id = await jobs.enqueue(
   'email',
   { to: 'user@example.com', subject: 'Welcome' },
-  { platform }   // captures platform.requestId onto the row, surfaced as job.requestId on claim
+  { platform }   // captures requestId + current trace context on the durable row
 );
 ```
 
-The third argument is an options bag; `platform` (the SvelteKit `event.platform`) auto-captures the originating request id, or pass `requestId` explicitly to override. The captured id surfaces on `job.requestId` when the row is claimed, so the worker can correlate logs back to the request that enqueued the job.
+The third argument is an options bag; `platform` (the SvelteKit
+`event.platform`) auto-captures the originating request id and its live W3C
+trace context. Pass `requestId` or `traceContext` explicitly to override
+either value; explicit `traceContext: null` suppresses Platform fallback.
+The values surface as `job.requestId` and `job.traceContext` when
+claimed, so a worker can correlate logs and continue the distributed trace.
 
 `enqueue()` returns the row id verbatim from `pg`, which serialises `BIGINT`/`BIGSERIAL` columns as **strings** by default to avoid precision loss past `Number.MAX_SAFE_INTEGER`. Pass it through to `claim()`/`complete()`/`fail()`/`extend()` as-is. If you want a JS number for logging or comparison, coerce explicitly with `Number(id)` (safe up to 2^53 - still ~9 quadrillion rows of headroom).
 
@@ -1911,7 +1980,9 @@ CREATE TABLE IF NOT EXISTS svti_jobs (
   svti_jobs_id  BIGSERIAL   PRIMARY KEY,
   queue         TEXT        NOT NULL,
   payload       JSONB,
-  request_id    TEXT,                       - originating platform.requestId, or null
+  request_id    TEXT,                       -- originating platform.requestId, or null
+  traceparent   TEXT,                       -- validated W3C context, or null
+  tracestate    TEXT,
   claimed_at    TIMESTAMPTZ,
   claimed_until TIMESTAMPTZ,
   attempts      INTEGER     NOT NULL DEFAULT 0,
@@ -1923,7 +1994,19 @@ CREATE INDEX IF NOT EXISTS idx_svti_jobs_visibility
     ON svti_jobs (claimed_until) WHERE claimed_at IS NOT NULL;
 ```
 
-Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS request_id TEXT` on first use; idempotent and zero-downtime.
+Existing deployments forward-migrate the `request_id`, `traceparent`,
+and `tracestate` columns via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+on first use; idempotent and zero-downtime. Rows created by older releases
+claim with `traceContext: null`.
+
+With `autoMigrate: false`, apply those nullable columns before deploying this
+reader, because its claim/list queries select them even for older rows:
+
+```sql
+ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS request_id TEXT;
+ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS tracestate TEXT;
+```
 
 #### Options
 
@@ -1937,8 +2020,8 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 
 | Method | Description |
 |---|---|
-| `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, platform? }` - `platform.requestId` is captured automatically when `platform` is passed |
-| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. `batchSize` is capped at 1000, the same per-call id limit `complete` / `fail` / `extend` enforce - a larger claim could never be finished, so the batch would only expire and be redelivered. Each returned job carries `id, queue, payload, requestId, attempts, created_at` |
+| `enqueue(queue, payload, opts?)` | Insert a job; returns the job id. Opts: `{ requestId?, traceContext?, platform? }` - the Platform's request and trace context are captured automatically |
+| `claim(queue, opts?)` | `SELECT ... FOR UPDATE SKIP LOCKED` claim; opts: `{ batchSize?, visibilityTimeoutMs? }`. `batchSize` is capped at 1000, the same per-call id limit `complete` / `fail` / `extend` enforce - a larger claim could never be finished, so the batch would only expire and be redelivered. Each returned job carries `id, queue, payload, requestId, traceContext, attempts, created_at` |
 | `complete(idOrIds)` | Delete the job(s) on success |
 | `fail(idOrIds)` | Release the claim for retry |
 | `extend(idOrIds, ms)` | Push back the visibility deadline |
@@ -2704,8 +2787,8 @@ export const tasks = createTaskRunner(pg, {
   rowTtl: 7 * 24 * 3600  // keep terminal rows for 7 days
 });
 
-tasks.register('charge-customer', async ({ input, idempotencyKey, requestId, signal }) => {
-  log.info({ requestId, customerId: input.customerId }, 'charging customer');
+tasks.register('charge-customer', async ({ input, idempotencyKey, requestId, traceContext, signal }) => {
+  log.info({ requestId, traceContext, customerId: input.customerId }, 'charging customer');
   return await stripe.paymentIntents.create(
     { amount: input.amount, customer: input.customerId },
     { idempotencyKey, signal }
@@ -2731,14 +2814,21 @@ export const actions = {
     const result = await tasks.run('charge-customer', {
       input: { amount, customerId: locals.user.stripeCustomerId },
       idempotencyKey: `charge-${locals.user.id}-${request.headers.get('idempotency-key')}`,
-      platform   // captures platform.requestId onto the row, exposed as ctx.requestId in the handler
+      platform   // captures requestId + live trace context onto the durable row
     });
     return { success: true, paymentIntentId: result.id };
   }
 };
 ```
 
-Pass `platform` (the SvelteKit `event.platform`) to capture the originating request id automatically - it lands on `svti_tasks.request_id` and surfaces as `ctx.requestId` in the handler so logs from inside the task correlate back to the WS / HTTP request that started it. Override explicitly via the `requestId` option for non-request contexts (cron, recovery, manual invocation).
+Pass `platform` (the SvelteKit `event.platform`) to capture the
+originating request id and live W3C trace context automatically. They land on
+the durable task row and surface as `ctx.requestId` and
+`ctx.traceContext` in every handler attempt, including dispatch and
+recovery on another instance. Override explicitly via `requestId` or
+`traceContext`; explicit `traceContext: null` suppresses Platform
+fallback. Configure a default `platform` on `createTaskRunner` when
+background dispatch/recovery should start structural consumer operations.
 
 #### Schema
 
@@ -2750,8 +2840,10 @@ CREATE TABLE IF NOT EXISTS svti_tasks (
   name                 TEXT         NOT NULL,
   input                JSONB,
   svti_idempotency_key TEXT,
-  request_id           TEXT,                    - originating platform.requestId, or null
-  status               TEXT         NOT NULL,  - 'running' | 'committed' | 'failed'
+  request_id           TEXT,                    -- originating platform.requestId, or null
+  traceparent          TEXT,                    -- validated W3C context, or null
+  tracestate           TEXT,
+  status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
   result               JSONB,
   error                JSONB,
   fence                UUID         NOT NULL,
@@ -2766,7 +2858,19 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
     ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
 
-Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS request_id TEXT` on first use; idempotent and zero-downtime.
+Existing deployments forward-migrate `request_id`, `traceparent`, and
+`tracestate` with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+statements. Older rows remain readable and expose `traceContext: null`.
+
+With `autoMigrate: false`, apply those nullable columns before deploying this
+reader: the state query reads `request_id`, and the list query and the dispatch
+and recovery sweeps read all three, even for older rows:
+
+```sql
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS request_id TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS traceparent TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate TEXT;
+```
 
 #### Options
 
@@ -2788,6 +2892,7 @@ Existing 0.5.0-next.1 deployments forward-migrate via `ALTER TABLE ... ADD COLUM
 | `serializeErrorCause` | `false` | Persist `error.cause` alongside name/message/stack/code on a failed task. Off by default: handlers routinely attach config-bearing causes (a connection error carries its DSN) and the stored row is re-served to dashboards by `await()` / `list()`. |
 | `maxPayloadBytes` | `262144` (256KB) | Byte ceiling on an encoded task `input` and `result`, and the point at which a persisted error is truncated to fit. Minimum 80 bytes, so a failed row can retain a valid terminal error shape. Worth setting deliberately, because the two sides fail differently - see below. |
 | `onStateChange` | - | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |
+| `platform` | - | Default structural Platform request/tracing surface for background dispatch and recovery. Per-call `platform` wins. |
 | `breaker` | - | Circuit breaker; bypassed when broken |
 | `metrics` | - | Prometheus registry; emits `tasks_*_total` counters |
 
@@ -2819,7 +2924,7 @@ The runner owns every state-machine transition; expose what it knows via the `on
 ```js
 const tasks = createTaskRunner(pg, {
   onStateChange(event) {
-    // event.{ taskId, name, oldStatus, newStatus, attempt, requestId, result?, error? }
+    // event.{ taskId, name, oldStatus, newStatus, attempt, requestId, traceContext, result?, error? }
     metrics.inc(`tasks.${event.name}.${event.newStatus}`);
     if (event.newStatus === 'committed') {
       bus.publish(`task:${event.taskId}`, 'committed', { result: event.result });
@@ -2883,6 +2988,8 @@ Default is no retry on handler-thrown errors - safe for non-idempotent tasks. St
 {
   input: TInput,                    // the input passed to run()
   idempotencyKey: string | undefined, // forward to external services
+  requestId: string | null,         // originating request correlation
+  traceContext: TraceContext | null, // restored context for this attempt
   fence: string,                    // this attempt's fence UUID, read-only
   signal: AbortSignal,              // aborts when the fence is lost
   attempt: number                   // 1-based attempt counter
@@ -3503,11 +3610,66 @@ Critical invariants across the extensions are checked at runtime via a tiered as
 
 | Mode | `assert` behavior (SOFT) | `fatal` behavior (HARD) | `devAssert` behavior |
 |---|---|---|---|
-| **Production** (`NODE_ENV === 'production'`) | counter++, structured `[extensions/assert]` log line, **does NOT throw** - a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | counter++, `[extensions/fatal]` log, then a **deferred `process.exit(78)`** scheduled after the current callback frame unwinds (never a synchronous exit inside a callback) | full no-op |
+| **Production** (`NODE_ENV === 'production'`) | counter++, package-attributed diagnostic with `severity=warn`, **does NOT throw** - a thrown exception inside a Redis pubsub callback or a publish hot-path microtask could leave a half-applied transaction or a corrupted local index | counter++, package-attributed diagnostic with `severity=fatal`, then a **deferred `process.exit(78)`** scheduled after the current callback frame unwinds (never a synchronous exit inside a callback) | full no-op |
 | **Test** (`process.env.VITEST` or `NODE_ENV === 'test'`) | counter++, log, and throws so vitest surfaces the failure as a test error | counter++, log, and throws (the deferred exit is suppressed so the runner is not killed) | log only, never throws |
 | **Development** (otherwise) | counter++, log, no throw | counter++, log, then deferred `process.exit(78)` | log only |
 
 `devAssert` is for cosmetic / DX hints (schema-mismatch warnings, etc); `assert` is for invariants whose violation indicates corrupted-but-recoverable internal state; `fatal` is the hard tier for genuinely unrecoverable state, where continuing would propagate the corruption (it terminates the worker with exit code 78 so a supervisor can restart it from a clean slate). The deferred exit is injectable via `setFatalSink` / `resetFatalSink` so a simulation harness can capture fatals instead of exiting. The DX framing matches the adapter's: hard assertions never fire on healthy code; if they fire, something is genuinely wrong.
+
+All three helpers emit the ecosystem grammar the adapter prints, byte for byte:
+`[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.assertion event=invariant.violated severity=...] <category> {json}`.
+Collectors should use `parseDiagnostic()` from
+`svelte-adapter-uws/observability`; it parses these canonical lines and still
+recognizes the former `[extensions/*]`, `[redis/*]`, and `[postgres/*]`
+families during the 0.6 compatibility window.
+
+Diagnostic `message` text is fixed package-owned English. Redis groups,
+Postgres channels, error details, and other external values remain in
+structured `attributes` under stable `event` identities. The physical
+console line uses visible ASCII escapes for controls, bidirectional formatting
+characters, and non-ASCII text; parsing restores the exact attribute values.
+HTML dashboards must escape each decoded value and wrap it in
+`<bdi dir="auto">` before display.
+
+#### Operational event sink
+
+Every operational failure this package reports - connection and subscriber,
+clock, leader, replay-storage, rate-limit, task-sweep, task-listener, bound and
+metrics failures - is emitted through the process-wide operational event sink that
+`svelte-adapter-uws/observability` owns. Configure it once, from the adapter's
+entry point; every record this package emits arrives there, alongside the
+adapter's and `svelte-realtime`'s. Without a sink, events are canonical
+one-line JSON console diagnostics:
+
+```js
+import { setOperationalEventSink } from 'svelte-adapter-uws/observability';
+
+const restore = setOperationalEventSink((record) => {
+  logger[record.severity]({ operationalEvent: record });
+});
+```
+
+Optional feature callbacks such as `onError` still run, but no longer
+determine whether the framework-owned root-cause event exists. A throwing or rejecting custom
+sink falls back to console so it cannot erase the original failure. The
+returned disposer unregisters only its own installation: nested registrations
+resume the newest sink that is still active, and disposing an older
+registration out of order can never resurrect it later. Assertion violations
+(`event=invariant.violated`) are the exception: as in the adapter, they are
+written straight to the console with `console.error` and never reach an
+installed sink. The three one-shot configuration advisories and the
+diagnostic pipeline's own last-resort lines are console-only too. A caught
+error is reported with its own text, connection-string passwords removed.
+Where a backend error repeats what was sent or received - an unknown
+command's arguments, or a reply ioredis could not match to a command - that
+part is cut, as is a channel or key built from a topic or a client identity
+where the reporting code knows it. A custom NOTIFY parser's error is reported
+by name and code only, since its text can quote the payload. What an application callback
+throws is reported as the application wrote it. Every failure event
+this package can emit is indexed in the [error reference](./docs/errors.md)
+with its cause, consequence, recovery, and next action, and `npm run check`
+fails on a console failure line that is neither indexed nor recorded as a
+deliberate exception.
 
 #### Wiring the metric
 

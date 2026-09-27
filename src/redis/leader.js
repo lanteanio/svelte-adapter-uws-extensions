@@ -35,6 +35,8 @@
 import { randomBytes, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 const DEFAULT_KEY = 'leader';
 const DEFAULT_LEASE_MS = 30_000;
@@ -131,15 +133,19 @@ export function createLeader(client, options = {}) {
 	let timer = null;
 	let inFlight = null;
 
-	function reportError(err) {
+	function reportError(err, operation) {
 		mRenewalFailures?.inc({ key_class: keyClass });
 		if (onError) {
 			try { onError(err); } catch { /* swallow listener errors */ }
 		}
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.LEADER_TICK, { error: err, attributes: { operation, keyClass } });
 	}
 
 	async function tick() {
 		if (stopped) return;
+		// Captured before the await: a failure clears _isLeader, and the report
+		// names the step that failed, not the state after it.
+		const operation = _isLeader ? 'renew' : 'acquire';
 		try {
 			if (_isLeader) {
 				const r = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, fullKey, instanceId, leaseMs);
@@ -165,7 +171,7 @@ export function createLeader(client, options = {}) {
 				_isLeader = false;
 				mLost?.inc({ key_class: keyClass });
 			}
-			reportError(err);
+			reportError(err, operation);
 		}
 	}
 
@@ -190,6 +196,7 @@ export function createLeader(client, options = {}) {
 			if (onError) {
 				try { onError(err); } catch { /* swallow */ }
 			}
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.LEADER_READ_CURRENT, { error: err, attributes: { keyClass } });
 			return null;
 		}
 	}
@@ -214,6 +221,7 @@ export function createLeader(client, options = {}) {
 				// until its TTL elapses. The compare-and-delete shape means
 				// we never accidentally release someone else's lease.
 				breaker?.failure(err);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.LEADER_RELEASE, { error: err, attributes: { keyClass } });
 			}
 			_isLeader = false;
 		}

@@ -32,6 +32,16 @@ import {
 } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { execMultiSlot, isCluster, keySlot } from '../shared/cluster.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import {
+	REDIS_TRACE_ATTRIBUTES,
+	injectTraceContext,
+	carriedTraceContext,
+	liveTraceContext,
+	runTraceOperation,
+	traceEnabled
+} from '../shared/trace-context.js';
 
 // A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
 // channel's slot never resolves - the command hangs instead of returning a MOVED
@@ -127,6 +137,8 @@ export function createShardedBus(client, options = {}) {
 	let active = false;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
+	// Whether activePlatform has a tracing provider, read once at activate.
+	let activeTracing = false;
 
 	/** @type {Map<string, number>} topic -> follow refcount */
 	const followCounts = new Map();
@@ -138,6 +150,11 @@ export function createShardedBus(client, options = {}) {
 	const channelNode = new Map();
 	/** @type {ReturnType<typeof setTimeout> | null} debounce for the reshard reconcile sweep */
 	let reconcileTimer = null;
+	// One report per failure streak for each kind of failure, re-armed by a
+	// reconciliation that completes: a channel its new owner refuses fails
+	// again on every later reconciliation.
+	let refreshFailing = false;
+	let channelsFailing = false;
 	// Set when a subscriber error signals a possible reshard, so the next
 	// subscribe refreshes the slot map before resolving an owner (rather than
 	// blind-subscribing on a stale - and therefore hanging - old owner).
@@ -177,18 +194,149 @@ export function createShardedBus(client, options = {}) {
 		arr.push({ msg, topics });
 		if (channelBatches.size >= MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK && !batchChannelsWarnFired) {
 			batchChannelsWarnFired = true;
-			console.warn(
-				'[sharded-bus] tick batch reached ' + channelBatches.size +
-				' distinct channels in one iteration. The batch is drained every tick, ' +
-				'so reaching this size means a publisher emitted a million distinct ' +
-				'channels in one synchronous burst - likely a topic-cardinality leak.\n' +
-				'  See: https://svti.me/sharded-bus-burst'
-			);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST, {
+				attributes: { channels: channelBatches.size }
+			});
 		}
 		if (relayTimer === null) {
 			relayTimer = setTimer(flushRelay, 0);
 			if (relayTimer.unref) relayTimer.unref();
 		}
+	}
+
+	// Relay one envelope on its shard channel from inside a producer operation,
+	// carrying its trace context when the encoded result still fits under
+	// maxEnvelopeBytes. Every receiving instance enforces that cap before
+	// parsing, so an envelope the trace fields push over it would be dropped by
+	// every peer; the message goes without them instead. An envelope over the
+	// cap on its own is relayed exactly as an untraced one is, and is not
+	// reported as an omission.
+	let traceOmissionReported = false;
+	function relayTraced(channel, env, topics, traceContext) {
+		if (traceContext === null) {
+			scheduleRelay(channel, JSON.stringify(env), topics);
+			return;
+		}
+		injectTraceContext(env, traceContext);
+		const traced = JSON.stringify(env);
+		if (validator.acceptRaw(traced)) {
+			scheduleRelay(channel, traced, topics);
+			return;
+		}
+		delete env.traceparent;
+		delete env.tracestate;
+		const plain = JSON.stringify(env);
+		if (!traceOmissionReported && validator.acceptRaw(plain)) {
+			traceOmissionReported = true;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_TRACE_OMITTED, {
+				attributes: { maxEnvelopeBytes: validator.maxBytes }
+			});
+		}
+		scheduleRelay(channel, plain, topics);
+	}
+
+	// Local delivery of one envelope relayed by another instance. The untraced
+	// receive path calls it directly; on a Platform with a tracing provider it
+	// runs inside a consumer operation parented on the producer's context.
+	function deliverEnvelope(parsed) {
+		// Coalesced relay: re-coalesce onto local subscribers (latest-value-
+		// wins per ws+key), mirroring the publishing instance's sendCoalesced.
+		// Precedes the batch/single branches so a coalesced frame is never
+		// broadcast.
+		if (parsed.coalesced === true) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
+			mReceived?.inc({ topic: mt(parsed.topic) });
+			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
+				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+			});
+			return;
+		}
+		// Shared binary fan-out relay: a stateless `shared: true` codec
+		// published on another instance. Re-derive the codec by capability and
+		// re-run publishWire locally so THIS instance does its own native cohort
+		// split (its own server-wide wire-id, its own subscribers); relay: false
+		// stops a re-relay loop. Falls back to a plain JSON publish when the
+		// codec is not registered here (a pure-subscriber instance) - still a
+		// correct delivery. Precedes the batch/single branches.
+		if (parsed.wire === true) {
+			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			mReceived?.inc({ topic: mt(parsed.topic) });
+			const codec = wireCodecs.get(parsed.capability);
+			if (codec && typeof activePlatform.publishWire === 'function') {
+				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
+					parsed.compress === true ? { relay: false, compress: true } : { relay: false });
+			} else {
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+			}
+			return;
+		}
+		if (Array.isArray(parsed.batch)) {
+			const local = [];
+			for (let i = 0; i < parsed.batch.length; i++) {
+				const m = parsed.batch[i];
+				if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+					mParseErrors?.inc();
+					continue;
+				}
+				mReceived?.inc({ topic: mt(m.topic) });
+				local.push({
+					topic: m.topic,
+					event: m.event,
+					data: m.data,
+					options: { relay: false }
+				});
+			}
+			if (local.length === 0) return;
+			activePlatform.publishBatched(local);
+		} else {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			mReceived?.inc({ topic: mt(parsed.topic) });
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
+		}
+	}
+
+	function deliverTraced(parsed) {
+		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', carriedTraceContext(parsed), REDIS_TRACE_ATTRIBUTES,
+			() => deliverEnvelope(parsed));
+	}
+
+	function wireEnvelope(topic, event, data, wire, opts) {
+		const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
+		if (opts && opts.compress === true) /** @type {any} */ (env).compress = true;
+		return env;
+	}
+
+	/** @returns {Map<string, Array<{topic: string, event: string, data: unknown}>>} */
+	function batchesByChannel(messages) {
+		const byChannel = new Map();
+		for (let i = 0; i < messages.length; i++) {
+			const mes = messages[i];
+			if (mes.options && mes.options.relay === false) continue;
+			const ch = channelFor(mes.topic);
+			let arr = byChannel.get(ch);
+			if (!arr) {
+				arr = [];
+				byChannel.set(ch, arr);
+			}
+			arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
+		}
+		return byChannel;
+	}
+
+	function batchTopics(batch) {
+		const topics = new Array(batch.length);
+		for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
+		return topics;
 	}
 
 	function flushRelay() {
@@ -238,7 +386,7 @@ export function createShardedBus(client, options = {}) {
 				// and deliver an unidentifiable frame to the branches below. Drop
 				// explicitly, mirroring the pubsub bus.
 				if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
-					assert(false, 'sharded-bus.envelope.shape', { ch });
+					assert(false, 'sharded-bus.envelope.shape', { slot: keySlot(ch) });
 					return;
 				}
 				// One echo check per envelope; batched envelopes carry
@@ -248,70 +396,12 @@ export function createShardedBus(client, options = {}) {
 					return;
 				}
 				if (!activePlatform) return;
-				// Coalesced relay: re-coalesce onto local subscribers (latest-value-
-				// wins per ws+key), mirroring the publishing instance's sendCoalesced.
-				// Precedes the batch/single branches so a coalesced frame is never
-				// broadcast.
-				if (parsed.coalesced === true) {
-					if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
-						mParseErrors?.inc();
-						return;
-					}
-					const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
-					mReceived?.inc({ topic: mt(parsed.topic) });
-					activePlatform.forEachSubscriber(parsed.topic, (ws) => {
-						activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
-					});
-					return;
-				}
-				// Shared binary fan-out relay: a stateless `shared: true` codec
-				// published on another instance. Re-derive the codec by capability and
-				// re-run publishWire locally so THIS instance does its own native cohort
-				// split (its own server-wide wire-id, its own subscribers); relay: false
-				// stops a re-relay loop. Falls back to a plain JSON publish when the
-				// codec is not registered here (a pure-subscriber instance) - still a
-				// correct delivery. Precedes the batch/single branches.
-				if (parsed.wire === true) {
-					if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
-						mParseErrors?.inc();
-						return;
-					}
-					mReceived?.inc({ topic: mt(parsed.topic) });
-					const codec = wireCodecs.get(parsed.capability);
-					if (codec && typeof activePlatform.publishWire === 'function') {
-						activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-							parsed.compress === true ? { relay: false, compress: true } : { relay: false });
-					} else {
-						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
-					}
-					return;
-				}
-				if (Array.isArray(parsed.batch)) {
-					const local = [];
-					for (let i = 0; i < parsed.batch.length; i++) {
-						const m = parsed.batch[i];
-						if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
-							mParseErrors?.inc();
-							continue;
-						}
-						mReceived?.inc({ topic: mt(m.topic) });
-						local.push({
-							topic: m.topic,
-							event: m.event,
-							data: m.data,
-							options: { relay: false }
-						});
-					}
-					if (local.length === 0) return;
-					activePlatform.publishBatched(local);
-				} else {
-					if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
-						mParseErrors?.inc();
-						return;
-					}
-					mReceived?.inc({ topic: mt(parsed.topic) });
-					activePlatform.publish(parsed.topic, parsed.event, parsed.data, parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
-				}
+				// Local delivery runs no application code, so a carried trace
+				// context only matters to a tracing provider: with one, delivery is a
+				// consumer operation parented on the producer's context; without one
+				// the trace fields are ignored and nothing is allocated for them.
+				if (activeTracing) deliverTraced(parsed);
+				else deliverEnvelope(parsed);
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
 				// is observable instead of silently swallowed.
@@ -320,7 +410,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	function subOnError(err) {
-		console.error('sharded bus subscriber error:', err.message);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_SUBSCRIBER, { error: err });
 		// A slot migration makes the source master drop that slot's shard
 		// subscriptions; ioredis surfaces the server-initiated unsubscribe here
 		// rather than as a clean event. Mark the slot map stale so the next
@@ -401,15 +491,15 @@ export function createShardedBus(client, options = {}) {
 			ownerId = ownerIdForSlot(slot);
 		}
 		let conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
-		if (!conn) throw new Error('sharded bus: no owning node for channel ' + channel);
+		if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
 		try {
-			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe ' + channel);
+			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot);
 		} catch {
 			await subRefreshTopology();
 			ownerId = ownerIdForSlot(slot);
 			conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
-			if (!conn) throw new Error('sharded bus: no owning node for channel ' + channel);
-			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe ' + channel + ' (retry)');
+			if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
+			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot + ' (retry)');
 		}
 		channelNode.set(channel, ownerId);
 	}
@@ -423,8 +513,13 @@ export function createShardedBus(client, options = {}) {
 		if (!isCluster(client.redis) || !subReady) return;
 		try {
 			await subRefreshTopology();
-		} catch {
-			return; // transient; the next error reschedules
+		} catch (err) {
+			// Nothing retries on a timer: the next subscriber error reschedules.
+			if (!refreshFailing) {
+				refreshFailing = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err });
+			}
+			return;
 		}
 		const moved = [];
 		for (const channel of subscribedChannels) {
@@ -432,21 +527,39 @@ export function createShardedBus(client, options = {}) {
 			if (ownerId !== null && channelNode.get(channel) !== ownerId) moved.push(channel);
 		}
 		// Re-subscribe the moved channels in parallel for fast recovery; the
-		// topology was refreshed above, so none resolves a stale owner.
+		// topology was refreshed above, so none resolves a stale owner. One
+		// failure does not abort the rest.
+		let failed = 0;
+		let first = null;
 		await Promise.all(moved.map((channel) =>
 			subscribeChannelOnOwner(channel).then(
 				() => mResubscribes?.inc(),
-				// Leave a failed one for the next sweep rather than aborting the rest.
-				(err) => console.error('sharded bus reconcile ' + channel + ': ' + err.message)
+				(err) => {
+					failed++;
+					first ??= { err, channel };
+				}
 			)
 		));
+		if (first === null) {
+			refreshFailing = false;
+			channelsFailing = false;
+			return;
+		}
+		if (channelsFailing) return;
+		channelsFailing = true;
+		// The channel is built from a topic; cut it should the error repeat it.
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE, {
+			error: first.err,
+			redact: [first.channel],
+			attributes: { slot: keySlot(first.channel), failed }
+		});
 	}
 
 	function scheduleReconcile() {
 		if (reconcileTimer !== null) return;
 		reconcileTimer = setTimer(() => {
 			reconcileTimer = null;
-			subReconcile().catch((err) => console.error('sharded bus reconcile failed:', err.message));
+			subReconcile().catch((err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err }));
 		}, 0);
 		if (reconcileTimer.unref) reconcileTimer.unref();
 	}
@@ -487,7 +600,7 @@ export function createShardedBus(client, options = {}) {
 		if (!conn) return;
 		// Best-effort: a channel whose slot already migrated is gone from this
 		// node, and sunsubscribe on a non-owner would hang, so cap and ignore.
-		await withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe ' + channel).catch(() => {});
+		await withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe on slot ' + keySlot(channel)).catch(() => {});
 	}
 
 	async function subClose() {
@@ -495,6 +608,8 @@ export function createShardedBus(client, options = {}) {
 			clearTimer(reconcileTimer);
 			reconcileTimer = null;
 		}
+		refreshFailing = false;
+		channelsFailing = false;
 		const all = isCluster(client.redis)
 			? [...subByNodeId.values()]
 			: (subStandalone ? [subStandalone] : []);
@@ -508,6 +623,7 @@ export function createShardedBus(client, options = {}) {
 
 	async function activate(platform) {
 		activePlatform = platform;
+		activeTracing = traceEnabled(platform);
 		if (active) return;
 
 		b?.guard();
@@ -734,6 +850,83 @@ export function createShardedBus(client, options = {}) {
 
 	const bus = {
 		wrap(platform) {
+			// The relaying methods below are the untraced relay: they read no
+			// trace context and allocate nothing for tracing. When the Platform
+			// has a tracing provider, the traced versions defined here replace
+			// them on the returned object (see the end of wrap), and each call
+			// becomes one producer operation, parented on the Platform's live
+			// context, around the local delivery and the relay; the envelope
+			// carries the operation's own context. The adapter configures its
+			// provider at build time, so whether a Platform traces is fixed for
+			// its lifetime and the choice is made once, here.
+			const traced = (fn) => runTraceOperation(platform, 'redis.sharded-pubsub.publish', 'producer',
+				liveTraceContext(platform), REDIS_TRACE_ATTRIBUTES, fn);
+			const publishTraced = (topic, event, data, opts) => {
+				if (opts && opts.relay === false) return platform.publish(topic, event, data, opts);
+				return traced((traceContext) => {
+					const result = platform.publish(topic, event, data, opts);
+					const env = { instanceId, topic, event, data };
+					if (opts && typeof opts.jitterMs === 'number' && opts.jitterMs > 0) {
+						/** @type {any} */ (env).j = opts.jitterMs;
+					}
+					relayTraced(channelFor(topic), env, [topic], traceContext);
+					return result;
+				});
+			};
+			// A batch with nothing to relay opens no operation, like a publish
+			// with relay: false. A non-array or a null entry counts as relaying, so
+			// it takes the traced path and the platform rejects it there exactly
+			// as it does untraced.
+			const relaysAny = (messages) => {
+				if (!Array.isArray(messages)) return true;
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					if (!m || !m.options || m.options.relay !== false) return true;
+				}
+				return false;
+			};
+			const batchTraced = (messages) => (!relaysAny(messages) ? platform.batch(messages) : traced((traceContext) => {
+				const results = platform.batch(messages);
+				for (let i = 0; i < messages.length; i++) {
+					const mes = messages[i];
+					if (!mes.options || mes.options.relay !== false) {
+						relayTraced(channelFor(mes.topic), { instanceId, topic: mes.topic, event: mes.event, data: mes.data }, [mes.topic], traceContext);
+					}
+				}
+				return results;
+			}));
+			const publishBatchedTraced = (messages) => {
+				if (!Array.isArray(messages)) {
+					throw new TypeError('sharded bus: publishBatched requires an array of messages');
+				}
+				if (messages.length === 0) return;
+				if (!relaysAny(messages)) {
+					platform.publishBatched(messages);
+					return;
+				}
+				// Local delivery first, as on the untraced path: the platform
+				// rejects a malformed entry with its own error before shardKey or
+				// the relay list sees the entries.
+				traced((traceContext) => {
+					platform.publishBatched(messages);
+					const byChannel = batchesByChannel(messages);
+					for (const [ch, batch] of byChannel) {
+						relayTraced(ch, { instanceId, batch }, batchTopics(batch), traceContext);
+					}
+				});
+			};
+			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
+				relayTraced(channelFor(topic), { instanceId, coalesced: true, topic, event, data, coalesceKey }, [topic], traceContext));
+			const publishWireTraced = (topic, event, data, wire, opts) => {
+				if (!(wire && wire.shared === true && (!opts || opts.relay !== false))) {
+					return platform.publishWire(topic, event, data, wire, opts);
+				}
+				return traced((traceContext) => {
+					const result = platform.publishWire(topic, event, data, wire, opts);
+					relayTraced(channelFor(topic), wireEnvelope(topic, event, data, wire, opts), [topic], traceContext);
+					return result;
+				});
+			};
 			const wrapped = {
 				publish(topic, event, data, opts) {
 					const result = platform.publish(topic, event, data, opts);
@@ -853,6 +1046,8 @@ export function createShardedBus(client, options = {}) {
 				} : undefined,
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
+				get traceContext() { return platform.traceContext ?? null; },
+				get trace() { return platform.trace; },
 				get pressure() { return platform.pressure; },
 				// Forward the live protection posture through the wrapped seam so
 				// cluster-side admission code (per-IP upgrade buckets, capability
@@ -945,6 +1140,13 @@ export function createShardedBus(client, options = {}) {
 					};
 				}
 			};
+			if (traceEnabled(platform)) {
+				wrapped.publish = publishTraced;
+				wrapped.batch = batchTraced;
+				wrapped.publishBatched = publishBatchedTraced;
+				wrapped.relayCoalesced = relayCoalescedTraced;
+				if (wrapped.publishWire) wrapped.publishWire = publishWireTraced;
+			}
 			return wrapped;
 		},
 		activate,

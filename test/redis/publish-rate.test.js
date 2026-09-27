@@ -3,6 +3,8 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPublishRateAggregator } from '../../src/redis/publish-rate.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 describe('redis publish-rate aggregator', () => {
 	let client;
@@ -702,8 +704,15 @@ describe('redis publish-rate aggregator', () => {
 			agg.onPublishRate(() => { good++; });
 
 			setRates([['a', 100]]);
-			expect(() => agg._evaluateCrossingsNow()).not.toThrow();
+			const sink = captureRegistered();
+			try {
+				expect(() => agg._evaluateCrossingsNow()).not.toThrow();
+			} finally {
+				sink.stop();
+			}
 			expect(good).toBe(1);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PUBLISH_RATE_LISTENER]);
+			expect(sink.records[0].attributes.error.message).toBe('boom');
 			await agg.deactivate();
 		});
 

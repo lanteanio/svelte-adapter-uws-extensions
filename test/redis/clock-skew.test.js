@@ -2,6 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createClockSkewSampler } from '../../src/redis/clock-skew.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 // A minimal RedisClient shape: only `.redis.time()` is exercised by the sampler.
 function fakeClient(timeFn) {
@@ -120,13 +122,20 @@ describe('clock-skew sampler', () => {
 			{ samples: 2, immediate: false, onError: (e) => errors.push(e) }
 		);
 
-		const skew = await sampler.sample();
+		const sink = captureRegistered();
+		let skew;
+		try {
+			skew = await sampler.sample();
+		} finally {
+			sink.stop();
+		}
 		await sampler.stop();
 
 		expect(skew).toBeNull();
 		expect(sampler.current()).toBeNull();
 		expect(errors).toHaveLength(1);
 		expect(errors[0].message).toBe('redis down');
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.CLOCK_SKEW_SAMPLE]);
 	});
 
 	it('current() is null before the first sample', async () => {

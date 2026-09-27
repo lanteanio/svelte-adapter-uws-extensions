@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createNotifyBridge } from '../../src/postgres/notify.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
+
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 
 /**
  * Cluster-scoped mock that simulates Postgres advisory-lock state across
@@ -279,6 +283,93 @@ describe('postgres notify bridge', () => {
 			});
 		});
 
+		it('delivers inside a consumer operation parented on the carrier, outside application data', async () => {
+			platform.trace.enabled = true;
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform);
+			client._simulate('changes', JSON.stringify({
+				topic: 'messages',
+				event: 'created',
+				data: { traceparent: 'application-data' },
+				traceparent: TRACE_A,
+				tracestate: 'vendor=value'
+			}));
+			// Transport fields never become application data or a publish option.
+			expect(platform.published[0]).toEqual({
+				topic: 'messages',
+				event: 'created',
+				data: { traceparent: 'application-data' },
+				options: { relay: false }
+			});
+			expect(platform.traceOperations).toEqual([{
+				name: 'postgres.notify.receive',
+				options: {
+					kind: 'consumer',
+					parent: { traceparent: TRACE_A, tracestate: 'vendor=value' },
+					attributes: { 'messaging.system': 'postgresql' }
+				}
+			}]);
+		});
+
+		it('parents on the traceContext a custom parser returns, over trace fields on the result itself', async () => {
+			const OTHER = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-01';
+			platform.trace.enabled = true;
+			let explicit = { traceparent: OTHER };
+			bridge = createNotifyBridge(client, {
+				channel: 'changes',
+				parse: (payload) => {
+					const row = JSON.parse(payload);
+					return { topic: row.topic, event: 'changed', data: row.id, traceparent: TRACE_A, traceContext: explicit };
+				}
+			});
+			await bridge.activate(platform);
+
+			client._simulate('changes', JSON.stringify({ topic: 'rows', id: 7 }));
+			expect(platform.published[0]).toEqual({ topic: 'rows', event: 'changed', data: 7, options: { relay: false } });
+			expect(platform.traceOperations.map((op) => op.options.parent)).toEqual([{ traceparent: OTHER }]);
+
+			// An explicit null starts a new trace even though the result carries one.
+			explicit = null;
+			client._simulate('changes', JSON.stringify({ topic: 'rows', id: 8 }));
+			expect(platform.traceOperations.map((op) => op.options.parent)).toEqual([{ traceparent: OTHER }, null]);
+		});
+
+		it('ignores carrier fields on a Platform without a tracing provider', async () => {
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform);
+			client._simulate('changes', JSON.stringify({
+				topic: 'messages', event: 'created', data: 1, traceparent: TRACE_A
+			}));
+			expect(platform.published[0].options).toEqual({ relay: false });
+			expect(platform.traceOperations).toEqual([]);
+			expect(platform.traceRestored).toEqual([]);
+		});
+
+		it('measures the near-limit warning in bytes, the unit Postgres caps NOTIFY in', async () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform);
+			// 2600 three-byte characters: 7800 bytes, well under 7500 characters.
+			const payload = JSON.stringify({ topic: 'messages', event: 'created', data: String.fromCharCode(0x20ac).repeat(2600) });
+			client._simulate('changes', payload);
+			const line = warn.mock.calls.map((call) => call[0]).find((text) => text.includes('postgres.notify.payload-near-limit'));
+			expect(line).toBeDefined();
+			expect(JSON.parse(line.slice(line.indexOf('{'))).attributes.bytes).toBe(Buffer.byteLength(payload, 'utf8'));
+			warn.mockRestore();
+		});
+
+		it('drops invalid transport context while preserving delivery', async () => {
+			bridge = createNotifyBridge(client, { channel: 'changes' });
+			await bridge.activate(platform);
+			client._simulate('changes', JSON.stringify({
+				topic: 'messages',
+				event: 'created',
+				data: 1,
+				traceparent: 'not-a-traceparent'
+			}));
+			expect(platform.published[0].options).toEqual({ relay: false });
+		});
+
 		it('skips notifications on wrong channel', async () => {
 			bridge = createNotifyBridge(client, { channel: 'changes' });
 			await bridge.activate(platform);
@@ -342,19 +433,48 @@ describe('postgres notify bridge', () => {
 			expect(platform.published).toHaveLength(0);
 		});
 
-		it('logs warning when custom parse throws', async () => {
+		it('reports a throwing custom parser by name and code only, since its message can quote the payload', async () => {
 			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 			bridge = createNotifyBridge(client, {
 				channel: 'changes',
-				parse: () => { throw new Error('bad payload'); }
+				parse: (payload) => { const row = JSON.parse(payload); return { topic: 'rows', event: 'changed', data: row }; }
+			});
+			await bridge.activate(platform);
+
+			// A payload that is not JSON: V8's SyntaxError quotes the start of it.
+			const payload = 'user alice@example.com joined';
+			let quoted = '';
+			try { JSON.parse(payload); } catch (err) { quoted = err.message; }
+			expect(quoted).toContain('alice');
+
+			client._simulate('changes', payload);
+			expect(platform.published).toHaveLength(0);
+			expect(warnSpy).toHaveBeenCalledOnce();
+			const line = warnSpy.mock.calls[0][0];
+			expect(line).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.postgres\.notify event=postgres\.notify\.parse\.failed severity=warn\]/);
+			const record = JSON.parse(line.slice(line.indexOf('{')));
+			expect(record.attributes).toEqual({ channel: 'changes', error: { name: 'SyntaxError', code: null, message: '<redacted>' } });
+			expect(line).not.toContain('alice');
+			warnSpy.mockRestore();
+		});
+
+		it('reports a failing publish of the parsed result with its message, escaped for the console', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const hostile = 'bad ' + String.fromCodePoint(0x85, 0x202e, 0x5e9);
+			platform.publish = () => { throw new Error(hostile); };
+			bridge = createNotifyBridge(client, {
+				channel: 'changes',
+				parse: () => ({ topic: 'rows', event: 'changed', data: 1 })
 			});
 			await bridge.activate(platform);
 
 			client._simulate('changes', 'whatever');
-			expect(platform.published).toHaveLength(0);
 			expect(warnSpy).toHaveBeenCalledOnce();
-			expect(warnSpy.mock.calls[0][0]).toContain('[postgres/notify]');
-			expect(warnSpy.mock.calls[0][1]).toContain('bad payload');
+			const line = warnSpy.mock.calls[0][0];
+			expect(line).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.postgres\.notify event=postgres\.notify\.parse\.failed severity=warn\]/);
+			expect(line).not.toMatch(/[\u0000-\u001f\u007f-\uffff]/);
+			const record = JSON.parse(line.slice(line.indexOf('{')));
+			expect(record.attributes).toEqual({ channel: 'changes', error: { name: 'Error', code: null, message: hostile } });
 			warnSpy.mockRestore();
 		});
 
@@ -461,8 +581,18 @@ describe('postgres notify bridge', () => {
 			expect(breaker.failures).toBe(0);
 			const errorFns = listeners.get('error') || [];
 			expect(errorFns.length).toBeGreaterThan(0);
-			errorFns[0](new Error('connection lost'));
+			const sink = captureRegistered();
+			try {
+				errorFns[0](new Error('connection lost'));
+			} finally {
+				sink.stop();
+			}
 			expect(breaker.failures).toBe(1);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_CONNECTION]);
+			expect(sink.records[0].attributes).toEqual({
+				channel: 'ch',
+				error: { name: 'Error', code: null, message: 'connection lost' }
+			});
 
 			breaker.destroy();
 		});

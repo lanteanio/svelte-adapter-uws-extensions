@@ -2,6 +2,18 @@ import type { Platform } from 'svelte-adapter-uws';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+import type { TraceContext } from '../shared/trace-context.js';
+
+export interface NotifyEnvelope {
+	topic: string;
+	event: string;
+	data?: unknown;
+	/** Explicit restored context. Invalid/null explicitly suppresses carrier fallback. */
+	traceContext?: TraceContext | null;
+	/** W3C carrier fields accepted by the default parser and custom parsers. */
+	traceparent?: string;
+	tracestate?: string;
+}
 
 export interface NotifyBridgeOptions {
 	/** Postgres LISTEN channel name. Required. */
@@ -12,7 +24,7 @@ export interface NotifyBridgeOptions {
 	 * Return null to skip the notification.
 	 * Defaults to JSON.parse expecting `{ topic, event, data }`.
 	 */
-	parse?: (payload: string, channel: string) => { topic: string; event: string; data?: unknown } | null;
+	parse?: (payload: string, channel: string) => NotifyEnvelope | null;
 
 	/** Reconnect on connection loss. @default true */
 	autoReconnect?: boolean;

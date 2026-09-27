@@ -166,6 +166,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 				input                JSONB,
 				svti_idempotency_key TEXT,
 				request_id           TEXT,
+				traceparent          TEXT,
+				tracestate           TEXT,
 				status               TEXT         NOT NULL,
 				result               JSONB,
 				error                JSONB,
@@ -188,6 +190,12 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		// duplicate-column error path on older versions defensively.
 		await safeCreate(client, `
 			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
+		`);
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS traceparent TEXT
+		`);
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tracestate TEXT
 		`);
 		// Right-to-erasure column: a task input may carry the enqueuing user's PII,
 		// so row DELETE is the only clean erasure. Stamped from the runner's
@@ -217,7 +225,29 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * the first value could pass the cap and the second could fail inside the
 	 * storage breaker, misclassifying caller input as a transient DB failure.
 	 */
-	async function insertAttempt(taskId, name, encodedInput, idempotencyKey, fence, requestId, userId) {
+	async function insertAttempt(taskId, name, encodedInput, idempotencyKey, fence, requestId, userId, traceContext) {
+		if (traceContext != null) {
+			await client.query({
+				name: 'tasks_insert_trace_' + table,
+				text: `INSERT INTO ${table}
+				          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, user_id, traceparent, tracestate)
+				       VALUES
+				          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval, $8, $9, $10)`,
+				values: [
+					taskId,
+					name,
+					encodedInput,
+					idempotencyKey ?? null,
+					requestId ?? null,
+					fence,
+					fenceTtl,
+					userId ?? null,
+					traceContext.traceparent,
+					traceContext.tracestate ?? null
+				]
+			});
+			return;
+		}
 		await client.query({
 			name: 'tasks_insert_' + table,
 			text: `INSERT INTO ${table}
@@ -335,6 +365,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			              error,
 			              attempts,
 			              request_id,
+			              traceparent,
+			              tracestate,
 			              created_at,
 			              updated_at,
 			              fence_expires_at
@@ -400,7 +432,27 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	}
 
 	/** Same already-encoded contract as insertAttempt(), for enqueue(). */
-	async function insertPending(taskId, name, encodedInput, idempotencyKey, requestId, userId) {
+	async function insertPending(taskId, name, encodedInput, idempotencyKey, requestId, userId, traceContext) {
+		if (traceContext != null) {
+			await client.query({
+				name: 'tasks_enqueue_trace_' + table,
+				text: `INSERT INTO ${table}
+				          (svti_tasks_id, name, input, svti_idempotency_key, request_id, user_id, traceparent, tracestate, status, fence, fence_expires_at, attempts)
+				       VALUES
+				          ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, 'pending', gen_random_uuid(), now(), 0)`,
+				values: [
+					taskId,
+					name,
+					encodedInput,
+					idempotencyKey ?? null,
+					requestId ?? null,
+					userId ?? null,
+					traceContext.traceparent,
+					traceContext.tracestate ?? null
+				]
+			});
+			return;
+		}
 		await client.query({
 			name: 'tasks_enqueue_' + table,
 			text: `INSERT INTO ${table}
@@ -429,7 +481,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			              updated_at = now()
 			         FROM claimed
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.request_id, t.fence, t.attempts`,
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
+			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;
@@ -452,7 +505,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			              updated_at = now()
 			         FROM claimed
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
-			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key, t.request_id, t.fence, t.attempts`,
+			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
+			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
 			values: [limit, fenceTtl]
 		});
 		return res.rows;

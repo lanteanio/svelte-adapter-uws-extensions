@@ -19,6 +19,8 @@ import { evalCached } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
+import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
+import { emitRegisteredFailure } from '../../shared/diagnostic.js';
 
 /**
  * Create the cursor Redis I/O subsystem. State (pending snapshots, subscriber,
@@ -64,8 +66,45 @@ export function createRedisIo({
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 	let subscriberReady = null;
+	// One report per failure streak: every cursor update retries a failed subscribe.
+	let subscribeFailing = false;
 	let cleanupTimer = null;
 	let snapshotTimer = null;
+
+	// Once subscribed, catch up on the positions other instances stored while
+	// this one was not listening.
+	async function catchUp() {
+		if (!activePlatform || activeTopics.size === 0) return;
+		const topicList = [...activeTopics];
+		const commands = topicList.map((topic) => ['hgetall', hashKey(topic)]);
+		let results;
+		try {
+			results = await execMultiSlot(redis, commands);
+		} catch { return; }
+		if (!activePlatform) return;
+		const nowTs = now();
+		for (let i = 0; i < topicList.length; i++) {
+			const [, all] = results[i];
+			if (!all) continue;
+			const topic = topicList[i];
+			const catalogEntries = [];
+			const positionEntries = [];
+			for (const key of Object.keys(all)) {
+				if (key.startsWith(instanceId + ':')) continue;
+				try {
+					const parsed = JSON.parse(all[key]);
+					if (parsed.ts && (nowTs - parsed.ts) <= cursorTtlMs) {
+						catalogEntries.push({ key, user: parsed.user });
+						positionEntries.push({ key, data: parsed.data });
+					}
+				} catch { /* skip */ }
+			}
+			if (catalogEntries.length > 0 && activePlatform) {
+				emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform, { relay: false });
+				emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform, { relay: false });
+			}
+		}
+	}
 
 	function ensureSubscriber(platform) {
 		activePlatform = platform;
@@ -74,7 +113,7 @@ export function createRedisIo({
 		const sub = client.duplicate({ enableReadyCheck: false });
 		subscriber = sub;
 		sub.on('error', (err) => {
-			console.error('cursor subscriber error:', err.message);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBER, { error: err });
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
@@ -89,56 +128,67 @@ export function createRedisIo({
 				// Malformed, skip
 			}
 		});
-		subscriberReady = sub.subscribe(channel).then(async () => {
-			if (!activePlatform || activeTopics.size === 0) return;
-			const topicList = [...activeTopics];
-			const commands = topicList.map((topic) => ['hgetall', hashKey(topic)]);
-			let results;
-			try {
-				results = await execMultiSlot(redis, commands);
-			} catch { return; }
-			if (!activePlatform) return;
-			const nowTs = now();
-			for (let i = 0; i < topicList.length; i++) {
-				const [, all] = results[i];
-				if (!all) continue;
-				const topic = topicList[i];
-				const catalogEntries = [];
-				const positionEntries = [];
-				for (const key of Object.keys(all)) {
-					if (key.startsWith(instanceId + ':')) continue;
-					try {
-						const parsed = JSON.parse(all[key]);
-						if (parsed.ts && (nowTs - parsed.ts) <= cursorTtlMs) {
-							catalogEntries.push({ key, user: parsed.user });
-							positionEntries.push({ key, data: parsed.data });
-						}
-					} catch { /* skip */ }
-				}
-				if (catalogEntries.length > 0 && activePlatform) {
-					emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform, { relay: false });
-					emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform, { relay: false });
-				}
-			}
-		}).catch(() => {
+		subscriberReady = sub.subscribe(channel).then(() => {
+			subscribeFailing = false;
+			// Best-effort: a catch-up that fails leaves the subscribed relay running.
+			return catchUp().catch(() => {});
+		}, (err) => {
 			sub.quit().catch(() => sub.disconnect());
 			if (subscriber === sub) {
 				subscriber = null;
+			}
+			if (!subscribeFailing) {
+				subscribeFailing = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBE, { error: err });
 			}
 		}).finally(() => {
 			subscriberReady = null;
 		});
 	}
 
+	// One report per failure streak: a Redis outage fails every topic on every
+	// sweep, and a line per topic per sweep would bury everything else. A streak
+	// that narrows from every topic failing (an outage) to only some (a bad
+	// entry) is reported once more, so the narrower failure is not hidden behind
+	// the outage that preceded it.
+	/** @type {'all' | 'some' | null} */
+	let cleanupReported = null;
+
 	function startCleanupTimer() {
 		if (cleanupTimer) return;
 		cleanupTimer = setIntervalTimer(() => {
 			const nowTs = now();
+			const runs = [];
 			for (const topic of activeTopics) {
-				evalCached(redis, CLEANUP_SCRIPT, 1, hashKey(topic), nowTs, cursorTtlMs).catch((err) => {
-					console.warn('cursor cleanup: stale removal failed for topic "' + topic + '":', err.message);
-				});
+				const key = hashKey(topic);
+				runs.push(evalCached(redis, CLEANUP_SCRIPT, 1, key, nowTs, cursorTtlMs).then(
+					() => null,
+					(err) => ({ err, redact: [key, topic] })
+				));
 			}
+			if (runs.length === 0) return;
+			Promise.all(runs).then((results) => {
+				let first = null;
+				let failed = 0;
+				for (const r of results) {
+					if (r === null) continue;
+					failed++;
+					first ??= r;
+				}
+				if (first === null) {
+					cleanupReported = null;
+					return;
+				}
+				const scope = failed === results.length ? 'all' : 'some';
+				if (cleanupReported !== null && !(cleanupReported === 'all' && scope === 'some')) return;
+				cleanupReported = scope;
+				// The key embeds the topic; cut it should the error repeat it.
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, {
+					error: first.err,
+					redact: first.redact,
+					attributes: { failed, topics: results.length }
+				});
+			});
 		}, cleanupInterval);
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}

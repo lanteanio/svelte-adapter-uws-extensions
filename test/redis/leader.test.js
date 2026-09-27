@@ -3,6 +3,8 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createLeader } from '../../src/redis/leader.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -206,6 +208,32 @@ describe('redis leader', () => {
 			expect(errors[0].message).toBe('redis down');
 		});
 
+		it('names the failing step, renew or acquire, on the tick diagnostic', async () => {
+			const lines = [];
+			const warn = console.warn;
+			const error = console.error;
+			console.warn = (line) => lines.push(String(line));
+			console.error = (line) => lines.push(String(line));
+			try {
+				const l = track(createLeader(client, { leaseMs: 600, renewMs: 50, onError: () => {} }));
+				await waitFor(() => l.isLeader());
+
+				client.redis.eval = async () => { throw new Error('renew down'); };
+				await waitFor(() => !l.isLeader(), { timeoutMs: 500 });
+				client.redis.set = async () => { throw new Error('acquire down'); };
+				await waitFor(() => lines.filter((line) => line.includes('event=redis.leader.tick.failed')).length >= 2, { timeoutMs: 500 });
+			} finally {
+				console.warn = warn;
+				console.error = error;
+			}
+			const operations = lines
+				.filter((line) => line.includes('event=redis.leader.tick.failed'))
+				.map((line) => JSON.parse(line.slice(line.indexOf('{'))).attributes.operation);
+			expect(operations[0]).toBe('renew');
+			expect(operations.slice(1)).toContain('acquire');
+			expect(new Set(operations)).toEqual(new Set(['renew', 'acquire']));
+		});
+
 		it('renewal-interval errors do not throw out of the worker', async () => {
 			// If a setInterval callback rejects synchronously, vitest sees
 			// an unhandled rejection. We assert the run completes normally.
@@ -277,8 +305,29 @@ describe('redis leader', () => {
 			const l = track(createLeader(client, { onError: (err) => errors.push(err) }));
 			client.redis.get = async () => { throw new Error('get failed'); };
 
-			expect(await l.currentLeader()).toBe(null);
+			const sink = captureRegistered();
+			try {
+				expect(await l.currentLeader()).toBe(null);
+			} finally {
+				sink.stop();
+			}
 			expect(errors.length).toBe(1);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.LEADER_READ_CURRENT]);
+		});
+
+		it('reports a failed lease release on stop and still steps down', async () => {
+			const l = track(createLeader(client, { leaseMs: 60_000, renewMs: 30_000 }));
+			await waitFor(() => l.isLeader());
+			client.redis.eval = async () => { throw new Error('release failed'); };
+
+			const sink = captureRegistered();
+			try {
+				await l.stop();
+			} finally {
+				sink.stop();
+			}
+			expect(l.isLeader()).toBe(false);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.LEADER_RELEASE]);
 		});
 	});
 

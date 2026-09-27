@@ -14,6 +14,16 @@ import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import {
+	REDIS_TRACE_ATTRIBUTES,
+	injectTraceContext,
+	carriedTraceContext,
+	liveTraceContext,
+	runTraceOperation,
+	traceEnabled
+} from '../shared/trace-context.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 /**
  * @typedef {Object} PubSubBusOptions
@@ -130,6 +140,8 @@ export function createPubSubBus(client, options = {}) {
 
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
+	// Whether activePlatform has a tracing provider, read once at activate.
+	let activeTracing = false;
 
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
@@ -160,18 +172,160 @@ export function createPubSubBus(client, options = {}) {
 		relayBatch.push({ msg, count });
 		if (relayBatch.length >= MAX_PUBSUB_RELAY_BATCH_PER_TICK && !relayBatchWarnFired) {
 			relayBatchWarnFired = true;
-			console.warn(
-				'[pubsub] tick relay batch reached ' + relayBatch.length +
-				' entries in one iteration. The batch is drained every tick, so a ' +
-				'caller emitted a million publishes in one synchronous burst - likely ' +
-				'a publish-in-loop without yielding.\n' +
-				'  See: https://svti.me/pubsub-burst'
-			);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST, {
+				attributes: { entries: relayBatch.length }
+			});
 		}
 		if (relayTimer === null) {
 			relayTimer = setTimer(flushRelay, 0);
 			if (relayTimer.unref) relayTimer.unref();
 		}
+	}
+
+	// Relay one envelope from inside a producer operation, carrying its trace
+	// context when the encoded result still fits under maxEnvelopeBytes. Every
+	// receiving instance enforces that cap before parsing, so an envelope the
+	// trace fields push over it would be dropped by every peer; the message
+	// goes without them instead. An envelope over the cap on its own is relayed
+	// exactly as an untraced one is, and is not reported as an omission.
+	let traceOmissionReported = false;
+	function relayTraced(env, count, traceContext) {
+		if (traceContext === null) {
+			scheduleRelay(JSON.stringify(env), count);
+			return;
+		}
+		injectTraceContext(env, traceContext);
+		const traced = JSON.stringify(env);
+		if (validator.acceptRaw(traced)) {
+			scheduleRelay(traced, count);
+			return;
+		}
+		delete env.traceparent;
+		delete env.tracestate;
+		const plain = JSON.stringify(env);
+		if (!traceOmissionReported && validator.acceptRaw(plain)) {
+			traceOmissionReported = true;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_TRACE_OMITTED, {
+				attributes: { maxEnvelopeBytes: validator.maxBytes }
+			});
+		}
+		scheduleRelay(plain, count);
+	}
+
+	// Local delivery of one envelope relayed by another instance. The untraced
+	// receive path calls it directly; on a Platform with a tracing provider it
+	// runs inside a consumer operation parented on the producer's context.
+	function deliverEnvelope(parsed) {
+		// Coalesced relay: re-coalesce the latest value onto this
+		// instance's local subscribers (latest-value-wins per ws+key),
+		// mirroring the publishing instance's sendCoalesced fan-out. Must
+		// precede the batch/single branches - a plain publish would
+		// broadcast and defeat the per-key coalesce.
+		if (parsed.coalesced === true) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
+			mReceived?.inc();
+			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
+				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+			});
+			return;
+		}
+		// relay: false prevents the adapter from IPC-relaying to
+		// sibling workers, since each worker has its own Redis
+		// subscriber already receiving this envelope.
+		// Shared binary fan-out relay: a stateless `shared: true` codec
+		// published on another instance. Re-derive the codec by capability
+		// and re-run publishWire locally so THIS instance does its own
+		// native cohort split (its own server-wide wire-id, its own
+		// subscribers); relay: false stops a re-relay loop. Falls back to a
+		// plain JSON publish when the codec is not registered here (a
+		// pure-subscriber instance that never registered it) - still a
+		// correct delivery. Precedes the batch/single branches.
+		if (parsed.wire === true) {
+			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			mReceived?.inc();
+			const codec = wireCodecs.get(parsed.capability);
+			if (codec && typeof activePlatform.publishWire === 'function') {
+				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
+					parsed.compress === true ? { relay: false, compress: true } : { relay: false });
+			} else {
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+			}
+			return;
+		}
+		if (Array.isArray(parsed.batch)) {
+			const local = [];
+			for (let i = 0; i < parsed.batch.length; i++) {
+				const m = parsed.batch[i];
+				if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+					mParseErrors?.inc();
+					continue;
+				}
+				local.push({
+					topic: m.topic,
+					event: m.event,
+					data: m.data,
+					options: { relay: false }
+				});
+			}
+			if (local.length === 0) return;
+			mReceived?.inc(local.length);
+			activePlatform.publishBatched(local);
+		} else {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+				mParseErrors?.inc();
+				return;
+			}
+			mReceived?.inc();
+			// Re-apply the de-herd window (carried as `j`) and the authoritative
+			// seq (carried as `s`) so this node's subscribers stagger AND dedup
+			// against the origin's seq space; `relay: false` stops the re-relay.
+			const opts = { relay: false };
+			if (parsed.j !== undefined) opts.jitterMs = parsed.j;
+			if (typeof parsed.s === 'number') opts.seq = parsed.s;
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, opts);
+		}
+	}
+
+	function deliverTraced(parsed) {
+		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', carriedTraceContext(parsed), REDIS_TRACE_ATTRIBUTES,
+			() => deliverEnvelope(parsed));
+	}
+
+	// The traced publish's envelope; the untraced publish builds the same
+	// fields inline (see wrap().publish for why each optional one is there).
+	function singleEnvelope(topic, event, data, options) {
+		const env = { instanceId, topic, event, data };
+		if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
+			/** @type {any} */ (env).j = options.jitterMs;
+		}
+		if (options && typeof options.seq === 'number') {
+			/** @type {any} */ (env).s = options.seq;
+		}
+		return env;
+	}
+
+	function wireEnvelope(topic, event, data, wire, options) {
+		const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
+		if (options && options.compress === true) /** @type {any} */ (env).compress = true;
+		return env;
+	}
+
+	function relayableBatch(messages) {
+		const relayable = [];
+		for (let i = 0; i < messages.length; i++) {
+			const m = messages[i];
+			if (!m.options || m.options.relay !== false) {
+				relayable.push({ topic: m.topic, event: m.event, data: m.data });
+			}
+		}
+		return relayable;
 	}
 
 	function flushRelay() {
@@ -208,6 +362,77 @@ export function createPubSubBus(client, options = {}) {
 
 	const bus = {
 		wrap(platform) {
+			// The relaying methods below are the untraced relay: they read no
+			// trace context and allocate nothing for tracing. When the Platform
+			// has a tracing provider, the traced versions defined here replace
+			// them on the returned object (see the end of wrap), and each call
+			// becomes one producer operation, parented on the Platform's live
+			// context, around the local delivery and the relay; the envelope
+			// carries the operation's own context. The adapter configures its
+			// provider at build time, so whether a Platform traces is fixed for
+			// its lifetime and the choice is made once, here.
+			const traced = (fn) => runTraceOperation(platform, 'redis.pubsub.publish', 'producer',
+				liveTraceContext(platform), REDIS_TRACE_ATTRIBUTES, fn);
+			const publishTraced = (topic, event, data, options) => {
+				if (options && options.relay === false) return platform.publish(topic, event, data, options);
+				return traced((traceContext) => {
+					const result = platform.publish(topic, event, data, options);
+					relayTraced(singleEnvelope(topic, event, data, options), 1, traceContext);
+					return result;
+				});
+			};
+			// A batch with nothing to relay opens no operation, like a publish
+			// with relay: false. A non-array or a null entry counts as relaying, so
+			// it takes the traced path and the platform rejects it there exactly
+			// as it does untraced.
+			const relaysAny = (messages) => {
+				if (!Array.isArray(messages)) return true;
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					if (!m || !m.options || m.options.relay !== false) return true;
+				}
+				return false;
+			};
+			const batchTraced = (messages) => (!relaysAny(messages) ? platform.batch(messages) : traced((traceContext) => {
+				const results = platform.batch(messages);
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					if (!m.options || m.options.relay !== false) {
+						relayTraced({ instanceId, topic: m.topic, event: m.event, data: m.data }, 1, traceContext);
+					}
+				}
+				return results;
+			}));
+			const publishBatchedTraced = (messages) => {
+				if (!Array.isArray(messages)) {
+					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
+				}
+				if (messages.length === 0) return;
+				if (!relaysAny(messages)) {
+					platform.publishBatched(messages);
+					return;
+				}
+				// Local delivery first, as on the untraced path: the platform
+				// rejects a malformed entry with its own error before the relay
+				// list reads the entries.
+				traced((traceContext) => {
+					platform.publishBatched(messages);
+					const relayable = relayableBatch(messages);
+					relayTraced({ instanceId, batch: relayable }, relayable.length, traceContext);
+				});
+			};
+			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
+				relayTraced({ instanceId, coalesced: true, topic, event, data, coalesceKey }, 1, traceContext));
+			const publishWireTraced = (topic, event, data, wire, options) => {
+				if (!(wire && wire.shared === true && (!options || options.relay !== false))) {
+					return platform.publishWire(topic, event, data, wire, options);
+				}
+				return traced((traceContext) => {
+					const result = platform.publishWire(topic, event, data, wire, options);
+					relayTraced(wireEnvelope(topic, event, data, wire, options), 1, traceContext);
+					return result;
+				});
+			};
 			const wrapped = {
 				publish(topic, event, data, options) {
 					const result = platform.publish(topic, event, data, options);
@@ -329,6 +554,8 @@ export function createPubSubBus(client, options = {}) {
 				} : undefined,
 				get connections() { return platform.connections; },
 				get requestId() { return platform.requestId; },
+				get traceContext() { return platform.traceContext ?? null; },
+				get trace() { return platform.trace; },
 				get pressure() { return platform.pressure; },
 				// Forward the live protection posture through the wrapped seam so
 				// cluster-side admission code (per-IP upgrade buckets, capability
@@ -427,6 +654,13 @@ export function createPubSubBus(client, options = {}) {
 					};
 				}
 			};
+			if (traceEnabled(platform)) {
+				wrapped.publish = publishTraced;
+				wrapped.batch = batchTraced;
+				wrapped.publishBatched = publishBatchedTraced;
+				wrapped.relayCoalesced = relayCoalescedTraced;
+				if (wrapped.publishWire) wrapped.publishWire = publishWireTraced;
+			}
 			return wrapped;
 		},
 
@@ -435,6 +669,7 @@ export function createPubSubBus(client, options = {}) {
 			// are forwarded through the latest platform, even if a
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
+			activeTracing = traceEnabled(platform);
 			if (active) return;
 			b?.guard();
 
@@ -470,6 +705,7 @@ export function createPubSubBus(client, options = {}) {
 			}
 
 			subscriber = client.duplicate({ enableReadyCheck: false });
+			subscriber.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
 
 			subscriber.on('message', (ch, message) => {
 				if (ch !== channel) return;
@@ -505,81 +741,12 @@ export function createPubSubBus(client, options = {}) {
 					// null platform in a branch below (which the outer catch would
 					// swallow as a spurious parse error). Mirrors the sharded handler.
 					if (!activePlatform) return;
-					// Coalesced relay: re-coalesce the latest value onto this
-					// instance's local subscribers (latest-value-wins per ws+key),
-					// mirroring the publishing instance's sendCoalesced fan-out. Must
-					// precede the batch/single branches - a plain publish would
-					// broadcast and defeat the per-key coalesce.
-					if (parsed.coalesced === true) {
-						if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
-							mParseErrors?.inc();
-							return;
-						}
-						const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
-						mReceived?.inc();
-						activePlatform.forEachSubscriber(parsed.topic, (ws) => {
-							activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
-						});
-						return;
-					}
-					// relay: false prevents the adapter from IPC-relaying to
-					// sibling workers, since each worker has its own Redis
-					// subscriber already receiving this envelope.
-					// Shared binary fan-out relay: a stateless `shared: true` codec
-					// published on another instance. Re-derive the codec by capability
-					// and re-run publishWire locally so THIS instance does its own
-					// native cohort split (its own server-wide wire-id, its own
-					// subscribers); relay: false stops a re-relay loop. Falls back to a
-					// plain JSON publish when the codec is not registered here (a
-					// pure-subscriber instance that never registered it) - still a
-					// correct delivery. Precedes the batch/single branches.
-					if (parsed.wire === true) {
-						if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
-							mParseErrors?.inc();
-							return;
-						}
-						mReceived?.inc();
-						const codec = wireCodecs.get(parsed.capability);
-						if (codec && typeof activePlatform.publishWire === 'function') {
-							activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-								parsed.compress === true ? { relay: false, compress: true } : { relay: false });
-						} else {
-							activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
-						}
-						return;
-					}
-					if (Array.isArray(parsed.batch)) {
-						const local = [];
-						for (let i = 0; i < parsed.batch.length; i++) {
-							const m = parsed.batch[i];
-							if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
-								mParseErrors?.inc();
-								continue;
-							}
-							local.push({
-								topic: m.topic,
-								event: m.event,
-								data: m.data,
-								options: { relay: false }
-							});
-						}
-						if (local.length === 0) return;
-						mReceived?.inc(local.length);
-						activePlatform.publishBatched(local);
-					} else {
-						if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
-							mParseErrors?.inc();
-							return;
-						}
-						mReceived?.inc();
-						// Re-apply the de-herd window (carried as `j`) and the authoritative
-						// seq (carried as `s`) so this node's subscribers stagger AND dedup
-						// against the origin's seq space; `relay: false` stops the re-relay.
-						const opts = { relay: false };
-						if (parsed.j !== undefined) opts.jitterMs = parsed.j;
-						if (typeof parsed.s === 'number') opts.seq = parsed.s;
-						activePlatform.publish(parsed.topic, parsed.event, parsed.data, opts);
-					}
+					// Local delivery runs no application code, so a carried trace
+					// context only matters to a tracing provider: with one, delivery is
+					// a consumer operation parented on the producer's context; without
+					// one the trace fields are ignored and nothing is allocated for them.
+					if (activeTracing) deliverTraced(parsed);
+					else deliverEnvelope(parsed);
 				} catch {
 					// Malformed envelope; counted so a stream of bad messages
 					// is observable instead of silently swallowed.

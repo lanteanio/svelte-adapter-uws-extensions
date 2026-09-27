@@ -3,6 +3,8 @@ import { mockRedisClient } from '../../src/testing/mock-redis.js';
 import { mockPlatform } from '../../src/testing/mock-platform.js';
 import { mockWs } from '../../src/testing/mock-ws.js';
 import { createPresence } from '../../src/redis/presence.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { isReservedPresenceField, mergeFields, newFieldMap } from '../../src/redis/presence/field-policy.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -220,7 +222,12 @@ describe('presence cross-instance bus ingress', () => {
 		try {
 			await presence.join(mockWs({ id: 'large' }), 'room', platform);
 			expect(publish.mock.calls.some(([channel]) => channel === 'p-outbound:presence:events:room')).toBe(false);
-			expect(warn).toHaveBeenCalledWith(expect.stringMatching(/exceeds maxEnvelopeBytes/));
+			expect(warn).toHaveBeenCalledOnce();
+			const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.PRESENCE_ENVELOPE_OVERSIZED);
+			expect(record.attributes).toEqual({ event: expect.any(String), bytes: expect.any(Number), maxEnvelopeBytes: 256 });
+			expect(record.attributes.bytes).toBeGreaterThan(256);
+			// Topics can embed user ids and stay out of the line.
+			expect(warn.mock.calls[0][0]).not.toContain('room');
 		} finally {
 			await presence.destroy?.();
 			warn.mockRestore();

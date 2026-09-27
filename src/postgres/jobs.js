@@ -28,6 +28,13 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import {
+	POSTGRES_TRACE_ATTRIBUTES,
+	carriedTraceContext,
+	explicitTraceContext,
+	liveTraceContext,
+	runTraceOperation
+} from '../shared/trace-context.js';
 
 /**
  * @typedef {Object} JobQueueOptions
@@ -79,6 +86,8 @@ export function createJobQueue(client, options = {}) {
 				queue         TEXT        NOT NULL,
 				payload       JSONB,
 				request_id    TEXT,
+				traceparent   TEXT,
+				tracestate    TEXT,
 				claimed_at    TIMESTAMPTZ,
 				claimed_until TIMESTAMPTZ,
 				attempts      INTEGER     NOT NULL DEFAULT 0,
@@ -95,6 +104,12 @@ export function createJobQueue(client, options = {}) {
 		// Forward-migrate existing 0.5.0-next.1 deployments.
 		await safeCreate(client, `
 			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
+		`);
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS traceparent TEXT
+		`);
+		await safeCreate(client, `
+			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tracestate TEXT
 		`);
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
@@ -178,16 +193,39 @@ export function createJobQueue(client, options = {}) {
 				throw new Error('postgres jobs: queue must be a non-empty string');
 			}
 			const requestId = resolveRequestId(opts);
-			const res = await withBreaker(b, async () => {
+			const insert = (traceContext) => withBreaker(b, async () => {
 				await ensureTable();
+				if (traceContext === null) {
+					return client.query({
+						name: 'jobs_enqueue_' + table,
+						text: `INSERT INTO ${table} (queue, payload, request_id)
+						            VALUES ($1, $2, $3)
+						        RETURNING svti_jobs_id AS id`,
+						values: [queue, JSON.stringify(payload ?? null), requestId]
+					});
+				}
 				return client.query({
-					name: 'jobs_enqueue_' + table,
-					text: `INSERT INTO ${table} (queue, payload, request_id)
-					            VALUES ($1, $2, $3)
+					name: 'jobs_enqueue_trace_' + table,
+					text: `INSERT INTO ${table} (queue, payload, request_id, traceparent, tracestate)
+					            VALUES ($1, $2, $3, $4, $5)
 					        RETURNING svti_jobs_id AS id`,
-					values: [queue, JSON.stringify(payload ?? null), requestId]
+					values: [
+						queue,
+						JSON.stringify(payload ?? null),
+						requestId,
+						traceContext.traceparent,
+						traceContext.tracestate ?? null
+					]
 				});
 			});
+			// An explicit null (or invalid) traceContext opts this job out of
+			// tracing: no producer operation, which under a provider would
+			// otherwise parent itself on the request's active context.
+			const explicit = explicitTraceContext(opts);
+			const res = explicit === null
+				? await insert(null)
+				: await runTraceOperation(opts.platform, 'postgres.jobs.enqueue', 'producer',
+					explicit ?? liveTraceContext(opts.platform), POSTGRES_TRACE_ATTRIBUTES, insert);
 			mEnqueued?.inc({ queue });
 			return res.rows[0].id;
 		},
@@ -234,16 +272,21 @@ export function createJobQueue(client, options = {}) {
 					       attempts = t.attempts + 1
 					  FROM claimed
 					 WHERE t.svti_jobs_id = claimed.svti_jobs_id
-					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.request_id, t.attempts, t.created_at`,
+					RETURNING t.svti_jobs_id AS id, t.queue, t.payload, t.request_id,
+					          t.traceparent, t.tracestate, t.attempts, t.created_at`,
 					values: [queue, batchSize, String(visibilityTimeoutMs)]
 				});
 			});
 			if (res.rows.length > 0) mClaimed?.inc({ queue }, res.rows.length);
+			// The stored context is handed back for the worker to continue; a
+			// consumer operation belongs around the worker's processing of the
+			// job, not around building this record.
 			return res.rows.map((row) => ({
 				id: row.id,
 				queue: row.queue,
 				payload: row.payload,
 				requestId: row.request_id ?? null,
+				traceContext: carriedTraceContext(row),
 				attempts: row.attempts,
 				created_at: row.created_at
 			}));

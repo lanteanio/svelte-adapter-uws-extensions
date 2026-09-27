@@ -210,10 +210,12 @@
 		"src",
 		"LICENSE",
 		"README.md",
-		"MIGRATION.md"
+		"MIGRATION.md",
+		"docs"
 	],
 	"scripts": {
-		"check": "node scripts/check-types.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js",
+		"check": "node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js",
+		"check:errors": "node scripts/generate-error-reference.js --check",
 		"pretest": "npm run check",
 		"test": "vitest run",
 		"test:watch": "vitest",
@@ -240,6 +242,7 @@
 		"pg": "^8.0.0"
 	},
 	"devDependencies": {
+		"acorn": "^8.16.0",
 		"svelte-adapter-uws": "^0.6.0-next.94",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0"

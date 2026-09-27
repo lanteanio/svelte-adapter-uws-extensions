@@ -3,6 +3,9 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 import type { RedisIdempotencyStore } from '../redis/idempotency.js';
 import type { PgIdempotencyStore } from './idempotency.js';
+import type { TraceContext, TracePlatform } from '../shared/trace-context.js';
+
+export type TaskTracePlatform = TracePlatform;
 
 export type TaskStatus = 'pending' | 'running' | 'committed' | 'failed';
 
@@ -44,6 +47,8 @@ export interface TaskRow {
 	error: TaskError | null;
 	attempts: number;
 	requestId: string | null;
+	/** Restored W3C context captured with the durable task row. */
+	traceContext: TraceContext | null;
 	createdAt: Date;
 	updatedAt: Date;
 	fenceExpiresAt: Date;
@@ -66,6 +71,8 @@ export interface TaskStateChangeEvent {
 	/** 0 for `pending` rows just inserted by `enqueue`, 1+ for `running` and terminal. */
 	attempt: number;
 	requestId: string | null;
+	/** Durable context associated with this transition. */
+	traceContext: TraceContext | null;
 	/** Present when `newStatus === 'committed'`. */
 	result?: unknown;
 	/** Present when `newStatus === 'failed'`. */
@@ -163,6 +170,11 @@ export interface TaskRunnerOptions {
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
 	breaker?: CircuitBreaker;
+	/**
+	 * Default structural adapter Platform surface for background dispatch,
+	 * recovery spans, and request/trace context fallback.
+	 */
+	platform?: TaskTracePlatform;
 }
 
 export interface TaskHandlerContext<TInput = unknown> {
@@ -179,6 +191,8 @@ export interface TaskHandlerContext<TInput = unknown> {
 	 * an upstream).
 	 */
 	requestId: string | null;
+	/** Restored context active for this handler attempt. */
+	traceContext: TraceContext | null;
 	/** This attempt's fence UUID. Read-only. */
 	fence: string;
 	/** Aborts when the fence is lost (recovery loop took over mid-run). */
@@ -240,12 +254,19 @@ export interface TaskRunOptions<TInput = unknown> {
 	 */
 	requestId?: string;
 	/**
-	 * Convenience for callers inside a request handler: when `platform` is
-	 * passed, `platform.requestId` is captured automatically. Pass the
-	 * `event.platform` from your SvelteKit handler. Ignored if `requestId`
-	 * is also set.
+	 * Explicit W3C context to persist and run under. `null` (or an invalid
+	 * context) opts the call out of tracing: nothing is persisted and no
+	 * producer or consumer operation runs.
 	 */
-	platform?: { requestId?: string };
+	traceContext?: TraceContext | null;
+	/**
+	 * Convenience for callers inside a request handler: when `platform` is
+	 * passed, `platform.requestId` is captured automatically, and its live
+	 * trace context is used unless `traceContext` is given. Pass the
+	 * `event.platform` from your SvelteKit handler. The request id is
+	 * ignored if `requestId` is also set.
+	 */
+	platform?: TaskTracePlatform;
 }
 
 export interface TaskAwaitOptions {

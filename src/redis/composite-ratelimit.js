@@ -37,6 +37,8 @@ import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { wallEpoch } from '../shared/runtime.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 // Same version discipline as the single-dimension limiter: a layout change
 // moves to a fresh key space and old keys age out via TTL.
@@ -547,11 +549,8 @@ export function createCompositeRateLimit(client, options) {
 				mFloor?.inc();
 				if (!warnedStorageFloor) {
 					warnedStorageFloor = true;
-					console.warn(
-						'redis composite ratelimit: store unreachable; deciding on the in-process floor. ' +
-						'Limits hold per instance while degraded; cross-instance state resumes when the ' +
-						'store recovers. This warning fires once.'
-					);
+					// The keys embed the client identity; cut them should the error repeat one.
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.COMPOSITE_RATELIMIT_STORE_FLOOR, { error: err, redact: keys });
 				}
 				verdict = consumeFloorComposite(keys, cost);
 			}

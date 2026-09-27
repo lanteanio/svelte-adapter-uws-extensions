@@ -7,9 +7,11 @@
 // cursor/pubsub/crdt unit tests use. True multi-instance behavior and lease TTL
 // handoff are covered on real Redis in test/integration/redis/smooth-cluster.test.js.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createSmoothCluster } from '../../src/redis/smooth-cluster.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 /** Let the deferred subscribe + publish + synchronous delivery settle. */
 const settle = async () => {
@@ -299,4 +301,36 @@ describe('createSmoothCluster snapshot (warm handoff)', () => {
 	// NOTE: SET PX TTL is a no-op in the mock (the flag is accepted and ignored),
 	// so snapshot expiry is asserted only against real Redis in
 	// test/integration/redis/smooth-cluster.test.js.
+});
+
+describe('createSmoothCluster degraded relay owner', () => {
+	// A cluster whose slot map cannot be read (a reshard in flight, CLUSTERDOWN)
+	// leaves the relay channel owner unresolved; publishes pin to one master to
+	// keep their order, and that fallback is reported once.
+	it('pins to a fallback master and reports it once', async () => {
+		const client = mockRedisClient('smooth-degraded:');
+		client.redis.nodes = () => [client.redis];
+		client.redis.cluster = async () => { throw new Error('CLUSTERDOWN The cluster is down'); };
+		const a = createSmoothCluster(client);
+		const b = createSmoothCluster(client);
+		const ra = recorder();
+		const rb = recorder();
+		a.onMessage(ra.handlers);
+		b.onMessage(rb.handlers);
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			a.relayCommand('__smooth:room:1', 'player-1', a.instanceId, [{ id: 1 }]);
+			await settle();
+			a.relayCommand('__smooth:room:1', 'player-1', a.instanceId, [{ id: 2 }]);
+			await settle();
+			expect(rb.commands.map((c) => c.batch[0].id)).toEqual([1, 2]);
+			expect(warn).toHaveBeenCalledOnce();
+			const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.SMOOTH_OWNER_FALLBACK);
+			expect(record.attributes).toBeNull();
+		} finally {
+			warn.mockRestore();
+			a.destroy?.();
+			b.destroy?.();
+		}
+	});
 });

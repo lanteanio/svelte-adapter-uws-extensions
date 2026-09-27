@@ -28,7 +28,7 @@ const DEFAULT_MAX_PER_TICK = 1000;
 const DEFAULT_JITTER_MS = 1000;
 
 /**
- * @typedef {{ category: string, context: unknown }} Violation
+ * @typedef {{ category: string, context: unknown, key?: string }} Violation
  * @typedef {(window: { offset: number, limit: number }) => (import('./invariants.js').StateSnapshot & { total?: number })} SnapshotFn
  */
 
@@ -75,10 +75,13 @@ export function createConsistencyAuditor(opts) {
 	let previousViolations = new Set();
 	const stats = { ticks: 0, violations: 0, fatals: 0 };
 
+	// A predicate that keeps an identifier out of its logged context passes it
+	// as `key`, so two entities with the same counts never read as one
+	// violation persisting across audits.
 	function violationKey(v) {
 		let ctx;
 		try { ctx = JSON.stringify(v.context ?? null); } catch { ctx = '?'; }
-		return v.category + ':' + ctx;
+		return v.category + ':' + ctx + (typeof v.key === 'string' ? ':' + JSON.stringify(v.key) : '');
 	}
 
 	/**

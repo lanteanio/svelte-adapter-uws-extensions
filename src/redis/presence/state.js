@@ -37,7 +37,7 @@ export function createPresenceState(client, options = {}) {
 	const select = sanitizeSelected ? options.select : projectDefaultUserData;
 	if (!sanitizeSelected && isUnsafeProjectionFieldName(keyField)) {
 		console.warn(
-			`redis presence: key field '${keyField}' is private or transport metadata, so the default ` +
+			`[extensions] redis presence: key field '${keyField}' is private or transport metadata, so the default ` +
 			'projection drops it and each connection gets its own presence entry. A presence key is ' +
 			'broadcast as a roster property: use a non-secret id, or pass an explicit select() to opt in.'
 		);

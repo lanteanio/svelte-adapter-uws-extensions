@@ -103,7 +103,7 @@ export function mockPgClient(options = {}) {
 	/** @type {Map<string, {status: string, result: any, expires_at: number}>} */
 	const idemRows = new Map();
 
-	/** @type {Map<string, {id: string, name: string, input: any, idempotency_key: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number, _ins: number}>} */
+	/** @type {Map<string, {id: string, name: string, input: any, idempotency_key: string|null, request_id: string|null, traceparent: string|null, tracestate: string|null, status: string, result: any, error: any, fence: string, fence_expires_at: number, attempts: number, created_at: number, updated_at: number, _ins: number}>} */
 	const taskRows = new Map();
 	// Monotonic insertion counter. A virtual clock can stamp several rows with
 	// the same created_at, so created_at alone is not a total order; `_ins`
@@ -111,7 +111,7 @@ export function mockPgClient(options = {}) {
 	// the BIGSERIAL primary key Postgres assigns each INSERT).
 	let taskInsSeq = 1;
 
-	/** @type {Map<number, {id: number, queue: string, payload: any, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
+	/** @type {Map<number, {id: number, queue: string, payload: any, request_id: string|null, traceparent: string|null, tracestate: string|null, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
 	const jobRows = new Map();
 	let jobNextId = 1;
 
@@ -443,6 +443,8 @@ export function mockPgClient(options = {}) {
 				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 				idempotency_key: values[3],
 				request_id: values[4] ?? null,
+				traceparent: values[8] ?? null,
+				tracestate: values[9] ?? null,
 				status: 'running',
 				result: null,
 				error: null,
@@ -472,6 +474,8 @@ export function mockPgClient(options = {}) {
 				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 				idempotency_key: values[3],
 				request_id: values[4] ?? null,
+				traceparent: values[6] ?? null,
+				tracestate: values[7] ?? null,
 				status: 'pending',
 				result: null,
 				error: null,
@@ -617,6 +621,8 @@ export function mockPgClient(options = {}) {
 					input: row.input,
 					idempotency_key: row.idempotency_key,
 					request_id: row.request_id ?? null,
+					traceparent: row.traceparent ?? null,
+					tracestate: row.tracestate ?? null,
 					fence: row.fence,
 					attempts: row.attempts
 				});
@@ -655,6 +661,8 @@ export function mockPgClient(options = {}) {
 					input: row.input,
 					idempotency_key: row.idempotency_key,
 					request_id: row.request_id ?? null,
+					traceparent: row.traceparent ?? null,
+					tracestate: row.tracestate ?? null,
 					fence: row.fence,
 					attempts: row.attempts
 				});
@@ -694,6 +702,8 @@ export function mockPgClient(options = {}) {
 				error: r.error,
 				attempts: r.attempts,
 				request_id: r.request_id ?? null,
+				traceparent: r.traceparent ?? null,
+				tracestate: r.tracestate ?? null,
 				created_at: new Date(r.created_at), // determinism-allow: r.created_at is a seam-sourced (now()) epoch ms
 				updated_at: new Date(r.updated_at), // determinism-allow: r.updated_at is a seam-sourced (now()) epoch ms
 				fence_expires_at: new Date(r.fence_expires_at) // determinism-allow: derived from a seam-sourced epoch ms
@@ -762,7 +772,7 @@ export function mockPgClient(options = {}) {
 		// Job enqueue: INSERT INTO svti_jobs (queue, payload, request_id) VALUES ($1, $2, $3) RETURNING svti_jobs_id AS id
 		if (
 			sql.startsWith('INSERT INTO') &&
-			sql.includes('(queue, payload, request_id)') &&
+			sql.includes('(queue, payload, request_id') &&
 			sql.includes('RETURNING svti_jobs_id AS id')
 		) {
 			const id = jobNextId++;
@@ -771,6 +781,8 @@ export function mockPgClient(options = {}) {
 				queue: values[0],
 				payload: typeof values[1] === 'string' ? JSON.parse(values[1]) : values[1],
 				request_id: values[2] ?? null,
+				traceparent: values[3] ?? null,
+				tracestate: values[4] ?? null,
 				claimed_at: null,
 				claimed_until: null,
 				attempts: 0,
@@ -807,6 +819,8 @@ export function mockPgClient(options = {}) {
 					queue: row.queue,
 					payload: row.payload,
 					request_id: row.request_id ?? null,
+					traceparent: row.traceparent ?? null,
+					tracestate: row.tracestate ?? null,
 					attempts: row.attempts,
 					created_at: row.created_at
 				});

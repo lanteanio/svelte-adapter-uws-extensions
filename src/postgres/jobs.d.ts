@@ -1,6 +1,9 @@
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+import type { TraceContext, TracePlatform } from '../shared/trace-context.js';
+
+export type JobTracePlatform = TracePlatform;
 
 export interface JobQueueOptions {
 	/** Table name. @default 'svti_jobs' */
@@ -29,6 +32,8 @@ export interface Job {
 	 * request. `null` when the job was enqueued outside a request context.
 	 */
 	requestId: string | null;
+	/** Restored W3C context captured when the job was enqueued. */
+	traceContext: TraceContext | null;
 	attempts: number;
 	created_at: Date;
 }
@@ -53,10 +58,18 @@ export interface EnqueueOptions {
 	 */
 	requestId?: string;
 	/**
-	 * Convenience for callers inside a request handler: when `platform` is
-	 * passed, `platform.requestId` is captured automatically.
+	 * Explicit W3C context to persist, for instance a claimed job's
+	 * `traceContext` when a worker enqueues follow-up work. `null` (or an
+	 * invalid context) opts this job out of tracing: nothing is persisted and
+	 * no producer operation runs.
 	 */
-	platform?: { requestId?: string };
+	traceContext?: TraceContext | null;
+	/**
+	 * Convenience for callers inside a request handler: when `platform` is
+	 * passed, `platform.requestId` is captured automatically, and its live
+	 * trace context is persisted unless `traceContext` is given.
+	 */
+	platform?: JobTracePlatform;
 }
 
 /** Exact job-id input. Numbers must be safe integers; use string/bigint above 2^53. */

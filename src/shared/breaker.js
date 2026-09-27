@@ -17,10 +17,11 @@
 
 import { MAX_BREAKER_LISTENERS, MAX_BREAKER_KEYS } from './caps.js';
 import { setTimer, clearTimer } from './runtime.js';
+import { EXTENSIONS_ERROR_IDS, extensionsError } from '../error-registry.js';
 
 export class CircuitBrokenError extends Error {
 	constructor() {
-		super('circuit breaker is open - backend unavailable');
+		super(extensionsError(EXTENSIONS_ERROR_IDS.CIRCUIT_OPEN));
 		this.name = 'CircuitBrokenError';
 	}
 }

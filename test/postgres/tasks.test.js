@@ -2,6 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { createTaskRunner, TaskInFlightError, UnknownTaskError } from '../../src/postgres/tasks.js';
 import { createIdempotencyStore } from '../../src/postgres/idempotency.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
+
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
 
 describe('postgres tasks', () => {
 	let client;
@@ -164,6 +170,23 @@ describe('postgres tasks', () => {
 			expect(seen).toBe('req-from-platform');
 		});
 
+		it('falls back to the runner-level platform, read when each task starts', async () => {
+			let current = 'req-1';
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				platform: { get requestId() { return current; } }
+			});
+			const seen = [];
+			r.register('echo', async ({ requestId }) => { seen.push(requestId); });
+			await r.run('echo', { input: null });
+			current = 'req-2';
+			await r.run('echo', { input: null });
+			await r.run('echo', { input: null, platform: { requestId: 'per-call' } });
+			expect(seen).toEqual(['req-1', 'req-2', 'per-call']);
+			r.destroy();
+		});
+
 		it('explicit requestId wins over platform.requestId when both are given', async () => {
 			let seen;
 			runner.register('echo', async ({ requestId }) => { seen = requestId; });
@@ -199,6 +222,92 @@ describe('postgres tasks', () => {
 			expect(result).toBe('ok');
 			expect(attempts).toBe(2);
 			expect(lastRequestId).toBe('req-retry');
+		});
+
+		it('persists explicit trace context and restores it for handlers and list DTOs', async () => {
+			let seen;
+			runner.register('traceable', async ({ input, traceContext }) => {
+				seen = traceContext;
+				return input;
+			});
+			await runner.run('traceable', {
+				input: { traceparent: 'application-data' },
+				traceContext: { traceparent: TRACE_A, tracestate: 'vendor=value' },
+				platform: { traceContext: { traceparent: TRACE_B } }
+			});
+
+			expect(seen).toEqual({ traceparent: TRACE_A, tracestate: 'vendor=value' });
+			const [row] = await runner.list({ name: 'traceable' });
+			expect(row.traceContext).toEqual({ traceparent: TRACE_A, tracestate: 'vendor=value' });
+			expect(row.input).toEqual({ traceparent: 'application-data' });
+		});
+
+		it('treats explicit null as an override of Platform trace context', async () => {
+			let seen = 'unset';
+			runner.register('trace-null', async ({ traceContext }) => { seen = traceContext; });
+			await runner.run('trace-null', {
+				input: null,
+				traceContext: null,
+				platform: { traceContext: { traceparent: TRACE_B } }
+			});
+			expect(seen).toBeNull();
+			expect([...client._getTaskRows().values()][0].traceparent).toBeNull();
+		});
+
+		it('opts run() and enqueue() out of tracing on an explicit null, even under a provider', async () => {
+			const spans = [];
+			const active = { traceparent: TRACE_B };
+			const platform = {
+				traceContext: active,
+				trace: {
+					enabled: true,
+					current: () => active,
+					// Like the adapter's run(): a null parent falls back to the
+					// active context, so an operation here would re-attach it.
+					run(name, options, fn) {
+						spans.push({ name, options });
+						return fn();
+					}
+				}
+			};
+			let seen = 'unset';
+			runner.register('trace-opt-out', async ({ traceContext }) => { seen = traceContext; });
+			await runner.run('trace-opt-out', { input: null, traceContext: null, platform });
+			const taskId = await runner.enqueue('trace-opt-out', { input: null, traceContext: null, platform });
+
+			expect(spans).toEqual([]);
+			expect(seen).toBeNull();
+			for (const row of client._getTaskRows().values()) expect(row.traceparent).toBeNull();
+			expect(typeof taskId).toBe('string');
+		});
+
+		it('starts structural producer and consumer spans around storage and execution', async () => {
+			const spans = [];
+			let current = null;
+			const platform = {
+				traceContext: { traceparent: TRACE_A },
+				trace: {
+					enabled: true,
+					current: () => current,
+					run(name, options, fn) {
+						spans.push({ name, options });
+						current = { traceparent: TRACE_B };
+						try { return fn(); } finally { current = null; }
+					}
+				}
+			};
+			let seen;
+			runner.register('trace-spans', async ({ traceContext }) => {
+				seen = traceContext;
+				return 'ok';
+			});
+			await runner.run('trace-spans', { input: null, platform });
+			expect(seen).toEqual({ traceparent: TRACE_B });
+			expect(spans.map((span) => span.name)).toEqual([
+				'postgres.tasks.enqueue',
+				'postgres.tasks.execute'
+			]);
+			expect(spans.map((span) => span.options.kind)).toEqual(['producer', 'consumer']);
 		});
 	});
 
@@ -799,5 +908,106 @@ describe('postgres tasks', () => {
 				onStateChange: 'not a function'
 			})).toThrow(/onStateChange/);
 		});
+	});
+});
+
+describe('postgres tasks recovery', () => {
+	afterEach(() => {
+		resetRuntimeEnv();
+	});
+
+	it('runs a recovered attempt under the trace context persisted with the task', async () => {
+		const ticks = new Map();
+		setRuntimeEnv({ timers: {
+			setInterval: (cb, ms) => { ticks.set(ms, cb); return { unref() {} }; },
+			clearInterval: () => {}
+		} });
+		const client = mockPgClient();
+		const runner = createTaskRunner(client, { recoveryInterval: 1000, dispatchInterval: 0, cleanupInterval: 0 });
+		let seen;
+		runner.register('worker', async ({ traceContext }) => { seen = traceContext; return 'done'; });
+		client._getTaskRows().set('stuck-traced', {
+			id: 'stuck-traced',
+			name: 'worker',
+			input: null,
+			idempotency_key: null,
+			status: 'running',
+			result: null,
+			error: null,
+			fence: 'old-fence',
+			fence_expires_at: Date.now() - 10000,
+			attempts: 1,
+			created_at: Date.now() - 60000,
+			updated_at: Date.now() - 60000,
+			traceparent: TRACE_A,
+			tracestate: 'vendor=value'
+		});
+		try {
+			await ticks.get(1000)();
+			await vi.waitFor(() => expect(client._getTaskRows().get('stuck-traced').status).toBe('committed'));
+			expect(seen).toEqual({ traceparent: TRACE_A, tracestate: 'vendor=value' });
+		} finally {
+			runner.destroy();
+		}
+	});
+});
+
+describe('postgres tasks sweep failure report', () => {
+	/** @type {Map<number, () => Promise<void>>} interval callbacks by period */
+	let ticks;
+	beforeEach(() => {
+		ticks = new Map();
+		setRuntimeEnv({ timers: {
+			setInterval: (cb, ms) => { ticks.set(ms, cb); return { unref() {} }; },
+			clearInterval: () => {}
+		} });
+	});
+	afterEach(() => {
+		resetRuntimeEnv();
+		vi.restoreAllMocks();
+	});
+
+	// A table managed with autoMigrate: false that lacks a column this release
+	// reads fails every sweep with Postgres's undefined-column error. Without a
+	// breaker nothing else surfaces that, so each sweep reports it once per
+	// failure streak, and a successful sweep re-arms the report.
+	it('reports each failing sweep once per streak and re-arms on success', async () => {
+		const client = mockPgClient();
+		const query = client.query.bind(client);
+		let failing = true;
+		client.query = (...args) => {
+			if (!failing) return query(...args);
+			return Promise.reject(Object.assign(new Error('column "traceparent" does not exist'), { code: '42703' }));
+		};
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const runner = createTaskRunner(client, {
+			autoMigrate: false,
+			dispatchInterval: 1000,
+			recoveryInterval: 2000,
+			cleanupInterval: 3000
+		});
+		try {
+			const dispatch = ticks.get(1000);
+			const recovery = ticks.get(2000);
+			const cleanup = ticks.get(3000);
+			for (let i = 0; i < 3; i++) await dispatch();
+			for (let i = 0; i < 2; i++) await recovery();
+			await cleanup();
+			const records = error.mock.calls.map((call) => registeredRecord(call[0], EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_SWEEP));
+			expect(records.map((r) => r.attributes.sweep)).toEqual(['dispatch', 'recovery', 'cleanup']);
+			expect(records[0].attributes.error).toEqual({ name: 'Error', code: '42703', message: 'column "traceparent" does not exist' });
+
+			// A success ends the streak; the next failure is reported again.
+			failing = false;
+			await dispatch();
+			expect(error).toHaveBeenCalledTimes(3);
+			failing = true;
+			await dispatch();
+			await dispatch();
+			expect(error).toHaveBeenCalledTimes(4);
+			expect(registeredRecord(error.mock.calls[3][0], EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_SWEEP).attributes.sweep).toBe('dispatch');
+		} finally {
+			runner.destroy();
+		}
 	});
 });

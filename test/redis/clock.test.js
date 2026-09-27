@@ -2,6 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createClusterClock, attachClusterClock } from '../../src/redis/clock.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 // A minimal RedisClient shape: the clock exercises `.redis.time()` plus, in
 // leader mode, `.redis.set()` / `.redis.get()`.
@@ -182,11 +184,17 @@ describe('cluster clock - thresholds and drift', () => {
 		expect(clock.now()).toBe(LOCAL_MS - 300); // 3-source median
 
 		ntpValue = new Error('ntp down');
-		await clock.sample();
+		const sink = captureRegistered();
+		try {
+			await clock.sample();
+		} finally {
+			sink.stop();
+		}
 		await clock.stop();
 		// Back to the 2-source midpoint - the dead source no longer votes.
 		expect(clock.now()).toBe(LOCAL_MS - 150);
 		expect(errors).toEqual(['ntp down']);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.CLOCK_NTP_SAMPLE]);
 	});
 
 	it('a failed Redis round keeps the last good state and reports the error', async () => {
@@ -202,11 +210,18 @@ describe('cluster clock - thresholds and drift', () => {
 		);
 		await clock.sample();
 		fail = true;
-		const second = await clock.sample();
+		const sink = captureRegistered();
+		let second;
+		try {
+			second = await clock.sample();
+		} finally {
+			sink.stop();
+		}
 		await clock.stop();
 		expect(second).toBeNull();
 		expect(clock.skew()).toBe(300);
 		expect(errors).toEqual(['redis down']);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.CLOCK_SAMPLE]);
 	});
 });
 
@@ -287,10 +302,38 @@ describe('cluster clock - leader stamping', () => {
 			}),
 			{ samples: 1, immediate: false, leader: { isLeader: () => true }, onError: (e) => errors.push(e.message) }
 		);
-		const skew = await clock.sample();
+		const sink = captureRegistered();
+		let skew;
+		try {
+			skew = await clock.sample();
+		} finally {
+			sink.stop();
+		}
 		await clock.stop();
 		expect(skew).toBe(300);
 		expect(errors).toEqual(['set failed']);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.CLOCK_LEADER_OFFSET]);
+	});
+
+	it('a follower whose leader-offset read fails reports it and keeps the round', async () => {
+		pinLocalClock(LOCAL_MS);
+		const clock = createClusterClock(
+			fakeClient(async () => timeReplyFor(LOCAL_MS - 300), {
+				get: async () => { throw new Error('get failed'); }
+			}),
+			{ samples: 1, immediate: false, leader: { isLeader: () => false } }
+		);
+		const sink = captureRegistered();
+		let skew;
+		try {
+			skew = await clock.sample();
+		} finally {
+			sink.stop();
+		}
+		await clock.stop();
+		expect(skew).toBe(300);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.CLOCK_LEADER_OFFSET]);
+		expect(sink.records[0].attributes.error.message).toBe('get failed');
 	});
 });
 

@@ -9,8 +9,9 @@
 // Pure with respect to its arguments (reads no clock / RNG / module singleton),
 // so a unit test drives it with plain Maps and the presence factory closes over
 // the live structures at the call site. Structure-only: it carries per-topic
-// distinct-key cardinalities and a metric-sanitized topic label, never a user
-// key, a connection, or any presence data.
+// distinct-key cardinalities and the topic, never a user key, a connection, or
+// any presence data. The topic only tells violations apart; the predicate keeps
+// it out of the logged context, since a topic can carry a user id.
 
 /**
  * Build a bounded snapshot of the round-robin window of locally-tracked presence
@@ -26,14 +27,12 @@
  *   read for `.size` as the per-topic distinct-key count and the population total.
  * @param {(topic: string) => number} args.topicKeyCount - the local index's O(1)
  *   per-topic distinct-key count (from `createLocalIndex`).
- * @param {(topic: string) => string} [args.mt] - metric-safe topic transform; the
- *   only topic representation that reaches the (logged) violation context.
  * @param {number} args.offset - window start (round-robin position).
  * @param {number} args.limit - window size (max topics this tick).
  * @returns {{ presenceTopics: Array<{ topic: string, countKeys: number, indexKeys: number }>, total: number }}
  */
 export function buildPresenceAuditSnapshot(args) {
-	const { localCounts, topicKeyCount, mt, offset, limit } = args;
+	const { localCounts, topicKeyCount, offset, limit } = args;
 	const total = localCounts.size;
 	/** @type {Array<{ topic: string, countKeys: number, indexKeys: number }>} */
 	const presenceTopics = [];
@@ -43,7 +42,7 @@ export function buildPresenceAuditSnapshot(args) {
 		if (presenceTopics.length >= limit) break;
 		i++;
 		presenceTopics.push({
-			topic: mt ? mt(topic) : topic,
+			topic,
 			countKeys: counts.size,
 			indexKeys: topicKeyCount(topic)
 		});

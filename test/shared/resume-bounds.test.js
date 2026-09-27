@@ -4,6 +4,8 @@ import { createLruMap } from '../../src/shared/lru-map.js';
 import { MAX_RESUME_TOPICS } from '../../src/shared/caps.js';
 import { mockWs } from '../../src/testing/mock-ws.js';
 import { mockPlatform } from '../../src/testing/mock-platform.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 describe('resume topic bound', () => {
 	function hookWithSpies(options = {}) {
@@ -85,8 +87,8 @@ describe('resume topic bound', () => {
 				hook(mockWs({ id: 'm' }), { lastSeenSeqs: overflowing(), platform: mockPlatform() })
 			);
 			expect(warnings).toHaveLength(1);
-			expect(warnings[0]).toContain('MAX_RESUME_TOPICS');
-			expect(warnings[0]).toContain(`more than ${MAX_RESUME_TOPICS}`);
+			const record = registeredRecord(warnings[0], EXTENSIONS_ERROR_IDS.RESUME_TOPICS_TRUNCATED);
+			expect(record.attributes).toEqual({ accepted: MAX_RESUME_TOPICS, intervalMs: expect.any(Number) });
 		});
 
 		it('reports every overflow to metrics even while logs are throttled', async () => {

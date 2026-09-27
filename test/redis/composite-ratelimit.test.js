@@ -8,6 +8,8 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCompositeRateLimit } from '../../src/redis/ratelimit.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 function mockWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -167,5 +169,43 @@ describe('composite ratelimit peek', () => {
 			vi.spyOn(client.redis, 'eval').mockRejectedValue(new Error('down'));
 			await expect(composite.peek(mockWs({ user: 'x', ip: '3.3.3.3' }))).rejects.toThrow('down');
 		});
+	});
+});
+
+describe('composite ratelimit floor report', () => {
+	it('reports the degraded floor once, as its registered diagnostic', async () => {
+		const client = mockRedisClient('test-floor:');
+		const composite = createCompositeRateLimit(client, { dimensions: DIMS, localFloorOnStorageFailure: true });
+		vi.spyOn(client.redis, 'eval').mockRejectedValue(new Error('down'));
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const ws = mockWs({ user: 'frank', ip: '5.5.5.5' });
+			await composite.consume(ws);
+			await composite.consume(ws);
+			await composite.consume(ws);
+			expect(warn).toHaveBeenCalledOnce();
+			const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.COMPOSITE_RATELIMIT_STORE_FLOOR);
+			expect(record.attributes).toEqual({ error: { name: 'Error', code: null, message: 'down' } });
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it('cuts the bucket keys out of an error that repeats them', async () => {
+		const client = mockRedisClient('test-floor-acl:');
+		const composite = createCompositeRateLimit(client, { dimensions: DIMS, localFloorOnStorageFailure: true });
+		// A backend or proxy that repeats the keys it refused; each embeds a client identity.
+		vi.spyOn(client.redis, 'eval').mockImplementation(async (_script, _numKeys, ...keys) => {
+			throw new Error("backend refused '" + keys[0] + "' and '" + keys[1] + "'");
+		});
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			await composite.consume(mockWs({ user: 'frank', ip: '5.5.5.5' }));
+			const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.COMPOSITE_RATELIMIT_STORE_FLOOR);
+			expect(record.attributes.error.message).toBe("backend refused '<redacted>' and '<redacted>'");
+			expect(warn.mock.calls[0][0]).not.toMatch(/frank|5\.5\.5\.5/);
+		} finally {
+			vi.restoreAllMocks();
+		}
 	});
 });

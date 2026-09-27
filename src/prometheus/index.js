@@ -11,6 +11,8 @@
  * @module svelte-adapter-uws-extensions/prometheus
  */
 import { timingSafeEqual, createHash } from 'node:crypto';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const LABEL_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
@@ -425,13 +427,9 @@ function recordSeriesDrop(metric) {
 	if (metric._onDrop) metric._onDrop(metric.name);
 	if (!metric._warned) {
 		metric._warned = true;
-		console.warn(
-			`[prometheus] metric "${metric.name}" hit maxSeries cap ` +
-			`${metric.maxSeries} - subsequent unique labelsets dropped. ` +
-			'See `prometheus_series_dropped_total{metric="' + metric.name + '"}` ' +
-			'for ongoing drop count. Bump `maxSeries` if legitimate, or use ' +
-			'`mapTopic` to bound the label cardinality.'
-		);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PROMETHEUS_SERIES_CAP, {
+			attributes: { metric: metric.name, maxSeries: metric.maxSeries }
+		});
 	}
 }
 

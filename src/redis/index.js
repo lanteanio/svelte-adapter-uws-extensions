@@ -11,6 +11,8 @@ import Redis from 'ioredis';
 import { ConnectionError } from '../shared/errors.js';
 import { MAX_REDIS_DUPLICATES_PER_CLIENT } from '../shared/caps.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 /**
  * @typedef {Object} RedisClientOptions
@@ -65,6 +67,10 @@ export function createRedisClient(options = {}) {
 		throw new ConnectionError('redis', `failed to create client for ${redactConnectionUrl(url)}`, err);
 	}
 
+	// Without a listener ioredis prints its own unindexed "Unhandled error
+	// event" line, with the connection error unredacted.
+	redis.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_CLIENT, { error: err }));
+
 	// Track duplicate connections for cleanup
 	/** @type {Set<import('ioredis').Redis>} */
 	const duplicates = new Set();
@@ -98,14 +104,9 @@ export function createRedisClient(options = {}) {
 			duplicates.add(dup);
 			if (duplicates.size >= MAX_REDIS_DUPLICATES_PER_CLIENT && !duplicatesWarnFired) {
 				duplicatesWarnFired = true;
-				console.warn(
-					'[redis] client has spawned ' + duplicates.size +
-					' duplicate connections. A single Node process should never need ' +
-					'more than a handful (one per subscriber-shaped module). Each ' +
-					'duplicate owns a real ioredis socket; check for a lifecycle leak ' +
-					'where modules are constructed without a corresponding deactivate.\n' +
-					'  See: https://svti.me/redis-duplicates'
-				);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_DUPLICATES, {
+					attributes: { duplicates: duplicates.size }
+				});
 			}
 			// Untrack only on 'end' - the TERMINAL edge (manual quit/disconnect
 			// or retry exhaustion). 'close' also fires on every transient

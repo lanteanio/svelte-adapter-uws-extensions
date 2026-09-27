@@ -41,7 +41,7 @@ const verbose = process.argv.includes('--verbose');
 
 // Everything a consumer can read: the shipped tree, the shipped docs, and the
 // suites and benches whose describe() strings surface in test output.
-const SCAN_ROOTS = ['src', 'test', 'bench'];
+const SCAN_ROOTS = ['src', 'test', 'bench', 'docs'];
 const EXTRA_FILES = ['README.md', 'MIGRATION.md', 'CHANGELOG.md'];
 
 const SKIP_SEGMENTS = new Set([

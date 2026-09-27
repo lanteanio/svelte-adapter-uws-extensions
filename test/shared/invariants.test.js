@@ -145,9 +145,12 @@ describe('checkRedisPresenceLocalIndex', () => {
 			{ topic: 'room', countKeys: 2, indexKeys: 2 },
 			{ topic: 'lobby', countKeys: 1, indexKeys: 0 }
 		] };
+		// The topic can carry a user id: it keys the violation and stays out of
+		// the context the assertion line prints.
 		expect(checkRedisPresenceLocalIndex(snap)).toEqual({
 			category: 'redis.presence.local-index-desync',
-			context: { topic: 'lobby', countKeys: 1, indexKeys: 0 }
+			key: 'lobby',
+			context: { countKeys: 1, indexKeys: 0 }
 		});
 	});
 

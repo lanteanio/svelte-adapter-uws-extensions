@@ -17,6 +17,8 @@ import { createCursor } from '../../src/redis/cursor.js';
 import { createReplay as createPgReplay } from '../../src/postgres/replay.js';
 import { createNotifyBridge } from '../../src/postgres/notify.js';
 import { MAX_RESUME_TOPICS } from '../../src/shared/caps.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 function mockWs(userData = {}) {
 	const subscriptions = new Set();
@@ -370,7 +372,8 @@ describe('prometheus metrics', () => {
 			c.inc({ k: 'd' }); // third drop, still no extra warn
 
 			expect(warnSpy).toHaveBeenCalledTimes(1);
-			expect(warnSpy.mock.calls[0][0]).toContain('hit maxSeries cap 1');
+			const record = registeredRecord(warnSpy.mock.calls[0][0], EXTENSIONS_ERROR_IDS.PROMETHEUS_SERIES_CAP);
+			expect(record.attributes).toEqual({ metric: 'foo', maxSeries: 1 });
 
 			const out = m.serialize();
 			expect(out).toContain('prometheus_series_dropped_total{metric="foo"} 3');

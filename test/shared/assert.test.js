@@ -10,10 +10,54 @@ import {
 	_resetCountersForTesting
 } from '../../src/shared/assert.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { diagnosticError, formatDiagnostic } from '../../src/shared/diagnostic.js';
+
+function diagnosticRecord(line) {
+	return JSON.parse(line.slice(line.indexOf('{')));
+}
 
 describe('shared/assert', () => {
 	beforeEach(() => {
 		_resetCountersForTesting();
+	});
+
+	it('keeps bridge diagnostics on one physical line', () => {
+		const line = formatDiagnostic({
+			source: 'svelte-adapter-uws-extensions', component: 'runtime.redis',
+			event: 'redis.warning', severity: 'warn', message: 'warning',
+			attributes: { value: 'a\u2028b\u2029c' }
+		});
+		expect(line).not.toContain('\u2028');
+		expect(line).not.toContain('\u2029');
+		expect(line).toContain('\\u2028');
+		expect(line).toContain('\\u2029');
+		expect(JSON.parse(line.slice(line.indexOf('{'))).attributes.value).toBe('a\u2028b\u2029c');
+	});
+
+	it('ASCII-escapes control, bidi, and right-to-left external values', () => {
+		const hostile = String.fromCodePoint(0, 0x85, 0x202e, 0x2066, 0x5e9);
+		const line = formatDiagnostic({
+			source: 'svelte-adapter-uws-extensions',
+			component: 'runtime.redis',
+			event: 'redis.warning',
+			severity: 'warn',
+			message: 'external=' + hostile,
+			attributes: { name: hostile }
+		});
+		expect(line).not.toMatch(/[\u0000-\u001f\u007f-\uffff]/);
+		for (const escaped of ['\\u0000', '\\u0085', '\\u202e', '\\u2066', '\\u05e9']) {
+			expect(line).toContain(escaped);
+		}
+		const record = diagnosticRecord(line);
+		expect(record.message).toBe('external=\\u0000\\u0085\\u202e\\u2066\\u05e9');
+		expect(record.attributes.name).toBe(hostile);
+	});
+
+	it('contains thrown values whose accessors and string conversion also throw', () => {
+		const hostile = new Proxy({}, {
+			get() { throw new Error('getter failed'); }
+		});
+		expect(diagnosticError(hostile)).toEqual({ name: 'Error', code: null, message: 'Uninspectable thrown value' });
 	});
 
 	describe('assert', () => {
@@ -39,9 +83,9 @@ describe('shared/assert', () => {
 			expect(() => assert(false, 'shape.test', { x: 1 })).toThrow();
 			expect(errSpy).toHaveBeenCalledTimes(1);
 			const line = errSpy.mock.calls[0][0];
-			expect(line).toMatch(/^\[extensions\/assert\]/);
-			const json = line.slice('[extensions/assert] '.length);
-			expect(JSON.parse(json)).toEqual({
+			expect(line).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.assertion event=invariant\.violated severity=warn\]/);
+			const record = diagnosticRecord(line);
+			expect(record.attributes).toEqual({
 				category: 'shape.test',
 				context: { x: 1 }
 			});
@@ -58,21 +102,19 @@ describe('shared/assert', () => {
 					authorization: 'bearer xxx'
 				})
 			).toThrow();
-			const json = errSpy.mock.calls[0][0].slice('[extensions/assert] '.length);
-			const parsed = JSON.parse(json);
-			expect(parsed.context).toHaveProperty('userId');
-			expect(parsed.context).not.toHaveProperty('password');
-			expect(parsed.context).not.toHaveProperty('token');
-			expect(parsed.context).not.toHaveProperty('authorization');
+			const parsed = diagnosticRecord(errSpy.mock.calls[0][0]);
+			expect(parsed.attributes.context).toHaveProperty('userId');
+			expect(parsed.attributes.context).not.toHaveProperty('password');
+			expect(parsed.attributes.context).not.toHaveProperty('token');
+			expect(parsed.attributes.context).not.toHaveProperty('authorization');
 			errSpy.mockRestore();
 		});
 
 		it('omits the context field when no context was passed', () => {
 			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			expect(() => assert(false, 'no.context')).toThrow();
-			const json = errSpy.mock.calls[0][0].slice('[extensions/assert] '.length);
-			const parsed = JSON.parse(json);
-			expect(parsed).toEqual({ category: 'no.context' });
+			const parsed = diagnosticRecord(errSpy.mock.calls[0][0]);
+			expect(parsed.attributes).toEqual({ category: 'no.context', context: null });
 			errSpy.mockRestore();
 		});
 	});
@@ -83,15 +125,19 @@ describe('shared/assert', () => {
 		});
 
 		it('does not throw on violation, even in test mode', () => {
-			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			expect(() => devAssert(false, 'shape mismatch', { got: 'string' })).not.toThrow();
-			expect(warnSpy).toHaveBeenCalledTimes(1);
-			expect(warnSpy.mock.calls[0][0]).toMatch(/^\[extensions\/devAssert\] shape mismatch/);
-			warnSpy.mockRestore();
+			expect(errSpy).toHaveBeenCalledTimes(1);
+			expect(errSpy.mock.calls[0][0]).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.assertion event=invariant\.violated severity=error\] shape mismatch/);
+			expect(diagnosticRecord(errSpy.mock.calls[0][0]).attributes).toEqual({
+				category: 'development.assertion',
+				context: { got: 'string' }
+			});
+			errSpy.mockRestore();
 		});
 
 		it('logs the message and context when violated', () => {
-			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			devAssert(false, 'mismatch', { hint: 'check options' });
 			const line = warnSpy.mock.calls[0][0];
 			expect(line).toContain('mismatch');
@@ -126,7 +172,7 @@ describe('shared/assert', () => {
 		});
 
 		it('devAssert: respects a NODE_ENV flip from prod to dev between calls', () => {
-			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			const originalVitest = process.env.VITEST;
 			const originalNodeEnv = process.env.NODE_ENV;
 			try {
@@ -251,12 +297,12 @@ describe('shared/assert', () => {
 			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			expect(() => fatal(false, 'fatal.log', { topic: 'room', password: 'leaked' })).toThrow();
 			const line = errSpy.mock.calls[0][0];
-			expect(line).toMatch(/^\[extensions\/fatal\]/);
-			const parsed = JSON.parse(line.slice('[extensions/fatal] '.length));
+			expect(line).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.assertion event=invariant\.violated severity=fatal\]/);
+			const parsed = diagnosticRecord(line);
 			expect(parsed.severity).toBe('fatal');
-			expect(parsed.category).toBe('fatal.log');
-			expect(parsed.context).toHaveProperty('topic');
-			expect(parsed.context).not.toHaveProperty('password');
+			expect(parsed.attributes.category).toBe('fatal.log');
+			expect(parsed.attributes.context).toHaveProperty('topic');
+			expect(parsed.attributes.context).not.toHaveProperty('password');
 			errSpy.mockRestore();
 		});
 

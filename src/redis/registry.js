@@ -28,6 +28,7 @@
  */
 
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+import { EXTENSIONS_ERROR_IDS, extensionsError } from '../error-registry.js';
 import { evalCached } from '../shared/eval-cached.js';
 import {
 	randomBytes,
@@ -41,6 +42,7 @@ import {
 import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { execMultiSlot } from '../shared/cluster.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
 	MAX_REGISTRY_PENDING_REQUESTS,
@@ -334,14 +336,9 @@ export function createConnectionRegistry(client, options) {
 			users.add(userId);
 			if (users.size >= MAX_REGISTRY_INDEX_VALUES_PER_KEY && !indexValuesWarnFired.has(k)) {
 				indexValuesWarnFired.add(k);
-				console.warn(
-					'[registry] secondary-index bucket for attribute "' + k +
-					'" has grown to ' + users.size + ' userIds. Eviction would corrupt ' +
-					'sendTo matching, so the index keeps growing - raise this if the ' +
-					'cardinality is legitimate, or check for an attributes(ws) callback ' +
-					'returning unique values per connection.\n' +
-					'  See: https://svti.me/registry-index'
-				);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REGISTRY_INDEX_BUCKET, {
+					attributes: { attribute: k, userIds: users.size }
+				});
 			}
 		}
 	}
@@ -367,13 +364,9 @@ export function createConnectionRegistry(client, options) {
 		indexUser(userId, attrs);
 		if (userToInstance.size >= MAX_REGISTRY_USER_INDEX && !userIndexWarnFired) {
 			userIndexWarnFired = true;
-			console.warn(
-				'[registry] cluster-wide user index has grown to ' + userToInstance.size +
-				' entries. Each entry is ~32 bytes of Map state per instance maintaining ' +
-				'the index. Eviction would mis-route sendTo, so the index keeps growing - ' +
-				'split the cluster or stop registering anonymous-shaped userIds.\n' +
-				'  See: https://svti.me/registry-index'
-			);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REGISTRY_USER_INDEX, {
+				attributes: { entries: userToInstance.size }
+			});
 		}
 	}
 
@@ -629,7 +622,7 @@ export function createConnectionRegistry(client, options) {
 		if (subscriber) return;
 		subscriber = client.duplicate({ enableReadyCheck: false });
 		subscriber.on('error', (err) => {
-			console.error('[redis/registry] subscriber error:', err.message);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REGISTRY_SUBSCRIBER, { error: err });
 		});
 		subscriber.on('message', (ch, raw) => {
 			if (ch === ownPushChannel) {
@@ -976,17 +969,17 @@ export function createConnectionRegistry(client, options) {
 
 	async function request(target, event, data, opts = {}) {
 		if (typeof target !== 'string' || target.length === 0) {
-			throw new Error('registry.request: target must be a non-empty userId string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TARGET));
 		}
 		if (typeof event !== 'string' || event.length === 0) {
-			throw new Error('registry.request: event must be a non-empty string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_EVENT));
 		}
 		const timeoutMs = opts.timeoutMs ?? defaultRequestTimeoutMs;
 
 		const entry = await lookup(target);
 		if (!entry) {
 			mRequests?.inc({ result: 'offline' });
-			throw new Error(`registry.request: target user "${target}" is offline`);
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE, target + '" is offline'));
 		}
 
 		// Self-targeting: short-circuit to local platform.request, no Redis hop.
@@ -994,7 +987,7 @@ export function createConnectionRegistry(client, options) {
 			const ws = sessionToWs.get(entry.sessionId);
 			if (!ws || !activePlatform) {
 				mRequests?.inc({ result: 'offline' });
-				throw new Error(`registry.request: target user "${target}" is offline`);
+				throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE, target + '" is offline'));
 			}
 			const start = monotonicNow();
 			try {
@@ -1017,10 +1010,10 @@ export function createConnectionRegistry(client, options) {
 		// the heap fills with pending entries.
 		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
 			mRequests?.inc({ result: 'error' });
-			throw new Error(
-				'registry.request: pending requests exceeded ' +
+			throw new Error(extensionsError(
+				EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_PENDING,
 				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
-			);
+			));
 		}
 
 		const ref = randomBytes(12).toString('hex');
@@ -1045,7 +1038,10 @@ export function createConnectionRegistry(client, options) {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
-				reject(new Error(`registry.request: timed out after ${timeoutMs}ms`));
+				reject(new Error(extensionsError(
+					EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TIMEOUT,
+					timeoutMs + 'ms'
+				)));
 			}, timeoutMs);
 			if (timer.unref) timer.unref();
 			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
@@ -1078,17 +1074,17 @@ export function createConnectionRegistry(client, options) {
 	 */
 	async function requestSession(target, event, data, opts = {}) {
 		if (typeof target !== 'string' || target.length === 0) {
-			throw new Error('registry.requestSession: target must be a non-empty sessionId string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_TARGET));
 		}
 		if (typeof event !== 'string' || event.length === 0) {
-			throw new Error('registry.requestSession: event must be a non-empty string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_EVENT));
 		}
 		const timeoutMs = opts.timeoutMs ?? defaultRequestTimeoutMs;
 
 		const entry = await lookupSession(target);
 		if (!entry) {
 			mRequests?.inc({ result: 'offline' });
-			throw new Error(`registry.requestSession: target session "${target}" is offline`);
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE, target + '" is offline'));
 		}
 
 		// Self-targeting: the session migrated onto this instance; resolve locally.
@@ -1096,7 +1092,7 @@ export function createConnectionRegistry(client, options) {
 			const ws = appSessionToWs.get(target);
 			if (!ws || !activePlatform) {
 				mRequests?.inc({ result: 'offline' });
-				throw new Error(`registry.requestSession: target session "${target}" is offline`);
+				throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE, target + '" is offline'));
 			}
 			const start = monotonicNow();
 			try {
@@ -1114,10 +1110,10 @@ export function createConnectionRegistry(client, options) {
 		await ensureSubscriber(activePlatform);
 		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
 			mRequests?.inc({ result: 'error' });
-			throw new Error(
-				'registry.requestSession: pending requests exceeded ' +
+			throw new Error(extensionsError(
+				EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_PENDING,
 				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
-			);
+			));
 		}
 
 		const ref = randomBytes(12).toString('hex');
@@ -1139,7 +1135,10 @@ export function createConnectionRegistry(client, options) {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
-				reject(new Error(`registry.requestSession: timed out after ${timeoutMs}ms`));
+				reject(new Error(extensionsError(
+					EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_TIMEOUT,
+					timeoutMs + 'ms'
+				)));
 			}, timeoutMs);
 			if (timer.unref) timer.unref();
 			pending.set(ref, { resolve, reject, timer, startTime: monotonicNow() });
@@ -1158,7 +1157,7 @@ export function createConnectionRegistry(client, options) {
 
 	async function sendCoalesced(target, message) {
 		if (typeof target !== 'string' || target.length === 0) {
-			throw new Error('registry.sendCoalesced: target must be a non-empty userId string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SEND_COALESCED_TARGET));
 		}
 		if (!message || typeof message !== 'object') {
 			throw new Error('registry.sendCoalesced: message must be an object');
@@ -1220,7 +1219,7 @@ export function createConnectionRegistry(client, options) {
 
 	async function send(target, topic, event, data) {
 		if (typeof target !== 'string' || target.length === 0) {
-			throw new Error('registry.send: target must be a non-empty userId string');
+			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SEND_TARGET));
 		}
 		if (typeof topic !== 'string' || topic.length === 0) {
 			throw new Error('registry.send: topic must be a non-empty string');

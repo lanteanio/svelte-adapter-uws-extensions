@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { capabilityCookie } from '../src/capability-cookie.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
+import { EXTENSIONS_ERROR_IDS } from '../src/error-registry.js';
+import { registeredRecord } from './helpers/diagnostic-line.js';
 
 const COOKIE_NAME = 'sauws_cap';
 
@@ -442,6 +444,8 @@ describe('capabilityCookie', () => {
 				expect(cap.verify(null, { required: true })).toBe(false);
 				expect(cap.verify(COOKIE_NAME + '=garbage', { required: false })).toBe(false);
 				expect(errSpy).toHaveBeenCalledTimes(1);
+				const record = registeredRecord(errSpy.mock.calls[0][0], EXTENSIONS_ERROR_IDS.CAPABILITY_COOKIE_METRICS);
+				expect(record.attributes).toEqual({ error: { name: 'Error', code: null, message: 'emit boom' } });
 			} finally {
 				errSpy.mockRestore();
 			}

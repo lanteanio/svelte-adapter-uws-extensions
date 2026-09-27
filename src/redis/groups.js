@@ -25,6 +25,8 @@ import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
 import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -197,7 +199,7 @@ export function createGroup(client, name, options = {}) {
 			.catch((err) => {
 				pendingMeta = null;
 				metaInitError = err;
-				console.warn('groups: initial meta write failed for "' + name + '":', err.message);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_META_INITIALIZE, { error: err, attributes: { group: name } });
 			});
 	}
 
@@ -207,6 +209,11 @@ export function createGroup(client, name, options = {}) {
 	// built, so every batch carries the SHA-backed name, not the script body -
 	// this was the one remaining per-call full-script eval on a hot cadence).
 	const cleanupCmd = evalCachedName(redis, CLEANUP_SCRIPT);
+	// Group failures name the group. A group owns its own subscriber
+	// connection and heartbeat timer, so its name identifies a long-lived
+	// deployment resource, like a channel name, and it is already a metric
+	// label; a topic is not reported that way.
+	let heartbeatFailing = false;
 	const heartbeatTimer = setIntervalTimer(() => {
 		if (b && !b.isHealthy) return;
 		// Retry a close whose authoritative flag was unreadable when its bus
@@ -231,8 +238,11 @@ export function createGroup(client, name, options = {}) {
 		// instance holds the group open, and expire once every instance stops.
 		pipe.pexpire(membersKey, keyExpiryMs);
 		pipe.pexpire(metaKey, keyExpiryMs);
-		pipe.exec().catch((err) => {
-			if (err) console.warn('groups heartbeat: pipeline failed for group "' + name + '":', err.message);
+		pipe.exec().then(() => { heartbeatFailing = false; }, (err) => {
+			// One report per failure streak; the next successful beat re-arms it.
+			if (!err || heartbeatFailing) return;
+			heartbeatFailing = true;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_HEARTBEAT, { error: err, attributes: { group: name } });
 		});
 	}, memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
@@ -390,7 +400,7 @@ export function createGroup(client, name, options = {}) {
 		if (subscriber) return;
 		const sub = client.duplicate({ enableReadyCheck: false });
 		sub.on('error', (err) => {
-			console.error('groups subscriber error:', err.message);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_SUBSCRIBER, { error: err, attributes: { group: name } });
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== eventChannel) return;

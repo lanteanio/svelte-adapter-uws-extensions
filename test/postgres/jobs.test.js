@@ -3,6 +3,9 @@ import { mockPgClient } from '../helpers/mock-pg.js';
 import { createJobQueue } from '../../src/postgres/jobs.js';
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
+
 describe('postgres job queue', () => {
 	let client;
 	let queue;
@@ -92,6 +95,74 @@ describe('postgres job queue', () => {
 			await queue.enqueue('email', null, { requestId: '' });
 			const claimed = await queue.claim('email');
 			expect(claimed[0].requestId).toBeNull();
+		});
+
+		it('persists an explicit W3C context separately from the payload', async () => {
+			await queue.enqueue('email', { traceparent: 'application-data' }, {
+				traceContext: { traceparent: TRACE_A, tracestate: 'vendor=value' },
+				platform: { traceContext: { traceparent: TRACE_B } }
+			});
+			const [job] = await queue.claim('email');
+			expect(job.traceContext).toEqual({ traceparent: TRACE_A, tracestate: 'vendor=value' });
+			expect(job.payload).toEqual({ traceparent: 'application-data' });
+		});
+
+		it('uses live Platform context unless explicit null suppresses it', async () => {
+			await queue.enqueue('email', 1, { platform: { traceContext: { traceparent: TRACE_B } } });
+			await queue.enqueue('email', 2, {
+				traceContext: null,
+				platform: { traceContext: { traceparent: TRACE_B } }
+			});
+			const jobs = await queue.claim('email', { batchSize: 2 });
+			expect(jobs[0].traceContext).toEqual({ traceparent: TRACE_B });
+			expect(jobs[1].traceContext).toBeNull();
+		});
+
+		it('starts a producer span on enqueue and hands the stored context back on claim without a span of its own', async () => {
+			const spans = [];
+			let current = null;
+			const platform = {
+				traceContext: { traceparent: TRACE_A },
+				trace: {
+					enabled: true,
+					current: () => current,
+					run(name, options, fn) {
+						spans.push({ name, options });
+						current = { traceparent: TRACE_B };
+						try { return fn(); } finally { current = null; }
+					}
+				}
+			};
+			await queue.enqueue('email', null, { platform });
+			const [job] = await queue.claim('email');
+			expect(job.traceContext).toEqual({ traceparent: TRACE_B });
+			// The worker continues the stored context around its own processing;
+			// a span around building the claimed record would end before the
+			// caller ever saw the job.
+			expect(spans.map((span) => span.name)).toEqual(['postgres.jobs.enqueue']);
+			expect(spans[0].options.kind).toBe('producer');
+		});
+
+		it('opts a job out of tracing on an explicit null, even under a provider', async () => {
+			const spans = [];
+			const active = { traceparent: TRACE_B };
+			const platform = {
+				traceContext: active,
+				trace: {
+					enabled: true,
+					current: () => active,
+					// Like the adapter's run(): a null parent falls back to the
+					// active context, so an operation here would re-attach it.
+					run(name, options, fn) {
+						spans.push({ name, options });
+						return fn();
+					}
+				}
+			};
+			await queue.enqueue('email', null, { traceContext: null, platform });
+			const [job] = await queue.claim('email');
+			expect(spans).toEqual([]);
+			expect(job.traceContext).toBeNull();
 		});
 	});
 

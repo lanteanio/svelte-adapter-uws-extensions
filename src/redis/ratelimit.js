@@ -25,6 +25,8 @@ import {
 	GCRA_PEEK_SCRIPT
 } from './token-bucket-script.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 export { createEmergencyScaleOps as createRateLimitEmergency } from './emergency-scale.js';
 export { createCompositeRateLimit } from './composite-ratelimit.js';
@@ -509,14 +511,16 @@ export function createRateLimit(client, options) {
 		if (warnedProxyCollapse || !ipMode || addressHeaderSet) return;
 		if (!isPrivateOrLoopbackAddress(key)) return;
 		warnedProxyCollapse = true;
-		console.warn(
-			`redis ratelimit: denied a request keyed on the private/loopback address "${key}" ` +
-			"while keyBy:'ip' and ADDRESS_HEADER is unset. If this server sits behind an " +
-			'address-rewriting proxy (docker userland-proxy, an L4 load balancer, a non-XFF proxy), ' +
-			'every client arrives as the same gateway address and this per-IP rate limiter collapses ' +
-			'into one shared global bucket. Set ADDRESS_HEADER (and XFF_DEPTH) so the adapter resolves ' +
-			'the real client IP, or pass an explicit keyBy. This warning fires once.'
-		);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.RATELIMIT_PROXY_COLLAPSE, {
+			attributes: {
+				keyBy: 'ip',
+				addressClass: 'private-or-loopback',
+				addressValue: 'omitted',
+				addressHeaderConfigured: false,
+				action: 'Configure ADDRESS_HEADER and XFF_DEPTH, or pass an explicit keyBy resolver.',
+				suppression: 'once-per-limiter'
+			}
+		});
 	}
 
 	/**
@@ -580,12 +584,8 @@ export function createRateLimit(client, options) {
 				mFloor?.inc();
 				if (!warnedStorageFloor) {
 					warnedStorageFloor = true;
-					console.warn(
-						'redis ratelimit: store unreachable; deciding on the in-process floor. ' +
-						'Limits hold per instance while degraded (N instances allow up to N times ' +
-						'the floor budget); cross-instance state resumes when the store recovers. ' +
-						'This warning fires once.'
-					);
+					// The key embeds the client identity; cut it should the error repeat it.
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.RATELIMIT_STORE_FLOOR, { error: err, redact: [bk, key] });
 				}
 				verdict = floor.consume(bk, cost);
 			}

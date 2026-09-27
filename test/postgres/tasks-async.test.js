@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { createTaskRunner } from '../../src/postgres/tasks.js';
 
+const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+
 describe('postgres tasks (enqueue / await / dispatch)', () => {
 	let client;
 	let runner;
@@ -158,6 +160,41 @@ describe('postgres tasks (enqueue / await / dispatch)', () => {
 			expect(row.result).toEqual({ result: 'pending-1' });
 			expect(calls).toBe(1);
 
+			r.destroy();
+		});
+
+		it('restores durable context through a background dispatch claim', async () => {
+			const restored = [];
+			const platform = {
+				traceContext: null,
+				trace: {
+					enabled: false,
+					withContext(context, fn) {
+						restored.push(context);
+						return fn();
+					}
+				}
+			};
+			const r = createTaskRunner(client, {
+				recoveryInterval: 0,
+				cleanupInterval: 0,
+				dispatchInterval: 20,
+				platform
+			});
+			let seen;
+			r.register('trace-dispatch', async ({ traceContext }) => {
+				seen = traceContext;
+				return 'ok';
+			});
+			const id = await r.enqueue('trace-dispatch', {
+				input: null,
+				traceContext: { traceparent: TRACE_A }
+			});
+			await new Promise((resolve) => setTimeout(resolve, 80));
+
+			expect(client._getTaskRows().get(id).status).toBe('committed');
+			expect(seen).toEqual({ traceparent: TRACE_A });
+			expect(restored).toContainEqual({ traceparent: TRACE_A });
 			r.destroy();
 		});
 

@@ -5,7 +5,7 @@
  *
  * - `assert(cond, category, context)` - production-safe invariant check
  *   (SOFT tier). On violation: increments the per-category counter on the
- *   live module-level Map, logs a structured `[extensions/assert] {...}`
+ *   live module-level Map, logs a structured package-attributed diagnostic
  *   line, and (in test mode only) throws so vitest surfaces the failure as
  *   a test error. In production it does NOT throw - a thrown exception
  *   inside a Redis pubsub callback or a publish hot-path microtask could
@@ -15,7 +15,7 @@
  * - `fatal(cond, category, context)` - HARD tier for genuinely
  *   unrecoverable state. Shares the same counter Map and the same bound
  *   Prometheus counter (the violation is labelled `severity="fatal"`),
- *   logs a `[extensions/fatal] {...}` line, and - in production only -
+ *   logs a fatal package-attributed diagnostic, and - in production only -
  *   schedules a DEFERRED process termination with exit code 78 AFTER the
  *   current callback frame unwinds (a synchronous exit inside a Redis
  *   callback risks the same half-applied state `assert` guards against).
@@ -25,9 +25,9 @@
  *
  * - `devAssert(cond, message, context)` - dev-time DX hint. Full no-op
  *   when `NODE_ENV === 'production'`. On violation in non-prod modes
- *   logs a warning. Use for cosmetic checks, schema-mismatch hints, etc.
- *   Does NOT throw, even in test mode (matches adapter shape: dev hints
- *   should not gate test runs).
+ *   logs a severity=error diagnostic line under `event=invariant.violated`
+ *   with `category=development.assertion`. Use for cosmetic checks,
+ *   schema-mismatch hints, etc. Does NOT throw, even in test mode.
  *
  * Test mode detection matches the adapter exactly:
  * `process.env.VITEST || process.env.NODE_ENV === 'test'`.
@@ -37,6 +37,32 @@
 
 import { stripInternal } from './sensitive.js';
 import { microtask } from './runtime.js';
+import { formatDiagnostic } from './diagnostic.js';
+
+// One line shape for all three tiers, matching the adapter's assertion
+// diagnostics field for field: the event is always invariant.violated, the
+// severity selects the tier, and the category and context ride in attributes.
+function assertionDiagnostic(severity, category, context, message = category) {
+	try {
+		return formatDiagnostic({
+			source: 'svelte-adapter-uws-extensions',
+			component: 'runtime.assertion',
+			event: 'invariant.violated',
+			severity,
+			message,
+			attributes: { category, context: context ?? null }
+		});
+	} catch {
+		return formatDiagnostic({
+			source: 'svelte-adapter-uws-extensions',
+			component: 'runtime.assertion',
+			event: 'invariant.violated',
+			severity,
+			message,
+			attributes: { category, context: null, contextSerializationFailed: true }
+		});
+	}
+}
 
 // Process exit code for a hard-tier invariant violation. Distinct from a
 // config-error exit (1) and a graceful shutdown (0) so ops can tell a
@@ -118,7 +144,7 @@ export function assert(cond, category, context) {
 	const payload = JSON.stringify(safeContext === undefined
 		? { category }
 		: { category, context: safeContext });
-	console.error('[extensions/assert] ' + payload);
+	console.error(assertionDiagnostic('warn', category, safeContext));
 	if (isTestMode()) {
 		throw new Error('extensions assertion failed: ' + category + ' ' + payload);
 	}
@@ -147,7 +173,7 @@ export function fatal(cond, category, context) {
 	const payload = JSON.stringify(safeContext === undefined
 		? { category, severity: 'fatal' }
 		: { category, context: safeContext, severity: 'fatal' });
-	console.error('[extensions/fatal] ' + payload);
+	console.error(assertionDiagnostic('fatal', category, safeContext));
 	if (isTestMode()) {
 		throw new Error('extensions fatal: ' + category + ' ' + payload);
 	}
@@ -181,7 +207,8 @@ export function resetFatalSink() {
 }
 
 /**
- * Dev-time DX hint. Full no-op in production; warning log in dev / test.
+ * Dev-time DX hint. Full no-op in production; in dev / test it logs a
+ * severity=error diagnostic line and does not throw.
  *
  * @param {boolean} cond
  * @param {string} message
@@ -191,8 +218,7 @@ export function devAssert(cond, message, context) {
 	if (isProd()) return;
 	if (cond) return;
 	const safeContext = context ? stripInternal(context) : undefined;
-	const suffix = safeContext === undefined ? '' : ' ' + JSON.stringify(safeContext);
-	console.warn('[extensions/devAssert] ' + message + suffix);
+	console.error(assertionDiagnostic('error', 'development.assertion', safeContext, message));
 }
 
 /**

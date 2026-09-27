@@ -211,6 +211,10 @@ export function redactConnectionUrl(url) {
 	let out = '';
 	let cursor = 0;
 	let from = 0;
+	// The first whitespace at or after the last lookup. Every later URL in the
+	// same whitespace-free run shares it, so the scan stays linear in the
+	// input rather than rescanning the run once per URL.
+	let ws = -1;
 	for (;;) {
 		const at = url.indexOf('://', from);
 		if (at === -1) break;
@@ -222,7 +226,7 @@ export function redactConnectionUrl(url) {
 		// compact JSON config line is the ordinary carrier) become ONE token:
 		// only one authority is found, and the scan resumes past both, so
 		// every later credential in that run is re-emitted verbatim.
-		const ws = whitespaceAt(url, at + 3);
+		if (ws < at + 3) ws = whitespaceAt(url, at + 3);
 		const nextScheme = url.indexOf('://', at + 3);
 		const end = nextScheme === -1 ? ws : Math.min(ws, schemeStart(url, nextScheme));
 		out += url.slice(cursor, at) + redactUrlRegion(url.slice(at, end));
@@ -385,7 +389,7 @@ export function createSensitiveWarner(prefix) {
 		for (const k of Object.keys(data)) {
 			if (SENSITIVE_WARN_RE.test(k)) {
 				console.warn(
-					`[${prefix}] userData key "${k}" looks sensitive; ` +
+					`[extensions] [${prefix}] userData key "${k}" looks sensitive; ` +
 					'use the select option to strip it before broadcasting\n' +
 					'  See: https://svti.me/userdata-sensitive'
 				);

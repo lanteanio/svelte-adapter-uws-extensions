@@ -243,12 +243,9 @@ export function createDistributedLock(client, options = {}) {
 			// which then calls controller.abort(...). The signal must
 			// always be aborted by the time we observe `lost`. The reverse
 			// is not true: an external signal may have aborted the
-			// controller without lostLock firing.
-			assert(
-				!lost || controller.signal.aborted,
-				'lock.heartbeat.signal-aborted-iff-lost',
-				{ key }
-			);
+			// controller without lostLock firing. No context: the lock key is the
+			// application's, and it can embed a user or an order id.
+			assert(!lost || controller.signal.aborted, 'lock.heartbeat.signal-aborted-iff-lost');
 			if (!lost) {
 				try {
 					await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);

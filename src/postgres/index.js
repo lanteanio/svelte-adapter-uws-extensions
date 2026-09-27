@@ -10,6 +10,8 @@
 import pg from 'pg';
 import { ConnectionError } from '../shared/errors.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 const { Pool, Client } = pg;
 
@@ -81,14 +83,11 @@ export function createPgClient(opts) {
 			throw new ConnectionError('postgres', 'failed to create pool', err);
 		}
 		pool.on('error', (err) => {
-			// Idle client errors should not crash the process.
-			// pg Pool handles reconnection automatically.
-			// pg embeds the connection DSN in some failure-mode message
-			// strings (auth failed, host unreachable, SSL mismatch); pipe
-			// through redactConnectionUrl so the password segment never
-			// reaches stderr / log aggregators.
-			const message = typeof err?.message === 'string' ? redactConnectionUrl(err.message) : String(err);
-			console.error('postgres: idle client error', message);
+			// Idle client errors should not crash the process; pg.Pool handles
+			// reconnection. The registered emission redacts the connection DSN
+			// pg embeds in some failure-mode messages (auth failed, host
+			// unreachable, SSL mismatch) so the password never reaches a sink.
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_POOL_IDLE_CLIENT, { error: err });
 		});
 	} else {
 		pool = externalPool;

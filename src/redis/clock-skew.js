@@ -30,6 +30,8 @@
  */
 
 import { wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_SAMPLES = 5;
@@ -248,6 +250,7 @@ export function createClockSkewSampler(client, options = {}) {
 			if (onError) {
 				try { onError(err); } catch { /* swallow */ }
 			}
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CLOCK_SKEW_SAMPLE, { error: err });
 			return null;
 		}
 	}

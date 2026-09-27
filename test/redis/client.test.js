@@ -19,6 +19,9 @@ vi.mock('ioredis', () => {
 });
 
 const { createRedisClient } = await import('../../src/redis/index.js');
+const { EXTENSIONS_ERROR_IDS } = await import('../../src/error-registry.js');
+const { MAX_REDIS_DUPLICATES_PER_CLIENT } = await import('../../src/shared/caps.js');
+const { registeredRecord } = await import('../helpers/diagnostic-line.js');
 
 describe('createRedisClient', () => {
 	it('returns a client with the expected API', () => {
@@ -80,5 +83,37 @@ describe('createRedisClient', () => {
 		dup._emit('end');
 		await client.quit();
 		expect(dup.quit).not.toHaveBeenCalled();
+	});
+});
+
+describe('createRedisClient connection errors', () => {
+	it('reports an error on the main connection through the registry, with the URL redacted', async () => {
+		const { captureRegistered } = await import('../helpers/diagnostic-line.js');
+		const client = createRedisClient({ autoShutdown: false });
+		const onError = client.redis.listeners.error?.[0];
+		expect(typeof onError).toBe('function');
+		const sink = captureRegistered();
+		try {
+			onError(Object.assign(new Error('connect failed for redis://app:hunter2@cache.internal:6379'), { code: 'ECONNREFUSED' }));
+		} finally {
+			sink.stop();
+		}
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_CLIENT]);
+		expect(JSON.stringify(sink.records)).not.toContain('hunter2');
+	});
+});
+
+describe('createRedisClient duplicate bound', () => {
+	it('reports once when the duplicate count reaches the bound', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const client = createRedisClient({ autoShutdown: false });
+			for (let i = 0; i < MAX_REDIS_DUPLICATES_PER_CLIENT + 5; i++) client.duplicate();
+			expect(warn).toHaveBeenCalledOnce();
+			const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.REDIS_DUPLICATES);
+			expect(record.attributes).toEqual({ duplicates: MAX_REDIS_DUPLICATES_PER_CLIENT });
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

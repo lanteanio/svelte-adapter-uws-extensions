@@ -25,16 +25,17 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const verbose = process.argv.includes('--verbose');
 
-// Published doc surfaces: the src tree plus the two shipped markdown docs.
-// (package.json `files` ships exactly src, README.md, MIGRATION.md.)
-const SRC_ROOT = 'src';
+// Published doc surfaces: the src and docs trees plus the two shipped
+// root markdown docs (package.json `files` ships src, docs, README.md,
+// MIGRATION.md).
+const SCAN_ROOTS = ['src', 'docs'];
 const EXTRA_FILES = ['README.md', 'MIGRATION.md'];
 
 // Path segments that are never published runtime/doc source.
 const SKIP_SEGMENTS = new Set([
 	'node_modules', 'test', 'tests', '__tests__', 'bench', 'benchmarks', 'scripts',
 	'fixture', 'fixtures', '.svelte-kit', 'dist', 'build', 'coverage', 'examples',
-	'example', 'docs', '.git'
+	'example', '.git'
 ]);
 
 // First path segment after the host: a `#anchor` or `/subpath` is not part of
@@ -76,7 +77,7 @@ function scanFile(rel) {
 }
 
 const files = [];
-walk(join(root, SRC_ROOT), files);
+for (const r of SCAN_ROOTS) if (existsSync(join(root, r))) walk(join(root, r), files);
 for (const f of EXTRA_FILES) if (existsSync(join(root, f))) files.push(f);
 files.sort();
 

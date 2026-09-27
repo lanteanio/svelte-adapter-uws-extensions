@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../src/postgres/replay.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
 
 describe('postgres replay', () => {
 	let client;
@@ -935,8 +937,8 @@ describe('postgres replay', () => {
 			}
 			expect(platform.published).toHaveLength(2); // both fell back to local publish
 			expect(warns).toHaveLength(1);
-			expect(warns[0]).toContain('[postgres replay]');
-			expect(warns[0]).toContain('requestId=req-pg');
+			const record = registeredRecord(warns[0], EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_STORAGE_FALLBACK);
+			expect(record.attributes).toEqual({ requestId: 'req-pg', error: { name: 'Error', code: null, message: 'db down' } });
 			// The raw topic is deliberately not logged (it can embed user ids).
 			expect(warns[0]).not.toContain('chat');
 			r.destroy();

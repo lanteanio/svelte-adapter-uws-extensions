@@ -24,6 +24,8 @@ import { isCluster } from '../../shared/cluster.js';
 import { createBusValidator } from '../../shared/bus-validate.js';
 import { mergeFields, newFieldMap } from './field-policy.js';
 import { INTERNAL_EVENTS } from './lua.js';
+import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
+import { emitRegisteredFailure } from '../../shared/diagnostic.js';
 
 /**
  * JSON object shape used by every presence event payload container.
@@ -117,10 +119,6 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	// emptied (its last per-field TTL lapsed), which we forward as an empty state.
 	const topicPrefix = client.key('presence:topic:{');
 
-	const KEYSPACE_PSUBSCRIBE_FAIL =
-		'[redis/presence] keyspace notifications: psubscribe failed - ' +
-		'enable on the server with `CONFIG SET notify-keyspace-events Eg` (or any flagset including `K`/`E` and `g`): ';
-
 	// Forward a whole-topic-hash deletion as an empty state to local subscribers.
 	// The per-topic hash has no whole-key TTL; it is REMOVED (a `del` keyevent) the
 	// moment its last field's per-field TTL (HPEXPIRE) lapses - i.e. when the last
@@ -175,7 +173,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 				if (keyspaceSubs.has(id)) return;
 				const s = node.duplicate({ enableReadyCheck: false });
 				s.on('error', (err) => {
-					console.error('presence keyspace subscriber error:', err.message);
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBER, { error: err });
 					scheduleKeyspaceReconcile();
 				});
 				s.on('pmessage', onKeyspaceDel);
@@ -187,7 +185,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					keyspaceSubs.delete(id);
 					s.removeAllListeners();
 					s.quit().catch(() => s.disconnect());
-					console.warn(KEYSPACE_PSUBSCRIBE_FAIL + err.message + '\n  See: https://svti.me/redis-keyspace');
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE, { error: err, attributes: { master: id } });
 				}
 			}));
 			if (disposed) return;
@@ -208,7 +206,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		if (disposed || keyspaceReconcileTimer) return;
 		keyspaceReconcileTimer = setTimer(() => {
 			keyspaceReconcileTimer = null;
-			reconcileKeyspaceMasters().catch((err) => console.error('presence keyspace reconcile failed:', err.message));
+			reconcileKeyspaceMasters().catch((err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE, { error: err }));
 		}, 0);
 		if (keyspaceReconcileTimer.unref) keyspaceReconcileTimer.unref();
 	}
@@ -234,7 +232,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 			await subscriber.psubscribe('__keyevent@*__:del');
 			keyspaceSubscribed = true;
 		} catch (err) {
-			console.warn(KEYSPACE_PSUBSCRIBE_FAIL + err.message + '\n  See: https://svti.me/redis-keyspace');
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE, { error: err });
 		}
 	}
 
@@ -248,7 +246,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 			const prefix = client.key('presence:events:');
 			subscriber = client.duplicate({ enableReadyCheck: false });
 			subscriber.on('error', (err) => {
-				console.error('presence subscriber error:', err.message);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_SUBSCRIBER, { error: err });
 			});
 			subscriber.on('message', (ch, message) => {
 				if (!ch.startsWith(prefix)) return;

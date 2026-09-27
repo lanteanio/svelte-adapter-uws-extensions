@@ -24,15 +24,19 @@ export interface RedisPresenceOptions {
 	/** TTL in seconds for presence hash entries. @default 90 */
 	ttl?: number;
 	/**
-	 * Subscribe to `__keyevent@*__:expired` so a topic's local subscribers
-	 * receive an empty `list` event the moment its presence hash expires.
-	 * Catches the instance-died scenario where a sync-only observer would
-	 * otherwise show stale data forever.
+	 * Subscribe to `__keyevent@*__:del` so a topic's local subscribers
+	 * receive an empty `state` event the moment its presence hash is
+	 * removed, which the server does when the hash's last field TTL lapses
+	 * (no instance is presenting anyone on the topic any more). Catches the
+	 * instance-died scenario where a sync-only observer would otherwise show
+	 * stale data.
 	 *
-	 * Requires `CONFIG SET notify-keyspace-events Ex` (or any flagset
-	 * including `K`/`E` and `x`) on the Redis server. If the psubscribe
-	 * fails the failure is logged once and the rest of the tracker keeps
-	 * working without the keyspace branch.
+	 * Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset
+	 * including `E` and `g`) on every Redis master. Redis accepts the
+	 * subscription whether or not notifications are enabled, so a missing
+	 * flag means the cleanup never fires. A psubscribe that fails (an ACL
+	 * refusal or a dropped connection) is reported and the rest of the
+	 * tracker keeps working without the keyspace branch.
 	 *
 	 * @default false
 	 */

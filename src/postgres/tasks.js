@@ -60,6 +60,15 @@ import { createTaskSql, encodeTaskPayload, MIN_TASK_PAYLOAD_BYTES } from './_tas
 import { withBreaker } from '../shared/breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import {
+	POSTGRES_TRACE_ATTRIBUTES,
+	carriedTraceContext,
+	explicitTraceContext,
+	liveTraceContext,
+	runTraceOperation
+} from '../shared/trace-context.js';
 
 export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 
@@ -71,6 +80,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {'pending' | 'running' | 'committed' | 'failed'} newStatus
  * @property {number} attempt - 0 for `pending` rows just inserted by `enqueue`, 1+ for `running` and terminal.
  * @property {string | null} requestId
+ * @property {{traceparent: string, tracestate?: string} | null} traceContext
  * @property {unknown} [result] - Present when `newStatus === 'committed'`.
  * @property {unknown} [error] - Present when `newStatus === 'failed'` (the deserialised handler error).
  */
@@ -94,6 +104,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern - still wants `postgres/notify`.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional Prometheus metrics registry.
+ * @property {object} [platform] - Default structural Platform trace surface for background dispatch and recovery.
  */
 
 /**
@@ -103,6 +114,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {string} fence - This attempt's fence UUID. Read-only.
  * @property {AbortSignal} signal - Aborts when the fence is lost (recovery loop took over).
  * @property {number} attempt - 1-based attempt counter.
+ * @property {{traceparent: string, tracestate?: string} | null} traceContext - Restored context for this attempt.
  */
 
 /**
@@ -122,6 +134,8 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @typedef {Object} TaskRunOptions
  * @property {unknown} [input] - JSON-serialisable input. Defaults to null.
  * @property {string} [idempotencyKey] - Stable retry key.
+ * @property {{traceparent: string, tracestate?: string} | null} [traceContext] - Explicit context; null (or invalid) opts the call out of tracing.
+ * @property {object} [platform] - Structural Platform request/tracing surface.
  */
 
 /**
@@ -252,6 +266,18 @@ export function createTaskRunner(client, options = {}) {
 		throw new Error('postgres tasks: onStateChange must be a function');
 	}
 	const onStateChange = options.onStateChange || null;
+	const defaultTracePlatform = options.platform ?? null;
+
+	// The trace surface and parent context for one run()/enqueue() call. An
+	// explicit null (or invalid) traceContext opts the call out of tracing:
+	// no Platform, so no producer or consumer operation, which under a
+	// provider would otherwise parent itself on the request's active context.
+	function producerTrace(runOptions) {
+		const explicit = explicitTraceContext(runOptions);
+		if (explicit === null) return { tracePlatform: null, traceContext: null };
+		const tracePlatform = runOptions.platform ?? defaultTracePlatform;
+		return { tracePlatform, traceContext: explicit ?? liveTraceContext(tracePlatform) };
+	}
 
 	const b = options.breaker;
 	const m = options.metrics;
@@ -311,15 +337,15 @@ export function createTaskRunner(client, options = {}) {
 			const result = onStateChange(event);
 			if (result && typeof result.then === 'function') {
 				result.catch((err) => {
-					console.warn('[postgres tasks] onStateChange listener rejected:', err?.message ?? err);
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_STATE_LISTENER, { error: err, attributes: { outcome: 'rejected' } });
 				});
 			}
 		} catch (err) {
-			console.warn('[postgres tasks] onStateChange listener threw:', err?.message ?? err);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_STATE_LISTENER, { error: err, attributes: { outcome: 'threw' } });
 		}
 	}
 
-	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId) {
+	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -356,14 +382,16 @@ export function createTaskRunner(client, options = {}) {
 		}
 
 		try {
-			return await reg.executor({
-				input,
-				idempotencyKey,
-				requestId: requestId ?? null,
-				fence,
-				signal: controller.signal,
-				attempt
-			});
+			return await runTraceOperation(tracePlatform, 'postgres.tasks.execute', 'consumer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => reg.executor({
+					input,
+					idempotencyKey,
+					requestId: requestId ?? null,
+					traceContext: currentTraceContext,
+					fence,
+					signal: controller.signal,
+					attempt
+				})
+			);
 		} finally {
 			if (heartbeatId) clearIntervalTimer(heartbeatId);
 			if (!controller.signal.aborted) controller.abort();
@@ -403,7 +431,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, awaitCanonical = false, initialEncodedInput) {
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -420,7 +448,19 @@ export function createTaskRunner(client, options = {}) {
 				if (fence === null || fence === undefined) {
 					// Entry path from run(): row does not exist yet.
 					fence = randomUuid();
-					await sql.insertAttempt(taskId, name, initialEncodedInput, idempotencyKey, fence, requestId, _taskUserId(input, name));
+					await runTraceOperation(tracePlatform, 'postgres.tasks.enqueue', 'producer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => {
+						traceContext = currentTraceContext;
+						return sql.insertAttempt(
+							taskId,
+							name,
+							initialEncodedInput,
+							idempotencyKey,
+							fence,
+							requestId,
+							_taskUserId(input, name),
+							traceContext
+						);
+					});
 					firedTransitionThisIter = 'insert';
 				} else if (attempt > startingAttempt) {
 					// Retry within the loop: rotate the fence and rearm the existing
@@ -457,15 +497,15 @@ export function createTaskRunner(client, options = {}) {
 			}
 
 			if (firedTransitionThisIter === 'insert') {
-				fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null });
+				fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
 			} else if (firedTransitionThisIter === 'rearm') {
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'running', attempt, requestId: requestId ?? null });
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
 			}
 
 			mRunStart?.inc({ name });
 
 			try {
-				result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId);
+				result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform);
 			} catch (err) {
 				handlerError = err;
 			}
@@ -498,7 +538,7 @@ export function createTaskRunner(client, options = {}) {
 						if (canonical) return canonical.result;
 						throw encodeError;
 					}
-					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseErrorSafe(encodeError, { includeCause: serializeErrorCause }) });
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(encodeError, { includeCause: serializeErrorCause }) });
 					mRunFail?.inc({ name });
 					throw encodeError;
 				}
@@ -519,7 +559,7 @@ export function createTaskRunner(client, options = {}) {
 					// canonical writer fires on its commit.
 					return result;
 				}
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, result });
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, traceContext, result });
 				mRunCommit?.inc({ name });
 				return result;
 			}
@@ -546,7 +586,7 @@ export function createTaskRunner(client, options = {}) {
 					// Background caller only: outcome not yet terminal; discarded.
 					return result;
 				}
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, error: serialiseErrorSafe(handlerError, { includeCause: serializeErrorCause }) });
+				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(handlerError, { includeCause: serializeErrorCause }) });
 				mRunFail?.inc({ name });
 				throw handlerError;
 			}
@@ -559,6 +599,18 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
+	// A sweep that throws is otherwise visible only as a breaker failure, and
+	// with no breaker not at all: a table managed with autoMigrate: false that
+	// lacks a column this release reads would stop dispatch on every tick with
+	// nothing in the log. One report per failure streak per sweep; a success
+	// re-arms it.
+	const sweepFailing = { dispatch: false, recovery: false, cleanup: false };
+	function reportSweepFailure(sweep, err) {
+		if (sweepFailing[sweep]) return;
+		sweepFailing[sweep] = true;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_SWEEP, { error: err, attributes: { sweep } });
+	}
+
 	async function recoveryTick() {
 		if (recoveryRunning || destroyed) return;
 		if (b && !b.isHealthy) return;
@@ -567,7 +619,9 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 			const reclaimed = await sql.reclaimStuck(recoveryBatchSize);
 			b?.success();
+			sweepFailing.recovery = false;
 			for (const row of reclaimed) {
+				const traceContext = carriedTraceContext(row);
 				// reclaimStuck transitioned status from 'running' (with stale
 				// fence) to 'running' (with fresh fence + incremented
 				// attempts). Fire the state-change so observers see the
@@ -578,7 +632,8 @@ export function createTaskRunner(client, options = {}) {
 					oldStatus: 'running',
 					newStatus: 'running',
 					attempt: row.attempts,
-					requestId: row.request_id ?? null
+					requestId: row.request_id ?? null,
+					traceContext
 				});
 				const reg = handlers.get(row.name);
 				if (!reg) {
@@ -592,12 +647,23 @@ export function createTaskRunner(client, options = {}) {
 				mRecovered?.inc({ name: row.name });
 				// Run in the background; do not await all reclaimed rows
 				// serially or one slow handler stalls the sweep.
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence, row.request_id).catch(() => {
+				runRegisteredTask(
+					row.name,
+					row.input,
+					row.idempotency_key,
+					row.id,
+					row.attempts,
+					row.fence,
+					row.request_id,
+					traceContext,
+					defaultTracePlatform
+				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}
 		} catch (err) {
 			b?.failure(err);
+			reportSweepFailure('recovery', err);
 		} finally {
 			recoveryRunning = false;
 		}
@@ -611,7 +677,9 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 			const claimed = await sql.claimPending(dispatchBatchSize);
 			b?.success();
+			sweepFailing.dispatch = false;
 			for (const row of claimed) {
+				const traceContext = carriedTraceContext(row);
 				// claimPending transitioned status from 'pending' to 'running'
 				// in the CTE update. Fire state-change for every claimed row
 				// so observers see the dispatch even when no handler is
@@ -622,7 +690,8 @@ export function createTaskRunner(client, options = {}) {
 					oldStatus: 'pending',
 					newStatus: 'running',
 					attempt: row.attempts,
-					requestId: row.request_id ?? null
+					requestId: row.request_id ?? null,
+					traceContext
 				});
 				if (!handlers.has(row.name)) {
 					// Unknown handler in this process.  Leave the row in
@@ -632,12 +701,23 @@ export function createTaskRunner(client, options = {}) {
 					continue;
 				}
 				mDispatched?.inc({ name: row.name });
-				runRegisteredTask(row.name, row.input, row.idempotency_key, row.id, row.attempts, row.fence, row.request_id).catch(() => {
+				runRegisteredTask(
+					row.name,
+					row.input,
+					row.idempotency_key,
+					row.id,
+					row.attempts,
+					row.fence,
+					row.request_id,
+					traceContext,
+					defaultTracePlatform
+				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
 			}
 		} catch (err) {
 			b?.failure(err);
+			reportSweepFailure('dispatch', err);
 		} finally {
 			dispatchRunning = false;
 		}
@@ -651,8 +731,10 @@ export function createTaskRunner(client, options = {}) {
 			await sql.ensureTable();
 			await sql.deleteOldTerminal();
 			b?.success();
+			sweepFailing.cleanup = false;
 		} catch (err) {
 			b?.failure(err);
+			reportSweepFailure('cleanup', err);
 		} finally {
 			cleanupRunning = false;
 		}
@@ -759,7 +841,8 @@ export function createTaskRunner(client, options = {}) {
 			if (idempotencyKey !== undefined && idempotencyKey.length > 256) {
 				throw new Error('postgres tasks: idempotencyKey must be at most 256 characters');
 			}
-			const requestId = resolveRequestId(runOptions);
+			const { tracePlatform, traceContext } = producerTrace(runOptions);
+			const requestId = resolveRequestId(runOptions, runOptions.platform ?? defaultTracePlatform);
 
 			await sql.ensureTable();
 
@@ -771,7 +854,7 @@ export function createTaskRunner(client, options = {}) {
 				const slot = await idempotency.acquire(cacheKey);
 				if (slot.acquired) {
 					try {
-						const result = await runWithoutCache(name, input, encodedInput, idempotencyKey, requestId);
+						const result = await runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform);
 						await slot.commit(result);
 						return result;
 					} catch (err) {
@@ -786,7 +869,7 @@ export function createTaskRunner(client, options = {}) {
 				return slot.result;
 			}
 
-			return runWithoutCache(name, input, encodedInput, idempotencyKey, requestId);
+			return runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform);
 		},
 
 		async enqueue(name, runOptions = {}) {
@@ -811,19 +894,34 @@ export function createTaskRunner(client, options = {}) {
 			if (idempotencyKey !== undefined && idempotencyKey.length > 256) {
 				throw new Error('postgres tasks: idempotencyKey must be at most 256 characters');
 			}
-			const requestId = resolveRequestId(runOptions);
+			const producer = producerTrace(runOptions);
+			const tracePlatform = producer.tracePlatform;
+			let traceContext = producer.traceContext;
+			const requestId = resolveRequestId(runOptions, runOptions.platform ?? defaultTracePlatform);
 
 			await sql.ensureTable();
 
 			const taskId = randomUuid();
-			await withBreaker(b, () => sql.insertPending(taskId, name, encodedInput, idempotencyKey, requestId, _taskUserId(input, name)));
+			await runTraceOperation(tracePlatform, 'postgres.tasks.enqueue', 'producer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => {
+				traceContext = currentTraceContext;
+				return withBreaker(b, () => sql.insertPending(
+					taskId,
+					name,
+					encodedInput,
+					idempotencyKey,
+					requestId,
+					_taskUserId(input, name),
+					traceContext
+				));
+			});
 			fireStateChange({
 				taskId,
 				name,
 				oldStatus: null,
 				newStatus: 'pending',
 				attempt: 0,
-				requestId: requestId ?? null
+				requestId: requestId ?? null,
+				traceContext
 			});
 			mEnqueued?.inc({ name });
 			return taskId;
@@ -965,12 +1063,12 @@ export function createTaskRunner(client, options = {}) {
 		}
 	};
 
-	function runWithoutCache(name, input, encodedInput, idempotencyKey, requestId) {
+	function runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform) {
 		const taskId = randomUuid();
 		// Foreground caller: must report the CANONICAL outcome (and the idempotency
 		// store caches whatever this returns), so poll the durable row on a lost
 		// fence rather than surfacing the stale local attempt.
-		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, true, encodedInput);
+		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, traceContext, tracePlatform, true, encodedInput);
 	}
 }
 
@@ -994,6 +1092,7 @@ function shapeTaskRow(row) {
 		error: row.error ?? null,
 		attempts: row.attempts,
 		requestId: row.request_id ?? null,
+		traceContext: carriedTraceContext(row),
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 		fenceExpiresAt: row.fence_expires_at
@@ -1003,11 +1102,11 @@ function shapeTaskRow(row) {
 // Resolve a request id from run / enqueue options. Explicit `requestId`
 // takes precedence over the platform-extracted one so callers can override
 // when running outside an HTTP/WS request context (cron, background sweep).
-function resolveRequestId(opts) {
+function resolveRequestId(opts, platform) {
 	if (typeof opts.requestId === 'string' && opts.requestId.length > 0) {
 		return opts.requestId;
 	}
-	const fromPlatform = opts.platform && opts.platform.requestId;
+	const fromPlatform = platform && platform.requestId;
 	if (typeof fromPlatform === 'string' && fromPlatform.length > 0) {
 		return fromPlatform;
 	}

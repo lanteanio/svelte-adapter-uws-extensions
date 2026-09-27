@@ -30,6 +30,8 @@ import { assert } from '../shared/assert.js';
 import { randomBytes, wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { MAX_AGGREGATOR_REMOTE_INSTANCES, MAX_REMOTE_SLICE_ENTRIES } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -229,7 +231,7 @@ export function createPublishRateAggregator(client, options = {}) {
 
 		subscriber = client.duplicate({ enableReadyCheck: false });
 		subscriber.on('error', (err) => {
-			console.error('[publish-rate] subscriber error:', err.message);
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBLISH_RATE_SUBSCRIBER, { error: err });
 		});
 		subscriber.on('message', (ch, raw) => {
 			if (ch !== channel) return;
@@ -275,6 +277,16 @@ export function createPublishRateAggregator(client, options = {}) {
 				// delete-then-set below), so the candidate is the first key -
 				// no scan, which at a 10,000-entry bound would itself be a
 				// ~50us-per-envelope CPU amplifier.
+				//
+				// Reported on the first arrival at the bound, whichever way it
+				// goes: a full table of live siblings drops every newcomer, and
+				// that is when the aggregate is blind.
+				if (!remoteInstancesWarnFired) {
+					remoteInstancesWarnFired = true;
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBLISH_RATE_REMOTE_CAP, {
+						attributes: { maxRemoteInstances: MAX_AGGREGATOR_REMOTE_INSTANCES }
+					});
+				}
 				const oldestId = remoteSlices.keys().next().value;
 				const oldest = oldestId === undefined ? undefined : remoteSlices.get(oldestId);
 				if (!oldest || (now - oldest.ts) <= staleAfter) {
@@ -284,17 +296,6 @@ export function createPublishRateAggregator(client, options = {}) {
 				remoteSlices.delete(oldestId);
 				remoteSubs.delete(oldestId);
 				mRemoteEvicted?.inc();
-				if (!remoteInstancesWarnFired) {
-					remoteInstancesWarnFired = true;
-					console.warn(
-						'[publish-rate] aggregator is tracking ' + MAX_AGGREGATOR_REMOTE_INSTANCES +
-						' sibling instances; stale entries are now evicted to admit new ones and ' +
-						'envelopes past the bound are dropped. Cluster sizes past this threshold ' +
-						'typically indicate a deployment misconfig or a stale-instance leak - see the ' +
-						'cluster_publish_rate_remote_evicted_total and _remote_dropped_total counters.\n' +
-						'  See: https://svti.me/publish-rate-aggregator'
-					);
-				}
 			}
 			mReceived?.inc();
 			// Delete-then-set keeps the Map in least-recently-refreshed order,
@@ -512,7 +513,7 @@ export function createPublishRateAggregator(client, options = {}) {
 				try {
 					sub.callback(crossings);
 				} catch (err) {
-					console.error('[publish-rate] onPublishRate callback threw:', err?.message ?? err);
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBLISH_RATE_LISTENER, { error: err });
 				}
 			}
 		}

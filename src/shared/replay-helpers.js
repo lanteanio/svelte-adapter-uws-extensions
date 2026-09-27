@@ -14,6 +14,8 @@ import { redactConnectionUrl } from './sensitive.js';
 import { MAX_RESUME_TOPICS, MAX_STORE_PAYLOAD_BYTES } from './caps.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from './replay-gate.js';
 import { now } from './runtime.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from './diagnostic.js';
 
 /** In-flight authorization checks per resume frame. */
 const RESUME_AUTH_CONCURRENCY = 32;
@@ -410,11 +412,9 @@ export function createResumeHook({ currentEpochs, replay, authorize = checkRepla
 			const nowMs = now();
 			if (nowMs - truncationWarnedAt >= RESUME_TRUNCATION_WARN_INTERVAL_MS) {
 				truncationWarnedAt = nowMs;
-				console.warn(
-					`replay resume: more than ${MAX_RESUME_TOPICS} topics presented, ${MAX_RESUME_TOPICS} accepted ` +
-					'(MAX_RESUME_TOPICS); the remainder were not inspected or resumed. Further occurrences on this ' +
-					`store are reported at most once per ${RESUME_TRUNCATION_WARN_INTERVAL_MS}ms.`
-				);
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.RESUME_TOPICS_TRUNCATED, {
+					attributes: { accepted: MAX_RESUME_TOPICS, intervalMs: RESUME_TRUNCATION_WARN_INTERVAL_MS }
+				});
 			}
 		}
 		// Authorize BEFORE any per-topic work. Without this, an unauthorized

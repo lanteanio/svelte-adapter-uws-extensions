@@ -63,6 +63,8 @@ import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator, isValidBusTopic } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
 import { isCluster, keySlot } from '../shared/cluster.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_COMMAND = 'cmd';
@@ -142,6 +144,8 @@ export function createSmoothCluster(client, options = {}) {
 	let subscriber = null;
 	/** @type {Promise<any> | null} */
 	let subscriberReady = null;
+	// One report per failure streak: every relay retries a failed subscribe.
+	let subscribeFailing = false;
 	let destroyed = false;
 
 	const onCluster = isCluster(redis);
@@ -190,7 +194,7 @@ export function createSmoothCluster(client, options = {}) {
 				if (masters.length) {
 					if (!degradedPubWarned) {
 						degradedPubWarned = true;
-						console.warn('[redis/smooth] relay channel owner unresolved (cluster topology in flux); pinning publishes to a fallback master to keep broadcast order.');
+						emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SMOOTH_OWNER_FALLBACK);
 					}
 					return masters[0];
 				}
@@ -227,6 +231,7 @@ export function createSmoothCluster(client, options = {}) {
 		if (subscriber || destroyed) return;
 		const sub = client.duplicate({ enableReadyCheck: false });
 		subscriber = sub;
+		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SMOOTH_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
 			if (!validator.acceptRaw(message)) return; // size cap before parse
@@ -280,11 +285,15 @@ export function createSmoothCluster(client, options = {}) {
 				}
 			}
 		});
-		subscriberReady = sub.subscribe(channel).catch((err) => {
+		subscriberReady = sub.subscribe(channel).then(() => { subscribeFailing = false; }, (err) => {
 			// Failed subscribe: tear down so the next relay re-subscribes fresh.
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
 			if (subscriber === sub) { subscriber = null; subscriberReady = null; }
 			if (typeof options.onError === 'function') { try { options.onError(err); } catch { /* host handler */ } }
+			if (!subscribeFailing) {
+				subscribeFailing = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SMOOTH_SUBSCRIBE, { error: err });
+			}
 		});
 	}
 

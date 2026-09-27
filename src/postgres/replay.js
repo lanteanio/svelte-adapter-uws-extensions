@@ -41,6 +41,8 @@ import { withTransaction } from '../shared/pg-tx.js';
 import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 export { ReplayStorageError, ReplaySerializationError };
 
 /**
@@ -332,12 +334,10 @@ export function createReplay(client, options = {}) {
 	function warnStorageFallbackOnce(platform, err) {
 		if (warnedStorageFallback) return;
 		warnedStorageFallback = true;
-		console.warn(
-			'[postgres replay] storage failed; falling back to local publish, durability degraded' +
-			(platform?.requestId ? ' (requestId=' + platform.requestId + ')' : '') +
-			'. Further occurrences are suppressed; see the replay_storage_fallbacks_total metric. Cause: ' +
-			(err?.message ?? err)
-		);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_STORAGE_FALLBACK, {
+			error: err,
+			attributes: platform?.requestId ? { requestId: platform.requestId } : null
+		});
 	}
 
 	// Trim by sequence number: seqs are contiguous per topic (1, 2, 3, ...) so

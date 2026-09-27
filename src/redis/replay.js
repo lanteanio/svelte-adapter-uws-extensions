@@ -32,6 +32,8 @@ import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { decodeSortedSetMember } from '../shared/replay-envelope.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from '../shared/diagnostic.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
 
@@ -282,12 +284,12 @@ export function createReplay(client, options = {}) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
 					if (!warnedStorageFallback) {
 						warnedStorageFallback = true;
-						console.warn(
-							'[redis replay] storage failed; falling back to local publish, durability degraded' +
-							(platform?.requestId ? ' (requestId=' + platform.requestId + ')' : '') +
-							'. Further occurrences are suppressed; see the replay_storage_fallbacks_total metric. Cause: ' +
-							(err?.message ?? err)
-						);
+						emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STORAGE_FALLBACK, {
+							error: err,
+							// Each key embeds the topic; cut them should the error repeat one.
+							redact: [sk, bk, ek, topic],
+							attributes: platform?.requestId ? { requestId: platform.requestId } : null
+						});
 					}
 					return platform.publish(topic, event, data);
 				}

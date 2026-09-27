@@ -91,7 +91,7 @@ describe('createPgClient', () => {
 
 		errorHandler(new Error('connect ECONNREFUSED postgres://app:hunter2@db.internal:5432/main'));
 		const logged = errSpy.mock.calls[0].join(' ');
-		expect(logged).toContain('postgres: idle client error');
+		expect(logged).toContain('event=postgres.pool.idle-client.failed');
 		expect(logged).toContain('postgres://app:***@db.internal:5432/main');
 		expect(logged).not.toContain('hunter2');
 		errSpy.mockRestore();
@@ -105,7 +105,11 @@ describe('createPgClient', () => {
 
 		// Object without a string message - the handler falls back to String(err).
 		errorHandler({ code: 'ECONNRESET' });
-		expect(errSpy.mock.calls[0][0]).toBe('postgres: idle client error');
+		const line = errSpy.mock.calls[0][0];
+		expect(line).toContain('event=postgres.pool.idle-client.failed');
+		expect(JSON.parse(line.slice(line.indexOf('{'))).attributes.error).toEqual({
+			name: 'Error', code: 'ECONNRESET', message: '[object Object]'
+		});
 		errSpy.mockRestore();
 	});
 });
