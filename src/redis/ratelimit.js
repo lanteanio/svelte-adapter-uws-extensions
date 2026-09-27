@@ -61,7 +61,7 @@ const FLOOR_MAX_ENTRIES = 10000;
  *   the Lua: max(1, floor(maxPoints * scale)) with a mid-window clamp.
  * @returns {FloorBucket}
  */
-export function createWindowFloor(maxPoints, interval, blockDuration, getScale) {
+function createWindowFloor(maxPoints, interval, blockDuration, getScale) {
 	/** @type {Map<string, { points: number, resetAt: number, bannedUntil: number }>} */
 	const buckets = new Map();
 	function effMaxNow() {
@@ -132,19 +132,6 @@ export function createWindowFloor(maxPoints, interval, blockDuration, getScale) 
 }
 
 /**
- * Backward-compatible alias for the fixed-window floor's consume function (the
- * shape callers imported before the peek-capable floor landed).
- * @param {number} maxPoints
- * @param {number} interval
- * @param {number} blockDuration
- * @param {(() => number) | null} [getScale]
- * @returns {(key: string, cost: number) => ConsumeResult}
- */
-export function createLocalFloorBucket(maxPoints, interval, blockDuration, getScale) {
-	return createWindowFloor(maxPoints, interval, blockDuration, getScale).consume;
-}
-
-/**
  * In-process sliding-window-counter floor mirroring SLIDING_SCRIPT. Same
  * effective-budget math and window roll as the Lua, evaluated on the exact
  * wall-clock seam.
@@ -155,7 +142,7 @@ export function createLocalFloorBucket(maxPoints, interval, blockDuration, getSc
  * @param {(() => number) | null} [getScale]
  * @returns {FloorBucket}
  */
-export function createSlidingFloor(maxPoints, interval, blockDuration, getScale) {
+function createSlidingFloor(maxPoints, interval, blockDuration, getScale) {
 	/** @type {Map<string, { curr: number, prev: number, windowStart: number, bannedUntil: number }>} */
 	const buckets = new Map();
 	function effMaxNow() {
@@ -253,7 +240,7 @@ export function createSlidingFloor(maxPoints, interval, blockDuration, getScale)
  * @param {(() => number) | null} [getScale]
  * @returns {FloorBucket}
  */
-export function createGcraFloor(maxPoints, interval, blockDuration, getScale) {
+function createGcraFloor(maxPoints, interval, blockDuration, getScale) {
 	/** @type {Map<string, { tat: number, bannedUntil: number }>} */
 	const buckets = new Map();
 	function effMaxNow() {

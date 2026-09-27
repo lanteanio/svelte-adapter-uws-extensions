@@ -67,3 +67,10 @@ export function getAssertionCounters(): Map<string, number>;
  * twice replaces the bound counter (most-recent registry wins).
  */
 export function wireAssertionMetrics(metrics: MetricsRegistry): void;
+
+/**
+ * Test-only: clear the violation counters, unbind the Prometheus counter, and
+ * restore the default termination sink, so each test starts from zero. Never
+ * call from production code.
+ */
+export function _resetCountersForTesting(): void;

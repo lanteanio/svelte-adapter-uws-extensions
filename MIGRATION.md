@@ -95,6 +95,21 @@ reported the difference. `NaN` is the sharp one: it *is* a number, and every
 reading the value from an environment variable, `Number(process.env.X)` yields
 `NaN` for an unset one - use a fallback.
 
+### `redis/ratelimit` no longer exports its in-process floor helpers
+
+**Symptom.** `SyntaxError: The requested module
+'svelte-adapter-uws-extensions/redis/ratelimit' does not provide an export
+named 'createWindowFloor'` (or `createSlidingFloor`, `createGcraFloor`,
+`createLocalFloorBucket`) when the importing module loads.
+
+**Why.** These were implementation helpers of the rate limiter's storage-outage
+floor. They were never declared in the type definitions or documented, and the
+type gate now fails any runtime export its declaration omits.
+
+**Action.** Configure the floor through the limiter instead:
+`createRateLimit(client, { ..., localFloorOnStorageFailure: true })` (or
+`{ points, interval }` for a tighter per-instance budget).
+
 ## 2. Needs an operational step
 
 ### Jobs and tasks tables gain trace columns

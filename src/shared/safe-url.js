@@ -10,11 +10,11 @@
  * address-level `classifyAddress` / `isAddressSafe`, the blocked ranges, and the
  * `strict` / `allowlist` / `off` modes).
  *
- * The `.d.ts` re-exports the whole surface via `export *`, so the runtime named
- * re-export below MUST list every symbol or it resolves to `undefined` at
- * runtime while still type-checking.
+ * Both this module and its `.d.ts` re-export the whole surface with
+ * `export *`, so a symbol the adapter adds is present at runtime exactly when
+ * it type-checks.
  *
  * @module svelte-adapter-uws-extensions/shared/safe-url
  */
 
-export { isSafeUrl, checkUrl, checkUrlResolved, classifyAddress, isAddressSafe } from 'svelte-adapter-uws/safe-url';
+export * from 'svelte-adapter-uws/safe-url';
