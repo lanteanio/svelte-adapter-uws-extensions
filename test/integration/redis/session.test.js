@@ -95,17 +95,17 @@ describe('redis distributed session (integration)', () => {
 			await sessions.set('tok', { v: 1 });
 
 			// Burn some of the original TTL on Redis's OWN clock, where the
-			// PTTL decays - drift-immune, so `before - after > 0` below cannot
-			// flake on a stalled Docker VM clock.
+			// PTTL decays, so a refresh would visibly push it back up.
 			await waitRedisMs(client, 120);
 			const before = await client.redis.pttl(client.key('sess:tok'));
 			await sessions.get('tok');
 			const after = await client.redis.pttl(client.key('sess:tok'));
 
-			// after must not be larger than before; with refreshOnGet=true it
-			// would be back near 30_000. Slack for clock granularity.
+			// With refreshOnGet=true the TTL would be back near 30_000. The two
+			// reads can land in the same millisecond, so equal is allowed; slack
+			// for clock granularity.
 			expect(after).toBeLessThanOrEqual(before + 5);
-			expect(before - after).toBeGreaterThan(0);
+			expect(after).toBeLessThan(30_000 - 100);
 		});
 
 		it('touch returns true and refreshes PEXPIRE while the entry exists', async () => {
