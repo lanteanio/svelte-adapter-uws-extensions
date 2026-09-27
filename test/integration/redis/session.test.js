@@ -106,6 +106,7 @@ describe('redis distributed session (integration)', () => {
 			// for clock granularity.
 			expect(after).toBeLessThanOrEqual(before + 5);
 			expect(after).toBeLessThan(30_000 - 100);
+			expect(after).toBeGreaterThan(0);
 		});
 
 		it('touch returns true and refreshes PEXPIRE while the entry exists', async () => {

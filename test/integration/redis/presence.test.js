@@ -420,9 +420,9 @@ describeIntegration('redis presence (integration)', () => {
 
 	describe('keyspace notification setting check', () => {
 		it('reports a server whose flags cannot deliver the deletion the cleanup listens for', async () => {
-			await setBackendConfig(client, 'notify-keyspace-events', 'Kg');
 			const sink = captureRegistered();
 			try {
+				await setBackendConfig(client, 'notify-keyspace-events', 'Kg');
 				const presence = makeTracker({ keyspaceNotifications: true });
 				await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
 				await wait(200);
