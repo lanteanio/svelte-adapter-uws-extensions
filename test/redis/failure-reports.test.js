@@ -393,12 +393,16 @@ function fakeCluster() {
 		const c = {
 			refuse: false,
 			hang: false,
+			attempts: 0,
+			subscribed: new Set(),
 			on(event, fn) { listeners.set(event, fn); return c; },
 			removeAllListeners() { listeners.clear(); },
 			emit(event, ...args) { listeners.get(event)?.(...args); },
 			async ssubscribe(channel) {
+				c.attempts++;
 				if (c.hang) return new Promise(() => {});
 				if (c.refuse) throw noperm('channel');
+				c.subscribed.add(channel);
 			},
 			async sunsubscribe() {},
 			async psubscribe() { if (c.refuse) throw noperm('channel'); },
@@ -420,7 +424,8 @@ function fakeCluster() {
 			nodes: () => masters,
 			cluster: async () => {
 				if (slotsDown) throw new Error('CLUSTERDOWN The cluster is down');
-				return [[0, 16383, ['127.0.0.1', 7000, owner]]];
+				// A null owner leaves every slot out of the map.
+				return owner === null ? [] : [[0, 16383, ['127.0.0.1', 7000, owner]]];
 			},
 			spublish: async () => 0,
 			on() {}
@@ -536,6 +541,87 @@ describe('cluster-only failure paths', () => {
 
 		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.SHARDED_SUBSCRIBER, EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE]);
 		expect(sink.records[1].attributes.error).toEqual({ name: 'Error', code: null, message: 'CLUSTERDOWN The cluster is down' });
+		await bus.deactivate();
+	});
+
+	it('retries a channel its new owner refused until it subscribes', async () => {
+		const { cluster, bus } = await followedCluster();
+		// Every retry delay elapses at once; the reconcile debounce keeps its 0.
+		setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
+		cluster.setOwner('node-b');
+		const nodeB = cluster.conns.get('node-b');
+		nodeB.refuse = true;
+		sink = captureRegistered();
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle(60);
+		expect(nodeB.attempts).toBeGreaterThan(4);
+		expect(sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE)).toHaveLength(1);
+
+		nodeB.refuse = false;
+		await settle(60);
+		expect(nodeB.subscribed.has(CHANNEL)).toBe(true);
+		const attempts = nodeB.attempts;
+		await settle(30);
+		expect(nodeB.attempts).toBe(attempts);
+		await bus.deactivate();
+	});
+
+	it('does not wait out a pending retry when a subscriber error arrives', async () => {
+		const { cluster, bus } = await followedCluster();
+		cluster.setOwner('node-b');
+		const nodeB = cluster.conns.get('node-b');
+		nodeB.refuse = true;
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		// The first retry is a second away; the next error reconciles now.
+		nodeB.refuse = false;
+		nodeB.emit('error', new Error('MOVED'));
+		await settle();
+		expect(nodeB.subscribed.has(CHANNEL)).toBe(true);
+		await bus.deactivate();
+	});
+
+	it('retries a channel whose slot has no owner in the map', async () => {
+		const { cluster, bus } = await followedCluster();
+		setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
+		cluster.setOwner(null);
+		sink = captureRegistered();
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle(40);
+		const record = sink.records.find((r) => r.event === 'redis.sharded-pubsub.channel-reconcile.failed');
+		expect(record.attributes.error.message).toBe('sharded bus: no owning node for slot ' + keySlot(CHANNEL));
+		cluster.setOwner('node-b');
+		await settle(40);
+		expect(cluster.conns.get('node-b').subscribed.has(CHANNEL)).toBe(true);
+		await bus.deactivate();
+	});
+
+	it('stops retrying once the bus is deactivated', async () => {
+		const { cluster, bus } = await followedCluster();
+		setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
+		cluster.setOwner('node-b');
+		const nodeB = cluster.conns.get('node-b');
+		nodeB.refuse = true;
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle(20);
+		await bus.deactivate();
+		const attempts = nodeB.attempts;
+		await settle(30);
+		expect(nodeB.attempts).toBe(attempts);
+	});
+
+	it('retries a reconciliation whose slot map could not be read', async () => {
+		const { cluster, bus } = await followedCluster();
+		setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
+		cluster.setOwner('node-b');
+		cluster.setSlotsDown(true);
+		sink = captureRegistered();
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle(40);
+		expect(sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE)).toHaveLength(1);
+		cluster.setSlotsDown(false);
+		await settle(40);
+		expect(cluster.conns.get('node-b').subscribed.has(CHANNEL)).toBe(true);
 		await bus.deactivate();
 	});
 

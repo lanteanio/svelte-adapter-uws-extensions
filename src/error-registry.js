@@ -543,10 +543,10 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE,
 		event: 'redis.sharded-pubsub.channel-reconcile.failed', component: 'runtime.redis.sharded-pubsub', severity: 'error',
 		problemPrefix: 'A sharded pub/sub channel could not be re-subscribed on its new owner.',
-		cause: 'SSUBSCRIBE on the channel\'s new slot owner threw or timed out after a reshard. The channel is not logged, since it is built from a topic; the slot attribute identifies the first failed one and the failed attribute counts them.',
-		consequence: 'Messages on those channels are missed on this instance until a later reconciliation re-subscribes them; the other moved channels were handled. Reported once per failure streak; a reconciliation that completes re-arms it.',
-		automaticRecovery: 'Only on the next subscriber error. Reconciliation runs when a shard subscriber connection reports an error, not on a timer, so on a stable cluster the channel stays unsubscribed.',
-		nextAction: 'Check the health of the node that now owns the slot attribute (CLUSTER SHARDS or CLUSTER SLOTS). If the cluster is stable again, restart the instance to restore delivery on that channel.',
+		cause: 'SSUBSCRIBE on the channel\'s new slot owner threw or timed out after a reshard, or the slot had no owner in the cluster\'s slot map. The channel is not logged, since it is built from a topic; the slot attribute identifies the first failed one and the failed attribute counts them.',
+		consequence: 'Messages on those channels are missed on this instance until a retry re-subscribes them; the other moved channels were handled. Reported once per failure streak; a reconciliation that completes re-arms it.',
+		automaticRecovery: 'Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until every moved channel is subscribed on its owner. A subscriber error retries at once.',
+		nextAction: 'Check the health of the node that owns the slot attribute (CLUSTER SHARDS or CLUSTER SLOTS), and for NOPERM the Redis user\'s channel permissions. Delivery resumes on its own once the node accepts the subscription.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-channel-reconcile'
 	}),
 	direct({
@@ -555,8 +555,8 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		problemPrefix: 'Sharded pub/sub reconciliation could not refresh slot ownership.',
 		cause: 'Reading CLUSTER SLOTS, or a master\'s CLUSTER MYID, threw while reconciling after a subscriber error.',
 		consequence: 'Channels that moved during the reshard stay unsubscribed on this instance until a reconciliation succeeds. Reported once per failure streak; a reconciliation that completes re-arms it.',
-		automaticRecovery: 'Only on the next subscriber error. Reconciliation is not retried on a timer, so on a stable cluster the moved channels stay unsubscribed.',
-		nextAction: 'Check cluster health and run CLUSTER SLOTS from the instance. If the cluster is stable again and delivery has not resumed, restart the instance.',
+		automaticRecovery: 'Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until it completes. A subscriber error retries at once.',
+		nextAction: 'Check cluster health and run CLUSTER SLOTS from the instance; delivery resumes on its own once the slot map can be read.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-reconcile'
 	}),
 	direct({

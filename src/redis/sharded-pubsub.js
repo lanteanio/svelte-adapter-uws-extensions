@@ -50,6 +50,14 @@ import {
 // after a topology refresh.
 const SHARD_SUBSCRIBE_TIMEOUT_MS = 5000;
 
+// A reconciliation that leaves a wanted channel unsubscribed (its new owner
+// refused it, timed out, or the slot map could not be read) is retried on its
+// own: on a stable cluster no further subscriber error would ever trigger one.
+// The delay doubles from the first to the second bound; a subscriber error
+// still reconciles at once.
+const RECONCILE_RETRY_FIRST_MS = 1000;
+const RECONCILE_RETRY_MAX_MS = 30000;
+
 /**
  * @typedef {Object} ShardedBusOptions
  * @property {string} [channelPrefix='uws:sharded:'] - Prefix for sharded pub/sub channels.
@@ -148,8 +156,11 @@ export function createShardedBus(client, options = {}) {
 	const subscribedChannels = new Set();
 	/** @type {Map<string, string>} channel -> node id it is currently ssubscribed on (cluster) */
 	const channelNode = new Map();
-	/** @type {ReturnType<typeof setTimeout> | null} debounce for the reshard reconcile sweep */
+	/** @type {ReturnType<typeof setTimeout> | null} pending reconcile: the debounce after a subscriber error, or a retry */
 	let reconcileTimer = null;
+	let reconcileDueAt = 0;
+	// Delay of the next retry; 0 while the last reconciliation completed.
+	let reconcileRetryMs = 0;
 	// One report per failure streak for each kind of failure, re-armed by a
 	// reconciliation that completes: a channel its new owner refuses fails
 	// again on every later reconciliation.
@@ -508,23 +519,24 @@ export function createShardedBus(client, options = {}) {
 	// makes the source master drop that slot's shard subscriptions, so on a
 	// subscriber error this refreshes the topology and re-subscribes the channels
 	// whose owner moved. Debounced (a reshard fans out errors across connections)
-	// and refreshes first, so resolution is never stale.
+	// and refreshes first, so resolution is never stale. Resolves false when a
+	// wanted channel is left unsubscribed, which schedules a retry.
 	async function subReconcile() {
-		if (!isCluster(client.redis) || !subReady) return;
+		if (!isCluster(client.redis) || !subReady) return true;
 		try {
 			await subRefreshTopology();
 		} catch (err) {
-			// Nothing retries on a timer: the next subscriber error reschedules.
 			if (!refreshFailing) {
 				refreshFailing = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err });
 			}
-			return;
+			return false;
 		}
 		const moved = [];
 		for (const channel of subscribedChannels) {
 			const ownerId = ownerIdForSlot(keySlot(channel));
-			if (ownerId !== null && channelNode.get(channel) !== ownerId) moved.push(channel);
+			// A slot with no owner in the map is retried like a refused one.
+			if (ownerId === null || channelNode.get(channel) !== ownerId) moved.push(channel);
 		}
 		// Re-subscribe the moved channels in parallel for fast recovery; the
 		// topology was refreshed above, so none resolves a stale owner. One
@@ -543,9 +555,9 @@ export function createShardedBus(client, options = {}) {
 		if (first === null) {
 			refreshFailing = false;
 			channelsFailing = false;
-			return;
+			return true;
 		}
-		if (channelsFailing) return;
+		if (channelsFailing) return false;
 		channelsFailing = true;
 		// The channel is built from a topic; cut it should the error repeat it.
 		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE, {
@@ -553,14 +565,31 @@ export function createShardedBus(client, options = {}) {
 			redact: [first.channel],
 			attributes: { slot: keySlot(first.channel), failed }
 		});
+		return false;
 	}
 
-	function scheduleReconcile() {
-		if (reconcileTimer !== null) return;
+	function scheduleReconcile(delayMs = 0) {
+		const dueAt = monotonicNow() + delayMs;
+		if (reconcileTimer !== null) {
+			// A subscriber error does not wait out a pending retry's backoff.
+			if (dueAt >= reconcileDueAt) return;
+			clearTimer(reconcileTimer);
+		}
+		reconcileDueAt = dueAt;
 		reconcileTimer = setTimer(() => {
 			reconcileTimer = null;
-			subReconcile().catch((err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err }));
-		}, 0);
+			subReconcile().then((complete) => {
+				if (complete) {
+					reconcileRetryMs = 0;
+					return;
+				}
+				if (!subReady) return;
+				reconcileRetryMs = reconcileRetryMs === 0
+					? RECONCILE_RETRY_FIRST_MS
+					: Math.min(reconcileRetryMs * 2, RECONCILE_RETRY_MAX_MS);
+				scheduleReconcile(reconcileRetryMs);
+			}, (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err }));
+		}, delayMs);
 		if (reconcileTimer.unref) reconcileTimer.unref();
 	}
 
@@ -610,6 +639,7 @@ export function createShardedBus(client, options = {}) {
 		}
 		refreshFailing = false;
 		channelsFailing = false;
+		reconcileRetryMs = 0;
 		const all = isCluster(client.redis)
 			? [...subByNodeId.values()]
 			: (subStandalone ? [subStandalone] : []);
