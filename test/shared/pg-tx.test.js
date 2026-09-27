@@ -144,6 +144,30 @@ describe('shared/pg-tx', () => {
 		expect(conn.listenerCount('error')).toBe(0);
 	});
 
+	it('reports a connection once when pg emits twice for one drop', async () => {
+		const conn = new EventEmitter();
+		conn.query = async (text) => {
+			if (text === 'WORK') {
+				// A FATAL between statements, then the socket closing.
+				conn.emit('error', new Error('terminating connection due to administrator command'));
+				conn.emit('error', new Error('Connection terminated unexpectedly'));
+				throw new Error('Client has encountered a connection error and is not queryable');
+			}
+			return { rows: [], rowCount: 0 };
+		};
+		conn.release = () => {};
+		const sink = captureRegistered();
+		try {
+			await expect(withTransaction({ pool: { connect: async () => conn } }, async (tx) => {
+				await tx.query('WORK');
+			})).rejects.toThrow('not queryable');
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.POSTGRES_TRANSACTION_CLIENT]);
+			expect(sink.records[0].attributes.error.message).toBe('terminating connection due to administrator command');
+		} finally {
+			sink.stop();
+		}
+	});
+
 	it('removes its listener when the transaction commits', async () => {
 		const { client, conn, getReleaseArg } = makeDroppingClient();
 		await withTransaction(client, async (tx) => {

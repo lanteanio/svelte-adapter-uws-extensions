@@ -368,9 +368,9 @@ the stable ID tag on the line):
 - **Code/event:** `postgres.transaction.client.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.transaction.client.failed severity=error] A Postgres connection checked out for a transaction reported an error.`
 - **Cause:** The server ended the connection, or the network dropped it, while a transaction held it: a failover or restart, idle_in_transaction_session_timeout, or pg_terminate_backend.
-- **Consequence:** The statement in flight fails and the server rolls the transaction back; the operation that ran it rejects with the failure. The connection is discarded rather than returned to the pool.
+- **Consequence:** The statement in flight, or the next one, fails and the operation that ran the transaction rejects. The server rolls the transaction back unless the drop hit COMMIT, whose outcome is then unknown. The connection is discarded rather than returned to the pool. Reported once per connection.
 - **Automatic recovery:** pg.Pool opens a fresh connection on the next checkout. The failed operation is not retried by this package.
-- **Next action:** Read the error attribute (connection strings are redacted) and the Postgres logs for why the backend ended; retry the failed operation if it is safe to.
+- **Next action:** The error attribute often says only that the connection terminated; the reason is in the Postgres log. Retry the failed operation if it is safe to, and after a drop during COMMIT check first whether it took effect.
 - **Runtime help:** `docs/errors.md#extensions-err-postgres-transaction-client`
 - **Runtime sources:** [src/shared/pg-tx.js](../src/shared/pg-tx.js)
 

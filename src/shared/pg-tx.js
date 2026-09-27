@@ -56,12 +56,17 @@ export async function withTransaction(client, fn) {
 	// client released with a truthy error instead of returning it to the
 	// pool - an uncertain connection must never serve a later checkout.
 	let unsafe;
+	let reported = false;
 	const onError = (err) => {
 		unsafe ??= err;
+		// pg can emit twice for one drop (the backend's FATAL, then the socket
+		// closing); the connection is reported once.
+		if (reported) return;
+		reported = true;
 		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TRANSACTION_CLIENT, { error: err });
 	};
-	if (typeof pgClient.on === 'function') pgClient.on('error', onError);
 	try {
+		if (typeof pgClient.on === 'function') pgClient.on('error', onError);
 		try {
 			await pgClient.query('BEGIN');
 		} catch (err) {
