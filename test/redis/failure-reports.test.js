@@ -636,6 +636,58 @@ describe('cluster-only failure paths', () => {
 		expect(cluster.created).toBe(created);
 	});
 
+	it('opens no subscriber connection when a resubscribe fails after the bus closed', async () => {
+		const { cluster, bus } = await followedCluster();
+		cluster.setOwner('node-b');
+		const nodeB = cluster.conns.get('node-b');
+		let open;
+		nodeB.gate = new Promise((resolve) => { open = resolve; });
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		const created = cluster.created;
+		await bus.deactivate();
+		// The closed connection's pending subscribe fails, as ioredis's does.
+		nodeB.refuse = true;
+		open();
+		await settle();
+		expect(cluster.created).toBe(created);
+	});
+
+	it('opens no subscriber connection when a follow outlives the bus closing', async () => {
+		const { cluster, bus } = await followedCluster();
+		const release = cluster.holdMyid();
+		// The error marks the slot map stale, so the follow waits on a refresh.
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		const pending = bus.follow('user:43:inbox');
+		await settle();
+		const created = cluster.created;
+		await bus.deactivate();
+		release();
+		await pending.catch(() => {});
+		await settle();
+		expect(cluster.created).toBe(created);
+	});
+
+	it('leaves a channel unfollowed during followBatch out of later reconciliations', async () => {
+		const { cluster, bus } = await followedCluster();
+		const nodeA = cluster.conns.get('node-a');
+		let open;
+		nodeA.gate = new Promise((resolve) => { open = resolve; });
+		const batch = bus.followBatch(['user:7:inbox']);
+		await settle();
+		await bus.unfollow('user:7:inbox');
+		open();
+		await batch;
+		nodeA.gate = null;
+		const attempts = nodeA.attempts;
+		nodeA.emit('error', new Error('MOVED'));
+		await settle();
+		expect(nodeA.attempts).toBe(attempts);
+		expect(nodeA.subscribed.has('uws:sharded:user:7:inbox')).toBe(false);
+		await bus.deactivate();
+	});
+
 	it('undoes a resubscribe that completes after its channel was unfollowed', async () => {
 		const { cluster, bus } = await followedCluster();
 		cluster.setOwner('node-b');

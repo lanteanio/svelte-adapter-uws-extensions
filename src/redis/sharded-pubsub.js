@@ -163,6 +163,9 @@ export function createShardedBus(client, options = {}) {
 	// when the bus closes sees a different generation and stops before it opens
 	// a connection or records state that nothing would clean up.
 	let subGeneration = 0;
+	// Set by subEnsure, cleared by subClose: a refresh started while the bus is
+	// closed (by work that outlived the close) opens nothing.
+	let subOpen = false;
 	// Delay of the next retry; 0 while the last reconciliation completed.
 	let reconcileRetryMs = 0;
 	// One report per failure streak for each kind of failure, re-armed by a
@@ -444,12 +447,18 @@ export function createShardedBus(client, options = {}) {
 	// instead of each issuing its own.
 	function subRefreshTopology() {
 		if (!topologyRefresh) {
-			topologyRefresh = refreshTopologyNow().finally(() => { topologyRefresh = null; });
+			// Clear only this refresh: subClose drops a stale one, and a newer
+			// refresh may already be in the slot when this one settles.
+			const refresh = refreshTopologyNow().finally(() => {
+				if (topologyRefresh === refresh) topologyRefresh = null;
+			});
+			topologyRefresh = refresh;
 		}
 		return topologyRefresh;
 	}
 
 	async function refreshTopologyNow() {
+		if (!subOpen) return;
 		const generation = subGeneration;
 		const masters = client.redis.nodes('master');
 		await Promise.all(masters.map(async (node) => {
@@ -503,10 +512,14 @@ export function createShardedBus(client, options = {}) {
 		const slot = keySlot(channel);
 		// If a reshard was signaled, the cached owner map may be stale and an
 		// ssubscribe on the old owner would hang, so refresh before resolving.
+		// Each wait below can outlive a close; stop there rather than resolve an
+		// owner from a cleared slot map.
 		if (topologyDirty) await subRefreshTopology();
+		if (generation !== subGeneration) return;
 		let ownerId = ownerIdForSlot(slot);
 		if (ownerId === null) {
 			await subRefreshTopology();
+			if (generation !== subGeneration) return;
 			ownerId = ownerIdForSlot(slot);
 		}
 		let conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
@@ -514,7 +527,9 @@ export function createShardedBus(client, options = {}) {
 		try {
 			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot);
 		} catch {
+			if (generation !== subGeneration) return;
 			await subRefreshTopology();
+			if (generation !== subGeneration) return;
 			ownerId = ownerIdForSlot(slot);
 			conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
 			if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
@@ -541,9 +556,11 @@ export function createShardedBus(client, options = {}) {
 	// wanted channel is left unsubscribed, which schedules a retry.
 	async function subReconcile() {
 		if (!isCluster(client.redis) || !subReady) return true;
+		const generation = subGeneration;
 		try {
 			await subRefreshTopology();
 		} catch (err) {
+			if (generation !== subGeneration) return true;
 			if (!refreshFailing) {
 				refreshFailing = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE, { error: err });
@@ -570,7 +587,8 @@ export function createShardedBus(client, options = {}) {
 				}
 			)
 		));
-		if (first === null) {
+		// A close during the reconciliation ends it; nothing is left to report.
+		if (first === null || generation !== subGeneration) {
 			refreshFailing = false;
 			channelsFailing = false;
 			return true;
@@ -613,6 +631,7 @@ export function createShardedBus(client, options = {}) {
 
 	async function subEnsure() {
 		if (subReady) return;
+		subOpen = true;
 		if (isCluster(client.redis)) {
 			await subRefreshTopology();
 		} else {
@@ -651,7 +670,9 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function subClose() {
+		subOpen = false;
 		subGeneration++;
+		topologyRefresh = null;
 		if (reconcileTimer !== null) {
 			clearTimer(reconcileTimer);
 			reconcileTimer = null;
@@ -815,7 +836,8 @@ export function createShardedBus(client, options = {}) {
 			// collapses N new-channel subscribes into one round trip when the
 			// caller's topics span multiple shards.
 			await subSubscribe(channelsToSubscribe);
-			for (const ch of channelsToSubscribe) subscribedChannels.add(ch);
+			// A channel unfollowed while the batch was subscribing stays out.
+			for (const ch of channelsToSubscribe) if (channelRefcounts.has(ch)) subscribedChannels.add(ch);
 			b?.success();
 			mFollows?.inc(channelsToSubscribe.length);
 		} catch (err) {
