@@ -669,6 +669,37 @@ describe('cluster-only failure paths', () => {
 		expect(cluster.created).toBe(created);
 	});
 
+	it('a reconciliation from before a close leaves the next activation\'s reports alone', async () => {
+		const { cluster, bus } = await followedCluster();
+		// A reconciliation whose resubscribe is still in flight when the bus closes.
+		cluster.setOwner('node-b');
+		const staleB = cluster.conns.get('node-b');
+		let open;
+		staleB.gate = new Promise((resolve) => { open = resolve; });
+		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+		await settle();
+		await bus.deactivate();
+
+		// The bus comes back and starts a failure streak of its own.
+		await bus.activate(mockPlatform());
+		await bus.follow('user:42:inbox');
+		cluster.setOwner('node-a');
+		cluster.conns.get('node-a').refuse = true;
+		sink = captureRegistered();
+		const channelReports = () => sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE).length;
+		cluster.conns.get('node-b').emit('error', new Error('MOVED'));
+		await settle();
+		expect(channelReports()).toBe(1);
+
+		// The old reconciliation finishes; the streak must still be latched.
+		open();
+		await settle();
+		cluster.conns.get('node-b').emit('error', new Error('MOVED'));
+		await settle();
+		expect(channelReports()).toBe(1);
+		await bus.deactivate();
+	});
+
 	it('leaves a channel unfollowed during followBatch out of later reconciliations', async () => {
 		const { cluster, bus } = await followedCluster();
 		const nodeA = cluster.conns.get('node-a');

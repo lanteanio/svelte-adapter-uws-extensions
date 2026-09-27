@@ -587,8 +587,10 @@ export function createShardedBus(client, options = {}) {
 				}
 			)
 		));
-		// A close during the reconciliation ends it; nothing is left to report.
-		if (first === null || generation !== subGeneration) {
+		// A close during the reconciliation ends it; nothing is left to report,
+		// and the report latches belong to whatever bus is active now.
+		if (generation !== subGeneration) return true;
+		if (first === null) {
 			refreshFailing = false;
 			channelsFailing = false;
 			return true;
@@ -614,7 +616,10 @@ export function createShardedBus(client, options = {}) {
 		reconcileDueAt = dueAt;
 		reconcileTimer = setTimer(() => {
 			reconcileTimer = null;
+			const generation = subGeneration;
 			subReconcile().then((complete) => {
+				// One that outlived a close leaves the retry state alone.
+				if (generation !== subGeneration) return;
 				if (complete) {
 					reconcileRetryMs = 0;
 					return;
