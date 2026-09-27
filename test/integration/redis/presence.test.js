@@ -25,6 +25,7 @@ import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../src/redis/presence.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
+import { captureRegistered } from '../../helpers/diagnostic-line.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
@@ -414,6 +415,37 @@ describeIntegration('redis presence (integration)', () => {
 			// And the topic hash is genuinely gone (the cleanup did not fire on a
 			// still-populated key).
 			expect(await client.redis.exists(topicHashKey('room'))).toBe(0);
+		});
+	});
+
+	describe('keyspace notification setting check', () => {
+		it('reports a server whose flags cannot deliver the deletion the cleanup listens for', async () => {
+			await setBackendConfig(client, 'notify-keyspace-events', 'Kg');
+			const sink = captureRegistered();
+			try {
+				const presence = makeTracker({ keyspaceNotifications: true });
+				await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
+				await wait(200);
+				const reports = sink.records.filter((r) => r.event === 'redis.presence.keyspace-events.off');
+				expect(reports.length).toBeGreaterThan(0);
+				expect(reports[0].attributes.flags).not.toContain('E');
+			} finally {
+				sink.stop();
+				await setBackendConfig(client, 'notify-keyspace-events', 'Eg');
+			}
+		});
+
+		it('stays quiet when the flags deliver it', async () => {
+			await setBackendConfig(client, 'notify-keyspace-events', 'Eg');
+			const sink = captureRegistered();
+			try {
+				const presence = makeTracker({ keyspaceNotifications: true });
+				await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
+				await wait(200);
+				expect(sink.records.filter((r) => r.event === 'redis.presence.keyspace-events.off')).toEqual([]);
+			} finally {
+				sink.stop();
+			}
 		});
 	});
 

@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 59 diagnostic events. Each is one canonical line
+- 60 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -59,6 +59,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-LEADER-RELEASE](#extensions-err-leader-release) | `redis.leader.release.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.leader event=redis.leader.release.failed severity=warn] The Redis leader lease could not be released; it expires by TTL.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER](#extensions-err-presence-keyspace-subscriber) | `redis.presence.keyspace-subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscriber.failed severity=error] A presence keyspace-notification subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE](#extensions-err-presence-keyspace-subscribe) | `redis.presence.keyspace-subscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscribe.failed severity=warn] The presence keyspace cleanup could not subscribe to key-deletion events.` |
+| [EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF](#extensions-err-presence-keyspace-events-off) | `redis.presence.keyspace-events.off` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-events.off severity=warn] A Redis server's keyspace notification setting cannot deliver the key deletions the presence cleanup listens for.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE](#extensions-err-presence-keyspace-reconcile) | `redis.presence.keyspace-reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-reconcile.failed severity=error] Presence keyspace subscriber reconciliation failed; the next topology event retries.` |
 | [EXTENSIONS-ERR-PRESENCE-SUBSCRIBER](#extensions-err-presence-subscriber) | `redis.presence.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.subscriber.failed severity=error] The Redis presence subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PUBLISH-RATE-SUBSCRIBER](#extensions-err-publish-rate-subscriber) | `redis.publish-rate.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.publish-rate event=redis.publish-rate.subscriber.failed severity=error] The cluster publish-rate subscriber connection reported an error.` |
@@ -105,7 +106,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 59 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 60 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -132,6 +133,7 @@ Indexed events:
 - `redis.leader.release.failed` - [EXTENSIONS-ERR-LEADER-RELEASE](#extensions-err-leader-release)
 - `redis.presence.keyspace-subscriber.failed` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER](#extensions-err-presence-keyspace-subscriber)
 - `redis.presence.keyspace-subscribe.failed` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE](#extensions-err-presence-keyspace-subscribe)
+- `redis.presence.keyspace-events.off` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF](#extensions-err-presence-keyspace-events-off)
 - `redis.presence.keyspace-reconcile.failed` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE](#extensions-err-presence-keyspace-reconcile)
 - `redis.presence.subscriber.failed` - [EXTENSIONS-ERR-PRESENCE-SUBSCRIBER](#extensions-err-presence-subscriber)
 - `redis.publish-rate.subscriber.failed` - [EXTENSIONS-ERR-PUBLISH-RATE-SUBSCRIBER](#extensions-err-publish-rate-subscriber)
@@ -570,12 +572,25 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.presence.keyspace-subscribe.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscribe.failed severity=warn] The presence keyspace cleanup could not subscribe to key-deletion events.`
-- **Cause:** psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing.
+- **Cause:** psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.
 - **Consequence:** This instance is not told when a topic's presence hash is deleted because the last instance presenting it stopped heartbeating, so its sync-only observers keep showing the last roster until new presence traffic or a reload.
 - **Automatic recovery:** On a cluster the masters are swept again whenever the topology changes. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.
 - **Next action:** For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next topology change subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.
 - **Operator shortlink:** `https://svti.me/redis-keyspace`
 - **Runtime help:** `docs/errors.md#extensions-err-presence-keyspace-subscribe`
+- **Runtime sources:** [src/redis/presence/subscriber.js](../src/redis/presence/subscriber.js)
+
+<a id="extensions-err-presence-keyspace-events-off"></a>
+## `EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF`
+
+- **Code/event:** `redis.presence.keyspace-events.off`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-events.off severity=warn] A Redis server's keyspace notification setting cannot deliver the key deletions the presence cleanup listens for.`
+- **Cause:** notify-keyspace-events on that server lacks E (keyevent notifications) or g (generic commands, also included in A); the flags attribute carries its value. Redis accepts the subscription regardless, so nothing else reports this.
+- **Consequence:** The keyspace cleanup never fires for topics whose presence hash lives on that server: when the last instance presenting a topic dies, its sync-only observers keep showing the last roster until new presence traffic or a reload.
+- **Automatic recovery:** None; this is server configuration. The setting is read when the subscription is set up, so a corrected server is checked again the next time it is.
+- **Next action:** Run CONFIG SET notify-keyspace-events Eg on every master (or add E and g to the flags it already has), and set it in redis.conf so a restart keeps it; see the shortlink.
+- **Operator shortlink:** `https://svti.me/redis-keyspace`
+- **Runtime help:** `docs/errors.md#extensions-err-presence-keyspace-events-off`
 - **Runtime sources:** [src/redis/presence/subscriber.js](../src/redis/presence/subscriber.js)
 
 <a id="extensions-err-presence-keyspace-reconcile"></a>

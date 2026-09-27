@@ -33,10 +33,12 @@ export interface RedisPresenceOptions {
 	 *
 	 * Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset
 	 * including `E` and `g`) on every Redis master. Redis accepts the
-	 * subscription whether or not notifications are enabled, so a missing
-	 * flag means the cleanup never fires. A psubscribe that fails (an ACL
-	 * refusal or a dropped connection) is reported and the rest of the
-	 * tracker keeps working without the keyspace branch.
+	 * subscription whether or not notifications are enabled, so the tracker
+	 * reads the setting when it subscribes and reports flags that cannot
+	 * deliver the deletion; a server that refuses CONFIG is not checked. A
+	 * psubscribe that fails (an ACL refusal or a dropped connection) is
+	 * reported and the rest of the tracker keeps working without the keyspace
+	 * branch.
 	 *
 	 * @default false
 	 */

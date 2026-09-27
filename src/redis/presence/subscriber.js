@@ -151,6 +151,25 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		}).catch(() => {});
 	}
 
+	// Redis accepts the psubscribe whether or not keyspace notifications are
+	// enabled, so a subscription that succeeds says nothing about whether a
+	// deletion will ever arrive. Read the setting where the server allows it;
+	// managed services and ACLs often refuse CONFIG, and that is not reported.
+	function checkKeyspaceEvents(conn, master) {
+		if (typeof conn?.config !== 'function') return;
+		let reply;
+		try { reply = conn.config('GET', 'notify-keyspace-events'); } catch { return; }
+		Promise.resolve(reply).then((r) => {
+			const flags = Array.isArray(r) ? r[1] : r?.['notify-keyspace-events'];
+			if (typeof flags !== 'string' || disposed) return;
+			// `del` is a keyevent (E) of the generic class (g, also part of A).
+			if (flags.includes('E') && (flags.includes('g') || flags.includes('A'))) return;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_EVENTS_OFF, {
+				attributes: master === null ? { flags } : { master, flags }
+			});
+		}, () => {});
+	}
+
 	// Subscribe the del keyevent on every current master (cluster path). Idempotent
 	// and single-flight: adds a connection for any master not yet covered, prunes
 	// one whose master is gone (failover / reshard), and is safe to call
@@ -181,6 +200,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 				try {
 					await s.psubscribe('__keyevent@*__:del');
 					keyspaceSubscribed = true;
+					checkKeyspaceEvents(node, id);
 				} catch (err) {
 					keyspaceSubs.delete(id);
 					s.removeAllListeners();
@@ -231,6 +251,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		try {
 			await subscriber.psubscribe('__keyevent@*__:del');
 			keyspaceSubscribed = true;
+			checkKeyspaceEvents(client.redis, null);
 		} catch (err) {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE, { error: err });
 		}

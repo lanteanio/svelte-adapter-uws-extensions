@@ -412,11 +412,22 @@ function fakeCluster() {
 		conns.set(id, c);
 		return c;
 	};
-	const node = (id) => ({ cluster: async () => id, duplicate: () => conn(id) });
+	/** @type {Map<string, string | Error>} what CONFIG GET notify-keyspace-events answers per node */
+	const keyspaceFlags = new Map();
+	const node = (id) => ({
+		cluster: async () => id,
+		duplicate: () => conn(id),
+		config: async () => {
+			const flags = keyspaceFlags.get(id) ?? 'Eg';
+			if (flags instanceof Error) throw flags;
+			return ['notify-keyspace-events', flags];
+		}
+	});
 	const masters = [node('node-a'), node('node-b')];
 	return {
 		conns,
 		masters,
+		setKeyspaceFlags(id, flags) { keyspaceFlags.set(id, flags); },
 		setOwner(id) { owner = id; },
 		setSlotsDown(down) { slotsDown = down; },
 		redis: {
@@ -658,6 +669,59 @@ describe('cluster-only failure paths', () => {
 				master: 'node-b',
 				error: { name: 'Error', code: null, message: 'NOPERM No permissions to access a channel' }
 			});
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master whose keyspace notification setting cannot fire the cleanup is reported with its flags', async () => {
+		const cluster = fakeCluster();
+		cluster.setKeyspaceFlags('node-a', 'KEA');
+		cluster.setKeyspaceFlags('node-b', 'Kg');
+		const client = mockRedisClient('fr-keyspace-flags:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			await settle();
+			// KEA includes g; Kg has no keyevent (E) channel at all.
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_EVENTS_OFF]);
+			expect(sink.records[0].attributes).toEqual({ master: 'node-b', flags: 'Kg' });
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master that refuses CONFIG is not reported', async () => {
+		const cluster = fakeCluster();
+		cluster.setKeyspaceFlags('node-a', new Error("ERR unknown command 'CONFIG'"));
+		cluster.setKeyspaceFlags('node-b', new Error("NOPERM User default has no permissions to run the 'config|get' command"));
+		const client = mockRedisClient('fr-keyspace-noconfig:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			await settle();
+			expect(sink.ids()).toEqual([]);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a standalone server whose keyspace notification setting cannot fire the cleanup is reported', async () => {
+		const client = mockRedisClient('fr-keyspace-solo:');
+		client.redis.config = async () => ['notify-keyspace-events', ''];
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			await settle();
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_EVENTS_OFF]);
+			expect(sink.records[0].attributes).toEqual({ flags: '' });
 		} finally {
 			await subscriber.dispose?.();
 		}

@@ -62,6 +62,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	PRESENCE_KEYSPACE_SUBSCRIBER: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER',
 	PRESENCE_KEYSPACE_SUBSCRIBE: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE',
 	PRESENCE_KEYSPACE_RECONCILE: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE',
+	PRESENCE_KEYSPACE_EVENTS_OFF: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF',
 	PRESENCE_SUBSCRIBER: 'EXTENSIONS-ERR-PRESENCE-SUBSCRIBER',
 	PUBLISH_RATE_SUBSCRIBER: 'EXTENSIONS-ERR-PUBLISH-RATE-SUBSCRIBER',
 	PUBLISH_RATE_LISTENER: 'EXTENSIONS-ERR-PUBLISH-RATE-LISTENER',
@@ -462,12 +463,23 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE,
 		event: 'redis.presence.keyspace-subscribe.failed', component: 'runtime.redis.presence', severity: 'warn',
 		problemPrefix: 'The presence keyspace cleanup could not subscribe to key-deletion events.',
-		cause: 'psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing.',
+		cause: 'psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.',
 		consequence: 'This instance is not told when a topic\'s presence hash is deleted because the last instance presenting it stopped heartbeating, so its sync-only observers keep showing the last roster until new presence traffic or a reload.',
 		automaticRecovery: 'On a cluster the masters are swept again whenever the topology changes. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.',
 		nextAction: 'For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next topology change subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.',
 		link: 'https://svti.me/redis-keyspace',
 		sources: ['src/redis/presence/subscriber.js'], anchor: 'extensions-err-presence-keyspace-subscribe'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_EVENTS_OFF,
+		event: 'redis.presence.keyspace-events.off', component: 'runtime.redis.presence', severity: 'warn',
+		problemPrefix: 'A Redis server\'s keyspace notification setting cannot deliver the key deletions the presence cleanup listens for.',
+		cause: 'notify-keyspace-events on that server lacks E (keyevent notifications) or g (generic commands, also included in A); the flags attribute carries its value. Redis accepts the subscription regardless, so nothing else reports this.',
+		consequence: 'The keyspace cleanup never fires for topics whose presence hash lives on that server: when the last instance presenting a topic dies, its sync-only observers keep showing the last roster until new presence traffic or a reload.',
+		automaticRecovery: 'None; this is server configuration. The setting is read when the subscription is set up, so a corrected server is checked again the next time it is.',
+		nextAction: 'Run CONFIG SET notify-keyspace-events Eg on every master (or add E and g to the flags it already has), and set it in redis.conf so a restart keeps it; see the shortlink.',
+		link: 'https://svti.me/redis-keyspace',
+		sources: ['src/redis/presence/subscriber.js'], anchor: 'extensions-err-presence-keyspace-events-off'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE,
