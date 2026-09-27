@@ -17,22 +17,25 @@ Every item lists the **symptom** you will actually see and the **action**.
 
 ## 1. Fails at startup
 
-These throw from a factory, so they fail on the deploy rather than in
-production traffic. Fix them before you ship.
+These fail at install, at import, or from a factory, so they fail on the
+deploy rather than in production traffic. Fix them before you ship.
 
-### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.87`
+### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.91`
 
 **Symptom.** `npm ERR! ERESOLVE unable to resolve dependency tree` (or a peer
 warning under `--legacy-peer-deps`) naming `svelte-adapter-uws`, at install
-time.
+time. On an older adapter that slipped past the peer check, `import` of
+`svelte-adapter-uws-extensions/admission` fails with
+`ERR_PACKAGE_PATH_NOT_EXPORTED` for `svelte-adapter-uws/observability`.
 
-**Why.** The presence and cursor snapshot lanes now pass the observer-lane
-mode `{ requireGrant: true }` to `checkSubscribe`, and `0.6.0-next.87` is the
-adapter release that implements it. An older adapter silently ignores the
-option, which re-opens the pure-grant roster exposure the mode exists to
-close - so the floor is what makes the gate real.
+**Why.** Two releases raised the floor. `0.6.0-next.87` implements the
+observer-lane mode `{ requireGrant: true }` that the presence and cursor
+snapshot lanes pass to `checkSubscribe`; an older adapter silently ignores
+the option and re-opens the pure-grant roster exposure. `0.6.0-next.91` ships
+`svelte-adapter-uws/observability`, and admission control reads the adapter's
+pressure-reason table from that entry point.
 
-**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.87` or later in the same
+**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.91` or later in the same
 upgrade. The ecosystem packages move together (see the version table in the
 README).
 
@@ -184,6 +187,20 @@ able to write to it.
 calls `attach`.
 
 ## 4. Silent behaviour changes to audit
+
+### Admission rules recognize all seven adapter pressure reasons
+
+**Symptom.** An admission class intended to shed under any pressure keeps
+accepting while the adapter reports `PSI`, `CPU_QUOTA`, or `CAPACITY`.
+
+**Why.** Those host and protection signals joined the adapter pressure enum
+after the original four-value admission validator was written. The extensions
+runtime and type now derive from the exported frozen `PRESSURE_REASONS` tuple.
+
+**Action.** Replace hand-maintained "all pressure" arrays with
+`PRESSURE_REASONS.filter((reason) => reason !== 'NONE')`. Explicit policies may
+instead add only the new reasons they intend to shed. Registration now accepts
+all seven values and still rejects unknown strings.
 
 ### Redis presence/cursor defaults withhold personal and transport data
 

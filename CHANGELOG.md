@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0-next.64] - 2026-09-11
 
+### Breaking Changes
+
+- **The adapter peer floor is raised to `svelte-adapter-uws >= 0.6.0-next.91`.** That release ships `svelte-adapter-uws/observability` (the process-wide operational event sink, the canonical diagnostic grammar, the W3C trace helpers, and the published pressure-reason table) and the Platform `trace` / `traceContext` surface. Admission control reads its reason list from that entry point at runtime.
+
 ### Added
 
 - **The README routes launch and topology changes to the ecosystem capacity kit.** Its open-arrival proof covers Redis/Postgres and relay telemetry in the same artifact as the deployment shape, peak p50/p95/p99 and errors, the first resource to saturate, and recovery under continuing traffic.
@@ -18,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The task runner is documented as at-least-once execution with a fenced canonical result.** The README no longer says effectful work runs exactly once: the lease fence guarantees that exactly one attempt commits the canonical result, while an expired or paused handler can overlap its successor, so every external effect must use the stable `idempotencyKey` or an equivalent downstream fence.
+
+### Fixed
+
+- **Admission control recognizes every adapter pressure reason.** The exported frozen `PRESSURE_REASONS` tuple is read from the adapter's published `PRESSURE_REASON_CODES` at load time and drives runtime validation: `NONE`, `SUBSCRIBERS`, `PUBLISH_RATE`, `PSI`, `CPU_QUOTA`, `CAPACITY`, and `MEMORY`. Rules can therefore shed under kernel stalls, container quota throttling, or protection capacity instead of rejecting those names at startup or silently admitting them at runtime, and a reason the adapter adds later is accepted at runtime without a release here. The `PressureReason` type lists the reasons of the supported adapter release, as the adapter's own `pressure.reason` type does.
 
 ## [0.6.0-next.63] - 2026-07-30
 

@@ -124,7 +124,7 @@ Postgres support is optional:
 npm install pg
 ```
 
-Requires `svelte-adapter-uws >= 0.6.0-next.87` as a peer dependency.
+Requires `svelte-adapter-uws >= 0.6.0-next.91` as a peer dependency.
 
 ---
 
@@ -3767,21 +3767,23 @@ try {
 
 ## Admission control
 
-Pressure-aware companion to the [circuit breaker](#circuit-breaker). Where the breaker answers "is the backend up?", admission control answers "are we OK to take more work right now?" - using the adapter's `platform.pressure` signal (memory, publish rate, subscriber ratio) to gate non-critical work before it ever reaches a backend.
+Pressure-aware companion to the [circuit breaker](#circuit-breaker). Where the breaker answers "is the backend up?", admission control answers "are we OK to take more work right now?" - using the adapter's `platform.pressure` signal (memory, protection capacity, host stalls/quota, publish rate, and subscriber ratio) to gate non-critical work before it ever reaches a backend.
 
-Requires `svelte-adapter-uws >= 0.5.0-next.1` (the version that ships `platform.pressure`).
+Requires `svelte-adapter-uws >= 0.6.0-next.91`, the release that ships `platform.pressure` with all seven reasons and the `svelte-adapter-uws/observability` table admission reads them from.
 
 #### Setup
 
 ```js
 // src/lib/server/admission.js
-import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
+import { createAdmissionControl, PRESSURE_REASONS } from 'svelte-adapter-uws-extensions/admission';
+
+const ACTIVE_PRESSURE_REASONS = PRESSURE_REASONS.filter((reason) => reason !== 'NONE');
 
 export const ac = createAdmissionControl({
   classes: {
     critical:   ['MEMORY'],                              // refuse only on memory pressure
     normal:     ['MEMORY', 'PUBLISH_RATE'],              // refuse on memory or publish rate
-    background: ['MEMORY', 'PUBLISH_RATE', 'SUBSCRIBERS'] // refuse on any pressure
+    background: ACTIVE_PRESSURE_REASONS                   // refuse on any active pressure
   }
 });
 ```
@@ -3800,7 +3802,7 @@ export async function POST({ platform, request }) {
 }
 ```
 
-Each class is independently configured. The adapter has already collapsed concurrent signals (memory, publish rate, subscribers) into a single most-urgent `reason` - this controller just maps the resolved reason to a per-class accept/reject decision.
+Each class is independently configured. The adapter has already collapsed concurrent signals into a single most-urgent `reason` - this controller just maps the resolved reason to a per-class accept/reject decision. `PRESSURE_REASONS` is the frozen, least-to-most-severe contract shared by validation and the exported `PressureReason` type.
 
 #### Class rule shapes
 
@@ -3818,7 +3820,7 @@ classes: {
 
 Predicates receive the full `PressureSnapshot` so they can apply custom thresholds (e.g. block above a specific publish-rate that's tighter than the adapter's). Array form is the simple-case shorthand and is what 90% of callers should use.
 
-Valid reason strings: `'NONE'`, `'PUBLISH_RATE'`, `'SUBSCRIBERS'`, `'MEMORY'`. Including `'NONE'` in a block list means "always block this class," which is occasionally useful for kill-switching a class without removing the wiring.
+Valid reason strings: `'NONE'`, `'SUBSCRIBERS'`, `'PUBLISH_RATE'`, `'PSI'`, `'CPU_QUOTA'`, `'CAPACITY'`, `'MEMORY'`. Including `'NONE'` in a block list means "always block this class," which is occasionally useful for kill-switching a class without removing the wiring. For "any active pressure," use `PRESSURE_REASONS.filter((reason) => reason !== 'NONE')` so future call sites do not silently omit the host-pressure reasons.
 
 #### Options
 

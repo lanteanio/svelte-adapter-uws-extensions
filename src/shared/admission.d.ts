@@ -1,6 +1,17 @@
 import type { MetricsRegistry } from '../prometheus/index.js';
 
-export type PressureReason = 'NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS' | 'MEMORY';
+/** Every pressure reason emitted by the supported adapter, least to most severe. */
+export const PRESSURE_REASONS: readonly [
+	'NONE',
+	'SUBSCRIBERS',
+	'PUBLISH_RATE',
+	'PSI',
+	'CPU_QUOTA',
+	'CAPACITY',
+	'MEMORY'
+];
+
+export type PressureReason = (typeof PRESSURE_REASONS)[number];
 
 export interface PressureSnapshot {
 	readonly active: boolean;
@@ -88,7 +99,7 @@ export interface AdmissionControl {
 	 *
 	 * Reads `platform.pressure` - a property access, no I/O. Safe to
 	 * call on every request hot path. The reason-precedence math
-	 * (memory > publish rate > subscribers > none) lives in the
+	 * (`MEMORY > CAPACITY > CPU_QUOTA > PSI > PUBLISH_RATE > SUBSCRIBERS > NONE`) lives in the
 	 * adapter; this method only checks the resolved `reason` against
 	 * the configured rule.
 	 *

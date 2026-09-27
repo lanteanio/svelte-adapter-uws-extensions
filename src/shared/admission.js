@@ -4,21 +4,34 @@
  * Pressure-aware companion to the dependency circuit breaker. Where the
  * breaker answers "is the backend up?", admission control answers "are
  * we OK to take more work right now?" - using `platform.pressure` from
- * the adapter (memory, publish rate, subscriber ratio) to gate
+ * the adapter (memory, capacity, host pressure, publish rate, and subscriber
+ * ratio) to gate
  * non-critical work before it ever reaches a backend.
  *
- * The reason-precedence math (memory > publish rate > subscribers) lives
- * in the adapter. This module just maps a class name to a block-list of
- * reasons and answers true/false against the current snapshot.
+ * The reason-precedence math lives in the adapter. This module just maps a
+ * class name to a block-list of reasons and answers true/false against the
+ * current snapshot.
  *
  * @module svelte-adapter-uws-extensions/admission
  */
 
-const VALID_REASONS = new Set(['NONE', 'PUBLISH_RATE', 'SUBSCRIBERS', 'MEMORY']);
-const REASONS_FOR_DOC = 'PUBLISH_RATE, SUBSCRIBERS, MEMORY';
+import { PRESSURE_REASON_CODES } from 'svelte-adapter-uws/observability';
 
 /**
- * @typedef {'NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS' | 'MEMORY'} PressureReason
+ * Every pressure reason the adapter can report, in the adapter's own order,
+ * read from its published observability manifest so a reason added there is
+ * accepted here without a release. `'NONE'` is a reason like the others: a
+ * class that lists it blocks while the platform reports no pressure, so a
+ * class that should shed under any ACTIVE pressure spreads the tuple minus
+ * `'NONE'`.
+ * @type {readonly ['NONE', 'SUBSCRIBERS', 'PUBLISH_RATE', 'PSI', 'CPU_QUOTA', 'CAPACITY', 'MEMORY']}
+ */
+export const PRESSURE_REASONS = Object.freeze(/** @type {any} */ (Object.keys(PRESSURE_REASON_CODES)));
+const VALID_REASONS = new Set(PRESSURE_REASONS);
+const REASONS_FOR_DOC = PRESSURE_REASONS.join(', ');
+
+/**
+ * @typedef {(typeof PRESSURE_REASONS)[number]} PressureReason
  */
 
 /**
@@ -62,7 +75,7 @@ const REASONS_FOR_DOC = 'PUBLISH_RATE, SUBSCRIBERS, MEMORY';
  *   classes: {
  *     critical:   ['MEMORY'],                              // refuse only on memory pressure
  *     normal:     ['MEMORY', 'PUBLISH_RATE'],              // refuse on memory or publish rate
- *     background: ['MEMORY', 'PUBLISH_RATE', 'SUBSCRIBERS'] // refuse on any pressure
+ *     background: ['MEMORY', 'CAPACITY', 'CPU_QUOTA', 'PSI', 'PUBLISH_RATE', 'SUBSCRIBERS'] // refuse on any active pressure
  *   }
  * });
  *
