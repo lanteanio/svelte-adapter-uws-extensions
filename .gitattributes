@@ -1,0 +1,7 @@
+# Checkouts materialize LF on every platform. The generators and gates in this
+# repository emit and compare LF, and the test loader cannot parse a module
+# whose shebang line ends in CRLF: under a core.autocrlf checkout, every test
+# that imports a script from scripts/ fails to collect with a bare SyntaxError.
+# The eol attribute overrides core.autocrlf, so a clean clone behaves the same
+# with or without that global setting.
+* text=auto eol=lf
