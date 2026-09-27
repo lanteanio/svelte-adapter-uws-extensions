@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { withTransaction } from '../../src/shared/pg-tx.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 function makeMockClient() {
 	const queries = [];
@@ -104,6 +107,51 @@ describe('shared/pg-tx', () => {
 		const { client, getReleaseArg } = makeFailingClient(['BEGIN']);
 		await expect(withTransaction(client, async () => 1)).rejects.toThrow('BEGIN failed');
 		expect(getReleaseArg()).toBeInstanceOf(Error);
+	});
+
+	// A checked-out pg client is an EventEmitter whose 'error' event throws
+	// when nothing listens, which is what pg emits when the backend ends the
+	// connection mid-transaction.
+	function makeDroppingClient() {
+		const conn = new EventEmitter();
+		let releaseArg = 'never-called';
+		conn.query = async (text) => {
+			if (text === 'WORK') {
+				const err = new Error('terminating connection due to administrator command');
+				conn.emit('error', err);
+				throw err;
+			}
+			return { rows: [], rowCount: 0 };
+		};
+		conn.release = (err) => { releaseArg = err; };
+		return { client: { pool: { connect: async () => conn } }, conn, getReleaseArg: () => releaseArg };
+	}
+
+	it('survives the connection dropping mid-transaction: the work rejects, the failure is reported, the connection is discarded', async () => {
+		const { client, conn, getReleaseArg } = makeDroppingClient();
+		const sink = captureRegistered();
+		try {
+			await expect(withTransaction(client, async (tx) => {
+				await tx.query('WORK');
+			})).rejects.toThrow('terminating connection');
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.POSTGRES_TRANSACTION_CLIENT]);
+			expect(sink.records[0].attributes.error.message).toBe('terminating connection due to administrator command');
+		} finally {
+			sink.stop();
+		}
+		expect(getReleaseArg()).toBeInstanceOf(Error);
+		// The listener lives only as long as the checkout.
+		expect(conn.listenerCount('error')).toBe(0);
+	});
+
+	it('removes its listener when the transaction commits', async () => {
+		const { client, conn, getReleaseArg } = makeDroppingClient();
+		await withTransaction(client, async (tx) => {
+			expect(conn.listenerCount('error')).toBe(1);
+			await tx.query('SELECT 1');
+		});
+		expect(conn.listenerCount('error')).toBe(0);
+		expect(getReleaseArg()).toBeUndefined();
 	});
 
 	it('releases with NO error after a successful ROLLBACK (connection stays pooled)', async () => {

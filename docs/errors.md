@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 58 diagnostic events. Each is one canonical line
+- 59 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -41,6 +41,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-CIRCUIT-OPEN](#extensions-err-circuit-open) | `breaker.circuit-open` | `circuit breaker is open - backend unavailable` |
 | [EXTENSIONS-ERR-CAPABILITY-COOKIE-METRICS](#extensions-err-capability-cookie-metrics) | `capability-cookie.metrics-instrument.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.capability-cookie event=capability-cookie.metrics-instrument.failed severity=error] The capability-cookie metrics instrument threw; further instrument failures are not reported.` |
 | [EXTENSIONS-ERR-POSTGRES-POOL-IDLE-CLIENT](#extensions-err-postgres-pool-idle-client) | `postgres.pool.idle-client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.pool.idle-client.failed severity=error] An idle Postgres pool client reported an error.` |
+| [EXTENSIONS-ERR-POSTGRES-TRANSACTION-CLIENT](#extensions-err-postgres-transaction-client) | `postgres.transaction.client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.transaction.client.failed severity=error] A Postgres connection checked out for a transaction reported an error.` |
 | [EXTENSIONS-ERR-POSTGRES-NOTIFY-PAYLOAD-NEAR-LIMIT](#extensions-err-postgres-notify-payload-near-limit) | `postgres.notify.payload-near-limit` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.notify event=postgres.notify.payload-near-limit severity=warn] A Postgres NOTIFY payload is approaching the 8000-byte transport limit.` |
 | [EXTENSIONS-ERR-POSTGRES-NOTIFY-PARSE](#extensions-err-postgres-notify-parse) | `postgres.notify.parse.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.notify event=postgres.notify.parse.failed severity=warn] The application-owned Postgres NOTIFY parser, or the publish of its result, threw.` |
 | [EXTENSIONS-ERR-POSTGRES-TASKS-STATE-LISTENER](#extensions-err-postgres-tasks-state-listener) | `postgres.tasks.state-listener.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.tasks event=postgres.tasks.state-listener.failed severity=warn] The task state-change listener failed; task execution continues.` |
@@ -104,7 +105,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 58 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 59 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -113,6 +114,7 @@ Indexed events:
 
 - `capability-cookie.metrics-instrument.failed` - [EXTENSIONS-ERR-CAPABILITY-COOKIE-METRICS](#extensions-err-capability-cookie-metrics)
 - `postgres.pool.idle-client.failed` - [EXTENSIONS-ERR-POSTGRES-POOL-IDLE-CLIENT](#extensions-err-postgres-pool-idle-client)
+- `postgres.transaction.client.failed` - [EXTENSIONS-ERR-POSTGRES-TRANSACTION-CLIENT](#extensions-err-postgres-transaction-client)
 - `postgres.notify.payload-near-limit` - [EXTENSIONS-ERR-POSTGRES-NOTIFY-PAYLOAD-NEAR-LIMIT](#extensions-err-postgres-notify-payload-near-limit)
 - `postgres.notify.parse.failed` - [EXTENSIONS-ERR-POSTGRES-NOTIFY-PARSE](#extensions-err-postgres-notify-parse)
 - `postgres.tasks.state-listener.failed` - [EXTENSIONS-ERR-POSTGRES-TASKS-STATE-LISTENER](#extensions-err-postgres-tasks-state-listener)
@@ -357,6 +359,18 @@ the stable ID tag on the line):
 - **Next action:** Read the error attribute (connection strings are redacted) and check Postgres logs, network stability, and idle timeouts between the instance and the database.
 - **Runtime help:** `docs/errors.md#extensions-err-postgres-pool-idle-client`
 - **Runtime sources:** [src/postgres/index.js](../src/postgres/index.js)
+
+<a id="extensions-err-postgres-transaction-client"></a>
+## `EXTENSIONS-ERR-POSTGRES-TRANSACTION-CLIENT`
+
+- **Code/event:** `postgres.transaction.client.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.transaction.client.failed severity=error] A Postgres connection checked out for a transaction reported an error.`
+- **Cause:** The server ended the connection, or the network dropped it, while a transaction held it: a failover or restart, idle_in_transaction_session_timeout, or pg_terminate_backend.
+- **Consequence:** The statement in flight fails and the server rolls the transaction back; the operation that ran it rejects with the failure. The connection is discarded rather than returned to the pool.
+- **Automatic recovery:** pg.Pool opens a fresh connection on the next checkout. The failed operation is not retried by this package.
+- **Next action:** Read the error attribute (connection strings are redacted) and the Postgres logs for why the backend ended; retry the failed operation if it is safe to.
+- **Runtime help:** `docs/errors.md#extensions-err-postgres-transaction-client`
+- **Runtime sources:** [src/shared/pg-tx.js](../src/shared/pg-tx.js)
 
 <a id="extensions-err-postgres-notify-payload-near-limit"></a>
 ## `EXTENSIONS-ERR-POSTGRES-NOTIFY-PAYLOAD-NEAR-LIMIT`

@@ -16,8 +16,17 @@
  * or ROLLBACK) is released WITH the error so the pool destroys it
  * instead of handing it to a later checkout.
  *
+ * pg-pool removes its idle-client `error` listener on checkout, and pg emits
+ * `error` when the backend ends the connection, so a checked-out client with
+ * no listener turns a dropped connection into an uncaught exception. One is
+ * attached for the lifetime of the checkout; the statement in flight still
+ * rejects with the failure.
+ *
  * @module svelte-adapter-uws-extensions/shared/pg-tx
  */
+
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure } from './diagnostic.js';
 
 /**
  * @typedef {Object} PgTxClient
@@ -47,6 +56,11 @@ export async function withTransaction(client, fn) {
 	// client released with a truthy error instead of returning it to the
 	// pool - an uncertain connection must never serve a later checkout.
 	let unsafe;
+	const onError = (err) => {
+		unsafe ??= err;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TRANSACTION_CLIENT, { error: err });
+	};
+	if (typeof pgClient.on === 'function') pgClient.on('error', onError);
 	try {
 		try {
 			await pgClient.query('BEGIN');
@@ -71,6 +85,7 @@ export async function withTransaction(client, fn) {
 		}
 		return result;
 	} finally {
+		if (typeof pgClient.removeListener === 'function') pgClient.removeListener('error', onError);
 		pgClient.release(unsafe);
 	}
 }

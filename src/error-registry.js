@@ -43,6 +43,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	CIRCUIT_OPEN: 'EXTENSIONS-ERR-CIRCUIT-OPEN',
 	CAPABILITY_COOKIE_METRICS: 'EXTENSIONS-ERR-CAPABILITY-COOKIE-METRICS',
 	POSTGRES_POOL_IDLE_CLIENT: 'EXTENSIONS-ERR-POSTGRES-POOL-IDLE-CLIENT',
+	POSTGRES_TRANSACTION_CLIENT: 'EXTENSIONS-ERR-POSTGRES-TRANSACTION-CLIENT',
 	POSTGRES_NOTIFY_PAYLOAD_NEAR_LIMIT: 'EXTENSIONS-ERR-POSTGRES-NOTIFY-PAYLOAD-NEAR-LIMIT',
 	POSTGRES_NOTIFY_PARSE: 'EXTENSIONS-ERR-POSTGRES-NOTIFY-PARSE',
 	POSTGRES_TASKS_STATE_LISTENER: 'EXTENSIONS-ERR-POSTGRES-TASKS-STATE-LISTENER',
@@ -285,6 +286,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'pg.Pool reconnects on demand; nothing is retried by this package.',
 		nextAction: 'Read the error attribute (connection strings are redacted) and check Postgres logs, network stability, and idle timeouts between the instance and the database.',
 		sources: ['src/postgres/index.js'], anchor: 'extensions-err-postgres-pool-idle-client'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.POSTGRES_TRANSACTION_CLIENT,
+		event: 'postgres.transaction.client.failed', component: 'runtime.postgres', severity: 'error',
+		problemPrefix: 'A Postgres connection checked out for a transaction reported an error.',
+		cause: 'The server ended the connection, or the network dropped it, while a transaction held it: a failover or restart, idle_in_transaction_session_timeout, or pg_terminate_backend.',
+		consequence: 'The statement in flight fails and the server rolls the transaction back; the operation that ran it rejects with the failure. The connection is discarded rather than returned to the pool.',
+		automaticRecovery: 'pg.Pool opens a fresh connection on the next checkout. The failed operation is not retried by this package.',
+		nextAction: 'Read the error attribute (connection strings are redacted) and the Postgres logs for why the backend ended; retry the failed operation if it is safe to.',
+		sources: ['src/shared/pg-tx.js'], anchor: 'extensions-err-postgres-transaction-client'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_PAYLOAD_NEAR_LIMIT,
