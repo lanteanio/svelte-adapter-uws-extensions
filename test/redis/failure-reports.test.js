@@ -15,6 +15,8 @@ import { createGroup } from '../../src/redis/groups.js';
 import { createCursor } from '../../src/redis/cursor.js';
 import { createPublishRateAggregator } from '../../src/redis/publish-rate.js';
 import { createSubscriber } from '../../src/redis/presence/subscriber.js';
+import { createPresence } from '../../src/redis/presence.js';
+import { createRedisIo } from '../../src/redis/cursor/redis-io.js';
 import { keySlot } from '../../src/shared/cluster.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
@@ -50,6 +52,20 @@ const noperm = (what) => new Error('NOPERM No permissions to access a ' + what);
 /** A backend, or a proxy in front of it, that repeats what it refused. */
 const echoing = (name) => new Error("backend refused '" + name + "'");
 
+/** What a replica answers a write with after a failover. */
+const readonly = () => new Error("READONLY You can't write against a read only replica.");
+
+/** A breaker double that records what it was told. */
+function recordingBreaker() {
+	return {
+		state: 'healthy',
+		isHealthy: true,
+		guard() {},
+		success: vi.fn(),
+		failure: vi.fn(),
+		subscribe() { return () => {}; }
+	};
+}
 
 /** A metrics registry double that records every counter increment. */
 function recordingMetrics() {
@@ -824,6 +840,32 @@ describe('cluster-only failure paths', () => {
 		}
 	});
 
+
+	it('a shard relay batch with a refused SPUBLISH fails the breaker and counts only what went out', async () => {
+		const cluster = fakeCluster();
+		const breaker = recordingBreaker();
+		const metrics = recordingMetrics();
+		cluster.redis.spublish = async (channel) => {
+			if (channel.includes('secret')) throw noperm('channel');
+			return 1;
+		};
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' }, { breaker, metrics });
+		await bus.activate(mockPlatform());
+		try {
+			breaker.success.mockClear();
+			const platform = bus.wrap(mockPlatform());
+			platform.publish('room:open', 'msg', 1);
+			platform.publish('room:secret', 'msg', 2);
+			await settle();
+			expect(breaker.failure).toHaveBeenCalledTimes(1);
+			expect(breaker.success).not.toHaveBeenCalled();
+			const relayed = metrics.incs.filter((inc) => inc.name === 'sharded_pubsub_messages_relayed_total');
+			expect(relayed.map((inc) => inc.labels)).toEqual([{ topic: 'room:open' }]);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
 	it('a master that refuses the keyspace subscription is reported by its node id', async () => {
 		const cluster = fakeCluster();
 		cluster.conns.clear();
@@ -918,6 +960,181 @@ describe('cluster-only failure paths', () => {
 			expect(sink.records[1].attributes.error).toEqual({ name: 'Error', code: null, message: 'connect ECONNREFUSED' });
 		} finally {
 			await subscriber.dispose?.();
+		}
+	});
+});
+
+describe('a command Redis refuses inside a batch is a failed command', () => {
+	it('groups heartbeat: a refused command fails the beat, and only a clean beat re-arms the report', async () => {
+		const intervals = captureIntervals();
+		const client = mockRedisClient('fr-groups-refused:');
+		const group = createGroup(client, 'lobby');
+		const pipeline = client.redis.pipeline.bind(client.redis);
+		// exec() resolves; the refusal is an [err, result] entry, as ioredis reports it.
+		const refusingPipeline = () => {
+			const pipe = new Proxy({}, { get: (_, prop) => (prop === 'exec' ? () => Promise.resolve([[null, 1], [readonly(), null], [null, 1], [null, 1]]) : () => pipe) });
+			return pipe;
+		};
+		const rejectingPipeline = () => {
+			const pipe = new Proxy({}, { get: (_, prop) => (prop === 'exec' ? () => Promise.reject(new Error('pipeline down')) : () => pipe) });
+			return pipe;
+		};
+		const beat = async () => {
+			for (const { cb } of intervals) cb();
+			await settle();
+		};
+		try {
+			await group.join(mockWs({ id: 'member-1' }), mockPlatform());
+			sink = captureRegistered();
+			const heartbeats = () => sink.records.filter((r) => r.event === 'redis.groups.heartbeat.failed');
+			client.redis.pipeline = refusingPipeline;
+			await beat();
+			await beat();
+			expect(heartbeats()).toHaveLength(1);
+			expect(heartbeats()[0].attributes).toEqual({ group: 'lobby', error: { name: 'Error', code: null, message: "READONLY You can't write against a read only replica." } });
+
+			// A rejected beat and then a refused one are the same streak.
+			client.redis.pipeline = rejectingPipeline;
+			await beat();
+			client.redis.pipeline = refusingPipeline;
+			await beat();
+			expect(heartbeats()).toHaveLength(1);
+
+			client.redis.pipeline = pipeline;
+			await beat();
+			client.redis.pipeline = refusingPipeline;
+			await beat();
+			expect(heartbeats()).toHaveLength(2);
+		} finally {
+			group.destroy();
+		}
+	});
+
+	it('pub/sub relay: a refused PUBLISH in a batch fails the breaker and is not counted as relayed', async () => {
+		const client = mockRedisClient('fr-pubsub-refused:');
+		const breaker = recordingBreaker();
+		const metrics = recordingMetrics();
+		const bus = createPubSubBus(client, { breaker, metrics });
+		await bus.activate(mockPlatform());
+		try {
+			breaker.success.mockClear();
+			let publishes = 0;
+			const publish = client.redis.publish.bind(client.redis);
+			client.redis.publish = async (...args) => {
+				if (++publishes === 2) throw noperm('channel');
+				return publish(...args);
+			};
+			const platform = bus.wrap(mockPlatform());
+			platform.publish('a', 'e', 1);
+			platform.publish('b', 'e', 2);
+			platform.publish('c', 'e', 3);
+			await settle();
+			expect(publishes).toBe(3);
+			expect(breaker.failure).toHaveBeenCalledTimes(1);
+			expect(breaker.success).not.toHaveBeenCalled();
+			expect(metrics.count('pubsub_messages_relayed_total')).toBe(2);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
+	it('cursor: a refused snapshot write fails the breaker, and a refused removal is not reported as done', async () => {
+		const client = mockRedisClient('fr-cursor-refused:');
+		const breaker = recordingBreaker();
+		const make = (snapshotIntervalMs) => createRedisIo({
+			client, redis: client.redis, channel: 'cursor-ch', instanceId: 'i1', b: breaker,
+			validator: { acceptRaw: () => true, acceptEnvelope: () => true },
+			cursorTtl: 30, snapshotIntervalMs, activeTopics: new Set(['room']),
+			emit() {}, onMessage() {}, queueRemove() {}
+		});
+		client.redis.hset = async () => { throw readonly(); };
+		client.redis.hdel = async () => { throw readonly(); };
+
+		const direct = make(0);
+		direct.queueSnapshot('room', 'i1:c1', { id: 'c1' }, { x: 1 });
+		await settle();
+		expect(breaker.failure).toHaveBeenCalledTimes(1);
+		expect(breaker.success).not.toHaveBeenCalled();
+
+		const batched = make(50);
+		batched.queueSnapshot('room', 'i1:c1', { id: 'c1' }, { x: 2 });
+		batched.flushSnapshot();
+		await settle();
+		expect(breaker.failure).toHaveBeenCalledTimes(2);
+
+		expect(await direct.removeKeysBatch(['room'], 'i1:c1')).toBe(false);
+		expect(breaker.failure).toHaveBeenCalledTimes(3);
+		expect(breaker.success).not.toHaveBeenCalled();
+		direct.dispose();
+		batched.dispose();
+	});
+
+	it('cursor erasure: a cursor whose removal Redis refused is not counted as erased', async () => {
+		const client = mockRedisClient('fr-cursor-erase:');
+		const cursor = createCursor(client);
+		try {
+			const entry = JSON.stringify({ user: 'u1', data: { x: 1 }, ts: Date.now() });
+			await client.redis.hset(client.key('cursor:{room}'), 'other:c1', entry);
+			const hdel = client.redis.hdel.bind(client.redis);
+			client.redis.hdel = async () => { throw readonly(); };
+			expect(await cursor.purgeUser(null, 'u1')).toBe(0);
+			client.redis.hdel = hdel;
+			expect(await cursor.purgeUser(null, 'u1')).toBe(1);
+		} finally {
+			cursor.destroy?.();
+		}
+	});
+
+	it('cursor erasure: a refused REMOVE publish fails the breaker but the erased cursor still counts', async () => {
+		const client = mockRedisClient('fr-cursor-erase-pub:');
+		const breaker = recordingBreaker();
+		const cursor = createCursor(client, { breaker });
+		try {
+			const entry = JSON.stringify({ user: 'u1', data: { x: 1 }, ts: Date.now() });
+			await client.redis.hset(client.key('cursor:{room}'), 'other:c1', entry);
+			client.redis.publish = async () => { throw noperm('channel'); };
+			expect(await cursor.purgeUser(null, 'u1')).toBe(1);
+			expect(await client.redis.hgetall(client.key('cursor:{room}'))).toEqual({});
+			expect(breaker.failure).toHaveBeenCalled();
+		} finally {
+			cursor.destroy?.();
+		}
+	});
+
+	it('connection registry heartbeat: a refused EXPIRE fails the breaker', async () => {
+		const intervals = captureIntervals();
+		const client = mockRedisClient('fr-registry-refused:');
+		const breaker = recordingBreaker();
+		const registry = createConnectionRegistry(client, { identify: (ws) => ws.getUserData().userId, heartbeat: 60000, breaker });
+		try {
+			const ws = mockWs({ userId: 'u1' });
+			ws.getUserData()[WS_SESSION_ID] = 's1';
+			await registry.hooks.open(ws, { platform: mockPlatform() });
+			breaker.success.mockClear();
+			breaker.failure.mockClear();
+			client.redis.expire = async () => { throw readonly(); };
+			for (const { cb } of intervals) cb();
+			await settle();
+			expect(breaker.failure).toHaveBeenCalledTimes(1);
+			expect(breaker.success).not.toHaveBeenCalled();
+		} finally {
+			await registry.destroy();
+		}
+	});
+
+	it('presence erasure: a topic whose delete Redis refused is not counted as erased', async () => {
+		const client = mockRedisClient('fr-presence-refused:');
+		const presence = createPresence(client);
+		try {
+			await client.redis.hset(client.key('presence:user:{room}:u1'), 'i1|w1', '{}');
+			await client.redis.hset(client.key('presence:{room}'), 'u1', '{}');
+			const del = client.redis.del.bind(client.redis);
+			client.redis.del = async () => { throw readonly(); };
+			expect(await presence.purgeUser(null, 'u1')).toBe(0);
+			client.redis.del = del;
+			expect(await presence.purgeUser(null, 'u1')).toBe(1);
+		} finally {
+			await presence.destroy?.();
 		}
 	});
 });

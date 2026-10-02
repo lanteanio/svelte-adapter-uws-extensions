@@ -56,7 +56,7 @@ import {
 import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
-import { execMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
@@ -1249,10 +1249,13 @@ export function createPresence(client, options = {}) {
 				if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
 				const topic = k.slice(prefix.length, k.length - suffix.length);
 				try {
-					await execMultiSlot(redis, [
+					// A refused DEL or HDEL resolves as a per-command error; the user's
+					// data is still there, so the topic is not counted as erased.
+					const err = firstCommandError(await execMultiSlot(redis, [
 						['del', userHashKey(topic, userId)],
 						['hdel', topicHashKey(topic), userId]
-					]);
+					]));
+					if (err) throw err;
 					b?.success();
 				} catch (err) {
 					b?.failure(err);

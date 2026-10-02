@@ -25,6 +25,7 @@ import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
 import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { firstCommandError } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
@@ -238,12 +239,19 @@ export function createGroup(client, name, options = {}) {
 		// instance holds the group open, and expire once every instance stops.
 		pipe.pexpire(membersKey, keyExpiryMs);
 		pipe.pexpire(metaKey, keyExpiryMs);
-		pipe.exec().then(() => { heartbeatFailing = false; }, (err) => {
+		// A beat fails when exec() rejects or when any command in it failed
+		// (exec() resolves with READONLY, OOM or NOPERM as per-command entries).
+		const beatFailed = (err) => {
 			// One report per failure streak; the next successful beat re-arms it.
 			if (!err || heartbeatFailing) return;
 			heartbeatFailing = true;
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_HEARTBEAT, { error: err, attributes: { group: name } });
-		});
+		};
+		pipe.exec().then((results) => {
+			const err = firstCommandError(results);
+			if (err) beatFailed(err);
+			else heartbeatFailing = false;
+		}, beatFailed);
 	}, memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 

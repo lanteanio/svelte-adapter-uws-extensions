@@ -500,7 +500,7 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.groups.heartbeat.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.heartbeat.failed severity=warn] A Redis group heartbeat pipeline failed.`
-- **Cause:** The periodic pipeline that refreshes member timestamps and key expiry threw.
+- **Cause:** The periodic pipeline that refreshes member timestamps and key expiry was rejected, or Redis refused one of its commands (READONLY after a failover, OOM, NOPERM).
 - **Consequence:** If heartbeats keep failing past the member TTL, other instances treat this instance's members as gone and the group keys may expire. Reported once per failure streak per group; a successful heartbeat re-arms it.
 - **Automatic recovery:** The next heartbeat tick retries; a single failure inside the TTL window has no visible effect.
 - **Next action:** Check Redis connectivity; sustained failures on one instance mean its members are being evicted cluster-wide.

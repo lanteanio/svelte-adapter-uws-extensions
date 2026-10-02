@@ -17,7 +17,7 @@
 import { now, setIntervalTimer, clearIntervalTimer } from '../../shared/runtime.js';
 import { evalCached } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
-import { execMultiSlot } from '../../shared/cluster.js';
+import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
@@ -228,7 +228,7 @@ export function createRedisIo({
 			queued += entries.size;
 		}
 		if (queued === 0) return;
-		execMultiSlot(redis, commands).then(() => b?.success()).catch((err) => b?.failure(err));
+		execMultiSlot(redis, commands).then(settleBreaker).catch((err) => b?.failure(err));
 	}
 
 	function queueSnapshot(topic, key, user, data) {
@@ -237,7 +237,7 @@ export function createRedisIo({
 			const pipe = redis.pipeline();
 			pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: now() }));
 			pipe.expire(hashKey(topic), cursorTtl);
-			pipe.exec().then(() => b?.success()).catch((err) => b?.failure(err));
+			pipe.exec().then(settleBreaker).catch((err) => b?.failure(err));
 			return;
 		}
 		let topicPending = redisPending.get(topic);
@@ -246,6 +246,14 @@ export function createRedisIo({
 			redisPending.set(topic, topicPending);
 		}
 		topicPending.set(key, { user, data, ts: now() });
+	}
+
+	// A snapshot write fails when Redis refuses any of its commands, not only
+	// when the batch is rejected.
+	function settleBreaker(results) {
+		const err = firstCommandError(results);
+		if (err) b?.failure(err);
+		else b?.success();
 	}
 
 	function hashKey(topic) {
@@ -309,7 +317,9 @@ export function createRedisIo({
 	 * Remove one connection key across several topics in one multi-slot batch:
 	 * an HDEL of the key from each topic hash plus the REMOVE publish, atomic per
 	 * slot. execMultiSlot (NOT pipeline) so the hdel+publish for an other-node
-	 * topic is not silently dropped. Returns false on breaker-open/Redis error.
+	 * topic is not silently dropped. Returns false when Redis did not take an
+	 * HDEL; a refused REMOVE publish still reaches the breaker but does not
+	 * undo the erasure (other instances age the entry out).
 	 */
 	async function removeKeysBatch(topics, key) {
 		const commands = [];
@@ -319,14 +329,20 @@ export function createRedisIo({
 				instanceId, topic: t, event: EVENTS.REMOVE, payload: { key }
 			})]);
 		}
+		let results;
 		try {
-			await execMultiSlot(redis, commands);
-			b?.success();
-			return true;
+			results = await execMultiSlot(redis, commands);
 		} catch (err) {
 			b?.failure(err);
 			return false;
 		}
+		const err = firstCommandError(results);
+		if (err) b?.failure(err);
+		else b?.success();
+		for (let i = 0; i < results.length; i += 2) {
+			if (results[i] && results[i][0]) return false;
+		}
+		return true;
 	}
 
 	/** Swap in a fresh pending map (tracker clear()). The old map is dropped. */

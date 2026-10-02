@@ -257,6 +257,18 @@ counted in `pubsub_parse_errors_total` / `sharded_pubsub_parse_errors_total`,
 like every other malformed envelope. Move an alert on those two assertion
 categories to the parse-error counters.
 
+### A command Redis refuses inside a batch now reaches the breaker
+
+The pub/sub and sharded relay flushes, cursor snapshot writes and removals
+(every cursor close, and cursor `purgeUser`), the connection-registry
+heartbeat and presence `purgeUser` report a batch with a refused command
+(READONLY after a failover, OOM, NOPERM) to the breaker as a failure, where they
+counted it as a success. During a failover window a breaker shared with other
+modules can therefore open, and their awaited calls throw `CircuitBrokenError`
+until it probes healthy again. The relayed-message counters now count only what
+went out. Size `failureThreshold` for this, or give the busiest modules (the
+relay buses, cursor) their own breaker.
+
 ### Admission rules recognize all seven adapter pressure reasons
 
 **Symptom.** An admission class intended to shed under any pressure keeps

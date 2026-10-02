@@ -403,7 +403,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.GROUPS_HEARTBEAT,
 		event: 'redis.groups.heartbeat.failed', component: 'runtime.redis.groups', severity: 'warn',
 		problemPrefix: 'A Redis group heartbeat pipeline failed.',
-		cause: 'The periodic pipeline that refreshes member timestamps and key expiry threw.',
+		cause: 'The periodic pipeline that refreshes member timestamps and key expiry was rejected, or Redis refused one of its commands (READONLY after a failover, OOM, NOPERM).',
 		consequence: 'If heartbeats keep failing past the member TTL, other instances treat this instance\'s members as gone and the group keys may expire. Reported once per failure streak per group; a successful heartbeat re-arms it.',
 		automaticRecovery: 'The next heartbeat tick retries; a single failure inside the TTL window has no visible effect.',
 		nextAction: 'Check Redis connectivity; sustained failures on one instance mean its members are being evicted cluster-wide.',

@@ -30,7 +30,7 @@ import {
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
 } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { execMultiSlot, isCluster, keySlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, isCluster, keySlot } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
@@ -371,22 +371,26 @@ export function createShardedBus(client, options = {}) {
 		// to one node and silently drop the channels owned elsewhere, so route
 		// each SPUBLISH per owning-node on a cluster (one pipeline on standalone).
 		const commands = [];
-		const counts = []; // for metric inc per channel
+		const commandTopics = []; // index-aligned with commands, for the relayed counter
 		for (const [ch, entries] of batches) {
-			for (const { msg } of entries) {
+			for (const { msg, topics } of entries) {
 				commands.push(['spublish', ch, msg]);
+				commandTopics.push(topics);
 			}
-			counts.push({ entries });
 		}
-		execMultiSlot(client.redis, commands).then(() => {
-			for (const { entries } of counts) {
-				for (const { topics } of entries) {
-					for (let i = 0; i < topics.length; i++) {
-						mRelayed?.inc({ topic: mt(topics[i]) });
-					}
+		execMultiSlot(client.redis, commands).then((results) => {
+			// A refused SPUBLISH resolves as a per-command error (on a cluster
+			// every command is issued on its own); count only what went out.
+			for (let c = 0; c < commandTopics.length; c++) {
+				if (results[c] && results[c][0]) continue;
+				const topics = commandTopics[c];
+				for (let i = 0; i < topics.length; i++) {
+					mRelayed?.inc({ topic: mt(topics[i]) });
 				}
 			}
-			b?.success();
+			const err = firstCommandError(results);
+			if (err) b?.failure(err);
+			else b?.success();
 		}).catch((err) => { b?.failure(err); });
 	}
 

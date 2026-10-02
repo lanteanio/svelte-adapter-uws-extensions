@@ -53,6 +53,25 @@ export async function execMultiSlot(redis, commands) {
 	);
 }
 
+/**
+ * The first per-command error in a pipeline, transaction or `execMultiSlot`
+ * result, or null when every command succeeded. `exec()` resolves even when
+ * individual commands fail (READONLY after a failover, OOM, NOPERM): each
+ * failure is an `[err, value]` entry, never a rejection, so a caller that only
+ * handles the rejection counts those commands as done.
+ *
+ * @param {Array<[Error | null, any]> | null | undefined} results
+ * @returns {Error | null}
+ */
+export function firstCommandError(results) {
+	if (!results) return null;
+	for (let i = 0; i < results.length; i++) {
+		const err = results[i] && results[i][0];
+		if (err) return err;
+	}
+	return null;
+}
+
 const HASH_SLOTS = 16384;
 
 /**

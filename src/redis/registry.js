@@ -41,7 +41,7 @@ import {
 } from '../shared/runtime.js';
 import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { execMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
@@ -779,7 +779,12 @@ export function createConnectionRegistry(client, options) {
 		for (const sessionId of appSessionToWs.keys()) {
 			commands.push(['expire', sessionKey(sessionId), ttl]);
 		}
-		execMultiSlot(redis, commands).then(() => breaker?.success()).catch((err) => breaker?.failure(err));
+		execMultiSlot(redis, commands).then((results) => {
+			// A refused EXPIRE resolves as a per-command error, not a rejection.
+			const err = firstCommandError(results);
+			if (err) breaker?.failure(err);
+			else breaker?.success();
+		}).catch((err) => breaker?.failure(err));
 	}
 
 	function handleInbound(envelope) {

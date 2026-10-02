@@ -14,6 +14,7 @@ import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { firstCommandError } from '../shared/cluster.js';
 import {
 	REDIS_TRACE_ATTRIBUTES,
 	injectTraceContext,
@@ -353,10 +354,23 @@ export function createPubSubBus(client, options = {}) {
 		for (let i = 0; i < batch.length; i++) {
 			pipe.publish(channel, batch[i].msg);
 		}
-		pipe.exec().then(() => {
+		pipe.exec().then((results) => {
 			mBatchSize?.observe(batch.length);
-			mRelayed?.inc(totalMessages);
-			b?.success();
+			// A refused PUBLISH resolves as a per-command error; count only the
+			// messages that went out, and report the failure as the single-publish
+			// path above does.
+			const err = firstCommandError(results);
+			if (err === null) {
+				mRelayed?.inc(totalMessages);
+				b?.success();
+				return;
+			}
+			let relayed = 0;
+			for (let i = 0; i < batch.length; i++) {
+				if (!results[i][0]) relayed += batch[i].count;
+			}
+			if (relayed > 0) mRelayed?.inc(relayed);
+			b?.failure(err);
 		}).catch((err) => { b?.failure(err); });
 	}
 
