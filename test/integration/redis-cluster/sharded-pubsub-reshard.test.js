@@ -129,4 +129,44 @@ describe('sharded bus survives a live slot migration (cluster)', () => {
 			await clientB.redis.quit().catch(() => clientB.redis.disconnect());
 		}
 	}, 30000);
+
+	it('gets a followed channel back after its master drops the subscriber connection', async () => {
+		const channelPrefix = 'inttest-reconnect:';
+		const topic = 'room';
+		const slot = keySlot(channelPrefix + topic);
+
+		const clientA = busClient(clusterClient());
+		const clientB = busClient(clusterClient());
+		const platA = mockPlatform();
+		const platB = mockPlatform();
+		const busA = createShardedBus(clientA, { channelPrefix });
+		const busB = createShardedBus(clientB, { channelPrefix });
+
+		try {
+			await busA.activate(platA);
+			await busB.activate(platB);
+			await busB.follow(topic);
+
+			busA.wrap(platA).publish(topic, 'msg', { n: 1 });
+			await waitFor(() => platB.published.some((p) => p.data && p.data.n === 1));
+
+			// The owner closes every pub/sub connection. A cluster node connection
+			// never reconnects (ioredis gives it no retry strategy), so the
+			// channel only comes back if the bus replaces the connection.
+			const ownerId = ownerIdOf(await ctrl.cluster('SLOTS'), slot);
+			await mastersById.get(ownerId).client('KILL', 'TYPE', 'pubsub');
+
+			await waitFor(async () => {
+				busA.wrap(platA).publish(topic, 'msg', { n: 2 });
+				await wait(150);
+				return platB.published.some((p) => p.data && p.data.n === 2);
+			}, 10000);
+			expect(platB.published.some((p) => p.data && p.data.n === 2)).toBe(true);
+		} finally {
+			await busA.deactivate().catch(() => {});
+			await busB.deactivate().catch(() => {});
+			await clientA.redis.quit().catch(() => clientA.redis.disconnect());
+			await clientB.redis.quit().catch(() => clientB.redis.disconnect());
+		}
+	}, 30000);
 });

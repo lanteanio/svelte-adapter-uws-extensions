@@ -471,6 +471,10 @@ export function createShardedBus(client, options = {}) {
 				const s = node.duplicate({ enableReadyCheck: false });
 				s.on('error', subOnError);
 				s.on('smessage', handleSMessage);
+				// ioredis gives cluster node connections no retry strategy and a
+				// duplicate inherits it, so this connection never reconnects: one
+				// the master drops ends for good.
+				s.on('end', () => masterEnded(id, s));
 				subByNodeId.set(id, s);
 			}
 		}));
@@ -479,6 +483,24 @@ export function createShardedBus(client, options = {}) {
 		// Each entry: [startSlot, endSlot, [ip, port, nodeId], ...replicas].
 		slotRanges = slots.map((e) => ({ start: e[0], end: e[1], nodeId: e[2][2] }));
 		topologyDirty = false;
+	}
+
+	// A master connection that ended took its shard channels with it. It is
+	// dropped, so the next topology refresh opens a fresh one for the master,
+	// and its channels go to the reconciliation, which subscribes each on its
+	// slot's current owner with a timeout, a slot-map refresh and a retry (an
+	// SSUBSCRIBE for a slot the master no longer owns is never answered, so the
+	// old owner is not assumed).
+	function masterEnded(id, conn) {
+		if (subByNodeId.get(id) !== conn) return;
+		subByNodeId.delete(id);
+		let lost = false;
+		for (const [channel, nodeId] of channelNode) {
+			if (nodeId !== id) continue;
+			channelNode.delete(channel);
+			lost = true;
+		}
+		if (lost) scheduleReconcile();
 	}
 
 	// The node id owning a slot, from the cached slot map (null if unknown). The
@@ -520,7 +542,11 @@ export function createShardedBus(client, options = {}) {
 		if (topologyDirty) await subRefreshTopology();
 		if (generation !== subGeneration) return;
 		let ownerId = ownerIdForSlot(slot);
-		if (ownerId === null) {
+		// No owner in the map, or an owner whose connection ended since the map
+		// was read: a refresh resolves the owner and opens its connection. One
+		// that was already past this master when its connection ended does not
+		// reopen it, so a second one runs.
+		for (let attempt = 0; attempt < 2 && (ownerId === null || !subByNodeId.has(ownerId)); attempt++) {
 			await subRefreshTopology();
 			if (generation !== subGeneration) return;
 			ownerId = ownerIdForSlot(slot);

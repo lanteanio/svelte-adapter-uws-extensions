@@ -442,6 +442,10 @@ function fakeCluster() {
 	let created = 0;
 	/** @type {Promise<void> | null} while set, CLUSTER MYID waits for it */
 	let myidGate = null;
+	/** @type {Promise<void> | null} while set, CLUSTER SLOTS waits for it */
+	let slotsGate = null;
+	/** @type {Promise<void> | null} while set, every psubscribe waits for it */
+	let psubscribeGate = null;
 	/** @type {Map<string, any>} */
 	const conns = new Map();
 	const conn = (id) => {
@@ -454,9 +458,13 @@ function fakeCluster() {
 			gate: null,
 			attempts: 0,
 			subscribed: new Set(),
-			on(event, fn) { listeners.set(event, fn); return c; },
+			on(event, fn) {
+				if (!listeners.has(event)) listeners.set(event, []);
+				listeners.get(event).push(fn);
+				return c;
+			},
 			removeAllListeners() { listeners.clear(); },
-			emit(event, ...args) { listeners.get(event)?.(...args); },
+			emit(event, ...args) { for (const fn of listeners.get(event) ?? []) fn(...args); },
 			async ssubscribe(channel) {
 				c.attempts++;
 				if (c.gate) await c.gate;
@@ -465,7 +473,13 @@ function fakeCluster() {
 				c.subscribed.add(channel);
 			},
 			async sunsubscribe(channel) { c.subscribed.delete(channel); },
-			async psubscribe() { if (c.refuse) throw noperm('channel'); },
+			patterns: new Set(),
+			async psubscribe(pattern) {
+				if (psubscribeGate) await psubscribeGate;
+				if (c.ended) throw new Error('Connection is closed.');
+				if (c.refuse) throw noperm('channel');
+				c.patterns.add(pattern);
+			},
 			quits: 0,
 			async quit() { c.quits++; },
 			disconnect() {}
@@ -494,6 +508,18 @@ function fakeCluster() {
 		setKeyspaceFlags(id, flags) { keyspaceFlags.set(id, flags); },
 		get created() { return created; },
 		/** Hold CLUSTER MYID until the returned function is called. */
+		/** Hold CLUSTER SLOTS until the returned function is called. */
+		holdSlots() {
+			let release;
+			slotsGate = new Promise((resolve) => { release = resolve; });
+			return () => { slotsGate = null; release(); };
+		},
+		/** Hold every psubscribe until the returned function is called. */
+		holdPsubscribe() {
+			let release;
+			psubscribeGate = new Promise((resolve) => { release = resolve; });
+			return () => { psubscribeGate = null; release(); };
+		},
 		holdMyid() {
 			let release;
 			myidGate = new Promise((resolve) => { release = resolve; });
@@ -505,6 +531,7 @@ function fakeCluster() {
 			info: async () => '# Server\nredis_version:7.2.0\n',
 			nodes: () => masters,
 			cluster: async () => {
+				if (slotsGate) await slotsGate;
 				if (slotsDown) throw new Error('CLUSTERDOWN The cluster is down');
 				// A null owner leaves every slot out of the map.
 				return owner === null ? [] : [[0, 16383, ['127.0.0.1', 7000, owner]]];
@@ -841,6 +868,106 @@ describe('cluster-only failure paths', () => {
 		}
 	});
 
+	it('a master connection that ends is replaced, and its channels come back on the fresh one', async () => {
+		const { cluster, bus } = await followedCluster();
+		const first = cluster.conns.get('node-a');
+		expect(first.subscribed.has(CHANNEL)).toBe(true);
+		first.subscribed.clear();
+		first.emit('end');
+		await settle();
+		const fresh = cluster.conns.get('node-a');
+		expect(fresh).not.toBe(first);
+		expect(fresh.subscribed.has(CHANNEL)).toBe(true);
+		// The ended connection is out of the bus: deactivate quits only the live ones.
+		await bus.deactivate();
+		expect(first.quits).toBe(0);
+		expect(fresh.quits).toBe(1);
+	});
+
+	it('a master connection that ends while holding nothing is replaced on the next follow', async () => {
+		const cluster = fakeCluster();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		await bus.activate(mockPlatform());
+		const first = cluster.conns.get('node-a');
+		first.emit('end');
+		await settle();
+		expect(cluster.conns.get('node-a')).toBe(first);
+		await bus.follow('user:42:inbox');
+		const fresh = cluster.conns.get('node-a');
+		expect(fresh).not.toBe(first);
+		expect(fresh.subscribed.has(CHANNEL)).toBe(true);
+		expect(first.attempts).toBe(0);
+		await bus.deactivate();
+	});
+
+	it('a master connection that ends during a topology refresh is replaced before the next follow uses it', async () => {
+		const cluster = fakeCluster();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		await bus.activate(mockPlatform());
+		const first = cluster.conns.get('node-a');
+		// A reconciliation's refresh is past CLUSTER MYID and waiting on SLOTS when
+		// the connection ends; it must not clear the staleness the end recorded.
+		const release = cluster.holdSlots();
+		first.emit('error', new Error('read ECONNRESET'));
+		await settle();
+		first.emit('end');
+		release();
+		await settle();
+		await bus.follow('user:42:inbox');
+		const fresh = cluster.conns.get('node-a');
+		expect(fresh).not.toBe(first);
+		expect(fresh.subscribed.has(CHANNEL)).toBe(true);
+		await bus.deactivate();
+	});
+
+	it('a presence keyspace connection that ends while a sweep is running is still replaced', async () => {
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-race:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			const release = cluster.holdPsubscribe();
+			const subscribing = subscriber.subscribeToTopic('room', mockPlatform());
+			await settle();
+			// The sweep is waiting on the psubscribe when the master drops node-a.
+			const first = cluster.conns.get('node-a');
+			first.ended = true;
+			first.emit('end');
+			// The replacement it schedules runs while that sweep is still waiting.
+			await settle();
+			release();
+			await subscribing;
+			await settle();
+			const fresh = cluster.conns.get('node-a');
+			expect(fresh).not.toBe(first);
+			expect(fresh.patterns.has('__keyevent@*__:del')).toBe(true);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a presence keyspace connection a master drops is replaced and subscribed again', async () => {
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-end:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			const first = cluster.conns.get('node-a');
+			expect(first.patterns.has('__keyevent@*__:del')).toBe(true);
+			first.emit('end');
+			await settle();
+			const fresh = cluster.conns.get('node-a');
+			expect(fresh).not.toBe(first);
+			expect(fresh.patterns.has('__keyevent@*__:del')).toBe(true);
+			// node-b's connection is untouched.
+			expect(cluster.created).toBe(3);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
 
 	it('an activation that cannot read the slot map closes the subscriber connections it opened', async () => {
 		const cluster = fakeCluster();

@@ -106,6 +106,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	let keyspaceReconcileTimer = null;
 	/** @type {Promise<void> | null} single-flight guard for the master sweep */
 	let keyspaceReconciling = null;
+	let keyspaceRerun = false;
 	// Set once dispose() runs so a sweep that is mid-await (or a post-dispose error /
 	// node event) cannot repopulate keyspaceSubs with connections nothing will quit.
 	let disposed = false;
@@ -178,7 +179,12 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	// re-covered.
 	async function reconcileKeyspaceMasters() {
 		if (disposed) return;
-		if (keyspaceReconciling) return keyspaceReconciling;
+		if (keyspaceReconciling) {
+			// The running sweep may already be past the master that asked; run
+			// once more when it finishes.
+			keyspaceRerun = true;
+			return keyspaceReconciling;
+		}
 		keyspaceReconciling = (async () => {
 			let masters;
 			try { masters = /** @type {any} */ (client.redis).nodes('master'); } catch { return; }
@@ -197,6 +203,14 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					scheduleKeyspaceReconcile();
 				});
 				s.on('pmessage', onKeyspaceDel);
+				// ioredis gives cluster node connections no retry strategy and a
+				// duplicate inherits it, so this connection never reconnects: one the
+				// master drops ends for good and is replaced.
+				s.on('end', () => {
+					if (keyspaceSubs.get(id) !== s) return;
+					keyspaceSubs.delete(id);
+					scheduleKeyspaceReconcile();
+				});
 				keyspaceSubs.set(id, s); // now tracked: a dispose() during psubscribe will quit it
 				try {
 					await s.psubscribe('__keyevent@*__:del');
@@ -219,7 +233,13 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					s.quit().catch(() => s.disconnect());
 				}
 			}
-		})().finally(() => { keyspaceReconciling = null; });
+		})().finally(() => {
+			keyspaceReconciling = null;
+			if (keyspaceRerun) {
+				keyspaceRerun = false;
+				scheduleKeyspaceReconcile();
+			}
+		});
 		return keyspaceReconciling;
 	}
 
