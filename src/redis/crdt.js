@@ -53,6 +53,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT } from '../shared/lease-scripts.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_UPDATE = 'u';
@@ -126,7 +127,7 @@ export function createCrdtCluster(client, options = {}) {
 	/** Bring up the relay subscriber once; idempotent. */
 	function ensureSubscriber() {
 		if (subscriber || destroyed) return;
-		const sub = client.duplicate({ enableReadyCheck: false });
+		const sub = openSubscriber(client, 'crdt');
 		subscriber = sub;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CRDT_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => {

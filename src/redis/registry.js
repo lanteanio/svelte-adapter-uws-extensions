@@ -49,6 +49,7 @@ import {
 	MAX_REGISTRY_USER_INDEX,
 	MAX_REGISTRY_INDEX_VALUES_PER_KEY
 } from '../shared/caps.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 /**
  * Lua-atomic compare-and-delete: only removes the registry entry if the
@@ -620,7 +621,7 @@ export function createConnectionRegistry(client, options) {
 	async function ensureSubscriber(platform) {
 		activePlatform = platform || activePlatform;
 		if (subscriber) return;
-		subscriber = client.duplicate({ enableReadyCheck: false });
+		subscriber = openSubscriber(client, 'registry');
 		subscriber.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REGISTRY_SUBSCRIBER, { error: err });
 		});

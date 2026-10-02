@@ -26,6 +26,7 @@ import { mergeFields, newFieldMap } from './field-policy.js';
 import { INTERNAL_EVENTS } from './lua.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
+import { openSubscriber } from '../../shared/redis-subscriber.js';
 
 /**
  * JSON object shape used by every presence event payload container.
@@ -265,7 +266,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 			// sibling bus module.
 			const busValidator = createBusValidator({ label: 'redis presence', maxBytes: maxEnvelopeBytes });
 			const prefix = client.key('presence:events:');
-			subscriber = client.duplicate({ enableReadyCheck: false });
+			subscriber = openSubscriber(client, 'presence');
 			subscriber.on('error', (err) => {
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_SUBSCRIBER, { error: err });
 			});

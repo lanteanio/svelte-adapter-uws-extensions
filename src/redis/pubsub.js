@@ -25,6 +25,7 @@ import {
 } from '../shared/trace-context.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 /**
  * @typedef {Object} PubSubBusOptions
@@ -718,7 +719,7 @@ export function createPubSubBus(client, options = {}) {
 				});
 			}
 
-			const sub = client.duplicate({ enableReadyCheck: false });
+			const sub = openSubscriber(client, 'pubsub');
 			subscriber = sub;
 			sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
 

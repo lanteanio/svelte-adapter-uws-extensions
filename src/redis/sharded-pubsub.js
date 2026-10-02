@@ -41,6 +41,7 @@ import {
 	runTraceOperation,
 	traceEnabled
 } from '../shared/trace-context.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 // A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
 // channel's slot never resolves - the command hangs instead of returning a MOVED
@@ -642,7 +643,7 @@ export function createShardedBus(client, options = {}) {
 		if (isCluster(client.redis)) {
 			await subRefreshTopology();
 		} else {
-			subStandalone = client.duplicate({ enableReadyCheck: false });
+			subStandalone = openSubscriber(client, 'sharded-pubsub');
 			subStandalone.on('error', subOnError);
 			subStandalone.on('smessage', handleSMessage);
 		}

@@ -3717,6 +3717,12 @@ The breaker is a three-state machine: **healthy** (all requests pass through) ->
 
 A relay, snapshot, heartbeat or erasure batch that Redis answers with a refused command (READONLY after a failover, OOM, NOPERM) counts as a failure even though the pipeline itself resolves: the pub/sub and sharded relay flushes, cursor snapshot writes and removals, the registry heartbeat and presence `purgeUser` report it to the breaker; the groups heartbeat reports a failed beat; presence and cursor `purgeUser` do not count what Redis refused to delete as erased; and relayed-message counters count only what went out. The presence heartbeat and the group join TTL refresh stay best-effort.
 
+#### Subscriptions across a reconnect
+
+Every subscriber connection a module opens through the client's `duplicate()` restores its own channels after a reconnect instead of leaving that to ioredis. Redis disconnects a client that loses access to a channel it is subscribed to, so an ACL change is itself a reconnect, and the re-subscribe that follows is refused with `NOPERM`; left to ioredis, that refusal is an unhandled rejection, which ends a Node process in the default mode. Here the channels Redis still accepts come back at once, the refusal is reported once per failure streak as `redis.subscriber.resubscribe.failed` with the owning module and a count (never a channel name), and refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, so restoring the grant restores delivery without waiting for another reconnect. Connections you open yourself with `redis.duplicate()` keep ioredis's own behaviour.
+
+On a Redis Cluster the client's `duplicate()` returns a Cluster, whose subscriber is ioredis's own: it re-subscribes when it moves to another node and does not crash on a refusal, but it neither reports nor retries one, so a refused channel stays unsubscribed until ioredis next moves the subscriber.
+
 #### Notifying clients of degradation
 
 When Redis pub/sub fails, live streams on other replicas stop receiving updates. Connected clients continue showing stale data with no indication that the stream is degraded. The pub/sub bus emits this directly: when the shared breaker leaves the healthy state, a `degraded` event fires on the bus's `systemChannel` (default `'__realtime'`); when it returns to healthy, a `recovered` event fires.

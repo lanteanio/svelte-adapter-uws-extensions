@@ -21,6 +21,7 @@ import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
+import { openSubscriber } from '../../shared/redis-subscriber.js';
 
 /**
  * Create the cursor Redis I/O subsystem. State (pending snapshots, subscriber,
@@ -110,7 +111,7 @@ export function createRedisIo({
 		activePlatform = platform;
 		if (subscriber) return;
 		if (b && b.state === 'broken') return;
-		const sub = client.duplicate({ enableReadyCheck: false });
+		const sub = openSubscriber(client, 'cursor');
 		subscriber = sub;
 		sub.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBER, { error: err });

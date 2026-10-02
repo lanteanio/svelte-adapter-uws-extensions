@@ -28,6 +28,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { firstCommandError } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -406,7 +407,7 @@ export function createGroup(client, name, options = {}) {
 	async function ensureSubscriber(platform) {
 		subscribedPlatform = platform;
 		if (subscriber) return;
-		const sub = client.duplicate({ enableReadyCheck: false });
+		const sub = openSubscriber(client, 'groups');
 		sub.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_SUBSCRIBER, { error: err, attributes: { group: name } });
 		});

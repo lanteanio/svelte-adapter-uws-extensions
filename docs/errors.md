@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 60 diagnostic events. Each is one canonical line
+- 61 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -88,6 +88,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-PROMETHEUS-SERIES-CAP](#extensions-err-prometheus-series-cap) | `prometheus.series.cap-reached` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.prometheus event=prometheus.series.cap-reached severity=warn] A metric reached its maxSeries cap; new label sets for it are dropped.` |
 | [EXTENSIONS-ERR-POSTGRES-TASKS-SWEEP](#extensions-err-postgres-tasks-sweep) | `postgres.tasks.sweep.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.tasks event=postgres.tasks.sweep.failed severity=error] A background task sweep failed.` |
 | [EXTENSIONS-ERR-REDIS-CLIENT](#extensions-err-redis-client) | `redis.client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.client event=redis.client.failed severity=error] The Redis client created by createRedisClient reported an error.` |
+| [EXTENSIONS-ERR-REDIS-RESUBSCRIBE](#extensions-err-redis-resubscribe) | `redis.subscriber.resubscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.resubscribe.failed severity=error] Redis refused a subscription restored after a reconnect.` |
 | [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber) | `redis.pubsub.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.subscriber.failed severity=error] The pub/sub bus subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber) | `redis.crdt.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.crdt event=redis.crdt.subscriber.failed severity=error] The CRDT relay subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber) | `redis.smooth.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.smooth event=redis.smooth.subscriber.failed severity=error] The smooth relay subscriber connection reported an error.` |
@@ -106,7 +107,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 60 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 61 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -162,6 +163,7 @@ Indexed events:
 - `prometheus.series.cap-reached` - [EXTENSIONS-ERR-PROMETHEUS-SERIES-CAP](#extensions-err-prometheus-series-cap)
 - `postgres.tasks.sweep.failed` - [EXTENSIONS-ERR-POSTGRES-TASKS-SWEEP](#extensions-err-postgres-tasks-sweep)
 - `redis.client.failed` - [EXTENSIONS-ERR-REDIS-CLIENT](#extensions-err-redis-client)
+- `redis.subscriber.resubscribe.failed` - [EXTENSIONS-ERR-REDIS-RESUBSCRIBE](#extensions-err-redis-resubscribe)
 - `redis.pubsub.subscriber.failed` - [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber)
 - `redis.crdt.subscriber.failed` - [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber)
 - `redis.smooth.subscriber.failed` - [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber)
@@ -934,6 +936,18 @@ the stable ID tag on the line):
 - **Next action:** Check Redis reachability and credentials; the error attribute carries the redacted cause.
 - **Runtime help:** `docs/errors.md#extensions-err-redis-client`
 - **Runtime sources:** [src/redis/index.js](../src/redis/index.js)
+
+<a id="extensions-err-redis-resubscribe"></a>
+## `EXTENSIONS-ERR-REDIS-RESUBSCRIBE`
+
+- **Code/event:** `redis.subscriber.resubscribe.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.resubscribe.failed severity=error] Redis refused a subscription restored after a reconnect.`
+- **Cause:** A subscriber connection reconnected and Redis refused the SUBSCRIBE, PSUBSCRIBE or SSUBSCRIBE that restores one of its channels, for example NOPERM after the Redis user lost access to the channel, which is itself what makes Redis close a subscribed connection.
+- **Consequence:** Messages on the refused channels do not reach this instance, while the module that owns the connection still treats them as subscribed. The owner attribute names that module, kind the subscription type of the first refused channel and refused how many channels were refused; channel names are not logged. Reported once per failure streak per connection.
+- **Automatic recovery:** Refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, and again after every reconnect, until Redis accepts them or the module releases them. Channels Redis accepts are restored at once.
+- **Next action:** Grant the Redis user the channels this package subscribes to, or restore the server configuration that changed; the next retry restores the subscription.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-resubscribe`
+- **Runtime sources:** [src/shared/redis-subscriber.js](../src/shared/redis-subscriber.js)
 
 <a id="extensions-err-pubsub-subscriber"></a>
 ## `EXTENSIONS-ERR-PUBSUB-SUBSCRIBER`

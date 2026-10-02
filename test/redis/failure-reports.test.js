@@ -1268,3 +1268,48 @@ describe('a pub/sub envelope without an instance id', () => {
 		}
 	});
 });
+
+describe('every subscriber connection the package opens takes over its re-subscription', () => {
+	/** A recording client whose duplicates carry ioredis options, as real ones do. */
+	function optionsClient(prefix) {
+		const recorded = recordingClient(prefix);
+		const duplicate = recorded.client.duplicate;
+		recorded.client.duplicate = (...args) => {
+			const dup = duplicate(...args);
+			dup.options = { autoResubscribe: true };
+			return dup;
+		};
+		return recorded;
+	}
+
+	const sessionWs = () => {
+		const ws = mockWs({ userId: 'u1' });
+		ws.getUserData()[WS_SESSION_ID] = 's1';
+		return ws;
+	};
+
+	for (const [owner, start] of [
+		['pubsub', async (client) => { const bus = createPubSubBus(client); await bus.activate(mockPlatform()); return () => bus.deactivate(); }],
+		['sharded-pubsub', async (client) => { const bus = createShardedBus(client); await bus.activate(mockPlatform()); return () => bus.deactivate(); }],
+		['groups', async (client) => { captureIntervals(); const group = createGroup(client, 'lobby'); await group.join(mockWs({ id: 'm1' }), mockPlatform()); return () => group.destroy(); }],
+		['cursor', async (client) => { captureIntervals(); const cursor = createCursor(client); cursor.update(mockWs({ id: 'c1' }), 'room', { x: 1, y: 2 }, mockPlatform()); return () => cursor.destroy?.(); }],
+		['presence', async (client) => { const subscriber = presenceSubscriber(client, false); await subscriber.subscribeToTopic('room', mockPlatform()); return () => subscriber.dispose?.(); }],
+		['crdt', async (client) => { const relay = createCrdtCluster(client); relay.onMessage({ onUpdate() {} }); return () => relay.destroy?.(); }],
+		['smooth-cluster', async (client) => { const relay = createSmoothCluster(client); relay.onMessage({ onCommand() {} }); return () => relay.destroy?.(); }],
+		['topic-broadcast', async (client) => { const relay = createTopicBroadcast(client); relay.onRequest(async () => []); return () => relay.destroy?.(); }],
+		['registry', async (client) => { const registry = createConnectionRegistry(client, { identify: (ws) => ws.getUserData().userId, heartbeat: 60000 }); await registry.hooks.open(sessionWs(), { platform: mockPlatform() }); return () => registry.destroy(); }],
+		['publish-rate', async (client) => { const aggregator = createPublishRateAggregator(client); await aggregator.activate(mockPlatform()); return () => aggregator.deactivate(); }]
+	]) {
+		it(owner, async () => {
+			const { client, duplicates } = optionsClient('fr-guard-' + owner + ':');
+			const stop = await start(client);
+			try {
+				await settle();
+				expect(duplicates.length).toBeGreaterThan(0);
+				for (const dup of duplicates) expect(dup.options.autoResubscribe).toBe(false);
+			} finally {
+				await stop();
+			}
+		});
+	}
+});

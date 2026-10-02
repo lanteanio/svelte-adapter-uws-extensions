@@ -32,6 +32,7 @@ import { MAX_AGGREGATOR_REMOTE_INSTANCES, MAX_REMOTE_SLICE_ENTRIES } from '../sh
 import { createBusValidator } from '../shared/bus-validate.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -229,7 +230,7 @@ export function createPublishRateAggregator(client, options = {}) {
 		activated = true;
 		activePlatform = platform;
 
-		subscriber = client.duplicate({ enableReadyCheck: false });
+		subscriber = openSubscriber(client, 'publish-rate');
 		subscriber.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBLISH_RATE_SUBSCRIBER, { error: err });
 		});

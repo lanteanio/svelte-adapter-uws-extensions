@@ -65,6 +65,7 @@ import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-script
 import { isCluster, keySlot } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { openSubscriber } from '../shared/redis-subscriber.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_COMMAND = 'cmd';
@@ -229,7 +230,7 @@ export function createSmoothCluster(client, options = {}) {
 	/** Bring up the relay subscriber once; idempotent. */
 	function ensureSubscriber() {
 		if (subscriber || destroyed) return;
-		const sub = client.duplicate({ enableReadyCheck: false });
+		const sub = openSubscriber(client, 'smooth-cluster');
 		subscriber = sub;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SMOOTH_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => {
