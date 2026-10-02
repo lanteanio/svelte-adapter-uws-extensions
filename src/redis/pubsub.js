@@ -718,10 +718,11 @@ export function createPubSubBus(client, options = {}) {
 				});
 			}
 
-			subscriber = client.duplicate({ enableReadyCheck: false });
-			subscriber.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
+			const sub = client.duplicate({ enableReadyCheck: false });
+			subscriber = sub;
+			sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
 
-			subscriber.on('message', (ch, message) => {
+			sub.on('message', (ch, message) => {
 				if (ch !== channel) return;
 				// Pre-parse size guard. A bus subscriber that JSON.parses an
 				// arbitrarily large attacker payload pays parsing CPU + V8
@@ -768,14 +769,17 @@ export function createPubSubBus(client, options = {}) {
 			});
 
 			try {
-				await subscriber.subscribe(channel);
+				await sub.subscribe(channel);
 				b?.success();
 				active = true;
 			} catch (err) {
 				b?.failure(err);
 				activePlatform = null;
-				subscriber.quit().catch(() => subscriber.disconnect());
-				subscriber = null;
+				// quit() is the likely one to reject here, since Redis is what just
+				// failed, and its handler runs after the slot is cleared, so it uses
+				// this connection rather than reading the slot.
+				if (subscriber === sub) subscriber = null;
+				sub.quit().catch(() => sub.disconnect());
 				if (unsubscribeBreaker) {
 					unsubscribeBreaker();
 					unsubscribeBreaker = null;
@@ -797,9 +801,10 @@ export function createPubSubBus(client, options = {}) {
 			if (!active || !subscriber) return;
 			active = false;
 			activePlatform = null;
-			await subscriber.unsubscribe(channel).catch(() => {});
-			await subscriber.quit().catch(() => subscriber.disconnect());
+			const sub = subscriber;
 			subscriber = null;
+			await sub.unsubscribe(channel).catch(() => {});
+			await sub.quit().catch(() => sub.disconnect());
 		},
 
 		hooks: {

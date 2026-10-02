@@ -361,8 +361,9 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 				idleTimer = setTimer(() => {
 					idleTimer = null;
 					if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
-						subscriber.quit().catch(() => subscriber.disconnect());
+						const sub = subscriber;
 						subscriber = null;
+						sub.quit().catch(() => sub.disconnect());
 					}
 				}, 30000);
 				if (idleTimer.unref) idleTimer.unref();

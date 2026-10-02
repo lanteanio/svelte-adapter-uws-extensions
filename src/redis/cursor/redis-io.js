@@ -357,8 +357,9 @@ export function createRedisIo({
 		if (snapshotTimer) clearIntervalTimer(snapshotTimer);
 		snapshotTimer = null;
 		if (subscriber) {
-			subscriber.quit().catch(() => subscriber.disconnect());
+			const sub = subscriber;
 			subscriber = null;
+			sub.quit().catch(() => sub.disconnect());
 		}
 		activePlatform = null;
 	}

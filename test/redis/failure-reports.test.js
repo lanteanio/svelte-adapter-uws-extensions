@@ -1139,6 +1139,89 @@ describe('a command Redis refuses inside a batch is a failed command', () => {
 	});
 });
 
+describe('teardown survives a refused quit', () => {
+	it('pub/sub bus: a refused subscribe closes its own connection when quit is refused too', async () => {
+		const client = mockRedisClient('fr-pubsub-quit:');
+		const duplicate = client.duplicate.bind(client);
+		/** @type {any} */
+		let conn = null;
+		client.duplicate = (...args) => {
+			conn = duplicate(...args);
+			conn.subscribe = async () => { throw noperm('channel'); };
+			conn.quit = async () => { throw new Error('Connection is closed.'); };
+			conn.disconnect = vi.fn();
+			return conn;
+		};
+		const unhandled = vi.fn();
+		process.on('unhandledRejection', unhandled);
+		try {
+			const bus = createPubSubBus(client);
+			await expect(bus.activate(mockPlatform())).rejects.toThrow('NOPERM');
+			await settle();
+			expect(conn.disconnect).toHaveBeenCalledTimes(1);
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off('unhandledRejection', unhandled);
+		}
+	});
+
+	it('pub/sub bus: a deactivate still closing leaves the connection of a newer activation alone', async () => {
+		const { client, duplicates } = recordingClient('fr-pubsub-race:');
+		const bus = createPubSubBus(client);
+		const platform = mockPlatform();
+		await bus.activate(platform);
+		const first = duplicates[0];
+		let release;
+		first.unsubscribe = () => new Promise((resolve) => { release = resolve; });
+		first.quit = vi.fn(async () => {});
+		const stopping = bus.deactivate();
+		await bus.activate(platform);
+		const second = duplicates[1];
+		second.quit = vi.fn(async () => {});
+		release();
+		await stopping;
+		expect(first.quit).toHaveBeenCalledTimes(1);
+		expect(second.quit).not.toHaveBeenCalled();
+		await bus.deactivate();
+		expect(second.quit).toHaveBeenCalledTimes(1);
+	});
+
+	it('cursor: dispose closes its connection when quit is refused', async () => {
+		const { client, duplicates } = recordingClient('fr-cursor-quit:');
+		const io = createRedisIo({
+			client, redis: client.redis, channel: 'cursor-ch', instanceId: 'i1', b: null,
+			validator: { acceptRaw: () => true, acceptEnvelope: () => true },
+			cursorTtl: 30, snapshotIntervalMs: 0, activeTopics: new Set(),
+			emit() {}, onMessage() {}, queueRemove() {}
+		});
+		io.ensureSubscriber(mockPlatform());
+		await settle();
+		const conn = duplicates[0];
+		conn.quit = async () => { throw new Error('Connection is closed.'); };
+		conn.disconnect = vi.fn();
+		io.dispose();
+		await settle();
+		expect(conn.disconnect).toHaveBeenCalledTimes(1);
+	});
+
+	it('presence: the idle shutdown closes its connection when quit is refused', async () => {
+		/** @type {Array<() => unknown>} */
+		const timers = [];
+		setRuntimeEnv({ timers: { set: (cb) => { timers.push(cb); return { unref() {} }; }, clear: () => {} } });
+		const { client, duplicates } = recordingClient('fr-presence-quit:');
+		const subscriber = presenceSubscriber(client, false);
+		await subscriber.subscribeToTopic('room', mockPlatform());
+		const conn = duplicates[0];
+		conn.quit = async () => { throw new Error('Connection is closed.'); };
+		conn.disconnect = vi.fn();
+		await subscriber.unsubscribeFromTopic('room');
+		for (const cb of timers) cb();
+		await settle();
+		expect(conn.disconnect).toHaveBeenCalledTimes(1);
+		await subscriber.dispose?.();
+	});
+});
+
 describe('a pub/sub envelope without an instance id', () => {
 	it('is counted and dropped without a console line, in every mode', async () => {
 		const { client, duplicates } = recordingClient('fr-pubsub-shape:');
