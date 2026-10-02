@@ -124,9 +124,13 @@ describe('shared/assert', () => {
 			expect(() => devAssert(true, 'all good')).not.toThrow();
 		});
 
-		it('does not throw on violation, even in test mode', () => {
+		it('logs and then throws on violation in test mode, as the adapter does', () => {
 			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-			expect(() => devAssert(false, 'shape mismatch', { got: 'string' })).not.toThrow();
+			let thrown = null;
+			try { devAssert(false, 'shape mismatch', { got: 'string' }); } catch (err) { thrown = err; }
+			expect(thrown).toBeInstanceOf(Error);
+			expect(thrown.message).toBe('extensions devAssert: shape mismatch');
+			expect(thrown.context).toEqual({ got: 'string' });
 			expect(errSpy).toHaveBeenCalledTimes(1);
 			expect(errSpy.mock.calls[0][0]).toMatch(/^\[lantean\/diagnostic source=svelte-adapter-uws-extensions component=runtime\.assertion event=invariant\.violated severity=error\] shape mismatch/);
 			expect(diagnosticRecord(errSpy.mock.calls[0][0]).attributes).toEqual({
@@ -138,12 +142,30 @@ describe('shared/assert', () => {
 
 		it('logs the message and context when violated', () => {
 			const warnSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-			devAssert(false, 'mismatch', { hint: 'check options' });
+			expect(() => devAssert(false, 'mismatch', { hint: 'check options' })).toThrow('extensions devAssert: mismatch');
 			const line = warnSpy.mock.calls[0][0];
 			expect(line).toContain('mismatch');
 			expect(line).toContain('hint');
 			expect(line).toContain('check options');
 			warnSpy.mockRestore();
+		});
+
+		it('strips internal keys from the context it throws, as from the line it logs', () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			let thrown = null;
+			try { devAssert(false, 'leak check', { password: 'hunter2', hint: 'ok' }); } catch (err) { thrown = err; }
+			expect(thrown.context).not.toHaveProperty('password');
+			expect(thrown.context.hint).toBe('ok');
+			expect(errSpy.mock.calls[0][0]).not.toContain('hunter2');
+			errSpy.mockRestore();
+		});
+
+		it('throws with a null context when none is given', () => {
+			const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			let thrown = null;
+			try { devAssert(false, 'bare'); } catch (err) { thrown = err; }
+			expect(thrown.context).toBeNull();
+			errSpy.mockRestore();
 		});
 	});
 
@@ -182,9 +204,9 @@ describe('shared/assert', () => {
 				devAssert(false, 'mode.prod-noop');
 				expect(warnSpy).not.toHaveBeenCalled();
 
-				// Flip to dev: subsequent call warns.
+				// Flip to dev: the next call logs and throws.
 				process.env.NODE_ENV = 'development';
-				devAssert(false, 'mode.dev-warns');
+				expect(() => devAssert(false, 'mode.dev-warns')).toThrow('extensions devAssert: mode.dev-warns');
 				expect(warnSpy).toHaveBeenCalledTimes(1);
 				expect(warnSpy.mock.calls[0][0]).toContain('mode.dev-warns');
 			} finally {

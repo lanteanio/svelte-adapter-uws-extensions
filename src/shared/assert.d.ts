@@ -45,10 +45,11 @@ export function setFatalSink(sink: { exit(code: number): void }): void;
 export function resetFatalSink(): void;
 
 /**
- * Dev-time DX hint. Full no-op when `NODE_ENV === 'production'`. On
- * violation in non-prod modes logs a severity=error diagnostic line under
- * `event=invariant.violated` with `category=development.assertion`. Does
- * NOT throw, even in test mode.
+ * Dev-time invariant. Full no-op when `NODE_ENV === 'production'`. On
+ * violation in every other mode it logs a severity=error diagnostic line under
+ * `event=invariant.violated` with `category=development.assertion`, then
+ * throws an Error (`extensions devAssert: <message>`) whose `context`
+ * property is the PII-stripped context, or null.
  */
 export function devAssert(cond: boolean, message: string, context?: Record<string, unknown>): void;
 

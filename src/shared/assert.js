@@ -23,11 +23,12 @@
  *   killing the harness. The deferred exit is injectable via
  *   `setFatalSink` so the simulator captures fatals instead of exiting.
  *
- * - `devAssert(cond, message, context)` - dev-time DX hint. Full no-op
- *   when `NODE_ENV === 'production'`. On violation in non-prod modes
+ * - `devAssert(cond, message, context)` - dev-time invariant. Full no-op
+ *   when `NODE_ENV === 'production'`. On violation in every other mode it
  *   logs a severity=error diagnostic line under `event=invariant.violated`
- *   with `category=development.assertion`. Use for cosmetic checks,
- *   schema-mismatch hints, etc. Does NOT throw, even in test mode.
+ *   with `category=development.assertion` and throws, as the adapter's
+ *   `devAssert` does. Use for DX-shape checks whose cost is unwelcome in
+ *   production.
  *
  * Test mode detection matches the adapter exactly:
  * `process.env.VITEST || process.env.NODE_ENV === 'test'`.
@@ -207,8 +208,9 @@ export function resetFatalSink() {
 }
 
 /**
- * Dev-time DX hint. Full no-op in production; in dev / test it logs a
- * severity=error diagnostic line and does not throw.
+ * Dev-time invariant. Full no-op in production; in dev and test it logs a
+ * severity=error diagnostic line and throws an Error whose `context` is the
+ * PII-stripped context (or null).
  *
  * @param {boolean} cond
  * @param {string} message
@@ -219,6 +221,10 @@ export function devAssert(cond, message, context) {
 	if (cond) return;
 	const safeContext = context ? stripInternal(context) : undefined;
 	console.error(assertionDiagnostic('error', 'development.assertion', safeContext, message));
+	const err = new Error('extensions devAssert: ' + message);
+	// @ts-ignore augment with context for the caller
+	err.context = safeContext ?? null;
+	throw err;
 }
 
 /**

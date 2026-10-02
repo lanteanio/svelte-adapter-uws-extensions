@@ -230,6 +230,21 @@ able to write to it.
 **Action.** Catch `err.code === 'SUBSCRIBE_DENIED'` in the join-room RPC that
 calls `attach`.
 
+### `devAssert` throws outside production
+
+**Symptom.** `Error: extensions devAssert: <message>` from a `devAssert` call
+imported from `svelte-adapter-uws-extensions/assert`, in development or a test
+run, right after the `severity=error` line it already printed.
+
+**Why.** The adapter's `devAssert` throws in every mode but production, so
+the same check behaved differently depending on which package it was imported
+from.
+
+**Action.** Fix the violated condition, or catch the error where a violation is
+expected; `err.context` carries the context passed to the call, with internal
+keys stripped. Production (`NODE_ENV=production`) is unaffected: `devAssert`
+stays a no-op there.
+
 ## 4. Silent behaviour changes to audit
 
 ### Admission rules recognize all seven adapter pressure reasons
