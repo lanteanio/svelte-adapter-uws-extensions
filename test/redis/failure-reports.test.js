@@ -50,6 +50,43 @@ const noperm = (what) => new Error('NOPERM No permissions to access a ' + what);
 /** A backend, or a proxy in front of it, that repeats what it refused. */
 const echoing = (name) => new Error("backend refused '" + name + "'");
 
+
+/** A metrics registry double that records every counter increment. */
+function recordingMetrics() {
+	/** @type {Array<{ name: string, labels: any, value: any }>} */
+	const incs = [];
+	return {
+		incs,
+		/** Sum of a counter's increments: inc(n), inc(labels, n) and inc(labels) all count. */
+		count: (name) => incs
+			.filter((inc) => inc.name === name)
+			.reduce((n, inc) => n + (typeof inc.labels === 'number' ? inc.labels : (inc.value ?? 1)), 0),
+		counter: (name) => ({ inc: (labels, value) => { incs.push({ name, labels, value }); } }),
+		histogram: () => ({ observe() {} }),
+		gauge: () => ({ set() {}, inc() {}, dec() {} }),
+		mapTopic: (topic) => topic
+	};
+}
+
+/**
+ * Run fn outside test mode (no VITEST), with NODE_ENV set to the given mode:
+ * production by default, the mode a deployment runs in.
+ */
+async function inMode(fn, nodeEnv = 'production') {
+	const vitest = process.env.VITEST;
+	const previous = process.env.NODE_ENV;
+	delete process.env.VITEST;
+	process.env.NODE_ENV = nodeEnv;
+	try {
+		return await fn();
+	} finally {
+		if (vitest === undefined) delete process.env.VITEST;
+		else process.env.VITEST = vitest;
+		if (previous === undefined) delete process.env.NODE_ENV;
+		else process.env.NODE_ENV = previous;
+	}
+}
+
 let sink = null;
 afterEach(() => {
 	sink?.stop();
@@ -764,15 +801,23 @@ describe('cluster-only failure paths', () => {
 		await bus.deactivate();
 	});
 
-	it('a malformed shard envelope is asserted by its slot, not its channel', async () => {
-		const { cluster, bus } = await followedCluster();
+	it('a shard envelope without an instance id is counted and dropped without a console line, in every mode', async () => {
+		const cluster = fakeCluster();
+		const metrics = recordingMetrics();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' }, { metrics });
+		await bus.activate(mockPlatform());
+		await bus.follow('user:42:inbox');
 		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 		try {
-			cluster.conns.get('node-a').emit('smessage', CHANNEL, '{"instanceId":7}');
-			const line = error.mock.calls.map((call) => String(call[0])).find((text) => text.includes('sharded-bus.envelope.shape'));
-			expect(line).toBeDefined();
-			expect(JSON.parse(line.slice(line.indexOf('{'))).attributes.context).toEqual({ slot: keySlot(CHANNEL) });
-			expect(line).not.toContain('user:42');
+			for (let i = 0; i < 20; i++) cluster.conns.get('node-a').emit('smessage', CHANNEL, '{"instanceId":7}');
+			await inMode(() => {
+				for (let i = 0; i < 20; i++) cluster.conns.get('node-a').emit('smessage', CHANNEL, '{"instanceId":null}');
+			});
+			await inMode(() => {
+				for (let i = 0; i < 20; i++) cluster.conns.get('node-a').emit('smessage', CHANNEL, '"just a string"');
+			}, 'development');
+			expect(error).not.toHaveBeenCalled();
+			expect(metrics.count('sharded_pubsub_parse_errors_total')).toBe(60);
 		} finally {
 			error.mockRestore();
 			await bus.deactivate();
@@ -873,6 +918,31 @@ describe('cluster-only failure paths', () => {
 			expect(sink.records[1].attributes.error).toEqual({ name: 'Error', code: null, message: 'connect ECONNREFUSED' });
 		} finally {
 			await subscriber.dispose?.();
+		}
+	});
+});
+
+describe('a pub/sub envelope without an instance id', () => {
+	it('is counted and dropped without a console line, in every mode', async () => {
+		const { client, duplicates } = recordingClient('fr-pubsub-shape:');
+		const metrics = recordingMetrics();
+		const bus = createPubSubBus(client, { metrics });
+		await bus.activate(mockPlatform());
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const deliver = duplicates[0]._listeners.get('message');
+			for (let i = 0; i < 20; i++) deliver('uws:pubsub', '{"instanceId":7}');
+			await inMode(() => {
+				for (let i = 0; i < 20; i++) deliver('uws:pubsub', '[1,2]');
+			});
+			await inMode(() => {
+				for (let i = 0; i < 20; i++) deliver('uws:pubsub', 'null');
+			}, 'development');
+			expect(error).not.toHaveBeenCalled();
+			expect(metrics.count('pubsub_parse_errors_total')).toBe(60);
+		} finally {
+			error.mockRestore();
+			await bus.deactivate();
 		}
 	});
 });

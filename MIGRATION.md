@@ -247,6 +247,16 @@ stays a no-op there.
 
 ## 4. Silent behaviour changes to audit
 
+### Malformed relay envelopes are parse errors, not assertion violations
+
+An inbound pub/sub or sharded envelope without a string `instanceId` printed an
+`invariant.violated` line per envelope under `pubsub.envelope.shape` /
+`sharded-bus.envelope.shape` and counted in
+`extensions_assertion_violations_total`. It is now dropped without a line and
+counted in `pubsub_parse_errors_total` / `sharded_pubsub_parse_errors_total`,
+like every other malformed envelope. Move an alert on those two assertion
+categories to the parse-error counters.
+
 ### Admission rules recognize all seven adapter pressure reasons
 
 **Symptom.** An admission class intended to shed under any pressure keeps

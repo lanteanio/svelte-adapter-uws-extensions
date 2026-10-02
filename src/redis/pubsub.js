@@ -718,14 +718,13 @@ export function createPubSubBus(client, options = {}) {
 				}
 				try {
 					const parsed = JSON.parse(message);
-					// A forged or byte-corrupted envelope with a non-string instanceId
-					// must drop the same way in every run mode. `assert` throws in test
-					// mode but only logs-and-counts in production (throwing in a pubsub
-					// callback could corrupt state), so a bare assert would fall through
-					// in production and deliver an unidentifiable frame. Drop explicitly,
-					// keeping the production shape signal.
+					// An envelope without a string instanceId cannot be echo-checked
+					// or delivered. It is input from a shared transport, not a broken
+					// invariant of this package, so it is counted and dropped like any
+					// other malformed envelope: a line per message would let anyone who
+					// can publish on the channel flood the log.
 					if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
-						assert(false, 'pubsub.envelope.shape', { ch });
+						mParseErrors?.inc();
 						return;
 					}
 					// Skip messages from this instance (echo suppression).

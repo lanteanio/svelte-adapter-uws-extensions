@@ -3604,7 +3604,7 @@ Aggregate-memory protection still belongs to the adapter's `upgradeAdmission.max
 
 ## Production assertions
 
-Critical invariants across the extensions are checked at runtime via a tiered assertion helper that mirrors the adapter's shape. Three helpers - `assert(cond, category, context)`, `fatal(cond, category, context)`, and `devAssert(cond, message, context)` - live in `shared/assert.js`. `assert` fires at ~10 invariant sites today (envelope shape on inbound pubsub frames, registry session-shadow consistency, registry events-channel payload type, secondary-index consistency, lock heartbeat-vs-signal-aborted invariant, etc).
+Critical invariants across the extensions are checked at runtime via a tiered assertion helper that mirrors the adapter's shape. Three helpers - `assert(cond, category, context)`, `fatal(cond, category, context)`, and `devAssert(cond, message, context)` - live in `shared/assert.js`. `assert` fires at a handful of invariant sites: the lock heartbeat-vs-signal-aborted invariant, publish-rate echo suppression, the pub/sub relay batch count, the registry's pending-request entry shape and its session-shadow consistency. Malformed input from a shared transport is not an invariant of this package and is never asserted: the pub/sub and sharded buses drop a relay envelope that fails validation and count it in their parse-error metric when `metrics` is configured.
 
 #### How violations surface
 
@@ -3683,7 +3683,7 @@ wireAssertionMetrics(metrics);
 
 After wiring, every `assert` violation increments `extensions_assertion_violations_total{category,severity="soft"}` and every `fatal` violation increments `extensions_assertion_violations_total{category,severity="fatal"}`. The label cardinality is bounded by the number of distinct categories declared in the source (times the two severities) - not user-input-driven.
 
-If a counter goes non-zero in production: file an issue with the category name, the log entries, and a description of the workload. The category names follow the convention `<module>.<invariant>` (e.g. `registry.session-shadow.consistency`, `pubsub.envelope.shape`).
+If a counter goes non-zero in production: file an issue with the category name, the log entries, and a description of the workload. The category names follow the convention `<module>.<invariant>` (e.g. `registry.session-shadow.consistency`, `lock.heartbeat.signal-aborted-iff-lost`).
 
 #### Reading counters in process
 

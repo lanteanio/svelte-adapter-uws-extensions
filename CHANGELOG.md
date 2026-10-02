@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The task runner is documented as at-least-once execution with a fenced canonical result.** The README no longer says effectful work runs exactly once: the lease fence guarantees that exactly one attempt commits the canonical result, while an expired or paused handler can overlap its successor, so every external effect must use the stable `idempotencyKey` or an equivalent downstream fence.
+- **A relay envelope without a string `instanceId` is a parse error, not an assertion violation.** The pub/sub and sharded buses drop it without a console line and count it in `pubsub_parse_errors_total` / `sharded_pubsub_parse_errors_total`, in every run mode, like any other malformed envelope. Each one printed an `invariant.violated` line before, so anyone able to publish on the channel could flood the log, and in production it was counted under the `pubsub.envelope.shape` / `sharded-bus.envelope.shape` assertion categories instead of as a parse error. Those two categories are gone.
 
 ### Fixed
 

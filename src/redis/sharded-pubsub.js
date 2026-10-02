@@ -25,7 +25,6 @@
 import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { parseRedisVersion } from '../shared/redis-version.js';
-import { assert } from '../shared/assert.js';
 import {
 	MAX_SHARDED_BUS_TOPICS,
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
@@ -398,13 +397,12 @@ export function createShardedBus(client, options = {}) {
 			}
 			try {
 				const parsed = JSON.parse(message);
-				// A forged or byte-corrupted envelope with a non-string instanceId must
-				// drop the same way in every run mode. assert throws in test mode but only
-				// logs-and-counts in production, so a bare assert would fall through there
-				// and deliver an unidentifiable frame to the branches below. Drop
-				// explicitly, mirroring the pubsub bus.
+				// An envelope without a string instanceId cannot be echo-checked or
+				// delivered. It is input from a shared transport, not a broken
+				// invariant of this package, so it is counted and dropped like any
+				// other malformed envelope, as the pubsub bus does.
 				if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
-					assert(false, 'sharded-bus.envelope.shape', { slot: keySlot(ch) });
+					mParseErrors?.inc();
 					return;
 				}
 				// One echo check per envelope; batched envelopes carry
