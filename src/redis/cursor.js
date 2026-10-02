@@ -854,10 +854,9 @@ export function createCursor(client, options = {}) {
 			}
 
 			// No topic: the connection itself is gone, so its per-ws record has
-			// to go with it on EVERY exit from here - including the two early
-			// returns below, which fire precisely when Redis is unhealthy. The
-			// record is keyed by the ws object in a plain Map (not a WeakMap),
-			// so a skipped delete pins the closed socket and its selected user
+			// to go with it on EVERY exit from here, including when Redis is
+			// unhealthy. The record is keyed by the ws object in a plain Map
+			// (not a WeakMap), so a skipped delete pins the closed socket and its selected user
 			// data for the life of the process, once per disconnect for as long
 			// as the outage lasts; and it now carries the `member` set, leaving
 			// an authorization record alive after the connection it authorized.
@@ -869,7 +868,8 @@ export function createCursor(client, options = {}) {
 			// socket would keep reading it as a member.
 			for (const t of state.member) removeWsSubscription(ws, '__cursor:' + t);
 			try {
-				if (b) { try { b.guard(); } catch { return; } }
+				let redisUp = true;
+				if (b) { try { b.guard(); } catch { redisUp = false; } }
 
 				const removedTopics = [];
 				for (const t of state.topics) {
@@ -884,7 +884,11 @@ export function createCursor(client, options = {}) {
 					}
 				}
 
-				if (!(await removeKeysBatch(removedTopics, state.key))) return;
+				// The cursor leaves this instance whatever Redis answers: nothing
+				// else would ever remove a closed connection's entry from the local
+				// maps. One Redis could not delete expires there with the cursor
+				// TTL, and catch-up never replays this instance's own keys.
+				if (redisUp) await removeKeysBatch(removedTopics, state.key);
 
 				for (const t of removedTopics) {
 					queueRemove(t, state.key, platform);

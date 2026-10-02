@@ -70,7 +70,7 @@ describe('cursor snapshot during a Redis outage', () => {
 });
 
 describe('cursor close during a Redis outage', () => {
-	it('drops the per-ws record even when the close path bails early', async () => {
+	it('drops the per-ws record and the cursor even with the circuit open', async () => {
 		const breaker = toggleBreaker();
 		const cursors = createCursor(mockRedisClient('out3:'), { ...opts, breaker });
 		const platform = mockPlatform();
@@ -80,17 +80,24 @@ describe('cursor close during a Redis outage', () => {
 		cursors.hooks.message(ws, { data: { type: 'cursor', topic: 'board', data: { x: 1 } }, platform });
 		await sleep(20);
 
-		// The socket disconnects while the circuit is open, so remove() takes
-		// its early return. The record is keyed by the ws object in a plain
-		// Map, so a skipped delete pins the closed socket and its user data for
-		// the life of the process - once per disconnect for as long as the
-		// outage lasts - and leaves the `member` authorization set alive after
-		// the connection it authorized.
+		// The socket disconnects while the circuit is open, so remove() skips
+		// Redis. The record is keyed by the ws object in a plain Map, so a
+		// skipped delete would pin the closed socket and its user data for the
+		// life of the process - once per disconnect for as long as the outage
+		// lasts - and leave the `member` authorization set alive after the
+		// connection it authorized.
 		expect(ws.getUserData()[WS_SUBSCRIPTIONS]?.has('__cursor:board')).toBe(true);
 
 		breaker.open = true;
+		platform.reset();
 		await cursors.hooks.close(ws, { platform });
 		breaker.open = false;
+		await sleep(20);
+
+		// The cursor itself leaves this instance too: nothing else would ever
+		// drop a closed connection's entry from the local maps.
+		expect(platform.published.some((p) => p.topic === '__cursor:board' && p.event === 'remove')).toBe(true);
+		expect(cursors.stats().activeTopicsTotal).toBe(0);
 
 		platform.reset();
 		cursors.hooks.message(ws, { data: { type: 'cursor', topic: 'board', data: { x: 99 } }, platform });
@@ -103,6 +110,27 @@ describe('cursor close during a Redis outage', () => {
 		// still holding this socket reads to decide the socket is in the room.
 		// Asserted on its own so deleting either half fails a test.
 		expect(ws.getUserData()[WS_SUBSCRIPTIONS]?.has('__cursor:board')).toBe(false);
+		cursors.destroy();
+	});
+
+	it('removes the cursor locally when Redis refuses its removal', async () => {
+		const client = mockRedisClient('out5:');
+		const cursors = createCursor(client, opts);
+		const platform = mockPlatform();
+		const ws = mockWs({ id: 'alice' });
+
+		await cursors.attach(ws, 'board', platform);
+		cursors.hooks.message(ws, { data: { type: 'cursor', topic: 'board', data: { x: 1 } }, platform });
+		await sleep(20);
+
+		// A replica after a failover: the pipeline resolves, the HDEL inside it is refused.
+		client.redis.hdel = async () => { throw new Error("READONLY You can't write against a read only replica."); };
+		platform.reset();
+		await cursors.hooks.close(ws, { platform });
+		await sleep(20);
+
+		expect(platform.published.some((p) => p.topic === '__cursor:board' && p.event === 'remove')).toBe(true);
+		expect(cursors.stats().activeTopicsTotal).toBe(0);
 		cursors.destroy();
 	});
 
