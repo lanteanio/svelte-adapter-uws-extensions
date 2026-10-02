@@ -722,7 +722,19 @@ export function createShardedBus(client, options = {}) {
 		}
 		b?.success();
 
-		await subEnsure();
+		try {
+			await subEnsure();
+		} catch (err) {
+			// On a cluster subEnsure opens a subscriber per master before it reads
+			// the slot map, so a CLUSTER SLOTS failure leaves those connections
+			// open. deactivate() does nothing for a bus that never became active,
+			// so close them here.
+			b?.failure(err);
+			activePlatform = null;
+			activeTracing = false;
+			await subClose();
+			throw err;
+		}
 		active = true;
 	}
 

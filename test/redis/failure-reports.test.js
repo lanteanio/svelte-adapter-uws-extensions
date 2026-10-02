@@ -466,7 +466,8 @@ function fakeCluster() {
 			},
 			async sunsubscribe(channel) { c.subscribed.delete(channel); },
 			async psubscribe() { if (c.refuse) throw noperm('channel'); },
-			async quit() {},
+			quits: 0,
+			async quit() { c.quits++; },
 			disconnect() {}
 		};
 		conns.set(id, c);
@@ -840,6 +841,27 @@ describe('cluster-only failure paths', () => {
 		}
 	});
 
+
+	it('an activation that cannot read the slot map closes the subscriber connections it opened', async () => {
+		const cluster = fakeCluster();
+		cluster.setSlotsDown(true);
+		const breaker = recordingBreaker();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' }, { breaker });
+		await expect(bus.activate(mockPlatform())).rejects.toThrow('CLUSTERDOWN');
+		const opened = [...cluster.conns.values()];
+		expect(opened).toHaveLength(2);
+		for (const conn of opened) expect(conn.quits).toBe(1);
+		expect(breaker.failure).toHaveBeenCalledTimes(1);
+		// Nothing of the failed activation survives into the next one.
+		cluster.setSlotsDown(false);
+		await bus.activate(mockPlatform());
+		await bus.follow('user:42:inbox');
+		const conn = cluster.conns.get('node-a');
+		expect(opened).not.toContain(conn);
+		expect(conn.subscribed.has(CHANNEL)).toBe(true);
+		await bus.deactivate();
+		expect(conn.quits).toBe(1);
+	});
 
 	it('a shard relay batch with a refused SPUBLISH fails the breaker and counts only what went out', async () => {
 		const cluster = fakeCluster();
