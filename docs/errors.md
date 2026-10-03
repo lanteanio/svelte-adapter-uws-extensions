@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 61 diagnostic events. Each is one canonical line
+- 63 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -89,6 +89,8 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-POSTGRES-TASKS-SWEEP](#extensions-err-postgres-tasks-sweep) | `postgres.tasks.sweep.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.tasks event=postgres.tasks.sweep.failed severity=error] A background task sweep failed.` |
 | [EXTENSIONS-ERR-REDIS-CLIENT](#extensions-err-redis-client) | `redis.client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.client event=redis.client.failed severity=error] The Redis client created by createRedisClient reported an error.` |
 | [EXTENSIONS-ERR-REDIS-RESUBSCRIBE](#extensions-err-redis-resubscribe) | `redis.subscriber.resubscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.resubscribe.failed severity=error] Redis refused a subscription restored after a reconnect.` |
+| [EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT](#extensions-err-redis-subscriber-silent) | `redis.subscriber.silent` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.silent severity=error] A Redis subscriber connection stopped answering and was closed.` |
+| [EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE](#extensions-err-redis-subscriber-unreachable) | `redis.subscriber.unreachable` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.unreachable severity=error] No node of the Redis Cluster accepted a subscriber connection.` |
 | [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber) | `redis.pubsub.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.subscriber.failed severity=error] The pub/sub bus subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber) | `redis.crdt.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.crdt event=redis.crdt.subscriber.failed severity=error] The CRDT relay subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber) | `redis.smooth.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.smooth event=redis.smooth.subscriber.failed severity=error] The smooth relay subscriber connection reported an error.` |
@@ -107,7 +109,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 61 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 63 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -164,6 +166,8 @@ Indexed events:
 - `postgres.tasks.sweep.failed` - [EXTENSIONS-ERR-POSTGRES-TASKS-SWEEP](#extensions-err-postgres-tasks-sweep)
 - `redis.client.failed` - [EXTENSIONS-ERR-REDIS-CLIENT](#extensions-err-redis-client)
 - `redis.subscriber.resubscribe.failed` - [EXTENSIONS-ERR-REDIS-RESUBSCRIBE](#extensions-err-redis-resubscribe)
+- `redis.subscriber.silent` - [EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT](#extensions-err-redis-subscriber-silent)
+- `redis.subscriber.unreachable` - [EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE](#extensions-err-redis-subscriber-unreachable)
 - `redis.pubsub.subscriber.failed` - [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber)
 - `redis.crdt.subscriber.failed` - [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber)
 - `redis.smooth.subscriber.failed` - [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber)
@@ -947,6 +951,30 @@ the stable ID tag on the line):
 - **Automatic recovery:** Refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, and again after every reconnect or move to a new cluster node connection, until Redis accepts them or the module releases them. Channels Redis accepts are restored at once.
 - **Next action:** Grant the Redis user the channels this package subscribes to, or restore the server configuration that changed; the next retry restores the subscription.
 - **Runtime help:** `docs/errors.md#extensions-err-redis-resubscribe`
+- **Runtime sources:** [src/shared/redis-subscriber.js](../src/shared/redis-subscriber.js)
+
+<a id="extensions-err-redis-subscriber-silent"></a>
+## `EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT`
+
+- **Code/event:** `redis.subscriber.silent`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.silent severity=error] A Redis subscriber connection stopped answering and was closed.`
+- **Cause:** Nothing came in over the connection within timeoutMs milliseconds of a PING, or a new connection stayed in its handshake for timeoutMs (a whole PING round). Subscriber connections are asked every 30 seconds because one that only receives notices no failure on its own: a host that died or was cut off without closing the socket, or a NAT or load balancer that dropped the idle flow, leaves it open and silent until TCP keepalive gives up, about two hours at the operating system default. A server blocked for longer than timeoutMs by one command reads the same way.
+- **Consequence:** Messages published on the connection's channels while it was silent, or before its channels are restored, may not have reached this instance. The owner attribute names the module that owns it. Reported once per streak per subscriber, until a PING there is answered again.
+- **Automatic recovery:** The connection is closed at once. A standalone subscriber reconnects and restores its channels; on a Redis Cluster a module subscriber moves its channels to another node.
+- **Next action:** Check the network path to the Redis node and its health. If it repeats while the server is healthy, look for commands that block it for seconds (SLOWLOG) and for a proxy that drops idle connections.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-subscriber-silent`
+- **Runtime sources:** [src/shared/redis-subscriber.js](../src/shared/redis-subscriber.js)
+
+<a id="extensions-err-redis-subscriber-unreachable"></a>
+## `EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE`
+
+- **Code/event:** `redis.subscriber.unreachable`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.unreachable severity=error] No node of the Redis Cluster accepted a subscriber connection.`
+- **Cause:** A connection to every node the subscriber's Cluster knows ended before a command on it succeeded: the nodes are down or unreachable from this host, refuse the login or the connection (maxclients), or every one of them moved to a new address, as a rolling restart without stable addresses does. The nodes attribute is how many nodes it knows, and the error attribute the last error such a connection raised, when one did.
+- **Consequence:** Messages on the subscriber's channels do not reach this instance until a node accepts it. The owner attribute names the module that owns it. Reported once per failure streak per subscriber.
+- **Automatic recovery:** The subscriber reads the cluster slot map again and keeps trying with a delay of up to 2 seconds. When no node it knows answers that read either, its Cluster reconnects through the startup nodes, which looks their addresses up again. The attempts of that reconnect, and of one a slot map read of the subscriber set off (a node with no slots answers with an empty map, on which ioredis drops every node), are spaced as the node connections are redialled, growing to 2 seconds, or longer when clusterRetryStrategy asks, and do not stop until the Cluster is ready again, even when the strategy would give up. ioredis raises an error for an attempt whose slot map read reaches no node, which the owning module reports as its subscriber error. A connection that works ends the streak and re-arms this report.
+- **Next action:** Check that the cluster nodes are up, reachable from this host and accept the configured credentials. When node addresses change on restart, give the Cluster startup nodes that resolve to the current ones, such as a DNS name.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-subscriber-unreachable`
 - **Runtime sources:** [src/shared/redis-subscriber.js](../src/shared/redis-subscriber.js)
 
 <a id="extensions-err-pubsub-subscriber"></a>

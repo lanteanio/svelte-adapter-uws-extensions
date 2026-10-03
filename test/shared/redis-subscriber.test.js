@@ -1,13 +1,19 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { guardSubscriber, openSubscriber } from '../../src/shared/redis-subscriber.js';
+import { guardSubscriber, openSubscriber, watchLiveness } from '../../src/shared/redis-subscriber.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import Redis from 'ioredis';
 import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 const noperm = () => Object.assign(new Error('NOPERM No permissions to access a channel'), { name: 'ReplyError' });
+
+// ioredis's class for an error the server replied with; one a bundler renamed
+// is told by the class alone.
+const { ReplyError } = Redis;
+class RenamedReplyError extends ReplyError {}
 
 /**
  * An ioredis-shaped subscriber connection. `server` is what Redis holds for it;
@@ -49,11 +55,31 @@ function fakeConn() {
 	conn.punsubscribe = unsubscribe('psubscribe', 'punsubscribe');
 	conn.ssubscribe = subscribe('ssubscribe');
 	conn.sunsubscribe = unsubscribe('ssubscribe', 'sunsubscribe');
+	// While `silent` is set a PING is never answered, as on a host that died
+	// without closing the socket; `pingReply` is what an answered one returns.
+	conn.silent = false;
+	conn.pings = 0;
+	conn.pingReply = () => Promise.resolve(['pong', '']);
+	conn.ping = () => {
+		conn.pings++;
+		return conn.silent ? new Promise(() => {}) : conn.pingReply();
+	};
+	// Each connection has a socket of its own. Destroying it closes the
+	// connection, which `socketClosed` then handles as ioredis does.
+	conn.sockets = [];
+	const openSocket = () => {
+		const socket = Object.assign(new EventEmitter(), { destroyed: false, destroy() { this.destroyed = true; conn.socketClosed(); } });
+		conn.sockets.push(socket);
+		conn.stream = socket;
+	};
+	openSocket();
 	conn.reconnect = () => {
 		for (const kind of Object.keys(conn.server)) conn.server[kind].clear();
+		openSocket();
 		conn.status = 'ready';
 		conn.emit('ready');
 	};
+	conn.socketClosed = () => conn.reconnect();
 	return conn;
 }
 
@@ -64,20 +90,31 @@ function connected(owner = 'pubsub') {
 	return conn;
 }
 
-/** Capture timers set through the runtime seam so a test fires them by hand. */
-function captureTimers() {
+/**
+ * Capture timers set through the runtime seam so a test fires them by hand:
+ * fire() runs the one-shot timers due, tick() one round of every interval.
+ * `env` is installed with them, a seeded RNG for example.
+ */
+function captureTimers(env = {}) {
 	/** @type {Array<{ cb: () => unknown, ms: number, cleared: boolean }>} */
 	const timers = [];
-	setRuntimeEnv({ timers: {
-		set: (cb, ms) => { const t = { cb, ms, cleared: false, unref() {} }; timers.push(t); return t; },
-		clear: (t) => { if (t) t.cleared = true; }
-	} });
+	/** @type {Array<{ cb: () => unknown, ms: number, cleared: boolean }>} */
+	const intervals = [];
+	const timer = (list) => (cb, ms) => { const t = { cb, ms, cleared: false, unref() {} }; list.push(t); return t; };
+	const clear = (t) => { if (t) t.cleared = true; };
+	setRuntimeEnv({ ...env, timers: { set: timer(timers), clear, setInterval: timer(intervals), clearInterval: clear } });
 	return {
 		timers,
+		intervals,
 		pending: () => timers.filter((t) => !t.cleared && !t.fired),
+		running: () => intervals.filter((t) => !t.cleared),
 		async fire() {
 			const due = timers.filter((t) => !t.cleared && !t.fired);
 			for (const t of due) { t.fired = true; t.cb(); }
+			await flush();
+		},
+		async tick() {
+			for (const t of intervals.filter((t) => !t.cleared)) t.cb();
 			await flush();
 		}
 	};
@@ -369,6 +406,511 @@ describe('guarded subscriber connections', () => {
 	});
 });
 
+describe('subscriber connections that stop answering', () => {
+	it('ask for a PING every 30 seconds and reconnect one that does not answer within 10, restoring its channels', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		await conn.subscribe('a');
+		await conn.psubscribe('p:*');
+		sink = captureRegistered();
+		expect(clock.running().map((t) => t.ms)).toEqual([30000]);
+		await clock.tick();
+		expect(conn.pings).toBe(1);
+		// Answered: its timeout is cleared, nothing is closed, and nothing is
+		// left listening on the socket, which an idle connection would pile up.
+		expect(clock.pending()).toEqual([]);
+		expect(conn.stream.listenerCount('data')).toBe(0);
+		expect(conn.sockets).toHaveLength(1);
+
+		conn.silent = true;
+		await clock.tick();
+		expect(conn.pings).toBe(2);
+		expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+		await clock.fire();
+		// Its socket is destroyed, not ended: ending waits on a peer that may
+		// never answer. ioredis then reconnects and the channels come back.
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(conn.sockets).toHaveLength(2);
+		expect(conn.server.subscribe).toEqual(new Set(['a']));
+		expect(conn.server.psubscribe).toEqual(new Set(['p:*']));
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+		expect(sink.records[0].attributes).toEqual({ owner: 'pubsub', timeoutMs: 10000 });
+	});
+
+	it('report the first silent connection of a streak, and again once a PING was answered in between', async () => {
+		const clock = captureTimers();
+		const conn = connected('registry');
+		await conn.subscribe('a');
+		sink = captureRegistered();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		await clock.tick();
+		await clock.fire();
+		expect(conn.sockets).toHaveLength(3);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+
+		conn.silent = false;
+		await clock.tick();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT, EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+	});
+
+	it('take any reply for an answer, a refusal of the PING included', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		await conn.subscribe('a');
+		conn.pingReply = () => Promise.reject(Object.assign(new Error('NOPERM this user has no permissions to run the \'ping\' command'), { name: 'ReplyError' }));
+		await clock.tick();
+		expect(conn.pings).toBe(1);
+		expect(clock.pending()).toEqual([]);
+		expect(conn.sockets).toHaveLength(1);
+		// It ends a silence streak like any answer.
+		sink = captureRegistered();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		conn.silent = false;
+		await clock.tick();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT, EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+	});
+
+	it('send no second PING while one is out, and none on a connection that is not ready', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		conn.silent = true;
+		await clock.tick();
+		await clock.tick();
+		expect(conn.pings).toBe(1);
+		await clock.fire();
+		conn.status = 'reconnecting';
+		await clock.tick();
+		expect(conn.pings).toBe(1);
+	});
+
+	it('decide nothing from a PING ioredis gave up on itself (commandTimeout); the 10 second limit does', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		await conn.subscribe('a');
+		sink = captureRegistered();
+		conn.pingReply = () => Promise.reject(new Error('Command timed out'));
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(false);
+		expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+		await clock.fire();
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+		expect(conn.server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('take anything coming in over the socket for an answer, as on a busy connection whose reply waits behind its messages', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		conn.silent = true;
+		await clock.tick();
+		conn.stream.emit('data', Buffer.from('*3\r\n$7\r\nmessage\r\n'));
+		await flush();
+		expect(clock.pending()).toEqual([]);
+		expect(conn.stream.listenerCount('data')).toBe(0);
+		await clock.fire();
+		expect(conn.sockets[0].destroyed).toBe(false);
+	});
+
+	it('take what came in before the 10 seconds were up for an answer, though the timer runs ahead of the socket read', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		conn.silent = true;
+		await clock.tick();
+		// A timer runs before the socket is read in the same turn of the event
+		// loop, so what arrived meanwhile is read after it.
+		const [timeout] = clock.pending();
+		timeout.fired = true;
+		timeout.cb();
+		conn.stream.emit('data', Buffer.from('+PONG\r\n'));
+		await flush();
+		expect(conn.sockets[0].destroyed).toBe(false);
+		expect(sink.ids()).toEqual([]);
+	});
+
+	it('take a reply of ioredis\'s error class for an answer, renamed or not', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		for (const Reply of [ReplyError, RenamedReplyError]) {
+			conn.silent = true;
+			await clock.tick();
+			await clock.fire();
+			conn.silent = false;
+			conn.pingReply = () => Promise.reject(new Reply('NOPERM this user has no permissions to run the \'ping\' command'));
+			await clock.tick();
+		}
+		// Each refusal ended the streak, so each silence before it was reported.
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT, EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(sink.ids()).toHaveLength(3);
+	});
+
+	it('count nothing for a PING whose connection reconnected or closed meanwhile', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		await conn.subscribe('a');
+		sink = captureRegistered();
+		// Out when the connection dropped, and still unanswered when the
+		// reconnect is up: whatever that one says comes next round.
+		conn.silent = true;
+		await clock.tick();
+		conn.reconnect();
+		await clock.fire();
+		expect(conn.sockets.map((s) => s.destroyed)).toEqual([false, false]);
+		// Rejected because the connection closed: its end is handled elsewhere.
+		conn.silent = false;
+		conn.pingReply = () => Promise.reject(new Error('Connection is closed.'));
+		await clock.tick();
+		expect(conn.sockets.map((s) => s.destroyed)).toEqual([false, false]);
+		expect(sink.ids()).toEqual([]);
+	});
+
+	it('keep a silence streak through a PING rejected because its connection closed', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(sink.ids()).toHaveLength(1);
+		// No answer: the streak goes on, and the next silence is not reported.
+		conn.silent = false;
+		conn.pingReply = () => Promise.reject(new Error('Connection is closed.'));
+		await clock.tick();
+		conn.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(conn.sockets.filter((s) => s.destroyed)).toHaveLength(2);
+		expect(sink.ids()).toHaveLength(1);
+	});
+
+	it('count nothing for a PING still out while its connection is reconnecting on the same socket object', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		conn.silent = true;
+		const socket = conn.stream;
+		await clock.tick();
+		// ioredis keeps the old stream until the reconnect connects.
+		conn.status = 'reconnecting';
+		await clock.fire();
+		expect(socket.destroyed).toBe(false);
+		expect(sink.ids()).toEqual([]);
+		// And nothing is left listening on it.
+		expect(socket.listenerCount('data')).toBe(0);
+	});
+
+	it('close a connection whose handshake is still unanswered on the same socket a round later', async () => {
+		const clock = captureTimers();
+		const conn = fakeConn();
+		const closed = [];
+		watchLiveness('cursor', () => [conn], (c) => { closed.push(c.stream); });
+		sink = captureRegistered();
+		// TCP is up, the server does not answer: ioredis has no time limit here.
+		conn.status = 'connect';
+		await clock.tick();
+		expect(closed).toEqual([]);
+		await clock.tick();
+		expect(closed).toEqual([conn.stream]);
+		expect(sink.records[0].attributes).toEqual({ owner: 'cursor', timeoutMs: 30000 });
+		// One that gets through its handshake between two rounds is left alone,
+		// and so is a handshake started again on a new socket.
+		closed.length = 0;
+		await clock.tick();
+		conn.status = 'ready';
+		await clock.tick();
+		conn.status = 'connect';
+		await clock.tick();
+		conn.reconnect();
+		conn.status = 'connect';
+		await clock.tick();
+		expect(closed).toEqual([]);
+	});
+
+	it('close a standalone subscriber stuck in its handshake, and send again what its owner asked for meanwhile', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		// Written during the handshake and never answered; ioredis drops these
+		// without settling them when the socket closes.
+		conn.status = 'connect';
+		conn.gate = new Promise(() => {});
+		const a = conn.subscribe('a');
+		const b = conn.subscribe('b');
+		const undoA = conn.unsubscribe('a');
+		conn.gate = null;
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(false);
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(sink.records[0].attributes).toEqual({ owner: 'pubsub', timeoutMs: 30000 });
+		// Ready again: sent again in order, for the channels a later call did
+		// not decide.
+		await Promise.all([a, b, undoA]);
+		expect(conn.calls.slice(3)).toEqual([['subscribe', 'b'], ['unsubscribe', 'a']]);
+		expect(conn.server.subscribe).toEqual(new Set(['b']));
+		// Held from then on.
+		conn.reconnect();
+		expect(conn.server.subscribe).toEqual(new Set(['b']));
+	});
+
+	it('send again a call lost in the handshake of the first connection', async () => {
+		const clock = captureTimers();
+		const conn = guardSubscriber(fakeConn(), 'pubsub');
+		conn.status = 'connect';
+		conn.gate = new Promise(() => {});
+		const a = conn.subscribe('a');
+		conn.gate = null;
+		await clock.tick();
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(true);
+		await a;
+		expect(conn.calls).toEqual([['subscribe', 'a'], ['subscribe', 'a']]);
+		expect(conn.server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('send nothing lost in a handshake again for a channel a later call of the owner decided', async () => {
+		const conn = connected('pubsub');
+		conn.status = 'connect';
+		conn.gate = new Promise(() => {});
+		const a = conn.subscribe('a');
+		conn.gate = null;
+		// The socket closes; while reconnecting the owner releases the channel,
+		// which ioredis sends from its offline queue before the 'ready' event.
+		conn.status = 'reconnecting';
+		const undo = conn.unsubscribe('a');
+		conn.reconnect();
+		await Promise.all([a, undo]);
+		expect(conn.calls).toEqual([['subscribe', 'a'], ['unsubscribe', 'a']]);
+		expect(conn.server.subscribe).toEqual(new Set());
+	});
+
+	it('send again an unsubscribe of everything lost in a handshake for the channels the owner held', async () => {
+		const conn = connected('pubsub');
+		await conn.subscribe('a');
+		// ioredis sends again on the next ready what a ready connection left
+		// unanswered, a restore of 'a' for example: the lost unsubscribe must
+		// name it.
+		conn.status = 'connect';
+		conn.gate = new Promise(() => {});
+		const undo = conn.unsubscribe();
+		conn.gate = null;
+		conn.reconnect();
+		await undo;
+		expect(conn.calls.slice(-1)).toEqual([['unsubscribe', 'a']]);
+	});
+
+	it('wait for the reply of a call written during a handshake that completes', async () => {
+		const conn = connected('pubsub');
+		conn.status = 'connect';
+		let answer;
+		conn.gate = new Promise((resolve) => { answer = resolve; });
+		const a = conn.subscribe('a');
+		conn.gate = null;
+		conn.status = 'ready';
+		conn.emit('ready');
+		answer();
+		await a;
+		expect(conn.calls).toEqual([['subscribe', 'a']]);
+		conn.reconnect();
+		expect(conn.server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('reject a call lost in a handshake when the connection ends or is closed between two attempts', async () => {
+		const conn = connected('pubsub');
+		conn.status = 'connect';
+		conn.gate = new Promise(() => {});
+		const a = conn.subscribe('a');
+		conn.gate = null;
+		conn.status = 'end';
+		conn.emit('end');
+		await expect(a).rejects.toThrow('Connection is closed.');
+
+		// ioredis emits no 'end' for a connection closed between two attempts.
+		const other = fakeConn();
+		other.disconnect = () => {};
+		guardSubscriber(other, 'pubsub');
+		other.emit('ready');
+		other.status = 'connect';
+		other.gate = new Promise(() => {});
+		const b = other.subscribe('b');
+		other.gate = null;
+		other.status = 'reconnecting';
+		other.disconnect();
+		await expect(b).rejects.toThrow('Connection is closed.');
+	});
+
+	it('close a standalone subscriber stuck in its handshake while a call waits for it in the offline queue', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		sink = captureRegistered();
+		// Sent while reconnecting: ioredis queues it and sends it once ready,
+		// so closing the socket loses nothing.
+		conn.status = 'reconnecting';
+		conn.gate = new Promise(() => {});
+		conn.subscribe('a');
+		conn.status = 'connect';
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(false);
+		await clock.tick();
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+	});
+
+	it('keep a streak per master when the watched connections name one', async () => {
+		const clock = captureTimers();
+		const a = fakeConn();
+		const b = fakeConn();
+		const closed = [];
+		const names = new Map([[a, 'id-a'], [b, 'id-b']]);
+		watchLiveness('sharded-pubsub', () => [a, b], (conn) => { closed.push(names.get(conn)); }, { identify: (conn) => names.get(conn) });
+		sink = captureRegistered();
+		a.silent = true;
+		b.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(closed).toEqual(['id-a', 'id-b']);
+		expect(sink.records.map((r) => r.attributes)).toEqual([
+			{ owner: 'sharded-pubsub', master: 'id-a', timeoutMs: 10000 },
+			{ owner: 'sharded-pubsub', master: 'id-b', timeoutMs: 10000 }
+		]);
+		// b answering ends b's streak, not a's.
+		b.silent = false;
+		await clock.tick();
+		b.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(sink.records.map((r) => r.attributes.master)).toEqual(['id-a', 'id-b', 'id-b']);
+		expect(closed).toEqual(['id-a', 'id-b', 'id-a', 'id-b']);
+	});
+
+	it('stop asking once the owner quits or disconnects the connection, and keep asking through a reconnect', async () => {
+		const clock = captureTimers();
+		for (const close of ['quit', 'disconnect']) {
+			const conn = fakeConn();
+			conn.quit = async () => 'OK';
+			conn.disconnect = () => {};
+			guardSubscriber(conn, 'pubsub');
+			conn.emit('ready');
+			expect(clock.running()).toHaveLength(1);
+			await conn[close]();
+			expect(clock.running()).toEqual([]);
+			clock.intervals.length = 0;
+		}
+		// What ioredis does itself on an error or a reconnect.
+		const conn = fakeConn();
+		conn.disconnect = () => {};
+		guardSubscriber(conn, 'pubsub');
+		conn.emit('ready');
+		conn.disconnect(true);
+		expect(clock.running()).toHaveLength(1);
+	});
+
+	it('close a connection its QUIT has not closed within 10 seconds, as on a host that died', async () => {
+		const clock = captureTimers();
+		const conn = fakeConn();
+		const disconnects = [];
+		conn.quit = () => new Promise(() => {});
+		conn.disconnect = (reconnect) => { disconnects.push(reconnect); };
+		// Closed on purpose, as ioredis does after a QUIT: no reconnect.
+		conn.socketClosed = () => { conn.status = 'end'; conn.emit('end'); };
+		guardSubscriber(conn, 'pubsub');
+		conn.emit('ready');
+		conn.quit();
+		expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+		await clock.fire();
+		expect(disconnects).toEqual([undefined]);
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(conn.status).toBe('end');
+
+		// One ioredis queued after all (its socket was already closing) and that
+		// is between two attempts when the time is up: closing it now would
+		// leave it neither reconnecting nor ended.
+		const queued = fakeConn();
+		const queuedDisconnects = [];
+		queued.quit = () => new Promise(() => {});
+		queued.disconnect = (reconnect) => { queuedDisconnects.push(reconnect); };
+		guardSubscriber(queued, 'pubsub');
+		queued.emit('ready');
+		queued.quit();
+		queued.status = 'reconnecting';
+		await clock.fire();
+		expect(queuedDisconnects).toEqual([]);
+
+		// One sent during a handshake the server does not answer: the same.
+		const stuck = fakeConn();
+		const stuckDisconnects = [];
+		stuck.quit = () => new Promise(() => {});
+		stuck.disconnect = (reconnect) => { stuckDisconnects.push(reconnect); };
+		stuck.socketClosed = () => { stuck.status = 'end'; stuck.emit('end'); };
+		guardSubscriber(stuck, 'pubsub');
+		stuck.emit('ready');
+		stuck.status = 'connect';
+		stuck.quit();
+		await clock.fire();
+		expect(stuckDisconnects).toEqual([undefined]);
+		expect(stuck.status).toBe('end');
+
+		// One sent between two attempts waits in ioredis's offline queue for the
+		// next connection, and closing the connection now would leave it neither
+		// reconnecting nor ended: no time limit, and the PINGs go on until it
+		// ends, as they would close a stuck handshake on the next socket.
+		const waiting = fakeConn();
+		const waitingDisconnects = [];
+		waiting.quit = () => new Promise(() => {});
+		waiting.disconnect = (reconnect) => { waitingDisconnects.push(reconnect); };
+		guardSubscriber(waiting, 'pubsub');
+		waiting.emit('ready');
+		waiting.status = 'reconnecting';
+		waiting.quit();
+		expect(clock.pending()).toEqual([]);
+		expect(clock.running()).toHaveLength(1);
+		await clock.fire();
+		expect(waitingDisconnects).toEqual([]);
+		waiting.status = 'end';
+		waiting.emit('end');
+		expect(clock.running()).toEqual([]);
+
+		// One its QUIT closed is left alone.
+		const done = fakeConn();
+		done.quit = async () => { done.status = 'end'; done.emit('end'); return 'OK'; };
+		const doneDisconnect = vi.fn();
+		done.disconnect = doneDisconnect;
+		guardSubscriber(done, 'pubsub');
+		done.emit('ready');
+		await done.quit();
+		expect(clock.pending()).toEqual([]);
+		expect(doneDisconnect).not.toHaveBeenCalled();
+		expect(done.sockets[0].destroyed).toBe(false);
+	});
+
+	it('stop asking once the connection ends', async () => {
+		const clock = captureTimers();
+		const conn = connected('pubsub');
+		conn.silent = true;
+		await clock.tick();
+		conn.status = 'end';
+		conn.emit('end');
+		expect(clock.running()).toEqual([]);
+		// A PING out when it ended does not close anything.
+		await clock.fire();
+		expect(conn.sockets[0].destroyed).toBe(false);
+	});
+});
+
 /**
  * An ioredis-shaped Cluster. Its own (un)subscribe methods only record the
  * call, since a guarded Cluster must not use them for what it takes over.
@@ -404,6 +946,23 @@ function fakeCluster() {
 		cluster.connects++;
 		cluster.status = 'ready';
 		cluster.emit('ready');
+	};
+	// As ioredis: the slot map is read from one known node after another, and
+	// 'refresh' is emitted before the callback. While `unreadable` is set no
+	// node answers, which ioredis reports as a ClusterAllFailedError.
+	cluster.refreshes = 0;
+	cluster.unreadable = false;
+	cluster.refreshSlotsCache = (callback) => {
+		cluster.refreshes++;
+		queueMicrotask(() => {
+			if (cluster.unreadable) {
+				// Told by its message, as ioredis does: a bundler can rename the class.
+				callback?.(new Error('Failed to refresh slots cache.'));
+				return;
+			}
+			cluster.emit('refresh');
+			callback?.();
+		});
 	};
 	cluster.autoConnect = true;
 	// While set, a node connection becomes 'ready' as ioredis reports one
@@ -473,6 +1032,8 @@ function fakeCluster() {
 			conn.quit = async () => { conn.quits++; conn.end(); return 'OK'; };
 			conn.disconnects = 0;
 			conn.disconnect = () => { conn.disconnects++; conn.end(); };
+			// ioredis gives node connections no retry strategy.
+			conn.socketClosed = () => conn.end();
 			cluster.opened.push(conn);
 			if (cluster.autoConnect) {
 				queueMicrotask(() => {
@@ -622,7 +1183,11 @@ describe('guarded Cluster subscribers', () => {
 
 	it('replace a connection on which nothing succeeded after a growing delay, and at once after one that answered', async () => {
 		const clock = captureTimers();
-		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		const fake = fakeCluster();
+		// More nodes than connections fail here, so every one goes to a node
+		// that has not failed yet.
+		fake.nodeList = Array.from({ length: 30 }, (_, i) => fake.node(7000 + i));
+		const cluster = guardSubscriber(fake, 'pubsub');
 		await cluster.subscribe('a');
 		cluster.autoConnect = false;
 		cluster.opened[0].end();
@@ -649,7 +1214,9 @@ describe('guarded Cluster subscribers', () => {
 
 	it('back off from a node that reports ready but refused the login', async () => {
 		const clock = captureTimers();
-		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		const fake = fakeCluster();
+		fake.nodeList = [fake.node(7000), fake.node(7001), fake.node(7002)];
+		const cluster = guardSubscriber(fake, 'pubsub');
 		await cluster.subscribe('a');
 		sink = captureRegistered();
 		cluster.loginRefused = true;
@@ -921,8 +1488,11 @@ describe('guarded Cluster subscribers', () => {
 		cluster.on('message', (...args) => received.push(args));
 		await cluster.quit();
 		expect(cluster.quits).toBe(1);
-		// Closed at once, as ioredis stops its own subscriber.
+		// Closed at once, as ioredis stops its own subscriber, and its socket
+		// destroyed, which a host that no longer answers would never close.
 		expect(conn.disconnects).toBe(1);
+		expect(conn.sockets[0].destroyed).toBe(true);
+		expect(clock.running()).toEqual([]);
 		// What the closing connection still receives is not re-emitted.
 		conn.emit('message', 'a', 'late');
 		expect(received).toEqual([]);
@@ -995,5 +1565,387 @@ describe('guarded Cluster subscribers', () => {
 		await cluster.subscribe('a');
 		expect(cluster.ownCalls).toEqual([]);
 		expect(cluster.opened[0].server.subscribe).toEqual(new Set(['a']));
+	});
+});
+
+describe('Cluster subscribers on nodes that go silent, leave or cannot be reached', () => {
+	it('move the channels off a node connection that stops answering, to a node that has not failed', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'cursor');
+		await cluster.subscribe('a');
+		const first = cluster.opened[0];
+		expect(first.options.port).toBe(7000);
+		sink = captureRegistered();
+		first.silent = true;
+		await clock.tick();
+		await clock.fire();
+		expect(first.status).toBe('end');
+		expect(first.sockets[0].destroyed).toBe(true);
+		// The RNG names the first node again, but the silent one is not dialled
+		// while another has not failed.
+		expect(cluster.opened.map((c) => c.options.port)).toEqual([7000, 7001]);
+		expect(cluster.opened[1].server.subscribe).toEqual(new Set(['a']));
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+		expect(sink.records[0].attributes).toEqual({ owner: 'cursor', timeoutMs: 10000 });
+	});
+
+	it('read the slot map every other round while a node connection is open, and move off a node it no longer lists', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		await clock.tick();
+		await clock.tick();
+		// Nothing is open, so there is nothing to check.
+		expect(cluster.refreshes).toBe(0);
+		await cluster.subscribe('a');
+		await clock.tick();
+		await clock.tick();
+		expect(cluster.refreshes).toBe(1);
+		expect(cluster.opened).toHaveLength(1);
+		// Removed from the cluster: the node still answers, but the next read
+		// no longer lists it.
+		cluster.nodeList = cluster.nodeList.slice(1);
+		await clock.tick();
+		await clock.tick();
+		expect(cluster.refreshes).toBe(2);
+		expect(cluster.opened[0].status).toBe('end');
+		// Destroyed, so a node that left because it died closes all the same.
+		expect(cluster.opened[0].sockets[0].destroyed).toBe(true);
+		expect(cluster.opened[1].options.port).toBe(7001);
+		expect(cluster.opened[1].server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('replace a node connection still in its handshake a round later', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const fake = fakeCluster();
+		fake.autoConnect = false;
+		const cluster = guardSubscriber(fake, 'pubsub');
+		const subscribed = cluster.subscribe('a');
+		await flush();
+		const stuck = cluster.opened[0];
+		stuck.status = 'connect';
+		sink = captureRegistered();
+		await clock.tick();
+		expect(stuck.status).toBe('connect');
+		await clock.tick();
+		expect(stuck.status).toBe('end');
+		expect(sink.records[0].attributes).toEqual({ owner: 'pubsub', timeoutMs: 30000 });
+		// The call moves to a node that has not failed.
+		cluster.autoConnect = true;
+		await clock.fire();
+		cluster.opened[1].connect();
+		await subscribed;
+		expect(cluster.opened[1].options.port).toBe(7001);
+		expect(cluster.opened[1].server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('take a reconnect its own slot map read set off for forced: a slotless node answered it', async () => {
+		const clock = captureTimers();
+		const fake = fakeCluster();
+		fake.options.clusterRetryStrategy = (times) => (times > 2 ? null : 100);
+		const cluster = guardSubscriber(fake, 'pubsub');
+		const strategy = (times) => cluster.options.clusterRetryStrategy.call(cluster, times);
+		await cluster.subscribe('a');
+		// A reconnect that starts while the read is out is none of its doing,
+		// and a read that finds the slot map as it was leaves the strategy alone.
+		let answer = () => {};
+		cluster.refreshSlotsCache = (callback) => {
+			cluster.refreshes++;
+			answer = () => { cluster.emit('refresh'); callback(); };
+		};
+		await clock.tick();
+		await clock.tick();
+		expect(cluster.refreshes).toBe(1);
+		expect(strategy(3)).toBe(null);
+		answer();
+		await flush();
+		expect(strategy(3)).toBe(null);
+		// One a reset node answers with an empty map: ioredis drops every node
+		// before the callback, and the Cluster reconnects once the first of them
+		// has closed, which can take longer than a turn of the event loop.
+		const emptyMap = (callback) => {
+			cluster.refreshes++;
+			queueMicrotask(() => {
+				cluster.nodeList = [];
+				cluster.emit('refresh');
+				callback();
+			});
+		};
+		cluster.refreshSlotsCache = emptyMap;
+		await clock.tick();
+		await clock.tick();
+		for (let i = 0; i < 3; i++) await flush();
+		expect(cluster.refreshes).toBe(2);
+		cluster.status = 'reconnecting';
+		expect(strategy(3)).toBe(300);
+		cluster.status = 'ready';
+		cluster.emit('ready');
+		expect(strategy(3)).toBe(null);
+		// Closed before that reconnect: any reconnect of the Cluster afterwards
+		// is the strategy's alone.
+		await clock.tick();
+		await clock.tick();
+		await flush();
+		expect(cluster.refreshes).toBe(3);
+		expect(strategy(3)).toBe(300);
+		await cluster.quit();
+		expect(strategy(3)).toBe(null);
+	});
+
+	it('leave a Cluster already reconnecting to that reconnect when no known node answers the slot map read', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		await cluster.subscribe('a');
+		cluster.autoConnect = false;
+		// ioredis is reconnecting the Cluster by the time the read fails.
+		cluster.refreshSlotsCache = (callback) => {
+			cluster.refreshes++;
+			queueMicrotask(() => {
+				cluster.status = 'connecting';
+				callback(new Error('Failed to refresh slots cache.'));
+			});
+		};
+		cluster.opened[0].end();
+		await flush();
+		cluster.opened[1].end();
+		await flush();
+		await clock.fire();
+		cluster.opened[2].end();
+		await flush();
+		await clock.fire();
+		expect(cluster.refreshes).toBe(1);
+		expect(cluster.disconnects).toEqual([]);
+		// Its 'ready' leads to the next connection.
+		cluster.autoConnect = true;
+		cluster.status = 'ready';
+		cluster.emit('ready');
+		await clock.fire();
+		expect(cluster.opened).toHaveLength(4);
+		expect(cluster.opened[3].server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('keep the node connection through a slot map that lists no node', async () => {
+		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		await cluster.subscribe('a');
+		// What a removed node, reset and slotless, answers for the slot map.
+		cluster.nodeList = [];
+		cluster.emit('refresh');
+		await flush();
+		expect(cluster.opened[0].status).toBe('ready');
+		expect(cluster.opened).toHaveLength(1);
+	});
+
+	it('report no unreachable cluster when the one node it knows only went silent, and open it again', async () => {
+		const clock = captureTimers();
+		const fake = fakeCluster();
+		fake.nodeList = [fake.node(7000)];
+		const cluster = guardSubscriber(fake, 'pubsub');
+		await cluster.subscribe('a');
+		sink = captureRegistered();
+		cluster.opened[0].silent = true;
+		await clock.tick();
+		await clock.fire();
+		// Silent, so it is dialled again after the slot map is read again.
+		expect(cluster.refreshes).toBe(1);
+		expect(cluster.opened).toHaveLength(2);
+		expect(cluster.opened[1].server.subscribe).toEqual(new Set(['a']));
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+	});
+
+	it('leave the slot map to a Cluster that reads it at least once a minute itself', async () => {
+		const clock = captureTimers();
+		const often = fakeCluster();
+		often.options.slotsRefreshInterval = 60000;
+		guardSubscriber(often, 'pubsub');
+		await often.subscribe('a');
+		const rarely = fakeCluster();
+		rarely.options.slotsRefreshInterval = 120000;
+		guardSubscriber(rarely, 'pubsub');
+		await rarely.subscribe('a');
+		for (let i = 0; i < 4; i++) await clock.tick();
+		expect(often.refreshes).toBe(0);
+		expect(rarely.refreshes).toBe(2);
+	});
+
+	it('dial a failed node again only after every other node failed, then report it once per streak and read the slot map again', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'groups');
+		await cluster.subscribe('a');
+		sink = captureRegistered();
+		cluster.loginRefused = true;
+		const step = async () => {
+			await clock.fire();
+			await flush();
+		};
+		cluster.opened[0].end();
+		await flush();
+		await flush();
+		expect(cluster.opened.map((c) => c.options.port)).toEqual([7000, 7000]);
+		await step();
+		// The node that has not failed, whatever the RNG names.
+		expect(cluster.opened.map((c) => c.options.port)).toEqual([7000, 7000, 7001]);
+		expect(cluster.refreshes).toBe(0);
+		expect(sink.ids()).toEqual([]);
+
+		// Both failed: the slot map is read before either is dialled again.
+		await step();
+		expect(cluster.opened).toHaveLength(3);
+		expect(cluster.refreshes).toBe(1);
+		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_UNREACHABLE]);
+		expect(sink.records[0].attributes).toMatchObject({
+			owner: 'groups',
+			nodes: 2,
+			error: { message: expect.stringContaining('WRONGPASS') }
+		});
+		// Then each is tried again after the delay the failures earned.
+		expect(clock.pending().map((t) => t.ms)).toEqual([200]);
+		await step();
+		await step();
+		await step();
+		expect(cluster.opened).toHaveLength(5);
+		expect(cluster.refreshes).toBe(2);
+		expect(sink.ids()).toHaveLength(1);
+
+		cluster.loginRefused = false;
+		await step();
+		expect(cluster.opened).toHaveLength(6);
+		expect(cluster.opened[5].server.subscribe).toEqual(new Set(['a']));
+		// A connection that works ends the streak, so the next is reported.
+		cluster.loginRefused = true;
+		cluster.opened[5].end();
+		await flush();
+		await flush();
+		await step();
+		await step();
+		expect(sink.ids()).toEqual([
+			EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_UNREACHABLE,
+			EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_UNREACHABLE
+		]);
+	});
+
+	it('forget the nodes a streak failed on once a connection works', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const fake = fakeCluster();
+		fake.nodeList = [fake.node(7000), fake.node(7001), fake.node(7002)];
+		const cluster = guardSubscriber(fake, 'pubsub');
+		await cluster.subscribe('a');
+		cluster.autoConnect = false;
+		cluster.opened[0].end();
+		await flush();
+		cluster.opened[1].end();
+		await flush();
+		cluster.autoConnect = true;
+		await clock.fire();
+		expect(cluster.opened.map((c) => c.options.port)).toEqual([7000, 7000, 7001]);
+		expect(cluster.opened[2].server.subscribe).toEqual(new Set(['a']));
+		// 7001 worked, so 7000 is a candidate again, and the RNG names it.
+		cluster.opened[2].end();
+		await flush();
+		expect(cluster.opened[3].options.port).toBe(7000);
+	});
+
+	it('reconnect the Cluster through its startup nodes when no node it knows answers the slot map read', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		await cluster.subscribe('a');
+		sink = captureRegistered();
+		// Every node moved to a new address: the known ones cannot be reached.
+		cluster.autoConnect = false;
+		cluster.unreadable = true;
+		cluster.opened[0].end();
+		await flush();
+		cluster.opened[1].end();
+		await flush();
+		await clock.fire();
+		cluster.opened[2].end();
+		await flush();
+		await clock.fire();
+		expect(cluster.refreshes).toBe(1);
+		expect(cluster.disconnects).toEqual([true]);
+		expect(cluster.opened).toHaveLength(3);
+
+		// The reconnect reads the slot map from the startup nodes, which name the
+		// new addresses, and its 'ready' opens a connection there.
+		cluster.autoConnect = true;
+		cluster.unreadable = false;
+		cluster.nodeList = [cluster.node(8000), cluster.node(8001)];
+		cluster.status = 'ready';
+		cluster.emit('ready');
+		await flush();
+		expect(cluster.opened.map((c) => c.options.port)).toEqual([7000, 7000, 7001, 8000]);
+		expect(cluster.opened[3].server.subscribe).toEqual(new Set(['a']));
+	});
+
+	it('space the reconnects of the Cluster it forced, stop none of them, and leave every other reconnect to the strategy', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const fake = fakeCluster();
+		const seen = [];
+		// ioredis's default, except that it gives up after two attempts.
+		fake.options.clusterRetryStrategy = function (times, reason) {
+			seen.push([this, times, reason]);
+			return times > 2 ? null : Math.min(100 + times * 2, 2000);
+		};
+		const cluster = guardSubscriber(fake, 'pubsub');
+		const strategy = (times) => cluster.options.clusterRetryStrategy.call(cluster, times, 'why');
+		// Not forced: the strategy's own answer, giving up included.
+		expect([strategy(1), strategy(3)]).toEqual([102, null]);
+		expect(seen[0]).toEqual([cluster, 1, 'why']);
+
+		// No node it knows can be opened, and none answers the slot map read.
+		sink = captureRegistered();
+		await cluster.subscribe('a');
+		cluster.autoConnect = false;
+		cluster.unreadable = true;
+		cluster.opened[0].end();
+		await flush();
+		cluster.opened[1].end();
+		await flush();
+		await clock.fire();
+		cluster.opened[2].end();
+		await flush();
+		await clock.fire();
+		expect(cluster.disconnects).toEqual([true]);
+		// Forced: spaced, the longer delay winning, and never given up.
+		expect([1, 2, 5, 20, 40].map(strategy)).toEqual([102, 200, 500, 2000, 2000]);
+
+		// Ready again: the strategy alone.
+		cluster.status = 'ready';
+		cluster.emit('ready');
+		expect(strategy(3)).toBe(null);
+	});
+
+	it('open nothing while the slot map is read again, and nothing after a quit meanwhile', async () => {
+		const clock = captureTimers({ rng: { float: () => 0 } });
+		const cluster = guardSubscriber(fakeCluster(), 'pubsub');
+		await cluster.subscribe('a');
+		sink = captureRegistered();
+		cluster.autoConnect = false;
+		cluster.opened[0].end();
+		await flush();
+		cluster.opened[1].end();
+		await flush();
+		await clock.fire();
+		cluster.opened[2].end();
+		await flush();
+		let finish;
+		cluster.refreshSlotsCache = (callback) => {
+			cluster.refreshes++;
+			finish = callback;
+		};
+		await clock.fire();
+		expect(cluster.refreshes).toBe(1);
+		// A topology event during the read opens nothing.
+		cluster.emit('+node', cluster.nodeList[0]);
+		await flush();
+		expect(cluster.opened).toHaveLength(3);
+		// No node answered it, but the Cluster was quit meanwhile: it is not
+		// reconnected.
+		await cluster.quit();
+		const err = new Error('Failed to refresh slots cache.');
+		Object.defineProperty(err, 'name', { value: 'ClusterAllFailedError' });
+		finish(err);
+		await flush();
+		expect(cluster.disconnects).toEqual([]);
+		expect(cluster.opened).toHaveLength(3);
+		expect(clock.pending()).toEqual([]);
 	});
 });

@@ -23,13 +23,26 @@
  * a node connection of its own instead, moves them to a new node connection
  * the same way, and restores them there as above.
  *
+ * A subscriber connection only receives, so a host that died without closing
+ * the socket, or a NAT or load balancer that dropped the idle flow, leaves it
+ * open and silent until TCP keepalive gives up, about two hours at the OS
+ * default ioredis uses. Each connection is asked for a PING every 30 seconds,
+ * and one that does not answer within 10 seconds is closed as a dropped
+ * connection would be: a standalone one reconnects, a Cluster's moves to
+ * another node. A Cluster subscriber also reads the cluster's slot map every
+ * minute, since a node removed from the cluster keeps its connections open and
+ * answering while PUBLISH no longer reaches it.
+ *
  * @module svelte-adapter-uws-extensions/shared/redis-subscriber
  */
 
-import { setTimer, clearTimer, randomFloat } from './runtime.js';
+import Redis from 'ioredis';
+import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer, setImmediateTimer, randomFloat } from './runtime.js';
 import { isCluster } from './cluster.js';
 import { emitRegisteredFailure } from './diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+
+const { ReplyError } = Redis;
 
 const KINDS = Object.freeze([
 	Object.freeze({ name: 'subscribe', undo: 'unsubscribe', batch: true }),
@@ -57,12 +70,24 @@ const REOPEN_MAX_MS = 2000;
 // connection under it closed.
 const DEFAULT_MAX_REDIRECTIONS = 16;
 
+// How often a subscriber connection is asked for a PING, and how long it has
+// to answer before it is taken for dead (see the module comment).
+const LIVENESS_INTERVAL_MS = 30000;
+const LIVENESS_TIMEOUT_MS = 10000;
+
+// A Cluster subscriber reads the slot map again every this many PING rounds,
+// unless the Cluster already does so at least as often.
+const MEMBERSHIP_ROUNDS = 2;
+
 /** What a cluster node connection receives and the Cluster re-emits. */
 const MESSAGE_EVENTS = Object.freeze(['message', 'messageBuffer']);
 const PATTERN_EVENTS = Object.freeze(['pmessage', 'pmessageBuffer']);
 
 /** ioredis's message for a command on a connection that has ended. */
 const CLOSED = 'Connection is closed.';
+
+/** ioredis's message for a slot map no node it knows would give. */
+const CLUSTER_ALL_FAILED = 'Failed to refresh slots cache.';
 
 /**
  * Open a subscriber connection on `source`, a client wrapper from
@@ -74,6 +99,186 @@ const CLOSED = 'Connection is closed.';
  */
 export function openSubscriber(source, owner) {
 	return guardSubscriber(source.duplicate({ enableReadyCheck: false }), owner);
+}
+
+/** What a PING says of its connection (see answersPing). */
+const ANSWERED = 'answered';
+const SILENT = 'silent';
+const MOOT = 'moot';
+
+/**
+ * Ask each connection `list()` returns for a PING every LIVENESS_INTERVAL_MS
+ * and hand one that stopped answering to `onSilent`, which closes it: one
+ * from which nothing came within LIVENESS_TIMEOUT_MS of its PING, or one
+ * still in its connect handshake on the same socket a round later, which
+ * ioredis waits for without a time limit. The first silent connection of a
+ * streak is reported under `owner`, with the master `identify` names when it
+ * names one, and each master has a streak of its own; an answered PING ends
+ * it. `onRound` runs at the start of every round.
+ *
+ * @param {string} owner - module name reported
+ * @param {() => Iterable<any>} list
+ * @param {(conn: any) => void} onSilent
+ * @param {{ onRound?: () => void, identify?: (conn: any) => string | undefined }} [hooks]
+ * @returns {{ stop(): void }}
+ */
+export function watchLiveness(owner, list, onSilent, { onRound, identify } = {}) {
+	/** @type {WeakSet<object>} connections with a PING out */
+	const probing = new WeakSet();
+	/** @type {WeakMap<object, unknown>} the socket each was in its handshake on at the last round */
+	const handshaking = new WeakMap();
+	/** @type {Set<string>} the streaks reported, by master ('' without one) */
+	const reported = new Set();
+	let stopped = false;
+
+	/**
+	 * @param {any} conn
+	 * @param {number} waitedMs - how long it went unanswered at least
+	 */
+	function silent(conn, waitedMs) {
+		const master = identify ? identify(conn) : undefined;
+		if (!reported.has(master ?? '')) {
+			reported.add(master ?? '');
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT, {
+				attributes: master === undefined
+					? { owner, timeoutMs: waitedMs }
+					: { owner, master, timeoutMs: waitedMs }
+			});
+		}
+		onSilent(conn);
+	}
+
+	function round() {
+		if (stopped) return;
+		if (onRound) onRound();
+		for (const conn of list()) {
+			// TCP is up and the server does not answer the handshake; one still
+			// connecting is bounded by ioredis's connect timeout.
+			if (conn.status === 'connect') {
+				if (handshaking.has(conn) && handshaking.get(conn) === conn.stream) {
+					handshaking.delete(conn);
+					silent(conn, LIVENESS_INTERVAL_MS);
+				} else {
+					handshaking.set(conn, conn.stream);
+				}
+				continue;
+			}
+			handshaking.delete(conn);
+			if (probing.has(conn) || conn.status !== 'ready' || typeof conn.ping !== 'function') continue;
+			probing.add(conn);
+			answersPing(conn).then((verdict) => {
+				probing.delete(conn);
+				if (stopped || verdict === MOOT) return;
+				if (verdict === ANSWERED) {
+					reported.delete((identify ? identify(conn) : undefined) ?? '');
+					return;
+				}
+				silent(conn, LIVENESS_TIMEOUT_MS);
+			});
+		}
+	}
+
+	const timer = setIntervalTimer(round, LIVENESS_INTERVAL_MS);
+	if (timer && timer.unref) timer.unref();
+	return {
+		stop() {
+			if (stopped) return;
+			stopped = true;
+			clearIntervalTimer(timer);
+		}
+	};
+}
+
+/**
+ * Whether `err` is an error the server replied with, which proves the
+ * connection works. The class is the test; its name stands in where a bundler
+ * kept a second copy of it.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isReplyError(err) {
+	return err instanceof ReplyError || /** @type {any} */ (err)?.name === 'ReplyError';
+}
+
+/**
+ * Send `conn` a PING and resolve what it says of the connection: ANSWERED
+ * when anything came in over its socket meanwhile (the reply, an error reply,
+ * or a message ahead of the reply on a busy connection); SILENT when nothing
+ * did within LIVENESS_TIMEOUT_MS; MOOT when the connection closed or
+ * reconnected meanwhile, which is handled where it ends or reconnects. ioredis
+ * giving up on the PING itself (its commandTimeout option) decides nothing:
+ * the reply can still be on its way behind a burst of messages.
+ *
+ * @param {any} conn
+ * @returns {Promise<string>}
+ */
+function answersPing(conn) {
+	const stream = conn.stream;
+	return new Promise((resolve) => {
+		let settled = false;
+		/** @param {string} verdict */
+		const settle = (verdict) => {
+			if (settled) return;
+			settled = true;
+			clearTimer(timer);
+			if (listening) stream.removeListener('data', heard);
+			resolve(verdict);
+		};
+		const heard = () => settle(ANSWERED);
+		// Decided after the event loop has read what already arrived: a timer runs
+		// before the socket is read in the same turn.
+		const timer = setTimer(() => setImmediateTimer(() => settle(conn.status === 'ready' && conn.stream === stream ? SILENT : MOOT)), LIVENESS_TIMEOUT_MS);
+		if (timer && timer.unref) timer.unref();
+		const listening = !!stream && typeof stream.once === 'function' && typeof stream.removeListener === 'function';
+		if (listening) stream.once('data', heard);
+		try {
+			Promise.resolve(conn.ping()).then(heard, (/** @type {any} */ err) => {
+				if (isReplyError(err)) settle(ANSWERED);
+				else if (err?.message !== 'Command timed out') settle(MOOT);
+			});
+		} catch {
+			settle(MOOT);
+		}
+	});
+}
+
+/**
+ * Destroy `conn`'s socket, which closes the connection at once the way a
+ * dropped one closes. Ending it instead waits for the peer to acknowledge,
+ * which a dead host never does (newer ioredis destroys it after its
+ * disconnectTimeout, 2 seconds by default). Returns whether there was a
+ * socket to destroy.
+ *
+ * @param {any} conn
+ * @returns {boolean}
+ */
+function dropSocket(conn) {
+	const stream = conn.stream;
+	if (!stream || typeof stream.destroy !== 'function' || stream.destroyed) return false;
+	stream.destroy();
+	return true;
+}
+
+/**
+ * Close a connection that is not to reconnect, at once, whatever state its
+ * peer is in.
+ *
+ * @param {any} conn
+ */
+export function closeConnection(conn) {
+	conn.disconnect();
+	dropSocket(conn);
+}
+
+/**
+ * A node's address, as ioredis keys its node list.
+ *
+ * @param {any} node
+ * @returns {string}
+ */
+function addressOf(node) {
+	return node.options.host + ':' + node.options.port;
 }
 
 /**
@@ -120,20 +325,74 @@ export function guardSubscriber(conn, owner) {
 	const subs = trackSubscriptions(conn, owner, KINDS, {
 		send,
 		restore: send,
-		isUp: () => conn.status === 'ready'
+		isUp: () => conn.status === 'ready',
+		// ioredis writes a subscribe made during the handshake straight to the
+		// socket, and drops it without settling it when the socket closes
+		// before the handshake is done.
+		handshakeSocket: () => (conn.status === 'connect' && conn.stream ? conn.stream : null)
 	});
 
 	// The first ready sends what the owner queued while connecting; every later
-	// one follows a reconnect that dropped the subscriptions.
+	// one follows a reconnect that dropped the subscriptions. Either may follow
+	// a socket that closed in its handshake.
 	let readyBefore = false;
 	conn.on('ready', () => {
+		subs.settleLost(conn.stream);
 		if (!readyBefore) {
 			readyBefore = true;
 			return;
 		}
 		subs.restoreAll();
 	});
-	conn.on('end', () => subs.end());
+	// A connection that went silent, or stuck in its handshake, is closed so
+	// ioredis reconnects it, and the 'ready' after restores its channels.
+	const liveness = watchLiveness(owner, () => [conn], dropSocket);
+	/** @type {any} */
+	let quitTimer = null;
+	conn.on('end', () => {
+		subs.end();
+		liveness.stop();
+		if (quitTimer !== null) {
+			clearTimer(quitTimer);
+			quitTimer = null;
+		}
+	});
+	// A QUIT goes out at once on a ready connection or in its handshake, and
+	// closing it on purpose then stops the PINGs: a QUIT to a server that
+	// stopped answering leaves the connection open until it times out. One
+	// its QUIT has not closed within LIVENESS_TIMEOUT_MS is closed at once,
+	// since a dead host never answers the QUIT and the open socket would keep
+	// the process alive until TCP gives up. At any other time ioredis queues
+	// the QUIT for the next connection, or closes the connection at once when
+	// nothing else is queued, and the PINGs go on until it ends.
+	const quit = conn.quit;
+	if (typeof quit === 'function') {
+		conn.quit = function (...args) {
+			if (conn.status === 'ready' || conn.status === 'connect') {
+				liveness.stop();
+				if (quitTimer === null) {
+					quitTimer = setTimer(() => {
+						quitTimer = null;
+						// Between two attempts the QUIT was queued, not sent.
+						if (conn.status !== 'end' && conn.status !== 'reconnecting') closeConnection(conn);
+					}, LIVENESS_TIMEOUT_MS);
+					if (quitTimer && quitTimer.unref) quitTimer.unref();
+				}
+			}
+			return quit.apply(this, args);
+		};
+	}
+	const disconnect = conn.disconnect;
+	if (typeof disconnect === 'function') {
+		conn.disconnect = function (reconnect, ...rest) {
+			// Closed for good. Between two attempts ioredis then emits no 'end'.
+			if (!reconnect) {
+				liveness.stop();
+				subs.end();
+			}
+			return disconnect.call(this, reconnect, ...rest);
+		};
+	}
 
 	return conn;
 }
@@ -144,16 +403,26 @@ export function guardSubscriber(conn, owner) {
  * `io.send`, and restore them on request with `io.restore` on the connection
  * that carries the subscriptions.
  *
+ * A call sent while `io.handshakeSocket()` names a socket is lost when that
+ * socket closes before the connection is ready, and settleLost() sends it
+ * again once the connection is ready on another, for the channels no later
+ * call of the owner has decided. What ioredis sends on its own at that ready
+ * (its offline queue, and what an earlier ready connection left unanswered)
+ * goes out first, and was asked for before the lost call or is a later call
+ * of the owner that decides its channels.
+ *
  * @param {any} target
  * @param {string} owner
  * @param {ReadonlyArray<typeof KINDS[number]>} kinds - the subscription kinds taken over
  * @param {{
  *   send: (name: string, args: unknown[]) => Promise<unknown>,
  *   restore: (name: string, args: unknown[]) => Promise<unknown>,
- *   isUp: () => boolean
- * }} io - `isUp` says whether that connection is ready
+ *   isUp: () => boolean,
+ *   handshakeSocket?: () => unknown
+ * }} io - `isUp` says whether that connection is ready; `handshakeSocket`
+ *   names the socket a call is written to during its handshake, null otherwise
  */
-function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
+function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handshakeSocket }) {
 	/** @type {Map<string, Set<string>>} kind -> channels the owner holds */
 	const held = new Map();
 	for (const kind of kinds) held.set(kind.name, new Set());
@@ -163,6 +432,40 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
 	/** @type {Map<string, number>} */
 	const inFlight = new Map();
 	let callSeq = 0;
+	/** @typedef {{ name: string, prefix: string, keys: string[], id: number, socket: unknown, done: boolean, resolve: (v: unknown) => void, reject: (e: unknown) => void }} Exposed */
+	/** @type {Exposed[]} calls written during a handshake not known to be done, in order */
+	let exposed = [];
+
+	/**
+	 * Send a call of the owner. One written during a handshake is kept until
+	 * the connection is ready, and the owner gets a promise of its own, which
+	 * the reply settles, or settleLost() when the socket closed first.
+	 *
+	 * @param {string} name
+	 * @param {unknown[]} args
+	 * @param {string} prefix
+	 * @param {string[]} keys - the in-flight keys the call decides
+	 * @param {number} id
+	 */
+	function dispatch(name, args, prefix, keys, id) {
+		const socket = handshakeSocket ? handshakeSocket() : null;
+		const reply = send(name, args);
+		if (socket === null) return reply;
+		return new Promise((resolve, reject) => {
+			/** @type {Exposed} */
+			const call = { name, prefix, keys, id, socket, done: false, resolve, reject };
+			exposed.push(call);
+			reply.then((value) => {
+				if (call.done) return;
+				call.done = true;
+				resolve(value);
+			}, (err) => {
+				if (call.done) return;
+				call.done = true;
+				reject(err);
+			});
+		});
+	}
 
 	for (const kind of kinds) {
 		const set = /** @type {Set<string>} */ (held.get(kind.name));
@@ -174,7 +477,7 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
 			const channels = channelArgs(args);
 			const id = ++callSeq;
 			for (const channel of channels) inFlight.set(prefix + channel, id);
-			const reply = send(kind.name, args);
+			const reply = dispatch(kind.name, args, prefix, channels.map((channel) => prefix + channel), id);
 			const settle = (subscribed) => {
 				for (const channel of channels) {
 					if (inFlight.get(prefix + channel) !== id) continue;
@@ -194,12 +497,15 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
 			/** @type {string[]} */
 			const keys = [];
 			if (channels.length === 0) {
-				// No channels: every channel of this kind, including those still
-				// being subscribed.
-				set.clear();
+				// No channels: every channel of this kind, held or still being
+				// subscribed.
+				const all = new Set();
+				for (const channel of set) all.add(prefix + channel);
 				for (const key of inFlight.keys()) {
-					if (key.startsWith(prefix)) keys.push(key);
+					if (key.startsWith(prefix)) all.add(key);
 				}
+				set.clear();
+				keys.push(...all);
 			} else {
 				for (const channel of channels) {
 					set.delete(channel);
@@ -207,7 +513,7 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
 				}
 			}
 			for (const key of keys) inFlight.set(key, id);
-			const reply = send(kind.undo, args);
+			const reply = dispatch(kind.undo, args, prefix, keys, id);
 			const settle = () => {
 				for (const key of keys) {
 					if (inFlight.get(key) === id) inFlight.delete(key);
@@ -322,10 +628,41 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
 
 	return {
 		restoreAll,
-		/** Stop for good. */
+		/**
+		 * The connection is ready on `current`: send again, in order, each call
+		 * written during the handshake of a socket that closed first (see
+		 * above). One written on `current` is answered there.
+		 *
+		 * @param {unknown} current
+		 */
+		settleLost(current) {
+			const calls = exposed;
+			exposed = [];
+			for (const call of calls) {
+				if (call.done || call.socket === current) continue;
+				call.done = true;
+				const open = [];
+				for (const key of call.keys) {
+					if (inFlight.get(key) === call.id) open.push(key.slice(call.prefix.length));
+				}
+				if (open.length === 0) {
+					call.resolve(0);
+					continue;
+				}
+				send(call.name, [open]).then(call.resolve, call.reject);
+			}
+		},
+		/** Stop for good: a call lost with a socket is rejected. */
 		end() {
 			ended = true;
 			cancelRetry();
+			const calls = exposed;
+			exposed = [];
+			for (const call of calls) {
+				if (call.done) continue;
+				call.done = true;
+				call.reject(new Error(CLOSED));
+			}
 		},
 		/** Whether the owner holds any channel. */
 		holdsAny() {
@@ -347,12 +684,21 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp }) {
  * The node is sampled from every node the Cluster knows once it is ready, as
  * ioredis does: a classic PUBLISH reaches every node of a cluster. Node
  * connections never reconnect (ioredis gives them no retry strategy), so one
- * that ends, or whose node a refreshed slot map of the Cluster no longer
- * lists, is replaced by a connection to a sampled node and the held channels
- * are restored there. The owner's calls
+ * that ends, goes silent, or whose node a refreshed slot map of the Cluster
+ * no longer lists, is replaced by a connection to a sampled node and the held
+ * channels are restored there. The owner's calls
  * it had not answered go to the replacement in the order they were made, as
  * the Cluster would send them again; an undo with no subscribe ahead of it is
  * settled instead, since no server holds what it would undo.
+ *
+ * A node whose connection failed is sampled again only once every other node
+ * the Cluster knows failed too. Then the slot map is read again, and the
+ * failure reported when no node could be opened at all; when no known node
+ * answers that read either, the Cluster reconnects, which reads it from the
+ * startup nodes, as ioredis does for its own sharded subscribers. It would
+ * not on its own: its connections to nodes it never sent a command to stay
+ * unopened, so they never fail, and a rolling restart that gives every node a
+ * new address leaves it dialling none of them.
  *
  * @param {any} cluster
  * @param {string} owner
@@ -377,7 +723,41 @@ function guardCluster(cluster, owner) {
 	let failedOpens = 0;
 	/** @type {any} */
 	let reopenTimer = null;
+	// Addresses of the nodes whose connection ended unproven or went silent
+	// since one last proved itself, of those that ended unproven, and the last
+	// error such a connection raised.
+	/** @type {Set<string>} */
+	const failed = new Set();
+	/** @type {Set<string>} */
+	const unopened = new Set();
+	/** @type {unknown} */
+	let lastError = null;
+	let unreachableReported = false;
+	// Set while the slot map is read again after every known node failed.
+	let rediscovering = false;
+	let rounds = 0;
 	const maxAttempts = cluster.options.maxRedirections > 0 ? cluster.options.maxRedirections : DEFAULT_MAX_REDIRECTIONS;
+	const ownRefresh = !(cluster.options.slotsRefreshInterval > 0 &&
+		cluster.options.slotsRefreshInterval <= LIVENESS_INTERVAL_MS * MEMBERSHIP_ROUNDS);
+
+	// Set while a reconnect of the Cluster is this guard's doing, one it forced
+	// when no node it knows answered (see rediscover) or one a slot map read of
+	// its own set off (see readSlotMap), until the Cluster is ready again.
+	let forcing = false;
+	// ioredis reports each attempt of such a reconnect that finds no node as an
+	// 'error', which the owner reports, and its default strategy tries again
+	// about every 100 ms, so those attempts are spaced as the node connections
+	// here are redialled, growing to 2 seconds, or longer when the strategy
+	// asks. They do not stop, which the strategy may ask for, since without the
+	// reconnect the subscriber would have gone on redialling its nodes. Any
+	// other reconnect is the strategy's alone.
+	const retryStrategy = cluster.options.clusterRetryStrategy;
+	cluster.options.clusterRetryStrategy = function (/** @type {number} */ times, /** @type {unknown} */ reason) {
+		const delay = typeof retryStrategy === 'function' ? retryStrategy.call(this, times, reason) : null;
+		if (!forcing) return delay;
+		const spaced = Math.min(Math.max(1, times) * REOPEN_STEP_MS, REOPEN_MAX_MS);
+		return typeof delay === 'number' ? Math.max(delay, spaced) : spaced;
+	};
 
 	const subs = trackSubscriptions(cluster, owner, CLUSTER_KINDS, {
 		send(name, args) {
@@ -405,6 +785,10 @@ function guardCluster(cluster, owner) {
 			if (conn !== current) return;
 			proven = true;
 			failedOpens = 0;
+			failed.clear();
+			unopened.clear();
+			lastError = null;
+			unreachableReported = false;
 		}, () => {});
 		return reply;
 	}
@@ -456,7 +840,7 @@ function guardCluster(cluster, owner) {
 	}
 
 	function open() {
-		if (current !== null || closed || reopenTimer !== null) return;
+		if (current !== null || closed || reopenTimer !== null || rediscovering) return;
 		// Nothing is sent before the Cluster is ready, as the Cluster itself
 		// does; one created with lazyConnect is connected here, since nothing
 		// else sends through it. 'ready' and '+node' call this again.
@@ -467,7 +851,16 @@ function guardCluster(cluster, owner) {
 		let nodes = [];
 		try { nodes = cluster.nodes('all'); } catch { /* reset while reconnecting */ }
 		if (!Array.isArray(nodes) || nodes.length === 0) return;
-		const node = nodes[Math.min(nodes.length - 1, Math.floor(randomFloat() * nodes.length))];
+		const untried = nodes.filter((node) => !failed.has(addressOf(node)));
+		if (untried.length === 0) {
+			// Reported when none of them could be opened; one that only went
+			// silent may well open again.
+			if (nodes.every((node) => unopened.has(addressOf(node)))) reportUnreachable(nodes.length);
+			rediscover();
+			return;
+		}
+		const node = untried[Math.min(untried.length - 1, Math.floor(randomFloat() * untried.length))];
+		const address = addressOf(node);
 		let conn;
 		try {
 			conn = node.duplicate({ enableReadyCheck: false, autoResubscribe: false });
@@ -485,9 +878,11 @@ function guardCluster(cluster, owner) {
 		faulted = false;
 		// Not reported, as ioredis's own subscriber does not report its
 		// connection's errors: one that fails the connection ends it, and it is
-		// replaced then.
-		conn.on('error', () => {
-			if (conn === current && !proven) faulted = true;
+		// replaced then. The last one is reported once every node failed.
+		conn.on('error', (err) => {
+			if (conn !== current || proven) return;
+			faulted = true;
+			lastError = err;
 		});
 		// Forwarded exactly as ioredis does; a connection that stops carrying the
 		// subscriptions drops these listeners instead of checking each message.
@@ -512,7 +907,11 @@ function guardCluster(cluster, owner) {
 			sent = [];
 			waiting = cut.concat(waiting);
 			settleIdleUndos();
-			if (!proven) failedOpens++;
+			if (!proven) {
+				failedOpens++;
+				failed.add(address);
+				unopened.add(address);
+			}
 			reopen();
 		});
 		// Sent through the connection's offline queue, which also connects it.
@@ -533,6 +932,67 @@ function guardCluster(cluster, owner) {
 		schedule();
 	}
 
+	/**
+	 * No node the Cluster knows could be opened since a connection last proved
+	 * itself: reported once per streak.
+	 *
+	 * @param {number} known - how many nodes the Cluster knows
+	 */
+	function reportUnreachable(known) {
+		if (unreachableReported) return;
+		unreachableReported = true;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_UNREACHABLE, lastError === null
+			? { attributes: { owner, nodes: known } }
+			: { error: lastError, attributes: { owner, nodes: known } });
+	}
+
+	/**
+	 * Every node the Cluster knows failed: read the slot map again, or
+	 * reconnect the Cluster when no known node answers that either (see
+	 * guardCluster). Its 'ready' then opens the next connection.
+	 */
+	function rediscover() {
+		failed.clear();
+		unopened.clear();
+		if (typeof cluster.refreshSlotsCache !== 'function') {
+			schedule();
+			return;
+		}
+		rediscovering = true;
+		readSlotMap((/** @type {any} */ err) => {
+			rediscovering = false;
+			if (closed) return;
+			// ioredis tells this error by its message too. A Cluster already
+			// reconnecting reads its startup nodes anyway.
+			if (err && err.message === CLUSTER_ALL_FAILED && cluster.status === 'ready') {
+				forcing = true;
+				cluster.disconnect(true);
+			} else {
+				schedule();
+			}
+		});
+	}
+
+	/**
+	 * Read the slot map. A node with no slots, one reset after it was removed
+	 * for example, answers with an empty map, on which ioredis drops every node
+	 * before the callback runs and reconnects the Cluster once the first of them
+	 * has closed: that reconnect is this guard's doing, so the retry strategy
+	 * treats it as forced (see above) until the Cluster is ready.
+	 *
+	 * @param {(err: unknown) => void} [onRead]
+	 */
+	function readSlotMap(onRead) {
+		cluster.refreshSlotsCache((/** @type {any} */ err) => {
+			if (!err && !closed && cluster.status === 'ready') {
+				let known = 1;
+				try { known = cluster.nodes('all').length; } catch { /* reset while reconnecting */ }
+				if (known === 0) forcing = true;
+			}
+			if (onRead) onRead(err);
+		});
+	}
+
 	/** Open a node connection now, or after the delay that unproven ones earned. */
 	function schedule() {
 		if (current !== null || closed || reopenTimer !== null) return;
@@ -551,27 +1011,48 @@ function guardCluster(cluster, owner) {
 		if (current === null && (subs.holdsAny() || waiting.length > 0)) open();
 	};
 	// Whether the node still belongs to the cluster is read from the slot map
-	// once it is refreshed. '-node' is no sign: ioredis also emits it when its
-	// own connection to the node ends, which leaves this one working.
+	// once it is refreshed, which this does every MEMBERSHIP_ROUNDS PING rounds
+	// besides whatever else refreshes it. '-node' is no sign: ioredis also
+	// emits it when its own connection to the node ends, which leaves this one
+	// working.
+	// A map that lists no node came from a node with no slots, one reset after
+	// it was removed for example, and says nothing of this one's.
 	const onRefresh = () => {
 		if (current === null) return;
 		let nodes = [];
 		try { nodes = cluster.nodes('all'); } catch { return; }
-		const { host, port } = current.options;
-		if (!nodes.some((node) => node.options.host === host && node.options.port === port)) current.disconnect();
+		if (nodes.length === 0) return;
+		const address = addressOf(current);
+		if (!nodes.some((node) => addressOf(node) === address)) closeConnection(current);
 	};
+	const onReady = () => { forcing = false; };
+	cluster.on('ready', onReady);
 	cluster.on('ready', onTopology);
 	cluster.on('+node', onTopology);
 	cluster.on('refresh', onRefresh);
 
+	const liveness = watchLiveness(owner, () => (current !== null ? [current] : []), (conn) => {
+		if (conn !== current) return;
+		failed.add(addressOf(conn));
+		closeConnection(conn);
+	}, {
+		onRound() {
+			if (++rounds % MEMBERSHIP_ROUNDS !== 0 || !ownRefresh || typeof cluster.refreshSlotsCache !== 'function') return;
+			if (current !== null && cluster.status === 'ready') readSlotMap();
+		}
+	});
+
 	function close() {
 		if (closed) return;
 		closed = true;
+		forcing = false;
 		subs.end();
+		liveness.stop();
 		if (reopenTimer !== null) {
 			clearTimer(reopenTimer);
 			reopenTimer = null;
 		}
+		cluster.removeListener('ready', onReady);
 		cluster.removeListener('ready', onTopology);
 		cluster.removeListener('+node', onTopology);
 		cluster.removeListener('refresh', onRefresh);
@@ -588,9 +1069,10 @@ function guardCluster(cluster, owner) {
 			const conn = current;
 			current = null;
 			retire(conn);
-			// As ioredis stops its own subscriber: a QUIT would wait behind a
-			// connect still in progress and keep the process alive meanwhile.
-			conn.disconnect();
+			// Not a QUIT, as ioredis stops its own subscriber: one would wait
+			// behind a connect still in progress, or forever on a dead host,
+			// and keep the process alive meanwhile.
+			closeConnection(conn);
 		}
 	}
 

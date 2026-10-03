@@ -91,6 +91,8 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	POSTGRES_TASKS_SWEEP: 'EXTENSIONS-ERR-POSTGRES-TASKS-SWEEP',
 	REDIS_CLIENT: 'EXTENSIONS-ERR-REDIS-CLIENT',
 	REDIS_RESUBSCRIBE: 'EXTENSIONS-ERR-REDIS-RESUBSCRIBE',
+	REDIS_SUBSCRIBER_SILENT: 'EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT',
+	REDIS_SUBSCRIBER_UNREACHABLE: 'EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE',
 	PUBSUB_SUBSCRIBER: 'EXTENSIONS-ERR-PUBSUB-SUBSCRIBER',
 	CRDT_SUBSCRIBER: 'EXTENSIONS-ERR-CRDT-SUBSCRIBER',
 	CRDT_SUBSCRIBE: 'EXTENSIONS-ERR-CRDT-SUBSCRIBE',
@@ -771,6 +773,26 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, and again after every reconnect or move to a new cluster node connection, until Redis accepts them or the module releases them. Channels Redis accepts are restored at once.',
 		nextAction: 'Grant the Redis user the channels this package subscribes to, or restore the server configuration that changed; the next retry restores the subscription.',
 		sources: ['src/shared/redis-subscriber.js'], anchor: 'extensions-err-redis-resubscribe'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT,
+		event: 'redis.subscriber.silent', component: 'runtime.redis.subscriber', severity: 'error',
+		problemPrefix: 'A Redis subscriber connection stopped answering and was closed.',
+		cause: 'Nothing came in over the connection within timeoutMs milliseconds of a PING, or a new connection stayed in its handshake for timeoutMs (a whole PING round). Subscriber connections are asked every 30 seconds because one that only receives notices no failure on its own: a host that died or was cut off without closing the socket, or a NAT or load balancer that dropped the idle flow, leaves it open and silent until TCP keepalive gives up, about two hours at the operating system default. A server blocked for longer than timeoutMs by one command reads the same way.',
+		consequence: 'Messages published on the connection\'s channels while it was silent, or before its channels are restored, may not have reached this instance. The owner attribute names the module that owns it. Reported once per streak per subscriber, until a PING there is answered again.',
+		automaticRecovery: 'The connection is closed at once. A standalone subscriber reconnects and restores its channels; on a Redis Cluster a module subscriber moves its channels to another node.',
+		nextAction: 'Check the network path to the Redis node and its health. If it repeats while the server is healthy, look for commands that block it for seconds (SLOWLOG) and for a proxy that drops idle connections.',
+		sources: ['src/shared/redis-subscriber.js'], anchor: 'extensions-err-redis-subscriber-silent'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_UNREACHABLE,
+		event: 'redis.subscriber.unreachable', component: 'runtime.redis.subscriber', severity: 'error',
+		problemPrefix: 'No node of the Redis Cluster accepted a subscriber connection.',
+		cause: 'A connection to every node the subscriber\'s Cluster knows ended before a command on it succeeded: the nodes are down or unreachable from this host, refuse the login or the connection (maxclients), or every one of them moved to a new address, as a rolling restart without stable addresses does. The nodes attribute is how many nodes it knows, and the error attribute the last error such a connection raised, when one did.',
+		consequence: 'Messages on the subscriber\'s channels do not reach this instance until a node accepts it. The owner attribute names the module that owns it. Reported once per failure streak per subscriber.',
+		automaticRecovery: 'The subscriber reads the cluster slot map again and keeps trying with a delay of up to 2 seconds. When no node it knows answers that read either, its Cluster reconnects through the startup nodes, which looks their addresses up again. The attempts of that reconnect, and of one a slot map read of the subscriber set off (a node with no slots answers with an empty map, on which ioredis drops every node), are spaced as the node connections are redialled, growing to 2 seconds, or longer when clusterRetryStrategy asks, and do not stop until the Cluster is ready again, even when the strategy would give up. ioredis raises an error for an attempt whose slot map read reaches no node, which the owning module reports as its subscriber error. A connection that works ends the streak and re-arms this report.',
+		nextAction: 'Check that the cluster nodes are up, reachable from this host and accept the configured credentials. When node addresses change on restart, give the Cluster startup nodes that resolve to the current ones, such as a DNS name.',
+		sources: ['src/shared/redis-subscriber.js'], anchor: 'extensions-err-redis-subscriber-unreachable'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER,
