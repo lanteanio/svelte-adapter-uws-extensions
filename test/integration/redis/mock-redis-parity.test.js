@@ -13,6 +13,7 @@ import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
 import { mockRedisClient } from '../../../src/testing/mock-redis.js';
+import { isCluster } from '../../../src/shared/cluster.js';
 import { CONSUME_SCRIPT } from '../../../src/redis/token-bucket-script.js';
 
 describe('mock-redis Lua parity against real Redis (integration)', () => {
@@ -149,14 +150,19 @@ describe('mock-redis Lua parity against real Redis (integration)', () => {
 			'[!abc]'
 		];
 
+		// A keyless SCAN on a Cluster reaches one sampled node, so every master
+		// is scanned and the results joined.
 		async function scanAll(redis, pattern) {
 			const found = new Set();
-			let cursor = '0';
-			do {
-				const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
-				for (const k of batch) found.add(k);
-				cursor = String(next);
-			} while (cursor !== '0');
+			const nodes = isCluster(redis) ? /** @type {any} */ (redis).nodes('master') : [redis];
+			for (const node of nodes) {
+				let cursor = '0';
+				do {
+					const [next, batch] = await node.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
+					for (const k of batch) found.add(k);
+					cursor = String(next);
+				} while (cursor !== '0');
+			}
 			return found;
 		}
 
