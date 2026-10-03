@@ -1,20 +1,21 @@
 /**
  * Integration tests for subscriber re-subscription after a reconnect, against
- * a real Redis server.
+ * a real Redis server and, under the cluster-mirror tier, a real Redis
+ * Cluster.
  *
  * Redis disconnects a client that loses access to a channel it is subscribed
  * to, so removing a channel from the user's ACL is a real reconnect whose
  * re-subscribe Redis refuses with NOPERM. Left to ioredis, that refusal is an
- * unhandled rejection and ends the process. These tests pin that it is
- * reported instead, and that the subscription comes back on its own once the
- * ACL grants the channel again, with no reconnect in between.
+ * unhandled rejection that ends the process on a standalone server, and a
+ * silent loss of every channel of the refused command on a Cluster. These
+ * tests pin that it is reported instead, and that the subscription comes back
+ * on its own once the ACL grants the channel again.
  *
- * Standalone only: on a Cluster the client's duplicate() returns ioredis's own
- * Cluster subscriber, which the package leaves alone.
+ * ACLs are per node on a Cluster, so every ACL change, channel count and
+ * client listing covers every node.
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { createBackendClient, isClusterBackend } from '../helpers/backend.js';
-import { createRedisClient } from '../../../src/redis/index.js';
 import { createPubSubBus } from '../../../src/redis/pubsub.js';
 import { createShardedBus } from '../../../src/redis/sharded-pubsub.js';
 import { createConnectionRegistry } from '../../../src/redis/registry.js';
@@ -38,7 +39,11 @@ async function waitFor(fn, timeoutMs = 5000) {
 	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
-describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnect (integration)', () => {
+// A cluster retries a refused shard channel or keyspace subscription with a
+// backoff that can grow past 5 seconds while the grant is withheld.
+const RESTORE_TIMEOUT_MS = isClusterBackend() ? 20000 : 5000;
+
+describe('subscriber re-subscription after a reconnect (integration)', () => {
 	const user = 'inttest-resub-' + Math.random().toString(16).slice(2, 10);
 	const password = 'pw-' + Math.random().toString(16).slice(2, 10);
 	let admin;
@@ -47,15 +52,17 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 	let sink = null;
 	const unhandled = vi.fn();
 
+	/** The server connections: every node of a Cluster, or the one server. */
+	const servers = () => (isClusterBackend() ? admin.redis.nodes('all') : [admin.redis]);
+	const onEveryServer = (...args) => Promise.all(servers().map((s) => s.call(...args)));
+
 	/**
 	 * A client that connects as the test's ACL user. `readies()` counts the
 	 * 'ready' events of the subscriber connections the modules open from it.
 	 */
 	function userClient(keyPrefix) {
-		const url = new URL(process.env.INTEGRATION_REDIS_URL);
-		url.username = user;
-		url.password = password;
-		const client = createRedisClient({ url: url.toString(), keyPrefix, autoShutdown: false });
+		const auth = { username: user, password };
+		const client = createBackendClient({ keyPrefix, options: isClusterBackend() ? { redisOptions: auth } : auth });
 		let readies = 0;
 		const duplicate = client.duplicate;
 		client.duplicate = (...args) => {
@@ -68,27 +75,50 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		return client;
 	}
 
-	const grantAllChannels = () => admin.redis.call('ACL', 'SETUSER', user, 'allchannels');
-	/** Subscribers the server holds on a channel, and its pattern subscriptions. */
-	const numsub = async (channel) => Number((await admin.redis.call('PUBSUB', 'NUMSUB', channel))[1]);
+	const grantAllChannels = () => onEveryServer('ACL', 'SETUSER', user, 'allchannels');
+	/** Subscribers the servers hold on a channel. */
+	const numsub = async (channel) => {
+		let total = 0;
+		for (const reply of await onEveryServer('PUBSUB', 'NUMSUB', channel)) total += Number(reply[1]);
+		return total;
+	};
 	/** Pattern subscriptions held by the test user's connections. */
 	const userPatterns = async () => {
-		const list = await admin.redis.call('CLIENT', 'LIST', 'TYPE', 'pubsub');
 		let total = 0;
-		for (const line of String(list).split('\n')) {
-			if (!line.includes(' user=' + user + ' ')) continue;
-			const m = / psub=(\d+)/.exec(line);
-			if (m) total += Number(m[1]);
+		for (const list of await onEveryServer('CLIENT', 'LIST', 'TYPE', 'pubsub')) {
+			for (const line of String(list).split('\n')) {
+				if (!line.includes(' user=' + user + ' ')) continue;
+				const m = / psub=(\d+)/.exec(line);
+				if (m) total += Number(m[1]);
+			}
 		}
 		return total;
 	};
-	const channelsMatching = (pattern) => admin.redis.call('PUBSUB', 'CHANNELS', pattern);
+	/** The test user's connections holding a channel, by server address and client id. */
+	const userSubscribers = async () => {
+		const found = [];
+		for (const list of await onEveryServer('CLIENT', 'LIST', 'TYPE', 'pubsub')) {
+			for (const line of String(list).split('\n')) {
+				if (!line.includes(' user=' + user + ' ') || !/ sub=[1-9]/.test(line)) continue;
+				found.push(/ laddr=(\S+)/.exec(line)?.[1] + '#' + /^id=(\d+)/.exec(line)?.[1]);
+			}
+		}
+		return found;
+	};
+	const channelsMatching = async (pattern) => {
+		const all = new Set();
+		for (const reply of await onEveryServer('PUBSUB', 'CHANNELS', pattern)) {
+			for (const channel of reply) all.add(String(channel));
+		}
+		return [...all];
+	};
 	// Redis disconnects the user's subscribed clients when a channel is taken away.
-	const revokeChannels = () => admin.redis.call('ACL', 'SETUSER', user, 'resetchannels');
+	const revokeChannels = () => onEveryServer('ACL', 'SETUSER', user, 'resetchannels');
 
 	beforeAll(async () => {
 		admin = createBackendClient({ keyPrefix: 'inttest-resub:' });
-		await admin.redis.call('ACL', 'SETUSER', user, 'reset', 'on', '>' + password, '~*', '&*', '+@all');
+		if (isClusterBackend()) await admin.redis.ping();
+		await onEveryServer('ACL', 'SETUSER', user, 'reset', 'on', '>' + password, '~*', '&*', '+@all');
 		process.on('unhandledRejection', unhandled);
 	});
 
@@ -101,7 +131,7 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 
 	afterAll(async () => {
 		process.off('unhandledRejection', unhandled);
-		await admin.redis.call('ACL', 'DELUSER', user).catch(() => {});
+		await onEveryServer('ACL', 'DELUSER', user).catch(() => {});
 		await admin.quit();
 	});
 
@@ -112,6 +142,7 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		const bus = createPubSubBus(client, { channel });
 		cleanups.push(() => bus.deactivate());
 		await bus.activate(platform);
+		expect(await numsub(channel)).toBe(1);
 		sink = captureRegistered();
 		const resubscribes = () => sink.records.filter((r) => r.event === 'redis.subscriber.resubscribe.failed');
 
@@ -121,6 +152,7 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		expect(resubscribes()[0].attributes).toMatchObject({ owner: 'pubsub', kind: 'subscribe', refused: 1 });
 		expect(resubscribes()[0].attributes.error.message).toMatch(/^NOPERM/);
 		expect(JSON.stringify(sink.records)).not.toContain(channel);
+		expect(await numsub(channel)).toBe(0);
 
 		// The grant does not reconnect anything; the backoff retry restores the channel.
 		const readiesBeforeGrant = client.readies();
@@ -130,8 +162,33 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 			await admin.redis.publish(channel, envelope);
 			return platform.published.some((p) => p.event === 'msg');
 		});
+		expect(await numsub(channel)).toBe(1);
 		expect(client.readies()).toBe(readiesBeforeGrant);
 		expect(resubscribes()).toHaveLength(1);
+		expect(unhandled).not.toHaveBeenCalled();
+	});
+
+	it('pub/sub bus: a subscriber connection the server drops comes back with its channel', async () => {
+		const channel = 'inttest-resub:dropped:' + Date.now();
+		const client = userClient('inttest-resub:');
+		const platform = mockPlatform();
+		const bus = createPubSubBus(client, { channel });
+		cleanups.push(() => bus.deactivate());
+		await bus.activate(platform);
+		expect(await numsub(channel)).toBe(1);
+		const before = await userSubscribers();
+		expect(before).toHaveLength(1);
+
+		await onEveryServer('CLIENT', 'KILL', 'USER', user);
+		await waitFor(async () => {
+			const now = await userSubscribers();
+			return now.length === 1 && now[0] !== before[0] && (await numsub(channel)) === 1;
+		});
+		const envelope = JSON.stringify({ instanceId: 'remote', topic: 'chat', event: 'back', data: 1 });
+		await waitFor(async () => {
+			await admin.redis.publish(channel, envelope);
+			return platform.published.some((p) => p.event === 'back');
+		});
 		expect(unhandled).not.toHaveBeenCalled();
 	});
 
@@ -144,11 +201,16 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		await bus.activate(platform);
 		await bus.follow('room');
 		sink = captureRegistered();
-		const resubscribes = () => sink.records.filter((r) => r.event === 'redis.subscriber.resubscribe.failed');
+		// On a cluster the sharded bus subscribes on each slot's master itself and
+		// reports a refused channel from its reconciliation.
+		const event = isClusterBackend() ? 'redis.sharded-pubsub.channel-reconcile.failed' : 'redis.subscriber.resubscribe.failed';
+		const refusals = () => sink.records.filter((r) => r.event === event);
 
 		await revokeChannels();
-		await waitFor(() => resubscribes().length > 0);
-		expect(resubscribes()[0].attributes).toMatchObject({ owner: 'sharded-pubsub', kind: 'ssubscribe', refused: 1 });
+		await waitFor(() => refusals().length > 0);
+		if (!isClusterBackend()) {
+			expect(refusals()[0].attributes).toMatchObject({ owner: 'sharded-pubsub', kind: 'ssubscribe', refused: 1 });
+		}
 		expect(JSON.stringify(sink.records)).not.toContain(prefix);
 
 		const readiesBeforeGrant = client.readies();
@@ -157,7 +219,7 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		await waitFor(async () => {
 			await admin.redis.spublish(prefix + 'room', envelope);
 			return platform.published.some((p) => p.event === 'msg');
-		});
+		}, RESTORE_TIMEOUT_MS);
 		expect(client.readies()).toBe(readiesBeforeGrant);
 		expect(unhandled).not.toHaveBeenCalled();
 	});
@@ -179,10 +241,10 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 
 		// Keep only the events channel: Redis drops the connection, and the
 		// restore's SUBSCRIBE of both channels is refused as a whole.
-		await admin.redis.call('ACL', 'SETUSER', user, 'resetchannels', '&' + eventsChannel);
+		await onEveryServer('ACL', 'SETUSER', user, 'resetchannels', '&' + eventsChannel);
 		await waitFor(() => resubscribes().length > 0);
 		expect(resubscribes()[0].attributes).toMatchObject({ owner: 'registry', kind: 'subscribe', refused: 1 });
-		expect(await numsub(eventsChannel)).toBe(1);
+		await waitFor(async () => (await numsub(eventsChannel)) === 1);
 		expect(await channelsMatching(pushPattern)).toHaveLength(0);
 
 		await grantAllChannels();
@@ -196,17 +258,30 @@ describe.runIf(!isClusterBackend())('subscriber re-subscription after a reconnec
 		const presence = createPresence(client, { key: 'id', select: (ud) => ({ id: ud.id }), heartbeat: 60000, keyspaceNotifications: true });
 		cleanups.push(async () => presence.destroy?.());
 		await presence.join(mockWs({ id: 'u1' }), 'room', mockPlatform());
-		expect(await userPatterns()).toBe(1);
+		// One keyspace subscription per master on a cluster, where key deletion
+		// events are node-local; on standalone it shares the topic's connection.
+		const patterns = isClusterBackend() ? admin.redis.nodes('master').length : 1;
+		expect(await userPatterns()).toBe(patterns);
 		sink = captureRegistered();
 		const resubscribes = () => sink.records.filter((r) => r.event === 'redis.subscriber.resubscribe.failed');
+		const keyspaceRefusals = () => sink.records.filter((r) => r.event === 'redis.presence.keyspace-subscribe.failed');
 
 		await revokeChannels();
-		await waitFor(() => resubscribes().length > 0);
-		expect(resubscribes()[0].attributes).toMatchObject({ owner: 'presence', refused: 2 });
+		if (isClusterBackend()) {
+			await waitFor(() => resubscribes().length > 0 && keyspaceRefusals().length === patterns);
+			expect(resubscribes()[0].attributes).toMatchObject({ owner: 'presence', kind: 'subscribe', refused: 1 });
+			// Past the first retries (1 s, then 2 s), each still refused.
+			await wait(3500);
+		} else {
+			await waitFor(() => resubscribes().length > 0);
+			expect(resubscribes()[0].attributes).toMatchObject({ owner: 'presence', refused: 2 });
+		}
 		expect(await userPatterns()).toBe(0);
 
 		await grantAllChannels();
-		await waitFor(async () => (await userPatterns()) === 1);
+		await waitFor(async () => (await userPatterns()) === patterns, RESTORE_TIMEOUT_MS);
+		// Each refusal streak is reported once, however often it was retried.
+		expect(keyspaceRefusals()).toHaveLength(isClusterBackend() ? patterns : 0);
 		expect(unhandled).not.toHaveBeenCalled();
 	});
 });

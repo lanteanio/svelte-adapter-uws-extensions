@@ -766,9 +766,9 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.REDIS_RESUBSCRIBE,
 		event: 'redis.subscriber.resubscribe.failed', component: 'runtime.redis.subscriber', severity: 'error',
 		problemPrefix: 'Redis refused a subscription restored after a reconnect.',
-		cause: 'A subscriber connection reconnected and Redis refused the SUBSCRIBE, PSUBSCRIBE or SSUBSCRIBE that restores one of its channels, for example NOPERM after the Redis user lost access to the channel, which is itself what makes Redis close a subscribed connection.',
-		consequence: 'Messages on the refused channels do not reach this instance, while the module that owns the connection still treats them as subscribed. The owner attribute names that module, kind the subscription type of the first refused channel and refused how many channels were refused; channel names are not logged. Reported once per failure streak per connection.',
-		automaticRecovery: 'Refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, and again after every reconnect, until Redis accepts them or the module releases them. Channels Redis accepts are restored at once.',
+		cause: 'A subscriber connection reconnected, or on a Redis Cluster its subscriptions moved to a new node connection after the previous one ended, and Redis refused the SUBSCRIBE, PSUBSCRIBE or SSUBSCRIBE that restores one of its channels, for example NOPERM after the Redis user lost access to the channel, which is itself what makes Redis close a subscribed connection.',
+		consequence: 'Messages on the refused channels do not reach this instance, while the module that owns the connection still treats them as subscribed. The owner attribute names that module, kind the subscription type of the first refused channel and refused how many channels were refused; channel names are not logged. Reported once per failure streak per subscriber.',
+		automaticRecovery: 'Refused channels are retried with a backoff from 1 to 30 seconds while the connection stays up, and again after every reconnect or move to a new cluster node connection, until Redis accepts them or the module releases them. Channels Redis accepts are restored at once.',
 		nextAction: 'Grant the Redis user the channels this package subscribes to, or restore the server configuration that changed; the next retry restores the subscription.',
 		sources: ['src/shared/redis-subscriber.js'], anchor: 'extensions-err-redis-resubscribe'
 	}),
