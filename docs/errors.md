@@ -60,7 +60,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER](#extensions-err-presence-keyspace-subscriber) | `redis.presence.keyspace-subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscriber.failed severity=error] A presence keyspace-notification subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE](#extensions-err-presence-keyspace-subscribe) | `redis.presence.keyspace-subscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscribe.failed severity=warn] The presence keyspace cleanup could not subscribe to key-deletion events.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF](#extensions-err-presence-keyspace-events-off) | `redis.presence.keyspace-events.off` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-events.off severity=warn] A Redis server's keyspace notification setting cannot deliver the key deletions the presence cleanup listens for.` |
-| [EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE](#extensions-err-presence-keyspace-reconcile) | `redis.presence.keyspace-reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-reconcile.failed severity=error] Presence keyspace subscriber reconciliation failed; the next topology event retries.` |
+| [EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE](#extensions-err-presence-keyspace-reconcile) | `redis.presence.keyspace-reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-reconcile.failed severity=error] Presence keyspace subscriber reconciliation failed; it is retried with a backoff.` |
 | [EXTENSIONS-ERR-PRESENCE-SUBSCRIBER](#extensions-err-presence-subscriber) | `redis.presence.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.subscriber.failed severity=error] The Redis presence subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PUBLISH-RATE-SUBSCRIBER](#extensions-err-publish-rate-subscriber) | `redis.publish-rate.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.publish-rate event=redis.publish-rate.subscriber.failed severity=error] The cluster publish-rate subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PUBLISH-RATE-LISTENER](#extensions-err-publish-rate-listener) | `redis.publish-rate.listener.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.publish-rate event=redis.publish-rate.listener.failed severity=error] A publish-rate threshold listener threw; aggregation continues.` |
@@ -562,9 +562,9 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.presence.keyspace-subscriber.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscriber.failed severity=error] A presence keyspace-notification subscriber connection reported an error.`
-- **Cause:** A per-master connection that listens for expired presence keys emitted an error.
+- **Cause:** A per-master connection subscribed to key-deletion events, which the presence cleanup of expired topics listens on, emitted an error after its subscription stood. An error before that is reported as EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE instead.
 - **Consequence:** Presence expiry deletions from that master may be missed until reconciliation repairs the subscriber set.
-- **Automatic recovery:** The Redis client reconnects and the handler schedules keyspace reconciliation.
+- **Automatic recovery:** A sweep of the masters runs at once. These connections do not reconnect: one that ended is replaced by a new connection to its master.
 - **Next action:** Inspect the Redis error and confirm reconciliation restores expired presence state.
 - **Runtime help:** `docs/errors.md#extensions-err-presence-keyspace-subscriber`
 - **Runtime sources:** [src/redis/presence/subscriber.js](../src/redis/presence/subscriber.js)
@@ -574,10 +574,10 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.presence.keyspace-subscribe.failed`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscribe.failed severity=warn] The presence keyspace cleanup could not subscribe to key-deletion events.`
-- **Cause:** psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.
+- **Cause:** psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection failed or dropped during the call, in which case the error is the one the connection raised (a refused login, for example). Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.
 - **Consequence:** This instance is not told when a topic's presence hash is deleted because the last instance presenting it stopped heartbeating, so its sync-only observers keep showing the last roster until new presence traffic or a reload.
-- **Automatic recovery:** On a cluster the masters are swept again whenever the topology changes. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.
-- **Next action:** For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next topology change subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.
+- **Automatic recovery:** On a cluster the master is subscribed again with a backoff from 1 to 30 seconds, and at once whenever the topology changes, and each kind of failure is reported once per streak per master. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.
+- **Next action:** For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next retry subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.
 - **Operator shortlink:** `https://svti.me/redis-keyspace`
 - **Runtime help:** `docs/errors.md#extensions-err-presence-keyspace-subscribe`
 - **Runtime sources:** [src/redis/presence/subscriber.js](../src/redis/presence/subscriber.js)
@@ -599,11 +599,11 @@ the stable ID tag on the line):
 ## `EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE`
 
 - **Code/event:** `redis.presence.keyspace-reconcile.failed`
-- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-reconcile.failed severity=error] Presence keyspace subscriber reconciliation failed; the next topology event retries.`
-- **Cause:** Re-reading the cluster master set or re-subscribing a master threw.
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-reconcile.failed severity=error] Presence keyspace subscriber reconciliation failed; it is retried with a backoff.`
+- **Cause:** Re-reading the cluster master set or re-subscribing a master threw, or a master did not answer CLUSTER MYID.
 - **Consequence:** Masters added by a failover may not have a keyspace subscriber yet, so expiry cleanup from them lags.
-- **Automatic recovery:** Reconciliation reruns on the next topology event or subscriber error.
-- **Next action:** Check cluster health; if this repeats without topology changes, inspect connectivity to individual masters.
+- **Automatic recovery:** Reconciliation reruns after a backoff from 1 to 30 seconds, and at once on the next topology event or subscriber error; a master ioredis dropped from its node list is swept again once a refreshed slot map lists it. A failed sweep is reported once per failure streak, a master that does not answer once until it answers or the slot map drops it.
+- **Next action:** Check cluster health; if it persists, inspect connectivity to individual masters, and that the Redis user may run CLUSTER MYID (+cluster|myid).
 - **Runtime help:** `docs/errors.md#extensions-err-presence-keyspace-reconcile`
 - **Runtime sources:** [src/redis/presence/subscriber.js](../src/redis/presence/subscriber.js)
 

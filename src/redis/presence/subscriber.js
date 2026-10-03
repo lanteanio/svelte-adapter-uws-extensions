@@ -19,7 +19,7 @@
  * @module svelte-adapter-uws-extensions/redis/presence/subscriber
  */
 
-import { setTimer, clearTimer } from '../../shared/runtime.js';
+import { setTimer, clearTimer, monotonicNow } from '../../shared/runtime.js';
 import { isCluster } from '../../shared/cluster.js';
 import { createBusValidator } from '../../shared/bus-validate.js';
 import { mergeFields, newFieldMap } from './field-policy.js';
@@ -27,6 +27,34 @@ import { INTERNAL_EVENTS } from './lua.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
 import { openSubscriber } from '../../shared/redis-subscriber.js';
+
+// A sweep that left a master without its keyspace subscription runs again
+// after a delay that doubles from the first value up to the cap.
+const KEYSPACE_RETRY_FIRST_MS = 1000;
+const KEYSPACE_RETRY_MAX_MS = 30000;
+
+/**
+ * What kind of failure an error is, to tell one cause from the next: a
+ * system error's code (ECONNREFUSED), else the reply's leading word (NOPERM,
+ * WRONGPASS). Compared only, never logged.
+ * @param {unknown} err
+ * @returns {string}
+ */
+function failureKind(err) {
+	const e = /** @type {any} */ (err);
+	if (typeof e?.code === 'string' && e.code !== '') return e.code;
+	return String(e?.message ?? '').split(' ', 1)[0];
+}
+
+/**
+ * A node's address, as ioredis keys its node list.
+ * @param {unknown} node
+ * @returns {string}
+ */
+function addressOf(node) {
+	const options = /** @type {any} */ (node)?.options;
+	return options ? options.host + ':' + options.port : '';
+}
 
 /**
  * JSON object shape used by every presence event payload container.
@@ -103,19 +131,48 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	// catches everything and this map stays empty.
 	/** @type {Map<string, import('ioredis').Redis>} master node id -> keyspace subscriber */
 	const keyspaceSubs = new Map();
+	// Master node id -> its address, for every master a sweep has read.
+	/** @type {Map<string, string>} */
+	const keyspaceAddresses = new Map();
 	let keyspaceReconcileTimer = null;
+	// When the pending sweep is due, so one asked for now replaces a retry
+	// still waiting out its backoff.
+	let keyspaceReconcileDueAt = 0;
+	let keyspaceRetryMs = 0;
 	/** @type {Promise<void> | null} single-flight guard for the master sweep */
 	let keyspaceReconciling = null;
 	let keyspaceRerun = false;
+	// Masters whose failed subscription is reported for the current streak, with
+	// the kinds of failure reported (see failureKind).
+	/** @type {Map<string, Set<string>>} */
+	const keyspaceRefused = new Map();
+	// Addresses of masters that did not answer CLUSTER MYID, reported once
+	// until the master answers or a refreshed slot map drops it.
+	/** @type {Set<string>} */
+	const keyspaceUnread = new Set();
+	// The masters' addresses at the last refresh (see pruneKeyspaceMasters), as
+	// a set and as a comparable signature; null before the first.
+	/** @type {Set<string> | null} */
+	let keyspaceLive = null;
+	/** @type {string | null} */
+	let keyspaceMasterSet = null;
+	// Connections closed on purpose because their master left, whose pending
+	// subscription is then no failure.
+	/** @type {WeakSet<object>} */
+	const keyspaceRetired = new WeakSet();
+	// A sweep that failed as a whole is reported once per failure streak.
+	let keyspaceReconcileFailing = false;
 	// Set once dispose() runs so a sweep that is mid-await (or a post-dispose error /
 	// node event) cannot repopulate keyspaceSubs with connections nothing will quit.
 	let disposed = false;
-	// The cluster `+node`/`-node` handler, kept so dispose() can detach it. ioredis
-	// does not surface a slot migration to a freshly scaled-out master as an error on
-	// the existing per-master psubscribe connections (a pattern subscription is not
-	// slot-bound), so the error-driven reconcile alone would miss it; reacting to a
-	// node joining/leaving the cluster re-sweeps and covers the new master.
+	// The cluster `+node` / `refresh` handlers, kept so dispose() can detach them.
+	// ioredis does not surface a slot migration to a freshly scaled-out master as an
+	// error on the existing per-master psubscribe connections (a pattern
+	// subscription is not slot-bound), so the error-driven reconcile alone would
+	// miss it; a node joining re-sweeps and covers the new master, and a refreshed
+	// slot map drops the masters that left (pruneKeyspaceMasters).
 	let keyspaceNodeListener = null;
+	let keyspaceRefreshListener = null;
 
 	// The per-topic hash key prefix; a `del` of a key under it means the topic
 	// emptied (its last per-field TTL lapsed), which we forward as an empty state.
@@ -173,10 +230,13 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	}
 
 	// Subscribe the del keyevent on every current master (cluster path). Idempotent
-	// and single-flight: adds a connection for any master not yet covered, prunes
-	// one whose master is gone (failover / reshard), and is safe to call
-	// repeatedly. A subscriber-connection error reschedules it so a moved master is
-	// re-covered.
+	// and single-flight: adds a connection for any master not yet covered and is
+	// safe to call repeatedly. A subscriber-connection error reschedules it so a
+	// moved master is re-covered, and a sweep that leaves a master it lists
+	// uncovered (refused, failed, or its id unread) runs again after a backoff,
+	// since nothing else would ask once the cause is fixed. A master ioredis
+	// dropped from its node list (its own connection to it ended) comes back
+	// through '+node' or a refreshed slot map.
 	async function reconcileKeyspaceMasters() {
 		if (disposed) return;
 		if (keyspaceReconciling) {
@@ -185,20 +245,59 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 			keyspaceRerun = true;
 			return keyspaceReconciling;
 		}
+		let swept = false;
+		let missed = false;
 		keyspaceReconciling = (async () => {
 			let masters;
-			try { masters = /** @type {any} */ (client.redis).nodes('master'); } catch { return; }
-			const liveIds = new Set();
+			try {
+				masters = /** @type {any} */ (client.redis).nodes('master');
+			} catch (err) {
+				missed = true;
+				reportSweepFailure(err);
+				return;
+			}
 			await Promise.all(masters.map(async (node) => {
+				const address = addressOf(node);
 				let id;
-				try { id = await node.cluster('MYID'); } catch { return; }
+				try {
+					id = await node.cluster('MYID');
+				} catch (err) {
+					if (disposed) return;
+					missed = true;
+					// ioredis drops a node whose connection failed from its list
+					// until a refreshed slot map lists it again, so this is reported
+					// once until the master answers or the slot map drops it. A
+					// node the last refreshed map does not list (a refresh dropped it
+					// while this was out) is no master to report.
+					if (keyspaceLive !== null && !keyspaceLive.has(address)) return;
+					if (!keyspaceUnread.has(address)) {
+						keyspaceUnread.add(address);
+						emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE, { error: err });
+					}
+					return;
+				}
+				keyspaceUnread.delete(address);
 				// dispose() may have run during the MYID round trip; bail before
-				// opening a connection nothing would ever quit.
-				if (disposed) return;
-				liveIds.add(id);
+				// opening a connection nothing would ever quit. So may a refresh
+				// that found the node no master (a reconnect lists its startup
+				// nodes as masters until the slot map says otherwise), whose prune
+				// this would undo.
+				if (disposed || !isMaster(node)) return;
+				keyspaceAddresses.set(id, address);
 				if (keyspaceSubs.has(id)) return;
 				const s = node.duplicate({ enableReadyCheck: false });
+				// Until the subscription stands, a failure of this connection (a
+				// refused login, a dropped connect) rejects the psubscribe below,
+				// which reports it and leaves the master to the retry backoff; an
+				// immediate sweep from here would redial it in a tight loop.
+				let subscribed = false;
+				/** @type {unknown} what failed the connection before it subscribed */
+				let cause = null;
 				s.on('error', (err) => {
+					if (!subscribed) {
+						cause = err;
+						return;
+					}
 					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBER, { error: err });
 					scheduleKeyspaceReconcile();
 				});
@@ -209,46 +308,128 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 				s.on('end', () => {
 					if (keyspaceSubs.get(id) !== s) return;
 					keyspaceSubs.delete(id);
-					scheduleKeyspaceReconcile();
+					if (subscribed) scheduleKeyspaceReconcile();
 				});
 				keyspaceSubs.set(id, s); // now tracked: a dispose() during psubscribe will quit it
 				try {
 					await s.psubscribe('__keyevent@*__:del');
+					// Pruned or disposed while subscribing: already quit.
+					if (disposed || keyspaceRetired.has(s)) return;
+					subscribed = true;
 					keyspaceSubscribed = true;
+					keyspaceRefused.delete(id);
 					checkKeyspaceEvents(node, id);
 				} catch (err) {
+					// Pruned or disposed while subscribing: closed on purpose.
+					if (disposed || keyspaceRetired.has(s)) return;
 					keyspaceSubs.delete(id);
 					s.removeAllListeners();
 					s.quit().catch(() => s.disconnect());
-					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE, { error: err, attributes: { master: id } });
+					missed = true;
+					// A connection that failed rejects the call only as closed; the
+					// error it raised first says why. Retried until the master
+					// accepts it, so each kind of failure is reported once per
+					// streak (an outage that ends in a refusal shows both).
+					const error = cause !== null && /** @type {any} */ (err)?.message === 'Connection is closed.' ? cause : err;
+					const kind = failureKind(error);
+					let kinds = keyspaceRefused.get(id);
+					if (!kinds) keyspaceRefused.set(id, kinds = new Set());
+					if (!kinds.has(kind)) {
+						kinds.add(kind);
+						emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE, { error, attributes: { master: id } });
+					}
 				}
 			}));
-			if (disposed) return;
-			// Drop connections to masters that no longer exist (a failover promoted a
-			// replica with a new id, or a node left); a fresh master is added above.
-			for (const [id, s] of keyspaceSubs) {
-				if (!liveIds.has(id)) {
-					keyspaceSubs.delete(id);
-					s.removeAllListeners();
-					s.quit().catch(() => s.disconnect());
-				}
-			}
+			keyspaceReconcileFailing = false;
+			swept = true;
 		})().finally(() => {
 			keyspaceReconciling = null;
+			if (disposed) return;
 			if (keyspaceRerun) {
 				keyspaceRerun = false;
 				scheduleKeyspaceReconcile();
+				return;
 			}
+			if (swept && !missed) {
+				keyspaceRetryMs = 0;
+				return;
+			}
+			keyspaceRetryMs = keyspaceRetryMs === 0
+				? KEYSPACE_RETRY_FIRST_MS
+				: Math.min(keyspaceRetryMs * 2, KEYSPACE_RETRY_MAX_MS);
+			scheduleKeyspaceReconcile(keyspaceRetryMs);
 		});
 		return keyspaceReconciling;
 	}
 
-	function scheduleKeyspaceReconcile() {
-		if (disposed || keyspaceReconcileTimer) return;
+	// Drop what belongs to masters that left: the connections, the refusal
+	// record (a master that comes back starts over) and the unread report. Run
+	// as ioredis emits 'refresh', right after it rebuilt its node list from the
+	// slot map, when the list names exactly the cluster's masters; between
+	// refreshes it also lacks a master whose ioredis connection merely ended
+	// (an idle timeout), whose keyspace connection keeps working.
+	// Returns whether the masters differ from those at the last refresh, which
+	// is the one thing a refresh says that '+node' and the connections' own
+	// ends do not: a replica promoted in place joins the masters without a
+	// '+node'. ioredis also refreshes on every MOVED and slotsRefreshInterval
+	// tick, which must not cut a retry's backoff short.
+	function pruneKeyspaceMasters() {
+		let masters;
+		try { masters = /** @type {any} */ (client.redis).nodes('master'); } catch { return false; }
+		const live = new Set(masters.map(addressOf));
+		const signature = [...live].sort().join(' ');
+		const changed = signature !== keyspaceMasterSet;
+		keyspaceMasterSet = signature;
+		keyspaceLive = live;
+		for (const [id, address] of keyspaceAddresses) {
+			if (live.has(address)) continue;
+			keyspaceAddresses.delete(id);
+			keyspaceRefused.delete(id);
+			const s = keyspaceSubs.get(id);
+			if (!s) continue;
+			keyspaceSubs.delete(id);
+			keyspaceRetired.add(s);
+			s.removeAllListeners();
+			s.quit().catch(() => s.disconnect());
+		}
+		for (const address of keyspaceUnread) {
+			if (!live.has(address)) keyspaceUnread.delete(address);
+		}
+		return changed;
+	}
+
+	/** Whether ioredis lists `node` among the masters now. */
+	function isMaster(node) {
+		try {
+			return /** @type {any} */ (client.redis).nodes('master').includes(node);
+		} catch {
+			return false;
+		}
+	}
+
+	// A sweep that failed as a whole (the master list could not be read, or a
+	// connection could not be created) is retried after a backoff, so it is
+	// reported once per failure streak; a sweep that completes ends the streak.
+	function reportSweepFailure(err) {
+		if (keyspaceReconcileFailing) return;
+		keyspaceReconcileFailing = true;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE, { error: err });
+	}
+
+	function scheduleKeyspaceReconcile(delayMs = 0) {
+		if (disposed) return;
+		const dueAt = monotonicNow() + delayMs;
+		if (keyspaceReconcileTimer) {
+			// A dropped connection or a topology change does not wait out a
+			// retry's backoff.
+			if (dueAt >= keyspaceReconcileDueAt) return;
+			clearTimer(keyspaceReconcileTimer);
+		}
+		keyspaceReconcileDueAt = dueAt;
 		keyspaceReconcileTimer = setTimer(() => {
 			keyspaceReconcileTimer = null;
-			reconcileKeyspaceMasters().catch((err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE, { error: err }));
-		}, 0);
+			reconcileKeyspaceMasters().catch(reportSweepFailure);
+		}, delayMs);
 		if (keyspaceReconcileTimer.unref) keyspaceReconcileTimer.unref();
 	}
 
@@ -257,14 +438,23 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	// subscriber connection catches everything.
 	async function setupKeyspaceCleanup() {
 		if (isCluster(client.redis)) {
-			// Re-sweep when the cluster topology grows/shrinks so a master added by a
-			// scale-out (which does not error the existing slot-bound-free pattern
-			// subscriptions) still gets a keyspace subscriber.
-			keyspaceNodeListener = () => scheduleKeyspaceReconcile();
-			try {
-				/** @type {any} */ (client.redis).on('+node', keyspaceNodeListener);
-				/** @type {any} */ (client.redis).on('-node', keyspaceNodeListener);
-			} catch { keyspaceNodeListener = null; }
+			// Re-sweep when a node joins, so a master added by a scale-out (which
+			// does not error the existing slot-bound-free pattern subscriptions)
+			// still gets a keyspace subscriber, and prune after each refreshed slot
+			// map. Attached once: an idle shutdown sets the subscriber up again.
+			if (keyspaceNodeListener === null) {
+				keyspaceNodeListener = () => scheduleKeyspaceReconcile();
+				keyspaceRefreshListener = () => {
+					if (pruneKeyspaceMasters()) scheduleKeyspaceReconcile();
+				};
+				try {
+					/** @type {any} */ (client.redis).on('+node', keyspaceNodeListener);
+					/** @type {any} */ (client.redis).on('refresh', keyspaceRefreshListener);
+				} catch {
+					keyspaceNodeListener = null;
+					keyspaceRefreshListener = null;
+				}
+			}
 			await reconcileKeyspaceMasters();
 			return;
 		}
@@ -416,9 +606,10 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		if (keyspaceNodeListener) {
 			try {
 				/** @type {any} */ (client.redis).removeListener('+node', keyspaceNodeListener);
-				/** @type {any} */ (client.redis).removeListener('-node', keyspaceNodeListener);
+				/** @type {any} */ (client.redis).removeListener('refresh', keyspaceRefreshListener);
 			} catch { /* not a cluster / already gone */ }
 			keyspaceNodeListener = null;
+			keyspaceRefreshListener = null;
 		}
 		if (subscriber) {
 			const sub = subscriber;

@@ -454,9 +454,9 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBER,
 		event: 'redis.presence.keyspace-subscriber.failed', component: 'runtime.redis.presence', severity: 'error',
 		problemPrefix: 'A presence keyspace-notification subscriber connection reported an error.',
-		cause: 'A per-master connection that listens for expired presence keys emitted an error.',
+		cause: 'A per-master connection subscribed to key-deletion events, which the presence cleanup of expired topics listens on, emitted an error after its subscription stood. An error before that is reported as EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE instead.',
 		consequence: 'Presence expiry deletions from that master may be missed until reconciliation repairs the subscriber set.',
-		automaticRecovery: 'The Redis client reconnects and the handler schedules keyspace reconciliation.',
+		automaticRecovery: 'A sweep of the masters runs at once. These connections do not reconnect: one that ended is replaced by a new connection to its master.',
 		nextAction: 'Inspect the Redis error and confirm reconciliation restores expired presence state.',
 		sources: ['src/redis/presence/subscriber.js'], anchor: 'extensions-err-presence-keyspace-subscriber'
 	}),
@@ -464,10 +464,10 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE,
 		event: 'redis.presence.keyspace-subscribe.failed', component: 'runtime.redis.presence', severity: 'warn',
 		problemPrefix: 'The presence keyspace cleanup could not subscribe to key-deletion events.',
-		cause: 'psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection dropped during the call. Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.',
+		cause: 'psubscribe to __keyevent@*__:del failed: an ACL denied the user PSUBSCRIBE or that channel pattern (NOPERM), or the connection failed or dropped during the call, in which case the error is the one the connection raised (a refused login, for example). Redis accepts the subscription even when keyspace notifications are disabled, so a disabled notify-keyspace-events setting never produces this event; the subscription then succeeds and receives nothing, and EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF reports the setting where the server lets it be read.',
 		consequence: 'This instance is not told when a topic\'s presence hash is deleted because the last instance presenting it stopped heartbeating, so its sync-only observers keep showing the last roster until new presence traffic or a reload.',
-		automaticRecovery: 'On a cluster the masters are swept again whenever the topology changes. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.',
-		nextAction: 'For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next topology change subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.',
+		automaticRecovery: 'On a cluster the master is subscribed again with a backoff from 1 to 30 seconds, and at once whenever the topology changes, and each kind of failure is reported once per streak per master. On standalone Redis the subscription is attempted again only when the presence subscriber connection is set up again.',
+		nextAction: 'For NOPERM, grant the Redis user +psubscribe and the pattern &__keyevent@*__:del; otherwise check connectivity to the server (on a cluster, the master attribute names it). On a cluster the next retry subscribes again; on standalone Redis restart the instance. For the cleanup to receive anything once subscribed, notify-keyspace-events must include E and g (for example Eg) on every master; see the shortlink.',
 		link: 'https://svti.me/redis-keyspace',
 		sources: ['src/redis/presence/subscriber.js'], anchor: 'extensions-err-presence-keyspace-subscribe'
 	}),
@@ -485,11 +485,11 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE,
 		event: 'redis.presence.keyspace-reconcile.failed', component: 'runtime.redis.presence', severity: 'error',
-		problemPrefix: 'Presence keyspace subscriber reconciliation failed; the next topology event retries.',
-		cause: 'Re-reading the cluster master set or re-subscribing a master threw.',
+		problemPrefix: 'Presence keyspace subscriber reconciliation failed; it is retried with a backoff.',
+		cause: 'Re-reading the cluster master set or re-subscribing a master threw, or a master did not answer CLUSTER MYID.',
 		consequence: 'Masters added by a failover may not have a keyspace subscriber yet, so expiry cleanup from them lags.',
-		automaticRecovery: 'Reconciliation reruns on the next topology event or subscriber error.',
-		nextAction: 'Check cluster health; if this repeats without topology changes, inspect connectivity to individual masters.',
+		automaticRecovery: 'Reconciliation reruns after a backoff from 1 to 30 seconds, and at once on the next topology event or subscriber error; a master ioredis dropped from its node list is swept again once a refreshed slot map lists it. A failed sweep is reported once per failure streak, a master that does not answer once until it answers or the slot map drops it.',
+		nextAction: 'Check cluster health; if it persists, inspect connectivity to individual masters, and that the Redis user may run CLUSTER MYID (+cluster|myid).',
 		sources: ['src/redis/presence/subscriber.js'], anchor: 'extensions-err-presence-keyspace-reconcile'
 	}),
 	direct({
