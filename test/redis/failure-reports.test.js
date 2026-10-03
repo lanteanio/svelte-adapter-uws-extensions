@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
@@ -19,6 +20,7 @@ import { createPresence } from '../../src/redis/presence.js';
 import { createRedisIo } from '../../src/redis/cursor/redis-io.js';
 import { keySlot } from '../../src/shared/cluster.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const settle = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -352,6 +354,36 @@ function captureTimers() {
 	};
 }
 
+/**
+ * Capture one-shot timers and intervals through the runtime seam: fire() runs
+ * the timers due, tick() one round of every interval.
+ */
+function captureClock() {
+	/** @type {Array<{ cb: () => unknown, ms: number, cleared: boolean, fired?: boolean }>} */
+	const timers = [];
+	/** @type {Array<{ cb: () => unknown, ms: number, cleared: boolean }>} */
+	const intervals = [];
+	const timer = (list) => (cb, ms) => { const t = { cb, ms, cleared: false, unref() {} }; list.push(t); return t; };
+	const clear = (t) => { if (t) t.cleared = true; };
+	setRuntimeEnv({ timers: { set: timer(timers), clear, setInterval: timer(intervals), clearInterval: clear } });
+	const pending = () => timers.filter((t) => !t.cleared && !t.fired);
+	return {
+		pending,
+		running: () => intervals.filter((t) => !t.cleared),
+		async fire() {
+			for (const t of pending()) {
+				t.fired = true;
+				t.cb();
+			}
+			await settle();
+		},
+		async tick() {
+			for (const t of intervals.filter((t) => !t.cleared)) t.cb();
+			await settle();
+		}
+	};
+}
+
 /** The presence subscriber the tracker creates, on its own. */
 function presenceSubscriber(client, keyspaceNotifications) {
 	return createSubscriber({
@@ -502,17 +534,27 @@ function fakeCluster() {
 				c.patterns.add(pattern);
 			},
 			quits: 0,
-			async quit() { c.quits++; },
-			disconnect() {}
+			// Closed either way: a QUIT, or at once.
+			closes: 0,
+			async quit() { c.quits++; c.closes++; },
+			disconnect() { c.closes++; }
 		};
 		conns.set(id, c);
 		return c;
+	};
+	const slotsReply = async () => {
+		if (slotsGate) await slotsGate;
+		if (slotsDown) throw new Error('CLUSTERDOWN The cluster is down');
+		// A null owner leaves every slot out of the map.
+		return owner === null ? [] : [[0, 16383, ['127.0.0.1', 7000, owner]]];
 	};
 	/** @type {Map<string, string | Error>} what CONFIG GET notify-keyspace-events answers per node */
 	const keyspaceFlags = new Map();
 	const node = (id) => ({
 		options: { host: id, port: 6379 },
-		cluster: async () => {
+		// CLUSTER SLOTS answers the same on every node.
+		cluster: async (sub) => {
+			if (String(sub).toUpperCase() === 'SLOTS') return slotsReply();
 			if (myidGate) await myidGate;
 			return id;
 		},
@@ -572,12 +614,7 @@ function fakeCluster() {
 			info: async () => '# Server\nredis_version:7.2.0\n',
 			// A fresh array per call, as ioredis returns.
 			nodes: () => [...masters],
-			cluster: async () => {
-				if (slotsGate) await slotsGate;
-				if (slotsDown) throw new Error('CLUSTERDOWN The cluster is down');
-				// A null owner leaves every slot out of the map.
-				return owner === null ? [] : [[0, 16383, ['127.0.0.1', 7000, owner]]];
-			},
+			cluster: () => slotsReply(),
 			spublish: async () => 0,
 			on() {}
 		}
@@ -920,10 +957,12 @@ describe('cluster-only failure paths', () => {
 		const fresh = cluster.conns.get('node-a');
 		expect(fresh).not.toBe(first);
 		expect(fresh.subscribed.has(CHANNEL)).toBe(true);
-		// The ended connection is out of the bus: deactivate quits only the live ones.
+		// The ended connection is out of the bus: deactivate closes only the live ones.
 		await bus.deactivate();
-		expect(first.quits).toBe(0);
-		expect(fresh.quits).toBe(1);
+		expect(first.closes).toBe(0);
+		expect(fresh.closes).toBe(1);
+		// At once: a QUIT waits forever on a master that stopped answering.
+		expect(fresh.quits).toBe(0);
 	});
 
 	it('a master connection that ends while holding nothing is replaced on the next follow', async () => {
@@ -979,8 +1018,9 @@ describe('cluster-only failure paths', () => {
 			first.emit('end');
 			await settle();
 			// The psubscribe fails with the connection, which leaves the master to
-			// the retry rather than to an immediate redial.
-			expect(clock.pending()).toEqual([]);
+			// the retry rather than to an immediate redial: only the time limits of
+			// the two psubscribes still out are pending.
+			expect(clock.pending().map((t) => t.ms)).toEqual([10000, 10000]);
 			release();
 			await subscribing;
 			await settle();
@@ -1079,6 +1119,410 @@ describe('cluster-only failure paths', () => {
 		}
 	});
 
+	it('a master that does not answer CLUSTER MYID is missed after 10 seconds instead of holding the sweep, and its retry reads the slot map first', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-myid-silent:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		client.redis.refreshSlotsCache = vi.fn();
+		const myid = cluster.masters[1].cluster;
+		cluster.masters[1].cluster = () => new Promise(() => {});
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			let done = false;
+			const subscribing = subscriber.subscribeToTopic('room', mockPlatform()).then(() => { done = true; });
+			await settle();
+			expect(done).toBe(false);
+			expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+			await clock.fire();
+			await subscribing;
+			expect(cluster.conns.get('node-a').patterns.has('__keyevent@*__:del')).toBe(true);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_RECONCILE]);
+			expect(sink.records[0].attributes.error.message).toBe('CLUSTER MYID was not answered within 10000 ms');
+			expect(client.redis.refreshSlotsCache).not.toHaveBeenCalled();
+			// Retried with the backoff, reading the slot map first; the master
+			// answers now.
+			cluster.masters[1].cluster = myid;
+			expect(clock.pending().map((t) => t.ms)).toEqual([1000]);
+			await clock.fire();
+			expect(client.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			expect(cluster.conns.get('node-b').patterns.has('__keyevent@*__:del')).toBe(true);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	/**
+	 * A cluster-shaped presence client whose master node-b refuses connections,
+	 * with ioredis's events: CLUSTER MYID on node-b fails and takes it off the
+	 * node list, as its ended node connection does, and a slot map read, which
+	 * still lists node-b, puts it back and emits '+node' for it, then 'refresh'.
+	 */
+	function refusingMasterClient(prefix) {
+		const cluster = fakeCluster();
+		const client = mockRedisClient(prefix);
+		const events = new EventEmitter();
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = (event, fn) => { events.on(event, fn); };
+		client.redis.removeListener = (event, fn) => { events.removeListener(event, fn); };
+		const nodeB = cluster.masters[1];
+		client.redis.refreshSlotsCache = vi.fn(() => {
+			queueMicrotask(() => {
+				if (!cluster.masters.includes(nodeB)) {
+					cluster.masters.push(nodeB);
+					events.emit('+node', nodeB);
+				}
+				events.emit('refresh');
+			});
+		});
+		const myid = nodeB.cluster;
+		const refuse = (err) => {
+			nodeB.cluster = async () => {
+				const i = cluster.masters.indexOf(nodeB);
+				if (i !== -1) cluster.masters.splice(i, 1);
+				throw err;
+			};
+		};
+		refuse(Object.assign(new Error('connect ECONNREFUSED 10.0.0.2:6379'), { code: 'ECONNREFUSED' }));
+		return { cluster, client, nodeB, refuse, restore: () => { nodeB.cluster = myid; } };
+	}
+
+	it('a master that refuses connections is swept with a growing backoff and one slot map read per retry', async () => {
+		const clock = captureClock();
+		const { cluster, client } = refusingMasterClient('fr-keyspace-refusing:');
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			const seen = [];
+			for (let i = 0; i < 8; i++) {
+				seen.push([clock.pending().map((t) => t.ms), client.redis.refreshSlotsCache.mock.calls.length]);
+				await clock.fire();
+			}
+			// Each retry reads the slot map, whose '+node' for node-b starts one
+			// more sweep; both miss node-b, so the backoff keeps growing.
+			expect(seen).toEqual([
+				[[1000], 0], [[0], 1],
+				[[4000], 1], [[0], 2],
+				[[16000], 2], [[0], 3],
+				[[30000], 3], [[0], 4]
+			]);
+			expect(cluster.conns.has('node-b')).toBe(false);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a keyspace PSUBSCRIBE that ioredis gave up on (commandTimeout) closes its connection at once, not with a QUIT', async () => {
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-cmd-timeout:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const duplicateB = cluster.masters[1].duplicate;
+		let conn = null;
+		cluster.masters[1].duplicate = () => {
+			conn = duplicateB();
+			conn.psubscribe = async () => { throw new Error('Command timed out'); };
+			// A QUIT to a master that stopped answering is never answered.
+			conn.quit = () => { conn.quits++; return new Promise(() => {}); };
+			return conn;
+		};
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			expect(conn.quits).toBe(0);
+			expect(conn.closes).toBe(1);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE]);
+			expect(sink.records[0].attributes).toMatchObject({ master: 'node-b', error: { message: 'Command timed out' } });
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a subscribe after the tracker was disposed starts no PING rounds', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-after-dispose:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		client.redis.removeListener = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		await subscriber.subscribeToTopic('room', mockPlatform());
+		expect(clock.running()).toHaveLength(1);
+		subscriber.dispose();
+		expect(clock.running()).toEqual([]);
+		// Nothing is opened again either: nothing would close it.
+		const duplicate = vi.spyOn(client, 'duplicate');
+		await subscriber.subscribeToTopic('room', mockPlatform());
+		expect(duplicate).not.toHaveBeenCalled();
+		expect(clock.running()).toEqual([]);
+	});
+
+	it('a slot map that lists no master prunes no keyspace connection', async () => {
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-empty-map:');
+		client.redis.nodes = cluster.redis.nodes;
+		const listeners = {};
+		client.redis.on = (event, fn) => { listeners[event] = fn; };
+		client.redis.removeListener = () => {};
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			// What a removed node, reset and slotless, answers for the slot map.
+			const masters = cluster.masters.splice(0);
+			listeners.refresh();
+			expect(cluster.conns.get('node-a').closes).toBe(0);
+			expect(cluster.conns.get('node-b').closes).toBe(0);
+			cluster.masters.push(...masters);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('while sweeps fail, the topology events between two retries start one sweep', async () => {
+		const clock = captureClock();
+		const { cluster, client, nodeB } = refusingMasterClient('fr-keyspace-node-events:');
+		const listeners = {};
+		client.redis.on = (event, fn) => { listeners[event] = fn; };
+		let asked = 0;
+		const refusing = nodeB.cluster;
+		nodeB.cluster = (...args) => { asked++; return refusing(...args); };
+		/** Run the sweeps asked for at once, not the retry waiting out its backoff. */
+		const sweepNow = async () => {
+			for (const t of clock.pending().filter((p) => p.ms === 0)) {
+				t.fired = true;
+				t.cb();
+			}
+			await settle();
+		};
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			expect(asked).toBe(1);
+			// ioredis creating its connection to node-b again and again for the
+			// app's own traffic, while node-b refuses every one.
+			for (let i = 0; i < 3; i++) {
+				cluster.masters.push(nodeB);
+				listeners['+node'](nodeB);
+				await sweepNow();
+			}
+			// The first started a sweep, which missed node-b again; the others
+			// wait for the retry.
+			expect(asked).toBe(2);
+			expect(clock.pending().map((t) => t.ms)).toEqual([2000]);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master the slot map lists that ioredis lost while its keyspace connection stands is not missed', async () => {
+		const clock = captureClock();
+		const { cluster, client, nodeB, restore } = refusingMasterClient('fr-keyspace-covered:');
+		restore();
+		const listeners = {};
+		client.redis.on = (event, fn) => { listeners[event] = fn; };
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			listeners.refresh();
+			// ioredis's own idle connection to node-b ended; the keyspace one did not.
+			cluster.masters.splice(cluster.masters.indexOf(nodeB), 1);
+			listeners['+node']();
+			await clock.fire();
+			expect(clock.pending()).toEqual([]);
+			expect(client.redis.refreshSlotsCache).not.toHaveBeenCalled();
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master whose keyspace subscription stands is not asked for its id again', async () => {
+		const clock = captureClock();
+		const { cluster, client, restore } = refusingMasterClient('fr-keyspace-covered-myid:');
+		restore();
+		const listeners = {};
+		client.redis.on = (event, fn) => { listeners[event] = fn; };
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			// ioredis's own connection to node-a no longer answers; the keyspace
+			// one does.
+			let asked = 0;
+			cluster.masters[0].cluster = () => { asked++; return new Promise(() => {}); };
+			listeners['+node']();
+			await clock.fire();
+			expect(asked).toBe(0);
+			expect(clock.pending()).toEqual([]);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master that refuses CLUSTER MYID itself needs no slot map read', async () => {
+		const clock = captureClock();
+		const { client, nodeB } = refusingMasterClient('fr-keyspace-myid-noperm:');
+		// It answers, with an error: the node list is not in doubt.
+		nodeB.cluster = async () => { throw Object.assign(new Error('NOPERM this user has no permissions to run the \'cluster|myid\' command'), { name: 'ReplyError' }); };
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			for (let i = 0; i < 3; i++) await clock.fire();
+			expect(client.redis.refreshSlotsCache).not.toHaveBeenCalled();
+			expect(clock.pending().map((t) => t.ms)).toEqual([8000]);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a master the slot map lists but ioredis lost, with its keyspace connection gone, is missed until a slot map read brings it back', async () => {
+		const clock = captureClock();
+		const { cluster, client, nodeB, restore } = refusingMasterClient('fr-keyspace-lost:');
+		restore();
+		const subscriber = presenceSubscriber(client, true);
+		try {
+			// No slot map was read since: the node list at setup stands for it.
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			const before = cluster.conns.get('node-b');
+			// node-b restarted: ioredis's connection to it ended, which took it off
+			// the node list, and so did its keyspace connection.
+			cluster.masters.splice(cluster.masters.indexOf(nodeB), 1);
+			before.emit('end');
+			await clock.fire();
+			// The sweep does not see node-b; it is missed, not done with.
+			expect(client.redis.refreshSlotsCache).not.toHaveBeenCalled();
+			expect(clock.pending().map((t) => t.ms)).toEqual([1000]);
+			await clock.fire();
+			await clock.fire();
+			expect(client.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			const fresh = cluster.conns.get('node-b');
+			expect(fresh).not.toBe(before);
+			expect(fresh.patterns.has('__keyevent@*__:del')).toBe(true);
+			expect(clock.pending()).toEqual([]);
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a keyspace PSUBSCRIBE that is not answered within 10 seconds closes its connection and is reported as such', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-psub-silent:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		const duplicateB = cluster.masters[1].duplicate;
+		/** @type {any[]} */
+		const silent = [];
+		cluster.masters[1].duplicate = () => {
+			const c = duplicateB();
+			let fail;
+			c.psubscribe = () => new Promise((_, reject) => { fail = reject; });
+			c.disconnects = 0;
+			// As ioredis: closing it rejects what is out as closed, then ends it.
+			c.disconnect = () => {
+				c.disconnects++;
+				fail(new Error('Connection is closed.'));
+				c.emit('end');
+			};
+			silent.push(c);
+			return c;
+		};
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			const subscribing = subscriber.subscribeToTopic('room', mockPlatform());
+			await settle();
+			expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+			// A connection still subscribing is left to that limit, not asked for
+			// a PING as well.
+			silent[0].status = 'ready';
+			silent[0].ping = vi.fn(() => new Promise(() => {}));
+			await clock.tick();
+			expect(silent[0].ping).not.toHaveBeenCalled();
+			await clock.fire();
+			await subscribing;
+			expect(silent[0].disconnects).toBeGreaterThan(0);
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBE]);
+			expect(sink.records[0].attributes).toMatchObject({
+				master: 'node-b',
+				error: { message: 'PSUBSCRIBE was not answered within 10000 ms' }
+			});
+			expect(clock.pending().map((t) => t.ms)).toEqual([1000]);
+
+			// One that raised an error before it stalled is reported with that error.
+			cluster.masters[1].duplicate = () => {
+				const c = duplicateB();
+				let fail;
+				c.psubscribe = () => {
+					queueMicrotask(() => c.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })));
+					return new Promise((_, reject) => { fail = reject; });
+				};
+				c.disconnect = () => {
+					fail(new Error('Connection is closed.'));
+					c.emit('end');
+				};
+				return c;
+			};
+			await clock.fire();
+			await clock.fire();
+			expect(sink.ids()).toHaveLength(2);
+			expect(sink.records[1].attributes).toMatchObject({ master: 'node-b', error: { code: 'ECONNRESET' } });
+		} finally {
+			await subscriber.dispose?.();
+		}
+	});
+
+	it('a keyspace connection that stops answering PING is closed, reported by its master, and replaced', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		const client = mockRedisClient('fr-keyspace-ping:');
+		client.redis.nodes = cluster.redis.nodes;
+		client.redis.on = () => {};
+		client.redis.refreshSlotsCache = vi.fn();
+		const duplicateA = cluster.masters[0].duplicate;
+		/** @type {any[]} */
+		const opened = [];
+		cluster.masters[0].duplicate = () => {
+			const c = duplicateA();
+			c.status = 'ready';
+			// The first goes silent; the one that replaces it answers.
+			c.ping = opened.length === 0 ? () => new Promise(() => {}) : async () => ['pong', ''];
+			c.disconnect = () => {
+				c.status = 'end';
+				c.emit('end');
+			};
+			opened.push(c);
+			return c;
+		};
+		const subscriber = presenceSubscriber(client, true);
+		sink = captureRegistered();
+		try {
+			await subscriber.subscribeToTopic('room', mockPlatform());
+			expect(clock.running().map((t) => t.ms)).toEqual([30000]);
+			await clock.tick();
+			expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+			await clock.fire();
+			expect(opened[0].status).toBe('end');
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+			expect(sink.records[0].attributes).toEqual({ owner: 'presence-keyspace', master: 'node-a', timeoutMs: 10000 });
+			// ioredis still lists the master, so the sweep needs no slot map.
+			expect(client.redis.refreshSlotsCache).not.toHaveBeenCalled();
+			// Its 'end' sweeps at once, which opens a new connection to the master.
+			await clock.fire();
+			expect(opened).toHaveLength(2);
+			expect(opened[1].patterns.has('__keyevent@*__:del')).toBe(true);
+			await clock.tick();
+			expect(clock.pending()).toEqual([]);
+			expect(opened[1].status).toBe('ready');
+		} finally {
+			await subscriber.dispose?.();
+		}
+		expect(clock.running()).toEqual([]);
+	});
+
 	it('an activation that cannot read the slot map closes the subscriber connections it opened', async () => {
 		const cluster = fakeCluster();
 		cluster.setSlotsDown(true);
@@ -1087,7 +1531,7 @@ describe('cluster-only failure paths', () => {
 		await expect(bus.activate(mockPlatform())).rejects.toThrow('CLUSTERDOWN');
 		const opened = [...cluster.conns.values()];
 		expect(opened).toHaveLength(2);
-		for (const conn of opened) expect(conn.quits).toBe(1);
+		for (const conn of opened) expect(conn.closes).toBe(1);
 		expect(breaker.failure).toHaveBeenCalledTimes(1);
 		// Nothing of the failed activation survives into the next one.
 		cluster.setSlotsDown(false);
@@ -1097,7 +1541,217 @@ describe('cluster-only failure paths', () => {
 		expect(opened).not.toContain(conn);
 		expect(conn.subscribed.has(CHANNEL)).toBe(true);
 		await bus.deactivate();
-		expect(conn.quits).toBe(1);
+		expect(conn.closes).toBe(1);
+	});
+
+	it('a master that does not answer CLUSTER MYID within 5 seconds holds back only the channels on its slots', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		cluster.redis.refreshSlotsCache = vi.fn();
+		cluster.masters[1].cluster = () => new Promise(() => {});
+		// Sent to any node, the slot map read could land on the silent one.
+		cluster.redis.cluster = () => new Promise(() => {});
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		try {
+			const activating = bus.activate(mockPlatform());
+			await settle();
+			// node-a answered; node-b's time limit is running.
+			expect(clock.pending().map((t) => t.ms)).toEqual([5000]);
+			await clock.fire();
+			await activating;
+			// The master that did not answer may have moved or left.
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			// node-a owns the channel's slot: subscribed although node-b is silent.
+			await bus.follow('user:42:inbox');
+			expect(cluster.conns.get('node-a').subscribed.has(CHANNEL)).toBe(true);
+			// The slot moves to node-b, which has no connection here: the
+			// reconciliation reports its channel, mentioning node-b's error.
+			sink = captureRegistered();
+			cluster.setOwner('node-b');
+			cluster.conns.get('node-a').emit('error', new Error('read ECONNRESET'));
+			for (let i = 0; i < 4; i++) await clock.fire();
+			const failures = sink.records.filter((r) => r.event === 'redis.sharded-pubsub.channel-reconcile.failed');
+			expect(failures).toHaveLength(1);
+			expect(failures[0].attributes.error.message).toBe(
+				'sharded bus: no owning node for slot ' + keySlot(CHANNEL) +
+				' (a master did not give its id: sharded bus: CLUSTER MYID timed out (the master did not answer))'
+			);
+			// Slot map reads are at least 5 seconds apart.
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+		} finally {
+			await bus.deactivate();
+		}
+		expect(clock.running()).toEqual([]);
+	});
+
+	it('a slot map read that is not answered within 5 seconds, there or through the client, fails the sharded topology read', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		for (const node of cluster.masters) {
+			const myid = node.cluster;
+			node.cluster = (sub) => (String(sub).toUpperCase() === 'SLOTS' ? new Promise(() => {}) : myid(sub));
+		}
+		cluster.redis.cluster = () => new Promise(() => {});
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		const activating = bus.activate(mockPlatform());
+		activating.catch(() => {});
+		await settle();
+		expect(clock.pending().map((t) => t.ms)).toEqual([5000]);
+		await clock.fire();
+		// Then once more through the client, which picks a node itself.
+		expect(clock.pending().map((t) => t.ms)).toEqual([5000]);
+		await clock.fire();
+		await expect(activating).rejects.toThrow('sharded bus: CLUSTER SLOTS timed out (the node did not answer)');
+		expect(clock.running()).toEqual([]);
+	});
+
+	it('a slot map read whose node connection closed since it gave its id goes through the client instead', async () => {
+		const cluster = fakeCluster();
+		for (const node of cluster.masters) {
+			const myid = node.cluster;
+			node.cluster = (sub) => (String(sub).toUpperCase() === 'SLOTS' ? Promise.reject(new Error('Connection is closed.')) : myid(sub));
+		}
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		try {
+			await bus.activate(mockPlatform());
+			await bus.follow('user:42:inbox');
+			expect(cluster.conns.get('node-a').subscribed.has(CHANNEL)).toBe(true);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
+	it('a topology read where no master gives its id fails, and with it the activation', async () => {
+		const cluster = fakeCluster();
+		for (const node of cluster.masters) {
+			node.cluster = async () => { throw Object.assign(new Error('NOPERM this user has no permissions to run the \'cluster|myid\' command'), { name: 'ReplyError' }); };
+		}
+		const breaker = recordingBreaker();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' }, { breaker });
+		await expect(bus.activate(mockPlatform())).rejects.toThrow(/^NOPERM/);
+		expect(breaker.failure).toHaveBeenCalledTimes(1);
+	});
+
+	it('slot map reads the sharded bus asks for are at least 5 seconds apart, and go on after', async () => {
+		let clockNow = 0;
+		setRuntimeEnv({
+			clock: { monotonic: () => clockNow },
+			timers: { set: () => ({ unref() {} }), clear: () => {} }
+		});
+		const cluster = fakeCluster();
+		cluster.redis.refreshSlotsCache = vi.fn();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		try {
+			await bus.activate(mockPlatform());
+			const endNodeA = async (topic) => {
+				// A follow opens node-a's connection again; its end asks for a read.
+				await bus.follow(topic);
+				cluster.conns.get('node-a').emit('end');
+			};
+			await endNodeA('t1');
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			clockNow = 4999;
+			await endNodeA('t2');
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			clockNow = 5000;
+			await endNodeA('t3');
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(2);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
+	it('a slot owner ioredis does not list as a master fails its channel and has the slot map read', async () => {
+		const cluster = fakeCluster();
+		cluster.redis.refreshSlotsCache = vi.fn();
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		cluster.setOwner('node-x');
+		try {
+			await bus.activate(mockPlatform());
+			await expect(bus.follow('user:42:inbox')).rejects.toThrow(/^sharded bus: no owning node for slot \d+$/);
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
+	it('a channel whose slot owner has no connection fails its follow, which counts against the breaker, its probe included', async () => {
+		const clock = captureClock();
+		const cluster = fakeCluster();
+		cluster.masters[1].cluster = async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }); };
+		cluster.setOwner('node-b');
+		const breaker = createCircuitBreaker({ failureThreshold: 2, resetTimeout: 1000 });
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' }, { breaker });
+		try {
+			await bus.activate(mockPlatform());
+			breaker.reset();
+			for (let i = 0; i < 2; i++) await expect(bus.follow('room-' + i)).rejects.toThrow(/no owning node/);
+			expect(breaker.state).toBe('broken');
+			await clock.fire();
+			expect(breaker.state).toBe('probing');
+			// The probe it lets through fails the same way: broken again with the
+			// next probe scheduled, not probing with no probe left.
+			await expect(bus.follow('room-2')).rejects.toThrow(/no owning node/);
+			expect(breaker.state).toBe('broken');
+			await clock.fire();
+			expect(breaker.state).toBe('probing');
+			// A batch follow the same.
+			await expect(bus.followBatch(['room-3', 'room-4'])).rejects.toThrow(/no owning node/);
+			expect(breaker.state).toBe('broken');
+		} finally {
+			await bus.deactivate();
+			breaker.destroy();
+		}
+	});
+
+	it('a master that refuses CLUSTER MYID holds back its channels without a slot map read', async () => {
+		const cluster = fakeCluster();
+		cluster.redis.refreshSlotsCache = vi.fn();
+		cluster.masters[1].cluster = async () => { throw Object.assign(new Error('NOPERM this user has no permissions to run the \'cluster|myid\' command'), { name: 'ReplyError' }); };
+		const bus = createShardedBus({ redis: cluster.redis, key: (k) => k, keyPrefix: '' });
+		try {
+			await bus.activate(mockPlatform());
+			await bus.follow('user:42:inbox');
+			expect(cluster.conns.get('node-a').subscribed.has(CHANNEL)).toBe(true);
+			// It answered: the slot map is not in doubt.
+			expect(cluster.redis.refreshSlotsCache).not.toHaveBeenCalled();
+		} finally {
+			await bus.deactivate();
+		}
+	});
+
+	it('a shard connection that stops answering PING is closed, its channels subscribed again, and the slot map read again', async () => {
+		const clock = captureClock();
+		const { cluster, bus } = await followedCluster();
+		cluster.redis.refreshSlotsCache = vi.fn();
+		sink = captureRegistered();
+		try {
+			const owner = cluster.conns.get('node-a');
+			expect(owner.subscribed.has(CHANNEL)).toBe(true);
+			owner.status = 'ready';
+			owner.ping = () => new Promise(() => {});
+			owner.disconnect = () => {
+				owner.status = 'end';
+				owner.emit('end');
+			};
+			expect(clock.running().map((t) => t.ms)).toEqual([30000]);
+			await clock.tick();
+			expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+			await clock.fire();
+			expect(owner.status).toBe('end');
+			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
+			expect(sink.records[0].attributes).toEqual({ owner: 'sharded-pubsub', master: 'node-a', timeoutMs: 10000 });
+			expect(cluster.redis.refreshSlotsCache).toHaveBeenCalledTimes(1);
+			// The reconciliation its end scheduled opens a new connection to the
+			// slot's owner and subscribes the channel there.
+			await clock.fire();
+			const fresh = cluster.conns.get('node-a');
+			expect(fresh).not.toBe(owner);
+			expect(fresh.subscribed.has(CHANNEL)).toBe(true);
+		} finally {
+			await bus.deactivate();
+		}
+		expect(clock.running()).toEqual([]);
 	});
 
 	it('a shard relay batch with a refused SPUBLISH fails the breaker and counts only what went out', async () => {
@@ -1286,11 +1940,12 @@ describe('cluster-only failure paths', () => {
 			cluster.masters.splice(1, 1);
 			cluster.failMyid('node-a');
 			listeners.refresh();
-			expect(b.quits).toBe(1);
+			expect(b.closes).toBe(1);
+			expect(b.quits).toBe(0);
 			await clock.fire();
 			// node-a stays listed in the refreshed map, so its working
 			// connection stays, although its id could not be read since.
-			expect(a.quits).toBe(0);
+			expect(a.closes).toBe(0);
 		} finally {
 			await subscriber.dispose?.();
 		}
@@ -1336,13 +1991,13 @@ describe('cluster-only failure paths', () => {
 			const nodeB = cluster.masters.splice(1, 1)[0];
 			listeners['+node']();
 			await clock.fire();
-			expect(b.quits).toBe(0);
+			expect(b.closes).toBe(0);
 			expect(cluster.conns.get('node-b')).toBe(b);
 
 			// A refreshed slot map without node-b: it left.
 			listeners.refresh();
 			await clock.fire();
-			expect(b.quits).toBe(1);
+			expect(b.closes).toBe(1);
 			cluster.masters.push(nodeB);
 		} finally {
 			await subscriber.dispose?.();
@@ -1366,9 +2021,10 @@ describe('cluster-only failure paths', () => {
 			expect(cluster.conns.has('node-b')).toBe(false);
 			expect(failures()).toHaveLength(1);
 			expect(failures()[0].attributes.error.code).toBe('ECONNREFUSED');
-			// The retry finds node-b gone from the list, as ioredis drops it.
+			// The retry finds node-b gone from the list, as ioredis drops it, but
+			// the cluster still lists it: it is still missed, and retried.
 			await clock.fire();
-			expect(clock.pending()).toEqual([]);
+			expect(clock.pending().map((t) => t.ms)).toEqual([2000]);
 
 			// A refreshed slot map lists it again, still not answering.
 			restore();
@@ -1459,7 +2115,7 @@ describe('cluster-only failure paths', () => {
 			// answers the quit connection's psubscribe is not node-c's.
 			cluster.masters.splice(cluster.masters.indexOf(nodeC), 1);
 			listeners.refresh();
-			expect(cluster.conns.get('node-c').quits).toBe(1);
+			expect(cluster.conns.get('node-c').closes).toBe(1);
 			release();
 			await clock.fire();
 			expect(sink.ids()).toEqual([]);
@@ -1636,14 +2292,14 @@ describe('cluster-only failure paths', () => {
 			cluster.conns.get('node-b').emit('error', new Error('read ECONNRESET'));
 			await clock.fire();
 			await clock.fire();
-			expect(a.quits).toBe(0);
+			expect(a.closes).toBe(0);
 			expect(cluster.conns.get('node-a')).toBe(a);
 
 			// The slot map still lists node-a: its connection stays.
 			restore();
 			listeners.refresh();
 			await clock.fire();
-			expect(a.quits).toBe(0);
+			expect(a.closes).toBe(0);
 			expect(cluster.conns.get('node-a')).toBe(a);
 		} finally {
 			await subscriber.dispose?.();

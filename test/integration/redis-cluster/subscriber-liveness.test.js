@@ -1,19 +1,25 @@
 /**
- * Cluster subscriber connections whose node leaves the cluster, against a
- * real Redis Cluster.
+ * Cluster subscriber connections whose node stops answering or leaves the
+ * cluster, against a real Redis Cluster.
  *
- * A node that is forgotten by the others and reset keeps running and keeps
- * its connections, and answers them, but PUBLISH no longer reaches it. This
- * pins that a module subscriber on it moves to a member and delivers again.
+ * CLIENT PAUSE ... ALL makes a node hold every command it receives while its
+ * connections stay open, which is what a subscriber sees of a host that died
+ * without closing its sockets. A node that is forgotten by the others and
+ * reset keeps running and keeps its connections, and answers them, but
+ * PUBLISH no longer reaches it. These tests pin that each kind of cluster
+ * subscriber notices and delivers again.
  *
  * The PING rounds, and the slot map reads every other one, run on demand
- * through the runtime seam.
+ * through the runtime seam; the 10 second PING timeout is real.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { clusterClient } from '../helpers/cluster-client.js';
 import { createPubSubBus } from '../../../src/redis/pubsub.js';
+import { createShardedBus } from '../../../src/redis/sharded-pubsub.js';
+import { createPresence } from '../../../src/redis/presence.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { mockWs } from '../../helpers/mock-ws.js';
 import { captureRegistered } from '../../helpers/diagnostic-line.js';
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -26,7 +32,13 @@ async function waitFor(fn, timeoutMs = 10000) {
 	throw new Error('waitFor timed out after ' + timeoutMs + 'ms');
 }
 
-describe('cluster subscribers on nodes that leave the cluster (cluster)', () => {
+// Longer than the PING timeout and the step limit of what follows it (10
+// seconds each), so the subscriber gives up on the node, and a sweep or a
+// topology read that waits on it gives up too, while it still holds every
+// command.
+const PAUSE_MS = 25000;
+
+describe('cluster subscribers on nodes that stop answering or leave (cluster)', () => {
 	/** @type {import('ioredis').Cluster} */
 	let ctrl;
 	/** @type {Array<() => Promise<unknown>>} */
@@ -61,7 +73,30 @@ describe('cluster subscribers on nodes that leave the cluster (cluster)', () => 
 	}
 
 	const nodes = () => ctrl.nodes('all');
+	/** The one node connection for which `count(node)` is positive. */
+	async function nodeWith(count) {
+		const found = [];
+		for (const node of nodes()) {
+			if ((await count(node)) > 0) found.push(node);
+		}
+		expect(found).toHaveLength(1);
+		return found[0];
+	}
 	const numsub = async (node, channel) => Number((await node.call('PUBSUB', 'NUMSUB', channel))[1]);
+	const shardnumsub = async (node, channel) => Number((await node.call('PUBSUB', 'SHARDNUMSUB', channel))[1]);
+	/** Ids of the node's connections holding a subscription of a kind (psub, ssub). */
+	const clientsWith = async (node, kind) => String(await node.call('CLIENT', 'LIST', 'TYPE', 'pubsub'))
+		.split('\n')
+		.filter((line) => new RegExp(' ' + kind + '=[1-9]').test(line))
+		.map((line) => /^id=(\d+)/.exec(line)?.[1]);
+
+	/** Hold every command on `node` for PAUSE_MS; the test waits it out before the next one. */
+	async function pause(node) {
+		await node.call('CLIENT', 'PAUSE', String(PAUSE_MS), 'ALL');
+		// Answered once the pause is over.
+		cleanups.unshift(() => node.ping());
+		return Date.now() + PAUSE_MS;
+	}
 	/** One PING round of every subscriber, as its 30 second interval would run it. */
 	const pingRound = () => {
 		for (const t of intervals) if (!t.cleared) t.cb();
@@ -171,4 +206,79 @@ describe('cluster subscribers on nodes that leave the cluster (cluster)', () => 
 		expect(silences()).toEqual([]);
 		expect(unhandled).not.toHaveBeenCalled();
 	}, 90000);
+
+	it('presence: a master that stops answering holds up no keyspace sweep, and its subscription is replaced once it answers', async () => {
+		const client = wrapper('inttest-live-presence' + Date.now() + ':');
+		const presence = createPresence(client, { key: 'id', select: (ud) => ({ id: ud.id }), heartbeat: 60000, keyspaceNotifications: true });
+		cleanups.push(async () => presence.destroy?.());
+		await presence.join(mockWs({ id: 'u1' }), 'room', mockPlatform());
+		const [target, other] = ctrl.nodes('master');
+		const before = await clientsWith(target, 'psub');
+		const otherBefore = await clientsWith(other, 'psub');
+		expect(before).toHaveLength(1);
+		expect(otherBefore).toHaveLength(1);
+
+		const pausedUntil = await pause(target);
+		pingRound();
+		await waitFor(() => silences().some((r) => r.attributes.owner === 'presence-keyspace'), 12000);
+		// The sweep after it waits on the paused master's CLUSTER MYID. Another
+		// master's keyspace connection dropped meanwhile is subscribed again
+		// before the pause is over: that sweep gave up on the paused master.
+		await other.call('CLIENT', 'KILL', 'ID', otherBefore[0]);
+		await waitFor(async () => {
+			const now = await clientsWith(other, 'psub');
+			return now.length === 1 && now[0] !== otherBefore[0];
+		}, 15000);
+		expect(Date.now()).toBeLessThan(pausedUntil);
+		// The paused master is asked again with a backoff until it answers.
+		await waitFor(async () => {
+			const now = await clientsWith(target, 'psub');
+			return now.length === 1 && now[0] !== before[0];
+		}, 30000);
+		expect(unhandled).not.toHaveBeenCalled();
+	}, 90000);
+
+	it('sharded bus: a master that stops answering holds back only its own shard channels, which come back once it answers', async () => {
+		const prefix = 'inttest-live:sharded:' + Date.now() + ':';
+		const client = wrapper('');
+		const platform = mockPlatform();
+		const bus = createShardedBus(client, { channelPrefix: prefix });
+		cleanups.push(() => bus.deactivate());
+		await bus.activate(platform);
+		// Topics until two masters own one each.
+		/** @type {Map<object, string>} owner node -> a topic on it */
+		const topicOn = new Map();
+		for (let i = 0; topicOn.size < 2; i++) {
+			const topic = 'room-' + i;
+			await bus.follow(topic);
+			const owner = await nodeWith((node) => shardnumsub(node, prefix + topic));
+			if (!topicOn.has(owner)) topicOn.set(owner, topic);
+		}
+		const [[paused, pausedTopic], [other, otherTopic]] = topicOn;
+		const before = await clientsWith(paused, 'ssub');
+		const otherBefore = await clientsWith(other, 'ssub');
+		expect(otherBefore).toHaveLength(1);
+		const envelope = (topic, event) => JSON.stringify({ instanceId: 'remote', topic, event, data: 1 });
+		const deliveredOn = (node, topic, event, timeoutMs) => waitFor(async () => {
+			await node.spublish(prefix + topic, envelope(topic, event));
+			return platform.published.some((p) => p.event === event);
+		}, timeoutMs);
+
+		const pausedUntil = await pause(paused);
+		pingRound();
+		await waitFor(() => silences().some((r) => r.attributes.owner === 'sharded-pubsub'), 12000);
+		// The topology read that follows waits on the paused master's CLUSTER
+		// MYID. Another master's shard connection dropped meanwhile delivers
+		// again before the pause is over: that read gave up on the paused
+		// master, and needed nothing more from it.
+		await other.call('CLIENT', 'KILL', 'ID', otherBefore[0]);
+		await deliveredOn(other, otherTopic, 'other-back', 14000);
+		expect(Date.now()).toBeLessThan(pausedUntil);
+		// The paused master's channels come back on a new connection once it answers.
+		await deliveredOn(paused, pausedTopic, 'paused-back', 40000);
+		const now = await clientsWith(paused, 'ssub');
+		expect(now).toHaveLength(1);
+		expect(now[0]).not.toBe(before[0]);
+		expect(unhandled).not.toHaveBeenCalled();
+	}, 120000);
 });

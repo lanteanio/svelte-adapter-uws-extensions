@@ -41,7 +41,7 @@ import {
 	runTraceOperation,
 	traceEnabled
 } from '../shared/trace-context.js';
-import { openSubscriber } from '../shared/redis-subscriber.js';
+import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
 
 // A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
 // channel's slot never resolves - the command hangs instead of returning a MOVED
@@ -139,6 +139,18 @@ export function createShardedBus(client, options = {}) {
 	let subStandalone = null;
 	/** @type {Map<string, import('ioredis').Redis>} nodeId -> subscriber connection */
 	const subByNodeId = new Map();
+	// Asks each of those for a PING while the bus is open on a cluster; one that
+	// stopped answering is closed, and its end hands its channels to the
+	// reconciliation (see masterEnded).
+	/** @type {{ stop(): void } | null} */
+	let subLiveness = null;
+	/** @type {WeakMap<object, string>} subscriber connection -> its master's node id */
+	const subIdOf = new WeakMap();
+	// Why a master the last topology refresh read did not give its id, if one did not.
+	/** @type {unknown} */
+	let masterUnread = null;
+	// When the slot map was last read on the bus's behalf (see refreshSlotMap).
+	let slotMapReadAt = -Infinity;
 	/** @type {Array<{start: number, end: number, nodeId: string}> | null} */
 	let slotRanges = null;
 	let subReady = false;
@@ -464,8 +476,27 @@ export function createShardedBus(client, options = {}) {
 		if (!subOpen) return;
 		const generation = subGeneration;
 		const masters = client.redis.nodes('master');
+		/** @type {unknown} why the first master that did not give its id did not */
+		let unread = null;
+		// A master that answered, which the slot map is read from: one sent to
+		// any node could land on the one that does not.
+		/** @type {any} */
+		let reader = null;
 		await Promise.all(masters.map(async (node) => {
-			const id = await node.cluster('MYID');
+			let id;
+			try {
+				id = await withSubTimeout(node.cluster('MYID'), 'CLUSTER MYID', 'the master did not answer');
+				reader ??= node;
+			} catch (err) {
+				// The channels on the other masters need nothing from this one;
+				// those on its slots find no connection and fail with this error
+				// until it answers or the slot map moves them.
+				unread ??= err;
+				// Not answering, unlike refusing the command, may mean the master
+				// moved or left.
+				if (!isReplyError(err)) refreshSlotMap();
+				return;
+			}
 			if (generation !== subGeneration) return;
 			if (!subByNodeId.has(id)) {
 				const s = node.duplicate({ enableReadyCheck: false });
@@ -476,12 +507,25 @@ export function createShardedBus(client, options = {}) {
 				// the master drops ends for good.
 				s.on('end', () => masterEnded(id, s));
 				subByNodeId.set(id, s);
+				subIdOf.set(s, id);
 			}
 		}));
-		const slots = await client.redis.cluster('SLOTS');
+		// No master gave its id: nothing could be subscribed anywhere.
+		if (reader === null && unread !== null) throw unread;
+		const readSlots = (/** @type {any} */ from) => withSubTimeout(from.cluster('SLOTS'), 'CLUSTER SLOTS', 'the node did not answer');
+		let slots;
+		try {
+			slots = await readSlots(reader ?? client.redis);
+		} catch (err) {
+			// That node's connection may have closed since it answered; the client
+			// sends it on to another.
+			if (reader === null) throw err;
+			slots = await readSlots(client.redis);
+		}
 		if (generation !== subGeneration) return;
 		// Each entry: [startSlot, endSlot, [ip, port, nodeId], ...replicas].
 		slotRanges = slots.map((e) => ({ start: e[0], end: e[1], nodeId: e[2][2] }));
+		masterUnread = unread;
 		topologyDirty = false;
 	}
 
@@ -494,6 +538,8 @@ export function createShardedBus(client, options = {}) {
 	function masterEnded(id, conn) {
 		if (subByNodeId.get(id) !== conn) return;
 		subByNodeId.delete(id);
+		// The master may have restarted, moved or failed over.
+		refreshSlotMap();
 		let lost = false;
 		for (const [channel, nodeId] of channelNode) {
 			if (nodeId !== id) continue;
@@ -514,13 +560,38 @@ export function createShardedBus(client, options = {}) {
 		return null;
 	}
 
+	// ioredis reads the slot map again after MOVED or a failed command, and the
+	// bus sends its masters nothing else, so a master that failed over, restarted
+	// or moved can stay off ioredis's node list, which the topology refresh reads.
+	// Each read opens a connection, so they are at least this far apart.
+	function refreshSlotMap() {
+		const now = monotonicNow();
+		if (now - slotMapReadAt < SHARD_SUBSCRIBE_TIMEOUT_MS) return;
+		slotMapReadAt = now;
+		const redis = /** @type {any} */ (client.redis);
+		if (typeof redis.refreshSlotsCache === 'function') redis.refreshSlotsCache();
+	}
+
+	/**
+	 * The error for a slot whose owner has no connection here: ioredis does not
+	 * list it as a master yet, which a slot map read fixes, or it is a master
+	 * that did not give its id, which the error mentions without telling which.
+	 */
+	function noOwner(slot) {
+		refreshSlotMap();
+		const unread = /** @type {any} */ (masterUnread);
+		return new Error('sharded bus: no owning node for slot ' + slot +
+			(unread === null ? '' : ' (a master did not give its id: ' + (unread?.message ?? String(unread)) + ')'));
+	}
+
 	// Bound a shard (un)subscribe so a stale-owner hang cannot wedge the caller
-	// forever (see SHARD_SUBSCRIBE_TIMEOUT_MS).
-	function withSubTimeout(promise, label) {
+	// forever (see SHARD_SUBSCRIBE_TIMEOUT_MS), and CLUSTER MYID so a master that
+	// stopped answering cannot hold every topology refresh.
+	function withSubTimeout(promise, label, reason = 'stale slot owner') {
 		let timer;
 		const timeout = new Promise((_, reject) => {
 			timer = setTimer(
-				() => reject(new Error('sharded bus: ' + label + ' timed out (stale slot owner)')),
+				() => reject(new Error('sharded bus: ' + label + ' timed out (' + reason + ')')),
 				SHARD_SUBSCRIBE_TIMEOUT_MS
 			);
 			if (timer.unref) timer.unref();
@@ -552,7 +623,7 @@ export function createShardedBus(client, options = {}) {
 			ownerId = ownerIdForSlot(slot);
 		}
 		let conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
-		if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
+		if (!conn) throw noOwner(slot);
 		try {
 			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot);
 		} catch {
@@ -561,7 +632,7 @@ export function createShardedBus(client, options = {}) {
 			if (generation !== subGeneration) return;
 			ownerId = ownerIdForSlot(slot);
 			conn = ownerId !== null ? subByNodeId.get(ownerId) : null;
-			if (!conn) throw new Error('sharded bus: no owning node for slot ' + slot);
+			if (!conn) throw noOwner(slot);
 			await withSubTimeout(conn.ssubscribe(channel), 'ssubscribe on slot ' + slot + ' (retry)');
 		}
 		// The bus closed while the subscribe was in flight: its connections are
@@ -667,6 +738,7 @@ export function createShardedBus(client, options = {}) {
 		if (subReady) return;
 		subOpen = true;
 		if (isCluster(client.redis)) {
+			if (subLiveness === null) subLiveness = watchLiveness('sharded-pubsub', () => subByNodeId.values(), closeConnection, { identify: (s) => subIdOf.get(s) });
 			await subRefreshTopology();
 		} else {
 			subStandalone = openSubscriber(client, 'sharded-pubsub');
@@ -711,6 +783,10 @@ export function createShardedBus(client, options = {}) {
 			clearTimer(reconcileTimer);
 			reconcileTimer = null;
 		}
+		if (subLiveness !== null) {
+			subLiveness.stop();
+			subLiveness = null;
+		}
 		refreshFailing = false;
 		channelsFailing = false;
 		reconcileRetryMs = 0;
@@ -719,10 +795,12 @@ export function createShardedBus(client, options = {}) {
 			: (subStandalone ? [subStandalone] : []);
 		subByNodeId.clear();
 		channelNode.clear();
+		masterUnread = null;
 		subStandalone = null;
 		slotRanges = null;
 		subReady = false;
-		await Promise.all(all.map((s) => s.quit().catch(() => s.disconnect())));
+		// Closed at once: a QUIT waits forever on a master that stopped answering.
+		for (const s of all) closeConnection(s);
 	}
 
 	async function activate(platform) {
