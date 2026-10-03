@@ -15,6 +15,22 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { clusterClient } from '../helpers/cluster-client.js';
 import { scanAndUnlink } from '../../../src/shared/redis-scan.js';
 
+/**
+ * Keys under this suite's prefix on one master. Other suites in the tier
+ * leave their own keys behind, so a whole-database count depends on order.
+ * @param {import('ioredis').Redis} node
+ */
+async function ownKeys(node) {
+	let count = 0;
+	let cursor = '0';
+	do {
+		const [next, keys] = await node.scan(cursor, 'MATCH', 'cluster-scan-test:*', 'COUNT', 1000);
+		count += keys.length;
+		cursor = next;
+	} while (cursor !== '0');
+	return count;
+}
+
 describe('scanAndUnlink (cluster)', () => {
 	/** @type {import('ioredis').Cluster} */
 	let cluster;
@@ -57,8 +73,7 @@ describe('scanAndUnlink (cluster)', () => {
 		expect(masters).toHaveLength(3);
 		let totalBefore = 0;
 		for (const m of masters) {
-			const dbsize = await m.dbsize();
-			totalBefore += dbsize;
+			totalBefore += await ownKeys(m);
 		}
 		expect(totalBefore).toBe(100);
 
@@ -68,7 +83,7 @@ describe('scanAndUnlink (cluster)', () => {
 
 		let totalAfter = 0;
 		for (const m of masters) {
-			totalAfter += await m.dbsize();
+			totalAfter += await ownKeys(m);
 		}
 		expect(totalAfter).toBe(0);
 	});
@@ -88,7 +103,7 @@ describe('scanAndUnlink (cluster)', () => {
 		const masters = cluster.nodes('master');
 		let nonEmptyMasters = 0;
 		for (const m of masters) {
-			if ((await m.dbsize()) > 0) nonEmptyMasters++;
+			if ((await ownKeys(m)) > 0) nonEmptyMasters++;
 		}
 		// All 100 keys land in the same slot -> exactly one master holds them.
 		expect(nonEmptyMasters).toBe(1);
@@ -96,7 +111,7 @@ describe('scanAndUnlink (cluster)', () => {
 		await expect(scanAndUnlink(cluster, 'cluster-scan-test:*')).resolves.toBeUndefined();
 
 		for (const m of masters) {
-			expect(await m.dbsize()).toBe(0);
+			expect(await ownKeys(m)).toBe(0);
 		}
 	});
 
@@ -113,13 +128,13 @@ describe('scanAndUnlink (cluster)', () => {
 
 		const masters = cluster.nodes('master');
 		let totalBefore = 0;
-		for (const m of masters) totalBefore += await m.dbsize();
+		for (const m of masters) totalBefore += await ownKeys(m);
 		expect(totalBefore).toBe(100);
 
 		await expect(scanAndUnlink(cluster, 'cluster-scan-test:*')).resolves.toBeUndefined();
 
 		for (const m of masters) {
-			expect(await m.dbsize()).toBe(0);
+			expect(await ownKeys(m)).toBe(0);
 		}
 	});
 
@@ -151,7 +166,7 @@ describe('scanAndUnlink (cluster)', () => {
 
 		const masters = cluster.nodes('master');
 		for (const m of masters) {
-			expect(await m.dbsize()).toBe(0);
+			expect(await ownKeys(m)).toBe(0);
 		}
 	});
 
