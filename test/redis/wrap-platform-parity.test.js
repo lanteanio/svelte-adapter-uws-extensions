@@ -3,6 +3,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform, PLATFORM_KEYS } from '../../src/testing/mock-platform.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
+import { FORWARDED, PROVIDED_ANYWAY } from '../helpers/wrap-surface.js';
 
 /**
  * Parity contract: every member listed in `PLATFORM_KEYS` (the canonical
@@ -365,6 +366,82 @@ describe('Platform parity: bus wraps expose every adapter Platform member', () =
 		platform._emitPublishRate([{ topic: 't', messagesPerSec: 5, bytesPerSec: 5 }]);
 		expect(seen).toHaveLength(1);
 	});
+});
+
+const BUSES = [
+	['pubsub', () => createPubSubBus(mockRedisClient('test:'))],
+	['sharded', () => createShardedBus(mockRedisClient('test:'))]
+];
+
+/**
+ * Adapters differ in which optional platform members they implement, and
+ * callers feature-detect them (`if (!platform.batch)`) to fall back. A wrap
+ * that bound a missing member threw at `bus.wrap(platform)`; one that exposed
+ * a member its source lacks passed the caller's check and then threw on the
+ * call.
+ */
+describe('Platform parity: a wrap leaves out what its source platform lacks', () => {
+	for (const [name, createBus] of BUSES) {
+		for (const traced of [false, true]) {
+			it(`${name} wrap${traced ? ' with tracing on' : ''}: each missing member stays missing`, () => {
+				const wrong = [];
+				for (const key of FORWARDED) {
+					if (Object.hasOwn(PROVIDED_ANYWAY, key)) continue;
+					const platform = mockPlatform();
+					platform.trace.enabled = traced;
+					delete platform[key];
+					expect(platform[key], key).toBeUndefined();
+					let wrapped;
+					try {
+						wrapped = createBus().wrap(platform);
+					} catch (err) {
+						wrong.push(key + ': wrap threw ' + err.message);
+						continue;
+					}
+					if (wrapped[key] !== undefined) wrong.push(key + ': ' + typeof wrapped[key]);
+				}
+				expect(wrong).toEqual([]);
+			});
+		}
+
+		it(`${name} wrap: a platform with nothing but publish wraps and publishes`, () => {
+			const published = [];
+			const platform = { publish: (topic, event, data, options) => { published.push({ topic, event, data, options }); return true; } };
+			const wrapped = createBus().wrap(platform);
+
+			const present = FORWARDED.filter((k) => !Object.hasOwn(PROVIDED_ANYWAY, k) && wrapped[k] !== undefined);
+			expect(present).toEqual([]);
+			expect(wrapped.publish('room', 'msg', 1)).toBe(true);
+			expect(published).toEqual([{ topic: 'room', event: 'msg', data: 1, options: undefined }]);
+		});
+
+		it(`${name} wrap: batch and publishBatched call the platform's member at call time`, () => {
+			const platform = mockPlatform();
+			const wrapped = createBus().wrap(platform);
+			const { batch, publishBatched } = platform;
+			const calls = [];
+			platform.batch = (messages) => { calls.push('batch'); return batch(messages); };
+			platform.publishBatched = (messages) => { calls.push('publishBatched'); return publishBatched(messages); };
+
+			wrapped.batch([{ topic: 'room', event: 'a', data: 1 }]);
+			wrapped.publishBatched([{ topic: 'room', event: 'b', data: 2 }]);
+			expect(calls).toEqual(['batch', 'publishBatched']);
+			expect(platform.published.map((m) => m.event)).toEqual(['a', 'b']);
+		});
+
+		it(`${name} wrap: topicEpoch answers through a replay tracker when the platform has none`, () => {
+			const platform = mockPlatform();
+			delete platform.topicEpoch;
+			expect(createBus().wrap(platform).topicEpoch).toBeUndefined();
+
+			platform.replay = { cachedEpoch: (t) => (t === 'chat' ? 7 : 0) };
+			const wrapped = createBus().wrap(platform);
+			expect(wrapped.topicEpoch('chat')).toBe(7);
+			// The tracker is read when called, so a replacement is used.
+			platform.replay = { cachedEpoch: () => 9 };
+			expect(wrapped.topicEpoch('chat')).toBe(9);
+		});
+	}
 });
 
 /**

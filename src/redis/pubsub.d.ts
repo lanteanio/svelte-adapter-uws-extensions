@@ -66,11 +66,13 @@ export interface PubSubBus {
 	/**
 	 * Returns a new Platform whose `publish()` / `batch()` / `publishBatched()`
 	 * send to Redis + local. Other Platform methods (`send`, `sendCoalesced`,
-	 * `request`, `pressure`, etc.) pass through unchanged.
+	 * `request`, `pressure`, etc.) pass through unchanged. A method the
+	 * platform does not have is `undefined` on the wrapped platform too.
 	 *
 	 * `publishBatched` ships one Redis envelope per call regardless of batch
 	 * size; receivers fan out via local `platform.publishBatched` so each
-	 * subscriber sees one wire frame per batch (post-coalesce).
+	 * subscriber sees one wire frame per batch (post-coalesce). A receiver
+	 * without `publishBatched` publishes the messages one by one.
 	 *
 	 * Use this wrapped platform everywhere you call `publish()` or
 	 * `publishBatched()`.

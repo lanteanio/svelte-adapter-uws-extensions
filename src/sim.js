@@ -68,28 +68,6 @@ function resetBothSeams() {
 }
 
 /**
- * Fill the few production Platform helpers `createTestServer` does not implement
- * (`sendCoalesced` / `onPressure` / `onPublishRate`), so a plugin's `bus.wrap`
- * (which binds the full Platform surface) can wrap it. None are on the
- * cross-instance relay path: the sim exercises neither coalesced sends nor the
- * live pressure / publish-rate samplers, so the defaults are faithful. (A future
- * adapter patch can add these to createTestServer's platform for full parity.)
- * @param {any} platform
- */
-function completePlatform(platform) {
-	if (typeof platform.sendCoalesced === 'function'
-		&& typeof platform.onPressure === 'function'
-		&& typeof platform.onPublishRate === 'function') return platform;
-	return Object.assign(Object.create(platform), {
-		sendCoalesced: typeof platform.sendCoalesced === 'function'
-			? platform.sendCoalesced.bind(platform)
-			: (ws, topic, event, data, options) => platform.send(ws, topic, event, data, options),
-		onPressure: typeof platform.onPressure === 'function' ? platform.onPressure.bind(platform) : () => () => {},
-		onPublishRate: typeof platform.onPublishRate === 'function' ? platform.onPublishRate.bind(platform) : () => () => {}
-	});
-}
-
-/**
  * Construct the requested stateful redis plugins against the ONE shared client
  * and compose their createTestServer handler hooks. `replay` adds a `resume`
  * hook (gap-fill from the shared ring); `presence` ships subscribe/unsubscribe/
@@ -390,7 +368,7 @@ export async function runRedisSim(config = {}) {
 				server.platform.replay = plugins.replay;
 				server.platform.topicEpoch = (t) => plugins.replay.cachedEpoch(t);
 			}
-			const platform = completePlatform(server.platform);
+			const platform = server.platform;
 			const bus = createPubSubBus(sharedClient, { channel, systemChannel: false });
 			const wrapped = bus.wrap(platform);
 			await bus.activate(platform);
@@ -655,7 +633,7 @@ export async function runPgSim(config = {}) {
 				server.platform.replay = plugins.replay;
 				server.platform.topicEpoch = (t) => plugins.replay.cachedEpoch(t);
 			}
-			const platform = completePlatform(server.platform);
+			const platform = server.platform;
 			const bridge = createNotifyBridge(sharedClient, { channel, multiListener: 'all', autoReconnect: false });
 			await bridge.activate(platform);
 			instancesArr.push({ id: i, app, server, bridge, platform, plugins, clients: [] });

@@ -357,6 +357,55 @@ describe('redis sharded bus', () => {
 			await busB.deactivate();
 		});
 
+		it('cross-instance: a receiver without publishBatched publishes each batched message on its own', async () => {
+			const busA = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const busB = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			delete platformB.publishBatched;
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+			await busB.follow('chat:room2');
+
+			busA.wrap(platformA).publishBatched([
+				{ topic: 'chat:room1', event: 'msg', data: { id: 1 } },
+				{ topic: 'chat:room2', event: 'msg', data: { id: 2 } }
+			]);
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(platformB.published).toEqual([
+				{ topic: 'chat:room1', event: 'msg', data: { id: 1 }, options: { relay: false } },
+				{ topic: 'chat:room2', event: 'msg', data: { id: 2 }, options: { relay: false } }
+			]);
+
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
+		it.each(['sendCoalesced', 'forEachSubscriber'])('cross-instance: a receiver without %s publishes the coalesced value', async (missing) => {
+			const busA = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const busB = createShardedBus(client, { shardKey: (t) => t.split(':')[0] });
+			const platformA = mockPlatform();
+			const platformB = mockPlatform();
+			delete platformB[missing];
+
+			await busA.activate(platformA);
+			await busB.activate(platformB);
+			await busB.follow('chat:room1');
+
+			busA.wrap(platformA).relayCoalesced('chat:room1', 'tick', { v: 9 }, 'k1');
+			await new Promise((r) => setTimeout(r, 5));
+
+			expect(platformB.published).toEqual([
+				{ topic: 'chat:room1', event: 'tick', data: { v: 9 }, options: { relay: false } }
+			]);
+
+			await busA.deactivate();
+			await busB.deactivate();
+		});
+
 		it('echo-suppresses the whole batched envelope on instanceId match', async () => {
 			const bus = createShardedBus(client);
 			await bus.activate(platform);

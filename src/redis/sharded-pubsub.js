@@ -278,8 +278,15 @@ export function createShardedBus(client, options = {}) {
 				mParseErrors?.inc();
 				return;
 			}
-			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
 			mReceived?.inc({ topic: mt(parsed.topic) });
+			// A platform without sendCoalesced cannot coalesce per key at all, so
+			// the value goes out as a plain publish: every subscriber still gets
+			// it, as the wire branch below falls back to JSON.
+			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				return;
+			}
+			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
 			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
 				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
 			});
@@ -324,7 +331,15 @@ export function createShardedBus(client, options = {}) {
 				});
 			}
 			if (local.length === 0) return;
-			activePlatform.publishBatched(local);
+			// A peer's platform batched these; this one may not have the batched
+			// lane, and then each message goes out on its own.
+			if (typeof activePlatform.publishBatched === 'function') {
+				activePlatform.publishBatched(local);
+			} else {
+				for (let i = 0; i < local.length; i++) {
+					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
+				}
+			}
 		} else {
 			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
 				mParseErrors?.inc();
@@ -1122,6 +1137,78 @@ export function createShardedBus(client, options = {}) {
 					return result;
 				});
 			};
+			// Per-event loop. Mirrors `platform.batch` semantics: N submitted
+			// messages produce N wire frames per subscriber. Use
+			// `publishBatched` instead when you want one wire frame per
+			// subscriber per call.
+			const batchUntraced = (messages) => {
+				const results = platform.batch(messages);
+				for (let i = 0; i < messages.length; i++) {
+					const mes = messages[i];
+					if (!mes.options || mes.options.relay !== false) {
+						const channel = channelFor(mes.topic);
+						scheduleRelay(channel, JSON.stringify({
+							instanceId, topic: mes.topic, event: mes.event, data: mes.data
+						}), [mes.topic]);
+					}
+				}
+				return results;
+			};
+			// Wire-batched publish. One SPUBLISH envelope per shard channel
+			// per call. Receivers fan out via local `platform.publishBatched`
+			// for one wire frame per subscriber. Empty arrays no-op.
+			const publishBatchedUntraced = (messages) => {
+				if (!Array.isArray(messages)) {
+					throw new TypeError('sharded bus: publishBatched requires an array of messages');
+				}
+				if (messages.length === 0) return;
+
+				platform.publishBatched(messages);
+
+				/** @type {Map<string, Array<{topic: string, event: string, data: unknown}>>} */
+				const byChannel = new Map();
+				for (let i = 0; i < messages.length; i++) {
+					const mes = messages[i];
+					if (mes.options && mes.options.relay === false) continue;
+					const ch = channelFor(mes.topic);
+					let arr = byChannel.get(ch);
+					if (!arr) {
+						arr = [];
+						byChannel.set(ch, arr);
+					}
+					arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
+				}
+
+				for (const [ch, batch] of byChannel) {
+					const topics = new Array(batch.length);
+					for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
+					scheduleRelay(ch, JSON.stringify({ instanceId, batch }), topics);
+				}
+			};
+			const tracing = traceEnabled(platform);
+			const batch = tracing ? batchTraced : batchUntraced;
+			const publishBatched = tracing ? publishBatchedTraced : publishBatchedUntraced;
+			// The subscribe-ack epoch must carry the SAME generation domain
+			// the resume hook later compares against. When a replay tracker
+			// is wired on the source platform it owns the per-topic seq space,
+			// so its cached per-topic generation is the authority - route the
+			// ack to it. Without this bridge the ack would carry the source
+			// platform's single-worker process generation while the resume
+			// hook reads the tracker's small-integer generation, mismatching
+			// on every resume and forcing a cold re-read where gap-fill should
+			// apply. A deployment may still override the source platform's
+			// topicEpoch directly; that path is honoured when no cachedEpoch
+			// tracker is present. Read live so post-wrap wiring propagates.
+			const topicEpoch = (t) => {
+				const r = platform.replay;
+				if (r && typeof r.cachedEpoch === 'function') return r.cachedEpoch(t);
+				return platform.topicEpoch(t);
+			};
+			// A method the platform does not have is undefined on the wrap too, so a
+			// caller's feature check (`if (!platform.batch)`) gives the same answer
+			// through it. Which methods are there is decided here, when wrap() runs;
+			// batch, publishBatched and topicEpoch read the platform's member (and
+			// topicEpoch its replay tracker) when called.
 			const wrapped = {
 				publish(topic, event, data, opts) {
 					const result = platform.publish(topic, event, data, opts);
@@ -1138,56 +1225,10 @@ export function createShardedBus(client, options = {}) {
 					}
 					return result;
 				},
-				// Per-event loop. Mirrors `platform.batch` semantics: N submitted
-				// messages produce N wire frames per subscriber. Use
-				// `publishBatched` instead when you want one wire frame per
-				// subscriber per call.
-				batch(messages) {
-					const results = platform.batch(messages);
-					for (let i = 0; i < messages.length; i++) {
-						const mes = messages[i];
-						if (!mes.options || mes.options.relay !== false) {
-							const channel = channelFor(mes.topic);
-							scheduleRelay(channel, JSON.stringify({
-								instanceId, topic: mes.topic, event: mes.event, data: mes.data
-							}), [mes.topic]);
-						}
-					}
-					return results;
-				},
-				// Wire-batched publish. One SPUBLISH envelope per shard channel
-				// per call. Receivers fan out via local `platform.publishBatched`
-				// for one wire frame per subscriber. Empty arrays no-op.
-				publishBatched(messages) {
-					if (!Array.isArray(messages)) {
-						throw new TypeError('sharded bus: publishBatched requires an array of messages');
-					}
-					if (messages.length === 0) return;
-
-					platform.publishBatched(messages);
-
-					/** @type {Map<string, Array<{topic: string, event: string, data: unknown}>>} */
-					const byChannel = new Map();
-					for (let i = 0; i < messages.length; i++) {
-						const mes = messages[i];
-						if (mes.options && mes.options.relay === false) continue;
-						const ch = channelFor(mes.topic);
-						let arr = byChannel.get(ch);
-						if (!arr) {
-							arr = [];
-							byChannel.set(ch, arr);
-						}
-						arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
-					}
-
-					for (const [ch, batch] of byChannel) {
-						const topics = new Array(batch.length);
-						for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
-						scheduleRelay(ch, JSON.stringify({ instanceId, batch }), topics);
-					}
-				},
-				send: platform.send.bind(platform),
-				sendTo: platform.sendTo.bind(platform),
+				batch: typeof platform.batch === 'function' ? batch : undefined,
+				publishBatched: typeof platform.publishBatched === 'function' ? publishBatched : undefined,
+				send: typeof platform.send === 'function' ? platform.send.bind(platform) : undefined,
+				sendTo: typeof platform.sendTo === 'function' ? platform.sendTo.bind(platform) : undefined,
 				// Relay-only coalesce (mirrors the pubsub bus): the local sendCoalesced
 				// fan-out already ran on the publishing instance; this carries the
 				// latest value to OTHER instances on the topic's shard channel, where
@@ -1197,12 +1238,12 @@ export function createShardedBus(client, options = {}) {
 					const channel = channelFor(topic);
 					scheduleRelay(channel, JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), [topic]);
 				},
-				sendCoalesced: platform.sendCoalesced.bind(platform),
-				request: platform.request.bind(platform),
+				sendCoalesced: typeof platform.sendCoalesced === 'function' ? platform.sendCoalesced.bind(platform) : undefined,
+				request: typeof platform.request === 'function' ? platform.request.bind(platform) : undefined,
 				// Single-instance topic broadcast-with-reply, forwarded as-is so the
 				// realtime layer can serve THIS instance's subscribers; the cluster
 				// fan-out rides the `topicBroadcast` coordinator (getter below).
-				requestTopic: platform.requestTopic ? platform.requestTopic.bind(platform) : undefined,
+				requestTopic: typeof platform.requestTopic === 'function' ? platform.requestTopic.bind(platform) : undefined,
 				// Binary wire methods. Forwarded for local fan-out. A STATELESS
 				// `shared: true` codec additionally relays its logical event across the
 				// cluster on the topic's shard channel: the byte-identical 0x03 frame's
@@ -1214,7 +1255,7 @@ export function createShardedBus(client, options = {}) {
 				// their own per-plugin relay, so they never double-relay here. `undefined`
 				// when the underlying platform predates per-frame binary wire, so the
 				// plugins' typeof guard degrades gracefully.
-				publishWire: platform.publishWire ? (topic, event, data, wire, opts) => {
+				publishWire: typeof platform.publishWire === 'function' ? (topic, event, data, wire, opts) => {
 					const result = platform.publishWire(topic, event, data, wire, opts);
 					if (wire && wire.shared === true && (!opts || opts.relay !== false)) {
 						// excludeWs is NOT carried: the excluded socket is local to this
@@ -1226,7 +1267,7 @@ export function createShardedBus(client, options = {}) {
 					}
 					return result;
 				} : undefined,
-				sendWire: platform.sendWire ? platform.sendWire.bind(platform) : undefined,
+				sendWire: typeof platform.sendWire === 'function' ? platform.sendWire.bind(platform) : undefined,
 				// Register a shared/stateful codec by capability on THIS instance.
 				// Stores the codec locally (so an inbound shared relay can re-encode
 				// binary without the codec crossing the bus) AND forwards to the
@@ -1235,7 +1276,7 @@ export function createShardedBus(client, options = {}) {
 				// on every instance for a pure-subscriber instance to re-encode binary
 				// (an unregistered instance degrades a shared relay to JSON, which is
 				// still a correct delivery). Version-gated like publishWire.
-				registerWireCodec: platform.registerWireCodec ? (wire) => {
+				registerWireCodec: typeof platform.registerWireCodec === 'function' ? (wire) => {
 					if (wire && typeof wire.capability === 'string') wireCodecs.set(wire.capability, wire);
 					platform.registerWireCodec(wire);
 				} : undefined,
@@ -1273,36 +1314,22 @@ export function createShardedBus(client, options = {}) {
 				// the fallback is a process-local HLC of the same shape for adapters
 				// that predate the projection.
 				get hlc() { return platform.hlc ?? fallbackHlc; },
-				onPressure: platform.onPressure.bind(platform),
-				onPublishRate: platform.onPublishRate.bind(platform),
-				subscribers: platform.subscribers.bind(platform),
-				forEachSubscriber: platform.forEachSubscriber.bind(platform),
-				subscribe: platform.subscribe.bind(platform),
-				unsubscribe: platform.unsubscribe.bind(platform),
-				checkSubscribe: platform.checkSubscribe.bind(platform),
+				onPressure: typeof platform.onPressure === 'function' ? platform.onPressure.bind(platform) : undefined,
+				onPublishRate: typeof platform.onPublishRate === 'function' ? platform.onPublishRate.bind(platform) : undefined,
+				subscribers: typeof platform.subscribers === 'function' ? platform.subscribers.bind(platform) : undefined,
+				forEachSubscriber: typeof platform.forEachSubscriber === 'function' ? platform.forEachSubscriber.bind(platform) : undefined,
+				subscribe: typeof platform.subscribe === 'function' ? platform.subscribe.bind(platform) : undefined,
+				unsubscribe: typeof platform.unsubscribe === 'function' ? platform.unsubscribe.bind(platform) : undefined,
+				checkSubscribe: typeof platform.checkSubscribe === 'function' ? platform.checkSubscribe.bind(platform) : undefined,
 				// Forwarded so a framework arming wire-subscribe authorization at init
 				// reaches the real adapter flag through the wrapped platform. Version-
 				// gated: an older adapter without it degrades to a no-op.
-				authorizeWireSubscribe: platform.authorizeWireSubscribe ? platform.authorizeWireSubscribe.bind(platform) : undefined,
+				authorizeWireSubscribe: typeof platform.authorizeWireSubscribe === 'function' ? platform.authorizeWireSubscribe.bind(platform) : undefined,
 				get maxPayloadLength() { return platform.maxPayloadLength; },
-				bufferedAmount: platform.bufferedAmount.bind(platform),
+				bufferedAmount: typeof platform.bufferedAmount === 'function' ? platform.bufferedAmount.bind(platform) : undefined,
 				get closedWsAborts() { return platform.closedWsAborts ?? 0; },
-				// The subscribe-ack epoch must carry the SAME generation domain
-				// the resume hook later compares against. When a replay tracker
-				// is wired on the source platform it owns the per-topic seq space,
-				// so its cached per-topic generation is the authority - route the
-				// ack to it. Without this bridge the ack would carry the source
-				// platform's single-worker process generation while the resume
-				// hook reads the tracker's small-integer generation, mismatching
-				// on every resume and forcing a cold re-read where gap-fill should
-				// apply. A deployment may still override the source platform's
-				// topicEpoch directly; that path is honoured when no cachedEpoch
-				// tracker is present. Read live so post-wrap wiring propagates.
-				topicEpoch(t) {
-					const r = platform.replay;
-					if (r && typeof r.cachedEpoch === 'function') return r.cachedEpoch(t);
-					return platform.topicEpoch(t);
-				},
+				// There when a replay tracker or the platform can answer it.
+				topicEpoch: (platform.replay && typeof platform.replay.cachedEpoch === 'function') || typeof platform.topicEpoch === 'function' ? topicEpoch : undefined,
 				// Framework conventions stashed on the source platform by
 				// app init code (e.g. `platform.replay = createReplay(...)`,
 				// `platform.redis = ioredisClient`) must survive the wrap so
@@ -1335,10 +1362,8 @@ export function createShardedBus(client, options = {}) {
 					};
 				}
 			};
-			if (traceEnabled(platform)) {
+			if (tracing) {
 				wrapped.publish = publishTraced;
-				wrapped.batch = batchTraced;
-				wrapped.publishBatched = publishBatchedTraced;
 				wrapped.relayCoalesced = relayCoalescedTraced;
 				if (wrapped.publishWire) wrapped.publishWire = publishWireTraced;
 			}

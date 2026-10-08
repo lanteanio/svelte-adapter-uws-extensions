@@ -63,12 +63,15 @@ export interface ShardedBus {
 	 * Returns a Platform whose `publish()` / `batch()` / `publishBatched()`
 	 * send to Redis via SPUBLISH (and to the local platform). Other Platform
 	 * methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass
-	 * through unchanged. Mirrors the shape of `createPubSubBus().wrap(platform)`.
+	 * through unchanged, and one the platform does not have is `undefined` on
+	 * the wrapped platform too. Mirrors the shape of
+	 * `createPubSubBus().wrap(platform)`.
 	 *
 	 * `publishBatched` groups its message list by shard channel and ships one
 	 * SPUBLISH envelope per channel per call. Receivers fan out via local
 	 * `platform.publishBatched` so each subscriber sees one wire frame per
-	 * batched envelope.
+	 * batched envelope; a receiver without it publishes the messages one by
+	 * one.
 	 */
 	wrap(platform: Platform): Platform;
 

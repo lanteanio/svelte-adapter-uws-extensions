@@ -278,6 +278,25 @@ describe('redis pubsub bus', () => {
 			expect(local[1].options).toEqual({ relay: false });
 		});
 
+		it('receiver publishes each batched message on its own when the platform has no publishBatched', async () => {
+			delete platform.publishBatched;
+			await bus.activate(platform);
+			platform.reset();
+
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: 'other-instance',
+				batch: [
+					{ topic: 'a', event: 'x', data: 1 },
+					{ topic: 'b', event: 'y', data: 2 }
+				]
+			}));
+
+			expect(platform.published).toEqual([
+				{ topic: 'a', event: 'x', data: 1, options: { relay: false } },
+				{ topic: 'b', event: 'y', data: 2, options: { relay: false } }
+			]);
+		});
+
 		it('receiver echo-suppresses the whole batched envelope on instanceId match', async () => {
 			await bus.activate(platform);
 			const wrapped = bus.wrap(platform);
@@ -344,6 +363,25 @@ describe('redis pubsub bus', () => {
 			expect(platform.sentCoalesced[1].ws).toBe(wsB);
 			// A coalesced frame must never be broadcast via publish.
 			expect(platform.published).toHaveLength(0);
+		});
+
+		it.each(['sendCoalesced', 'forEachSubscriber'])('receiver publishes an inbound coalesced value when the platform has no %s', async (missing) => {
+			delete platform[missing];
+			await bus.activate(platform);
+			platform.reset();
+
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: 'other-instance',
+				coalesced: true,
+				topic: 'prices',
+				event: 'tick',
+				data: { p: 5 },
+				coalesceKey: 'btc'
+			}));
+
+			expect(platform.published).toEqual([
+				{ topic: 'prices', event: 'tick', data: { p: 5 }, options: { relay: false } }
+			]);
 		});
 
 		it('receiver echo-suppresses an own-instance coalesced envelope', async () => {

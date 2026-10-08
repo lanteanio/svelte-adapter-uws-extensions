@@ -228,8 +228,15 @@ export function createPubSubBus(client, options = {}) {
 				mParseErrors?.inc();
 				return;
 			}
-			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
 			mReceived?.inc();
+			// A platform without sendCoalesced cannot coalesce per key at all, so
+			// the value goes out as a plain publish: every subscriber still gets
+			// it, as the wire branch below falls back to JSON.
+			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				return;
+			}
+			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
 			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
 				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
 			});
@@ -278,7 +285,15 @@ export function createPubSubBus(client, options = {}) {
 			}
 			if (local.length === 0) return;
 			mReceived?.inc(local.length);
-			activePlatform.publishBatched(local);
+			// A peer's platform batched these; this one may not have the batched
+			// lane, and then each message goes out on its own.
+			if (typeof activePlatform.publishBatched === 'function') {
+				activePlatform.publishBatched(local);
+			} else {
+				for (let i = 0; i < local.length; i++) {
+					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
+				}
+			}
 		} else {
 			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
 				mParseErrors?.inc();
@@ -448,6 +463,68 @@ export function createPubSubBus(client, options = {}) {
 					return result;
 				});
 			};
+			// Per-event loop. Mirrors `platform.batch` semantics: N submitted
+			// messages produce N wire frames per subscriber. Use
+			// `publishBatched` instead when you want one wire frame per
+			// subscriber per call.
+			const batchUntraced = (messages) => {
+				const results = platform.batch(messages);
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					if (!m.options || m.options.relay !== false) {
+						scheduleRelay(JSON.stringify({
+							instanceId, topic: m.topic, event: m.event, data: m.data
+						}), 1);
+					}
+				}
+				return results;
+			};
+			// Wire-batched publish. One Redis envelope per call carries the
+			// whole list; receivers fan out via local `platform.publishBatched`
+			// for one wire frame per subscriber. Empty arrays no-op.
+			const publishBatchedUntraced = (messages) => {
+				if (!Array.isArray(messages)) {
+					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
+				}
+				if (messages.length === 0) return;
+
+				platform.publishBatched(messages);
+
+				const relayable = [];
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					if (!m.options || m.options.relay !== false) {
+						relayable.push({ topic: m.topic, event: m.event, data: m.data });
+					}
+				}
+				if (relayable.length === 0) return;
+
+				scheduleRelay(JSON.stringify({ instanceId, batch: relayable }), relayable.length);
+			};
+			const tracing = traceEnabled(platform);
+			const batch = tracing ? batchTraced : batchUntraced;
+			const publishBatched = tracing ? publishBatchedTraced : publishBatchedUntraced;
+			// The subscribe-ack epoch must carry the SAME generation domain
+			// the resume hook later compares against. When a replay tracker
+			// is wired on the source platform it owns the per-topic seq space,
+			// so its cached per-topic generation is the authority - route the
+			// ack to it. Without this bridge the ack would carry the source
+			// platform's single-worker process generation while the resume
+			// hook reads the tracker's small-integer generation, mismatching
+			// on every resume and forcing a cold re-read where gap-fill should
+			// apply. A deployment may still override the source platform's
+			// topicEpoch directly; that path is honoured when no cachedEpoch
+			// tracker is present. Read live so post-wrap wiring propagates.
+			const topicEpoch = (t) => {
+				const r = platform.replay;
+				if (r && typeof r.cachedEpoch === 'function') return r.cachedEpoch(t);
+				return platform.topicEpoch(t);
+			};
+			// A method the platform does not have is undefined on the wrap too, so a
+			// caller's feature check (`if (!platform.batch)`) gives the same answer
+			// through it. Which methods are there is decided here, when wrap() runs;
+			// batch, publishBatched and topicEpoch read the platform's member (and
+			// topicEpoch its replay tracker) when called.
 			const wrapped = {
 				publish(topic, event, data, options) {
 					const result = platform.publish(topic, event, data, options);
@@ -474,46 +551,10 @@ export function createPubSubBus(client, options = {}) {
 
 					return result;
 				},
-				// Per-event loop. Mirrors `platform.batch` semantics: N submitted
-				// messages produce N wire frames per subscriber. Use
-				// `publishBatched` instead when you want one wire frame per
-				// subscriber per call.
-				batch(messages) {
-					const results = platform.batch(messages);
-					for (let i = 0; i < messages.length; i++) {
-						const m = messages[i];
-						if (!m.options || m.options.relay !== false) {
-							scheduleRelay(JSON.stringify({
-								instanceId, topic: m.topic, event: m.event, data: m.data
-							}), 1);
-						}
-					}
-					return results;
-				},
-				// Wire-batched publish. One Redis envelope per call carries the
-				// whole list; receivers fan out via local `platform.publishBatched`
-				// for one wire frame per subscriber. Empty arrays no-op.
-				publishBatched(messages) {
-					if (!Array.isArray(messages)) {
-						throw new TypeError('pubsub bus: publishBatched requires an array of messages');
-					}
-					if (messages.length === 0) return;
-
-					platform.publishBatched(messages);
-
-					const relayable = [];
-					for (let i = 0; i < messages.length; i++) {
-						const m = messages[i];
-						if (!m.options || m.options.relay !== false) {
-							relayable.push({ topic: m.topic, event: m.event, data: m.data });
-						}
-					}
-					if (relayable.length === 0) return;
-
-					scheduleRelay(JSON.stringify({ instanceId, batch: relayable }), relayable.length);
-				},
-				send: platform.send.bind(platform),
-				sendTo: platform.sendTo.bind(platform),
+				batch: typeof platform.batch === 'function' ? batch : undefined,
+				publishBatched: typeof platform.publishBatched === 'function' ? publishBatched : undefined,
+				send: typeof platform.send === 'function' ? platform.send.bind(platform) : undefined,
+				sendTo: typeof platform.sendTo === 'function' ? platform.sendTo.bind(platform) : undefined,
 				// Relay-only coalesce: realtime's coalesceBy branch has already fanned
 				// out to THIS instance's sockets via sendCoalesced; this carries the
 				// latest value to OTHER instances, which re-coalesce it onto their own
@@ -522,15 +563,15 @@ export function createPubSubBus(client, options = {}) {
 				relayCoalesced(topic, event, data, coalesceKey) {
 					scheduleRelay(JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), 1);
 				},
-				sendCoalesced: platform.sendCoalesced.bind(platform),
-				request: platform.request.bind(platform),
+				sendCoalesced: typeof platform.sendCoalesced === 'function' ? platform.sendCoalesced.bind(platform) : undefined,
+				request: typeof platform.request === 'function' ? platform.request.bind(platform) : undefined,
 				// Single-instance topic broadcast-with-reply. Forwarded as-is (no
 				// cross-instance fan-out here): the realtime layer uses this to serve
 				// THIS instance's subscribers, and routes the cluster fan-out through
 				// the `topicBroadcast` coordinator below. `undefined` when the
 				// underlying platform predates requestTopic, so realtime's typeof guard
 				// degrades to single-instance.
-				requestTopic: platform.requestTopic ? platform.requestTopic.bind(platform) : undefined,
+				requestTopic: typeof platform.requestTopic === 'function' ? platform.requestTopic.bind(platform) : undefined,
 				// Binary wire methods. Forwarded for local fan-out. A STATELESS
 				// `shared: true` codec additionally relays its logical event across the
 				// cluster: the byte-identical 0x03 frame's only per-connection-varying
@@ -542,7 +583,7 @@ export function createPubSubBus(client, options = {}) {
 				// per-plugin relay, so they never double-relay here. `undefined` when the
 				// underlying platform predates per-frame binary wire, so the plugins'
 				// typeof guard degrades gracefully.
-				publishWire: platform.publishWire ? (topic, event, data, wire, options) => {
+				publishWire: typeof platform.publishWire === 'function' ? (topic, event, data, wire, options) => {
 					const result = platform.publishWire(topic, event, data, wire, options);
 					if (wire && wire.shared === true && (!options || options.relay !== false)) {
 						// excludeWs is NOT carried: the excluded socket is local to this
@@ -554,7 +595,7 @@ export function createPubSubBus(client, options = {}) {
 					}
 					return result;
 				} : undefined,
-				sendWire: platform.sendWire ? platform.sendWire.bind(platform) : undefined,
+				sendWire: typeof platform.sendWire === 'function' ? platform.sendWire.bind(platform) : undefined,
 				// Register a shared/stateful codec by capability on THIS instance.
 				// Stores the codec object locally (so an inbound shared relay can
 				// re-encode binary without the codec crossing the bus) AND forwards to
@@ -563,7 +604,7 @@ export function createPubSubBus(client, options = {}) {
 				// activate on every instance for a pure-subscriber instance to re-encode
 				// binary (an unregistered instance degrades a shared relay to JSON,
 				// which is still a correct delivery). Version-gated like publishWire.
-				registerWireCodec: platform.registerWireCodec ? (wire) => {
+				registerWireCodec: typeof platform.registerWireCodec === 'function' ? (wire) => {
 					if (wire && typeof wire.capability === 'string') wireCodecs.set(wire.capability, wire);
 					platform.registerWireCodec(wire);
 				} : undefined,
@@ -601,37 +642,23 @@ export function createPubSubBus(client, options = {}) {
 				// the fallback is a process-local HLC of the same shape for adapters
 				// that predate the projection.
 				get hlc() { return platform.hlc ?? fallbackHlc; },
-				onPressure: platform.onPressure.bind(platform),
-				onPublishRate: platform.onPublishRate.bind(platform),
-				subscribers: platform.subscribers.bind(platform),
-				forEachSubscriber: platform.forEachSubscriber.bind(platform),
-				subscribe: platform.subscribe.bind(platform),
-				unsubscribe: platform.unsubscribe.bind(platform),
-				checkSubscribe: platform.checkSubscribe.bind(platform),
+				onPressure: typeof platform.onPressure === 'function' ? platform.onPressure.bind(platform) : undefined,
+				onPublishRate: typeof platform.onPublishRate === 'function' ? platform.onPublishRate.bind(platform) : undefined,
+				subscribers: typeof platform.subscribers === 'function' ? platform.subscribers.bind(platform) : undefined,
+				forEachSubscriber: typeof platform.forEachSubscriber === 'function' ? platform.forEachSubscriber.bind(platform) : undefined,
+				subscribe: typeof platform.subscribe === 'function' ? platform.subscribe.bind(platform) : undefined,
+				unsubscribe: typeof platform.unsubscribe === 'function' ? platform.unsubscribe.bind(platform) : undefined,
+				checkSubscribe: typeof platform.checkSubscribe === 'function' ? platform.checkSubscribe.bind(platform) : undefined,
 				// Forwarded so a framework that arms wire-subscribe authorization at
 				// init reaches the real adapter flag through the wrapped platform in a
 				// cluster deployment. Version-gated: an older adapter without it
 				// degrades to a no-op (the framework optional-chains the call).
-				authorizeWireSubscribe: platform.authorizeWireSubscribe ? platform.authorizeWireSubscribe.bind(platform) : undefined,
+				authorizeWireSubscribe: typeof platform.authorizeWireSubscribe === 'function' ? platform.authorizeWireSubscribe.bind(platform) : undefined,
 				get maxPayloadLength() { return platform.maxPayloadLength; },
-				bufferedAmount: platform.bufferedAmount.bind(platform),
+				bufferedAmount: typeof platform.bufferedAmount === 'function' ? platform.bufferedAmount.bind(platform) : undefined,
 				get closedWsAborts() { return platform.closedWsAborts ?? 0; },
-				// The subscribe-ack epoch must carry the SAME generation domain
-				// the resume hook later compares against. When a replay tracker
-				// is wired on the source platform it owns the per-topic seq space,
-				// so its cached per-topic generation is the authority - route the
-				// ack to it. Without this bridge the ack would carry the source
-				// platform's single-worker process generation while the resume
-				// hook reads the tracker's small-integer generation, mismatching
-				// on every resume and forcing a cold re-read where gap-fill should
-				// apply. A deployment may still override the source platform's
-				// topicEpoch directly; that path is honoured when no cachedEpoch
-				// tracker is present. Read live so post-wrap wiring propagates.
-				topicEpoch(t) {
-					const r = platform.replay;
-					if (r && typeof r.cachedEpoch === 'function') return r.cachedEpoch(t);
-					return platform.topicEpoch(t);
-				},
+				// There when a replay tracker or the platform can answer it.
+				topicEpoch: (platform.replay && typeof platform.replay.cachedEpoch === 'function') || typeof platform.topicEpoch === 'function' ? topicEpoch : undefined,
 				// Framework conventions stashed on the source platform by
 				// app init code (e.g. `platform.replay = createReplay(...)`,
 				// `platform.redis = ioredisClient`) must survive the wrap so
@@ -669,10 +696,8 @@ export function createPubSubBus(client, options = {}) {
 					};
 				}
 			};
-			if (traceEnabled(platform)) {
+			if (tracing) {
 				wrapped.publish = publishTraced;
-				wrapped.batch = batchTraced;
-				wrapped.publishBatched = publishBatchedTraced;
 				wrapped.relayCoalesced = relayCoalescedTraced;
 				if (wrapped.publishWire) wrapped.publishWire = publishWireTraced;
 			}
