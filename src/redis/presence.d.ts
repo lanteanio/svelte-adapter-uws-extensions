@@ -146,7 +146,9 @@ export interface RedisPresenceTracker {
 	 * `undefined`. Return the value from a `hooks.subscribe` wiring so the
 	 * denial reaches the adapter and the subscribe itself is refused; a
 	 * caller that discards it leaves the socket subscribed to a topic the
-	 * platform refused, with only the roster withheld.
+	 * platform refused, with only the roster withheld. A `__`-prefixed topic
+	 * resolves `undefined` without a check and sends nothing: presence tracks
+	 * no such topic.
 	 */
 	sync(ws: any, topic: string, platform: Platform): Promise<string | undefined>;
 

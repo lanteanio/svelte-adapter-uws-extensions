@@ -986,6 +986,10 @@ export function createPresence(client, options = {}) {
 		 * callers that ignore the return value are unaffected.
 		 */
 		async sync(ws, topic, platform) {
+			// Presence tracks no `__` topic (join and update skip them), so
+			// there is no roster to send and no event channel to open for one.
+			// Before the breaker guard, which would otherwise spend a probe.
+			if (typeof topic !== 'string' || topic.startsWith('__')) return;
 			b?.guard();
 			// Authorize against the REAL topic before granting tap-channel
 			// membership (mirrors in-memory presence sync + the cursor snapshot):
@@ -1152,11 +1156,14 @@ export function createPresence(client, options = {}) {
 			await ensureRedis74();
 			const all = await withBreaker(b, () => redis.hgetall(topicHashKey(topic)));
 			const result = [];
-			for (const userKey of Object.keys(all)) {
-				try {
-					const parsed = JSON.parse(all[userKey]);
-					result.push(parsed.data);
-				} catch { /* skip corrupted */ }
+			// The same read-back as the state snapshot, which applies the field
+			// rule. Identity only: durable fields are written by update(), which
+			// takes any non-reserved name a client sends. The rebuilt `data` of an
+			// entry that had a reserved name has a null prototype; it is copied
+			// so the caller always gets ordinary objects.
+			for (const [, entry] of parseEntries(all)) {
+				const data = entry.data;
+				result.push(Object.getPrototypeOf(data) === null ? { ...data } : data);
 			}
 			return result;
 		},

@@ -609,16 +609,26 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					const topic = ch.slice(prefix.length);
 					if (!isRecord(parsed)) return;
 					if (typeof parsed.instanceId !== 'string' || parsed.instanceId.length === 0) return;
-					if (parsed.topic !== topic || !busValidator.acceptEnvelope(parsed.topic, parsed.event)) return;
+					// The topic is the one the channel names, and this instance
+					// subscribes only the channels of topics it tracks. No
+					// wire-topic shape rule here: its 256-character limit would
+					// drop a peer's events for a longer topic both instances track.
+					if (parsed.topic !== topic) return;
 					if (!isValidPresencePayload(parsed.event, parsed.payload)) return;
 					if (parsed.instanceId === instanceId) return;
 					if (!activePlatform) return;
 					const ev = parsed.event;
 					const payload = parsed.payload;
+					// Relayed entry data gets the field rule of every other
+					// ingress (local update, Redis read-back, FIELDS below). A
+					// peer's join and leave data is its select output after
+					// stripInternal, and its update data publicData, both of which
+					// already drop these names, so only a forged envelope loses
+					// anything.
 					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
-						bufferDiff(topic, 'join', payload?.key, payload?.data, activePlatform);
+						bufferDiff(topic, 'join', payload.key, mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {
-						bufferDiff(topic, 'leave', payload?.key, payload?.data, activePlatform);
+						bufferDiff(topic, 'leave', payload.key, payload.data === null ? null : mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.FIELDS) {
 						// Field-level update from another instance. Fan it out to this
 						// instance's local subscribers as an `updates` diff entry

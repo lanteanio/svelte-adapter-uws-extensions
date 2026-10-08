@@ -393,6 +393,147 @@ describe('presence read-back from Redis', () => {
 		for (const v of Object.values(state.data)) expect(v.polluted).toBeUndefined();
 		await presence.destroy?.();
 	});
+
+	it('applies the field rule to identity data already stored', async () => {
+		const client = mockRedisClient('p12:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		// Anything with write access to the hash can store names the select
+		// projection never produces, in `data` as well as in `fields`. JSON.parse
+		// keeps '__proto__' an own key; 'ghost' carries no other reserved name.
+		const plant = (key, data) => client.redis.hset('p12:presence:topic:{room}', key, JSON.stringify({ data: JSON.parse(data), ts: Date.now() }));
+		await plant('mallory', '{"__admin":1,"__proto__":{"polluted":1},"name":"mallory"}');
+		await plant('ghost', '{"__proto__":{"polluted":1},"name":"ghost"}');
+
+		platform.reset();
+		await presence.sync(mockWs({ id: 'observer' }), 'room', platform);
+		const state = platform.sent.find((e) => e.event === 'state').data;
+		expect(Object.keys(state.mallory)).toEqual(['name']);
+		expect(Object.keys(state.ghost)).toEqual(['name']);
+
+		// list() reads the same hash and hands back ordinary objects.
+		const listed = await presence.list('room');
+		const mallory = listed.find((e) => e.name === 'mallory');
+		expect(Object.keys(mallory)).toEqual(['name']);
+		expect(Object.getPrototypeOf(mallory)).toBe(Object.prototype);
+		expect(listed.find((e) => e.name === 'ghost')).toEqual({ name: 'ghost' });
+		await presence.destroy?.();
+	});
+
+	it('skips a stored value that is not an entry', async () => {
+		const client = mockRedisClient('p13:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		for (const [key, raw] of [['ghost', 'null'], ['seven', '7'], ['bare', '{"ts":1}'], ['five', '{"data":5,"ts":1}'], ['nulldata', '{"data":null,"ts":1}']]) {
+			await client.redis.hset('p13:presence:topic:{room}', key, raw);
+		}
+
+		platform.reset();
+		await presence.sync(mockWs({ id: 'observer' }), 'room', platform);
+		expect(Object.keys(platform.sent.find((e) => e.event === 'state').data)).toEqual(['alice']);
+		expect(await presence.list('room')).toEqual([{ id: 'alice' }]);
+		const bob = mockWs({ id: 'bob' });
+		await presence.join(bob, 'room', platform);
+		expect(Object.keys(platform.sent.find((e) => e.ws === bob && e.event === 'state').data).sort()).toEqual(['alice', 'bob']);
+		await presence.destroy?.();
+	});
+
+	it('list() returns the identity the server set, not fields a client wrote', async () => {
+		// update() takes any non-reserved name a client sends, identity-shaped
+		// ones included, so durable fields stay out of list().
+		const client = mockRedisClient('p14:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		const alice = mockWs({ id: 'alice' });
+		await presence.join(alice, 'room', platform);
+		await presence.update(alice, 'room', { color: 'red', id: 'bob' }, platform);
+		expect(await presence.list('room')).toEqual([{ id: 'alice' }]);
+		await presence.destroy?.();
+	});
+
+	it('sync() of a __ topic sends nothing and takes no events for it', async () => {
+		const client = mockRedisClient('p15:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		await waitForDiffFlush(platform);
+
+		platform.reset();
+		expect(await presence.sync(mockWs({ id: 'observer' }), '__x', platform)).toBeUndefined();
+		await client.redis.publish('p15:presence:events:__x', JSON.stringify({
+			instanceId: 'foreign', topic: '__x', event: 'join', payload: { key: 'mallory', data: { name: 'mallory' } }
+		}));
+		await sleep(30);
+		presence.flushDiffs();
+		expect(platform.sent).toEqual([]);
+		expect(platform.published).toEqual([]);
+		await presence.destroy?.();
+	});
+});
+
+describe('presence bus ingress', () => {
+	// What this instance fanned out to its own subscribers since the reset.
+	const frames = (platform) => JSON.stringify(platform.sent) + JSON.stringify(platform.published);
+
+	it('applies the field rule to the data of a relayed join and leave', async () => {
+		const client = mockRedisClient('p7:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		await waitForDiffFlush(platform);
+
+		// A peer's data never carries these names, so only a forged envelope
+		// does; JSON.parse makes '__proto__' an own key.
+		const relay = (event, key, data) => client.redis.publish('p7:presence:events:room', JSON.stringify({
+			instanceId: 'foreign', topic: 'room', event, payload: { key, data }
+		}));
+		const data = JSON.parse('{"__proto__":{"isAdmin":true},"__admin":1,"name":"mallory"}');
+
+		platform.reset();
+		await relay('join', 'mallory', data);
+		await waitForDiffFlush(platform);
+		expect(frames(platform)).toContain('"name":"mallory"');
+		expect(frames(platform)).not.toContain('__admin');
+		expect(frames(platform)).not.toContain('__proto__');
+
+		platform.reset();
+		await relay('updated', 'mallory', data);
+		await waitForDiffFlush(platform);
+		expect(frames(platform)).toContain('"name":"mallory"');
+		expect(frames(platform)).not.toContain('__admin');
+		expect(frames(platform)).not.toContain('__proto__');
+
+		platform.reset();
+		await relay('leave', 'mallory', data);
+		await waitForDiffFlush(platform);
+		expect(frames(platform)).toContain('"name":"mallory"');
+		expect(frames(platform)).not.toContain('__admin');
+		expect(frames(platform)).not.toContain('__proto__');
+		await presence.destroy?.();
+	});
+
+	it('takes a peer\'s events for a topic longer than the wire-topic limit', async () => {
+		// presence.join() tracks any topic but a `__` one, and the adapter
+		// frames a topic of any length, so participants joined server-side get
+		// each other's events whatever the topic's length.
+		const topic = 'r'.repeat(300);
+		const client = mockRedisClient('p8:');
+		const platformA = mockPlatform();
+		const platformB = mockPlatform();
+		const a = createPresence(client, opts);
+		const b = createPresence(client, opts);
+		await b.join(mockWs({ id: 'bob' }), topic, platformB);
+		await waitForDiffFlush(platformB);
+		platformB.reset();
+
+		await a.join(mockWs({ id: 'alice' }), topic, platformA);
+		await waitForDiffFlush(platformB);
+		expect(frames(platformB)).toContain('"id":"alice"');
+		await a.destroy?.();
+		await b.destroy?.();
+	});
 });
 
 describe('presence roster accumulators', () => {

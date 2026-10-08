@@ -8,7 +8,7 @@
  * @module svelte-adapter-uws-extensions/redis/presence/data
  */
 
-import { isReservedPresenceField } from './field-policy.js';
+import { isReservedPresenceField, mergeFields, newFieldMap } from './field-policy.js';
 
 /**
  * Build the public-view projection bound to a set of transient field names.
@@ -140,19 +140,46 @@ export function deepEqual(a, b, depth, budget) {
 }
 
 /**
+ * Whether a parsed object has an own name the field rule refuses. `for...in`
+ * rather than Object.keys: no array per entry, and an object from JSON.parse
+ * has no inherited enumerable names.
+ * @param {Record<string, any>} obj
+ */
+function hasReservedField(obj) {
+	for (const k in obj) {
+		if (isReservedPresenceField(k)) return true;
+	}
+	return false;
+}
+
+/**
  * Parse the per-topic hash HGETALL result into a Map<userKey, {data, ts}>.
  * Staleness filtering and cross-instance deduplication are no longer
  * needed: the new storage layout uses one field per userKey (Redis
  * collapses cross-instance writes via HSET on the same field), and per-
  * field HPEXPIRE removes stale entries before HGETALL sees them. So this
- * is now just a JSON-parse + drop-corrupted loop.
+ * is now just a JSON-parse + drop-corrupted loop, plus the field rule on each
+ * entry's `data`: anything with write access to the hash can store names the
+ * select projection never produces, and publicData filters only `fields`.
  */
 export function parseEntries(all) {
 	const seen = new Map();
 	for (const userKey of Object.keys(all)) {
+		let entry;
 		try {
-			seen.set(userKey, JSON.parse(all[userKey]));
-		} catch { /* corrupted entry */ }
+			entry = JSON.parse(all[userKey]);
+		} catch { continue; /* corrupted entry */ }
+		// A stored value that is not an entry with object data (`null`, a
+		// number, an object without `data`) is corrupt too: every consumer
+		// reads entry.data as the user's identity.
+		if (entry === null || entry.data === null || typeof entry.data !== 'object') continue;
+		// Rebuilt only when a reserved name is there: the check is a few
+		// character compares per field, the rebuild an allocation per entry on
+		// every join and sync snapshot.
+		if (hasReservedField(entry.data)) {
+			entry.data = mergeFields(newFieldMap(), entry.data);
+		}
+		seen.set(userKey, entry);
 	}
 	return seen;
 }
