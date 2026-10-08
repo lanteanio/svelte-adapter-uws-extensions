@@ -3,7 +3,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform, PLATFORM_KEYS } from '../../src/testing/mock-platform.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
-import { FORWARDED, PROVIDED_ANYWAY } from '../helpers/wrap-surface.js';
+import { FORWARDED, PROVIDED_ANYWAY, wrapMismatches } from '../helpers/wrap-surface.js';
 
 /**
  * Parity contract: every member listed in `PLATFORM_KEYS` (the canonical
@@ -378,7 +378,8 @@ const BUSES = [
  * callers feature-detect them (`if (!platform.batch)`) to fall back. A wrap
  * that bound a missing member threw at `bus.wrap(platform)`; one that exposed
  * a member its source lacks passed the caller's check and then threw on the
- * call.
+ * call. svelte-adapter-bunserve's real platform object is held to the same
+ * rule by the cross-repo gate's bunserve-wrap rung.
  */
 describe('Platform parity: a wrap leaves out what its source platform lacks', () => {
 	for (const [name, createBus] of BUSES) {
@@ -442,6 +443,28 @@ describe('Platform parity: a wrap leaves out what its source platform lacks', ()
 			expect(wrapped.topicEpoch('chat')).toBe(9);
 		});
 	}
+});
+
+describe('wrapMismatches: the check the bunserve-wrap rung applies to a real platform', () => {
+	it('accepts a wrap that forwards what the platform has and fills in only its own members', () => {
+		const platform = { publish: 'function', send: 'function', connections: 'number' };
+		const wrap = {
+			publish: 'function', send: 'function', connections: 'number', topic: 'function',
+			now: 'function', monotonic: 'function', random: 'object', hlc: 'function',
+			protection: 'string', closedWsAborts: 'number', traceContext: 'null'
+		};
+		expect(wrapMismatches(platform, wrap)).toEqual([]);
+	});
+
+	it('reports a member the wrap adds and one it drops', () => {
+		expect(wrapMismatches({ publish: 'function', request: 'function' }, { publish: 'function', batch: 'function' }))
+			.toEqual(['batch: platform undefined, wrap function', 'request: platform function, wrap undefined']);
+	});
+
+	it('compares a fallback member the platform does have, and a getter of another kind', () => {
+		expect(wrapMismatches({ publish: 'function', hlc: 'function', pressure: 'object' }, { publish: 'function', hlc: 'undefined', pressure: 'throws' }))
+			.toEqual(['pressure: platform object, wrap throws', 'hlc: platform function, wrap undefined']);
+	});
 });
 
 /**

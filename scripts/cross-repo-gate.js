@@ -35,13 +35,21 @@
  * into each tree first, which rewrites trees this harness does not own; that is
  * not done here.
  *
+ * One rung reaches past the three heads:
+ *
+ *   bunserve-wrap  extensions' bus wraps over svelte-adapter-bunserve's real
+ *                  platform object, which leaves out the platform members that
+ *                  adapter does not implement: each wrap must carry exactly the
+ *                  forwarded members it has. No bunserve checkout is a SKIP.
+ *
  * Zero-config, from this repo:
  *
  *   node scripts/cross-repo-gate.js
  *
  * The sibling heads are discovered on disk; every knob below is optional.
  *
- *   --repo <path>        Add or override a repo path (repeatable). The package
+ *   --repo <path>        Add or override a repo path (repeatable): a head, or
+ *                        the svelte-adapter-bunserve checkout. The package
  *                        name is read from its package.json, so order is free.
  *   --rungs a,b,c        Run only these rungs. Prerequisites are pulled in
  *                        automatically, so `--rungs types` also packs and
@@ -50,8 +58,9 @@
  *                        (pack, install, peers, types).
  *   --work-dir <path>    Where tarballs and the consumer are built.
  *                        Default: .cross-repo-gate/ under this repo.
- *   --require-clean      Fail unless every head is a clean git checkout. Use in
- *                        CI, where the gate must describe committed SHAs.
+ *   --require-clean      Fail unless every head, and a bunserve checkout when
+ *                        one is found, is a clean git checkout. Use in CI,
+ *                        where the gate must describe committed SHAs.
  *   --strict             Treat SKIPPED rungs as failures. Use in CI, where a
  *                        skipped rung is an untested claim.
  *   --clean              Remove the work dir before starting.
@@ -80,6 +89,10 @@ const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 // The heads, in dependency order: each may only peer on the ones before it.
 const HEADS = ['svelte-adapter-uws', 'svelte-adapter-uws-extensions', 'svelte-realtime'];
+
+// Checkouts a rung reads besides the heads. Optional: a rung whose checkout is
+// not there is a SKIP.
+const SITES = ['svelte-adapter-bunserve'];
 
 // What the consumer supplies for itself: the heads' true peers (see each head's
 // peerDependencies). `ioredis` is a direct dependency of extensions and `pg` an
@@ -230,12 +243,12 @@ function discoverRepos(explicit) {
 	for (const dir of explicit) {
 		const pkg = readPkg(dir);
 		if (!pkg) die(`--repo ${dir} has no readable package.json`);
-		if (!HEADS.includes(pkg.name)) die(`--repo ${dir} is "${pkg.name}", not one of: ${HEADS.join(', ')}`);
+		if (!HEADS.includes(pkg.name) && !SITES.includes(pkg.name)) die(`--repo ${dir} is "${pkg.name}", not one of: ${[...HEADS, ...SITES].join(', ')}`);
 		found[pkg.name] = { dir, pkg };
 	}
 
 	const parent = resolve(HERE, '..');
-	for (const name of HEADS) {
+	for (const name of [...HEADS, ...SITES]) {
 		if (found[name]) continue;
 		for (const candidate of [HERE, join(parent, name)]) {
 			const pkg = readPkg(candidate);
@@ -671,6 +684,45 @@ function rungExtensionsIntegration() {
 	return true;
 }
 
+/**
+ * Extensions' bus wraps over svelte-adapter-bunserve's real platform object.
+ * The probe (test/helpers/bunserve-wrap-probe.mjs) loads it in its own process
+ * under the `bunserve-test` export condition bunserve's unit tests use, wraps
+ * it with both buses and compares every forwarded member. bunserve leaves out
+ * the members it does not implement, so it is where a wrap that assumes one
+ * fails. No bunserve checkout is a SKIP.
+ */
+function rungBunserveWrap() {
+	const site = state.repos['svelte-adapter-bunserve'];
+	if (!site) {
+		const sibling = join(resolve(HERE, '..'), 'svelte-adapter-bunserve');
+		if (existsSync(sibling)) {
+			record('bunserve-wrap', FAIL, `${sibling} exists but its package.json does not read as svelte-adapter-bunserve`);
+			return false;
+		}
+		record('bunserve-wrap', SKIP, `no svelte-adapter-bunserve checkout next to ${HERE}; pass --repo <path> for one elsewhere`);
+		return null;
+	}
+	const ext = state.repos['svelte-adapter-uws-extensions'].dir;
+	const r = run(process.execPath, ['--conditions=bunserve-test', join(ext, 'test', 'helpers', 'bunserve-wrap-probe.mjs'), site.dir], ext);
+	let report = null;
+	try { report = JSON.parse(r.stdout); } catch { /* reported below with the raw output */ }
+	const g = gitState(site.dir);
+	const at = `svelte-adapter-bunserve ${g.sha}${g.dirty ? ` +${g.files} uncommitted` : ''}`;
+	if (!report) {
+		record('bunserve-wrap', FAIL, `the probe did not run against ${at} (exit ${r.code})`, r.stdout + '\n' + r.stderr);
+		return false;
+	}
+	if (r.code !== 0) {
+		const lines = [report.error, ...Object.entries(report.wraps).flatMap(([bus, w]) => (w.error ? [`${bus}: ${w.error.split('\n')[0]}`] : w.mismatches.map((m) => `${bus}: ${m}`)))].filter(Boolean);
+		const headline = report.error ? `the probe could not read the platform of ${at}` : `the bus wraps disagree with the real platform of ${at}`;
+		record('bunserve-wrap', FAIL, headline, lines.length ? lines.join('\n') : `exit ${r.code}\n${r.stderr}`);
+		return false;
+	}
+	record('bunserve-wrap', PASS, `both bus wraps match the real platform of ${at} on all ${report.compared} forwarded members (${report.present} of them on that platform)`);
+	return true;
+}
+
 // - main ------------------------------------------------------------
 
 const RUNGS = [
@@ -681,7 +733,8 @@ const RUNGS = [
 	{ name: 'check', quick: false, needs: [], run: () => rungPerRepo('check', 'check', 'own check passes') },
 	{ name: 'unit', quick: false, needs: [], run: () => rungPerRepo('unit', 'test', 'own unit suite passes') },
 	{ name: 'realtime-e2e', quick: false, needs: [], run: rungRealtimeE2E },
-	{ name: 'extensions-integration', quick: false, needs: [], run: rungExtensionsIntegration }
+	{ name: 'extensions-integration', quick: false, needs: [], run: rungExtensionsIntegration },
+	{ name: 'bunserve-wrap', quick: false, needs: [], run: rungBunserveWrap }
 ];
 
 /** Expand a selection to include what it depends on, keeping rung order. */
@@ -719,6 +772,12 @@ function main() {
 		else if (g.dirty) unclean.push(`${name} (${g.files} uncommitted file(s))`);
 		const suffix = g.unknown ? ' git state unreadable' : g.dirty ? ` +${g.files} uncommitted` : '';
 		console.log(`  ${name.padEnd(30)} ${String(repos[name].pkg.version).padEnd(16)} ${g.sha}${suffix}`);
+	}
+	// A rung reads these too, so --require-clean holds them to the same rule.
+	for (const name of SITES.filter((n) => repos[n])) {
+		const g = gitState(repos[name].dir);
+		if (g.unknown) unclean.push(`${name} (git state unreadable)`);
+		else if (g.dirty) unclean.push(`${name} (${g.files} uncommitted file(s))`);
 	}
 	console.log(`  work dir: ${workDir}\n`);
 
