@@ -394,3 +394,63 @@ describe('presence read-back from Redis', () => {
 		await presence.destroy?.();
 	});
 });
+
+describe('presence roster accumulators', () => {
+	// A roster hash field literally named '__proto__' (anything with Redis
+	// write access can leave one). Collected into a plain object it would set
+	// the frame's prototype and drop out of the roster.
+	async function plantProtoEntry(client, prefix) {
+		await client.redis.hset(prefix + 'presence:topic:{room}', '__proto__', JSON.stringify({ data: { id: 'ghost' }, ts: Date.now() }));
+	}
+
+	it('sync() keeps a __proto__ roster entry as data', async () => {
+		const client = mockRedisClient('p9:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		await plantProtoEntry(client, 'p9:');
+
+		platform.reset();
+		await presence.sync(mockWs({ id: 'observer' }), 'room', platform);
+		const state = platform.sent.find((e) => e.event === 'state').data;
+		expect(Object.getPrototypeOf(state)).toBeNull();
+		expect(Object.keys(state).sort()).toEqual(['__proto__', 'alice']);
+		expect(state['__proto__']).toEqual({ id: 'ghost' });
+		await presence.destroy?.();
+	});
+
+	it('the join snapshot keeps a __proto__ roster entry as data', async () => {
+		const client = mockRedisClient('p10:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, opts);
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		await plantProtoEntry(client, 'p10:');
+
+		platform.reset();
+		const bob = mockWs({ id: 'bob' });
+		await presence.join(bob, 'room', platform);
+		const state = platform.sent.find((e) => e.ws === bob && e.event === 'state').data;
+		expect(Object.getPrototypeOf(state)).toBeNull();
+		expect(Object.keys(state).sort()).toEqual(['__proto__', 'alice', 'bob']);
+		await presence.destroy?.();
+	});
+
+	it('the heartbeat map has no prototype for a key to reach', async () => {
+		const client = mockRedisClient('p11:');
+		const platform = mockPlatform();
+		const presence = createPresence(client, { ...opts, heartbeat: 20 });
+		await presence.join(mockWs({ id: 'alice' }), 'room', platform);
+		platform.reset();
+
+		const start = Date.now();
+		let beat;
+		while (!beat && Date.now() - start < 2000) {
+			beat = platform.published.find((e) => e.topic === '__presence:room' && e.event === 'heartbeat');
+			if (!beat) await sleep(10);
+		}
+		expect(beat).toBeDefined();
+		expect(Object.getPrototypeOf(beat.data)).toBeNull();
+		expect(Object.keys(beat.data)).toEqual(['alice']);
+		await presence.destroy?.();
+	});
+});
