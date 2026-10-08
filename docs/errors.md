@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 63 diagnostic events. Each is one canonical line
+- 64 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -81,6 +81,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REGISTRY-INDEX-BUCKET](#extensions-err-registry-index-bucket) | `redis.registry.index-bucket.large` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.registry event=redis.registry.index-bucket.large severity=warn] A registry secondary-index bucket is very large and keeps growing.` |
 | [EXTENSIONS-ERR-REGISTRY-USER-INDEX](#extensions-err-registry-user-index) | `redis.registry.user-index.large` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.registry event=redis.registry.user-index.large severity=warn] The cluster-wide registry user index is very large and keeps growing.` |
 | [EXTENSIONS-ERR-PUBSUB-RELAY-BURST](#extensions-err-pubsub-relay-burst) | `redis.pubsub.relay-batch.burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] One event-loop iteration queued more relay publishes than the per-tick bound.` |
+| [EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED](#extensions-err-pubsub-system-channel-refused) | `redis.pubsub.system-channel.refused` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.system-channel.refused severity=warn] A connection was not subscribed to the bus's systemChannel, so it gets no degraded or recovered events.` |
 | [EXTENSIONS-ERR-SHARDED-RELAY-BURST](#extensions-err-sharded-relay-burst) | `redis.sharded-pubsub.relay-batch.channel-burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] One event-loop iteration queued publishes for more distinct shard channels than the per-tick bound.` |
 | [EXTENSIONS-ERR-REDIS-DUPLICATES](#extensions-err-redis-duplicates) | `redis.client.duplicates.excessive` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.client event=redis.client.duplicates.excessive severity=warn] One Redis client has spawned more duplicate connections than a process should need.` |
 | [EXTENSIONS-ERR-SMOOTH-OWNER-FALLBACK](#extensions-err-smooth-owner-fallback) | `redis.smooth.relay-owner.unresolved` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.smooth event=redis.smooth.relay-owner.unresolved severity=warn] The smooth relay channel owner could not be resolved; publishes are pinned to a fallback master.` |
@@ -109,7 +110,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 63 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 64 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -158,6 +159,7 @@ Indexed events:
 - `redis.registry.index-bucket.large` - [EXTENSIONS-ERR-REGISTRY-INDEX-BUCKET](#extensions-err-registry-index-bucket)
 - `redis.registry.user-index.large` - [EXTENSIONS-ERR-REGISTRY-USER-INDEX](#extensions-err-registry-user-index)
 - `redis.pubsub.relay-batch.burst` - [EXTENSIONS-ERR-PUBSUB-RELAY-BURST](#extensions-err-pubsub-relay-burst)
+- `redis.pubsub.system-channel.refused` - [EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED](#extensions-err-pubsub-system-channel-refused)
 - `redis.sharded-pubsub.relay-batch.channel-burst` - [EXTENSIONS-ERR-SHARDED-RELAY-BURST](#extensions-err-sharded-relay-burst)
 - `redis.client.duplicates.excessive` - [EXTENSIONS-ERR-REDIS-DUPLICATES](#extensions-err-redis-duplicates)
 - `redis.smooth.relay-owner.unresolved` - [EXTENSIONS-ERR-SMOOTH-OWNER-FALLBACK](#extensions-err-smooth-owner-fallback)
@@ -853,6 +855,18 @@ the stable ID tag on the line):
 - **Next action:** Find the publish-in-loop and yield between chunks, or send the list as one envelope with publishBatched.
 - **Operator shortlink:** `https://svti.me/pubsub-burst`
 - **Runtime help:** `docs/errors.md#extensions-err-pubsub-relay-burst`
+- **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
+
+<a id="extensions-err-pubsub-system-channel-refused"></a>
+## `EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED`
+
+- **Code/event:** `redis.pubsub.system-channel.refused`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.system-channel.refused severity=warn] A connection was not subscribed to the bus's systemChannel, so it gets no degraded or recovered events.`
+- **Cause:** The bus's open hook subscribes each connection with platform.subscribe(ws, systemChannel), which runs the application's subscribeBatch hook when it exports one and its subscribe hook otherwise, and the platform refused with the reason attribute. FORBIDDEN, UNAUTHENTICATED or APP_DEFINED (a reason the application wrote) mean that hook denied the topic, and INTERNAL_ERROR that it threw. RATE_LIMITED means the connection was at one of the adapter's per-connection subscribe limits, or the hook returned it. INVALID_TOPIC means the hook returned it, the adapter's topic check refused the name (over 256 characters, a control character, a quote or a backslash), or the adapter does not take a server-side subscribe to a __-prefixed topic. Reported only for a bus with a breaker, the only kind that publishes degraded and recovered events.
+- **Consequence:** Connections refused this way get every other message, but not the degraded and recovered events this bus publishes on the systemChannel. Reported once per bus.
+- **Automatic recovery:** None; a connection is subscribed once, when it opens.
+- **Next action:** Let the subscribeBatch or subscribe hook, whichever the application exports, allow the systemChannel topic (__realtime unless configured). For an adapter RATE_LIMITED, run the bus's open hook before code that subscribes the connection to its other topics; for an adapter INVALID_TOPIC on a custom systemChannel, use a plain name. If the hook allows the topic and the adapter still refuses a __-prefixed one, create the bus with systemChannel: false, as when no client needs the events.
+- **Runtime help:** `docs/errors.md#extensions-err-pubsub-system-channel-refused`
 - **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
 
 <a id="extensions-err-sharded-relay-burst"></a>

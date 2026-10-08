@@ -3,6 +3,8 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { registeredRecord } from '../helpers/diagnostic-line.js';
+import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 
 const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
@@ -1270,6 +1272,83 @@ describe('redis pubsub bus', () => {
 			expect(platform.subscribed).toEqual([]);
 
 			await noChBus.deactivate();
+		});
+
+		// Every console.warn line printed while `fn` runs, with the bus's
+		// subscribe refusal given time to settle.
+		async function warnings(fn) {
+			const lines = [];
+			const spy = vi.spyOn(console, 'warn').mockImplementation((line) => { lines.push(line); });
+			try { await fn(); await settle(); } finally { spy.mockRestore(); }
+			return lines;
+		}
+
+		// A bus that publishes degraded / recovered, which needs a breaker.
+		function healthBus() {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			return createPubSubBus(client, { breaker });
+		}
+
+		it('reports a refused systemChannel subscribe once, with the adapter reason', async () => {
+			// The adapter's platform.subscribe resolves its denial asynchronously,
+			// after the application's subscribe hook has run.
+			platform.subscribe = async () => 'FORBIDDEN';
+			const healthy = healthBus();
+			const lines = await warnings(async () => {
+				await healthy.hooks.open({ id: 'w1' }, { platform });
+				await healthy.hooks.open({ id: 'w2' }, { platform });
+			});
+
+			expect(lines).toHaveLength(1);
+			const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED);
+			expect(record.attributes).toEqual({ reason: 'FORBIDDEN' });
+
+			await healthy.deactivate();
+		});
+
+		it('reports a reason the application wrote without logging its text', async () => {
+			platform.subscribe = () => 'user 42 is not in room 7';
+			const healthy = healthBus();
+			const lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+
+			expect(lines).toHaveLength(1);
+			const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED);
+			expect(record.attributes).toEqual({ reason: 'APP_DEFINED' });
+			expect(lines[0]).not.toContain('user 42');
+
+			await healthy.deactivate();
+		});
+
+		it('reports nothing when the systemChannel subscribe succeeds', async () => {
+			platform.subscribe = async () => null;
+			const healthy = healthBus();
+			const lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+
+			expect(lines).toEqual([]);
+
+			await healthy.deactivate();
+		});
+
+		it('reports nothing on a bus without a breaker, which publishes no degraded or recovered', async () => {
+			platform.subscribe = async () => 'FORBIDDEN';
+			const lines = await warnings(() => bus.hooks.open({ id: 'w1' }, { platform }));
+
+			expect(lines).toEqual([]);
+
+			await bus.deactivate();
+		});
+
+		it('does not wait for the systemChannel subscribe to settle', async () => {
+			platform.subscribe = () => new Promise(() => {});
+			const healthy = healthBus();
+			const opened = await Promise.race([
+				healthy.hooks.open({ id: 'w1' }, { platform }).then(() => 'opened'),
+				new Promise((resolve) => setTimeout(() => resolve('waiting'), 500))
+			]);
+
+			expect(opened).toBe('opened');
+
+			await healthy.deactivate();
 		});
 
 		it('activates the Redis subscriber on first call', async () => {

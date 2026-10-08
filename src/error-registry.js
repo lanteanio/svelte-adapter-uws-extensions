@@ -83,6 +83,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	REGISTRY_INDEX_BUCKET: 'EXTENSIONS-ERR-REGISTRY-INDEX-BUCKET',
 	REGISTRY_USER_INDEX: 'EXTENSIONS-ERR-REGISTRY-USER-INDEX',
 	PUBSUB_RELAY_BURST: 'EXTENSIONS-ERR-PUBSUB-RELAY-BURST',
+	PUBSUB_SYSTEM_CHANNEL_REFUSED: 'EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED',
 	SHARDED_RELAY_BURST: 'EXTENSIONS-ERR-SHARDED-RELAY-BURST',
 	REDIS_DUPLICATES: 'EXTENSIONS-ERR-REDIS-DUPLICATES',
 	SMOOTH_OWNER_FALLBACK: 'EXTENSIONS-ERR-SMOOTH-OWNER-FALLBACK',
@@ -693,6 +694,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Yes; the batch drains every tick.',
 		nextAction: 'Find the publish-in-loop and yield between chunks, or send the list as one envelope with publishBatched.',
 		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-relay-burst', link: 'https://svti.me/pubsub-burst'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED,
+		event: 'redis.pubsub.system-channel.refused', component: 'runtime.redis.pubsub', severity: 'warn',
+		problemPrefix: 'A connection was not subscribed to the bus\'s systemChannel, so it gets no degraded or recovered events.',
+		cause: 'The bus\'s open hook subscribes each connection with platform.subscribe(ws, systemChannel), which runs the application\'s subscribeBatch hook when it exports one and its subscribe hook otherwise, and the platform refused with the reason attribute. FORBIDDEN, UNAUTHENTICATED or APP_DEFINED (a reason the application wrote) mean that hook denied the topic, and INTERNAL_ERROR that it threw. RATE_LIMITED means the connection was at one of the adapter\'s per-connection subscribe limits, or the hook returned it. INVALID_TOPIC means the hook returned it, the adapter\'s topic check refused the name (over 256 characters, a control character, a quote or a backslash), or the adapter does not take a server-side subscribe to a __-prefixed topic. Reported only for a bus with a breaker, the only kind that publishes degraded and recovered events.',
+		consequence: 'Connections refused this way get every other message, but not the degraded and recovered events this bus publishes on the systemChannel. Reported once per bus.',
+		automaticRecovery: 'None; a connection is subscribed once, when it opens.',
+		nextAction: 'Let the subscribeBatch or subscribe hook, whichever the application exports, allow the systemChannel topic (__realtime unless configured). For an adapter RATE_LIMITED, run the bus\'s open hook before code that subscribes the connection to its other topics; for an adapter INVALID_TOPIC on a custom systemChannel, use a plain name. If the hook allows the topic and the adapter still refuses a __-prefixed one, create the bus with systemChannel: false, as when no client needs the events.',
+		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-system-channel-refused'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST,

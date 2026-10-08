@@ -100,7 +100,9 @@ export interface PubSubBus {
 	 *
 	 * Subscribing through `platform.subscribe` (server-trust) intentionally
 	 * bypasses the wire-level `__`-prefix gate that the adapter enforces
-	 * on client-sent subscribe frames.
+	 * on client-sent subscribe frames. It still runs the app's subscribe /
+	 * subscribeBatch hook; on a bus with a breaker, a refusal is reported once as
+	 * `EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED`.
 	 */
 	hooks: {
 		open(ws: any, ctx: { platform: Platform }): Promise<void>;

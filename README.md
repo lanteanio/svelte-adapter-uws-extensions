@@ -382,7 +382,7 @@ See [Notifying clients of degradation](#notifying-clients-of-degradation) for th
 | Method | Description |
 |---|---|
 | `bus.wrap(platform)` | Returns a new Platform whose `publish()`, `batch()`, and `publishBatched()` send to Redis + local. Other Platform methods (`send`, `sendCoalesced`, `request`, `pressure`, etc.) pass through unchanged, and a method the platform does not have is `undefined` on the wrapped platform too. App-stashed convention slots (`platform.replay` for svelte-realtime's auto-replay routing) are forwarded as live getters so framework discovery survives the wrap on the cron seam |
-| `bus.hooks` | Ready-made WebSocket hooks. `open(ws, ctx)` activates the Redis subscriber (idempotent) AND subscribes `ws` to the bus's `systemChannel` so `degraded` / `recovered` events are delivered. Destructure for one-line `hooks.ws.js` wiring: `export const { open } = bus.hooks;` |
+| `bus.hooks` | Ready-made WebSocket hooks. `open(ws, ctx)` activates the Redis subscriber (idempotent) AND subscribes `ws` to the bus's `systemChannel` so `degraded` / `recovered` events are delivered. That subscribe runs your app's `subscribe` / `subscribeBatch` hook; on a bus with a `breaker` a refusal is reported once as `EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED`. Destructure for one-line `hooks.ws.js` wiring: `export const { open } = bus.hooks;` |
 | `bus.activate(platform)` | Start the Redis subscriber (idempotent). Equivalent to the subscriber half of `bus.hooks.open`; prefer `bus.hooks.open` for new code |
 | `bus.deactivate()` | Stop the subscriber |
 
@@ -3751,6 +3751,8 @@ import { bus } from '$lib/server/bus';
 // bus.hooks.open subscribes every connection to the systemChannel.
 // Without this wiring, degraded / recovered events publish into an
 // empty subscriber set and clients never hear about the outage.
+// Your subscribe / subscribeBatch hook decides that subscribe too, so
+// it must allow __realtime.
 export const { open } = bus.hooks;
 ```
 

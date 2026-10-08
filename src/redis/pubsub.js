@@ -27,6 +27,11 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
 
+// The subscribe denial reasons the adapter declares (its SubscribeDenialReason
+// type) and INTERNAL_ERROR, its answer when a subscribe hook throws. Any
+// other reason is text the application's hook wrote and is not logged.
+const ADAPTER_DENIAL_CODES = new Set(['UNAUTHENTICATED', 'FORBIDDEN', 'INVALID_TOPIC', 'RATE_LIMITED', 'INTERNAL_ERROR']);
+
 /**
  * @typedef {Object} PubSubBusOptions
  * @property {string} [channel='uws:pubsub'] - Redis channel name for pub/sub messages
@@ -212,6 +217,19 @@ export function createPubSubBus(client, options = {}) {
 			});
 		}
 		scheduleRelay(plain, count);
+	}
+
+	// A platform.subscribe(ws, systemChannel) result from the open hook: null
+	// when subscribed, a reason string when refused. Only a bus with a breaker
+	// publishes degraded / recovered, so only there does a refusal lose any.
+	const announcesHealth = !!(b && typeof b.subscribe === 'function');
+	let systemChannelRefusalReported = false;
+	function reportSystemChannelRefusal(denial) {
+		if (typeof denial !== 'string' || !announcesHealth || systemChannelRefusalReported) return;
+		systemChannelRefusalReported = true;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED, {
+			attributes: { reason: ADAPTER_DENIAL_CODES.has(denial) ? denial : 'APP_DEFINED' }
+		});
 	}
 
 	// Local delivery of one envelope relayed by another instance. The untraced
@@ -841,8 +859,13 @@ export function createPubSubBus(client, options = {}) {
 				// not the wire path, so it bypasses the adapter's `__`-prefix
 				// gate. Subscribing here is what restores `degraded` / `recovered`
 				// delivery after the wire path was closed in adapter 0.5.0-next.21.
+				// The platform still runs the application's subscribe /
+				// subscribeBatch hook, which can refuse the topic. A refusal is
+				// not awaited; on a bus with a breaker it is reported.
 				if (systemChannel) {
-					platform.subscribe(ws, systemChannel);
+					const denial = platform.subscribe(ws, systemChannel);
+					if (denial && typeof denial.then === 'function') denial.then(reportSystemChannelRefusal);
+					else reportSystemChannelRefusal(denial);
 				}
 				await bus.activate(platform);
 			}
