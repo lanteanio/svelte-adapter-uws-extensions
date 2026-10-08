@@ -753,6 +753,14 @@ export function createPresence(client, options = {}) {
 			const selected = select(safeData);
 			warnSensitive(selected);
 			const data = sanitizeSelected ? stripInternal(selected) : selected;
+			// A roster entry is an object; anything else would be stored as the
+			// user's data and skipped by every read-back. Checked on what is
+			// stored, after the strip (which turns a byte view into a string),
+			// and thrown before any state is staged and before the breaker guard,
+			// as the in-memory plugin does.
+			if (!data || typeof data !== 'object') {
+				throw new TypeError(`redis presence: select() must return a plain object, got ${data === null ? 'null' : typeof data}`);
+			}
 			// The key is part of every roster object's wire shape, so it must be
 			// resolved from the projected data rather than the raw connection data.
 			// A default-dropped email/session/ip therefore falls back to __conn:N

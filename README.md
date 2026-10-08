@@ -842,7 +842,7 @@ export async function close(ws, { platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `key` | `'id'` | Field in projected data for user dedup (multi-tab). If the default privacy projection drops it, presence warns and uses a per-connection key so the value cannot leak as the roster property name. |
-| `select` | recursive privacy projection | Extract public fields from userData. The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. Pass an explicit allowlist for app-specific privacy. |
+| `select` | recursive privacy projection | Extract public fields from userData; must return an object (`join()` throws a `TypeError` otherwise). The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. Pass an explicit allowlist for app-specific privacy. |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |

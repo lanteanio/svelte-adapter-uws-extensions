@@ -1256,14 +1256,16 @@ describe('redis presence', () => {
 	});
 
 	describe('key resolution from projected data', () => {
-		it('falls back cleanly when an explicit select returns a primitive', async () => {
+		it('refuses an explicit select that returns a primitive, storing nothing', async () => {
+			// Neither the primitive nor the private key behind select may reach
+			// the roster hash: the join throws before anything is staged.
 			const local = createPresence(client, { key: 'id', select: () => 'public-label' });
 			const ws = mockWs({ id: 'private-id' });
-			await local.join(ws, 'room', platform);
+			await expect(local.join(ws, 'room', platform)).rejects.toThrow(TypeError);
 
 			const hash = client._hashes.get(client.key('presence:topic:{room}'));
 			local.destroy();
-			expect([...hash.keys()]).toEqual(['__conn:1']);
+			expect(hash ? [...hash.keys()] : []).toEqual([]);
 		});
 
 		it('does not leak a key that select omitted through roster property names', async () => {

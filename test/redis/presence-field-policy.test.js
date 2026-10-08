@@ -440,6 +440,21 @@ describe('presence read-back from Redis', () => {
 		await presence.destroy?.();
 	});
 
+	it('join() refuses a select that does not return an object, before storing anything', async () => {
+		// A byte view passes as an object but is stored as a string after the
+		// strip, so it is refused too.
+		for (const select of [(u) => u.id, () => null, () => undefined, () => new Uint8Array(4)]) {
+			const client = mockRedisClient('p16:');
+			const platform = mockPlatform();
+			const presence = createPresence(client, { select });
+			await expect(presence.join(mockWs({ id: 'alice' }), 'room', platform)).rejects.toThrow(TypeError);
+			expect(await client.redis.hgetall('p16:presence:topic:{room}')).toEqual({});
+			// Nothing was staged locally either.
+			expect(presence.metrics().totalOnline).toBe(0);
+			await presence.destroy?.();
+		}
+	});
+
 	it('list() returns the identity the server set, not fields a client wrote', async () => {
 		// update() takes any non-reserved name a client sends, identity-shaped
 		// ones included, so durable fields stay out of list().

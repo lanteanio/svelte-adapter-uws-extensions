@@ -15,7 +15,8 @@ export interface RedisPresenceOptions {
 	 * Extract public fields from userData. The default recursively drops
 	 * internal keys, credentials, common personal data, and request transport
 	 * metadata. An explicit callback can intentionally admit fields; its result
-	 * still passes through `stripInternal()`.
+	 * still passes through `stripInternal()`. It must return an object:
+	 * `join()` throws a `TypeError` otherwise.
 	 * @default privacy projection
 	 */
 	select?: (userData: any) => Record<string, any>;
