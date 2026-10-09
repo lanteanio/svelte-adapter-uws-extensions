@@ -9,7 +9,7 @@
  * @module svelte-adapter-uws-extensions/redis/presence/data
  */
 
-import { isReservedPresenceField, withoutReservedNames } from './field-policy.js';
+import { isReservedPresenceField, withoutReservedNames, mergeFields, newFieldMap } from './field-policy.js';
 import { isSensitiveFieldName, isStructurallyUnsafeFieldName } from '../../shared/sensitive-names.js';
 
 /**
@@ -181,16 +181,37 @@ export function deepEqual(a, b, depth, budget) {
 }
 
 /**
+ * Stored dynamic fields minus the names the tracker's `update()` rule refuses.
+ * A value that is not a plain object is no fields at all: `publicData` reads
+ * `Object.keys`, which turns a stored string or array into index-named fields.
+ * Returned as-is when every name is accepted, the common case.
+ * @param {unknown} fields
+ * @param {(k: string) => boolean} acceptsField
+ * @returns {Record<string, any> | null | undefined}
+ */
+function acceptedFields(fields, acceptsField) {
+	if (fields === undefined || fields === null) return fields;
+	if (typeof fields !== 'object' || Array.isArray(fields)) return null;
+	for (const k in fields) {
+		if (!acceptsField(k)) return mergeFields(newFieldMap(), fields, acceptsField);
+	}
+	return /** @type {Record<string, any>} */ (fields);
+}
+
+/**
  * Parse the per-topic hash HGETALL result into a Map<userKey, {data, ts}>.
  * Staleness filtering and cross-instance deduplication are no longer
  * needed: the new storage layout uses one field per userKey (Redis
  * collapses cross-instance writes via HSET on the same field), and per-
  * field HPEXPIRE removes stale entries before HGETALL sees them. So this
  * is now just a JSON-parse + drop-corrupted loop, plus the field rule on each
- * entry's `data` that the local join applies: anything with write access to
- * the hash can store such names, and publicData filters only `fields`.
+ * entry's `data` that the local join applies, and the tracker's `update()`
+ * rule on its `fields`: anything with write access to the hash can store
+ * names neither path writes.
+ * @param {Record<string, string>} all
+ * @param {(k: string) => boolean} acceptsField - the tracker's `fromServer` field rule
  */
-export function parseEntries(all) {
+export function parseEntries(all, acceptsField) {
 	const seen = new Map();
 	for (const userKey of Object.keys(all)) {
 		let entry;
@@ -202,6 +223,7 @@ export function parseEntries(all) {
 		// reads entry.data as the user's identity.
 		if (entry === null || entry.data === null || typeof entry.data !== 'object') continue;
 		entry.data = withoutReservedNames(entry.data);
+		entry.fields = acceptedFields(entry.fields, acceptsField);
 		seen.set(userKey, entry);
 	}
 	return seen;

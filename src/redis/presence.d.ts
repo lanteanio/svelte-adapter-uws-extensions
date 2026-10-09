@@ -66,6 +66,30 @@ export interface RedisPresenceOptions {
 	 */
 	maxEnvelopeBytes?: number;
 	/**
+	 * Field names a client may write through a wire `presence-update` frame.
+	 *
+	 * Unset (the default), a client frame writes no field at all. Set it to
+	 * accept exactly the listed names. Every listed name is one any client on
+	 * the topic can write for itself, so listing a reserved name such as `role`
+	 * lets clients set their own role. `select` is read once per connection, at
+	 * join; a server-owned value that changes during a session goes under an
+	 * unreserved name of its own, written with `update()` while this is unset.
+	 * Prototype and `__`-prefixed names are always taken out of the list.
+	 *
+	 * Direct server calls to {@link RedisPresenceTracker.update} keep the
+	 * reserved-name guard while this is unset. Once it is set, the same list is
+	 * also the whole rule for direct calls: a server call then writes only
+	 * listed names, and an empty list lets nothing through.
+	 *
+	 * @example
+	 * ```js
+	 * const presence = createPresence(redis, { clientUpdateFields: ['typing', 'selection'] });
+	 * ```
+	 *
+	 * @default undefined // wire presence-update frames write nothing
+	 */
+	clientUpdateFields?: string[];
+	/**
 	 * Dynamic field names (set via `update()`) that are broadcast live but
 	 * NEVER persisted to Redis and NEVER included in the `state` snapshot or
 	 * the heartbeat roster. A (re)joining or swept-then-readded client never
@@ -177,10 +201,27 @@ export interface RedisPresenceTracker {
 	 * any instance - may call it. A connection not present on the topic is a
 	 * silent no-op. No-op if no field actually changed. Mirrors the in-memory
 	 * `presence.update`.
+	 *
+	 * This method is the trusted server-side path. Server-reserved field names
+	 * are stripped by default: the dedup key field, `id`, `userId`, `role`,
+	 * `roles` and `userRole` in any case or separator spelling, `__`-prefixed,
+	 * `constructor`, `prototype`, and credential-shaped, personal-data and
+	 * transport names. Outside production the first refusal of each identity
+	 * name logs a warning. The `clientUpdateFields` option replaces that guard
+	 * with an explicit allowlist and independently gates wire
+	 * `presence-update` frames. Dynamic fields relayed by another instance and
+	 * read back from Redis get the same rule.
 	 */
 	update(ws: any, topic: string, fields: Record<string, any>, platform: Platform): Promise<void>;
 
-	/** Get the current presence list for a topic. */
+	/**
+	 * Get the current presence list for a topic.
+	 *
+	 * Each entry is the value the `state` snapshot puts on the wire: the
+	 * identity produced by `select` plus the durable `update()` fields, minus
+	 * anything named in `transient`. An SSR render and the client's first
+	 * WebSocket snapshot therefore agree. Returns copies.
+	 */
 	list(topic: string): Promise<Record<string, any>[]>;
 
 	/** Get the number of unique users present on a topic. */
@@ -232,7 +273,8 @@ export interface RedisPresenceTracker {
 	 * `subscribe` handles both regular topics (calls `join`) and `__presence:*`
 	 * topics (calls `sync` so the client gets the current list immediately).
 	 * `message` serves the client's `presence-snapshot` and `presence-update`
-	 * frames. `unsubscribe` removes presence from a single topic when the
+	 * frames; a `presence-update` frame writes only the names
+	 * `clientUpdateFields` lists. `unsubscribe` removes presence from a single topic when the
 	 * client unsubscribes (requires core adapter v0.4.0+). `close` calls
 	 * `leave`.
 	 *

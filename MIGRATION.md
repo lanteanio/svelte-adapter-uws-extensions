@@ -373,6 +373,30 @@ only what peers should see. Presence alone drops top-level `__`-prefixed,
 `constructor` and `prototype` names from it. Keep `presence.key` on a
 non-secret selected identifier.
 
+### Redis presence updates from clients need `clientUpdateFields`
+
+**Symptom.** Typing indicators, selections or other state a client sends as a
+`presence-update` frame stop reaching peers. A server-side `presence.update()`
+that sets `id`, `role`, the key field, or a credential, personal-data or
+transport name such as `email` drops that field, with a one-time warning per
+identity name outside production. `presence.list()` entries gain the durable
+`update()` fields.
+
+**Why.** A client frame could write any field name, `id` and `role` included.
+It was stored in Redis, relayed to every instance and rendered by every peer,
+so a client could change the identity peers saw for it or publish private
+data under its own entry. The in-memory plugin refuses the same names.
+
+**Action.** List the fields clients may write:
+`createPresence(redis, { clientUpdateFields: ['typing', 'selection'] })`.
+That list is then also the whole rule for server calls, and every name on it
+is one clients can write. A server `update()` that set `role` during a
+session no longer does: `select` is read once per connection, at join, so a
+server-owned value that changes later goes under a name of its own that is not
+reserved, such as `isHost`, written with `update()` while `clientUpdateFields`
+is unset. Code that read only the identity from `list()` should pick the
+fields it needs.
+
 ### Authorization now fails closed
 
 `presence.sync`, `cursor.snapshot` / `cursor.attach` and the replay resume gate

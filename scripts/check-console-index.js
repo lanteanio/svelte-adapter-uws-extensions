@@ -90,6 +90,11 @@ export const UNINDEXED = new Map(Object.entries({
 	"redis/presence/state.js::[extensions] redis presence: key field '{}' is private or transport metadata, so the default projection drops it and each connection gets its own presence entry. A presence key is broadcast as a roster property: use a non-secret id, or pass an explicit select() to opt in.": 'names the field, the consequence for the roster, and the explicit select that resolves it; the adapter records its presence twin the same way',
 	'shared/sensitive.js::[extensions] [{}] userData key "{}" looks sensitive; use the select option to strip it before broadcasting See: https://svti.me/userdata-sensitive': 'names the key, the exposure and the remedy, with a short link; the adapter records its userData twin the same way',
 
+	// Development-only advisory, once per reserved identity name, for a server
+	// update() whose field was refused; it names the field and the option that
+	// admits it, and production never prints it.
+	"redis/presence/field-policy.js::[extensions] redis presence.update(): field '{}' is reserved and was dropped. Reserved names are the dedup key field, id, userId, role, roles, userRole, __-prefixed, constructor/prototype and credential-shaped names, so a client cannot overwrite the identity its peers see. If this call is server-owned and intentional, pass clientUpdateFields: [{}, ...] to replace the guard with an explicit allowlist; clients can then write every listed name too, so a server-owned value is better kept under an unreserved name of its own.": 'a development-only hint that names the refused field and the clientUpdateFields entry that admits it; the adapter prints its twin the same way',
+
 	// Wiring advisory for the developer who connected the hook.
 	'redis/cursor/diagnostics.js::[redis/cursor] hooks.message called with unexpected shape ({}). Expected a parsed object {type:"cursor", topic, data} or {type:"cursor-snapshot", topic}. If you wired this from `createMessage({ onUnhandled })` and got raw bytes, switch to `createMessage({ onJsonMessage(ws, msg, platform) { ... } })` which forwards the parsed JSON envelope. This warning fires once per process. See: https://svti.me/cursor-hooks-message': 'names the shape received, the shape expected, the hook that forwards the parsed envelope, and a short link; printed once per process'
 }));

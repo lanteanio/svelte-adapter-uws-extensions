@@ -20,6 +20,7 @@ import { hashFieldTTLSupport } from '../../shared/redis-version.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { makeKeys } from './keys.js';
 import { makePublicData, makeDefaultPresenceSelect } from './data.js';
+import { createFieldNameRule, createReservedFieldWarner } from './field-policy.js';
 
 /**
  * Assemble the presence context for one createPresence instance.
@@ -43,6 +44,14 @@ export function createPresenceState(client, options = {}) {
 			'broadcast as a roster property: use a non-secret id, or pass an explicit select() to opt in.'
 		);
 	}
+	// A wire presence-update frame writes nothing unless the application lists
+	// the names it lets clients write. A bare string is the obvious typo, and
+	// reading it as "unset" would make the requested client update vanish.
+	if (options.clientUpdateFields !== undefined && !Array.isArray(options.clientUpdateFields)) {
+		throw new Error('redis presence: clientUpdateFields must be an array of field names');
+	}
+	const fieldNames = createFieldNameRule(keyField, options.clientUpdateFields);
+	const warnReservedField = fieldNames.listsClientFields ? null : createReservedFieldWarner(keyField);
 	const heartbeatInterval = options.heartbeat ?? 30000;
 	const presenceTtl = options.ttl ?? 90;
 
@@ -276,6 +285,8 @@ export function createPresenceState(client, options = {}) {
 	return {
 		keyField,
 		select,
+		fieldNames,
+		warnReservedField,
 		heartbeatInterval,
 		presenceTtl,
 		presenceTtlMs,

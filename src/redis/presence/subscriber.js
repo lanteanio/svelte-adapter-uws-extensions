@@ -129,10 +129,11 @@ function isValidPresencePayload(event, payload) {
  *   localData: Map<string, Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>>,
  *   emit: (fullTopic: string, event: string, data: any, platform: any, opts?: any) => void,
  *   eventChannel: (topic: string) => string,
- *   mKeyspaceCleanups: { inc: () => void } | null | undefined
+ *   mKeyspaceCleanups: { inc: () => void } | null | undefined,
+ *   acceptsField: (k: string) => boolean
  * }} deps
  */
-export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups }) {
+export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups, acceptsField }) {
 	// Redis subscriber for cross-instance join/leave events
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -646,19 +647,19 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 							// rejects - so an all-reserved envelope passed the
 							// test and fanned an `update` diff carrying nothing
 							// out to every local subscriber.
-							const changed = mergeFields(newFieldMap(), durable);
-							mergeFields(changed, transient);
+							const changed = mergeFields(newFieldMap(), durable, acceptsField);
+							mergeFields(changed, transient, acceptsField);
 							if (Object.keys(changed).length > 0) {
 								bufferUpdate(topic, key, changed, activePlatform);
 								const localEntry = localData.get(topic)?.get(key);
 								if (localEntry) {
 									if (!localEntry.fields) localEntry.fields = newFieldMap();
-									// Same rule as the local presence-update ingress:
-									// a forged envelope must not land a field name the
-									// client path refuses, or the bus becomes a way to
-									// inject phantom fields into every roster frame.
-									mergeFields(localEntry.fields, durable);
-									mergeFields(localEntry.fields, transient);
+									// The server rule of update(): a forged envelope
+									// must not land a field name a server call cannot
+									// write, or the bus becomes a way to plant an
+									// identity or a private field in every roster frame.
+									mergeFields(localEntry.fields, durable, acceptsField);
+									mergeFields(localEntry.fields, transient, acceptsField);
 								}
 							}
 						}

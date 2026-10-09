@@ -845,6 +845,7 @@ export async function close(ws, { platform }) {
 | `select` | the `key` field only | Extract the public roster data from userData; must return an object (`join()` throws a `TypeError` otherwise). The default copies only the `key` field, and only a string or finite-number value. An explicit `select` is used as-is apart from top-level `__`-prefixed, `constructor` and `prototype` names, so make it an allowlist. |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
+| `clientUpdateFields` | unset | Field names a client may write through a wire `presence-update` frame. Unset, a client frame writes nothing. Set, only the listed names are taken, and the list is also the whole rule for direct `update()` calls in place of the reserved-name guard; every listed name is one clients can write, and prototype and `__`-prefixed names are always left out. A non-array value throws at construction. See [Field-level updates](#field-level-updates). |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
 | `keyspaceNotifications` | `false` | Subscribe to the server's `__keyevent@*__:del`. When a per-topic presence hash is removed (its last field's TTL lapsed - the instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 | `consistencyAuditIntervalMs` | `5000` | Interval in ms for the per-instance consistency auditor, a slow unref'd background check that this instance's per-topic member-count map and local reverse index agree on their distinct-user cardinality. Never runs on the hot path. A desync logs and counts under `redis.presence.local-index-desync` (soft); only one that persists across two consecutive audits of the same bounded window escalates to a deferred process restart. Set `0` to disable entirely. |
@@ -888,6 +889,19 @@ const presence = createPresence(redis, {
   transient: ['typing']   // broadcast live, never snapshotted
 });
 ```
+
+A client sends its own field updates as `{ type: 'presence-update', topic, fields }` frames; `hooks.message` routes a parsed frame to `update()`. Such a frame writes nothing unless the app lists the names clients may write:
+
+```js
+const presence = createPresence(redis, {
+  key: 'id',
+  select: (ud) => ({ id: ud.id, name: ud.name }),
+  clientUpdateFields: ['typing', 'selection'],
+  transient: ['typing']
+});
+```
+
+A direct `update()` from server code can write any other name except the identity peers see (the key field, `id`, `userId`, `role`, `roles`, `userRole`, in any case or separator spelling), `__`-prefixed and prototype names, credential-shaped, personal-data and transport names such as `apiKey`, `email` or `ip`, and names longer than 64 characters. Outside production the first refusal of each identity name logs a warning. When `clientUpdateFields` is set it is the whole rule for server calls too: a server call then writes only listed names, and every listed name is one any client can also write for itself, so there is no way to let only the server write an identity name such as `role`. The identity in `select` is read once per connection, when it joins. A server-owned value that changes during a session, such as a promoted host, goes under a name of its own that is not reserved (`isHost`, say) and is written with `update()`; that works while `clientUpdateFields` is unset, because a server call may then write any unreserved name and a client none. With `clientUpdateFields` set, a server call writes only listed names, and clients can write those too. A dynamic field relayed by another instance or read back from Redis gets the same rule, so a forged relay message or a value written straight into Redis cannot add a dynamic field `update()` refuses. The identity data on those paths is screened like the local join's: only `__`-prefixed, `constructor` and `prototype` names are dropped from it. `list()` returns the same value as the `state` snapshot: the identity plus the durable fields.
 
 Additive and wire-compatible: a deployment that never calls `update()` sends the byte-identical `{joins, leaves}` diff as before, and an old client ignores `updates`. The behavior mirrors the bundled in-memory `presence.update` / `transient` in `svelte-adapter-uws`, so the same client store handles both single-instance and clustered deployments.
 

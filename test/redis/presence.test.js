@@ -2198,7 +2198,8 @@ describe('redis presence - client presence-update message frame', () => {
 			data: { type: 'presence-update', topic: 'room', fields: { typing: true } },
 			platform
 		});
-		expect(spy).toHaveBeenCalledWith(ws, 'room', { typing: true }, platform);
+		// Flagged as a client frame, so update() applies clientUpdateFields.
+		expect(spy).toHaveBeenCalledWith(ws, 'room', { typing: true }, platform, true);
 		await Promise.resolve();
 		spy.mockRestore();
 	});

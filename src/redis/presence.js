@@ -65,7 +65,7 @@ import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './pre
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
-import { isReservedPresenceField, newFieldMap, withoutReservedNames } from './presence/field-policy.js';
+import { newFieldMap, withoutReservedNames } from './presence/field-policy.js';
 import { createDiffBuffer } from './presence/diff-buffer.js';
 import { createSubscriber } from './presence/subscriber.js';
 import { createPresenceState } from './presence/state.js';
@@ -86,6 +86,7 @@ export { WsClosedError };
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
  * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:del` so a topic's local subscribers receive an empty `state` event the moment its per-topic presence hash is removed (instance-died scenario: the server deletes the hash when its last field's TTL lapses). Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset including `E` and `g`) on every master; Redis accepts the subscription without it, so the tracker reads the setting when it subscribes and reports flags that cannot deliver the deletion (a server that refuses CONFIG is not checked). Per-field expiry that leaves other users on the topic does not fire it.
  * @property {number} [maxEnvelopeBytes=1048576] - Byte ceiling for one cross-instance presence envelope, enforced before inbound JSON.parse and before outbound publish. Oversized outbound lifecycle events warn and drop rather than failing the connection operation.
+ * @property {string[]} [clientUpdateFields] - Field names a client's wire `presence-update` frame may write. Unset (the default), a client frame writes nothing. Set, it is also the whole rule for direct `update()` calls, replacing the reserved-name guard; prototype and `__`-prefixed names are always left out.
  * @property {string[]} [transient] - Dynamic field names (set via `update()`) that are broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or the heartbeat roster. A (re)joining or swept-then-readded client therefore never inherits a possibly-stale transient value - a disconnected typer leaves no stuck indicator across the cluster. Identity fields (from `select`) and durable `update()` fields not listed here persist and ride the snapshot normally. Default: none (every `update()` field is durable). Matches the bundled in-memory presence plugin.
  */
 
@@ -120,7 +121,7 @@ export { WsClosedError };
 export function createPresence(client, options = {}) {
 	const ctx = createPresenceState(client, options);
 	const {
-		keyField, select, heartbeatInterval, presenceTtlMs, transientFields, publicData,
+		keyField, select, fieldNames, warnReservedField, heartbeatInterval, presenceTtlMs, transientFields, publicData,
 		emit, emitTo, instanceId, redis, keyspaceNotifications, maxEnvelopeBytes, ensureRedis74, b, mt,
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
 		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, mSelfPreserveActive, mSelfPreserveHeld,
@@ -320,7 +321,8 @@ export function createPresence(client, options = {}) {
 		localData,
 		emit,
 		eventChannel,
-		mKeyspaceCleanups
+		mKeyspaceCleanups,
+		acceptsField: fieldNames.fromServer
 	});
 	const { subscribeToTopic, unsubscribeFromTopic } = subscriberCtx;
 
@@ -958,7 +960,7 @@ export function createPresence(client, options = {}) {
 			// Send current snapshot to this connection. Flat `{[key]: data}`
 			// shape mirrors the adapter's bundled presence plugin so a single
 			// client decoder handles both implementations.
-			const entries = parseEntries(all);
+			const entries = parseEntries(all, fieldNames.fromServer);
 			/** @type {Record<string, Record<string, any>>} */
 			const state = Object.create(null);
 			for (const [userKey, entry] of entries) {
@@ -1033,7 +1035,7 @@ export function createPresence(client, options = {}) {
 				throw err;
 			}
 			const presenceTopic = '__presence:' + topic;
-			const entries = parseEntries(all);
+			const entries = parseEntries(all, fieldNames.fromServer);
 			/** @type {Record<string, Record<string, any>>} */
 			const state = Object.create(null);
 			for (const [userKey, entry] of entries) {
@@ -1072,9 +1074,24 @@ export function createPresence(client, options = {}) {
 			}
 		},
 
-		async update(ws, topic, fields, platform) {
+		async update(ws, topic, fields, platform, fromClient = false) {
 			if (topic.startsWith('__')) return;
 			if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return;
+			// A client frame is cut down to the listed names before anything reads
+			// a value. With no allowlist it returns without touching the fields at
+			// all, so an unlisted getter or toJSON never runs.
+			let effective = fields;
+			if (fromClient) {
+				if (!fieldNames.listsClientFields) return;
+				effective = newFieldMap();
+				let accepted = false;
+				for (const k of Object.keys(fields)) {
+					if (!fieldNames.fromClient(k)) continue;
+					effective[k] = fields[k];
+					accepted = true;
+				}
+				if (!accepted) return;
+			}
 			// Resolve the user this connection represents on the topic from local
 			// state. A connection that is not present (never joined, or its join
 			// has not committed localData yet during an async gap) is a silent
@@ -1098,10 +1115,16 @@ export function createPresence(client, options = {}) {
 			/** @type {Record<string, any>} */
 			const changedTransient = newFieldMap();
 			let any = false;
-			for (const k of Object.keys(fields)) {
-				// One rule for every fields ingress - see field-policy.js.
-				if (isReservedPresenceField(k)) continue;
-				const v = fields[k];
+			for (const k of Object.keys(effective)) {
+				// The server rule: the allowlist when there is one, otherwise no
+				// identity and no credential, personal-data or transport name. A
+				// client frame has already been cut down to listed names, which
+				// this passes. The relay and the read-back apply the same rule.
+				if (!fieldNames.fromServer(k)) {
+					if (warnReservedField) warnReservedField(k);
+					continue;
+				}
+				const v = effective[k];
 				if (!deepEqual(entry.fields[k], v)) {
 					entry.fields[k] = v;
 					if (transientFields.has(k)) changedTransient[k] = v;
@@ -1154,13 +1177,14 @@ export function createPresence(client, options = {}) {
 			await ensureRedis74();
 			const all = await withBreaker(b, () => redis.hgetall(topicHashKey(topic)));
 			const result = [];
-			// The same read-back as the state snapshot, which applies the field
-			// rule. Identity only: durable fields are written by update(), which
-			// takes any non-reserved name a client sends. The rebuilt `data` of an
-			// entry that had a reserved name has a null prototype; it is copied
-			// so the caller always gets ordinary objects.
-			for (const [, entry] of parseEntries(all)) {
-				const data = entry.data;
+			// publicData(), not entry.data: the identity plus the durable update()
+			// fields, minus transient - the value the `state` snapshot sends, so an
+			// SSR render and the client's first snapshot agree. The read-back is the
+			// snapshot's, with the same field rule. Every call parses the hash
+			// afresh, so nothing returned is shared; only an entry rebuilt with a
+			// null prototype is copied, so the caller always gets ordinary objects.
+			for (const [, entry] of parseEntries(all, fieldNames.fromServer)) {
+				const data = publicData(entry);
 				result.push(Object.getPrototypeOf(data) === null ? { ...data } : data);
 			}
 			return result;
@@ -1356,9 +1380,10 @@ export function createPresence(client, options = {}) {
 				}
 				if (data && data.type === 'presence-update' && typeof data.topic === 'string' && data.fields && typeof data.fields === 'object') {
 					// Client-pushed field update (mirrors the in-memory presence
-					// plugin). `update` self-gates on membership and field shape, then
-					// splits durable/transient and relays the change cross-instance.
-					tracker.update(ws, data.topic, data.fields, platform).catch(() => { /* surfaced via breaker */ });
+					// plugin). `update` takes only the names clientUpdateFields lists,
+					// self-gates on membership and field shape, then splits
+					// durable/transient and relays the change cross-instance.
+					tracker.update(ws, data.topic, data.fields, platform, true).catch(() => { /* surfaced via breaker */ });
 				}
 			},
 			async unsubscribe(ws, topic, { platform }) {

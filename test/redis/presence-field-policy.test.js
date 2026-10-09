@@ -453,16 +453,18 @@ describe('presence read-back from Redis', () => {
 		}
 	});
 
-	it('list() returns the identity the server set, not fields a client wrote', async () => {
-		// update() takes any non-reserved name a client sends, identity-shaped
-		// ones included, so durable fields stay out of list().
+	it('list() returns the identity plus the durable fields update() accepted', async () => {
+		// The state snapshot's value: an identity-shaped name never gets past
+		// update(), so the identity in list() is the one the server set.
 		const client = mockRedisClient('p14:');
 		const platform = mockPlatform();
 		const presence = createPresence(client, opts);
 		const alice = mockWs({ id: 'alice' });
 		await presence.join(alice, 'room', platform);
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		await presence.update(alice, 'room', { color: 'red', id: 'bob' }, platform);
-		expect(await presence.list('room')).toEqual([{ id: 'alice' }]);
+		warn.mockRestore();
+		expect(await presence.list('room')).toEqual([{ id: 'alice', color: 'red' }]);
 		await presence.destroy?.();
 	});
 
