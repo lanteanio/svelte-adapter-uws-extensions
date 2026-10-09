@@ -59,6 +59,7 @@ import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
+import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
@@ -131,6 +132,9 @@ export function createPresence(client, options = {}) {
 	} = ctx;
 
 	let lastHeartbeatLatency = 0;
+	// Set while heartbeat publishes keep failing, so a failure streak is
+	// reported once; a heartbeat with no failure clears it.
+	let heartbeatPublishReported = false;
 	let staleCleanedTotal = 0;
 	let connCounter = 0;
 
@@ -273,6 +277,10 @@ export function createPresence(client, options = {}) {
 		// instance stopped heartbeating, exactly the behavior the previous
 		// CLEANUP_SCRIPT simulated at every tick.
 		const commands = [];
+		let publishFailed = 0;
+		let published = 0;
+		let firstPublishError = null;
+		let firstFailedTopic = '';
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
 			if (data && data.size > 0) {
@@ -297,11 +305,30 @@ export function createPresence(client, options = {}) {
 					/** @type {Record<string, any>} */
 					const dataMap = Object.create(null);
 					for (const [userKey, entry] of data) dataMap[userKey] = publicData(entry);
-					emit('__presence:' + topic, 'heartbeat', dataMap, subscriberCtx.activePlatform);
+					// Per topic: a publish that throws for one topic must not end the
+					// tick, which would skip every other topic's heartbeat and, worse,
+					// the TTL refresh below for all of them, letting the whole
+					// instance's roster expire. The failure is reported, not dropped.
+					published++;
+					try {
+						emit('__presence:' + topic, 'heartbeat', dataMap, subscriberCtx.activePlatform);
+					} catch (err) {
+						if (publishFailed++ === 0) { firstPublishError = err; firstFailedTopic = topic; }
+					}
 				}
 			}
 		}
 		execMultiSlot(redis, commands).catch(() => {});
+		if (publishFailed === 0) {
+			heartbeatPublishReported = false;
+		} else if (!heartbeatPublishReported) {
+			heartbeatPublishReported = true;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_HEARTBEAT_PUBLISH, {
+				error: firstPublishError,
+				redact: [firstFailedTopic, '__presence:' + firstFailedTopic],
+				attributes: { failed: publishFailed, topics: published }
+			});
+		}
 		lastHeartbeatLatency = monotonicNow() - tickStart;
 		mHeartbeatLatency?.set(lastHeartbeatLatency);
 	}, heartbeatInterval);
@@ -738,6 +765,10 @@ export function createPresence(client, options = {}) {
 	const tracker = {
 		async join(ws, topic, platform) {
 			if (topic.startsWith('__')) return;
+			// Ignored, like a `__` topic: no frame can carry it, so its roster
+			// could never be sent and every heartbeat for it would fail. The wire
+			// subscribe path refuses such topics before this hook runs.
+			if (!isFramableTopic(topic)) return;
 
 			let connTopics = wsTopics.get(ws);
 			if (connTopics && connTopics.has(topic)) return;
@@ -990,6 +1021,8 @@ export function createPresence(client, options = {}) {
 			// there is no roster to send and no event channel to open for one.
 			// Before the breaker guard, which would otherwise spend a probe.
 			if (typeof topic !== 'string' || topic.startsWith('__')) return;
+			// No frame can carry such a topic; the adapter's own code for it.
+			if (!isFramableTopic(topic)) return 'INVALID_TOPIC';
 			b?.guard();
 			// Authorize against the REAL topic before granting tap-channel
 			// membership (mirrors in-memory presence sync + the cursor snapshot):

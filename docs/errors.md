@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 64 diagnostic events. Each is one canonical line
+- 66 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -51,12 +51,14 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-CLOCK-LEADER-OFFSET](#extensions-err-clock-leader-offset) | `redis.clock.leader-offset-read.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.clock event=redis.clock.leader-offset-read.failed severity=warn] The cluster-clock leader offset could not be published or read; the prior state remains active.` |
 | [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber) | `redis.cursor.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.subscriber.failed severity=error] The Redis cursor subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup) | `redis.cursor.cleanup.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.cleanup.failed severity=warn] Cursor stale-entry cleanup failed; the next sweep retries.` |
+| [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush) | `redis.cursor.flush.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.flush.failed severity=warn] A cursor tick could not publish one or more topics; the other topics were flushed.` |
 | [EXTENSIONS-ERR-GROUPS-META-INITIALIZE](#extensions-err-groups-meta-initialize) | `redis.groups.meta-initialize.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.meta-initialize.failed severity=warn] The initial Redis group metadata write failed.` |
 | [EXTENSIONS-ERR-GROUPS-HEARTBEAT](#extensions-err-groups-heartbeat) | `redis.groups.heartbeat.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.heartbeat.failed severity=warn] A Redis group heartbeat pipeline failed.` |
 | [EXTENSIONS-ERR-GROUPS-SUBSCRIBER](#extensions-err-groups-subscriber) | `redis.groups.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.subscriber.failed severity=error] The Redis group subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-LEADER-TICK](#extensions-err-leader-tick) | `redis.leader.tick.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.leader event=redis.leader.tick.failed severity=error] A Redis leader election tick failed; leadership is fail-closed.` |
 | [EXTENSIONS-ERR-LEADER-READ-CURRENT](#extensions-err-leader-read-current) | `redis.leader.read-current.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.leader event=redis.leader.read-current.failed severity=warn] The current Redis leader could not be read.` |
 | [EXTENSIONS-ERR-LEADER-RELEASE](#extensions-err-leader-release) | `redis.leader.release.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.leader event=redis.leader.release.failed severity=warn] The Redis leader lease could not be released; it expires by TTL.` |
+| [EXTENSIONS-ERR-PRESENCE-HEARTBEAT-PUBLISH](#extensions-err-presence-heartbeat-publish) | `redis.presence.heartbeat.publish-failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.heartbeat.publish-failed severity=warn] A presence heartbeat could not be published for one or more topics; the TTL refresh and the other topics went ahead.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER](#extensions-err-presence-keyspace-subscriber) | `redis.presence.keyspace-subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscriber.failed severity=error] A presence keyspace-notification subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE](#extensions-err-presence-keyspace-subscribe) | `redis.presence.keyspace-subscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-subscribe.failed severity=warn] The presence keyspace cleanup could not subscribe to key-deletion events.` |
 | [EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF](#extensions-err-presence-keyspace-events-off) | `redis.presence.keyspace-events.off` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.keyspace-events.off severity=warn] A Redis server's keyspace notification setting cannot deliver the key deletions the presence cleanup listens for.` |
@@ -110,7 +112,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 64 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 66 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -129,12 +131,14 @@ Indexed events:
 - `redis.clock.leader-offset-read.failed` - [EXTENSIONS-ERR-CLOCK-LEADER-OFFSET](#extensions-err-clock-leader-offset)
 - `redis.cursor.subscriber.failed` - [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber)
 - `redis.cursor.cleanup.failed` - [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup)
+- `redis.cursor.flush.failed` - [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush)
 - `redis.groups.meta-initialize.failed` - [EXTENSIONS-ERR-GROUPS-META-INITIALIZE](#extensions-err-groups-meta-initialize)
 - `redis.groups.heartbeat.failed` - [EXTENSIONS-ERR-GROUPS-HEARTBEAT](#extensions-err-groups-heartbeat)
 - `redis.groups.subscriber.failed` - [EXTENSIONS-ERR-GROUPS-SUBSCRIBER](#extensions-err-groups-subscriber)
 - `redis.leader.tick.failed` - [EXTENSIONS-ERR-LEADER-TICK](#extensions-err-leader-tick)
 - `redis.leader.read-current.failed` - [EXTENSIONS-ERR-LEADER-READ-CURRENT](#extensions-err-leader-read-current)
 - `redis.leader.release.failed` - [EXTENSIONS-ERR-LEADER-RELEASE](#extensions-err-leader-release)
+- `redis.presence.heartbeat.publish-failed` - [EXTENSIONS-ERR-PRESENCE-HEARTBEAT-PUBLISH](#extensions-err-presence-heartbeat-publish)
 - `redis.presence.keyspace-subscriber.failed` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER](#extensions-err-presence-keyspace-subscriber)
 - `redis.presence.keyspace-subscribe.failed` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBE](#extensions-err-presence-keyspace-subscribe)
 - `redis.presence.keyspace-events.off` - [EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF](#extensions-err-presence-keyspace-events-off)
@@ -491,6 +495,18 @@ the stable ID tag on the line):
 - **Runtime help:** `docs/errors.md#extensions-err-cursor-cleanup`
 - **Runtime sources:** [src/redis/cursor/redis-io.js](../src/redis/cursor/redis-io.js)
 
+<a id="extensions-err-cursor-flush"></a>
+## `EXTENSIONS-ERR-CURSOR-FLUSH`
+
+- **Code/event:** `redis.cursor.flush.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.flush.failed severity=warn] A cursor tick could not publish one or more topics; the other topics were flushed.`
+- **Cause:** Publishing a topic's coalesced cursor frame threw during a tick. The failed attribute counts those topics out of the flushed attribute, and the error attribute is the first failure.
+- **Consequence:** Viewers on the failed topics miss those positions; the next move on such a topic is tried again on a later tick. Reported once per failure streak; a streak ends after ten seconds with no failed flush.
+- **Automatic recovery:** Every later tick publishes again.
+- **Next action:** Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their cursor data. Topics are not logged, since they can carry user ids.
+- **Runtime help:** `docs/errors.md#extensions-err-cursor-flush`
+- **Runtime sources:** [src/redis/cursor/scheduler.js](../src/redis/cursor/scheduler.js)
+
 <a id="extensions-err-groups-meta-initialize"></a>
 ## `EXTENSIONS-ERR-GROUPS-META-INITIALIZE`
 
@@ -562,6 +578,18 @@ the stable ID tag on the line):
 - **Next action:** Nothing unless the failover delay is unacceptable; then check Redis connectivity during shutdown.
 - **Runtime help:** `docs/errors.md#extensions-err-leader-release`
 - **Runtime sources:** [src/redis/leader.js](../src/redis/leader.js)
+
+<a id="extensions-err-presence-heartbeat-publish"></a>
+## `EXTENSIONS-ERR-PRESENCE-HEARTBEAT-PUBLISH`
+
+- **Code/event:** `redis.presence.heartbeat.publish-failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.heartbeat.publish-failed severity=warn] A presence heartbeat could not be published for one or more topics; the TTL refresh and the other topics went ahead.`
+- **Cause:** Publishing a topic's heartbeat roster threw. The failed attribute counts those topics out of the topics attribute, and the error attribute is the first failure.
+- **Consequence:** Clients on the failed topics get no heartbeat, so a client maxAge sweep can drop users who are still present; the Redis TTL refresh is unaffected. Reported once per failure streak; a heartbeat with no failure re-arms it.
+- **Automatic recovery:** Every heartbeat publishes again.
+- **Next action:** Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their roster data. Topics are not logged, since they can carry user ids.
+- **Runtime help:** `docs/errors.md#extensions-err-presence-heartbeat-publish`
+- **Runtime sources:** [src/redis/presence.js](../src/redis/presence.js)
 
 <a id="extensions-err-presence-keyspace-subscriber"></a>
 ## `EXTENSIONS-ERR-PRESENCE-KEYSPACE-SUBSCRIBER`

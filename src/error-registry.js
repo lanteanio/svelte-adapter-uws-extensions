@@ -53,6 +53,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	CLOCK_LEADER_OFFSET: 'EXTENSIONS-ERR-CLOCK-LEADER-OFFSET',
 	CURSOR_SUBSCRIBER: 'EXTENSIONS-ERR-CURSOR-SUBSCRIBER',
 	CURSOR_CLEANUP: 'EXTENSIONS-ERR-CURSOR-CLEANUP',
+	CURSOR_FLUSH: 'EXTENSIONS-ERR-CURSOR-FLUSH',
 	GROUPS_META_INITIALIZE: 'EXTENSIONS-ERR-GROUPS-META-INITIALIZE',
 	GROUPS_HEARTBEAT: 'EXTENSIONS-ERR-GROUPS-HEARTBEAT',
 	GROUPS_SUBSCRIBER: 'EXTENSIONS-ERR-GROUPS-SUBSCRIBER',
@@ -64,6 +65,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	PRESENCE_KEYSPACE_RECONCILE: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-RECONCILE',
 	PRESENCE_KEYSPACE_EVENTS_OFF: 'EXTENSIONS-ERR-PRESENCE-KEYSPACE-EVENTS-OFF',
 	PRESENCE_SUBSCRIBER: 'EXTENSIONS-ERR-PRESENCE-SUBSCRIBER',
+	PRESENCE_HEARTBEAT_PUBLISH: 'EXTENSIONS-ERR-PRESENCE-HEARTBEAT-PUBLISH',
 	PUBLISH_RATE_SUBSCRIBER: 'EXTENSIONS-ERR-PUBLISH-RATE-SUBSCRIBER',
 	PUBLISH_RATE_LISTENER: 'EXTENSIONS-ERR-PUBLISH-RATE-LISTENER',
 	RATELIMIT_PROXY_COLLAPSE: 'EXTENSIONS-ERR-RATELIMIT-PROXY-COLLAPSE',
@@ -394,6 +396,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/cursor/redis-io.js'], anchor: 'extensions-err-cursor-cleanup'
 	}),
 	direct({
+		id: EXTENSIONS_ERROR_IDS.CURSOR_FLUSH,
+		event: 'redis.cursor.flush.failed', component: 'runtime.redis.cursor', severity: 'warn',
+		problemPrefix: 'A cursor tick could not publish one or more topics; the other topics were flushed.',
+		cause: 'Publishing a topic\'s coalesced cursor frame threw during a tick. The failed attribute counts those topics out of the flushed attribute, and the error attribute is the first failure.',
+		consequence: 'Viewers on the failed topics miss those positions; the next move on such a topic is tried again on a later tick. Reported once per failure streak; a streak ends after ten seconds with no failed flush.',
+		automaticRecovery: 'Every later tick publishes again.',
+		nextAction: 'Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their cursor data. Topics are not logged, since they can carry user ids.',
+		sources: ['src/redis/cursor/scheduler.js'], anchor: 'extensions-err-cursor-flush'
+	}),
+	direct({
 		id: EXTENSIONS_ERROR_IDS.GROUPS_META_INITIALIZE,
 		event: 'redis.groups.meta-initialize.failed', component: 'runtime.redis.groups', severity: 'warn',
 		problemPrefix: 'The initial Redis group metadata write failed.',
@@ -452,6 +464,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'The lease expires on its own; no other instance can accidentally release someone else\'s lease.',
 		nextAction: 'Nothing unless the failover delay is unacceptable; then check Redis connectivity during shutdown.',
 		sources: ['src/redis/leader.js'], anchor: 'extensions-err-leader-release'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.PRESENCE_HEARTBEAT_PUBLISH,
+		event: 'redis.presence.heartbeat.publish-failed', component: 'runtime.redis.presence', severity: 'warn',
+		problemPrefix: 'A presence heartbeat could not be published for one or more topics; the TTL refresh and the other topics went ahead.',
+		cause: 'Publishing a topic\'s heartbeat roster threw. The failed attribute counts those topics out of the topics attribute, and the error attribute is the first failure.',
+		consequence: 'Clients on the failed topics get no heartbeat, so a client maxAge sweep can drop users who are still present; the Redis TTL refresh is unaffected. Reported once per failure streak; a heartbeat with no failure re-arms it.',
+		automaticRecovery: 'Every heartbeat publishes again.',
+		nextAction: 'Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their roster data. Topics are not logged, since they can carry user ids.',
+		sources: ['src/redis/presence.js'], anchor: 'extensions-err-presence-heartbeat-publish'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_SUBSCRIBER,

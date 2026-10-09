@@ -53,6 +53,7 @@ import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError, SubscribeDeniedError } from '../shared/errors.js';
+import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 import { EVENTS } from './cursor/events.js';
@@ -651,6 +652,13 @@ export function createCursor(client, options = {}) {
 		},
 
 		update(ws, topic, data, platform) {
+			// Dropped before anything is staged. A non-string or empty topic, as
+			// the in-memory cursor drops it, and one no frame can carry, which a
+			// staged topic would make every flush fail on. The character check
+			// runs only for a topic not yet tracked, so a frame on a live topic
+			// pays one Map lookup.
+			if (typeof topic !== 'string' || topic.length === 0) return;
+			if (!topics.has(topic) && !isFramableTopic(topic)) return;
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);
 

@@ -25,6 +25,8 @@
  * channels (e.g. pubsub's `__realtime` degraded/recovered events).
  */
 
+import { isFramableTopic } from './frame-topic.js';
+
 const DEFAULT_MAX_ENVELOPE_BYTES = 1024 * 1024; // 1 MB
 const MAX_TOPIC_LEN = 256;
 const MAX_EVENT_LEN = 256;
@@ -48,11 +50,7 @@ const MAX_EVENT_LEN = 256;
  */
 export function isValidBusTopic(topic) {
 	if (typeof topic !== 'string' || topic.length === 0 || topic.length > MAX_TOPIC_LEN) return false;
-	for (let i = 0; i < topic.length; i++) {
-		const c = topic.charCodeAt(i);
-		if (c < 32 || c === 34 || c === 92) return false;
-	}
-	return true;
+	return isFramableTopic(topic);
 }
 
 /**

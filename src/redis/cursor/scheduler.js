@@ -14,6 +14,11 @@
 import { monotonicNow, setTimer, clearTimer } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 import { INDEX_CROSSOVER, createViewportCuller } from './spatial.js';
+import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
+import { emitRegisteredFailure } from '../../shared/diagnostic.js';
+
+/** Quiet time, in ms, after which a failed cursor flush is reported as a new streak. */
+const FLUSH_FAILURE_STREAK_GAP_MS = 10_000;
 
 /**
  * Create the cursor flush scheduler. The shared collections (wsState /
@@ -189,20 +194,25 @@ export function createScheduler({
 		let flushPlatform = null;
 		let localCount = 0;
 
-		// Local-origin slice first so we can take a prefix for the relay.
-		for (const [k, v] of state.dirty) {
-			entries.push({ key: k, data: v.data });
-			flushPlatform = v.platform;
-			queueSnapshot(topic, k, v.user, v.data);
-			localCount++;
+		// Local-origin slice first so we can take a prefix for the relay. The
+		// dirty maps are cleared even when this throws (queueSnapshot serializes
+		// the data), so one bad entry cannot be retried, and fail, on every
+		// later flush of the topic.
+		try {
+			for (const [k, v] of state.dirty) {
+				entries.push({ key: k, data: v.data });
+				flushPlatform = v.platform;
+				queueSnapshot(topic, k, v.user, v.data);
+				localCount++;
+			}
+			for (const [k, v] of state.inboundDirty) {
+				entries.push({ key: k, data: v.data });
+				flushPlatform ||= v.platform;
+			}
+		} finally {
+			state.dirty.clear();
+			state.inboundDirty.clear();
 		}
-		for (const [k, v] of state.inboundDirty) {
-			entries.push({ key: k, data: v.data });
-			flushPlatform ||= v.platform;
-		}
-
-		state.dirty.clear();
-		state.inboundDirty.clear();
 
 		if (!flushPlatform || entries.length === 0) return;
 
@@ -309,6 +319,11 @@ export function createScheduler({
 		tickTimer = null;
 		const nowTs = monotonicNow();
 		let nextDeadline = Infinity;
+		let flushed = 0;
+		let failed = 0;
+		let firstError = null;
+		let firstFailedTopic = '';
+		const failedAt = nowTs;
 
 		for (const topic of dirtyTopics) {
 			const state = topicFlush.get(topic);
@@ -324,7 +339,16 @@ export function createScheduler({
 				driftCount++;
 				if (drift > driftMax) driftMax = drift;
 
-				flushBoth(topic, state);
+				// A publish that throws for one topic must not end the tick:
+				// the timer is already spent, so the throw would leave every
+				// later topic unflushed until something re-arms it. flushBoth
+				// clears the topic's dirty entries even when it throws.
+				flushed++;
+				try {
+					flushBoth(topic, state);
+				} catch (err) {
+					if (failed++ === 0) { firstError = err; firstFailedTopic = topic; }
+				}
 				dirtyTopics.delete(topic);
 
 				// Target-anchored: advance lastFlush by the cadence amount.
@@ -338,11 +362,31 @@ export function createScheduler({
 			}
 		}
 
+		if (failed > 0) {
+			const startsStreak = lastFlushFailureAt === null || failedAt - lastFlushFailureAt > FLUSH_FAILURE_STREAK_GAP_MS;
+			lastFlushFailureAt = failedAt;
+			if (startsStreak) {
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_FLUSH, {
+					error: firstError,
+					redact: [firstFailedTopic, '__cursor:' + firstFailedTopic],
+					attributes: { failed, flushed }
+				});
+			}
+		}
+
 		if (nextDeadline !== Infinity) {
 			tickTimer = setTimer(tick, Math.max(0, nextDeadline - monotonicNow()));
 		}
 		// else: scheduler goes idle until next broadcast() / enqueueInbound().
 	}
+
+	// When a tick last failed to publish a topic. A failure is reported only
+	// when it starts a streak, after a gap of FLUSH_FAILURE_STREAK_GAP_MS with no
+	// failed flush. A gap rather than "a tick with no failure": topics flush on
+	// ticks of their own phase, so a tick that flushes only healthy topics says
+	// nothing about one that keeps failing.
+	/** @type {number | null} */
+	let lastFlushFailureAt = null;
 
 	function armTick(delay) {
 		if (tickTimer !== null) return;
@@ -503,6 +547,7 @@ export function createScheduler({
 		alwaysVisible.length = 0;
 		culler.reset();
 		inDeliver = false;
+		lastFlushFailureAt = null;
 	}
 
 	return {
