@@ -295,7 +295,7 @@ The same pattern applies to every extension in this README: read identity, decid
 
 ## Pub/sub bus
 
-Distributes `platform.publish()` calls across multiple server instances via Redis pub/sub. Each instance publishes locally AND to Redis. Incoming Redis messages are forwarded to the local platform with echo suppression (messages originating from the same instance are dropped on receive, keyed by a per-process instance ID).
+Distributes `platform.publish()` calls across multiple server instances via Redis pub/sub. Each instance publishes locally AND to Redis. Incoming Redis messages are forwarded to the local platform with echo suppression (messages originating from the same instance are dropped on receive, keyed by an instance ID each bus picks when it is created, so every worker of a multi-worker adapter is an instance of its own).
 
 Multiple `publish()` calls within the same event-loop tick are coalesced into a single Redis pipeline via microtask batching. This means a form action that publishes to three topics results in one pipelined round trip, not three independent commands.
 
@@ -342,6 +342,19 @@ import { bus } from '$lib/server/bus';
 
 export const { open } = bus.hooks;
 ```
+
+#### Multi-worker adapters
+
+On an adapter that runs several worker threads, each worker loads its own copy of the bus and of every module in this package, with its own Redis subscriber, so each worker is an instance like any other. A frame published through the bus reaches the other workers of the process the way it reaches other instances, through Redis, and the bus turns the adapter's in-process relay off for it (`relay: false`) so they receive it once. What Redis does not carry misses the other workers as it misses the other instances: anything published while Redis is unreachable, an envelope over `maxEnvelopeBytes`, and on the sharded bus a topic the receiving worker does not follow. The one exception is a frame the bus never carries by rule, because its receivers refuse the envelope (a `__` topic the bus does not admit, see `allowSystemTopics`): the bus leaves the adapter's relay on for it, so the other workers of this process still get it, unless it has an authoritative seq, which the adapter refuses to relay. On a single worker the options you pass reach the platform untouched, and on either the bus returns what the platform's `publish` returns. Both buses behave the same way.
+
+Such an adapter refuses any publish that would draw its per-worker sequence counter, and publishes through the bus follow the same rule: pass `{ seq: false }` for volatile events, or the seq an ordered source allocated, as the [replay buffer](#replay-buffer-redis) does. Through the bus, `relay: false` keeps a publish on this worker, so it is not the way to reach the other workers. The bus carries `seq: false` and an authoritative number to every other instance, so the frame is stamped the same everywhere. A frame published with any other spelling (the counter, `null`, a bigint) arrives with no choice attached: a single worker stamps its own counter on it, a multi-worker one delivers it unsequenced. Scoped helpers take the options as their last argument, as on the adapter's platform.
+
+```js
+distributed.publish('cursor:42', 'move', pos, { seq: false });
+distributed.topic('todos').created(todo, { seq: false });
+```
+
+The modules publish their own frames with a declared choice and need nothing from you. Presence, cursor and groups frames carry no seq (a client rebuilds them from the snapshot and the heartbeat). Presence diffs, cursor frames and group events reach the other workers the way they reach other instances, through each module's own Redis relay, so they too miss the other workers while Redis is unreachable; a presence heartbeat lists only its own worker's users, is not relayed through Redis, and goes to the other workers through the adapter's relay. A cursor that only watches opens its Redis relay when it attaches, and retries it while a connection there uses the cursor. The bus's `degraded` / `recovered` frames go to the subscribers of the worker whose breaker changed. A notify bridge delivers notifications unsequenced. Replay frames carry the buffer's seq, so on a multi-worker adapter pass the bus-wrapped platform to `replay.publish`: the bus is what fans those frames out to the other workers. On the bare platform the adapter refuses the live frame after the buffer has stored the event, so the publish rejects and clients receive the event when they next resume.
 
 #### Wire-batched publish (`publishBatched`)
 
@@ -510,7 +523,7 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 
 If you don't have a concrete cluster + fine-grained-topics use case, `createPubSubBus` is simpler and sufficient.
 
-**Binary wire across the cluster.** Both buses forward the adapter's binary wire methods (`publishWire` / `sendWire` / `registerWireCodec`), so the cluster-backed cursor and presence plugins keep their compact binary frames instead of falling back to JSON. A stateless codec marked `shared: true` (the byte-identical world-snapshot tier, where every binary subscriber gets the same frame) additionally fans out cluster-wide automatically: a shared `publishWire` relays only the logical `{capability, event, data}` as JSON over the bus, and each receiving instance re-derives the codec by capability and runs its own native fan-out locally with its own per-process wire-id - the binary frame never crosses the bus. Register the codec on every instance with `platform.registerWireCodec(codec)` at activate so a relay-receiving instance can re-encode (an unregistered instance falls back to a correct JSON delivery). A `shared: true` codec therefore behaves identically on a single instance, across worker threads, and across a Redis-bus cluster, with no per-codec relay wiring.
+**Binary wire across the cluster.** Both buses forward the adapter's binary wire methods (`publishWire` / `sendWire` / `registerWireCodec`), so the cluster-backed cursor and presence plugins keep their compact binary frames instead of falling back to JSON. A stateless codec marked `shared: true` (the byte-identical world-snapshot tier, where every binary subscriber gets the same frame) additionally fans out cluster-wide automatically: a shared `publishWire` relays only the logical `{capability, event, data}` as JSON over the bus, and each receiving instance re-derives the codec by capability and runs its own native fan-out locally with its own per-process wire-id - the binary frame never crosses the bus. Register the codec on every instance through the bus-wrapped platform (`bus.wrap(platform).registerWireCodec(codec)`) at activate, so a relay-receiving instance can re-encode; one that registered it only on the bare platform, or not at all, delivers a correct JSON frame instead. On a multi-worker adapter every worker is such an instance. With that one registration a `shared: true` codec behaves the same on a single instance, across worker threads, and across a Redis-bus cluster, with no per-codec relay wiring.
 
 **Platforms that leave members out.** Not every adapter implements every Platform member; svelte-adapter-bunserve, for one, has no `request`, `batch` or `publishBatched`. A method the platform does not have is `undefined` on a wrapped platform from either bus, so a feature check such as `if (!platform.batch)` gives the same answer through the wrap and the caller falls back as it would without the bus. Which methods a wrapped platform has is decided when `wrap()` runs; `topicEpoch` is also there when a replay tracker is attached by then. The wrap still provides what it implements itself: its `topic()` helper and the clock, RNG, HLC, `protection`, `closedWsAborts` and `traceContext` fallbacks. A batched or coalesced relay from a peer reaches such a platform as plain publishes.
 
@@ -528,16 +541,15 @@ none. The context always comes from the Platform: the buses take no
 `traceContext` publish option.
 
 Without a provider the buses do no trace work at all: a publish reads no
-context and relays the same envelope an untraced release did, and trace fields
-on an inbound envelope are ignored. Envelopes without trace fields remain
+context and relays an envelope without trace fields, and trace fields on an
+inbound envelope are ignored. Envelopes without trace fields remain
 valid, so mixed-version clusters interoperate. Trace fields stay outside
 `data`: an application payload property named `traceparent` remains ordinary
 application data and is never trusted as transport context.
 
-The trace fields are the only thing a publish adds to an envelope after the
-application sized it. Every instance drops an inbound envelope above
-`maxEnvelopeBytes` before parsing, so when a payload alone fits but would not
-with its context, the bus relays it untraced and reports
+Every instance drops an inbound envelope above `maxEnvelopeBytes` before
+parsing, so when an envelope fits without its trace fields but not with them,
+the bus relays it untraced and reports
 `redis.pubsub.trace-context.omitted` (`redis.sharded-pubsub.trace-context.omitted`
 on the sharded bus) once; the message is delivered, only the correlation is
 lost.
@@ -585,6 +597,8 @@ export const actions = {
   }
 };
 ```
+
+The live frame carries the buffer's seq, so a resuming client gap-fills against the same numbers on every instance. Pass the bus-wrapped platform (`bus.wrap(platform)`) to reach the clients of the other instances; on a multi-worker adapter that is required, because the adapter only accepts an external seq when something other than its own relay fans the frame out (see [Multi-worker adapters](#multi-worker-adapters)). A frame published without a buffer seq, such as the local fan-out `localFanoutOnStorageFailure` sends while storage is down, carries `seq: false`: a local counter value could move a client's watermark past entries the buffer still holds.
 
 ```js
 // In +page.server.js
@@ -1894,7 +1908,7 @@ export function open(ws, { platform }) {
 }
 ```
 
-**Requires a cross-instance pub/sub bus.** In `'all'` mode the bridge passes `relay: false` because every replica's local LISTEN already delivers the notification. In `'advisory'` mode only the leader has LISTEN active, so the leader publishes *with* relay - the bus fans out to non-leader replicas via Redis. Without a bus the leader's local clients receive notifications but other replicas' clients don't.
+**Requires a cross-instance pub/sub bus.** In `'all'` mode the bridge passes `relay: false` because every replica's local LISTEN already delivers the notification. In `'advisory'` mode only the leader has LISTEN active, so the leader publishes *with* relay - the bus fans out to non-leader replicas via Redis. Without a bus the leader's local clients receive notifications but other replicas' clients don't. A notification carries no seq: a single worker stamps its own counter on it, and a multi-worker adapter, which refuses that counter, delivers it with `seq: false`.
 
 **Choosing a `lockId`.** Pick a stable 32-bit signed integer that's unique per channel within your deployment. CRC32 of the channel name is a reasonable hash; multiple channels in the same database need distinct ids.
 

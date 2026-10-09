@@ -15,6 +15,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { EXTERNAL_DELIVERY, LOCAL_DEFAULT } from '../shared/sequence-authority.js';
 import {
 	POSTGRES_TRACE_ATTRIBUTES,
 	normalizeTraceContext,
@@ -223,8 +224,10 @@ export function createNotifyBridge(client, options) {
 				// it must publish *with* relay so the bus fans out to
 				// non-leader replicas. In 'all' mode every instance has
 				// its own LISTEN, so suppress relay to avoid duplicate
-				// fan-out via the bus.
-				const publishOpts = advisory ? undefined : { relay: false };
+				// fan-out via the bus. A notification carries no seq: a
+				// single worker stamps its counter, a multi-worker adapter
+				// (which refuses that counter) gets seq: false.
+				const publishOpts = advisory ? LOCAL_DEFAULT : EXTERNAL_DELIVERY;
 				// With a tracing provider, delivery is a consumer operation parented
 				// on the notification's validated context, so a bus relaying this
 				// publish carries the operation onward. Without one, nothing reads a

@@ -34,6 +34,7 @@ import { decodeSortedSetMember } from '../shared/replay-envelope.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
 
@@ -291,7 +292,7 @@ export function createReplay(client, options = {}) {
 							attributes: platform?.requestId ? { requestId: platform.requestId } : null
 						});
 					}
-					return platform.publish(topic, event, data);
+					return platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 				}
 				throw new ReplayStorageError('publish', err);
 			}
@@ -306,12 +307,13 @@ export function createReplay(client, options = {}) {
 			// buffer stores - across a restart, or across instances via the shared
 			// Redis buffer - instead of the adapter's per-worker counter, which would
 			// diverge and cause duplicate/dropped events on resume. Guard on a valid
-			// positive integer (the adapter poisons its convergence tracker on 0/NaN);
-			// the degraded local-fanout fallback above stays counter-stamped since it
-			// has no authoritative seq.
+			// positive integer (the adapter poisons its convergence tracker on 0/NaN).
+			// A frame without one, like the degraded local-fanout fallback above, goes
+			// out with seq: false: a local counter value in this topic's seq space
+			// could move a client's watermark past entries the buffer still holds.
 			return Number.isInteger(seq) && seq >= 1
 				? platform.publish(topic, event, data, { seq })
-				: platform.publish(topic, event, data);
+				: platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 		},
 
 		async seq(topic) {

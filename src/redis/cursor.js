@@ -65,6 +65,10 @@ import { createScheduler } from './cursor/scheduler.js';
 
 export { WsClosedError, SubscribeDeniedError };
 
+// emit()'s options: a worker-local frame with no seq (see emit).
+const WIRE_OPTIONS = Object.freeze({ relay: false, seq: false });
+const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false });
+
 
 /**
  * @typedef {Object} RedisCursorOptions
@@ -178,19 +182,23 @@ export function createCursor(client, options = {}) {
 	 * Broadcast a cursor wire event to local subscribers. Prefers the binary
 	 * publishWire (0x03 frames, uncompressed - the 60Hz hot path) and falls back
 	 * to JSON publish ({ compress: false }) when binary is off or the platform
-	 * lacks the wire methods (e.g. the unit-test mock). `opts` carries `relay`
-	 * (the cross-instance fan-out is this plugin's own Redis relay).
+	 * lacks the wire methods (e.g. the unit-test mock). Every frame is local to
+	 * this worker: the cross-instance fan-out is this plugin's own Redis relay,
+	 * which also reaches the sibling workers of a multi-worker adapter, so the
+	 * adapter's in-process relay stays off (`relay: false`). Every frame is also
+	 * `seq: false`: positions are absolute and a joining client takes the
+	 * snapshot, so the frames make no monotonic promise, and a multi-worker
+	 * adapter refuses a publish that would draw its per-worker counter.
 	 * @param {string} fullTopic
 	 * @param {string} event
 	 * @param {any} data
 	 * @param {import('svelte-adapter-uws').Platform} platform
-	 * @param {{ relay?: boolean }} [opts]
 	 */
-	function emit(fullTopic, event, data, platform, opts) {
+	function emit(fullTopic, event, data, platform) {
 		if (wireCodec && typeof platform.publishWire === 'function') {
-			platform.publishWire(fullTopic, event, data, wireCodec, opts);
+			platform.publishWire(fullTopic, event, data, wireCodec, WIRE_OPTIONS);
 		} else {
-			platform.publish(fullTopic, event, data, opts ? { ...opts, compress: false } : { compress: false });
+			platform.publish(fullTopic, event, data, JSON_OPTIONS);
 		}
 	}
 
@@ -369,13 +377,7 @@ export function createCursor(client, options = {}) {
 			// other instance, propagating the OOM risk cluster-wide.
 			queueRemove(parsed.topic, parsed.payload.key, platform);
 		} else {
-			emit(
-				'__cursor:' + parsed.topic,
-				parsed.event,
-				parsed.payload,
-				platform,
-				{ relay: false }
-			);
+			emit('__cursor:' + parsed.topic, parsed.event, parsed.payload, platform);
 		}
 	}
 
@@ -391,7 +393,8 @@ export function createCursor(client, options = {}) {
 		activeTopics,
 		emit,
 		onMessage: onPeerMessage,
-		queueRemove
+		queueRemove,
+		inUse: () => wsState.size > 0
 	});
 	const {
 		ensureSubscriber,
@@ -542,12 +545,17 @@ export function createCursor(client, options = {}) {
 	 * Emit the current roster and positions for `topic` to one socket. Split
 	 * out of `snapshot` so the attach path, which has just authorized, does
 	 * not pay for a second `checkSubscribe` round trip. Every caller MUST
-	 * have authorized first.
+	 * have authorized first. `relayReady`, when given, is the pending relay
+	 * subscription: TIME and YOU go out at once, and the roster is read once
+	 * the relay is open, so a join relayed from then on reaches the socket live.
+	 * Nothing after that wait allocates per-socket state, so a socket that
+	 * closes meanwhile leaves none behind.
 	 * @param {any} ws
 	 * @param {string} topic
 	 * @param {any} platform
+	 * @param {Promise<void>} [relayReady]
 	 */
-	async function emitSnapshot(ws, topic, platform) {
+	async function emitSnapshot(ws, topic, platform, relayReady) {
 		// Server time first - even for an empty board - so the requester's
 		// smoothing clock is seeded before the first stamped position frame
 		// and the request/reply round trip is measurable. Rides the codec's
@@ -575,6 +583,7 @@ export function createCursor(client, options = {}) {
 		} catch {
 			// WebSocket closed before send
 		}
+		if (relayReady) await relayReady;
 		// `list()` rethrows both the breaker's open-circuit throw and any
 		// Redis rejection, and every caller of emitSnapshot is reached from a
 		// fire-and-forget `hooks.message` branch. An unhandled rejection
@@ -636,10 +645,14 @@ export function createCursor(client, options = {}) {
 			// which is already registry-aware.
 			addWsSubscription(ws, '__cursor:' + topic);
 			grantMembership(ws, topic);
+			// A connection that only watches still needs the other instances'
+			// cursors, which arrive on the Redis relay: open it here, not only on
+			// this instance's first move. The socket already has local frames;
+			// the roster is read once the relay is open (see emitSnapshot).
 			// emitSnapshot() itself swallows ws-closed during platform.send (the
 			// state is already committed; clients recover via the next bulk
 			// frame). Intentional asymmetry with subscribe failure above.
-			await emitSnapshot(ws, topic, platform);
+			await emitSnapshot(ws, topic, platform, ensureSubscriber(platform));
 		},
 
 		detach(ws, topic, platform) {
@@ -1174,8 +1187,12 @@ export function createCursor(client, options = {}) {
 					// subscribing the socket to the broadcast channel, which
 					// is the larger half of what the gate exists to prevent.
 					if (denial) return denial;
+					// A socket that closed during the authorization has already been
+					// removed; state granted to it now would never be.
+					try { ws.getBufferedAmount(); } catch { return undefined; }
 					grantMembership(ws, realTopic);
-					await emitSnapshot(ws, realTopic, platform);
+					// As in attach(): a watcher needs the Redis relay open.
+					await emitSnapshot(ws, realTopic, platform, ensureSubscriber(platform));
 				}
 			},
 			message(ws, { data, platform }) {

@@ -903,7 +903,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		problemPrefix: 'The cursor relay could not subscribe to its channel.',
 		cause: 'SUBSCRIBE on the dedicated connection was rejected: the Redis user may not subscribe to the channel (NOPERM), or the connection failed while subscribing.',
 		consequence: 'Cursor positions from other instances do not reach this instance until a subscribe succeeds. Reported once per failure streak.',
-		automaticRecovery: 'The connection is closed and the next cursor update subscribes on a fresh one; a subscribe that succeeds re-arms this report.',
+		automaticRecovery: 'The connection is closed and a fresh one subscribes on the next cursor update, attach or `__cursor:` subscribe, and on a retry that backs off from one to thirty seconds while a connection on this instance uses the cursor; a subscribe that succeeds re-arms this report.',
 		nextAction: 'Check Redis connectivity and that the Redis user may SUBSCRIBE to the channel.',
 		sources: ['src/redis/cursor/redis-io.js'], anchor: 'extensions-err-cursor-subscribe'
 	}),

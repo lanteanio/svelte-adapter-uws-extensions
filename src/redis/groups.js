@@ -32,6 +32,14 @@ import { openSubscriber } from '../shared/redis-subscriber.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
+// Options for every frame a group publishes on its internal topic. The group's
+// own Redis channel carries each event to every other worker and instance, so
+// the adapter's in-process relay to sibling workers would deliver it twice
+// (`relay: false`). A member list is re-read on join, so the frames make no
+// monotonic promise, and a multi-worker adapter refuses a publish that would
+// draw its per-worker counter (`seq: false`).
+const FRAME_OPTIONS = Object.freeze({ relay: false, seq: false });
+
 /** Wire-protocol event names this module emits. */
 const EVENTS = Object.freeze({
 	JOIN: 'join',
@@ -306,7 +314,7 @@ export function createGroup(client, name, options = {}) {
 		isClosed = true;
 		closeVerifyPending = false;
 		try {
-			platform?.publish(internalTopic, EVENTS.CLOSE, data, { relay: false });
+			platform?.publish(internalTopic, EVENTS.CLOSE, data, FRAME_OPTIONS);
 		} catch { /* platform torn down mid-close */ }
 		for (const [ws] of localMembers) {
 			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
@@ -401,7 +409,7 @@ export function createGroup(client, name, options = {}) {
 			await verifyCloseCoalesced(platform, parsed.data);
 			return;
 		}
-		platform.publish(internalTopic, parsed.event, parsed.data, { relay: false });
+		platform.publish(internalTopic, parsed.event, parsed.data, FRAME_OPTIONS);
 	}
 
 	async function ensureSubscriber(platform) {
@@ -613,7 +621,7 @@ export function createGroup(client, name, options = {}) {
 			// Publish join event only after the snapshot succeeded.
 			// This prevents orphaned join events when the snapshot step
 			// fails, eliminating the need for compensating leave events.
-			platform.publish(internalTopic, EVENTS.JOIN, { role });
+			platform.publish(internalTopic, EVENTS.JOIN, { role }, FRAME_OPTIONS);
 			await publishEvent(EVENTS.JOIN, { role }).catch(() => {});
 
 			const freshNow = now();
@@ -662,7 +670,7 @@ export function createGroup(client, name, options = {}) {
 
 			mGroupLeaves?.inc({ group: name });
 			const leavePayload = { role: entry.role };
-			platform.publish(internalTopic, EVENTS.LEAVE, leavePayload);
+			platform.publish(internalTopic, EVENTS.LEAVE, leavePayload, FRAME_OPTIONS);
 			await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
 
 			if (onLeave) onLeave(ws, entry.role);
@@ -682,7 +690,7 @@ export function createGroup(client, name, options = {}) {
 
 			if (role == null) {
 				// Broadcast to all via topic
-				platform.publish(internalTopic, event, data);
+				platform.publish(internalTopic, event, data, FRAME_OPTIONS);
 				await publishRaw(raw).catch(() => {});
 				return;
 			}
@@ -728,7 +736,7 @@ export function createGroup(client, name, options = {}) {
 				const alreadyClosed = await redis.get(closedKey);
 				if (alreadyClosed === '1') {
 					isClosed = true;
-					platform.publish(internalTopic, EVENTS.CLOSE, null);
+					platform.publish(internalTopic, EVENTS.CLOSE, null, FRAME_OPTIONS);
 					await publishEvent(EVENTS.CLOSE, null);
 					for (const [ws] of localMembers) {
 						try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
@@ -744,7 +752,7 @@ export function createGroup(client, name, options = {}) {
 				await redis.set(closedKey, '1');
 				isClosed = true;
 
-				platform.publish(internalTopic, EVENTS.CLOSE, null);
+				platform.publish(internalTopic, EVENTS.CLOSE, null, FRAME_OPTIONS);
 				await publishEvent(EVENTS.CLOSE, null);
 
 				for (const [ws] of localMembers) {

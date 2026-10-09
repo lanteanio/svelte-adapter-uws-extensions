@@ -731,8 +731,9 @@ describe('redis replay (stream backend)', () => {
 			const result = await r.publish(platform, 'chat', 'msg', { id: 1 });
 
 			expect(result).toBe(true);
+			// No authoritative seq, and no counter seq in the buffer's seq space.
 			expect(platform.published).toEqual([
-				{ topic: 'chat', event: 'msg', data: { id: 1 } }
+				{ topic: 'chat', event: 'msg', data: { id: 1 }, options: { seq: false } }
 			]);
 		});
 

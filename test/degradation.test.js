@@ -74,7 +74,7 @@ describe('createPubSubBus degradationPolicy integration', () => {
 		const deg = find(platform, 'degraded');
 		expect(deg).toBeDefined();
 		expect(deg.data.mitigation).toEqual({ retryAfterMs: 4000, bannerCopy: 'Read-only', rpcs: ['orders/create'] });
-		expect(deg.options).toMatchObject({ jitterMs: 1000 }); // min(4000/4, 5000)
+		expect(deg.options).toEqual({ relay: false, seq: false, jitterMs: 1000 }); // min(4000/4, 5000)
 	});
 
 	it('without a policy the degraded event is { at } only (unchanged)', () => {
@@ -83,7 +83,8 @@ describe('createPubSubBus degradationPolicy integration', () => {
 		const deg = find(platform, 'degraded');
 		expect(deg).toBeDefined();
 		expect('mitigation' in deg.data).toBe(false);
-		expect(deg.options).toBeUndefined();
+		// This worker's breaker, so this worker's subscribers only, and no seq.
+		expect(deg.options).toEqual({ relay: false, seq: false });
 	});
 
 	it('ships recovery hints + jitter on the recovered event', () => {
@@ -94,7 +95,7 @@ describe('createPubSubBus degradationPolicy integration', () => {
 		const rec = find(platform, 'recovered');
 		expect(rec).toBeDefined();
 		expect(rec.data.recovery).toEqual({ refetch: true, bannerCopy: 'Back online' });
-		expect(rec.options).toMatchObject({ jitterMs: 3000 });
+		expect(rec.options).toEqual({ relay: false, seq: false, jitterMs: 3000 });
 	});
 
 	it('rejects a malformed degradationPolicy', () => {

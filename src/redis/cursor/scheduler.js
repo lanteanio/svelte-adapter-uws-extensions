@@ -483,7 +483,7 @@ export function createScheduler({
 		// `&&` short-circuits, so the throttled path never runs topicNeedsWalk.
 		if (topicThrottleMs <= 0 && !(perSubscriberWalk && topicNeedsWalk(topic))) {
 			// Legacy immediate mode (matches old receiver behavior).
-			emit('__cursor:' + topic, EVENTS.UPDATE, { key, data }, platform, { relay: false });
+			emit('__cursor:' + topic, EVENTS.UPDATE, { key, data }, platform);
 			return;
 		}
 

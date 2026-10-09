@@ -42,6 +42,7 @@ import {
 	traceEnabled
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
+import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 
 // A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
 // channel's slot never resolves - the command hangs instead of returning a MOVED
@@ -120,6 +121,14 @@ export function createShardedBus(client, options = {}) {
 		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: []
 	});
+
+	// Whether this bus carries a frame to the other workers of this process at
+	// all: their receivers apply this same envelope rule, so a frame it refuses
+	// (a `__` topic it does not admit, a malformed name) can only reach them
+	// through the adapter's relay. Only read on a multi-worker runtime (see
+	// relayedLocally).
+	const reachesSiblings = (topic, event) => validator.acceptEnvelope(topic, event);
+	const entryReachesSiblings = (m) => reachesSiblings(m.topic, m.event);
 
 	// Wire codecs registered on THIS instance, keyed by capability. A
 	// `shared: true` stateless codec relays its logical event over the shard
@@ -281,9 +290,10 @@ export function createShardedBus(client, options = {}) {
 			mReceived?.inc({ topic: mt(parsed.topic) });
 			// A platform without sendCoalesced cannot coalesce per key at all, so
 			// the value goes out as a plain publish: every subscriber still gets
-			// it, as the wire branch below falls back to JSON.
+			// it, as the wire branch below falls back to JSON. Unsequenced, like the
+			// coalesced send it stands in for.
 			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
 				return;
 			}
 			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
@@ -308,9 +318,9 @@ export function createShardedBus(client, options = {}) {
 			const codec = wireCodecs.get(parsed.capability);
 			if (codec && typeof activePlatform.publishWire === 'function') {
 				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-					parsed.compress === true ? { relay: false, compress: true } : { relay: false });
+					receivedOptions(parsed.s, undefined, parsed.compress === true));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s));
 			}
 			return;
 		}
@@ -327,7 +337,7 @@ export function createShardedBus(client, options = {}) {
 					topic: m.topic,
 					event: m.event,
 					data: m.data,
-					options: { relay: false }
+					options: receivedOptions(m.s, m.j)
 				});
 			}
 			if (local.length === 0) return;
@@ -346,7 +356,9 @@ export function createShardedBus(client, options = {}) {
 				return;
 			}
 			mReceived?.inc({ topic: mt(parsed.topic) });
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, parsed.j !== undefined ? { relay: false, jitterMs: parsed.j } : { relay: false });
+			// Re-apply the de-herd window (`j`) and the origin's seq choice (`s`);
+			// `relay: false` stops the re-relay.
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j));
 		}
 	}
 
@@ -355,9 +367,24 @@ export function createShardedBus(client, options = {}) {
 			() => deliverEnvelope(parsed));
 	}
 
+	// One publish as the bus relays it. The de-herd window (`j`) and the seq
+	// choice (`s`: an authoritative number, or `false` for a publish without a
+	// seq) ride along when set; the common publish's envelope stays byte-identical.
+	function singleEnvelope(topic, event, data, opts) {
+		const env = { instanceId, topic, event, data };
+		if (opts && typeof opts.jitterMs === 'number' && opts.jitterMs > 0) {
+			/** @type {any} */ (env).j = opts.jitterMs;
+		}
+		const s = opts ? carriedSeq(opts.seq) : undefined;
+		if (s !== undefined) /** @type {any} */ (env).s = s;
+		return env;
+	}
+
 	function wireEnvelope(topic, event, data, wire, opts) {
 		const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
 		if (opts && opts.compress === true) /** @type {any} */ (env).compress = true;
+		const s = opts ? carriedSeq(opts.seq) : undefined;
+		if (s !== undefined) /** @type {any} */ (env).s = s;
 		return env;
 	}
 
@@ -373,7 +400,7 @@ export function createShardedBus(client, options = {}) {
 				arr = [];
 				byChannel.set(ch, arr);
 			}
-			arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
+			arr.push(relayEntry(mes));
 		}
 		return byChannel;
 	}
@@ -1074,12 +1101,8 @@ export function createShardedBus(client, options = {}) {
 			const publishTraced = (topic, event, data, opts) => {
 				if (opts && opts.relay === false) return platform.publish(topic, event, data, opts);
 				return traced((traceContext) => {
-					const result = platform.publish(topic, event, data, opts);
-					const env = { instanceId, topic, event, data };
-					if (opts && typeof opts.jitterMs === 'number' && opts.jitterMs > 0) {
-						/** @type {any} */ (env).j = opts.jitterMs;
-					}
-					relayTraced(channelFor(topic), env, [topic], traceContext);
+					const result = platform.publish(topic, event, data, relayedLocally(opts, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
+					relayTraced(channelFor(topic), singleEnvelope(topic, event, data, opts), [topic], traceContext);
 					return result;
 				});
 			};
@@ -1096,11 +1119,11 @@ export function createShardedBus(client, options = {}) {
 				return false;
 			};
 			const batchTraced = (messages) => (!relaysAny(messages) ? platform.batch(messages) : traced((traceContext) => {
-				const results = platform.batch(messages);
+				const results = platform.batch(relayedBatchLocally(messages, entryReachesSiblings));
 				for (let i = 0; i < messages.length; i++) {
 					const mes = messages[i];
 					if (!mes.options || mes.options.relay !== false) {
-						relayTraced(channelFor(mes.topic), { instanceId, topic: mes.topic, event: mes.event, data: mes.data }, [mes.topic], traceContext);
+						relayTraced(channelFor(mes.topic), singleEnvelope(mes.topic, mes.event, mes.data, mes.options), [mes.topic], traceContext);
 					}
 				}
 				return results;
@@ -1118,7 +1141,7 @@ export function createShardedBus(client, options = {}) {
 				// rejects a malformed entry with its own error before shardKey or
 				// the relay list sees the entries.
 				traced((traceContext) => {
-					platform.publishBatched(messages);
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
 					const byChannel = batchesByChannel(messages);
 					for (const [ch, batch] of byChannel) {
 						relayTraced(ch, { instanceId, batch }, batchTopics(batch), traceContext);
@@ -1132,7 +1155,7 @@ export function createShardedBus(client, options = {}) {
 					return platform.publishWire(topic, event, data, wire, opts);
 				}
 				return traced((traceContext) => {
-					const result = platform.publishWire(topic, event, data, wire, opts);
+					const result = platform.publishWire(topic, event, data, wire, relayedLocally(opts, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
 					relayTraced(channelFor(topic), wireEnvelope(topic, event, data, wire, opts), [topic], traceContext);
 					return result;
 				});
@@ -1142,14 +1165,12 @@ export function createShardedBus(client, options = {}) {
 			// `publishBatched` instead when you want one wire frame per
 			// subscriber per call.
 			const batchUntraced = (messages) => {
-				const results = platform.batch(messages);
+				const results = platform.batch(relayedBatchLocally(messages, entryReachesSiblings));
 				for (let i = 0; i < messages.length; i++) {
 					const mes = messages[i];
 					if (!mes.options || mes.options.relay !== false) {
 						const channel = channelFor(mes.topic);
-						scheduleRelay(channel, JSON.stringify({
-							instanceId, topic: mes.topic, event: mes.event, data: mes.data
-						}), [mes.topic]);
+						scheduleRelay(channel, JSON.stringify(singleEnvelope(mes.topic, mes.event, mes.data, mes.options)), [mes.topic]);
 					}
 				}
 				return results;
@@ -1163,21 +1184,9 @@ export function createShardedBus(client, options = {}) {
 				}
 				if (messages.length === 0) return;
 
-				platform.publishBatched(messages);
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
 
-				/** @type {Map<string, Array<{topic: string, event: string, data: unknown}>>} */
-				const byChannel = new Map();
-				for (let i = 0; i < messages.length; i++) {
-					const mes = messages[i];
-					if (mes.options && mes.options.relay === false) continue;
-					const ch = channelFor(mes.topic);
-					let arr = byChannel.get(ch);
-					if (!arr) {
-						arr = [];
-						byChannel.set(ch, arr);
-					}
-					arr.push({ topic: mes.topic, event: mes.event, data: mes.data });
-				}
+				const byChannel = batchesByChannel(messages);
 
 				for (const [ch, batch] of byChannel) {
 					const topics = new Array(batch.length);
@@ -1211,18 +1220,11 @@ export function createShardedBus(client, options = {}) {
 			// topicEpoch its replay tracker) when called.
 			const wrapped = {
 				publish(topic, event, data, opts) {
-					const result = platform.publish(topic, event, data, opts);
-					if (!opts || opts.relay !== false) {
-						const channel = channelFor(topic);
-						// Carry the de-herd window across the cluster (the receiving
-						// worker re-stamps `j`); omitted when absent so the common
-						// publish's relay wire is byte-identical.
-						const env = { instanceId, topic, event, data };
-						if (opts && typeof opts.jitterMs === 'number' && opts.jitterMs > 0) {
-							/** @type {any} */ (env).j = opts.jitterMs;
-						}
-						scheduleRelay(channel, JSON.stringify(env), [topic]);
-					}
+					if (opts && opts.relay === false) return platform.publish(topic, event, data, opts);
+					// The bus is this publish's fan-out to every other worker and
+					// instance, so a multi-worker adapter's in-process relay stays off.
+					const result = platform.publish(topic, event, data, relayedLocally(opts, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
+					scheduleRelay(channelFor(topic), JSON.stringify(singleEnvelope(topic, event, data, opts)), [topic]);
 					return result;
 				},
 				batch: typeof platform.batch === 'function' ? batch : undefined,
@@ -1256,15 +1258,14 @@ export function createShardedBus(client, options = {}) {
 				// when the underlying platform predates per-frame binary wire, so the
 				// plugins' typeof guard degrades gracefully.
 				publishWire: typeof platform.publishWire === 'function' ? (topic, event, data, wire, opts) => {
-					const result = platform.publishWire(topic, event, data, wire, opts);
-					if (wire && wire.shared === true && (!opts || opts.relay !== false)) {
-						// excludeWs is NOT carried: the excluded socket is local to this
-						// origin instance; other instances have no such socket and fan out
-						// fully (the adapter relays on its excludeWs walk path too).
-						const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
-						if (opts && opts.compress === true) env.compress = true;
-						scheduleRelay(channelFor(topic), JSON.stringify(env), [topic]);
+					if (!(wire && wire.shared === true && (!opts || opts.relay !== false))) {
+						return platform.publishWire(topic, event, data, wire, opts);
 					}
+					const result = platform.publishWire(topic, event, data, wire, relayedLocally(opts, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
+					// excludeWs is NOT carried: the excluded socket is local to this
+					// origin instance; other instances have no such socket and fan out
+					// fully (the adapter relays on its excludeWs walk path too).
+					scheduleRelay(channelFor(topic), JSON.stringify(wireEnvelope(topic, event, data, wire, opts)), [topic]);
 					return result;
 				} : undefined,
 				sendWire: typeof platform.sendWire === 'function' ? platform.sendWire.bind(platform) : undefined,
@@ -1350,15 +1351,18 @@ export function createShardedBus(client, options = {}) {
 				// The topic-broadcast cluster coordinator; live getter so realtime
 				// detects it on the wrapped seam to fan live.push({ topic }) cluster-wide.
 				get topicBroadcast() { return platform.topicBroadcast; },
+				// The adapter's scoped helpers, published through this wrap so they
+				// relay: each forwards its options, the counters default to 1, and
+				// each returns the publish result.
 				topic(t) {
 					return {
-						publish(event, data) { wrapped.publish(t, event, data); },
-						created(data) { wrapped.publish(t, 'created', data); },
-						updated(data) { wrapped.publish(t, 'updated', data); },
-						deleted(data) { wrapped.publish(t, 'deleted', data); },
-						set(value) { wrapped.publish(t, 'set', value); },
-						increment(amount) { wrapped.publish(t, 'increment', amount); },
-						decrement(amount) { wrapped.publish(t, 'decrement', amount); }
+						publish: (event, data, opts) => wrapped.publish(t, event, data, opts),
+						created: (data, opts) => wrapped.publish(t, 'created', data, opts),
+						updated: (data, opts) => wrapped.publish(t, 'updated', data, opts),
+						deleted: (data, opts) => wrapped.publish(t, 'deleted', data, opts),
+						set: (value, opts) => wrapped.publish(t, 'set', value, opts),
+						increment: (amount = 1, opts) => wrapped.publish(t, 'increment', amount, opts),
+						decrement: (amount = 1, opts) => wrapped.publish(t, 'decrement', amount, opts)
 					};
 				}
 			};

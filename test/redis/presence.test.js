@@ -132,7 +132,7 @@ describe('redis presence', () => {
 			expect(diffs[0].topic).toBe('__presence:room');
 			expect(diffs[0].data.joins).toEqual({ '2': { id: '2', name: 'Bob' } });
 			expect(diffs[0].data.leaves).toEqual({});
-			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true, seq: false });
 		});
 
 		it('coalesces multiple same-tick joins into one diff per topic', async () => {
@@ -716,7 +716,7 @@ describe('redis presence', () => {
 			const diffs = diffsOf(platform);
 			expect(diffs).toHaveLength(1);
 			expect(diffs[0].data.joins).toEqual({ remote: { id: 'remote', name: 'Remote' } });
-			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true, seq: false });
 		});
 
 		it('routes inbound leave from another instance through the diff buffer', async () => {
@@ -898,7 +898,7 @@ describe('redis presence', () => {
 			);
 			expect(empties.length).toBeGreaterThan(0);
 			expect(empties[0].data).toEqual({});
-			expect(empties[0].options).toEqual({ relay: false, compress: true });
+			expect(empties[0].options).toEqual({ relay: false, compress: true, seq: false });
 			local.destroy();
 		});
 
@@ -1104,7 +1104,7 @@ describe('redis presence', () => {
 			const diffs = wp.publishedWire.filter((p) => p.event === 'diff');
 			expect(diffs.length).toBeGreaterThan(0);
 			expect(diffs[0].wire.capability).toBe('presence.protocol:1');
-			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true, seq: false });
 			expect(wp.published.filter((p) => p.event === 'diff')).toHaveLength(0); // not JSON
 		});
 
@@ -1150,7 +1150,7 @@ describe('redis presence', () => {
 
 			const beat = heartbeatsOf(platform).find((h) => h.topic === '__presence:room');
 			expect(beat).toBeDefined();
-			expect(beat.options).toEqual({ compress: true });
+			expect(beat.options).toEqual({ compress: true, seq: false });
 			local.destroy();
 		});
 	});
@@ -1912,7 +1912,7 @@ describe('redis presence', () => {
 			expect(diffs[0].data.updates).toEqual({ '1': { typing: true } });
 			expect(diffs[0].data.joins).toEqual({});
 			expect(diffs[0].data.leaves).toEqual({});
-			expect(diffs[0].options).toEqual({ relay: false, compress: true });
+			expect(diffs[0].options).toEqual({ relay: false, compress: true, seq: false });
 		});
 
 		it('broadcasts only the fields that actually changed (per-field delta)', async () => {

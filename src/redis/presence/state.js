@@ -22,6 +22,8 @@ import { makeKeys } from './keys.js';
 import { makePublicData, makeDefaultPresenceSelect } from './data.js';
 import { createFieldNameRule, createReservedFieldWarner } from './field-policy.js';
 
+const EMIT_OPTIONS = Object.freeze({ compress: true, seq: false });
+
 /**
  * Assemble the presence context for one createPresence instance.
  *
@@ -87,7 +89,10 @@ export function createPresenceState(client, options = {}) {
 	 * per-call `relay` flag - the cross-instance fan-out is this plugin's own
 	 * Redis relay, so local frames pass `{ relay: false }`. `compress: true` opts
 	 * into permessage-deflate (presence is low-frequency; the opposite of the
-	 * cursor 60Hz hot path).
+	 * cursor 60Hz hot path). Every frame is `seq: false`: a client rebuilds the
+	 * roster from the state snapshot and the heartbeat, so the frames make no
+	 * monotonic promise, and a multi-worker adapter refuses a publish that would
+	 * draw its per-worker counter.
 	 * @param {string} fullTopic
 	 * @param {string} event
 	 * @param {any} data
@@ -95,7 +100,7 @@ export function createPresenceState(client, options = {}) {
 	 * @param {{ relay?: boolean }} [opts]
 	 */
 	function emit(fullTopic, event, data, platform, opts) {
-		const wireOptions = opts ? { ...opts, compress: true } : { compress: true };
+		const wireOptions = opts ? { ...opts, compress: true, seq: false } : EMIT_OPTIONS;
 		if (wireCodec && typeof platform.publishWire === 'function') {
 			platform.publishWire(fullTopic, event, data, wireCodec, wireOptions);
 		} else {

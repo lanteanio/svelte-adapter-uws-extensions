@@ -1247,8 +1247,9 @@ describe('redis replay', () => {
 			const result = await r.publish(platform, 'chat', 'created', { id: 1 });
 
 			expect(result).toBe(true);
+			// No authoritative seq, and no counter seq in the buffer's seq space.
 			expect(platform.published).toEqual([
-				{ topic: 'chat', event: 'created', data: { id: 1 } }
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: false } }
 			]);
 
 			restore();

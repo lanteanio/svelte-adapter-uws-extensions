@@ -1126,11 +1126,11 @@ describe('postgres replay', () => {
 				client.query = origQuery;
 				r.destroy();
 			}
-			// Degraded fan-out carries no authoritative seq.
+			// Degraded fan-out carries no authoritative seq, and no counter seq either.
 			expect(platform.publishedBatches).toHaveLength(1);
 			expect(platform.publishedBatches[0].messages).toEqual([
-				{ topic: 'chat', event: 'created', data: { id: 1 } },
-				{ topic: 'chat', event: 'created', data: { id: 2 } }
+				{ topic: 'chat', event: 'created', data: { id: 1 }, options: { seq: false } },
+				{ topic: 'chat', event: 'created', data: { id: 2 }, options: { seq: false } }
 			]);
 			expect(await replay.seq('chat')).toBe(0);
 		});

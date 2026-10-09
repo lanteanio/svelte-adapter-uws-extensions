@@ -14,7 +14,7 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/redis-io
  */
 
-import { now, setIntervalTimer, clearIntervalTimer } from '../../shared/runtime.js';
+import { now, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from '../../shared/runtime.js';
 import { evalCached } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
@@ -22,6 +22,10 @@ import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
 import { openSubscriber } from '../../shared/redis-subscriber.js';
+
+// Backoff for reopening a relay subscription that could not open.
+const SUBSCRIBE_RETRY_MIN_MS = 1000;
+const SUBSCRIBE_RETRY_MAX_MS = 30000;
 
 /**
  * Create the cursor Redis I/O subsystem. State (pending snapshots, subscriber,
@@ -33,7 +37,8 @@ import { openSubscriber } from '../../shared/redis-subscriber.js';
  *   client: import('../index.js').RedisClient, redis: import('ioredis').Redis,
  *   channel: string, instanceId: string, b: any, validator: any,
  *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>,
- *   emit: Function, onMessage: (parsed: any, platform: any) => void, queueRemove: Function
+ *   emit: Function, onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
+ *   inUse: () => boolean
  * }} deps
  */
 export function createRedisIo({
@@ -48,7 +53,8 @@ export function createRedisIo({
 	activeTopics,
 	emit,
 	onMessage,
-	queueRemove
+	queueRemove,
+	inUse
 }) {
 	const cursorTtlMs = cursorTtl * 1000;
 	const cleanupInterval = Math.max(cursorTtlMs, 10000);
@@ -69,6 +75,14 @@ export function createRedisIo({
 	let subscriberReady = null;
 	// One report per failure streak: every cursor update retries a failed subscribe.
 	let subscribeFailing = false;
+	// An instance whose connections only watch never calls update(), so a
+	// subscription that could not open (the breaker open, SUBSCRIBE refused) is
+	// retried on a timer, backing off to SUBSCRIBE_RETRY_MAX_MS, while a
+	// connection on this instance still uses the cursor (inUse); after that the
+	// next attach or update opens it.
+	let subscribeRetryTimer = null;
+	let subscribeRetryMs = SUBSCRIBE_RETRY_MIN_MS;
+	let disposed = false;
 	let cleanupTimer = null;
 	let snapshotTimer = null;
 
@@ -101,16 +115,45 @@ export function createRedisIo({
 				} catch { /* skip */ }
 			}
 			if (catalogEntries.length > 0 && activePlatform) {
-				emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform, { relay: false });
-				emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform, { relay: false });
+				emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform);
+				emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform);
 			}
 		}
 	}
 
+	function retrySubscribeLater() {
+		if (subscribeRetryTimer !== null || disposed) return;
+		subscribeRetryTimer = setTimer(() => {
+			subscribeRetryTimer = null;
+			if (subscriber || !activePlatform) return;
+			if (!inUse()) {
+				// Nothing here uses the cursor any more: the next attach or update
+				// opens the relay, starting a new backoff and failure streak.
+				subscribeRetryMs = SUBSCRIBE_RETRY_MIN_MS;
+				subscribeFailing = false;
+				return;
+			}
+			ensureSubscriber(activePlatform);
+		}, subscribeRetryMs);
+		if (subscribeRetryTimer.unref) subscribeRetryTimer.unref();
+		subscribeRetryMs = Math.min(subscribeRetryMs * 2, SUBSCRIBE_RETRY_MAX_MS);
+	}
+
+	/**
+	 * Open the relay subscription if it is not open. Returns the pending
+	 * subscribe (settled once SUBSCRIBE is answered and the catch-up has run,
+	 * never rejected) so a watcher can wait for it before reading the snapshot,
+	 * or undefined when there is nothing to wait for.
+	 * @returns {Promise<void> | undefined}
+	 */
 	function ensureSubscriber(platform) {
+		if (disposed) return undefined;
 		activePlatform = platform;
-		if (subscriber) return;
-		if (b && b.state === 'broken') return;
+		if (subscriber) return subscriberReady ?? undefined;
+		if (b && b.state === 'broken') {
+			retrySubscribeLater();
+			return undefined;
+		}
 		const sub = openSubscriber(client, 'cursor');
 		subscriber = sub;
 		sub.on('error', (err) => {
@@ -129,8 +172,9 @@ export function createRedisIo({
 				// Malformed, skip
 			}
 		});
-		subscriberReady = sub.subscribe(channel).then(() => {
+		const ready = sub.subscribe(channel).then(() => {
 			subscribeFailing = false;
+			subscribeRetryMs = SUBSCRIBE_RETRY_MIN_MS;
 			// Best-effort: a catch-up that fails leaves the subscribed relay running.
 			return catchUp().catch(() => {});
 		}, (err) => {
@@ -142,9 +186,13 @@ export function createRedisIo({
 				subscribeFailing = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBE, { error: err });
 			}
+			retrySubscribeLater();
 		}).finally(() => {
-			subscriberReady = null;
+			// A newer subscribe may have started after this one failed.
+			if (subscriberReady === ready) subscriberReady = null;
 		});
+		subscriberReady = ready;
+		return ready;
 	}
 
 	// One report per failure streak: a Redis outage fails every topic on every
@@ -353,6 +401,9 @@ export function createRedisIo({
 
 	/** Terminal teardown (tracker destroy()): stop timers, quit the subscriber. */
 	function dispose() {
+		disposed = true;
+		if (subscribeRetryTimer !== null) clearTimer(subscribeRetryTimer);
+		subscribeRetryTimer = null;
 		if (cleanupTimer) clearIntervalTimer(cleanupTimer);
 		cleanupTimer = null;
 		if (snapshotTimer) clearIntervalTimer(snapshotTimer);

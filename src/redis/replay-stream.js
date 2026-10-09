@@ -32,6 +32,7 @@ import { decodeStreamFields } from '../shared/replay-envelope.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 
 /**
  * Lua script for atomic idempotent publish.
@@ -384,7 +385,7 @@ export function createStreamReplay(client, options = {}) {
 			// sortedset replay for the full rationale) so a resuming client dedups
 			// against the same seq space the buffer stores. seq comes from the Lua
 			// INCR, so it is a valid positive integer; guarded for safety.
-			await platform.publish(topic, event, data, Number.isInteger(seq) && seq >= 1 ? { seq } : undefined);
+			await platform.publish(topic, event, data, Number.isInteger(seq) && seq >= 1 ? { seq } : UNSEQUENCED_PUBLISH);
 			return { seq, isDuplicate: false };
 		},
 
@@ -423,7 +424,7 @@ export function createStreamReplay(client, options = {}) {
 							attributes: platform?.requestId ? { requestId: platform.requestId } : null
 						});
 					}
-					return platform.publish(topic, event, data);
+					return platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 				}
 				throw new ReplayStorageError('publish', err);
 			}
@@ -433,11 +434,12 @@ export function createStreamReplay(client, options = {}) {
 				await awaitReplicationGrouped(redis, minReplicas, replicationTimeoutMs, b, mReplications, mReplicationTimeouts);
 			}
 
-			// Thread the authoritative stream seq onto the live frame; the degraded
-			// local-fanout fallback above stays counter-stamped (no authoritative seq).
+			// Thread the authoritative stream seq onto the live frame; a frame without
+			// one, like the degraded local-fanout fallback above, goes out with
+			// seq: false (see the sorted-set replay for why).
 			return Number.isInteger(seq) && seq >= 1
 				? platform.publish(topic, event, data, { seq })
-				: platform.publish(topic, event, data);
+				: platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 		},
 
 		async seq(topic) {

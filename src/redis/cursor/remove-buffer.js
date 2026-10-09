@@ -11,6 +11,11 @@
 import { setTimer, clearTimer } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 
+// A REMOVE is local to this worker and carries no seq, like every cursor frame
+// (see emit in ../cursor.js): the cursor's own Redis relay reaches the other
+// workers and instances.
+const REMOVE_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false });
+
 /**
  * @typedef {Object} RemoveBuffer
  * @property {(topic: string, key: string, platform: import('svelte-adapter-uws').Platform) => void} queueRemove
@@ -85,12 +90,12 @@ export function createRemoveBuffer() {
 			if (typeof platform.publishBatched === 'function') {
 				const messages = [];
 				for (const key of keys) {
-					messages.push({ topic: '__cursor:' + topic, event: EVENTS.REMOVE, data: { key } });
+					messages.push({ topic: '__cursor:' + topic, event: EVENTS.REMOVE, data: { key }, options: REMOVE_OPTIONS });
 				}
 				try { platform.publishBatched(messages); } catch { /* platform unavailable mid-flight */ }
 			} else {
 				for (const key of keys) {
-					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }, { compress: false }); } catch { /* swallow */ }
+					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }, REMOVE_OPTIONS); } catch { /* swallow */ }
 				}
 			}
 		}

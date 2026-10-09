@@ -49,7 +49,7 @@ export interface RedisReplayOptions {
 	idempotencyTtl?: number;
 	/**
 	 * When `true`, `publish()` falls back to a best-effort
-	 * `platform.publish(topic, event, data)` if the underlying storage
+	 * `platform.publish(topic, event, data, { seq: false })` if the underlying storage
 	 * call fails (Redis down, breaker open, etc.) instead of throwing.
 	 * The `replay_storage_fallbacks_total{topic}` counter increments
 	 * on each fallback, so observability is preserved.
@@ -62,7 +62,9 @@ export interface RedisReplayOptions {
 	 * keeps working.
 	 *
 	 * Does not affect `publishIdempotent`, which always throws on
-	 * storage failure to preserve its exactly-once contract.
+	 * storage failure to preserve its exactly-once contract. The local
+	 * frame carries `seq: false`: it has no buffer seq, and a counter value
+	 * could move a client's watermark past entries the buffer holds.
 	 *
 	 * @default false
 	 */
@@ -120,7 +122,7 @@ export class ReplicationTimeoutError extends Error {
  * Thrown by `publish()` and `publishIdempotent()` when the underlying
  * storage call fails (Redis eval, circuit breaker open, connection refused).
  * The original error is preserved in `.cause`. Catch this to fall back to a
- * best-effort `platform.publish(topic, event, data)`, or set
+ * best-effort `platform.publish(topic, event, data, { seq: false })`, or set
  * `localFanoutOnStorageFailure: true` to have the backend do that for you.
  *
  * Always thrown by `publishIdempotent` even when the option is set, since

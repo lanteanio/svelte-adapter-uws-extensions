@@ -381,8 +381,9 @@ describe('redis pubsub bus', () => {
 				coalesceKey: 'btc'
 			}));
 
+			// Unsequenced, like the coalesced send it stands in for.
 			expect(platform.published).toEqual([
-				{ topic: 'prices', event: 'tick', data: { p: 5 }, options: { relay: false } }
+				{ topic: 'prices', event: 'tick', data: { p: 5 }, options: { relay: false, seq: false } }
 			]);
 		});
 

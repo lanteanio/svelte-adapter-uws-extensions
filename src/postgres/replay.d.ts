@@ -16,7 +16,7 @@ export interface PgReplayOptions {
 	cleanupInterval?: number;
 	/**
 	 * When `true`, `publish()` falls back to a best-effort
-	 * `platform.publish(topic, event, data)` if the underlying Postgres
+	 * `platform.publish(topic, event, data, { seq: false })` if the underlying Postgres
 	 * call fails (connection refused, breaker open, etc.) instead of
 	 * throwing. The `replay_storage_fallbacks_total{topic}` counter
 	 * increments on each fallback.
@@ -26,7 +26,9 @@ export interface PgReplayOptions {
 	 * messages that were delivered live but never persisted. Set `true`
 	 * for dev environments running without Postgres, or for use cases
 	 * where loss of replay durability is acceptable as long as live
-	 * delivery keeps working.
+	 * delivery keeps working. The local frame carries `seq: false`: it has
+	 * no buffer seq, and a counter value could move a client's watermark
+	 * past rows the table holds.
 	 *
 	 * @default false
 	 */
@@ -53,7 +55,7 @@ export interface PgReplayOptions {
  * Thrown by `publish()` when the underlying Postgres query fails (connection
  * refused, circuit breaker open, etc). The original error is preserved in
  * `.cause`. Catch this to fall back to a best-effort
- * `platform.publish(topic, event, data)`, or set
+ * `platform.publish(topic, event, data, { seq: false })`, or set
  * `localFanoutOnStorageFailure: true` to have the backend do that for you.
  */
 export class ReplayStorageError extends Error {

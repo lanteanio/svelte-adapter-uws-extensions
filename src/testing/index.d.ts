@@ -125,7 +125,7 @@ export interface MockPlatform {
 	protection: 'normal' | 'elevated' | 'siege';
 	publish(topic: string, event: string, data?: any, options?: any): boolean;
 	send(ws: any, topic: string, event: string, data?: any, options?: any): number;
-	batch(messages: Array<{ topic: string; event: string; data?: any }>): boolean[];
+	batch(messages: Array<{ topic: string; event: string; data?: any; options?: any }>): boolean[];
 	sendTo(filter: any, topic: string, event: string, data?: any): number;
 	subscribers(topic: string): number;
 	subscribe(ws: any, topic: string): string | null;
@@ -138,13 +138,13 @@ export interface MockPlatform {
 	/** Test-only: invoke every registered publish-rate listener with the given events. */
 	_emitPublishRate(events: Array<{ topic: string; messagesPerSec: number; bytesPerSec: number }>): void;
 	topic(t: string): {
-		publish(event: string, data?: any): void;
-		created(data?: any): void;
-		updated(data?: any): void;
-		deleted(data?: any): void;
-		set(value?: any): void;
-		increment(amount?: number): void;
-		decrement(amount?: number): void;
+		publish(event: string, data?: any, options?: any): void;
+		created(data?: any, options?: any): void;
+		updated(data?: any, options?: any): void;
+		deleted(data?: any, options?: any): void;
+		set(value?: any, options?: any): void;
+		increment(amount?: number, options?: any): void;
+		decrement(amount?: number, options?: any): void;
 	};
 	/** Clear all recorded publish/send calls. */
 	reset(): void;

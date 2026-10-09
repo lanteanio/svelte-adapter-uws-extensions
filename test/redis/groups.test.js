@@ -94,14 +94,16 @@ describe('redis groups', () => {
 			expect(membersSent[0].data).toEqual([{ role: 'member' }]);
 		});
 
-		it('publishes join event without relay: false', async () => {
+		it('publishes the join event worker-local and unsequenced', async () => {
 			const ws = mockWs();
 			await group.join(ws, platform);
 
 			const joins = platform.published.filter((p) => p.event === 'join');
 			expect(joins).toHaveLength(1);
 			expect(joins[0].data).toEqual({ role: 'member' });
-			expect(joins[0].options).toBeUndefined();
+			// The group's own channel reaches the other workers, so the adapter's
+			// in-process relay would deliver it to them twice.
+			expect(joins[0].options).toEqual({ relay: false, seq: false });
 		});
 
 		it('default role is member', async () => {
@@ -522,7 +524,7 @@ describe('redis groups', () => {
 			// The event should have been forwarded using platform2 (latest), not platform1
 			const chatEvents = platform2.published.filter((p) => p.event === 'chat');
 			expect(chatEvents).toHaveLength(1);
-			expect(chatEvents[0].options).toEqual({ relay: false });
+			expect(chatEvents[0].options).toEqual({ relay: false, seq: false });
 			expect(platform1.published.filter((p) => p.event === 'chat')).toHaveLength(0);
 
 			g.destroy();
@@ -554,7 +556,7 @@ describe('redis groups', () => {
 			// Remote close should use relay: false
 			const closeEvents = platform2.published.filter((p) => p.event === 'close');
 			expect(closeEvents).toHaveLength(1);
-			expect(closeEvents[0].options).toEqual({ relay: false });
+			expect(closeEvents[0].options).toEqual({ relay: false, seq: false });
 
 			instance1.destroy();
 			instance2.destroy();

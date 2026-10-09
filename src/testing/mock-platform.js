@@ -189,7 +189,7 @@ export function mockPlatform() {
 			return Promise.resolve(undefined);
 		},
 		batch(messages) {
-			return messages.map((m) => p.publish(m.topic, m.event, m.data));
+			return messages.map((m) => p.publish(m.topic, m.event, m.data, m.options));
 		},
 		sendTo(filter, topic, event, data) {
 			return 0;
@@ -240,15 +240,17 @@ export function mockPlatform() {
 		authorizeWireSubscribe() {
 			p.wireSubscribeAuthorized = true;
 		},
+		// The adapter's scoped helpers: options forwarded, counters default to 1,
+		// each returns the publish result.
 		topic(t) {
 			return {
-				publish(event, data) { p.publish(t, event, data); },
-				created(data) { p.publish(t, 'created', data); },
-				updated(data) { p.publish(t, 'updated', data); },
-				deleted(data) { p.publish(t, 'deleted', data); },
-				set(value) { p.publish(t, 'set', value); },
-				increment(amount) { p.publish(t, 'increment', amount); },
-				decrement(amount) { p.publish(t, 'decrement', amount); }
+				publish: (event, data, options) => p.publish(t, event, data, options),
+				created: (data, options) => p.publish(t, 'created', data, options),
+				updated: (data, options) => p.publish(t, 'updated', data, options),
+				deleted: (data, options) => p.publish(t, 'deleted', data, options),
+				set: (value, options) => p.publish(t, 'set', value, options),
+				increment: (amount = 1, options) => p.publish(t, 'increment', amount, options),
+				decrement: (amount = 1, options) => p.publish(t, 'decrement', amount, options)
 			};
 		},
 		// Mirrors the adapter's platform.topicEpoch. The mock returns the

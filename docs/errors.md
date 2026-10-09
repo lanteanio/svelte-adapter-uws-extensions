@@ -1110,7 +1110,7 @@ the stable ID tag on the line):
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.subscribe.failed severity=error] The cursor relay could not subscribe to its channel.`
 - **Cause:** SUBSCRIBE on the dedicated connection was rejected: the Redis user may not subscribe to the channel (NOPERM), or the connection failed while subscribing.
 - **Consequence:** Cursor positions from other instances do not reach this instance until a subscribe succeeds. Reported once per failure streak.
-- **Automatic recovery:** The connection is closed and the next cursor update subscribes on a fresh one; a subscribe that succeeds re-arms this report.
+- **Automatic recovery:** The connection is closed and a fresh one subscribes on the next cursor update, attach or `__cursor:` subscribe, and on a retry that backs off from one to thirty seconds while a connection on this instance uses the cursor; a subscribe that succeeds re-arms this report.
 - **Next action:** Check Redis connectivity and that the Redis user may SUBSCRIBE to the channel.
 - **Runtime help:** `docs/errors.md#extensions-err-cursor-subscribe`
 - **Runtime sources:** [src/redis/cursor/redis-io.js](../src/redis/cursor/redis-io.js)

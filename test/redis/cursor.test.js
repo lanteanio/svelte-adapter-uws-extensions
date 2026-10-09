@@ -698,7 +698,7 @@ describe('redis cursor', () => {
 	});
 
 	describe('update - basic', () => {
-		it('first update emits join + update; neither carries relay: false', () => {
+		it('first update emits join + update as worker-local, unsequenced frames', () => {
 			const ws = mockWs({ id: '1', name: 'Alice' });
 			cursors.update(ws, 'canvas', { x: 10, y: 20 }, platform);
 
@@ -715,10 +715,12 @@ describe('redis cursor', () => {
 				key: expect.any(String),
 				data: { x: 10, y: 20 }
 			});
-			// User-initiated broadcasts relay to sibling workers (no relay:false)
-			// and stay off the compressor (cursor 60Hz hot path).
-			expect(join.options).toEqual({ compress: false });
-			expect(update.options).toEqual({ compress: false });
+			// The cursor's own Redis relay reaches every other worker and instance,
+			// so the adapter's in-process relay stays off (it would deliver to the
+			// sibling workers a second time); no seq; and off the compressor
+			// (cursor 60Hz hot path).
+			expect(join.options).toEqual({ relay: false, compress: false, seq: false });
+			expect(update.options).toEqual({ relay: false, compress: false, seq: false });
 		});
 
 		it('uses select to extract user info on join', () => {
@@ -1207,7 +1209,7 @@ describe('redis cursor', () => {
 			expect(platform.published[0].topic).toBe('__cursor:canvas');
 			expect(platform.published[0].data.key).toBe('remote:1');
 			expect(platform.published[0].data.data).toEqual({ x: 77 });
-			expect(platform.published[0].options).toEqual({ relay: false, compress: false });
+			expect(platform.published[0].options).toEqual({ relay: false, compress: false, seq: false });
 			c.destroy();
 		});
 
@@ -1230,7 +1232,7 @@ describe('redis cursor', () => {
 			expect(platform.published[0].topic).toBe('__cursor:canvas');
 			expect(platform.published[0].event).toBe('join');
 			expect(platform.published[0].data).toEqual({ key: 'remote:2', user: { id: '2', name: 'Bob' } });
-			expect(platform.published[0].options).toEqual({ relay: false, compress: false });
+			expect(platform.published[0].options).toEqual({ relay: false, compress: false, seq: false });
 			c.destroy();
 		});
 
@@ -1340,7 +1342,9 @@ describe('redis cursor', () => {
 			expect(join).toBeDefined();
 			expect(update).toBeDefined();
 			expect(update.wire.capability).toBe('cursor.protocol:2');
-			expect(update.options).toBeUndefined(); // binary publishWire defaults off; no compress
+			// Binary publishWire compression defaults off, so no compress flag.
+			expect(update.options).toEqual({ relay: false, seq: false });
+			expect(join.options).toEqual({ relay: false, seq: false });
 			expect(wp.published.filter((p) => p.event === 'update')).toHaveLength(0); // not JSON
 			c.destroy();
 		});
@@ -1491,7 +1495,7 @@ describe('redis cursor', () => {
 
 			const removes = noBatch.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
-			expect(removes[0].options).toEqual({ compress: false });
+			expect(removes[0].options).toEqual({ relay: false, compress: false, seq: false });
 			c.destroy();
 		});
 
@@ -1507,9 +1511,9 @@ describe('redis cursor', () => {
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
 			expect(removes[0].batched).toBe(true);
-			// publishBatched takes no options; the adapter sends batched frames
-			// uncompressed regardless, so no per-frame compress flag is set here.
-			expect(removes[0].options).toBeUndefined();
+			// Each entry carries the REMOVE options (worker-local, unsequenced); the
+			// adapter sends batched frames uncompressed whatever compress says.
+			expect(removes[0].options).toEqual({ relay: false, compress: false, seq: false });
 			c.destroy();
 		});
 	});
@@ -2596,5 +2600,294 @@ describe('redis cursor', () => {
 			expect(positions(platform).length).toBe(before); // settle did not fire after remove
 			c.destroy();
 		});
+	});
+});
+
+describe('redis cursor: an instance whose connections only watch', () => {
+	it('receives the other instances\' joins, moves and removes', async () => {
+		const client = mockRedisClient('watch:');
+		const moverPlatform = mockPlatform();
+		const watcherPlatform = mockPlatform();
+		const mover = createCursor(client, { throttle: 0 });
+		const watcher = createCursor(client, { throttle: 0 });
+		const until = async (check) => {
+			for (let i = 0; i < 400 && !check(); i++) await new Promise((r) => setTimeout(r, 5));
+			expect(check()).toBe(true);
+		};
+		try {
+			// The watcher's only connection attaches and never moves, so nothing
+			// but attach() can open its relay subscription.
+			await watcher.attach(mockWs({ id: 'viewer' }), 'canvas', watcherPlatform);
+			const alice = mockWs({ id: 'alice' });
+			mover.update(alice, 'canvas', { x: 5 }, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice'));
+			await until(() => watcherPlatform.published.some((f) => (f.event === 'update' || f.event === 'bulk') && JSON.stringify(f.data).includes('"x":5')));
+			await mover.remove(alice, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'remove'));
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+		}
+	});
+});
+
+describe('redis cursor: a watcher subscribed through the subscribe hook', () => {
+	it('receives the other instances\' moves', async () => {
+		const client = mockRedisClient('watch-hook:');
+		const moverPlatform = mockPlatform();
+		const watcherPlatform = mockPlatform();
+		const mover = createCursor(client, { throttle: 0 });
+		const watcher = createCursor(client, { throttle: 0 });
+		try {
+			expect(await watcher.hooks.subscribe(mockWs({ id: 'viewer' }), '__cursor:canvas', { platform: watcherPlatform })).toBeUndefined();
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 7 }, moverPlatform);
+			for (let i = 0; i < 400 && !watcherPlatform.published.some((f) => f.event === 'join'); i++) await new Promise((r) => setTimeout(r, 5));
+			expect(watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice')).toBe(true);
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+		}
+	});
+});
+
+describe('redis cursor: the watcher relay subscription', () => {
+	const until = async (check, ms = 3000) => {
+		const start = Date.now();
+		while (!check() && Date.now() - start < ms) await new Promise((r) => setTimeout(r, 5));
+		expect(check()).toBe(true);
+	};
+
+	/**
+	 * A mover whose relay is already open, and a watcher on the same Redis whose
+	 * next subscriber connection answers SUBSCRIBE through `answer` (delayed,
+	 * refused once, ...). Only the watcher's connection is affected.
+	 */
+	async function moverAndWatcher(prefix, answer, watcherOptions = {}) {
+		const client = mockRedisClient(prefix);
+		const moverPlatform = mockPlatform();
+		const watcherPlatform = mockPlatform();
+		const mover = createCursor(client, { throttle: 0 });
+		const watcher = createCursor(client, { throttle: 0, ...watcherOptions });
+		// Open the mover's relay first, on another topic.
+		mover.update(mockWs({ id: 'warmup' }), 'elsewhere', { x: 0 }, moverPlatform);
+		await new Promise((r) => setTimeout(r, 10));
+		const duplicate = client.duplicate.bind(client);
+		let calls = 0;
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			const subscribe = sub.subscribe.bind(sub);
+			const attempt = calls++;
+			sub.subscribe = (...channels) => answer(attempt, () => subscribe(...channels));
+			return sub;
+		};
+		return { mover, watcher, moverPlatform, watcherPlatform };
+	}
+
+	const slow = (attempt, subscribe) => new Promise((r) => setTimeout(r, 30)).then(subscribe);
+
+	it('is open before attach() resolves, so a join published right after it arrives', async () => {
+		const { mover, watcher, moverPlatform, watcherPlatform } = await moverAndWatcher('watch-slow:', slow);
+		try {
+			await watcher.attach(mockWs({ id: 'viewer' }), 'canvas', watcherPlatform);
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 1 }, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice'));
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+		}
+	});
+
+	it('is open before the __cursor: subscribe hook resolves', async () => {
+		const { mover, watcher, moverPlatform, watcherPlatform } = await moverAndWatcher('watch-slow-hook:', slow);
+		try {
+			await watcher.hooks.subscribe(mockWs({ id: 'viewer' }), '__cursor:canvas', { platform: watcherPlatform });
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 1 }, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice'));
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+		}
+	});
+
+	it('opens later when SUBSCRIBE was refused at attach', async () => {
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		let opened = false;
+		const refuseFirst = (attempt, subscribe) => (attempt === 0
+			? Promise.reject(new Error('NOPERM'))
+			: subscribe().then((r) => { opened = true; return r; }));
+		const { mover, watcher, moverPlatform, watcherPlatform } = await moverAndWatcher('watch-refused:', refuseFirst);
+		try {
+			await watcher.attach(mockWs({ id: 'viewer' }), 'canvas', watcherPlatform);
+			// Nothing on this instance calls update(); only the retry can reopen it.
+			await until(() => opened);
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 1 }, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice'));
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+			vi.restoreAllMocks();
+		}
+	}, 10000);
+
+	it('opens later when the breaker was open at attach', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 20 });
+		let opened = false;
+		const record = (attempt, subscribe) => subscribe().then((r) => { opened = true; return r; });
+		const { mover, watcher, moverPlatform, watcherPlatform } = await moverAndWatcher('watch-retry:', record, { breaker });
+		try {
+			breaker.failure(new Error('down'));
+			await watcher.attach(mockWs({ id: 'viewer' }), 'canvas', watcherPlatform);
+			// Nothing on this instance calls update(); only the retry can open it.
+			await until(() => opened);
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 2 }, moverPlatform);
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice'));
+		} finally {
+			mover.destroy();
+			watcher.destroy();
+		}
+	}, 10000);
+});
+
+describe('redis cursor: a watcher while its relay opens', () => {
+	const until = async (check, ms = 4000) => {
+		const start = Date.now();
+		while (!check() && Date.now() - start < ms) await new Promise((r) => setTimeout(r, 5));
+		expect(check()).toBe(true);
+	};
+
+	it('subscribes, admits and seeds the socket at once, and reads the roster once the relay is open', async () => {
+		const client = mockRedisClient('watch-order:');
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			const subscribe = sub.subscribe.bind(sub);
+			sub.subscribe = (...channels) => new Promise((r) => setTimeout(r, 40)).then(() => subscribe(...channels));
+			return sub;
+		};
+		const watcherPlatform = mockPlatform();
+		const watcher = createCursor(client, { throttle: 0 });
+		const ws = mockWs({ id: 'viewer' });
+		try {
+			let settled = false;
+			const attaching = watcher.attach(ws, 'canvas', watcherPlatform).then(() => { settled = true; });
+			await new Promise((r) => setTimeout(r, 10));
+			// The relay has not answered yet; local cursors already work.
+			expect(settled).toBe(false);
+			expect(ws.isSubscribed('__cursor:canvas')).toBe(true);
+			expect(watcherPlatform.sent.filter((f) => f.ws === ws).map((f) => f.event)).toEqual(['time', 'you']);
+			watcher.hooks.message(ws, { data: { type: 'cursor', topic: 'canvas', data: { x: 1 } }, platform: watcherPlatform });
+			await until(() => watcherPlatform.published.some((f) => f.event === 'join'));
+			await attaching;
+			expect(settled).toBe(true);
+		} finally {
+			watcher.destroy();
+		}
+	});
+});
+
+describe('redis cursor: the subscribe hook while its relay opens', () => {
+	it('grants nothing to a socket that closed during the authorization', async () => {
+		const client = mockRedisClient('watch-closed-hook:');
+		const watcherPlatform = mockPlatform();
+		// The application's subscribe check answers 30 ms late.
+		watcherPlatform.checkSubscribe = () => new Promise((r) => setTimeout(() => r(null), 30));
+		const watcher = createCursor(client, { throttle: 0 });
+		const ws = mockWs({ id: 'viewer' });
+		try {
+			const subscribing = watcher.hooks.subscribe(ws, '__cursor:canvas', { platform: watcherPlatform });
+			setTimeout(() => ws.close(), 10);
+			expect(await subscribing).toBeUndefined();
+			expect(watcherPlatform.sent.filter((f) => f.ws === ws)).toEqual([]);
+			// No membership was granted, so a cursor frame from it is refused.
+			watcher.hooks.message(ws, { data: { type: 'cursor', topic: 'canvas', data: { x: 1 } }, platform: watcherPlatform });
+			expect(watcherPlatform.published).toEqual([]);
+		} finally {
+			watcher.destroy();
+		}
+	});
+});
+
+describe('redis cursor: a relay SUBSCRIBE that keeps being refused', () => {
+	it('is reported once for the streak and retried until it is answered', async () => {
+		const lines = [];
+		vi.spyOn(console, 'error').mockImplementation((line) => { lines.push(String(line)); });
+		vi.spyOn(console, 'warn').mockImplementation((line) => { lines.push(String(line)); });
+		const client = mockRedisClient('watch-streak:');
+		const duplicate = client.duplicate.bind(client);
+		let attempts = 0;
+		let answered = false;
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			const subscribe = sub.subscribe.bind(sub);
+			const attempt = attempts++;
+			sub.subscribe = (...channels) => (attempt < 2
+				? Promise.reject(new Error('NOPERM'))
+				: subscribe(...channels).then((r) => { answered = true; return r; }));
+			return sub;
+		};
+		const watcherPlatform = mockPlatform();
+		const moverPlatform = mockPlatform();
+		const watcher = createCursor(client, { throttle: 0 });
+		const mover = createCursor(client, { throttle: 0 });
+		try {
+			await watcher.attach(mockWs({ id: 'viewer' }), 'canvas', watcherPlatform);
+			// Refused at once and again after 1 s; answered 2 s after that.
+			for (let i = 0; i < 1600 && !answered; i++) await new Promise((r) => setTimeout(r, 5));
+			expect(answered).toBe(true);
+			expect(attempts).toBe(3);
+			expect(lines.filter((line) => line.includes('event=redis.cursor.subscribe.failed ')).length).toBe(1);
+			mover.update(mockWs({ id: 'alice' }), 'canvas', { x: 1 }, moverPlatform);
+			for (let i = 0; i < 400 && !watcherPlatform.published.some((f) => f.event === 'join'); i++) await new Promise((r) => setTimeout(r, 5));
+			expect(watcherPlatform.published.some((f) => f.event === 'join' && f.data.user?.id === 'alice')).toBe(true);
+		} finally {
+			watcher.destroy();
+			mover.destroy();
+			vi.restoreAllMocks();
+		}
+	}, 10000);
+
+	it('stops retrying once no connection on the instance uses the cursor', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const client = mockRedisClient('watch-idle:');
+		const duplicate = client.duplicate.bind(client);
+		let attempts = 0;
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			attempts++;
+			sub.subscribe = () => Promise.reject(new Error('NOPERM'));
+			return sub;
+		};
+		const platform = mockPlatform();
+		const watcher = createCursor(client, { throttle: 0 });
+		const ws = mockWs({ id: 'viewer' });
+		try {
+			await watcher.attach(ws, 'canvas', platform);
+			await watcher.remove(ws, platform);
+			// Past the first retry (1 s): it finds nothing using the cursor and stops.
+			await new Promise((r) => setTimeout(r, 1500));
+			expect(attempts).toBe(1);
+		} finally {
+			watcher.destroy();
+			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe('redis cursor: after destroy()', () => {
+	it('opens no relay subscription for a late attach', async () => {
+		const client = mockRedisClient('watch-destroyed:');
+		const duplicate = client.duplicate.bind(client);
+		let opened = 0;
+		client.duplicate = (overrides) => { opened++; return duplicate(overrides); };
+		const platform = mockPlatform();
+		const watcher = createCursor(client, { throttle: 0 });
+		// The application's subscribe check is still pending when the tracker goes.
+		platform.checkSubscribe = () => new Promise((r) => setTimeout(() => r(null), 20));
+		const attaching = watcher.attach(mockWs({ id: 'viewer' }), 'canvas', platform);
+		watcher.destroy();
+		await attaching.catch(() => {});
+		expect(opened).toBe(0);
 	});
 });

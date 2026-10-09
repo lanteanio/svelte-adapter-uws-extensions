@@ -238,9 +238,9 @@ describeIntegration('redis cursor (integration)', () => {
 				expect(got.event).toBe('update');
 				expect(got.data.data).toEqual({ x: 77 });
 				// Cursor JSON frames carry { compress: false } (the 60Hz hot path
-				// opts out of permessage-deflate); relayed frames also carry
-				// { relay: false } so the receiving instance does not re-relay.
-				expect(got.options).toEqual({ relay: false, compress: false });
+				// opts out of permessage-deflate), { relay: false } (the cursor's own
+				// Redis relay reaches every other worker and instance) and no seq.
+				expect(got.options).toEqual({ relay: false, compress: false, seq: false });
 			} finally {
 				await publisher.quit();
 			}
@@ -296,7 +296,7 @@ describeIntegration('redis cursor (integration)', () => {
 				(p) => p.event === 'join' && p.data && p.data.user && p.data.user.id === 'alice'
 			);
 			expect(joinOnB.topic).toBe('__cursor:canvas');
-			expect(joinOnB.options).toEqual({ relay: false, compress: false });
+			expect(joinOnB.options).toEqual({ relay: false, compress: false, seq: false });
 
 			const updateOnB = platformB.published.find(
 				(p) => p.event === 'update' && p.data && p.data.key === joinOnB.data.key
@@ -304,7 +304,7 @@ describeIntegration('redis cursor (integration)', () => {
 			expect(updateOnB).toBeDefined();
 			expect(updateOnB.topic).toBe('__cursor:canvas');
 			expect(updateOnB.data.data).toEqual({ x: 42, y: 7 });
-			expect(updateOnB.options).toEqual({ relay: false, compress: false });
+			expect(updateOnB.options).toEqual({ relay: false, compress: false, seq: false });
 
 			// B's list() also reflects the cross-instance write via the
 			// shared Redis hash, after A's snapshot timer flushes the HSET.
@@ -360,8 +360,9 @@ describeIntegration('redis cursor (integration)', () => {
 			expect(removeOnB.topic).toBe('__cursor:canvas');
 			// REMOVE coalesces through platform.publishBatched (one frame per
 			// subscriber per tick), so it lands via the batched path rather than
-			// a per-event publish with { relay: false }.
+			// a per-event publish.
 			expect(removeOnB.batched).toBe(true);
+			expect(removeOnB.options).toEqual({ relay: false, compress: false, seq: false });
 
 			// B's list no longer contains alice.
 			const list = await trackerB.list('canvas');

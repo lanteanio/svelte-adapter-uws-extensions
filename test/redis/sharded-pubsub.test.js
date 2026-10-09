@@ -398,8 +398,9 @@ describe('redis sharded bus', () => {
 			busA.wrap(platformA).relayCoalesced('chat:room1', 'tick', { v: 9 }, 'k1');
 			await new Promise((r) => setTimeout(r, 5));
 
+			// Unsequenced, like the coalesced send it stands in for.
 			expect(platformB.published).toEqual([
-				{ topic: 'chat:room1', event: 'tick', data: { v: 9 }, options: { relay: false } }
+				{ topic: 'chat:room1', event: 'tick', data: { v: 9 }, options: { relay: false, seq: false } }
 			]);
 
 			await busA.deactivate();

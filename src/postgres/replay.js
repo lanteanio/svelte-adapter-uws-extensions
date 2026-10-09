@@ -43,6 +43,7 @@ import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.j
 import { tenantTopicSql } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 export { ReplayStorageError, ReplaySerializationError };
 
 /**
@@ -394,7 +395,7 @@ export function createReplay(client, options = {}) {
 				if (localFanoutOnStorageFailure) {
 					mStorageFallbacks?.inc({ topic: mt(topic) });
 					warnStorageFallbackOnce(platform, err);
-					return platform.publish(topic, event, data);
+					return platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 				}
 				throw new ReplayStorageError('publish', err);
 			}
@@ -414,11 +415,13 @@ export function createReplay(client, options = {}) {
 			// client dedups against the same per-topic contiguous seq space the table
 			// stores (across a restart, or across instances via the shared table)
 			// instead of the adapter's per-worker counter. seq is a contiguous
-			// positive integer from the CTE; guarded for safety. The degraded
-			// local-fanout fallback above stays counter-stamped (no authoritative seq).
+			// positive integer from the CTE; guarded for safety. A frame without one,
+			// like the degraded local-fanout fallback above, goes out with seq: false:
+			// a local counter value in this topic's seq space could move a client's
+			// watermark past rows the table still holds.
 			return Number.isInteger(seq) && seq >= 1
 				? platform.publish(topic, event, data, { seq })
-				: platform.publish(topic, event, data);
+				: platform.publish(topic, event, data, UNSEQUENCED_PUBLISH);
 		},
 
 		async publishBatch(platform, messages) {
@@ -498,16 +501,16 @@ export function createReplay(client, options = {}) {
 				if (localFanoutOnStorageFailure) {
 					for (const topic of topics) mStorageFallbacks?.inc({ topic: mt(topic) });
 					warnStorageFallbackOnce(platform, err);
-					// Degraded local fan-out: no authoritative seq (mirrors the
-					// single path's counter-stamped fallback).
+					// Degraded local fan-out: no authoritative seq, so seq: false
+					// (as on the single path's fallback).
 					if (typeof platform.publishBatched === 'function') {
 						return platform.publishBatched(messages.map((msg) => ({
-							topic: msg.topic, event: msg.event, data: msg.data
+							topic: msg.topic, event: msg.event, data: msg.data, options: UNSEQUENCED_PUBLISH
 						}))) ?? true;
 					}
 					let ok = true;
 					for (const msg of messages) {
-						if (platform.publish(msg.topic, msg.event, msg.data) === false) ok = false;
+						if (platform.publish(msg.topic, msg.event, msg.data, UNSEQUENCED_PUBLISH) === false) ok = false;
 					}
 					return ok;
 				}
@@ -536,9 +539,7 @@ export function createReplay(client, options = {}) {
 				const seq = nextSeq.get(topic);
 				nextSeq.set(topic, seq + 1);
 				mPublishes?.inc({ topic: mt(topic) });
-				batch[i] = Number.isInteger(seq) && seq >= 1
-					? { topic, event: events[i], data: messages[i].data, options: { seq } }
-					: { topic, event: events[i], data: messages[i].data };
+				batch[i] = { topic, event: events[i], data: messages[i].data, options: Number.isInteger(seq) && seq >= 1 ? { seq } : UNSEQUENCED_PUBLISH };
 			}
 
 			for (const [topic, high] of highs) {
@@ -554,10 +555,7 @@ export function createReplay(client, options = {}) {
 			}
 			let ok = true;
 			for (const msg of batch) {
-				const r = msg.options
-					? platform.publish(msg.topic, msg.event, msg.data, msg.options)
-					: platform.publish(msg.topic, msg.event, msg.data);
-				if (r === false) ok = false;
+				if (platform.publish(msg.topic, msg.event, msg.data, msg.options) === false) ok = false;
 			}
 			return ok;
 		},

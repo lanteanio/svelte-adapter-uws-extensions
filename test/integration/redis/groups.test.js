@@ -263,7 +263,7 @@ describeIntegration('redis groups (integration)', () => {
 			);
 			expect(bLocal).toBeDefined();
 			expect(bLocal.data).toEqual({ msg: 'hello cluster' });
-			expect(bLocal.options).toEqual({ relay: false });
+			expect(bLocal.options).toEqual({ relay: false, seq: false });
 		});
 
 		it('role-filtered publish only reaches the matching role on the remote instance', async () => {

@@ -26,6 +26,11 @@ import {
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
+
+// The degraded / recovered frames report this worker's own breaker, so they go
+// to this worker's subscribers only, and they make no monotonic promise.
+const SYSTEM_FRAME = Object.freeze({ relay: false, seq: false });
 
 // The subscribe denial reasons the adapter declares (its SubscribeDenialReason
 // type) and INTERNAL_ERROR, its answer when a subscribe hook throws. Any
@@ -130,6 +135,14 @@ export function createPubSubBus(client, options = {}) {
 		allowSystemTopics: options.allowSystemTopics === true,
 		allowedSystemTopics: systemChannel ? [systemChannel] : []
 	});
+
+	// Whether this bus carries a frame to the other workers of this process at
+	// all: their receivers apply this same envelope rule, so a frame it refuses
+	// (a `__` topic it does not admit, a malformed name) can only reach them
+	// through the adapter's relay. Only read on a multi-worker runtime (see
+	// relayedLocally).
+	const reachesSiblings = (topic, event) => validator.acceptEnvelope(topic, event);
+	const entryReachesSiblings = (m) => reachesSiblings(m.topic, m.event);
 
 	// Wire codecs registered on THIS instance, keyed by capability. A
 	// `shared: true` stateless codec relays its logical event over the bus; a
@@ -249,9 +262,10 @@ export function createPubSubBus(client, options = {}) {
 			mReceived?.inc();
 			// A platform without sendCoalesced cannot coalesce per key at all, so
 			// the value goes out as a plain publish: every subscriber still gets
-			// it, as the wire branch below falls back to JSON.
+			// it, as the wire branch below falls back to JSON. Unsequenced, like the
+			// coalesced send it stands in for.
 			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
 				return;
 			}
 			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
@@ -280,9 +294,9 @@ export function createPubSubBus(client, options = {}) {
 			const codec = wireCodecs.get(parsed.capability);
 			if (codec && typeof activePlatform.publishWire === 'function') {
 				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-					parsed.compress === true ? { relay: false, compress: true } : { relay: false });
+					receivedOptions(parsed.s, undefined, parsed.compress === true));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s));
 			}
 			return;
 		}
@@ -298,7 +312,7 @@ export function createPubSubBus(client, options = {}) {
 					topic: m.topic,
 					event: m.event,
 					data: m.data,
-					options: { relay: false }
+					options: receivedOptions(m.s, m.j)
 				});
 			}
 			if (local.length === 0) return;
@@ -318,13 +332,10 @@ export function createPubSubBus(client, options = {}) {
 				return;
 			}
 			mReceived?.inc();
-			// Re-apply the de-herd window (carried as `j`) and the authoritative
-			// seq (carried as `s`) so this node's subscribers stagger AND dedup
+			// Re-apply the de-herd window (carried as `j`) and the origin's seq
+			// choice (carried as `s`) so this node's subscribers stagger AND dedup
 			// against the origin's seq space; `relay: false` stops the re-relay.
-			const opts = { relay: false };
-			if (parsed.j !== undefined) opts.jitterMs = parsed.j;
-			if (typeof parsed.s === 'number') opts.seq = parsed.s;
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, opts);
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j));
 		}
 	}
 
@@ -340,15 +351,16 @@ export function createPubSubBus(client, options = {}) {
 		if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
 			/** @type {any} */ (env).j = options.jitterMs;
 		}
-		if (options && typeof options.seq === 'number') {
-			/** @type {any} */ (env).s = options.seq;
-		}
+		const s = options ? carriedSeq(options.seq) : undefined;
+		if (s !== undefined) /** @type {any} */ (env).s = s;
 		return env;
 	}
 
 	function wireEnvelope(topic, event, data, wire, options) {
 		const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
 		if (options && options.compress === true) /** @type {any} */ (env).compress = true;
+		const s = options ? carriedSeq(options.seq) : undefined;
+		if (s !== undefined) /** @type {any} */ (env).s = s;
 		return env;
 	}
 
@@ -357,7 +369,7 @@ export function createPubSubBus(client, options = {}) {
 		for (let i = 0; i < messages.length; i++) {
 			const m = messages[i];
 			if (!m.options || m.options.relay !== false) {
-				relayable.push({ topic: m.topic, event: m.event, data: m.data });
+				relayable.push(relayEntry(m));
 			}
 		}
 		return relayable;
@@ -424,7 +436,7 @@ export function createPubSubBus(client, options = {}) {
 			const publishTraced = (topic, event, data, options) => {
 				if (options && options.relay === false) return platform.publish(topic, event, data, options);
 				return traced((traceContext) => {
-					const result = platform.publish(topic, event, data, options);
+					const result = platform.publish(topic, event, data, relayedLocally(options, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
 					relayTraced(singleEnvelope(topic, event, data, options), 1, traceContext);
 					return result;
 				});
@@ -442,11 +454,11 @@ export function createPubSubBus(client, options = {}) {
 				return false;
 			};
 			const batchTraced = (messages) => (!relaysAny(messages) ? platform.batch(messages) : traced((traceContext) => {
-				const results = platform.batch(messages);
+				const results = platform.batch(relayedBatchLocally(messages, entryReachesSiblings));
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
 					if (!m.options || m.options.relay !== false) {
-						relayTraced({ instanceId, topic: m.topic, event: m.event, data: m.data }, 1, traceContext);
+						relayTraced(singleEnvelope(m.topic, m.event, m.data, m.options), 1, traceContext);
 					}
 				}
 				return results;
@@ -464,7 +476,7 @@ export function createPubSubBus(client, options = {}) {
 				// rejects a malformed entry with its own error before the relay
 				// list reads the entries.
 				traced((traceContext) => {
-					platform.publishBatched(messages);
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
 					const relayable = relayableBatch(messages);
 					relayTraced({ instanceId, batch: relayable }, relayable.length, traceContext);
 				});
@@ -476,7 +488,7 @@ export function createPubSubBus(client, options = {}) {
 					return platform.publishWire(topic, event, data, wire, options);
 				}
 				return traced((traceContext) => {
-					const result = platform.publishWire(topic, event, data, wire, options);
+					const result = platform.publishWire(topic, event, data, wire, relayedLocally(options, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
 					relayTraced(wireEnvelope(topic, event, data, wire, options), 1, traceContext);
 					return result;
 				});
@@ -486,13 +498,11 @@ export function createPubSubBus(client, options = {}) {
 			// `publishBatched` instead when you want one wire frame per
 			// subscriber per call.
 			const batchUntraced = (messages) => {
-				const results = platform.batch(messages);
+				const results = platform.batch(relayedBatchLocally(messages, entryReachesSiblings));
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
 					if (!m.options || m.options.relay !== false) {
-						scheduleRelay(JSON.stringify({
-							instanceId, topic: m.topic, event: m.event, data: m.data
-						}), 1);
+						scheduleRelay(JSON.stringify(singleEnvelope(m.topic, m.event, m.data, m.options)), 1);
 					}
 				}
 				return results;
@@ -506,13 +516,13 @@ export function createPubSubBus(client, options = {}) {
 				}
 				if (messages.length === 0) return;
 
-				platform.publishBatched(messages);
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
 
 				const relayable = [];
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
 					if (!m.options || m.options.relay !== false) {
-						relayable.push({ topic: m.topic, event: m.event, data: m.data });
+						relayable.push(relayEntry(m));
 					}
 				}
 				if (relayable.length === 0) return;
@@ -545,27 +555,28 @@ export function createPubSubBus(client, options = {}) {
 			// topicEpoch its replay tracker) when called.
 			const wrapped = {
 				publish(topic, event, data, options) {
-					const result = platform.publish(topic, event, data, options);
+					if (options && options.relay === false) return platform.publish(topic, event, data, options);
+					// The bus is this publish's fan-out to every other worker and
+					// instance, so a multi-worker adapter's in-process relay stays off.
+					const result = platform.publish(topic, event, data, relayedLocally(options, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
 
-					if (!options || options.relay !== false) {
-						// Carry the de-herd window across the cluster so subscribers on
-						// OTHER nodes also stagger; the receiving worker re-stamps `j` on
-						// its local frame. Omitted when absent so the relay wire is
-						// byte-identical for the common (non-jittered) publish.
-						const env = { instanceId, topic, event, data };
-						if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
-							/** @type {any} */ (env).j = options.jitterMs;
-						}
-						// Carry an authoritative numeric seq across the cluster so a
-						// subscriber on ANOTHER node dedups against the SAME seq space (the
-						// replay buffer's) instead of a fresh local counter, which would read
-						// as cross-instance non-monotonic on resume. Omitted for the common
-						// counter-stamped publish (byte-identical relay wire).
-						if (options && typeof options.seq === 'number') {
-							/** @type {any} */ (env).s = options.seq;
-						}
-						scheduleRelay(JSON.stringify(env), 1);
+					// Carry the de-herd window across the cluster so subscribers on
+					// OTHER nodes also stagger; the receiving worker re-stamps `j` on
+					// its local frame. Omitted when absent so the relay wire is
+					// byte-identical for the common (non-jittered) publish.
+					const env = { instanceId, topic, event, data };
+					if (options && typeof options.jitterMs === 'number' && options.jitterMs > 0) {
+						/** @type {any} */ (env).j = options.jitterMs;
 					}
+					// Carry the seq choice across the cluster: an authoritative number
+					// so a subscriber on ANOTHER node dedups against the SAME seq space
+					// (the replay buffer's) instead of a fresh local counter, which would
+					// read as cross-instance non-monotonic on resume; `false` so a frame
+					// published without a seq goes out without one there too. Omitted for
+					// the common counter-stamped publish (byte-identical relay wire).
+					const s = options ? carriedSeq(options.seq) : undefined;
+					if (s !== undefined) /** @type {any} */ (env).s = s;
+					scheduleRelay(JSON.stringify(env), 1);
 
 					return result;
 				},
@@ -602,15 +613,14 @@ export function createPubSubBus(client, options = {}) {
 				// underlying platform predates per-frame binary wire, so the plugins'
 				// typeof guard degrades gracefully.
 				publishWire: typeof platform.publishWire === 'function' ? (topic, event, data, wire, options) => {
-					const result = platform.publishWire(topic, event, data, wire, options);
-					if (wire && wire.shared === true && (!options || options.relay !== false)) {
-						// excludeWs is NOT carried: the excluded socket is local to this
-						// origin instance; other instances have no such socket and fan out
-						// fully (the adapter relays on its excludeWs walk path too).
-						const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
-						if (options && options.compress === true) env.compress = true;
-						scheduleRelay(JSON.stringify(env), 1);
+					if (!(wire && wire.shared === true && (!options || options.relay !== false))) {
+						return platform.publishWire(topic, event, data, wire, options);
 					}
+					const result = platform.publishWire(topic, event, data, wire, relayedLocally(options, MULTI_WORKER_RUNTIME && reachesSiblings(topic, event)));
+					// excludeWs is NOT carried: the excluded socket is local to this
+					// origin instance; other instances have no such socket and fan out
+					// fully (the adapter relays on its excludeWs walk path too).
+					scheduleRelay(JSON.stringify(wireEnvelope(topic, event, data, wire, options)), 1);
 					return result;
 				} : undefined,
 				sendWire: typeof platform.sendWire === 'function' ? platform.sendWire.bind(platform) : undefined,
@@ -702,15 +712,18 @@ export function createPubSubBus(client, options = {}) {
 				// post-wrap assignment propagates; realtime detects it on the wrapped
 				// seam to fan `live.push({ topic })` across instances.
 				get topicBroadcast() { return platform.topicBroadcast; },
+				// The adapter's scoped helpers, published through this wrap so they
+				// relay: each forwards its options, the counters default to 1, and
+				// each returns the publish result.
 				topic(t) {
 					return {
-						publish(event, data) { wrapped.publish(t, event, data); },
-						created(data) { wrapped.publish(t, 'created', data); },
-						updated(data) { wrapped.publish(t, 'updated', data); },
-						deleted(data) { wrapped.publish(t, 'deleted', data); },
-						set(value) { wrapped.publish(t, 'set', value); },
-						increment(amount) { wrapped.publish(t, 'increment', amount); },
-						decrement(amount) { wrapped.publish(t, 'decrement', amount); }
+						publish: (event, data, options) => wrapped.publish(t, event, data, options),
+						created: (data, options) => wrapped.publish(t, 'created', data, options),
+						updated: (data, options) => wrapped.publish(t, 'updated', data, options),
+						deleted: (data, options) => wrapped.publish(t, 'deleted', data, options),
+						set: (value, options) => wrapped.publish(t, 'set', value, options),
+						increment: (amount = 1, options) => wrapped.publish(t, 'increment', amount, options),
+						decrement: (amount = 1, options) => wrapped.publish(t, 'decrement', amount, options)
 					};
 				}
 			};
@@ -744,7 +757,7 @@ export function createPubSubBus(client, options = {}) {
 							let out = null;
 							if (degradationPolicy) { try { out = degradationPolicy.onDegraded({ from, to }); } catch { /* a policy must never break the emit */ } }
 							const data = out && out.mitigation ? { at: now(), mitigation: out.mitigation } : { at: now() };
-							activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { jitterMs: out.jitterMs } : undefined);
+							activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
 							mDegraded?.inc();
 						}
 					} else if (from !== 'healthy' && to === 'healthy') {
@@ -755,7 +768,7 @@ export function createPubSubBus(client, options = {}) {
 							let out = null;
 							if (degradationPolicy) { try { out = degradationPolicy.onRecovered({ from, to }); } catch { /* a policy must never break the emit */ } }
 							const data = out && out.recovery ? { at: now(), recovery: out.recovery } : { at: now() };
-							activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { jitterMs: out.jitterMs } : undefined);
+							activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
 							mRecovered?.inc();
 						}
 					}
