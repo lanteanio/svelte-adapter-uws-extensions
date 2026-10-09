@@ -69,4 +69,17 @@ describe('default broadcast projection policy', () => {
 		expect(input.email).toBe('alice@example.test');
 		expect(input.profile.remoteAddress).toBe('10.0.0.4');
 	});
+
+	it('drops a raw header list in each of its spellings', () => {
+		const headers = ['authorization', 'Bearer secret', 'cookie', 'sid=secret'];
+		const projected = projectDefaultUserData({
+			id: '1',
+			rawHeaders: headers,
+			rawHeader: headers,
+			requestRawHeaders: headers,
+			httpRawHeaders: headers,
+			raw_headers: headers
+		});
+		expect(projected).toEqual({ id: '1' });
+	});
 });
