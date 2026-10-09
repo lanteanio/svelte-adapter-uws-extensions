@@ -5,19 +5,32 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisPresenceOptions {
 	/**
-	 * Field in projected data for user dedup. If the default projection drops
-	 * this field, each connection gets a fallback key so the private value is
-	 * not broadcast or persisted as a roster property name.
+	 * Field in the selected data that identifies a user, for multi-tab dedup:
+	 * connections whose value matches count as one presence entry. If the
+	 * field is missing from the data, each connection is tracked separately.
+	 *
+	 * The resolved key is the roster property name in every frame and in
+	 * Redis, so the default `select` refuses a credential-shaped or transport
+	 * name here (`key: 'sessionId'`, `key: 'email'`): it warns at construction
+	 * and each connection gets its own entry. Dedup on a non-secret
+	 * identifier, or pass an explicit `select` that returns the field.
 	 * @default 'id'
 	 */
 	key?: string;
 	/**
-	 * Extract public fields from userData. The default recursively drops
-	 * internal keys, credentials, common personal data, and request transport
-	 * metadata. An explicit callback can intentionally admit fields; its result
-	 * still passes through `stripInternal()`. It must return an object:
-	 * `join()` throws a `TypeError` otherwise.
-	 * @default privacy projection
+	 * Extract the public roster data from a connection's userData. Only the
+	 * returned fields are broadcast to peers and stored in Redis.
+	 *
+	 * By default only the {@link RedisPresenceOptions.key} field is copied, and
+	 * only when its name is safe and its value is a string or finite number.
+	 * Names, avatars, profiles, transport metadata and every other field need
+	 * an explicit `select`. An explicit `select` is the application's own
+	 * policy and its result is used as-is, so make it an allowlist such as
+	 * `select: (ud) => ({ id: ud.id, name: ud.name })`. Only top-level
+	 * `__`-prefixed, `constructor` and `prototype` names are dropped from it,
+	 * as the cross-instance relay and the read-back from Redis drop them. It
+	 * must return an object: `join()` throws a `TypeError` otherwise.
+	 * @default the `key` field only
 	 */
 	select?: (userData: any) => Record<string, any>;
 	/** Heartbeat interval in ms (refresh TTL). @default 30000 */

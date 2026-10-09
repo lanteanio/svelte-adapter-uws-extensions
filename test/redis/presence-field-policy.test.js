@@ -441,9 +441,7 @@ describe('presence read-back from Redis', () => {
 	});
 
 	it('join() refuses a select that does not return an object, before storing anything', async () => {
-		// A byte view passes as an object but is stored as a string after the
-		// strip, so it is refused too.
-		for (const select of [(u) => u.id, () => null, () => undefined, () => new Uint8Array(4)]) {
+		for (const select of [(u) => u.id, () => null, () => undefined, () => 7, () => true]) {
 			const client = mockRedisClient('p16:');
 			const platform = mockPlatform();
 			const presence = createPresence(client, { select });

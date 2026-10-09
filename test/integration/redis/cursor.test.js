@@ -94,7 +94,8 @@ describeIntegration('redis cursor (integration)', () => {
 				expect(keys).toHaveLength(1);
 				const stored = JSON.parse(all[keys[0]]);
 				expect(stored.data).toEqual({ x: 42, y: 99 });
-				expect(stored.user).toMatchObject({ id: '1', name: 'Alice' });
+				// The default select stores the identity and nothing else.
+				expect(stored.user).toEqual({ id: '1' });
 				expect(typeof stored.ts).toBe('number');
 			} finally {
 				await reader.quit();

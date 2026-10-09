@@ -494,110 +494,136 @@ describe('redis presence', () => {
 		});
 	});
 
-	describe('userData sanitization', () => {
-		it('strips __subscriptions and remoteAddress before select', async () => {
-			const ws = mockWs({ id: '1', name: 'Alice', remoteAddress: '1.2.3.4' });
-			ws.getUserData().__subscriptions = new Set(['x']);
-			await presence.join(ws, 'room', platform);
+	describe('select input', () => {
+		it('hands an explicit select the connection userData unchanged', async () => {
+			// The in-memory plugin's contract: select sees what the upgrade hook
+			// returned, and what it returns is what peers receive.
+			let seen;
+			const local = createPresence(client, {
+				key: 'id',
+				select: (ud) => { seen = ud; return { id: ud.id, ip: ud.remoteAddress }; }
+			});
+			const userData = { id: '1', remoteAddress: '203.0.113.10' };
+			await local.join(mockWs(userData), 'room', platform);
+			local.destroy();
 
-			const state = statesOf(platform)[0];
-			expect(state.data['1']).not.toHaveProperty('__subscriptions');
-			expect(state.data['1']).not.toHaveProperty('remoteAddress');
+			expect(seen).toBe(userData);
+			expect(statesOf(platform)[0].data['1']).toEqual({ id: '1', ip: '203.0.113.10' });
 		});
 	});
 
-	describe('default select', () => {
-		it('strips __-prefixed and sensitive keys', async () => {
-			const local = createPresence(client, { key: 'id' });
-			const ws = mockWs({ id: '1', name: 'Alice', __internal: 'x', token: 'abc' });
-			await local.join(ws, 'room', platform);
-
-			const state = statesOf(platform)[0];
-			expect(state.data['1']).toEqual({ id: '1', name: 'Alice' });
-			local.destroy();
+	describe('default select is identity-only', () => {
+		const privateUser = () => ({
+			id: '1',
+			name: 'Alice',
+			medicalDiagnosis: 'private-diagnosis',
+			rawHeaders: ['authorization', 'Bearer secret', 'cookie', 'sid=secret'],
+			remoteAddress: '203.0.113.10',
+			profile: { avatar: 'a.png', sessionToken: 'inner-secret' },
+			primaryKey: 'ordinary-identifier'
 		});
 
-		it('drops personal and transport data before broadcasting or persisting it', async () => {
+		it('copies only the key into the state, the diff, the relay, Redis and list()', async () => {
 			const local = createPresence(client, { key: 'id' });
-			const ws = mockWs({
-				id: '1',
-				name: 'Alice',
-				role: 'admin',
-				authorId: 'author-7',
-				microphoneOn: true,
-				email: 'alice@example.test',
-				phoneNumber: '+49 30 123456',
-				userphone: '+49 30 654321',
-				ip: '203.0.113.10',
-				address: '203.0.113.10',
-				apiKey: 'secret-api-key',
-				profile: {
-					displayName: 'Alice A.',
-					avatarUrl: '/avatars/alice.png',
-					remoteAddress: '10.0.0.4',
-					sessionToken: 'secret-session',
-					contactphone: '+49 30 999999'
-				}
-			});
-
-			await local.join(ws, 'room', platform);
-			const stateData = statesOf(platform)[0].data['1'];
-			const stored = JSON.parse(
-				client._hashes.get(client.key('presence:topic:{room}')).get('1')
-			).data;
+			const relayed = vi.spyOn(client.redis, 'publish');
+			await local.join(mockWs(privateUser()), 'room', platform);
+			local.flushDiffs();
+			const hash = client._hashes.get(client.key('presence:topic:{room}'));
+			const listed = await local.list('room');
 			local.destroy();
 
-			const expected = {
-				id: '1',
-				name: 'Alice',
-				role: 'admin',
-				authorId: 'author-7',
-				microphoneOn: true,
-				profile: {
-					displayName: 'Alice A.',
-					avatarUrl: '/avatars/alice.png'
-				}
-			};
-			expect(stateData).toEqual(expected);
+			expect(statesOf(platform)[0].data['1']).toEqual({ id: '1' });
+			expect(diffsOf(platform)[0].data.joins['1']).toEqual({ id: '1' });
+			expect(JSON.parse(hash.get('1')).data).toEqual({ id: '1' });
+			expect(listed).toEqual([{ id: '1' }]);
+			expect(relayed).toHaveBeenCalled();
+			const everything = JSON.stringify([platform.sent, platform.published, [...hash.values()], relayed.mock.calls]);
+			for (const value of ['Alice', 'private-diagnosis', 'Bearer secret', 'sid=secret', '203.0.113.10', 'a.png', 'inner-secret', 'ordinary-identifier']) {
+				expect(everything).not.toContain(value);
+			}
+		});
+
+		it('uses a safe custom key and refuses a non-scalar identity value', async () => {
+			const byUserKey = createPresence(client, { key: 'userKey' });
+			await byUserKey.join(mockWs({ userKey: 42, name: 'Ada' }), 'room', platform);
+			const listed = await byUserKey.list('room');
+			byUserKey.destroy();
+			expect(listed).toEqual([{ userKey: 42 }]);
+
+			const local = createPresence(client, { key: 'id' });
+			await local.join(mockWs({ id: { toJSON: () => 'secret-id' }, name: 'Alice' }), 'other', platform);
+			const state = statesOf(platform).at(-1).data;
+			local.destroy();
+			const [onlyKey] = Object.keys(state);
+			expect(onlyKey.startsWith('__conn:')).toBe(true);
+			expect(state[onlyKey]).toEqual({});
+			expect(JSON.stringify(state)).not.toContain('secret-id');
+		});
+
+		it('reads nothing but an own key field', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const nameGetter = vi.fn(() => 'Alice');
+			const userData = Object.create({ id: 'inherited' });
+			Object.defineProperty(userData, 'name', { enumerable: true, get: nameGetter });
+			await local.join(mockWs(userData), 'room', platform);
+			const state = statesOf(platform)[0].data;
+			local.destroy();
+
+			const [onlyKey] = Object.keys(state);
+			expect(onlyKey.startsWith('__conn:')).toBe(true);
+			expect(state[onlyKey]).toEqual({});
+			expect(nameGetter).not.toHaveBeenCalled();
+		});
+
+		it('joins with an empty entry when the key getter throws', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const userData = {};
+			Object.defineProperty(userData, 'id', { enumerable: true, get() { throw new Error('getter'); } });
+			await local.join(mockWs(userData), 'room', platform);
+			const state = statesOf(platform)[0].data;
+			local.destroy();
+			expect(Object.values(state)).toEqual([{}]);
+		});
+	});
+
+	describe('an explicit select is used as-is', () => {
+		it('publishes and stores exactly what it returns, nested fields included', async () => {
+			const local = createPresence(client, {
+				key: 'id',
+				select: (ud) => ({ id: ud.id, authorName: ud.authorName, profile: ud.profile })
+			});
+			const profile = { displayName: 'A', sessionToken: 'shared-by-policy', __note: 'kept' };
+			await local.join(mockWs({ id: '1', authorName: 'Ada', profile }), 'room', platform);
+			const stored = JSON.parse(client._hashes.get(client.key('presence:topic:{room}')).get('1')).data;
+			local.destroy();
+
+			const expected = { id: '1', authorName: 'Ada', profile };
+			expect(statesOf(platform)[0].data['1']).toEqual(expected);
 			expect(stored).toEqual(expected);
 		});
-	});
 
-	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
-		it('strips nested sensitive keys even when select is identity', async () => {
+		it('drops a reserved top-level name, as the relay and the read-back do', async () => {
 			const local = createPresence(client, {
 				key: 'id',
-				select: /** @type {any} */ ((ud) => ud)
+				select: () => JSON.parse('{"id":"1","name":"Ada","__proto__":{"admin":true},"constructor":"forged","__internal":"x"}')
 			});
-			const ws = mockWs({
-				id: '1',
-				name: 'Alice',
-				profile: { displayName: 'A', token: 'shh', authToken: 'xyz' }
-			});
-			await local.join(ws, 'room', platform);
-
-			const state = statesOf(platform)[0];
-			expect(state.data['1'].profile.displayName).toBe('A');
-			expect(state.data['1'].profile).not.toHaveProperty('token');
-			expect(state.data['1'].profile).not.toHaveProperty('authToken');
+			const relayed = vi.spyOn(client.redis, 'publish');
+			await local.join(mockWs({ id: '1' }), 'room', platform);
+			local.flushDiffs();
+			const stored = client._hashes.get(client.key('presence:topic:{room}')).get('1');
+			const state = statesOf(platform)[0].data['1'];
+			const joined = diffsOf(platform)[0].data.joins['1'];
 			local.destroy();
-		});
 
-		it('strips nested __-prefixed keys when select picks the parent', async () => {
-			const local = createPresence(client, {
-				key: 'id',
-				select: (ud) => ({ id: ud.id, meta: ud.meta })
-			});
-			const ws = mockWs({
-				id: '1',
-				meta: { displayName: 'Alice', __internal: 'leak' }
-			});
-			await local.join(ws, 'room', platform);
-
-			const state = statesOf(platform)[0];
-			expect(state.data['1'].meta.displayName).toBe('Alice');
-			expect(state.data['1'].meta).not.toHaveProperty('__internal');
-			local.destroy();
+			for (const entry of [state, joined, JSON.parse(stored).data]) {
+				expect(Object.keys(entry)).toEqual(['id', 'name']);
+				expect(entry.admin).toBeUndefined();
+			}
+			const relay = JSON.stringify(relayed.mock.calls);
+			for (const name of ['__proto__', 'constructor', '__internal', 'forged']) {
+				expect(stored).not.toContain(name);
+				expect(relay).not.toContain(name);
+			}
 		});
 	});
 
@@ -1051,26 +1077,22 @@ describe('redis presence', () => {
 			expect(states[0].wire.encode('state', states[0].data)).toBeInstanceOf(Uint8Array);
 		});
 
-		it('applies the default privacy projection before binary state encoding', async () => {
+		it('encodes only the default identity into the binary state frame', async () => {
 			const local = createPresence(client, { key: 'id', heartbeat: 60000, ttl: 180 });
 			const wp = wirePlatform();
 			await local.join(mockWs({
 				id: '1',
 				name: 'Alice',
-				authorId: 'author-7',
 				email: 'alice@example.test',
 				profile: { avatarUrl: '/a.png', remoteAddress: '10.0.0.4' }
 			}), 'room', wp);
 
 			const state = wp.sentWire.find((entry) => entry.event === 'state');
 			local.destroy();
-			expect(state.data['1']).toEqual({
-				id: '1',
-				name: 'Alice',
-				authorId: 'author-7',
-				profile: { avatarUrl: '/a.png' }
-			});
-			expect(state.wire.encode('state', state.data)).toBeInstanceOf(Uint8Array);
+			expect(state.data['1']).toEqual({ id: '1' });
+			const bytes = Buffer.from(state.wire.encode('state', state.data)).toString('latin1');
+			expect(bytes).not.toContain('alice@example.test');
+			expect(bytes).not.toContain('10.0.0.4');
 		});
 
 		it('diff broadcast routes through publishWire with the presence codec (relay:false, compress:true)', async () => {
@@ -1211,47 +1233,14 @@ describe('redis presence', () => {
 	});
 
 	describe('default select edge cases', () => {
-		it('recursively strips nested __-prefixed keys', async () => {
-			const local = createPresence(client, { key: 'id' });
-			const ws = mockWs({ id: '1', name: 'Alice', meta: { __secret: 'x', visible: 'y' } });
-			await local.join(ws, 'room', platform);
-
-			const state = statesOf(platform)[0];
-			expect(state.data['1'].meta).toEqual({ visible: 'y' });
-			local.destroy();
-		});
-
-		it('strips sensitive-regex keys like password / token / secret', async () => {
-			const local = createPresence(client, { key: 'id' });
-			const ws = mockWs({ id: '1', name: 'Alice', password: 'p', token: 't', sessionId: 's' });
-			await local.join(ws, 'room', platform);
-
-			const state = statesOf(platform)[0];
-			expect(state.data['1']).not.toHaveProperty('password');
-			expect(state.data['1']).not.toHaveProperty('token');
-			expect(state.data['1']).not.toHaveProperty('sessionId');
-			expect(state.data['1'].id).toBe('1');
-			expect(state.data['1'].name).toBe('Alice');
-			local.destroy();
-		});
-
-		it('handles circular references without crashing the join flow', async () => {
+		it('joins circular userData with the identity alone', async () => {
 			const local = createPresence(client, { key: 'id' });
 			const data = { id: '1', name: 'Alice' };
 			data.self = data;
-			const ws = mockWs(data);
-			// Behavior contract: either resolves (cycles stripped) or throws a
-			// JSON-serializable error - never an unhandled rejection.
-			let outcome = 'unset';
-			try {
-				await local.join(ws, 'room', platform);
-				outcome = 'resolved';
-			} catch (err) {
-				expect(err).toBeInstanceOf(Error);
-				outcome = 'rejected';
-			}
-			expect(['resolved', 'rejected']).toContain(outcome);
+			await local.join(mockWs(data), 'room', platform);
+			const state = statesOf(platform)[0].data;
 			local.destroy();
+			expect(state['1']).toEqual({ id: '1' });
 		});
 	});
 
@@ -1296,11 +1285,13 @@ describe('redis presence', () => {
 
 			const hash = client._hashes.get(client.key('presence:topic:{room}'));
 			const [storedKey, storedValue] = [...hash.entries()][0];
+			const warnings = warn.mock.calls.length;
 			local.destroy();
 			warn.mockRestore();
 
+			expect(warnings).toBe(1);
 			expect(storedKey).toBe('__conn:1');
-			expect(JSON.parse(storedValue).data).toEqual({ name: 'Alice' });
+			expect(JSON.parse(storedValue).data).toEqual({});
 		});
 
 		it('allows an explicit select to opt a non-secret custom key back in', async () => {

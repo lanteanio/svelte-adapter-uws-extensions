@@ -619,12 +619,11 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					if (!activePlatform) return;
 					const ev = parsed.event;
 					const payload = parsed.payload;
-					// Relayed entry data gets the field rule of every other
-					// ingress (local update, Redis read-back, FIELDS below). A
-					// peer's join and leave data is its select output after
-					// stripInternal, and its update data publicData, both of which
-					// already drop these names, so only a forged envelope loses
-					// anything.
+					// Relayed entry data gets the reserved-name rule of the local
+					// join and the Redis read-back. A peer's join and leave data is
+					// its select output after that rule, and its update data
+					// publicData, which drops these names too, so only a forged
+					// envelope loses anything.
 					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
 						bufferDiff(topic, 'join', payload.key, mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {

@@ -154,153 +154,116 @@ describe('redis cursor', () => {
 		});
 	});
 
-	describe('default select recursive stripping', () => {
-		it('strips nested __-prefixed keys', () => {
+	describe('default select is identity-only', () => {
+		it('announces and stores only the id', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
-			const ws = mockWs({ id: '1', profile: { name: 'Alice', __token: 'x' } });
-			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(platform.published[0].data.user.profile.name).toBe('Alice');
-			expect(platform.published[0].data.user.profile.__token).toBeUndefined();
+			const relayed = vi.spyOn(client.redis, 'publish');
+			c.update(mockWs({
+				id: '1',
+				name: 'Alice',
+				medicalDiagnosis: 'private-diagnosis',
+				rawHeaders: ['authorization', 'Bearer secret', 'cookie', 'sid=secret'],
+				remoteAddress: '203.0.113.10',
+				profile: { avatarUrl: '/a.png', sessionToken: 'inner-secret' }
+			}), 'room', { x: 5, y: 5 }, platform);
+			const join = platform.published.find((p) => p.event === 'join');
+			const storedHash = client._hashes.get(client.key('cursor:{room}'));
+			const stored = [...storedHash.values()];
 			c.destroy();
+
+			expect(join.data.user).toEqual({ id: '1' });
+			expect(JSON.parse(stored[0]).user).toEqual({ id: '1' });
+			const everything = JSON.stringify([platform.published, stored, relayed.mock.calls]);
+			for (const value of ['Alice', 'private-diagnosis', 'Bearer secret', 'sid=secret', '203.0.113.10', '/a.png', 'inner-secret']) {
+				expect(everything).not.toContain(value);
+			}
 		});
 
-		it('handles circular references without crashing', () => {
+		it('copies a numeric id and refuses an inherited or non-scalar one', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			c.update(mockWs({ id: 42 }), 'a', { x: 1 }, platform);
+			c.update(mockWs(Object.create({ id: 'inherited' })), 'b', { x: 1 }, platform);
+			c.update(mockWs({ id: { toJSON: () => 'secret-id' } }), 'c', { x: 1 }, platform);
+			const users = platform.published.filter((p) => p.event === 'join').map((p) => p.data.user);
+			c.destroy();
+
+			expect(users).toEqual([{ id: 42 }, {}, {}]);
+			expect(JSON.stringify(platform.published)).not.toContain('secret-id');
+		});
+
+		it('reads nothing but an own id, and survives an id getter that throws', () => {
+			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+			const nameGetter = vi.fn(() => 'Alice');
+			const reader = { id: '1' };
+			Object.defineProperty(reader, 'name', { enumerable: true, get: nameGetter });
+			const thrower = {};
+			Object.defineProperty(thrower, 'id', { enumerable: true, get() { throw new Error('getter'); } });
+			c.update(mockWs(reader), 'a', { x: 1 }, platform);
+			c.update(mockWs(thrower), 'b', { x: 1 }, platform);
+			const users = platform.published.filter((p) => p.event === 'join').map((p) => p.data.user);
+			c.destroy();
+
+			expect(users).toEqual([{ id: '1' }, {}]);
+			expect(nameGetter).not.toHaveBeenCalled();
+		});
+
+		it('handles circular userData without crashing', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const userData = { id: '1', name: 'Alice' };
 			userData.self = userData;
-			const ws = mockWs(userData);
-			c.update(ws, 'doc', { x: 1 }, platform);
+			c.update(mockWs(userData), 'doc', { x: 1 }, platform);
 
-			expect(platform.published[0].data.user.id).toBe('1');
-			expect(platform.published[0].data.user.name).toBe('Alice');
+			expect(platform.published[0].data.user).toEqual({ id: '1' });
 			c.destroy();
 		});
+	});
 
-		it('strips sensitive-regex keys like password and token', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
-			const ws = mockWs({ id: '1', password: 'secret', sessionToken: 'xyz' });
-			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(platform.published[0].data.user.id).toBe('1');
-			expect(platform.published[0].data.user.password).toBeUndefined();
-			expect(platform.published[0].data.user.sessionToken).toBeUndefined();
-			c.destroy();
-		});
-
-		it('drops personal and transport data before broadcasting or persisting it', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
-			const ws = mockWs({
-				id: '1',
-				name: 'Alice',
-				role: 'admin',
-				authorId: 'author-7',
-				microphoneOn: true,
-				email: 'alice@example.test',
-				phoneNumber: '+49 30 123456',
-				userphone: '+49 30 654321',
-				ip: '203.0.113.10',
-				address: '203.0.113.10',
-				apiKey: 'secret-api-key',
-				profile: {
-					displayName: 'Alice A.',
-					avatarUrl: '/avatars/alice.png',
-					remoteAddress: '10.0.0.4',
-					sessionToken: 'secret-session',
-					contactphone: '+49 30 999999'
-				}
+	describe('an explicit select is used as-is', () => {
+		it('announces and stores exactly what it returns, nested fields included', () => {
+			const c = createCursor(client, {
+				throttle: 0,
+				topicThrottle: 0, snapshotIntervalMs: 0,
+				select: (ud) => ({ id: ud.id, authorName: ud.authorName, profile: ud.profile })
 			});
-
-			c.update(ws, 'room', { x: 5, y: 5 }, platform);
-			const join = platform.published.find((p) => p.event === 'join');
-			const storedHash = client._hashes.get(client.key('cursor:{room}'));
-			const stored = JSON.parse([...storedHash.values()][0]).user;
+			const profile = { name: 'Alice', sessionToken: 'shared-by-policy', __note: 'kept' };
+			c.update(mockWs({ id: '1', authorName: 'Ada', profile }), 'room', { x: 1 }, platform);
+			const stored = JSON.parse([...client._hashes.get(client.key('cursor:{room}')).values()][0]).user;
 			c.destroy();
 
-			const expected = {
-				id: '1',
-				name: 'Alice',
-				role: 'admin',
-				authorId: 'author-7',
-				microphoneOn: true,
-				profile: {
-					displayName: 'Alice A.',
-					avatarUrl: '/avatars/alice.png'
-				}
-			};
-			expect(join.data.user).toEqual(expected);
+			const expected = { id: '1', authorName: 'Ada', profile };
+			expect(platform.published[0].data.user).toEqual(expected);
 			expect(stored).toEqual(expected);
 		});
-	});
 
-	describe('custom select cannot leak nested secrets (defense-in-depth)', () => {
-		it('strips nested sensitive keys even when select is identity', () => {
+		it('keeps top-level reserved names, as the in-memory cursor does', () => {
+			// Presence drops them because its relay and read-back do; cursor
+			// drops them nowhere, so its catalog matches the bundled plugin's.
 			const c = createCursor(client, {
 				throttle: 0,
 				topicThrottle: 0, snapshotIntervalMs: 0,
-				select: /** @type {any} */ ((ud) => ud)
+				select: () => JSON.parse('{"id":"1","__role":"mod","constructor":"x"}')
 			});
-			const ws = mockWs({
-				id: '1',
-				profile: { name: 'Alice', token: 'shh', authToken: 'xyz' }
-			});
-			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(platform.published[0].data.user.id).toBe('1');
-			expect(platform.published[0].data.user.profile.name).toBe('Alice');
-			expect(platform.published[0].data.user.profile.token).toBeUndefined();
-			expect(platform.published[0].data.user.profile.authToken).toBeUndefined();
+			c.update(mockWs({ id: '1' }), 'room', { x: 1 }, platform);
+			const stored = JSON.parse([...client._hashes.get(client.key('cursor:{room}')).values()][0]).user;
 			c.destroy();
+
+			expect(Object.keys(platform.published[0].data.user)).toEqual(['id', '__role', 'constructor']);
+			expect(stored).toEqual({ id: '1', __role: 'mod', constructor: 'x' });
 		});
 
-		it('strips nested __-prefixed keys even when select picks the parent', () => {
+		it('hands select the connection userData unchanged', () => {
+			let seen;
 			const c = createCursor(client, {
 				throttle: 0,
 				topicThrottle: 0, snapshotIntervalMs: 0,
-				select: (ud) => ({ id: ud.id, meta: ud.meta })
+				select: (ud) => { seen = ud; return { id: ud.id, ip: ud.remoteAddress }; }
 			});
-			const ws = mockWs({
-				id: '1',
-				meta: { displayName: 'Alice', __internal: 'leak' }
-			});
-			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(platform.published[0].data.user.meta.displayName).toBe('Alice');
-			expect(platform.published[0].data.user.meta.__internal).toBeUndefined();
+			const userData = { id: '1', remoteAddress: '203.0.113.10' };
+			c.update(mockWs(userData), 'canvas', { x: 10 }, platform);
 			c.destroy();
-		});
 
-		it('strips constructor / prototype keys returned by a select that re-injects them', () => {
-			const c = createCursor(client, {
-				throttle: 0,
-				topicThrottle: 0, snapshotIntervalMs: 0,
-				select: (ud) => ({ id: ud.id, constructor: 'forged', prototype: 'forged' })
-			});
-			const ws = mockWs({ id: '1' });
-			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(platform.published[0].data.user.id).toBe('1');
-			expect(platform.published[0].data.user.constructor).not.toBe('forged');
-			expect(platform.published[0].data.user.prototype).toBeUndefined();
-			c.destroy();
-		});
-	});
-
-	describe('userData sanitization', () => {
-		it('strips __subscriptions and remoteAddress from userData', () => {
-			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
-			const ws = mockWs({
-				id: '1',
-				name: 'Alice',
-				__subscriptions: new Set(['room']),
-				remoteAddress: '127.0.0.1'
-			});
-			c.update(ws, 'canvas', { x: 10 }, platform);
-
-			expect(platform.published[0].data.user.__subscriptions).toBeUndefined();
-			expect(platform.published[0].data.user.remoteAddress).toBeUndefined();
-			expect(platform.published[0].data.user.id).toBe('1');
-			c.destroy();
+			expect(seen).toBe(userData);
+			expect(platform.published[0].data.user).toEqual({ id: '1', ip: '203.0.113.10' });
 		});
 	});
 
@@ -773,13 +736,13 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('without select, broadcasts full userData on join', () => {
+		it('without select, announces only the id on join', () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', role: 'admin' });
 			c.update(ws, 'room', { x: 5, y: 5 }, platform);
 
 			const join = platform.published.find((p) => p.event === 'join');
-			expect(join.data.user).toEqual({ id: '1', role: 'admin' });
+			expect(join.data.user).toEqual({ id: '1' });
 			c.destroy();
 		});
 
@@ -1177,7 +1140,7 @@ describe('redis cursor', () => {
 			const update = publishCalls.find((p) => p.message.event === 'update');
 			expect(join.channel).toBe('test:cursor:events');
 			expect(join.message.topic).toBe('canvas');
-			expect(join.message.payload.user).toEqual({ id: '1', name: 'Alice' });
+			expect(join.message.payload.user).toEqual({ id: '1' });
 			expect(update.message.topic).toBe('canvas');
 			expect(update.message.payload.data).toEqual({ x: 10, y: 20 });
 			expect(update.message.payload.user).toBeUndefined();
@@ -1382,23 +1345,17 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('applies the default privacy projection before binary join and catalog encoding', async () => {
+		it('encodes only the default identity into the binary join and catalog frames', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const moverPlatform = wirePlatform();
 			c.update(mockWs({
 				id: '1',
 				name: 'Alice',
-				authorId: 'author-7',
 				email: 'alice@example.test',
 				profile: { avatarUrl: '/a.png', remoteAddress: '10.0.0.4' }
 			}), 'canvas', { x: 1, y: 2 }, moverPlatform);
 
-			const expected = {
-				id: '1',
-				name: 'Alice',
-				authorId: 'author-7',
-				profile: { avatarUrl: '/a.png' }
-			};
+			const expected = { id: '1' };
 			const join = moverPlatform.publishedWire.find((entry) => entry.event === 'join');
 			expect(join.data.user).toEqual(expected);
 
@@ -2170,21 +2127,20 @@ describe('redis cursor', () => {
 		});
 	});
 
-	describe('sensitive data warning for arrays', () => {
-		it('warns about sensitive keys nested inside arrays', () => {
+	describe('explicit select output', () => {
+		it('is not second-guessed with a console warning', () => {
 			vi.useRealTimers();
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (ud) => ud });
 
-			const ws = mockWs({ id: '1', profiles: [{ authToken: 'secret' }] });
+			const ws = mockWs({ id: '1', authorName: 'Ada', profiles: [{ authToken: 'shared-by-policy' }] });
 			c.update(ws, 'doc', { x: 1 }, platform);
-
-			expect(warn).toHaveBeenCalledWith(
-				expect.stringContaining('authToken')
-			);
+			const warnings = warn.mock.calls.length;
 
 			warn.mockRestore();
 			c.destroy();
+			expect(warnings).toBe(0);
+			expect(platform.published[0].data.user.profiles).toEqual([{ authToken: 'shared-by-policy' }]);
 		});
 	});
 

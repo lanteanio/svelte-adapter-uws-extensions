@@ -61,3 +61,32 @@ export function mergeFields(target, src) {
 export function newFieldMap() {
 	return Object.create(null);
 }
+
+/**
+ * Whether an object has an own name the field rule refuses. `for...in`
+ * rather than Object.keys: no array per entry, and an object from JSON.parse
+ * has no inherited enumerable names.
+ * @param {Record<string, any>} obj
+ */
+function hasReservedField(obj) {
+	for (const k in obj) {
+		if (isReservedPresenceField(k)) return true;
+	}
+	return false;
+}
+
+/**
+ * A user's identity `data` without the names the field rule refuses. The
+ * local join and the read-back from Redis call this, and the relayed join
+ * merges its data through the same rule, so a peer sees the same entry
+ * whichever instance it is connected to.
+ *
+ * The object is returned as-is when it has no such name, which is the case
+ * for every ordinary roster entry; rebuilding costs an allocation per entry
+ * on every join and sync snapshot.
+ * @param {Record<string, any>} data
+ * @returns {Record<string, any>}
+ */
+export function withoutReservedNames(data) {
+	return hasReservedField(data) ? mergeFields(newFieldMap(), data) : data;
+}

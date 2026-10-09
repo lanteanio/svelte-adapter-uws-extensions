@@ -781,9 +781,9 @@ Same API as the core `createPresence` plugin, but backed by Redis hashes. Presen
 
 > **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorization model](#authorization-model).
 
-With no `select`, the Redis presence and cursor trackers use the same recursive privacy projection. It removes adapter-internal/prototype keys, credential-shaped names, common personal-data names (email, phone, government/payment identifiers), and request transport metadata (`remoteAddress`, IP/address variants, headers, request URL/id) before the value reaches either a peer frame or Redis. Ordinary roster fields such as `authorId`, `microphoneOn`, `avatarUrl`, and `role` remain. This is a denylist safety net, not a domain privacy boundary; use an explicit allowlist `select` when the application has stricter requirements. Explicit selects can intentionally admit fields, but their result still passes through the existing [`stripInternal`](#stripinternalobj----safe-to-spread-safe-to-log) backstop with that helper's documented rules.
+With no `select`, presence copies only the configured `key` field into a roster entry, and only when its value is a string or a finite number; cursor copies only an own `id` the same way. Display names, avatars, profiles, the client address and everything else the upgrade hook returned stay on the server until a `select` names them. An explicit `select` is the application's own policy and its result is used as-is, so write it as an allowlist: `select: (ud) => ({ id: ud.id, name: ud.name })`. It receives the connection's userData unchanged, and what it returns is what peers see and what Redis stores. The in-memory plugins follow the same rule, so a roster keeps its shape when an app moves from one process to a cluster. The one exception is presence, which drops top-level `__`-prefixed, `constructor` and `prototype` names from the result: its cross-instance relay and its read-back from Redis drop them too, so the local join does the same and a user looks alike on every instance.
 
-The `key` is part of the wire and storage shape: it becomes the property/hash-field name for the roster entry. It is therefore resolved from projected data. If the default drops a configured key such as `email` or `sessionId`, presence warns and uses a per-connection `__conn:N` key instead of leaking the value through the roster key. Choose a non-secret identifier for multi-tab dedup, or use an explicit `select` only when the configured key is intentionally public.
+The `key` is part of the wire and storage shape: it becomes the property/hash-field name for the roster entry. It is therefore resolved from the selected data. The default `select` never copies a credential-shaped or transport name such as `sessionId`, `email` or `ip`; with one of those as `key`, presence warns at construction and gives each connection its own `__conn:N` key instead of leaking the value through the roster key. Choose a non-secret identifier for multi-tab dedup, or use an explicit `select` only when the configured key is intentionally public.
 
 #### Wire shape
 
@@ -841,8 +841,8 @@ export async function close(ws, { platform }) {
 
 | Option | Default | Description |
 |---|---|---|
-| `key` | `'id'` | Field in projected data for user dedup (multi-tab). If the default privacy projection drops it, presence warns and uses a per-connection key so the value cannot leak as the roster property name. |
-| `select` | recursive privacy projection | Extract public fields from userData; must return an object (`join()` throws a `TypeError` otherwise). The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. Pass an explicit allowlist for app-specific privacy. |
+| `key` | `'id'` | Field in the selected data for user dedup (multi-tab). The default `select` never copies a credential-shaped or transport name; with one here, presence warns and gives each connection its own key, so the value cannot leak as the roster property name. |
+| `select` | the `key` field only | Extract the public roster data from userData; must return an object (`join()` throws a `TypeError` otherwise). The default copies only the `key` field, and only a string or finite-number value. An explicit `select` is used as-is apart from top-level `__`-prefixed, `constructor` and `prototype` names, so make it an allowlist. |
 | `heartbeat` | `30000` | TTL refresh interval in ms |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
@@ -1530,7 +1530,7 @@ Hash entries have a TTL so stale cursors from crashed instances get cleaned up a
 
 > **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorization model](#authorization-model).
 
-With no `select`, cursor identity uses the same recursive privacy projection described in [Presence](#presence), before both the catalog/join frame and the Redis cursor snapshot are built. An explicit `select` is the place to define the smallest identity shape your UI actually needs; its result still passes through the existing [`stripInternal`](#stripinternalobj----safe-to-spread-safe-to-log) backstop.
+With no `select`, a cursor's identity is only its own `id` (a string or finite number), in both the catalog/join frame and the Redis cursor snapshot. An explicit `select` defines the identity your UI needs and is used as-is, as described in [Presence](#presence).
 
 #### Setup
 
@@ -1600,7 +1600,7 @@ export function close(ws, { platform }) {
 | `position` | reads `data.x` / `data.y` | Extract the `{ x, y }` coordinate from cursor `data` for `minMove` and `viewport`. A frame with no extractable finite coordinate is always delivered. |
 | `viewport` | off | `true`, or `{ enabled, padding, cell }`. Per-subscriber viewport culling: a subscriber that reports a viewport rect receives only the cursors inside it (plus `padding` overscan, default `256`, widened when zoomed out); `cell` (default `256`) sizes the spatial index. Off by default, and a viewport-enabled topic stays on the shared fan-out until a subscriber actually reports a rect (so enabling it globally is free on rooms with no reporters). Each instance culls its own subscribers over the combined local + peer cursor set, so a cursor that originated on another instance is culled exactly like a local one; no viewport rect ever crosses Redis. |
 | `backpressure` | off | `true`, or `{ enabled, maxBufferedBytes }`. Skip a subscriber whose socket write buffer exceeds `maxBufferedBytes` (default `1048576` = 1 MiB) for the current tick; cursors are latest-value so a skipped subscriber catches up on the next tick. Bounds a slow or stalled consumer's send queue. Off by default. |
-| `select` | recursive privacy projection | Extract user data to broadcast and persist alongside position. The default drops internal/prototype keys, credential-shaped names, common personal data, and request transport metadata at every depth. |
+| `select` | the `id` field only | Extract user data to broadcast and persist alongside position. The default copies only an own `id` that is a string or finite number. An explicit `select` is used as-is, so make it an allowlist. |
 | `ttl` | `30` | Per-entry TTL in seconds (auto-refreshed on each broadcast). Stale entries from crashed instances are filtered out individually, even if other instances are still active on the same topic. |
 | `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound cursor envelopes larger than this before `JSON.parse` runs. The inner topic is always validated against the `__` denylist (the module constructs its own `__cursor:` wrapper prefix), so no `allowSystemTopics` knob is needed here. Must be a positive integer; an invalid value throws at construction. |
 
@@ -3459,11 +3459,11 @@ Non-string input passes through `String(url)` without scanning, so callers can p
 
 ### `createSensitiveWarner(prefix)` -- one-shot dev warning
 
-Returns a function that scans a userData object (up to depth 3) and calls `console.warn` once if it finds a key matching `/token|secret|password|key|auth|session|cookie|jwt|credential/i`. After the first warning the function latches and is a no-op. Designed for plugin `select` callbacks: the plugin wires a warner per topic and surfaces a one-time hint when a developer forgets to strip credentials from broadcast data.
+Returns a function that scans a userData object (up to depth 3) and calls `console.warn` once if it finds a key matching `/token|secret|password|key|auth|session|cookie|jwt|credential/i`. After the first warning the function latches and is a no-op. Meant for an app's own broadcast surfaces: wire one warner per surface and it gives a one-time hint when a developer forgets to strip credentials from the data. The presence and cursor trackers do not use it; their default `select` copies only an identity field.
 
 ```js
 import { createSensitiveWarner } from 'svelte-adapter-uws-extensions/sensitive';
-const warn = createSensitiveWarner('redis/cursor');
+const warn = createSensitiveWarner('chat-roster');
 warn(userData); // logs once if userData has anything credential-shaped
 warn(userData); // no-op after the latch
 ```

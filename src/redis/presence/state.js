@@ -15,12 +15,11 @@
  */
 
 import { randomBytes } from '../../shared/runtime.js';
-import { createSensitiveWarner } from '../../shared/sensitive.js';
-import { projectDefaultUserData, isUnsafeProjectionFieldName } from '../../shared/default-projection.js';
+import { isSensitiveFieldName, isStructurallyUnsafeFieldName } from '../../shared/sensitive-names.js';
 import { hashFieldTTLSupport } from '../../shared/redis-version.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { makeKeys } from './keys.js';
-import { makePublicData } from './data.js';
+import { makePublicData, makeDefaultPresenceSelect } from './data.js';
 
 /**
  * Assemble the presence context for one createPresence instance.
@@ -33,9 +32,11 @@ export function createPresenceState(client, options = {}) {
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis presence: select must be a function');
 	}
-	const sanitizeSelected = options.select != null;
-	const select = sanitizeSelected ? options.select : projectDefaultUserData;
-	if (!sanitizeSelected && isUnsafeProjectionFieldName(keyField)) {
+	// Zero-config presence copies the dedup key and nothing else. An explicit
+	// select is the application's own policy and its result is used as-is, apart
+	// from the reserved names the join drops (see withoutReservedNames).
+	const select = options.select ?? makeDefaultPresenceSelect(keyField);
+	if (options.select == null && (isSensitiveFieldName(keyField) || isStructurallyUnsafeFieldName(keyField))) {
 		console.warn(
 			`[extensions] redis presence: key field '${keyField}' is private or transport metadata, so the default ` +
 			'projection drops it and each connection gets its own presence entry. A presence key is ' +
@@ -212,8 +213,6 @@ export function createPresenceState(client, options = {}) {
 	const mSelfPreserveHeld = m?.gauge('presence_self_preservation_held', 'Dead sockets currently held from eviction by the self-preservation guard');
 	const mSelfPreserveActivations = m?.counter('presence_self_preservation_activations_total', 'Times the self-preservation hold activated');
 
-	const warnSensitive = createSensitiveWarner('redis/presence');
-
 	/**
 	 * Per-connection state: which topics they've joined and their key on each.
 	 * @type {Map<any, Map<string, { key: string, data: Record<string, any> }>>}
@@ -277,7 +276,6 @@ export function createPresenceState(client, options = {}) {
 	return {
 		keyField,
 		select,
-		sanitizeSelected,
 		heartbeatInterval,
 		presenceTtl,
 		presenceTtlMs,
@@ -307,7 +305,6 @@ export function createPresenceState(client, options = {}) {
 		mSelfPreserveHeld,
 		mSelfPreserveActivations,
 		selfPreservation,
-		warnSensitive,
 		wsTopics,
 		localCounts,
 		localData,

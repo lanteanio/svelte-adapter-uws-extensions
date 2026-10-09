@@ -350,23 +350,28 @@ The diagnostic pipeline's own last-resort lines, printed when a record cannot
 be rendered or delivered, start with `[extensions] ` and end with their
 stable ID.
 
-### Redis presence/cursor defaults withhold personal and transport data
+### Redis presence/cursor defaults carry only the identity
 
-**Symptom.** A field such as `email`, `phoneNumber`, `apiKey`, `ip`, `address`,
-or nested `remoteAddress` disappears from a zero-config presence roster or
-cursor catalog. If `presence.key` names a dropped field, the tracker warns and
-uses one `__conn:N` entry per connection instead of multi-tab dedup.
+**Symptom.** A zero-config presence roster entry is just `{ id }` (the
+configured `key` field) and a zero-config cursor catalog user is just
+`{ id }`: `name`, `avatarUrl`, `role` and every other field the upgrade
+hook returned are gone. If `presence.key` names a credential-shaped or
+transport field such as `sessionId` or `email`, the tracker warns and uses one
+`__conn:N` entry per connection instead of multi-tab dedup.
 
-**Why.** Those values previously reached every topic peer and the Redis
-presence/cursor hashes. A presence key is also a roster property/hash-field
-name, so resolving a dropped key from raw userData would leak the same value
-through a second channel.
+**Why.** Whatever the upgrade hook returned reached every topic peer and the
+Redis presence/cursor hashes, minus a denylist of names. A denylist cannot know
+which fields of an app's user record are private, so the default now copies the
+identity only, as the adapter's in-memory plugins do. A presence key is also a
+roster property/hash-field name, so a private key is never copied either.
 
-**Action.** Prefer an explicit allowlist containing only the identity the UI
-needs, for example `select: (ud) => ({ id: ud.id, name: ud.name })`. If a
-personal or transport field is intentionally public, return it explicitly.
-Keep `presence.key` on a non-secret selected identifier. Explicit select output
-still passes through `stripInternal` with that helper's existing documented rules.
+**Action.** Pass an explicit allowlist containing only what the UI needs, for
+example `select: (ud) => ({ id: ud.id, name: ud.name })`. An explicit select is
+used as-is: it receives the connection's userData unchanged, `remoteAddress`
+included, and its result is no longer passed through `stripInternal`, so return
+only what peers should see. Presence alone drops top-level `__`-prefixed,
+`constructor` and `prototype` names from it. Keep `presence.key` on a
+non-secret selected identifier.
 
 ### Authorization now fails closed
 

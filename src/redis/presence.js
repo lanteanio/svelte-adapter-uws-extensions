@@ -53,7 +53,6 @@ import {
 	setIntervalTimer,
 	clearIntervalTimer
 } from '../shared/runtime.js';
-import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
@@ -66,7 +65,7 @@ import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './pre
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
-import { isReservedPresenceField, newFieldMap } from './presence/field-policy.js';
+import { isReservedPresenceField, newFieldMap, withoutReservedNames } from './presence/field-policy.js';
 import { createDiffBuffer } from './presence/diff-buffer.js';
 import { createSubscriber } from './presence/subscriber.js';
 import { createPresenceState } from './presence/state.js';
@@ -81,8 +80,8 @@ export { WsClosedError };
 
 /**
  * @typedef {Object} RedisPresenceOptions
- * @property {string} [key='id'] - Field in projected data for user dedup. A field dropped by the default projection falls back to a per-connection key so private data cannot leak as a roster property name.
- * @property {(userData: any) => Record<string, any>} [select] - Extract public fields from userData. By default, recursively drops internal keys, credentials, common personal data, and request transport metadata. An explicit function can intentionally admit fields; its result still passes through stripInternal().
+ * @property {string} [key='id'] - Field in the selected data for user dedup. A credential-shaped or transport field name is not copied by the default select, so each connection then gets its own entry and the value never becomes a roster property name.
+ * @property {(userData: any) => Record<string, any>} [select] - Extract the public roster data from userData. By default only the `key` field is copied, and only when its value is a string or finite number. An explicit select is the application's own policy and its result is used as-is, apart from top-level `__`-prefixed, `constructor` and `prototype` names, which every instance drops.
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
  * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:del` so a topic's local subscribers receive an empty `state` event the moment its per-topic presence hash is removed (instance-died scenario: the server deletes the hash when its last field's TTL lapses). Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset including `E` and `g`) on every master; Redis accepts the subscription without it, so the tracker reads the setting when it subscribes and reports flags that cannot deliver the deletion (a server that refuses CONFIG is not checked). Per-field expiry that leaves other users on the topic does not fire it.
@@ -121,11 +120,11 @@ export { WsClosedError };
 export function createPresence(client, options = {}) {
 	const ctx = createPresenceState(client, options);
 	const {
-		keyField, select, sanitizeSelected, heartbeatInterval, presenceTtlMs, transientFields, publicData,
+		keyField, select, heartbeatInterval, presenceTtlMs, transientFields, publicData,
 		emit, emitTo, instanceId, redis, keyspaceNotifications, maxEnvelopeBytes, ensureRedis74, b, mt,
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
 		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, mSelfPreserveActive, mSelfPreserveHeld,
-		mSelfPreserveActivations, selfPreservation, warnSensitive, wsTopics, localCounts,
+		mSelfPreserveActivations, selfPreservation, wsTopics, localCounts,
 		localData, syncObservers, syncCounts, topicHashKey, userHashKey, eventChannel,
 		coalesceHgetall
 	} = ctx;
@@ -741,28 +740,19 @@ export function createPresence(client, options = {}) {
 			let connTopics = wsTopics.get(ws);
 			if (connTopics && connTopics.has(topic)) return;
 
-			const raw = ws.getUserData();
-			const { __subscriptions, remoteAddress, ...safeData } = raw || {};
-			// Warn first on the raw select output so developers see sensitive
-			// keys their select forwarded (the warning fires once per process
-			// and is the signal that they should tighten the select). Then
-			// deep-strip for the wire: a user-supplied select might return
-			// data with nested sensitive keys, and the wire output must not
-			// carry them regardless of how select is wired. resolveKey runs
-			// on the shallow safeData to keep id / name resolution unchanged.
-			const selected = select(safeData);
-			warnSensitive(selected);
-			const data = sanitizeSelected ? stripInternal(selected) : selected;
+			const selected = select(ws.getUserData());
 			// A roster entry is an object; anything else would be stored as the
-			// user's data and skipped by every read-back. Checked on what is
-			// stored, after the strip (which turns a byte view into a string),
-			// and thrown before any state is staged and before the breaker guard,
-			// as the in-memory plugin does.
-			if (!data || typeof data !== 'object') {
-				throw new TypeError(`redis presence: select() must return a plain object, got ${data === null ? 'null' : typeof data}`);
+			// user's data and skipped by every read-back. Thrown before any state
+			// is staged and before the breaker guard, as the in-memory plugin does.
+			if (!selected || typeof selected !== 'object') {
+				throw new TypeError(`redis presence: select() must return a plain object, got ${selected === null ? 'null' : typeof selected}`);
 			}
+			// The relayed join and the read-back from Redis both drop these
+			// names, so the local join does too: otherwise this instance's peers
+			// would see an entry that every other instance's peers do not.
+			const data = withoutReservedNames(selected);
 			// The key is part of every roster object's wire shape, so it must be
-			// resolved from the projected data rather than the raw connection data.
+			// resolved from the selected data rather than the raw connection data.
 			// A default-dropped email/session/ip therefore falls back to __conn:N
 			// instead of leaking as the roster property name. An explicit select is
 			// the deliberate opt-in path for a non-secret custom key.

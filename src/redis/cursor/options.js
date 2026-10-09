@@ -5,7 +5,29 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/options
  */
 
-import { projectDefaultUserData } from '../../shared/default-projection.js';
+/**
+ * Fail-closed default projection for catalog and join frames. Only a stable,
+ * JSON-safe `id` is copied. Every display/profile field requires an explicit
+ * application allowlist.
+ * @param {unknown} obj
+ * @returns {Record<string, string | number>}
+ */
+function defaultCursorSelect(obj) {
+	const selected = {};
+	if (!obj || typeof obj !== 'object') return selected;
+	let value;
+	try {
+		if (!Object.prototype.hasOwnProperty.call(obj, 'id')) return selected;
+		value = obj.id;
+	} catch {
+		return selected;
+	}
+	if (typeof value !== 'string' && !(typeof value === 'number' && Number.isFinite(value))) {
+		return selected;
+	}
+	selected.id = value;
+	return selected;
+}
 
 /**
  * @typedef {Object} ResolvedCursorOptions
@@ -13,7 +35,6 @@ import { projectDefaultUserData } from '../../shared/default-projection.js';
  * @property {number} topicThrottleMs
  * @property {number} snapshotIntervalMs
  * @property {(userData: any) => any} select
- * @property {boolean} sanitizeSelected
  * @property {number} cursorTtl
  * @property {(data: any) => ({ x: number, y: number } | null)} position
  * @property {(data: any) => ({ x: number, y: number } | null)} finitePosition
@@ -44,8 +65,9 @@ export function resolveCursorOptions(options = {}) {
 	if (options.select != null && typeof options.select !== 'function') {
 		throw new Error('redis cursor: select must be a function');
 	}
-	const sanitizeSelected = options.select != null;
-	const select = sanitizeSelected ? options.select : projectDefaultUserData;
+	// Zero-config cursors announce only the connection's `id`. An explicit
+	// select is the application's own policy and its result is used as-is.
+	const select = options.select ?? defaultCursorSelect;
 	const cursorTtl = options.ttl ?? 30;
 
 	// Read {x, y} out of the app's cursor `data` for the jitter filter. The
@@ -189,7 +211,6 @@ export function resolveCursorOptions(options = {}) {
 		topicThrottleMs,
 		snapshotIntervalMs,
 		select,
-		sanitizeSelected,
 		cursorTtl,
 		position,
 		finitePosition,

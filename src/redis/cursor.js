@@ -49,7 +49,6 @@ import {
 	setTimer,
 	clearTimer,
 } from '../shared/runtime.js';
-import { stripInternal, createSensitiveWarner } from '../shared/sensitive.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
@@ -86,9 +85,8 @@ export { WsClosedError, SubscribeDeniedError };
  *   reconcile. 100ms staleness on the reconcile path is fine for cursors.
  *   0 disables coalescing and reverts to per-flush HSET (legacy behavior).
  * @property {(userData: any) => any} [select] - Extract user-identifying data from userData.
- *   By default, recursively drops internal keys, credentials, common personal data,
- *   and request transport metadata. An explicit function can intentionally admit
- *   fields; its result still passes through stripInternal().
+ *   By default only an own `id` whose value is a string or finite number is copied.
+ *   An explicit select is the application's own policy and its result is used as-is.
  * @property {number} [ttl=30] - TTL in seconds for hash entries. Should be longer than
  *   the expected gap between updates. Entries are refreshed on every snapshot tick.
  * @property {(data: any) => ({ x: number, y: number } | null)} [position] - Extract a
@@ -151,7 +149,6 @@ export function createCursor(client, options = {}) {
 		topicThrottleMs,
 		snapshotIntervalMs,
 		select,
-		sanitizeSelected,
 		cursorTtl,
 		position,
 		finitePosition,
@@ -227,23 +224,18 @@ export function createCursor(client, options = {}) {
 	const mThrottled = m?.counter('cursor_throttled_total', 'Cursor updates deferred by throttle', ['topic']);
 	const mAttachesAborted = m?.counter('cursor_attaches_aborted_total', 'Cursor attach calls that aborted because the websocket closed before `ws.subscribe` could complete. Symmetric with `presence_joins_aborted_total`; same `WS_CLOSED` cause.', ['topic', 'reason']);
 
-	const warnSensitive = createSensitiveWarner('redis/cursor');
-
 	let connCounter = 0;
 
-	function safeUserData(ws) {
+	function userDataOf(ws) {
 		// Closed-WS race: getWsState (called from `update`) may reach here
 		// after an `await` that outlasted the socket; `ws.getUserData()`
 		// throws on a freed native handle. Fall back to an empty userData
-		// rather than crashing the worker. Matches adapter 0.5.5's
-		// `plugins/cursor/server.js getWsState` guard.
-		let raw = {};
+		// rather than crashing the worker, as the in-memory cursor plugin does.
+		let userData = {};
 		if (typeof ws.getUserData === 'function') {
-			try { raw = ws.getUserData(); } catch { raw = {}; }
+			try { userData = ws.getUserData(); } catch { userData = {}; }
 		}
-		if (!raw || typeof raw !== 'object') return {};
-		const { __subscriptions, remoteAddress, ...safeData } = raw;
-		return safeData;
+		return userData;
 	}
 
 	/**
@@ -276,9 +268,7 @@ export function createCursor(client, options = {}) {
 					`redis cursor: local ws count exceeded ${MAX_CURSOR_WS} on this instance`
 				);
 			}
-			const selected = select(safeUserData(ws));
-			warnSensitive(selected);
-			const user = sanitizeSelected ? stripInternal(selected) : selected;
+			const user = select(userDataOf(ws));
 			try { JSON.stringify(user); } catch {
 				throw new Error('redis cursor: select() must return JSON-serializable data');
 			}

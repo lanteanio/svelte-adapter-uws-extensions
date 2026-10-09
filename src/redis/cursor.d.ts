@@ -27,11 +27,14 @@ export interface RedisCursorOptions {
 
 	/**
 	 * Extract user-identifying data from userData.
-	 * Broadcast alongside cursor data so other clients know who the cursor belongs to.
-	 * The default recursively drops internal keys, credentials, common personal
-	 * data, and request transport metadata. An explicit callback can intentionally
-	 * admit fields; its result still passes through `stripInternal()`.
-	 * @default privacy projection
+	 * Announced on the `catalog` / `join` frames every peer on the topic
+	 * receives, and stored in Redis with the position.
+	 * The default copies only an own `id` whose value is a string or finite
+	 * number. Names, colors, profiles, transport metadata and every other field
+	 * need an explicit `select`. An explicit `select` is the application's own
+	 * policy and its result is used as-is, so make it an allowlist such as
+	 * `select: (ud) => ({ id: ud.id, name: ud.name, color: ud.color })`.
+	 * @default the `id` field only
 	 */
 	select?: (userData: any) => any;
 
