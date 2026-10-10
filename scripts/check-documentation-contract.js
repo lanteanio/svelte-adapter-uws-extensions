@@ -29,7 +29,7 @@ export function headingsOf(source) {
 	return headings;
 }
 function category(title) {
-	if (['What you get', 'Version compatibility', 'Installation', 'Authorize every extension call'].includes(title)) return 'Start here';
+	if (['What you get', 'Version compatibility', 'Installation', 'Authorize every extension call', 'Production hardening'].includes(title)) return 'Start here';
 	if (/client$/.test(title)) return 'Clients';
 	if (/metrics|Sensitive|assertions|Capacity/.test(title)) return 'Observability and capacity';
 	if (/Failure|breaker|admission|Admission|erasure|shutdown|tenant|Testing|Related|License|URL safety/.test(title)) return 'Operations and support';

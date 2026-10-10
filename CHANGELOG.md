@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Remove competing manual README categories and add a consolidated production-hardening route to the canonical guide and supported extension controls.
+
 - Validate relative documentation targets against the staged file inventory and preserve owned sibling Markdown fragments in scheduled link checks.
 
 - Version the documentation route manifest, pin reader-path purposes and compatibility ownership, and reject native-version facts outside generated blocks or missing documentation gates.

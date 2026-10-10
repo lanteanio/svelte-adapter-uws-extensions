@@ -56,6 +56,7 @@ Search the [error reference](./docs/errors.md) for a stable diagnostic ID. Use [
 - [Version compatibility](#version-compatibility)
 - [Installation](#installation)
 - [Authorize every extension call](#authorize-every-extension-call)
+- [Production hardening](#production-hardening)
 
 ### Clients
 
@@ -116,8 +117,6 @@ Search the [error reference](./docs/errors.md) for a stable diagnostic ID. Use [
 
 ---
 
-**Getting started**
-
 ## Version compatibility
 
 The three ecosystem packages move together. Bump them as a group:
@@ -160,8 +159,6 @@ For a complete working example, follow [First success](docs/getting-started.md):
 After prerequisites pass, choose the Redis or Postgres factory for the primitive you need; each backend documents its own client creation and lifecycle.
 
 ---
-
-**Clients**
 
 ## Redis client
 
@@ -308,7 +305,16 @@ The same pattern applies to every extension in this README: read identity, decid
 
 ---
 
-**Redis extensions**
+## Production hardening
+
+Follow the [production hardening guide](https://svelte-realtime.dev/guides/production-hardening) for proxy trust, enumeration-safe responses and deployment policy. Connect that policy to the supported extension APIs:
+
+- [Authorize every extension call](#authorize-every-extension-call) using server-established identity and tenant scope before accessing shared state.
+- Configure [capability cookies](#capability-cookie), including `previousSecret` during key rotation, and [cluster-clock fencing](#cluster-clock) for time-sensitive writes.
+- Combine [composite limits](#composite-limits-createcompositeratelimit), the [emergency scale](#emergency-scale-incident-switch), [message admission](#admission-control) and [upgrade admission](#upgrade-admission) with measured resource pressure and CPU quota.
+- For caller-influenced destinations, combine [URL validation and resolved-address checks](#url-safety-ssrf) with transport-level pinning of the verified address.
+
+---
 
 ## Pub/sub bus
 
@@ -1751,8 +1757,6 @@ Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (
 
 ---
 
-**Postgres extensions**
-
 ## Replay buffer (Postgres)
 
 Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table using `INSERT ... ON CONFLICT DO UPDATE`, so concurrent publishes from multiple instances produce strictly ordered sequences with no duplicates or gaps.
@@ -2105,8 +2109,6 @@ ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS tracestate TEXT;
 If your handler needs durable result tracking and crash recovery, and its effects are idempotent across retries, reach for `createTaskRunner`. If you want a lighter producer/consumer split with caller-driven retry, this is the simpler shape.
 
 ---
-
-**Cross-backend**
 
 ## Idempotency store
 
@@ -3175,8 +3177,6 @@ The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then p
 
 ---
 
-**Observability**
-
 ## Prometheus metrics
 
 Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled - every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
@@ -3623,8 +3623,6 @@ const result = await checkUrlResolved(userWebhookUrl, {
 `checkUrlResolved` runs the literal check first (so a private literal short-circuits without a lookup), then -- only for a DNS name -- resolves and re-checks every resolved address. A resolver that throws yields `{ safe: false, reason: 'unresolved-host' }`. In `mode: 'off'` the resolver path is skipped entirely, so the opt-out bypasses the range checks uniformly for both IP literals and DNS names. Note that even with a resolver this does not fully close the time-of-check-to-time-of-use window: a name can resolve to a public IP at check time and a private IP at fetch time. For a hard guarantee, pin the resolved address and connect to it directly.
 
 ---
-
-**Reliability**
 
 ## Capacity model
 
@@ -4450,8 +4448,6 @@ await lib.delete();  // FUNCTION DELETE
 Requires Redis 7+. There is no built-in fallback to `EVALSHA` for older servers because that would require maintaining each function in two forms (library function + plain Lua); on Redis 6 just call `redis.eval` directly with your own SHA caching.
 
 ---
-
-**Operations**
 
 ## Graceful shutdown
 
