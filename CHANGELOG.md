@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add optional bounded Redis relay outcome counters, local messages with unconfirmed relay, and relay duration in seconds for standard and sharded buses. Document partial failures and ambiguous delivery.
+
 - Refresh compatible runtime clients to ioredis 5.11.1 and pg 8.23.1 in the lockfile, and define a quarterly client maintenance review with real-backend and performance checks.
 
 - Bound worker task admission by jobs and input bytes, reserve capacity before durable claims, expire and remove cancelled queued jobs, and settle worker exit or IPC failures without leaking capacity. Document worker pressure metrics and cancellation behavior.
@@ -39,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
+
+- Owned PostgreSQL clients stop notification bridges and close standalone sessions before their pool. Serialize notification startup and recovery, cancel pending startup on shutdown, release abandoned breaker probes, and prevent late reactivation. Add bounded reconnect jitter and document session-pooling requirements.
 
 - Coalesce task fence renewals and abort on lost renewal confidence, including time spent acquiring a lease. Pending external renewal cannot be discarded by a returning handler, and an ignored abort cannot commit stale success.
 - Clarify that bundled deduplication and distributed idempotency use different caller contracts, and list asynchronous session storage, omitted size introspection, and added lifecycle members.
