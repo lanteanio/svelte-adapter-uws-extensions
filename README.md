@@ -2824,7 +2824,7 @@ There is intentionally no `size()` method: a cluster-wide count of session keys 
 
 Wraps an effectful operation in a state machine that survives process crashes and naturally fans across cluster instances. Use it for background work that needs durable retry and result tracking: charging a customer, sending a transactional email, posting to a webhook, or kicking off a long-running pipeline. Handler execution is at least once after a lease expires, so externally visible effects must be idempotent or fenced.
 
-**Requires Postgres 13+.** Uses the built-in `gen_random_uuid()` function (added to core in 13; older versions need the `pgcrypto` extension explicitly enabled, which the runner does not do for you).
+Uses the PostgreSQL baseline in the [supported subpath matrix](./docs/postgres-support.md#postgresql-support). Run the version preflight and await schema readiness before starting task workers.
 
 **Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** - start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
 

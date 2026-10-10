@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Point task-runner requirements at the supported PostgreSQL subpath matrix instead of a conflicting minimum.
+
 - Keep release history and companion guides reachable from the package overview, add reciprocal navigation, and enforce those routes in the documentation link gate.
 
 - Remove competing manual README categories and add a consolidated production-hardening route to the canonical guide and supported extension controls.
