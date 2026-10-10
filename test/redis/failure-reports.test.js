@@ -2501,7 +2501,8 @@ describe('a command Redis refuses inside a batch is a failed command', () => {
 			client, redis: client.redis, channel: 'cursor-ch', instanceId: 'i1', b: breaker,
 			validator: { acceptRaw: () => true, acceptEnvelope: () => true },
 			cursorTtl: 30, snapshotIntervalMs, activeTopics: new Set(['room']),
-			emit() {}, onMessage() {}, queueRemove() {}
+			watchedTopics: () => [], mergeRoster: () => [], inUse: () => false,
+			resetRoster() {}, recoverTopic() {}, onMessage() {}, queueRemove() {}
 		});
 		client.redis.hset = async () => { throw readonly(); };
 		client.redis.hdel = async () => { throw readonly(); };
@@ -2648,7 +2649,8 @@ describe('teardown survives a refused quit', () => {
 			client, redis: client.redis, channel: 'cursor-ch', instanceId: 'i1', b: null,
 			validator: { acceptRaw: () => true, acceptEnvelope: () => true },
 			cursorTtl: 30, snapshotIntervalMs: 0, activeTopics: new Set(),
-			emit() {}, onMessage() {}, queueRemove() {}
+			watchedTopics: () => [], mergeRoster: () => [], inUse: () => false,
+			resetRoster() {}, recoverTopic() {}, onMessage() {}, queueRemove() {}
 		});
 		io.ensureSubscriber(mockPlatform());
 		await settle();
