@@ -236,6 +236,7 @@
 		"svelte-adapter-uws": ">=0.6.0-next.91"
 	},
 	"dependencies": {
+		"@types/pg": "8.23.1",
 		"ioredis": "^5.0.0"
 	},
 	"optionalDependencies": {
@@ -244,6 +245,7 @@
 	"devDependencies": {
 		"acorn": "^8.16.0",
 		"svelte-adapter-uws": "^0.6.0-next.94",
+		"typescript": "5.9.3",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0"
 	},
