@@ -64,6 +64,8 @@ import { resolveCursorOptions } from './cursor/options.js';
 import { createRemoveBuffer } from './cursor/remove-buffer.js';
 import { createRedisIo } from './cursor/redis-io.js';
 import { createRoster } from './cursor/roster.js';
+import { createInputDropReporter } from '../shared/input-drops.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { createScheduler } from './cursor/scheduler.js';
 
 export { WsClosedError, SubscribeDeniedError };
@@ -232,6 +234,7 @@ export function createCursor(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
+	const inputDropped = createInputDropReporter(m, 'cursor', EXTENSIONS_ERROR_IDS.CURSOR_INPUT_DROPPED);
 	const mt = m?.mapTopic || (() => 'all');
 	const mUpdates = m?.counter('cursor_updates_total', 'Cursor update calls', ['topic']);
 	const mBroadcasts = m?.counter('cursor_broadcasts_total', 'Cursor broadcasts sent', ['topic']);
@@ -378,7 +381,7 @@ export function createCursor(client, options = {}) {
 	// ./cursor/remove-buffer.js for the setTimeout(0) cross-socket coalescing).
 	const { queueRemove, clear: clearRemoveBuffer } = createRemoveBuffer();
 
-	const roster = createRoster({ topics, instanceId, cursorTtl });
+	const roster = createRoster({ topics, instanceId, cursorTtl, inputDropped });
 
 	function onPeerMessage(parsed, platform) {
 		if (!hasLocalInterest(parsed.topic, platform)) return;
@@ -416,6 +419,7 @@ export function createCursor(client, options = {}) {
 	}
 
 	const redisIo = createRedisIo({
+		inputDropped,
 		client,
 		redis,
 		channel,
@@ -751,13 +755,13 @@ export function createCursor(client, options = {}) {
 			// staged topic would make every flush fail on. The character check
 			// runs only for a topic not yet tracked, so a frame on a live topic
 			// pays one Map lookup.
-			if (typeof topic !== 'string' || topic.length === 0) return;
-			if (!topics.has(topic) && !isFramableTopic(topic)) return;
+			if (typeof topic !== 'string' || topic.length === 0) { inputDropped('invalid_envelope', 'update'); return; }
+			if (!topics.has(topic) && !isFramableTopic(topic)) { inputDropped('invalid_envelope', 'update'); return; }
 			if (data !== undefined && data !== null) {
 				try {
-					if (Buffer.byteLength(JSON.stringify(data)) > maxDataBytes) return;
-					if (exceedsDepth(data, MAX_PROJECTION_DEPTH)) return;
-				} catch { return; }
+					if (Buffer.byteLength(JSON.stringify(data)) > maxDataBytes) { inputDropped('data_limit', 'update'); return; }
+					if (exceedsDepth(data, MAX_PROJECTION_DEPTH)) { inputDropped('data_limit', 'update'); return; }
+				} catch { inputDropped('serialization_failed', 'update'); return; }
 			}
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);
@@ -974,7 +978,7 @@ export function createCursor(client, options = {}) {
 			for (const t of state.member) removeWsSubscription(ws, '__cursor:' + t);
 			try {
 				let redisUp = true;
-				if (b) { try { b.guard(); } catch { redisUp = false; } }
+				if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'remove'); redisUp = false; } }
 
 				const removedTopics = [];
 				for (const t of state.topics) {
@@ -1093,12 +1097,13 @@ export function createCursor(client, options = {}) {
 		},
 
 		async list(topic) {
-			if (b) b.guard();
+			try { b?.guard(); } catch (err) { inputDropped('breaker_open', 'snapshot_read'); throw err; }
 			let all;
 			try {
 				all = await redis.hgetall(hashKey(topic));
 				b?.success();
 			} catch (err) {
+				inputDropped('redis_failure', 'snapshot_read');
 				b?.failure(err);
 				throw err;
 			}
@@ -1108,9 +1113,10 @@ export function createCursor(client, options = {}) {
 			for (const key of Object.keys(all)) {
 				try {
 					const parsed = JSON.parse(all[key]);
-					if (!parsed.ts || (nowTs - parsed.ts) > ttlMs) continue;
+					if (!parsed || !Number.isFinite(parsed.ts) || !parsed.ts) { inputDropped('corrupt_entry', 'snapshot_read'); continue; }
+					if ((nowTs - parsed.ts) > ttlMs) continue;
 					result.push({ key, user: parsed.user, data: parsed.data });
-				} catch { /* corrupted entry */ }
+				} catch { inputDropped('corrupt_entry', 'snapshot_read'); }
 			}
 			// Include locally-pending entries that have not yet been flushed
 			// to Redis. Without this, a list() call between a broadcast and

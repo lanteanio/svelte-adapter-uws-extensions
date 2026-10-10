@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Report corrupt Redis replay entries and cursor input, snapshot, relay and background failures through bounded operational diagnostics and finite reason/stage counters without exposing payloads or identifiers.
+
 - Exercise native WebSocket delivery through the packed adapter, realtime message hook and extensions relay in the quick ecosystem gate, with required canonical native bindings and local/remote value, order and count checks.
 
 - Bound Redis relay retention to 8,192 envelopes and 8 MiB per bus, including unsettled submissions. Drain FIFO chunks with event-loop yields, preserve local delivery under overload, and expose aggregate queue depth, bytes and oldest age.

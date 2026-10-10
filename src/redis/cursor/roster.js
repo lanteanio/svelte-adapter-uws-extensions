@@ -2,7 +2,7 @@ import { now, setTimer, clearTimer } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 
 /** Merge persisted cursors with live relay changes and this worker's movers. */
-export function createRoster({ topics, instanceId, cursorTtl }) {
+export function createRoster({ topics, instanceId, cursorTtl, inputDropped = () => {} }) {
 	const live = new Map();
 	const ttlMs = cursorTtl * 1000;
 	let timer = null;
@@ -43,8 +43,9 @@ export function createRoster({ topics, instanceId, cursorTtl }) {
 			if (key.startsWith(instanceId + ':')) continue;
 			try {
 				const entry = JSON.parse(value);
-				if (entry.ts && entry.ts >= cutoff) result.set(key, { key, user: entry.user, data: entry.data });
-			} catch { /* corrupted entry */ }
+				if (!entry || !Number.isFinite(entry.ts) || !entry.ts) { inputDropped('corrupt_entry', 'snapshot_read'); continue; }
+				if (entry.ts >= cutoff) result.set(key, { key, user: entry.user, data: entry.data });
+			} catch { inputDropped('corrupt_entry', 'snapshot_read'); }
 		}
 		for (const [key, entry] of live.get(topic) || []) {
 			if (entry.ts < cutoff) continue;

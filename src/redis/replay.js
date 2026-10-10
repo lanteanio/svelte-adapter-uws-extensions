@@ -34,6 +34,7 @@ import { decodeSortedSetMember } from '../shared/replay-envelope.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
@@ -158,6 +159,7 @@ export function createReplay(client, options = {}) {
 		'Resume frames whose topic set exceeded MAX_RESUME_TOPICS'
 	);
 	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
+	const inputDropped = createInputDropReporter(m, 'replay', EXTENSIONS_ERROR_IDS.REDIS_REPLAY_INPUT_DROPPED);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 	const mStorageFallbacks = localFanoutOnStorageFailure
@@ -340,7 +342,7 @@ export function createReplay(client, options = {}) {
 
 			for (let i = 0; i < raw.length; i++) {
 				const decoded = decodeSortedSetMember(raw[i], topic);
-				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode'); continue; }
 				b?.success();
 				if (decoded.seq > target) {
 					return { truncated: true, missingFrom: target };
@@ -376,7 +378,7 @@ export function createReplay(client, options = {}) {
 			const result = [];
 			for (let i = 0; i < raw.length; i++) {
 				const decoded = decodeSortedSetMember(raw[i], topic);
-				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode'); continue; }
 				result.push(decoded);
 			}
 			return result;
@@ -439,7 +441,7 @@ export function createReplay(client, options = {}) {
 					// it falls in the delivered range; counting it in both loops would
 					// double-report the same entry in replay_corruptions_total.
 					const decoded = decodeSortedSetMember(oldestRaw[i], topic);
-					if (decoded === null) continue;
+					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
 					oldestSeq = decoded.seq;
 					break;
 				}
@@ -453,7 +455,7 @@ export function createReplay(client, options = {}) {
 			const missed = [];
 			for (let i = 0; i < missedRaw.length; i++) {
 				const decoded = decodeSortedSetMember(missedRaw[i], topic);
-				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode'); continue; }
 				missed.push(decoded);
 			}
 
@@ -557,7 +559,7 @@ export function createReplay(client, options = {}) {
 				const toRemove = [];
 				for (const member of members) {
 					const decoded = decodeSortedSetMember(member, topic);
-					if (decoded === null) continue;
+					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
 					let uid;
 					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
 					if (uid === userId) toRemove.push(member);

@@ -32,6 +32,7 @@ import { decodeStreamFields } from '../shared/replay-envelope.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 
 /**
@@ -243,6 +244,7 @@ export function createStreamReplay(client, options = {}) {
 		'Resume frames whose topic set exceeded MAX_RESUME_TOPICS'
 	);
 	const mCorruptions = m?.counter('replay_corruptions_total', 'Stored replay entries dropped as corrupt or an unknown envelope version', ['topic']);
+	const inputDropped = createInputDropReporter(m, 'replay', EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_INPUT_DROPPED);
 	const mReplications = replicated ? m?.counter('replay_replications_total', 'Publishes confirmed replicated within timeout') : null;
 	const mReplicationTimeouts = replicated ? m?.counter('replay_replication_timeouts_total', 'Publishes that did not reach minReplicas within timeout') : null;
 	const mIdmpHits = m?.counter('replay_idmp_hits_total', 'publishIdempotent calls served from the dedup cache (no XADD)', ['topic']);
@@ -478,7 +480,7 @@ export function createStreamReplay(client, options = {}) {
 				// sorted-set gap() and the strict replay read path, and is counted.
 				const decoded = decodeStreamFields(fieldsToObject(flat), seq, topic);
 				if (decoded === null) {
-					mCorruptions?.inc({ topic: mt(topic) });
+					mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode');
 					return { truncated: true, missingFrom: target };
 				}
 				return { truncated: false, missingFrom: null };
@@ -515,7 +517,7 @@ export function createStreamReplay(client, options = {}) {
 				// key; an unknown version or a required-field miss is dropped as a
 				// corruption (reads as a resume gap) and counted.
 				const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
-				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode'); continue; }
 				result.push(decoded);
 			}
 			return result;
@@ -566,7 +568,7 @@ export function createStreamReplay(client, options = {}) {
 			const missed = [];
 			for (const [id, flat] of entries) {
 				const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
-				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); continue; }
+				if (decoded === null) { mCorruptions?.inc({ topic: mt(topic) }); inputDropped('corrupt_entry', 'decode'); continue; }
 				missed.push(decoded);
 			}
 
@@ -668,7 +670,7 @@ export function createStreamReplay(client, options = {}) {
 				const toDel = [];
 				for (const [id, flat] of entries) {
 					const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
-					if (decoded === null) continue;
+					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
 					let uid;
 					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
 					if (uid === userId) toDel.push(id);

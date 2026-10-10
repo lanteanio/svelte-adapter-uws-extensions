@@ -52,6 +52,9 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	CLOCK_NTP_SAMPLE: 'EXTENSIONS-ERR-CLOCK-NTP-SAMPLE',
 	CLOCK_LEADER_OFFSET: 'EXTENSIONS-ERR-CLOCK-LEADER-OFFSET',
 	CURSOR_SUBSCRIBER: 'EXTENSIONS-ERR-CURSOR-SUBSCRIBER',
+	CURSOR_INPUT_DROPPED: 'EXTENSIONS-ERR-CURSOR-INPUT-DROPPED',
+	REDIS_REPLAY_INPUT_DROPPED: 'EXTENSIONS-ERR-REDIS-REPLAY-INPUT-DROPPED',
+	REDIS_REPLAY_STREAM_INPUT_DROPPED: 'EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED',
 	CURSOR_CLEANUP: 'EXTENSIONS-ERR-CURSOR-CLEANUP',
 	CURSOR_FLUSH: 'EXTENSIONS-ERR-CURSOR-FLUSH',
 	GROUPS_META_INITIALIZE: 'EXTENSIONS-ERR-GROUPS-META-INITIALIZE',
@@ -376,6 +379,36 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'The next scheduled sample publishes or reads the key again.',
 		nextAction: 'Check Redis connectivity and confirm the leader instance is alive and publishing.',
 		sources: ['src/redis/clock.js'], anchor: 'extensions-err-clock-leader-offset'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.CURSOR_INPUT_DROPPED,
+		event: 'redis.cursor.input-dropped', component: 'runtime.redis.cursor', severity: 'warn',
+		problemPrefix: 'Cursor input or background work was dropped; inspect the reason and stage counters.',
+		cause: 'Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.',
+		consequence: 'The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; cursor_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.',
+		automaticRecovery: 'Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.',
+		nextAction: 'Inspect cursor_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.',
+		sources: ['src/redis/cursor.js', 'src/shared/input-drops.js'], anchor: 'extensions-err-cursor-input-dropped'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_INPUT_DROPPED,
+		event: 'redis.replay.input-dropped', component: 'runtime.redis.replay', severity: 'warn',
+		problemPrefix: 'Replay input or background work was dropped; inspect the reason and stage counters.',
+		cause: 'Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.',
+		consequence: 'The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; replay_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.',
+		automaticRecovery: 'Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.',
+		nextAction: 'Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.',
+		sources: ['src/redis/replay.js', 'src/shared/input-drops.js'], anchor: 'extensions-err-redis-replay-input-dropped'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_INPUT_DROPPED,
+		event: 'redis.replay-stream.input-dropped', component: 'runtime.redis.replay-stream', severity: 'warn',
+		problemPrefix: 'Stream replay input or background work was dropped; inspect the reason and stage counters.',
+		cause: 'Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.',
+		consequence: 'The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; replay_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.',
+		automaticRecovery: 'Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.',
+		nextAction: 'Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.',
+		sources: ['src/redis/replay-stream.js', 'src/shared/input-drops.js'], anchor: 'extensions-err-redis-replay-stream-input-dropped'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBER,

@@ -3374,7 +3374,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms |
 | `presence_keyspace_cleanups_total` | counter | | Topic hash removals that triggered an empty-list emit (keyspace mode only) |
 
-**Replay buffer (Redis and Postgres)**
+**Replay buffer (Redis and Postgres)** - [Redis corrupt-input counters and diagnostics](docs/input-drops.md)
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -3405,7 +3405,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `group_leaves_total` | counter | `group` | Leave events |
 | `group_publishes_total` | counter | `group` | Publish events |
 
-**Cursor**
+**Cursor** - [Input and background failure counters](docs/input-drops.md)
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|

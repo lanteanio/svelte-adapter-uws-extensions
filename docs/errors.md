@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 68 diagnostic events. Each is one canonical line
+- 71 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -49,6 +49,9 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-CLOCK-SAMPLE](#extensions-err-clock-sample) | `redis.clock.sample.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.clock event=redis.clock.sample.failed severity=error] A Redis cluster-clock sample failed; the last good state remains active.` |
 | [EXTENSIONS-ERR-CLOCK-NTP-SAMPLE](#extensions-err-clock-ntp-sample) | `redis.clock.ntp-sample.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.clock event=redis.clock.ntp-sample.failed severity=warn] The auxiliary NTP clock sample failed and was excluded from this round.` |
 | [EXTENSIONS-ERR-CLOCK-LEADER-OFFSET](#extensions-err-clock-leader-offset) | `redis.clock.leader-offset-read.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.clock event=redis.clock.leader-offset-read.failed severity=warn] The cluster-clock leader offset could not be published or read; the prior state remains active.` |
+| [EXTENSIONS-ERR-CURSOR-INPUT-DROPPED](#extensions-err-cursor-input-dropped) | `redis.cursor.input-dropped` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.input-dropped severity=warn] Cursor input or background work was dropped; inspect the reason and stage counters.` |
+| [EXTENSIONS-ERR-REDIS-REPLAY-INPUT-DROPPED](#extensions-err-redis-replay-input-dropped) | `redis.replay.input-dropped` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.input-dropped severity=warn] Replay input or background work was dropped; inspect the reason and stage counters.` |
+| [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED](#extensions-err-redis-replay-stream-input-dropped) | `redis.replay-stream.input-dropped` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.input-dropped severity=warn] Stream replay input or background work was dropped; inspect the reason and stage counters.` |
 | [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber) | `redis.cursor.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.subscriber.failed severity=error] The Redis cursor subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup) | `redis.cursor.cleanup.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.cleanup.failed severity=warn] Cursor stale-entry cleanup failed; the next sweep retries.` |
 | [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush) | `redis.cursor.flush.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.flush.failed severity=warn] A cursor tick could not publish one or more topics; the other topics were flushed.` |
@@ -114,7 +117,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 68 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 71 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -131,6 +134,9 @@ Indexed events:
 - `redis.clock.sample.failed` - [EXTENSIONS-ERR-CLOCK-SAMPLE](#extensions-err-clock-sample)
 - `redis.clock.ntp-sample.failed` - [EXTENSIONS-ERR-CLOCK-NTP-SAMPLE](#extensions-err-clock-ntp-sample)
 - `redis.clock.leader-offset-read.failed` - [EXTENSIONS-ERR-CLOCK-LEADER-OFFSET](#extensions-err-clock-leader-offset)
+- `redis.cursor.input-dropped` - [EXTENSIONS-ERR-CURSOR-INPUT-DROPPED](#extensions-err-cursor-input-dropped)
+- `redis.replay.input-dropped` - [EXTENSIONS-ERR-REDIS-REPLAY-INPUT-DROPPED](#extensions-err-redis-replay-input-dropped)
+- `redis.replay-stream.input-dropped` - [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED](#extensions-err-redis-replay-stream-input-dropped)
 - `redis.cursor.subscriber.failed` - [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber)
 - `redis.cursor.cleanup.failed` - [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup)
 - `redis.cursor.flush.failed` - [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush)
@@ -474,6 +480,42 @@ the stable ID tag on the line):
 - **Next action:** Check Redis connectivity and confirm the leader instance is alive and publishing.
 - **Runtime help:** `docs/errors.md#extensions-err-clock-leader-offset`
 - **Runtime sources:** [src/redis/clock.js](../src/redis/clock.js)
+
+<a id="extensions-err-cursor-input-dropped"></a>
+## `EXTENSIONS-ERR-CURSOR-INPUT-DROPPED`
+
+- **Code/event:** `redis.cursor.input-dropped`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.input-dropped severity=warn] Cursor input or background work was dropped; inspect the reason and stage counters.`
+- **Cause:** Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.
+- **Consequence:** The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; cursor_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.
+- **Automatic recovery:** Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.
+- **Next action:** Inspect cursor_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.
+- **Runtime help:** `docs/errors.md#extensions-err-cursor-input-dropped`
+- **Runtime sources:** [src/redis/cursor.js](../src/redis/cursor.js), [src/shared/input-drops.js](../src/shared/input-drops.js)
+
+<a id="extensions-err-redis-replay-input-dropped"></a>
+## `EXTENSIONS-ERR-REDIS-REPLAY-INPUT-DROPPED`
+
+- **Code/event:** `redis.replay.input-dropped`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.input-dropped severity=warn] Replay input or background work was dropped; inspect the reason and stage counters.`
+- **Cause:** Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.
+- **Consequence:** The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; replay_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.
+- **Automatic recovery:** Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.
+- **Next action:** Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-replay-input-dropped`
+- **Runtime sources:** [src/redis/replay.js](../src/redis/replay.js), [src/shared/input-drops.js](../src/shared/input-drops.js)
+
+<a id="extensions-err-redis-replay-stream-input-dropped"></a>
+## `EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED`
+
+- **Code/event:** `redis.replay-stream.input-dropped`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.input-dropped severity=warn] Stream replay input or background work was dropped; inspect the reason and stage counters.`
+- **Cause:** Invalid stored or relayed input, a refused operation, or failed background delivery. The finite reason and stage attributes identify the path without carrying payloads, identities, or backend error text.
+- **Consequence:** The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; replay_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.
+- **Automatic recovery:** Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.
+- **Next action:** Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-replay-stream-input-dropped`
+- **Runtime sources:** [src/redis/replay-stream.js](../src/redis/replay-stream.js), [src/shared/input-drops.js](../src/shared/input-drops.js)
 
 <a id="extensions-err-cursor-subscriber"></a>
 ## `EXTENSIONS-ERR-CURSOR-SUBSCRIBER`

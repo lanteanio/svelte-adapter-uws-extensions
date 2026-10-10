@@ -21,6 +21,7 @@ import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
+import { createInputDropReporter } from '../../shared/input-drops.js';
 import { openSubscriber, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../shared/redis-subscriber.js';
 
 // Backoff for reopening a relay subscription that could not open.
@@ -38,10 +39,11 @@ const SUBSCRIBE_RETRY_MAX_MS = 30000;
  *   channel: string, instanceId: string, b: any, validator: any,
  *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, watchedTopics: Function, recoverTopic: Function,
  *   onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
- *   inUse: () => boolean
+ *   inUse: () => boolean, inputDropped?: (reason: string, stage: string) => void
  * }} deps
  */
 export function createRedisIo({
+	inputDropped = createInputDropReporter(null, 'cursor', EXTENSIONS_ERROR_IDS.CURSOR_INPUT_DROPPED),
 	client,
 	redis,
 	channel,
@@ -112,14 +114,14 @@ export function createRedisIo({
 		const topicList = [...new Set([...activeTopics, ...watchedTopics()])];
 		if (topicList.length === 0) { recoveryNeeded = false; return Promise.resolve(); }
 		const run = (async () => {
-			try { b?.guard(); } catch { return; }
+			try { b?.guard(); } catch { inputDropped('breaker_open', 'catch_up'); return; }
 			let results;
 			try {
 				results = await execMultiSlot(redis, topicList.map((topic) => ['hgetall', hashKey(topic)]));
 				const error = firstCommandError(results);
 				if (error) throw error;
 				b?.success();
-			} catch (error) { b?.failure(error); return; }
+			} catch (error) { inputDropped('redis_failure', 'catch_up'); b?.failure(error); return; }
 			if (disposed || !activePlatform || generation !== recoveryGeneration || !relayOnline) return;
 			for (let i = 0; i < topicList.length; i++) {
 				const topic = topicList[i];
@@ -128,7 +130,7 @@ export function createRedisIo({
 			}
 			recoveryNeeded = false;
 			recoveryRetryMs = SUBSCRIBE_RETRY_MIN_MS;
-		})().catch(() => {}).finally(() => {
+		})().catch(() => { inputDropped('delivery_failed', 'catch_up'); }).finally(() => {
 			if (recoveryRunning === run) recoveryRunning = null;
 			if (recoveryNeeded) retryRecoveryLater();
 		});
@@ -166,6 +168,7 @@ export function createRedisIo({
 		activePlatform = platform;
 		if (subscriber) return subscriberReady ?? undefined;
 		if (b && b.state === 'broken') {
+			inputDropped('breaker_open', 'subscribe');
 			retrySubscribeLater();
 			return undefined;
 		}
@@ -187,15 +190,17 @@ export function createRedisIo({
 		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
-			if (!validator.acceptRaw(message)) return;
+			if (!validator.acceptRaw(message)) { inputDropped('invalid_raw', 'relay_receive'); return; }
+			let parsed;
+			try { parsed = JSON.parse(message); } catch { inputDropped('invalid_json', 'relay_receive'); return; }
 			try {
-				const parsed = JSON.parse(message);
+				if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { inputDropped('invalid_envelope', 'relay_receive'); return; }
 				if (parsed.instanceId === instanceId) return;
-				if (!validator.acceptEnvelope(parsed.topic, parsed.event)) return;
+				if (!validator.acceptEnvelope(parsed.topic, parsed.event)) { inputDropped('invalid_envelope', 'relay_receive'); return; }
 				if (!activePlatform) return;
 				onMessage(parsed, activePlatform);
 			} catch {
-				// Malformed, skip
+				inputDropped('delivery_failed', 'relay_receive');
 			}
 		});
 		const ready = sub.subscribe(channel).then(() => {
@@ -287,7 +292,7 @@ export function createRedisIo({
 
 	function flushSnapshot() {
 		if (redisPending.size === 0) return;
-		if (b) { try { b.guard(); } catch { redisPending = new Map(); return; } }
+		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; } }
 		const pending = redisPending;
 		redisPending = new Map();
 		const commands = [];
@@ -296,23 +301,27 @@ export function createRedisIo({
 			if (entries.size === 0) continue;
 			const args = [];
 			for (const [key, entry] of entries) {
-				args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts }));
+				try { args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts })); }
+				catch { inputDropped('serialization_failed', 'snapshot_write'); }
 			}
+			if (args.length === 0) continue;
 			commands.push(['hset', hashKey(topic), ...args]);
 			commands.push(['expire', hashKey(topic), cursorTtl]);
 			queued += entries.size;
 		}
 		if (queued === 0) return;
-		execMultiSlot(redis, commands).then(settleBreaker).catch((err) => b?.failure(err));
+		execMultiSlot(redis, commands).then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
 	}
 
 	function queueSnapshot(topic, key, user, data) {
 		if (snapshotIntervalMs === 0) {
-			if (b) { try { b.guard(); } catch { return; } }
+			if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); return; } }
+			let value;
+			try { value = JSON.stringify({ user, data, ts: now() }); } catch { inputDropped('serialization_failed', 'snapshot_write'); return; }
 			const pipe = redis.pipeline();
-			pipe.hset(hashKey(topic), key, JSON.stringify({ user, data, ts: now() }));
+			pipe.hset(hashKey(topic), key, value);
 			pipe.expire(hashKey(topic), cursorTtl);
-			pipe.exec().then(settleBreaker).catch((err) => b?.failure(err));
+			pipe.exec().then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
 			return;
 		}
 		let topicPending = redisPending.get(topic);
@@ -325,9 +334,9 @@ export function createRedisIo({
 
 	// A snapshot write fails when Redis refuses any of its commands, not only
 	// when the batch is rejected.
-	function settleBreaker(results) {
+	function settleSnapshot(results) {
 		const err = firstCommandError(results);
-		if (err) b?.failure(err);
+		if (err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); }
 		else b?.success();
 	}
 
@@ -337,23 +346,24 @@ export function createRedisIo({
 
 	function relay(topic, event, payload) {
 		let msg;
-		try { msg = JSON.stringify({ instanceId, topic, event, payload }); } catch { return; }
+		try { msg = JSON.stringify({ instanceId, topic, event, payload }); } catch { inputDropped('serialization_failed', 'relay_send'); return; }
 		const publish = () => {
 			if (disposed) return;
-			try { b?.guard(); } catch { return; }
-			redis.publish(channel, msg).then(() => b?.success(), (error) => b?.failure(error));
+			try { b?.guard(); } catch { inputDropped('breaker_open', 'relay_send'); return; }
+			redis.publish(channel, msg).then(() => b?.success(), (error) => { inputDropped('redis_failure', 'relay_send'); b?.failure(error); });
 		};
 		if (subscriberReady) subscriberReady.then(publish);
 		else publish();
 	}
 
 	async function broadcastRemove(topic, key, platform) {
-		if (b) { try { b.guard(); } catch { return false; } }
+		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'remove'); return false; } }
 
 		try {
 			await redis.hdel(hashKey(topic), key);
 			b?.success();
 		} catch (err) {
+			inputDropped('redis_failure', 'remove');
 			b?.failure(err);
 			return false;
 		}
@@ -410,11 +420,12 @@ export function createRedisIo({
 		try {
 			results = await execMultiSlot(redis, commands);
 		} catch (err) {
+			inputDropped('redis_failure', 'remove');
 			b?.failure(err);
 			return false;
 		}
 		const err = firstCommandError(results);
-		if (err) b?.failure(err);
+		if (err) { inputDropped('redis_failure', 'remove'); b?.failure(err); }
 		else b?.success();
 		for (let i = 0; i < results.length; i += 2) {
 			if (results[i] && results[i][0]) return false;
