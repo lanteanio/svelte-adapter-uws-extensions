@@ -17,7 +17,7 @@ export function parseCompatibility(source) {
 	});
 }
 
-export function validateCompatibility(rows, pkg, adapter) {
+export function validateCompatibility(rows, pkg, adapter, { release = false } = {}) {
 	if (!rows.length || rows.some(row => row.schema_version !== '1' || row.owner !== 'svelte-adapter-uws')) throw new Error('Unsupported compatibility schema or owner');
 	if (rows.some(row => !['true', 'false'].includes(row.current)) || rows.filter(row => row.current === 'true').length !== 1) throw new Error('Expected exactly one current compatibility row');
 	if (new Set(rows.map(row => row.channel)).size !== rows.length || rows.some(row => !['legacy', 'stable', 'prerelease'].includes(row.channel))) throw new Error('Invalid compatibility channels');
@@ -28,6 +28,8 @@ export function validateCompatibility(rows, pkg, adapter) {
 	const current = rows.find(row => row.current === 'true');
 	for (const key of ['adapter_version', 'realtime_version', 'extensions_version']) if (valid(current[key]) !== current[key]) throw new Error('Current train requires exact ' + key);
 	if (!validRange(current.node)) throw new Error('Invalid Node prerequisite');
+	if (pkg.engines?.node !== current.node) throw new Error('Node engine disagrees with the current manifest');
+	if (release && pkg.version !== current.extensions_version) throw new Error('Publication version disagrees with the current manifest');
 	if (adapter.version !== current.adapter_version || pkg.devDependencies['svelte-adapter-uws'] !== current.adapter_version) throw new Error('Installed adapter and development pin disagree with the current manifest');
 	if (pkg.peerDependencies['svelte-adapter-uws'] !== '>=' + current.adapter_version) throw new Error('Adapter peer floor disagrees with the current manifest');
 	if (current.uwebsockets !== adapter.optionalDependencies['uWebSockets.js']) throw new Error('Native addon pin disagrees with the installed adapter');
@@ -80,12 +82,12 @@ export function installedCompatibility() {
 function main() {
 	const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 	const { adapter, rows } = installedCompatibility();
-	validateCompatibility(rows, pkg, adapter);
+	validateCompatibility(rows, pkg, adapter, { release: process.argv.includes('--release') });
 	const path = join(root, 'README.md'), source = readFileSync(path, 'utf8');
 	const expected = replaceBlocks(source, renderBlocks(rows));
 	if (process.argv.includes('--write')) writeFileSync(path, expected);
 	else if (source !== expected) throw new Error('Compatibility blocks are stale; run node scripts/check-compatibility.js --write');
-	console.log('check-compatibility: declared tuple, native pin and adapter peer floor match the installed manifest');
+	console.log('check-compatibility: declared tuple, Node engine, native pin and adapter peer floor match the installed manifest' + (process.argv.includes('--release') ? '; publication version matches' : ''));
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }

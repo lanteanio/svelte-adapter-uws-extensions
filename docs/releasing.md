@@ -1,5 +1,7 @@
 # Releasing
 
+Publication requires this package version and Node engine to match the installed adapter's compatibility manifest. `prepublishOnly` runs `node scripts/check-compatibility.js --release` before the ordinary checks; development checks permit an unpublished local version stamp, but still enforce the Node prerequisite. Coordinate tuple changes in the lead manifest before publishing.
+
 This is the publication contract for `svelte-adapter-uws-extensions`. Release preparation does not authorize pushing tags or publishing a version. The checked-in path verifies a candidate; an authorized maintainer controls promotion.
 
 ## Release scope and acceptance

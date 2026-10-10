@@ -87,6 +87,8 @@ describe('trusted release workflow', () => {
 		const weakenings = [
 			['check', 'echo ok'],
 			['prepublishOnly', 'true'],
+			['prepublishOnly', 'npm run check'],
+			['test:integration:pgbouncer', 'vitest run --config vitest.config.integration.postgres.js'],
 			['verify:pr', 'npm run verify:sim'],
 			['test', 'vitest run test/env.test.js'],
 			['verify:release', 'npm test']

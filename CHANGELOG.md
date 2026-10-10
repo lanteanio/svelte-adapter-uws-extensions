@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Require the declared Node prerequisite for development checks and the exact ecosystem package version before publication.
+
 - Complete the current migration path for hash-tagged Redis storage, custom PostgreSQL table names, presence and cursor limits, batched publication rejection, and metric registration conflicts.
 
 - Point task-runner requirements at the supported PostgreSQL subpath matrix instead of a conflicting minimum.
