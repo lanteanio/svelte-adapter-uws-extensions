@@ -797,7 +797,7 @@ Both hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is 
 
 4. **`keyspaceNotifications: true` scope is narrower.** Pre-fix, the option subscribed to whole-key `__keyevent@*__:expired` for `presence:{topic}` keys and emitted an empty `state` when one fired. Same shape in 0.5 (the per-topic hash whole-key expiry only fires when every field has expired, i.e. no live instances). Per-field expiry (a single crashed instance) does NOT trigger this notification; users disappear from `list()` / `count()` results lazily. If you need explicit per-field-expiry events, subscribe to `__keyevent@*__:hexpired` separately (separate Redis CONFIG flag).
 
-5. **Falling back to single-instance.** If you can't upgrade Redis, switch to the in-memory `createPresence` plugin from `svelte-adapter-uws/plugins/presence`. Public API is the same; you lose cross-instance presence which is the whole point of the Redis variant, but for single-instance deployments it's a clean drop-in.
+5. **Falling back to single-instance.** If you can't upgrade Redis, switch to the in-memory `createPresence` plugin from `svelte-adapter-uws/plugins/presence`. This changes the storage and call contract: the bundled tracker is process-local and its roster reads are synchronous, while Redis operations require `await` and backend failure handling. Review the plugin's declarations and adapt the caller before replacing it.
 
 If your app uses `createPresence` and you cannot upgrade Redis immediately, pin `svelte-adapter-uws-extensions` to the last 0.5.x release before this change.
 

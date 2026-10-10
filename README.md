@@ -9,7 +9,7 @@ single-server deployments, but the moment you scale to multiple instances you
 need shared state. This package provides Redis and Postgres counterparts with
 backend-specific factories and client setup. Moving from memory to a shared
 backend also changes some calls: distributed session methods are asynchronous
-and have no `size` property; distributed locks use expiring leases and omit
+and omit the `size()` method; distributed locks use expiring leases and omit
 `held`, `size`, and `clear`. Check each extension's API and failure behavior
 before replacing an in-memory primitive.
 
@@ -584,7 +584,7 @@ lost.
 
 ## Replay buffer (Redis)
 
-Same API as the core `createReplay` plugin, but backed by Redis sorted sets. Messages survive restarts and are shared across instances.
+Redis-backed counterpart to the core `createReplay` plugin. Storage operations such as `publish`, `since`, and `seq` return promises; await them and handle backend failures when replacing the synchronous in-memory buffer. Messages survive restarts and are shared across instances.
 
 Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script - no second round trip required.
 
@@ -817,7 +817,7 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 ## Presence
 
-Same API as the core `createPresence` plugin, but backed by Redis hashes. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub. Valkey (BSD-3) is the recommended cache backend; everything here is wire-compatible with both.
+Redis-backed counterpart to the core `createPresence` plugin. Backend operations, including `join`, `leave`, `list`, and `count`, are asynchronous; adapt synchronous in-memory callers to await them and handle failures. Presence state is shared across instances with cross-instance join/leave notifications via Redis pub/sub. Valkey (BSD-3) is the recommended cache backend; everything here is wire-compatible with both.
 
 **Requires Redis 7.4+ or Valkey 9.0+.** Uses the per-field hash TTL primitive (`HEXPIRE` family) so staleness is enforced atomically by the server rather than by an application-side cleanup script. Redis shipped these commands in 7.4; Valkey shipped them in 9.0 (and pins `redis_version` at `7.2.4` forever while reporting its real version in `valkey_version`, so the activation probe is server-aware - a Valkey 9.0 server is accepted even though its `redis_version` reads `7.2.4`). `createPresence` runs `INFO server` on first use and throws on older servers; fall back to the in-memory `createPresence` from `svelte-adapter-uws/plugins/presence` for single-instance deployments on older servers.
 
@@ -1284,7 +1284,7 @@ The session map is **independent of userId**: a connection may carry a userId, a
 
 ## Rate limiting
 
-Same API as the core `createRateLimit` plugin, but backed by Redis using an atomic Lua script. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.
+Redis-backed counterpart to the core `createRateLimit` plugin, using an atomic Lua script. Await `consume` instead of reading the synchronous core result; the shared limiter also exposes `peek`. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.
 
 > **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -1434,7 +1434,7 @@ if (!allowed) {
 
 ## Broadcast groups
 
-Same API as the core `createGroup` plugin, but membership is stored in Redis so groups work across multiple server instances. Local WebSocket tracking is maintained per-instance, and cross-instance events are relayed via Redis pub/sub.
+Redis-backed counterpart to the core `createGroup` plugin. Await membership changes; use `localMembers()` for sockets owned by this instance instead of the core group's `members()`. Shared membership makes groups work across multiple server instances. Local WebSocket tracking is maintained per-instance, and cross-instance events are relayed via Redis pub/sub.
 
 > **Authorization:** the `onJoin` hook is the join-decision site; the plugin itself does not authorize. Returning a role admits the socket; throwing rejects. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -1590,7 +1590,7 @@ Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres;
 
 ## Cursor
 
-Same API as the core `createCursor` plugin, but cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
+Redis-backed counterpart to the core `createCursor` plugin. Await `attach(ws, topic, platform)` before sending updates so subscription admission and the shared snapshot complete. Cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
 
 Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
@@ -2123,7 +2123,7 @@ The store exposes three states via `acquire(key)`:
 
 A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hold the key, so a crashed owner cannot deadlock retries forever. Each `acquire` stamps the pending slot with a distinct owner token, and `commit`/`abort` act only on the slot they still own (see [Lease loss](#lease-loss-commit-after-expiry)). On `commit` the longer `ttl` (default 48 hours) governs the cache lifetime.
 
-Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
+The Redis and Postgres idempotency stores share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is a separate process-local message-ID deduplicator with a different contract; see [Pairing with the Dedup plugin](#pairing-with-the-dedup-plugin).
 
 > **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always encode trusted identity and validated input as separate key components - e.g. `JSON.stringify(['order', userId, payload.clientOrderId])`. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -2258,7 +2258,7 @@ The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`
 
 ## Distributed lock
 
-Cluster-wide **cooperative** locking primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; the Redis implementation coordinates multiple instances. Its `withLock` call is asynchronous, can fail to acquire or lose its lease, and passes an `AbortSignal` to the callback. It does not expose the in-memory `held`, `size`, or `clear` operations. Distinct from `redis/fence`: the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose cooperative lock any user code can grab. It gives mutual exclusion while every holder stays responsive to its lease - but it is a TTL lease with cooperative release, not a hard fencing mutex under a process stall. See [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex).
+Cluster-wide **cooperative** locking primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; the Redis implementation coordinates multiple instances. Both implementations return promises from `withLock` and can fail acquisition. Redis additionally uses `ttlMs` leases, can lose a lease, and passes an `AbortSignal` to the callback. It does not expose the in-memory `held`, `size`, or `clear` operations. Distinct from `redis/fence`: the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose cooperative lock any user code can grab. It gives mutual exclusion while every holder stays responsive to its lease - but it is a TTL lease with cooperative release, not a hard fencing mutex under a process stall. See [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex).
 
 > **Authorization:** `withLock(key, fn)` serializes whoever calls it under that key; it does not check whether the caller owns the resource the key represents. A wire-supplied lock key lets an attacker grab a lock on a resource they don't own and stall any legitimate owner. Derive lock keys from a trusted prefix - e.g. `\`account:${assertedAccountId(ctx, payload.accountId)}\``. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -2672,7 +2672,7 @@ Rejections count under `admission_rejected_total{reason="CLOCK_TRIPPED"}`. Any o
 
 ## Distributed session
 
-Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; the Redis implementation lets a session created on instance A be read on instance B after a load-balancer hop. All store operations are asynchronous and can fail on backend access. Await `get`, `set`, `touch`, `delete`, and `clear`; there is no synchronous `size` property for the distributed keyspace. Stored data must be JSON-serializable. Tokens beginning with `byuser:` are reserved; see [token rules and migration](docs/session-tokens.md).
+Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; the Redis implementation lets a session created on instance A be read on instance B after a load-balancer hop. All store operations are asynchronous and can fail on backend access. Await `get`, `set`, `touch`, `delete`, and `clear`; there is no `size()` method for the distributed keyspace. Stored data must be JSON-serializable. Tokens beginning with `byuser:` are reserved; see [token rules and migration](docs/session-tokens.md).
 
 Pairs with [Connection registry](#connection-registry): when both are wired, the session provides the durable per-user state (survives disconnect, persists across reconnect, available before a WS even opens), while the registry provides the live "where is this user right now" pointer (only meaningful while the WS is connected). They answer different questions and compose without overlap.
 
@@ -2767,7 +2767,7 @@ if (s) s.lastSeen = Date.now();   // persisted once, on disconnect
 
 #### Pairing with the bundled Session plugin
 
-The stores share `get` / `set` / `delete` / `touch` / `clear` names and sliding-TTL semantics. Redis-backed storage methods return promises and require `await`; the bundled plugin is synchronous and additionally exposes `size()`, which the distributed store omits. The distributed store also provides `purgeUser`, `create`, `withHooks`, and `of` for erasure and connection lifecycle integration. Review these differences when replacing a process-local session store with Redis.
+The stores share `get` / `set` / `delete` / `touch` / `clear` names and sliding-TTL semantics. Redis-backed storage methods return promises and require `await`; the bundled plugin is synchronous and additionally exposes `size()`, which the distributed store omits. The distributed store also provides `purgeUser`, `create`, `withHooks`, and `of` for erasure and connection lifecycle integration. The in-memory TTL option is `ttl`; Redis uses `ttlMs`, both in milliseconds. Review these differences when replacing a process-local session store with Redis.
 
 #### Pairing with the connection registry
 
