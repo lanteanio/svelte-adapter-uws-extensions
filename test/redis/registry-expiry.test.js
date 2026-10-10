@@ -164,3 +164,18 @@ it('a late bootstrap cannot resurrect an erased remote attribute', async () => {
 	await send();
 	expect(publishes).toEqual([]);
 });
+
+it('expires a cached row naming this instance when no local socket owns it', async () => {
+	await openRemote('orphan', { email }, registry.instanceId);
+	now = 1001;
+	const hgetall = client.redis.hgetall.bind(client.redis);
+	const reads = [];
+	client.redis.hgetall = async key => { reads.push(key); return hgetall(key); };
+	await client.redis.del(client.key('conns:orphan'));
+	await tick();
+	expect(reads).toContain(client.key('conns:orphan'));
+	reads.length = 0;
+	now = 2002;
+	await tick();
+	expect(reads).toEqual([]);
+});

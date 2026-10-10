@@ -378,7 +378,7 @@ export function createConnectionRegistry(client, options) {
 	function applyOpenEvent(userId, ownerInstanceId, attrs) {
 		if (destroyed) return;
 		indexChecks.delete(userId);
-		if (ownerInstanceId !== instanceId && !localUsers.has(userId)) {
+		if (!localUsers.has(userId)) {
 			const expiresAt = monotonicNow() + ttl * 1000;
 			remoteIndex.set(userId, { owner: ownerInstanceId, expiresAt });
 			nextIndexCheck = Math.min(nextIndexCheck, expiresAt);
@@ -1431,8 +1431,10 @@ export function createConnectionRegistry(client, options) {
 			throw new Error('registry.sendTo: criteria must include at least one attribute key');
 		}
 
-		const refresh = reconcileIndex();
-		if (refresh) await refresh;
+		if (indexRefresh || (nextIndexCheck !== Infinity && monotonicNow() >= nextIndexCheck)) {
+			const refresh = reconcileIndex();
+			if (refresh) return refresh.then(() => sendTo(norm, topic, event, data));
+		}
 		const matches = resolveMatches(norm);
 		if (matches.size === 0) {
 			mSendTo?.inc({ result: 'empty' });
