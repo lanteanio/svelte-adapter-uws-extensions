@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Collect isolated PostgreSQL query plans, statement I/O and maintenance evidence with deterministic skew and churn, bounded work and private-schema cleanup.
+
 - Report corrupt Redis replay entries and cursor input, snapshot, relay and background failures through bounded operational diagnostics and finite reason/stage counters without exposing payloads or identifiers.
 
 - Exercise native WebSocket delivery through the packed adapter, realtime message hook and extensions relay in the quick ecosystem gate, with required canonical native bindings and local/remote value, order and count checks.
