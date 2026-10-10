@@ -45,6 +45,7 @@ export function createScheduler({
 	viewportCell,
 	viewportPadding,
 	wsState,
+	hasLocalInterest,
 	topicFlush,
 	dirtyTopics,
 	subViewport,
@@ -330,6 +331,7 @@ export function createScheduler({
 			if (!state) { dirtyTopics.delete(topic); continue; }
 			if (state.dirty.size === 0 && state.inboundDirty.size === 0) {
 				dirtyTopics.delete(topic);
+				if (!hasLocalInterest(topic)) topicFlush.delete(topic);
 				continue;
 			}
 			const deadline = state.lastFlush + topicThrottleMs;
@@ -350,6 +352,7 @@ export function createScheduler({
 					if (failed++ === 0) { firstError = err; firstFailedTopic = topic; }
 				}
 				dirtyTopics.delete(topic);
+				if (!hasLocalInterest(topic)) topicFlush.delete(topic);
 
 				// Target-anchored: advance lastFlush by the cadence amount.
 				// Multi-cycle backlog collapse to `nowTs` so the next
@@ -475,6 +478,7 @@ export function createScheduler({
 	 * is the structural benefit.
 	 */
 	function enqueueInbound(topic, key, data, platform) {
+		if (!hasLocalInterest(topic, platform)) return;
 		// Mirror broadcast(): the immediate path bypasses the coalesced flush where
 		// the per-subscriber walk lives, so force coalescing when a reducer is
 		// engaged. A peer-origin cursor must be a first-class member of the combined

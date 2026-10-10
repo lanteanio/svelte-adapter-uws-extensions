@@ -260,6 +260,29 @@ export function createCursor(client, options = {}) {
 	 * @type {Map<any, { key: string, user: any, topics: Set<string>, member: Set<string> }>}
 	 */
 	const wsState = new Map();
+	const topicMembers = new Map();
+
+	function watchTopic(ws, topic) {
+		let members = topicMembers.get(topic);
+		if (!members) topicMembers.set(topic, members = new Set());
+		members.add(ws);
+	}
+
+	function hasLocalInterest(topic, platform) {
+		return topicMembers.has(topic) || topics.has(topic) || platform?.subscribers?.('__cursor:' + topic) > 0;
+	}
+
+	function unwatchTopic(ws, topic) {
+		const members = topicMembers.get(topic);
+		if (members && members.delete(ws) && members.size === 0) topicMembers.delete(topic);
+		if (!hasLocalInterest(topic)) {
+			const pending = topicFlush.get(topic);
+			if (!pending || pending.dirty.size === 0) {
+				topicFlush.delete(topic);
+				dirtyTopics.delete(topic);
+			}
+		}
+	}
 
 	/**
 	 * Per-topic local cursor state. Drives the per-(ws,topic) throttle and the
@@ -352,6 +375,7 @@ export function createCursor(client, options = {}) {
 	const { queueRemove, clear: clearRemoveBuffer } = createRemoveBuffer();
 
 	function onPeerMessage(parsed, platform) {
+		if (!hasLocalInterest(parsed.topic, platform)) return;
 		// Receiver-side coalescing for high-frequency cursor-position
 		// events. UPDATE / BULK enqueue into the local topic's
 		// inboundDirty map so the NEXT local flush emits one combined
@@ -432,6 +456,7 @@ export function createCursor(client, options = {}) {
 		viewportCell,
 		viewportPadding,
 		wsState,
+		hasLocalInterest,
 		topicFlush,
 		dirtyTopics,
 		subViewport,
@@ -499,6 +524,7 @@ export function createCursor(client, options = {}) {
 	 */
 	function grantMembership(ws, topic) {
 		getWsState(ws).member.add(topic);
+		watchTopic(ws, topic);
 	}
 
 	/**
@@ -664,7 +690,10 @@ export function createCursor(client, options = {}) {
 			} catch { /* closed */ }
 			// Membership ends with the subscription: a detached connection
 			// must not keep writing cursor state into the room.
-			wsState.get(ws)?.member.delete(topic);
+			const state = wsState.get(ws);
+			state?.member.delete(topic);
+			unwatchTopic(ws, topic);
+			if (state) dropWsStateIfIdle(ws, state);
 		},
 
 		update(ws, topic, data, platform) {
@@ -886,6 +915,9 @@ export function createCursor(client, options = {}) {
 			// connection down. Relying on that teardown makes revocation depend
 			// on something outside this module, and anything still holding the
 			// socket would keep reading it as a member.
+			for (const [t, members] of topicMembers) {
+				if (members.has(ws)) unwatchTopic(ws, t);
+			}
 			for (const t of state.member) removeWsSubscription(ws, '__cursor:' + t);
 			try {
 				let redisUp = true;
@@ -1118,6 +1150,7 @@ export function createCursor(client, options = {}) {
 			topics.clear();
 			topicFlush.clear();
 			wsState.clear();
+			topicMembers.clear();
 			subViewport.clear();
 			topicReporters.clear();
 			activeTopics.clear();
