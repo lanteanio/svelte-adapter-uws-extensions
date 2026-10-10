@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **PostgreSQL stores validate a versioned schema before automatic initialization completes.** Review legacy rows and operator-added restrictions, preserve the migration ledger, and use a direct/session-pooled migration connection. Automatic migration failures now stay latched until an explicit `ready()` retry or store recreation; migrate large tables before traffic with explicit DDL bounds. See the PostgreSQL preflight in the migration guide.
+
 - **Alarm stores require ordered generations.** Reserve with `nextGeneration(topic)` and pass the exact string to `set` and `delete`; stop old topic-only writers before rollout. PostgreSQL migration version 3 and three Redis authority hashes retain counters after deletion or clear. Restore authority with schedules and the migration ledger; see the alarm generation migration guide.
 
 - **Duration histogram defaults now use seconds, and `lock_acquire_wait_ms` is replaced by `lock_acquire_wait_seconds`.** Update lock queries and divide millisecond thresholds by 1000. Supply explicit buckets for application count, byte or millisecond histograms; historical bucket counts cannot be converted to the new layout. See the [metric migration guidance](MIGRATION.md#duration-metric-migration).

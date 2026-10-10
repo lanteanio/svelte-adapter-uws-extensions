@@ -149,6 +149,22 @@ describe('PostgreSQL schema contracts', () => {
 		await validateSchema(client, { store: 'jobs' });
 	});
 
+	it('does not rebuild a failed replay index on each request and retries explicitly after repair', async () => {
+		for (const statement of postgresMigrations({ store: 'replay' })[0].statements) await client.query(statement);
+		await client.query("INSERT INTO svti_replay (topic, seq, event) VALUES ('test', 1, 'first'), ('test', 1, 'second')");
+		const replay = createReplay(client, { cleanupInterval: 0 });
+		stores.push(replay);
+		await expect(replay.ready()).rejects.toMatchObject({ code: '23505' });
+		const failedIndex = await client.query("SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_svti_replay_identity')");
+		expect(failedIndex.rows[0].indisvalid).toBe(false);
+		for (let i = 0; i < 3; i++) await expect(replay.since('test', 0)).rejects.toMatchObject({ code: '23505' });
+		expect((await client.query("SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_svti_replay_identity')")).rows).toEqual(failedIndex.rows);
+		await client.query("DELETE FROM svti_replay WHERE event = 'second'");
+		await replay.ready();
+		expect(replay.status()).toEqual({ state: 'ready', error: null });
+		expect(await replay.since('test', 0)).toHaveLength(1);
+	});
+
 	it('retains duplicate replay rows, recovers an invalid concurrent index and replaces the old index', async () => {
 		for (const statement of postgresMigrations({ store: 'replay' })[0].statements) await client.query(statement);
 		await client.query("INSERT INTO svti_replay (topic, seq, event) VALUES ('test', 1, 'first'), ('test', 1, 'second')");

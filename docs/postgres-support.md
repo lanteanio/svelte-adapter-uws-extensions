@@ -15,11 +15,11 @@ The supported server floor is PostgreSQL 16. The repository integration lane run
 | `postgres/dead-letter` | 16 | Table/index access; schema creation privileges when automatic initialization is enabled. |
 | `postgres/alarm-store` | 16 | Table/index access; schema creation privileges when automatic initialization is enabled. |
 | `postgres/idempotency` | 16 | Table/index access; schema creation privileges when automatic initialization is enabled. |
-| `postgres/tasks` | 16 | Table/index access and `SKIP LOCKED`; apply the documented nullable columns before running with automatic migration disabled. |
-| `postgres/jobs` | 16 | Table/index access and `SKIP LOCKED`; apply the documented nullable columns before running with automatic migration disabled. No queue extension is required. |
+| `postgres/tasks` | 16 | Table/index access and `SKIP LOCKED`; run the complete versioned migration before disabling automatic migration. |
+| `postgres/jobs` | 16 | Table/index access and `SKIP LOCKED`; run the complete versioned migration before disabling automatic migration. No queue extension is required. |
 | `postgres/notify` | 16 | A dedicated session for `LISTEN`; transaction-pooling proxies cannot preserve session subscriptions. |
 
-All suffixes are under `svelte-adapter-uws-extensions/`. The old job-queue claim of PostgreSQL 9.5 support was incorrect: although 9.5 has `SKIP LOCKED`, its `ALTER TABLE` grammar lacks `ADD COLUMN IF NOT EXISTS`, which initialization uses. Compare the official [9.5 grammar](https://www.postgresql.org/docs/9.5/sql-altertable.html) and [9.6 grammar](https://www.postgresql.org/docs/9.6/sql-altertable.html). Legacy 9.x support is not provided.
+All suffixes are under `svelte-adapter-uws-extensions/`. PostgreSQL versions below 16 are not supported.
 
 ## Read-only preflight
 
@@ -98,7 +98,7 @@ Operation durations declare explicit seconds buckets `[0.001, 0.005, 0.01, 0.025
 
 ## Notification sessions and shutdown
 
-`createNotifyBridge()` needs a persistent PostgreSQL session. Use a direct database DSN or a PgBouncer pool configured in **session** mode. Transaction and statement pooling cannot preserve `LISTEN` subscriptions or session-scoped advisory locks. A transaction-pooled DSN may still be suitable for ordinary application queries, but it must not be reused for this bridge. Pass a separate direct/session DSN alongside an external query pool when the two routes differ.
+`createNotifyBridge()` needs a persistent PostgreSQL session. Use a direct database DSN or a PgBouncer pool configured in **session** mode. Transaction and statement pooling cannot preserve `LISTEN` subscriptions or session-scoped advisory locks. A transaction-pooled DSN may still be suitable for ordinary application queries after separate deployment migrations and with runtime stores using `autoMigrate: false`, but it must not be reused for this bridge. Pass a separate direct/session DSN alongside an external query pool when the two routes differ.
 
 Each active bridge consumes one standalone database session outside `pool.max`. In both `multiListener: 'all'` and `'advisory'`, N replicas with B bridges consume N x B additional sessions. Advisory election reduces active LISTEN consumers to one per lock, while every follower retains a session to attempt the lock. Budget pooled connections, these dedicated sessions, administrative access, migrations and other services against the server/proxy connection limits. Reconnects wait for the old session to close before creating its replacement.
 
@@ -145,7 +145,7 @@ Ordinary operations with automatic migration disabled
 retain their existing behavior; explicitly await readiness before traffic.
 
 `status()` returns `{ state, error }`, where state is `idle`, `checking`, `ready`
-or `failed`. Concurrent readiness calls share work; a failed call can be retried.
+or `failed`. Concurrent readiness calls share work. Failed automatic initialization is latched for ordinary operations, including retention ticks; they reject the stored error without repeating DDL. After repairing the cause, explicitly retry `ready()` or recreate the store.
 Successful readiness is cached for that store instance. Use
 `validateSchema(client, { store, table })` for a fresh read-only validation, with
 a ten-second bound per catalog operation. This is a point-in-time check, not a
@@ -184,6 +184,10 @@ table names and `search_path` in deployment and runtime. Grant the runtime role
 schema USAGE and required table DML, plus USAGE or UPDATE on serial sequences;
 grant SELECT on an existing migration ledger, without DDL ownership. Use a direct/session-pooled
 connection for migrations because migration coordination uses a session lock.
+This requirement also applies to default `autoMigrate: true` initialization,
+which uses the same migration path and session timeout settings. Custom clients
+must expose `connect()` with a dedicated `query()` / `release(true)` checkout;
+a query-only client is insufficient for automatic initialization.
 
 ### Versioned migration behavior
 
@@ -223,6 +227,9 @@ Driver query deadlines allow one additional second for server errors. The
 checkout is destroyed on success or failure so session locks and settings
 cannot leak into runtime queries. Busy tables can make a bounded migration fail;
 rehearse DDL on a restored copy and schedule a suitable deployment window.
+Large tables should use explicit deployment migrations with measured bounds,
+then runtime `autoMigrate: false`. Automatic initialization uses the migration
+defaults above even if the pool's query or statement timeout is longer.
 
 ### Existing replay and idempotency tables
 

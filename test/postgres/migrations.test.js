@@ -44,6 +44,21 @@ describe('PostgreSQL migration contracts', () => {
 		expect(jobs.status()).toEqual({ state: 'ready', error: null });
 		expect(client.connect).toHaveBeenCalledTimes(2);
 	});
+	it('latches failed automatic migrations until an explicit readiness retry', async () => {
+		const client = mockPgClient();
+		const connect = client.connect;
+		const failure = new Error('duplicate legacy identity');
+		client.connect = vi.fn().mockRejectedValueOnce(failure).mockImplementation(connect);
+		const jobs = createJobQueue(client);
+		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+		await expect(jobs.claim('test')).rejects.toBe(failure);
+		expect(client.connect).toHaveBeenCalledTimes(1);
+		await jobs.ready();
+		await jobs.enqueue('test', { repaired: true });
+		expect(client.connect).toHaveBeenCalledTimes(2);
+		expect(jobs.status()).toEqual({ state: 'ready', error: null });
+	});
 	it('keeps disabled automatic migration read-only and reports an absent schema', async () => {
 		const client = mockPgClient();
 		client.connect = vi.fn(client.connect);

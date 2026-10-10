@@ -202,7 +202,9 @@ export function createStoreSchema(client, store, table, automatic) {
 		return pending;
 	}
 	return {
-		ensure: automatic ? ready : () => Promise.resolve(),
+		// Failed DDL stays failed for ordinary traffic. Only an explicit startup
+		// gate retries after the operator has repaired schema/data/privileges.
+		ensure: automatic ? () => state === 'failed' ? Promise.reject(failure) : ready() : () => Promise.resolve(),
 		ready,
 		status: () => ({ state, error: failure })
 	};

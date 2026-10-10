@@ -12,10 +12,9 @@
 Ordered by **when the change reaches you**, because that is what decides how
 much of it you can discover in staging. Some changes fail at install, import or
 construction, so a misconfigured deployment stops at boot rather than at the
-first request. Two need an operational step before the deploy: a schema change
-for jobs and tasks tables you migrate yourself, and a drain window for one
-data-incompatible change. The rest surface on a call that used to succeed, or
-not at all.
+first request. PostgreSQL stores need schema and data preflight before deployment;
+lease and identity changes also require the drain windows described below.
+Other changes surface on calls that used to succeed.
 
 Every item lists the **symptom** you will actually see and the **action**.
 
@@ -37,6 +36,39 @@ that application build; do not combine independently chosen prereleases.
 The local [packed schema rehearsal](#executable-rehearsal) covers this package's
 additive PostgreSQL transition. It does not certify application authorization,
 Redis data conversion, native addon loading, or a mixed-version fleet.
+
+### PostgreSQL schema and migration preflight
+
+Automatic initialization now uses a versioned migration ledger named
+`svti_schema_migrations` in the store's schema and validates the complete
+catalog. Back up the ledger with its stores. Use a direct connection or a
+session-pooled DSN for both explicit `migrate()` and the default
+`autoMigrate: true`: session advisory locks and timeout settings cannot be
+preserved by transaction pooling. Custom clients must provide `connect()`
+returning a dedicated checkout with `query()` and `release(true)`.
+
+Before upgrading existing tables, reconcile duplicate replay `(topic, seq)`
+identities, unsupported task/idempotency statuses, negative attempts and
+inconsistent job claim timestamps. Migration rejects these rows without
+removing them. It also rejects extra CHECK/UNIQUE/foreign-key/exclusion
+restrictions, unexpected required or computed columns and changed defaults.
+Review operator-added constraints before rollout; nullable columns without
+defaults and ordinary nonunique indexes remain permitted.
+
+For large tables, run `migrate()` before traffic using an owner connection and
+explicit `statementTimeoutMs` / `lockTimeoutMs` suited to the rehearsed DDL.
+Automatic migration uses 30-second statement and 5-second lock limits; changing
+pool timeouts does not change these migration limits. Start runtime stores with
+`autoMigrate: false` and await every `ready()` gate. This also separates DDL
+privileges from runtime access and permits transaction pooling for ordinary
+queries, subject to the client's connection settings. Notification bridges still
+need their own persistent session.
+
+A failed automatic migration is latched for ordinary store operations. After
+repairing the cause, explicitly retry `ready()` or recreate the store; requests
+and retention ticks do not repeatedly rebuild an invalid index. Successful
+readiness remains cached. See [PostgreSQL support](docs/postgres-support.md#schema-transitions-and-readiness)
+for the catalog contract, migration limits and role setup.
 
 ## 1. Fails at startup
 
