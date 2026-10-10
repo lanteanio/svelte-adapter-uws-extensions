@@ -71,7 +71,8 @@ describe('generated extensions error reference', () => {
 			const expected = helper === null
 				? new RegExp("event: '" + entry.event.replace(/[.]/g, '[.]') + "'")
 				: new RegExp(helper + '[(]\\s*EXTENSIONS_ERROR_IDS[.]' + key + '\\b');
-			expect(expected.test(sources), `${entry.id} via ${expected}`).toBe(true);
+			const reporter = entry.emission === 'direct' && new RegExp('createInputDropReporter[(]\\s*[^,\\n]+,\\s*[^,\\n]+,\\s*EXTENSIONS_ERROR_IDS[.]' + key + '\\b');
+			expect(expected.test(sources) || (reporter && reporter.test(sources)), `${entry.id} via ${expected}`).toBe(true);
 		}
 	});
 

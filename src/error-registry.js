@@ -398,7 +398,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		consequence: 'The caller may see an incomplete result or peers may miss an update. Each instance reports once per reason/stage pair; replay_input_dropped_total counts every observation or failed operation, including repeated reads of the same bad data.',
 		automaticRecovery: 'Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.',
 		nextAction: 'Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.',
-		sources: ['src/redis/replay.js', 'src/shared/input-drops.js'], anchor: 'extensions-err-redis-replay-input-dropped'
+		sources: ['src/redis/replay.js', 'src/redis/replay-migrate.js', 'src/shared/input-drops.js'], anchor: 'extensions-err-redis-replay-input-dropped'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_INPUT_DROPPED,

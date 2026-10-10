@@ -404,7 +404,7 @@ export function createCursor(client, options = {}) {
 			for (const entry of parsed.payload) {
 				if (entry && typeof entry.key === 'string') {
 					enqueueInbound(parsed.topic, entry.key, entry.data, platform);
-				}
+				} else inputDropped('invalid_envelope', 'relay_receive');
 			}
 		} else if (parsed.event === EVENTS.REMOVE && parsed.payload && typeof parsed.payload.key === 'string') {
 			// Peer-relayed cursor removes are coalesced through the
@@ -1153,18 +1153,19 @@ export function createCursor(client, options = {}) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
 			const prefix = client.key('cursor:{');
 			let keys;
-			try { keys = await scanKeys(redis, hashKey('*')); } catch { return 0; }
+			try { keys = await scanKeys(redis, hashKey('*')); } catch { inputDropped('scan_failed', 'erase'); return 0; }
 			let n = 0;
 			for (const fullKey of keys) {
 				if (!fullKey.startsWith(prefix) || !fullKey.endsWith('}')) continue;
 				const topic = fullKey.slice(prefix.length, fullKey.length - 1);
 				if (!topicInTenant(tenantId, topic)) continue;
 				let all;
-				try { all = await redis.hgetall(fullKey); } catch { continue; }
+				try { all = await redis.hgetall(fullKey); } catch { inputDropped('read_failed', 'erase'); continue; }
 				if (!all) continue;
 				for (const field of Object.keys(all)) {
 					let parsed;
-					try { parsed = JSON.parse(all[field]); } catch { continue; }
+					try { parsed = JSON.parse(all[field]); } catch { inputDropped('corrupt_entry', 'erase'); continue; }
+					if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { inputDropped('corrupt_entry', 'erase'); continue; }
 					const u = parsed && parsed.user;
 					const matches = typeof u === 'string'
 						? u === userId
@@ -1183,6 +1184,7 @@ export function createCursor(client, options = {}) {
 						}
 					}
 					if (await removeKeysBatch([topic], field)) n++;
+					else inputDropped('delete_failed', 'erase');
 				}
 			}
 			return n;

@@ -505,7 +505,7 @@ the stable ID tag on the line):
 - **Automatic recovery:** Later valid input and successful operations proceed normally. Corrupt stored data is skipped and is not repaired by this diagnostic.
 - **Next action:** Inspect replay_input_dropped_total by reason and stage. Check writer compatibility for corruption and backend connectivity for failed operations. Use the existing operational event sink to collect these records.
 - **Runtime help:** `docs/errors.md#extensions-err-redis-replay-input-dropped`
-- **Runtime sources:** [src/redis/replay.js](../src/redis/replay.js), [src/shared/input-drops.js](../src/shared/input-drops.js)
+- **Runtime sources:** [src/redis/replay.js](../src/redis/replay.js), [src/redis/replay-migrate.js](../src/redis/replay-migrate.js), [src/shared/input-drops.js](../src/shared/input-drops.js)
 
 <a id="extensions-err-redis-replay-stream-input-dropped"></a>
 ## `EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED`

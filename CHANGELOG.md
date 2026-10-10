@@ -122,6 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Require degradation notices to contain a non-ignorable letter or number and well-formed Unicode; reject blank symbols, standalone marks, malformed surrogates and line separators while preserving shaping joiners alongside text.
 
+- Redis cursor and replay erasure now report failed scans, reads, deletes, corrupt entries and failed ownership extractors through bounded input-drop diagnostics. Cursor bulk relay reports malformed members, replay migration reports skipped corrupt or non-monotonic members, and the error-reference contract recognizes the shared reporter.
+
 - Cancel unsent Redis pipelines together when admission or a command deadline fails. Retire timed-out command sockets before reconnecting so rejected writes and blocking WAIT commands cannot be resent.
 
 - Keep Redis Cluster execution capacity available to healthy owners when one node stalls, preserve successful command results alongside failed batches, and bound cursor cleanup and periodic snapshot work with coalesced sweeps. Replay epoch reads and presence maintenance report failed command replies to their circuit breakers.

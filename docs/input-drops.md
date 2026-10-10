@@ -6,12 +6,16 @@ Replay and cursor failures use the existing operational event sink, or the defau
 
 | Counter | Labels | Counts |
 | --- | --- | --- |
-| `replay_input_dropped_total` | `reason`, `stage` | Corrupt Redis replay decode observations |
+| `replay_input_dropped_total` | `reason`, `stage` | Corrupt Redis replay decode observations and failed erasure operations |
 | `cursor_input_dropped_total` | `reason`, `stage` | Rejected cursor input and failed background operations |
 
 Counts represent observations or failed operations, not unique lost messages. Reading the same corrupt value again counts again. The sorted-set replay oldest-entry probe counts separately from the delivered-range scan; the existing `replay_corruptions_total` keeps its delivered-range counting behavior. A failed cursor command batch counts once even when several commands fail. These counters aggregate across instances sharing a metrics registry.
 
-Replay reports `corrupt_entry` at `decode`. Cursor uses the following finite labels:
+Replay reports `corrupt_entry` at `decode`. Both replay backends and cursor report erasure observations at `erase`: `scan_failed`, `read_failed`, `corrupt_entry`, and `delete_failed`; replay also reports `extractor_failed` when `forgetUserId` throws. Erasure remains best effort: its removed count is partial after a reported failure, and zero does not establish that every candidate was inspected. Cursor deletion failures also retain the existing `remove` diagnostic. A valid entry belonging to another user is normal absence.
+
+`migrateReplayToStream` emits the same replay diagnostic for `corrupt_entry` and `non_monotonic` at `migration`, once per pair per migration call. Its existing result counts still describe entries copied, and it has no metrics option.
+
+Cursor uses the following additional finite labels:
 
 | Stage | Reasons |
 | --- | --- |

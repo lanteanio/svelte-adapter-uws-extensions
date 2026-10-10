@@ -660,7 +660,7 @@ export function createStreamReplay(client, options = {}) {
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
 			const prefix = client.key('replay:streambuf:{');
 			let keys;
-			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
+			try { keys = await scanKeys(redis, bufKey('*')); } catch { inputDropped('scan_failed', 'erase'); return 0; }
 			let n = 0;
 			for (const bk of keys) {
 				const topic = bk.startsWith(prefix) && bk.endsWith('}') ? bk.slice(prefix.length, bk.length - 1) : '';
@@ -671,17 +671,17 @@ export function createStreamReplay(client, options = {}) {
 				// says it is fixed.
 				if (!topicInTenant(tenantId, topic)) continue;
 				let entries;
-				try { entries = await redis.xrange(bk, '-', '+'); } catch { continue; }
+				try { entries = await redis.xrange(bk, '-', '+'); } catch { inputDropped('read_failed', 'erase'); continue; }
 				const toDel = [];
 				for (const [id, flat] of entries) {
 					const decoded = decodeStreamFields(fieldsToObject(flat), seqFromId(id), topic);
-					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
+					if (decoded === null) { inputDropped('corrupt_entry', 'erase'); continue; }
 					let uid;
-					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
+					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { inputDropped('extractor_failed', 'erase'); continue; }
 					if (uid === userId) toDel.push(id);
 				}
 				if (toDel.length > 0) {
-					try { await redis.xdel(bk, ...toDel); n += toDel.length; } catch { /* best-effort */ }
+					try { await redis.xdel(bk, ...toDel); n += toDel.length; } catch { inputDropped('delete_failed', 'erase'); }
 				}
 			}
 			return n;

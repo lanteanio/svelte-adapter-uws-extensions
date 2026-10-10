@@ -23,6 +23,8 @@
  */
 
 import { scanKeys } from '../shared/redis-scan.js';
+import { createInputDropReporter } from '../shared/input-drops.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
 // The sorted-set per-topic buffer key shape: `replay:buf:{<topic>}`. The braces
 // are LITERAL Redis hash-tag characters wrapping the topic (so all of a topic's
@@ -79,6 +81,7 @@ export async function migrateReplayToStream(client, options = {}) {
 	}
 
 	const redis = client.redis;
+	const inputDropped = createInputDropReporter(undefined, 'replay', EXTENSIONS_ERROR_IDS.REDIS_REPLAY_INPUT_DROPPED);
 	const migrated = [];
 	const skipped = [];
 
@@ -130,12 +133,13 @@ export async function migrateReplayToStream(client, options = {}) {
 				try {
 					parsed = JSON.parse(member);
 				} catch {
-					continue; // skip corrupt member (mirrors the backends' skip-corrupt)
+					inputDropped('corrupt_entry', 'migration');
+					continue;
 				}
-				if (!parsed || typeof parsed !== 'object') continue;
+				if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { inputDropped('corrupt_entry', 'migration'); continue; }
 				const seq = parsed.seq;
-				if (!Number.isInteger(seq) || seq < 1 || seq <= highWaterSeq) continue;
-				if (typeof parsed.event !== 'string') continue;
+				if (!Number.isInteger(seq) || seq < 1 || typeof parsed.event !== 'string') { inputDropped('corrupt_entry', 'migration'); continue; }
+				if (seq <= highWaterSeq) { inputDropped('non_monotonic', 'migration'); continue; }
 				highWaterSeq = seq;
 				// Re-stringify data so the stream's `data` field matches the
 				// JSON.stringify(data ?? null) the backend's own publish writes.

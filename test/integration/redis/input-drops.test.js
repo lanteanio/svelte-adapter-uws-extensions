@@ -62,4 +62,27 @@ describe('input-drop diagnostics against Redis', () => {
 		expect(drops()).toHaveLength(1);
 		expect(JSON.stringify(drops())).not.toContain(secret);
 	});
+	for (const storage of ['cursor', 'sortedset', 'stream']) {
+		it(storage + ': erasure reports corrupt entries and real WRONGTYPE reads while removing valid data', async () => {
+			const metrics = createMetrics();
+			const cursor = storage === 'cursor';
+			const tracker = cursor ? createCursor(client, { metrics }) : createReplay(client, { storage, metrics, forgetUserId: entry => entry.data.user });
+			if (cursor) trackers.push(tracker);
+			const prefix = cursor ? 'cursor' : 'replay';
+			const key = topic => client.key((cursor ? 'cursor:{' : storage === 'sortedset' ? 'replay:buf:{' : 'replay:streambuf:{') + topic + '}');
+			if (cursor) await client.redis.hset(key(secret), 'good', JSON.stringify({ user: secret, ts: Date.now() }), 'bad', secret);
+			else {
+				await tracker.publish(mockPlatform(), secret, 'change', { user: secret });
+				if (storage === 'sortedset') await client.redis.zadd(key(secret), 2, secret);
+				else await client.redis.xadd(key(secret), '2-0', 'event', 'change', 'data', secret);
+			}
+			await client.redis.set(key('wrongtype'), secret);
+			expect(await tracker.purgeUser(null, secret)).toBe(1);
+			expect(await tracker.purgeUser(null, secret)).toBe(0);
+			for (const reason of ['corrupt_entry', 'read_failed']) expect(metrics.serialize()).toContain(prefix + '_input_dropped_total{reason="' + reason + '",stage="erase"} 2');
+			expect(drops()).toHaveLength(2);
+			expect(JSON.stringify(drops())).not.toContain(secret);
+		});
+	}
+
 });

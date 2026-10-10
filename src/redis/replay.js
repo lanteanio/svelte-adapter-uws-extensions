@@ -551,7 +551,7 @@ export function createReplay(client, options = {}) {
 		async purgeUser(tenantId, userId) {
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
 			let keys;
-			try { keys = await scanKeys(redis, bufKey('*')); } catch { return 0; }
+			try { keys = await scanKeys(redis, bufKey('*')); } catch { inputDropped('scan_failed', 'erase'); return 0; }
 			let n = 0;
 			for (const bk of keys) {
 				const topic = topicFromBufKey(bk);
@@ -560,17 +560,17 @@ export function createReplay(client, options = {}) {
 				// other tenant's buffered events for the same user id.
 				if (!topicInTenant(tenantId, topic)) continue;
 				let members;
-				try { members = await redis.zrange(bk, 0, -1); } catch { continue; }
+				try { members = await redis.zrange(bk, 0, -1); } catch { inputDropped('read_failed', 'erase'); continue; }
 				const toRemove = [];
 				for (const member of members) {
 					const decoded = decodeSortedSetMember(member, topic);
-					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
+					if (decoded === null) { inputDropped('corrupt_entry', 'erase'); continue; }
 					let uid;
-					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { continue; }
+					try { uid = forgetUserId({ topic: decoded.topic, event: decoded.event, data: decoded.data }); } catch { inputDropped('extractor_failed', 'erase'); continue; }
 					if (uid === userId) toRemove.push(member);
 				}
 				if (toRemove.length > 0) {
-					try { await redis.zrem(bk, ...toRemove); n += toRemove.length; } catch { /* best-effort */ }
+					try { await redis.zrem(bk, ...toRemove); n += toRemove.length; } catch { inputDropped('delete_failed', 'erase'); }
 				}
 			}
 			return n;
