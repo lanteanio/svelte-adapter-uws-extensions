@@ -176,7 +176,7 @@ export function createUpgradeBucket(client, options) {
 			let result;
 			try {
 				result = await withBreaker(b, () =>
-					evalCached(redis, 
+					evalCached(redis,
 						CONSUME_SCRIPT,
 						1,
 						bucketKey(key),

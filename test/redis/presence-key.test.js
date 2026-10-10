@@ -4,7 +4,7 @@ import { mockRedisClient } from '../../src/testing/mock-redis.js';
 import { mockWs } from '../../src/testing/mock-ws.js';
 import { mockPlatform } from '../../src/testing/mock-platform.js';
 
- describe('presence dedup keys', () => {
+describe('presence dedup keys', () => {
 	for (const key of ['constructor', '__proto__', 'prototype']) {
 		it(`keeps connections distinct with the default ${key} selector`, async () => {
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

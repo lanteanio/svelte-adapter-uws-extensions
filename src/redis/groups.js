@@ -549,7 +549,7 @@ export function createGroup(client, name, options = {}) {
 			b?.guard();
 			let result;
 			try {
-				result = await evalCached(redis, 
+				result = await evalCached(redis,
 					JOIN_SCRIPT, 2, membersKey, closedKey,
 					effectiveMax, memberId, memberData, nowTs, memberTtlMs
 				);
