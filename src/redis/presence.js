@@ -407,6 +407,12 @@ export function createPresence(client, options = {}) {
 		return payload;
 	}
 
+	// Reuse the eager identity encoding when building the Redis entry.
+	function storedValue(serializedData, ts) {
+		return serializedData === undefined ? JSON.stringify({ ts })
+			: '{"data":' + serializedData + ',"ts":' + JSON.stringify(ts) + '}';
+	}
+
 	async function publishEvent(topic, event, payload) {
 		const ch = eventChannel(topic);
 		const msg = JSON.stringify({ instanceId, topic, event, payload });
@@ -929,13 +935,10 @@ export function createPresence(client, options = {}) {
 			let identityChanged = false;
 			let wroteIdentity = false;
 			const currentEntry = localData.get(topic)?.get(key);
-			// `serializedData` is computed above to surface non-JSON-serializable
-			// data eagerly via the throw. The body below stringifies the full
-			// {data, ts} envelope per call since ts is fresh.
 
 			if (prevCount === 0) {
 				const ts = now();
-				const value = JSON.stringify({ data, ts });
+				const value = storedValue(serializedData, ts);
 				try {
 					const joinResult = await evalCached(redis,
 						JOIN_SCRIPT, 2,
@@ -975,7 +978,7 @@ export function createPresence(client, options = {}) {
 					const joinResult = await evalCached(redis,
 						JOIN_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key, JSON.stringify({ data, ts }), ts, presenceTtlMs
+						instanceId, key, storedValue(serializedData, ts), ts, presenceTtlMs
 					);
 					didRedisWrite = true;
 					wroteIdentity = joinResult[2] === 1;
