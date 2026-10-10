@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep subscriber PING silence detection active when bounded Redis commands time out.
+
 - Reject oversized or non-serializable publishBatched relay calls before local delivery or Redis relay; preflight every shard envelope and expose reason-only rejection counters.
 - Postgres task dispatch and recovery claim only locally registered handler names before batch limits, leaving unsupported rows, fences and attempts unchanged.
 - Presence identity resolution reads only own selected-data properties, preventing inherited names from merging unrelated users. Pending relayed join rosters exclude transient fields while retaining durable updates. Redis presence message hooks accept native parsed-message and byte envelopes and return true for owned frames.
