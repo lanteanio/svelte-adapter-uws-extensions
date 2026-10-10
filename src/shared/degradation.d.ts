@@ -6,7 +6,7 @@ export interface Mitigation {
 	rpcs?: string[];
 	/** How long (ms) the client should hold off before retrying. */
 	retryAfterMs?: number;
-	/** Optional source-English fallback notice. Non-blank plain text, at most 2048 UTF-8 bytes, without control characters. Render as text. */
+	/** Optional source-English fallback notice. Visible plain text, at most 2048 UTF-8 bytes, without control or format characters except ZWNJ/ZWJ alongside visible text. Render as text. */
 	bannerCopy?: string;
 }
 
@@ -16,7 +16,7 @@ export interface RecoveryHint {
 	refetch?: boolean;
 	/** The client should clear any local cache for the affected data. */
 	clearCache?: boolean;
-	/** Optional source-English fallback notice. Non-blank plain text, at most 2048 UTF-8 bytes, without control characters. Render as text. */
+	/** Optional source-English fallback notice. Visible plain text, at most 2048 UTF-8 bytes, without control or format characters except ZWNJ/ZWJ alongside visible text. Render as text. */
 	bannerCopy?: string;
 }
 

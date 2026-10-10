@@ -5,7 +5,7 @@ export interface CapabilityCookieOptions {
 	secret: string;
 	/** Cookie lifetime in seconds. @default 300 */
 	ttlSeconds?: number;
-	/** Immediately-previous secret, accepted during a rotation window. */
+	/** Immediately-previous secret, accepted during a rotation window; the same strength checks as secret apply. */
 	previousSecret?: string;
 	/** Cookie name. @default 'sauws_cap' */
 	cookieName?: string;

@@ -439,7 +439,7 @@ const bus = createPubSubBus(redis, {
 });
 ```
 
-The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: non-blank plain text of at most 2048 UTF-8 bytes without control characters. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
+The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: visible plain text of at most 2048 UTF-8 bytes without control or format characters; ZWNJ/ZWJ joiners are allowed alongside visible text. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
 
 ---
 
@@ -4273,7 +4273,7 @@ An unknown posture string degrades to the `normal` budget, so forwarding an unex
 
 No Redis dependency: the whole point is to reject before any backend work. Each issued or refreshed cookie contains a fresh random nonce, never an application session identifier. It is an admission capability, not proof of an authenticated user; keep normal authentication in the upgrade hook.
 
-Generate the secret once and keep it out of the repo. It must be at least 16 characters with at least 8 distinct characters and must be actual entropy - a padded placeholder is refused at startup, because an observer holds both the cookie's message and its signature and can grind a weak secret offline at memory speed:
+Generate the secret once and keep it out of the repo. Both current and previous secrets require at least 16 characters with at least 8 distinct characters. These startup checks detect common placeholders; they cannot measure entropy. Generate a random key because an observer holds both the cookie's message and its signature and can guess a weak key offline:
 
 ```sh
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -4329,7 +4329,7 @@ const cap = capabilityCookie({
 |---|---|---|
 | `secret` | *required* | HMAC secret. At least 16 characters with at least 8 distinct ones - length is not entropy, and a padded placeholder is the shape a weak secret takes. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. |
 | `ttlSeconds` | `300` | Cookie lifetime in seconds. An expired cookie is invalid even under the current secret. |
-| `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. Only has to be a non-empty string: the strength floor is deliberately not applied here, so a deployment can rotate *away* from a weak secret without signing every live session out. It verifies, never signs. |
+| `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. The same strength checks as `secret` apply. When replacing a weak old key, omit it: existing capability cookies are reissued on the next page response; application sessions are independent. |
 | `cookieName` | `'sauws_cap'` | Cookie name. Must be an RFC 6265 token (letters, digits and ``!#$%&'*+-.^_`|~``); anything else serializes into a header the browser silently drops, which degrades the capability check to permanently-absent with nothing logged. |
 | `secure` | `true` | Set the `Secure` attribute. |
 | `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). Matched case-insensitively and normalized. |

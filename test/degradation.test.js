@@ -48,13 +48,13 @@ describe('createDegradationPolicy', () => {
 	});
 
 	for (const field of ['mitigation', 'recovery']) {
-		it.each(['', ' ', '\t', '\n', '\u00a0', 'x'.repeat(2049), '\u00e9'.repeat(1025), 'notice\u0000', 'notice\u007f', 'notice\u0085more', 'notice\u009f'])('rejects invalid ' + field + ' notice %j', (bannerCopy) => {
+		it.each(['', ' ', '\t', '\n', '\u00a0', 'x'.repeat(2049), '\u00e9'.repeat(1025), 'notice\u0000', 'notice\u007f', 'notice\u0085more', 'notice\u009f', '\u200b', '\u200c', '\u200d', '\u2060', '\u00ad', '\u034f', '\ufe0f', '\u200e', '\u202eNotice', '\u2066Notice\u2069'])('rejects invalid ' + field + ' notice %j', (bannerCopy) => {
 			expect(() => createDegradationPolicy({ [field]: { bannerCopy } })).toThrow(/bannerCopy/);
 			const policy = createDegradationPolicy({ [field]: () => ({ bannerCopy }) });
 			expect(() => policy[field === 'mitigation' ? 'onDegraded' : 'onRecovered'](degrade)).toThrow(/bannerCopy/);
 		});
 		it('preserves bounded Unicode and literal text for ' + field, () => {
-			for (const bannerCopy of ['\u00e9'.repeat(1024), 'Saving <orders> is unavailable.', '  Saving is unavailable.  ']) {
+			for (const bannerCopy of ['\u00e9'.repeat(1024), 'Saving <orders> is unavailable.', '  Saving is unavailable.  ', '\u0645\u06cc\u200c\u0631\u0648\u062f', '\ud83d\udc69\u200d\u2695\ufe0f Saving is unavailable.']) {
 				const policy = createDegradationPolicy({ [field]: { bannerCopy } });
 				const result = policy[field === 'mitigation' ? 'onDegraded' : 'onRecovered'](degrade);
 				expect(result[field].bannerCopy).toBe(bannerCopy);

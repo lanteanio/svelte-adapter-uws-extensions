@@ -228,15 +228,8 @@ export function capabilityCookie(options) {
 	}
 	const { secret, previousSecret } = options;
 	assertSecretStrength(secret, 'secret');
-	// The floor deliberately does NOT apply to `previousSecret`. It exists to
-	// let a deployment rotate, and the single most important rotation to allow
-	// is the one away from a weak secret - refusing the old value there would
-	// leave "keep the weak secret" and "sign every live session out" as the
-	// only options, which is how a weak secret survives. It only ever VERIFIES,
-	// never signs, and the window is meant to be closed shortly after.
-	if (previousSecret !== undefined && (typeof previousSecret !== 'string' || previousSecret.length === 0)) {
-		throw new Error('capability-cookie: previousSecret must be a non-empty string when provided');
-	}
+	// Either verification key can authorize a cookie; both need the same floor.
+	if (previousSecret !== undefined) assertSecretStrength(previousSecret, 'previousSecret');
 
 	const ttlSeconds = options.ttlSeconds ?? DEFAULT_TTL_SECONDS;
 	if (typeof ttlSeconds !== 'number' || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {

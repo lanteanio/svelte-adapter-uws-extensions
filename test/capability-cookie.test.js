@@ -99,15 +99,12 @@ describe('capabilityCookie', () => {
 			}
 		});
 
-		it('lets a deployment rotate AWAY from a weak secret', () => {
-			// The floor must not apply to previousSecret. It only ever verifies,
-			// never signs, and refusing the old value would leave "keep the weak
-			// secret" and "sign every live session out" as the only options -
-			// which is how a weak secret survives.
-			expect(() => capabilityCookie({
-				secret: randomBytes(32).toString('hex'),
-				previousSecret: 'dev'
-			})).not.toThrow();
+		it('refuses a weak verification key even when the signing key is strong', () => {
+			for (const previousSecret of ['', 'q', 'dev', 'changeme', 'x'.repeat(64), 'ab'.repeat(32), 123, null]) {
+				expect(() => capabilityCookie({
+					secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', previousSecret
+				})).toThrow(/previousSecret/);
+			}
 		});
 
 		it('throws on non-positive ttlSeconds', () => {

@@ -36,7 +36,7 @@ function validateEnvelope(env, label) {
 	if (env.retryAfterMs !== undefined && (typeof env.retryAfterMs !== 'number' || !Number.isFinite(env.retryAfterMs) || env.retryAfterMs < 0)) {
 		throw new Error('degradation policy: ' + label + '.retryAfterMs must be a non-negative number');
 	}
-	if (env.bannerCopy !== undefined && (typeof env.bannerCopy !== 'string' || env.bannerCopy.trim().length === 0 || Buffer.byteLength(env.bannerCopy, 'utf8') > MAX_NOTICE_BYTES || /[\u0000-\u001f\u007f-\u009f]/.test(env.bannerCopy))) {
+	if (env.bannerCopy !== undefined && (typeof env.bannerCopy !== 'string' || !/[^\p{White_Space}\p{Default_Ignorable_Code_Point}]/u.test(env.bannerCopy) || Buffer.byteLength(env.bannerCopy, 'utf8') > MAX_NOTICE_BYTES || /(?![\u200c\u200d])[\p{Cc}\p{Cf}]/u.test(env.bannerCopy))) {
 		throw new Error('degradation policy: ' + label + '.bannerCopy must be non-blank plain text of at most 2048 UTF-8 bytes without control characters');
 	}
 	if (env.refetch !== undefined && typeof env.refetch !== 'boolean') throw new Error('degradation policy: ' + label + '.refetch must be a boolean');
@@ -70,7 +70,7 @@ function resolveJitter(envelope, explicit) {
  * @property {string[]} [streams] - Stream topics to treat as unavailable while degraded.
  * @property {string[]} [rpcs] - RPC paths to treat as unavailable while degraded.
  * @property {number} [retryAfterMs] - How long the client should hold off before retrying.
- * @property {string} [bannerCopy] - Optional source-English fallback notice. Non-blank plain text, at most 2048 UTF-8 bytes, without control characters. Render as text.
+ * @property {string} [bannerCopy] - Optional source-English fallback notice. Visible plain text, at most 2048 UTF-8 bytes, without control or format characters except ZWNJ/ZWJ alongside visible text. Render as text.
  */
 
 /**
