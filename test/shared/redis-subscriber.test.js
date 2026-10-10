@@ -4,6 +4,7 @@ import { guardSubscriber, openSubscriber, watchLiveness } from '../../src/shared
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 import Redis from 'ioredis';
+import { TimeoutError } from '../../src/shared/errors.js';
 import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -493,12 +494,12 @@ describe('subscriber connections that stop answering', () => {
 		expect(conn.pings).toBe(1);
 	});
 
-	it('decide nothing from a PING ioredis gave up on itself (commandTimeout); the 10 second limit does', async () => {
+	it.each([new Error('Command timed out'), new TimeoutError('redis', 'command', 5000)])('keeps the silence deadline after a command timeout (%s)', async error => {
 		const clock = captureTimers();
 		const conn = connected('pubsub');
 		await conn.subscribe('a');
 		sink = captureRegistered();
-		conn.pingReply = () => Promise.reject(new Error('Command timed out'));
+		conn.pingReply = () => Promise.reject(error);
 		await clock.tick();
 		expect(conn.sockets[0].destroyed).toBe(false);
 		expect(clock.pending().map((t) => t.ms)).toEqual([10000]);

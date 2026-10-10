@@ -106,7 +106,9 @@ describe('subscriber connections whose server stops answering (integration)', ()
 
 	it('pub/sub bus: a subscriber whose server stops answering is reported and delivers again', async () => {
 		const channel = 'inttest-live:pubsub:' + Date.now();
-		const client = createBackendClient({ keyPrefix: 'inttest-live:' });
+		// Exercise the PING watchdog after the shorter command deadline, without
+		// the independent socket deadline closing the connection first.
+		const client = createBackendClient({ keyPrefix: 'inttest-live:', options: { socketTimeout: undefined } });
 		cleanups.push(() => client.quit());
 		const platform = mockPlatform();
 		const bus = createPubSubBus(client, { channel });

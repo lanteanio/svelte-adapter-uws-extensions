@@ -38,7 +38,9 @@ it('expires a startup write without sending it after recovery, then fails fast d
 		const start = Date.now();
 		await expect(client.redis.set(key, 'must-not-arrive')).rejects.toThrow(/timed out|retries/i);
 		expect(Date.now() - start).toBeLessThan(6500);
-		expect(client.redis.offlineQueue.length).toBe(0);
+		// A reconnect handshake may queue INFO after the expired user write.
+		// Only the unsent write must disappear, and Redis must never apply it.
+		expect(client.redis.offlineQueue.toArray().some(entry => entry.command.name === 'set' && entry.command.args[0] === key)).toBe(false);
 		blocked = false;
 		for (const [upstream, chunk] of buffered) if (!upstream.destroyed) upstream.write(chunk);
 		await ready(client.redis);
@@ -52,7 +54,7 @@ it('expires a startup write without sending it after recovery, then fails fast d
 		const rejectedAt = Date.now();
 		await expect(client.redis.set(key, 'also-not-arriving')).rejects.toThrow();
 		expect(Date.now() - rejectedAt).toBeLessThan(500);
-		expect(client.redis.offlineQueue.length).toBe(0);
+		expect(client.redis.offlineQueue.toArray().some(entry => entry.command.name === 'set' && entry.command.args[0] === key)).toBe(false);
 	} finally {
 		client.redis.disconnect();
 		for (const socket of sockets) socket.destroy();

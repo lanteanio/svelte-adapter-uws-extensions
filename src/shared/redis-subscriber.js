@@ -239,7 +239,7 @@ function answersPing(conn) {
 		try {
 			Promise.resolve(conn.ping()).then(heard, (/** @type {any} */ err) => {
 				if (isReplyError(err)) settle(ANSWERED);
-				else if (err?.message !== 'Command timed out') settle(MOOT);
+				else if (err?.message !== 'Command timed out' && !(err?.name === 'TimeoutError' && err?.service === 'redis')) settle(MOOT);
 			});
 		} catch {
 			settle(MOOT);
