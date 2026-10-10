@@ -36,7 +36,7 @@ const SUBSCRIBE_RETRY_MAX_MS = 30000;
  * @param {{
  *   client: import('../index.js').RedisClient, redis: import('ioredis').Redis,
  *   channel: string, instanceId: string, b: any, validator: any,
- *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, watchedTopics: Function, recoverTopic: Function, resetRoster: Function,
+ *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, watchedTopics: Function, recoverTopic: Function,
  *   onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
  *   inUse: () => boolean
  * }} deps
@@ -54,7 +54,6 @@ export function createRedisIo({
 	mergeRoster,
 	watchedTopics,
 	recoverTopic,
-	resetRoster,
 	onMessage,
 	queueRemove,
 	inUse
@@ -176,7 +175,8 @@ export function createRedisIo({
 			relayOnline = false;
 			recoveryNeeded = true;
 			recoveryGeneration++;
-			resetRoster();
+			// Keep the TTL-bounded live roster: the hash can lag the relay or
+			// disappear on restart, so a gap is not evidence that users left.
 		});
 		sub.on(SUBSCRIBER_RESTORED, () => {
 			relayOnline = true;

@@ -427,14 +427,17 @@ export function createCursor(client, options = {}) {
 		activeTopics,
 		mergeRoster: roster.merge,
 		watchedTopics: () => topicMembers.keys(),
-		resetRoster: roster.clear,
 		recoverTopic(topic, cursors, platform) {
 			const catalog = cursors.map(({ key, user }) => ({ key, user }));
 			const positions = cursors.map(({ key, data }) => ({ key, data }));
 			const members = topicMembers.get(topic);
 			if (members) {
 				for (const ws of members) {
-					if (snapshotWaiters.get(ws)?.has(topic)) continue;
+					const pending = snapshotWaiters.get(ws)?.get(topic);
+					// An attach waiting for this recovery will read afterwards. A read
+					// already in flight may be stale and must not skip recovery.
+					if (pending?.size && ![...pending].some((request) => request.reading)) continue;
+					for (const request of pending || []) request.superseded = true;
 					try {
 						emitTo(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
 						emitTo(ws, '__cursor:' + topic, EVENTS.BULK, positions, platform);
@@ -613,18 +616,21 @@ export function createCursor(client, options = {}) {
 	async function emitSnapshot(ws, topic, platform, relayReady) {
 		let waiting = snapshotWaiters.get(ws);
 		if (!waiting) snapshotWaiters.set(ws, waiting = new Map());
-		waiting.set(topic, (waiting.get(topic) || 0) + 1);
-		try { await emitSnapshotBody(ws, topic, platform, relayReady); } finally {
-			const count = waiting.get(topic) - 1;
-			if (count) waiting.set(topic, count);
-			else waiting.delete(topic);
+		let pending = waiting.get(topic);
+		if (!pending) waiting.set(topic, pending = new Set());
+		const request = { superseded: false, reading: false };
+		pending.add(request);
+		try { await emitSnapshotBody(ws, topic, platform, relayReady, request); } finally {
+			pending.delete(request);
+			if (pending.size === 0) waiting.delete(topic);
 			if (waiting.size === 0) snapshotWaiters.delete(ws);
 		}
 	}
 
-	async function emitSnapshotBody(ws, topic, platform, relayReady) {
+	async function emitSnapshotBody(ws, topic, platform, relayReady, request) {
 		try { ws.getBufferedAmount(); } catch { return; }
-		watchTopic(ws, topic);
+		// Snapshot is a one-shot observer operation. Only actual membership
+		// registers lasting relay interest (grantMembership).
 		// Server time first - even for an empty board - so the requester's
 		// smoothing clock is seeded before the first stamped position frame
 		// and the request/reply round trip is measurable. Rides the codec's
@@ -653,6 +659,7 @@ export function createCursor(client, options = {}) {
 			// WebSocket closed before send
 		}
 		if (relayReady) await relayReady;
+		request.reading = true;
 		// `list()` rethrows both the breaker's open-circuit throw and any
 		// Redis rejection, and every caller of emitSnapshot is reached from a
 		// fire-and-forget `hooks.message` branch. An unhandled rejection
@@ -665,6 +672,7 @@ export function createCursor(client, options = {}) {
 		let cursors;
 		try {
 			cursors = await tracker.list(topic);
+			if (request.superseded) return;
 			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: now() })])));
 		} catch {
 			return;
@@ -887,6 +895,13 @@ export function createCursor(client, options = {}) {
 		},
 
 		async remove(ws, platform, topic) {
+			if (topic === undefined) {
+				// Interest must not survive a closed connection, even if another
+				// path already dropped its idle per-socket record.
+				for (const [t, members] of topicMembers) {
+					if (members.has(ws)) unwatchTopic(ws, t);
+				}
+			}
 			const state = wsState.get(ws);
 			if (!state) return;
 
@@ -956,9 +971,6 @@ export function createCursor(client, options = {}) {
 			// connection down. Relying on that teardown makes revocation depend
 			// on something outside this module, and anything still holding the
 			// socket would keep reading it as a member.
-			for (const [t, members] of topicMembers) {
-				if (members.has(ws)) unwatchTopic(ws, t);
-			}
 			for (const t of state.member) removeWsSubscription(ws, '__cursor:' + t);
 			try {
 				let redisUp = true;

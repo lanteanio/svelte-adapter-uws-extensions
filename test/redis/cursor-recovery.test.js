@@ -52,6 +52,64 @@ describe('cursor relay recovery', () => {
 		for (const ws of watchers) expect(platform.sent.filter((frame) => frame.ws === ws).map((frame) => frame.event)).toEqual(['catalog', 'bulk']);
 		for (const ws of watchers.slice(0, 2)) expect(platform.sent.find((frame) => frame.ws === ws && frame.event === 'catalog').data).toEqual([{ key: 'peer:1', user: { id: 'peer' } }]);
 	});
+
+	it('preserves live peers missing from the hash when a mover instance restores its relay', async () => {
+		const { cursor, client, platform, reconnect } = setup({ snapshotIntervalMs: 10000 });
+		const watcher = mockWs({ id: 'watcher' });
+		await cursor.attach(watcher, 'board', platform);
+		cursor.update(mockWs({ id: 'local' }), 'board', { x: 1 }, platform);
+		for (const [event, payload] of [
+			['join', { key: 'peer:1', user: { id: 'peer' } }],
+			['update', { key: 'peer:1', data: { x: 7 } }]
+		]) await client.redis.publish(client.key('cursor:events'), JSON.stringify({ instanceId: 'peer', topic: 'board', event, payload }));
+		expect(await client.redis.hgetall(client.key('cursor:{board}'))).toEqual({});
+		platform.reset();
+		reconnect();
+		await flush();
+		const catalog = platform.sent.find(frame => frame.ws === watcher && frame.event === 'catalog').data;
+		expect(catalog.map(entry => entry.user.id).sort()).toEqual(['local', 'peer']);
+		expect(platform.sent.find(frame => frame.ws === watcher && frame.event === 'bulk').data)
+			.toContainEqual({ key: 'peer:1', data: { x: 7 } });
+		await client.redis.publish(client.key('cursor:events'), JSON.stringify({ instanceId: 'peer', topic: 'board', event: 'update', payload: { key: 'peer:1', data: { x: 8 } } }));
+		expect(platform.published.filter(frame => frame.event === 'update').at(-1).data).toEqual({ key: 'peer:1', data: { x: 8 } });
+	});
+
+	it('retains live removal tombstones across recovery of a stale hash', async () => {
+		const { cursor, client, platform, reconnect } = setup();
+		const watcher = mockWs({ id: 'watcher' });
+		await cursor.attach(watcher, 'board', platform);
+		await client.redis.hset(client.key('cursor:{board}'), 'peer:gone', JSON.stringify({ user: { id: 'gone' }, data: {}, ts: Date.now() }));
+		await client.redis.publish(client.key('cursor:events'), JSON.stringify({ instanceId: 'peer', topic: 'board', event: 'remove', payload: { key: 'peer:gone' } }));
+		platform.reset();
+		reconnect();
+		await flush();
+		expect(platform.sent.find(frame => frame.ws === watcher && frame.event === 'catalog').data).toEqual([]);
+	});
+
+	it('supersedes a snapshot read begun before recovery instead of replacing the recovered roster with stale data', async () => {
+		const { cursor, client, platform, reconnect } = setup();
+		const watcher = mockWs({ id: 'watcher' });
+		await cursor.attach(watcher, 'board', platform);
+		let release;
+		vi.spyOn(client.redis, 'hgetall').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+		const snapshot = cursor.snapshot(watcher, 'board', platform);
+		await flush();
+		await client.redis.hset(client.key('cursor:{board}'), 'peer:new', JSON.stringify({ user: { id: 'new' }, data: { x: 9 }, ts: Date.now() }));
+		platform.reset();
+		reconnect();
+		await flush();
+		expect(platform.sent.filter(frame => frame.event === 'catalog').map(frame => frame.data))
+			.toEqual([[{ key: 'peer:new', user: { id: 'new' } }]]);
+		release({ 'peer:old': JSON.stringify({ user: { id: 'old' }, data: {}, ts: Date.now() }) });
+		await snapshot;
+		expect(platform.sent.filter(frame => frame.event === 'catalog').map(frame => frame.data))
+			.toEqual([[{ key: 'peer:new', user: { id: 'new' } }]]);
+		platform.reset();
+		await cursor.snapshot(watcher, 'board', platform);
+		expect(platform.sent.find(frame => frame.event === 'catalog').data)
+			.toEqual([{ key: 'peer:new', user: { id: 'new' } }]);
+	});
+
 	it('retries a failed recovery read while the subscription stays open', async () => {
 		const { cursor, client, platform, reconnect } = setup();
 		await cursor.attach(mockWs({ id: 'watcher' }), 'board', platform);
