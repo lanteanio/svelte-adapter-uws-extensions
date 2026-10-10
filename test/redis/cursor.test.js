@@ -565,7 +565,7 @@ describe('redis cursor', () => {
 
 			const out = await metrics.serialize();
 			// Serializer sorts labels alphabetically -> `reason,topic`.
-			expect(out).toMatch(/cursor_attaches_aborted_total\{reason="ws_closed",topic="canvas"\}\s+1/);
+			expect(out).toMatch(/cursor_attaches_aborted_total\{reason="ws_closed",topic="all"\}\s+1/);
 			c.destroy();
 		});
 

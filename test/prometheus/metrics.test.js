@@ -755,9 +755,9 @@ describe('prometheus metrics', () => {
 			expect(m.mapTopic('chat')).toBe('chat');
 		});
 
-		it('defaults to identity', () => {
+		it('defaults to an identifier-free class', () => {
 			const m = createMetrics();
-			expect(m.mapTopic('anything')).toBe('anything');
+			expect(m.mapTopic('anything')).toBe('all');
 		});
 
 		it('rejects non-function mapTopic', () => {
@@ -800,7 +800,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			client = mockRedisClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts relayed messages and batch sizes', async () => {
@@ -843,7 +843,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			client = mockRedisClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts joins and leaves', async () => {
@@ -880,7 +880,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			client = mockRedisClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts every oversized resume frame across all replay backends', async () => {
@@ -935,7 +935,7 @@ describe('prometheus metrics', () => {
 
 		beforeEach(() => {
 			client = mockRedisClient();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts allowed and denied requests', async () => {
@@ -975,7 +975,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			client = mockRedisClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts joins, leaves, and publishes', async () => {
@@ -1016,7 +1016,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			client = mockRedisClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts updates and broadcasts', async () => {
@@ -1066,7 +1066,7 @@ describe('prometheus metrics', () => {
 		beforeEach(() => {
 			pgClient = mockPgClient();
 			platform = mockPlatform();
-			metrics = createMetrics();
+			metrics = createMetrics({ mapTopic: (topic) => topic });
 		});
 
 		it('counts publishes', async () => {
@@ -1352,13 +1352,13 @@ describe('prometheus metrics', () => {
 
 	describe('wirePublishRateMetrics', () => {
 		it('throws on missing platform / metrics', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			expect(() => wirePublishRateMetrics(null, m)).toThrow('platform is required');
 			expect(() => wirePublishRateMetrics({ pressure: {} }, null)).toThrow('metrics registry is required');
 		});
 
 		it('throws on invalid topN', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const platform = mockPlatform();
 			expect(() => wirePublishRateMetrics(platform, m, { topN: 0 })).toThrow('topN must be a positive integer');
 			expect(() => wirePublishRateMetrics(platform, m, { topN: -1 })).toThrow('topN must be a positive integer');
@@ -1366,7 +1366,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('emits zero gauges when pressure has no topPublishers', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const platform = mockPlatform();
 			wirePublishRateMetrics(platform, m);
 
@@ -1379,7 +1379,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('reads topPublishers from the pressure snapshot at scrape time', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const platform = mockPlatform();
 			wirePublishRateMetrics(platform, m);
 
@@ -1403,7 +1403,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('caps cardinality at topN', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const platform = mockPlatform();
 			wirePublishRateMetrics(platform, m, { topN: 2 });
 
@@ -1442,9 +1442,8 @@ describe('prometheus metrics', () => {
 			});
 
 			const output = m.serialize();
-			// Both rooms collapse onto the same label; the second `set()`
-			// overwrites the first, so the visible value is the last entry's.
-			expect(output).toContain('ws_topic_publish_rate{topic="chat:*"} 50');
+			// Both rooms contribute to the same mapped class.
+			expect(output).toContain('ws_topic_publish_rate{topic="chat:*"} 150');
 		});
 
 		it('inline mapTopic option overrides the registry mapTopic', () => {
@@ -1463,7 +1462,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('reflects pressure changes between scrapes (collect at scrape time)', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const platform = mockPlatform();
 			wirePublishRateMetrics(platform, m);
 
@@ -1592,7 +1591,7 @@ describe('prometheus metrics', () => {
 		}
 
 		it('rejects bad inputs', () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			expect(() => wireClusterPublishRateMetrics(null, m)).toThrow('aggregator is required');
 			expect(() => wireClusterPublishRateMetrics({ topPublishers: [] }, null)).toThrow('metrics registry is required');
 			const agg = makeAggregator([]);
@@ -1601,7 +1600,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('emits cluster_topic_publish_rate and cluster_topic_publish_bytes from aggregator.topPublishers at scrape time', async () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const agg = makeAggregator([
 				{ topic: 'chat:room1', messagesPerSec: 300, bytesPerSec: 3000 },
 				{ topic: 'audit:org1', messagesPerSec: 50, bytesPerSec: 500 }
@@ -1615,7 +1614,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('caps emitted gauges at topN', async () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const agg = makeAggregator([
 				{ topic: 'a', messagesPerSec: 5, bytesPerSec: 50 },
 				{ topic: 'b', messagesPerSec: 4, bytesPerSec: 40 },
@@ -1630,7 +1629,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('honors mapTopic for cardinality control', async () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const agg = makeAggregator([
 				{ topic: 'org:42:items', messagesPerSec: 10, bytesPerSec: 100 }
 			]);
@@ -1644,7 +1643,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('handles an empty topPublishers list', async () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			const agg = makeAggregator([]);
 			wireClusterPublishRateMetrics(agg, m);
 
@@ -1654,7 +1653,7 @@ describe('prometheus metrics', () => {
 		});
 
 		it('reflects aggregator updates between scrapes', async () => {
-			const m = createMetrics();
+			const m = createMetrics({ mapTopic: (topic) => topic });
 			let snap = [{ topic: 'a', messagesPerSec: 1, bytesPerSec: 10 }];
 			const agg = { get topPublishers() { return snap; } };
 			wireClusterPublishRateMetrics(agg, m);

@@ -44,7 +44,7 @@ export interface DistributedLockOptions {
 	/**
 	 * Map lock key names to bounded label values for cardinality control
 	 * on the lock counters. Mirrors the `mapTopic` shape from the
-	 * Prometheus registry.
+	 * Prometheus registry. Defaults to the identifier-free class `all`.
 	 */
 	mapKey?: (key: string) => string;
 

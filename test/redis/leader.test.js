@@ -97,7 +97,7 @@ describe('redis leader', () => {
 			await sleep(250);
 
 			const out = m.serialize();
-			const match = out.match(/leader_renewals_total\{key_class="leader"\}\s+(\d+)/);
+			const match = out.match(/leader_renewals_total\{key_class="all"\}\s+(\d+)/);
 			expect(match).not.toBeNull();
 			expect(Number(match[1])).toBeGreaterThanOrEqual(2);
 		});
@@ -354,7 +354,7 @@ describe('redis leader', () => {
 			await waitFor(() => l.isLeader());
 
 			const out = m.serialize();
-			expect(out).toMatch(/leader_acquired_total\{key_class="leader"\} 1/);
+			expect(out).toMatch(/leader_acquired_total\{key_class="all"\} 1/);
 		});
 
 		it('emits leader_lost_total on transition to non-leader', async () => {
@@ -366,7 +366,7 @@ describe('redis leader', () => {
 			await waitFor(() => !l.isLeader(), { timeoutMs: 500 });
 
 			const out = m.serialize();
-			expect(out).toMatch(/leader_lost_total\{key_class="leader"\} 1/);
+			expect(out).toMatch(/leader_lost_total\{key_class="all"\} 1/);
 		});
 
 		it('mapKey controls the key_class label', async () => {

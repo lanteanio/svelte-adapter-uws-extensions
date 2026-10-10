@@ -48,7 +48,7 @@ const DEFAULT_LEASE_MS = 30_000;
  * @property {number} [leaseMs=30000] - TTL on the lease in milliseconds. Worst-case window between leader death and successor takeover.
  * @property {number} [renewMs] - Renewal interval in milliseconds. Must be `< leaseMs`. Default: `leaseMs / 3`. Also the interval at which non-leaders attempt fresh acquire.
  * @property {(err: Error) => void} [onError] - Called on every Redis failure (renewal, fresh acquire, release). Use for structured logging. Errors never escape the renewal interval regardless.
- * @property {(key: string) => string} [mapKey] - Map the lease key to a bounded label value for cardinality control on the four leader counters. Default: identity.
+ * @property {(key: string) => string} [mapKey] - Map the lease key to a bounded label value for cardinality control on the four leader counters. Default: the identifier-free class "all".
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  */
@@ -116,7 +116,7 @@ export function createLeader(client, options = {}) {
 	}
 
 	const onError = options.onError;
-	const mapKey = options.mapKey || ((k) => k);
+	const mapKey = options.mapKey || (() => 'all');
 	const breaker = options.breaker;
 	const redis = client.redis;
 	const fullKey = client.key(key);

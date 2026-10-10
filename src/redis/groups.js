@@ -183,6 +183,7 @@ export function createGroup(client, name, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
+	const metricGroup = m ? (m.mapTopic ? m.mapTopic(name) : 'all') : null;
 	const mJoins = m?.counter('group_joins_total', 'Group join events', ['group']);
 	const mRejected = m?.counter('group_joins_rejected_total', 'Group joins rejected (full)', ['group']);
 	const mGroupLeaves = m?.counter('group_leaves_total', 'Group leave events', ['group']);
@@ -563,7 +564,7 @@ export function createGroup(client, name, options = {}) {
 				return false;
 			}
 			if (result[0] === 0) {
-				mRejected?.inc({ group: name });
+				mRejected?.inc({ group: metricGroup });
 				if (onFull) onFull(ws, role);
 				return false;
 			}
@@ -582,7 +583,7 @@ export function createGroup(client, name, options = {}) {
 			// the same as a "group full" rejection - the caller already
 			// has graceful handling for that path.
 			if (!localMembers.has(ws) && localMembers.size >= MAX_GROUPS_LOCAL_MEMBERS) {
-				mRejected?.inc({ group: name });
+				mRejected?.inc({ group: metricGroup });
 				if (onFull) onFull(ws, role);
 				try { await redis.hdel(membersKey, memberId); } catch { /* ignore */ }
 				return false;
@@ -640,7 +641,7 @@ export function createGroup(client, name, options = {}) {
 				// ws closed after subscribe
 			}
 
-			mJoins?.inc({ group: name });
+			mJoins?.inc({ group: metricGroup });
 			if (onJoin) onJoin(ws, role);
 			return true;
 		},
@@ -668,7 +669,7 @@ export function createGroup(client, name, options = {}) {
 			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 			removeWsSubscription(ws, internalTopic);
 
-			mGroupLeaves?.inc({ group: name });
+			mGroupLeaves?.inc({ group: metricGroup });
 			const leavePayload = { role: entry.role };
 			platform.publish(internalTopic, EVENTS.LEAVE, leavePayload, FRAME_OPTIONS);
 			await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
@@ -686,7 +687,7 @@ export function createGroup(client, name, options = {}) {
 			const raw = role == null
 				? encodeEvent(event, data)
 				: encodeEvent(EVENTS.ROLE_FILTERED, { event, data, role });
-			mPublishes?.inc({ group: name });
+			mPublishes?.inc({ group: metricGroup });
 
 			if (role == null) {
 				// Broadcast to all via topic

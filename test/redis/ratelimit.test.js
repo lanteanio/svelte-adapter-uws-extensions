@@ -118,14 +118,13 @@ describe('redis ratelimit', () => {
 			await expect(lim.consume(mockWs({ ip: '1.2.3.4' }))).rejects.toThrow('NUL byte');
 		});
 
-		it('labels the rate-limit counters by tenant_id when a resolver is set', async () => {
+		it('aggregates tenant identifiers in rate-limit counters by default', async () => {
 			const metrics = createMetrics();
 			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org, metrics });
 			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'a' }));
 			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'b' }));
 			const out = metrics.serialize();
-			expect(out).toContain('ratelimit_allowed_total{tenant_id="a"} 1');
-			expect(out).toContain('ratelimit_allowed_total{tenant_id="b"} 1');
+			expect(out).toContain('ratelimit_allowed_total{tenant_id="all"} 2');
 		});
 
 		it('no tenant resolver -> counters carry no tenant_id label (byte-identical metrics)', async () => {

@@ -803,8 +803,7 @@ describe('redis presence', () => {
 			local.flushDiffs();
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/presence_diff_frames_total\{topic="room-a"\}\s+1/);
-			expect(out).toMatch(/presence_diff_frames_total\{topic="room-b"\}\s+1/);
+			expect(out).toMatch(/presence_diff_frames_total\{topic="all"\}\s+2/);
 			local.destroy();
 		});
 
@@ -830,7 +829,7 @@ describe('redis presence', () => {
 			await new Promise((r) => setTimeout(r, 10));
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/presence_diff_coalesced_total\{topic="room"\}\s+1/);
+			expect(out).toMatch(/presence_diff_coalesced_total\{topic="all"\}\s+1/);
 			local.destroy();
 		});
 
@@ -842,8 +841,8 @@ describe('redis presence', () => {
 			await local.leave(ws, platform, 'room');
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/presence_joins_total\{topic="room"\}\s+1/);
-			expect(out).toMatch(/presence_leaves_total\{topic="room"\}\s+1/);
+			expect(out).toMatch(/presence_joins_total\{topic="all"\}\s+1/);
+			expect(out).toMatch(/presence_leaves_total\{topic="all"\}\s+1/);
 			local.destroy();
 		});
 	});
@@ -1583,7 +1582,7 @@ describe('redis presence', () => {
 
 			const out = await metrics.serialize();
 			// Serializer sorts labels alphabetically -> `reason,topic`.
-			expect(out).toMatch(/presence_joins_aborted_total\{reason="ws_closed",topic="room"\}\s+1/);
+			expect(out).toMatch(/presence_joins_aborted_total\{reason="ws_closed",topic="all"\}\s+1/);
 			// Negative control: a clean join must not bump the aborted
 			// counter, otherwise an operator would see false positives.
 			expect(out).not.toMatch(/presence_joins_aborted_total\{[^}]*\}\s+[2-9]/);
@@ -1633,7 +1632,7 @@ describe('redis presence', () => {
 			await new Promise((r) => setTimeout(r, 5));
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/presence_total_online\{topic="room"\}\s+1/);
+			expect(out).toMatch(/presence_total_online\{topic="all"\}\s+1/);
 			expect(out).toMatch(/presence_heartbeat_latency_ms\s+\d/);
 			local.destroy();
 		});

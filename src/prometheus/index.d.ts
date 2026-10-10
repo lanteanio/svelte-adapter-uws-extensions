@@ -1,7 +1,7 @@
 export interface MetricsOptions {
 	/** Prefix for all metric names. @default '' */
 	prefix?: string;
-	/** Map topic names to bounded label values for cardinality control. @default identity */
+	/** Map topic, group and tenant identifiers to bounded label classes. Raw identifiers require an explicit mapper. @default () => 'all' */
 	mapTopic?: (topic: string) => string;
 	/** Default histogram buckets. @default [1, 5, 10, 25, 50, 100, 250, 500, 1000] */
 	defaultBuckets?: number[];

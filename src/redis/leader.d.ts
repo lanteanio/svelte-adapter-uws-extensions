@@ -34,7 +34,7 @@ export interface LeaderOptions {
 	onError?: (err: Error) => void;
 	/**
 	 * Map the lease key to a bounded label value for cardinality control
-	 * on the four `leader_*` counters. Default: identity.
+	 * on the four `leader_*` counters. Default: the identifier-free class `all`.
 	 */
 	mapKey?: (key: string) => string;
 	breaker?: CircuitBreaker;

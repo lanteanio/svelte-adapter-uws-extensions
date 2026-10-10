@@ -466,11 +466,10 @@ export function createRateLimit(client, options) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	// When a tenant resolver is set, label the rate-limit counters by tenant so an
-	// operator can see per-tenant allow/deny/ban rates. Opt-in (no resolver -> no
-	// label, byte-identical series); the label is bounded by the metric's default
-	// max-series cardinality cap, so a tenant burst cannot blow up the registry.
+	// Tenant isolation must not implicitly export the tenant's identifier.
+	// Reuse the registry's bounded identifier mapper; no resolver adds no label.
 	const labelTenants = typeof tenant === 'function';
+	const mapTenant = m?.mapTopic || (() => 'all');
 	const tlabels = labelTenants ? ['tenant_id'] : undefined;
 	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed', tlabels);
 	const mDenied = m?.counter('ratelimit_denied_total', 'Requests denied', tlabels);
@@ -577,7 +576,7 @@ export function createRateLimit(client, options) {
 				verdict = floor.consume(bk, cost);
 			}
 
-			const labels = labelTenants ? { tenant_id: tenantId || '' } : undefined;
+			const labels = labelTenants ? { tenant_id: mapTenant(tenantId || '') } : undefined;
 			if (verdict.allowed) {
 				mAllowed?.inc(labels);
 			} else {
@@ -644,7 +643,7 @@ export function createRateLimit(client, options) {
 			if (dur <= 0) throw new Error('redis ratelimit: ban duration must be positive');
 			const bk = bucketKey(key, tenantId);
 			await withBreaker(b, () => evalCached(redis, BAN_SCRIPT, 1, bk, dur, points, interval));
-			mBans?.inc(labelTenants ? { tenant_id: tenantId || '' } : undefined);
+			mBans?.inc(labelTenants ? { tenant_id: mapTenant(tenantId || '') } : undefined);
 		},
 
 		async unban(key, tenantId) {

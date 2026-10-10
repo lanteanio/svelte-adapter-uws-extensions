@@ -80,6 +80,24 @@ import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
+const onlineMetricCollectors = new WeakMap();
+function collectOnlineMetric(gauge, mapTopic, counts) {
+	let collectors = onlineMetricCollectors.get(gauge);
+	if (!collectors) {
+		collectors = new Set();
+		onlineMetricCollectors.set(gauge, collectors);
+		gauge.collect(() => {
+			for (const entry of collectors) {
+				for (const [topic, users] of entry.counts) gauge.inc({ topic: entry.mapTopic(topic) }, users.size);
+			}
+		});
+	}
+	const entry = { mapTopic, counts };
+	collectors.add(entry);
+	return () => collectors.delete(entry);
+}
+
+
 const EMPTY_FIELDS = Object.freeze(Object.create(null));
 
 function fieldValueBytes(value) {
@@ -199,6 +217,10 @@ export function createPresence(client, options = {}) {
 	const spHeld = new Map();
 	let spActive = false;
 	let spSince = 0;
+	// Collect current memberships at scrape time, summing topics mapped to the
+	// same class without retaining departed topic labels or work on every tick.
+	const stopOnlineMetric = mTotalOnline ? collectOnlineMetric(mTotalOnline, mt, localCounts) : null;
+
 	const heartbeatTimer = setIntervalTimer(() => {
 		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
@@ -268,14 +290,6 @@ export function createPresence(client, options = {}) {
 				}
 				mSelfPreserveActive?.set(spActive ? 1 : 0);
 				mSelfPreserveHeld?.set(spHeld.size);
-			}
-		}
-
-		// totalOnline gauge tracks current state, which is meaningful
-		// even when the breaker is broken and the rest of the tick bails.
-		if (mTotalOnline) {
-			for (const [topic, counts] of localCounts) {
-				mTotalOnline.set({ topic: mt(topic) }, counts.size);
 			}
 		}
 
@@ -1428,6 +1442,7 @@ export function createPresence(client, options = {}) {
 		},
 
 		destroy() {
+			stopOnlineMetric?.();
 			clearIntervalTimer(heartbeatTimer);
 			if (consistencyAuditor) consistencyAuditor.stop();
 			subscriberCtx.dispose();

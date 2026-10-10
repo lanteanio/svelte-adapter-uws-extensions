@@ -2334,7 +2334,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 | `retryDelayMs` | `50` | Sleep between acquire retries when the key is held by another instance. Constant retry; no exponential backoff. |
 | `maxWaitMs` | `5000` | Total time to wait before throwing `LockAcquireTimeoutError`. Override per call via `withLock(key, fn, { maxWaitMs })`. |
 | `heartbeatMs` | `defaultTtlMs / 3` | Heartbeat refresh interval. Default keeps margin for one missed beat. |
-| `mapKey` | identity | Map lock key names to bounded label values for metric cardinality. |
+| `mapKey` | `() => 'all'` | Map lock key names to bounded label values for metric cardinality. |
 | `breaker` | - | Optional circuit breaker for the Redis ops. |
 | `metrics` | - | Optional Prometheus metrics registry. |
 
@@ -2429,7 +2429,7 @@ GC-pause caveat: a long stop-the-world pause on the leader can cause brief overl
 | `leaseMs` | `30000` | TTL on the lease in milliseconds. Worst-case window between leader death and successor takeover. |
 | `renewMs` | `leaseMs / 3` | Renewal interval, also the interval at which non-leaders attempt fresh acquire. Must be `< leaseMs`. |
 | `onError` | - | Called on every Redis failure. Use for structured logging. Errors never escape the renewal interval regardless. |
-| `mapKey` | identity | Map the lease key to a bounded label value for cardinality control on the four `leader_*` counters. |
+| `mapKey` | `() => 'all'` | Map the lease key to a bounded label value for cardinality control on the four `leader_*` counters. |
 | `breaker` | - | Optional circuit breaker. Renewal failures count via `breaker.failure(err)`; successes via `breaker.success()`. |
 | `metrics` | - | Optional Prometheus metrics registry. |
 
@@ -3193,6 +3193,8 @@ The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then p
 
 Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled - every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
 
+Built-in topic, group, tenant and lock/leader key labels collapse to `all` by default. Supply `mapTopic` (or the lock/leader `mapKey`) only when you can map identifiers to a small set of non-identifying classes. An explicit identity mapper restores raw labels and makes their privacy and retention your responsibility. Application-defined metric labels are also your responsibility. Erasing replay or other payloads cannot delete previously scraped time series; avoid recording personal identifiers in labels. Publish-rate gauges sum sampled topics in each mapped class; presence gauges sum per-topic user memberships in each class.
+
 Registering a name again requires the same help text, labels, series cap and histogram configuration. Label order and bucket order do not matter; conflicting registrations throw before observations can use the wrong instrument. The name `prometheus_series_dropped_total` is reserved for registry drop accounting, including when a registry prefix is configured.
 
 #### Setup
@@ -3203,7 +3205,7 @@ import { createMetrics } from 'svelte-adapter-uws-extensions/prometheus';
 
 export const metrics = createMetrics({
   prefix: 'myapp_',
-  mapTopic: (topic) => topic.startsWith('room:') ? 'room:*' : topic
+  mapTopic: (topic) => topic.startsWith('room:') ? 'room' : 'other'
 });
 ```
 
@@ -3281,7 +3283,7 @@ The predicate receives `(res, req)` and returns truthy to allow or falsy to deny
 | Option | Default | Description |
 |---|---|---|
 | `prefix` | `''` | Prefix for all metric names |
-| `mapTopic` | identity | Map topic names to bounded label values for cardinality control |
+| `mapTopic` | `() => 'all'` | Map topic, group and tenant identifiers to bounded, non-identifying label classes. |
 | `defaultBuckets` | `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` | Default histogram buckets |
 | `maxSeries` | `10_000` | Per-metric series cap; past this, new labelsets are dropped and `prometheus_series_dropped_total{metric}` counts them. Pass `Infinity` to disable. |
 | `maxBuckets` | `32` | Maximum buckets a histogram may declare. Throws at registration if exceeded. Pass `Infinity` to disable. |

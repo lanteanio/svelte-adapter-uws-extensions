@@ -332,7 +332,7 @@ describe('redis replay', () => {
 			const bufKey = client.key('replay:buf:{chat}');
 			client._sortedSets.get(bufKey)[0] = { score: 1, member: '{broken' };
 			await tracked.replay({}, 'chat', 0, platform);
-			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="chat"\} 1/);
+			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="all"\} 1/);
 		});
 	});
 
@@ -1303,8 +1303,8 @@ describe('redis replay', () => {
 			await r.publish(platform, 'chat', 'created', { id: 1 });
 
 			const out = metrics.serialize();
-			expect(out).toMatch(/replay_storage_fallbacks_total\{topic="chat"\} 1/);
-			expect(out).not.toMatch(/replay_publishes_total\{topic="chat"\} [1-9]/);
+			expect(out).toMatch(/replay_storage_fallbacks_total\{topic="all"\} 1/);
+			expect(out).not.toMatch(/replay_publishes_total\{topic="all"\} [1-9]/);
 
 			restore();
 		});

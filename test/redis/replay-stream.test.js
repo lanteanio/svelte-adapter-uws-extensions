@@ -221,7 +221,7 @@ describe('redis replay (stream backend)', () => {
 			const key = client.key('replay:streambuf:{chat}');
 			await client.redis.xadd(key, '2-0', 'v', '99', 'event', 'created', 'data', '{"id":2}');
 			await tracked.gap('chat', 1);
-			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="chat"\} 1/);
+			expect(metrics.serialize()).toMatch(/replay_corruptions_total\{topic="all"\} 1/);
 		});
 	});
 
@@ -685,8 +685,8 @@ describe('redis replay (stream backend)', () => {
 			});
 
 			const out = metrics.serialize();
-			expect(out).toMatch(/replay_idmp_writes_total\{topic="chat"\} 1/);
-			expect(out).toMatch(/replay_idmp_hits_total\{topic="chat"\} 1/);
+			expect(out).toMatch(/replay_idmp_writes_total\{topic="all"\} 1/);
+			expect(out).toMatch(/replay_idmp_hits_total\{topic="all"\} 1/);
 		});
 
 		it('is absent on the sorted-set backend', () => {

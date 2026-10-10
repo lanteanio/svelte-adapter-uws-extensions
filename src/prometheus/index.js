@@ -437,7 +437,7 @@ function recordSeriesDrop(metric) {
 /**
  * @typedef {Object} MetricsOptions
  * @property {string} [prefix=''] - Prefix for all metric names
- * @property {(topic: string) => string} [mapTopic] - Map topic names to bounded label values for cardinality control
+ * @property {(topic: string) => string} [mapTopic] - Map topic, group and tenant identifiers to bounded label classes. Defaults to the identifier-free class "all"
  * @property {number[]} [defaultBuckets] - Default histogram buckets
  * @property {number} [maxSeries=10_000] - Default per-metric series cap (label combinations).
  *   Past the cap, new labelsets are dropped, a warn-once log fires per metric, and the
@@ -510,7 +510,7 @@ export function createMetrics(options = {}) {
 	if (options.mapTopic != null && typeof options.mapTopic !== 'function') {
 		throw new Error('createMetrics: mapTopic must be a function');
 	}
-	const mapTopic = options.mapTopic || ((t) => t);
+	const mapTopic = options.mapTopic || (() => 'all');
 	const defaultBuckets = options.defaultBuckets || DEFAULT_BUCKETS;
 	const defaultMaxSeries = options.maxSeries ?? DEFAULT_MAX_SERIES;
 	validateMaxSeries(defaultMaxSeries, '<registry default>');
@@ -805,7 +805,7 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
 	if (!Number.isInteger(topN) || topN < 1) {
 		throw new TypeError('wirePublishRateMetrics: topN must be a positive integer');
 	}
-	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? ((t) => t);
+	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? (() => 'all');
 
 	const rateGauge = metrics.gauge(
 		'ws_topic_publish_rate',
@@ -827,12 +827,12 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
 
 	rateGauge.collect(() => {
 		for (const t of snapshot()) {
-			rateGauge.set({ topic: mapTopic(t.topic) }, t.messagesPerSec);
+			rateGauge.inc({ topic: mapTopic(t.topic) }, t.messagesPerSec);
 		}
 	});
 	bytesGauge.collect(() => {
 		for (const t of snapshot()) {
-			bytesGauge.set({ topic: mapTopic(t.topic) }, t.bytesPerSec);
+			bytesGauge.inc({ topic: mapTopic(t.topic) }, t.bytesPerSec);
 		}
 	});
 }
@@ -860,7 +860,7 @@ export function wireClusterPublishRateMetrics(aggregator, metrics, options = {})
 	if (!Number.isInteger(topN) || topN < 1) {
 		throw new TypeError('wireClusterPublishRateMetrics: topN must be a positive integer');
 	}
-	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? ((t) => t);
+	const mapTopic = options.mapTopic ?? metrics.mapTopic ?? (() => 'all');
 
 	const rateGauge = metrics.gauge(
 		'cluster_topic_publish_rate',
@@ -880,12 +880,12 @@ export function wireClusterPublishRateMetrics(aggregator, metrics, options = {})
 
 	rateGauge.collect(() => {
 		for (const t of snapshot()) {
-			rateGauge.set({ topic: mapTopic(t.topic) }, t.messagesPerSec);
+			rateGauge.inc({ topic: mapTopic(t.topic) }, t.messagesPerSec);
 		}
 	});
 	bytesGauge.collect(() => {
 		for (const t of snapshot()) {
-			bytesGauge.set({ topic: mapTopic(t.topic) }, t.bytesPerSec);
+			bytesGauge.inc({ topic: mapTopic(t.topic) }, t.bytesPerSec);
 		}
 	});
 }

@@ -49,7 +49,7 @@ import {
  * @property {number} [retryDelayMs=50] - Sleep between acquire retries when the key is held by another instance.
  * @property {number} [maxWaitMs=5000] - Total time to wait for the key to free up before throwing a `LockAcquireTimeoutError`. Override per call via `withLock(key, fn, { maxWaitMs })`.
  * @property {number} [heartbeatMs] - Interval at which the heartbeat refreshes the TTL. Defaults to `defaultTtlMs / 3` so a single missed beat still leaves margin before the TTL elapses.
- * @property {(key: string) => string} [mapKey] - Map lock key names to bounded label values for cardinality control on the `lock_acquired_total` / `lock_lost_total` / `lock_acquire_timeouts_total` counters. Default: identity.
+ * @property {(key: string) => string} [mapKey] - Map lock key names to bounded label values for cardinality control on the `lock_acquired_total` / `lock_lost_total` / `lock_acquire_timeouts_total` counters. Default: the identifier-free class "all".
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  */
@@ -121,7 +121,7 @@ export function createDistributedLock(client, options = {}) {
 	if (options.mapKey !== undefined && typeof options.mapKey !== 'function') {
 		throw new Error('lock: mapKey must be a function');
 	}
-	const mapKey = options.mapKey || ((k) => k);
+	const mapKey = options.mapKey || (() => 'all');
 	const breaker = options.breaker;
 	const redis = client.redis;
 
