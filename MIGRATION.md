@@ -1,5 +1,7 @@
 # Migration guide: svelte-adapter-uws-extensions
 
+[Package overview](./README.md) | [Release history](./CHANGELOG.md)
+
 - **[0.5.x to 0.6.x](#05x-to-06x)** - current release.
 - **[0.4.x to 0.5.x](#04x-to-05x)** - previous release.
 

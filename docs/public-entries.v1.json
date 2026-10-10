@@ -1,0 +1,381 @@
+{
+	"schemaVersion": 1,
+	"entries": [
+		{
+			"path": "./sim",
+			"goal": "Run seeded multi-instance fault simulations",
+			"backend": "None",
+			"heading": "Testing",
+			"prerequisites": "Development or test process",
+			"status": "Testing utility"
+		},
+		{
+			"path": "./redis",
+			"goal": "Create and own Redis connections",
+			"backend": "Redis",
+			"heading": "Redis client",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/pubsub",
+			"goal": "Relay publishes across instances",
+			"backend": "Redis",
+			"heading": "Pub/sub bus",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/crdt",
+			"goal": "Coordinate replicated CRDT documents",
+			"backend": "Redis",
+			"heading": "CRDT documents (cluster coordinator)",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/smooth",
+			"goal": "Coordinate interpolated entities",
+			"backend": "Redis",
+			"heading": "Smooth entities (cluster coordinator)",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/topic-broadcast",
+			"goal": "Collect replies from topic subscribers",
+			"backend": "Redis",
+			"heading": "Topic broadcast-with-reply",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/alarm-store",
+			"goal": "Persist and claim scheduled alarms",
+			"backend": "Redis",
+			"heading": "Durable alarm store",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/sharded-pubsub",
+			"goal": "Route pub/sub by shard",
+			"backend": "Redis",
+			"heading": "Sharded pub/sub bus",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/functions",
+			"goal": "Load Redis function libraries",
+			"backend": "Redis",
+			"heading": "Redis Functions",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/replay",
+			"goal": "Persist ordered replay history",
+			"backend": "Redis",
+			"heading": "Replay buffer (Redis)",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/dead-letter",
+			"goal": "Retain failed delivery records",
+			"backend": "Redis",
+			"heading": "Dead-letter store (Redis)",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/webhook-controls",
+			"goal": "Share webhook retry budgets and endpoint ejection",
+			"backend": "Redis",
+			"heading": "Webhook delivery controls",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/presence",
+			"goal": "Track cross-instance presence",
+			"backend": "Redis",
+			"heading": "Presence",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres",
+			"goal": "Create and own Postgres connections",
+			"backend": "Postgres",
+			"heading": "Postgres client",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/replay",
+			"goal": "Persist ordered replay history",
+			"backend": "Postgres",
+			"heading": "Replay buffer (Postgres)",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/dead-letter",
+			"goal": "Retain failed delivery records",
+			"backend": "Postgres",
+			"heading": "Dead-letter store (Redis)",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/alarm-store",
+			"goal": "Persist and claim scheduled alarms",
+			"backend": "Postgres",
+			"heading": "Durable alarm store",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/notify",
+			"goal": "Forward database notifications",
+			"backend": "Postgres",
+			"heading": "LISTEN/NOTIFY bridge",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/ratelimit",
+			"goal": "Meter shared request budgets",
+			"backend": "Redis",
+			"heading": "Rate limiting",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/upgrade-bucket",
+			"goal": "Limit connection upgrades",
+			"backend": "Redis",
+			"heading": "Upgrade admission",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/groups",
+			"goal": "Manage shared broadcast groups",
+			"backend": "Redis",
+			"heading": "Broadcast groups",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/cursor",
+			"goal": "Relay ephemeral positions",
+			"backend": "Redis",
+			"heading": "Cursor",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/clock-skew",
+			"goal": "Measure Redis clock offset",
+			"backend": "Redis",
+			"heading": "Clock-skew sampling",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/clock",
+			"goal": "Read a shared cluster clock",
+			"backend": "Redis",
+			"heading": "Cluster clock",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/ntp-source",
+			"goal": "Supply an NTP clock source",
+			"backend": "Redis",
+			"heading": "Cluster clock",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/idempotency",
+			"goal": "Cache completed operation results",
+			"backend": "Redis",
+			"heading": "Idempotency store",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/fence",
+			"goal": "Fence durable task ownership",
+			"backend": "Redis",
+			"heading": "Task runner",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/lock",
+			"goal": "Acquire cooperative leases",
+			"backend": "Redis",
+			"heading": "Distributed lock",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/lease-scripts",
+			"goal": "Use compare-and-renew or release Lua directly",
+			"backend": "Redis",
+			"heading": "Distributed lock",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported advanced API"
+		},
+		{
+			"path": "./redis/leader",
+			"goal": "Elect one active worker",
+			"backend": "Redis",
+			"heading": "Leader election",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/session",
+			"goal": "Share session state",
+			"backend": "Redis",
+			"heading": "Distributed session",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/registry",
+			"goal": "Find and contact user connections",
+			"backend": "Redis",
+			"heading": "Connection registry",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./redis/publish-rate",
+			"goal": "Aggregate cluster publish pressure",
+			"backend": "Redis",
+			"heading": "Cluster publish-rate aggregator",
+			"prerequisites": "Redis client and authorized keys/topics",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/idempotency",
+			"goal": "Cache completed operation results",
+			"backend": "Postgres",
+			"heading": "Idempotency store",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/tasks",
+			"goal": "Run recoverable background tasks",
+			"backend": "Postgres",
+			"heading": "Task runner",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./postgres/jobs",
+			"goal": "Claim background jobs",
+			"backend": "Postgres",
+			"heading": "Job queue",
+			"prerequisites": "Postgres client and authorized inputs",
+			"status": "Supported API"
+		},
+		{
+			"path": "./prometheus",
+			"goal": "Export bounded metrics",
+			"backend": "None",
+			"heading": "Prometheus metrics",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./breaker",
+			"goal": "Isolate failing dependencies",
+			"backend": "None",
+			"heading": "Circuit breaker",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./degradation",
+			"goal": "Describe unavailable capabilities",
+			"backend": "None",
+			"heading": "Pub/sub bus",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./forget-store",
+			"goal": "Compose user erasure across stores",
+			"backend": "None",
+			"heading": "Right to erasure (`live.forget` durable layer)",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./assert",
+			"goal": "Assert production invariants",
+			"backend": "None",
+			"heading": "Production assertions",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./admission",
+			"goal": "Apply publish admission policies",
+			"backend": "None",
+			"heading": "Admission control",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./capability-cookie",
+			"goal": "Issue upgrade capability tokens",
+			"backend": "None",
+			"heading": "Upgrade admission",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./bus-validate",
+			"goal": "Validate custom inbound transport envelopes",
+			"backend": "None",
+			"heading": "Bus envelope validation",
+			"prerequisites": "Server integration",
+			"status": "Supported advanced API"
+		},
+		{
+			"path": "./sensitive",
+			"goal": "Strip sensitive diagnostic fields",
+			"backend": "None",
+			"heading": "Sensitive data",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./safe-url",
+			"goal": "Validate outbound destination URLs",
+			"backend": "None",
+			"heading": "URL safety (SSRF)",
+			"prerequisites": "Server integration",
+			"status": "Supported API"
+		},
+		{
+			"path": "./testing",
+			"goal": "Use deterministic client and platform doubles",
+			"backend": "None",
+			"heading": "Testing",
+			"prerequisites": "Development or test process",
+			"status": "Testing utility"
+		}
+	]
+}

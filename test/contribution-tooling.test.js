@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { checkText, parseEditorConfig, propertiesFor } from '../scripts/check-formatting.js';
 import { checkMap, expandLanes, inventory, workflowLanes } from '../scripts/check-contributor-map.js';
 import { exerciseSharedCursors } from '../scripts/smoke.js';
@@ -47,7 +47,7 @@ describe('verification inventory', () => {
 	});
 	it('matches the checked-in package and hosted workflow', () => {
 		const load = (path) => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
-		expect(checkMap(load('CONTRIBUTING.md'), JSON.parse(load('package.json')).scripts, load('.github/workflows/verify.yml')).matches).toBe(true);
+		expect(checkMap(load('CONTRIBUTING.md'), JSON.parse(load('package.json')).scripts, readdirSync(new URL('../.github/workflows/', import.meta.url)).filter((name) => /\.ya?ml$/.test(name)).sort().map((name) => load('.github/workflows/' + name)).join('\n')).matches).toBe(true);
 	});
 });
 

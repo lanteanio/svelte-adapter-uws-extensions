@@ -1,0 +1,56 @@
+# Public entry points
+
+[Package overview](../README.md) | [Installation](../README.md#installation) | [Release history](../CHANGELOG.md)
+
+Choose an import below, satisfy its prerequisites, then follow its reference.
+All entries follow the package version; testing utilities are for development.
+
+| Import | Goal | Backend | Prerequisites | Status | Reference |
+| --- | --- | --- | --- | --- | --- |
+| [svelte-adapter-uws-extensions/admission](../src/shared/admission.d.ts) | Apply publish admission policies | None | Server integration | Supported API | [Admission control](../README.md#admission-control) |
+| [svelte-adapter-uws-extensions/assert](../src/shared/assert.d.ts) | Assert production invariants | None | Server integration | Supported API | [Production assertions](../README.md#production-assertions) |
+| [svelte-adapter-uws-extensions/breaker](../src/shared/breaker.d.ts) | Isolate failing dependencies | None | Server integration | Supported API | [Circuit breaker](../README.md#circuit-breaker) |
+| [svelte-adapter-uws-extensions/bus-validate](../src/shared/bus-validate.d.ts) | Validate custom inbound transport envelopes | None | Server integration | Supported advanced API | [Bus envelope validation](../README.md#bus-envelope-validation) |
+| [svelte-adapter-uws-extensions/capability-cookie](../src/capability-cookie.d.ts) | Issue upgrade capability tokens | None | Server integration | Supported API | [Upgrade admission](../README.md#upgrade-admission) |
+| [svelte-adapter-uws-extensions/degradation](../src/shared/degradation.d.ts) | Describe unavailable capabilities | None | Server integration | Supported API | [Pub/sub bus](../README.md#pubsub-bus) |
+| [svelte-adapter-uws-extensions/forget-store](../src/shared/forget-store.d.ts) | Compose user erasure across stores | None | Server integration | Supported API | [Right to erasure (`live.forget` durable layer)](../README.md#right-to-erasure-liveforget-durable-layer) |
+| [svelte-adapter-uws-extensions/postgres](../src/postgres/index.d.ts) | Create and own Postgres connections | Postgres | Postgres client and authorized inputs | Supported API | [Postgres client](../README.md#postgres-client) |
+| [svelte-adapter-uws-extensions/postgres/alarm-store](../src/postgres/alarm-store.d.ts) | Persist and claim scheduled alarms | Postgres | Postgres client and authorized inputs | Supported API | [Durable alarm store](../README.md#durable-alarm-store) |
+| [svelte-adapter-uws-extensions/postgres/dead-letter](../src/postgres/dead-letter.d.ts) | Retain failed delivery records | Postgres | Postgres client and authorized inputs | Supported API | [Dead-letter store (Redis)](../README.md#dead-letter-store-redis) |
+| [svelte-adapter-uws-extensions/postgres/idempotency](../src/postgres/idempotency.d.ts) | Cache completed operation results | Postgres | Postgres client and authorized inputs | Supported API | [Idempotency store](../README.md#idempotency-store) |
+| [svelte-adapter-uws-extensions/postgres/jobs](../src/postgres/jobs.d.ts) | Claim background jobs | Postgres | Postgres client and authorized inputs | Supported API | [Job queue](../README.md#job-queue) |
+| [svelte-adapter-uws-extensions/postgres/notify](../src/postgres/notify.d.ts) | Forward database notifications | Postgres | Postgres client and authorized inputs | Supported API | [LISTEN/NOTIFY bridge](../README.md#listennotify-bridge) |
+| [svelte-adapter-uws-extensions/postgres/replay](../src/postgres/replay.d.ts) | Persist ordered replay history | Postgres | Postgres client and authorized inputs | Supported API | [Replay buffer (Postgres)](../README.md#replay-buffer-postgres) |
+| [svelte-adapter-uws-extensions/postgres/tasks](../src/postgres/tasks.d.ts) | Run recoverable background tasks | Postgres | Postgres client and authorized inputs | Supported API | [Task runner](../README.md#task-runner) |
+| [svelte-adapter-uws-extensions/prometheus](../src/prometheus/index.d.ts) | Export bounded metrics | None | Server integration | Supported API | [Prometheus metrics](../README.md#prometheus-metrics) |
+| [svelte-adapter-uws-extensions/redis](../src/redis/index.d.ts) | Create and own Redis connections | Redis | Redis client and authorized keys/topics | Supported API | [Redis client](../README.md#redis-client) |
+| [svelte-adapter-uws-extensions/redis/alarm-store](../src/redis/alarm-store.d.ts) | Persist and claim scheduled alarms | Redis | Redis client and authorized keys/topics | Supported API | [Durable alarm store](../README.md#durable-alarm-store) |
+| [svelte-adapter-uws-extensions/redis/clock](../src/redis/clock.d.ts) | Read a shared cluster clock | Redis | Redis client and authorized keys/topics | Supported API | [Cluster clock](../README.md#cluster-clock) |
+| [svelte-adapter-uws-extensions/redis/clock-skew](../src/redis/clock-skew.d.ts) | Measure Redis clock offset | Redis | Redis client and authorized keys/topics | Supported API | [Clock-skew sampling](../README.md#clock-skew-sampling) |
+| [svelte-adapter-uws-extensions/redis/crdt](../src/redis/crdt.d.ts) | Coordinate replicated CRDT documents | Redis | Redis client and authorized keys/topics | Supported API | [CRDT documents (cluster coordinator)](../README.md#crdt-documents-cluster-coordinator) |
+| [svelte-adapter-uws-extensions/redis/cursor](../src/redis/cursor.d.ts) | Relay ephemeral positions | Redis | Redis client and authorized keys/topics | Supported API | [Cursor](../README.md#cursor) |
+| [svelte-adapter-uws-extensions/redis/dead-letter](../src/redis/dead-letter.d.ts) | Retain failed delivery records | Redis | Redis client and authorized keys/topics | Supported API | [Dead-letter store (Redis)](../README.md#dead-letter-store-redis) |
+| [svelte-adapter-uws-extensions/redis/fence](../src/redis/fence.d.ts) | Fence durable task ownership | Redis | Redis client and authorized keys/topics | Supported API | [Task runner](../README.md#task-runner) |
+| [svelte-adapter-uws-extensions/redis/functions](../src/redis/functions.d.ts) | Load Redis function libraries | Redis | Redis client and authorized keys/topics | Supported API | [Redis Functions](../README.md#redis-functions) |
+| [svelte-adapter-uws-extensions/redis/groups](../src/redis/groups.d.ts) | Manage shared broadcast groups | Redis | Redis client and authorized keys/topics | Supported API | [Broadcast groups](../README.md#broadcast-groups) |
+| [svelte-adapter-uws-extensions/redis/idempotency](../src/redis/idempotency.d.ts) | Cache completed operation results | Redis | Redis client and authorized keys/topics | Supported API | [Idempotency store](../README.md#idempotency-store) |
+| [svelte-adapter-uws-extensions/redis/leader](../src/redis/leader.d.ts) | Elect one active worker | Redis | Redis client and authorized keys/topics | Supported API | [Leader election](../README.md#leader-election) |
+| [svelte-adapter-uws-extensions/redis/lease-scripts](../src/redis/lease-scripts.d.ts) | Use compare-and-renew or release Lua directly | Redis | Redis client and authorized keys/topics | Supported advanced API | [Distributed lock](../README.md#distributed-lock) |
+| [svelte-adapter-uws-extensions/redis/lock](../src/redis/lock.d.ts) | Acquire cooperative leases | Redis | Redis client and authorized keys/topics | Supported API | [Distributed lock](../README.md#distributed-lock) |
+| [svelte-adapter-uws-extensions/redis/ntp-source](../src/redis/ntp-source.d.ts) | Supply an NTP clock source | Redis | Redis client and authorized keys/topics | Supported API | [Cluster clock](../README.md#cluster-clock) |
+| [svelte-adapter-uws-extensions/redis/presence](../src/redis/presence.d.ts) | Track cross-instance presence | Redis | Redis client and authorized keys/topics | Supported API | [Presence](../README.md#presence) |
+| [svelte-adapter-uws-extensions/redis/publish-rate](../src/redis/publish-rate.d.ts) | Aggregate cluster publish pressure | Redis | Redis client and authorized keys/topics | Supported API | [Cluster publish-rate aggregator](../README.md#cluster-publish-rate-aggregator) |
+| [svelte-adapter-uws-extensions/redis/pubsub](../src/redis/pubsub.d.ts) | Relay publishes across instances | Redis | Redis client and authorized keys/topics | Supported API | [Pub/sub bus](../README.md#pubsub-bus) |
+| [svelte-adapter-uws-extensions/redis/ratelimit](../src/redis/ratelimit.d.ts) | Meter shared request budgets | Redis | Redis client and authorized keys/topics | Supported API | [Rate limiting](../README.md#rate-limiting) |
+| [svelte-adapter-uws-extensions/redis/registry](../src/redis/registry.d.ts) | Find and contact user connections | Redis | Redis client and authorized keys/topics | Supported API | [Connection registry](../README.md#connection-registry) |
+| [svelte-adapter-uws-extensions/redis/replay](../src/redis/replay.d.ts) | Persist ordered replay history | Redis | Redis client and authorized keys/topics | Supported API | [Replay buffer (Redis)](../README.md#replay-buffer-redis) |
+| [svelte-adapter-uws-extensions/redis/session](../src/redis/session.d.ts) | Share session state | Redis | Redis client and authorized keys/topics | Supported API | [Distributed session](../README.md#distributed-session) |
+| [svelte-adapter-uws-extensions/redis/sharded-pubsub](../src/redis/sharded-pubsub.d.ts) | Route pub/sub by shard | Redis | Redis client and authorized keys/topics | Supported API | [Sharded pub/sub bus](../README.md#sharded-pubsub-bus) |
+| [svelte-adapter-uws-extensions/redis/smooth](../src/redis/smooth-cluster.d.ts) | Coordinate interpolated entities | Redis | Redis client and authorized keys/topics | Supported API | [Smooth entities (cluster coordinator)](../README.md#smooth-entities-cluster-coordinator) |
+| [svelte-adapter-uws-extensions/redis/topic-broadcast](../src/redis/topic-broadcast.d.ts) | Collect replies from topic subscribers | Redis | Redis client and authorized keys/topics | Supported API | [Topic broadcast-with-reply](../README.md#topic-broadcast-with-reply) |
+| [svelte-adapter-uws-extensions/redis/upgrade-bucket](../src/redis/upgrade-bucket.d.ts) | Limit connection upgrades | Redis | Redis client and authorized keys/topics | Supported API | [Upgrade admission](../README.md#upgrade-admission) |
+| [svelte-adapter-uws-extensions/redis/webhook-controls](../src/redis/webhook-controls.d.ts) | Share webhook retry budgets and endpoint ejection | Redis | Redis client and authorized keys/topics | Supported API | [Webhook delivery controls](../README.md#webhook-delivery-controls) |
+| [svelte-adapter-uws-extensions/safe-url](../src/shared/safe-url.d.ts) | Validate outbound destination URLs | None | Server integration | Supported API | [URL safety (SSRF)](../README.md#url-safety-ssrf) |
+| [svelte-adapter-uws-extensions/sensitive](../src/shared/sensitive.d.ts) | Strip sensitive diagnostic fields | None | Server integration | Supported API | [Sensitive data](../README.md#sensitive-data) |
+| [svelte-adapter-uws-extensions/sim](../src/sim.d.ts) | Run seeded multi-instance fault simulations | None | Development or test process | Testing utility | [Testing](../README.md#testing) |
+| [svelte-adapter-uws-extensions/testing](../src/testing/index.d.ts) | Use deterministic client and platform doubles | None | Development or test process | Testing utility | [Testing](../README.md#testing) |

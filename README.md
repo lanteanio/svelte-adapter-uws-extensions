@@ -13,6 +13,19 @@ and have no `size` property; distributed locks use expiring leases and omit
 `held`, `size`, and `clear`. Check each extension's API and failure behavior
 before replacing an in-memory primitive.
 
+<!-- documentation-paths:start -->
+| Need | Type | Route | Owner |
+| --- | --- | --- | --- |
+| Decide whether this package fits | Identity | [What you get](#what-you-get) | README.md |
+| Install and verify prerequisites | First success | [Installation](#installation) | README.md |
+| Choose a supported package tuple | Compatibility | [Version compatibility](#version-compatibility) | README.md |
+| Learn the ecosystem end to end | Tutorial | [Interactive tutorial](https://svelte-realtime.dev/tutorial) | svelte-realtime.dev |
+| Solve an application or deployment task | How-to | [Guides](https://svelte-realtime.dev/guides) | svelte-realtime.dev |
+| Find a supported import and its purpose | Reference | [Public entry points](./docs/public-entries.md) | docs/public-entries.md |
+| Understand shared backend boundaries | Explanation | [Multi-tenant deployments](#multi-tenant-deployments) | README.md |
+| Handle backend outages | Operations | [Failure handling](#failure-handling) | README.md |
+<!-- documentation-paths:end -->
+
 ## What you get
 
 - **Distributed pub/sub** - `platform.publish()` reaches all instances, not just the local one
@@ -23,6 +36,8 @@ before replacing an in-memory primitive.
 - **Shared cursor state** - ephemeral positions (cursors, selections, drawing strokes) visible across instances
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
 - **Prometheus metrics** - expose extension metrics for scraping, with no collection work when disabled
+
+**Documentation:** [Release history](./CHANGELOG.md) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
 
 **Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
 
@@ -60,53 +75,70 @@ microbenchmarks do not prove distributed production capacity.
 
 ## Table of contents
 
-**Getting started**
-- [Installation](#installation)
+<!-- topic-index:start -->
+### Start here
 
-**Clients**
+- [What you get](#what-you-get)
+- [Version compatibility](#version-compatibility)
+- [Installation](#installation)
+- [Authorize every extension call](#authorize-every-extension-call)
+
+### Clients
+
 - [Redis client](#redis-client)
 - [Postgres client](#postgres-client)
 
-**Redis extensions**
+### Extensions
+
 - [Pub/sub bus](#pubsub-bus)
 - [Sharded pub/sub bus](#sharded-pubsub-bus)
 - [Replay buffer (Redis)](#replay-buffer-redis)
 - [Presence](#presence)
+- [Connection registry](#connection-registry)
 - [Rate limiting](#rate-limiting)
 - [Broadcast groups](#broadcast-groups)
+- [CRDT documents (cluster coordinator)](#crdt-documents-cluster-coordinator)
+- [Smooth entities (cluster coordinator)](#smooth-entities-cluster-coordinator)
+- [Topic broadcast-with-reply](#topic-broadcast-with-reply)
+- [Durable alarm store](#durable-alarm-store)
 - [Cursor](#cursor)
-
-**Postgres extensions**
+- [Dead-letter store (Redis)](#dead-letter-store-redis)
 - [Replay buffer (Postgres)](#replay-buffer-postgres)
 - [LISTEN/NOTIFY bridge](#listennotify-bridge)
 - [Job queue](#job-queue)
-
-**Cross-backend**
 - [Idempotency store](#idempotency-store)
 - [Distributed lock](#distributed-lock)
+- [Leader election](#leader-election)
+- [Clock-skew sampling](#clock-skew-sampling)
+- [Cluster clock](#cluster-clock)
 - [Distributed session](#distributed-session)
 - [Task runner](#task-runner)
+- [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator)
+- [Redis Functions](#redis-functions)
+- [Webhook delivery controls](#webhook-delivery-controls)
+- [Bus envelope validation](#bus-envelope-validation)
 
-**Observability**
+### Observability and capacity
+
 - [Prometheus metrics](#prometheus-metrics)
 - [Sensitive data](#sensitive-data)
+- [Capacity model](#capacity-model)
+- [Production assertions](#production-assertions)
 
-**Reliability**
+### Operations and support
+
+- [URL safety (SSRF)](#url-safety-ssrf)
 - [Failure handling](#failure-handling)
 - [Circuit breaker](#circuit-breaker)
 - [Admission control](#admission-control)
 - [Upgrade admission](#upgrade-admission)
-- [Redis Functions](#redis-functions)
-
-**Operations**
+- [Right to erasure (`live.forget` durable layer)](#right-to-erasure-liveforget-durable-layer)
 - [Graceful shutdown](#graceful-shutdown)
 - [Multi-tenant deployments](#multi-tenant-deployments)
 - [Testing](#testing)
-
-**More**
-- [Error reference](./docs/errors.md)
 - [Related projects](#related-projects)
 - [License](#license)
+<!-- topic-index:end -->
 
 ---
 
@@ -1145,7 +1177,9 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
 | `destroy()` | Stop the heartbeat timer and Redis subscriber. |
 
-#### Targeted sends {#registry-targeted-sends}
+<a id="registry-targeted-sends"></a>
+
+#### Targeted sends
 
 `registry.send(target, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.send(ws, topic, event, data)`. Lookup resolves the owning instance, self-targeting short-circuits to a local `platform.send`, otherwise a fire-and-forget envelope `{type:'send', sessionId, topic, event, data}` ships on the owner's push channel.
 
@@ -1155,7 +1189,9 @@ registry.send('user-123', 'notifications', 'incoming', { id: 42 });
 
 Fire-and-forget: no Promise<reply>, no acknowledgement. Callers who need a delivery signal should use `request(...)` instead. A user offline at lookup-time silently drops with `push_sends_total{result="offline"}`. Mid-flight migration (user disconnects between lookup and arrival) drops on the receiver with `push_sends_total{result="late"}`.
 
-#### Coalesced sends {#registry-coalesced-sends}
+<a id="registry-coalesced-sends"></a>
+
+#### Coalesced sends
 
 `registry.sendCoalesced(target, { key, topic, event, data })` is the cluster-routed counterpart to the adapter's `platform.sendCoalesced(ws, ...)` - one slot per `(connection, key)` tuple, latest-value-wins. Fire-and-forget; no reply path, no `Promise<reply>`.
 
@@ -1174,7 +1210,9 @@ Per-`(connection, key)` replacement happens on the receiver via the adapter's ex
 
 Best fit: targeted latest-value streams where the target is a *user*, not a topic. Cursor positions inside a doc, typing indicators between two users, presence-state pushes from a moderator to a single subscriber. Topic-broadcast coalesce (every subscriber sees the same stream) already works cluster-wide via `bus.wrap(platform).publish(...)` on either bus with per-receiver aggregation; this method covers the remaining gap.
 
-#### Attribute-targeted broadcast {#registry-sendto}
+<a id="registry-sendto"></a>
+
+#### Attribute-targeted broadcast
 
 `registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined - whatever you return from `attributes(ws)` is what `sendTo` can match against. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
 
@@ -1241,7 +1279,9 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 - **Self-targeting** (the origin instance owns the user). Short-circuits to a local `platform.request(ws, ...)` without round-tripping Redis. One conditional in the dispatcher; not a special case at the API surface.
 - **Anonymous connections.** `identify(ws)` returning `null` / `undefined` makes the open / close hooks no-op. Anonymous users are not addressable through the registry by design (unless they carry an app session - see below).
 
-#### Routing by app session {#registry-request-session}
+<a id="registry-request-session"></a>
+
+#### Routing by app session
 
 Pass a `sessionIdentify(ws)` option and the registry also tracks a `sessionId -> instance` owner map (a `sess:{sessionId}` hash beside `conns:{userId}`), so `requestSession(sessionId, ...)` routes to whichever instance currently owns that session - the resume-aware counterpart of `request(userId, ...)`. It backs svelte-realtime's `live.push({ sessionId })` cluster routing.
 
@@ -3456,7 +3496,7 @@ The adapter's own upgrade-path counters and gauges (`upgrade_admitted_total`, `u
 
 ## Sensitive data
 
-Three helpers in [`shared/sensitive.js`](shared/sensitive.js) (re-exported from `svelte-adapter-uws-extensions/sensitive`) cover the recurring "this value might be a credential" problem so callers do not have to write a redactor per call site.
+Three helpers in [`shared/sensitive.js`](src/shared/sensitive.js) (re-exported from `svelte-adapter-uws-extensions/sensitive`) cover the recurring "this value might be a credential" problem so callers do not have to write a redactor per call site.
 
 ### `stripInternal(obj)` -- safe to spread, safe to log
 
@@ -3532,7 +3572,7 @@ The warner uses the broader pattern (the bare substring `"key"` is included) bec
 
 ## URL safety (SSRF)
 
-A server-side handler that fetches a user-supplied URL -- an outbound webhook, a link preview, an avatar-from-URL import -- is a classic server-side request forgery (SSRF) target. An attacker submits a URL that points back inside the trust boundary: the cloud instance-metadata endpoint (`169.254.169.254`, which hands out IAM credentials), a loopback admin panel, or an RFC1918 service. `isSafeUrl` in [`shared/safe-url.js`](shared/safe-url.js) (re-exported from `svelte-adapter-uws-extensions/safe-url`) answers "is it safe to fetch this URL" with a single boolean, with a zero-config strict default.
+A server-side handler that fetches a user-supplied URL -- an outbound webhook, a link preview, an avatar-from-URL import -- is a classic server-side request forgery (SSRF) target. An attacker submits a URL that points back inside the trust boundary: the cloud instance-metadata endpoint (`169.254.169.254`, which hands out IAM credentials), a loopback admin panel, or an RFC1918 service. `isSafeUrl` in [`shared/safe-url.js`](src/shared/safe-url.js) (re-exported from `svelte-adapter-uws-extensions/safe-url`) answers "is it safe to fetch this URL" with a single boolean, with a zero-config strict default.
 
 ```js
 import { isSafeUrl } from 'svelte-adapter-uws-extensions/safe-url';
@@ -4454,6 +4494,8 @@ presence.destroy();
 
 ---
 
+<a id="operational-notes-for-shared-redis-tenancy"></a>
+
 ## Multi-tenant deployments
 
 When two or more tenants share one Redis (or one Postgres) instance, the defaults will collide silently. The failure mode is the worst-case shape: cross-tenant data leakage on subscribe, cross-tenant cache hits on idempotency keys, cross-tenant lock contention on lock keys. Nothing throws; the wrong tenant just sees the wrong data.
@@ -4580,7 +4622,33 @@ Per-tenant prefixes add a handful of bytes to every key name and every published
 
 ---
 
+## Webhook delivery controls
+
+Import `createRetryBudget` and `createWebhookBreaker` from
+`svelte-adapter-uws-extensions/redis/webhook-controls` to share webhook retry
+allowances and endpoint ejection across replicas. Construct both with your Redis
+client and pass them to the delivery integration in svelte-realtime. Authorize
+webhook registrations and validate destination URLs before delivery. The
+[declarations](./src/redis/webhook-controls.d.ts) describe their asynchronous
+budget and outcome methods.
+
+## Bus envelope validation
+
+`svelte-adapter-uws-extensions/bus-validate` is a supported advanced API for
+custom shared-transport integrations. Existing buses already use it. Validate
+raw bytes before parsing with `acceptRaw`, then topic/event fields with
+`acceptEnvelope`; the helper is defense in depth and does not authorize
+application actions. Its [declarations](./src/shared/bus-validate.d.ts) define
+size limits and the explicit system-topic allowlist.
+
 ## Testing
+
+For seeded cross-instance faults, import `runRedisSim` or `runPgSim` from
+`svelte-adapter-uws-extensions/sim`. The simulation backend controls delivery
+loss, duplication, corruption and delay without a live server. Use it for
+repeatable protocol tests, then run the real-backend lanes before deploying;
+simulation is not evidence for Redis or Postgres command behavior. See the
+[simulation declarations](./src/sim.d.ts) for scenario and result shapes.
 
 This repo runs tests in two layers; the integration layer additionally mirrors the Redis suites against a real Redis Cluster. All stay green; you can run each independently.
 
@@ -4613,7 +4681,7 @@ Each command is **one backend running one suite**. The Redis-backed plugins (`re
 | `npm run test:integration:valkey-cluster-mirror` | `redis/**` | Valkey Cluster |
 | `npm run test:integration` | umbrella - runs `:redis` then `:postgres` | both |
 
-The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; the Postgres plugins have no alternative backend to test against, so `test:integration:postgres` is simply their single command (no solo/variant split). All commands share the compose stack at [`test/integration/docker-compose.yml`](test/integration/docker-compose.yml) (Redis on `56379`, Postgres on `55432` - non-default host ports so they do not clash with a locally running server). Each per-backend `global-setup-*.js` runs `docker compose up -d --wait <service>` (just the one it needs) before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL`, and tears the stack down with `docker compose down -v` afterwards.
+The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; the Postgres plugins have no alternative backend to test against, so `test:integration:postgres` is simply their single command (no solo/variant split). All commands share the compose stack at [`test/integration/docker-compose.yml`](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/test/integration/docker-compose.yml) (Redis on `56379`, Postgres on `55432` - non-default host ports so they do not clash with a locally running server). Each per-backend `global-setup-*.js` runs `docker compose up -d --wait <service>` (just the one it needs) before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL`, and tears the stack down with `docker compose down -v` afterwards.
 
 The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine:
 
@@ -4645,7 +4713,7 @@ The integration layer is additive: the mock-based test for a module stays in pla
 
 ### Cluster mirror (`test:integration:cluster-mirror`)
 
-The Redis integration suites run a second time against a real 3-master + 3-replica Redis Cluster, through a DRY env-switched backend ([`test/integration/helpers/backend.js`](test/integration/helpers/backend.js)): the same test bodies, with `createBackendClient` resolving to an `ioredis.Cluster` when `INTEGRATION_BACKEND=cluster`. This keeps an honest, continuously-verified map of cluster behaviour, and **every Redis-backed plugin now runs green on the mirror** - the whole `redis/**` suite passes with zero skips on both the Redis Cluster and the Valkey Cluster.
+The Redis integration suites run a second time against a real 3-master + 3-replica Redis Cluster, through a DRY env-switched backend ([`test/integration/helpers/backend.js`](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/test/integration/helpers/backend.js)): the same test bodies, with `createBackendClient` resolving to an `ioredis.Cluster` when `INTEGRATION_BACKEND=cluster`. This keeps an honest, continuously-verified map of cluster behaviour, and **every Redis-backed plugin now runs green on the mirror** - the whole `redis/**` suite passes with zero skips on both the Redis Cluster and the Valkey Cluster.
 
 Getting there took a key-layout pass so a cluster routes each operation correctly:
 

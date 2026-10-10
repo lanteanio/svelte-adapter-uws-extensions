@@ -1,0 +1,72 @@
+{
+	"schemaVersion": 1,
+	"owner": "svelte-adapter-uws-extensions",
+	"entryBudgetLines": 80,
+	"readmeMaxLines": 4816,
+	"paths": [
+		{
+			"key": "identity",
+			"type": "Identity",
+			"need": "Decide whether this package fits",
+			"label": "What you get",
+			"destination": "#what-you-get",
+			"owner": "README.md"
+		},
+		{
+			"key": "first-success",
+			"type": "First success",
+			"need": "Install and verify prerequisites",
+			"label": "Installation",
+			"destination": "#installation",
+			"owner": "README.md"
+		},
+		{
+			"key": "compatibility",
+			"type": "Compatibility",
+			"need": "Choose a supported package tuple",
+			"label": "Version compatibility",
+			"destination": "#version-compatibility",
+			"owner": "README.md"
+		},
+		{
+			"key": "tutorial",
+			"type": "Tutorial",
+			"need": "Learn the ecosystem end to end",
+			"label": "Interactive tutorial",
+			"destination": "https://svelte-realtime.dev/tutorial",
+			"owner": "svelte-realtime.dev"
+		},
+		{
+			"key": "how-to",
+			"type": "How-to",
+			"need": "Solve an application or deployment task",
+			"label": "Guides",
+			"destination": "https://svelte-realtime.dev/guides",
+			"owner": "svelte-realtime.dev"
+		},
+		{
+			"key": "reference",
+			"type": "Reference",
+			"need": "Find a supported import and its purpose",
+			"label": "Public entry points",
+			"destination": "./docs/public-entries.md",
+			"owner": "docs/public-entries.md"
+		},
+		{
+			"key": "explanation",
+			"type": "Explanation",
+			"need": "Understand shared backend boundaries",
+			"label": "Multi-tenant deployments",
+			"destination": "#multi-tenant-deployments",
+			"owner": "README.md"
+		},
+		{
+			"key": "operations",
+			"type": "Operations",
+			"need": "Handle backend outages",
+			"label": "Failure handling",
+			"destination": "#failure-handling",
+			"owner": "README.md"
+		}
+	]
+}
