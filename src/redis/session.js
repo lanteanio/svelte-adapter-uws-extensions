@@ -165,6 +165,9 @@ export function createDistributedSession(client, options = {}) {
 		if (typeof token !== 'string' || token.length === 0) {
 			throw new Error('session: token must be a non-empty string');
 		}
+		if (token.startsWith('byuser:')) {
+			throw new Error('session: token must not begin with reserved prefix byuser:');
+		}
 	}
 
 	async function get(token) {
@@ -314,6 +317,7 @@ export function createDistributedSession(client, options = {}) {
 	// not mix raw `set`/`get` with `create()` on the same token.
 
 	async function readRecord(token) {
+		validateToken(token);
 		const key = fullKey(token);
 		let raw;
 		try {
@@ -345,6 +349,7 @@ export function createDistributedSession(client, options = {}) {
 	}
 
 	async function writeRecord(token, data, createdAt) {
+		validateToken(token);
 		const key = fullKey(token);
 		const raw = JSON.stringify({ d: data, c: createdAt });
 		try {
@@ -495,6 +500,9 @@ export function createDistributedSession(client, options = {}) {
 			try { await redis.unlink(idxKey); } catch { /* best-effort */ }
 			return 0;
 		}
+		// Refuse legacy namespace collisions before deleting any indexed key.
+		// An old caller token may otherwise name another user's index.
+		for (const token of tokens) validateToken(token);
 		// Per-token UNLINK: each token key routes to its own slot under cluster.
 		const results = await Promise.all(tokens.map((t) => redis.unlink(fullKey(t)).catch(() => 0)));
 		try { await redis.unlink(idxKey); } catch { /* best-effort */ }

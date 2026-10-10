@@ -10,6 +10,7 @@ Derive application keys from trusted identity and validated operation components
 Encoding a tuple with `JSON.stringify` keeps component boundaries distinct.
 Tenant-qualified framework keys remain supported; a component containing
 `byuser:` is valid when the complete caller key does not begin with that prefix.
+A framework tenant id beginning with `byuser:` also makes its complete tenant-qualified key reserved and is rejected.
 This namespace guard does not replace authorization or isolate overlapping store
 prefixes configured by the application.
 

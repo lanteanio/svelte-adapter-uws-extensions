@@ -55,7 +55,7 @@ export interface DistributedSessionOptions<T = unknown> {
 
 	/**
 	 * What `withHooks` does when the session store is unreachable (Redis down,
-	 * breaker open) at connect, or `identify` throws. `'reject'` (default) fails
+	 * breaker open) at connect, or `identify` throws or returns a reserved `byuser:` token. `'reject'` (default) fails
 	 * closed - the upgrade is refused; `'anonymous'` fails open - the connection
 	 * proceeds with no session. An unknown or expired token is NOT an error: it
 	 * is always a clean anonymous connection (load-only never creates a session).
@@ -88,6 +88,7 @@ export interface DistributedSession<T = unknown> {
 
 	/**
 	 * Store or replace data for `token`. Resets the TTL via `SET PX`.
+	 * All token operations reject the reserved, case-sensitive `byuser:` prefix.
 	 * The data must be JSON-serializable.
 	 */
 	set(token: string, data: T): Promise<void>;

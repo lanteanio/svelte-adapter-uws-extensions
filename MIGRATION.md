@@ -222,6 +222,17 @@ deleted reverse indices require paused-writer inspection and reconciliation;
 the upgrade never automatically deletes retained data or repairs historical
 erasure mappings. See [key rules and existing data](./docs/idempotency-keys.md).
 
+### Redis sessions reserve their erasure-index namespace
+
+All token operations reject tokens beginning with the exact prefix `byuser:`
+before Redis access. Lifecycle cookie loads apply `onLoadError` to these invalid
+tokens; the default rejects the upgrade. Server-minted tokens are unaffected.
+Stop issuing reserved tokens before upgrading. A legacy reverse index containing
+a reserved token now makes `purgeUser` reject before deleting any sessions. With
+writers paused, reconcile those tokens and affected index hashes against trusted
+application records; the upgrade does not reconstruct missing ownership mappings
+or automatically delete colliding data. See [session token rules](./docs/session-tokens.md).
+
 ### Redis clients bound waits and disconnected buffering
 
 Owned clients default to 5-second command, connection and socket timeouts,

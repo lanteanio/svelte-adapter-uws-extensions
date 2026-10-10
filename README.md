@@ -2672,7 +2672,7 @@ Rejections count under `admission_rejected_total{reason="CLOCK_TRIPPED"}`. Any o
 
 ## Distributed session
 
-Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; the Redis implementation lets a session created on instance A be read on instance B after a load-balancer hop. All store operations are asynchronous and can fail on backend access. Await `get`, `set`, `touch`, `delete`, and `clear`; there is no synchronous `size` property for the distributed keyspace. Stored data must be JSON-serializable.
+Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; the Redis implementation lets a session created on instance A be read on instance B after a load-balancer hop. All store operations are asynchronous and can fail on backend access. Await `get`, `set`, `touch`, `delete`, and `clear`; there is no synchronous `size` property for the distributed keyspace. Stored data must be JSON-serializable. Tokens beginning with `byuser:` are reserved; see [token rules and migration](docs/session-tokens.md).
 
 Pairs with [Connection registry](#connection-registry): when both are wired, the session provides the durable per-user state (survives disconnect, persists across reconnect, available before a WS even opens), while the registry provides the live "where is this user right now" pointer (only meaningful while the WS is connected). They answer different questions and compose without overlap.
 
