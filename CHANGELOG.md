@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Re-registering a metric name now rejects conflicting help text, series caps, histogram buckets, negative-value policy, or bucket caps.
+
 - Redis buses preserve batch compression options on local and remote delivery.
 - Redis buses carry null as an unsequenced choice and bigint authorities as safe integer sequences.
 - Distributed session options carry the session data type through user erasure callbacks and inferred stores.

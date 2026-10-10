@@ -143,7 +143,7 @@ class Counter {
 		validateMaxSeries(maxSeries, name);
 		this.name = name;
 		this.help = help;
-		this.labelNames = labelNames || [];
+		this.labelNames = labelNames ? [...labelNames] : [];
 		this.maxSeries = maxSeries;
 		this.samples = new Map();
 		/**
@@ -211,7 +211,7 @@ class Gauge {
 		validateMaxSeries(maxSeries, name);
 		this.name = name;
 		this.help = help;
-		this.labelNames = labelNames || [];
+		this.labelNames = labelNames ? [...labelNames] : [];
 		this.maxSeries = maxSeries;
 		this.samples = new Map();
 		this.collectFn = null;
@@ -324,7 +324,7 @@ class Histogram {
 		}
 		this.name = name;
 		this.help = help;
-		this.labelNames = labelNames || [];
+		this.labelNames = labelNames ? [...labelNames] : [];
 		this.maxSeries = maxSeries;
 		const rawBuckets = buckets || DEFAULT_BUCKETS;
 		if (!Array.isArray(rawBuckets)) {
@@ -344,6 +344,7 @@ class Histogram {
 				throw new Error(`metric "${name}": bucket values must be finite numbers, got ${rawBuckets[i]}`);
 			}
 		}
+		this.maxBuckets = maxBuckets;
 		this.buckets = [...new Set(rawBuckets)].sort((a, b) => a - b);
 		// Histograms are non-negative by default (Prometheus convention).
 		// Negative observations corrupt `_sum` and break histogram bucket
@@ -592,16 +593,29 @@ export function createMetrics(options = {}) {
 		}
 	}
 
+	function assertSameDescriptor(existing, requested, fullName) {
+		assertSameLabelNames(existing, requested.labelNames, fullName);
+		for (const field of ['help', 'maxSeries', 'allowNegative', 'maxBuckets']) {
+			if (existing[field] !== requested[field]) {
+				throw new Error(`metric "${fullName}" already registered with different ${field}`);
+			}
+		}
+		if (existing instanceof Histogram && (existing.buckets.length !== requested.buckets.length ||
+			existing.buckets.some((value, index) => value !== requested.buckets[index]))) {
+			throw new Error(`metric "${fullName}" already registered with different buckets`);
+		}
+	}
+
 	function counter(name, help, labelNames, maxSeries) {
 		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
+		const c = new Counter(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Counter)) throw new Error(`metric "${fullName}" already registered as a different type`);
-			assertSameLabelNames(existing, a.labelNames, fullName);
+			assertSameDescriptor(existing, c, fullName);
 			return existing;
 		}
-		const c = new Counter(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		attachDropHook(c);
 		registry.set(fullName, c);
 		return c;
@@ -610,13 +624,13 @@ export function createMetrics(options = {}) {
 	function gauge(name, help, labelNames, maxSeries) {
 		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
+		const g = new Gauge(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		const existing = registry.get(fullName);
 		if (existing) {
 			if (!(existing instanceof Gauge)) throw new Error(`metric "${fullName}" already registered as a different type`);
-			assertSameLabelNames(existing, a.labelNames, fullName);
+			assertSameDescriptor(existing, g, fullName);
 			return existing;
 		}
-		const g = new Gauge(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		attachDropHook(g);
 		registry.set(fullName, g);
 		return g;
@@ -625,12 +639,6 @@ export function createMetrics(options = {}) {
 	function histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
 		const a = resolveMetricArgs(labelNames, { buckets, allowNegative, maxSeries, maxBuckets });
 		const fullName = prefix + name;
-		const existing = registry.get(fullName);
-		if (existing) {
-			if (!(existing instanceof Histogram)) throw new Error(`metric "${fullName}" already registered as a different type`);
-			assertSameLabelNames(existing, a.labelNames, fullName);
-			return existing;
-		}
 		const h = new Histogram(
 			fullName,
 			help,
@@ -640,6 +648,12 @@ export function createMetrics(options = {}) {
 			a.maxSeries ?? defaultMaxSeries,
 			a.maxBuckets ?? defaultMaxBuckets
 		);
+		const existing = registry.get(fullName);
+		if (existing) {
+			if (!(existing instanceof Histogram)) throw new Error(`metric "${fullName}" already registered as a different type`);
+			assertSameDescriptor(existing, h, fullName);
+			return existing;
+		}
 		attachDropHook(h);
 		registry.set(fullName, h);
 		return h;
