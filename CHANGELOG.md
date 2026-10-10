@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound worker task admission by jobs and input bytes, reserve capacity before durable claims, expire and remove cancelled queued jobs, and settle worker exit or IPC failures without leaking capacity. Document worker pressure metrics and cancellation behavior.
+
 - Owned PostgreSQL pools default to 100 unsettled wrapper operations, 10-second checkouts, and 30-second driver query and server statement deadlines, each with an explicit 0 opt-out. Supplied pools retain their configuration and lifecycle. Optional cancellation retains admission until driver settlement and releases abandoned checkouts once; optional metrics expose queue depth, outstanding operations, timeouts, and duration in seconds.
 
 - Bound multi-slot Redis work to eight concurrent batches and 256 commands per pipeline. Coalesce presence heartbeat and registry TTL refresh work and include completed I/O in heartbeat timing. Retry only explicitly refused routing operations without replaying successful writes.
