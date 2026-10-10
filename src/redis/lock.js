@@ -33,9 +33,7 @@ import {
 	randomFloat,
 	monotonicNow,
 	setTimer,
-	clearTimer,
-	setIntervalTimer,
-	clearIntervalTimer
+	clearTimer
 } from '../shared/runtime.js';
 import {
 	LEASE_RENEW_SCRIPT as HEARTBEAT_SCRIPT,
@@ -167,6 +165,7 @@ export function createDistributedLock(client, options = {}) {
 		// elapsed appear negative (extending the timeout indefinitely) or
 		// produce a histogram observation that underflows the bucket boundaries.
 		const start = monotonicNow();
+		let leaseDeadline = start + ttlMs, acknowledgedAt;
 		while (true) {
 			let result;
 			try {
@@ -177,8 +176,14 @@ export function createDistributedLock(client, options = {}) {
 				throw err;
 			}
 			if (result === 'OK') {
-				mWait?.observe((monotonicNow() - start) / 1000);
+				acknowledgedAt = monotonicNow();
+				mWait?.observe((acknowledgedAt - start) / 1000);
 				mAcquired?.inc({ key_class: keyClass });
+				if (acknowledgedAt >= leaseDeadline) {
+					mLost?.inc({ key_class: keyClass });
+					try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken); } catch (error) { breaker?.failure(error); }
+					throw new LockLostError(key);
+				}
 				break;
 			}
 			const elapsed = monotonicNow() - start;
@@ -195,11 +200,12 @@ export function createDistributedLock(client, options = {}) {
 			const jitter = (randomFloat() - 0.5) * 0.5 * retryDelayMs;
 			const delay = Math.max(0, Math.min(retryDelayMs + jitter, callMaxWaitMs - elapsed));
 			await sleepWithAbort(delay, externalSignal);
+			leaseDeadline = monotonicNow() + ttlMs;
 		}
 
 		// Held: start heartbeat, run user fn under combined signal, release.
 		const controller = new AbortController();
-		const onExternalAbort = () => controller.abort(externalSignal?.reason);
+		const onExternalAbort = externalSignal ? () => controller.abort(externalSignal.reason) : null;
 		if (externalSignal) {
 			if (externalSignal.aborted) controller.abort(externalSignal.reason);
 			else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
@@ -208,36 +214,50 @@ export function createDistributedLock(client, options = {}) {
 		let lost = false;
 		let stopped = false;
 		let lostError;
-		// Chain-style heartbeat: a `setInterval(async ...)` callback running
-		// slower than the interval produces concurrent Redis evals against
-		// the same fence key, races the breaker accounting, and breaks the
-		// "one in-flight refresh at a time" invariant the lease state machine
-		// assumes. Instead, queue each refresh onto the previous one's promise
-		// chain so a slow tick never overlaps itself. Mirrors leader.js#tick
-		// (see leader.js:174-179 for the canonical pattern).
-		let inFlight = null;
+		// One timer caps its next wake-up at the last confirmed lease deadline,
+		// including while a Redis reply is pending. Refreshes never queue up.
+		let inFlight = null, finishWaiter;
 		async function heartbeatTick() {
-			if (lost || stopped) return;
 			try {
+				if (lost || stopped) return;
+				const sentAt = monotonicNow();
 				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
 				breaker?.success();
-				if (Number(r) !== 1) {
+				if (lost) return;
+				if (Number(r) !== 1 || monotonicNow() >= leaseDeadline) {
 					lost = true;
 					lostError = new LockLostError(key);
 					mLost?.inc({ key_class: keyClass });
 					controller.abort(lostError);
-				}
+				} else leaseDeadline = sentAt + ttlMs;
 			} catch (err) {
 				breaker?.failure(err);
-				// A flaky heartbeat does not abort by itself - the next tick
-				// retries. The TTL is still on track unless heartbeats stay
-				// failing past `ttlMs`, at which point the next tick will
-				// observe the absent key and abort cleanly.
+				// An error does not extend the deadline. A later refresh may still
+				// recover within it; the deadline-capped timer detects expiry.
+			} finally {
+				inFlight = null;
+				finishWaiter?.();
+				finishWaiter = undefined;
 			}
 		}
-		const heartbeatTimer = setIntervalTimer(() => {
-			inFlight = (inFlight || Promise.resolve()).then(heartbeatTick).catch(() => {});
-		}, heartbeatMs);
+		let heartbeatTimer;
+		function heartbeatDue() {
+			if (lost) return;
+			const remaining = leaseDeadline - monotonicNow();
+			if (remaining <= 0) {
+				lost = true;
+				lostError = new LockLostError(key);
+				mLost?.inc({ key_class: keyClass });
+				controller.abort(lostError);
+				finishWaiter?.();
+				finishWaiter = undefined;
+			} else {
+				if (!stopped && !inFlight) inFlight = Promise.resolve().then(heartbeatTick).catch(() => {});
+				heartbeatTimer = setTimer(heartbeatDue, Math.min(heartbeatMs, remaining));
+				if (heartbeatTimer.unref) heartbeatTimer.unref();
+			}
+		}
+		heartbeatTimer = setTimer(heartbeatDue, Math.min(heartbeatMs, leaseDeadline - acknowledgedAt));
 		if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 		let result;
@@ -245,10 +265,17 @@ export function createDistributedLock(client, options = {}) {
 			result = await fn(controller.signal);
 		} finally {
 			stopped = true;
-			clearIntervalTimer(heartbeatTimer);
-			// Finish a refresh already on the wire; queued ticks see stopped and
-			// do no work. A late loss verdict must precede the caller's result.
-			if (inFlight) await inFlight;
+			// Keep deadline observation alive while an admitted refresh settles.
+			// Expiry releases this wait even if the transport never replies.
+			if (inFlight && !lost) {
+				if (monotonicNow() >= leaseDeadline) {
+					lost = true;
+					lostError = new LockLostError(key);
+					mLost?.inc({ key_class: keyClass });
+					controller.abort(lostError);
+				} else await new Promise(resolve => { finishWaiter = resolve; });
+			}
+			clearTimer(heartbeatTimer);
 			if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
 			// A loss verdict always calls controller.abort(...). The signal must
 			// always be aborted by the time we observe `lost`. The reverse
@@ -268,9 +295,14 @@ export function createDistributedLock(client, options = {}) {
 					breaker?.success();
 				} catch (err) {
 					breaker?.failure(err);
-					// Best-effort: a release failure leaves the key in place
-					// until its TTL elapses. The compare-and-delete shape means
-					// we never accidentally release someone else's lock.
+					// Only a positive release proves ownership beyond the conservative
+					// deadline; a failed command cannot support a successful result.
+					if (monotonicNow() >= leaseDeadline) {
+						lost = true;
+						lostError = new LockLostError(key);
+						mLost?.inc({ key_class: keyClass });
+						controller.abort(lostError);
+					}
 				}
 			}
 		}

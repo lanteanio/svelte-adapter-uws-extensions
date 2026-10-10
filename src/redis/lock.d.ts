@@ -80,10 +80,11 @@ export class LockAcquireTimeoutError extends Error {
 
 /**
  * Surfaced via `controller.abort(new LockLostError(key))` on the
- * `signal` passed to the user fn when the heartbeat detects we no
- * longer own the key (operator force-takeover, TTL elapsed, etc.).
+ * `signal` passed to the user fn when ownership changes or its confirmed
+ * lease expires before a renewal succeeds.
  * Also rejects `withLock` after an otherwise successful callback when the
- * heartbeat or final compare-and-delete confirms ownership loss.
+ * heartbeat or final compare-and-delete confirms ownership loss, or a renewal
+ * deadline expires without renewed ownership.
  */
 export class LockLostError extends Error {
 	constructor(key: string);
@@ -105,12 +106,12 @@ export interface DistributedLock {
 	 * reject stale writes or use the task runner's Postgres fence.
 	 *
 	 * The heartbeat refreshes the TTL while `fn` is running; if the
-	 * heartbeat detects we no longer own the key, the supplied
+	 * heartbeat detects loss or the last confirmed lease expires, the supplied
 	 * `AbortSignal` fires with a `LockLostError`. User code should
 	 * react via `signal.aborted` or `signal.addEventListener('abort')`.
 	 *
 	 * `fn`'s return value is forwarded only while ownership remains valid.
-	 * A confirmed loss rejects with `LockLostError` even if `fn` ignored its
+	 * A confirmed loss or expired renewal deadline rejects with `LockLostError` even if `fn` ignored its
 	 * signal. Errors thrown by `fn` retain precedence after cleanup.
 	 *
 	 * @example

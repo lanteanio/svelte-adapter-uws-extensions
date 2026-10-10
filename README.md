@@ -2309,16 +2309,16 @@ await lock.withLock('order-42', async (signal) => {
 });
 ```
 
-`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide cooperative lease on `key`. The user fn cannot forget to release - the lock module owns the release path. `fn`'s return value is forwarded through; errors thrown by `fn` propagate after the lock is released.
+`withLock(key, fn, options?)` runs `fn` while holding a cluster-wide cooperative lease on `key`. The user fn cannot forget to release - the lock module owns the release path. `fn`'s return value is forwarded only without lease loss; callback errors retain precedence after cleanup.
 
 #### How it works
 
 1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` - atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
 2. **Retry.** On collision (someone else holds the key), sleep `retryDelayMs` and try again. After `maxWaitMs` total wait, throw `LockAcquireTimeoutError`.
-3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. If the heartbeat returns 0 (we no longer own the key - operator force-takeover, TTL elapsed before we could refresh), the supplied `AbortSignal` fires with a `LockLostError` and the heartbeat stops.
-4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless). A heartbeat already in flight finishes before the call settles. If the heartbeat or release confirms ownership loss, an otherwise successful callback rejects with `LockLostError`; a callback error retains precedence.
+3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. A monotonic deadline starts when each acquire or renewal is sent. If no renewal is confirmed before that deadline, or Redis reports lost ownership, the supplied `AbortSignal` fires with `LockLostError`; a delayed reply cannot revive it.
+4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless). A heartbeat already in flight settles before the call finishes, bounded by its last confirmed lease deadline. Confirmed loss or an expired deadline with an unconfirmed release rejects an otherwise successful callback with `LockLostError`; a callback error retains precedence.
 
-The `AbortSignal` shape is the cluster-correctness story: when the heartbeat detects loss, your code learns immediately and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
+The `AbortSignal` shape is the cluster-correctness story: when a heartbeat detects loss or the local lease deadline expires, your code learns and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
 
 #### Cooperative, not a hard mutex
 
@@ -2350,7 +2350,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 #### Errors
 
 - **`LockAcquireTimeoutError`** - thrown by `withLock` when `maxWaitMs` elapses without a successful acquire. Properties: `key`, `waitedMs`.
-- **`LockLostError`** - surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it must react to prevent further effects. An otherwise successful `withLock()` rejects with this error after confirmed loss, including loss detected at release. Property: `key`.
+- **`LockLostError`** - surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when a heartbeat or release detects loss, or the local renewal deadline expires. The user fn keeps running through this; it must react to prevent further effects. An otherwise successful `withLock()` rejects with this error after confirmed loss or an expired renewal deadline, including uncertainty at release. Property: `key`.
 
 #### Metrics
 
@@ -2359,7 +2359,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 | `lock_acquired_total{key_class}` | Counter of successful acquires. `key_class` is `mapKey(key)`. |
 | `lock_acquire_wait_seconds` | Histogram of successful acquisition wait in seconds, with explicit fractional buckets. Replaces `lock_acquire_wait_ms`: migrate queries and thresholds by dividing milliseconds by 1000. |
 | `lock_acquire_timeouts_total{key_class}` | Counter of `withLock` calls that exceeded `maxWaitMs` without acquiring. |
-| `lock_lost_total{key_class}` | Counter of locks lost mid-flight via heartbeat detection. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
+| `lock_lost_total{key_class}` | Counter of locks lost through heartbeat/release detection or an expired renewal deadline. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
 
 #### When to use which
 
@@ -2456,7 +2456,7 @@ GC-pause caveat: a long stop-the-world pause on the leader can cause brief overl
 #### When to use which
 
 - **`createLeader`** for "exactly one of N workers fires this scheduled job." Cluster-wide singleton observation. The primitive holds long-lived state (the lease); the consumer polls `isLeader()` synchronously at every tick.
-- **`createDistributedLock`** for "at most one of N workers runs this critical section right now." Per-call cooperative serialization around a function that returns. The primitive holds the lease only while the function is running and forwards the function's return value; it is cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)).
+- **`createDistributedLock`** for "at most one of N workers runs this critical section right now." Per-call cooperative serialization around a function that returns. The primitive holds the lease while the function runs and forwards its return value only without lease loss; it is cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)).
 
 Both use the same backing Lua scripts and the same lease semantics; they differ in consumer shape (long-lived observer vs. scoped serializer).
 
