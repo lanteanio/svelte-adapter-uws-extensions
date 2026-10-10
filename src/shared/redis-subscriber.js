@@ -330,9 +330,7 @@ export function guardSubscriber(conn, owner) {
 		send,
 		restore: send,
 		isUp: () => conn.status === 'ready',
-		// ioredis writes a subscribe made during the handshake straight to the
-		// socket, and drops it without settling it when the socket closes
-		// before the handshake is done.
+		// Hold handshake calls behind ioredis's older offline/unanswered queues.
 		handshakeSocket: () => (conn.status === 'connect' && conn.stream ? conn.stream : null)
 	});
 
@@ -341,13 +339,15 @@ export function guardSubscriber(conn, owner) {
 	// a socket that closed in its handshake.
 	let readyBefore = false;
 	conn.on('ready', () => {
-		subs.settleLost(conn.stream);
+		subs.flushHeld();
 		if (!readyBefore) {
 			readyBefore = true;
 			return;
 		}
 		subs.restoreAll();
 	});
+	conn.on('error', (err) => subs.failHeld(err));
+	conn.on('close', () => subs.failHeld(new Error(CLOSED)));
 	// A connection that went silent, or stuck in its handshake, is closed so
 	// ioredis reconnects it, and the 'ready' after restores its channels.
 	const liveness = watchLiveness(owner, () => [conn], dropSocket);
@@ -372,6 +372,7 @@ export function guardSubscriber(conn, owner) {
 	const quit = conn.quit;
 	if (typeof quit === 'function') {
 		conn.quit = function (...args) {
+			subs.failHeld(new Error(CLOSED));
 			if (conn.status === 'ready' || conn.status === 'connect') {
 				liveness.stop();
 				if (quitTimer === null) {
@@ -407,13 +408,9 @@ export function guardSubscriber(conn, owner) {
  * `io.send`, and restore them on request with `io.restore` on the connection
  * that carries the subscriptions.
  *
- * A call sent while `io.handshakeSocket()` names a socket is lost when that
- * socket closes before the connection is ready, and settleLost() sends it
- * again once the connection is ready on another, for the channels no later
- * call of the owner has decided. What ioredis sends on its own at that ready
- * (its offline queue, and what an earlier ready connection left unanswered)
- * goes out first, and was asked for before the lost call or is a later call
- * of the owner that decides its channels.
+ * Calls made during a handshake are held until ready, after ioredis flushes
+ * its older offline and unanswered commands. Failed attempts reject held
+ * calls; later calls of the owner decide which channels still need sending.
  *
  * @param {any} target
  * @param {string} owner
@@ -424,7 +421,7 @@ export function guardSubscriber(conn, owner) {
  *   isUp: () => boolean,
  *   handshakeSocket?: () => unknown
  * }} io - `isUp` says whether that connection is ready; `handshakeSocket`
- *   names the socket a call is written to during its handshake, null otherwise
+ *   names the socket whose handshake holds owner calls, null otherwise
  */
 function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handshakeSocket }) {
 	/** @type {Map<string, Set<string>>} kind -> channels the owner holds */
@@ -436,39 +433,24 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 	/** @type {Map<string, number>} */
 	const inFlight = new Map();
 	let callSeq = 0;
-	/** @typedef {{ name: string, prefix: string, keys: string[], id: number, socket: unknown, done: boolean, resolve: (v: unknown) => void, reject: (e: unknown) => void }} Exposed */
-	/** @type {Exposed[]} calls written during a handshake not known to be done, in order */
-	let exposed = [];
+	/** @typedef {{ name: string, prefix: string, keys: string[], id: number, resolve: (v: unknown) => void, reject: (e: unknown) => void }} HeldCall */
+	/** @type {HeldCall[]} owner calls held during the handshake, in order */
+	let handshakeCalls = [];
 
-	/**
-	 * Send a call of the owner. One written during a handshake is kept until
-	 * the connection is ready, and the owner gets a promise of its own, which
-	 * the reply settles, or settleLost() when the socket closed first.
-	 *
-	 * @param {string} name
-	 * @param {unknown[]} args
-	 * @param {string} prefix
-	 * @param {string[]} keys - the in-flight keys the call decides
-	 * @param {number} id
-	 */
 	function dispatch(name, args, prefix, keys, id) {
-		const socket = handshakeSocket ? handshakeSocket() : null;
-		const reply = send(name, args);
-		if (socket === null) return reply;
-		return new Promise((resolve, reject) => {
-			/** @type {Exposed} */
-			const call = { name, prefix, keys, id, socket, done: false, resolve, reject };
-			exposed.push(call);
-			reply.then((value) => {
-				if (call.done) return;
-				call.done = true;
-				resolve(value);
-			}, (err) => {
-				if (call.done) return;
-				call.done = true;
-				reject(err);
-			});
+		if (!handshakeSocket || handshakeSocket() === null) return send(name, args);
+		const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+		const reply = new Promise((resolve, reject) => {
+			handshakeCalls.push({ name, prefix, keys, id, resolve, reject });
 		});
+		if (callback) reply.then((value) => callback(null, value), (error) => callback(error));
+		return reply;
+	}
+
+	function failHeld(error) {
+		const calls = handshakeCalls;
+		handshakeCalls = [];
+		for (const call of calls) call.reject(error);
 	}
 
 	for (const kind of kinds) {
@@ -634,19 +616,11 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 
 	return {
 		restoreAll,
-		/**
-		 * The connection is ready on `current`: send again, in order, each call
-		 * written during the handshake of a socket that closed first (see
-		 * above). One written on `current` is answered there.
-		 *
-		 * @param {unknown} current
-		 */
-		settleLost(current) {
-			const calls = exposed;
-			exposed = [];
+		/** Send held calls after ioredis has flushed older commands. */
+		flushHeld() {
+			const calls = handshakeCalls;
+			handshakeCalls = [];
 			for (const call of calls) {
-				if (call.done || call.socket === current) continue;
-				call.done = true;
 				const open = [];
 				for (const key of call.keys) {
 					if (inFlight.get(key) === call.id) open.push(key.slice(call.prefix.length));
@@ -655,20 +629,16 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 					call.resolve(0);
 					continue;
 				}
-				send(call.name, [open]).then(call.resolve, call.reject);
+				try { send(call.name, [open]).then(call.resolve, call.reject); }
+				catch (error) { call.reject(error); }
 			}
 		},
-		/** Stop for good: a call lost with a socket is rejected. */
+		failHeld,
+		/** Stop for good: held calls cannot reach another socket. */
 		end() {
 			ended = true;
 			cancelRetry();
-			const calls = exposed;
-			exposed = [];
-			for (const call of calls) {
-				if (call.done) continue;
-				call.done = true;
-				call.reject(new Error(CLOSED));
-			}
+			failHeld(new Error(CLOSED));
 		},
 		/** Whether the owner holds any channel. */
 		holdsAny() {

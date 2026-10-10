@@ -640,12 +640,11 @@ describe('subscriber connections that stop answering', () => {
 		expect(closed).toEqual([]);
 	});
 
-	it('close a standalone subscriber stuck in its handshake, and send again what its owner asked for meanwhile', async () => {
+	it('hold owner calls during a stuck handshake and send only the latest intent when ready', async () => {
 		const clock = captureTimers();
 		const conn = connected('pubsub');
 		sink = captureRegistered();
-		// Written during the handshake and never answered; ioredis drops these
-		// without settling them when the socket closes.
+		// Held during the handshake instead of writing ahead of older queues.
 		conn.status = 'connect';
 		conn.gate = new Promise(() => {});
 		const a = conn.subscribe('a');
@@ -657,17 +656,17 @@ describe('subscriber connections that stop answering', () => {
 		await clock.tick();
 		expect(conn.sockets[0].destroyed).toBe(true);
 		expect(sink.records[0].attributes).toEqual({ owner: 'pubsub', timeoutMs: 30000 });
-		// Ready again: sent again in order, for the channels a later call did
+		// Ready again: sent in order, for the channels a later call did
 		// not decide.
 		await Promise.all([a, b, undoA]);
-		expect(conn.calls.slice(3)).toEqual([['subscribe', 'b'], ['unsubscribe', 'a']]);
+		expect(conn.calls).toEqual([['subscribe', 'b'], ['unsubscribe', 'a']]);
 		expect(conn.server.subscribe).toEqual(new Set(['b']));
 		// Held from then on.
 		conn.reconnect();
 		expect(conn.server.subscribe).toEqual(new Set(['b']));
 	});
 
-	it('send again a call lost in the handshake of the first connection', async () => {
+	it('hold a call through the first handshake until a ready connection', async () => {
 		const clock = captureTimers();
 		const conn = guardSubscriber(fakeConn(), 'pubsub');
 		conn.status = 'connect';
@@ -678,11 +677,11 @@ describe('subscriber connections that stop answering', () => {
 		await clock.tick();
 		expect(conn.sockets[0].destroyed).toBe(true);
 		await a;
-		expect(conn.calls).toEqual([['subscribe', 'a'], ['subscribe', 'a']]);
+		expect(conn.calls).toEqual([['subscribe', 'a']]);
 		expect(conn.server.subscribe).toEqual(new Set(['a']));
 	});
 
-	it('send nothing lost in a handshake again for a channel a later call of the owner decided', async () => {
+	it('skip a held handshake call for a channel a later owner call decided', async () => {
 		const conn = connected('pubsub');
 		conn.status = 'connect';
 		conn.gate = new Promise(() => {});
@@ -694,11 +693,11 @@ describe('subscriber connections that stop answering', () => {
 		const undo = conn.unsubscribe('a');
 		conn.reconnect();
 		await Promise.all([a, undo]);
-		expect(conn.calls).toEqual([['subscribe', 'a'], ['unsubscribe', 'a']]);
+		expect(conn.calls).toEqual([['unsubscribe', 'a']]);
 		expect(conn.server.subscribe).toEqual(new Set());
 	});
 
-	it('send again an unsubscribe of everything lost in a handshake for the channels the owner held', async () => {
+	it('flush a held unsubscribe-all for channels the owner held', async () => {
 		const conn = connected('pubsub');
 		await conn.subscribe('a');
 		// ioredis sends again on the next ready what a ready connection left
@@ -713,7 +712,7 @@ describe('subscriber connections that stop answering', () => {
 		expect(conn.calls.slice(-1)).toEqual([['unsubscribe', 'a']]);
 	});
 
-	it('wait for the reply of a call written during a handshake that completes', async () => {
+	it('wait for the reply of a held call after the handshake completes', async () => {
 		const conn = connected('pubsub');
 		conn.status = 'connect';
 		let answer;
@@ -729,7 +728,7 @@ describe('subscriber connections that stop answering', () => {
 		expect(conn.server.subscribe).toEqual(new Set(['a']));
 	});
 
-	it('reject a call lost in a handshake when the connection ends or is closed between two attempts', async () => {
+	it('reject a held handshake call when the connection ends or disconnects', async () => {
 		const conn = connected('pubsub');
 		conn.status = 'connect';
 		conn.gate = new Promise(() => {});
@@ -1947,5 +1946,69 @@ describe('Cluster subscribers on nodes that go silent, leave or cannot be reache
 		expect(cluster.disconnects).toEqual([]);
 		expect(cluster.opened).toHaveLength(3);
 		expect(clock.pending()).toEqual([]);
+	});
+});
+
+
+describe('handshake owner command ordering', () => {
+	it.each([['subscribe', 'unsubscribe'], ['psubscribe', 'punsubscribe'], ['ssubscribe', 'sunsubscribe']])('holds %s behind older offline commands', async (subscribe, unsubscribe) => {
+		const raw = fakeConn();
+		const original = raw[subscribe];
+		let flushOffline;
+		raw[subscribe] = (...args) => raw.status === 'connecting'
+			? new Promise((resolve, reject) => { flushOffline = () => original(...args).then(resolve, reject); })
+			: original(...args);
+		const conn = guardSubscriber(raw, 'pubsub');
+		conn.emit('ready');
+		conn.status = 'connecting';
+		const first = conn[subscribe]('x');
+		conn.status = 'connect';
+		const callback = vi.fn();
+		const undo = conn[unsubscribe]('x', callback);
+		expect(conn.calls).toEqual([]);
+		conn.status = 'ready';
+		flushOffline();
+		conn.emit('ready');
+		await Promise.all([first, undo]);
+		expect(conn.server[subscribe]).toEqual(new Set());
+		expect(callback).toHaveBeenCalledExactlyOnceWith(null, 0);
+		conn.reconnect();
+		expect(conn.server[subscribe]).toEqual(new Set());
+		conn.emit('end');
+	});
+
+	it.each(['error', 'close', 'quit'])('settles held promises and callbacks when a handshake fails via %s', async (event) => {
+		const raw = fakeConn();
+		raw.quit = async () => 'OK';
+		const conn = guardSubscriber(raw, 'pubsub');
+		conn.emit('ready');
+		conn.status = 'connect';
+		const callback = vi.fn();
+		const waiting = conn.subscribe('x', callback);
+		const rejected = expect(waiting).rejects.toThrow(event === 'error' ? 'WRONGPASS' : 'Connection is closed');
+		if (event === 'quit') await conn.quit();
+		else conn.emit(event, new Error('WRONGPASS'));
+		await rejected;
+		expect(callback).toHaveBeenCalledTimes(1);
+		expect(callback.mock.calls[0][0]).toBeInstanceOf(Error);
+		conn.reconnect();
+		await flush();
+		expect(conn.calls).toEqual([]);
+		conn.emit('end');
+	});
+
+	it('holds unsubscribe-all after a previously unanswered subscribe is resent', async () => {
+		const conn = connected();
+		await conn.subscribe('x');
+		conn.status = 'connect';
+		const undo = conn.unsubscribe();
+		expect(conn.calls).toEqual([['subscribe', 'x']]);
+		// Model ioredis resending the unanswered older subscribe before ready.
+		conn.server.subscribe.add('x');
+		conn.status = 'ready';
+		conn.emit('ready');
+		await undo;
+		expect(conn.server.subscribe).toEqual(new Set());
+		conn.emit('end');
 	});
 });
