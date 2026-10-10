@@ -1091,6 +1091,12 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('cjson.decode') && script.includes('liveCount')) {
 					return evalGroupJoin(numKeys, args);
 				}
+				// Whole-hash TTL stays inert, matching this mock's EXPIRE surface.
+				if (script.includes('IDEM_INDEX')) {
+					if (!hashes.has(args[0])) hashes.set(args[0], new Map());
+					hashes.get(args[0]).set(args[1], '1');
+					return 1;
+				}
 				// Idempotency acquire (SET NX EX, then GET, distinguish pending vs result)
 				if (script.includes("'NX', 'EX', ARGV[2]") && script.includes("return {0, '', 1}")) {
 					return evalIdempotencyAcquire(args);

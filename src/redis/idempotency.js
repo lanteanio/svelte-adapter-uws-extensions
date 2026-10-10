@@ -108,6 +108,18 @@ end
 return 0
 `;
 
+// Old servers lack per-field hash expiry. Never shorten the shared index
+// below an earlier result's remaining lifetime when later results use less TTL.
+const INDEX_SCRIPT = `
+-- IDEM_INDEX
+redis.call('HSET', KEYS[1], ARGV[1], '1')
+local ttl = tonumber(ARGV[2])
+if redis.call('PTTL', KEYS[1]) < ttl then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+end
+return 1
+`;
+
 const PENDING_PREFIX = '__idem_pending__';
 
 /**
@@ -195,8 +207,8 @@ export function createIdempotencyStore(client, options = {}) {
 	// collision could over-delete or miss). A hash (vs a set) keeps it portable
 	// and lets fields carry TTLs. The store has no sweep loop (pure EX TTL), so
 	// each index field expires with its own cache entry via per-field HPEXPIRE
-	// (Redis 7.4+ / Valkey 9.0+); older servers fall back to a whole-key sliding
-	// EXPIRE, where a busy user's writes keep every field alive - fields can then
+	// (Redis 7.4+ / Valkey 9.0+); older servers fall back to a whole-key maximum
+	// expiry, where a busy user's writes keep every field alive - fields can then
 	// outlive their cache entries, and any stale field is a no-op DEL on purge.
 	// The composite index key is NUL-delimited, so neither segment may
 	// contain NUL - otherwise distinct (tenant,user) pairs collide
@@ -320,15 +332,15 @@ export function createIdempotencyStore(client, options = {}) {
 						if (forgetUser !== null) {
 							const idxKey = byUserKey(forgetTenant, forgetUser);
 							const hexOk = await hexReady;
-							const tx = redis.multi();
-							tx.hset(idxKey, k, '1');
-							// Per-field TTL bounds each index field to its own cache
-							// entry's lifetime; the whole-key fallback slides instead,
-							// so on old servers a busy user's index is bounded by their
-							// LAST commit rather than per entry.
-							if (hexOk) tx.hpexpire(idxKey, resultTtl * 1000, 'FIELDS', 1, k);
-							else tx.expire(idxKey, resultTtl);
-							await tx.exec().catch(() => { /* index best-effort; the cache entry is committed */ });
+							if (hexOk) {
+								const tx = redis.multi();
+								tx.hset(idxKey, k, '1');
+								tx.hpexpire(idxKey, resultTtl * 1000, 'FIELDS', 1, k);
+								await tx.exec().catch(() => { /* cache entry already committed */ });
+							} else {
+								await evalCached(redis, INDEX_SCRIPT, 1, idxKey, k, resultTtl * 1000)
+									.catch(() => { /* index best-effort; cache entry already committed */ });
+							}
 						}
 						mCommits?.inc();
 					},

@@ -29,6 +29,21 @@ describe('redis idempotency (integration)', () => {
 		await client.quit();
 	});
 
+	it('old-server index retains long-lived results after a shorter commit', async () => {
+		const info = client.redis.info;
+		client.redis.info = async () => '# Server\r\nredis_version:6.2.0\r\n';
+		try {
+			const store = createIdempotencyStore(client);
+			await (await store.acquire('long', 60, { user: 'alice' })).commit('long');
+			await (await store.acquire('short', 1, { user: 'alice' })).commit('short');
+			const index = client.key('idem:byuser:' + String.fromCharCode(0) + 'alice');
+			expect(await client.redis.pttl(index)).toBeGreaterThan(55_000);
+			await waitRedisMs(client.redis, 1100);
+			expect(await store.purgeUser(null, 'alice')).toBeGreaterThanOrEqual(1);
+			expect((await store.acquire('long')).acquired).toBe(true);
+		} finally { client.redis.info = info; }
+	});
+
 	it.each([undefined, 0, 5, 864000])('per-acquire retention %s replaces the pending lease', async (ttl) => {
 		const store = createIdempotencyStore(client);
 		const slot = await store.acquire('retention', ttl);
