@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add identifier-free aggregate breaker state and transition metrics with cleanup, plus native PostgreSQL active, idle and capacity gauges that deduplicate shared pools.
+- Clarify that enqueue creates a fresh task receipt and forwards its idempotency key to handlers; only run uses the optional result cache. Verify independent submissions against PostgreSQL.
+
 - Add optional bounded Redis relay outcome counters, local messages with unconfirmed relay, and relay duration in seconds for standard and sharded buses. Document partial failures and ambiguous delivery.
 
 - Refresh compatible runtime clients to ioredis 5.11.1 and pg 8.23.1 in the lockfile, and define a quarterly client maintenance review with real-backend and performance checks.
