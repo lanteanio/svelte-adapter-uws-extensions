@@ -682,7 +682,7 @@ describe('redis pubsub bus', () => {
 			// A payload that fits with its context keeps it.
 			origin.wrap(source).publish('chat', 'small', 'x');
 			await settle();
-			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([null, null, context]);
+			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([context]);
 			warn.mockRestore();
 			await origin.deactivate();
 			await peer.deactivate();
