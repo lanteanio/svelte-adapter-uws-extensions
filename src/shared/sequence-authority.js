@@ -99,7 +99,7 @@ export function receivedSeq(s) {
  */
 export function receivedOptions(s, j, compress) {
 	const seq = receivedSeq(s);
-	if (j === undefined && compress !== true) {
+	if (j === undefined && typeof compress !== 'boolean') {
 		if (seq === undefined) return RECEIVED_COUNTER;
 		if (seq === false) return RECEIVED_UNSEQUENCED;
 	}
@@ -107,7 +107,7 @@ export function receivedOptions(s, j, compress) {
 	const opts = { relay: false };
 	if (seq !== undefined) opts.seq = seq;
 	if (j !== undefined) opts.jitterMs = j;
-	if (compress === true) opts.compress = true;
+	if (typeof compress === 'boolean') opts.compress = compress;
 	return opts;
 }
 

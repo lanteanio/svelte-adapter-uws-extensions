@@ -1,3 +1,4 @@
+import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 /**
  * Sharded Redis pub/sub bus for svelte-adapter-uws.
@@ -326,9 +327,9 @@ export function createShardedBus(client, options = {}) {
 			const codec = wireCodecs.get(parsed.capability);
 			if (codec && typeof activePlatform.publishWire === 'function') {
 				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-					receivedOptions(parsed.s, undefined, parsed.compress === true));
+					receivedOptions(parsed.s, undefined, parsed.compress === true ? true : undefined));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s));
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
 			}
 			return;
 		}
@@ -345,7 +346,7 @@ export function createShardedBus(client, options = {}) {
 					topic: m.topic,
 					event: m.event,
 					data: m.data,
-					options: receivedOptions(m.s, m.j, parsed.compress === true)
+					options: receivedOptions(m.s, m.j, parsed.compress === true ? true : undefined)
 				});
 			}
 			if (local.length === 0) return;
@@ -355,7 +356,7 @@ export function createShardedBus(client, options = {}) {
 				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
-					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
+					activePlatform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
 				}
 			}
 		} else {
@@ -366,7 +367,7 @@ export function createShardedBus(client, options = {}) {
 			mReceived?.inc({ topic: mt(parsed.topic) });
 			// Re-apply the de-herd window (`j`) and the origin's seq choice (`s`);
 			// `relay: false` stops the re-relay.
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j));
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
 		}
 	}
 
@@ -389,6 +390,7 @@ export function createShardedBus(client, options = {}) {
 		}
 		const s = opts ? carriedSeq(opts.seq) : undefined;
 		if (s !== undefined) /** @type {any} */ (env).s = s;
+		if (typeof opts?.compress === 'boolean') /** @type {any} */ (env).compress = opts.compress;
 		return env;
 	}
 
@@ -700,7 +702,7 @@ export function createShardedBus(client, options = {}) {
 	// the owner so a later reshard can be detected and reconciled. A stale cache
 	// would resolve the old owner, where ssubscribe hangs, so a timeout triggers
 	// one topology refresh + retry on the true owner.
-	async function subscribeChannelOnOwner(channel) {
+	async function subscribeChannelOnOwner(channel, admissionOwnsCleanup = false) {
 		const generation = subGeneration;
 		const slot = keySlot(channel);
 		// If a reshard was signaled, the cached owner map may be stale and an
@@ -735,10 +737,10 @@ export function createShardedBus(client, options = {}) {
 		// The bus closed while the subscribe was in flight: its connections are
 		// already quit.
 		if (generation !== subGeneration) return;
-		// Every topic on the channel was unfollowed meanwhile (a reconcile
-		// retry can outlive the unfollow): undo the subscribe rather than record
-		// an owner nothing will unsubscribe.
-		if (!channelRefcounts.has(channel)) {
+		// A reconcile retry can outlive the last unfollow. Shared admissions
+		// instead retain every physical subscription until all channels settle:
+		// another follower can arrive while a different channel is still pending.
+		if (!admissionOwnsCleanup && !channelRefcounts.has(channel)) {
 			withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe on slot ' + slot).catch(() => {});
 			return;
 		}
@@ -888,7 +890,7 @@ export function createShardedBus(client, options = {}) {
 		// slot (same owning node is not enough), and node.ssubscribe only resolves
 		// on the slot's owning master (Cluster.ssubscribe hangs), so subscribe each
 		// channel individually on its owner.
-		const results = await Promise.allSettled(channels.map((ch) => subscribeChannelOnOwner(ch)));
+		const results = await Promise.allSettled(channels.map((ch) => subscribeChannelOnOwner(ch, true)));
 		const failed = results.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
 	}
@@ -1257,6 +1259,7 @@ export function createShardedBus(client, options = {}) {
 			const publishBatchedTraced = (messages, options) => {
 				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
 				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
 				traced((traceContext) => {
 					// Preserve the platform's malformed-entry error without touching shard routing.
@@ -1309,6 +1312,7 @@ export function createShardedBus(client, options = {}) {
 			const publishBatchedUntraced = (messages, options) => {
 				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
 				for (let i = 0; i < messages.length; i++) {
 					if (!messages[i]) return platform.publishBatched(messages, options);
 				}

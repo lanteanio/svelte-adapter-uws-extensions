@@ -295,8 +295,8 @@ describe('redis pubsub bus', () => {
 			}));
 
 			expect(platform.published).toEqual([
-				{ topic: 'a', event: 'x', data: 1, options: { relay: false } },
-				{ topic: 'b', event: 'y', data: 2, options: { relay: false } }
+				{ topic: 'a', event: 'x', data: 1, options: { relay: false, compress: false } },
+				{ topic: 'b', event: 'y', data: 2, options: { relay: false, compress: false } }
 			]);
 		});
 

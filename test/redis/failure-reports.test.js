@@ -734,24 +734,27 @@ describe('cluster-only failure paths', () => {
 
 	it('retries a channel its new owner refused until it subscribes', async () => {
 		const { cluster, bus } = await followedCluster();
-		// Every retry delay elapses at once; the reconcile debounce keeps its 0.
-		setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
-		cluster.setOwner('node-b');
-		const nodeB = cluster.conns.get('node-b');
-		nodeB.refuse = true;
-		sink = captureRegistered();
-		cluster.conns.get('node-a').emit('error', new Error('MOVED'));
-		await settle(60);
-		expect(nodeB.attempts).toBeGreaterThan(4);
-		expect(sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE)).toHaveLength(1);
+		try {
+			// Every retry delay elapses at once; the reconcile debounce keeps its 0.
+			setRuntimeEnv({ timers: { set: (cb, ms, ...a) => setTimeout(cb, ms >= 1000 ? 2 : ms, ...a) } });
+			cluster.setOwner('node-b');
+			const nodeB = cluster.conns.get('node-b');
+			nodeB.refuse = true;
+			sink = captureRegistered();
+			cluster.conns.get('node-a').emit('error', new Error('MOVED'));
+			await settle(60);
+			expect(nodeB.attempts).toBeGreaterThan(4);
+			expect(sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE)).toHaveLength(1);
 
-		nodeB.refuse = false;
-		await settle(60);
-		expect(nodeB.subscribed.has(CHANNEL)).toBe(true);
-		const attempts = nodeB.attempts;
-		await settle(30);
-		expect(nodeB.attempts).toBe(attempts);
-		await bus.deactivate();
+			nodeB.refuse = false;
+			await settle(60);
+			expect(nodeB.subscribed.has(CHANNEL)).toBe(true);
+			const attempts = nodeB.attempts;
+			await settle(30);
+			expect(nodeB.attempts).toBe(attempts);
+		} finally {
+			await bus.deactivate();
+		}
 	});
 
 	it('does not wait out a pending retry when a subscriber error arrives', async () => {

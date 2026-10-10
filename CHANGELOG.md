@@ -107,8 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Apply capability-cookie key checks to `previousSecret` as well as the signing key, and reject visually empty or direction-changing degradation notices while preserving visible script/emoji joiners.
 
-- Standard and sharded buses enforce complete outbound relay envelope caps, preserve local and cross-instance `compress: false`, and withhold oversized relays with failure reporting. Simulation forwards batch compression and packed mock declarations expose the matching recordings.
-- Sharded subscription admission restores a replacement follower that arrives while an unwanted subscription is being removed. Failed admissions roll back only their own reservations, and cancelled or successful half-open breaker probes release ownership.
+- Standard and sharded buses enforce outbound relay envelope caps, preserve explicit publish compression choices, and keep batch and codec fallbacks uncompressed unless opted in. Batched coalescing selects the final value before relay filtering or shard routing. Simulation forwards batch compression and packed mock declarations expose the matching recordings.
+- Sharded subscription admission preserves followers across multi-channel subscription and restoration races. WebSockets can retry failed subscriptions; closing or unsubscribing those sockets no longer stops delivery to other followers. Cancelled or successful half-open breaker probes release ownership.
+- Recover shard subscriptions lost during slot migration even when an outstanding Redis command absorbs the unsubscribe notification; a periodic state check detects missing subscriptions within about a second.
 - Topic broadcasts reject oversized request envelopes before dispatch and report and withhold oversized reply envelopes instead of allowing fleet-wide silent drops.
 
 - Expire and reconcile remote registry attributes even when close or erase notifications are lost; live local socket ownership remains authoritative.

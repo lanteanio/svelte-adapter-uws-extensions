@@ -95,6 +95,8 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		['seq: null', { seq: null }, { relay: false, seq: false }],
 		['seq: 12', { seq: 12 }, { relay: false, seq: 12 }],
 		['seq: 12n', { seq: 12n }, { relay: false, seq: 12 }],
+		['compress: false', { compress: false }, { relay: false, compress: false }],
+		['compress: true', { compress: true }, { relay: false, compress: true }],
 		['jitterMs and seq', { seq: false, jitterMs: 40 }, { relay: false, seq: false, jitterMs: 40 }]
 	])('a publish with %s reaches the peer with the same seq choice', async (_label, options, delivered) => {
 		const { b, a, wrapped, close } = await pair('bs1:');
@@ -156,16 +158,61 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		}
 	});
 
-	it('keeps compression when a peer falls back from a batch to individual publishes', async () => {
+	it.each([undefined, { compress: false }, { compress: true }])('keeps compression %j when a peer falls back from a batch to individual publishes', async options => {
 		const { b, wrapped, close } = await pair('batch-compression-fallback:');
 		b.publishBatched = undefined;
 		try {
-			wrapped.publishBatched([{ topic: 'chat', event: 'msg', data: 1, options: { seq: false } }], { compress: true });
+			wrapped.publishBatched([{ topic: 'chat', event: 'msg', data: 1, options: { seq: false } }], options);
 			await until(() => b.published.length === 1);
-			expect(b.published[0].options).toEqual({ relay: false, seq: false, compress: true });
+			expect(b.published[0].options).toEqual({ relay: false, seq: false, compress: options?.compress === true });
 		} finally {
 			await close();
 		}
+	});
+
+	it('preserves per-entry compression for ordinary batch publishes', async () => {
+		const { b, wrapped, close } = await pair('batch-entry-compression:');
+		try {
+			wrapped.batch([false, true, undefined].map((compress, data) => ({ topic: 'chat', event: 'msg', data, options: { compress } })));
+			await until(() => b.published.length === 3);
+			expect(b.published.map(entry => entry.options)).toEqual([
+				{ relay: false, compress: false }, { relay: false, compress: true }, { relay: false }
+			]);
+		} finally { await close(); }
+	});
+
+	it.each([false, true])('coalesces before relay filtering and shard routing (individual fallback=%s)', async fallback => {
+		const { a, b, busB, wrapped, close } = await pair('batch-coalesce:');
+		await follow(busB, 'other');
+		if (fallback) b.publishBatched = undefined;
+		try {
+			wrapped.publishBatched([
+				{ topic: 'chat', event: 'msg', data: 0, coalesceKey: 'position' },
+				{ topic: 'chat', event: 'msg', data: 1 },
+				{ topic: 'chat', event: 'msg', data: 2, coalesceKey: 'position' },
+				{ topic: 'chat', event: 'msg', data: 3, coalesceKey: 'local' },
+				{ topic: 'chat', event: 'msg', data: 4, coalesceKey: 'local', options: { relay: false } },
+				{ topic: 'other', event: 'msg', data: 5, coalesceKey: 'cross-topic' },
+				{ topic: 'chat', event: 'msg', data: 6, coalesceKey: 'cross-topic' }
+			]);
+			await until(() => b.published.length >= 3);
+			await sleep(20);
+			expect(b.published.map(entry => entry.data)).toEqual([1, 2, 6]);
+			expect(a.published.map(entry => entry.data)).toEqual([1, 2, 4, 6]);
+		} finally { await close(); }
+	});
+
+	it('forwards malformed entries even after finding a coalescing key', async () => {
+		const { a, wrapped, close } = await pair('batch-coalesce-malformed:');
+		const rejection = new TypeError('platform rejected malformed batch');
+		a.publishBatched = () => { throw rejection; };
+		try {
+			expect(() => wrapped.publishBatched([
+				{ topic: 'chat', event: 'msg', data: 0, coalesceKey: 'position' },
+				null,
+				{ topic: 'chat', event: 'msg', data: 1, coalesceKey: 'position' }
+			])).toThrow(rejection);
+		} finally { await close(); }
 	});
 
 	it('carries the seq choice of a shared-codec publishWire', async () => {
@@ -179,6 +226,15 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		}
 		expect(a.publishedWire[0].options).toEqual({ seq: false });
 		expect(b.publishedWire[0].options).toEqual({ relay: false, seq: false });
+	});
+
+	it.each([undefined, false, true])('keeps codec compression %j when a peer uses JSON fallback', async compress => {
+		const { b, wrapped, close } = await pair('wire-compression-fallback:', wirePlatform);
+		try {
+			wrapped.publishWire('chat', 'snap', 1, sharedCodec, { compress });
+			await until(() => b.published.length === 1);
+			expect(b.published[0].options).toEqual({ relay: false, compress: compress === true });
+		} finally { await close(); }
 	});
 
 	it.each([0, -3, 1.5, '7', 2 ** 60, true, null])('stamps the counter for a peer envelope whose s is %j', async (s) => {

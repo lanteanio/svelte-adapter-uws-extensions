@@ -394,9 +394,9 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 - **Per-subscriber wire frames drop too.** A subscriber receives one frame containing N events instead of N frames containing one event each.
 - **Per-message `relay: false` is honored.** Flagged messages still publish locally but are excluded from the Redis envelope.
 
-`publishBatched(messages, { compress: true })` applies compression locally and carries it to peer batches, including individual-publish fallbacks. Before any local delivery or Redis publish, the call serializes and size-checks every relay envelope: an oversized envelope throws `RangeError`, and serialization errors propagate. Either rejection leaves the entire batch undelivered; a batch whose messages all have `relay: false` needs no relay envelope and bypasses this cap. Rejections increment `pubsub_batch_rejected_total{reason="oversized"|"serialize"}`.
+`publishBatched(messages, { compress: true })` opts the whole batch into compression locally and on peers; omitted or false stays uncompressed, including individual-publish fallbacks. The last occurrence of each `coalesceKey` survives at its original position before relay filtering or shard splitting. Before any local delivery or Redis publish, the call serializes and size-checks every relay envelope: oversized envelopes throw `RangeError`, and serialization errors propagate. Either rejection leaves the batch undelivered; messages all marked `relay: false` bypass this relay cap. Rejections increment `pubsub_batch_rejected_total{reason="oversized"|"serialize"}`.
 
-`wrapped.batch(messages)` is left in place for callers that explicitly want N independent publishes; it does not produce wire batching. Use `publishBatched` whenever you want one frame per subscriber per call.
+`wrapped.batch(messages)` keeps N independent publishes and each entry's compression choice, as ordinary `publish` does. Upgrade all receivers before relying on cross-instance `compress: false`. Use `publishBatched` for wire batching.
 
 #### Options
 
@@ -524,7 +524,7 @@ distributed.publishBatched([
 
 Compression is carried with the batch as on the unsharded bus. Every shard envelope is serialized and size-checked before any local delivery or Redis publish; an oversized envelope throws `RangeError` atomically and serialization errors propagate. All-local `relay: false` batches bypass the relay cap. Rejections increment `sharded_pubsub_batch_rejected_total{reason="oversized"|"serialize"}`.
 
-Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with batch size, per-subscriber wire frames drop from N to 1, per-message `relay: false` honored. Use `publishBatched` for bulk operations; `wrapped.batch(messages)` remains a per-event loop for callers that explicitly want N separate publishes.
+Same options as the unsharded bus: compression defaults off, `{ compress: true }` applies to all peers, and `coalesceKey` selects the last value across the whole call before shard splitting or `relay: false` filtering. Use `publishBatched` for bulk operations; `wrapped.batch(messages)` keeps N separate publishes and their individual compression choices.
 
 #### Options
 

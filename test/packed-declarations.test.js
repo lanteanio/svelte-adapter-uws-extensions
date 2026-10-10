@@ -64,10 +64,13 @@ stopBreakerMetrics();
 // @ts-expect-error A breaker cannot be replaced by an arbitrary object.
 wireBreakerMetrics({}, createMetrics());
 const platform = mockPlatform();
-platform.publishBatched([{ topic: 'room', event: 'changed' }], { compress: true });
+platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 'latest' }], { compress: true });
 const compressed: boolean | undefined = platform.publishedBatches[0].options?.compress;
+const coalesceKey: string | undefined = platform.publishedBatches[0].messages[0].coalesceKey;
 // @ts-expect-error Compression must be boolean.
 platform.publishBatched([], { compress: 'true' });
+// @ts-expect-error Coalescing keys must be strings.
+platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 1 }]);
 declare const redis: RedisClient;
 interface SessionData { userId: string; count: number }
 const options: DistributedSessionOptions<SessionData> = { forgetUserId: data => data.userId };

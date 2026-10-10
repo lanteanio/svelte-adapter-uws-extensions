@@ -1,3 +1,4 @@
+import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 /**
  * Redis pub/sub bus for svelte-adapter-uws.
  *
@@ -302,9 +303,9 @@ export function createPubSubBus(client, options = {}) {
 			const codec = wireCodecs.get(parsed.capability);
 			if (codec && typeof activePlatform.publishWire === 'function') {
 				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
-					receivedOptions(parsed.s, undefined, parsed.compress === true));
+					receivedOptions(parsed.s, undefined, parsed.compress === true ? true : undefined));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s));
+				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
 			}
 			return;
 		}
@@ -320,7 +321,7 @@ export function createPubSubBus(client, options = {}) {
 					topic: m.topic,
 					event: m.event,
 					data: m.data,
-					options: receivedOptions(m.s, m.j, parsed.compress === true)
+					options: receivedOptions(m.s, m.j, parsed.compress === true ? true : undefined)
 				});
 			}
 			if (local.length === 0) return;
@@ -331,7 +332,7 @@ export function createPubSubBus(client, options = {}) {
 				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
-					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
+					activePlatform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
 				}
 			}
 		} else {
@@ -343,7 +344,7 @@ export function createPubSubBus(client, options = {}) {
 			// Re-apply the de-herd window (carried as `j`) and the origin's seq
 			// choice (carried as `s`) so this node's subscribers stagger AND dedup
 			// against the origin's seq space; `relay: false` stops the re-relay.
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j));
+			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
 		}
 	}
 
@@ -365,6 +366,7 @@ export function createPubSubBus(client, options = {}) {
 		}
 		const s = options ? carriedSeq(options.seq) : undefined;
 		if (s !== undefined) /** @type {any} */ (env).s = s;
+		if (typeof options?.compress === 'boolean') /** @type {any} */ (env).compress = options.compress;
 		return env;
 	}
 
@@ -531,6 +533,7 @@ export function createPubSubBus(client, options = {}) {
 			const publishBatchedTraced = (messages, options) => {
 				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
 				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
 				traced((traceContext) => {
 					const relayable = relayableBatch(messages);
@@ -572,6 +575,7 @@ export function createPubSubBus(client, options = {}) {
 			const publishBatchedUntraced = (messages, options) => {
 				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
 				const relayable = new Array(messages.length);
 				let count = 0;
 				for (let i = 0; i < messages.length; i++) {
@@ -634,6 +638,7 @@ export function createPubSubBus(client, options = {}) {
 					// the common counter-stamped publish (byte-identical relay wire).
 					const s = options ? carriedSeq(options.seq) : undefined;
 					if (s !== undefined) /** @type {any} */ (env).s = s;
+					if (typeof options?.compress === 'boolean') /** @type {any} */ (env).compress = options.compress;
 					scheduleRelay(JSON.stringify(env), 1);
 
 					return result;

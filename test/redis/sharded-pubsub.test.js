@@ -376,8 +376,8 @@ describe('redis sharded bus', () => {
 			await new Promise((r) => setTimeout(r, 5));
 
 			expect(platformB.published).toEqual([
-				{ topic: 'chat:room1', event: 'msg', data: { id: 1 }, options: { relay: false } },
-				{ topic: 'chat:room2', event: 'msg', data: { id: 2 }, options: { relay: false } }
+				{ topic: 'chat:room1', event: 'msg', data: { id: 1 }, options: { relay: false, compress: false } },
+				{ topic: 'chat:room2', event: 'msg', data: { id: 2 }, options: { relay: false, compress: false } }
 			]);
 
 			await busA.deactivate();
