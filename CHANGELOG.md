@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
+
 ### Fixed
 
+- Redis buses preserve batch compression options on local and remote delivery.
+- Redis buses carry null as an unsequenced choice and bigint authorities as safe integer sequences.
 - Distributed session options carry the session data type through user erasure callbacks and inferred stores.
 - Postgres declarations include their required pg types for strict TypeScript consumers.
 

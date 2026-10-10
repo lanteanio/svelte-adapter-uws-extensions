@@ -118,14 +118,14 @@ The three ecosystem packages move together. Bump them as a group:
 |---|---|---|---|
 | `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
 | `^0.5.8` | `^0.5.0` | `^0.5.0` | Stable. Node 22+ required. |
-| `0.6.0-next.94` | `0.6.0-next.91` | `0.6.0-next.64` | Coordinated development candidate. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). |
+| `0.6.0-next.95` | `0.6.0-next.95` | `0.6.0-next.64` | Coordinated development candidate. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). |
 
 Mixed-version installs are rejected at install time with a peer-dep warning.
 
 ## Installation
 
 ```bash
-npm install svelte-adapter-uws@0.6.0-next.94 svelte-adapter-uws-extensions@0.6.0-next.64 ioredis
+npm install svelte-adapter-uws@0.6.0-next.95 svelte-adapter-uws-extensions@0.6.0-next.64 ioredis
 npm install https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v20.69.0.tar.gz
 npm exec -- svelte-adapter-uws-preflight
 ```
@@ -141,7 +141,7 @@ Postgres support is optional:
 npm install pg
 ```
 
-Requires `svelte-adapter-uws >= 0.6.0-next.91` as a peer dependency.
+Requires `svelte-adapter-uws >= 0.6.0-next.95` as a peer dependency.
 The exact command above is the deterministic first-success route for this
 release.
 
