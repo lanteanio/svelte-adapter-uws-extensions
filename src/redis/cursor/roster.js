@@ -27,7 +27,8 @@ export function createRoster({ topics, instanceId, cursorTtl }) {
 		if (!entries) live.set(topic, entries = new Map());
 		for (const item of incoming) {
 			if (!item || typeof item.key !== 'string') continue;
-			const entry = event === EVENTS.REMOVE ? { removed: true } : { ...entries.get(item.key), removed: false };
+			const entry = event === EVENTS.REMOVE ? { removed: true } : (entries.get(item.key) || {});
+			if (event !== EVENTS.REMOVE) entry.removed = false;
 			if (event === EVENTS.JOIN) entry.user = item.user;
 			if (event === EVENTS.UPDATE || event === EVENTS.BULK) entry.data = item.data;
 			entry.ts = now();

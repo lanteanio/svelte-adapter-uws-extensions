@@ -262,6 +262,7 @@ export function createCursor(client, options = {}) {
 	 */
 	const wsState = new Map();
 	const topicMembers = new Map();
+	const snapshotWaiters = new Map();
 
 	function watchTopic(ws, topic) {
 		let members = topicMembers.get(topic);
@@ -424,7 +425,25 @@ export function createCursor(client, options = {}) {
 		snapshotIntervalMs,
 		activeTopics,
 		mergeRoster: roster.merge,
-		emit,
+		watchedTopics: () => topicMembers.keys(),
+		resetRoster: roster.clear,
+		recoverTopic(topic, cursors, platform) {
+			const catalog = cursors.map(({ key, user }) => ({ key, user }));
+			const positions = cursors.map(({ key, data }) => ({ key, data }));
+			const members = topicMembers.get(topic);
+			if (members) {
+				for (const ws of members) {
+					if (snapshotWaiters.get(ws)?.has(topic)) continue;
+					try {
+						emitTo(ws, '__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
+						emitTo(ws, '__cursor:' + topic, EVENTS.BULK, positions, platform);
+					} catch { /* closed socket */ }
+				}
+			} else if (cursors.some((entry) => !entry.key.startsWith(instanceId + ':'))) {
+				emit('__cursor:' + topic, EVENTS.CATALOG, catalog, platform);
+				emit('__cursor:' + topic, EVENTS.BULK, positions, platform);
+			}
+		},
 		onMessage: onPeerMessage,
 		queueRemove,
 		inUse: () => wsState.size > 0
@@ -591,6 +610,18 @@ export function createCursor(client, options = {}) {
 	 * @param {Promise<void>} [relayReady]
 	 */
 	async function emitSnapshot(ws, topic, platform, relayReady) {
+		let waiting = snapshotWaiters.get(ws);
+		if (!waiting) snapshotWaiters.set(ws, waiting = new Map());
+		waiting.set(topic, (waiting.get(topic) || 0) + 1);
+		try { await emitSnapshotBody(ws, topic, platform, relayReady); } finally {
+			const count = waiting.get(topic) - 1;
+			if (count) waiting.set(topic, count);
+			else waiting.delete(topic);
+			if (waiting.size === 0) snapshotWaiters.delete(ws);
+		}
+	}
+
+	async function emitSnapshotBody(ws, topic, platform, relayReady) {
 		try { ws.getBufferedAmount(); } catch { return; }
 		watchTopic(ws, topic);
 		// Server time first - even for an empty board - so the requester's

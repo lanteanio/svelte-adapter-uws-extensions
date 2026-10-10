@@ -89,6 +89,10 @@ const CLOSED = 'Connection is closed.';
 /** ioredis's message for a slot map no node it knows would give. */
 const CLUSTER_ALL_FAILED = 'Failed to refresh slots cache.';
 
+// Internal lifecycle events, emitted after a restore starts and succeeds.
+export const SUBSCRIBER_RESTORING = Symbol.for('uws.extensions.subscriber.restoring');
+export const SUBSCRIBER_RESTORED = Symbol.for('uws.extensions.subscriber.restored');
+
 /**
  * Open a subscriber connection on `source`, a client wrapper from
  * createRedisClient, with guarded re-subscription.
@@ -579,6 +583,7 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 		if (refused.length === 0) {
 			refusedReported = false;
 			retryMs = 0;
+			target.emit?.(SUBSCRIBER_RESTORED);
 			return;
 		}
 		if (!refusedReported) {
@@ -597,6 +602,7 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 	}
 
 	function restoreAll() {
+		if ([...held.values()].some((channels) => channels.size > 0)) target.emit?.(SUBSCRIBER_RESTORING);
 		cancelRetry();
 		const id = ++round;
 		const attempts = [];

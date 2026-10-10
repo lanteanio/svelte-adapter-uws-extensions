@@ -21,7 +21,7 @@ import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
-import { openSubscriber } from '../../shared/redis-subscriber.js';
+import { openSubscriber, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../shared/redis-subscriber.js';
 
 // Backoff for reopening a relay subscription that could not open.
 const SUBSCRIBE_RETRY_MIN_MS = 1000;
@@ -31,13 +31,13 @@ const SUBSCRIBE_RETRY_MAX_MS = 30000;
  * Create the cursor Redis I/O subsystem. State (pending snapshots, subscriber,
  * timers) is private to the returned closure; the tracker drives it through the
  * exposed surface. The peer-message router (`onMessage`) and the local wire
- * `emit` are injected so this module never imports the scheduler.
+ * recovery delivery are injected so this module never imports the scheduler.
  *
  * @param {{
  *   client: import('../index.js').RedisClient, redis: import('ioredis').Redis,
  *   channel: string, instanceId: string, b: any, validator: any,
- *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function,
- *   emit: Function, onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
+ *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, watchedTopics: Function, recoverTopic: Function, resetRoster: Function,
+ *   onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
  *   inUse: () => boolean
  * }} deps
  */
@@ -52,7 +52,9 @@ export function createRedisIo({
 	snapshotIntervalMs,
 	activeTopics,
 	mergeRoster,
-	emit,
+	watchedTopics,
+	recoverTopic,
+	resetRoster,
 	onMessage,
 	queueRemove,
 	inUse
@@ -87,27 +89,52 @@ export function createRedisIo({
 	let cleanupTimer = null;
 	let snapshotTimer = null;
 
-	// Once subscribed, catch up on the positions other instances stored while
-	// this one was not listening.
-	async function catchUp() {
-		if (!activePlatform || activeTopics.size === 0) return;
-		const topicList = [...activeTopics];
-		const commands = topicList.map((topic) => ['hgetall', hashKey(topic)]);
-		let results;
-		try {
-			results = await execMultiSlot(redis, commands);
-		} catch { return; }
-		if (!activePlatform) return;
-		for (let i = 0; i < topicList.length; i++) {
-			const [err, all] = results[i];
-			if (err || !all) continue;
-			const topic = topicList[i];
-			const cursors = mergeRoster(topic, all);
-			if (activePlatform && cursors.some((entry) => !entry.key.startsWith(instanceId + ':'))) {
-				emit('__cursor:' + topic, EVENTS.CATALOG, cursors.map(({ key, user }) => ({ key, user })), activePlatform);
-				emit('__cursor:' + topic, EVENTS.BULK, cursors.map(({ key, data }) => ({ key, data })), activePlatform);
+	let recoveryNeeded = true;
+	let recoveryRunning = null;
+	let recoveryTimer = null;
+	let recoveryRetryMs = SUBSCRIBE_RETRY_MIN_MS;
+	let recoveryGeneration = 0;
+	let relayOnline = false;
+
+	function retryRecoveryLater() {
+		if (disposed || recoveryTimer !== null || !recoveryNeeded || !inUse()) return;
+		recoveryTimer = setTimer(() => {
+			recoveryTimer = null;
+			catchUp();
+		}, recoveryRetryMs);
+		recoveryTimer?.unref?.();
+		recoveryRetryMs = Math.min(recoveryRetryMs * 2, SUBSCRIBE_RETRY_MAX_MS);
+	}
+
+	function catchUp() {
+		if (recoveryRunning) return recoveryRunning;
+		if (!recoveryNeeded || !relayOnline || disposed || !activePlatform) return Promise.resolve();
+		const generation = recoveryGeneration;
+		const topicList = [...new Set([...activeTopics, ...watchedTopics()])];
+		if (topicList.length === 0) { recoveryNeeded = false; return Promise.resolve(); }
+		const run = (async () => {
+			try { b?.guard(); } catch { return; }
+			let results;
+			try {
+				results = await execMultiSlot(redis, topicList.map((topic) => ['hgetall', hashKey(topic)]));
+				const error = firstCommandError(results);
+				if (error) throw error;
+				b?.success();
+			} catch (error) { b?.failure(error); return; }
+			if (disposed || !activePlatform || generation !== recoveryGeneration || !relayOnline) return;
+			for (let i = 0; i < topicList.length; i++) {
+				const topic = topicList[i];
+				const cursors = mergeRoster(topic, results[i][1]);
+				recoverTopic(topic, cursors, activePlatform);
 			}
-		}
+			recoveryNeeded = false;
+			recoveryRetryMs = SUBSCRIBE_RETRY_MIN_MS;
+		})().catch(() => {}).finally(() => {
+			if (recoveryRunning === run) recoveryRunning = null;
+			if (recoveryNeeded) retryRecoveryLater();
+		});
+		recoveryRunning = run;
+		return run;
 	}
 
 	function retrySubscribeLater() {
@@ -145,6 +172,16 @@ export function createRedisIo({
 		}
 		const sub = openSubscriber(client, 'cursor');
 		subscriber = sub;
+		sub.on(SUBSCRIBER_RESTORING, () => {
+			relayOnline = false;
+			recoveryNeeded = true;
+			recoveryGeneration++;
+			resetRoster();
+		});
+		sub.on(SUBSCRIBER_RESTORED, () => {
+			relayOnline = true;
+			catchUp();
+		});
 		sub.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_SUBSCRIBER, { error: err });
 		});
@@ -164,8 +201,8 @@ export function createRedisIo({
 		const ready = sub.subscribe(channel).then(() => {
 			subscribeFailing = false;
 			subscribeRetryMs = SUBSCRIBE_RETRY_MIN_MS;
-			// Best-effort: a catch-up that fails leaves the subscribed relay running.
-			return catchUp().catch(() => {});
+			relayOnline = true;
+			return catchUp();
 		}, (err) => {
 			sub.quit().catch(() => sub.disconnect());
 			if (subscriber === sub) {
@@ -299,13 +336,15 @@ export function createRedisIo({
 	}
 
 	function relay(topic, event, payload) {
-		if (b) { try { b.guard(); } catch { return; } }
-		const msg = JSON.stringify({ instanceId, topic, event, payload });
-		if (subscriberReady) {
-			subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
-		} else {
-			redis.publish(channel, msg).catch(() => {});
-		}
+		let msg;
+		try { msg = JSON.stringify({ instanceId, topic, event, payload }); } catch { return; }
+		const publish = () => {
+			if (disposed) return;
+			try { b?.guard(); } catch { return; }
+			redis.publish(channel, msg).then(() => b?.success(), (error) => b?.failure(error));
+		};
+		if (subscriberReady) subscriberReady.then(publish);
+		else publish();
 	}
 
 	async function broadcastRemove(topic, key, platform) {
@@ -391,6 +430,8 @@ export function createRedisIo({
 	/** Terminal teardown (tracker destroy()): stop timers, quit the subscriber. */
 	function dispose() {
 		disposed = true;
+		if (recoveryTimer !== null) clearTimer(recoveryTimer);
+		recoveryTimer = null;
 		if (subscribeRetryTimer !== null) clearTimer(subscribeRetryTimer);
 		subscribeRetryTimer = null;
 		if (cleanupTimer) clearIntervalTimer(cleanupTimer);
