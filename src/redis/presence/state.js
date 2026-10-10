@@ -223,7 +223,7 @@ export function createPresenceState(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mJoins = m?.counter('presence_joins_total', 'Presence join events', ['topic']);
 	const mJoinsAborted = m?.counter('presence_joins_aborted_total', 'Presence join calls that aborted before commit because the websocket closed during an async gap. Server state was rolled back before the throw. Distinct from `presence_joins_total` (commits) and from generic RPC error metrics (which bucket all throws together regardless of cause).', ['topic', 'reason']);
 	const mLeaves = m?.counter('presence_leaves_total', 'Presence leave events', ['topic']);

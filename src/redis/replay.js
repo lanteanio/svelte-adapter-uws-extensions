@@ -149,7 +149,7 @@ export function createReplay(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);

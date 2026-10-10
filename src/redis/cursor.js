@@ -232,7 +232,7 @@ export function createCursor(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mUpdates = m?.counter('cursor_updates_total', 'Cursor update calls', ['topic']);
 	const mBroadcasts = m?.counter('cursor_broadcasts_total', 'Cursor broadcasts sent', ['topic']);
 	const mThrottled = m?.counter('cursor_throttled_total', 'Cursor updates deferred by throttle', ['topic']);

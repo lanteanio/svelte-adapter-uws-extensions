@@ -106,7 +106,7 @@ export function createDeadLetter(client, options = {}) {
 	const redis = client.redis;
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
 
 	const seqKey = client.key('dlq:seq:{dlq}');
@@ -246,7 +246,7 @@ export function createDeadLetter(client, options = {}) {
 			}
 			await withBreaker(b, () => tx.exec());
 			await evict(serverNow).catch(() => { /* capture already persisted */ });
-			mAdded?.inc({ topic: mt ? mt(rec.topic) : rec.topic });
+			mAdded?.inc({ topic: mt(rec.topic) });
 			return id;
 		},
 

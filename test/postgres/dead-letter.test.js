@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createDeadLetter } from '../../src/postgres/dead-letter.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 // A focused in-memory Postgres double for exactly the queries the dead-letter
 // store issues (autoMigrate:false skips DDL). It mirrors PG semantics for those
@@ -251,4 +252,13 @@ describe('postgres dead-letter store', () => {
 		await vi.advanceTimersByTimeAsync(5_000);
 		expect(await store.count()).toBe(1); // destroyed -> no sweep runs
 	});
+});
+
+
+it('keeps dead-letter topics private when a registry omits the mapper', async () => {
+	const metrics = createMetrics();
+	const store = createDeadLetter(fakePg(), { autoMigrate: false, metrics: { ...metrics, mapTopic: undefined } });
+	await store.add({ webhookId: 'webhook', topic: 'alice@example.com', event: 'event', data: {}, attempts: 1, error: 'offline', failedAt: 1 });
+	expect(metrics.serialize()).toContain('dead_letter_added_total{topic="all"} 1');
+	expect(metrics.serialize()).not.toContain('alice@example.com');
 });

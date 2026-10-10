@@ -87,7 +87,7 @@ export function createDeadLetter(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
 
 	let migrated = false;
@@ -190,7 +190,7 @@ export function createDeadLetter(client, options = {}) {
 					[ttlMs]
 				)).catch(() => { /* capture already persisted */ });
 			}
-			mAdded?.inc({ topic: mt ? mt(rec.topic) : rec.topic });
+			mAdded?.inc({ topic: mt(rec.topic) });
 			return String(res.rows[0][pkCol]);
 		},
 

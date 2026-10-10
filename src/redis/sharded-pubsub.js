@@ -103,7 +103,7 @@ export function createShardedBus(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
-	const mt = m?.mapTopic;
+	const mt = m?.mapTopic || (() => 'all');
 	const mRelayed = m?.counter('sharded_pubsub_messages_relayed_total', 'Messages SPUBLISHed', ['topic']);
 	const mReceived = m?.counter('sharded_pubsub_messages_received_total', 'Messages received via SSUBSCRIBE', ['topic']);
 	const mEchoSuppressed = m?.counter('sharded_pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
