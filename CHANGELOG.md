@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Generate the declared compatibility tuple and installation pins from the installed adapter manifest; use fractional-second histogram defaults and lock acquisition seconds, retaining explicit count/millisecond buckets.
+
 - Keep metric identifiers private by default, mark the legacy testing request-ID constant deprecated, and document actionable replay-denial state.
 
 - The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.

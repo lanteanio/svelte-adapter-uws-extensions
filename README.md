@@ -122,26 +122,29 @@ Search the [error reference](./docs/errors.md) for a stable diagnostic ID.
 
 The three ecosystem packages move together. Bump them as a group:
 
+<!-- compatibility-table:start -->
 | `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
 |---|---|---|---|
-| `^0.4.x` | `^0.4.x` | `^0.4.x` | Legacy stable |
-| `^0.5.8` | `^0.5.0` | `^0.5.0` | Stable. Node 22+ required. |
-| `0.6.0-next.95` | `0.6.0-next.95` | `0.6.0-next.64` | Coordinated development candidate. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). |
+| `0.4.x` | `0.4.x` | `0.4.x` | legacy |
+| `0.5.8` | `0.5.x` | `0.5.x` | stable; Node >=22.0.0 |
+| `0.6.0-next.95` | `0.6.0-next.90` | `0.6.0-next.63` | Declared current train; Node >=22.0.0. Redis 7+ / Valkey 7.2+ for sharded pub/sub and functions; Redis 7.4+ / Valkey 9.0+ for presence. |
+
+Generated from the installed adapter's `docs/compatibility.v1.csv`. Provenance `workspace` describes the declared train, not proof of coordinated publication. Confirm the exact versions are published before installing.
+<!-- compatibility-table:end -->
 
 For mixed-version reports, first capture the adapter boot banner package tuple (also available as `platform.introspect().versions`) and compare the resolved versions with this table. Peer-dependency warnings identify unsupported installs.
 
 ## Installation
 
+<!-- compatibility-install:start -->
 ```bash
-npm install svelte-adapter-uws@0.6.0-next.95 svelte-adapter-uws-extensions@0.6.0-next.64 ioredis
+npm install svelte-adapter-uws@0.6.0-next.95 svelte-adapter-uws-extensions@0.6.0-next.63 ioredis
 npm install https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v20.69.0.tar.gz
 npm exec -- svelte-adapter-uws-preflight
 ```
+<!-- compatibility-install:end -->
 
-Continue only after `preflight OK`. This is the extensions/adapter tuple the
-test suite runs against; the preflight stops at an unsupported Node, OS,
-architecture, Linux libc, or native addon before Redis or Postgres
-configuration can disguise the actual prerequisite failure.
+Continue only after `preflight OK`; it checks Node, OS, architecture, Linux libc and the native addon before backend setup. The checkout tests its installed adapter; the generated table separately records that adapter's declared ecosystem tuple.
 
 Postgres support is optional:
 
@@ -149,16 +152,12 @@ Postgres support is optional:
 npm install pg
 ```
 
+<!-- compatibility-floor:start -->
 Requires `svelte-adapter-uws >= 0.6.0-next.95` as a peer dependency.
-The exact command above is the deterministic first-success route for this release.
-
+<!-- compatibility-floor:end -->
 For a complete working example, follow [First success](docs/getting-started.md): run the shared-cursor flow without a server, then against a temporary Redis container, with expected output and cleanup included.
 
-After prerequisites pass, choose the documented Redis or Postgres factory for
-the primitive you need. Existing publish/subscribe/replay call sites keep their
-familiar shapes; client creation and lifecycle remain deliberately
-backend-specific rather than being hidden behind a misleading universal
-constructor.
+After prerequisites pass, choose the Redis or Postgres factory for the primitive you need; each backend documents its own client creation and lifecycle.
 
 ---
 
