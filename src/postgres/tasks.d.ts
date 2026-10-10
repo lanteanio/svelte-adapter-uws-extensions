@@ -82,7 +82,7 @@ export interface TaskStateChangeEvent {
 export interface TaskRunnerOptions {
 	/** Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. @default 'svti_tasks' */
 	table?: string;
-	/** Optional cache for committed results. Pass an idempotency store to deduplicate caller retries. */
+	/** Optional cache for committed run() results. enqueue() does not consult this store. */
 	idempotency?: RedisIdempotencyStore | PgIdempotencyStore;
 	/** Optional external fence provider (e.g. createRedisFence). Pairs with the Postgres heartbeat for force-takeover detection. */
 	fence?: import('../redis/fence.js').FenceProvider;
@@ -246,7 +246,8 @@ export interface TaskRegistrationOptions {
 export interface TaskRunOptions<TInput = unknown> {
 	/** JSON-serialisable input. Defaults to null. */
 	input?: TInput;
-	/** Stable retry key. */
+	/** run() uses this for result caching when an idempotency store is configured.
+	 * enqueue() persists and forwards it to the handler without deduplicating submissions. */
 	idempotencyKey?: string;
 	/**
 	 * Request id to persist on the task row, exposed to the handler as
@@ -305,7 +306,10 @@ export interface TaskRunner {
 	 * dispatch sweep on an instance with that name registered picks up the
 	 * row and runs the handler in the background. Pair with `await(taskId)` to block on
 	 * completion, or fire-and-forget for jobs whose result no caller is
-	 * waiting on.
+	 * waiting on. Every call inserts a fresh row and returns a new taskId, even
+	 * when idempotencyKey repeats or an idempotency store is configured. The
+	 * key is persisted and forwarded to the handler for downstream use only.
+	 * A lost insert reply can leave an unknown outcome; retrying may duplicate work.
 	 */
 	enqueue(name: string, options: TaskRunOptions): Promise<string>;
 

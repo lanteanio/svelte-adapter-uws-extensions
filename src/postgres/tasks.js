@@ -4,9 +4,10 @@
  * Wraps an effectful operation in a state machine that survives process
  * crashes and naturally fans across cluster instances. Three guarantees:
  *
- *   1. Caller-retry idempotency: a stable `idempotencyKey` paired with an
+ *   1. run() caller-retry idempotency: a stable `idempotencyKey` paired with an
  *      idempotency store ensures retries from the original caller return
- *      the cached result rather than re-executing.
+ *      the cached result rather than re-executing. enqueue() always inserts a
+ *      new row; its key is persisted and forwarded to the handler only.
  *   2. Worker-crash recovery: every attempt holds a fence (UUID + expiry).
  *      The conditional commit `UPDATE ... WHERE fence = $current` is
  *      atomic, so a stuck attempt that comes back from the dead cannot
@@ -89,7 +90,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 /**
  * @typedef {Object} TaskRunnerOptions
  * @property {string} [table='svti_tasks'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
- * @property {import('../redis/idempotency.js').RedisIdempotencyStore | import('./idempotency.js').PgIdempotencyStore} [idempotency] - Optional cache for committed results.
+ * @property {import('../redis/idempotency.js').RedisIdempotencyStore | import('./idempotency.js').PgIdempotencyStore} [idempotency] - Optional cache for committed run() results; enqueue() does not consult it.
  * @property {import('../redis/fence.js').RedisFenceProvider} [fence] - Optional external fence provider (e.g. `createRedisFence`). When set, the runner pairs Postgres heartbeats with the provider's heartbeat so a force-takeover via the external store is detected immediately.
  * @property {number} [fenceTtl=60] - Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler is running.
  * @property {number} [heartbeatInterval] - Positive integer ms between coalesced fence heartbeats, below the fence lifetime. Zero uses the default, fenceTtl * 1000 / 3.
@@ -134,7 +135,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 /**
  * @typedef {Object} TaskRunOptions
  * @property {unknown} [input] - JSON-serialisable input. Defaults to null.
- * @property {string} [idempotencyKey] - Stable retry key.
+ * @property {string} [idempotencyKey] - run() result-cache key when a store is configured; enqueue() stores and forwards it without deduplicating rows.
  * @property {{traceparent: string, tracestate?: string} | null} [traceContext] - Explicit context; null (or invalid) opts the call out of tracing.
  * @property {object} [platform] - Structural Platform request/tracing surface.
  */

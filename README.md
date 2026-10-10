@@ -2830,7 +2830,7 @@ Wraps an effectful operation in a state machine that survives process crashes an
 
 Three guarantees:
 
-- **Caller-retry idempotency.** Pair the runner with the idempotency store via the `idempotency` option. When a caller passes the same `idempotencyKey` twice, the second call returns the cached result instead of re-running the handler.
+- **Caller-retry idempotency.** Pair the runner with the idempotency store via the `idempotency` option. For `run()`, repeating the same task name and `idempotencyKey` within the store TTL returns the cached result. `enqueue()` does not use this result cache.
 - **Worker-crash recovery.** Every attempt holds a fence UUID and a `fence_expires_at` timestamp. The conditional commit `UPDATE ... WHERE fence = $current_fence` is atomic, so a stuck attempt that comes back from the dead cannot overwrite a completed attempt's result. A periodic recovery sweep reclaims rows whose fence has expired and re-drives the handler on a live instance where that name is registered.
 - **External-service idempotency.** The `idempotencyKey` is forwarded to the handler, where you pass it on to Stripe / SendGrid / S3 so the side-effect target de-duplicates retries too.
 
@@ -2945,7 +2945,7 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
 | Option | Default | Description |
 |---|---|---|
 | `table` | `'svti_tasks'` | Table name |
-| `idempotency` | - | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
+| `idempotency` | - | An idempotency store ([above](#idempotency-store)). Caches `run()` results per task name and `idempotencyKey`; `enqueue()` does not consult it. |
 | `fenceTtl` | `60` | Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler runs. |
 | `heartbeatInterval` | `fenceTtl * 1000 / 3` | Positive integer ms below the fence lifetime; zero uses the default, slow renewals coalesce and a missed confidence deadline aborts the handler |
 | `recoveryInterval` | `30000` | ms between recovery sweeps. 0 disables. |
@@ -3062,7 +3062,7 @@ The `signal` fires when the heartbeat detects another worker has reclaimed the r
 `run()` throws four error shapes:
 
 - `UnknownTaskError` - no handler registered for that name in this process. Dispatch and recovery skip unknown names before claiming because the handler may live on a different deployment.
-- `TaskInFlightError` - the idempotency store reports the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
+- `TaskInFlightError` - `run()` reports that the idempotency store holds the slot as pending (another caller is mid-flight for the same key). Caller may surface a 409 to the upstream HTTP request or retry after a backoff.
 - `TaskFenceLostError` (`err.code === 'TASK_FENCE_LOST'`) - this worker's fence was superseded by another worker before it could record its outcome, and the canonical result did not become terminal within `awaitTimeout`. `run()` reports the durable outcome the winning worker commits, never this worker's stale local attempt; if that outcome is not yet available it throws this rather than the local value (which the idempotency store would otherwise cache). Retry, or `await(taskId)`, to read the canonical result once it lands. On a lost fence `run()` polls the durable row up to `awaitTimeout` (default 60s) - the same bound as `await()`; `awaitTimeout: 0` polls until the winning worker's outcome lands rather than giving up.
 - The handler's own thrown error, after retries are exhausted. Errors are serialised to `{name, message, stack, code, cause}` for the failed-row record and reconstructed as a plain `Error` if a sibling caller reads the row.
 
@@ -3070,7 +3070,7 @@ The `signal` fires when the heartbeat detects another worker has reclaimed the r
 
 `run()` blocks the calling process until the handler finishes. Two more verbs let you decouple submission from completion:
 
-- **`enqueue(name, opts)`** - fire-and-forget. Inserts the row with `status='pending'` and returns the `taskId` immediately. A dispatch sweep on an instance with that handler registered picks up the row and runs it in the background.
+- **`enqueue(name, opts)`** - inserts a fresh pending row and resolves after insertion with its new `taskId`. Reusing `idempotencyKey` still creates another task, even with an idempotency store configured: the key is persisted and forwarded to the handler for downstream deduplication only. A dispatch sweep runs each row independently. Keep the returned task ID to inspect or await that submission; a lost insert reply leaves its outcome unknown, so blindly retrying can duplicate work.
 - **`await(taskId, opts?)`** - block until the task reaches a terminal status. Returns the committed result, throws the stored error, or rejects with a timeout if the task is still pending/running past `awaitTimeout`.
 
 ```js
@@ -3079,7 +3079,7 @@ import { tasks } from '$lib/server/tasks';
 // Submit a job that will be processed elsewhere
 const taskId = await tasks.enqueue('send-welcome-email', {
   input: { userId: locals.user.id },
-  idempotencyKey: `welcome-${locals.user.id}`
+  idempotencyKey: `welcome-${locals.user.id}` // forwarded to the handler; enqueue does not deduplicate
 });
 
 // Optionally block on completion (or fire-and-forget by skipping this)
