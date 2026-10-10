@@ -163,8 +163,8 @@ export function mockPlatform() {
 			p.published.push({ topic, event, data, options });
 			return true;
 		},
-		publishBatched(messages) {
-			p.publishedBatches.push({ messages });
+		publishBatched(messages, options) {
+			p.publishedBatches.push({ messages, options });
 			for (let i = 0; i < messages.length; i++) {
 				const m = messages[i];
 				p.published.push({

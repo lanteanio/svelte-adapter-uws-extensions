@@ -344,7 +344,7 @@ export function createShardedBus(client, options = {}) {
 			// A peer's platform batched these; this one may not have the batched
 			// lane, and then each message goes out on its own.
 			if (typeof activePlatform.publishBatched === 'function') {
-				activePlatform.publishBatched(local);
+				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
 					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
@@ -377,6 +377,12 @@ export function createShardedBus(client, options = {}) {
 		}
 		const s = opts ? carriedSeq(opts.seq) : undefined;
 		if (s !== undefined) /** @type {any} */ (env).s = s;
+		return env;
+	}
+
+	function batchEnvelope(batch, options) {
+		const env = { instanceId, batch };
+		if (options?.compress === true) /** @type {any} */ (env).compress = true;
 		return env;
 	}
 
@@ -1128,23 +1134,23 @@ export function createShardedBus(client, options = {}) {
 				}
 				return results;
 			}));
-			const publishBatchedTraced = (messages) => {
+			const publishBatchedTraced = (messages, options) => {
 				if (!Array.isArray(messages)) {
 					throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				}
 				if (messages.length === 0) return;
 				if (!relaysAny(messages)) {
-					platform.publishBatched(messages);
+					platform.publishBatched(messages, options);
 					return;
 				}
 				// Local delivery first, as on the untraced path: the platform
 				// rejects a malformed entry with its own error before shardKey or
 				// the relay list sees the entries.
 				traced((traceContext) => {
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
 					const byChannel = batchesByChannel(messages);
 					for (const [ch, batch] of byChannel) {
-						relayTraced(ch, { instanceId, batch }, batchTopics(batch), traceContext);
+						relayTraced(ch, batchEnvelope(batch, options), batchTopics(batch), traceContext);
 					}
 				});
 			};
@@ -1178,20 +1184,20 @@ export function createShardedBus(client, options = {}) {
 			// Wire-batched publish. One SPUBLISH envelope per shard channel
 			// per call. Receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
-			const publishBatchedUntraced = (messages) => {
+			const publishBatchedUntraced = (messages, options) => {
 				if (!Array.isArray(messages)) {
 					throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				}
 				if (messages.length === 0) return;
 
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
 
 				const byChannel = batchesByChannel(messages);
 
 				for (const [ch, batch] of byChannel) {
 					const topics = new Array(batch.length);
 					for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
-					scheduleRelay(ch, JSON.stringify({ instanceId, batch }), topics);
+					scheduleRelay(ch, JSON.stringify(batchEnvelope(batch, options)), topics);
 				}
 			};
 			const tracing = traceEnabled(platform);

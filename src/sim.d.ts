@@ -34,7 +34,7 @@ export interface SimRedisInstanceApi {
 	connect(opts?: { headers?: Record<string, string>; query?: string }): SimClientFacade;
 	clients(): SimClientFacade[];
 	publish(topic: string, event: string, data?: unknown, options?: unknown): boolean;
-	publishBatched(messages: unknown[]): void;
+	publishBatched(messages: unknown[], options?: { compress?: boolean }): void;
 	/** The bus-wrapped platform (publishing through it relays cross-instance). */
 	platform: any;
 	/** The raw createTestServer platform. */

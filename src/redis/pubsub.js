@@ -320,7 +320,7 @@ export function createPubSubBus(client, options = {}) {
 			// A peer's platform batched these; this one may not have the batched
 			// lane, and then each message goes out on its own.
 			if (typeof activePlatform.publishBatched === 'function') {
-				activePlatform.publishBatched(local);
+				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
 					activePlatform.publish(local[i].topic, local[i].event, local[i].data, local[i].options);
@@ -353,6 +353,12 @@ export function createPubSubBus(client, options = {}) {
 		}
 		const s = options ? carriedSeq(options.seq) : undefined;
 		if (s !== undefined) /** @type {any} */ (env).s = s;
+		return env;
+	}
+
+	function batchEnvelope(batch, options) {
+		const env = { instanceId, batch };
+		if (options?.compress === true) /** @type {any} */ (env).compress = true;
 		return env;
 	}
 
@@ -463,22 +469,22 @@ export function createPubSubBus(client, options = {}) {
 				}
 				return results;
 			}));
-			const publishBatchedTraced = (messages) => {
+			const publishBatchedTraced = (messages, options) => {
 				if (!Array.isArray(messages)) {
 					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				}
 				if (messages.length === 0) return;
 				if (!relaysAny(messages)) {
-					platform.publishBatched(messages);
+					platform.publishBatched(messages, options);
 					return;
 				}
 				// Local delivery first, as on the untraced path: the platform
 				// rejects a malformed entry with its own error before the relay
 				// list reads the entries.
 				traced((traceContext) => {
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
 					const relayable = relayableBatch(messages);
-					relayTraced({ instanceId, batch: relayable }, relayable.length, traceContext);
+					relayTraced(batchEnvelope(relayable, options), relayable.length, traceContext);
 				});
 			};
 			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
@@ -510,13 +516,13 @@ export function createPubSubBus(client, options = {}) {
 			// Wire-batched publish. One Redis envelope per call carries the
 			// whole list; receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
-			const publishBatchedUntraced = (messages) => {
+			const publishBatchedUntraced = (messages, options) => {
 				if (!Array.isArray(messages)) {
 					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				}
 				if (messages.length === 0) return;
 
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings));
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
 
 				const relayable = [];
 				for (let i = 0; i < messages.length; i++) {
@@ -527,7 +533,7 @@ export function createPubSubBus(client, options = {}) {
 				}
 				if (relayable.length === 0) return;
 
-				scheduleRelay(JSON.stringify({ instanceId, batch: relayable }), relayable.length);
+				scheduleRelay(JSON.stringify(batchEnvelope(relayable, options)), relayable.length);
 			};
 			const tracing = traceEnabled(platform);
 			const batch = tracing ? batchTraced : batchUntraced;

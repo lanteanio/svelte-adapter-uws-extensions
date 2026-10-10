@@ -140,6 +140,20 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		});
 	});
 
+	it.each([undefined, { compress: false }, { compress: true }])('carries batch compression %j to local and peer platforms', async (options) => {
+		const { a, b, wrapped, close } = await pair('batch-compression:');
+		try {
+			wrapped.publishBatched([{ topic: 'chat', event: 'msg', data: 1 }], options);
+			await until(() => b.publishedBatches.length === 1);
+			expect(a.publishedBatches[0].options).toBe(options);
+			expect(b.publishedBatches[0].options).toEqual(options?.compress ? { compress: true } : undefined);
+			wrapped.publishBatched([{ topic: 'chat', event: 'local', data: 2, options: { relay: false } }], options);
+			expect(a.publishedBatches[1].options).toBe(options);
+		} finally {
+			await close();
+		}
+	});
+
 	it('carries the seq choice of a shared-codec publishWire', async () => {
 		const { a, b, wrapped, busB, close } = await pair('bs3:', wirePlatform);
 		busB.wrap(b).registerWireCodec(sharedCodec);
