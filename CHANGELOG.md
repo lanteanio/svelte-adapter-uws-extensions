@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Owned PostgreSQL pools default to 100 unsettled wrapper operations, 10-second checkouts, and 30-second driver query and server statement deadlines, each with an explicit 0 opt-out. Supplied pools retain their configuration and lifecycle. Optional cancellation retains admission until driver settlement and releases abandoned checkouts once; optional metrics expose queue depth, outstanding operations, timeouts, and duration in seconds.
+
 - Bound multi-slot Redis work to eight concurrent batches and 256 commands per pipeline. Coalesce presence heartbeat and registry TTL refresh work and include completed I/O in heartbeat timing. Retry only explicitly refused routing operations without replaying successful writes.
 
 - Classify every README code block, compile and check supported APIs, and execute standalone examples against the packed artifact. Explicit fragment exceptions remain bounded.
@@ -33,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
+
+- Preserve a newer peer-selected presence identity when an older local tab closes. Redis relays carry selected identity separately from durable fields, including shadowing fields and updates missed before the relay. Updated receivers retain legacy public snapshots separately and reconcile selected identity on a later local join; update all receivers for the full guarantee.
 
 - Keep subscriber PING silence detection active when bounded Redis commands time out.
 
