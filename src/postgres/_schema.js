@@ -21,7 +21,6 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 	const index = (suffix, columns, predicate = null, unique = false) => ({ name: `idx_${table}_${suffix}`, columns, predicate, unique });
 	const check = (suffix, expression) => ({ name: `chk_${table}_${suffix}`, expression });
 	if (store === 'replay') {
-		main.privileges = ['SELECT', 'INSERT', 'DELETE'];
 		main.columns = [[primary, 'bigint', true, 'serial'], text('topic', true), ['seq', 'bigint', true], text('event', true), json('data'), timestamp('created_at', false, 'now()'), text('user_id')];
 		main.primary = [primary]; main.additions = ['user_id'];
 		main.indexes = [index('topic_seq', ['topic', 'seq']), index('created_at', ['created_at']), index('user', ['user_id'])];
@@ -42,7 +41,6 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		main.indexes = [index('user', ['user_id']), index('running_fence', ['fence_expires_at'], "status = 'running'"), index('terminal_updated', ['updated_at'], "status IN ('committed', 'failed')")];
 		main.checks = [check('status', "status = 'pending' OR status = 'running' OR status = 'committed' OR status = 'failed'"), check('attempts', 'attempts >= 0')];
 	} else if (store === 'dead-letter') {
-		main.privileges = ['SELECT', 'INSERT', 'DELETE'];
 		main.columns = [[primary, 'bigint', true, 'serial'], text('webhook_id'), text('topic', true), text('event'), json('data'), integer('attempts'), text('error'), ['failed_at', 'bigint', true], text('user_id')];
 		main.primary = [primary]; main.additions = ['user_id'];
 		main.indexes = [index('topic', ['topic']), index('failed_at', ['failed_at']), index('user', ['user_id'])];

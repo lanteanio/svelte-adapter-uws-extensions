@@ -189,6 +189,31 @@ which uses the same migration path and session timeout settings. Custom clients
 must expose `connect()` with a dedicated `query()` / `release(true)` checkout;
 a query-only client is insufficient for automatic initialization.
 
+### Runtime grants
+
+The deployment role owns the schema, store tables, indexes and migration ledger.
+Use a distinct login for runtime, grant schema `USAGE` without `CREATE`, and
+start stores with `autoMigrate: false`. Readiness requires these privileges:
+
+| Relation (default name) | Runtime table privileges |
+| --- | --- |
+| Replay events `svti_replay` and counters `svti_replay_seq` | SELECT, INSERT, UPDATE, DELETE |
+| Jobs `svti_jobs` | SELECT, INSERT, UPDATE, DELETE |
+| Tasks `svti_tasks` | SELECT, INSERT, UPDATE, DELETE |
+| Idempotency `svti_idempotency` | SELECT, INSERT, UPDATE, DELETE |
+| Dead letters `svti_dead_letter` | SELECT, INSERT, UPDATE, DELETE |
+| Alarm schedules `svti_alarms` | SELECT, INSERT, UPDATE, DELETE |
+| Alarm authority `svti_alarms_generations` | SELECT, INSERT, UPDATE |
+| Migration ledger `svti_schema_migrations` | SELECT |
+
+Grant `USAGE` (or `UPDATE`) on the owned serial sequences for replay, jobs and
+dead letters. Substitute configured names and grant only the stores in use.
+Replay and dead-letter cleanup select rows with `FOR UPDATE SKIP LOCKED`, so
+`UPDATE` is required even though their public event operations insert and delete
+rather than updating stored payloads. Test readiness and maintenance through the
+actual runtime login: testing with the owner or superuser can conceal missing
+grants. Trigger behavior and row-level policies still need application tests.
+
 ### Versioned migration behavior
 
 `postgresMigrations({ store, table })` returns the versioned SQL and SHA-256

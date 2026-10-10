@@ -94,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PostgreSQL readiness requires UPDATE on replay and dead-letter tables because retention locks selected rows. Document exact runtime grants and validate all six stores through a separate non-owner login, including cleanup and recovery.
+
 - Claim durable worker tasks only when a thread is available, keeping excess rows eligible for later dispatch instead of failing them at the foreground queue deadline. Retain reservations through retries and database settlement, and replace crashed threads without failing unrelated queued jobs.
 
 - Preserve all PostgreSQL pool and breaker observations across registry facades, deduplicate shared instruments independently, and reclaim dead registration handles without requiring scrapes.
