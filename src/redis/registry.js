@@ -323,6 +323,22 @@ export function createConnectionRegistry(client, options) {
 	 */
 	const secondaryIndex = new Map();
 
+	// Remote index entries are leases on observed Redis state, not permanent
+	// ownership. A live peer need not emit another open event while refreshing.
+	const remoteIndex = new Map();
+	const indexChecks = new Map();
+	let nextIndexCheck = Infinity;
+	let indexRefresh = null;
+	let bootstrapPromise = null;
+
+	function removeIndex(userId) {
+		const prevAttrs = userIdAttrs.get(userId);
+		if (prevAttrs) unindexUser(userId, prevAttrs);
+		userIdAttrs.delete(userId);
+		userToInstance.delete(userId);
+		remoteIndex.delete(userId);
+	}
+
 	function indexUser(userId, attrs) {
 		if (!attrs) return;
 		for (const [k, v] of Object.entries(attrs)) {
@@ -360,6 +376,13 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function applyOpenEvent(userId, ownerInstanceId, attrs) {
+		if (destroyed) return;
+		indexChecks.delete(userId);
+		if (ownerInstanceId !== instanceId && !localUsers.has(userId)) {
+			const expiresAt = monotonicNow() + ttl * 1000;
+			remoteIndex.set(userId, { owner: ownerInstanceId, expiresAt });
+			nextIndexCheck = Math.min(nextIndexCheck, expiresAt);
+		} else remoteIndex.delete(userId);
 		const prevAttrs = userIdAttrs.get(userId);
 		if (prevAttrs) unindexUser(userId, prevAttrs);
 		userToInstance.set(userId, ownerInstanceId);
@@ -374,14 +397,11 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function applyCloseEvent(userId, ownerInstanceId) {
-		// Only remove if the close came from the recorded owner. A stale
-		// close from a previous owner (after the user already migrated to a
-		// different instance) must not clear a live registration.
+		// Also invalidate a read whose expired entry was already removed.
+		const pendingOwner = indexChecks.get(userId)?.owner;
+		if (pendingOwner === null || pendingOwner === ownerInstanceId) indexChecks.delete(userId);
 		if (userToInstance.get(userId) !== ownerInstanceId) return;
-		const prevAttrs = userIdAttrs.get(userId);
-		if (prevAttrs) unindexUser(userId, prevAttrs);
-		userIdAttrs.delete(userId);
-		userToInstance.delete(userId);
+		removeIndex(userId);
 	}
 
 	// Right-to-erasure (`live.forget`): clear EVERY in-memory trace of a user on
@@ -393,10 +413,8 @@ export function createConnectionRegistry(client, options) {
 	// are keyed by app-session id (no userId link) and are ws-bound, so they
 	// clear on the user's own disconnect.
 	function applyForgetEvent(userId) {
-		const prevAttrs = userIdAttrs.get(userId);
-		if (prevAttrs) unindexUser(userId, prevAttrs);
-		userIdAttrs.delete(userId);
-		userToInstance.delete(userId);
+		indexChecks.delete(userId);
+		removeIndex(userId);
 		const sessionId = localUsers.get(userId);
 		if (sessionId !== undefined) {
 			localUsers.delete(userId);
@@ -604,10 +622,17 @@ export function createConnectionRegistry(client, options) {
 
 	async function lookup(userId) {
 		if (!withBreakerGuard()) return null;
+		const observed = userIdAttrs.get(userId);
 		try {
 			const result = await redis.hgetall(userKey(userId));
 			breaker?.success();
-			if (!result || !result.instanceId) return null;
+			if (!result || !result.instanceId) {
+				if (!localUsers.has(userId) && userIdAttrs.get(userId) === observed) {
+					indexChecks.delete(userId);
+					removeIndex(userId);
+				}
+				return null;
+			}
 			return {
 				instanceId: result.instanceId,
 				sessionId: result.sessionId || '',
@@ -649,14 +674,7 @@ export function createConnectionRegistry(client, options) {
 		// SCAN; live events that race with the SCAN are idempotent under
 		// set semantics. Skipped when no `attributes` option was supplied
 		// since neither the index nor `sendTo` would have anything to do.
-		if (attributes && !bootstrapped) {
-			bootstrapped = true;
-			bootstrapIndex().catch(() => {
-				// Bootstrap is best-effort; live events fill in over time
-				// even without the initial SCAN.
-				bootstrapped = false;
-			});
-		}
+		startBootstrap();
 
 		if (!heartbeatTimer) {
 			heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
@@ -664,8 +682,63 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
+	function startBootstrap() {
+		if (destroyed || !attributes || bootstrapped || bootstrapPromise) return;
+		bootstrapped = true;
+		bootstrapPromise = bootstrapIndex().catch(() => {
+			bootstrapped = false;
+		}).finally(() => { bootstrapPromise = null; });
+	}
+
+	function reconcileIndex() {
+		if (indexRefresh) return indexRefresh;
+		if (destroyed || nextIndexCheck === Infinity || monotonicNow() < nextIndexCheck) return null;
+		const now = monotonicNow();
+		const due = [];
+		nextIndexCheck = Infinity;
+		for (const [userId, record] of remoteIndex) {
+			if (record.expiresAt > now) {
+				nextIndexCheck = Math.min(nextIndexCheck, record.expiresAt);
+				continue;
+			}
+			removeIndex(userId);
+			indexChecks.set(userId, record);
+			due.push([userId, record]);
+		}
+		if (due.length === 0) return null;
+		indexRefresh = (async () => {
+			try {
+				if (!withBreakerGuard()) { bootstrapped = false; return; }
+				for (let offset = 0; offset < due.length && !destroyed; offset += 100) {
+					const batch = due.slice(offset, offset + 100);
+					const results = await execMultiSlot(redis, batch.map(([userId]) => ['hgetall', userKey(userId)]));
+					const error = firstCommandError(results);
+					if (error) { breaker?.failure(error); bootstrapped = false; }
+					else breaker?.success();
+					for (let i = 0; i < batch.length; i++) {
+						const [userId, record] = batch[i];
+						if (destroyed || indexChecks.get(userId) !== record) continue;
+						indexChecks.delete(userId);
+						const [err, entry] = results[i] || [];
+						if (!err && entry?.instanceId && !localUsers.has(userId)) {
+							applyOpenEvent(userId, entry.instanceId, parseAttrsField(entry.attrs));
+						}
+					}
+				}
+			} catch (err) {
+				breaker?.failure(err);
+				bootstrapped = false;
+			} finally {
+				for (const [userId, record] of due) {
+					if (indexChecks.get(userId) === record) indexChecks.delete(userId);
+				}
+			}
+		})().finally(() => { indexRefresh = null; });
+		return indexRefresh;
+	}
+
 	async function bootstrapIndex() {
-		if (!withBreakerGuard()) return;
+		if (!withBreakerGuard()) { bootstrapped = false; return; }
 		const pattern = userKeyPattern();
 		// Cluster-aware iteration mirrors shared/redis-scan.js. On a Cluster
 		// client, SCAN routes to a randomly-sampled node and the remaining
@@ -689,7 +762,7 @@ export function createConnectionRegistry(client, options) {
 				breaker?.success();
 			} catch (err) {
 				breaker?.failure(err);
-				return;
+				throw err;
 			}
 			cursor = scanRes[0];
 			const keys = (scanRes[1] || []).filter((k) => !seen.has(k));
@@ -701,17 +774,33 @@ export function createConnectionRegistry(client, options) {
 			// returned by SCAN all belong to this master's slot range, so
 			// the pipeline executes locally on `node`.
 			let results;
+			const checks = keys.map((key) => {
+				const userId = userIdFromKey(key);
+				if (!userId || indexChecks.has(userId)) return null;
+				const record = { owner: userToInstance.get(userId) || null };
+				indexChecks.set(userId, record);
+				return { userId, record };
+			});
 			try {
 				const pipe = node.pipeline();
 				for (const k of keys) pipe.hgetall(k);
 				results = await pipe.exec();
 				breaker?.success();
 			} catch (err) {
+				for (const check of checks) {
+					if (check && indexChecks.get(check.userId) === check.record) indexChecks.delete(check.userId);
+				}
 				breaker?.failure(err);
-				continue;
+				throw err;
 			}
 
+			if (destroyed) return;
+			const batchError = firstCommandError(results);
+			if (batchError) { breaker?.failure(batchError); bootstrapped = false; }
 			for (let i = 0; i < keys.length; i++) {
+				const check = checks[i];
+				if (!check || indexChecks.get(check.userId) !== check.record) continue;
+				indexChecks.delete(check.userId);
 				const tuple = (results && results[i]) || [];
 				const err = tuple[0];
 				const entry = tuple[1];
@@ -771,7 +860,10 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function heartbeatTick() {
-		if (destroyed || (localUsers.size === 0 && appSessionToWs.size === 0)) return;
+		if (destroyed) return;
+		startBootstrap();
+		reconcileIndex();
+		if (localUsers.size === 0 && appSessionToWs.size === 0) return;
 		if (!withBreakerGuard()) return;
 		// Refresh TTL on every locally-owned entry (users + app sessions). A
 		// pipeline keeps this to one round trip regardless of N.
@@ -1339,6 +1431,8 @@ export function createConnectionRegistry(client, options) {
 			throw new Error('registry.sendTo: criteria must include at least one attribute key');
 		}
 
+		const refresh = reconcileIndex();
+		if (refresh) await refresh;
 		const matches = resolveMatches(norm);
 		if (matches.size === 0) {
 			mSendTo?.inc({ result: 'empty' });
@@ -1611,6 +1705,8 @@ export function createConnectionRegistry(client, options) {
 			userToInstance.clear();
 			userIdAttrs.clear();
 			secondaryIndex.clear();
+			remoteIndex.clear();
+			indexChecks.clear();
 			bootstrapped = false;
 			if (subscriber) {
 				const sub = subscriber;

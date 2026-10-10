@@ -65,6 +65,29 @@ describe('redis connection registry (integration)', () => {
 		return r;
 	}
 
+	it('stops cohort routing after an owner dies and its real Redis row expires', async () => {
+		const email = 'expired-owner@example.test';
+		const owner = makeRegistry({ ttl: 1, heartbeat: 100, attributes: () => ({ email }) });
+		const observer = makeRegistry({ ttl: 1, heartbeat: 50, attributes: () => ({}) });
+		const ownerPlatform = mockPlatform();
+		await observer.hooks.open(mockWs({}), { platform: mockPlatform() });
+		await owner.hooks.open(wsWithSession({ userId: 'expiring' }, 'expiring-session'), { platform: ownerPlatform });
+		await wait(50);
+		await observer.sendTo({ email }, 'updates', 'changed', {});
+		await wait(30);
+		expect(ownerPlatform.sent).toHaveLength(1);
+		await owner.destroy(); // Abrupt process loss: no close event or row deletion.
+		await waitRedisMs(client.redis, 2200);
+		expect(await client.redis.exists(client.key('conns:expiring'))).toBe(0);
+		let attempts = 0;
+		const publish = client.redis.publish.bind(client.redis);
+		client.redis.publish = (...args) => { attempts++; return publish(...args); };
+		try {
+			await observer.sendTo({ email }, 'updates', 'changed', {});
+			expect(attempts).toBe(0);
+		} finally { client.redis.publish = publish; }
+	});
+
 	it('writes the entry shape Redis sees on registration', async () => {
 		const registry = makeRegistry();
 		const platform = mockPlatform();

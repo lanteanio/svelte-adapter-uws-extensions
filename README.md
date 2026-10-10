@@ -1214,7 +1214,7 @@ registry.sendTo({ role: 'admin', region: 'eu' }, 'audit', 'created', payload);
 
 How it works:
 
-1. Each instance maintains an in-memory secondary index: `Map<attrKey, Map<attrValue, Set<userId>>>` plus a shadow `userId -> attrs` map and a `userId -> instanceId` map.
+1. Each instance maintains an in-memory secondary index: `Map<attrKey, Map<attrValue, Set<userId>>>` plus `userId -> attrs` and `userId -> instanceId` maps. Remote entries expire `ttl` seconds after their last open event or authoritative Redis read; the next heartbeat revalidates them in batches of at most 100. `sendTo` also revalidates expired matches before routing. Expired attributes are removed before reads, and failed reads suppress remote cohort routing until a later bootstrap succeeds. A confirmed absent `lookup` removes the cached entry immediately; local connected sockets stay authoritative. Prefer opaque cohort identifiers over raw email or phone attributes.
 2. Updates ride a shared `{prefix}__registry-events` Redis pub/sub channel. Every successful `hooks.open` publishes `{type:'open', userId, instanceId, attrs}`; every successful close publishes `{type:'close', userId, instanceId}` (compare-and-delete already protects against a stale close from a previous owner).
 3. When a new instance starts up, it bootstraps the index by SCAN-ing the existing `{prefix}conns:*` hashes and calling HGETALL on each to populate from the live registry state. Subscribe-first / SCAN-second keeps the bootstrap race-tolerant under set semantics.
 4. `sendTo(criteria, ...)` resolves matching userIds via the local index, groups them by their owning instance, fires once per owning instance on the existing `{prefix}__push:` channel: `{type:'sendTo', criteria, topic, event, data}`.

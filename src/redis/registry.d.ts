@@ -53,7 +53,11 @@ export interface RegistryOptions {
 
 	/**
 	 * Refresh interval in ms. Each tick `EXPIRE`s every locally-owned
-	 * entry back to `ttl`.
+	 * entry back to `ttl` and revalidates expired remote attribute-cache entries.
+	 * Remote attributes are retained for at most `ttl` seconds since their last
+	 * observed open or Redis read, plus the next heartbeat scheduling delay.
+	 * Expired entries are removed before reads; failed reads suppress cohort
+	 * routing until a later bootstrap succeeds.
 	 * @default 30000
 	 */
 	heartbeat?: number;
