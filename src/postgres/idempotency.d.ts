@@ -12,7 +12,7 @@ export interface PgIdempotencyOptions {
 	acquireTtl?: number;
 	/** Auto-create the table on first use. @default true */
 	autoMigrate?: boolean;
-	/** How often to delete expired rows (ms). 0 disables. @default 60000 */
+	/** Maximum jitter delay between bounded maintenance passes, in ms. 0 disables; integer up to 2147483647. @default 60000 */
 	cleanupInterval?: number;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;

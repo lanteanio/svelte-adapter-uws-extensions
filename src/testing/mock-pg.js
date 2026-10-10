@@ -125,6 +125,7 @@ export function mockPgClient(options = {}) {
 	// connection's end() releases every lock it still holds.
 	/** @type {Map<number, number>} lockId -> holderConnId */
 	const advisoryLocks = new Map();
+	const transactionLocks = new Map();
 	let nextConnId = 1;
 
 	// ----- Row-lock model for FOR UPDATE SKIP LOCKED.
@@ -231,8 +232,51 @@ export function mockPgClient(options = {}) {
 			if (txState) {
 				txState.inTx = false;
 				releaseRowLocks(connId);
+				for (const [key, owner] of transactionLocks) if (owner === connId) transactionLocks.delete(key);
 			}
 			return { rows: [], rowCount: 0 };
+		}
+
+		if (sql.includes('set_config(')) return { rows: [], rowCount: 1 };
+		if (sql.includes('pg_try_advisory_xact_lock')) {
+			const key = values[0], owner = transactionLocks.get(key);
+			const acquired = owner === undefined || owner === connId;
+			if (acquired && txState?.inTx) transactionLocks.set(key, connId);
+			return { rows: [{ acquired }], rowCount: 1 };
+		}
+		if (sql.startsWith('WITH expired AS')) {
+			let count = 0;
+			if (sql.includes('svti_tasks_id')) {
+				const cutoff = now() - Number(values[0]) * 1000, limit = Number(values[1]);
+				for (const [key, row] of [...taskRows].sort((a, b) => a[1].updated_at - b[1].updated_at)) {
+					if (count >= limit) break;
+					if (['committed', 'failed'].includes(row.status) && row.updated_at < cutoff && !isRowLockedByOther('task', key, connId)) {
+						taskRows.delete(key); count++;
+					}
+				}
+			} else if (sql.includes('svti_idempotency_key')) {
+				for (const [key, row] of [...idemRows].sort((a, b) => a[1].expires_at - b[1].expires_at)) {
+					if (count >= Number(values[0])) break;
+					if (row.expires_at < idemNow()) { idemRows.delete(key); count++; }
+				}
+			} else {
+				const ttl = sql.includes('created_at <');
+				const limit = Number(values[ttl ? 1 : 2]);
+				const cutoff = ttl ? now() - Number(values[0]) * 1000 : Number(values[1]);
+				const eligible = rows.filter(row => ttl ? row.created_at.getTime() < cutoff : row.topic === values[0] && row.seq <= cutoff)
+					.sort((a, b) => ttl ? a.created_at - b.created_at : a.seq - b.seq).slice(0, limit);
+				const selected = new Set(eligible);
+				rows = rows.filter(row => !selected.has(row)); count = eligible.length;
+			}
+			return { rows: [], rowCount: count };
+		}
+		if (sql.startsWith('SELECT topic FROM') && sql.includes('LIMIT 32')) {
+			const selected = [...seqCounters.keys()].filter(topic => topic > values[0]).sort().slice(0, 32).map(topic => ({ topic }));
+			return { rows: selected, rowCount: selected.length };
+		}
+		if (sql.startsWith('SELECT seq FROM') && sql.includes('OFFSET $2 LIMIT 1')) {
+			const row = rows.filter(row => row.topic === values[0]).sort((a, b) => b.seq - a.seq)[Number(values[1])];
+			return { rows: row ? [{ seq: row.seq }] : [], rowCount: row ? 1 : 0 };
 		}
 
 		// LISTEN / UNLISTEN: register or drop this dedicated client on a
@@ -1357,6 +1401,7 @@ export function mockPgClient(options = {}) {
 	}
 
 	function releaseConn(connId) {
+		for (const [key, owner] of transactionLocks) if (owner === connId) transactionLocks.delete(key);
 		for (const [lockId, holder] of advisoryLocks) {
 			if (holder === connId) advisoryLocks.delete(lockId);
 		}
@@ -1377,13 +1422,19 @@ export function mockPgClient(options = {}) {
 				return {
 					query: (textOrObj, vals) =>
 						Promise.resolve(runQuery(textOrObj, vals, connId, null, txState)),
-					release: () => {
+					release: (error) => {
 						txState.inTx = false;
-						releaseRowLocks(connId);
+						if (error) releaseConn(connId);
+						else {
+							releaseRowLocks(connId);
+							for (const [key, owner] of transactionLocks) if (owner === connId) transactionLocks.delete(key);
+						}
 					}
 				};
 			}
 		},
+
+		async connect() { return client.pool.connect(); },
 
 		async query(textOrObj, values) {
 			// The shared client is autocommit: connId 0, no transaction window,

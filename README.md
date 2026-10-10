@@ -1796,7 +1796,7 @@ CREATE TABLE IF NOT EXISTS svti_replay (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_svti_replay_topic_seq ON svti_replay (topic, seq);
-
+CREATE INDEX IF NOT EXISTS idx_svti_replay_created_at ON svti_replay (created_at);
 CREATE TABLE IF NOT EXISTS svti_replay_seq (
   topic TEXT PRIMARY KEY,
   seq BIGINT NOT NULL DEFAULT 0,
@@ -1818,7 +1818,7 @@ ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAU
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Row expiry in seconds (0 = never) |
 | `autoMigrate` | `true` | Auto-create table |
-| `cleanupInterval` | `60000` | Periodic cleanup interval in ms (0 to disable) |
+| `cleanupInterval` | `60000` | Maximum jitter delay between bounded cleanup passes in ms (0 disables); [retention limits](docs/postgres-retention.md) |
 
 #### API
 
@@ -2158,7 +2158,7 @@ export const idempotency = createIdempotencyStore(pg, {
 });
 ```
 
-The Postgres backend periodically deletes expired rows (configurable via `cleanupInterval`, default 60s, 0 to disable). Stale pending rows clear on the next sweep without manual intervention.
+The Postgres backend drains expired rows in bounded, jittered passes (maximum delay `cleanupInterval`, default 60s, 0 to disable). Stale pending rows clear over successive passes without manual intervention; [ownership, budgets and metrics](docs/postgres-retention.md).
 
 The Postgres table is created automatically on first use:
 
@@ -2209,7 +2209,7 @@ export async function placeOrder(input, ctx) {
 | `ttl` | `172800` (48h) | Result cache lifetime in seconds |
 | `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |
 | `autoMigrate` (Postgres) | `true` | Auto-create the table on first use |
-| `cleanupInterval` (Postgres) | `60000` | Periodic expired-row cleanup interval in ms (0 to disable) |
+| `cleanupInterval` (Postgres) | `60000` | Maximum jitter delay between bounded expired-row passes in ms (0 disables); [retention limits](docs/postgres-retention.md) |
 | `breaker` | - | Circuit breaker; bypassed when broken |
 | `metrics` | - | Prometheus registry; emits `idempotency_*_total` counters |
 
@@ -2954,7 +2954,7 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
 | `dispatchBatchSize` | `10` | Max pending rows claimed per dispatch sweep |
 | `awaitPollInterval` | `500` | ms between row reads while `await()` waits |
 | `awaitTimeout` | `60000` | ms after which `await()` rejects if the task is still not terminal. 0 = no timeout. |
-| `cleanupInterval` | `3600000` | ms between cleanup sweeps. 0 disables. |
+| `cleanupInterval` | `3600000` | Maximum jitter delay between bounded cleanup passes in ms. 0 disables; [retention limits](docs/postgres-retention.md). |
 | `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
 | `autoMigrate` | `true` | Auto-create the table on first use. Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
 | `serializeErrorCause` | `false` | Persist `error.cause` alongside name/message/stack/code on a failed task. Off by default: handlers routinely attach config-bearing causes (a connection error carries its DSN) and the stored row is re-served to dashboards by `await()` / `list()`. |

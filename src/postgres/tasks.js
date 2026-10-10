@@ -56,6 +56,7 @@ import {
 	deserialiseError,
 	serialiseErrorSafe
 } from './_tasks-errors.js';
+import { scheduleCleanup } from './_cleanup.js';
 import { startTaskHeartbeat } from './_tasks-heartbeat.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql, encodeTaskPayload, MIN_TASK_PAYLOAD_BYTES } from './_tasks-sql.js';
@@ -100,7 +101,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {number} [dispatchBatchSize=10] - Max pending rows claimed per sweep.
  * @property {number} [awaitPollInterval=500] - ms between row reads while awaiting a task's terminal state.
  * @property {number} [awaitTimeout=60000] - ms after which await() rejects if the task is still not terminal. 0 = no timeout.
- * @property {number} [cleanupInterval=3600000] - ms between cleanup sweeps. 0 disables.
+ * @property {number} [cleanupInterval=3600000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {number} [rowTtl=604800] - Seconds to keep terminal rows (committed/failed) before deletion. Default 7 days.
  * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
  * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern - still wants `postgres/notify`.
@@ -302,8 +303,6 @@ export function createTaskRunner(client, options = {}) {
 	let recoveryRunning = false;
 	let dispatchTimer = null;
 	let dispatchRunning = false;
-	let cleanupTimer = null;
-	let cleanupRunning = false;
 	let destroyed = false;
 
 	// Gates `cause` on BOTH surfaces that re-serve a handler error: the
@@ -740,22 +739,19 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function cleanupTick() {
-		if (cleanupRunning || destroyed) return;
-		if (b && !b.isHealthy) return;
-		cleanupRunning = true;
-		try {
-			await sql.ensureTable();
-			await sql.deleteOldTerminal();
-			b?.success();
-			sweepFailing.cleanup = false;
-		} catch (err) {
-			b?.failure(err);
-			reportSweepFailure('cleanup', err);
-		} finally {
-			cleanupRunning = false;
+	const cleanup = scheduleCleanup({
+		client, table, kind: 'tasks', interval: cleanupInterval, metrics: m,
+		ready: sql.ensureTable, healthy: () => !destroyed && (!b || b.isHealthy),
+		success() { b?.success(); sweepFailing.cleanup = false; },
+		failure(error) { b?.failure(error); reportSweepFailure('cleanup', error); },
+		async work(budget) {
+			while (budget.available) {
+				const limit = budget.limit;
+				const count = await sql.deleteOldTerminal(budget, limit);
+				if (count < limit) break;
+			}
 		}
-	}
+	});
 
 	if (recoveryInterval > 0) {
 		recoveryTimer = setIntervalTimer(recoveryTick, recoveryInterval);
@@ -765,10 +761,7 @@ export function createTaskRunner(client, options = {}) {
 		dispatchTimer = setIntervalTimer(dispatchTick, dispatchInterval);
 		if (dispatchTimer.unref) dispatchTimer.unref();
 	}
-	if (cleanupInterval > 0) {
-		cleanupTimer = setIntervalTimer(cleanupTick, cleanupInterval);
-		if (cleanupTimer.unref) cleanupTimer.unref();
-	}
+
 
 	return {
 		register(name, handler, registrationOptions = {}) {
@@ -1070,10 +1063,7 @@ export function createTaskRunner(client, options = {}) {
 				clearIntervalTimer(dispatchTimer);
 				dispatchTimer = null;
 			}
-			if (cleanupTimer) {
-				clearIntervalTimer(cleanupTimer);
-				cleanupTimer = null;
-			}
+			cleanup.stop();
 			for (const reg of handlers.values()) {
 				if (reg.pool) reg.pool.destroy();
 			}

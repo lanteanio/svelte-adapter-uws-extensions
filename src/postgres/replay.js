@@ -36,7 +36,7 @@ import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { createLruMap } from '../shared/lru-map.js';
 import { withBreaker } from '../shared/breaker.js';
-import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { scheduleCleanup } from './_cleanup.js';
 import { withTransaction } from '../shared/pg-tx.js';
 import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
@@ -88,7 +88,7 @@ const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
  * @property {number} [size=1000] - Max messages per topic
  * @property {number} [ttl=0] - TTL in seconds (0 = no expiry). Rows older than this are cleaned up periodically.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use
- * @property {number} [cleanupInterval=60000] - How often to run cleanup (ms). 0 to disable.
+ * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, including each publishBatch entry.
  */
 
@@ -188,6 +188,7 @@ export function createReplay(client, options = {}) {
 		await safeCreate(client, `
 			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
 		`);
+		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_created_at ON ${table} (created_at)`);
 		// Right-to-erasure column (ALTER so existing buffers forward-migrate).
 		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
 		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
@@ -215,52 +216,63 @@ export function createReplay(client, options = {}) {
 		migrated = true;
 	}
 
-	// Periodic cleanup
-	let cleanupTimer = null;
-	let cleanupRunning = false;
-	if (cleanupInterval > 0) {
-		cleanupTimer = setIntervalTimer(async () => {
-			if (cleanupRunning) return;
-			if (b && !b.isHealthy) return;
-			cleanupRunning = true;
-			try {
-				await ensureTable();
-
-				// Trim by size: for each topic, keep only the newest `maxSize` rows
-				await client.query(`
-					DELETE FROM ${table} r
-					 USING (
-					   SELECT sub.topic,
-					          (SELECT seq FROM ${table}
-					            WHERE topic = sub.topic
-					            ORDER BY seq DESC
-					            OFFSET $1
-					            LIMIT 1) AS cutoff_seq
-					     FROM (SELECT DISTINCT topic FROM ${table}) sub
-					 ) cutoffs
-					 WHERE r.topic = cutoffs.topic
-					   AND cutoffs.cutoff_seq IS NOT NULL
-					   AND r.seq <= cutoffs.cutoff_seq
-				`, [maxSize]);
-
-				// Trim by TTL
-				if (ttl > 0) {
-					await client.query(
-						`DELETE FROM ${table}
-						  WHERE created_at < now() - interval '1 second' * $1`,
-						[ttl]
-					);
-				}
-
-				b?.success();
-				} catch (err) {
-				b?.failure(err);
-			} finally {
-				cleanupRunning = false;
-			}
-		}, cleanupInterval);
-		if (cleanupTimer.unref) cleanupTimer.unref();
+	let cleanupTopic = '';
+	let ttlFirst = true;
+	async function trimExpired(budget) {
+		if (ttl <= 0) return;
+		while (budget.available) {
+			const limit = budget.limit;
+			const count = await budget.remove(`WITH expired AS (
+				SELECT ${pkCol} FROM ${table}
+				WHERE created_at < now() - interval '1 second' * $1
+				ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${table} r USING expired WHERE r.${pkCol} = expired.${pkCol}`, [ttl, limit]);
+			if (count < limit) break;
+		}
 	}
+	async function trimSizes(budget) {
+		if (!budget.available) return;
+		// The sequence table has one indexed row per topic. Walk at most 32
+		// topics per pass, retaining the cursor instead of DISTINCT-scanning data.
+		let result = await budget.query(`SELECT topic FROM ${seqTable}
+			WHERE topic > $1 ORDER BY topic LIMIT 32`, [cleanupTopic]);
+		if (result.rows.length === 0 && cleanupTopic && budget.available) {
+			cleanupTopic = '';
+			result = await budget.query(`SELECT topic FROM ${seqTable} WHERE topic > $1 ORDER BY topic LIMIT 32`, [cleanupTopic]);
+		}
+		for (const { topic } of result.rows) {
+			if (!budget.available) break;
+			const cutoff = await budget.query(`SELECT seq FROM ${table}
+				WHERE topic = $1 ORDER BY seq DESC OFFSET $2 LIMIT 1`, [topic, maxSize]);
+			if (!cutoff.rows.length) { cleanupTopic = topic; continue; }
+			let complete = false;
+			while (budget.available) {
+				const limit = budget.limit;
+				const count = await budget.remove(`WITH expired AS (
+					SELECT ${pkCol} FROM ${table} WHERE topic = $1 AND seq <= $2
+					ORDER BY seq LIMIT $3 FOR UPDATE SKIP LOCKED
+				) DELETE FROM ${table} r USING expired WHERE r.${pkCol} = expired.${pkCol}`, [topic, cutoff.rows[0].seq, limit]);
+				if (count < limit) { complete = true; break; }
+			}
+			cleanupTopic = topic;
+			// Revisit a busy topic after the cursor wraps, allowing later topics
+			// to progress even while its backlog keeps growing.
+			if (!complete) break;
+		}
+	}
+	const cleanup = scheduleCleanup({
+		client, table, kind: 'replay', interval: cleanupInterval, metrics: m,
+		ready: ensureTable, healthy: () => !b || b.isHealthy,
+		success: () => b?.success(), failure: (error) => b?.failure(error),
+		async work(budget) {
+			// Neither TTL backlog nor size backlog can starve the other policy.
+			const first = ttlFirst ? trimExpired : trimSizes;
+			const second = ttlFirst ? trimSizes : trimExpired;
+			ttlFirst = !ttlFirst;
+			await first(budget);
+			await second(budget);
+		}
+	});
 
 	// Last epoch this process observed for a topic, so a synchronous caller (the
 	// subscribe-ack carrier, which cannot await Postgres) can read a recent
@@ -845,10 +857,7 @@ export function createReplay(client, options = {}) {
 		},
 
 		destroy() {
-			if (cleanupTimer) {
-				clearIntervalTimer(cleanupTimer);
-				cleanupTimer = null;
-			}
+			cleanup.stop();
 		},
 
 		/**

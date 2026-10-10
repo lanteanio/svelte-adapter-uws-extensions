@@ -12,7 +12,7 @@ export interface PgReplayOptions {
 	ttl?: number;
 	/** Auto-create table on first use. @default true */
 	autoMigrate?: boolean;
-	/** Cleanup interval in ms (0 to disable). @default 60000 */
+	/** Maximum jitter delay between bounded maintenance passes, in ms. 0 disables; integer up to 2147483647. @default 60000 */
 	cleanupInterval?: number;
 	/**
 	 * When `true`, `publish()` falls back to a best-effort

@@ -957,7 +957,9 @@ describe('postgres tasks sweep failure report', () => {
 	let ticks;
 	beforeEach(() => {
 		ticks = new Map();
-		setRuntimeEnv({ timers: {
+		setRuntimeEnv({ rng: { float: () => 1 }, timers: {
+			set: (cb, ms) => { ticks.set(ms, cb); return { unref() {} }; },
+			clear: () => {},
 			setInterval: (cb, ms) => { ticks.set(ms, cb); return { unref() {} }; },
 			clearInterval: () => {}
 		} });
@@ -974,7 +976,9 @@ describe('postgres tasks sweep failure report', () => {
 	it('reports each failing sweep once per streak and re-arms on success', async () => {
 		const client = mockPgClient();
 		const query = client.query.bind(client);
+		const connect = client.connect.bind(client);
 		let failing = true;
+		client.connect = () => failing ? Promise.reject(Object.assign(new Error('column \"traceparent\" does not exist'), { code: '42703' })) : connect();
 		client.query = (...args) => {
 			if (!failing) return query(...args);
 			return Promise.reject(Object.assign(new Error('column "traceparent" does not exist'), { code: '42703' }));

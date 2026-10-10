@@ -30,7 +30,8 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
-import { setIntervalTimer, clearIntervalTimer, randomUuid } from '../shared/runtime.js';
+import { randomUuid } from '../shared/runtime.js';
+import { scheduleCleanup } from './_cleanup.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../shared/errors.js';
 
@@ -50,7 +51,7 @@ const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
  *   default and semantics as the Redis backend so the two stores are
  *   drop-in interchangeable. Pass `Infinity` to disable.
  * @property {boolean} [autoMigrate=true] - Auto-create table on first use.
- * @property {number} [cleanupInterval=60000] - How often expired rows are deleted (ms). 0 disables.
+ * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional metrics registry (Prometheus).
  */
@@ -161,25 +162,22 @@ export function createIdempotencyStore(client, options = {}) {
 		}
 	}
 
-	let cleanupTimer = null;
-	let cleanupRunning = false;
-	if (cleanupInterval > 0) {
-		cleanupTimer = setIntervalTimer(async () => {
-			if (cleanupRunning) return;
-			if (b && !b.isHealthy) return;
-			cleanupRunning = true;
-			try {
-				await ensureTable();
-				await client.query(`DELETE FROM ${table} WHERE expires_at < now()`);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-			} finally {
-				cleanupRunning = false;
+	const cleanup = scheduleCleanup({
+		client, table, kind: 'idempotency', interval: cleanupInterval, metrics: m,
+		ready: ensureTable, healthy: () => !b || b.isHealthy,
+		success: () => b?.success(), failure: (error) => b?.failure(error),
+		async work(budget) {
+			while (budget.available) {
+				const limit = budget.limit;
+				const count = await budget.remove(`WITH expired AS (
+					SELECT svti_idempotency_key FROM ${table} WHERE expires_at < now()
+					ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED
+				) DELETE FROM ${table} r USING expired
+				WHERE r.svti_idempotency_key = expired.svti_idempotency_key`, [limit]);
+				if (count < limit) break;
 			}
-		}, cleanupInterval);
-		if (cleanupTimer.unref) cleanupTimer.unref();
-	}
+		}
+	});
 
 	function commitFor(idempotencyKey, ownerToken, resultTtl) {
 		return async function commit(result) {
@@ -373,10 +371,7 @@ export function createIdempotencyStore(client, options = {}) {
 		},
 
 		destroy() {
-			if (cleanupTimer) {
-				clearIntervalTimer(cleanupTimer);
-				cleanupTimer = null;
-			}
+			cleanup.stop();
 		}
 	};
 }

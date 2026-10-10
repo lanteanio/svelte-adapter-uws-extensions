@@ -125,7 +125,7 @@ export interface TaskRunnerOptions {
 	awaitPollInterval?: number;
 	/** ms after which await() rejects if the task is still not terminal. 0 = no timeout. @default 60000 */
 	awaitTimeout?: number;
-	/** ms between cleanup sweeps. 0 disables. @default 3600000 (1 hour) */
+	/** Maximum jitter delay between bounded maintenance passes, in ms. 0 disables; integer up to 2147483647. @default 3600000 */
 	cleanupInterval?: number;
 	/** Seconds to keep terminal rows (committed/failed) before deletion. @default 604800 (7 days) */
 	rowTtl?: number;

@@ -514,15 +514,13 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		return res.rows;
 	}
 
-	async function deleteOldTerminal() {
-		const res = await client.query({
-			name: 'tasks_cleanup_' + table,
-			text: `DELETE FROM ${table}
-			        WHERE status IN ('committed', 'failed')
-			          AND updated_at < now() - ($1 || ' seconds')::interval`,
-			values: [rowTtl]
-		});
-		return res.rowCount;
+	async function deleteOldTerminal(budget, limit) {
+		return budget.remove(`WITH expired AS (
+			SELECT svti_tasks_id FROM ${table}
+			WHERE status IN ('committed', 'failed')
+			AND updated_at < now() - ($1 || ' seconds')::interval
+			ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED
+		) DELETE FROM ${table} r USING expired WHERE r.svti_tasks_id = expired.svti_tasks_id`, [rowTtl, limit]);
 	}
 
 	// Right-to-erasure: delete every task row stamped with this user's id.
