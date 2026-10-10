@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document Redis and PostgreSQL recovery with versioned persistence and evidence manifests, bounded read-only verification, and real archive/restore drills that check expiry, sequence continuity and schema migration state.
+
 - Add stable operational error codes across backend connection, breaker, replay, lock and task failures; preserve them across worker and persisted task boundaries.
 
 - Add serialized, versioned PostgreSQL migrations with a checksum ledger, bounded dedicated sessions, resumable concurrent indexes, state/attempt/claim constraints, and unique replay `(topic, seq)` identities. Existing incompatible data fails validation without automatic repair.

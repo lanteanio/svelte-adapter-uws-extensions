@@ -67,3 +67,6 @@ uses bounded individual routing. Presence and registry TTL heartbeats run one
 refresh at a time, coalescing missed ticks into one rerun with current membership.
 Presence heartbeat latency includes Redis completion. Keep the heartbeat-to-TTL
 margin large enough for the complete refresh at your deployment's cardinality.
+
+For backup scope, coupled restore groups and the read-only verification command,
+see [Storage recovery](./recovery.md).

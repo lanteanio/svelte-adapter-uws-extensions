@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"packageVersion": "record-the-installed-package-version",
+	"manifestSha256": "record-the-persistence-manifest-digest",
+	"backupCutUtc": "record-the-consistent-application-cut",
+	"backendVersions": {},
+	"artifacts": [],
+	"scopeFileSha256": "record-the-private-scope-digest",
+	"verificationReportSha256": "record-the-report-digest",
+	"reconciliation": {
+		"oldWorkersIsolated": false,
+		"externalEffectsReconciled": false,
+		"laterErasuresApplied": false,
+		"clientsReauthenticated": false
+	},
+	"hostDrill": {
+		"restoredCheckpointUtc": null,
+		"serviceRestoredUtc": null,
+		"measuredRpoSeconds": null,
+		"measuredRtoSeconds": null
+	}
+}

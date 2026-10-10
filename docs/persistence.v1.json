@@ -1,0 +1,574 @@
+{
+	"schemaVersion": 1,
+	"package": "svelte-adapter-uws-extensions",
+	"versionSource": "../package.json",
+	"postgresMinimum": 16,
+	"postgres": [
+		{
+			"id": "schema-migrations",
+			"table": "svti_schema_migrations",
+			"columns": {
+				"table_name": "text",
+				"store": "text",
+				"version": "integer",
+				"checksum": "text",
+				"applied_at": "timestamp with time zone"
+			},
+			"indexColumns": [["table_name", "version"]],
+			"restoreGroup": "postgres-schema"
+		},
+		{
+			"id": "replay",
+			"table": "svti_replay",
+			"columns": {
+				"$id": "bigint",
+				"topic": "text",
+				"seq": "bigint",
+				"event": "text",
+				"data": "jsonb",
+				"created_at": "timestamp with time zone",
+				"user_id": "text"
+			},
+			"indexColumns": [
+				[
+					"topic",
+					"seq"
+				],
+				[
+					"created_at"
+				],
+				[
+					"user_id"
+				]
+			],
+			"serialColumn": "$id",
+			"restoreGroup": "postgres-replay"
+		},
+		{
+			"id": "replay-sequence",
+			"table": "svti_replay_seq",
+			"columns": {
+				"topic": "text",
+				"seq": "bigint",
+				"epoch": "bigint"
+			},
+			"indexColumns": [
+				[
+					"topic"
+				]
+			],
+			"restoreGroup": "postgres-replay"
+		},
+		{
+			"id": "idempotency",
+			"table": "svti_idempotency",
+			"columns": {
+				"svti_idempotency_key": "text",
+				"status": "text",
+				"result": "jsonb",
+				"expires_at": "timestamp with time zone",
+				"user_id": "text",
+				"tenant_id": "text",
+				"owner_token": "text"
+			},
+			"indexColumns": [
+				[
+					"expires_at"
+				],
+				[
+					"tenant_id",
+					"user_id"
+				]
+			],
+			"restoreGroup": "postgres-idempotency"
+		},
+		{
+			"id": "jobs",
+			"table": "svti_jobs",
+			"columns": {
+				"svti_jobs_id": "bigint",
+				"queue": "text",
+				"payload": "jsonb",
+				"request_id": "text",
+				"traceparent": "text",
+				"tracestate": "text",
+				"claimed_at": "timestamp with time zone",
+				"claimed_until": "timestamp with time zone",
+				"attempts": "integer",
+				"created_at": "timestamp with time zone"
+			},
+			"indexColumns": [
+				[
+					"queue",
+					"svti_jobs_id"
+				],
+				[
+					"claimed_until"
+				]
+			],
+			"serialColumn": "svti_jobs_id",
+			"restoreGroup": "postgres-jobs"
+		},
+		{
+			"id": "tasks",
+			"table": "svti_tasks",
+			"columns": {
+				"svti_tasks_id": "uuid",
+				"name": "text",
+				"input": "jsonb",
+				"svti_idempotency_key": "text",
+				"request_id": "text",
+				"traceparent": "text",
+				"tracestate": "text",
+				"status": "text",
+				"result": "jsonb",
+				"error": "jsonb",
+				"fence": "uuid",
+				"fence_expires_at": "timestamp with time zone",
+				"attempts": "integer",
+				"created_at": "timestamp with time zone",
+				"updated_at": "timestamp with time zone",
+				"user_id": "text"
+			},
+			"indexColumns": [
+				[
+					"user_id"
+				],
+				[
+					"fence_expires_at"
+				],
+				[
+					"updated_at"
+				]
+			],
+			"restoreGroup": "postgres-tasks"
+		},
+		{
+			"id": "dead-letter",
+			"table": "svti_dead_letter",
+			"columns": {
+				"$id": "bigint",
+				"webhook_id": "text",
+				"topic": "text",
+				"event": "text",
+				"data": "jsonb",
+				"attempts": "integer",
+				"error": "text",
+				"failed_at": "bigint",
+				"user_id": "text"
+			},
+			"indexColumns": [
+				[
+					"topic"
+				],
+				[
+					"failed_at"
+				],
+				[
+					"user_id"
+				]
+			],
+			"serialColumn": "$id",
+			"restoreGroup": "postgres-dead-letter"
+		},
+		{
+			"id": "alarms",
+			"table": "svti_alarms",
+			"columns": {
+				"topic": "text",
+				"fire_at": "bigint",
+				"meta": "jsonb",
+				"tenant": "text"
+			},
+			"indexColumns": [
+				[
+					"fire_at"
+				]
+			],
+			"restoreGroup": "postgres-alarms"
+		}
+	],
+	"redis": [
+		{
+			"id": "replay",
+			"restore": "together",
+			"roles": [
+				{
+					"id": "sequence",
+					"type": "string",
+					"template": "replay:seq:{<topic>}"
+				},
+				{
+					"id": "buffer",
+					"type": "zset",
+					"template": "replay:buf:{<topic>}"
+				},
+				{
+					"id": "stream",
+					"type": "stream",
+					"template": "replay:streambuf:{<topic>}"
+				},
+				{
+					"id": "epoch",
+					"type": "string",
+					"template": "replay:epoch:{<topic>}"
+				},
+				{
+					"id": "producer-cache",
+					"type": "hash",
+					"template": "replay:idmp:<producer>:{<topic>}"
+				}
+			],
+			"notes": "Restore all selected buffer backends, sequence, epoch and producer-cache keys at one cut. Empty buffers and absent legacy epoch zero are valid; retained events require sequence authority."
+		},
+		{
+			"id": "dead-letter",
+			"restore": "together",
+			"roles": [
+				{
+					"id": "sequence",
+					"type": "string",
+					"template": "dlq:seq:{dlq}"
+				},
+				{
+					"id": "records",
+					"type": "hash",
+					"template": "dlq:recs:{dlq}"
+				},
+				{
+					"id": "order",
+					"type": "zset",
+					"template": "dlq:order:{dlq}"
+				},
+				{
+					"id": "erasure",
+					"type": "string",
+					"template": "dlq:purged:<user>"
+				}
+			],
+			"notes": "Preserve erasure tombstones and reconcile erasures completed after the backup before retrying captured deliveries."
+		},
+		{
+			"id": "alarms",
+			"restore": "together",
+			"roles": [
+				{
+					"id": "due",
+					"type": "zset",
+					"template": "<prefix>{alarms}:due"
+				},
+				{
+					"id": "metadata",
+					"type": "hash",
+					"template": "<prefix>{alarms}:meta"
+				}
+			],
+			"defaultPrefix": "alarm:",
+			"notes": "Restore schedule and resolver metadata together; reconcile external side effects before enabling due work."
+		},
+		{
+			"id": "idempotency",
+			"restore": "together",
+			"roles": [
+				{
+					"id": "erasure-index",
+					"type": "hash",
+					"template": "<prefix>byuser:<identity>"
+				},
+				{
+					"id": "result",
+					"type": "string",
+					"template": "<prefix><key>"
+				}
+			],
+			"defaultPrefix": "idem:",
+			"notes": "Preserve committed outcomes and reverse identity indexes. Reconcile pending ownership and external effects before accepting retries."
+		},
+		{
+			"id": "sessions",
+			"restore": "together",
+			"roles": [
+				{
+					"id": "erasure-index",
+					"type": "hash",
+					"template": "<prefix>byuser:<user>"
+				},
+				{
+					"id": "session",
+					"type": "string",
+					"template": "<prefix><token>"
+				}
+			],
+			"defaultPrefix": "sess:",
+			"notes": "Restore session records with reverse erasure indexes and original expiry, or explicitly invalidate all sessions. Reapply revocations after the backup."
+		},
+		{
+			"id": "presence",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "roster",
+					"type": "hash",
+					"template": "presence:topic:{<topic>}"
+				},
+				{
+					"id": "connections",
+					"type": "hash",
+					"template": "presence:user:{<topic>}:<user>"
+				},
+				{
+					"id": "identity-generations",
+					"type": "hash",
+					"template": "presence:pending:{<topic>}"
+				}
+			],
+			"notes": "Connection-bound state must be rebuilt from reauthenticated sockets; a snapshot cannot revive socket ownership."
+		},
+		{
+			"id": "registry",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "connections",
+					"type": "hash",
+					"template": "<prefix>conns:<user>"
+				},
+				{
+					"id": "session-routing",
+					"type": "hash",
+					"template": "<prefix>sess:<session>"
+				}
+			],
+			"defaultPrefix": "",
+			"notes": "Routing references live instances. Reconnect clients; configure distinct prefixes from durable session storage."
+		},
+		{
+			"id": "cursor",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "snapshot",
+					"type": "hash",
+					"template": "cursor:{<topic>}"
+				}
+			],
+			"notes": "Transient cursor positions may contain user metadata; rebuild from live publishers."
+		},
+		{
+			"id": "groups",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "metadata",
+					"type": "hash",
+					"template": "group:{<group>}:meta"
+				},
+				{
+					"id": "members",
+					"type": "hash",
+					"template": "group:{<group>}:members"
+				},
+				{
+					"id": "closed",
+					"type": "string",
+					"template": "group:{<group>}:closed"
+				}
+			],
+			"notes": "Preserve group metadata and closure decisions, but reconcile connection-bound memberships."
+		},
+		{
+			"id": "smooth",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "owner",
+					"type": "string",
+					"template": "smooth:owner:<topic>"
+				},
+				{
+					"id": "snapshot",
+					"type": "string",
+					"template": "smooth:snap:<topic>"
+				}
+			],
+			"notes": "Invalidate expired ownership; restore compatible application snapshots only with their authority and original expiry."
+		},
+		{
+			"id": "crdt",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "persistence-lease",
+					"type": "string",
+					"template": "crdt:persist:<topic>"
+				}
+			],
+			"notes": "Redis holds a persistence lease, not the document snapshot. The application owns its snapshot callback storage and recovery."
+		},
+		{
+			"id": "fences",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "lease",
+					"type": "string",
+					"template": "<prefix><task>"
+				}
+			],
+			"defaultPrefix": "fence:",
+			"notes": "Task UUID fence mirrors derive from canonical PostgreSQL task ownership. Stop old workers before recovery; never restore stale mirrors as owners."
+		},
+		{
+			"id": "locks",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "lease",
+					"type": "string",
+					"template": "<prefix><key>"
+				}
+			],
+			"defaultPrefix": "lock:",
+			"notes": "Lease tokens cannot certify that a previous process or its external work stopped. Reconcile side effects before reacquisition."
+		},
+		{
+			"id": "leader",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "lease",
+					"type": "string",
+					"template": "<prefix>"
+				}
+			],
+			"defaultPrefix": "leader",
+			"notes": "A lease is live-process authority, not durable leadership. Re-elect after isolating old owners."
+		},
+		{
+			"id": "clock",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "offset",
+					"type": "string",
+					"template": "<prefix>"
+				}
+			],
+			"defaultPrefix": "clock:leader-offset",
+			"notes": "Re-establish clock synchronization; do not revive a stale leader offset."
+		},
+		{
+			"id": "topic-broadcast",
+			"restore": "rebuild",
+			"roles": [
+				{
+					"id": "instances",
+					"type": "zset",
+					"template": "<prefix>{topic-broadcast}:instances"
+				}
+			],
+			"defaultPrefix": "",
+			"notes": "Instance completion hints are rebuilt by live participants."
+		},
+		{
+			"id": "rate-window",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimit:<key>"
+				}
+			],
+			"notes": "Preserve abuse-control policy and original expiry, or choose a documented conservative reset."
+		},
+		{
+			"id": "rate-sliding",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimits:<key>"
+				}
+			],
+			"notes": "Restore rolling budget state with original expiry."
+		},
+		{
+			"id": "rate-gcra",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimitg:<key>"
+				}
+			],
+			"notes": "Restore rate-control state with original expiry."
+		},
+		{
+			"id": "rate-composite",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimitc:<key>"
+				}
+			],
+			"notes": "Tenant dimensions share admission decisions; restore dimensions at one cut."
+		},
+		{
+			"id": "upgrade-bucket",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:upgrade-bucket:<ip>"
+				}
+			],
+			"notes": "Connection admission state may include client addresses; keep backups private."
+		},
+		{
+			"id": "emergency-scale",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "scale",
+					"type": "string",
+					"template": "v1:ratelimit:emergency"
+				}
+			],
+			"notes": "Restore only the intended current operator policy. This exact key takes precedence over the rate-window pattern."
+		},
+		{
+			"id": "webhook-controls",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "budget",
+					"type": "hash",
+					"template": "whbudget:{<key>}"
+				},
+				{
+					"id": "failure-count",
+					"type": "string",
+					"template": "whbreaker:fail:<key>"
+				}
+			],
+			"notes": "Coordinate retry budgets with delivery and external endpoint reconciliation."
+		}
+	],
+	"externalState": [
+		"Application CRDT snapshot callbacks",
+		"Application side effects of jobs, tasks, alarms and webhooks",
+		"Secrets, credentials, routing configuration and tenant authorization",
+		"Erasure and session revocation decisions newer than the backup"
+	],
+	"nonPersistent": [
+		"Redis Pub/Sub channels and notifications",
+		"In-process caches, callback registrations and active sockets"
+	],
+	"restoreRule": "One isolated consistent restore cut per coupled group; cross-database and external effects require an application recovery barrier. Preserve expiry deadlines and sequence identity. Never start workers merely because verification passed."
+}

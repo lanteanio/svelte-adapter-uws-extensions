@@ -288,3 +288,6 @@ old replay/idempotency schemas and the failed-schema/disabled-migration boundary
 The [packed rehearsal](../MIGRATION.md#executable-rehearsal) covers both automatic
 and documented manual jobs/tasks upgrades. Run both on the actual PostgreSQL
 version before deployment; neither substitutes for a host restore drill.
+
+For backup scope, coupled restore groups and the read-only verification command,
+see [Storage recovery](./recovery.md).
