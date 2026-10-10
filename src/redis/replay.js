@@ -395,7 +395,7 @@ export function createReplay(client, options = {}) {
 			// return the entire buffer via `sinceSeq + 1 <= 0`. Emit a
 			// bare `end` marker so the wire protocol shape is preserved.
 			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
-				platform.send(ws, '__replay:' + topic, 'end', { reqId: reqId || undefined });
+				platform.send(ws, '__replay:' + topic, 'end', { reqId: reqId ?? undefined });
 				return;
 			}
 			const replayTopic = '__replay:' + topic;
@@ -430,6 +430,7 @@ export function createReplay(client, options = {}) {
 				throw err;
 			}
 
+			let truncated = false;
 			let oldestSeq = null;
 			if (oldestRaw) {
 				for (let i = 0; i < oldestRaw.length; i++) {
@@ -445,6 +446,7 @@ export function createReplay(client, options = {}) {
 			}
 			if (oldestSeq !== null && sinceSeq > 0 && oldestSeq > sinceSeq + 1) {
 				mTruncations?.inc({ topic: mt(topic) });
+				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
 			}
 
@@ -458,6 +460,7 @@ export function createReplay(client, options = {}) {
 			const currentSeq = seqRaw ? parseInt(seqRaw, 10) : 0;
 			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0 && currentSeq > sinceSeq) {
 				mTruncations?.inc({ topic: mt(topic) });
+				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
 			}
 			b?.success();
@@ -465,13 +468,14 @@ export function createReplay(client, options = {}) {
 			for (let i = 0; i < missed.length; i++) {
 				const msg = missed[i];
 				platform.send(ws, replayTopic, 'msg', {
+					...(reqId == null ? {} : { reqId }),
 					seq: msg.seq,
 					event: msg.event,
 					data: msg.data
 				});
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
-			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined, ...(truncated ? { truncated: true } : {}) });
 			// Covered watermark for the adapter's recovery barrier: the highest seq
 			// this gap-fill actually delivered (ZRANGEBYSCORE is ascending, so the
 			// last valid decode is the highest). Everything at or below it is

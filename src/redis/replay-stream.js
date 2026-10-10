@@ -536,7 +536,7 @@ export function createStreamReplay(client, options = {}) {
 			// Emit a bare `end` marker so the wire protocol shape is
 			// preserved.
 			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
-				platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+				platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined });
 				return;
 			}
 			if (b) b.guard();
@@ -587,10 +587,10 @@ export function createStreamReplay(client, options = {}) {
 			}
 
 			for (const msg of missed) {
-				platform.send(ws, replayTopic, 'msg', { seq: msg.seq, event: msg.event, data: msg.data });
+				platform.send(ws, replayTopic, 'msg', { ...(reqId == null ? {} : { reqId }), seq: msg.seq, event: msg.event, data: msg.data });
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
-			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined, ...(truncated ? { truncated: true } : {}) });
 			// Covered watermark for the adapter's recovery barrier: the highest seq
 			// this gap-fill actually delivered (XRANGE is id-ascending and the seq
 			// IS the stream id's ms part, so the last valid decode is the highest).

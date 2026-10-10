@@ -609,7 +609,7 @@ Same API as the core `createReplay` plugin, but backed by Redis sorted sets. Mes
 
 Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + trim in a single `EVAL`), so concurrent publishes from multiple instances produce strictly ordered, gap-free sequences per topic. When the buffer exceeds `size`, the oldest entries are removed inside the same Lua script - no second round trip required.
 
-When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
+When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL). The final `end` also includes `truncated: true`; every `msg` and `end` echoes a supplied `reqId`, so clients matching concurrent requests receive both the history and its completeness signal.
 
 > **Authorization:** `replay()` authorizes before reading the buffer: it runs `platform.checkSubscribe(ws, topic)` per topic and **fails closed** - a platform that cannot answer (no `checkSubscribe`, or an authorizer that throws) is treated as a denial. A denied topic emits a `denied` event on `__replay:{topic}` and resolves `undefined` (no watermark) instead of history. Gate the topic-subscribe in your handler as before; the replay gate is the second line that keeps a guessed topic name from yielding the buffer. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -660,7 +660,7 @@ export async function load() {
 export async function message(ws, { data, platform }) {
   const msg = JSON.parse(Buffer.from(data).toString());
   if (msg.type === 'replay') {
-    await replay.replay(ws, msg.topic, msg.since, platform);
+    await replay.replay(ws, msg.topic, msg.since, platform, msg.reqId);
     return;
   }
 }

@@ -661,7 +661,7 @@ export function createReplay(client, options = {}) {
 			// negative bound. Emit a bare `end` marker so the wire protocol
 			// shape is preserved.
 			if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
-				platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+				platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined });
 				return;
 			}
 			b?.guard();
@@ -697,9 +697,11 @@ export function createReplay(client, options = {}) {
 			// Captured on the missed-empty path so the return below can confirm
 			// the client's sinceSeq against the counter before trusting it as
 			// the covered watermark.
+			let truncated = false;
 			let currentSeq = null;
 			if (sinceSeq > 0 && missed.length > 0 && missed[0].seq > sinceSeq + 1) {
 				mTruncations?.inc({ topic: mt(topic) });
+				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
 			} else if (sinceSeq > 0 && missed.length === 0) {
 				try {
@@ -713,6 +715,7 @@ export function createReplay(client, options = {}) {
 					currentSeq = seqRes.rows.length > 0 ? parseInt(seqRes.rows[0].current_seq, 10) : 0;
 					if (currentSeq > sinceSeq) {
 						mTruncations?.inc({ topic: mt(topic) });
+						truncated = true;
 						platform.send(ws, replayTopic, 'truncated', null);
 					}
 				} catch (err) {
@@ -725,13 +728,14 @@ export function createReplay(client, options = {}) {
 			for (let i = 0; i < missed.length; i++) {
 				const msg = missed[i];
 				platform.send(ws, replayTopic, 'msg', {
+					...(reqId == null ? {} : { reqId }),
 					seq: msg.seq,
 					event: msg.event,
 					data: msg.data
 				});
 			}
 			if (missed.length > 0) mReplayed?.inc({ topic: mt(topic) }, missed.length);
-			platform.send(ws, replayTopic, 'end', { reqId: reqId || undefined });
+			platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined, ...(truncated ? { truncated: true } : {}) });
 			// Covered watermark for the adapter's recovery barrier: the highest seq
 			// this gap-fill actually delivered (ORDER BY seq ASC, so the last row is
 			// the highest). Everything at or below it is already on the wire, so

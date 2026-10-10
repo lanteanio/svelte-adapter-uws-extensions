@@ -173,7 +173,9 @@ export interface PgReplayBuffer {
 	 * message on `__replay:{topic}`, then an end marker.
 	 *
 	 * If the buffer has been trimmed past `sinceSeq`, a `truncated` event
-	 * is sent before the messages so the client knows data was lost.
+	 * is sent before the messages and the end marker includes `truncated: true`.
+	 * Every message and the end marker echo a supplied `reqId`, so concurrent
+	 * requests can filter both history and truncation by their correlation ID.
 	 *
 	 * Resolves the covered watermark: the highest seq it delivered, or
 	 * `sinceSeq` itself when nothing newer existed AND the stored seq counter
@@ -184,7 +186,7 @@ export interface PgReplayBuffer {
 	 *
 	 * @param reqId - Optional correlation ID for disambiguating concurrent replays.
 	 */
-	replay(ws: any, topic: string, sinceSeq: number, platform: Platform, reqId?: string): Promise<number | undefined>;
+	replay(ws: any, topic: string, sinceSeq: number, platform: Platform, reqId?: string | number): Promise<number | undefined>;
 
 	/** Clear all replay data. */
 	clear(): Promise<void>;
