@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound multi-slot Redis work to eight concurrent batches and 256 commands per pipeline. Coalesce presence heartbeat and registry TTL refresh work and include completed I/O in heartbeat timing. Retry only explicitly refused routing operations without replaying successful writes.
+
 - Classify every README code block, compile and check supported APIs, and execute standalone examples against the packed artifact. Explicit fragment exceptions remain bounded.
 - Redis presence enforces maxUpdateBytes (8192), maxFieldsBytes (65536), maxTopicsPerConnection (100), and topicThrottle (16 ms); set topicThrottle: 0 for immediate diff flushing.
 
