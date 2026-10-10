@@ -80,7 +80,8 @@ function fakeConn() {
 		conn.status = 'ready';
 		conn.emit('ready');
 	};
-	conn.socketClosed = () => conn.reconnect();
+	conn.socketClosed = () => { conn.status = 'close'; conn.emit('close'); conn.reconnect(); };
+	conn.flushQueue = () => {};
 	return conn;
 }
 
@@ -1978,7 +1979,7 @@ describe('handshake owner command ordering', () => {
 		conn.emit('end');
 	});
 
-	it.each(['error', 'close', 'quit'])('settles held promises and callbacks when a handshake fails via %s', async (event) => {
+	it.each(['flush', 'quit'])('settles held promises and callbacks when a handshake fails via %s', async (event) => {
 		const raw = fakeConn();
 		raw.quit = async () => 'OK';
 		const conn = guardSubscriber(raw, 'pubsub');
@@ -1986,9 +1987,9 @@ describe('handshake owner command ordering', () => {
 		conn.status = 'connect';
 		const callback = vi.fn();
 		const waiting = conn.subscribe('x', callback);
-		const rejected = expect(waiting).rejects.toThrow(event === 'error' ? 'WRONGPASS' : 'Connection is closed');
+		const rejected = expect(waiting).rejects.toThrow(event === 'flush' ? 'WRONGPASS' : 'Connection is closed');
 		if (event === 'quit') await conn.quit();
-		else conn.emit(event, new Error('WRONGPASS'));
+		else conn.flushQueue(new Error('WRONGPASS'));
 		await rejected;
 		expect(callback).toHaveBeenCalledTimes(1);
 		expect(callback.mock.calls[0][0]).toBeInstanceOf(Error);
@@ -2012,4 +2013,45 @@ describe('handshake owner command ordering', () => {
 		expect(conn.server.subscribe).toEqual(new Set());
 		conn.emit('end');
 	});
+});
+
+
+it.each(['close', 'error'])('retains held undo intent across a temporary handshake %s', async event => {
+	const raw = fakeConn(), original = raw.subscribe;
+	let flushOffline;
+	raw.subscribe = (...args) => raw.status === 'connecting'
+		? new Promise((resolve, reject) => { flushOffline = () => original(...args).then(resolve, reject); })
+		: original(...args);
+	const conn = guardSubscriber(raw, 'pubsub');
+	conn.status = 'connecting';
+	const first = conn.subscribe('x');
+	conn.status = 'connect';
+	const callback = vi.fn();
+	const undo = conn.unsubscribe('x', callback);
+	void undo.catch(() => {});
+	if (event === 'close') conn.status = 'close';
+	conn.emit(event, new Error('temporary handshake failure'));
+	await flush();
+	expect(callback).not.toHaveBeenCalled();
+	conn.status = 'ready'; flushOffline(); conn.emit('ready');
+	await Promise.all([first, undo]);
+	expect(callback).toHaveBeenCalledExactlyOnceWith(null, 0);
+	expect(conn.server.subscribe).toEqual(new Set());
+	conn.emit('end');
+});
+
+it('rejects unanswered commands from the previous ready socket when held calls fail', async () => {
+	const conn = connected();
+	const reject = vi.fn();
+	const previous = [{ command: { reject } }];
+	conn.prevCommandQueue = previous;
+	conn.status = 'connect';
+	const waiting = conn.unsubscribe('x');
+	const failure = new Error('retry limit reached');
+	conn.flushQueue(failure);
+	await expect(waiting).rejects.toBe(failure);
+	expect(reject).toHaveBeenCalledExactlyOnceWith(failure);
+	expect(previous).toHaveLength(0);
+	expect(conn.prevCommandQueue).toBeNull();
+	conn.emit('end');
 });

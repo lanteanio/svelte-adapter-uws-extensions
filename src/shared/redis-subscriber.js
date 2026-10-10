@@ -346,8 +346,25 @@ export function guardSubscriber(conn, owner) {
 		}
 		subs.restoreAll();
 	});
-	conn.on('error', (err) => subs.failHeld(err));
-	conn.on('close', () => subs.failHeld(new Error(CLOSED)));
+	// A failed socket can leave older commands queued for the next attempt.
+	// Held owner calls must keep their order until those queues flush or fail.
+	const flushQueue = conn.flushQueue;
+	if (typeof flushQueue === 'function') conn.flushQueue = function (error, options) {
+		const previous = this.prevCommandQueue;
+		const result = flushQueue.call(this, error, options);
+		if (options?.offlineQueue !== false && options?.commandQueue !== false) {
+			// ioredis keeps this older queue separately during a failed handshake.
+			// Reject it with the others so a failed undo cannot precede its resend.
+			if (previous && previous !== this.commandQueue) {
+				let item;
+				while ((item = previous.shift())) item.command.reject(error);
+				if (this.prevCommandQueue === previous) this.prevCommandQueue = null;
+			}
+			subs.failHeld(error);
+		}
+		return result;
+	};
+	conn.on('error', (err) => { if (conn.status === 'end') subs.failHeld(err); });
 	// A connection that went silent, or stuck in its handshake, is closed so
 	// ioredis reconnects it, and the 'ready' after restores its channels.
 	const liveness = watchLiveness(owner, () => [conn], dropSocket);
@@ -409,8 +426,8 @@ export function guardSubscriber(conn, owner) {
  * that carries the subscriptions.
  *
  * Calls made during a handshake are held until ready, after ioredis flushes
- * its older offline and unanswered commands. Failed attempts reject held
- * calls; later calls of the owner decide which channels still need sending.
+ * its older offline and unanswered commands. Temporary socket failures keep
+ * held calls pending; rejecting the older queues rejects held calls as well.
  *
  * @param {any} target
  * @param {string} owner

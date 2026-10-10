@@ -45,3 +45,24 @@ it('rejects held calls and callbacks during a fatal AUTH failure', async () => {
 		await admin.quit();
 	}
 });
+
+
+it.each([false, true])('keeps an unsubscribe across a closed handshake behind an offline subscribe (all=%s)', async all => {
+	const admin = createBackendClient();
+	await admin.redis.ping();
+	const source = typeof admin.redis.nodes === 'function' ? admin.redis.nodes('master')[0] : admin.redis;
+	const subscriber = guardSubscriber(source.duplicate({ lazyConnect: true, enableOfflineQueue: true, enableReadyCheck: true, maxRetriesPerRequest: 1, retryStrategy: () => 10 }), 'test');
+	const topic = 'inttest-handshake:closed:' + all;
+	let undo, rejected;
+	subscriber.once('connect', () => {
+		undo = (all ? subscriber.unsubscribe() : subscriber.unsubscribe(topic)).catch(error => { rejected = error; });
+		subscriber.stream.destroy();
+	});
+	try {
+		await subscriber.subscribe(topic);
+		await undo;
+		expect(rejected).toBeUndefined();
+		expect(Number((await source.pubsub('NUMSUB', topic))[1])).toBe(0);
+		expect(await source.publish(topic, 'after release')).toBe(0);
+	} finally { subscriber.disconnect(); await admin.quit(); }
+});

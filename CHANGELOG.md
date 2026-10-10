@@ -98,6 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Require degradation notices to contain a non-ignorable letter or number and well-formed Unicode; reject blank symbols, standalone marks, malformed surrogates and line separators while preserving shaping joiners alongside text.
 
+- Redis subscriber calls made during a connection handshake preserve their order through temporary socket failures. Released channels remain unsubscribed after recovery; a terminal queue failure rejects held calls and older unanswered commands together.
+
 - Redis relay queues accept one envelope above 8 MiB when it fits `maxEnvelopeBytes` and the queue is empty. It retains the queue's full capacity until Redis settles it; later envelopes still respect backpressure.
 
 - Redis presence releases half-open breaker probes when a join is abandoned by a closing socket, sync is denied, or Redis version detection fails, so other users of the shared breaker can recover normally.
