@@ -38,6 +38,19 @@ describeIntegration('redis replay (integration)', () => {
 		await client.quit();
 	});
 
+	it('correlates real stored history and an empty truncated end', async () => {
+		for (let n = 1; n <= 3; n++) await replay.publish(platform, 'wire', 'change', { n });
+		await replay.replay({}, 'wire', 0, platform, 'history');
+		const messages = platform.sent.filter((frame) => frame.event === 'msg');
+		expect(messages.map((frame) => frame.data.seq)).toEqual([1, 2, 3]);
+		for (const frame of messages) expect(frame.data.reqId).toBe('history');
+		expect(platform.sent.at(-1).data).toEqual({ reqId: 'history' });
+		await client.redis.del(client.key('replay:buf:{wire}'));
+		platform.reset();
+		await replay.replay({}, 'wire', 1, platform, 'expired');
+		expect(platform.sent.at(-1).data).toEqual({ reqId: 'expired', truncated: true });
+	});
+
 	describe('publish + Lua envelope', () => {
 		it('increments seq independently per topic and broadcasts', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
