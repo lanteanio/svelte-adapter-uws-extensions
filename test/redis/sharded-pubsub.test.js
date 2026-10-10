@@ -1308,3 +1308,31 @@ it('keeps the second follower after a shared pending admission succeeds', async 
 		expect(platform.published).toHaveLength(1);
 	} finally { await bus.deactivate(); }
 });
+
+
+it('clears successful admission flags when a released channel cleanup fails', async () => {
+	const client = mockRedisClient();
+	let subscriber;
+	const duplicate = client.redis.duplicate.bind(client.redis);
+	client.redis.duplicate = (...args) => (subscriber = duplicate(...args));
+	const platform = mockPlatform();
+	const bus = createShardedBus(client);
+	await bus.activate(platform);
+	const subscribe = subscriber.ssubscribe.bind(subscriber);
+	const unsubscribe = subscriber.sunsubscribe.bind(subscriber);
+	let release;
+	subscriber.ssubscribe = (...channels) => new Promise((resolve) => { release = () => resolve(subscribe(...channels)); });
+	subscriber.sunsubscribe = vi.fn().mockRejectedValueOnce(new Error('unsubscribe failed')).mockImplementation(unsubscribe);
+	try {
+		const batch = bus.followBatch(['chat', 'audit']);
+		const failed = expect(batch).rejects.toThrow('unsubscribe failed');
+		await bus.unfollow('audit');
+		release();
+		await failed;
+		subscriber.ssubscribe = vi.fn(subscribe);
+		await bus.follow('chat');
+		expect(subscriber.ssubscribe).toHaveBeenCalledTimes(1);
+		await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+		expect(platform.published).toHaveLength(1);
+	} finally { await bus.deactivate(); }
+});

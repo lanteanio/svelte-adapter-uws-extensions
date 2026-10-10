@@ -176,6 +176,8 @@ export function createShardedBus(client, options = {}) {
 	const channelRefcounts = new Map();
 	/** @type {Map<string, Promise<void>>} channel -> shared admission */
 	const pendingChannels = new Map();
+	/** @type {Map<string, number>} pending callers keep failures off the fast path until rollback */
+	const pendingTopics = new Map();
 	/** @type {Set<string>} */
 	const subscribedChannels = new Set();
 	/** @type {Map<string, string>} channel -> node id it is currently ssubscribed on (cluster) */
@@ -923,6 +925,7 @@ export function createShardedBus(client, options = {}) {
 		followCounts.clear();
 		channelRefcounts.clear();
 		pendingChannels.clear();
+		pendingTopics.clear();
 	}
 
 	// Reserve the shared promise before starting I/O, so every caller waits for
@@ -951,12 +954,14 @@ export function createShardedBus(client, options = {}) {
 						if (channelRefcounts.has(channel)) subscribedChannels.add(channel);
 						else await subUnsubscribe(channel);
 					}
+					if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
 					b?.success();
 					mFollows?.inc(fresh.length);
 				} catch (err) {
 					if (generation !== subGeneration) cancel?.();
 					else {
 						if (cancel) b?.failure(err);
+						for (const channel of fresh) subscribedChannels.delete(channel);
 						// A multi-channel admission can succeed on some cluster nodes
 						// before another refuses it. Release those partial subscriptions.
 						await Promise.allSettled(fresh.map(subUnsubscribe));
@@ -969,7 +974,7 @@ export function createShardedBus(client, options = {}) {
 				}
 			})().then(resolve, reject);
 		}
-		return Promise.all(waits);
+		return waits.size ? Promise.all(waits) : null;
 	}
 
 	async function follow(topic) {
@@ -978,17 +983,27 @@ export function createShardedBus(client, options = {}) {
 		if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
 			throw new Error('sharded bus: distinct topic count exceeded ' + MAX_SHARDED_BUS_TOPICS + ' on this instance');
 		}
-		const channel = channelFor(topic);
 		followCounts.set(topic, count + 1);
+		if (count > 0 && (pendingTopics.size === 0 || !pendingTopics.has(topic))) return;
+		const channel = channelFor(topic);
 		if (count === 0) channelRefcounts.set(channel, (channelRefcounts.get(channel) || 0) + 1);
 		if (subscribedChannels.has(channel) && !pendingChannels.has(channel)) return;
+		pendingTopics.set(topic, (pendingTopics.get(topic) || 0) + 1);
 		const generation = subGeneration;
 		try {
 			await admitChannels([channel]);
 		} catch (err) {
 			if (generation === subGeneration) await unfollow(topic);
 			throw err;
+		} finally {
+			if (generation === subGeneration) releasePendingTopic(topic);
 		}
+	}
+
+	function releasePendingTopic(topic) {
+		const count = pendingTopics.get(topic) || 0;
+		if (count <= 1) pendingTopics.delete(topic);
+		else pendingTopics.set(topic, count - 1);
 	}
 
 	/**
@@ -1019,6 +1034,7 @@ export function createShardedBus(client, options = {}) {
 		if (topics.length === 0) return;
 
 		const touchedTopics = new Set();
+		const waitingTopics = [];
 		const channels = new Set();
 		for (const topic of topics) {
 			if (typeof topic !== 'string' || topic.length === 0 || touchedTopics.has(topic)) continue;
@@ -1026,18 +1042,25 @@ export function createShardedBus(client, options = {}) {
 			if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) continue;
 			touchedTopics.add(topic);
 			followCounts.set(topic, count + 1);
+			if (count > 0 && (pendingTopics.size === 0 || !pendingTopics.has(topic))) continue;
+			waitingTopics.push(topic);
+			pendingTopics.set(topic, (pendingTopics.get(topic) || 0) + 1);
 			const channel = channelFor(topic);
 			channels.add(channel);
 			if (count === 0) channelRefcounts.set(channel, (channelRefcounts.get(channel) || 0) + 1);
 		}
+		if (channels.size === 0) return;
 		const generation = subGeneration;
 		try {
-			await admitChannels(channels);
+			const admission = admitChannels(channels);
+			if (admission) await admission;
 		} catch (err) {
 			// Each caller releases exactly its own reservation. A channel remains
 			// owned until the final topic's final reservation is released.
 			if (generation === subGeneration) await Promise.all([...touchedTopics].map(unfollow));
 			throw err;
+		} finally {
+			if (generation === subGeneration) for (const topic of waitingTopics) releasePendingTopic(topic);
 		}
 	}
 
