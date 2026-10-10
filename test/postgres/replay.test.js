@@ -954,6 +954,7 @@ describe('postgres replay', () => {
 			catch (err) { caught = err; }
 
 			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught).toMatchObject({ code: 'REPLAY_SERIALIZATION_FAILED' });
 			expect(caught).not.toBeInstanceOf(ReplayStorageError);
 			expect(caught.op).toBe('publish');
 			expect(caught.cause).toBeInstanceOf(TypeError);
@@ -1151,6 +1152,7 @@ describe('postgres replay', () => {
 			client.query = origQuery;
 
 			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught).toMatchObject({ code: 'REPLAY_STORAGE_FAILED' });
 			expect(caught.op).toBe('publishBatch');
 			expect(platform.published).toHaveLength(0);
 		});

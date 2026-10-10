@@ -318,7 +318,8 @@ export interface TaskRunner extends PostgresStoreReadiness {
 	 * Block until the given task reaches a terminal status. Returns the
 	 * committed result, throws the stored error, or rejects with a
 	 * timeout error if the task is still pending/running past the
-	 * configured awaitTimeout.
+	 * configured awaitTimeout (`TASK_AWAIT_TIMEOUT`). A missing row throws
+	 * `TASK_NOT_FOUND`; both errors retain the name `Error`.
 	 */
 	await<TResult = unknown>(taskId: string, options?: TaskAwaitOptions): Promise<TResult>;
 
@@ -381,6 +382,7 @@ export interface TaskRunner extends PostgresStoreReadiness {
  * a backoff or surface a 409 to the upstream HTTP request.
  */
 export class TaskInFlightError extends Error {
+	readonly code: 'TASK_IN_FLIGHT';
 	idempotencyKey: string;
 }
 
@@ -390,6 +392,7 @@ export class TaskInFlightError extends Error {
  * may live on a different deployment.
  */
 export class UnknownTaskError extends Error {
+	readonly code: 'UNKNOWN_TASK';
 	taskName: string;
 }
 

@@ -235,6 +235,7 @@ describe('redis distributed lock', () => {
 				expect.fail('should have thrown');
 			} catch (err) {
 				expect(err).toBeInstanceOf(LockAcquireTimeoutError);
+				expect(err).toMatchObject({ code: 'LOCK_ACQUIRE_TIMEOUT' });
 				expect(err.key).toBe('k');
 				expect(err.waitedMs).toBeGreaterThanOrEqual(30);
 			}
@@ -361,6 +362,7 @@ describe('redis distributed lock', () => {
 
 			await expect(result).rejects.toBeInstanceOf(LockLostError);
 			expect(lostError).toBeInstanceOf(LockLostError);
+			expect(lostError).toMatchObject({ code: 'LOCK_LOST' });
 			expect(lostError.key).toBe('contested');
 		});
 

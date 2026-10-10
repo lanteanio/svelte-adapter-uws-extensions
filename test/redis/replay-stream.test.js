@@ -720,6 +720,7 @@ describe('redis replay (stream backend)', () => {
 			catch (err) { caught = err; }
 
 			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught).toMatchObject({ code: 'REPLAY_STORAGE_FAILED' });
 			expect(caught.op).toBe('publish');
 			expect(caught.cause).toBe(failure);
 		});
@@ -797,6 +798,7 @@ describe('redis replay (stream backend)', () => {
 			catch (err) { caught = err; }
 
 			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught).toMatchObject({ code: 'REPLAY_SERIALIZATION_FAILED' });
 			expect(caught).not.toBeInstanceOf(ReplayStorageError);
 			expect(caught.op).toBe('publish');
 			expect(caught.cause).toBeInstanceOf(TypeError);

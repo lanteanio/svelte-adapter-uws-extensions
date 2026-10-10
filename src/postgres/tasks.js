@@ -946,13 +946,17 @@ export function createTaskRunner(client, options = {}) {
 			while (true) {
 				const row = await sql.readRow(taskId);
 				if (!row) {
-					throw new Error(`postgres tasks: task "${taskId}" not found`);
+					const error = new Error(`postgres tasks: task "${taskId}" not found`);
+					error.code = 'TASK_NOT_FOUND';
+					throw error;
 				}
 				if (row.status === 'committed') return row.result;
 				if (row.status === 'failed') throw deserialiseError(row.error);
 
 				if (timeout > 0 && monotonicNow() - start >= timeout) {
-					throw new Error(`postgres tasks: await timeout for task "${taskId}" (waited ${timeout}ms, status=${row.status})`);
+					const error = new Error(`postgres tasks: await timeout for task "${taskId}" (waited ${timeout}ms, status=${row.status})`);
+					error.code = 'TASK_AWAIT_TIMEOUT';
+					throw error;
 				}
 
 				const remainingTimeout = timeout > 0 ? Math.max(1, timeout - (monotonicNow() - start)) : pollInterval;

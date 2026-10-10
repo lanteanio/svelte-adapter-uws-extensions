@@ -1039,6 +1039,7 @@ describe('redis replay', () => {
 				caught = err;
 			}
 			expect(caught).toBeInstanceOf(ReplicationTimeoutError);
+			expect(caught).toMatchObject({ code: 'REPLICATION_TIMEOUT' });
 			expect(caught.ack).toBe(1);
 			expect(caught.minReplicas).toBe(3);
 			expect(caught.timeoutMs).toBe(250);
@@ -1233,6 +1234,7 @@ describe('redis replay', () => {
 			catch (err) { caught = err; }
 
 			expect(caught).toBeInstanceOf(ReplayStorageError);
+			expect(caught).toMatchObject({ code: 'REPLAY_STORAGE_FAILED' });
 			expect(caught.op).toBe('publish');
 			expect(caught.cause).toBe(failure);
 			expect(platform.published).toHaveLength(0);
@@ -1324,6 +1326,7 @@ describe('redis replay', () => {
 			catch (err) { caught = err; }
 
 			expect(caught).toBeInstanceOf(ReplaySerializationError);
+			expect(caught).toMatchObject({ code: 'REPLAY_SERIALIZATION_FAILED' });
 			expect(caught).not.toBeInstanceOf(ReplayStorageError);
 			expect(caught.op).toBe('publish');
 			expect(caught.cause).toBeInstanceOf(TypeError);

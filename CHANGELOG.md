@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add stable operational error codes across backend connection, breaker, replay, lock and task failures; preserve them across worker and persisted task boundaries.
+
 - Add serialized, versioned PostgreSQL migrations with a checksum ledger, bounded dedicated sessions, resumable concurrent indexes, state/attempt/claim constraints, and unique replay `(topic, seq)` identities. Existing incompatible data fails validation without automatic repair.
 - Add PostgreSQL server and aggregate readiness gates, uniform store `ready()`/`status()`, and read-only schema/privilege validation with `autoMigrate: false` for separate deployment and runtime roles.
 

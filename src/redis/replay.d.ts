@@ -111,6 +111,7 @@ export interface PublishIdempotentResult {
  * caller introspection.
  */
 export class ReplicationTimeoutError extends Error {
+	readonly code: 'REPLICATION_TIMEOUT';
 	readonly name: 'ReplicationTimeoutError';
 	readonly ack: number;
 	readonly minReplicas: number;
@@ -130,6 +131,7 @@ export class ReplicationTimeoutError extends Error {
  * breaking the exactly-once contract on a retry.
  */
 export class ReplayStorageError extends Error {
+	readonly code: 'REPLAY_STORAGE_FAILED';
 	readonly name: 'ReplayStorageError';
 	readonly op: string;
 	readonly cause: unknown;
@@ -146,6 +148,7 @@ export class ReplayStorageError extends Error {
  * is preserved in `.cause`.
  */
 export class ReplaySerializationError extends Error {
+	readonly code: 'REPLAY_SERIALIZATION_FAILED';
 	readonly name: 'ReplaySerializationError';
 	readonly op: string;
 	readonly cause: unknown;

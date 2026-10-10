@@ -61,6 +61,7 @@ export interface PgReplayOptions {
  */
 export class ReplayStorageError extends Error {
 	readonly name: 'ReplayStorageError';
+	readonly code: 'REPLAY_STORAGE_FAILED';
 	readonly op: string;
 	readonly cause: unknown;
 	constructor(op: string, cause: unknown);
@@ -77,6 +78,7 @@ export class ReplayStorageError extends Error {
  */
 export class ReplaySerializationError extends Error {
 	readonly name: 'ReplaySerializationError';
+	readonly code: 'REPLAY_SERIALIZATION_FAILED';
 	readonly op: string;
 	readonly cause: unknown;
 	constructor(op: string, cause: unknown);

@@ -72,6 +72,8 @@ export interface WithLockOptions {
  * acquire.
  */
 export class LockAcquireTimeoutError extends Error {
+	constructor(key: string, waitedMs: number);
+	readonly code: 'LOCK_ACQUIRE_TIMEOUT';
 	readonly key: string;
 	readonly waitedMs: number;
 }
@@ -84,6 +86,8 @@ export class LockAcquireTimeoutError extends Error {
  * heartbeat or final compare-and-delete confirms ownership loss.
  */
 export class LockLostError extends Error {
+	constructor(key: string);
+	readonly code: 'LOCK_LOST';
 	readonly key: string;
 }
 

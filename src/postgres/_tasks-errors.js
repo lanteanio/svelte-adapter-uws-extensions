@@ -15,6 +15,7 @@ export class TaskInFlightError extends Error {
 	constructor(idempotencyKey) {
 		super(`task in flight for idempotency key "${idempotencyKey}"`);
 		this.name = 'TaskInFlightError';
+		this.code = 'TASK_IN_FLIGHT';
 		this.idempotencyKey = idempotencyKey;
 	}
 }
@@ -28,6 +29,7 @@ export class UnknownTaskError extends Error {
 	constructor(name) {
 		super(`no handler registered for task "${name}"`);
 		this.name = 'UnknownTaskError';
+		this.code = 'UNKNOWN_TASK';
 		this.taskName = name;
 	}
 }

@@ -40,6 +40,7 @@ export class ReplicationTimeoutError extends Error {
 	constructor(ack, minReplicas, timeoutMs) {
 		super(`replication timed out: ${ack}/${minReplicas} replicas acked within ${timeoutMs}ms`);
 		this.name = 'ReplicationTimeoutError';
+		this.code = 'REPLICATION_TIMEOUT';
 		this.ack = ack;
 		this.minReplicas = minReplicas;
 		this.timeoutMs = timeoutMs;
@@ -59,6 +60,7 @@ export class ReplayStorageError extends Error {
 		// ioredis target errors); redact so the password never reaches logs.
 		super(`replay storage failed during ${op}: ${redactConnectionUrl(cause?.message ?? String(cause))}`);
 		this.name = 'ReplayStorageError';
+		this.code = 'REPLAY_STORAGE_FAILED';
 		this.op = op;
 		// Redacted too. `util.inspect` prints `cause` - which is what
 		// console.error(err) and every structured logger's error serializer
@@ -138,6 +140,7 @@ export class ReplaySerializationError extends Error {
 	constructor(op, cause) {
 		super(`replay payload could not be serialized during ${op}: ${redactConnectionUrl(cause?.message ?? String(cause))}`);
 		this.name = 'ReplaySerializationError';
+		this.code = 'REPLAY_SERIALIZATION_FAILED';
 		this.op = op;
 		this.cause = redactCause(cause);
 	}

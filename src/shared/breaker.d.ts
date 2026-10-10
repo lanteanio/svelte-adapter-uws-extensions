@@ -1,4 +1,5 @@
 export class CircuitBrokenError extends Error {
+	readonly code: 'CIRCUIT_BROKEN';
 	readonly name: 'CircuitBrokenError';
 }
 

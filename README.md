@@ -43,7 +43,7 @@ before replacing an in-memory primitive.
 
 For translation, privacy, incidents, releases and capacity testing, use the
 [ecosystem integration resources](./docs/integration-resources.md).
-Search the [error reference](./docs/errors.md) for a stable diagnostic ID.
+Search the [error reference](./docs/errors.md) for a stable diagnostic ID. Use [operational error codes](./docs/public-error-codes.md) to handle recoverable failures.
 
 ---
 

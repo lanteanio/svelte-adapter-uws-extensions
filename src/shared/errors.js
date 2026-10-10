@@ -10,6 +10,7 @@ export class ConnectionError extends Error {
 	constructor(service, detail, cause) {
 		super(`${service}: ${detail}`);
 		this.name = 'ConnectionError';
+		this.code = 'CONNECTION_FAILED';
 		this.service = service;
 		if (cause) this.cause = cause;
 	}
@@ -27,6 +28,7 @@ export class TimeoutError extends Error {
 	constructor(service, operation, ms) {
 		super(`${service}: ${operation} timed out after ${ms}ms`);
 		this.name = 'TimeoutError';
+		this.code = 'OPERATION_TIMEOUT';
 		this.service = service;
 		this.ms = ms;
 	}

@@ -396,6 +396,7 @@ describe('circuit breaker', () => {
 			const err = await replay.publish(platform, 'chat', 'msg', {}).catch((e) => e);
 			expect(err).toBeInstanceOf(ReplayStorageError);
 			expect(err.cause).toBeInstanceOf(CircuitBrokenError);
+			expect(err.cause).toMatchObject({ code: 'CIRCUIT_BROKEN' });
 			breaker.destroy();
 		});
 
@@ -651,35 +652,8 @@ describe('circuit breaker', () => {
 		});
 
 		it('postgres replay: clear() does not double-guard on fresh instance', async () => {
-			// The drift guard verifies columns after ensureTable, so the double
-			// answers the information_schema lookup per table (main table + the
-			// seq counter); everything else stays an empty result (this test is
-			// about the breaker).
-			const colsByTable = {
-				svti_replay: ['svti_replay_id', 'topic', 'seq', 'event', 'data', 'created_at'],
-				svti_replay_seq: ['topic', 'seq', 'epoch']
-			};
-			// verifyTableColumns calls query(textString, [table]); DDL calls pass a
-			// bare string or a {text,values} object - normalize both.
-			const answer = (textOrObj, valsArg) => {
-				const text = typeof textOrObj === 'string' ? textOrObj : textOrObj?.text;
-				const values = (typeof textOrObj === 'string' ? valsArg : textOrObj?.values) || [];
-				if (typeof text === 'string' && text.includes('information_schema.columns')) {
-					const cols = (colsByTable[values[0]] || []).map((column_name) => ({ column_name }));
-					return { rows: cols, rowCount: cols.length };
-				}
-				return { rows: [], rowCount: 0 };
-			};
-			const pgClient = {
-				pool: {
-					connect: async () => ({
-						query: async (t, v) => answer(t, v),
-						release: () => {}
-					})
-				},
-				async query(t, v) { return answer(t, v); },
-				async end() {}
-			};
+			const { mockPgClient } = await import('../helpers/mock-pg.js');
+			const pgClient = mockPgClient();
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });
 			const { createReplay: createPgReplay } = await import('../../src/postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
@@ -782,20 +756,26 @@ describe('circuit breaker', () => {
 		});
 
 		it('postgres replay: DDL failure records breaker failure on fresh instance', async () => {
-			let queryCount = 0;
-			const pgClient = {
-				pool: {},
-				async query() {
-					queryCount++;
-					throw new Error('DDL failed');
-				},
-				async end() {}
+			const { mockPgClient } = await import('../helpers/mock-pg.js');
+			const pgClient = mockPgClient();
+			const connect = pgClient.connect.bind(pgClient);
+			let ddlFailed = false;
+			pgClient.connect = async () => {
+				const connection = await connect();
+				const query = connection.query.bind(connection);
+				connection.query = async (sql, values) => {
+					const text = typeof sql === 'string' ? sql : sql.text;
+					if (text.startsWith('CREATE TABLE')) { ddlFailed = true; throw new Error('DDL failed'); }
+					return query(sql, values);
+				};
+				return connection;
 			};
 			const breaker = createCircuitBreaker({ failureThreshold: 5 });
 			const { createReplay: createPgReplay } = await import('../../src/postgres/replay.js');
 			const replay = createPgReplay(pgClient, { breaker, cleanupInterval: 0 });
 
 			await expect(replay.publish(platform, 'chat', 'msg', {})).rejects.toThrow('DDL failed');
+			expect(ddlFailed).toBe(true);
 			expect(breaker.failures).toBe(1);
 
 			replay.destroy();

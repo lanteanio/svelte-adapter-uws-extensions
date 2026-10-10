@@ -272,7 +272,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 	}),
 	thrown({
 		id: EXTENSIONS_ERROR_IDS.CIRCUIT_OPEN,
-		event: 'breaker.circuit-open', messagePrefix: 'circuit breaker is open - backend unavailable',
+		event: 'breaker.circuit-open', code: 'CIRCUIT_BROKEN', messagePrefix: 'circuit breaker is open - backend unavailable',
 		cause: 'The optional breaker crossed its failure threshold and is protecting an unhealthy backend.',
 		consequence: 'Awaited operations fail fast and fire-and-forget operations are skipped.',
 		automaticRecovery: 'After resetTimeout, bounded probes test the backend and the first success closes the circuit.',

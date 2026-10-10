@@ -25,6 +25,7 @@ export class CircuitBrokenError extends Error {
 	constructor() {
 		super(extensionsError(EXTENSIONS_ERROR_IDS.CIRCUIT_OPEN));
 		this.name = 'CircuitBrokenError';
+		this.code = 'CIRCUIT_BROKEN';
 	}
 }
 

@@ -63,6 +63,7 @@ export class LockAcquireTimeoutError extends Error {
 	constructor(key, waitedMs) {
 		super(`lock: failed to acquire "${key}" within ${waitedMs}ms`);
 		this.name = 'LockAcquireTimeoutError';
+		this.code = 'LOCK_ACQUIRE_TIMEOUT';
 		this.key = key;
 		this.waitedMs = waitedMs;
 	}
@@ -72,6 +73,7 @@ export class LockLostError extends Error {
 	constructor(key) {
 		super(`lock: lost ownership of "${key}" (lease ownership changed or TTL elapsed)`);
 		this.name = 'LockLostError';
+		this.code = 'LOCK_LOST';
 		this.key = key;
 	}
 }

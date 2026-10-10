@@ -38,7 +38,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REGISTRY-SESSION-TIMEOUT](#extensions-err-registry-session-timeout) | `registry.request-session.timeout` | `registry.requestSession: timed out after ` |
 | [EXTENSIONS-ERR-REGISTRY-SEND-TARGET](#extensions-err-registry-send-target) | `registry.send.invalid-target` | `registry.send: target must be a non-empty userId string` |
 | [EXTENSIONS-ERR-REGISTRY-SEND-COALESCED-TARGET](#extensions-err-registry-send-coalesced-target) | `registry.send-coalesced.invalid-target` | `registry.sendCoalesced: target must be a non-empty userId string` |
-| [EXTENSIONS-ERR-CIRCUIT-OPEN](#extensions-err-circuit-open) | `breaker.circuit-open` | `circuit breaker is open - backend unavailable` |
+| [EXTENSIONS-ERR-CIRCUIT-OPEN](#extensions-err-circuit-open) | `CIRCUIT_BROKEN` | `circuit breaker is open - backend unavailable` |
 | [EXTENSIONS-ERR-CAPABILITY-COOKIE-METRICS](#extensions-err-capability-cookie-metrics) | `capability-cookie.metrics-instrument.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.capability-cookie event=capability-cookie.metrics-instrument.failed severity=error] The capability-cookie metrics instrument threw; further instrument failures are not reported.` |
 | [EXTENSIONS-ERR-POSTGRES-POOL-IDLE-CLIENT](#extensions-err-postgres-pool-idle-client) | `postgres.pool.idle-client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.pool.idle-client.failed severity=error] An idle Postgres pool client reported an error.` |
 | [EXTENSIONS-ERR-POSTGRES-TRANSACTION-CLIENT](#extensions-err-postgres-transaction-client) | `postgres.transaction.client.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres event=postgres.transaction.client.failed severity=error] A Postgres connection checked out for a transaction reported an error.` |
@@ -351,7 +351,7 @@ the stable ID tag on the line):
 <a id="extensions-err-circuit-open"></a>
 ## `EXTENSIONS-ERR-CIRCUIT-OPEN`
 
-- **Code/event:** `breaker.circuit-open`
+- **Code/event:** `CIRCUIT_BROKEN`
 - **Message prefix:** `circuit breaker is open - backend unavailable`
 - **Cause:** The optional breaker crossed its failure threshold and is protecting an unhealthy backend.
 - **Consequence:** Awaited operations fail fast and fire-and-forget operations are skipped.
