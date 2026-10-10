@@ -135,7 +135,7 @@ Start a client maintenance review when a supported Redis, Valkey or PostgreSQL
 version cannot be used with the client, a reachable high or critical advisory has
 no fixed compatible release, or six months pass without upstream activity while
 a reproducible compatibility or security issue remains unresolved. Record the
-upstream evidence and affected operations in the task board. Review remediation,
+upstream evidence and affected operations in the issue. Review remediation,
 a maintained fork or client replacement according to compatibility and measured
 performance; inactivity alone does not justify replacing a stable dependency.
 
@@ -179,6 +179,8 @@ the Redis test helper, and both local and remote clients must receive the exact
 ordered values. This contract requires no backend service; native backend lanes
 remain separate. Use `--rungs contracts` to run only this contract and its packing
 and installation prerequisites.
+Use `--require-clean --strict` when recording exact committed source identities;
+the default also permits uncommitted working-tree changes.
 Never edit a sibling repository as part of this checkout's change; route the
 required change to its owner with the expected contract and verification evidence.
 
@@ -223,45 +225,37 @@ A sibling-only extension must first be agreed and implemented in the lead.
 
 ## Work lifecycle
 
-The local Relay board is the workspace source of truth. Public GitHub issues and
-PRs are intake and review surfaces; maintainers link them to the corresponding work item.
-External contributors coordinate ownership on the public issue; they do not need
-access to the maintainer's local board.
-The states are backlog, todo, in_progress, in_review and done. A label on GitHub
-may mirror a state, but is not a second independent queue.
+Coordinate ownership on the public GitHub issue before starting a change. Describe
+its observable outcome, owning repository, reproduction or supporting evidence,
+acceptance criteria, required checks, dependencies and compatibility risks. Resolve
+product decisions and missing evidence before implementation. Send security evidence
+through the private reporting route in [SECURITY.md](./SECURITY.md).
 
-An item is Ready for todo when it states the observable outcome, owning repository,
-reproduction or supporting evidence, acceptance criteria, test lanes, dependencies,
-compatibility risk and cost of delay. Product decisions or missing evidence are
-resolved before implementation starts. Security evidence belongs in the private route.
+Prioritize security and data loss, release-blocking regressions, confirmed correctness
+problems, compatibility and operations, then convenience and documentation. Explain
+priority changes on the issue. Within the same class, prefer the smallest complete
+change that removes the most risk.
 
-Order ready work by risk and cost of delay: security/data loss, release-blocking
-regressions, confirmed correctness problems, compatibility/operations, then
-convenience and documentation. Record why an item changes priority. Prefer the
-smallest complete change that removes the most risk within the same class.
+Keep no more than three independent changes under implementation per repository
+unless the maintainer agrees to a larger group with distinct file ownership and
+explicit dependencies. Each contributor owns one change or one coordinated group;
+review is separate. Describe progress on the issue and say when work pauses so
+another contributor can continue without duplicating it.
 
-Use a provisional limit of three independent implementation items in progress
-per repository. A maintainer may approve a larger group with distinct file ownership
-and linked dependencies. Each contributor owns one item or one explicitly coordinated
-cluster at a time; review work is separate. Claim the Relay task before work, move
-it to in_progress, record progress there, and release its lease when work pauses
-or finishes. Do not take another contributor's live claim.
+When a dependency prevents progress, link it from the issue and name its owner,
+what is already complete and when to check it again. Difficulty alone is not a
+dependency. Report changes needed in another package as an issue in its repository.
 
-A blocked item names its dependency, the owner who can resolve it, completed useful
-work, and a next review date. Keep it out of the ready queue while the blocker holds;
-blocked is a reason recorded on the item, not an invented Relay status. Difficulty
-alone is not a blocker. Report changes needed in another package as an issue in its repository.
+Maintainers review open issues every 30 days to revalidate evidence, ownership and
+priority, merge duplicates and revisit dependencies. An issue unchanged across two
+reviews may be closed with an explicit condition for reopening it. Record the
+review date on the issue; this is a maintenance checklist, not a response-time promise.
 
-At each 30-day backlog review, revalidate evidence, ownership and priority; merge
-duplicates; revisit blocked items; and promote only Ready work. An unchanged item
-across two reviews may be closed with an explicit reopening condition. The maintainer
-records the review date; this is a maintenance checklist, not a response-time promise.
-
-Move to in_review only after the implementation and its relevant checks are complete.
-Done requires all acceptance criteria, regression evidence, synchronized docs/types,
-reviewed generated and lockfile changes, relevant lane results or an accepted named
-exception, independent review, and maintainer acceptance. Done is distinct from
-published: attach a release link when publication happens.
+Request pull-request review after implementation and the relevant checks are complete.
+Acceptance requires the stated behavior, regression evidence, synchronized docs and
+types, reviewed generated files and lockfile changes, relevant test results or an
+accepted named exception, independent review and maintainer acceptance. Merging and
+publishing are separate: link the release once publication happens.
 
 The `good first issue` label is curated: a complete reproduction, named files,
 a runnable test command, and bounded acceptance criteria must be present. Exclude

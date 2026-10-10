@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document contribution ownership, dependencies and review through public issues and pull requests, with explicit clean-source verification for coordinated changes.
+
 - Verify retained alarm generation authority during recovery, including deleted and pending topics, bounded Redis hash reads and archive/restore continuity checks.
 
 - Reject reserved `byuser:` session tokens before Redis access, including lifecycle cookie loads, and refuse legacy index collisions before erasure deletes any token. Document reconciliation of historical collisions.
