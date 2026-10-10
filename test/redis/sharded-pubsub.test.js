@@ -1352,7 +1352,7 @@ describe('sharded channel binding', () => {
 			if (kind === 'wire') Object.assign(env, { wire: true, capability: 'missing' });
 			if (kind === 'coalesced') env.coalesced = true;
 			if (kind === 'batch') env.batch = [forged];
-			await client.redis.spublish('uws:sharded:public', JSON.stringify(env));
+			await client.redis.spublish('uws:sharded:public:room', JSON.stringify(env));
 			expect(platform.published).toEqual([]);
 			expect(platform.publishedBatches).toEqual([]);
 			expect(platform.sendCoalesced).not.toHaveBeenCalled();

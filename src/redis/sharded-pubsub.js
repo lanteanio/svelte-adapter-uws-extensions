@@ -295,13 +295,13 @@ export function createShardedBus(client, options = {}) {
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
-	function deliverEnvelope(parsed, channel) {
+	function deliverEnvelope(parsed, receivedShard) {
 		// Coalesced relay: re-coalesce onto local subscribers (latest-value-
 		// wins per ws+key), mirroring the publishing instance's sendCoalesced.
 		// Precedes the batch/single branches so a coalesced frame is never
 		// broadcast.
 		if (parsed.coalesced === true) {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -328,7 +328,7 @@ export function createShardedBus(client, options = {}) {
 		// codec is not registered here (a pure-subscriber instance) - still a
 		// correct delivery. Precedes the batch/single branches.
 		if (parsed.wire === true) {
-			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
+			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -346,7 +346,7 @@ export function createShardedBus(client, options = {}) {
 			const local = [];
 			for (let i = 0; i < parsed.batch.length; i++) {
 				const m = parsed.batch[i];
-				if (!m || !validator.acceptEnvelope(m.topic, m.event) || channelFor(m.topic) !== channel) {
+				if (!m || !validator.acceptEnvelope(m.topic, m.event) || String(shardKey(m.topic)) !== receivedShard) {
 					mParseErrors?.inc();
 					continue;
 				}
@@ -369,7 +369,7 @@ export function createShardedBus(client, options = {}) {
 				}
 			}
 		} else {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -380,13 +380,13 @@ export function createShardedBus(client, options = {}) {
 		}
 	}
 
-	function deliverTraced(parsed, channel) {
+	function deliverTraced(parsed, receivedShard) {
 		const parent = carriedTraceContext(parsed);
 		// A null parent means current context to the adapter. Delivery without
 		// a carrier must not inherit the subscriber's activation request span.
-		if (parent === null) return deliverEnvelope(parsed, channel);
+		if (parent === null) return deliverEnvelope(parsed, receivedShard);
 		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
-			() => deliverEnvelope(parsed, channel));
+			() => deliverEnvelope(parsed, receivedShard));
 	}
 
 	// One publish as the bus relays it. The de-herd window (`j`) and the seq
@@ -478,7 +478,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	function handleSMessage(ch, message) {
-			if (!validator.acceptRaw(message)) {
+			if (!ch.startsWith(channelPrefix) || !validator.acceptRaw(message)) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -503,8 +503,9 @@ export function createShardedBus(client, options = {}) {
 				// context only matters to a tracing provider: with one, delivery is a
 				// consumer operation parented on the producer's context; without one
 				// the trace fields are ignored and nothing is allocated for them.
-				if (activeTracing) deliverTraced(parsed, ch);
-				else deliverEnvelope(parsed, ch);
+				const shard = ch.slice(channelPrefix.length);
+				if (activeTracing) deliverTraced(parsed, shard);
+				else deliverEnvelope(parsed, shard);
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
 				// is observable instead of silently swallowed.
