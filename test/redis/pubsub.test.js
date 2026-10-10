@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { registeredRecord } from '../helpers/diagnostic-line.js';
@@ -1535,4 +1536,23 @@ describe('presence-field update frame: redis relay parity', () => {
 		await new Promise((r) => setTimeout(r, 5));
 		expect(platform.published).toHaveLength(1);
 	});
+});
+
+
+it('keeps batch-size buckets in message counts when duration defaults use seconds', async () => {
+	const metrics = createMetrics();
+	const bus = createPubSubBus(mockRedisClient('batch-buckets:'), { metrics });
+	const platform = mockPlatform();
+	try {
+		await bus.activate(platform);
+		const wrapped = bus.wrap(platform);
+		for (let i = 0; i < 7; i++) wrapped.publish('room', 'event', i);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const out = metrics.serialize();
+		expect(out).toContain('pubsub_relay_batch_size_bucket{le="5"} 0');
+		expect(out).toContain('pubsub_relay_batch_size_bucket{le="10"} 1');
+		expect(out).toContain('pubsub_relay_batch_size_sum 7');
+	} finally {
+		await bus.deactivate();
+	}
 });

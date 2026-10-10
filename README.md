@@ -2353,7 +2353,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 | Metric | Description |
 |---|---|
 | `lock_acquired_total{key_class}` | Counter of successful acquires. `key_class` is `mapKey(key)`. |
-| `lock_acquire_wait_ms` | Histogram of time waited from `withLock` call to successful acquire (ms). Observed only on success. |
+| `lock_acquire_wait_seconds` | Histogram of successful acquisition wait in seconds, with explicit fractional buckets. Replaces `lock_acquire_wait_ms`: migrate queries and thresholds by dividing milliseconds by 1000. |
 | `lock_acquire_timeouts_total{key_class}` | Counter of `withLock` calls that exceeded `maxWaitMs` without acquiring. |
 | `lock_lost_total{key_class}` | Counter of locks lost mid-flight via heartbeat detection. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
 
@@ -3281,7 +3281,7 @@ The predicate receives `(res, req)` and returns truthy to allow or falsy to deny
 |---|---|---|
 | `prefix` | `''` | Prefix for all metric names |
 | `mapTopic` | `() => 'all'` | Map topic, group and tenant identifiers to bounded, non-identifying label classes. |
-| `defaultBuckets` | `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` | Default histogram buckets |
+| `defaultBuckets` | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1]` | Duration buckets in seconds. For count, byte or millisecond observations, supply explicit buckets (or retain the former `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` via this option). Historical bucket counts cannot be converted to the new layout. |
 | `maxSeries` | `10_000` | Per-metric series cap; past this, new labelsets are dropped and `prometheus_series_dropped_total{metric}` counts them. Pass `Infinity` to disable. |
 | `maxBuckets` | `32` | Maximum buckets a histogram may declare. Throws at registration if exceeded. Pass `Infinity` to disable. |
 

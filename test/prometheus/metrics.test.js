@@ -166,21 +166,20 @@ describe('prometheus metrics', () => {
 	});
 
 	describe('histogram', () => {
-		it('records observations with default buckets', () => {
+		it('separates 5ms and 900ms observations with default seconds buckets', () => {
 			const m = createMetrics();
-			const h = m.histogram('request_size', 'Request size');
-			h.observe(3);
-			h.observe(7);
-			h.observe(42);
+			const h = m.histogram('request_duration_seconds', 'Request duration');
+			h.observe(0.005);
+			h.observe(0.9);
 
 			const output = m.serialize();
-			expect(output).toContain('# TYPE request_size histogram');
-			expect(output).toContain('request_size_bucket{le="5"} 1');
-			expect(output).toContain('request_size_bucket{le="10"} 2');
-			expect(output).toContain('request_size_bucket{le="50"} 3');
-			expect(output).toContain('request_size_bucket{le="+Inf"} 3');
-			expect(output).toContain('request_size_sum 52');
-			expect(output).toContain('request_size_count 3');
+			expect(output).toContain('# TYPE request_duration_seconds histogram');
+			expect(output).toContain('request_duration_seconds_bucket{le="0.005"} 1');
+			expect(output).toContain('request_duration_seconds_bucket{le="0.5"} 1');
+			expect(output).toContain('request_duration_seconds_bucket{le="1"} 2');
+			expect(output).toContain('request_duration_seconds_bucket{le="+Inf"} 2');
+			expect(output).toContain('request_duration_seconds_sum 0.905');
+			expect(output).toContain('request_duration_seconds_count 2');
 		});
 
 		it('supports custom buckets', () => {

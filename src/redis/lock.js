@@ -127,7 +127,8 @@ export function createDistributedLock(client, options = {}) {
 
 	const m = options.metrics;
 	const mAcquired = m?.counter('lock_acquired_total', 'Locks acquired by key class', ['key_class']);
-	const mWait = m?.histogram('lock_acquire_wait_ms', 'Time waited from withLock call to successful acquire (ms)');
+	const mWait = m?.histogram('lock_acquire_wait_seconds', 'Time waited from withLock call to successful acquire (seconds)', [],
+		[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]);
 	const mTimeouts = m?.counter('lock_acquire_timeouts_total', 'withLock calls that exceeded maxWaitMs without acquiring', ['key_class']);
 	const mLost = m?.counter('lock_lost_total', 'Locks whose lease ownership was lost', ['key_class']);
 
@@ -174,7 +175,7 @@ export function createDistributedLock(client, options = {}) {
 				throw err;
 			}
 			if (result === 'OK') {
-				mWait?.observe(monotonicNow() - start);
+				mWait?.observe((monotonicNow() - start) / 1000);
 				mAcquired?.inc({ key_class: keyClass });
 				break;
 			}

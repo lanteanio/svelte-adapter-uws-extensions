@@ -108,7 +108,8 @@ export function createPubSubBus(client, options = {}) {
 	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
 	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
 	const mParseErrors = m?.counter('pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
-	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush');
+	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush', [],
+		[1, 5, 10, 25, 50, 100, 250, 500, 1000]);
 	const mDegraded = m?.counter('pubsub_degraded_total', 'Auto-emitted degraded events');
 	const mRecovered = m?.counter('pubsub_recovered_total', 'Auto-emitted recovered events');
 

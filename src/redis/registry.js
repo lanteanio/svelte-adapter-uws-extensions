@@ -185,7 +185,9 @@ export function createConnectionRegistry(client, options) {
 	const mRequests = m?.counter('push_requests_total', 'Cluster requests by outcome', ['result']);
 	const mReplyLatency = m?.histogram(
 		'push_reply_latency_ms',
-		'Latency from request publish to reply receive (ms)'
+		'Latency from request publish to reply receive (ms)',
+		[],
+		[1, 5, 10, 25, 50, 100, 250, 500, 1000]
 	);
 	const mRegistrySize = m?.gauge('push_registry_size', 'Connections registered to this instance');
 	const mLateReply = m?.counter('push_late_replies_total', 'Replies that arrived after their request expired or migrated');

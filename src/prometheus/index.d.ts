@@ -3,7 +3,7 @@ export interface MetricsOptions {
 	prefix?: string;
 	/** Map topic, group and tenant identifiers to bounded label classes. Raw identifiers require an explicit mapper. @default () => 'all' */
 	mapTopic?: (topic: string) => string;
-	/** Default histogram buckets. @default [1, 5, 10, 25, 50, 100, 250, 500, 1000] */
+	/** Default histogram buckets, in seconds for duration observations. Other units supply explicit buckets. @default [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1] */
 	defaultBuckets?: number[];
 	/** Default per-metric series (labelset) cap. Pass `Infinity` to disable. @default 10000 */
 	maxSeries?: number;

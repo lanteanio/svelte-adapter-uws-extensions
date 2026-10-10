@@ -6,6 +6,7 @@ import {
 	LockLostError
 } from '../../src/redis/lock.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -525,14 +526,33 @@ describe('redis distributed lock', () => {
 			expect(out).toMatch(/lock_acquired_total\{key_class="payments"\}\s+1/);
 		});
 
-		it('observes lock_acquire_wait_ms on every successful acquire', async () => {
+		it('observes lock_acquire_wait_seconds on every successful acquire', async () => {
 			const metrics = createMetrics();
 			const lock = createDistributedLock(client, { metrics });
 			await lock.withLock('k', async () => {});
 			await lock.withLock('k', async () => {});
 
 			const out = await metrics.serialize();
-			expect(out).toMatch(/lock_acquire_wait_ms_count\s+2/);
+			expect(out).toMatch(/lock_acquire_wait_seconds_count\s+2/);
+		});
+
+		it('records acquisition wait in seconds with explicit bounds despite registry defaults', async () => {
+			const metrics = createMetrics({ defaultBuckets: [100, 1000] });
+			const lock = createDistributedLock(client, { metrics });
+			let now = 0;
+			setRuntimeEnv({ clock: { monotonic: () => now } });
+			const set = client.redis.set.bind(client.redis);
+			client.redis.set = async (...args) => { now += 5; return set(...args); };
+			try {
+				await lock.withLock('k', () => {});
+				const out = metrics.serialize();
+				expect(out).toContain('lock_acquire_wait_seconds_sum 0.005');
+				expect(out).toContain('lock_acquire_wait_seconds_bucket{le="0.001"} 0');
+				expect(out).toContain('lock_acquire_wait_seconds_bucket{le="0.005"} 1');
+				expect(out).not.toContain('lock_acquire_wait_ms');
+			} finally {
+				resetRuntimeEnv();
+			}
 		});
 
 		it('counts lock_acquire_timeouts_total under the mapKey class', async () => {

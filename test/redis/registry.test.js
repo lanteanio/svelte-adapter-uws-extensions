@@ -534,6 +534,8 @@ describe('redis connection registry', () => {
 
 			const out = await metrics.serialize();
 			expect(out).toMatch(/push_reply_latency_ms_count\s+1/);
+			expect(out).toContain('push_reply_latency_ms_bucket{le="1000"} 1');
+			expect(out).not.toContain('push_reply_latency_ms_bucket{le="0.005"}');
 			await local.destroy();
 		});
 
