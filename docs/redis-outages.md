@@ -55,3 +55,12 @@ from construction, so callers must wait for `ready` before sending normal comman
 The infinite retry and disabled deadline settings above are opt-ins for dedicated
 blocking workloads; do not share that connection with request-path rate limits,
 locks, or writes that need a bounded response.
+
+Independent multi-slot work shares a limit of eight in-flight pipelines or routed
+commands per client. Pipelines contain at most 256 commands. Cluster work groups
+known keys by their current owner allocation and retries only explicit MOVED/ASK
+refusals; transport failures do not replay ambiguous writes. Missing topology
+uses bounded individual routing. Presence and registry TTL heartbeats run one
+refresh at a time, coalescing missed ticks into one rerun with current membership.
+Presence heartbeat latency includes Redis completion. Keep the heartbeat-to-TTL
+margin large enough for the complete refresh at your deployment's cardinality.

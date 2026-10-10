@@ -2,6 +2,8 @@
  * Cluster-aware Redis helpers shared across the redis/ plugins.
  */
 
+import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from './caps.js';
+
 /**
  * True when the client is an ioredis Cluster (vs a standalone Redis).
  * Detected via the `nodes()` method, the canonical Cluster API surface.
@@ -13,19 +15,52 @@ export function isCluster(redis) {
 	return redis !== null && typeof redis === 'object' && typeof (/** @type {any} */ (redis).nodes) === 'function';
 }
 
+const executionQueues = new WeakMap();
+
+function withExecutionSlot(redis, run) {
+	let state = executionQueues.get(redis);
+	if (!state) { state = { active: 0, queue: [] }; executionQueues.set(redis, state); }
+	const start = () => {
+		state.active++;
+		let result;
+		try { result = run(); } catch (error) { result = Promise.reject(error); }
+		return Promise.resolve(result).finally(() => {
+			state.active--;
+			state.queue.shift()?.();
+		});
+	};
+	if (state.active < MAX_REDIS_INFLIGHT_BATCHES) return start();
+	return new Promise((resolve, reject) => {
+		state.queue.push(() => start().then(resolve, reject));
+	});
+}
+
+const UNKEYED_GROUP = Symbol('unkeyed Redis commands');
+const ROUTED_COMMANDS = Symbol('individually routed Redis commands');
+const FIRST_KEY_METHODS = new Set(['spublish', 'get', 'set', 'del', 'unlink', 'expire', 'pexpire', 'hgetall', 'hset', 'hdel', 'hpexpire']);
+function allocationGroup(redis, command) {
+	const method = command[0];
+	if (method === 'publish') return UNKEYED_GROUP;
+	const key = FIRST_KEY_METHODS.has(method) ? command[1]
+		: (method === 'eval' || method === 'evalsha') && Number(command[2]) > 0 ? command[3] : null;
+	if (typeof key !== 'string' || !Array.isArray(redis.slots)) return null;
+	const prefix = redis.options?.keyPrefix || '';
+	if (typeof prefix !== 'string') return null;
+	const owners = redis.slots[keySlot(prefix + key)];
+	return Array.isArray(owners) && owners.length ? owners.join(';') : null;
+}
+
 /**
  * Execute a set of independent single-slot commands and return their results
  * in ioredis pipeline shape: an array of `[err, value]` tuples index-aligned
  * with `commands`. Each command is a tuple `[method, ...args]`, e.g.
  * `['eval', SCRIPT, 2, k1, k2, arg]` or `['hpexpire', key, ms, 'FIELDS', 1, f]`.
  *
- * On a standalone Redis the commands are batched into a single pipeline - one
- * round trip, the original throughput shape. On a Redis Cluster each command is
- * issued on its own so ioredis routes it to the node that owns its keys: a
- * single pipeline spanning multiple hash slots is delivered to just ONE sampled
- * node, which silently no-ops (a per-command MOVED lands in the results array,
- * never a thrown error) every command whose keys live on another node. The
- * per-command form follows MOVED to the owning node, so every command runs.
+ * Commands are split into bounded pipelines with one shared concurrency budget
+ * per client. Cluster pipelines contain keys assigned to the same current node
+ * allocation group; missing topology falls back to individually routed commands.
+ * Explicit MOVED/ASK refusals retry only the refused command through Cluster,
+ * never successful writes or ambiguous transport failures.
  *
  * Each command's own keys must still co-locate to one slot (e.g. via a shared
  * `{hash-tag}`); this helper fans commands across nodes, it does not let a
@@ -37,20 +72,72 @@ export function isCluster(redis) {
  */
 export async function execMultiSlot(redis, commands) {
 	if (commands.length === 0) return [];
-	if (!isCluster(redis)) {
-		const pipe = redis.pipeline();
-		for (const [method, ...args] of commands) pipe[/** @type {keyof typeof pipe} */ (method)](...args);
-		return pipe.exec();
+	const clustered = isCluster(redis);
+	if (!clustered && commands.length <= MAX_REDIS_PIPELINE_COMMANDS) {
+		return withExecutionSlot(redis, () => {
+			const pipe = redis.pipeline();
+			for (const [method, ...args] of commands) pipe[method](...args);
+			return pipe.exec();
+		});
 	}
-	return Promise.all(
-		commands.map(async ([method, ...args]) => {
-			try {
-				return [null, await (/** @type {any} */ (redis))[method](...args)];
-			} catch (err) {
-				return [/** @type {Error} */ (err), undefined];
-			}
-		})
-	);
+	const groups = new Map();
+	if (!clustered) groups.set('standalone', commands.map((_, i) => i));
+	else {
+		for (let i = 0; i < commands.length; i++) {
+			const group = allocationGroup(redis, commands[i]);
+			const id = group === null ? ROUTED_COMMANDS : group;
+			let indexes = groups.get(id);
+			if (!indexes) { indexes = []; groups.set(id, indexes); }
+			indexes.push(i);
+		}
+	}
+	const entries = groups.entries();
+	let current = entries.next();
+	let offset = 0;
+	const results = new Array(commands.length);
+	async function individual(index) {
+		const [method, ...args] = commands[index];
+		try { results[index] = [null, await redis[method](...args)]; }
+		catch (error) { results[index] = [error, undefined]; }
+	}
+	async function worker() {
+		while (!current.done) {
+			const [group, indexes] = current.value;
+			const batch = indexes.slice(offset, offset + (group === ROUTED_COMMANDS ? 1 : MAX_REDIS_PIPELINE_COMMANDS));
+			offset += batch.length;
+			if (offset === indexes.length) { current = entries.next(); offset = 0; }
+			await withExecutionSlot(redis, async () => {
+				if (group === ROUTED_COMMANDS) { await individual(batch[0]); return; }
+				let replies;
+				try {
+					const pipe = redis.pipeline();
+					for (const index of batch) {
+						const [method, ...args] = commands[index];
+						pipe[method](...args);
+					}
+					replies = await pipe.exec();
+				} catch (error) {
+					// ioredis rejects this topology mismatch before writing the pipeline.
+					if (clustered && error.message === 'All keys in the pipeline should belong to the same slots allocation group') {
+						for (const index of batch) await individual(index);
+						return;
+					}
+					throw error;
+				}
+				for (let i = 0; i < batch.length; i++) {
+					const reply = replies[i];
+					if (clustered && /^(MOVED|ASK) \d+ /.test(reply?.[0]?.message || '')) await individual(batch[i]);
+					else results[batch[i]] = reply;
+				}
+			});
+		}
+	}
+	// Workers pull at most one batch each, so one large call never enqueues an
+	// unbounded number of promises ahead of unrelated calls sharing the client.
+	const settled = await Promise.allSettled(Array.from({ length: Math.min(MAX_REDIS_INFLIGHT_BATCHES, commands.length) }, worker));
+	const failed = settled.find(result => result.status === 'rejected');
+	if (failed) throw failed.reason;
+	return results;
 }
 
 /**

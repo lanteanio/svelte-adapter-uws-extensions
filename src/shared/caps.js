@@ -153,3 +153,8 @@ export const MAX_BREAKER_KEYS = 10_000;
  * user-supplied portion at 256.
  */
 export const MAX_IDEMPOTENCY_KEY_LENGTH = 1024;
+
+/** Commands written in one independent Redis pipeline. */
+export const MAX_REDIS_PIPELINE_COMMANDS = 256;
+/** Concurrent independent pipelines or routed commands per Redis client. */
+export const MAX_REDIS_INFLIGHT_BATCHES = 8;

@@ -57,6 +57,7 @@ import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { coalescedWork } from '../shared/coalesced-work.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
@@ -221,7 +222,7 @@ export function createPresence(client, options = {}) {
 	// same class without retaining departed topic labels or work on every tick.
 	const stopOnlineMetric = mTotalOnline ? collectOnlineMetric(mTotalOnline, mt, localCounts) : null;
 
-	const heartbeatTimer = setIntervalTimer(() => {
+	const heartbeatTick = coalescedWork(async () => {
 		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
 		// Detect dead connections whose close handler never fired.
@@ -351,7 +352,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		execMultiSlot(redis, commands).catch(() => {});
+		await execMultiSlot(redis, commands).catch(() => {});
 		if (publishFailed === 0) {
 			heartbeatPublishReported = false;
 		} else if (!heartbeatPublishReported) {
@@ -364,7 +365,8 @@ export function createPresence(client, options = {}) {
 		}
 		lastHeartbeatLatency = monotonicNow() - tickStart;
 		mHeartbeatLatency?.set(lastHeartbeatLatency);
-	}, heartbeatInterval);
+	});
+	const heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 	// Cross-instance subscriber: receives peers' join/leave/update events on the
@@ -1443,6 +1445,7 @@ export function createPresence(client, options = {}) {
 
 		destroy() {
 			stopOnlineMetric?.();
+			heartbeatTick.stop();
 			clearIntervalTimer(heartbeatTimer);
 			if (consistencyAuditor) consistencyAuditor.stop();
 			subscriberCtx.dispose();

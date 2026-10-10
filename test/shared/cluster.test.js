@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { keySlot, isCluster, execMultiSlot } from '../../src/shared/cluster.js';
+import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from '../../src/shared/caps.js';
 
 describe('keySlot', () => {
 	it('matches the CRC-16/XMODEM conformance vector Redis uses', () => {
@@ -92,4 +93,80 @@ describe('execMultiSlot', () => {
 		expect(res[1][0]).toBeInstanceOf(Error);
 		expect(res[1][1]).toBeUndefined();
 	});
+});
+
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+it.each([false, true])('bounds work across concurrent callers (cluster: %s)', async clustered => {
+	const waiting = [];
+	const sizes = [];
+	let active = 0, peak = 0;
+	const hold = values => { active++; peak = Math.max(peak, active); return new Promise(resolve => waiting.push(() => { active--; resolve(values); })); };
+	const redis = clustered ? { nodes: () => [], get: key => hold(key) } : {
+		pipeline() {
+			const keys = [];
+			return { get(key) { keys.push(key); return this; }, exec() { sizes.push(keys.length); return hold(keys.map(key => [null, key])); } };
+		}
+	};
+	const count = clustered ? 100_000 : MAX_REDIS_PIPELINE_COMMANDS * 20;
+	let complete = false;
+	const commands = Array.from({ length: count }, (_, i) => ['get', String(i)]);
+	const result = Promise.all([execMultiSlot(redis, commands), execMultiSlot(redis, commands)]).finally(() => { complete = true; });
+	await flush();
+	expect(peak).toBe(MAX_REDIS_INFLIGHT_BATCHES);
+	while (!complete) { for (const release of waiting.splice(0)) release(); await flush(); }
+	for (const replies of await result) expect(replies).toEqual(commands.map(([, key]) => [null, key]));
+	expect(peak).toBe(MAX_REDIS_INFLIGHT_BATCHES);
+	if (!clustered) expect(Math.max(...sizes)).toBe(MAX_REDIS_PIPELINE_COMMANDS);
+});
+
+it('groups cluster pipelines by current owner and retries only explicit routing refusals', async () => {
+	const slots = [];
+	for (const key of ['a', 'b', 'c']) slots[keySlot(key)] = [key === 'b' ? 'nodeB' : 'nodeA'];
+	const pipelines = [], retried = [];
+	const moved = new Error('MOVED ' + keySlot('c') + ' nodeC:6379');
+	const redis = {
+		nodes: () => [], slots,
+		async get(key) { retried.push(key); return key; },
+		pipeline() {
+			const keys = [];
+			return { get(key) { keys.push(key); return this; }, async exec() {
+				pipelines.push(keys);
+				return keys.map(key => key === 'c' ? [moved, undefined] : [null, key]);
+			} };
+		}
+	};
+	expect(await execMultiSlot(redis, [['get', 'a'], ['get', 'b'], ['get', 'c']])).toEqual([[null, 'a'], [null, 'b'], [null, 'c']]);
+	expect(pipelines).toEqual([['a', 'c'], ['b']]);
+	expect(retried).toEqual(['c']);
+});
+
+it.each([true, false])('only retries a pipeline rejected before writes (topology mismatch: %s)', async mismatch => {
+	const slots = []; slots[keySlot('a')] = ['nodeA'];
+	const calls = [];
+	const error = new Error(mismatch ? 'All keys in the pipeline should belong to the same slots allocation group' : 'connection lost after write');
+	const redis = { nodes: () => [], slots, async get(key) { calls.push(key); return 'value'; }, pipeline() { return { get() { return this; }, async exec() { throw error; } }; } };
+	if (mismatch) expect(await execMultiSlot(redis, [['get', 'a']])).toEqual([[null, 'value']]);
+	else await expect(execMultiSlot(redis, [['get', 'a']])).rejects.toBe(error);
+	expect(calls).toEqual(mismatch ? ['a'] : []);
+});
+
+
+it('waits for already-started batches before reporting one batch failure', async () => {
+	const failure = new Error('pipeline lost');
+	let calls = 0, release;
+	const redis = { pipeline() {
+		const keys = [];
+		return { get(key) { keys.push(key); return this; }, exec() {
+			if (++calls === 1) return Promise.reject(failure);
+			return new Promise(resolve => { release = () => resolve(keys.map(key => [null, key])); });
+		} };
+	} };
+	let settled = false;
+	const pending = execMultiSlot(redis, Array.from({ length: MAX_REDIS_PIPELINE_COMMANDS * 2 }, (_, i) => ['get', String(i)]))
+		.catch(error => { settled = true; return error; });
+	await flush();
+	expect(settled).toBe(false);
+	release();
+	expect(await pending).toBe(failure);
 });

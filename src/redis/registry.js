@@ -42,6 +42,7 @@ import {
 import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { coalescedWork } from '../shared/coalesced-work.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
@@ -859,10 +860,8 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	function heartbeatTick() {
+	const refreshTtls = coalescedWork(async () => {
 		if (destroyed) return;
-		startBootstrap();
-		reconcileIndex();
 		if (localUsers.size === 0 && appSessionToWs.size === 0) return;
 		if (!withBreakerGuard()) return;
 		// Refresh TTL on every locally-owned entry (users + app sessions). A
@@ -874,12 +873,19 @@ export function createConnectionRegistry(client, options) {
 		for (const sessionId of appSessionToWs.keys()) {
 			commands.push(['expire', sessionKey(sessionId), ttl]);
 		}
-		execMultiSlot(redis, commands).then((results) => {
+		await execMultiSlot(redis, commands).then((results) => {
 			// A refused EXPIRE resolves as a per-command error, not a rejection.
 			const err = firstCommandError(results);
 			if (err) breaker?.failure(err);
 			else breaker?.success();
 		}).catch((err) => breaker?.failure(err));
+	});
+
+	function heartbeatTick() {
+		if (destroyed) return;
+		startBootstrap();
+		reconcileIndex();
+		refreshTtls();
 	}
 
 	function handleInbound(envelope) {
@@ -1692,6 +1698,7 @@ export function createConnectionRegistry(client, options) {
 		},
 		async destroy() {
 			destroyed = true;
+			refreshTtls.stop();
 			if (heartbeatTimer) {
 				clearIntervalTimer(heartbeatTimer);
 				heartbeatTimer = null;
