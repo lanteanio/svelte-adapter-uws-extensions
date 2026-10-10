@@ -6,7 +6,7 @@ it.each([false, true])('orders handshake unsubscribe after offline subscribe (al
 	const admin = createBackendClient();
 	await admin.redis.ping();
 	const source = typeof admin.redis.nodes === 'function' ? admin.redis.nodes('master')[0] : admin.redis;
-	const subscriber = guardSubscriber(source.duplicate({ lazyConnect: true, enableReadyCheck: true }), 'test');
+	const subscriber = guardSubscriber(source.duplicate({ lazyConnect: true, enableOfflineQueue: true, enableReadyCheck: true }), 'test');
 	const topic = 'inttest-handshake:' + (all ? 'all' : 'single');
 	let undo;
 	let duringHandshake = false;
@@ -29,7 +29,7 @@ it('rejects held calls and callbacks during a fatal AUTH failure', async () => {
 	const admin = createBackendClient();
 	await admin.redis.ping();
 	const source = typeof admin.redis.nodes === 'function' ? admin.redis.nodes('master')[0] : admin.redis;
-	const subscriber = guardSubscriber(source.duplicate({ lazyConnect: true, enableReadyCheck: true, username: 'missing-handshake-test-user', password: 'wrong', retryStrategy: () => 10 }), 'test');
+	const subscriber = guardSubscriber(source.duplicate({ lazyConnect: true, enableOfflineQueue: true, enableReadyCheck: true, username: 'missing-handshake-test-user', password: 'wrong', retryStrategy: () => 10 }), 'test');
 	let count = 0;
 	let callbackError;
 	const attempt = new Promise((resolve) => subscriber.once('connect', () => {

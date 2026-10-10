@@ -90,6 +90,8 @@ export const MAX_PUBSUB_RELAY_BATCH_PER_TICK = 1_000_000;
 
 /** ioredis `client.duplicate()` connections owned by one client wrapper. */
 export const MAX_REDIS_DUPLICATES_PER_CLIENT = 1_000;
+// Per connection, including commands queued during initial connection setup.
+export const MAX_REDIS_QUEUED_COMMANDS = 4_096;
 
 /** Sibling instances broadcasting on the publish-rate aggregator channel. */
 export const MAX_AGGREGATOR_REMOTE_INSTANCES = 10_000;

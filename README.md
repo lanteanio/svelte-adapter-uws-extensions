@@ -184,7 +184,7 @@ export const redis = createRedisClient({
 | `url` | `'redis://localhost:6379'` | Redis connection URL |
 | `keyPrefix` | `''` | Prefix for all keys |
 | `autoShutdown` | `true` | Disconnect on `sveltekit:shutdown` |
-| `options` | `{}` | Extra ioredis options |
+| `options` | One retry; 5s deadlines | Override the [bounded Redis outage policy](docs/redis-outages.md). |
 
 #### API
 
@@ -192,7 +192,7 @@ export const redis = createRedisClient({
 |---|---|
 | `redis.redis` | The underlying ioredis instance |
 | `redis.key(k)` | Returns `keyPrefix + k` |
-| `redis.duplicate(overrides?)` | New connection with same config. Pass ioredis options to override defaults. |
+| `redis.duplicate(overrides?)` | New subscriber connection with bounded offline buffering and finite deadlines. Pass ioredis options to override defaults. |
 | `redis.quit()` | Gracefully disconnect all connections |
 
 ---

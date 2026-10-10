@@ -7,7 +7,7 @@ export interface RedisClientOptions {
 	keyPrefix?: string;
 	/** Listen for `sveltekit:shutdown` and disconnect. @default true */
 	autoShutdown?: boolean;
-	/** Extra ioredis options (merged on top of URL parsing). */
+	/** Override ioredis defaults: one retry, 5s command/connect/socket deadlines, bounded startup buffering and no offline buffering after first ready. */
 	options?: RedisOptions;
 }
 
@@ -18,7 +18,7 @@ export interface RedisClient {
 	readonly keyPrefix: string;
 	/** Prefix a key: `keyPrefix + key`. */
 	key(key: string): string;
-	/** Create a new connection with the same config. Pass overrides to change options (e.g. `{ enableReadyCheck: false }` for subscriber clients). */
+	/** Create a subscriber connection with bounded offline buffering and the same finite deadlines. Pass overrides to change options (e.g. `{ enableReadyCheck: false }` for subscriber clients). */
 	duplicate(overrides?: RedisOptions): Redis;
 	/** Gracefully disconnect all connections. */
 	quit(): Promise<void>;
