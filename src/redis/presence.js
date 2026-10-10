@@ -139,7 +139,7 @@ export function createPresence(client, options = {}) {
 	let connCounter = 0;
 
 	function resolveKey(data) {
-		if (data && (typeof data === 'object' || typeof data === 'function') && keyField in data && data[keyField] != null) {
+		if (data && (typeof data === 'object' || typeof data === 'function') && Object.prototype.hasOwnProperty.call(data, keyField) && data[keyField] != null) {
 			const key = String(data[keyField]);
 			// A roster key is a plain-object property name in every snapshot,
 			// diff and accumulator downstream. `__proto__` there would target
