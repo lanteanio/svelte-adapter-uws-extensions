@@ -217,7 +217,10 @@ export interface RedisPresenceTracker {
 	 * are stripped by default: the dedup key field, `id`, `userId`, `role`,
 	 * `roles` and `userRole` in any case or separator spelling, `__`-prefixed,
 	 * `constructor`, `prototype`, and credential-shaped, personal-data and
-	 * transport names. Outside production the first refusal of each identity
+	 * transport names. Identity aliases lowercase and retain ASCII letters and
+	 * digits; when the configured key has no such characters after lowercasing,
+	 * only its exact spelling is reserved by that identity rule.
+	 * Outside production the first refusal of each identity
 	 * name logs a warning. The `clientUpdateFields` option replaces that guard
 	 * with an explicit allowlist and independently gates wire
 	 * `presence-update` frames. Dynamic fields relayed by another instance and

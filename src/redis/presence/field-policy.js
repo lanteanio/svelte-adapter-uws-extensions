@@ -129,9 +129,9 @@ export function createFieldNameRule(keyField, clientUpdateFields) {
 	const allowlist = Array.isArray(clientUpdateFields)
 		? new Set(clientUpdateFields.filter((f) => typeof f === 'string' && !isReservedPresenceField(f)))
 		: null;
-	const identity = new Set([keyField, 'id', 'userId', 'role', 'roles', 'userRole'].map(foldName));
+	const identity = new Set([keyField, 'id', 'userId', 'role', 'roles', 'userRole'].map(foldName).filter(Boolean));
 	/** @param {string} k */
-	const isReserved = (k) => identity.has(foldName(k)) || isUnsafeProjectionFieldName(k);
+	const isReserved = (k) => k === keyField || identity.has(foldName(k)) || isUnsafeProjectionFieldName(k);
 
 	// Memoised. The read-back asks this for every field of every stored entry
 	// on each join and sync snapshot, a roster repeats a handful of names, and
@@ -196,11 +196,11 @@ const MAX_REMEMBERED_NAME_LENGTH = 64;
  */
 export function createReservedFieldWarner(keyField) {
 	if (process.env.NODE_ENV === 'production') return null;
-	const warnable = new Set([keyField, 'id', 'userId', 'role', 'roles', 'userRole'].map(foldName));
+	const warnable = new Set([keyField, 'id', 'userId', 'role', 'roles', 'userRole'].map(foldName).filter(Boolean));
 	const warned = new Set();
 	return (k) => {
 		const folded = foldName(k);
-		if (!warnable.has(folded) || warned.has(folded)) return;
+		if ((k !== keyField && !warnable.has(folded)) || warned.has(folded)) return;
 		warned.add(folded);
 		const name = k.slice(0, 64).replace(/[^\x20-\x7e]/g, '?');
 		console.warn(

@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis presence preserves unrelated Unicode and punctuation update names when the identity key has no ASCII letters or digits after lowercasing. Nonempty folded identity aliases remain reserved across updates, relays and snapshots.
+
 - Failed Redis presence joins no longer overwrite newer identities or strand membership. Commit identity after admission with bounded private generations, conditional cleanup and final leave notifications while preserving durable update storage.
 
 - Reserve Redis idempotency's by-user index namespace so caller acquisitions and purges cannot corrupt erasure indexes. Preserve existing data and document recovery of historical collisions.
