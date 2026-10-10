@@ -105,7 +105,7 @@ function isRecord(value) {
 function isValidPresencePayload(event, payload) {
 	if (!isRecord(payload) || typeof payload.key !== 'string') return false;
 	if (event === INTERNAL_EVENTS.JOIN || event === INTERNAL_EVENTS.UPDATED) {
-		return isRecord(payload.data);
+		return isRecord(payload.data) && (payload.identity === undefined || payload.identity === true || isRecord(payload.identity)) && (payload.fields === undefined || isRecord(payload.fields));
 	}
 	if (event === INTERNAL_EVENTS.LEAVE) {
 		return payload.data === null || isRecord(payload.data);
@@ -130,10 +130,11 @@ function isValidPresencePayload(event, payload) {
  *   emit: (fullTopic: string, event: string, data: any, platform: any, opts?: any) => void,
  *   eventChannel: (topic: string) => string,
  *   mKeyspaceCleanups: { inc: () => void } | null | undefined,
+ *   transientFields?: Set<string>,
  *   acceptsField: (k: string) => boolean
  * }} deps
  */
-export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups, acceptsField }) {
+export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups, acceptsField, transientFields = new Set() }) {
 	// Redis subscriber for cross-instance join/leave events
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -626,9 +627,35 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					// publicData, which drops these names too, so only a forged
 					// envelope loses anything.
 					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
+						const snapshot = mergeFields(newFieldMap(), payload.data);
 						const localEntry = localData.get(topic)?.get(payload.key);
-						if (localEntry) localEntry.data = mergeFields(newFieldMap(), payload.data);
-						bufferDiff(topic, 'join', payload.key, mergeFields(newFieldMap(), payload.data), activePlatform);
+						if (localEntry) {
+							// Public roster values cannot identify fields shadowing selected
+							// data. New peers carry both independent parts explicitly.
+							localEntry.remoteIdentity = true;
+							localEntry.serializedIdentity = undefined;
+							if (payload.identity !== undefined) {
+								localEntry.data = payload.identity === true ? snapshot : mergeFields(newFieldMap(), payload.identity);
+								delete localEntry.legacyData;
+								if (localEntry.fields || payload.fields) {
+									const fields = newFieldMap();
+									if (localEntry.fields) mergeFields(fields, localEntry.fields, name => transientFields.has(name));
+									if (payload.fields) mergeFields(fields, payload.fields, name => acceptsField(name) && !transientFields.has(name));
+									localEntry.fields = Object.keys(fields).length ? fields : null;
+								}
+							} else {
+								// Older peers expose only a public snapshot. Keep it separate
+								// from the last known identity until a local join reads Redis.
+								localEntry.legacyData = snapshot;
+								for (const name of Object.keys(localEntry.fields || {})) {
+									if (transientFields.has(name)) continue;
+									if (Object.prototype.hasOwnProperty.call(payload.data, name)) localEntry.fields[name] = payload.data[name];
+									else delete localEntry.fields[name];
+								}
+							}
+							localEntry.fieldsBytes = undefined;
+						}
+						bufferDiff(topic, 'join', payload.key, snapshot, activePlatform);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {
 						bufferDiff(topic, 'leave', payload.key, payload.data === null ? null : mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.FIELDS) {

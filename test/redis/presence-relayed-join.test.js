@@ -59,4 +59,110 @@ describe('presence relayed joins', () => {
 		} finally { a.destroy(); b.destroy(); vi.useRealTimers(); }
 	});
 
+	for (const closeAll of [false, true]) it('keeps the peer identity when an older local tab leaves, closeAll=' + closeAll, async () => {
+		const client = mockRedisClient();
+		const options = { binary: false, select: u => ({ id: u.id, name: u.name }) };
+		const a = createPresence(client, options), b = createPresence(client, options);
+		const pa = mockPlatform(), pb = mockPlatform();
+		const old1 = mockWs({ id: 'alice', name: 'Old' }), old2 = mockWs({ id: 'alice', name: 'Old' });
+		try {
+			await a.join(old1, 'room', pa); await a.join(old2, 'room', pa);
+			await a.update(old1, 'room', { color: 'blue' }, pa);
+			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+			a.flushDiffs(); b.flushDiffs(); pa.reset(); pb.reset();
+			const publish = vi.spyOn(client.redis, 'publish');
+			await a.leave(old1, pa, closeAll ? undefined : 'room');
+			a.flushDiffs(); b.flushDiffs();
+			expect(await a.list('room')).toEqual([{ id: 'alice', name: 'New', color: 'blue' }]);
+			expect(await b.list('room')).toEqual([{ id: 'alice', name: 'New', color: 'blue' }]);
+			expect(publish.mock.calls.filter(([, raw]) => JSON.parse(raw).event === 'updated')).toHaveLength(0);
+			expect(pa.published).toEqual([]); expect(pb.published).toEqual([]);
+		} finally { a.destroy(); b.destroy(); }
+	});
+
+	for (const legacy of [false, true]) it('keeps selected identity separate from shadowing fields, legacy=' + legacy, async () => {
+		vi.useFakeTimers();
+		const client = mockRedisClient();
+		const options = { binary: false, select: u => ({ id: u.id, name: u.name }), heartbeat: 100 };
+		const a = createPresence(client, options), b = createPresence(client, options);
+		const pa = mockPlatform(), pb = mockPlatform();
+		const old1 = mockWs({ id: 'alice', name: 'Old' }), old2 = mockWs({ id: 'alice', name: 'Old' });
+		const publish = client.redis.publish.bind(client.redis);
+		const sent = [];
+		client.redis.publish = (channel, raw) => {
+			const payload = JSON.parse(raw);
+			if (legacy && ['join', 'updated'].includes(payload.event)) {
+				delete payload.payload.identity; delete payload.payload.fields;
+			}
+			sent.push(payload);
+			return publish(channel, JSON.stringify(payload));
+		};
+		try {
+			await a.join(old1, 'room', pa); await a.join(old2, 'room', pa);
+			await a.update(old1, 'room', { name: 'Badge' }, pa);
+			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+			if (!legacy) {
+				const event = sent.findLast(entry => entry.event === 'updated');
+				expect(event.payload.identity).toEqual({ id: 'alice', name: 'New' });
+				expect(event.payload.fields).toEqual({ name: 'Badge' });
+			}
+			sent.length = 0;
+			await a.leave(old1, pa, 'room');
+			await a.join(mockWs({ id: 'alice', name: 'New' }), 'room', pa);
+			expect(sent.filter(entry => entry.event === 'updated')).toEqual([]);
+			expect(await a.list('room')).toEqual([{ id: 'alice', name: 'Badge' }]);
+			pa.reset(); pb.reset();
+			await vi.advanceTimersByTimeAsync(100);
+			for (const platform of [pa, pb]) expect(platform.published.find(frame => frame.event === 'heartbeat').data.alice).toEqual({ id: 'alice', name: 'Badge' });
+			const stored = JSON.parse(await client.redis.hget(client.key('presence:topic:{room}'), 'alice'));
+			expect(stored.data).toEqual({ id: 'alice', name: 'New' });
+		} finally { a.destroy(); b.destroy(); vi.useRealTimers(); }
+	});
+
+	it('repairs durable fields missed before an identity relay', async () => {
+		vi.useFakeTimers();
+		const client = mockRedisClient();
+		const options = { binary: false, select: u => ({ id: u.id, name: u.name }), heartbeat: 100 };
+		const a = createPresence(client, options), b = createPresence(client, options);
+		const pa = mockPlatform(), pb = mockPlatform();
+		const first = mockWs({ id: 'alice', name: 'Old' });
+		try {
+			await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', pa);
+			await b.join(first, 'room', pb);
+			const publish = client.redis.publish.bind(client.redis);
+			client.redis.publish = (channel, raw) => JSON.parse(raw).event === 'fields' ? Promise.resolve(0) : publish(channel, raw);
+			await b.update(first, 'room', { name: 'Badge', color: 'blue' }, pb);
+			client.redis.publish = publish;
+			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+			pa.reset();
+			await vi.advanceTimersByTimeAsync(100);
+			expect(pa.published.find(frame => frame.event === 'heartbeat').data.alice).toEqual({ id: 'alice', name: 'Badge', color: 'blue' });
+			const spy = vi.spyOn(client.redis, 'publish');
+			await a.join(mockWs({ id: 'alice', name: 'New' }), 'room', pa);
+			expect(spy.mock.calls.filter(([, raw]) => JSON.parse(raw).event === 'updated')).toEqual([]);
+		} finally { a.destroy(); b.destroy(); vi.useRealTimers(); }
+	});
+
+	it('replaces a durable snapshot without erasing locally cached transient values', async () => {
+		vi.useFakeTimers();
+		const client = mockRedisClient();
+		const a = createPresence(client, { binary: false, transient: ['typing'], heartbeat: 100 });
+		const pa = mockPlatform();
+		const ws = mockWs({ id: 'alice' });
+		try {
+			await a.join(ws, 'room', pa);
+			await a.update(ws, 'room', { color: 'blue', typing: true }, pa);
+			await client.redis.publish(client.key('presence:events:room'), JSON.stringify({
+				instanceId: 'peer', topic: 'room', event: 'updated',
+				payload: { key: 'alice', data: { id: 'alice' }, identity: true }
+			}));
+			a.flushDiffs(); pa.reset();
+			const publish = vi.spyOn(client.redis, 'publish');
+			await a.update(ws, 'room', { typing: true }, pa);
+			expect(publish).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(100);
+			expect(pa.published.find(frame => frame.event === 'heartbeat').data.alice).toEqual({ id: 'alice' });
+		} finally { a.destroy(); vi.useRealTimers(); }
+	});
+
 });

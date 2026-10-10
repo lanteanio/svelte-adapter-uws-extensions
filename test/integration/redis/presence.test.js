@@ -687,6 +687,27 @@ describeIntegration('redis presence (integration)', () => {
 			});
 		});
 
+		it.each([false, true])('retains peer identity after an older local tab leaves (all topics: %s)', async closeAll => {
+			const pa = mockPlatform(), pb = mockPlatform();
+			const a = makeTracker({ heartbeat: 100 }), b = makeTracker({ heartbeat: 100 });
+			const first = mockWs({ id: 'alice', name: 'Old' });
+			await a.join(first, 'room', pa);
+			await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', pa);
+			await a.update(first, 'room', { name: 'Badge', color: 'red' }, pa);
+			await wait(2);
+			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+			await vi.waitFor(() => expect(pa.published.some(frame => frame.event === 'heartbeat' && frame.data.alice?.name === 'Badge')).toBe(true));
+			await a.leave(first, pa, closeAll ? undefined : 'room');
+			await a.join(mockWs({ id: 'alice', name: 'New' }), 'room', pa);
+			const stored = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
+			expect(stored.data).toEqual({ id: 'alice', name: 'New' });
+			expect(stored.fields).toEqual({ name: 'Badge', color: 'red' });
+			pa.reset(); pb.reset();
+			await vi.waitFor(() => {
+				for (const p of [pa, pb]) expect(p.published.some(frame => frame.event === 'heartbeat' && frame.data.alice?.name === 'Badge' && frame.data.alice.color === 'red')).toBe(true);
+			});
+		});
+
 		it('JOIN_SCRIPT preserves durable fields across a newer-data overwrite (real Lua)', async () => {
 			const a = makeTracker();
 			const wsA = mockWs({ id: 'alice', name: 'Alice' });

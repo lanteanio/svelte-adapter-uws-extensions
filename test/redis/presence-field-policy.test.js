@@ -151,6 +151,9 @@ describe('presence cross-instance bus ingress', () => {
 			{ instanceId: 'foreign', topic: 'room', event: 'join', payload: null },
 			{ instanceId: 'foreign', topic: 'room', event: 'join', payload: { key: { coerced: true }, data: { id: 'phantom' } } },
 			{ instanceId: 'foreign', topic: 'room', event: 'join', payload: { key: 'phantom', data: 'PHANTOM' } },
+			...['join', 'updated'].flatMap(event => [null, [], 'invalid', false, 1].flatMap(value => ['identity', 'fields'].map(field => ({
+				instanceId: 'foreign', topic: 'room', event, payload: { key: 'local', data: { id: 'local' }, [field]: value }
+			})))),
 			{ instanceId: 'foreign', topic: 'room', event: 'leave', payload: { key: 'real', data: [] } },
 			{ instanceId: 'foreign', topic: 'room', event: 'fields', payload: { key: 'real', durable: [], transient: {} } },
 			{ instanceId: 'foreign', topic: 'room', event: 'fields', payload: { key: 'real', durable: {}, transient: null } }
@@ -233,6 +236,30 @@ describe('presence cross-instance bus ingress', () => {
 			warn.mockRestore();
 			publish.mockRestore();
 		}
+	});
+
+	it.each([0, 1])('counts internal identity metadata in the exact outbound byte limit (short by %s)', async shortBy => {
+		const data = { id: 'near-cap', name: '\u00e9'.repeat(100) };
+		const envelope = { instanceId: '0'.repeat(16), topic: 'room', event: 'join', payload: { key: data.id, data, identity: true } };
+		const bytes = Buffer.byteLength(JSON.stringify(envelope));
+		const maxEnvelopeBytes = bytes - shortBy;
+		const client = mockRedisClient();
+		const publish = vi.spyOn(client.redis, 'publish');
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const tracker = createPresence(client, { maxEnvelopeBytes, select: () => data });
+		try {
+			await tracker.join(mockWs({}), 'room', mockPlatform());
+			if (shortBy) {
+				expect(publish).not.toHaveBeenCalled();
+				const record = registeredRecord(warn.mock.calls[0][0], EXTENSIONS_ERROR_IDS.PRESENCE_ENVELOPE_OVERSIZED);
+				expect(record.attributes).toEqual({ event: 'join', bytes, maxEnvelopeBytes });
+			} else {
+				expect(publish).toHaveBeenCalledOnce();
+				expect(Buffer.byteLength(publish.mock.calls[0][1])).toBe(bytes);
+				expect(warn).not.toHaveBeenCalled();
+			}
+			expect(await tracker.list('room')).toEqual([data]);
+		} finally { await tracker.destroy(); warn.mockRestore(); publish.mockRestore(); }
 	});
 
 	it('rejects invalid maxEnvelopeBytes at construction', () => {

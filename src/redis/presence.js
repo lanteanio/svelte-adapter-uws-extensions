@@ -384,13 +384,29 @@ export function createPresence(client, options = {}) {
 		emit,
 		eventChannel,
 		mKeyspaceCleanups,
-		acceptsField: fieldNames.fromServer
+		acceptsField: fieldNames.fromServer,
+		transientFields
 	});
 	const { subscribeToTopic, unsubscribeFromTopic } = subscriberCtx;
 
 	// UTF-8 needs at most three bytes per UTF-16 code unit.
 	const safeEnvelopeChars = Math.floor(maxEnvelopeBytes / 3);
 	const safeFieldsChars = Math.floor(maxFieldsBytes / 3);
+	// Internal relay metadata keeps selected identity separate from durable
+	// fields that may shadow it. The public data member remains old-peer readable;
+	// true means that public data is already the complete selected identity.
+	function identityPayload(key, entry) {
+		const payload = { key, data: publicData(entry), identity: entry.fields ? entry.data : true };
+		if (entry.fields) {
+			const fields = newFieldMap();
+			for (const name of Object.keys(entry.fields)) {
+				if (!transientFields.has(name)) fields[name] = entry.fields[name];
+			}
+			payload.fields = fields;
+		}
+		return payload;
+	}
+
 	async function publishEvent(topic, event, payload) {
 		const ch = eventChannel(topic);
 		const msg = JSON.stringify({ instanceId, topic, event, payload });
@@ -543,7 +559,7 @@ export function createPresence(client, options = {}) {
 					if (topicData) {
 						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
-						if (newest && cached && !deepEqual(newest, cached.data)) {
+						if (newest && cached && !cached.remoteIdentity && !deepEqual(newest, cached.data)) {
 							setLocalData(topicData, key, newest);
 							const ts = now();
 							try {
@@ -553,7 +569,7 @@ export function createPresence(client, options = {}) {
 									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 								);
 								bufferDiff(topic, 'join', key, newest, platform);
-								publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: publicData(topicData.get(key)) });
+								publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, topicData.get(key)));
 							} catch {
 								setLocalData(topicData, key, cached.data);
 							}
@@ -655,7 +671,7 @@ export function createPresence(client, options = {}) {
 					if (topicData) {
 						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
-						if (newest && cached && !deepEqual(newest, cached.data)) {
+						if (newest && cached && !cached.remoteIdentity && !deepEqual(newest, cached.data)) {
 							deferredRestores.push({ topic, key, newest, cached });
 						}
 					}
@@ -686,7 +702,7 @@ export function createPresence(client, options = {}) {
 					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 				);
 				bufferDiff(topic, 'join', key, newest, platform);
-				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: publicData(topicData.get(key)) }));
+				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, topicData.get(key))));
 			} catch {
 				setLocalData(topicData, key, cached.data);
 			}
@@ -911,6 +927,8 @@ export function createPresence(client, options = {}) {
 			let didRedisWrite = false;
 			let isNewUser = false;
 			let identityChanged = false;
+			let wroteIdentity = false;
+			const currentEntry = localData.get(topic)?.get(key);
 			// `serializedData` is computed above to surface non-JSON-serializable
 			// data eagerly via the throw. The body below stringifies the full
 			// {data, ts} envelope per call since ts is fresh.
@@ -926,6 +944,7 @@ export function createPresence(client, options = {}) {
 					);
 					didRedisWrite = true;
 					isNewUser = joinResult[0] === 1;
+					wroteIdentity = joinResult[2] === 1;
 					if (!isNewUser && joinResult[2] === 1) {
 						let previous;
 						try { previous = JSON.parse(joinResult[1]); } catch { /* replace malformed data */ }
@@ -948,30 +967,29 @@ export function createPresence(client, options = {}) {
 					).catch(() => {});
 					throwWsClosed(topic, cancelAdmission);
 				}
-			} else if (prevData !== undefined && !deepEqual(prevData, data)) {
-				// Same instance, same user, different `select()` output.
-				// JOIN_SCRIPT's newer-ts conditional set overwrites the per-
-				// topic data, and refreshes the per-user-hash TTL so this
-				// path counts as an implicit heartbeat for our entry.
+			} else if (currentEntry?.legacyData || (currentEntry && currentEntry.serializedIdentity !== serializedData && !deepEqual(currentEntry.data, data))) {
+				// Defer cache changes and notifications until the authoritative
+				// read-back commits, just as on a first local join.
 				try {
 					const ts = now();
-					const value = JSON.stringify({ data, ts });
-					await evalCached(redis,
+					const joinResult = await evalCached(redis,
 						JOIN_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key, value, ts, presenceTtlMs
+						instanceId, key, JSON.stringify({ data, ts }), ts, presenceTtlMs
 					);
+					didRedisWrite = true;
+					wroteIdentity = joinResult[2] === 1;
+					identityChanged = wroteIdentity;
+					if (wroteIdentity && currentEntry?.legacyData) {
+						let previous;
+						try { previous = JSON.parse(joinResult[1]); } catch { /* replace malformed data */ }
+						identityChanged = !previous || !deepEqual(previous.data, data);
+					}
 				} catch (err) {
 					b?.failure(err);
 					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
 					throw err;
 				}
-
-				const td = localData.get(topic);
-				if (td) setLocalData(td, key, data);
-
-				bufferDiff(topic, 'join', key, data, platform);
-				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: td ? publicData(td.get(key)) : data });
 			}
 
 			let all;
@@ -1019,7 +1037,23 @@ export function createPresence(client, options = {}) {
 			}
 			const entries = parseEntries(all, fieldNames.fromServer);
 			const stored = entries.get(key);
-			setLocalData(topicData, key, prevCount === 0 && stored ? stored.data : data);
+			const matchesSelection = !stored || deepEqual(stored.data, data);
+			let committed = topicData.get(key);
+			if (!matchesSelection || committed?.serializedIdentity !== serializedData) {
+				setLocalData(topicData, key, stored ? stored.data : data);
+				committed = topicData.get(key);
+			}
+			if (matchesSelection) {
+				// join already encoded this selection for its eager JSON check.
+				// Reuse it for the next local join's identity equality guard.
+				committed.serializedIdentity = serializedData;
+				if (wroteIdentity) {
+					committed.remoteIdentity = false;
+					delete committed.legacyData;
+				}
+			} else {
+				committed.remoteIdentity = true;
+			}
 			if (stored?.fields) {
 				const committed = topicData.get(key);
 				committed.fields = Object.assign(newFieldMap(), committed.fields, stored.fields);
@@ -1034,11 +1068,11 @@ export function createPresence(client, options = {}) {
 			if (isNewUser) {
 				mJoins?.inc({ topic: mt(topic) });
 				bufferDiff(topic, 'join', key, data, platform);
-				await publishEvent(topic, INTERNAL_EVENTS.JOIN, { key, data: publicData(topicData.get(key)) });
+				await publishEvent(topic, INTERNAL_EVENTS.JOIN, identityPayload(key, topicData.get(key)));
 			} else if (identityChanged) {
 				const current = publicData(topicData.get(key));
 				bufferDiff(topic, 'join', key, current, platform);
-				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: current });
+				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, topicData.get(key)));
 			}
 
 			// Send current snapshot to this connection. Flat `{[key]: data}`

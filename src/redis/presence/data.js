@@ -56,7 +56,7 @@ export function makeDefaultPresenceSelect(keyField) {
  *
  * @param {Set<string>} transientFields - Field names broadcast live but never
  *   persisted nor included in snapshots/rosters.
- * @returns {(entry: { data: Record<string, any>, fields?: Record<string, any> | null }) => Record<string, any>}
+ * @returns {(entry: { data: Record<string, any>, fields?: Record<string, any> | null, legacyData?: Record<string, any> }) => Record<string, any>}
  */
 export function makePublicData(transientFields) {
 	/**
@@ -70,12 +70,13 @@ export function makePublicData(transientFields) {
 	 * (`{ data, fields }`) and a parsed Redis entry (`{ data, fields, ts }`);
 	 * Redis only ever stores durable fields, so the transient strip is a no-op
 	 * there but harmless.
-	 * @param {{ data: Record<string, any>, fields?: Record<string, any> | null }} entry
+	 * @param {{ data: Record<string, any>, fields?: Record<string, any> | null, legacyData?: Record<string, any> }} entry
 	 * @returns {Record<string, any>}
 	 */
 	return function publicData(entry) {
-		if (!entry.fields) return entry.data;
-		const out = { ...entry.data };
+		const identity = entry.legacyData || entry.data;
+		if (!entry.fields) return identity;
+		const out = { ...identity };
 		for (const k of Object.keys(entry.fields)) {
 			// The read-back path is the third fields ingress and gets the same
 			// rule as the other two. Durable fields come out of Redis, which a
@@ -96,13 +97,18 @@ export function makePublicData(transientFields) {
  * (join, data-change, leave-restore, rollback) re-set `data` repeatedly;
  * dynamic fields are user-level and orthogonal, so they must ride across
  * those re-sets rather than be clobbered.
- * @param {Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>} topicData
+ * @param {Map<string, { data: Record<string, any>, fields: Record<string, any> | null, remoteIdentity?: boolean, legacyData?: Record<string, any>, serializedIdentity?: string }> topicData
  * @param {string} key
  * @param {Record<string, any>} data
  */
 export function setLocalData(topicData, key, data) {
 	const existing = topicData.get(key);
-	topicData.set(key, existing ? { data, fields: existing.fields } : { data, fields: null });
+	const next = existing ? { data, fields: existing.fields } : { data, fields: null };
+	if (existing?.remoteIdentity && deepEqual(existing.data, data)) {
+		next.remoteIdentity = true;
+		if (existing.legacyData) next.legacyData = existing.legacyData;
+	}
+	topicData.set(key, next);
 }
 
 /**
