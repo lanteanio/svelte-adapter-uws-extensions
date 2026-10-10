@@ -190,7 +190,7 @@ or finishes. Do not take another contributor's live claim.
 A blocked item names its dependency, the owner who can resolve it, completed useful
 work, and a next review date. Keep it out of the ready queue while the blocker holds;
 blocked is a reason recorded on the item, not an invented Relay status. Difficulty
-alone is not a blocker. Route sibling work as a task in that repository's workstream.
+alone is not a blocker. Report changes needed in another package as an issue in its repository.
 
 At each 30-day backlog review, revalidate evidence, ownership and priority; merge
 duplicates; revisit blocked items; and promote only Ready work. An unchanged item
