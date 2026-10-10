@@ -4,6 +4,14 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisPresenceOptions {
+	/** Maximum serialized bytes in one update. Oversized updates are dropped. @default 8192 */
+	maxFieldsBytes?: number;
+	/** Cumulative per-user field bytes, including serialized names and framing. @default 65536 */
+	maxTotalFieldsBytes?: number;
+	/** Maximum presence topics per connection; excess joins are ignored. @default 100 */
+	maxTopicsPerConnection?: number;
+	/** Minimum diff batching interval in ms; zero uses the next timer turn. @default 16 */
+	topicThrottle?: number;
 	/**
 	 * Field in the selected data that identifies a user, for multi-tab dedup:
 	 * connections whose value matches count as one presence entry. If the
@@ -258,7 +266,7 @@ export interface RedisPresenceTracker {
 
 	/**
 	 * Drain the pending diff buffer synchronously. The diff buffer
-	 * normally flushes on the next microtask after a join / leave /
+	 * normally flushes after the topicThrottle interval following a join / leave /
 	 * update; call this when a test or graceful-shutdown path needs
 	 * the `diff` to land before the await chain continues.
 	 */

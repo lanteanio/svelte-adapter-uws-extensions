@@ -42,6 +42,7 @@ describe('redis presence', () => {
 
 	afterEach(() => {
 		presence.destroy();
+		vi.useRealTimers();
 	});
 
 	describe('createPresence', () => {
@@ -379,7 +380,7 @@ describe('redis presence', () => {
 				instanceId: 'OTHER', topic: 'room', event: 'leave',
 				payload: { key: 'remote', data: { id: 'remote' } }
 			}));
-			await new Promise((r) => setTimeout(r, 10));
+			await new Promise((r) => setTimeout(r, 30));
 
 			const diffs = diffsOf(platform);
 			expect(diffs).toHaveLength(1);
@@ -415,7 +416,7 @@ describe('redis presence', () => {
 			const local = createPresence(client, { key: 'id' });
 			const seed = mockWs({ id: 'seed' });
 			await local.join(seed, 'room', platform);
-			vi.advanceTimersByTime(1);
+			vi.advanceTimersByTime(16);
 			platform.reset();
 
 			const ch = client.key('presence:events:room');
@@ -427,7 +428,7 @@ describe('redis presence', () => {
 				}));
 				await Promise.resolve();
 			}
-			vi.advanceTimersByTime(1);
+			vi.advanceTimersByTime(16);
 
 			const diffs = diffsOf(platform).filter((d) => d.topic === '__presence:room');
 			expect(diffs).toHaveLength(1);
@@ -1181,7 +1182,7 @@ describe('redis presence', () => {
 				instanceId: 'OTHER', topic: 'room', event: 'join',
 				payload: { key: 'remote', data: { id: 'remote' } }
 			}));
-			await new Promise((r) => setTimeout(r, 5));
+			presence.flushDiffs();
 			expect(diffsOf(platform).length).toBeGreaterThan(0);
 		});
 	});

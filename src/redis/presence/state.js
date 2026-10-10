@@ -54,6 +54,16 @@ export function createPresenceState(client, options = {}) {
 	}
 	const fieldNames = createFieldNameRule(keyField, options.clientUpdateFields);
 	const warnReservedField = fieldNames.listsClientFields ? null : createReservedFieldWarner(keyField);
+	const maxFieldsBytes = options.maxFieldsBytes ?? 8192;
+	const maxTotalFieldsBytes = options.maxTotalFieldsBytes ?? 65536;
+	const maxTopicsPerConnection = options.maxTopicsPerConnection ?? 100;
+	const topicThrottle = options.topicThrottle ?? 16;
+	for (const [name, value] of Object.entries({ maxFieldsBytes, maxTotalFieldsBytes, maxTopicsPerConnection })) {
+		if (!Number.isInteger(value) || value < 1) throw new Error(`presence: ${name} must be a positive integer`);
+	}
+	if (typeof topicThrottle !== 'number' || !Number.isFinite(topicThrottle) || topicThrottle < 0) {
+		throw new Error('presence: topicThrottle must be a non-negative number');
+	}
 	const heartbeatInterval = options.heartbeat ?? 30000;
 	const presenceTtl = options.ttl ?? 90;
 
@@ -288,6 +298,7 @@ export function createPresenceState(client, options = {}) {
 	}
 
 	return {
+		maxFieldsBytes, maxTotalFieldsBytes, maxTopicsPerConnection, topicThrottle,
 		keyField,
 		select,
 		fieldNames,

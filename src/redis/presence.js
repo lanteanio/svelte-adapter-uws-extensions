@@ -56,6 +56,7 @@ import {
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
@@ -83,6 +84,10 @@ export { WsClosedError };
  * @typedef {Object} RedisPresenceOptions
  * @property {string} [key='id'] - Field in the selected data for user dedup. A credential-shaped or transport field name is not copied by the default select, so each connection then gets its own entry and the value never becomes a roster property name.
  * @property {(userData: any) => Record<string, any>} [select] - Extract the public roster data from userData. By default only the `key` field is copied, and only when its value is a string or finite number. An explicit select is the application's own policy and its result is used as-is, apart from top-level `__`-prefixed, `constructor` and `prototype` names, which every instance drops.
+ * @property {number} [maxFieldsBytes=8192] - Maximum serialized bytes in one update; oversized updates are dropped.
+ * @property {number} [maxTotalFieldsBytes=65536] - Maximum cumulative field bytes per user, including serialized names and framing.
+ * @property {number} [maxTopicsPerConnection=100] - Maximum presence topics per connection; excess joins are ignored.
+ * @property {number} [topicThrottle=16] - Minimum diff batching interval in milliseconds; zero flushes on the next timer turn.
  * @property {number} [heartbeat=30000] - Heartbeat interval in ms (how often to refresh per-field TTLs)
  * @property {number} [ttl=90] - TTL in seconds for presence entries (should be > heartbeat * 3). Applied per-field via HPEXPIRE; fields auto-expire field-by-field rather than at whole-key granularity.
  * @property {boolean} [keyspaceNotifications=false] - Subscribe to `__keyevent@*__:del` so a topic's local subscribers receive an empty `state` event the moment its per-topic presence hash is removed (instance-died scenario: the server deletes the hash when its last field's TTL lapses). Requires `CONFIG SET notify-keyspace-events Eg` (or any flagset including `E` and `g`) on every master; Redis accepts the subscription without it, so the tracker reads the setting when it subscribes and reports flags that cannot deliver the deletion (a server that refuses CONFIG is not checked). Per-field expiry that leaves other users on the topic does not fire it.
@@ -122,6 +127,7 @@ export { WsClosedError };
 export function createPresence(client, options = {}) {
 	const ctx = createPresenceState(client, options);
 	const {
+		maxFieldsBytes, maxTotalFieldsBytes, maxTopicsPerConnection, topicThrottle,
 		keyField, select, fieldNames, warnReservedField, heartbeatInterval, presenceTtlMs, transientFields, publicData,
 		emit, emitTo, instanceId, redis, keyspaceNotifications, maxEnvelopeBytes, ensureRedis74, b, mt,
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
@@ -161,6 +167,7 @@ export function createPresence(client, options = {}) {
 		localData,
 		publicData,
 		transientFields,
+		topicThrottle,
 		mt,
 		mDiffCoalesced,
 		mDiffFrames
@@ -773,6 +780,7 @@ export function createPresence(client, options = {}) {
 
 			let connTopics = wsTopics.get(ws);
 			if (connTopics && connTopics.has(topic)) return;
+			if (connTopics && connTopics.size >= maxTopicsPerConnection) return;
 
 			const selected = select(ws.getUserData());
 			// A roster entry is an object; anything else would be stored as the
@@ -1148,6 +1156,10 @@ export function createPresence(client, options = {}) {
 			const topicData = localData.get(topic);
 			const entry = topicData && topicData.get(key);
 			if (!entry) return;
+			try {
+				if (Buffer.byteLength(JSON.stringify(effective)) > maxFieldsBytes) return;
+				if (exceedsDepth(effective, MAX_PROJECTION_DEPTH)) return;
+			} catch { return; }
 			if (!entry.fields) entry.fields = newFieldMap();
 			// Per-field change detection against this instance's field view. Only
 			// fields whose value actually changed are merged and broadcast (the
@@ -1170,18 +1182,36 @@ export function createPresence(client, options = {}) {
 				}
 				const v = effective[k];
 				if (!deepEqual(entry.fields[k], v)) {
-					entry.fields[k] = v;
 					if (transientFields.has(k)) changedTransient[k] = v;
 					else changedDurable[k] = v;
 					any = true;
 				}
 			}
 			if (!any) return;
+			const changed = { ...changedDurable, ...changedTransient };
+			let totalBytes = entry.fieldsBytes;
+			try {
+				if (totalBytes === undefined) {
+					totalBytes = 0;
+					for (const k of Object.keys(entry.fields)) {
+						totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2 + Buffer.byteLength(JSON.stringify(entry.fields[k]) ?? '');
+					}
+				}
+				for (const k of Object.keys(changed)) {
+					totalBytes += Buffer.byteLength(JSON.stringify(changed[k]) ?? '');
+					if (Object.prototype.hasOwnProperty.call(entry.fields, k)) {
+						totalBytes -= Buffer.byteLength(JSON.stringify(entry.fields[k]) ?? '');
+					} else totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2;
+				}
+			} catch { return; }
+			if (totalBytes > maxTotalFieldsBytes) return;
+			Object.assign(entry.fields, changed);
+			entry.fieldsBytes = totalBytes;
 
 			// Local fan-out: buffer the update diff (durable + transient together)
 			// for this instance's subscribers. Coalesces with same-tick ops per
 			// the bufferUpdate collapse rules.
-			bufferUpdate(topic, key, { ...changedDurable, ...changedTransient }, platform);
+			bufferUpdate(topic, key, changed, platform);
 
 			// Persist durable fields to the per-topic hash value so a cross-instance
 			// state read (HGETALL) reconstructs them. Best-effort under the breaker:

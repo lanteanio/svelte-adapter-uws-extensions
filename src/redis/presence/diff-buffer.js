@@ -23,12 +23,13 @@ import { mergeFields, newFieldMap } from './field-policy.js';
  *   localData: Map<string, Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>>,
  *   publicData: (entry: { data: Record<string, any>, fields?: Record<string, any> | null }) => Record<string, any>,
  *   transientFields?: Set<string>,
+ *   topicThrottle?: number,
  *   mt: ((topic: string) => string) | undefined,
  *   mDiffCoalesced: { inc: (labels: Record<string, string>) => void } | null | undefined,
  *   mDiffFrames: { inc: (labels: Record<string, string>) => void } | null | undefined
  * }} deps
  */
-export function createDiffBuffer({ emit, localData, publicData, transientFields = new Set(), mt, mDiffCoalesced, mDiffFrames }) {
+export function createDiffBuffer({ emit, localData, publicData, transientFields = new Set(), topicThrottle = 0, mt, mDiffCoalesced, mDiffFrames }) {
 	/**
 	 * Per-topic pending diff buffer: latest op per key wins. Joins and
 	 * leaves on the same key in one event-loop iteration collapse so the
@@ -60,7 +61,7 @@ export function createDiffBuffer({ emit, localData, publicData, transientFields 
 	function armDiffFlush(platform) {
 		diffFlushPlatform = platform;
 		if (diffFlushTimer === null) {
-			diffFlushTimer = setTimer(flushPendingDiffs, 0);
+			diffFlushTimer = setTimer(flushPendingDiffs, topicThrottle);
 			if (diffFlushTimer.unref) diffFlushTimer.unref();
 		}
 	}

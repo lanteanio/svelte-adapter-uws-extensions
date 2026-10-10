@@ -662,6 +662,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 									// identity or a private field in every roster frame.
 									mergeFields(localEntry.fields, durable, acceptsField);
 									mergeFields(localEntry.fields, transient, acceptsField);
+									localEntry.fieldsBytes = undefined;
 								}
 							}
 						}
