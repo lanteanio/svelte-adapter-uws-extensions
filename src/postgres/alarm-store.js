@@ -3,7 +3,7 @@
  *
  * Same seam + contract as the Redis backend (`redis/alarm-store`), durable on
  * disk. Persists each room's single pending alarm so it survives a restart and
- * fires once cluster-wide. Plugs into the realtime `configureAlarm({ store })`
+ * supports an atomic storage claim cluster-wide. Plugs into the realtime `configureAlarm({ store })`
  * seam: realtime owns the in-memory timers + the leader-gated recovery poll; this
  * store is the durable record the poll reads. It runs no background loop of its
  * own.
@@ -18,8 +18,8 @@
  *   + index on (fire_at) so the due() sweep is a range scan
  *
  * Single-fire: `delete(topic)` is the atomic claim - `DELETE ... RETURNING` removes
- * the row and reports whether THIS call removed it, so the precise in-memory timer
- * and the recovery poll can never both fire the same alarm.
+ * the row and reports whether THIS call removed it. Handler delivery and
+ * generation-aware replacement belong to the realtime layer.
  *
  * @module svelte-adapter-uws-extensions/postgres/alarm-store
  */

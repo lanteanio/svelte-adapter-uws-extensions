@@ -20,7 +20,7 @@ const TABLE = 'svti_alarms_race_it';
 /** Rounds of the two-way race; each round is one independent claim window. */
 const ROUNDS = 25;
 
-describe('postgres alarm store single-fire claim (integration)', () => {
+describe('postgres alarm store single-fire claim (integration)', { retry: 0 }, () => {
 	let clientA;
 	let clientB;
 	let storeA;

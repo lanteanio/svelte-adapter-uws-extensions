@@ -19,7 +19,7 @@ import { createAlarmStore } from '../../../src/redis/alarm-store.js';
 /** Rounds of the two-way race; each round is one independent claim window. */
 const ROUNDS = 40;
 
-describe('redis alarm store single-fire claim (integration)', () => {
+describe('redis alarm store single-fire claim (integration)', { retry: 0 }, () => {
 	let clientA;
 	let clientB;
 	let storeA;

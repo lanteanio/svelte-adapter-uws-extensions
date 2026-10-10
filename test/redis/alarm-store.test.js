@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createAlarmStore } from '../../src/redis/alarm-store.js';
 
@@ -72,4 +72,39 @@ describe('redis durable alarm store', () => {
 		expect(await cstore.delete('room:c')).toBe(true); // ZREM + HDEL both applied on one node
 		expect(await cstore.due(2000)).toEqual([]);
 	});
+});
+
+
+describe('alarm transaction integrity', () => {
+	it('rejects asymmetric custom key mappings before opening a transaction', () => {
+		const client = mockRedisClient('app:');
+		client.key = (key) => key.endsWith(':due') ? '{left}:due' : '{right}:meta';
+		expect(() => createAlarmStore(client)).toThrow('different cluster slots');
+	});
+	it('claims through one MULTI containing ZREM and HDEL', async () => {
+		const client = mockRedisClient('app:');
+		const tx = { zrem: vi.fn().mockReturnThis(), hdel: vi.fn().mockReturnThis(), exec: vi.fn().mockResolvedValue([[null, 1], [null, 1]]) };
+		client.redis.multi = vi.fn(() => tx);
+		const store = createAlarmStore(client);
+		expect(await store.delete('room')).toBe(true);
+		expect(client.redis.multi).toHaveBeenCalledTimes(1);
+		expect(tx.zrem).toHaveBeenCalledWith('app:alarm:{alarms}:due', 'room');
+		expect(tx.hdel).toHaveBeenCalledWith('app:alarm:{alarms}:meta', 'room');
+		expect(tx.exec).toHaveBeenCalledTimes(1);
+	});
+	for (const method of ['set', 'delete', 'clear']) {
+		for (const failedCommand of [0, 1, null]) {
+			it(`${method} rejects transaction failure in command ${failedCommand}`, async () => {
+				const client = mockRedisClient('app:');
+				const error = new Error('NOPERM');
+				const results = failedCommand === null ? null : [[null, 1], [null, 1]];
+				if (results) results[failedCommand] = [error, null];
+				const tx = { exec: vi.fn().mockResolvedValue(results) };
+				for (const cmd of ['hset', 'zadd', 'zrem', 'hdel', 'del']) tx[cmd] = () => tx;
+				client.redis.multi = () => tx;
+				const store = createAlarmStore(client);
+				await expect(store[method]('room', 1)).rejects.toThrow(failedCommand === null ? 'not executed' : 'NOPERM');
+			});
+		}
+	}
 });

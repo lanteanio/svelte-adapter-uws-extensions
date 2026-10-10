@@ -2,7 +2,7 @@
  * Redis-backed durable alarm store for `live.alarm`.
  *
  * Persists each room's single pending alarm so it survives a process restart and
- * fires once cluster-wide. Plugs into the realtime `configureAlarm({ store })`
+ * supports an atomic storage claim cluster-wide. Plugs into the realtime `configureAlarm({ store })`
  * seam: the realtime layer owns the in-memory timers + the leader-gated recovery
  * poll; this store is the durable record the poll reads. It runs no background
  * loop of its own (the poll cadence lives in realtime), so it is a pure
@@ -19,14 +19,21 @@
  *     authoritative; recovery does not fall back to the path.
  *
  * Single-fire: `delete(topic)` is the atomic claim - `ZREM` returns 1 only for the
- * caller that actually removed the member, so the precise in-memory timer and the
- * recovery poll can never both fire the same alarm.
+ * caller that actually removed the member. This fences successful claims only;
+ * handler delivery and generation-aware replacement belong to the realtime layer.
  *
  * @module svelte-adapter-uws-extensions/redis/alarm-store
  */
 
 import { withBreaker } from '../shared/breaker.js';
-import { keySlot } from '../shared/cluster.js';
+import { keySlot, firstCommandError } from '../shared/cluster.js';
+
+// MULTI execution errors are returned per command, not rejected by ioredis.
+function assertExec(results) {
+	if (!results) throw new Error('redis alarm store: transaction was not executed');
+	const error = firstCommandError(results);
+	if (error) throw error;
+}
 
 /** Default cap on the rows returned by one `due(now)` sweep. */
 const DEFAULT_DUE_BATCH = 100;
@@ -112,7 +119,8 @@ export function createAlarmStore(client, options = {}) {
 				const payload = JSON.stringify({ at, meta: meta ?? null });
 				// Write the meta + the due-index as one atomic unit (same slot) so a
 				// crash can never leave a due member without its resolver metadata.
-				await redis.multi().hset(metaKey, topic, payload).zadd(dueKey, at, topic).exec();
+				const res = await redis.multi().hset(metaKey, topic, payload).zadd(dueKey, at, topic).exec();
+				assertExec(res);
 			});
 			mSet?.inc();
 		},
@@ -121,6 +129,7 @@ export function createAlarmStore(client, options = {}) {
 			assertTopic(topic);
 			return withBreaker(b, async () => {
 				const res = await redis.multi().zrem(dueKey, topic).hdel(metaKey, topic).exec();
+				assertExec(res);
 				// res[0] = [err, zremCount]. The ZREM count IS the atomic claim: exactly
 				// one caller sees 1, everyone else sees 0.
 				const n = res && res[0] ? Number(res[0][1]) : 0;
@@ -157,7 +166,8 @@ export function createAlarmStore(client, options = {}) {
 
 		async clear() {
 			await withBreaker(b, async () => {
-				await redis.multi().del(dueKey).del(metaKey).exec();
+				const res = await redis.multi().del(dueKey).del(metaKey).exec();
+				assertExec(res);
 			});
 		},
 
