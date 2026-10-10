@@ -2204,7 +2204,7 @@ export async function placeOrder(input, ctx) {
 
 | Option | Default | Description |
 |---|---|---|
-| `keyPrefix` (Redis) | `'idem:'` | Prepended to every Redis key after the client keyPrefix |
+| `keyPrefix` (Redis) | `'idem:'` | Prepended to every Redis key after the client keyPrefix; caller keys starting with `byuser:` are reserved ([key rules and existing data](docs/idempotency-keys.md)) |
 | `table` (Postgres) | `'svti_idempotency'` | Table name |
 | `ttl` | `172800` (48h) | Result cache lifetime in seconds |
 | `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |

@@ -241,6 +241,9 @@ export function createIdempotencyStore(client, options = {}) {
 		if (typeof userKey !== 'string' || userKey.length === 0) {
 			throw new Error('redis idempotency: key must be a non-empty string');
 		}
+		if (userKey.startsWith('byuser:')) {
+			throw new Error('redis idempotency: key must not start with reserved prefix byuser:');
+		}
 		if (userKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
 			throw new Error('redis idempotency: key must be at most ' + MAX_IDEMPOTENCY_KEY_LENGTH + ' characters');
 		}

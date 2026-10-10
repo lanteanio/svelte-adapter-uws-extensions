@@ -206,6 +206,16 @@ and manual SQL before disabling automatic migration. A resolved `ready()` with
 
 ## 3. Fails on a call that used to succeed
 
+### Redis idempotency reserves its erasure-index namespace
+
+Redis `acquire()` and `purge()` now reject caller keys beginning with the exact
+prefix `byuser:`. Normal cache/index layouts remain unchanged. Stop callers using
+that reserved prefix before upgrading, and drain pending work before changing
+application keys: a renamed key can repeat an effect. Previously overwritten or
+deleted reverse indices require paused-writer inspection and reconciliation;
+the upgrade never automatically deletes retained data or repairs historical
+erasure mappings. See [key rules and existing data](./docs/idempotency-keys.md).
+
 ### Redis clients bound waits and disconnected buffering
 
 Owned clients default to 5-second command, connection and socket timeouts,

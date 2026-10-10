@@ -83,10 +83,12 @@ export interface RedisIdempotencyStore {
 	 * Try to claim ownership of a key. Returns one of three slot shapes. The
 	 * optional `meta` records the committing user for `live.forget` right-to-
 	 * erasure (the realtime idempotent wrapper supplies it).
+	 * Keys beginning with byuser: are reserved for the erasure index and rejected.
+	 * ttlSec overrides the store default; zero releases the lease without retaining
+	 * a result. Must be a non-negative integer.
 	 */
-	/** ttlSec overrides the store default; zero releases the lease without retaining a result. Must be a non-negative integer. */
 	acquire<T = unknown>(key: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
-	/** Drop a single cached result. */
+	/** Drop a single cached result. Keys beginning with byuser: are reserved and rejected. */
 	purge(key: string): Promise<void>;
 	/** Right-to-erasure: delete every cached result this user committed. */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
