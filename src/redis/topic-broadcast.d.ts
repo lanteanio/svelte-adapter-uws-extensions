@@ -39,8 +39,10 @@ export interface TopicBroadcastOptions {
 	presenceTtlMs?: number;
 
 	/**
-	 * Reject inbound relay envelopes larger than this many bytes BEFORE
-	 * JSON.parse. Defends against a bus-side DoS on shared-Redis deployments.
+	 * Bound inbound envelopes before JSON.parse and outbound encoded bytes.
+	 * Oversized requests reject with RangeError before serving any local
+	 * subscribers. Oversized replies are withheld and reported, so the
+	 * requester may wait until its timeout.
 	 * @default 1048576
 	 */
 	maxEnvelopeBytes?: number;
@@ -77,6 +79,8 @@ export interface TopicBroadcast {
 	 * Resolves as soon as every live instance has answered, or at `timeoutMs`,
 	 * whichever comes first; a non-answering subscriber/instance simply does
 	 * not contribute (partial-success).
+	 * Rejects with RangeError for an oversized request, or Error for an invalid
+	 * topic or event, before serving local subscribers or publishing to Redis.
 	 */
 	broadcast<TReply = unknown>(
 		topic: string,

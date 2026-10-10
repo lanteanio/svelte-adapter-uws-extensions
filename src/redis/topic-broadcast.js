@@ -84,7 +84,7 @@ function positive(v, fallback) {
  * @property {number} [requestTimeoutMs=5000] - Default whole-fan-out budget for `broadcast(...)` when the call omits `timeoutMs`. The hard ceiling: the call resolves no later than this even if a recorded instance never answers.
  * @property {number} [heartbeat=10000] - Presence refresh interval in ms. Each tick re-stamps this instance's score and evicts instances stale beyond the TTL.
  * @property {number} [presenceTtlMs] - How long (ms) an instance counts as live after its last heartbeat. Default `heartbeat * 3` so a GC pause inside one missed beat does not drop a live instance from the early-completion set.
- * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound relay envelopes larger than this BEFORE JSON.parse. Defends against a bus-side DoS on shared-Redis deployments.
+ * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound envelopes before JSON.parse and outbound encoded bytes. Oversized requests reject with RangeError before serving local subscribers; oversized replies are withheld and reported, so the requester may wait until its timeout.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker; when open, outbound publishes and presence writes are skipped.
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics] - Optional Prometheus metrics registry.
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber failure (the subscriber tears down so a later broadcast re-subscribes).
