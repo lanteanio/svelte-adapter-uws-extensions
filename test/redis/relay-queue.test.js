@@ -25,6 +25,25 @@ it('does not keep abandoned relay queues alive through the metrics registry', ()
 });
 
 describe('bounded relay admission and scheduling', () => {
+	it('admits one large configured envelope and keeps its capacity until settlement', async () => {
+		let resolve;
+		const { queue: q, submit, dropped, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
+		const msg = 'x'.repeat(9 * 1024 * 1024);
+		expect(q.push(entry(msg))).toBe(true);
+		expect(q.state.snapshot()).toMatchObject({ retained: 1, retainedBytes: msg.length });
+		expect(overflow).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(submit.mock.calls[0][0].map(value => value.msg)).toEqual([msg]);
+		expect(q.push(entry('while pending'))).toBe(false);
+		expect(q.push(entry(msg))).toBe(false);
+		expect(dropped).toHaveBeenCalledTimes(2);
+		expect(overflow).toHaveBeenCalledTimes(1);
+		q.clear();
+		expect(q.state.snapshot().retainedBytes).toBe(msg.length);
+		resolve(); await Promise.resolve();
+		expect(q.push(entry('after settlement'))).toBe(true);
+		q.clear();
+	});
 	it('retains submitted capacity until actual settlement and refuses newest entries', async () => {
 		let resolve;
 		const { queue: q, submit, dropped, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
@@ -113,6 +132,21 @@ describe('bounded relay admission and scheduling', () => {
 });
 
 for (const [name, factory, prefix] of [['standard', createPubSubBus, 'pubsub'], ['sharded', createShardedBus, 'sharded_pubsub']]) {
+	it.each(['publish', 'publishBatched'])(`${name} relays a lone configured envelope above the normal queue budget via %s`, async (method) => {
+		const diagnostics = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const client = mockRedisClient(), platform = mockPlatform(), metrics = createMetrics();
+		const bus = factory(client, { metrics, maxEnvelopeBytes: 16 * 1024 * 1024 });
+		try {
+			const wrapped = bus.wrap(platform), data = 'x'.repeat(9 * 1024 * 1024);
+			if (method === 'publish') wrapped.publish('room', 'event', data);
+			else wrapped.publishBatched([{ topic: 'room', event: 'event', data }]);
+			expect(platform.published).toHaveLength(1);
+			expect(diagnostics).not.toHaveBeenCalled();
+			await vi.runAllTimersAsync();
+			expect(metrics.serialize()).toContain(prefix + '_relay_attempts_total{outcome="success"} 1');
+			expect(metrics.serialize()).not.toContain(prefix + '_messages_local_only_total{reason="queue_full"}');
+		} finally { await bus.deactivate(); }
+	});
 	it(`${name} overload preserves local delivery, reports loss once, and never fails the backend breaker`, async () => {
 		const diagnostics = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const client = mockRedisClient(), platform = mockPlatform(), metrics = createMetrics();

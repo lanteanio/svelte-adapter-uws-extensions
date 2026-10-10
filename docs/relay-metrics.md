@@ -39,8 +39,11 @@ disabled, relay duration does not read the clock.
 
 ## Bounded admission and draining
 
-Each bus retains at most 8,192 relay envelopes and 8 MiB of their encoded UTF-8
-payloads, counting both queued and submitted envelopes until Redis settles them.
+Each bus normally retains at most 8,192 relay envelopes and 8 MiB of their encoded
+UTF-8 payloads, counting queued and submitted envelopes until Redis settles them.
+An envelope within `maxEnvelopeBytes` but larger than 8 MiB is admitted only when
+the queue is empty; it occupies the queue alone until its submission settles.
+The retained byte ceiling is therefore `max(8 MiB, maxEnvelopeBytes)`.
 This bounds payload retention; it is not an exact JavaScript heap budget. A new
 envelope that would exceed either limit is withheld from Redis after its local
 delivery, including a locally accepted `publishBatched` call. Its logical
@@ -52,11 +55,13 @@ application state when missed events matter.
 One FIFO chunk runs at a time, preserving admission order for each channel.
 Chunks contain at most 256 envelopes and normally at most 1 MiB; conservative
 UTF-8 accounting may produce smaller chunks. One envelope
-larger than 1 MiB uses a chunk alone if it fits both the configured envelope cap
-and the queue's byte budget. Every subsequent chunk yields through the timer
+larger than 1 MiB uses a chunk alone if it fits the configured envelope cap.
+Every subsequent chunk yields through the timer
 queue. A stalled submission holds its capacity until its actual outcome, so new
 ticks cannot accumulate unbounded in-flight batches. Owned Redis clients have
 finite command deadlines; external clients must provide their own deadlines.
+One slow shard holds the next chunk for every channel of that bus; throughput is
+bounded by one chunk per Redis round trip.
 Standard Cluster publishing borrows one ready master connection across chunks so
 cross-node gossip cannot reorder a healthy stream. It selects another ready
 master only when the previous one is unavailable or removed. Node connections

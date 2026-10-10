@@ -788,10 +788,10 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.pubsub.envelope.oversized`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.envelope.oversized severity=warn] A publish envelope exceeds maxEnvelopeBytes and was not relayed.`
-- **Cause:** The serialized envelope exceeds the byte limit enforced by peers. The limit includes the whole batch envelope.
+- **Cause:** The serialized ordinary publish envelope exceeds the byte limit enforced by peers. Oversized publishBatched calls reject before delivery instead.
 - **Consequence:** Local delivery is retained, but remote instances and sibling workers miss this envelope. Reported once per oversized streak.
 - **Automatic recovery:** The next envelope within the limit is relayed normally and re-arms the report.
-- **Next action:** Reduce publish or batch payload sizes, or raise maxEnvelopeBytes consistently on every instance.
+- **Next action:** Reduce publish payload sizes, or raise maxEnvelopeBytes consistently on every instance.
 - **Runtime help:** `docs/errors.md#extensions-err-pubsub-envelope-oversized`
 - **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js), [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)
 

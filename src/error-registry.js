@@ -636,10 +636,10 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED,
 		event: 'redis.pubsub.envelope.oversized', component: 'runtime.redis.pubsub', severity: 'warn',
 		problemPrefix: 'A publish envelope exceeds maxEnvelopeBytes and was not relayed.',
-		cause: 'The serialized envelope exceeds the byte limit enforced by peers. The limit includes the whole batch envelope.',
+		cause: 'The serialized ordinary publish envelope exceeds the byte limit enforced by peers. Oversized publishBatched calls reject before delivery instead.',
 		consequence: 'Local delivery is retained, but remote instances and sibling workers miss this envelope. Reported once per oversized streak.',
 		automaticRecovery: 'The next envelope within the limit is relayed normally and re-arms the report.',
-		nextAction: 'Reduce publish or batch payload sizes, or raise maxEnvelopeBytes consistently on every instance.',
+		nextAction: 'Reduce publish payload sizes, or raise maxEnvelopeBytes consistently on every instance.',
 		sources: ['src/redis/pubsub.js', 'src/redis/sharded-pubsub.js'], anchor: 'extensions-err-pubsub-envelope-oversized'
 	}),
 	direct({

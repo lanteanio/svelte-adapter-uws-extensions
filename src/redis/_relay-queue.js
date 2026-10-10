@@ -87,7 +87,9 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix })
 			if (retained < MAX_ENTRIES && bytes > MAX_BYTES - retainedBytes) {
 				normalizeBytes(); bytes = Buffer.byteLength(msg); exact = true;
 			}
-			if (retained === MAX_ENTRIES || bytes > MAX_BYTES - retainedBytes) {
+			// A configured envelope above the normal byte budget occupies the
+			// queue alone. Its capacity stays charged until submission settles.
+			if (retained === MAX_ENTRIES || (bytes > MAX_BYTES - retainedBytes && retained > 0)) {
 				dropped('queue_full', 1, count);
 				if (!warned) { warned = true; normalizeBytes(); overflow({ entries: retained, bytes: retainedBytes, maxEntries: MAX_ENTRIES, maxBytes: MAX_BYTES }); }
 				return false;
