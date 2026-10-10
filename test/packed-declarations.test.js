@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, it } from 'vitest';
+import ts from 'typescript';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -87,6 +88,25 @@ explicit.set('token', { userId: 'user' });
 createPgClient({ connectionString: 'postgres://localhost/example' }).query('SELECT 1').then(result => result.rows);
 `);
 		run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--target', 'es2022', '--module', 'esnext', '--moduleResolution', 'bundler', '--skipLibCheck', 'false', '--types', 'node', 'consumer.ts'], work);
+		const deprecatedFile = join(work, 'deprecated-consumer.ts');
+		writeFileSync(deprecatedFile, "import { WS_REQUEST_ID_KEY } from 'svelte-adapter-uws-extensions/testing';\nexport const carrier = WS_REQUEST_ID_KEY;\n");
+		const compilerOptions = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler };
+		const service = ts.createLanguageService({
+			...ts.sys,
+			getScriptFileNames: () => [deprecatedFile],
+			getScriptVersion: () => '0',
+			getScriptSnapshot: file => {
+				const content = ts.sys.readFile(file);
+				return content === undefined ? undefined : ts.ScriptSnapshot.fromString(content);
+			},
+			getCurrentDirectory: () => work,
+			getCompilationSettings: () => compilerOptions,
+			getDefaultLibFileName: options => ts.getDefaultLibFilePath(options)
+		});
+		try {
+			expect(service.getSemanticDiagnostics(deprecatedFile)).toEqual([]);
+			expect(service.getSuggestionDiagnostics(deprecatedFile).some(diagnostic => diagnostic.code === 6385)).toBe(true);
+		} finally { service.dispose(); }
 	} finally {
 		rmSync(work, { recursive: true, force: true });
 	}

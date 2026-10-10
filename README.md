@@ -4766,7 +4766,7 @@ import {
 } from 'svelte-adapter-uws-extensions/testing';
 ```
 
-`WS_REQUEST_ID_KEY` remains available as a deprecated compatibility constant; it no longer names a runtime slot. Read `userData[WS_PLATFORM].requestId` instead. The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing-your-own-handlers) for the per-helper reference.
+`WS_REQUEST_ID_KEY` remains available as a deprecated compatibility constant for the adapter's internal request-ID carrier, which may change independently of public APIs. Read `userData[WS_PLATFORM].requestId` instead. The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing) for the per-helper reference.
 
 `createTestServer` is intentionally not re-exported - it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
 
