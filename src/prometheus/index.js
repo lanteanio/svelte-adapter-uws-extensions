@@ -609,6 +609,9 @@ export function createMetrics(options = {}) {
 	function counter(name, help, labelNames, maxSeries) {
 		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
+		if (fullName === droppedCounterName) {
+			throw new Error('prometheus_series_dropped_total is reserved for registry drop accounting');
+		}
 		const c = new Counter(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		const existing = registry.get(fullName);
 		if (existing) {
@@ -624,6 +627,9 @@ export function createMetrics(options = {}) {
 	function gauge(name, help, labelNames, maxSeries) {
 		const a = resolveMetricArgs(labelNames, { maxSeries });
 		const fullName = prefix + name;
+		if (fullName === droppedCounterName) {
+			throw new Error('prometheus_series_dropped_total is reserved for registry drop accounting');
+		}
 		const g = new Gauge(fullName, help, a.labelNames, a.maxSeries ?? defaultMaxSeries);
 		const existing = registry.get(fullName);
 		if (existing) {
@@ -639,6 +645,9 @@ export function createMetrics(options = {}) {
 	function histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
 		const a = resolveMetricArgs(labelNames, { buckets, allowNegative, maxSeries, maxBuckets });
 		const fullName = prefix + name;
+		if (fullName === droppedCounterName) {
+			throw new Error('prometheus_series_dropped_total is reserved for registry drop accounting');
+		}
 		const h = new Histogram(
 			fullName,
 			help,

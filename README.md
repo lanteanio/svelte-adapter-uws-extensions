@@ -3160,6 +3160,8 @@ The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then p
 
 Exposes extension metrics in Prometheus text exposition format. No external dependencies. Zero overhead when not enabled - every metric call uses optional chaining on a nullish reference, so V8 short-circuits on a single pointer check.
 
+Registering a name again requires the same help text, labels, series cap and histogram configuration. Label order and bucket order do not matter; conflicting registrations throw before observations can use the wrong instrument. The name `prometheus_series_dropped_total` is reserved for registry drop accounting, including when a registry prefix is configured.
+
 #### Setup
 
 ```js

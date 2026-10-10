@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Re-registering a metric name now rejects conflicting help text, series caps, histogram buckets, negative-value policy, or bucket caps.
+- Re-registering a metric name now rejects conflicting help text, series caps, histogram buckets, negative-value policy, or bucket caps. Registry drop accounting reserves its counter name so a user metric cannot replace it.
 
 - Redis buses preserve batch compression options on local and remote delivery.
 - Redis buses carry null as an unsequenced choice and bigint authorities as safe integer sequences.

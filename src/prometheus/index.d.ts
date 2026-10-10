@@ -58,6 +58,7 @@ export interface Histogram {
 	observe(value: number): void;
 }
 
+/** Metric names must have matching descriptors; prometheus_series_dropped_total is reserved. */
 export interface MetricsRegistry {
 	/** Create a counter metric (positional form). */
 	counter(name: string, help: string, labelNames?: string[], maxSeries?: number): Counter;

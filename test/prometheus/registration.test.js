@@ -43,3 +43,14 @@ describe('metric registration descriptors', () => {
 		expect(() => metrics[kind]('shared', 'Shared', ['route', 'route'])).toThrow('duplicate label');
 	});
 });
+it.each(['counter', 'gauge', 'histogram'])('reserves drop accounting before a user %s can replace it', (kind) => {
+	const metrics = createMetrics({ prefix: 'app_', maxSeries: 1 });
+	expect(() => metrics[kind]('prometheus_series_dropped_total', 'User metric')).toThrow('reserved');
+	const requests = metrics.counter('requests_total', 'Requests', ['route']);
+	requests.inc({ route: 'first' });
+	requests.inc({ route: 'second' });
+	expect(metrics.serialize()).toContain('app_prometheus_series_dropped_total{metric="app_requests_total"} 1');
+	expect(() => metrics[kind]('prometheus_series_dropped_total', 'User metric')).toThrow('reserved');
+	requests.inc({ route: 'third' });
+	expect(metrics.serialize()).toContain('app_prometheus_series_dropped_total{metric="app_requests_total"} 2');
+});
