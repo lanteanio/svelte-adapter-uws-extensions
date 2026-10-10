@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, it } from 'vitest';
@@ -22,9 +22,9 @@ it('resolves its boot-banner version and typechecks consumers from the packed pa
 			? process.env.npm_execpath
 			: join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
 		const packed = JSON.parse(run(process.execPath, [npm, 'pack', '--json', '--ignore-scripts', '--pack-destination', work], root));
-		run('tar', ['-xf', packed[0].filename], work);
-		mkdirSync(join(work, 'node_modules'));
-		renameSync(join(work, 'package'), join(work, 'node_modules/svelte-adapter-uws-extensions'));
+		const installed = join(work, 'node_modules/svelte-adapter-uws-extensions');
+		mkdirSync(installed, { recursive: true });
+		run('tar', ['-xf', packed[0].filename, '--strip-components=1', '-C', installed], work);
 		const manifest = JSON.parse(readFileSync(join(work, 'node_modules/svelte-adapter-uws-extensions/package.json'), 'utf8'));
 		expect(manifest.dependencies['@types/pg']).toEqual(expect.any(String));
 		writeFileSync(join(work, 'version-consumer.mjs'), `

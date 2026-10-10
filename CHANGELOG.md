@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Refresh vulnerable development dependencies and reject successful lock callbacks after confirmed lease ownership loss.
+
 - Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
 - Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
@@ -60,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An explicit `select` is used as-is.** Its result no longer passes through `stripInternal()`, which also dropped ordinary names such as `authorName` and `authoredAt`, and it receives the connection's userData unchanged, `remoteAddress` included, so return only the fields peers should see. Presence still drops top-level `__`-prefixed, `constructor` and `prototype` names, as its cross-instance relay and its read-back from Redis do. Neither tracker logs a warning about sensitive-looking keys in a `select` result any more.
 
 ### Added
+
+- Retain and digest-check one release artifact through a tag-only, protected OIDC publication workflow; verify the complete dependency graph and isolated lockfile regeneration before release.
 
 - Verify boot-banner version discovery from a packed consumer installation.
 

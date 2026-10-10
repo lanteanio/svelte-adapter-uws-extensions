@@ -45,9 +45,12 @@ describe('verification inventory', () => {
 		expect(() => expandLanes('a', { a: 'npm run b', b: 'npm run a' })).toThrow('Cyclic');
 		expect(() => workflowLanes('run: |\n  npm run smoke')).toThrow('single-line');
 	});
+	it('extracts explicit npm lanes beside closed multiline artifact commands', () => {
+		expect(workflowLanes('jobs:\n  release:\n    steps:\n      - run: npm run verify:pr\n      - run: |\n          npm pack --json\n          Get-FileHash artifact.tgz\n      - run: npm publish artifact.tgz --tag candidate\n')).toEqual(['verify:pr']);
+	});
 	it('matches the checked-in package and hosted workflow', () => {
 		const load = (path) => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
-		expect(checkMap(load('CONTRIBUTING.md'), JSON.parse(load('package.json')).scripts, readdirSync(new URL('../.github/workflows/', import.meta.url)).filter((name) => /\.ya?ml$/.test(name)).sort().map((name) => load('.github/workflows/' + name)).join('\n')).matches).toBe(true);
+		expect(checkMap(load('CONTRIBUTING.md'), JSON.parse(load('package.json')).scripts, readdirSync(new URL('../.github/workflows/', import.meta.url)).filter((name) => /\.ya?ml$/.test(name)).sort().map((name) => load('.github/workflows/' + name)).join('\n---\n')).matches).toBe(true);
 	});
 });
 

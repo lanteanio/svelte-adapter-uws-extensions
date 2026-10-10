@@ -67,7 +67,7 @@ The table below is generated from `package.json` and `.github/workflows/`.
 the workflow, run `node scripts/check-contributor-map.js --write` and inspect the diff.
 
 <!-- verification-inventory:start -->
-Hosted jobs: `dependencies`, `external-links`, `suite`, `onboarding`.
+Hosted jobs: `dependencies`, `external-links`, `verify`, `publish`, `suite`, `onboarding`.
 
 | Command | Script expansion | Coverage |
 |---|---|---|
@@ -83,6 +83,7 @@ Hosted jobs: `dependencies`, `external-links`, `suite`, `onboarding`.
 | `npm run verify:postgres` | `test:integration:postgres` | Local |
 | `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke` | Hosted |
 | `npm run verify:redis` | `test:integration:redis` | Local |
+| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres` | Hosted |
 | `npm run verify:unit` | `test` | Hosted |
 | `npm run verify:valkey` | `test:integration:valkey` | Local |
 | `npm run verify:valkey-cluster` | `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |

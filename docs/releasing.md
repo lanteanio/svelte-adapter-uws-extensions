@@ -1,0 +1,35 @@
+# Releasing
+
+This is the publication contract for `svelte-adapter-uws-extensions`. Release preparation does not authorize pushing tags or publishing a version. The checked-in path verifies a candidate; an authorized maintainer controls promotion.
+
+## Identity and branch roles
+
+- `dev` contains development candidates; prerelease versions use `publishConfig.tag: next`.
+- `main` contains stable releases; stable versions use `publishConfig.tag: latest`.
+- Prepare an annotated immutable tag `svelte-adapter-uws-extensions@<version>` on the reviewed release commit. The tag must match package name/version exactly and its commit must belong to the corresponding remote branch.
+- Record the source commit and tag, retained tarball SHA-256, npm integrity/shasum, publication time and workflow run URL with the release evidence. A dist-tag is a movable routing pointer, not artifact identity.
+
+Never reuse a version or move its Git tag. Upgrade the coordinated adapter/realtime/extensions tuple before promotion; use the [compatibility table](../README.md#version-compatibility) and each package's migration guide. A package passing its own suite does not certify a sibling's behavior.
+
+## Verify, retain, then publish
+
+The tag-only [release.yml](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/.github/workflows/release.yml) has two jobs:
+
+1. `verify` has only `contents: read`. Node 24.13.1 and npm 11.8.0 install the committed lock. The identity guard checks the event, repository, annotated tag, checkout and branch lineage. `verify:release` checks isolated lock regeneration, the complete dependency graph and audit, preflight, the unit/check chain, mock smoke, and standalone real Redis and Postgres integration suites. `prepublishOnly` independently invokes the check chain. Finally one publication artifact is packed, hashed and retained for 90 days; the filename and digest are separate job outputs.
+2. `publish` runs in `npm-release` with `id-token: write`. It installs no repository dependency tree and executes no repository script. Fully pinned actions download the retained artifact; a closed PowerShell body compares its SHA-256 with the verify job output. npm publishes those exact bytes with provenance and scripts disabled to the quarantine `candidate` dist-tag. It does not move `next` or `latest`.
+
+`check-release-workflow.js` checks closed workflow/job/step key inventories, exact commands and action commits, the artifact/digest bodies, and the complete package-script inventory. Script changes must update the explicit reviewed inventory in the same change. Plain local `npm publish` invokes `prepublishOnly`; overriding npm lifecycle execution deliberately bypasses that local guard and is not a supported publication route.
+
+The standalone integration suites start and remove their own Docker Compose stacks. Cluster/Valkey variants remain separate lanes listed in [CONTRIBUTING](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md#verification-inventory); a release needing those surfaces must additionally run their lanes and retain the evidence. Hosted execution and an actual registry publication cannot be inferred from a passing local workflow test.
+
+## External setup
+
+Before the first authorized release, configure the npm trusted publisher for package `svelte-adapter-uws-extensions`, GitHub owner `lanteanio`, repository `svelte-adapter-uws-extensions`, workflow filename `release.yml`, and environment `npm-release`. Configure that GitHub environment with required reviewers, prevent self-review, and restrict deployment to the package's version tags. Protect `dev`, `main`, and version tags against unreviewed updates/deletion. This repository cannot prove these account-level settings from local files.
+
+Follow the [npm trusted-publisher setup](https://docs.npmjs.com/trusted-publishers/) for the account-side identity. Use public GitHub-hosted runners and npm trusted publishing/OIDC; there is no token fallback. The workflow fails closed if trust, environment approval, identity, tests, artifact transfer, or provenance publication fails. Configure trust and review the concrete candidate before pushing a release tag.
+
+## Candidate promotion and recovery
+
+After quarantine publication, install the exact `package@version` in a clean consumer, run preflight and the affected real-backend route, inspect npm provenance/integrity against the retained evidence, and verify the coordinated ecosystem tuple. Only then may an authorized maintainer move `next` or `latest` to that immutable version. A failed candidate stays out of those channels; fix it under a new version.
+
+For an incident, capture the currently routed version and integrity before changing anything. Restore the intended dist-tag to the previously verified immutable version, reinstall that exact artifact, and follow [MIGRATION](../MIGRATION.md) for storage/wire compatibility. Moving a dist-tag does not roll back persistent data or already installed consumers. A stable hotfix starts from the recorded stable release tag, receives a new version and the same verification, and its source change is merged back to `dev` through review.
