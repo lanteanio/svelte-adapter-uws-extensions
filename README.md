@@ -1967,7 +1967,7 @@ If your real-time events are driven by database writes and you do not need Redis
 
 ## Job queue
 
-`createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on vanilla Postgres 9.5+ - no extensions required.
+`createJobQueue` (`svelte-adapter-uws-extensions/postgres/jobs`) is a minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue for vanilla Postgres 16+ - no extensions required. See the [PostgreSQL support matrix and read-only preflight](./docs/postgres-support.md) before initializing stores.
 
 The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in - the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
 

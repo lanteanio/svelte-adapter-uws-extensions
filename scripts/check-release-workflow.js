@@ -155,7 +155,8 @@ const EXPECTED_SCRIPTS = {
 	"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit",
 	"prepublishOnly": "npm run check",
 	"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
-	"check:publish": "publint && attw --pack . --profile esm-only"
+	"check:publish": "publint && attw --pack . --profile esm-only",
+	"preflight:postgres": "node scripts/check-postgres-support.js"
 };
 
 function checkSteps(errors, jobName, job, expected) {

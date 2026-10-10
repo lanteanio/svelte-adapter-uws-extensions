@@ -111,7 +111,7 @@ export interface JobQueue {
 
 /**
  * Create a Postgres-backed `SELECT ... FOR UPDATE SKIP LOCKED` job
- * queue. Works on vanilla Postgres 9.5+; no extensions required.
+ * queue. Works on vanilla Postgres 16+; no extensions required.
  *
  * Pairs with `createTaskRunner` as the lighter "ingest event,
  * defer work" producer.

@@ -2,7 +2,7 @@
  * Postgres-backed job queue for svelte-adapter-uws.
  *
  * Minimal `SELECT ... FOR UPDATE SKIP LOCKED` queue that works on
- * vanilla Postgres 9.5+ without any extensions, for the common case of
+ * vanilla Postgres 16+ without any extensions, for the common case of
  * standard managed Postgres without extension support.
  *
  * Pairs with `createTaskRunner` as the "enqueue here, task runner

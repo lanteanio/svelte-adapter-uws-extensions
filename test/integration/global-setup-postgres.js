@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createPgClient } from '../../src/postgres/index.js';
+import { verifyPostgresVersion } from '../../scripts/check-postgres-support.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const composePath = path.join(__dirname, 'docker-compose.yml');
@@ -42,7 +44,14 @@ export default async function setup() {
 
 	console.log(`[integration:postgres] starting postgres service (project=${PROJECT_NAME})...`);
 	compose(['up', '-d', '--wait', 'postgres']);
-	console.log(`[integration:postgres] postgres ready (:${POSTGRES_HOST_PORT})`);
+	try {
+		const client = createPgClient({ connectionString: POSTGRES_URL, autoShutdown: false, options: { max: 1, connectionTimeoutMillis: 5000, query_timeout: 5000, statement_timeout: 5000 } });
+		try { await verifyPostgresVersion(client); } finally { await client.end(); }
+	} catch (error) {
+		compose(['down', '-v']);
+		throw error;
+	}
+	console.log(`[integration:postgres] postgres ready (:${POSTGRES_HOST_PORT}); server version preflight passed`);
 
 	return async () => {
 		console.log('[integration:postgres] tearing down docker compose stack...');

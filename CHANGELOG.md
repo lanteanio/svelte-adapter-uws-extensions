@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Declare PostgreSQL 16 as the tested server baseline across Postgres subpaths, replace the incorrect 9.5 job-queue claim, and add a read-only server-version preflight before integration initialization.
+
 - Redis clients require ioredis 5.10.1 or later and default to finite command/retry deadlines and bounded offline buffering. Rejected unsent startup commands are removed before recovery.
 
 - Generate the declared compatibility tuple and installation pins from the installed adapter manifest; use fractional-second histogram defaults and lock acquisition seconds, retaining explicit count/millisecond buckets.
