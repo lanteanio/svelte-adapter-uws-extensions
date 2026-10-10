@@ -156,6 +156,18 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		}
 	});
 
+	it('keeps compression when a peer falls back from a batch to individual publishes', async () => {
+		const { b, wrapped, close } = await pair('batch-compression-fallback:');
+		b.publishBatched = undefined;
+		try {
+			wrapped.publishBatched([{ topic: 'chat', event: 'msg', data: 1, options: { seq: false } }], { compress: true });
+			await until(() => b.published.length === 1);
+			expect(b.published[0].options).toEqual({ relay: false, seq: false, compress: true });
+		} finally {
+			await close();
+		}
+	});
+
 	it('carries the seq choice of a shared-codec publishWire', async () => {
 		const { a, b, wrapped, busB, close } = await pair('bs3:', wirePlatform);
 		busB.wrap(b).registerWireCodec(sharedCodec);

@@ -351,7 +351,7 @@ export function createShardedBus(client, options = {}) {
 					topic: m.topic,
 					event: m.event,
 					data: m.data,
-					options: receivedOptions(m.s, m.j)
+					options: receivedOptions(m.s, m.j, parsed.compress === true)
 				});
 			}
 			if (local.length === 0) return;
