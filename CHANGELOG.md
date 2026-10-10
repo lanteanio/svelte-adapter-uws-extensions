@@ -5,6 +5,13 @@ All notable changes to `svelte-adapter-uws-extensions` will be documented in thi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Distributed session options carry the session data type through user erasure callbacks and inferred stores.
+- Postgres declarations include their required pg types for strict TypeScript consumers.
+
 ## [0.6.0-next.64] - 2026-09-11
 
 ### Breaking Changes

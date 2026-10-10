@@ -13,7 +13,7 @@ export interface SessionWsHooks {
 	close?(ws: any, ctx: CloseContext): void | Promise<void>;
 }
 
-export interface DistributedSessionOptions {
+export interface DistributedSessionOptions<T = unknown> {
 	/**
 	 * Prefix prepended (after the client `keyPrefix`) to every session key.
 	 * @default 'sess:'
@@ -159,5 +159,5 @@ export interface DistributedSession<T = unknown> {
  */
 export function createDistributedSession<T = unknown>(
 	client: RedisClient,
-	options?: DistributedSessionOptions
+	options?: DistributedSessionOptions<T>
 ): DistributedSession<T>;
