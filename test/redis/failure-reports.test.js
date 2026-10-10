@@ -1736,7 +1736,7 @@ describe('cluster-only failure paths', () => {
 			};
 			expect(clock.running().map((t) => t.ms)).toEqual([30000]);
 			await clock.tick();
-			expect(clock.pending().map((t) => t.ms)).toEqual([10000]);
+			expect(clock.pending().map((t) => t.ms)).toEqual([1000, 10000]);
 			await clock.fire();
 			expect(owner.status).toBe('end');
 			expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.REDIS_SUBSCRIBER_SILENT]);
@@ -1752,6 +1752,7 @@ describe('cluster-only failure paths', () => {
 			await bus.deactivate();
 		}
 		expect(clock.running()).toEqual([]);
+		expect(clock.pending()).toEqual([]);
 	});
 
 	it('a shard relay batch with a refused SPUBLISH fails the breaker and counts only what went out', async () => {
