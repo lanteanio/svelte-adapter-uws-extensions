@@ -36,7 +36,7 @@ import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { createLruMap } from '../shared/lru-map.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker, pgFailure, guardBreaker } from './_breaker.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { withTransaction } from '../shared/pg-tx.js';
 import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
@@ -222,7 +222,7 @@ export function createReplay(client, options = {}) {
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'replay', interval: cleanupInterval, metrics: m,
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
-		success: () => b?.success(), failure: (error) => b?.failure(error),
+		success: () => b?.success(), failure: (error) => pgFailure(b, error),
 		async work(budget) {
 			// Neither TTL backlog nor size backlog can starve the other policy.
 			const first = ttlFirst ? trimExpired : trimSizes;
@@ -556,7 +556,7 @@ export function createReplay(client, options = {}) {
 			if (lastSeenSeq === 0) return { truncated: false, missingFrom: null };
 
 			const target = lastSeenSeq + 1;
-			if (b) b.guard();
+			const cancelProbe = guardBreaker(b);
 
 			try {
 				await ensureTable();
@@ -590,7 +590,7 @@ export function createReplay(client, options = {}) {
 				}
 				return { truncated: false, missingFrom: null };
 			} catch (err) {
-				b?.failure(err);
+				pgFailure(b, err, cancelProbe);
 				throw err;
 			}
 		},
@@ -639,11 +639,11 @@ export function createReplay(client, options = {}) {
 				platform.send(ws, replayTopic, 'end', { reqId: reqId ?? undefined });
 				return;
 			}
-			b?.guard();
+			const cancelProbe = guardBreaker(b);
 			try {
 				await ensureTable();
 			} catch (err) {
-				b?.failure(err);
+				pgFailure(b, err, cancelProbe);
 				throw err;
 			}
 
@@ -659,7 +659,7 @@ export function createReplay(client, options = {}) {
 					values: [topic, sinceSeq]
 				});
 			} catch (err) {
-				b?.failure(err);
+				pgFailure(b, err, cancelProbe);
 				throw err;
 			}
 			const missed = missedRes.rows.map((row) => ({
@@ -694,7 +694,7 @@ export function createReplay(client, options = {}) {
 						platform.send(ws, replayTopic, 'truncated', null);
 					}
 				} catch (err) {
-					b?.failure(err);
+					pgFailure(b, err, cancelProbe);
 					throw err;
 				}
 			}

@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+    ports:
+      - "${INTEGRATION_POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - ./pgbouncer/init.sql:/docker-entrypoint-initdb.d/timeout.sql:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  session:
+    # PgBouncer 1.24.1, pinned so startup-parameter behavior is reproducible.
+    image: edoburu/pgbouncer@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
+    entrypoint: ["/usr/bin/pgbouncer"]
+    command: ["/etc/pgbouncer/pgbouncer.ini"]
+    ports:
+      - "${INTEGRATION_PGBOUNCER_SESSION_PORT:-55433}:6432"
+    volumes:
+      - ./pgbouncer/session.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  transaction:
+    image: edoburu/pgbouncer@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
+    entrypoint: ["/usr/bin/pgbouncer"]
+    command: ["/etc/pgbouncer/pgbouncer.ini"]
+    ports:
+      - "${INTEGRATION_PGBOUNCER_TRANSACTION_PORT:-55434}:6432"
+    volumes:
+      - ./pgbouncer/transaction.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy

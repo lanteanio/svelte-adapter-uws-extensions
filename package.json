@@ -224,6 +224,7 @@
 		"test:integration": "npm run test:integration:redis && npm run test:integration:postgres",
 		"test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
 		"test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",
+		"test:integration:pgbouncer": "vitest run --config vitest.config.integration.pgbouncer.js",
 		"test:integration:valkey": "vitest run --config vitest.config.integration.valkey.js",
 		"test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js",
 		"test:integration:cluster-mirror": "vitest run --config vitest.config.integration.cluster-mirror.js",

@@ -28,7 +28,7 @@
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker } from './_breaker.js';
 import {
 	POSTGRES_TRACE_ATTRIBUTES,
 	carriedTraceContext,

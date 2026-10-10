@@ -64,9 +64,34 @@ This verifies the server floor, not schema readiness, migration privileges, pool
 
 Each setting accepts `0` to disable its bound. Timeout values must be integers from `0` through `2147483647` milliseconds; `maxInFlight` must be a non-negative safe integer. Choose overrides for long migrations or deliberate long-running statements; finite deadlines are a behavior change from the driver's unlimited defaults. Pool checkout and query execution are separate phases, so a query can consume both budgets. Configure timeout opt-outs on the factory's `options`; node-postgres does not treat a per-query `query_timeout: 0` as an override of a positive pool default.
 
-Admission happens before entering the driver queue. Excess calls reject with a `ConnectionError` whose `code` is `PG_CAPACITY_EXCEEDED`. A query holds admission through checkout and query settlement. `connect()` holds admission only until checkout settles; the caller then owns the lease and must release it. The driver's pool `max` still bounds checked-out connections. Direct calls through `client.pool`, acquired-client queries, and standalone `createClient()` sessions bypass wrapper admission. Owned timeout defaults also apply to standalone sessions.
+Admission happens before entering the driver queue. Excess calls reject with a `ConnectionError` whose `code` is `PG_CAPACITY_EXCEEDED`. Store breakers leave dependency health unchanged for these local rejections and release a held half-open probe; they still count actual driver failures. A query holds admission through checkout and query settlement. `connect()` holds admission only until checkout settles; the caller then owns the lease and must release it. The driver's pool `max` still bounds checked-out connections. Direct calls through `client.pool`, acquired-client queries, and standalone `createClient()` sessions bypass wrapper admission. Owned timeout defaults also apply to standalone sessions.
 
 A supplied `pool` retains its original settings and lifecycle. Its default `maxInFlight` is `0`; opt into admission with `createPgClient({ pool, maxInFlight: 100 })`. Configure `connectionTimeoutMillis`, `query_timeout` and `statement_timeout` on the original `pg.Pool` before passing it in. `options` does not reconfigure that pool, and `end()` remains a no-op. If a connection string is also supplied for `createClient()`, its standalone configuration uses the supplied `options` without adding owned-pool defaults.
+
+### PgBouncer startup parameters
+
+The owned client's default `statement_timeout` is sent as a PostgreSQL startup parameter. PgBouncer rejects unsupported startup parameters in both session and transaction modes, including this one in its default configuration. A plain owned factory can therefore fail with `08P01: unsupported startup parameter: statement_timeout`. See [PgBouncer startup parameter handling](https://www.pgbouncer.org/config.html#ignore_startup_parameters).
+
+For a proxy route, configure a finite execution deadline on the actual backend login role, reconnect existing backend sessions, and omit the factory startup parameter:
+
+```sql
+ALTER ROLE application_runtime SET statement_timeout = '30s';
+```
+
+```js
+const runtime = createPgClient({
+  connectionString: process.env.DATABASE_PROXY_URL,
+  options: { statement_timeout: 0 }
+});
+const { rows } = await runtime.query('SHOW statement_timeout');
+// Verify the expected server deadline before admitting application traffic.
+```
+
+Here `statement_timeout: 0` omits that startup parameter; it does not clear a role/database default. The factory still supplies its 10-second connection deadline, 30-second query-read deadline and 100-operation admission bound. PostgreSQL applies [role defaults at login](https://www.postgresql.org/docs/16/sql-alterrole.html); if PgBouncer forces a backend user, configure that role. Verify `SHOW statement_timeout` through every application route and test a server-cancelled statement. Merely adding `statement_timeout` to PgBouncer's `ignore_startup_parameters` discards it without installing an execution limit; a client read timeout alone does not establish server cancellation.
+
+Use a separate direct/session route for deployment migrations and runtime `autoMigrate: false` through transaction pooling. Notification bridges still require their own direct/session route. A session-mode proxy also needs the startup-parameter adjustment for `createClient()`; supply the corresponding standalone `options` when wrapping an external pool.
+
+Run `npm run test:integration:pgbouncer` for the isolated native proxy regression. It verifies rejection under the default proxy configuration, runtime store readiness/writes with the documented configuration, inherited role deadlines, server cancellation and standalone clients in both modes. Host ports and the Compose project can be overridden with `INTEGRATION_POSTGRES_HOST_PORT`, `INTEGRATION_PGBOUNCER_SESSION_PORT`, `INTEGRATION_PGBOUNCER_TRANSACTION_PORT` and `INTEGRATION_COMPOSE_PROJECT`.
 
 ### Caller cancellation and deadlines
 

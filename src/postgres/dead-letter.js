@@ -35,7 +35,7 @@
  */
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker, pgFailure } from './_breaker.js';
 import { createStoreSchema } from './migrations.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
@@ -133,7 +133,7 @@ export function createDeadLetter(client, options = {}) {
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
-		success: () => b?.success(), failure: error => b?.failure(error),
+		success: () => b?.success(), failure: error => pgFailure(b, error),
 		async work(budget) {
 			const first = ttlFirst ? trimExpired : trimSize;
 			const second = ttlFirst ? trimSize : trimExpired;

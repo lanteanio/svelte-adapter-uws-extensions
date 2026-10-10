@@ -27,7 +27,7 @@
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker } from './_breaker.js';
 import { assertAlarmGeneration } from '../shared/alarm-generation.js';
 
 /** Default cap on the rows returned by one `due(now)` sweep. */

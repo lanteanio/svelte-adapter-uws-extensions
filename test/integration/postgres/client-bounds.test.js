@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
+import { createJobQueue } from '../../../src/postgres/jobs.js';
 import { createPgClient } from '../../../src/postgres/index.js';
 import { createMetrics } from '../../../src/prometheus/index.js';
 import { createCircuitBreaker, withBreaker } from '../../../src/shared/breaker.js';
@@ -13,6 +14,28 @@ function create(options = {}) {
 afterEach(async () => { await Promise.all(clients.splice(0).map((client) => client.end())); });
 
 describe('PostgreSQL pool bounds against the real driver', () => {
+	it('sheds five excess writes in a healthy 105-call burst without opening the store breaker', async () => {
+		const client = create({ options: { max: 1 } });
+		const breaker = createCircuitBreaker({ failureThreshold: 5 });
+		const jobs = createJobQueue(client, { table: 'capacity_burst_jobs', breaker });
+		await jobs.ready();
+		const lease = await client.pool.connect();
+		let released = false;
+		try {
+			const admitted = Array.from({ length: 100 }, () => jobs.enqueue('work', {}).catch(error => error));
+			// Let all admitted operations enter the driver checkout queue.
+			await new Promise(resolve => setImmediate(resolve));
+			expect(client.pool.waitingCount).toBe(100);
+			for (let i = 0; i < 5; i++) await expect(jobs.enqueue('work', {})).rejects.toHaveProperty('code', 'PG_CAPACITY_EXCEEDED');
+			expect(breaker.state).toBe('healthy');
+			expect(breaker.failures).toBe(0);
+			lease.release(); released = true;
+			for (const result of await Promise.all(admitted)) expect(result).not.toBeInstanceOf(Error);
+			await expect(jobs.enqueue('work', {})).resolves.toBeDefined();
+			expect(breaker.state).toBe('healthy');
+		} finally { if (!released) lease.release(); breaker.destroy(); }
+	});
+
 	it('limits queued work and expires checkout waits behind a held connection', async () => {
 		const metrics = createMetrics();
 		const client = create({ maxInFlight: 2, metrics, options: { max: 1, connectionTimeoutMillis: 100 } });

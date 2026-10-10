@@ -21,7 +21,7 @@ export interface PgClientOptions {
 	/** Listen for `sveltekit:shutdown` and disconnect. @default `true` when the client owns the pool, `false` when `pool` is provided. */
 	autoShutdown?: boolean;
 	/** Owned pools default to connectionTimeoutMillis: 10000, query_timeout: 30000,
-	 * statement_timeout: 30000. Override each with 0 to disable it. Ignored for an external pool. */
+	 * statement_timeout: 30000. Override each with 0 to disable it. Does not reconfigure an external pool; still configures createClient() when connectionString is supplied. */
 	options?: PoolConfig;
 	/** Maximum unsettled wrapper query/connect operations; 0 disables. @default 100 for owned pools, 0 for external pools */
 	maxInFlight?: number;

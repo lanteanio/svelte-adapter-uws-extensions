@@ -30,7 +30,7 @@
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker, pgFailure, guardBreaker } from './_breaker.js';
 import { randomUuid } from '../shared/runtime.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
@@ -123,7 +123,7 @@ export function createIdempotencyStore(client, options = {}) {
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'idempotency', interval: cleanupInterval, metrics: m,
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
-		success: () => b?.success(), failure: (error) => b?.failure(error),
+		success: () => b?.success(), failure: (error) => pgFailure(b, error),
 		async work(budget) {
 			while (budget.available) {
 				const limit = budget.limit;
@@ -248,7 +248,7 @@ export function createIdempotencyStore(client, options = {}) {
 			const userId = meta && typeof meta.user === 'string' ? meta.user : null;
 			const tenantId = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
 
-			b?.guard();
+			const cancelProbe = guardBreaker(b);
 			let outcome;
 			try {
 				await ensureTable();
@@ -263,7 +263,7 @@ export function createIdempotencyStore(client, options = {}) {
 				}
 				b?.success();
 			} catch (err) {
-				b?.failure(err);
+				pgFailure(b, err, cancelProbe);
 				throw err;
 			}
 

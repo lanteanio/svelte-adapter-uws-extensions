@@ -60,7 +60,7 @@ import { scheduleCleanup } from './_cleanup.js';
 import { startTaskHeartbeat } from './_tasks-heartbeat.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql, encodeTaskPayload, MIN_TASK_PAYLOAD_BYTES } from './_tasks-sql.js';
-import { withBreaker } from '../shared/breaker.js';
+import { withBreaker, pgFailure } from './_breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
@@ -679,7 +679,7 @@ export function createTaskRunner(client, options = {}) {
 				});
 			}
 		} catch (err) {
-			b?.failure(err);
+			pgFailure(b, err);
 			reportSweepFailure('recovery', err);
 		} finally {
 			recoveryRunning = false;
@@ -723,7 +723,7 @@ export function createTaskRunner(client, options = {}) {
 				});
 			}
 		} catch (err) {
-			b?.failure(err);
+			pgFailure(b, err);
 			reportSweepFailure('dispatch', err);
 		} finally {
 			dispatchRunning = false;
@@ -734,7 +734,7 @@ export function createTaskRunner(client, options = {}) {
 		client, table, kind: 'tasks', interval: cleanupInterval, metrics: m,
 		ready: sql.ensureTable, healthy: () => !destroyed && (!b || b.isHealthy),
 		success() { b?.success(); sweepFailing.cleanup = false; },
-		failure(error) { b?.failure(error); reportSweepFailure('cleanup', error); },
+		failure(error) { pgFailure(b, error); reportSweepFailure('cleanup', error); },
 		async work(budget) {
 			while (budget.available) {
 				const limit = budget.limit;

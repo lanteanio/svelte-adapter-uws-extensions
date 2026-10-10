@@ -23,7 +23,7 @@ const { Pool, Client } = pg;
  * @property {string} [connectionString] - Postgres connection string. Required UNLESS `pool` is provided.
  * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` becomes a no-op.
  * @property {boolean} [autoShutdown=true] - Listen for `sveltekit:shutdown` and disconnect. Defaults to `false` when `pool` is provided.
- * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Owned defaults: 10s checkout, 30s query and statement deadlines; each accepts 0 to disable. Ignored when `pool` is provided.
+ * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Owned defaults: 10s checkout, 30s query and statement deadlines; each accepts 0 to disable. Does not reconfigure an external pool; still configures standalone createClient() sessions when connectionString is supplied.
  * @property {number} [maxInFlight] - Maximum unsettled query/connect operations (100 owned, 0 external). 0 disables admission bounds.
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics] - Optional pool admission, waiter and duration metrics.
  */

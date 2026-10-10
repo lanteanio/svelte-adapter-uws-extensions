@@ -326,10 +326,19 @@ connection/query/statement waits.
 **Action.** Size `maxInFlight` for deliberate fan-out and override
 `options.connectionTimeoutMillis`, `options.query_timeout` and
 `options.statement_timeout` for long-running operations. Each accepts `0`
-to opt out. Supplied pools retain their settings and default to unbounded
+to opt out. Timeout overrides must be integer milliseconds from `0` through
+`2147483647`; strings such as `"30000"` now throw instead of being coerced.
+Supplied pools retain their settings and default to unbounded
 wrapper admission; configure the original pool and opt into `maxInFlight`
 explicitly. See [pool operation bounds](./docs/postgres-support.md#pool-operation-bounds)
 for cancellation, capacity accounting, metrics and direct-pool bypasses.
+
+PgBouncer rejects the default `statement_timeout` startup parameter unless its
+configuration accounts for it, in both session and transaction modes. Configure
+a finite backend-role deadline and use `options: { statement_timeout: 0 }` to
+omit the startup parameter, then verify the inherited deadline through the
+proxy before admitting traffic. See the tested [PgBouncer configuration](./docs/postgres-support.md#pgbouncer-startup-parameters).
+Local `PG_CAPACITY_EXCEEDED` rejections do not change store breaker health.
 
 ### Scope arguments that cannot be scoped are refused
 
