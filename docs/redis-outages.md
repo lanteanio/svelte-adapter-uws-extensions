@@ -1,5 +1,8 @@
 # Redis outage policy
 
+For replacing credentials and subscriber connections with a tested rollback path,
+see [Database credential rotation](./credential-rotation.md).
+
 `createRedisClient()` bounds command waits by default while allowing calls made
 immediately after construction to wait for initial connection setup.
 

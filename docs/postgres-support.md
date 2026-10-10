@@ -1,5 +1,8 @@
 # PostgreSQL support
 
+For replacing credentials, draining pools and preserving emergency access, see
+[Database credential rotation](./credential-rotation.md).
+
 The supported server floor is PostgreSQL 16. The repository integration lane runs `postgres:16-alpine`; that is the verified baseline, not a claim that every newer server or managed provider has been qualified. Use a current minor release and consult the [PostgreSQL support policy](https://www.postgresql.org/support/versioning/). Qualify newer majors and provider-specific behavior with the same affected integration suites before deployment.
 
 | Import suffix | Server floor | Additional requirement |
