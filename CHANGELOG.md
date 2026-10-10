@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Correct the task-cache migration note: only `run()` consults the result cache; `enqueue()` forwards its key without deduplicating durable receipts.
+
 - Document Redis and PostgreSQL recovery with versioned persistence and evidence manifests, bounded read-only verification, and real archive/restore drills that check expiry, sequence continuity and schema migration state.
 
 - Add stable operational error codes across backend connection, breaker, replay, lock and task failures; preserve them across worker and persisted task boundaries.

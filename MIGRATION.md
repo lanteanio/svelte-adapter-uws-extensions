@@ -751,7 +751,7 @@ Custom platforms without `checkSubscribe` fail closed and receive a denial; impl
 
 **In-flight cache entries become invisible after deploy.**
 
-**What changed.** The cache key passed to `idempotency.acquire(...)` for `tasks.run` and `tasks.enqueue` is now `'task:' + name + ':' + idempotencyKey` (was the bare `idempotencyKey`). Pre-fix, two tasks sharing one client-supplied key shared one cache slot, which let a privileged task's cached result leak to a public task. Both methods also reject `idempotencyKey` longer than 256 characters; the underlying stores cap `acquire(key)` at 1024 chars as defense in depth.
+**What changed.** The cache key passed to `idempotency.acquire(...)` for `tasks.run` is now `'task:' + name + ':' + idempotencyKey` (was the bare `idempotencyKey`). Pre-fix, two tasks sharing one client-supplied key shared one cache slot, which let a privileged task's cached result leak to a public task. Both `tasks.run` and `tasks.enqueue` reject `idempotencyKey` longer than 256 characters; the underlying stores cap `acquire(key)` at 1024 chars as defense in depth.
 
 **How to migrate.** No source change at call sites. In-flight cached entries from before the upgrade become invisible after deploy because the namespaced key does not match the old un-namespaced key. For Redis stores the old keys TTL out; for Postgres the cleanup interval handles them. Audit any code that supplies long `idempotencyKey` strings (request bodies, opaque tokens) and shorten them if they exceed 256 chars.
 
