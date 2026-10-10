@@ -174,6 +174,8 @@ export function createShardedBus(client, options = {}) {
 	const followCounts = new Map();
 	/** @type {Map<string, number>} channel -> # of topics resolving to it */
 	const channelRefcounts = new Map();
+	/** @type {Map<string, Promise<void>>} channel -> shared admission */
+	const pendingChannels = new Map();
 	/** @type {Set<string>} */
 	const subscribedChannels = new Set();
 	/** @type {Map<string, string>} channel -> node id it is currently ssubscribed on (cluster) */
@@ -820,7 +822,9 @@ export function createShardedBus(client, options = {}) {
 		// slot (same owning node is not enough), and node.ssubscribe only resolves
 		// on the slot's owning master (Cluster.ssubscribe hangs), so subscribe each
 		// channel individually on its owner.
-		await Promise.all(channels.map((ch) => subscribeChannelOnOwner(ch)));
+		const results = await Promise.allSettled(channels.map((ch) => subscribeChannelOnOwner(ch)));
+		const failed = results.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 	}
 
 	async function subUnsubscribe(channel) {
@@ -918,52 +922,71 @@ export function createShardedBus(client, options = {}) {
 		}
 		followCounts.clear();
 		channelRefcounts.clear();
+		pendingChannels.clear();
+	}
+
+	// Reserve the shared promise before starting I/O, so every caller waits for
+	// the same admission even when it follows an already-reserved topic.
+	function admitChannels(channels) {
+		const waits = new Set();
+		const fresh = [];
+		for (const channel of new Set(channels)) {
+			const pending = pendingChannels.get(channel);
+			if (pending) waits.add(pending);
+			else if (!subscribedChannels.has(channel)) fresh.push(channel);
+		}
+		if (fresh.length) {
+			let resolve, reject;
+			const admission = new Promise((yes, no) => { resolve = yes; reject = no; });
+			for (const channel of fresh) pendingChannels.set(channel, admission);
+			waits.add(admission);
+			const generation = subGeneration;
+			(async () => {
+				let cancel;
+				try {
+					cancel = guardBreaker(b);
+					await subSubscribe(fresh);
+					if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+					for (const channel of fresh) {
+						if (channelRefcounts.has(channel)) subscribedChannels.add(channel);
+						else await subUnsubscribe(channel);
+					}
+					b?.success();
+					mFollows?.inc(fresh.length);
+				} catch (err) {
+					if (generation !== subGeneration) cancel?.();
+					else {
+						if (cancel) b?.failure(err);
+						// A multi-channel admission can succeed on some cluster nodes
+						// before another refuses it. Release those partial subscriptions.
+						await Promise.allSettled(fresh.map(subUnsubscribe));
+					}
+					throw err;
+				} finally {
+					for (const channel of fresh) {
+						if (pendingChannels.get(channel) === admission) pendingChannels.delete(channel);
+					}
+				}
+			})().then(resolve, reject);
+		}
+		return Promise.all(waits);
 	}
 
 	async function follow(topic) {
-		if (!subReady) {
-			throw new Error('sharded bus: activate() must be called before follow()');
-		}
+		if (!subReady) throw new Error('sharded bus: activate() must be called before follow()');
 		const count = followCounts.get(topic) || 0;
-		// Per-instance cap on distinct followed topics. Mirrors the
-		// adapter's WS_SUBSCRIPTIONS denial shape but at the bus layer.
-		// The reject is structured so callers can distinguish "topic
-		// rejected" from a Redis failure.
 		if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
-			throw new Error(
-				'sharded bus: distinct topic count exceeded ' +
-				MAX_SHARDED_BUS_TOPICS + ' on this instance'
-			);
+			throw new Error('sharded bus: distinct topic count exceeded ' + MAX_SHARDED_BUS_TOPICS + ' on this instance');
 		}
-		followCounts.set(topic, count + 1);
-		// Channel refcount tracks distinct active topics resolving to
-		// the channel, not raw follow-call count. Only bump when this
-		// topic transitions from 0 to active.
-		if (count > 0) return;
-
 		const channel = channelFor(topic);
-		const chCount = channelRefcounts.get(channel) || 0;
-		channelRefcounts.set(channel, chCount + 1);
-		if (chCount > 0) return;
-
-		subscribedChannels.add(channel);
+		followCounts.set(topic, count + 1);
+		if (count === 0) channelRefcounts.set(channel, (channelRefcounts.get(channel) || 0) + 1);
+		if (subscribedChannels.has(channel) && !pendingChannels.has(channel)) return;
 		const generation = subGeneration;
-		let cancel;
 		try {
-			cancel = guardBreaker(b);
-			await subSubscribe([channel]);
-			if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
-			b?.success();
-			mFollows?.inc();
+			await admitChannels([channel]);
 		} catch (err) {
-			if (generation !== subGeneration) {
-				cancel?.();
-				throw err;
-			}
-			if (cancel) b?.failure(err);
-			subscribedChannels.delete(channel);
-			channelRefcounts.delete(channel);
-			followCounts.delete(topic);
+			if (generation === subGeneration) await unfollow(topic);
 			throw err;
 		}
 	}
@@ -996,65 +1019,24 @@ export function createShardedBus(client, options = {}) {
 		if (topics.length === 0) return;
 
 		const touchedTopics = new Set();
-		const activatedTopics = [];
-		const channelsToSubscribe = [];
-
+		const channels = new Set();
 		for (const topic of topics) {
-			if (typeof topic !== 'string' || topic.length === 0) continue;
-			if (touchedTopics.has(topic)) continue;
-			touchedTopics.add(topic);
+			if (typeof topic !== 'string' || topic.length === 0 || touchedTopics.has(topic)) continue;
 			const count = followCounts.get(topic) || 0;
-			// Per-instance cap shared with `follow`. New topics past the
-			// cap are silently skipped here (rather than rejecting the
-			// whole batch) so a partial subscribe can still land for the
-			// caller's existing topics.
-			if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
-				continue;
-			}
+			if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) continue;
+			touchedTopics.add(topic);
 			followCounts.set(topic, count + 1);
-			if (count > 0) continue;
-			activatedTopics.push(topic);
-
 			const channel = channelFor(topic);
-			const chCount = channelRefcounts.get(channel) || 0;
-			channelRefcounts.set(channel, chCount + 1);
-			if (chCount === 0) channelsToSubscribe.push(channel);
+			channels.add(channel);
+			if (count === 0) channelRefcounts.set(channel, (channelRefcounts.get(channel) || 0) + 1);
 		}
-
-		if (channelsToSubscribe.length === 0) return;
-
 		const generation = subGeneration;
-		let cancel;
 		try {
-			cancel = guardBreaker(b);
-			// ioredis accepts multiple channels in one ssubscribe call; this
-			// collapses N new-channel subscribes into one round trip when the
-			// caller's topics span multiple shards.
-			await subSubscribe(channelsToSubscribe);
-			if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
-			// A channel unfollowed while the batch was subscribing stays out.
-			for (const ch of channelsToSubscribe) if (channelRefcounts.has(ch)) subscribedChannels.add(ch);
-			b?.success();
-			mFollows?.inc(channelsToSubscribe.length);
+			await admitChannels(channels);
 		} catch (err) {
-			if (generation !== subGeneration) {
-				cancel?.();
-				throw err;
-			}
-			if (cancel) b?.failure(err);
-			// Roll back every refcount bump we did under this call so the
-			// caller can retry without leaking stale counts.
-			for (const topic of touchedTopics) {
-				const cur = followCounts.get(topic) || 0;
-				if (cur <= 1) followCounts.delete(topic);
-				else followCounts.set(topic, cur - 1);
-			}
-			for (const topic of activatedTopics) {
-				const channel = channelFor(topic);
-				const chCur = channelRefcounts.get(channel) || 0;
-				if (chCur <= 1) channelRefcounts.delete(channel);
-				else channelRefcounts.set(channel, chCur - 1);
-			}
+			// Each caller releases exactly its own reservation. A channel remains
+			// owned until the final topic's final reservation is released.
+			if (generation === subGeneration) await Promise.all([...touchedTopics].map(unfollow));
 			throw err;
 		}
 	}

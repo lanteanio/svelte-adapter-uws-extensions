@@ -1240,3 +1240,71 @@ describe.each(['follow', 'followBatch'])('sharded %s breaker admission', (method
 		}
 	});
 });
+
+
+describe.each([['subscribe', 'subscribe'], ['subscribe', 'subscribeBatch'], ['subscribeBatch', 'subscribe'], ['subscribeBatch', 'subscribeBatch']])('concurrent sharded %s / %s', (firstHook, secondHook) => {
+	for (const sameTopic of [true, false]) {
+		it(`waits for shared admission and rolls both reservations back (same topic: ${sameTopic})`, async () => {
+			const client = mockRedisClient();
+			const platform = mockPlatform();
+			let subscriber;
+			const duplicate = client.redis.duplicate.bind(client.redis);
+			client.redis.duplicate = (...args) => (subscriber = duplicate(...args));
+			const bus = createShardedBus(client, { shardKey: () => 'shared' });
+			await bus.activate(platform);
+			const realSubscribe = subscriber.ssubscribe.bind(subscriber);
+			let reject;
+			subscriber.ssubscribe = vi.fn(() => new Promise((_, no) => { reject = no; }));
+			const a = {}, b = {}, c = {};
+			const secondTopic = sameTopic ? 'chat' : 'audit';
+			const follow = (hook, ws, topic) => bus.hooks[hook](ws, hook === 'subscribe' ? topic : [topic]);
+			try {
+				const first = follow(firstHook, a, 'chat');
+				let secondSettled = false;
+				const second = follow(secondHook, b, secondTopic).finally(() => { secondSettled = true; });
+				const outcomes = Promise.allSettled([first, second]);
+				await settle();
+				expect(secondSettled).toBe(false);
+				expect(subscriber.ssubscribe).toHaveBeenCalledTimes(1);
+				reject(new Error('offline'));
+				expect((await outcomes).map((result) => result.status)).toEqual(['rejected', 'rejected']);
+				subscriber.ssubscribe = realSubscribe;
+				await follow('subscribe', c, 'chat');
+				await bus.hooks.close(a);
+				await bus.hooks.close(b);
+				await client.redis.spublish('uws:sharded:shared', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+				expect(platform.published).toHaveLength(1);
+				await follow(firstHook, a, 'chat');
+				await bus.hooks.close(c);
+				await client.redis.spublish('uws:sharded:shared', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+				expect(platform.published).toHaveLength(2);
+			} finally { await bus.deactivate(); }
+		});
+	}
+});
+
+
+it('keeps the second follower after a shared pending admission succeeds', async () => {
+	const client = mockRedisClient();
+	let subscriber;
+	const duplicate = client.redis.duplicate.bind(client.redis);
+	client.redis.duplicate = (...args) => (subscriber = duplicate(...args));
+	const platform = mockPlatform();
+	const bus = createShardedBus(client);
+	await bus.activate(platform);
+	const subscribe = subscriber.ssubscribe.bind(subscriber);
+	let release;
+	subscriber.ssubscribe = (...channels) => new Promise((resolve) => { release = () => resolve(subscribe(...channels)); });
+	try {
+		const first = bus.follow('chat');
+		const second = bus.followBatch(['chat']);
+		release();
+		await Promise.all([first, second]);
+		await bus.unfollow('chat');
+		await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+		expect(platform.published).toHaveLength(1);
+		await bus.unfollow('chat');
+		await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+		expect(platform.published).toHaveLength(1);
+	} finally { await bus.deactivate(); }
+});
