@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Document contribution ownership, dependencies and review through public issues and pull requests, with explicit clean-source verification for coordinated changes.
 
+- Redis cursor accepts `maxDataBytes` (default 8192), requires a positive integer, and drops `update()` data that exceeds its UTF-8 JSON byte limit or depth limit, or cannot be serialized as JSON.
+
 - Verify retained alarm generation authority during recovery, including deleted and pending topics, bounded Redis hash reads and archive/restore continuity checks.
 
 - Reject reserved `byuser:` session tokens before Redis access, including lifecycle cookie loads, and refuse legacy index collisions before erasure deletes any token. Document reconciliation of historical collisions.
@@ -129,7 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Postgres task dispatch and recovery claim only locally registered handler names before batch limits, leaving unsupported rows, fences and attempts unchanged.
 - Presence identity resolution reads only own selected-data properties, preventing inherited names from merging unrelated users. Pending relayed join rosters exclude transient fields while retaining durable updates. Redis presence message hooks accept native parsed-message and byte envelopes and return true for owned frames.
 
-- Redis cursor projections enforce the default 8192-byte limit, JSON serialization and depth bounds. Relay interest belongs only to actual memberships, and close removes observer flush state. Snapshot recovery merges live and local rosters, retains TTL-bounded joins and removal tombstones through Redis gaps, and supersedes stale pending reads. Relay restoration retries and publish outcomes update breaker accounting.
+- Redis cursor relay interest belongs only to actual memberships, and close removes observer flush state. Snapshot recovery merges live and local rosters, retains TTL-bounded joins and removal tombstones through Redis gaps, and supersedes stale pending reads. Relay restoration retries and publish outcomes update breaker accounting.
 
 - Apply capability-cookie key checks to `previousSecret` as well as the signing key, and reject visually empty or direction-changing degradation notices while preserving visible script/emoji joiners.
 
