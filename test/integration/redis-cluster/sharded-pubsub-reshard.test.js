@@ -68,13 +68,25 @@ describe('sharded bus survives a live slot migration (cluster)', () => {
 		void src;
 	}
 
-	it('re-subscribes a followed channel on its new owner after a reshard', async () => {
+	it.each([false, true])('re-subscribes after reshard with an outstanding PING: %s', async (queuedPing) => {
 		const channelPrefix = 'inttest-reshard:';
 		const topic = 'room';
 		const slot = keySlot(channelPrefix + topic);
 
 		const clientA = busClient(clusterClient());
 		const clientB = busClient(clusterClient());
+		const subscribers = new Map();
+		await clientB.redis.cluster('info');
+		for (const node of clientB.redis.nodes('master')) {
+			const id = await node.cluster('MYID');
+			const duplicate = node.duplicate.bind(node);
+			node.duplicate = (...args) => {
+				const conn = duplicate(...args);
+				subscribers.set(id, conn);
+				return conn;
+			};
+		}
+
 		const platA = mockPlatform();
 		const platB = mockPlatform();
 		const busA = createShardedBus(clientA, { channelPrefix });
@@ -96,6 +108,19 @@ describe('sharded bus survives a live slot migration (cluster)', () => {
 			const toId = [...mastersById.keys()].find((id) => id !== fromId);
 			expect(fromId).toBeTruthy();
 			expect(toId).toBeTruthy();
+			if (queuedPing) {
+				const subscriber = subscribers.get(fromId);
+				const write = subscriber.stream.write.bind(subscriber.stream);
+				// Keep a real ioredis PING command outstanding by delaying its
+				// socket write. The live SUNSUBSCRIBE must update client state while
+				// its parser consumes that command instead of emitting an error.
+				subscriber.stream.write = (chunk, ...args) => {
+					if (chunk.toString().toLowerCase().includes('\r\nping\r\n')) return true;
+					return write(chunk, ...args);
+				};
+				void subscriber.ping().catch(() => {});
+				expect(subscriber.commandQueue.length).toBeGreaterThan(0);
+			}
 			await migrateSlot(slot, fromId, toId);
 
 			slots = await ctrl.cluster('SLOTS');

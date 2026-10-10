@@ -59,6 +59,10 @@ const SHARD_SUBSCRIBE_TIMEOUT_MS = 5000;
 // still reconciles at once.
 const RECONCILE_RETRY_FIRST_MS = 1000;
 const RECONCILE_RETRY_MAX_MS = 30000;
+// ioredis updates its subscription set on server SUNSUBSCRIBE even when an
+// outstanding command absorbs the reply. Inspect that local state off the
+// message path; no additional Redis commands or public options are needed.
+const SHARD_STATE_CHECK_MS = 1000;
 
 /**
  * @typedef {Object} ShardedBusOptions
@@ -164,6 +168,7 @@ export function createShardedBus(client, options = {}) {
 	/** @type {Array<{start: number, end: number, nodeId: string}> | null} */
 	let slotRanges = null;
 	let subReady = false;
+	let shardStateTimer = null;
 	let active = false;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
@@ -805,12 +810,44 @@ export function createShardedBus(client, options = {}) {
 		if (reconcileTimer.unref) reconcileTimer.unref();
 	}
 
+	function watchShardState() {
+		const generation = subGeneration;
+		function tick() {
+			if (!subOpen || generation !== subGeneration) return;
+			shardStateTimer = null;
+			// Each confirmed channel is visited once, bounded by the topic cap.
+			// Snapshot each node's local set once rather than per channel.
+			const reported = new Map();
+			for (const [id, conn] of subByNodeId) {
+				if (conn.status !== 'ready' || !conn.condition) continue;
+				const state = conn.condition.subscriber;
+				if (state === false) reported.set(id, new Set());
+				else if (typeof state?.channels === 'function') reported.set(id, new Set(state.channels('ssubscribe')));
+			}
+			let lost = false;
+			for (const [channel, id] of channelNode) {
+				if (!subscribedChannels.has(channel) || !reported.has(id) || reported.get(id).has(channel)) continue;
+				channelNode.delete(channel);
+				lost = true;
+			}
+			if (lost) {
+				refreshSlotMap();
+				scheduleReconcile();
+			}
+			shardStateTimer = setTimer(tick, SHARD_STATE_CHECK_MS);
+			shardStateTimer.unref?.();
+		}
+		shardStateTimer = setTimer(tick, SHARD_STATE_CHECK_MS);
+		shardStateTimer.unref?.();
+	}
+
 	async function subEnsure() {
 		if (subReady) return;
 		subOpen = true;
 		if (isCluster(client.redis)) {
 			if (subLiveness === null) subLiveness = watchLiveness('sharded-pubsub', () => subByNodeId.values(), closeConnection, { identify: (s) => subIdOf.get(s) });
 			await subRefreshTopology();
+			watchShardState();
 		} else {
 			subStandalone = openSubscriber(client, 'sharded-pubsub');
 			subStandalone.on('error', subOnError);
@@ -851,6 +888,7 @@ export function createShardedBus(client, options = {}) {
 	async function subClose() {
 		subOpen = false;
 		subGeneration++;
+		if (shardStateTimer !== null) { clearTimer(shardStateTimer); shardStateTimer = null; }
 		topologyRefresh = null;
 		if (reconcileTimer !== null) {
 			clearTimer(reconcileTimer);
