@@ -36,8 +36,11 @@ function validateEnvelope(env, label) {
 	if (env.retryAfterMs !== undefined && (typeof env.retryAfterMs !== 'number' || !Number.isFinite(env.retryAfterMs) || env.retryAfterMs < 0)) {
 		throw new Error('degradation policy: ' + label + '.retryAfterMs must be a non-negative number');
 	}
-	if (env.bannerCopy !== undefined && (typeof env.bannerCopy !== 'string' || !/[^\p{White_Space}\p{Default_Ignorable_Code_Point}]/u.test(env.bannerCopy) || Buffer.byteLength(env.bannerCopy, 'utf8') > MAX_NOTICE_BYTES || /(?![\u200c\u200d])[\p{Cc}\p{Cf}]/u.test(env.bannerCopy))) {
-		throw new Error('degradation policy: ' + label + '.bannerCopy must be non-blank plain text of at most 2048 UTF-8 bytes without control characters');
+	const notice = env.bannerCopy;
+	// The same code point must be a letter/number and non-ignorable: a blank
+	// symbol beside a default-ignorable letter filler is still not notice text.
+	if (notice !== undefined && (typeof notice !== 'string' || Buffer.byteLength(notice, 'utf8') > MAX_NOTICE_BYTES || !notice.isWellFormed() || !/(?!\p{Default_Ignorable_Code_Point})[\p{L}\p{N}]/u.test(notice) || /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(notice))) {
+		throw new Error('degradation policy: ' + label + '.bannerCopy must be well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control characters or line breaks');
 	}
 	if (env.refetch !== undefined && typeof env.refetch !== 'boolean') throw new Error('degradation policy: ' + label + '.refetch must be a boolean');
 	if (env.clearCache !== undefined && typeof env.clearCache !== 'boolean') throw new Error('degradation policy: ' + label + '.clearCache must be a boolean');
@@ -70,7 +73,7 @@ function resolveJitter(envelope, explicit) {
  * @property {string[]} [streams] - Stream topics to treat as unavailable while degraded.
  * @property {string[]} [rpcs] - RPC paths to treat as unavailable while degraded.
  * @property {number} [retryAfterMs] - How long the client should hold off before retrying.
- * @property {string} [bannerCopy] - Optional source-English fallback notice. Visible plain text, at most 2048 UTF-8 bytes, without control or format characters except ZWNJ/ZWJ alongside visible text. Render as text.
+ * @property {string} [bannerCopy] - Optional source-English fallback notice. Well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ may accompany text. Render as text.
  */
 
 /**

@@ -442,7 +442,7 @@ const bus = createPubSubBus(redis, {
 });
 ```
 
-The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: visible plain text of at most 2048 UTF-8 bytes without control or format characters; ZWNJ/ZWJ joiners are allowed alongside visible text. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
+The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ joiners may accompany text. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
 
 ---
 
