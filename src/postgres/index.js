@@ -8,6 +8,7 @@
  */
 
 import pg from 'pg';
+import { registerPgLifecycle } from './_client-lifecycle.js';
 import { createPoolOperations } from './_pool-operations.js';
 import { ConnectionError } from '../shared/errors.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
@@ -30,7 +31,7 @@ const { Pool, Client } = pg;
  * @typedef {Object} PgClient
  * @property {import('pg').Pool} pool - The underlying pg Pool
  * @property {(text: string | import('pg').QueryConfig, values?: any[], options?: { signal?: AbortSignal }) => Promise<import('pg').QueryResult>} query - Run a query
- * @property {() => Promise<void>} end - Gracefully close the pool. When the pool was provided externally, this is a no-op (the caller owns the lifecycle).
+ * @property {() => Promise<void>} end - Stop registered notification bridges, close owned standalone sessions, then close the pool. When the pool was provided externally, this is a no-op (the caller owns the lifecycle).
  */
 
 /**
@@ -39,7 +40,7 @@ const { Pool, Client } = pg;
  * Two construction modes:
  *
  *   1. Pass `connectionString`: a fresh `pg.Pool` is created and owned by
- *      this client. `end()` closes the pool; `autoShutdown` (default `true`)
+ *      this client. `end()` stops notification bridges and closes standalone sessions before the pool; `autoShutdown` (default `true`)
  *      attaches a `sveltekit:shutdown` listener.
  *
  *   2. Pass `pool` (an existing `pg.Pool`): the client wraps the provided
@@ -108,16 +109,26 @@ export function createPgClient(opts) {
 	const operations = createPoolOperations(pool, maxInFlight, opts.metrics, redactError);
 
 	let ended = false;
+	let ending = null;
+	const dedicated = new Set();
+	const lifecycle = { closing: false, stoppers: new Set() };
 
-	async function end() {
-		if (ended) return;
+	function end() {
+		// An externally supplied pool and its standalone sessions remain caller-owned.
+		if (!ownedPool) return Promise.resolve();
+		if (ending) return ending;
 		ended = true;
-		// Only close pools we own. The caller-provided pool is never ours
-		// to close; this is a deliberate no-op so graceful-shutdown paths
-		// can call end() unconditionally without worrying about ownership.
-		if (ownedPool) {
-			await pool.end();
-		}
+		lifecycle.closing = true;
+		if (typeof process !== 'undefined') process.removeListener('sveltekit:shutdown', end);
+		ending = (async () => {
+			const stops = await Promise.allSettled([...lifecycle.stoppers].map((stop) => Promise.resolve().then(stop)));
+			lifecycle.stoppers.clear();
+			const closes = await Promise.allSettled([...dedicated].map((client) => client.end()));
+			const poolClose = await Promise.allSettled([pool.end()]);
+			const failed = [...stops, ...closes, ...poolClose].find((result) => result.status === 'rejected');
+			if (failed) throw redactError(failed.reason);
+		})();
+		return ending;
 	}
 
 	if (autoShutdown && typeof process !== 'undefined') {
@@ -132,7 +143,7 @@ export function createPgClient(opts) {
 		? { connectionString: opts.connectionString, ...poolOptions }
 		: null;
 
-	return {
+	const api = {
 		pool,
 
 		query: operations.query,
@@ -160,6 +171,7 @@ export function createPgClient(opts) {
 		},
 
 		createClient() {
+			if (ended) throw new ConnectionError('postgres', 'client is closing');
 			if (!connectionConfig) {
 				throw new ConnectionError(
 					'postgres',
@@ -167,6 +179,23 @@ export function createPgClient(opts) {
 				);
 			}
 			const client = new Client(connectionConfig);
+			if (ownedPool) {
+				dedicated.add(client);
+				client.once('end', () => dedicated.delete(client));
+				const rawEnd = client.end.bind(client);
+				let closing = null;
+				client.end = (callback) => {
+					if (!closing) {
+						try { closing = Promise.resolve(rawEnd()).then(() => { dedicated.delete(client); }); }
+						catch (error) { closing = Promise.reject(error); }
+					}
+					if (typeof callback === 'function') {
+						closing.then(() => callback(), (error) => callback(redactError(error)));
+						return;
+					}
+					return closing;
+				};
+			}
 			const rawConnect = client.connect.bind(client);
 			// LISTEN/NOTIFY runs on a dedicated client, and its connect() is
 			// the DSN-bearing path.
@@ -179,6 +208,8 @@ export function createPgClient(opts) {
 
 		end
 	};
+	if (ownedPool) registerPgLifecycle(api, lifecycle);
+	return api;
 }
 
 /** Marks a client whose `query` this module has already wrapped. */

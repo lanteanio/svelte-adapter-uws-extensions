@@ -519,13 +519,15 @@ describe('postgres notify bridge', () => {
 	});
 
 	describe('deactivate', () => {
-		it('runs UNLISTEN', async () => {
+		it('closes its dedicated session without another query', async () => {
+			const end = vi.spyOn(client._mockClient, 'end');
 			bridge = createNotifyBridge(client, { channel: 'changes' });
 			await bridge.activate(platform);
 			await bridge.deactivate();
 
 			const queries = client._getQueries();
-			expect(queries.some((q) => q.includes('UNLISTEN'))).toBe(true);
+			expect(queries).toEqual(['LISTEN "changes"']);
+			expect(end).toHaveBeenCalledTimes(1);
 		});
 
 		it('is safe to call without activate', async () => {

@@ -1836,7 +1836,7 @@ Same as [Replay buffer (Redis)](#api-3) - including `currentEpoch(topic)` / `cac
 
 Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table - this module handles the listening side.
 
-Uses a standalone connection (not from the pool) since LISTEN requires a persistent connection that stays open for the lifetime of the bridge.
+Uses a dedicated session outside the pool. Await initialization and shutdown; use a direct or session-pooled DSN. See [notification lifecycle and session budgets](docs/postgres-support.md#notification-sessions-and-shutdown).
 
 > **Authorization:** the bridge forwards every NOTIFY payload from Postgres straight to `platform.publish()`. The trigger that emits the NOTIFY is the trust boundary - if your trigger fires on every row mutation regardless of tenant, the published topic must encode the tenant so subscribers see only their own data, AND your subscribe gate must enforce that tenants only subscribe to their own topics. Treating a NOTIFY payload as "already authenticated because it came from the DB" is incorrect; the DB does not know who is subscribing. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -1862,13 +1862,8 @@ export const bridge = createNotifyBridge(pg, {
 // src/hooks.ws.js
 import { bridge } from '$lib/server/notify';
 
-let activated = false;
-
-export function open(ws, { platform }) {
-  if (!activated) {
-    activated = true;
-    bridge.activate(platform);
-  }
+export async function init({ platform }) {
+  await bridge.activate(platform);
 }
 ```
 
@@ -1918,7 +1913,7 @@ notification. Transport fields never become part of `data`.
 | `channel` | *required* | Postgres LISTEN channel name |
 | `parse` | JSON with `{ topic, event, data }` | Parse notification payload into a publish call. Return null to skip. |
 | `autoReconnect` | `true` | Reconnect on connection loss |
-| `reconnectInterval` | `3000` | ms between reconnect attempts |
+| `reconnectInterval` | `3000` | Reconnect baseline in ms; jittered retries wait from this value up to twice it. |
 | `multiListener` | `'all'` | `'all'`: every replica opens its own LISTEN (current default). `'advisory'`: leader-elected via `pg_try_advisory_lock`. See [Single-listener mode](#single-listener-mode). |
 | `lockId` | - | Advisory lock id. Required when `multiListener: 'advisory'`. |
 | `pollInterval` | `5000` | ms between leader-election polls (advisory mode only). |
@@ -1929,7 +1924,7 @@ notification. Transport fields never become part of `data`.
 
 By default each replica in an N-replica deployment opens its own LISTEN connection. That's N persistent Postgres connections doing the same work, plus N copies of the same notification.
 
-`multiListener: 'advisory'` elects a single leader via Postgres advisory locks. One replica wins `pg_try_advisory_lock(lockId)` and holds the LISTEN connection; others poll for the lock every `pollInterval` ms. If the leader's connection drops, the session-scoped lock auto-releases and another replica picks it up on its next poll.
+`multiListener: 'advisory'` elects a single leader via Postgres advisory locks. One replica wins `pg_try_advisory_lock(lockId)` and holds the LISTEN connection; every contender still owns one dedicated session and polls for the lock every `pollInterval` ms. This reduces LISTEN consumers, not database session count. If the leader's connection drops, the session-scoped lock auto-releases and another replica picks it up on its next poll.
 
 ```js
 import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
@@ -1943,9 +1938,9 @@ const bridge = createNotifyBridge(pg, {
   lockId: 0x6e6f7466  // any stable 32-bit id; e.g. CRC32 of the channel name
 });
 
-export function open(ws, { platform }) {
-  bus.activate(platform);
-  bridge.activate(bus.wrap(platform));
+export async function init({ platform }) {
+  await bus.activate(platform);
+  await bridge.activate(bus.wrap(platform));
 }
 ```
 
@@ -1957,8 +1952,8 @@ export function open(ws, { platform }) {
 
 | Method | Description |
 |---|---|
-| `activate(platform)` | Start listening (idempotent) |
-| `deactivate()` | Stop listening and release the connection |
+| `activate(platform)` | Await session setup; resolves for a healthy advisory follower, rejects connection/setup failures. Concurrent calls share startup. |
+| `deactivate()` | Await timer cancellation and dedicated session closure. Owned `pg.end()` calls this before closing the pool. |
 
 #### Limitations
 

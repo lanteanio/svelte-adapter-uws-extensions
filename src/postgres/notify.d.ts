@@ -29,7 +29,7 @@ export interface NotifyBridgeOptions {
 	/** Reconnect on connection loss. @default true */
 	autoReconnect?: boolean;
 
-	/** ms between reconnect attempts. @default 3000 */
+	/** Reconnect baseline in ms; retries wait a jittered delay from this value up to twice it. @default 3000 */
 	reconnectInterval?: number;
 
 	/**
@@ -43,8 +43,8 @@ export interface NotifyBridgeOptions {
 	 * If the leader's connection drops, the lock auto-releases and the
 	 * next poll on another replica picks it up. Requires `lockId`.
 	 *
-	 * Use `'advisory'` to avoid N LISTEN connections in an N-replica
-	 * deployment. The platform must be wrapped by a cross-instance bus
+	 * Use `'advisory'` to avoid N LISTEN consumers in an N-replica
+	 * deployment. Every contender still owns one dedicated database session. Use a direct or session-pooled DSN, never transaction pooling. The platform must be wrapped by a cross-instance bus
 	 * (e.g. `createPubSubBus`) so non-leader replicas receive the
 	 * leader's publishes.
 	 *
@@ -89,10 +89,10 @@ export interface NotifyBridgeOptions {
 }
 
 export interface NotifyBridge {
-	/** Start listening. Forwards notifications to platform.publish(). Idempotent. */
+	/** Await session setup before serving traffic. A healthy advisory follower resolves; connection/setup failures reject. Concurrent calls share startup. */
 	activate(platform: Platform): Promise<void>;
 
-	/** Stop listening and release the connection. */
+	/** Await timer cancellation and session closure. Owned PgClient.end() calls this before closing its pool. */
 	deactivate(): Promise<void>;
 }
 

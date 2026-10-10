@@ -265,6 +265,20 @@ expected; `err.context` carries the context passed to the call, with internal
 keys stripped. Production (`NODE_ENV=production`) is unaffected: `devAssert`
 stays a no-op there.
 
+### Notification startup and dedicated session shutdown
+
+**Symptom.** Awaited advisory-mode notification activation now rejects a real
+connection or LISTEN failure; a healthy follower still resolves. Owned
+PostgreSQL factory shutdown also closes its standalone clients and notification
+bridges, so those sessions no longer survive the pool that created them.
+
+**Action.** Await notification activation in the adapter's init hook and handle
+startup failure before serving traffic. Keep standalone sessions under the
+owning factory's lifetime. With an external pool, explicitly await bridge
+deactivation and standalone client closure before closing that pool; wrapper
+end remains a no-op. Use direct or session-pooled PostgreSQL connections for
+LISTEN/advisory locks. See [session budgets and shutdown](docs/postgres-support.md#notification-sessions-and-shutdown).
+
 ## 4. Silent behaviour changes to audit
 
 ### Malformed relay envelopes are parse errors, not assertion violations

@@ -51,11 +51,11 @@ export interface PgClient {
 	connect(options?: PgOperationOptions): Promise<PoolClient>;
 	/**
 	 * Create a standalone pg.Client with the same connection config (not
-	 * from the pool). Throws if neither `connectionString` was provided.
+	 * from the pool). Owned factories track it until end(); external-pool wrappers leave it caller-owned. Throws if no connectionString was provided or owned shutdown has begun.
 	 */
 	createClient(): Client;
 	/**
-	 * Gracefully close the pool. No-op when the client wraps an
+	 * Stop registered notification bridges, close owned standalone sessions, then close the pool. No-op when the client wraps an
 	 * externally-provided pool (the caller owns that lifecycle).
 	 */
 	end(): Promise<void>;

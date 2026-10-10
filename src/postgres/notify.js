@@ -11,8 +11,10 @@
  * @module svelte-adapter-uws-extensions/postgres/notify
  */
 
+import { onPgShutdown } from './_client-lifecycle.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer, randomFloat } from '../shared/runtime.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { EXTERNAL_DELIVERY, LOCAL_DEFAULT } from '../shared/sequence-authority.js';
@@ -30,7 +32,7 @@ import {
  *   Parse the notification payload into a publish call. Return null to skip.
  *   Defaults to JSON.parse expecting { topic, event, data }.
  * @property {boolean} [autoReconnect=true] - Reconnect on connection loss
- * @property {number} [reconnectInterval=3000] - ms between reconnect attempts
+ * @property {number} [reconnectInterval=3000] - Reconnect baseline in ms; retries are jittered from this value up to twice it
  * @property {'all' | 'advisory'} [multiListener='all'] -
  *   `'all'`: every instance opens its own LISTEN connection. `'advisory'`:
  *   one instance per cluster wins `pg_try_advisory_lock(lockId)` and holds
@@ -71,8 +73,8 @@ import {
  *   }
  * });
  *
- * // In your open hook (once):
- * bridge.activate(platform);
+ * // In your awaited init hook:
+ * await bridge.activate(platform);
  * ```
  *
  * Then create a trigger on your table:
@@ -127,8 +129,8 @@ export function createNotifyBridge(client, options) {
 		allowedSystemTopics: []
 	});
 	const reconnectInterval = options.reconnectInterval ?? 3000;
-	if (typeof reconnectInterval !== 'number' || !Number.isFinite(reconnectInterval) || reconnectInterval < 0) {
-		throw new Error('notify bridge: reconnectInterval must be a non-negative number');
+	if (typeof reconnectInterval !== 'number' || !Number.isFinite(reconnectInterval) || reconnectInterval < 0 || reconnectInterval > 2147483647) {
+		throw new Error('notify bridge: reconnectInterval must be a non-negative number no greater than 2147483647');
 	}
 	if (options.parse != null && typeof options.parse !== 'function') {
 		throw new Error('notify bridge: parse must be a function');
@@ -149,8 +151,8 @@ export function createNotifyBridge(client, options) {
 		lockId = options.lockId;
 	}
 	const pollInterval = options.pollInterval ?? 5000;
-	if (typeof pollInterval !== 'number' || !Number.isFinite(pollInterval) || pollInterval <= 0) {
-		throw new Error('notify bridge: pollInterval must be a positive number');
+	if (typeof pollInterval !== 'number' || !Number.isFinite(pollInterval) || pollInterval <= 0 || pollInterval > 2147483647) {
+		throw new Error('notify bridge: pollInterval must be a positive number no greater than 2147483647');
 	}
 
 	const b = options.breaker;
@@ -159,8 +161,12 @@ export function createNotifyBridge(client, options) {
 	const mParseErrors = m?.counter('notify_parse_errors_total', 'Notification parse failures', ['channel']);
 	const mReconnects = m?.counter('notify_reconnects_total', 'Connection reconnect attempts');
 
-	/** @type {import('pg').Client | null} */
 	let conn = null;
+	let generation = 0;
+	let flight = null;
+	let deactivating = null;
+	let unsubscribeShutdown = null;
+	const closing = new Set();
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 	// Whether activePlatform has a tracing provider, read once at activate.
@@ -253,174 +259,214 @@ export function createNotifyBridge(client, options) {
 		}
 	}
 
-	async function connect() {
-		b?.guard();
-		try {
-			// Use a standalone Client instead of pool.connect() to avoid
-			// permanently holding a pool connection. LISTEN needs a persistent
-			// connection that stays open for the lifetime of the bridge --
-			// borrowing from the pool would reduce available connections for queries.
-			conn = client.createClient();
-			conn.on('notification', onNotification);
-			conn.on('error', handleError);
-			await conn.connect();
-
-			await conn.query(`LISTEN ${quotedChannel}`);
-			b?.success();
-		} catch (err) {
-			b?.failure(err);
-			if (conn) {
-				try { await conn.end(); } catch { /* ignore */ }
-			}
-			conn = null;
-			if (active && autoReconnect) {
-				scheduleReconnect();
-			}
-			throw err;
-		}
+	function current(entry) {
+		return active && conn === entry && entry.generation === generation && !entry.stopping;
 	}
 
-	function handleError(err) {
-		b?.failure(err);
-		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_CONNECTION, { error: err, attributes: { channel } });
-		cleanup();
+	function closeEntry(entry) {
+		if (!entry) return Promise.resolve();
+		if (entry.closing) return entry.closing;
+		entry.stopping = true;
+		entry.cancelWait?.();
+		entry.cancelWait = null;
+		entry.client.removeListener('notification', onNotification);
+		entry.closing = (async () => {
+			try { await entry.client.end(); }
+			finally {
+				entry.client.removeListener('error', entry.onError);
+				entry.client.removeListener('end', entry.onEnd);
+			}
+		})();
+		closing.add(entry.closing);
+		// A failed close must not allow a replacement session to overlap it.
+		entry.closing.then(() => closing.delete(entry.closing), () => {});
+		return entry.closing;
+	}
+
+	function openEntry(epoch) {
+		const entry = { client: client.createClient(), generation: epoch, closing: null, stopping: false, failed: false, listening: false };
+		entry.onError = (error) => handleError(entry, error);
+		entry.onEnd = () => handleError(entry, new Error('Postgres notification connection ended'));
+		entry.client.on('error', entry.onError);
+		entry.client.on('end', entry.onEnd);
+		conn = entry;
+		return entry;
+	}
+
+	function handleError(entry, error) {
+		if (!current(entry) || entry.failed) return;
+		entry.failed = true;
+		b?.failure(error);
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_CONNECTION, { error, attributes: { channel } });
+		conn = null;
 		isLeader = false;
-		if (advisory) {
-			// Polling re-establishes the connection on the next tick.
-			return;
-		}
-		if (active && autoReconnect) {
-			scheduleReconnect();
-		}
+		if (!autoReconnect) stopAfterFailure();
+		closeEntry(entry).then(() => {
+			if (active && entry.generation === generation && autoReconnect) scheduleReconnect();
+		}, () => {});
 	}
 
-	async function ensureClient() {
-		if (conn) return;
-		conn = client.createClient();
-		conn.on('error', handleError);
-		await conn.connect();
+	function waitEntry(entry, operation) {
+		// pg may leave connect() pending when end() interrupts startup. Stop our
+		// wait when closing, while retaining handlers for any late rejection.
+		return new Promise((resolve, reject) => {
+			entry.cancelWait = resolve;
+			if (entry.stopping) { entry.cancelWait = null; resolve(); }
+			Promise.resolve(operation).then((value) => {
+				if (entry.cancelWait === resolve) entry.cancelWait = null;
+				resolve(value);
+			}, (error) => {
+				if (entry.cancelWait === resolve) entry.cancelWait = null;
+				reject(error);
+			});
+		});
 	}
 
-	async function advisoryTick() {
-		if (!active) return;
-		if (!conn) {
-			try {
-				await ensureClient();
-			} catch (err) {
-				b?.failure(err);
-				return;
-			}
-		}
+	async function step(epoch) {
+		await Promise.all([...closing]);
+		if (!active || generation !== epoch) return;
+		const cancelAdmission = guardBreaker(b);
+		let entry = conn;
 		try {
-			b?.guard();
-			const res = await conn.query('SELECT pg_try_advisory_lock($1) AS acquired', [lockId]);
-			const acquired = res.rows[0]?.acquired === true;
-			if (acquired && !isLeader) {
-				conn.on('notification', onNotification);
-				await conn.query(`LISTEN ${quotedChannel}`);
-				isLeader = true;
-			} else if (!acquired && isLeader) {
-				try { await conn.query(`UNLISTEN ${quotedChannel}`); } catch { /* ignore */ }
-				conn.removeListener('notification', onNotification);
-				isLeader = false;
+			if (!entry) {
+				entry = openEntry(epoch);
+				await waitEntry(entry, entry.client.connect());
 			}
-			b?.success();
-		} catch (err) {
-			b?.failure(err);
-			cleanup();
-			isLeader = false;
+			if (!current(entry)) { await closeEntry(entry); return; }
+			if (advisory) {
+				// Advisory locks are reentrant. Once acquired, check connection
+				// liveness without repeatedly incrementing the session lock count.
+				if (isLeader) await waitEntry(entry, entry.client.query('SELECT 1'));
+				else {
+					const result = await waitEntry(entry, entry.client.query('SELECT pg_try_advisory_lock($1) AS acquired', [lockId]));
+					if (!current(entry)) { await closeEntry(entry); return; }
+					if (result.rows[0]?.acquired === true) {
+						entry.client.on('notification', onNotification);
+						await waitEntry(entry, entry.client.query(`LISTEN ${quotedChannel}`));
+						if (!current(entry)) { await closeEntry(entry); return; }
+						entry.listening = true;
+						isLeader = true;
+					}
+				}
+			} else if (!entry.listening) {
+				entry.client.on('notification', onNotification);
+				await waitEntry(entry, entry.client.query(`LISTEN ${quotedChannel}`));
+				if (!current(entry)) { await closeEntry(entry); return; }
+				entry.listening = true;
+			}
+			if (current(entry)) b?.success();
+		} catch (error) {
+			if (!entry?.failed && active && generation === epoch) b?.failure(error);
+			if (conn === entry) { conn = null; isLeader = false; }
+			await closeEntry(entry);
+			throw error;
+		} finally {
+			// A shutdown has no backend verdict. Return a half-open probe lease;
+			// success/failure already invalidates this generation-bound cancellation.
+			cancelAdmission();
 		}
+	}
+
+	function stopAfterFailure() {
+		active = false;
+		activePlatform = null;
+		activeTracing = false;
+		stopTimers();
+		unsubscribeShutdown?.();
+		unsubscribeShutdown = null;
+	}
+
+	function runFlight() {
+		if (flight) return flight;
+		if (!active) return Promise.resolve();
+		const epoch = generation;
+		const pending = step(epoch);
+		flight = pending;
+		pending.then(() => {
+			if (flight === pending) flight = null;
+			if (advisory && active && generation === epoch && conn) startPolling();
+		}, () => {
+			if (flight === pending) flight = null;
+			if (active && generation === epoch) {
+				if (autoReconnect) scheduleReconnect();
+				else stopAfterFailure();
+			}
+		});
+		return pending;
 	}
 
 	function startPolling() {
-		if (pollTimer) return;
-		pollTimer = setIntervalTimer(() => { advisoryTick().catch(() => {}); }, pollInterval);
-		if (pollTimer.unref) pollTimer.unref();
+		if (pollTimer || !active) return;
+		pollTimer = setIntervalTimer(() => { if (conn && !reconnectTimer && !flight) runFlight().catch(() => {}); }, pollInterval);
+		pollTimer.unref?.();
 	}
 
-	function stopPolling() {
-		if (pollTimer) {
-			clearIntervalTimer(pollTimer);
-			pollTimer = null;
-		}
+	function stopTimers() {
+		if (pollTimer) { clearIntervalTimer(pollTimer); pollTimer = null; }
+		if (reconnectTimer) { clearTimer(reconnectTimer); reconnectTimer = null; }
 	}
 
 	function scheduleReconnect() {
-		if (reconnectTimer) return;
+		if (reconnectTimer || !active) return;
 		mReconnects?.inc();
-		reconnectTimer = setTimer(async () => {
+		// Never retry sooner than the configured baseline; spread fleet retries
+		// across the following interval instead of aligning every replica.
+		const delay = reconnectInterval === 0 ? 0 : Math.min(2147483647, Math.ceil(reconnectInterval * (1 + randomFloat())));
+		reconnectTimer = setTimer(() => {
 			reconnectTimer = null;
-			if (!active) return;
-			try {
-				await connect();
-			} catch {
-				// connect() already schedules another retry on failure
-			}
-		}, reconnectInterval);
-		if (reconnectTimer.unref) reconnectTimer.unref();
+			if (active) runFlight().catch(() => {});
+		}, delay);
+		reconnectTimer.unref?.();
 	}
 
-	function cleanup() {
-		if (conn) {
-			conn.removeListener('notification', onNotification);
-			conn.removeListener('error', handleError);
-			conn.end().catch(() => { /* already closed */ });
-			conn = null;
-		}
+	function deactivate() {
+		if (deactivating) return deactivating;
+		if (!active && !conn && !flight && closing.size === 0) return Promise.resolve();
+		active = false;
+		generation++;
+		activePlatform = null;
+		activeTracing = false;
+		stopTimers();
+		unsubscribeShutdown?.();
+		unsubscribeShutdown = null;
+		const entry = conn;
+		conn = null;
+		isLeader = false;
+		const pendingFlight = flight;
+		const pending = (async () => {
+			// Closing a dedicated session releases LISTEN and every advisory lock.
+			// An in-progress connect/query is interrupted by pg.Client.end().
+			await closeEntry(entry);
+			if (pendingFlight) await pendingFlight.catch(() => {});
+			await Promise.all([...closing]);
+		})();
+		deactivating = pending;
+		pending.then(() => { if (deactivating === pending) deactivating = null; }, () => { if (deactivating === pending) deactivating = null; });
+		return pending;
 	}
 
 	return {
 		async activate(platform) {
-			// Always update the platform reference so notifications
-			// are forwarded through the latest platform, even if a
-			// previous activate() already started the listener.
+			if (deactivating) await deactivating;
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);
-			if (active) return;
-			active = true;
-			if (advisory) {
-				// Initial poll attempt; polling continues regardless of
-				// outcome so this never throws - a follower replica is
-				// a valid steady state.
-				await advisoryTick();
-				startPolling();
+			if (active) {
+				if (flight || !conn) {
+					if (reconnectTimer) { clearTimer(reconnectTimer); reconnectTimer = null; }
+					await runFlight();
+				}
 				return;
 			}
-			try {
-				await connect();
-			} catch (err) {
-				if (!autoReconnect) {
-					// Without autoReconnect, reset so activate() can be retried
-					active = false;
-					activePlatform = null;
-				}
-				// With autoReconnect, connect() already scheduled a retry
-				throw err;
+			unsubscribeShutdown = onPgShutdown(client, deactivate);
+			active = true;
+			const epoch = ++generation;
+			try { await runFlight(); }
+			catch (error) {
+				if (!autoReconnect && generation === epoch) stopAfterFailure();
+				throw error;
 			}
+			if (advisory && active && generation === epoch) startPolling();
 		},
-
-		async deactivate() {
-			if (!active) return;
-			active = false;
-			activePlatform = null;
-			if (reconnectTimer) {
-				clearTimer(reconnectTimer);
-				reconnectTimer = null;
-			}
-			stopPolling();
-			if (conn) {
-				// 'all' mode always has LISTEN active; advisory mode only
-				// when this replica is the leader.
-				if (!advisory || isLeader) {
-					try {
-						await conn.query(`UNLISTEN ${quotedChannel}`);
-					} catch {
-						// Connection may already be dead
-					}
-				}
-				cleanup();
-			}
-			isLeader = false;
-		}
+		deactivate
 	};
 }
