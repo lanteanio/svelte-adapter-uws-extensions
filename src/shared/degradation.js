@@ -18,6 +18,8 @@
 const DEFAULT_JITTER_CAP_MS = 5000;
 /** Hard ceiling on any de-herd window (matches the publish-side cap). */
 const MAX_JITTER_MS = 60000;
+/** Keep a status notice bounded independently of the enclosing bus frame. */
+const MAX_NOTICE_BYTES = 2048;
 
 /**
  * Validate a mitigation / recovery envelope. All fields optional; unknown fields are
@@ -34,7 +36,9 @@ function validateEnvelope(env, label) {
 	if (env.retryAfterMs !== undefined && (typeof env.retryAfterMs !== 'number' || !Number.isFinite(env.retryAfterMs) || env.retryAfterMs < 0)) {
 		throw new Error('degradation policy: ' + label + '.retryAfterMs must be a non-negative number');
 	}
-	if (env.bannerCopy !== undefined && typeof env.bannerCopy !== 'string') throw new Error('degradation policy: ' + label + '.bannerCopy must be a string');
+	if (env.bannerCopy !== undefined && (typeof env.bannerCopy !== 'string' || env.bannerCopy.trim().length === 0 || Buffer.byteLength(env.bannerCopy, 'utf8') > MAX_NOTICE_BYTES || /[\u0000-\u001f\u007f-\u009f]/.test(env.bannerCopy))) {
+		throw new Error('degradation policy: ' + label + '.bannerCopy must be non-blank plain text of at most 2048 UTF-8 bytes without control characters');
+	}
 	if (env.refetch !== undefined && typeof env.refetch !== 'boolean') throw new Error('degradation policy: ' + label + '.refetch must be a boolean');
 	if (env.clearCache !== undefined && typeof env.clearCache !== 'boolean') throw new Error('degradation policy: ' + label + '.clearCache must be a boolean');
 	return env;
@@ -66,7 +70,7 @@ function resolveJitter(envelope, explicit) {
  * @property {string[]} [streams] - Stream topics to treat as unavailable while degraded.
  * @property {string[]} [rpcs] - RPC paths to treat as unavailable while degraded.
  * @property {number} [retryAfterMs] - How long the client should hold off before retrying.
- * @property {string} [bannerCopy] - Ready-to-render notice text.
+ * @property {string} [bannerCopy] - Optional source-English fallback notice. Non-blank plain text, at most 2048 UTF-8 bytes, without control characters. Render as text.
  */
 
 /**

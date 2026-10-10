@@ -47,6 +47,21 @@ describe('createDegradationPolicy', () => {
 		expect(out.jitterMs).toBe(3000);
 	});
 
+	for (const field of ['mitigation', 'recovery']) {
+		it.each(['', ' ', '\t', '\n', '\u00a0', 'x'.repeat(2049), '\u00e9'.repeat(1025), 'notice\u0000', 'notice\u007f', 'notice\u0085more', 'notice\u009f'])('rejects invalid ' + field + ' notice %j', (bannerCopy) => {
+			expect(() => createDegradationPolicy({ [field]: { bannerCopy } })).toThrow(/bannerCopy/);
+			const policy = createDegradationPolicy({ [field]: () => ({ bannerCopy }) });
+			expect(() => policy[field === 'mitigation' ? 'onDegraded' : 'onRecovered'](degrade)).toThrow(/bannerCopy/);
+		});
+		it('preserves bounded Unicode and literal text for ' + field, () => {
+			for (const bannerCopy of ['\u00e9'.repeat(1024), 'Saving <orders> is unavailable.', '  Saving is unavailable.  ']) {
+				const policy = createDegradationPolicy({ [field]: { bannerCopy } });
+				const result = policy[field === 'mitigation' ? 'onDegraded' : 'onRecovered'](degrade);
+				expect(result[field].bannerCopy).toBe(bannerCopy);
+			}
+		});
+	}
+
 	it('validates envelope fields and jitter ranges', () => {
 		expect(() => createDegradationPolicy({ mitigation: { retryAfterMs: -1 } })).toThrow(/retryAfterMs/);
 		expect(() => createDegradationPolicy({ mitigation: { streams: 'x' } })).toThrow(/streams/);

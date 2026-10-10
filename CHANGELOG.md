@@ -9,11 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Contribution documentation, issue forms, and verification commands now cover a read-only formatting check, declared CI lanes, and a mock plus real Redis smoke run.
+
 - Authorization guidance now starts with handler checks and trusted key derivation. Distributed session and lock introductions spell out asynchronous calls, omitted local introspection, and lease failures.
 
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
+
+- Degradation notices reject blank, oversized, and control-character text. Client guidance distinguishes backend capability loss from WebSocket disconnects and keeps elapsed timers outside live announcements.
+- Per-operation idempotency retention applies on Redis and Postgres, including zero retention. Older Redis erasure indexes retain longer-lived results when a later result has a shorter lifetime.
+- Redis alarm transactions surface command failures; Postgres test stores preserve tenant and user ownership for erasure.
+- Presence and cursor erasure restricts deletion to the requested tenant topic namespace.
 
 - Capability cookies contain fresh random nonces instead of application session identifiers, including when an older cookie is refreshed. Existing valid cookies remain verifiable until expiry.
 

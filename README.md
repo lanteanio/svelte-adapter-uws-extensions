@@ -426,14 +426,14 @@ const bus = createPubSubBus(redis, {
     mitigation: {
       rpcs: ['orders/create'],     // treat these as unavailable while degraded
       retryAfterMs: 8000,          // how long the client should hold off
-      bannerCopy: 'Saving is paused while we recover - back shortly.'
+      bannerCopy: 'Saving orders is temporarily unavailable.'
     }
     // jitterMs defaults to min(retryAfterMs / 4, 5000); override to tune the spread
   })
 });
 ```
 
-The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store so the client renders the banner and schedules the retry with zero per-failure app code. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
+The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: non-blank plain text of at most 2048 UTF-8 bytes without control characters. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
 
 ---
 
@@ -2107,7 +2107,7 @@ A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hol
 
 Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
 
-> **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always derive the key from a trusted identity prefix - e.g. `\`order:${userId}:${payload.clientOrderId}\``. See [Authorize every extension call](#authorize-every-extension-call).
+> **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always encode trusted identity and validated input as separate key components - e.g. `JSON.stringify(['order', userId, payload.clientOrderId])`. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup (Redis)
 
@@ -3807,7 +3807,13 @@ import { bus } from '$lib/server/bus';
 export const { open } = bus.hooks;
 ```
 
-On the client, subscribe to the `__realtime` topic and show a banner when the `degraded` event fires. On `recovered`, dismiss the banner and refetch stale data. The event payload is `{ at: <epoch ms> }` so a client can show "lost connection 12s ago".
+On the client, subscribe to the `__realtime` topic and identify the affected capability when `degraded` fires, for example "Live order updates are temporarily unavailable." This is a Redis-backed capability failure; the browser WebSocket may remain connected. Use the transport's own state to describe its connection. On `recovered`, update the notice and refetch stale data as required by your application.
+
+The event's `at` field is an epoch timestamp for that breaker transition, not the last successful application operation. Store it as the capability's degraded-at time. A mitigation's `streams` and `rpcs` identify affected operations. If `retryAfterMs` is supplied, record a retry deadline once when the event arrives; it is a retry delay, not a recovery promise. Without that hint, show no countdown or estimated recovery time. Track last-success time from successful application operations, separately from breaker transitions.
+
+Keep one persistent polite status region (`role="status"`) mounted before the event. Announce a meaningful capability change once, using the same notice shown visually. Keep focus where it is; associate unavailable controls with the notice using `aria-describedby`, and prevent activation while unavailable. A control kept focusable with `aria-disabled="true"` also needs its action handler to refuse activation. On recovery, restore availability without moving focus and announce the change once.
+
+Any elapsed-time display belongs outside the live region. Prefer a static semantic `<time datetime="...">` timestamp; if relative time updates, update coarsely and offer pause, stop, or hide. Never rewrite the status region every second. An elapsed degradation time must not be labeled as a lost client connection.
 
 Both the topic name and the auto-emission are configurable:
 
