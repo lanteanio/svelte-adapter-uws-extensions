@@ -120,7 +120,7 @@ const PUBLISH_STEPS = [
 // they run BEFORE the verification steps, where their effects are still
 // tested.
 const EXPECTED_SCRIPTS = {
-	"check": "node scripts/check-release-ledger.js && node scripts/check-compatibility.js && npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js && npm run check:publish",
+	"check": "node scripts/check-release-ledger.js && node scripts/check-compatibility.js && npm run check:documentation && node scripts/check-doc-code.js && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js && npm run check:publish",
 	"check:errors": "node scripts/generate-error-reference.js --check",
 	"pretest": "npm run check",
 	"test": "vitest run",
@@ -138,7 +138,7 @@ const EXPECTED_SCRIPTS = {
 	"check:format": "node scripts/check-formatting.js",
 	"check:contributor-map": "node scripts/check-contributor-map.js",
 	"verify:fast": "npm run check",
-	"verify:docs": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node node_modules/vitest/vitest.mjs run test/contribution-tooling.test.js test/check-links.test.js test/documentation-contract.test.js test/external-links.test.js test/onboarding-contract.test.js test/onboarding-route.test.js --no-cache",
+	"verify:docs": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/check-doc-code.js && node node_modules/vitest/vitest.mjs run test/contribution-tooling.test.js test/check-links.test.js test/documentation-contract.test.js test/external-links.test.js test/onboarding-contract.test.js test/onboarding-route.test.js test/doc-code-contract.test.js test/packed-readme-examples.test.js --no-cache",
 	"verify:unit": "npm test -- --no-cache",
 	"verify:pr": "npm run preflight && npm run verify:fast && npm run verify:unit && npm run smoke",
 	"verify:redis": "npm run test:integration:redis",
@@ -156,7 +156,8 @@ const EXPECTED_SCRIPTS = {
 	"prepublishOnly": "npm run check",
 	"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
 	"check:publish": "publint && attw --pack . --profile esm-only",
-	"preflight:postgres": "node scripts/check-postgres-support.js"
+	"preflight:postgres": "node scripts/check-postgres-support.js",
+	"check:docs-code": "node scripts/check-doc-code.js"
 };
 
 function checkSteps(errors, jobName, job, expected) {

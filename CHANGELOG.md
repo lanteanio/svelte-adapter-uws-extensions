@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Classify every README code block, compile and check supported APIs, and execute standalone examples against the packed artifact. Explicit fragment exceptions remain bounded.
+- Redis presence enforces maxUpdateBytes (8192), maxFieldsBytes (65536), maxTopicsPerConnection (100), and topicThrottle (16 ms); set topicThrottle: 0 for immediate diff flushing.
+
 - Declare PostgreSQL 16 as the tested server baseline across Postgres subpaths, replace the incorrect 9.5 job-queue claim, and add a read-only server-version preflight before integration initialization.
 
 - Redis clients require ioredis 5.10.1 or later and default to finite command/retry deadlines and bounded offline buffering. Rejected unsent startup commands are removed before recovery.
@@ -28,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
+
+- Reject oversized or non-serializable publishBatched relay calls before local delivery or Redis relay; preflight every shard envelope and expose reason-only rejection counters.
+- Postgres task dispatch and recovery claim only locally registered handler names before batch limits, leaving unsupported rows, fences and attempts unchanged.
+- Presence identity resolution reads only own selected-data properties, preventing inherited names from merging unrelated users. Pending relayed join rosters exclude transient fields while retaining durable updates. Redis presence message hooks accept native parsed-message and byte envelopes and return true for owned frames.
 
 - Redis cursor projections enforce the default 8192-byte limit, JSON serialization and depth bounds. Relay interest belongs only to actual memberships, and close removes observer flush state. Snapshot recovery merges live and local rosters, retains TTL-bounded joins and removal tombstones through Redis gaps, and supersedes stale pending reads. Relay restoration retries and publish outcomes update breaker accounting.
 

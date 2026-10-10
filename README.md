@@ -37,7 +37,7 @@ before replacing an in-memory primitive.
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
 - **Prometheus metrics** - expose extension metrics for scraping, with no collection work when disabled
 
-**Documentation:** [Release history](./CHANGELOG.md) | [Release acceptance](./docs/releasing.md#release-scope-and-acceptance) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
+**Documentation:** [Code examples](./docs/code-examples.md) | [Release history](./CHANGELOG.md) | [Release acceptance](./docs/releasing.md#release-scope-and-acceptance) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
 
 **Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
 
@@ -167,6 +167,7 @@ After prerequisites pass, choose the Redis or Postgres factory for the primitive
 
 Factory that wraps [ioredis](https://github.com/redis/ioredis) with lifecycle management. All Redis extensions accept this client.
 
+<!-- doc-code: no-run reason="external-service: Redis connection configured by the application" -->
 ```js
 // src/lib/server/redis.js
 import { createRedisClient } from 'svelte-adapter-uws-extensions/redis';
@@ -213,11 +214,11 @@ export const pg = createPgClient({
 // (2) Wrapped-pool: pass an existing pg.Pool to share with raw `pg` use
 //     elsewhere, another framework integration, or a different module
 //     in the same app - single connection footprint against the database.
-import pg from 'pg';
-const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+import PgDriver from 'pg';
+const pool = new PgDriver.Pool({ connectionString: env.DATABASE_URL });
 
 export const wrapped = createPgClient({ pool });
-// pg.end() is a no-op now - the caller owns `pool`'s lifecycle.
+// wrapped.end() is a no-op - the caller owns `pool`'s lifecycle.
 ```
 
 #### Options
@@ -365,7 +366,7 @@ On an adapter that runs several worker threads, each worker loads its own copy o
 
 Such an adapter refuses any publish that would draw its per-worker sequence counter, and publishes through the bus follow the same rule: pass `{ seq: false }` for volatile events, or the seq an ordered source allocated, as the [replay buffer](#replay-buffer-redis) does. Through the bus, `relay: false` keeps a publish on this worker, so it is not the way to reach the other workers. The bus carries `seq: false` and `seq: null` as an unsequenced choice, and an authoritative number or bigint as a safe integer, so the frame is stamped the same everywhere. A counter-stamped frame arrives with no choice attached: a single worker stamps its own counter on it, a multi-worker one delivers it unsequenced. Scoped helpers take the options as their last argument, as on the adapter's platform.
 
-Redis buses retain local delivery when a serialized publish envelope exceeds `maxEnvelopeBytes`, skip the Redis relay, and report `redis.pubsub.envelope.oversized` once per consecutive oversized streak. The limit includes the whole `publishBatched` envelope (per shard channel for the sharded bus). A valid envelope resumes relay and re-arms the report. Keep payloads within the configured cap or raise it consistently on every instance; skipped envelopes do not reach remote instances or sibling workers. Topic broadcasts reject oversized requests before serving local subscribers; oversized replies are skipped with `redis.topic-broadcast.envelope.oversized` and may leave the requester waiting for its timeout.
+For ordinary `publish` and `batch` calls, Redis buses retain local delivery when a serialized publish envelope exceeds `maxEnvelopeBytes`, skip the Redis relay, and report `redis.pubsub.envelope.oversized` once per consecutive oversized streak. `publishBatched` instead preflights every relay envelope and rejects the entire call before delivery if any exceed the limit (per shard channel for the sharded bus). A valid envelope resumes relay and re-arms the report. Keep payloads within the configured cap or raise it consistently on every instance; skipped envelopes do not reach remote instances or sibling workers. Topic broadcasts reject oversized requests before serving local subscribers; oversized replies are skipped with `redis.topic-broadcast.envelope.oversized` and may leave the requester waiting for its timeout.
 
 
 ```js
@@ -393,6 +394,8 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 - **Per-subscriber wire frames drop too.** A subscriber receives one frame containing N events instead of N frames containing one event each.
 - **Per-message `relay: false` is honored.** Flagged messages still publish locally but are excluded from the Redis envelope.
 
+`publishBatched(messages, { compress: true })` applies compression locally and carries it to peer batches, including individual-publish fallbacks. Before any local delivery or Redis publish, the call serializes and size-checks every relay envelope: an oversized envelope throws `RangeError`, and serialization errors propagate. Either rejection leaves the entire batch undelivered; a batch whose messages all have `relay: false` needs no relay envelope and bypasses this cap. Rejections increment `pubsub_batch_rejected_total{reason="oversized"|"serialize"}`.
+
 `wrapped.batch(messages)` is left in place for callers that explicitly want N independent publishes; it does not produce wire batching. Use `publishBatched` whenever you want one frame per subscriber per call.
 
 #### Options
@@ -404,7 +407,7 @@ Trade-offs vs `wrapped.publish` in a tight loop:
 | `onDegraded` | - | Server-side handler invoked once when the breaker leaves the healthy state |
 | `onRecovered` | - | Server-side handler invoked once when the breaker returns to the healthy state |
 | `degradationPolicy` | - | A `createDegradationPolicy()` result (from `svelte-adapter-uws-extensions/degradation`). When the breaker degrades, the bus ships the policy's precomputed client mitigation alongside the `degraded` event and de-herds the push, so clients act on the recommendation spread across the cooldown instead of all retrying at t+0. See [Proactive degradation policy](#proactive-degradation-policy) |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject **inbound** bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the bus with oversized payloads. Also available on `createConnectionRegistry`, `createGroup` and `createPresence` - and on those three it bounds the **outbound** side too, because an envelope past the bound reaches local subscribers and no remote instance, which the sender is the only side positioned to report. The bus itself does not bound outbound: it relays ordinary app publishes on the hottest path in the system, where a refusal is the app's own `platform.publish` throwing. Registry and groups throw; presence warns and drops (see its own note). Must be a positive integer - an invalid value throws at construction instead of silently selecting the default, so a bound you thought you set is a bound you have. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Bound inbound bus envelopes before `JSON.parse` and outbound relays after encoding. Oversized ordinary outbound relays are withheld and reported; local delivery remains intact. `publishBatched` preflights every relay envelope and throws `RangeError` before any delivery if one exceeds the cap. Also available on `createConnectionRegistry`, `createGroup` and `createPresence`, where it bounds both directions: registry and groups throw; presence warns and drops. Must be a positive integer; an invalid value throws at construction. |
 | `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped; the configured `systemChannel` (default `__realtime`) remains in an explicit allowlist so the bus's own degraded / recovered events still flow. Closes the bus-injection class in shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 See [Notifying clients of degradation](#notifying-clients-of-degradation) for the full pattern.
@@ -492,8 +495,8 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 `bus.followBatch(topics)` groups the input topics by shard channel and `SSUBSCRIBE`s any new channels in one round trip. Pairs with the adapter's `subscribeBatch` hook (`hooks.ws.subscribeBatch`) so an N-topic subscribe batch lands as one round-trip-per-channel rather than one round-trip-per-topic. With the adapter's client-side coalescing (next.7+), the win covers initial-mount subscribes too, not just reconnect resubscribes.
 
 ```js
-// Today (works, but N round trips):
-export const subscribeBatch = async (ws, topics) => {
+// Sequential calls use one round trip per topic:
+const subscribeIndividually = async (ws, topics) => {
   for (const topic of topics) await bus.follow(topic);
 };
 
@@ -519,6 +522,8 @@ distributed.publishBatched([
 // (one to the 'chat' shard channel, one to 'audit') instead of three.
 ```
 
+Compression is carried with the batch as on the unsharded bus. Every shard envelope is serialized and size-checked before any local delivery or Redis publish; an oversized envelope throws `RangeError` atomically and serialization errors propagate. All-local `relay: false` batches bypass the relay cap. Rejections increment `sharded_pubsub_batch_rejected_total{reason="oversized"|"serialize"}`.
+
 Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with batch size, per-subscriber wire frames drop from N to 1, per-message `relay: false` honored. Use `publishBatched` for bulk operations; `wrapped.batch(messages)` remains a per-event loop for callers that explicitly want N separate publishes.
 
 #### Options
@@ -527,7 +532,7 @@ Same trade-offs as the unsharded bus: linear Redis-publish-count reduction with 
 |---|---|---|
 | `channelPrefix` | `'uws:sharded:'` | Prefix for sharded pub/sub channels |
 | `shardKey` | `(topic) => topic` | Map a topic to a shard label. The channel is `channelPrefix + shardKey(topic)`. Default: identity (one channel per topic). |
-| `maxEnvelopeBytes` | `1048576` (1 MB) | Reject inbound bus envelopes larger than this before `JSON.parse` runs. Defends against a hostile co-tenant or compromised peer flooding the cluster bus with oversized payloads. Must be a positive integer; an invalid value throws at construction. |
+| `maxEnvelopeBytes` | `1048576` (1 MB) | Bound inbound bus envelopes before `JSON.parse` and outbound relays after encoding. Oversized ordinary outbound relays are withheld and reported; local delivery remains intact. `publishBatched` preflights all shard envelopes and throws `RangeError` before any delivery if one exceeds the cap. Must be a positive integer; an invalid value throws at construction. |
 | `allowSystemTopics` | `false` | When `false` (default), inbound envelopes addressed to `__`-prefixed topics are dropped. Closes the bus-injection class in shared-Redis deployments. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in with `true`. |
 
 #### When to use which bus
@@ -647,7 +652,9 @@ The adapter's WebSocket `resume` hook fires on reconnect when the client present
 ```js
 // src/lib/server/replay.js
 export const replay = createReplay(redis);
+```
 
+```js
 // src/hooks.ws.js
 import { replay } from '$lib/server/replay';
 export const resume = replay.resumeHook();
@@ -2233,6 +2240,7 @@ If a handler runs past its `acquireTtl`, the pending slot expires and a **succes
 
 A handler that finishes within `acquireTtl` (the common case) never sees the error. Catch it on the `code` - it is identical across the Redis and Postgres backends:
 
+<!-- doc-code: fragment reason="Handler body: slot and result come from the surrounding idempotent operation; return exits that handler." -->
 ```js
 try {
   await slot.commit(result);
@@ -2609,6 +2617,7 @@ Off by default. One SNTP read per sampling round joins the median, so a lone wro
 
 A clock skewed past its trip threshold is about to mint stale leases and corrupted orderings. Wire it into [admission control](#admission-control) so the machine stops admitting new work until the skew clears:
 
+<!-- doc-code: fragment reason="Upgrade-hook body: clock, platform and res come from the enclosing upgrade handler." -->
 ```js
 import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
 
@@ -2687,6 +2696,7 @@ export const sessions = createDistributedSession(redis, {
 
 #### Use
 
+<!-- doc-code: fragment reason="HTTP or WebSocket handler excerpts: sessions and token come from setup; return exits the request handler." -->
 ```js
 // On login (HTTP handler):
 await sessions.set(token, { userId: 42, role: 'admin' });
@@ -2925,13 +2935,9 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
     ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
 
-Existing deployments forward-migrate `request_id`, `traceparent`, and
-`tracestate` with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-statements. Older rows remain readable and expose `traceContext: null`.
+Existing deployments forward-migrate `request_id`, `traceparent`, and `tracestate` with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Older rows remain readable and expose `traceContext: null`.
 
-With `autoMigrate: false`, apply those nullable columns before deploying this
-reader: the state query reads `request_id`, and the list query and the dispatch
-and recovery sweeps read all three, even for older rows:
+With `autoMigrate: false`, apply those nullable columns before deploying this reader: the state query reads `request_id`, and the list query and the dispatch and recovery sweeps read all three, even for older rows:
 
 ```sql
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS request_id TEXT;
@@ -2963,8 +2969,7 @@ ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate TEXT;
 | `breaker` | - | Circuit breaker; bypassed when broken |
 | `metrics` | - | Prometheus registry; emits `tasks_*_total` counters |
 
-**On `maxPayloadBytes`.** The input and result sides of the bound fail in
-different places, and only one of them is free:
+**On `maxPayloadBytes`.** The input and result sides of the bound fail in different places, and only one of them is free:
 
 - An oversized **input** is refused by `enqueue` / `run` before a row exists.
   Nothing has happened yet; the caller gets an error and can retry smaller.
@@ -2974,15 +2979,7 @@ different places, and only one of them is free:
   time the cap is met the handler has already run and its side effects have
   landed, so the task reports failure for work that actually happened.
 
-That asymmetry is why the default is a starting point rather than a setting to
-leave alone. A task that returns a report, an export, or a batch of rows can sit
-under 256KB on an ordinary run and pass it on a large one - the failure arrives
-in production, on the big customer, after the work is done. Either raise the
-bound to cover the largest result the task can produce, or return a **reference**
-(an object-store key, a row id) and keep the bytes out of the task row. The
-refusal message names the option so the lever is findable from the error alone.
-Values below 80 bytes are rejected: no smaller ceiling can retain the required
-`name` / `message` fields on a terminal error row.
+That asymmetry is why the default is a starting point rather than a setting to leave alone. A task that returns a report, an export, or a batch of rows can sit under 256KB on an ordinary run and pass it on a large one - the failure arrives in production, on the big customer, after the work is done. Either raise the bound to cover the largest result the task can produce, or return a **reference** (an object-store key, a row id) and keep the bytes out of the task row. The refusal message names the option so the lever is findable from the error alone. Values below 80 bytes are rejected: no smaller ceiling can retain the required `name` / `message` fields on a terminal error row.
 
 #### Live observation
 
@@ -3052,15 +3049,15 @@ Default is no retry on handler-thrown errors - safe for non-idempotent tasks. St
 #### Handler context
 
 ```ts
-{
-  input: TInput,                    // the input passed to run()
-  idempotencyKey: string | undefined, // forward to external services
-  requestId: string | null,         // originating request correlation
-  traceContext: TraceContext | null, // restored context for this attempt
-  fence: string,                    // this attempt's fence UUID, read-only
-  signal: AbortSignal,              // aborts when the fence is lost
-  attempt: number                   // 1-based attempt counter
-}
+import type { TaskHandlerContext } from 'svelte-adapter-uws-extensions/postgres/tasks';
+declare const context: TaskHandlerContext<{ userId: string }>;
+context.input;           // typed input passed to run()
+context.idempotencyKey;  // string | undefined; forward to external services
+context.requestId;       // string | null; originating request correlation
+context.traceContext;    // TraceContext | null; restored for this attempt
+context.fence;           // string; this attempt's fence UUID
+context.signal;          // AbortSignal; aborts when the fence is lost
+context.attempt;         // number; 1-based attempt counter
 ```
 
 The `signal` fires when the heartbeat detects another worker has reclaimed the row (your fence_expires_at passed and the recovery sweep took over). Pass it to `fetch`, Stripe, anything that supports cancellation - the handler should bail gracefully when it fires rather than racing the new owner.
@@ -4078,7 +4075,7 @@ Each class is independently configured. The adapter has already collapsed concur
 A class rule is either an array of pressure reasons that should block this class, or a predicate function:
 
 ```js
-classes: {
+const classes = {
   // Array form: block when reason is in this list
   critical: ['MEMORY'],
 
@@ -4135,6 +4132,7 @@ The two layers complement each other: admission control prevents new work from p
 
 `platform.pressure.topPublishers` is per-instance. In an N-instance cluster, a topic that's hot across every instance simultaneously looks the same locally as one that's only hot here - but it warrants a different response. The `clusterTopPublisher` rule consults a `createPublishRateAggregator` (`redis/publish-rate`) to shed at the cluster layer:
 
+<!-- doc-code: fragment reason="Request-handler body: redis and platform come from setup; the early return rejects this request." -->
 ```js
 import { createPublishRateAggregator } from 'svelte-adapter-uws-extensions/redis/publish-rate';
 import { createAdmissionControl } from 'svelte-adapter-uws-extensions/admission';
@@ -4279,6 +4277,7 @@ Generate the secret once and keep it out of the repo. Both current and previous 
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
+<!-- doc-code: no-run reason="app-context: CAP_SECRET and the HTTP framework event are supplied by the application" -->
 ```js
 // src/hooks.server.js - set the cookie on the HTML page response.
 import { capabilityCookie } from 'svelte-adapter-uws-extensions/capability-cookie';
