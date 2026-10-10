@@ -47,8 +47,10 @@ export function auditDiagnosticSeverities(source, file = '<source>') {
 		if (node.type === 'Property' && node.kind === 'init') {
 			const key = node.computed || node.key.type === 'Literal' ? node.key.value : node.key.name;
 			const value = node.value;
-			if (key === 'severity' && value.type === 'Literal' && !allowed.has(value.value)) {
-				errors.push(`${file}:${value.loc.start.line}: invalid diagnostic severity ${typeof value.value === 'string' ? JSON.stringify(value.value) : String(value.value)}`);
+			const constant = value.type === 'Literal' || (value.type === 'TemplateLiteral' && value.expressions.length === 0);
+			const severity = value.type === 'TemplateLiteral' ? value.quasis[0].value.cooked : value.value;
+			if (key === 'severity' && constant && !allowed.has(severity)) {
+				errors.push(`${file}:${value.loc.start.line}: invalid diagnostic severity ${typeof severity === 'string' ? JSON.stringify(severity) : String(severity)}`);
 			}
 		}
 		for (const value of Object.values(node)) {

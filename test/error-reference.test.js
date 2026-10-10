@@ -381,6 +381,8 @@ describe('diagnostic severity contract', () => {
 		for (const literal of ['null', '3', 'false', '1n']) {
 			expect(auditDiagnosticSeverities(`emit({ severity: ${literal} });`)).toHaveLength(1);
 		}
+		expect(auditDiagnosticSeverities('emit({ severity: `warning` });')).toHaveLength(1);
+		expect(auditDiagnosticSeverities('emit({ severity: `warn` });')).toEqual([]);
 		expect(auditDiagnosticSeverities('emit({ "severity": "warning" });')).toHaveLength(1);
 		expect(auditDiagnosticSeverities('emit({ ["severity"]: "warning" });')).toHaveLength(1);
 		expect(auditDiagnosticSeverities("/** severity: 'warning' */\nconst x = { level: 'siege' }; // severity: 'critical'\n")).toEqual([]);
