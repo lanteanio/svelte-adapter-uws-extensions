@@ -222,6 +222,7 @@ export interface TaskRetryPolicy {
 export interface TaskWorkerOption {
 	/** URL or absolute path to the worker file. Default-export the handler. */
 	path: URL | string;
+	/** Internally bounded to size + 256 admitted jobs and 8 MiB of input reservations (or maxPayloadBytes if larger); queued execution expires after 30 seconds. */
 	pool?: {
 		/** Max worker threads spawned for this task. @default 1 */
 		size?: number;

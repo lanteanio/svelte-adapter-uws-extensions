@@ -13,6 +13,7 @@
 import { Worker } from 'node:worker_threads';
 import { randomUuid, setTimer, clearTimer } from '../shared/runtime.js';
 import { deserialiseError } from './_tasks-errors.js';
+import { TimeoutError } from '../shared/errors.js';
 
 const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
 
@@ -20,7 +21,7 @@ const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
  * @param {{ path: URL | string, pool?: { size?: number, idleTimeout?: number } }} workerOption
  * @param {string} taskName
  */
-export function createWorkerPool(workerOption, taskName) {
+export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBytes = 256 * 1024 } = {}) {
 	const handlerPath = workerOption.path instanceof URL ? workerOption.path.href : String(workerOption.path);
 	// Reject non-file URL schemes. Node's dynamic import() still accepts
 	// `data:` URLs (which execute inline code) on the current LTS line;
@@ -48,169 +49,180 @@ export function createWorkerPool(workerOption, taskName) {
 		throw new Error(`postgres tasks: worker.pool.idleTimeout for "${taskName}" must be a non-negative integer`);
 	}
 
-	/** @type {Set<Worker>} */
+	const maxJobs = size + 256;
+	const maxBytes = Math.max(8 * 1024 * 1024, maxPayloadBytes);
+	const queueTimeout = 30000;
+	const mQueued = metrics?.gauge('tasks_worker_queue_jobs', 'Worker jobs waiting for a thread');
+	const mBytes = metrics?.gauge('tasks_worker_reserved_bytes', 'Worker input bytes reserved by admission');
+	const mActive = metrics?.gauge('tasks_worker_active', 'Worker jobs executing in threads');
+	const mRejected = metrics?.counter('tasks_worker_rejected_total', 'Worker jobs refused or cancelled before execution', ['reason']);
+	const workers = new Set();
 	const idle = new Set();
-	/** @type {Map<string, { worker: Worker, resolve: Function, reject: Function, ctx: any }>} */
 	const inFlight = new Map();
-	/** @type {Array<{ id: string, ctx: any, resolve: Function, reject: Function }>} */
-	const queue = [];
-	/** @type {WeakMap<Worker, NodeJS.Timeout>} */
+	const queue = new Map();
+	const permits = new Set();
 	const idleTimers = new WeakMap();
-	let workerCount = 0;
+	const retireWorkers = new WeakMap();
+	const retirementErrors = new WeakMap();
+	let reservedBytes = 0;
 	let destroyed = false;
 
-	function clearIdleTimer(worker) {
-		const t = idleTimers.get(worker);
-		if (t) {
-			clearTimer(t);
-			idleTimers.delete(worker);
+	function capacity(bytes) {
+		return destroyed ? 0 : Math.max(0, Math.min(maxJobs - permits.size, Math.floor((maxBytes - reservedBytes) / Math.max(1, bytes))));
+	}
+	function reserve(bytes) {
+		if (destroyed) throw new Error('task runner destroyed');
+		if (permits.size >= maxJobs || bytes > maxBytes - reservedBytes) {
+			mRejected?.inc({ reason: 'capacity' });
+			throw new RangeError('postgres tasks: worker admission capacity exceeded');
 		}
+		const permit = { bytes, release() {
+			if (!permits.delete(permit)) return;
+			reservedBytes -= bytes;
+			mBytes?.inc(-bytes);
+		} };
+		permits.add(permit);
+		reservedBytes += bytes;
+		mBytes?.inc(bytes);
+		return permit;
 	}
-
-	function scheduleIdleTimeout(worker) {
+	function clearIdleTimer(worker) {
+		const timer = idleTimers.get(worker);
+		if (timer) { clearTimer(timer); idleTimers.delete(worker); }
+	}
+	function unqueue(job) {
+		if (!queue.delete(job.id)) return false;
+		clearTimer(job.timer);
+		job.timer = null;
+		mQueued?.inc(-1);
+		return true;
+	}
+	function continueWorker(worker) {
+		if (destroyed || !workers.has(worker) || retirementErrors.has(worker)) return;
+		const next = queue.size ? queue.values().next().value : undefined;
+		if (next) { unqueue(next); dispatch(worker, next); return; }
+		idle.add(worker);
 		if (idleTimeout === 0) return;
-		const t = setTimer(() => {
-			if (idle.has(worker)) {
-				idle.delete(worker);
-				workerCount -= 1;
-				worker.terminate().catch(() => {});
-			}
+		const timer = setTimer(() => {
+			if (!idle.delete(worker)) return;
+			workers.delete(worker);
+			idleTimers.delete(worker);
+			worker.terminate().catch(() => {});
 		}, idleTimeout);
-		if (t.unref) t.unref();
-		idleTimers.set(worker, t);
+		timer.unref?.();
+		idleTimers.set(worker, timer);
 	}
-
 	function dispatch(worker, job) {
 		clearIdleTimer(worker);
 		idle.delete(worker);
-		inFlight.set(job.id, { worker, resolve: job.resolve, reject: job.reject, ctx: job.ctx });
-		worker.postMessage({
-			type: 'run',
-			id: job.id,
-			input: job.ctx.input,
-			idempotencyKey: job.ctx.idempotencyKey,
-			fence: job.ctx.fence,
-			attempt: job.ctx.attempt
-		});
+		job.worker = worker;
+		inFlight.set(job.id, job);
+		mActive?.inc(1);
+		try {
+			worker.postMessage({ type: 'run', id: job.id, input: job.ctx.input,
+				idempotencyKey: job.ctx.idempotencyKey, fence: job.ctx.fence, attempt: job.ctx.attempt });
+		} catch (error) {
+			inFlight.delete(job.id);
+			mActive?.inc(-1);
+			job.reject(error);
+			continueWorker(worker);
+		}
 	}
-
 	function spawnWorker() {
-		const w = new Worker(HARNESS_URL, {
-			workerData: { handlerPath }
+		const worker = new Worker(HARNESS_URL, { workerData: { handlerPath } });
+		workers.add(worker);
+		worker.unref?.();
+		worker.on('message', message => {
+			if (message?.type !== 'result' && message?.type !== 'error') return;
+			const job = inFlight.get(message.id);
+			if (!job || job.worker !== worker) return;
+			inFlight.delete(message.id);
+			mActive?.inc(-1);
+			if (message.type === 'result') job.resolve(message.result);
+			else job.reject(deserialiseError(message.error));
+			continueWorker(worker);
 		});
-		workerCount += 1;
-		if (w.unref) w.unref();
-		w.on('message', (msg) => {
-			const slot = inFlight.get(msg.id);
-			if (!slot) return;
-			// Reject messages that reference an in-flight id this worker
-			// was not dispatched to. The worker IS user code (handler
-			// path is user-supplied); a misbehaving or compromised
-			// handler that postMessages a forged result for another
-			// worker's id could otherwise hijack that task's resolve()
-			// path. Mirrors the existing slot.worker === w check on the
-			// 'error' listener below.
-			if (slot.worker !== w) return;
-			inFlight.delete(msg.id);
-			if (msg.type === 'result') {
-				slot.resolve(msg.result);
-			} else if (msg.type === 'error') {
-				slot.reject(deserialiseError(msg.error));
+		function retire(error) {
+			if (!workers.delete(worker)) return;
+			idle.delete(worker);
+			clearIdleTimer(worker);
+			for (const [id, job] of inFlight) if (job.worker === worker) {
+				inFlight.delete(id);
+				mActive?.inc(-1);
+				job.reject(error);
 			}
-			const next = queue.shift();
-			if (next) {
-				dispatch(w, next);
-			} else {
-				idle.add(w);
-				scheduleIdleTimeout(w);
+			if (workers.size === 0) for (const job of queue.values()) {
+				unqueue(job);
+				job.reject(error);
 			}
-		});
-		w.on('error', (err) => {
-			for (const [id, slot] of inFlight) {
-				if (slot.worker === w) {
-					inFlight.delete(id);
-					slot.reject(err);
-				}
-			}
-			idle.delete(w);
-			clearIdleTimer(w);
-			workerCount -= 1;
-			// Draining only the in-flight slot is not enough. A queued job is
-			// waiting for a worker to come free, and the free-a-worker signal
-			// is the `message` handler above - which a dead worker never
-			// reaches. With no other live worker to pick them up, those jobs
-			// never settle at all: no result, no rejection, and no timeout on
-			// this path to end the wait.
-			if (workerCount === 0 && queue.length > 0) {
-				const stranded = queue.splice(0, queue.length);
-				for (const job of stranded) job.reject(err);
-			}
-		});
-		w.on('exit', () => {
-			idle.delete(w);
-			clearIdleTimer(w);
-		});
-		return w;
+		}
+		retireWorkers.set(worker, retire);
+		worker.on('error', retire);
+		worker.on('exit', () => retire(retirementErrors.get(worker) || new Error('postgres tasks: worker exited before completing its task')));
+		return worker;
 	}
-
 	return {
-		run(ctx) {
-			if (destroyed) {
-				return Promise.reject(new Error('task runner destroyed'));
-			}
+		capacity,
+		reserve,
+		run(ctx, permit) {
+			if (destroyed) return Promise.reject(new Error('task runner destroyed'));
+			if (ctx.signal?.aborted) return Promise.reject(ctx.signal.reason || new Error('aborted'));
+			const ownsPermit = !permit;
+			try {
+				permit ??= reserve(Buffer.byteLength(JSON.stringify(ctx.input ?? null)));
+				if (!permits.has(permit)) throw new Error('postgres tasks: worker admission expired');
+			} catch (error) { return Promise.reject(error); }
 			return new Promise((resolve, reject) => {
 				const id = randomUuid();
-				const job = { id, ctx, resolve, reject };
-
+				const cleanup = () => { ctx.signal?.removeEventListener('abort', onAbort); if (ownsPermit) permit.release(); };
+				const job = { id, ctx, timer: null, worker: null,
+					resolve(value) { cleanup(); resolve(value); },
+					reject(error) { cleanup(); reject(error); } };
 				const onAbort = () => {
-					const slot = inFlight.get(id);
-					if (slot) slot.worker.postMessage({ type: 'abort', id });
-				};
-				const cleanup = () => {
-					if (ctx.signal && !ctx.signal.aborted) {
-						ctx.signal.removeEventListener('abort', onAbort);
+					if (unqueue(job)) {
+						mRejected?.inc({ reason: 'abort' });
+						job.reject(ctx.signal.reason || new Error('aborted'));
+					} else {
+						const active = inFlight.get(id);
+						if (active) {
+							try { active.worker.postMessage({ type: 'abort', id }); }
+							catch (error) {
+								const worker = active.worker;
+								retirementErrors.set(worker, error);
+								// Keep the active reservation until the thread has stopped.
+								worker.terminate().then(() => retireWorkers.get(worker)(error), () => {});
+							}
+						}
 					}
 				};
-				const wrappedResolve = (v) => { cleanup(); resolve(v); };
-				const wrappedReject = (e) => { cleanup(); reject(e); };
-				job.resolve = wrappedResolve;
-				job.reject = wrappedReject;
-
-				if (ctx.signal) {
-					if (ctx.signal.aborted) {
-						wrappedReject(ctx.signal.reason || new Error('aborted'));
-						return;
+				ctx.signal?.addEventListener('abort', onAbort, { once: true });
+				try {
+					const worker = idle.values().next().value;
+					if (worker) dispatch(worker, job);
+					else if (workers.size < size) dispatch(spawnWorker(), job);
+					else {
+						queue.set(id, job);
+						mQueued?.inc(1);
+						job.timer = setTimer(() => {
+							if (!unqueue(job)) return;
+							mRejected?.inc({ reason: 'timeout' });
+							job.reject(new TimeoutError('postgres tasks', 'worker queue', queueTimeout));
+						}, queueTimeout);
+						job.timer.unref?.();
 					}
-					ctx.signal.addEventListener('abort', onAbort, { once: true });
-				}
-
-				let w = null;
-				for (const candidate of idle) { w = candidate; break; }
-				if (w) {
-					dispatch(w, job);
-				} else if (workerCount < size) {
-					dispatch(spawnWorker(), job);
-				} else {
-					queue.push(job);
-				}
+				} catch (error) { job.reject(error); }
 			});
 		},
-
 		destroy() {
+			if (destroyed) return;
 			destroyed = true;
-			for (const slot of inFlight.values()) {
-				slot.reject(new Error('task runner destroyed'));
-			}
+			for (const job of inFlight.values()) { mActive?.inc(-1); job.reject(new Error('task runner destroyed')); }
 			inFlight.clear();
-			for (const job of queue) {
-				job.reject(new Error('task runner destroyed'));
-			}
-			queue.length = 0;
-			for (const w of idle) {
-				clearIdleTimer(w);
-				w.terminate().catch(() => {});
-			}
+			for (const job of queue.values()) { unqueue(job); job.reject(new Error('task runner destroyed')); }
+			for (const worker of workers) { clearIdleTimer(worker); worker.terminate().catch(() => {}); }
+			workers.clear();
 			idle.clear();
+			for (const permit of permits) permit.release();
 		}
 	};
 }

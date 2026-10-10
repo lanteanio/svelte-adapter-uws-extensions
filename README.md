@@ -3141,7 +3141,7 @@ tasks.register('resize-image', null, {
 });
 ```
 
-When `worker` is set, the `handler` argument to `register` must be `null` or omitted - the handler argument exists in the worker file, not at the registration site. Pool defaults: `size: 1`, `idleTimeout: 30000` ms (set to `0` to keep workers warm forever). Workers spawn lazily on first run; idle workers past `idleTimeout` are terminated.
+When `worker` is set, the `handler` argument to `register` must be `null` or omitted - the handler argument exists in the worker file, not at the registration site. Pool defaults: `size: 1`, `idleTimeout: 30000` ms (set to `0` to keep workers warm forever). Workers spawn lazily on first run; idle workers past `idleTimeout` are terminated. Admission has finite job/byte limits and a 30-second queue deadline; saturated inline calls reject before insertion, while durable sweeps wait for capacity. See [task worker admission](docs/task-workers.md) for cancellation, retries and metrics.
 
 The `signal` in the handler context fires when the runner detects a fence loss, exactly as for in-process handlers. The runner forwards an abort message to the worker; the worker translates it into a local `AbortController.abort()` so the handler can bail.
 

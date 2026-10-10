@@ -345,7 +345,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform) {
+	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
@@ -390,7 +390,7 @@ export function createTaskRunner(client, options = {}) {
 					fence,
 					signal: controller.signal,
 					attempt
-				})
+				}, workerPermit)
 			);
 		} finally {
 			if (heartbeatId) clearIntervalTimer(heartbeatId);
@@ -431,172 +431,174 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput) {
-		const reg = handlers.get(name);
-		if (!reg) throw new UnknownTaskError(name);
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput, workerPermit) {
+		try {
+			const reg = handlers.get(name);
+			if (!reg) throw new UnknownTaskError(name);
 
-		let attempt = startingAttempt;
-		let fence = startingFence;
-		let lastError;
+			let attempt = startingAttempt;
+			let fence = startingFence;
+			let lastError;
 
-		while (true) {
-			let result;
-			let handlerError;
-			let firedTransitionThisIter = null; // 'insert' | 'rearm' | null
-			let rearmLost = false;
-			await withBreaker(b, async () => {
-				if (fence === null || fence === undefined) {
-					// Entry path from run(): row does not exist yet.
-					fence = randomUuid();
-					await runTraceOperation(tracePlatform, 'postgres.tasks.enqueue', 'producer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => {
-						traceContext = currentTraceContext;
-						return sql.insertAttempt(
-							taskId,
-							name,
-							initialEncodedInput,
-							idempotencyKey,
-							fence,
-							requestId,
-							_taskUserId(input, name),
-							traceContext
-						);
-					});
-					firedTransitionThisIter = 'insert';
-				} else if (attempt > startingAttempt) {
-					// Retry within the loop: rotate the fence and rearm the existing
-					// row, but ONLY if we still hold it. A worker whose fence was
-					// taken over mid-handler must not re-steal the row back from its
-					// successor - the fence-guarded rearm matches zero rows and we
-					// stop rather than re-acquire.
-					const priorFence = fence;
-					const nextFence = randomUuid();
-					const rearmed = await sql.rearmAttempt(taskId, priorFence, nextFence, attempt);
-					if (!rearmed) {
-						rearmLost = true;
-						return;
+			while (true) {
+				let result;
+				let handlerError;
+				let firedTransitionThisIter = null; // 'insert' | 'rearm' | null
+				let rearmLost = false;
+				await withBreaker(b, async () => {
+					if (fence === null || fence === undefined) {
+						// Entry path from run(): row does not exist yet.
+						fence = randomUuid();
+						await runTraceOperation(tracePlatform, 'postgres.tasks.enqueue', 'producer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => {
+							traceContext = currentTraceContext;
+							return sql.insertAttempt(
+								taskId,
+								name,
+								initialEncodedInput,
+								idempotencyKey,
+								fence,
+								requestId,
+								_taskUserId(input, name),
+								traceContext
+							);
+						});
+						firedTransitionThisIter = 'insert';
+					} else if (attempt > startingAttempt) {
+						// Retry within the loop: rotate the fence and rearm the existing
+						// row, but ONLY if we still hold it. A worker whose fence was
+						// taken over mid-handler must not re-steal the row back from its
+						// successor - the fence-guarded rearm matches zero rows and we
+						// stop rather than re-acquire.
+						const priorFence = fence;
+						const nextFence = randomUuid();
+						const rearmed = await sql.rearmAttempt(taskId, priorFence, nextFence, attempt);
+						if (!rearmed) {
+							rearmLost = true;
+							return;
+						}
+						fence = nextFence;
+						firedTransitionThisIter = 'rearm';
 					}
-					fence = nextFence;
-					firedTransitionThisIter = 'rearm';
+					// else: dispatch/recovery first iteration uses the fence assigned by the
+					// claim CTE; no row mutation needed (the dispatch/recovery sweep
+					// already fired the state-change event).
+					if (fenceProvider) {
+						await fenceProvider.acquire(taskId, fence, fenceTtl);
+					}
+				});
+
+				if (rearmLost) {
+					// The fence was taken over before this retry could rearm; the
+					// successor owns the row. Report its canonical outcome instead of
+					// re-running the handler (a foreground caller polls; a background
+					// dispatch/recovery caller discards the result).
+					const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+					if (canonical) return canonical.result;
+					return result;
 				}
-				// else: dispatch/recovery first iteration uses the fence assigned by the
-				// claim CTE; no row mutation needed (the dispatch/recovery sweep
-				// already fired the state-change event).
-				if (fenceProvider) {
-					await fenceProvider.acquire(taskId, fence, fenceTtl);
+
+				if (firedTransitionThisIter === 'insert') {
+					fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
+				} else if (firedTransitionThisIter === 'rearm') {
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
 				}
-			});
 
-			if (rearmLost) {
-				// The fence was taken over before this retry could rearm; the
-				// successor owns the row. Report its canonical outcome instead of
-				// re-running the handler (a foreground caller polls; a background
-				// dispatch/recovery caller discards the result).
-				const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
-				if (canonical) return canonical.result;
-				return result;
-			}
+				mRunStart?.inc({ name });
 
-			if (firedTransitionThisIter === 'insert') {
-				fireStateChange({ taskId, name, oldStatus: null, newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
-			} else if (firedTransitionThisIter === 'rearm') {
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'running', attempt, requestId: requestId ?? null, traceContext });
-			}
-
-			mRunStart?.inc({ name });
-
-			try {
-				result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform);
-			} catch (err) {
-				handlerError = err;
-			}
-
-			if (handlerError === undefined) {
-				// A result past the payload cap is a TERMINAL outcome, not a
-				// crash. The encode happens inside commitRow's parameter list,
-				// so letting it throw from there escapes this function with the
-				// row still `running` under a live fence: the recovery sweep
-				// reclaims the expired fence and re-runs the handler, which
-				// produces the same oversized result, forever. Retrying cannot
-				// help - the result is deterministic - so the row is failed
-				// outright rather than routed through the retry ladder.
-				let encodeError;
-				let encodedResult;
 				try {
-					encodedResult = encodeTaskPayload(result === undefined ? null : result, 'result', maxPayloadBytes);
+					result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit);
 				} catch (err) {
-					encodeError = err;
+					handlerError = err;
 				}
-				if (encodeError !== undefined) {
-					const failed = await sql.failRow(taskId, fence, encodeError);
+
+				if (handlerError === undefined) {
+					// A result past the payload cap is a TERMINAL outcome, not a
+					// crash. The encode happens inside commitRow's parameter list,
+					// so letting it throw from there escapes this function with the
+					// row still `running` under a live fence: the recovery sweep
+					// reclaims the expired fence and re-runs the handler, which
+					// produces the same oversized result, forever. Retrying cannot
+					// help - the result is deterministic - so the row is failed
+					// outright rather than routed through the retry ladder.
+					let encodeError;
+					let encodedResult;
+					try {
+						encodedResult = encodeTaskPayload(result === undefined ? null : result, 'result', maxPayloadBytes);
+					} catch (err) {
+						encodeError = err;
+					}
+					if (encodeError !== undefined) {
+						const failed = await sql.failRow(taskId, fence, encodeError);
+						if (fenceProvider) {
+							try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
+						}
+						if (!failed) {
+							// Fence lost before we could record it; the winning
+							// worker owns the canonical outcome.
+							const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+							if (canonical) return canonical.result;
+							throw encodeError;
+						}
+						fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(encodeError, { includeCause: serializeErrorCause }) });
+						mRunFail?.inc({ name });
+						throw encodeError;
+					}
+					const committed = await sql.commitRow(taskId, fence, encodedResult);
+					if (committed && fenceProvider) {
+						try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
+					}
+					if (!committed) {
+						// Our fence was lost; another worker took over. The canonical
+						// outcome is whatever that worker commits - never the result we
+						// just produced (it may differ from the durable row, and via the
+						// idempotency store it would be cached).
+						const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
+						if (canonical) return canonical.result;
+						// Background caller only (poll === false): the row is still
+						// running under the new fence and this result is discarded, so
+						// there is nothing more to do. No state-change fires here - the
+						// canonical writer fires on its commit.
+						return result;
+					}
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, traceContext, result });
+					mRunCommit?.inc({ name });
+					return result;
+				}
+
+				lastError = handlerError;
+
+				const retry = reg.retry;
+				const canRetry =
+					retry &&
+					attempt < retry.maxAttempts &&
+					(typeof retry.on !== 'function' || retry.on(handlerError) !== false);
+
+				if (!canRetry) {
+					const failed = await sql.failRow(taskId, fence, handlerError);
 					if (fenceProvider) {
 						try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
 					}
 					if (!failed) {
-						// Fence lost before we could record it; the winning
-						// worker owns the canonical outcome.
+						// Our fence was lost before we could record the failure; another
+						// worker owns the row and its canonical outcome may even be a
+						// success. Report that, never our stale local error.
 						const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
 						if (canonical) return canonical.result;
-						throw encodeError;
+						// Background caller only: outcome not yet terminal; discarded.
+						return result;
 					}
-					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(encodeError, { includeCause: serializeErrorCause }) });
+					fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(handlerError, { includeCause: serializeErrorCause }) });
 					mRunFail?.inc({ name });
-					throw encodeError;
+					throw handlerError;
 				}
-				const committed = await sql.commitRow(taskId, fence, encodedResult);
-				if (committed && fenceProvider) {
-					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
-				}
-				if (!committed) {
-					// Our fence was lost; another worker took over. The canonical
-					// outcome is whatever that worker commits - never the result we
-					// just produced (it may differ from the durable row, and via the
-					// idempotency store it would be cached).
-					const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
-					if (canonical) return canonical.result;
-					// Background caller only (poll === false): the row is still
-					// running under the new fence and this result is discarded, so
-					// there is nothing more to do. No state-change fires here - the
-					// canonical writer fires on its commit.
-					return result;
-				}
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'committed', attempt, requestId: requestId ?? null, traceContext, result });
-				mRunCommit?.inc({ name });
-				return result;
+
+				mRetry?.inc({ name });
+				const backoff = retry.backoff || defaultBackoff;
+				const ms = backoff(attempt, handlerError);
+				if (ms > 0) await delay(ms);
+				attempt += 1;
 			}
-
-			lastError = handlerError;
-
-			const retry = reg.retry;
-			const canRetry =
-				retry &&
-				attempt < retry.maxAttempts &&
-				(typeof retry.on !== 'function' || retry.on(handlerError) !== false);
-
-			if (!canRetry) {
-				const failed = await sql.failRow(taskId, fence, handlerError);
-				if (fenceProvider) {
-					try { await fenceProvider.release(taskId, fence); } catch { /* best-effort */ }
-				}
-				if (!failed) {
-					// Our fence was lost before we could record the failure; another
-					// worker owns the row and its canonical outcome may even be a
-					// success. Report that, never our stale local error.
-					const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical);
-					if (canonical) return canonical.result;
-					// Background caller only: outcome not yet terminal; discarded.
-					return result;
-				}
-				fireStateChange({ taskId, name, oldStatus: 'running', newStatus: 'failed', attempt, requestId: requestId ?? null, traceContext, error: serialiseErrorSafe(handlerError, { includeCause: serializeErrorCause }) });
-				mRunFail?.inc({ name });
-				throw handlerError;
-			}
-
-			mRetry?.inc({ name });
-			const backoff = retry.backoff || defaultBackoff;
-			const ms = backoff(attempt, handlerError);
-			if (ms > 0) await delay(ms);
-			attempt += 1;
-		}
+		} finally { workerPermit?.release(); }
 	}
 
 	// A sweep that throws is otherwise visible only as a breaker failure, and
@@ -611,16 +613,50 @@ export function createTaskRunner(client, options = {}) {
 		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_TASKS_SWEEP, { error: err, attributes: { sweep } });
 	}
 
+	async function* claimWithCapacity(method, limit) {
+		const names = [], inlineNames = [];
+		const pools = new Map();
+		let batchLimit = limit;
+		for (const [name, reg] of handlers) {
+			if (!reg.pool) { names.push(name); inlineNames.push(name); continue; }
+			const available = reg.pool.capacity(maxPayloadBytes);
+			if (available === 0) continue;
+			names.push(name);
+			pools.set(name, reg.pool);
+			batchLimit = Math.min(batchLimit, available);
+		}
+		if (names.length === 0) return;
+		const reserved = new Map();
+		try {
+			// Reserve before SQL awaits: dispatch, recovery and inline callers
+			// share these permits, including time spent claiming and retrying.
+			for (const [name, pool] of pools) {
+				const permits = [];
+				reserved.set(name, permits);
+				for (let i = 0; i < batchLimit; i++) permits.push(pool.reserve(maxPayloadBytes));
+			}
+			const rows = await sql[method](batchLimit, names);
+			b?.success();
+			sweepFailing[method === 'claimPending' ? 'dispatch' : 'recovery'] = false;
+			for (const row of rows) {
+				yield { row, permit: reserved.get(row.name)?.pop() };
+			}
+		} finally {
+			for (const permits of reserved.values()) for (const permit of permits) permit.release();
+		}
+		// A nearly full worker pool must not shrink the inline handlers' sweep.
+		// Fill its remaining budget after the mixed FIFO claim has been started.
+		if (inlineNames.length && batchLimit < limit) {
+			for (const row of await sql[method](limit - batchLimit, inlineNames)) yield { row };
+		}
+	}
 	async function recoveryTick() {
 		if (recoveryRunning || destroyed || handlers.size === 0) return;
 		if (b && !b.isHealthy) return;
 		recoveryRunning = true;
 		try {
 			await sql.ensureTable();
-			const reclaimed = await sql.reclaimStuck(recoveryBatchSize, [...handlers.keys()]);
-			b?.success();
-			sweepFailing.recovery = false;
-			for (const row of reclaimed) {
+			for await (const { row, permit } of claimWithCapacity('reclaimStuck', recoveryBatchSize)) {
 				const traceContext = carriedTraceContext(row);
 				// reclaimStuck transitioned status from 'running' (with stale
 				// fence) to 'running' (with fresh fence + incremented
@@ -647,7 +683,7 @@ export function createTaskRunner(client, options = {}) {
 					row.fence,
 					row.request_id,
 					traceContext,
-					defaultTracePlatform
+					defaultTracePlatform, false, undefined, permit
 				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
@@ -666,10 +702,7 @@ export function createTaskRunner(client, options = {}) {
 		dispatchRunning = true;
 		try {
 			await sql.ensureTable();
-			const claimed = await sql.claimPending(dispatchBatchSize, [...handlers.keys()]);
-			b?.success();
-			sweepFailing.dispatch = false;
-			for (const row of claimed) {
+			for await (const { row, permit } of claimWithCapacity('claimPending', dispatchBatchSize)) {
 				const traceContext = carriedTraceContext(row);
 				// claimPending transitioned status from 'pending' to 'running'
 				// in the CTE update. Only names registered in this process are
@@ -694,7 +727,7 @@ export function createTaskRunner(client, options = {}) {
 					row.fence,
 					row.request_id,
 					traceContext,
-					defaultTracePlatform
+					defaultTracePlatform, false, undefined, permit
 				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
@@ -791,8 +824,8 @@ export function createTaskRunner(client, options = {}) {
 				const normalised = workerOption instanceof URL || typeof workerOption === 'string'
 					? { path: workerOption }
 					: workerOption;
-				pool = createWorkerPool(normalised, name);
-				executor = (ctx) => pool.run(ctx);
+				pool = createWorkerPool(normalised, name, { metrics: m, maxPayloadBytes });
+				executor = (ctx, permit) => pool.run(ctx, permit);
 			} else {
 				executor = (ctx) => handler(ctx);
 			}
@@ -1052,7 +1085,14 @@ export function createTaskRunner(client, options = {}) {
 		// Foreground caller: must report the CANONICAL outcome (and the idempotency
 		// store caches whatever this returns), so poll the durable row on a lost
 		// fence rather than surfacing the stale local attempt.
-		return runRegisteredTask(name, input, idempotencyKey, taskId, 1, null, requestId, traceContext, tracePlatform, true, encodedInput);
+		const pool = handlers.get(name).pool;
+		const permit = pool?.reserve(Buffer.byteLength(encodedInput));
+		try {
+			// Worker queues retain the bounded JSON snapshot that was persisted,
+			// not a caller-owned object that may grow or change while waiting.
+			const workerInput = pool ? JSON.parse(encodedInput) : input;
+			return runRegisteredTask(name, workerInput, idempotencyKey, taskId, 1, null, requestId, traceContext, tracePlatform, true, encodedInput, permit);
+		} catch (error) { permit?.release(); throw error; }
 	}
 }
 
