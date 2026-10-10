@@ -40,9 +40,9 @@ export interface ShardedBusOptions {
 	breaker?: CircuitBreaker;
 
 	/**
-	 * Reject inbound bus envelopes larger than this many bytes before
-	 * `JSON.parse` runs. Defends against a hostile co-tenant or
-	 * compromised peer flooding the cluster bus with oversized payloads.
+	 * Bound inbound bus envelopes before `JSON.parse` and outbound relays
+	 * after encoding. Oversized outbound relays are withheld and reported;
+	 * local publishes remain delivered.
 	 * @default 1048576 (1 MB)
 	 */
 	maxEnvelopeBytes?: number;

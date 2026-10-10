@@ -43,7 +43,7 @@ const ADAPTER_DENIAL_CODES = new Set(['UNAUTHENTICATED', 'FORBIDDEN', 'INVALID_T
  * @property {string | null | false} [systemChannel='__realtime'] - Topic used for auto-emitted `degraded` / `recovered` events on the local platform. Set to `null` or `false` to disable auto-emission.
  * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
  * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
- * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound envelopes larger than this many bytes BEFORE JSON.parse runs. Defends against bus-side DoS in shared-Redis deployments.
+ * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound envelopes before JSON.parse and outbound relays after encoding; oversized outbound relays are withheld and reported while local publishes remain delivered.
  * @property {boolean} [allowSystemTopics=false] - Default false: drop inbound envelopes whose topic starts with `__` apart from this bus's own `systemChannel`. Defense against bus-side topic injection on shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in via `allowSystemTopics: true`.
  */
 
