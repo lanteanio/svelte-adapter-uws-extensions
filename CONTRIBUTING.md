@@ -47,6 +47,7 @@ its corresponding real-backend lane before review.
 | Redis commands, scripts, expiry, pub/sub or reconnect | `npm run verify:unit`, `npm run verify:redis`, `npm run verify:valkey`, `npm run verify:cluster`, `npm run verify:valkey-cluster`. |
 | Redis keys, hash tags, routing or a shared multi-slot helper | Both cluster lanes above plus the standalone Redis and Valkey lanes. Each cluster lane includes its dedicated tests and the standalone suite mirrored onto a cluster. |
 | Postgres SQL, transactions, notifications, tasks or jobs | `npm run verify:unit` and `npm run verify:postgres`. |
+| Dependency or lockfile changes | `npm run verify:dependencies`, a clean `npm ci`, full unit tests, and a full SBOM using the command below. |
 | Public exports, declarations or package metadata | `npm run verify:unit` (includes a packed strict TypeScript consumer), the affected backend lanes, and `npm run gate:cross-repo -- --quick` when sibling contracts change. |
 | Cursor/presence wire behavior or platform wrappers | Unit tests, smoke, Redis/Valkey/cluster lanes and matching lead-package wire fixtures. Coordinate sibling changes through their owning repository. |
 | Hot-path changes | Relevant correctness lanes plus a repeatable before/after benchmark from `bench/` under the same load and environment. |
@@ -66,7 +67,7 @@ The table below is generated from `package.json` and `.github/workflows/`.
 the workflow, run `node scripts/check-contributor-map.js --write` and inspect the diff.
 
 <!-- verification-inventory:start -->
-Hosted jobs: `external-links`, `suite`, `onboarding`.
+Hosted jobs: `dependencies`, `external-links`, `suite`, `onboarding`.
 
 | Command | Script expansion | Coverage |
 |---|---|---|
@@ -75,6 +76,7 @@ Hosted jobs: `external-links`, `suite`, `onboarding`.
 | `npm run gate:cross-repo` | `node scripts/cross-repo-gate.js` | Local |
 | `npm run smoke` | `node scripts/smoke.js` | Hosted |
 | `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Local |
+| `npm run verify:dependencies` | `check:lockfile` | Hosted |
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
 | `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Hosted |
 | `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
@@ -97,6 +99,28 @@ Plan for seconds for static checks, roughly 1-3 minutes for the unit suite, and
 usually take 1-5 minutes each, and each cluster lane 3-10 minutes. These are planning
 ranges, not deadlines or pass criteria; record actual elapsed time with results.
 A cold image pull, slow Docker storage or a large stress case can take longer.
+
+## Dependency graph
+
+The dependency workflow uses Node 24.13.1 and npm 11.8.0 for lockfile generation
+and verification. This is the dependency toolchain; the supported runtime minimum
+remains Node 22. A dependency change uses that toolchain and commits the resulting
+`package-lock.json` together with any intentional manifest change.
+
+```sh
+npm ci
+npm run verify:dependencies
+npm sbom --sbom-format cyclonedx --package-lock-only
+```
+
+`check:lockfile` copies the manifest, lockfile and project npm settings to a fresh
+temporary directory, runs `npm install --package-lock-only --ignore-scripts`, and
+requires an identical lockfile. It never changes the checkout or its installed
+dependencies. `verify:dependencies` also requires a valid installed dependency tree
+and a clean npm audit; registry access is required. The full lockfile SBOM includes
+development, peer and optional packages for all platforms. The hosted dependency
+job retains that CycloneDX file for 30 days and can be called by a release workflow
+through `workflow_call`. CI workflow presence does not configure branch protection.
 
 ## Backend setup and isolation
 

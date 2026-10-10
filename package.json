@@ -245,7 +245,9 @@
 		"check:links": "node scripts/check-links.js",
 		"check:links:external": "node scripts/check-external-links.js --concurrency=4 --timeout-ms=15000 --max-redirects=6",
 		"check:documentation": "node scripts/check-documentation-contract.js",
-		"preflight": "svelte-adapter-uws-preflight"
+		"preflight": "svelte-adapter-uws-preflight",
+		"check:lockfile": "node scripts/check-lockfile.js",
+		"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit"
 	},
 	"engines": {
 		"node": ">=22.0.0"
