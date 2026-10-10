@@ -75,8 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **A replay frame without a buffer seq carries `seq: false`.** The local fan-out `localFanoutOnStorageFailure` sends while storage is down, on the Redis sorted-set, Redis stream and Postgres replay stores, took a number from the adapter's per-topic counter. On a topic whose live frames carry the buffer's seq that number belongs to another sequence, and one above the buffer's moved a client's watermark past entries the buffer still holds, so a later resume skipped them.
 - **Frames the modules publish for themselves no longer take the counter seq on a single worker either.** Presence, cursor and groups frames, the bus's `degraded` / `recovered` frames and the coalesced value a bus delivers to a platform without `sendCoalesced` carry `seq: false` on every topology, as the adapter's bundled plugins do; a client rebuilds them from the snapshot or the heartbeat, so none of them made a monotonic promise. A client reading `seq` on these frames gets none.
 - **Redis `presence.list()` returns each user's durable `update()` fields with the identity**, the value the `state` snapshot sends, minus `transient` fields, as copies. It returned the identity alone.
@@ -84,9 +82,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A relay envelope without a string `instanceId` is a parse error, not an assertion violation.** The pub/sub and sharded buses drop it without a console line and count it in `pubsub_parse_errors_total` / `sharded_pubsub_parse_errors_total`, in every run mode, like any other malformed envelope. Each one printed an `invariant.violated` line before, so anyone able to publish on the channel could flood the log, and in production it was counted under the `pubsub.envelope.shape` / `sharded-bus.envelope.shape` assertion categories instead of as a parse error. Those two categories are gone.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Presence, cursor, groups, both buses, replay and the notify bridge work on a multi-worker adapter.** Such an adapter refuses any publish that would draw its per-worker sequence counter, and these modules published their own frames without saying otherwise: every presence diff was dropped by the flush that caught the error, and every heartbeat, cursor frame, group event and message a bus received from another instance threw. Each frame they publish now declares its choice. Presence, cursor and groups frames and the bus's `degraded` / `recovered` frames carry `seq: false`, as the adapter's own plugins' frames do. A notification, or a message a bus relays without a seq, is delivered with `seq: false` on such a runtime; a single worker still stamps its counter on it. A replay publish keeps the buffer's seq when it goes through the bus-wrapped platform. Each worker runs its own copy of these modules with its own Redis subscriber and is an instance like any other: cursor frames, group events and bus publishes go to the other workers through the module's Redis relay and pass `relay: false` (ignored on a single worker), so the adapter's in-process relay does not deliver them a second time, and what Redis does not carry misses the other workers as it misses the other instances. The bus leaves the adapter's relay on only for a frame its receivers refuse by rule, such as a `__` topic it does not admit. The `degraded` / `recovered` frames pass `relay: false` as well and go to the worker whose breaker changed. Tests run the modules' publish paths, as one worker of a two-worker runtime, against the adapter's own sequence rule, and a scan of `src` fails on a `publish` or `publishWire` call or a batch entry written without options, or with options it can read that do not declare a seq.
 - **A Redis cursor instance whose connections only watch receives the other instances' cursors.** The relay subscription opened on the instance's first cursor move, so an instance whose clients had only attached, or on a multi-worker adapter such a worker, showed the attach snapshot and nothing after it. `attach()` and the `__cursor:` subscribe hook now open it: the socket is subscribed and sent its TIME and YOU frames at once, so cursors on its own instance work while the relay opens, and the roster is read once the relay is open, so a join relayed from then on reaches the socket live. A subscription that could not open (the breaker open, SUBSCRIBE refused) is retried with a backoff from one to thirty seconds while a connection on the instance uses the cursor, instead of waiting for a local move.
@@ -151,8 +146,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **An unknown registry bus event is counted, not asserted.** The `__registry-events` channel is reachable by anything with bus write access, so an unrecognized `type` fired a development assert that logged once per envelope and threw in test mode - inside a subscriber callback where nothing catches it. Unknown types are now dropped quietly and counted on `push_bus_dropped_total{reason}`.
 - **Module documentation no longer cites outside projects.** The Prometheus bucket-count and cardinality caps dropped their appeals to other metrics client libraries and to a named dashboard product, keeping the reasoning that actually justifies the defaults; the Postgres job queue documents what it runs on rather than positioning itself against a third-party Postgres extension; the CRDT sync comments say "updates" instead of a term carried over from another CRDT library; and the task-runner contract names "the downstream API" rather than three commercial services. Comment and documentation text only - no behavior and no API surface changes.
 
@@ -173,9 +166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Postgres errors redact DSN credentials everywhere they can escape.** Query failures, connection acquisition (including the transaction and LISTEN/NOTIFY paths, which bypassed the previous single chokepoint) and `ReplayStorageError` all redact, and the redaction covers `err.stack` as well as `err.message` - assigning `message` alone leaves an already-materialized stack still carrying the DSN. The original error is never mutated, so a frozen error from a caller-supplied pool cannot turn a query failure into a `TypeError`.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **An oversized task result no longer leaves the row running forever.** The result is encoded inside `commitRow`'s parameter list, so a payload past the cap threw out of the commit before the UPDATE and escaped with the row still `running` under a live fence - the recovery sweep then reclaimed the expired fence and re-ran the handler, and its side effects, once per fence expiry indefinitely. The row is now failed terminally, and not routed through the retry ladder, because a deterministic result cannot get smaller on a second attempt. The `error` column has its own encoder that is total: it truncates rather than refusing on size, and degrades to a stand-in rather than throwing on a value JSON cannot represent at all, since either refusal recreates the same stuck row.
 - **A task error that cannot be JSON-encoded no longer strands the row.** Size was never the only way the terminal encode fails: the error serializer copies `code` verbatim and, when `serializeErrorCause` is on, a non-Error `cause` verbatim too, so a handler attaching a BigInt code or a circular object made `JSON.stringify` throw from inside `failRow`'s parameter list. That escaped with the row still `running` under a live fence - the exact loop the size fix above was written to close, reachable on the DEFAULT path because `code` is copied whether or not causes are opted in. Every failure mode now degrades to a stand-in that keeps `name`, `message` and a stringifiable `code`.
@@ -232,32 +222,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **The Postgres replay backend rejects a malformed resume offset instead of dumping the buffer.** `replay()` and `since()` now gate a non-integer or negative offset exactly like the Redis backends already did: `since()` returns `[]`, and `replay()` emits a bare `end` marker (and reports no watermark) rather than letting a negative bound in `seq > $2` return the entire buffer - a data-leak vector for host code that forwards client input unchecked. The adapter's own resume path always normalized these values, so only direct callers of the store API see the change.
 
 ## [0.6.0-next.60] - 2026-07-16
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The `svelte-adapter-uws-extensions/testing` `mockRedisClient` double now models string-key TTL.** `SET` with `EX` / `PX` / `EXAT` / `PXAT` records a deadline on the injectable server clock, a plain `SET` clears any prior TTL, `KEEPTTL` preserves it, and `GET` / `INCR` / `EXISTS` / `SET NX|XX` observe expiry (a key is alive up to its deadline and gone one ms past it, matching real Redis). TTL flags used to be silently ignored, which hid the fact that a `PX`-bounded key - a lock lease, a forget tombstone - eventually vanishes; a simulation that advances the clock now sees it expire.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **The Redis dead-letter store completes right-to-erasure against a delivery that raced a purge.** A webhook delivery already in flight when `live.forget` swept the store would, on failing AFTER the purge, re-insert the erased user's payload - the durable/cluster store had no defense (the in-memory store already carries a forget tombstone). `purgeUser` now writes a per-user forget tombstone (`{prefix}dlq:purged:<user>` = server time at purge, `forgetTombstoneMs` TTL, default 10 minutes) before deleting the user's records, and `add` drops (resolves `null`) a record whose delivery started before that purge. The purge time and the delivery start are reconciled onto the shared Redis server clock, so the check holds across a cluster where the delivering and purging instances differ (a per-process monotonic start alone is not comparable between instances). A delivery started after the purge, and other users, are unaffected. The residual - a single delivery whose total retry duration outlives the tombstone - is now a configurable window: raise `forgetTombstoneMs` above your max retry budget to close it.
 
 ## [0.6.0-next.59] - 2026-07-14
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **A task-runner retry no longer re-steals a row whose fence was taken over.** `rearmAttempt` (the retry loop's fence rotation) predicated on the task id alone, so a worker whose fence was superseded mid-handler - with a retry policy configured - would rotate the fence back to itself, re-acquiring the row from the successor (a mutual-takeover churn; the fence-guarded commit/fail still kept exactly one terminal write, so no result corruption). The rearm is now fence-guarded (`AND fence = <prior fence>`): a taken-over worker matches zero rows, stops retrying, and reports the successor's canonical outcome (or `TaskFenceLostError`) instead of re-running the handler.
 
@@ -269,9 +248,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **A fenced-out task caller no longer returns or caches a non-canonical result.** When a worker's fence was superseded mid-run, `run()` could return the stale result it produced locally (differing from the durable row), and the idempotency store would then cache it - so a later retry with the same key got the stale value while the row held the canonical outcome. The commit-lost path now polls the durable row for the canonical terminal result (bounded by `awaitTimeout`) instead of yielding the local attempt, and the fail-lost path - which previously always threw the local error - now reports the canonical outcome too (which may be a success committed by the winning worker). If no canonical outcome becomes durable within the bound, `run()` throws `TaskFenceLostError` rather than a stale value. Background dispatch/recovery callers, whose result is discarded, do not poll.
 
 ## [0.6.0-next.57] - 2026-07-13
@@ -282,17 +258,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **An expired idempotency owner can no longer overwrite or delete its successor's slot.** The pending slot was a shared sentinel with an unconditional result-write on commit and delete on abort (Redis), and a key-only predicate on both (Postgres), so an owner whose `acquireTtl` expired - and whose slot a successor had already re-acquired - would clobber the successor's cached result on `commit` or release it on `abort`, letting an at-most-once effect run again. Each `acquire` now mints a distinct owner token (stored in the pending slot on Redis, an `owner_token` column on Postgres); `commit` compare-and-sets and `abort` compare-and-deletes against it. A stale owner's `commit()` rejects with `IdempotencyLeaseLostError` instead of corrupting the slot, and its `abort()` is a silent no-op. A handler that finishes within `acquireTtl` never sees the error.
 
 ## [0.6.0-next.56] - 2026-07-13
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **The per-field-TTL capability probe re-detects after a reconnect.** The soft HEXPIRE/HPEXPIRE probe cached its answer for the process lifetime, so a failover to an older server (or a rolling downgrade) left a stale "supported" verdict that made the publish path HPEXPIRE a server that rejects it. It now re-probes on every reconnect and exposes `invalidate()` for a caller that catches an unknown-command error.
 - **The per-field-TTL capability probe can no longer stall a publish during an outage.** The probe's `INFO` can sit on the client's offline queue while the server is unreachable, never resolving or rejecting - so a publish that awaited the probe hung indefinitely instead of proceeding on the whole-key fallback. The wait is now bounded: it races the probe against a timer and returns the safe fallback if the probe has not answered in time, a single in-flight probe is reused across calls so an outage cannot pile the offline queue with retries, and a reconnect drops any still-stalled probe so the next call re-detects the current server.
@@ -307,9 +277,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **Persisting a dead-letter record no longer fails when its retention trim does.** The Postgres backend committed the row, then ran the size-cap and TTL deletes; a transient error on either (a lock timeout, or an open circuit breaker) rejected the whole `add` even though the record was already durable, so the caller could re-capture and double-store it. The trims are now best-effort - the committed row is what `add` reports, matching the Redis backend.
 - **A touched raw session that resembles a lifecycle record no longer escapes erasure.** `touch` inferred whether a token held raw data or a lifecycle wrapper from its shape (top-level `d` and `c` keys); raw data that happened to carry both keys was misread, so `touch` slid the record's TTL but not its per-user index field, and `purgeUser` could then miss it. `touch` now re-arms the index for both shapes, so neither storage layer can outlive its index.
 - **The stream replay backend's `gap()` no longer calls a corrupt next entry contiguous.** It compared only the stored sequence id; an entry at the next sequence written in an unknown envelope version (or missing a required field) is dropped on replay, yet `gap()` reported it present - a host relying on `gap()` to decide whether to rehydrate could leave a silent hole. `gap()` now decodes that entry, reports a gap when it is corrupt (matching the sorted-set backend and the strict replay read path), and counts it in `replay_corruptions_total`.
@@ -321,15 +288,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Stored replay entries are version-stamped envelopes.** The sorted-set backend now persists each entry as `{v: 1, seq, event, data...}` and stops duplicating the topic into every member (the reader recovers it from the per-topic key; entries written by older versions, with or without a `topic` field, read back unchanged under the absent-version-reads-as-v1 rule). Stream entries gain the same `v` field. An entry carrying an unknown version or missing required fields is dropped on read - never mis-parsed into a wrong-shaped event - and counted by the new `replay_corruptions_total{topic}` counter so silent history corruption is observable.
 - **`publishIdempotent` dedup entries age out individually.** On Redis 7.4+ / Valkey 9.0+ each `(producerId, requestId)` field carries its own per-field TTL inside the publish script, so the dedup hash's memory bound is per entry instead of "ttl since that producer's last publish". Older servers are detected once via a soft `INFO` probe (Valkey-aware: it reads `valkey_version`, not the pinned `redis_version`) and keep the previous whole-key sliding TTL - correct on both paths, never an unknown-command error.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Idempotent-publish dedup survives a buffer generation reset.** The dedup cache stored a bare seq, so after `clear()` (or data loss) reset the buffer epoch, a retried `requestId` could be answered with a cached seq pointing into the previous generation - a hole or the wrong entry. The cache value now records its generation and is compared inside the same atomic script; a hit from a stale generation re-publishes fresh instead of lying, and legacy bare-seq values stay honored within their own generation.
 - **A touch-kept session can no longer escape right-to-erasure.** `get` (sliding refresh), `touch`, and a lifecycle load all refreshed the session record's TTL but not its per-user index field, so a session kept alive by activity could outlive its index entry and `purgeUser` would miss it - the erased user's session survived. Every record refresh now slides the index field too; `touch` carries no data, so it derives the owner with one extra read, incurred only when `forgetUserId` is wired. The same guarantee applies to the idempotency store's per-user index.
@@ -341,16 +303,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **Postgres replay no longer overflows INTEGER when reading a hot topic's sequence.** The counter is stored `BIGINT` but `seq()`, `gap()`, and the replay truncation probe read it through `COALESCE(seq, 0)::int`, so Postgres raised `22003 integer out of range` server-side once a topic passed `2^31` (about 24.9 days at 1,000 events/s) - sequence inspection and gap/truncation detection then failed even though publishing kept working. The reads now cast to `::bigint`; node-postgres returns it as a string that the existing `parseInt` handles losslessly to `2^53`.
 - **Abandoned Redis groups now self-expire.** The `members` and `meta` hashes carried no key-level TTL, so a group whose every instance crashed or was destroyed leaked its member roster forever. Join and the heartbeat now stamp a `PEXPIRE` margin (`2 x memberTtl`) on both keys - refreshed while any instance holds the group open, and left to expire once none do. The `closed` tombstone is deliberately left un-expired.
 - **The schema-drift guard runs on the common path.** `safeCreate`'s column check only fired inside the `42P07` (relation-already-exists) race branch, but `CREATE TABLE IF NOT EXISTS` on a pre-existing table succeeds *without* raising `42P07`, so the steady-state "table already there with the wrong shape" case skipped verification entirely. It now verifies whenever a drift guard is supplied - on the clean-success path as well as the race - and scopes the `information_schema` lookup to `current_schema()` so a same-named table in another schema cannot mask real drift.
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Postgres table names are capped at 42 bytes.** Modules generate index names as `idx_<table>_<suffix>`; the longest suffix plus a name over the ceiling could truncate two distinct index names to the same 63-byte string, silently leaving one index uncreated. `assertSafeTableName` now rejects an over-long name with a clear error at construction rather than letting an access path vanish. Default `svti_*` names are far under the limit.
 
@@ -361,9 +318,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0-next.52] - 2026-07-11
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **A reconnecting Redis duplicate can no longer escape shutdown.** The client factory untracked a duplicate connection on BOTH `'close'` and `'end'`, but ioredis emits `'close'` on every transient disconnect (followed by `'reconnecting'`) - only `'end'` is terminal. One network blip therefore permanently ejected a still-reconnecting subscriber from the ownership set, and `quit()` left it alive with an open socket and retry timer. Untracking now happens on `'end'` only; per-module teardown and retry exhaustion still prune the set.
 - **A Postgres connection with uncertain transaction state is destroyed, not pooled.** `withTransaction` released its connection with no argument on every path, and `pg-pool` only removes a client when `release(err)` receives an error - so a connection whose `BEGIN`/`COMMIT` failed, or whose `ROLLBACK` itself failed after a work error (transaction state unknown, possibly still idle-in-transaction), went back into the pool and could serve a later checkout. Those paths now release WITH the error so the pool destroys the client; a work error whose `ROLLBACK` succeeded still returns the (cleanly reusable) connection and the caller always sees the original error.
@@ -391,8 +345,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Replicated-durability publishes group-commit their `WAIT`.** With `durability: 'replicated'`, every replay publish paid its own second round trip - a `WAIT minReplicas timeout` after the write - so a publish burst paid N WAITs for information one command already carries: Redis's WAIT acknowledges every write the client sent before it was issued. Concurrent publishes on one client now share WAIT round trips: a publish whose write has completed joins the pending window, one WAIT settles the whole window, and a burst of N costs one or two WAITs instead of N. The grouping is correctness-first: a publish that arrives while a WAIT is already in flight joins the NEXT window (its write may have landed after the in-flight WAIT sampled the replication offset, so being settled by it would claim a durability that was never checked), windows are keyed by the exact `(minReplicas, timeoutMs)` pair so distinct configurations never share a guarantee or a latency bound, an under-acked window rejects every waiter in it with the same `ReplicationTimeoutError` a solo WAIT would have thrown, and each waiter keeps its own metrics and breaker accounting. A lone publish pays exactly the single WAIT it always did - nothing is ever held back to fill a window, so no publish gains latency. Applies to both the sorted-set and stream backends (they share the grouping on a shared client). The Postgres backend is deliberately unchanged: its publish is already a single atomic statement with no second durability round trip, and client-side transaction batching would trade per-publish atomicity and latency for an fsync amortization the path does not pay for.
 
 ## [0.6.0-next.48] - 2026-07-09
@@ -403,23 +355,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Three shipped hot paths stopped paying avoidable round trips and recomputation.** (1) The idempotency commit on the common authenticated path (a result SET plus the right-to-erasure index write) now dispatches both concurrently instead of serially - one round trip of commit latency instead of two. They cannot share a pipeline (the cache key and the per-user index key hash to different slots, and a cross-slot batch fails on Redis Cluster), the SET keeps its breaker-guarded must-throw contract, the index stays best-effort, and an index field left behind by a failed SET was already tolerated by design (a stale field is a no-op DEL on purge). (2) The replay resume hook - the reconnect-storm path - batched: a client resuming N topics used to pay a serial epoch GET plus a serial gap-fill per topic; the epoch reads now go out as ONE round trip (a pipeline on standalone Redis, per-node fan-out on Cluster, one `ANY($1)` query on Postgres) and the per-topic gap-fills run concurrently, so a resume costs one replay latency instead of the sum. The epoch match/rehydrate semantics are unchanged and now live in one shared implementation (`createResumeHook`) instead of three per-store copies. (3) The publish-rate aggregator's merged cluster view was rebuilt and re-sorted on EVERY `rateOf`/`topPublishers` read - an admission rule consulting many topics inside one evaluation re-did the O(instances x topN) merge each time; the view is now memoized and recomputed only when a sibling slice arrives, a stale instance is pruned, or the adapter publishes a fresh local pressure sample. Results, ordering, and staleness bounds are unchanged on all three.
 
 ## [0.6.0-next.47] - 2026-07-09
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The last full-script Lua eval on a hot cadence now rides the cached EVALSHA path: the groups heartbeat's stale-member cleanup.** Every Redis plugin routes its scripts through the shared cached-script helper (the ~40-byte SHA-backed command ships per call instead of the script body) - except one call site: the groups heartbeat pipelined its cleanup script as a raw `eval`, re-sending the full script text every heartbeat tick for every group. The helper gains a pipeline form (`evalCachedName` returns the registered command name, sharing the same per-instance registry, so a caller registers once up front and invokes the name inside each batch), and the heartbeat uses it. The Redis test double's `defineCommand` now also records the eval shape of registered commands so its cluster-mode pipeline models their key slot correctly (previously the generic fallback would have read the leading `numKeys` argument as the key and no-op'd the command with a phantom `MOVED`) - a fidelity fix in the double, no behavior change for real Redis. Script semantics, cadence, and results are unchanged; only the per-heartbeat bytes drop.
 
 ## [0.6.0-next.46] - 2026-07-08
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **The Redis and Postgres replay buffers now stamp their authoritative storage sequence onto the live broadcast frame, so a resuming client dedups against the exact seq space the buffer replays - across a restart and, with a shared buffer, across instances.** Each replay `publish` already computes an authoritative per-topic seq (the Redis Lua `INCR`, the Postgres `INSERT ... ON CONFLICT DO UPDATE` CTE) and stores it in the buffer, but it then fanned out the live frame via a bare `platform.publish(topic, event, data)`, so the adapter stamped its own per-worker counter instead. A client that reconnected and gap-filled against the buffer's seq space was therefore deduping against a different space than the live stream carried, which could duplicate or drop events. The buffer seq is now threaded through as `platform.publish(..., { seq })` (the `seq: number` primitive the adapter added in 0.6.0-next.63) on the sorted-set, stream, and Postgres backends alike; the degraded local-fanout fallback (used when storage is down and `localFanoutOnStorageFailure` is set) stays counter-stamped since it has no authoritative seq. The `publish` / `publishIdempotent` signatures and return values are unchanged.
 - **The Redis pub/sub relay now carries an authoritative numeric seq across the cluster, fixing cross-instance sequence non-monotonicity.** A publish that carried a `seq: number` was relayed to other instances without it, so the receiving instance re-stamped a fresh local seq - which read as non-monotonic to a subscriber that had already seen the origin's higher seq. The relay envelope now carries the seq (as an internal `s` field, omitted for the common counter-stamped publish so the wire stays byte-identical) and the receiving instance re-applies it, so every instance stamps the same authoritative seq for a given frame. Requires `svelte-adapter-uws >= 0.6.0-next.63` (the peer-dependency floor is raised accordingly).
@@ -438,8 +384,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0-next.44] - 2026-07-06
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Hot Lua scripts now run through EVALSHA instead of shipping their full body every call.** Every direct `redis.eval(...)` call across the Redis plugins (the per-message rate limiter, presence, replay, groups, locks, leases, idempotency, CRDT, cursor cleanup, and the webhook controls) now routes through a shared `evalCached` helper that registers each unique script once via ioredis `defineCommand` and sends only its ~40-byte SHA per call, letting ioredis handle the EVALSHA send, the automatic NOSCRIPT reload, and per-node script loading on a Redis Cluster. Results, arguments, and error behavior are identical - a pure wire/parse optimization whose benefit grows with call frequency and script size (the rate-limiter CONSUME script is the hottest target). The helper works on any client shape - the `createRedisClient` wrapper or a raw `new Redis.Cluster(...)` a cluster deployment builds itself - and keeps its script cache per instance. One pipelined cleanup path (group member sweep) stays on plain `eval`. No API change and no configuration.
 
@@ -472,17 +416,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **Capability-cookie verification is timing-uniform across failure causes.** `decode()` returned before any HMAC for a malformed or expired cookie but computed one or two HMACs for a wrong signature - a timing oracle separating "expired or malformed" from "wrong secret" even though the returned boolean is uniform. The signature is now verified FIRST (the constant-work step) with expiry checked after, and malformed inputs burn one dummy sign-and-compare before failing, so a rejection's cause is no longer separable by the presence or absence of HMAC work. Behavior is unchanged: the same cookies verify, the same cookies fail, and the single `invalid` metric reason stays (an `expired` split would be sender-forgeable).
 
 ## [0.6.0-next.39] - 2026-06-28
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Presence keyspace cleanup (`keyspaceNotifications: true`) now works on a Redis/Valkey Cluster.** The cleanup psubscribes `__keyevent@*__:del` to forward a whole-topic-hash deletion (a topic emptied because its presenting instance(s) stopped heartbeating) as an empty `state` to local subscribers. On a cluster, keyspace `del` events are NODE-LOCAL - a node fires them only for keys it owns and does not propagate them across the cluster bus - so a single `Cluster.psubscribe` lands on one node and misses dels on every other master. The tracker now psubscribes the del keyevent on EVERY master directly (one subscriber connection per master, resolved by node id), so a topic-empty cleanup fires regardless of which master owns the topic hash. The set is reconciled on a subscriber-connection error (failover) and on cluster `+node`/`-node` events (scale-out / scale-in), and torn down cleanly on `destroy()`. Standalone is unchanged (one psubscribe on the shared subscriber connection). The feature is opt-in (default off); deployments that do not use it are byte-identical. Validated end to end against real Redis 7.4 and Valkey 9.0 clusters.
 - **`createSmoothCluster` broadcasts now arrive in order on a Redis/Valkey Cluster.** The coordinator relays a topic owner's updates/events/removes over a single pub/sub channel, and the receiver dedups by a per-owner monotonic sequence (so a redelivered or lease-overlap-duplicated one-shot event is dropped). On a cluster, ioredis routes a keyless `PUBLISH` to a varying node and the cluster bus then delivers those publishes to a subscriber OUT OF ORDER across nodes, so a late-arriving lower-sequence broadcast was dropped as a duplicate - silently losing a one-shot event (updates still converged latest-wins, but an event could fire zero times). The coordinator now pins every publish to the single master owning the relay channel's slot, so that node serializes them and a subscriber's single bus link delivers them in order. Regular `PUBLISH` still fans out cluster-wide from that node, so reach is unchanged; only ordering is fixed. If the owner cannot be resolved during a topology transition, publishes fall back to a single fixed master (still ordered), never the order-scrambling keyless route. Standalone is unchanged (a single connection already delivers in order). Verified empirically on a live cluster.
@@ -496,18 +434,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`createPubSubBus` inbound handler now drops a frame that arrives during shutdown instead of mislabeling it.** The subscriber message handler dereferenced the platform in every branch; during `deactivate()` (which nulls the platform before the UNSUBSCRIBE round-trip resolves) an in-flight frame could hit a null platform and be miscounted as a parse error. It now drops cleanly after echo-suppression, matching the sharded bus.
 - **`createShardedBus` inbound handler now drops a shape-invalid envelope explicitly.** The envelope-shape check was a bare `assert` (which only throws in test mode), so a forged object envelope missing `instanceId` could fall through to the dispatch branches in production. It now drops and returns on a shape failure, matching `createPubSubBus`.
 
 ## [0.6.0-next.37] - 2026-06-27
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`createPresence` now activates on Valkey 9.0+.** The per-field hash TTL (`HEXPIRE`/`HPEXPIRE`) activation probe gated on `redis_version >= 7.4`, but Valkey pins `redis_version` at `7.2.4` forever and reports its real version in `valkey_version` (with `server_name:valkey`). Valkey added the `HEXPIRE` family in 9.0, so a Valkey 9.0+ server - which HAS the commands - was wrongly rejected with "requires Redis 7.4+". The probe is now server-aware: it accepts Redis 7.4+ OR Valkey 9.0+, and the error names the actual server and version. The major-version gates for `createShardedBus` / `createFunctionLibrary` need only major >= 7, which Valkey's pinned `7.2.4` already satisfies, so those were already correct. Validated end to end against a real Valkey 9.0.4 server: the presence integration suite passes identically to Redis 7.4, and Valkey's hash-field-expiry keyspace-event sequence matches Redis 7.4 exactly. Valkey (BSD-3) is now a documented, recommended cache backend for the Redis-backed plugins.
 - **Presence keyspace cleanup (`keyspaceNotifications: true`) now fires on a real server.** The opt-in proactive cleanup - which emits an empty `state` to a topic's local subscribers when the topic empties because its presenting instance(s) stopped heartbeating - subscribed to `__keyevent@*__:expired`. But the per-topic hash carries only per-field TTLs (`HPEXPIRE`), never a whole-key TTL, so its removal fires a `del` keyevent, NOT `expired` - on BOTH Redis 7.4 and Valkey 9.0. The cleanup therefore never fired on a real server (a mock unit test had fabricated the `:expired` event, masking it). It now subscribes to `__keyevent@*__:del` and re-checks that the key is actually gone before emitting (so a delete racing a fresh join cannot wrongly clear a re-populated topic). Key deletion is the generic (`g`) notification class on both Redis and Valkey, so `CONFIG SET notify-keyspace-events Eg` works on either - unlike the hash-field-expiry event `hexpired`, which is class `h` on Redis but `x` on Valkey. Validated end to end against real Redis 7.4 and Valkey 9.0. The feature is opt-in (default off); deployments that do not use it are byte-identical.
@@ -551,9 +483,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`./redis/registry`: a same-instance reconnect no longer makes the just-connected socket unreachable.** When a user (or session) reconnected on a new socket on the SAME instance and the new socket's `open` ran before the old socket's `close`, the stale close drained the live binding from the local map AND deleted the user's Redis owner row, so `lookup` / `request` reported the user offline despite the live connection. The close hook now skips when this socket is no longer the user's current local binding (mirroring the realtime push registry's `entry.ws === ws` guard and the app-session drain), so a fast laptop-then-phone or refresh-driven reconnect stays reachable. Cross-instance migration is unaffected (the close still runs and is correctly ignored by the new owner's `applyCloseEvent` owner check).
 
 ## [0.6.0-next.31] - 2026-06-26
@@ -586,8 +515,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The replay buffers now emit a one-time correlation warning when a storage failure is swallowed by `localFanoutOnStorageFailure`.** When `localFanoutOnStorageFailure: true` is set and a publish's storage write fails, the buffer silently falls back to a local-only `platform.publish` (durability degraded). It now also logs a single `console.warn` the first time that happens per buffer instance, carrying `platform.requestId` (when present) as a correlation anchor and pointing at the `replay_storage_fallbacks_total` metric for the ongoing volume. The warning is latched (warn-once, not per-event) so a sustained outage cannot spam the log, and the raw topic is deliberately omitted from the message (it can embed user ids; the metric carries the sanitized topic label). Applies to all three backends with this fallback - the Redis sorted-set and stream `redis/replay`, and `postgres/replay`. No effect on the default path (`localFanoutOnStorageFailure` is off by default, where a storage failure throws `ReplayStorageError` instead).
 
 ## [0.6.0-next.27] - 2026-06-24
@@ -598,16 +525,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The stream replay backend (`storage: 'stream'`) no longer writes a per-entry `topic` field; each entry stores only `event` and `data`.** The topic is already encoded in the per-topic stream key (`replay:streambuf:{topic}`), so writing it into every entry was a redundant value paid on every publish: Redis stream listpack `SAMEFIELDS` encoding dedups identical field *names* across entries but never the *values*, so the repeated topic string was real per-entry bytes with no offsetting dedup. The read path now recovers the topic from the key, and entries written by older versions that still carry a `topic` field are read back unchanged (the field's presence discriminates the format - no version flag, no migration needed for existing buffers). The memory effect is workload-dependent: meaningful for small envelope-dominated events (where the topic string is a real fraction of the entry), negligible for large payloads. The wire shape `since()` and `replay()` return to consumers is unchanged.
 
 ## [0.6.0-next.26] - 2026-06-24
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`createIdempotencyStore({ maxResultBytes })` is now typed (Redis + Postgres).** The result-size cap has been validated + enforced at runtime (and documented in JSDoc + README) since it shipped, but was missing from the `RedisIdempotencyOptions` / `PgIdempotencyOptions` type - so a TypeScript app got a type error setting it. Added `maxResultBytes?: number` to both interfaces. No runtime change.
 
@@ -619,16 +541,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Docs: the metrics registry is wired into the adapter by module path, not inline, and scraped via `platform.metrics`.** The README showed the registry passed inline to the adapter (`adapter({ websocket: { metrics } })`), which is a silent no-op in a production build: adapter options are serialized into the bundle, so a live object never crosses into the runtime. The `createMetrics()` registry is unchanged; only the wiring moves. Point the adapter at the metrics module by path (`adapter({ websocket: { metrics: './src/lib/server/metrics.js' } })`) and read `platform.metrics` in the scrape route (re-importing the metrics module in the route can resolve to a separate, empty copy). Requires `svelte-adapter-uws >= 0.6.0-next.33`.
 
 ## [0.6.0-next.24] - 2026-06-23
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **The pub/sub and sharded buses now relay `coalesceBy` streams cross-instance.** `bus.wrap` gains `relayCoalesced(topic, event, data, coalesceKey)` (relay-only - the publishing instance has already fanned out locally via `sendCoalesced`), and the receiver re-coalesces the latest value onto its own subscribers via `forEachSubscriber` + `sendCoalesced` (a new `coalesced` envelope type, echo-suppressed by `instanceId`, never broadcast). This closes a silent cross-instance gap: a clustered `live.stream({ coalesceBy })` topic (prices, cursors, presence) previously delivered only to the publishing instance's subscribers. Mirrored across `redis/pubsub` and `redis/sharded-pubsub`. Needs `svelte-realtime >= 0.6.0-next.26` to emit the relay.
 
@@ -670,9 +587,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **The sharded bus wrap now forwards `platform.crdt`.** The standard pub/sub wrap forwarded `platform.crdt` (so the realtime `live.doc` layer discovers the document coordinator on the wrapped seam), but the sharded wrap stopped at `platform.presence` - so a clustered document running under the sharded bus silently degraded to single-instance, never converging across instances. The sharded wrap now forwards `crdt` as a live getter like the pub/sub wrap, and the wrap-parity test asserts the forward-when-set behavior on both wraps.
 
 ## [0.6.0-next.18] - 2026-06-13
@@ -685,8 +599,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The `svelte-adapter-uws` peer floor moved to `^0.6.0-next.24`** - the adapter release carrying the smooth plugin (prediction/reconciliation) and the `publishWire` sender-exclusion option this package's bus wraps forward; the pass-through is now pinned by regression tests for both the pub/sub and sharded wraps.
 
 ### Added
@@ -697,8 +609,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **The `svelte-adapter-uws` peer floor moved to `^0.6.0-next.23`** - the adapter release whose cursor codec factory stamps position frames with the server clock, so a cluster deployment cannot pair this package's snapshot clock seed with a stamp-less adapter.
 
 ### Added
@@ -707,9 +617,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **Sockets subscribed server-side by the redis plugins now receive stateful-codec binary publishes.** The adapter's `platform.publishWire` per-subscriber walk delivers by the connection's subscription registry, but the redis cursor attach, presence join/sync, and groups join established membership with the native socket call only - so once any binary-capable client subscribed a topic, those members silently received nothing from that topic's binary publishes (JSON-only deployments were unaffected). Every site now mirrors membership into the registry through the new `shared/ws-subscriptions.js` helpers (`addWsSubscription` / `removeWsSubscription`, resolved via the shared `Symbol.for` slot), with symmetric removal on every presence leave/clear path and every groups leave/close path; the cursor `detach` already routed through the registry-aware `platform.unsubscribe`. Each call site's existing closed-socket throw/catch contract is untouched - the registry ops never throw.
 
 ### Added
@@ -717,9 +624,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`capabilityCookie` accepts a `metrics` registry and counts failed verifications.** Pass the same registry the other modules take (`metrics: createMetrics()`) and the module registers `capability_cookie_misses_total{reason}`: `missing` increments when the cookie is absent while `required` (an absent cookie in normal posture is a first visit, not a miss, and stays uncounted), `invalid` increments whenever a presented cookie fails to verify - bad signature, malformed, or expired - whether or not it was required, since a presented-but-bad cookie is a signal in every posture. Expired is deliberately not its own reason: expiry is checked before the signature, so a separate label would be forgeable by the sender. Verification behaviour is unchanged; without the option the verify path gains a single undefined check, and a registry that throws on emit logs once and is silenced so `verify()` always returns its boolean.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`createMetrics()` now rejects a same-name re-registration with a different label shape at registration time.** Registration was idempotent by name only: a second `counter('x', ...)` with different `labelNames` silently returned the existing instrument, and every subsequent emit from that caller then threw label-validation errors - surfacing at the first emit in production instead of at startup. A label-shape collision now throws the same way a type collision always has (label order does not matter; same name + same label set still returns the existing instrument).
 
@@ -730,8 +634,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A hard-tier `fatal(cond, category, context)` companion to `assert`, plus the shared invariant predicates and an in-process consistency auditor.** `fatal` (exported from `svelte-adapter-uws-extensions/assert`) shares the same counter Map and the same bound Prometheus counter as `assert` - one metric namespace - for genuinely unrecoverable state: on violation in production it schedules a DEFERRED `process.exit(78)` after the current callback frame unwinds (a synchronous exit inside a Redis pubsub callback risks the half-applied state `assert` already guards against), and in test mode it throws so the runner sees it without dying. The deferred exit is injectable via `setFatalSink` / `resetFatalSink` so a simulation harness captures fatals instead of exiting. `shared/invariants.js` exports the named predicate set (`checkSubscriptionBookkeeping`, `checkTotalSubscriptions`, `checkTopicsHaveSubscribers`, `runInvariants`) that operates on a plain, structure-only state snapshot (no payload bytes, no user data), and `shared/auditor.js` exports `createConsistencyAuditor` - a per-instance background check that runs those predicates on a slow, unref'd, RNG-jittered timer (default 5s) over a bounded round-robin window, NEVER on the hot path; violations route to the soft `assert` by default, with an opt-in hard tier that escalates to `fatal` only when a violation persists across two consecutive audits. Purely additive.
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **`extensions_assertion_violations_total` now carries a `severity` label** (`severity="soft"` for `assert`, `severity="fatal"` for `fatal`) so a dashboard can separate observational soft violations from hard-tier terminations. Queries against the bare metric name are unaffected; a query that pinned `{category="..."}` without `severity` now matches the labelled series.
 
@@ -745,9 +647,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **The redis pub/sub bus now drops a malformed cross-instance envelope the same way in every run mode.** An envelope that parsed as JSON but carried a non-string `instanceId` was dropped in test mode (where the shape assertion throws) but, in production (where the assertion only logs, since throwing inside a pub/sub callback could corrupt state), fell through and could deliver an unidentifiable frame. The bus now drops such an envelope explicitly while keeping the production shape signal, so a forged or byte-corrupted frame is rejected consistently. No effect on well-formed traffic.
 
 ## [0.6.0-next.11] - 2026-06-07
@@ -760,9 +659,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`createPublishRateAggregator` now ages out a stale sibling slice reliably, including under sub-second `staleAfter` windows.** The cross-instance staleness check and the broadcast-envelope timestamp read the 1Hz-cached `now()`, which quantizes the elapsed-time delta to ~1 second - so a `staleAfter` shorter than a second could fail to prune a sibling that had stopped broadcasting, and the staleness math was coarse in general. Both now read the exact wall clock (`wallEpoch()`): still wall-clock (required, since the timestamp is stamped on another instance and a monotonic clock is per-process), but precise. The default `staleAfter` is 12 seconds, so a default deployment was unaffected; this matters for tight windows and makes the comparison exact in all cases.
 
 ## [0.6.0-next.10] - 2026-06-07
@@ -772,9 +668,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Redis presence and cursor snapshot handshakes now authorize against the underlying topic before joining the tap channel.** Mirrors the adapter fix: the `presence-snapshot` / `cursor-snapshot` message path subscribed a socket to `__presence:` / `__cursor:{topic}` (presence) or emitted its current state (cursor) with no authorization, so a client could read a cluster tap channel for a topic it was not allowed to subscribe to. Both now run `platform.checkSubscribe(ws, topic)` and drop a denied request without subscribing or emitting.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Redis presence no longer freezes a sync-observer's roster when a co-resident participant leaves.** A socket that is both a participant (`presence.join`) and a sync-observer (`presence-snapshot`) of a topic kept its `__presence:{topic}` subscription torn out when the participant role left, so the observer stopped receiving roster diffs and heartbeats. `leaveTopic` now peels one role at a time and unsubscribes the socket only when neither role remains (the symmetric per-topic observer leave is preserved).
 
@@ -788,14 +681,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`safe-url` (`isSafeUrl` / `checkUrl` / `checkUrlResolved`) is now re-exported from `svelte-adapter-uws/safe-url` rather than implemented here.** The public `svelte-adapter-uws-extensions/safe-url` entry is unchanged for consumers; the SSRF validator now has a single canonical copy in the adapter (the layer both this package and `svelte-realtime` depend on), so the logic cannot drift between packages. Requires `svelte-adapter-uws >= 0.6.0-next.15` (the release that adds `./safe-url`).
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`bus.wrap()` now degrades gracefully when wrapping an adapter platform that predates the injectable clock/RNG/HLC projection, instead of surfacing `undefined` for `now` / `monotonic` / `random` / `hlc`.** The package's peer-dependency floor admits older adapters where those members are not projected onto the Platform; a cluster-side per-message handler that read `wrapped.now()` / `wrapped.random.u32()` / `wrapped.hlc()` off such a platform would throw. Both wraps (`redis/pubsub` and `redis/sharded-pubsub`) now fall back to this package's own runtime seam (`now` / `monotonic` directly, a `{ float, u32, uuid, bytes }` object for `random`, and a process-local hybrid logical clock of the same `{ wall, logical, nodeId }` shape for `hlc`), so the wrapped surface is always populated and stays seedable in a simulation harness. The forwarders remain live getters, so a projected member (or a seeded harness override) on the source platform still wins; the fallback only fills the gap. No deployment-order coupling: an extensions install no longer requires a co-deployed adapter that projects the runtime surface.
 
@@ -835,8 +723,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - `redis/sharded-pubsub` recovers delivery after a live cluster reshard. When a hash slot migrates to a new master, Redis drops that slot's shard subscriptions on the old master; the bus now detects the drop and re-subscribes the affected channels on their new owner (resolved from a refreshed slot map), and every shard subscribe/unsubscribe is bounded by a timeout so a stale-owner resolution can no longer hang. A new `sharded_pubsub_resubscribes_total` metric counts reshard-driven re-subscriptions. Verified against a live `CLUSTER SETSLOT` migration on a real cluster. No change on a standalone Redis.
 - `redis/sharded-pubsub` now resolves a channel's cluster hash slot client-side (CRC16 of the hash-tag) instead of issuing a `CLUSTER KEYSLOT` round trip per channel, so `follow()` / `followBatch()` subscribe with one fewer network hop per new channel on a cluster. Behavior-identical: the slot a key maps to is fixed and topology-independent, and the client-side computation is verified against the live `CLUSTER KEYSLOT` on a real cluster. Standalone deployments are unaffected.
 - Hardened the type surface. Added the missing internal declaration file `redis/replay-stream.d.ts` (the `storage: 'stream'` replay backend, reached via `createReplay(client, { storage: 'stream' })`; the public `./redis/replay` types are unchanged), and a dependency-free `npm run check` (`scripts/check-types.js`, wired into `pretest`) that fails the build if any `exports` subpath stops resolving, a `types` condition is not a `.d.ts`, or a packaged file falls outside the `files` allowlist. No runtime change.
@@ -844,8 +730,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0-next.4] - 2026-06-02
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **The Redis extensions now run correctly on a Redis Cluster - every plugin. Includes a BREAKING key-format change for the topic/name-keyed plugins.** Previously the cluster test tier skipped most plugins because their multi-key Lua scripts and pipelines hashed to different cluster slots (`CROSSSLOT`) or were silently delivered to a single node. The whole sweep is now verified against a real 6-node Redis Cluster:
   - **Hash-tagged keys (BREAKING).** `presence`, `groups`, `replay`, `replay-stream`, and `cursor` now wrap their co-location id in a Redis hash tag, so a single entity's keys share one slot and the multi-key Lua scripts (`JOIN` / `LEAVE` / `UPDATE`, replay `PUBLISH`, groups join/close) stay atomic on a cluster: `presence:topic:{topic}` + `presence:user:{topic}:{userKey}`, `group:{name}:*`, `replay:seq:{topic}` / `replay:buf:{topic}`, `replay:streambuf:{topic}` / `replay:idmp:<producerId>:{topic}`, `cursor:{topic}`. Hash tags are inert on a standalone Redis (only the key string changes). **BREAKING:** the key strings change, so state written by an older deployment under the old key names is not read by the new code. This state is ephemeral (presence/cursor carry short per-field TTLs; replay buffers and group state are transient), so old keys age out on their own; a rolling cutover shows a brief reset. The cross-instance `*:events` pub/sub channels are unchanged (regular pub/sub broadcasts cluster-wide and needs no hash tag).
@@ -864,17 +748,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`bus.wrap()` (sharded-pubsub) now forwards the `platform.redis` and `platform.presence` framework-convention slots, matching the pubsub bus.** The sharded wrap forwarded `replay` but silently dropped `redis` and `presence`, so a sharded-pubsub deployment lost any framework auto-routing that discovers an ioredis client or the presence registry through the wrapped platform reference (e.g. svelte-realtime's `configureCron({ bus })` path). Both are now live getters, identical to the pubsub wrap. Regression-tested in the wrap-parity suite for both buses.
 
 ## [0.6.0-next.2] - 2026-05-30
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`createIdempotencyStore` (postgres): the eager startup migration can no longer surface as an unhandled promise rejection.** The constructor kicks off `ensureTable()` so callers can `await store.ready()` before first use, and the result was wrapped in `.catch((err) => { throw err })` - which simply re-threw into a promise a caller is not required to await. If that eager migration rejected (a transient database error, a permissions problem, or the table being dropped concurrently, as a test harness does between cases), the rejection became an unhandled rejection, which can terminate the process under Node's default policy. The eager migration's failure is now non-fatal: `acquire()` / `clear()` / `purge()` each re-run `ensureTable()` and surface the error on first real use, and an explicit `await store.ready()` still observes it. No change to the happy path or to `ready()` awaiters.
 
@@ -888,8 +766,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Peer dependency floor bumped to `svelte-adapter-uws ^0.6.0-next.5`** (was `^0.5.8`). The binary wire port imports `createCursorWireCodec` / `createPresenceWireCodec`, added to the adapter in `0.6.0-next.5`; apps wiring the adapter and extensions together MUST upgrade both in lockstep so a single install pulls the matching wire ends.
 
 - **`redis/cursor.js` now publishes every cursor WebSocket frame with `{ compress: false }`, matching the bundled in-memory cursor plugin for full wire parity.** `svelte-adapter-uws` >= 0.6.0-next.4 makes `websocket.compression` a real per-frame option (text frames default to compress-on). Without this opt-out, a clustered deployment that enabled `websocket.compression` would deflate the 60 Hz cursor hot path once per subscriber - on the order of 1-2.5 CPU cores per topic at high subscriber counts, since uWS permessage-deflate runs per recipient rather than once-and-fan-out. All cursor frames now opt out uniformly: live update/bulk/join/remove broadcasts, peer-relayed frames, and the one-shot catalog/snapshot sent on attach and on startup reconcile - so the Redis-backed and in-memory cursor backends are byte-for-byte identical on the wire under any compression setting. The mass-disconnect REMOVE batch path (`platform.publishBatched`) has no per-frame compress option and already sends uncompressed. No effect when `websocket.compression` is off (the default): the adapter resolves every compress flag to false regardless, so the wire is unchanged. Takes effect with a compression-capable adapter (>= 0.6.0-next.4); older adapters ignore the option harmlessly.
@@ -897,9 +773,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.10] - 2026-05-24
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`redis/cursor.js` mass-disconnect O(N^2) publish storm: REMOVE events coalesced through a tick buffer, same shape as the 0.5.9 presence diff buffer and the 0.5.7 cursor always-tick rewrite.** Pre-fix, every cursor removal called `platform.publish('__cursor:'+topic, REMOVE, {key})` immediately - both the local `leaveTopic` path and the `close`-hook sweep over `removedTopics`. A mass disconnect on one instance (5K cursors closing in one tick during a stress test or browser-tab teardown of a packed board) fired 5K immediate publishes per topic, each fanning out to every remaining subscriber. The resulting O(N^2) uWS send-queue allocations OOM-killed workers ~18s into the cleanup cascade. With this change, removals enqueue per-topic `pendingRemoves` Sets and arm a single tracker-wide `setTimeout(flushPendingRemoves, 0)`; the flush ships one frame per subscriber per topic per tick carrying the full leave list, regardless of how many sockets dropped together. When the adapter exposes `platform.publishBatched` (>= 0.5.0-next.5), the flush bundles N REMOVE events into one wire frame per subscriber; falls back to per-event publishes on older adapters. Symmetric to the `bufferDiff` buffer in `redis/presence.js`. `setTimeout(0)` over `queueMicrotask` for the same reason the prior two fixes chose it: uWS dispatches each WS close as its own JS task and N-API drains microtasks at the C++/JS boundary between tasks, so a microtask-deferred flush fires BEFORE the next socket's close handler runs and cross-socket coalescing is impossible at the microtask level. `removeFlushTimer` handle stored so `destroy()` / `clear()` can cancel a pending flush; `pendingRemoves` and `removeFlushPlatform` cleared on both teardown paths.
 
@@ -911,9 +784,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`redis/presence.js` mass-join fragmentation: `bufferDiff` deferred via `setTimeout(0)` instead of `queueMicrotask`.** Same structural bug class as the 0.5.7 cursor always-tick rewrite, this time on the presence diff buffer. The `queueMicrotask`-deferred flush assumed co-arriving `join` / `leave` ops share a JS task so they would all collapse into one publish per topic per iteration. They don't share a task: uWS dispatches each WS message as its own JS task and N-API drains microtasks at the C++/JS boundary between tasks, so the deferred flush ran BEFORE the next socket's handler and every per-message `bufferDiff` produced its own one-entry diff. Under mass-connect into a populated topic (N joiners, K existing subscribers), the publish count grew O(N) instead of O(1) and per-WS outbound buffer reservations climbed super-linearly with concurrent joiners. Demo cap probe at 8000 ws on a populated topic measured ~800 KB/conn outbound buffer vs the steady-state ~40 KB/conn linear curve. Post-fix, `bufferDiff` arms a tracker-wide `setTimeout(flushPendingDiffs, 0)` on the first dirty entry; subsequent entries in the same iteration accumulate into `pendingDiffs` until the timer fires. `setTimeout(0)` lands in libuv's timers phase, which fires only after the poll phase has dispatched every ready socket message in the current iteration - so all joins arriving together end up in one flush regardless of how many task boundaries separate them. `diffFlushTimer` handle stored so `clear()` / `destroy()` can cancel a pending flush. `flushDiffs()` accessor unchanged in shape - tests still drain synchronously. New cross-task-boundary regression test drives 50 peer-instance joins across `await Promise.resolve()` boundaries (the exact dispatch shape uWS produces) and asserts they all coalesce into one diff per topic - the prior `queueMicrotask` design fails this test, `setTimeout(0)` passes.
 
 - **`redis/pubsub.js` `scheduleRelay` and `redis/sharded-pubsub.js` `scheduleRelay`: same `queueMicrotask` -> `setTimeout(0)` swap.** Both modules pipelined Redis publishes via a per-iteration batch. Same cross-task fragmentation as the presence buffer: under per-WS dispatch, each socket handler's publish produced its own Redis round-trip instead of joining the pipelined batch. Consequence is more Redis round-trips per WS-driven publish burst, not more client-side frames, so the user-visible symptom is wire chattiness on the cluster relay rather than fanout fragmentation. The pre-fix warn message that referenced "drained every microtask" updated to "drained every tick" to match the new semantics. Handles stored in `relayTimer` and cancelled on `deactivate`. Test pattern `await Promise.resolve(); // flush microtask batch` migrated to `await new Promise((r) => setTimeout(r, 5)); // flush tick batch` in four pubsub tests.
@@ -922,8 +792,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`redis/presence.js` wire events renamed: `presence_state` -> `state`, `presence_diff` -> `diff`.** **Breaking** for hand-rolled clients decoding `__presence:{topic}` directly; the bundled `presence()` Svelte store in `svelte-adapter-uws` is updated in lockstep and unaffected. Mirrors the same rename in the adapter's in-memory `createPresence` so cluster and single-instance backends keep speaking one wire shape from a single browser bundle. Topic prefix already namespaces the channel - bare event names match cursor / groups / replay convention. Prometheus metric names `presence_diff_frames_total` and `presence_diff_coalesced_total` are unchanged - those are Prometheus-side identifiers, not wire events; descriptions on `presence_diff_frames_total` updated from "presence_diff frames published..." to "diff frames published..." for accuracy. Cross-instance Redis pub/sub envelope on `presence:events:{topic}` is also unchanged (`'join' | 'leave' | 'updated'` per-event shape - already bare). README wire-shape table, MIGRATION 0.4-to-0.5 decoder snippet, and `redis/presence.d.ts` discriminated-union literals all updated. Peer dependency floor bumped to `svelte-adapter-uws ^0.5.7` (see separate bullet) so a single `npm install` upgrade pulls both wire ends together.
 - **Peer dependency floor bumped to `svelte-adapter-uws ^0.5.7`** (was `^0.5.6`). Pulls the matching wire-event rename in the adapter's bundled `presence()` Svelte store so cluster and single-instance backends keep speaking one wire shape from a single browser bundle.
 
@@ -931,14 +799,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Peer dependency floor bumped to `svelte-adapter-uws ^0.5.6`** (was `^0.5.5`).
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`redis/cursor.js` `broadcast()` and `enqueueInbound()` rewritten as always-tick; the 0.5.5/0.5.6 `queueMicrotask` + `pendingMicroflush` design did not fix the production fragmentation it claimed to.** The 0.5.6 deferred-flush variant assumed co-arriving cursor broadcasts share a single JS task so they would all land in `state.dirty` before the deferred flush fired. They don't share a task: uWS dispatches each WS message as its own JS task, and N-API drains microtasks at the C++/JS boundary between tasks - so the deferred flush actually ran BEFORE the next socket's message handler, with a cross-socket coalescing window of zero. Demo verification under deployed 0.5.6 at Hetzner CCX13 (same 1000-cursor stress profile that motivated the original fix): smoothness probe over 30s saw ~99 percent single-cursor UPDATEs / ~1 percent BULKs (3356 vs 12 in 30s) - essentially the pre-fix shape. The new always-tick design drops the leading-edge synchronous fire and the microtask defer entirely; every broadcast appends to `state.dirty` (or `state.inboundDirty`), adds the topic to `dirtyTopics`, and arms the tracker-wide tick timer. `setTimeout(0)` lands in libuv's timers phase, which only fires AFTER the poll phase has processed every ready message on every socket - so all broadcasts dispatched in the same loop iteration end up in one flush regardless of how many task boundaries separate them. Structurally correct independent of dispatch model, and the same trade-off the bundled adapter cursor plugin makes. First-cursor latency cost: up to `topicThrottleMs` (16ms default, one frame budget) before fanout - below the perceptual floor for cursor smoothness. `state.lastFlush` initialized to `Date.now() - topicThrottleMs` (was `0`) so first-fire drift stats are not polluted by `Date.now()` worth of "lateness" on cold topics. New mandatory cross-task-boundary regression test in `test/redis/cursor.test.js` drives 50 updates each across an `await Promise.resolve()` boundary (the exact dispatch shape uWS produces) and asserts they all coalesce into one bulk per cadence cycle - the 0.5.5/0.5.6 `queueMicrotask` design fails this test, always-tick passes. Plus a cross-source-and-cross-task variant for `enqueueInbound`. Bench at `bench/03-cursor-always-tick.mjs` ports the adapter's three-way A/B/C comparison (sync / queueMicrotask / always-tick) under cross-task driving.
 
@@ -946,14 +809,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Peer dependency floor bumped to `svelte-adapter-uws ^0.5.5`** (was `^0.5.4`). Required for the closed-WS guards on every `platform.*` method that takes a ws argument and the leading-edge microtask-defer fix in the bundled cursor plugin. Apps that wire the adapter and extensions together MUST upgrade both packages in lockstep; extensions 0.5.6 reads `platform.closedWsAborts` (added in adapter 0.5.5) and surfaces it through `createPubSubBus().wrap()` / `createShardedBus().wrap()` as a live getter so operators inspecting the wrapped seam see the same counter as the source platform.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`redis/cursor.js` leading-edge fragmentation: `broadcast()` and `enqueueInbound()` defer the leading-edge flush by one microtask via a shared `state.pendingMicroflush` per topic.** Pre-fix, under sustained load with event-loop pauses > `topicThrottleMs` (V8 GC, uWS internal work, outbound drain) the first cursor in a post-pause burst fired alone as a single-cursor `update` (the leading-edge sync flush) while every co-arriving cursor in the same JS pass queued for the trailing tick. Demo measured 86 percent fragmentation at 1000-mover load on Hetzner CCX13 (`topicThrottle: 8`, 8 workers, ~30K RPCs/sec/worker): 1794 single-cursor UPDATEs vs 38 BULKs in 30s; per-cursor effective update rate at the subscriber collapsed to ~0.14 Hz vs the 125 Hz cadence target. Post-fix the leading-edge claims the cadence slot synchronously (`state.lastFlush = now`) but the actual `flushBoth` runs in a `queueMicrotask` callback. Subsequent broadcasts in the same JS pass see `now - state.lastFlush < topicThrottleMs` and take the trailing path, accumulating into `state.dirty` and `state.inboundDirty` before the microtask fires; one combined BULK ships per cycle. The `pendingMicroflush` flag is shared across both source paths (per topic state, not per source) so a local `broadcast` that claims the slot and a peer-relayed `enqueueInbound` in the same pass ship together as one combined frame (cross-source coalescing). Test contract change: assertions on `platform.published` immediately after a leading-edge `update()` now need `await Promise.resolve()` to drain the microtask first (`vi.useFakeTimers()` does NOT mock `queueMicrotask`). Two new regression tests in `test/redis/cursor.test.js` pin the N-bursts-of-M contract and the cross-source merge. Bench at `bench/03-cursor-microtask-defer.mjs` extends the adapter's `bench/micro-cursor-microtask-defer.mjs` with peer-relay traffic so both source paths exercise the shared microtask path.
 
@@ -966,9 +824,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.5] - 2026-05-22
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`redis/presence.js` and `redis/cursor.js`: `presence.join()` and `cursor.attach()` now throw `WsClosedError` (`code: 'WS_CLOSED'`) instead of silently returning when the websocket closes during an internal async gap.** Pre-fix, six sites across the two modules detected a closed websocket post-await (five in `presence.join`: pre-probe `wsTopics.has(ws)` checks, the `ws.getBufferedAmount()` probe catch, the post-`JOIN_SCRIPT`-eval `wsTopics.has(ws)` check, the `ws.subscribe('__presence:...')` catch, and the post-subscribe `wsTopics.has(ws)` check; one in `cursor.attach`: the `platform.subscribe` catch) and unwound state cleanly via `undoJoin` / explicit `LEAVE_SCRIPT` evals, but then `return`-ed without throwing. The calling RPC wrapper in `svelte-realtime` saw no error and reported `status="ok"` for these calls; under mass-connect stress (the original 1000-bot probe surfaced ~10-15% of WS dropped post-open by kernel/uWS accept backpressure) operators watched `svelte_realtime_rpc_total{status="ok"}` advance by the full attempted-count while only ~85% of bots actually landed in the per-topic presence set. The extensions-side `presence_joins_total` counter also under-reported, because it only fires on the cross-cluster `isNewUser` path, which the silent-return sites never reached. State rollback semantics are unchanged on every path; the throw is purely the missing observability signal. `WsClosedError` is re-exported from both `'svelte-adapter-uws-extensions/redis/presence'` and `'svelte-adapter-uws-extensions/redis/cursor'`; the stable catch shape is `err.code === 'WS_CLOSED'` so callers do not need to branch by feature. Snapshot-send failures in `cursor.attach` (post-subscribe `platform.send` throws) and `presence.join` (post-commit `platform.send` throws) intentionally do NOT throw - state is already committed and clients recover via the next bulk frame / `presence_diff`. Two new metrics: `presence_joins_aborted_total{topic, reason}` and `cursor_attaches_aborted_total{topic, reason}` (currently only `reason="ws_closed"`; the label is future-proofed). 6 new tests in `test/redis/presence.test.js` (`WsClosedError on ws-closed during async gap` block) + 2 new tests in `test/redis/cursor.test.js`; 2 existing tests updated to assert the throw instead of the silent return. All 1458 extensions tests pass (was 1451).
 
@@ -994,15 +849,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`redis/presence.js` heartbeat wire format: `heartbeat` event data is now a `{userKey: data}` map carrying the per-user `select()` output, replacing the previous key-only array.** Pre-fix, the heartbeat carried only `keys` and the client handler at `svelte-adapter-uws/plugins/presence/client.js` could only refresh `existing` entries' timestamps. An entry the client had already swept (cross-replica relay latency, brief socket backpressure, JS thread saturation during a busy frame) could never be recovered from a heartbeat alone - the entry stayed gone until a `presence_diff` fired (which only happens on a fresh join/leave for that user). Cross-replica scenarios were most affected because heartbeats for users on the other replica took the bus-relay path. With the data carried alongside the keys, the heartbeat handler can refresh AND re-add missing entries every tick, making presence self-healing under late-heartbeat conditions. The new client at the same version handles both shapes: the new `{userKey: data}` map (refresh + set-missing) and the legacy `[key1, key2, ...]` array (back-compat with older servers; refresh-existing-only path). One regression test updated in `test/redis/presence.test.js` (`heartbeat (event name unchanged) > publishes heartbeat with {userKey: data} map on the timer tick`) - the wire shape changed from `['1']` to `{ '1': { id: '1' } }`.
 
 ## [0.5.2] - 2026-05-22
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **`redis/cursor.js` wire format split: user catalog separated from per-frame positions; HSET writes coalesced onto a `snapshotIntervalMs` tick (default 100ms).** Pre-fix, every cursor `update` and `bulk` frame carried `{key, user, data}` per entry. With 1000 active movers on one topic at 60Hz, the `user` half (~80-100 bytes per cursor) was resent every 16ms for every dirty cursor, multiplying the JSON-stringify cost on the 1000-entry array, the Redis pub/sub relay envelope, and the wire payload (before permessage-deflate). The per-flush HSET storm also ran one `pipe.hset` per dirty cursor per flush window, hitting ~60K HSETs/sec at that scale, even though the hash is only read by snapshot-on-attach and the subscriber-startup reconcile (both tolerant of ~100ms staleness).
 
@@ -1020,16 +871,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`bus.wrap(platform)` now forwards `platform.redis` and `platform.presence` on the wrapped seam (live getters), matching the existing `replay` forwarding.** Pre-fix, only `replay` was forwarded. Framework code that stashes conventions on the source platform in init - e.g. `platform.redis = redis.redis` to enable `svelte-realtime`'s cluster-shared `live.room({ presence })` Redis HASH - found those conventions on the source platform but NOT on the wrapped platform that `createMessage({ platform: bus.wrap })` hands to per-message ctx. The framework's `_clusterPresenceAcquire` / `_clusterPresenceList` then saw `ctx.platform.redis === undefined` and fell through to the in-memory `_presenceRef` Map, silently negating the cluster-presence fix. The bug manifested in any multi-replica deploy that wired `platform.redis` correctly in init but still saw per-replica "Online" rosters in chat / room demos. The fix adds live getters for `redis` and `presence` to the wrapped object so post-wrap reassignment on the source platform also propagates - same pattern the existing `replay` getter uses.
 
 ## [0.5.0-next.16] - 2026-05-16
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **`createPresence` storage layout rewritten for O(1) leave + per-field HEXPIRE TTL; requires Redis 7.4+.** Pre-fix, the per-topic hash stored one field per `(instanceId, userKey)` pair via compound field names (`{instanceId}|{userKey}`), and `LEAVE_SCRIPT` ran `HDEL my_field` followed by a Lua suffix-match scan over `HGETALL` of the topic hash to decide whether to broadcast a leave. At realistic auctions/chat scale (10k users x 10 instances = 100k presence fields per topic), a single leave was ~1-5 ms of Redis-event-loop-blocked Lua time. Mass disconnect of 1k users on instance restart amounted to ~1-5 seconds of presence-unavailable Redis. The new layout splits storage into two hashes per topic: `presence:topic:{topic}` keyed by `userKey` (backs `list()`/`count()`) and `presence:user:{topic}:{userKey}` keyed by `instanceId` (backs the leave HLEN check). `JOIN_SCRIPT` does HSET + HPEXPIRE on both atomically. `LEAVE_SCRIPT` does HDEL + HLEN; if HLEN drops to zero, HDEL the userKey from the per-topic hash and return 1 (broadcast leave). Mass-disconnect time is now O(N) total Redis-blocked Lua time regardless of M (the topic's total user count). Per-field TTL via `HPEXPIRE` replaces the heartbeat-driven CLEANUP_SCRIPT and the per-leave timestamp-filter scan: stale entries from crashed instances auto-expire field-by-field via Redis itself. The new layout also fixes `count()` correctness - the previous HLEN-based count returned stale-inclusive counts, while the new version is exact (per-field auto-expiry means HLEN reflects live users only).
 
@@ -1063,8 +909,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`shared/assert.js` test-mode detection now per-call instead of module-load snapshot.** Pre-fix, `IS_TEST_MODE` and `IS_PROD` were `const` evaluated once at module import. A test that flipped `process.env.NODE_ENV` or `process.env.VITEST` partway through its run got the stale mode on every subsequent `assert()` / `devAssert()` call. Vitest setup files that re-enter mode mid-run (e.g. running a production-shape integration test inside an otherwise test-mode harness) couldn't drive the assert path through both modes. Fix: `isTestMode()` and `isProd()` are now functions that re-read `process.env` on each call. No API change. Cost is two property reads per assertion vs zero; the assertion path is not on the per-message hot path so this is unmeasurable. 2 new regression tests in `test/shared/assert.test.js` flip `NODE_ENV` between calls and assert that the second call observes the new mode.
 
 - **`postgres/replay.js` `clear()` and `clearTopic()` now run their two DELETEs inside a BEGIN/COMMIT transaction.** Pre-fix, the two DELETEs (one against the data table, one against the seqTable) were sent as separate `client.query` calls. With a `pg.Pool` wrapper, each call may even check out a different connection - so a crash, network blip, or external interruption between them could leave the seqTable populated while the data rows were already gone, producing readers that see a non-zero `seq()` for a topic with no buffered messages. The new `shared/pg-tx.js` helper exports `withTransaction(client, fn)` which pins a single pooled connection, issues BEGIN, runs `fn(tx)`, then COMMITs (or ROLLBACKs + re-throws on error). Both replay-clear paths now use it. The testing mock (`testing/mock-pg.js`) gained a `pool.connect()` stub that returns the same query dispatch behind a release-noop wrapper; BEGIN/COMMIT/ROLLBACK are accepted as no-ops by the dispatch since the mock does not model Postgres-side atomicity (integration tier is the right place for that assertion). 7 new tests across `test/shared/pg-tx.test.js` and `test/postgres/replay.test.js` cover the happy path, ROLLBACK on inner throw, ROLLBACK on query error, best-effort release when ROLLBACK itself throws, and BEGIN/COMMIT presence in the replay clear paths.
@@ -1076,9 +920,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`redis/lock.js` retry sleep now uses +/-25% jitter to avoid thundering-herd handoffs.** Pre-fix, the acquire loop slept a fixed `retryDelayMs` between SET NX attempts. With N callers contending on the same key, every lock-handoff produced an N-way SET NX burst on the Redis socket - one winner, N-1 losers, all retrying again at the next `retryDelayMs` tick. The pattern wastes Redis CPU and produces a stair-step latency distribution. Fix: each retry sleep is now `retryDelayMs +/- 25%` randomized (`(Math.random() - 0.5) * 0.5 * retryDelayMs`), preserving the expected wait but smearing actual delays over `[0.75x, 1.25x]` of the configured base. Math.random is the right primitive (thundering-herd avoidance, not security-relevant; marker comment added inline). No public-API change. `+2 new test cases` in `test/redis/lock.test.js` covering (a) jittered sleeps are non-identical and bounded by the 1.25x ceiling, (b) the existing `maxWaitMs` budget clamp still applies under jitter.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **`createNotifyBridge` validates the `channel` option against the same regex used for table names.** Pre-fix, the channel name was passed through a double-quote-escape (`"<name with "" doubled>"`) which is RFC-correct for Postgres delimited identifiers, but the regex constraint that table names get (`[a-zA-Z_][a-zA-Z0-9_]*` plus reserved-namespace rejection) was missing for channels. A misuse could still pass non-ASCII or reserved-prefix names through to LISTEN/NOTIFY queries. Fix: factory now rejects channel names that fail the same regex OR sit under `pg_*` / `information_schema*` namespaces, throwing at construction time before any query goes out. `+3 new test cases` covering shape rejection (spaces, dashes, dots, leading digits, embedded quotes), reserved-namespace rejection, and well-formed acceptance.
 
@@ -1093,9 +934,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ReplaySerializationError` exported from `postgres/replay`, `redis/replay`, and (via re-export through `redis/replay`) the stream backend.** Thrown when caller-supplied `data` cannot be serialized to JSON - typically a `BigInt`, a circular reference, or another value `JSON.stringify` refuses. Distinct from `ReplayStorageError` so callers can pattern-match: serialization failures are caller-input bugs (fix the payload), storage failures are operational (retry, fall back, alert). The original `TypeError` is preserved on `.cause`. Type declarations added to both `redis/replay.d.ts` and `postgres/replay.d.ts`.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Redis cursor and presence trackers now deep-strip the `select()` output before broadcasting, not just the default-select case.** Pre-fix, `safeUserData(ws)` did a shallow rest-spread `{ __subscriptions, remoteAddress, ...safeData } = raw` and passed the still-shallow result to `select`. The default `select` is `stripInternal` (which IS recursive), so the default-select path was always safe. But a user-supplied identity or partial-passthrough select - the documented pattern for surfacing additional userData fields, e.g. `select: (ud) => ({ id: ud.id, profile: ud.profile })` - would let nested sensitive keys (`profile.token`, `profile.authToken`, etc.) flow through to the wire unredacted. Fix: deep-strip the `select` output with `stripInternal` before storing on the per-ws state in cursor and before serializing for the presence diff. The `warnSensitive` call moved to run on the raw select output (so the developer-facing warning still fires on what their select returned, rather than silently swallowed by the backstop). resolveKey in presence continues to run on the pre-select shallow safeData so key resolution is unchanged. `+5 new test cases` across `test/redis/cursor.test.js` and `test/redis/presence.test.js` covering identity select with nested `token`/`authToken`, partial-passthrough select with nested `__internal`, and select that re-injects `constructor`/`prototype` (defense against shadow-via-Object.assign).
 
@@ -1115,9 +953,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`bus.wrap(platform)` now forwards `platform.replay` as a live getter on both `createPubSubBus` and `createShardedBus`.** Apps following svelte-realtime's `platform.replay = createReplay(...)` install convention had auto-replay routing silently bypass any seam that ran through `bus.wrap` - most visibly the cron seam, because `configureCron({ bus })` wraps internally on every tick. The wrap's strict allowlist returned an object literal without a `replay` slot, so the framework's discovery saw `undefined` and the buffer was never engaged. Fix: explicit `get replay()` forward (cheap getter, zero hot-path cost) on both bus wraps. The mock platform grows a matching `replay` slot, and `test/redis/wrap-platform-parity.test.js` gains a "framework conventions" describe block that drift-detects future convention-forward gaps. No app-side change required; the `setCronPlatform(platform) + configureCron({ leader, bus })` pattern from svelte-realtime's MIGRATION starts working as documented.
 
 ## [0.5.0-next.14] - 2026-05-14
@@ -1127,9 +962,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tracker.attach(ws, topic, platform)` and `tracker.detach(ws, topic, platform)` on `createCursor`.** Call `attach` from your "join room" RPC (mirroring `presence.join`) to opt the connection into receiving cursor updates for a topic; `detach` reverses it for explicit-leave flows. `attach` subscribes the connection to the internal `__cursor:{topic}` channel via the platform-trust path AND sends a snapshot of existing cursors in one step.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Cursor frames now reach clients.** Same regression class as the pubsub `systemChannel` issue fixed in 0.5.0-next.13. `cursor.update` publishes to `__cursor:{topic}`, but nothing in the extension was subscribing connections to that channel server-side. Pre-`svelte-adapter-uws@0.5.0-next.21`, the client store's wire subscribe to `__cursor:{topic}` populated the subscriber set as a side effect; after next.21 the wire frame is denied, and after next.23 the client does not send it. Result: hundreds of `moveCursor` RPCs fan out into an empty subscriber set, cross-tab / cross-user cursors silently dropped. `tracker.attach(ws, topic, platform)` (new) owns membership via `platform.subscribe`; call it from the same RPC where you call `presence.join`. The dead `hooks.subscribe` predicate path is kept as a no-op for source-compat.
 
@@ -1141,16 +973,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`degraded` / `recovered` events now reach clients.** With `svelte-adapter-uws` 0.5.0-next.21+, `__`-prefixed wire subscribes are denied, and from 0.5.0-next.23+ the client store does not send the wire frame at all. Nothing else was putting the connection into the `systemChannel` subscriber set server-side, so the pubsub bus's auto-emitted state-change events published into an empty set and `$health === 'degraded'` was silently dead. The new `bus.hooks.open` puts every connection in via the platform-trust path (`platform.subscribe`), which intentionally bypasses the wire-level `__`-prefix gate. Apps that documented a `{#if $health === 'degraded'}` banner regain delivery once they swap `bus.activate(platform)` for `bus.hooks.open(ws, ctx)`. Bump the `svelte-adapter-uws` peer minimum to `0.5.0-next.23` to also clear the cosmetic `[ws] subscribe denied` console warns on every page mount.
 
 ## [0.5.0-next.12] - 2026-05-13
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Warning messages now link to short-URL explainers.** Eight `console.warn` sites (`postgres/notify`, `redis/index`, `redis/presence`, `redis/publish-rate`, `redis/pubsub`, `redis/registry` x2, `redis/sharded-pubsub`, `shared/sensitive`) append a `See: https://svti.me/<slug>` pointer so an operator hitting a warning in production can land on a canonical writeup instead of grepping the source for context. No behavior change; pure ergonomics.
 - **`MIGRATION.md` reorganized into four tiers** (Critical / Required source changes / Notable defaults and behaviors / Cosmetic) instead of one long flat numbered list. Most apps only need to read the first two sections; type-only refactors and niche edge cases are now out of the critical path. The cluster of three "default `select` strips ..." items collapsed into a single entry covering the `__`-prefix strip, the sensitive-key strip, and the one-time warnings. Peer-dep mention updated from `^0.5.0-next.19` to `^0.5.0` now that the 0.5 line is stable.
@@ -1164,16 +991,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`isValidBusTopic` now rejects `"` (charCode 34) and `\\` (charCode 92) for parity with the adapter's `isValidWireTopic` unconditional rejections.** Pre-fix, the bus validator only checked control bytes (`< 32`); a topic containing `"` or `\\` would survive validation and crash the adapter's publish path inside `esc(topic)` instead of being rejected at the bus boundary. The comment claiming "tested for parity" is now backed by 12 new cases in `test/shared/bus-validate.test.js` covering the unconditional-rejection corpus plus the new `allowSystemTopics: false` default behavior. Non-ASCII rejection (the adapter's `allowNonAsciiTopics` opt-in) is intentionally NOT mirrored, since server-side code legitimately produces topics with localized labels (e.g. `__signal:Jose`) that the bus relays.
 
 ## [0.5.0-next.10] - 2026-05-10
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Bumped `engines.node` to `>=22.0.0` (was `>=20.0.0`).** Tracks `svelte-adapter-uws` 0.5, which pins `uWebSockets.js` v20.67.0 (Node 20 dropped upstream). Node 22 LTS, Node 24 current, and Node 26 supported. See `MIGRATION.md` for the runtime-bump checklist.
 - **Refreshed `node_modules`.** No source change; the remaining low-severity advisories all trace to `cookie<0.7.0` via the transitive `@sveltejs/kit` peer chain (unfixable until kit publishes a release that bumps cookie).
@@ -1210,8 +1032,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Cache-key shape change for `live.idempotent` and `tasks.run` is NOT backward compatible.** In-flight cached entries from before this release become invisible after deploy (the namespaced key does not match the old un-namespaced key). For Redis stores the old keys eventually TTL out; for Postgres stores the cleanup interval handles them. No migration is required.
 
 ### Security
@@ -1222,9 +1042,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **`bus.wrap(platform)` now exposes `maxPayloadLength`, `bufferedAmount`, and `onPublishRate`** on both `createPubSubBus` and `createShardedBus`. The first two landed in `svelte-adapter-uws@0.5.0-next.19` for backpressure-aware framework code (chunked-upload chunk-sizing, per-recipient send-queue depth checks); `onPublishRate` has been on `Platform` since `next.4` and was silently missing from the wrap for ~5 prerelease versions. Concrete consumer-visible bug closed: `svelte-realtime`'s `live.upload` chunk-size auto-discovery (`_captureUploadMaxFrameSize`) early-returned because `wrappedPlatform.maxPayloadLength` was `undefined`, forcing every upload chunk to the conservative 12 KB default regardless of the adapter's 1 MB cap. The three additions are pure pass-throughs: `maxPayloadLength` is a live getter (post-construction mutations propagate), the two methods are bound at wrap-construction (consistent with the existing `send` / `sendCoalesced` pattern, no per-call allocation).
 
 ### Added
@@ -1233,8 +1050,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mockPlatform()` grows `maxPayloadLength` (defaults to 1 MB, mirroring the adapter), `bufferedAmount(ws)` (returns 0; reassign for backpressure simulation), `onPublishRate(cb)` (registers a callback returning an unsubscribe), and `_emitPublishRate(events)` (test-only driver mirroring the `_setPressure` shape).** `MockPlatform` interface in `testing/index.d.ts` updated to match.
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.19`** (was `^0.5.0-next.14`). Required because `bus.wrap` now binds `maxPayloadLength` / `bufferedAmount` unconditionally; a pre-`next.19` adapter without these members would crash at wrap-construction time.
 
@@ -1256,15 +1071,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`redis/lock` Lua scripts moved to `shared/lease-scripts.js`** for reuse by `redis/leader`. Lock's `HEARTBEAT_SCRIPT` and `RELEASE_SCRIPT` are now imported from the shared module under their generic names (`LEASE_RENEW_SCRIPT`, `LEASE_RELEASE_SCRIPT`). Pure refactor; no behavior change.
 
 ## [0.5.0-next.6] - 2026-05-05
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Bus wrap exposes `subscribe`, `unsubscribe`, and `checkSubscribe` from the underlying platform.** `wrap(platform)` on both `createPubSubBus` and `createShardedBus` now passes through the three server-side subscription primitives that landed in `svelte-adapter-uws@0.5.0-next.13` / `next.14`. These are inherently local-worker (operating on a specific `(ws, topic)` pair) - pure pass-through, no relay logic. Without this, code holding a wrapped platform as a complete `Platform` replacement would hit `undefined` when it reached for any of the three. `mockPlatform()` from `svelte-adapter-uws-extensions/testing` grew matching recording arrays (`subscribed`, `unsubscribed`, `checkedSubscribe`) so the wrap surface stays testable end-to-end without booting a real adapter.
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.14`** (was `^0.5.0-next.12`). Required because `wrap()` now binds these three new methods unconditionally; an older platform without them would crash at wrap-time.
@@ -1278,15 +1089,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **`replay.publish()` storage failures now throw `ReplayStorageError` instead of the raw underlying error.** The original error is preserved on `.cause`. Any consumer that catches a specific underlying class (ioredis errors, `CircuitBrokenError`) needs to either catch `ReplayStorageError` and inspect `.cause`, or set `localFanoutOnStorageFailure: true` to opt into the silent-fallback policy. Affects `redis/replay` (sorted-set), `redis/replay-stream` (also `publishIdempotent`), and `postgres/replay`.
 
 ## [0.5.0-next.4] - 2026-05-04
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **`createCursor` defaults flipped to 60Hz world-state tick.** `throttle` defaults to `16` (was `50`) and `topicThrottle` defaults to `16` (was `0`). Out of the box the broadcast path is now a 60Hz world-state tick: each topic emits at most one bulk frame per 16ms window, carrying the latest position for every cursor that moved in that window. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - the same property the adapter's bundled cursor plugin recommends as the architecture for collaborative cursors at scale. Existing apps that prefer the previous "every update broadcast immediately, no aggregate cap" behavior should pass `topicThrottle: 0`; apps relying on the previous 50ms per-cursor floor should pass `throttle: 50` explicitly. For high-density rooms (>200 active movers) where the bulk-frame size becomes the per-peer bottleneck, raise `topicThrottle` to 33 (30Hz).
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.12`** (was `^0.5.0-next.10`). The new range matches the adapter release that fixes a wiring regression in `sendCoalesced`'s flush callback (the `ws.send` return code was dropped in a `next.8` refactor, so `DROPPED` payloads under sustained backpressure on slow clients were treated as success and silently lost). Affects `registry.sendCoalesced` on the connection registry, which routes through `platform.sendCoalesced` on the receiving instance.
@@ -1302,8 +1109,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README "Capacity model" and "Production assertions" sections** under Reliability documenting every cap, its default, its saturation behavior, and the assertion category list with the report-an-issue workflow.
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.10`** (was `^0.5.0-next.6`). The new range matches the adapter release that ships the matching production-assertion and bounded-by-default capacity-cap work across the adapter core and bundled plugins.
 
@@ -1345,8 +1150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **README "Adapter wire-shape helpers" subsection grew a paragraph naming the scope of the adapter's `__chaos` harness** (WS-frame outbound chokepoint inside the test server, not cross-wire) and pointing at the adapter's `Wrap your own transport for cross-wire chaos` pattern for fault injection on ioredis / pg / other transports. Closes the misunderstanding at the docs level so tests reaching for cross-wire coverage see the boundary up front.
 - **Peer dependency on `svelte-adapter-uws` bumped to `^0.5.0-next.6`** (was `^0.5.0-next.0`). The new range matches the `0.5.0-next.4` adapter release that ships `platform.publishBatched`, `platform.sendCoalesced`, `platform.request`, `platform.requestId`, and `platform.pressure` (consumed or passed through by the bus wrap), the `0.5.0-next.5` adapter release that re-exports the curated wire-protocol helpers and `userData` slot constants from `svelte-adapter-uws/testing` (re-exported here in turn), and the `0.5.0-next.6` adapter release that adds the `upgradeAdmission` option to `createTestServer` so the two-tier admission contract test can drive a real connection storm.
 
@@ -1383,8 +1186,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Postgres table prefix is now `svti_`** (was `ws_`). Default table names: `svti_replay`, `svti_replay_seq`, `svti_idempotency`, `svti_jobs`, `svti_tasks`. Override the prefix via the `table` option on each module. The new prefix lines up with the `svti.me` short-link domain so the schema is greppable back to the docs.
 - **Primary key columns follow the `[tablename]_id` rule.** `svti_replay_id` (was `id` via the `pkCol` option), `svti_jobs_id` (was `id`), `svti_tasks_id` (was `task_id`). The natural-key PK on idempotency renamed to `svti_idempotency_key` (was `key`); the FK column on tasks matches it (was `idempotency_key`). JS-level field names on row objects stay ergonomic via SQL `AS` aliases: `job.id`, `task.id`, `task.idempotency_key` are unchanged in code that reads from claim/dispatch results.
 - **Idempotency API parameter renamed `key` -> `idempotencyKey`.** `idempotency.acquire(idempotencyKey)` and `idempotency.purge(idempotencyKey)` now match the existing `idempotencyKey` option name on the task runner so the term is consistent across the package.
@@ -1402,9 +1203,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cursor reconnect snapshot fetch: explicit `redis.pipeline()`.** The previous code fired N independent `redis.hgetall(...)` promises and relied on ioredis auto-pipelining; auto-pipelining is off by default. Real-Redis bench against the integration stack measured 11 to 44 percent faster across topic counts 10 to 500 with auto-pipelining off, and roughly neutral with it on.
 
 ### Fixed
-
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
 
 - **Circuit breaker: `failures` counter no longer grows unbounded after broken state.** `failure()` increments are now capped at `failureThreshold`, so the gauge stays meaningful as "consecutive failures" instead of climbing into the millions during sustained outages. State transitions are unchanged.
 
@@ -1450,8 +1248,6 @@ The JS API for `enqueue()` / `claim()` / `await()` results is unchanged (SQL ali
 
 ### Changed
 
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
-
 - **Rate limiter: versioned Redis keys.** Bucket keys now include a version prefix (`v1:ratelimit:{key}` instead of `ratelimit:{key}`). When the Lua script algorithm changes in a future release, the version will be bumped so rolling deployments with different script versions use separate key spaces. Old-version keys expire naturally via their existing TTL. No migration needed - existing unversioned keys will expire on their own.
 - **Notify bridge: warn on custom parse errors.** When a custom `parse` function throws, the bridge now logs a `console.warn` with the channel name and error message. Previously, custom parse errors were counted in the `notify_parse_errors_total` metric but produced no log output, making them invisible without Prometheus.
 - **README: degradation notification pattern.** Added a "Notifying clients of degradation" subsection under Failure handling, showing how to wire `onStateChange` to publish a system-level event so clients can surface a stale-data banner when Redis pub/sub fails.
@@ -1462,14 +1258,9 @@ The JS API for `enqueue()` / `claim()` / `await()` results is unchanged (SQL ali
 
 ### Fixed
 
-- Sharded delivery rejects payload topics that do not match their Redis channel. Carrierless bus messages no longer inherit a subscriber activation trace as a consumer parent.
-- Replay history echoes request IDs, including zero, and matching end markers identify truncated history.
-
 - **Redis replay: gap detection when buffer is empty.** When all buffered entries had been trimmed (by size cap or TTL expiry) but the sequence counter had advanced past the client's `sinceSeq`, `replay()` did not fire a `truncated` event. The client would receive only an `end` marker and assume it was caught up, silently missing messages. Now falls back to checking the seq counter when the sorted set is empty, matching the Postgres replay behavior that already handled this case.
 
 ### Changed
-
-- The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - **README: failure handling section.** Added a top-level table describing per-extension degradation behavior when the circuit breaker trips.
 - **README: pub/sub bus.** Documented echo suppression mechanism and microtask batching (multiple publishes in one tick become a single Redis pipeline).
