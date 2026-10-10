@@ -85,7 +85,9 @@ async function waitForClusterReady() {
 			const state = /cluster_state:(\w+)/.exec(info)?.[1];
 			const slotsOk = /cluster_slots_ok:(\d+)/.exec(info)?.[1];
 			if (state === 'ok' && Number(slotsOk) === 16384) {
-				return;
+				// A healthy master map can precede replica synchronization.
+				const slots = await r.cluster('slots');
+				if (slots.length && slots.every(range => range.length >= 4)) return;
 			}
 			lastErr = new Error(`cluster_state=${state}, cluster_slots_ok=${slotsOk}`);
 		} catch (err) {

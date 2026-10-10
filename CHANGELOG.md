@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Refresh compatible runtime clients to ioredis 5.11.1 and pg 8.23.1 in the lockfile, and define a quarterly client maintenance review with real-backend and performance checks.
+
 - Bound worker task admission by jobs and input bytes, reserve capacity before durable claims, expire and remove cancelled queued jobs, and settle worker exit or IPC failures without leaking capacity. Document worker pressure metrics and cancellation behavior.
 
 - Owned PostgreSQL pools default to 100 unsettled wrapper operations, 10-second checkouts, and 30-second driver query and server statement deadlines, each with an explicit 0 opt-out. Supplied pools retain their configuration and lifecycle. Optional cancellation retains admission until driver settlement and releases abandoned checkouts once; optional metrics expose queue depth, outstanding operations, timeouts, and duration in seconds.

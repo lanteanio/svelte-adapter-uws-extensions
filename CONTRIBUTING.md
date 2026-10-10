@@ -123,6 +123,27 @@ development, peer and optional packages for all platforms. The hosted dependency
 job retains that CycloneDX file for 30 days and can be called by a release workflow
 through `workflow_call`. CI workflow presence does not configure branch protection.
 
+### Database client maintenance
+
+Keep ioredis and pg on supported compatible releases and commit their resolved
+versions in the lockfile. Check upstream releases and advisories before each
+release and at least quarterly. ioredis uses best-effort maintenance; retain it
+for the existing Redis API while its supported server versions, reliability and
+security meet this package's requirements.
+
+Start a client maintenance review when a supported Redis, Valkey or PostgreSQL
+version cannot be used with the client, a reachable high or critical advisory has
+no fixed compatible release, or six months pass without upstream activity while
+a reproducible compatibility or security issue remains unresolved. Record the
+upstream evidence and affected operations in the task board. Review remediation,
+a maintained fork or client replacement according to compatibility and measured
+performance; inactivity alone does not justify replacing a stable dependency.
+
+For a client update, run the dependency checks above, the unit suite and affected
+real-backend lanes. Redis client changes also exercise Cluster reconnects,
+subscription recovery, bounded queues and command deadlines. Recheck any private
+client integration seam and retain hot-path benchmark evidence before release.
+
 ## Backend setup and isolation
 
 Integration commands create and tear down their own Compose stacks. Run tiers
