@@ -8,6 +8,7 @@
  */
 
 import pg from 'pg';
+import { createPoolOperations } from './_pool-operations.js';
 import { ConnectionError } from '../shared/errors.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
@@ -20,13 +21,15 @@ const { Pool, Client } = pg;
  * @property {string} [connectionString] - Postgres connection string. Required UNLESS `pool` is provided.
  * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` becomes a no-op.
  * @property {boolean} [autoShutdown=true] - Listen for `sveltekit:shutdown` and disconnect. Defaults to `false` when `pool` is provided.
- * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Ignored when `pool` is provided.
+ * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Owned defaults: 10s checkout, 30s query and statement deadlines; each accepts 0 to disable. Ignored when `pool` is provided.
+ * @property {number} [maxInFlight] - Maximum unsettled query/connect operations (100 owned, 0 external). 0 disables admission bounds.
+ * @property {import('../prometheus/index.js').MetricsRegistry} [metrics] - Optional pool admission, waiter and duration metrics.
  */
 
 /**
  * @typedef {Object} PgClient
  * @property {import('pg').Pool} pool - The underlying pg Pool
- * @property {(text: string, values?: any[]) => Promise<import('pg').QueryResult>} query - Run a query
+ * @property {(text: string | import('pg').QueryConfig, values?: any[], options?: { signal?: AbortSignal }) => Promise<import('pg').QueryResult>} query - Run a query
  * @property {() => Promise<void>} end - Gracefully close the pool. When the pool was provided externally, this is a no-op (the caller owns the lifecycle).
  */
 
@@ -62,11 +65,20 @@ export function createPgClient(opts) {
 	if (externalPool === undefined && !opts.connectionString) {
 		throw new ConnectionError('postgres', 'connectionString or pool is required');
 	}
-	if (externalPool !== undefined && (typeof externalPool !== 'object' || typeof externalPool.query !== 'function')) {
+	if (externalPool !== undefined && (!externalPool || typeof externalPool !== 'object' || typeof externalPool.query !== 'function')) {
 		throw new ConnectionError('postgres', 'pool must be a pg.Pool instance');
 	}
 
 	const ownedPool = externalPool === undefined;
+	const maxInFlight = opts.maxInFlight ?? (ownedPool ? 100 : 0);
+	if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 0) throw new TypeError('maxInFlight must be a non-negative safe integer');
+	const poolOptions = { ...(opts.options || {}) };
+	if (ownedPool) {
+		for (const [name, fallback] of [['connectionTimeoutMillis', 10000], ['query_timeout', 30000], ['statement_timeout', 30000]]) {
+			if (poolOptions[name] === undefined) poolOptions[name] = fallback;
+			if (!Number.isSafeInteger(poolOptions[name]) || poolOptions[name] < 0 || poolOptions[name] > 2147483647) throw new TypeError(name + ' must be an integer between 0 and 2147483647');
+		}
+	}
 	// Default: auto-shutdown the pool we own. Caller-owned pools default to
 	// no auto-shutdown (the caller drives the lifecycle), but the option is
 	// still honored if explicitly set.
@@ -77,7 +89,7 @@ export function createPgClient(opts) {
 		try {
 			pool = new Pool({
 				connectionString: opts.connectionString,
-				...(opts.options || {})
+				...poolOptions
 			});
 		} catch (err) {
 			throw new ConnectionError('postgres', 'failed to create pool', err);
@@ -92,6 +104,8 @@ export function createPgClient(opts) {
 	} else {
 		pool = externalPool;
 	}
+
+	const operations = createPoolOperations(pool, maxInFlight, opts.metrics, redactError);
 
 	let ended = false;
 
@@ -115,15 +129,13 @@ export function createPgClient(opts) {
 	// actually invoked, since most consumers (the task runner, idempotency
 	// stores, etc.) only need pool.query() and never createClient().
 	const connectionConfig = opts.connectionString
-		? { connectionString: opts.connectionString, ...(opts.options || {}) }
+		? { connectionString: opts.connectionString, ...poolOptions }
 		: null;
 
 	return {
 		pool,
 
-		query(text, values) {
-			return pool.query(text, values).catch(redactAndRethrow);
-		},
+		query: operations.query,
 
 		/**
 		 * Acquire a dedicated connection from the pool. Use this rather than
@@ -133,8 +145,8 @@ export function createPgClient(opts) {
 		 * The returned client's `query` redacts too, and `release` is
 		 * unchanged.
 		 */
-		async connect() {
-			const client = await pool.connect().catch(redactAndRethrow);
+		async connect(options) {
+			const client = await operations.connect(options);
 			try {
 				return wrapClientQuery(client);
 			} catch (err) {

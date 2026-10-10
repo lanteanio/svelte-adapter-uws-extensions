@@ -168,6 +168,24 @@ same identity.
 
 ## 3. Fails on a call that used to succeed
 
+### Owned PostgreSQL pools bound admission and waits
+
+**Symptom.** A burst beyond 100 unsettled wrapper queries/checkouts rejects
+with `ConnectionError.code === 'PG_CAPACITY_EXCEEDED'`. A checkout wait can
+expire after 10 seconds, and a query read or server statement after 30 seconds.
+
+**Why.** Driver pool size limits connections, but its queue and wait duration
+were unlimited by default. Owned pools now bound both admission and native
+connection/query/statement waits.
+
+**Action.** Size `maxInFlight` for deliberate fan-out and override
+`options.connectionTimeoutMillis`, `options.query_timeout` and
+`options.statement_timeout` for long-running operations. Each accepts `0`
+to opt out. Supplied pools retain their settings and default to unbounded
+wrapper admission; configure the original pool and opt into `maxInFlight`
+explicitly. See [pool operation bounds](./docs/postgres-support.md#pool-operation-bounds)
+for cancellation, capacity accounting, metrics and direct-pool bypasses.
+
 ### Scope arguments that cannot be scoped are refused
 
 **Symptom.** `redis ratelimit: clear tenant id must not contain NUL or glob

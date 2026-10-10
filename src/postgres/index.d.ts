@@ -1,4 +1,5 @@
-import type { Pool, PoolClient, PoolConfig, QueryResult, Client } from 'pg';
+import type { Pool, PoolClient, PoolConfig, QueryResult, QueryConfig, Client } from 'pg';
+import type { MetricsRegistry } from '../prometheus/index.js';
 
 export interface PgClientOptions {
 	/** Postgres connection string. Required UNLESS `pool` is provided. */
@@ -19,15 +20,27 @@ export interface PgClientOptions {
 	pool?: Pool;
 	/** Listen for `sveltekit:shutdown` and disconnect. @default `true` when the client owns the pool, `false` when `pool` is provided. */
 	autoShutdown?: boolean;
-	/** Extra pg Pool options. Ignored when `pool` is provided. */
+	/** Owned pools default to connectionTimeoutMillis: 10000, query_timeout: 30000,
+	 * statement_timeout: 30000. Override each with 0 to disable it. Ignored for an external pool. */
 	options?: PoolConfig;
+	/** Maximum unsettled wrapper query/connect operations; 0 disables. @default 100 for owned pools, 0 for external pools */
+	maxInFlight?: number;
+	/** Optional bounded-label admission, duration, timeout and driver waiter metrics. */
+	metrics?: MetricsRegistry;
+}
+
+export interface PgOperationOptions {
+	/** Stops the caller's wait, not the database operation. Capacity remains reserved
+	 * until the underlying operation settles. An abandoned checkout is released when acquired.
+	 * Use AbortSignal.timeout(ms) for a caller deadline. SQL may still execute after abort. */
+	signal?: AbortSignal;
 }
 
 export interface PgClient {
 	/** The underlying pg Pool. */
 	readonly pool: Pool;
 	/** Run a query. */
-	query(text: string, values?: any[]): Promise<QueryResult>;
+	query(text: string | QueryConfig, values?: any[], options?: PgOperationOptions): Promise<QueryResult>;
 	/**
 	 * Acquire a dedicated connection from the pool. Prefer this over
 	 * `pool.connect()`: connection acquisition is the failure mode whose pg
@@ -35,7 +48,7 @@ export interface PgClient {
 	 * entirely. The returned client's `query` redacts too; `release` is
 	 * unchanged.
 	 */
-	connect(): Promise<PoolClient>;
+	connect(options?: PgOperationOptions): Promise<PoolClient>;
 	/**
 	 * Create a standalone pg.Client with the same connection config (not
 	 * from the pool). Throws if neither `connectionString` was provided.

@@ -30,6 +30,9 @@ describe('postgres idempotency (integration)', () => {
 		}
 		client = createPgClient({
 			connectionString: url,
+			// Deliberate 100-way cold-start DDL/acquire race needs extra admission
+			// for construction-time migration running alongside the contenders.
+			maxInFlight: 256,
 			autoShutdown: false
 		});
 	});

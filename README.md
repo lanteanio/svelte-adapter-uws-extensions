@@ -228,15 +228,15 @@ export const wrapped = createPgClient({ pool });
 | `connectionString` | - | Postgres connection string. Required UNLESS `pool` is provided. |
 | `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
 | `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Disconnect on `sveltekit:shutdown`. |
-| `options` | `{}` | Extra pg Pool options. Ignored when `pool` is provided. |
+| `options` | 10s checkout; 30s query/statement | Owned pool deadlines; each accepts `0` to disable. Supplied pools keep their settings. See [pool bounds, cancellation and metrics](docs/postgres-support.md#pool-operation-bounds) for `maxInFlight` and `metrics`. |
 
 #### API
 
 | Method | Description |
 |---|---|
 | `pg.pool` | The underlying pg Pool (provided or owned). |
-| `pg.query(text, values?)` | Run a query. |
-| `pg.connect()` | Acquire a dedicated pooled connection. Prefer this over `pool.connect()`: connection acquisition is the failure whose pg error text carries the DSN, and a raw handle bypasses redaction entirely. The returned client's `query` redacts too; `release` is unchanged. |
+| `pg.query(textOrConfig, values?, { signal }?)` | Run a query. An optional signal cancels the caller wait; SQL can still execute. |
+| `pg.connect({ signal }?)` | Acquire a dedicated pooled connection. Prefer this over `pool.connect()`: connection acquisition is the failure whose pg error text carries the DSN, and a raw handle bypasses redaction entirely. The returned client's `query` redacts too; `release` is unchanged. |
 | `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
 | `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
 
