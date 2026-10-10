@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis cursor projections enforce the default 8192-byte limit, JSON serialization and depth bounds. Relay interest belongs only to actual memberships, and close removes observer flush state. Snapshot recovery merges live and local rosters, retains TTL-bounded joins and removal tombstones through Redis gaps, and supersedes stale pending reads. Relay restoration retries and publish outcomes update breaker accounting.
+
 - Apply capability-cookie key checks to `previousSecret` as well as the signing key, and reject visually empty or direction-changing degradation notices while preserving visible script/emoji joiners.
 
 - Standard and sharded buses enforce complete outbound relay envelope caps, preserve local and cross-instance `compress: false`, and withhold oversized relays with failure reporting. Simulation forwards batch compression and packed mock declarations expose the matching recordings.

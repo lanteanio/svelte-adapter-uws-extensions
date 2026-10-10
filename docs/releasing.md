@@ -2,6 +2,21 @@
 
 This is the publication contract for `svelte-adapter-uws-extensions`. Release preparation does not authorize pushing tags or publishing a version. The checked-in path verifies a candidate; an authorized maintainer controls promotion.
 
+## Release scope and acceptance
+
+The 0.6 line provides shared Redis and Postgres state for applications whose WebSocket clients can reach different workers or instances: fan-out and cursor/presence state for connected users, replay for reconnecting clients, and durable jobs/tasks, idempotency, sessions and locks for application handlers. Its acceptance criteria are the behavior of the exact packaged code and the operator's recovery path. This package does not supply application authorization, exactly-once delivery, a managed database, or deployment-specific backup, region and retention policy. A local mock pass does not establish cross-instance or failure-recovery behavior.
+
+The ecosystem's current promotion requirements live in the adapter's [stable-promotion contract](https://github.com/lanteanio/svelte-adapter-uws/blob/dev/docs/releasing.md#stable-promotion). Before extensions promotes to `latest`, retain evidence for the exact candidate:
+
+- Application consumers can install all declared exports and types from the retained tarball: `verify:pr`, the packed declaration/consumer suites, `publint` and the packed type-resolution gate pass on every gated platform. The shipped examples and preflight run with the declared adapter/native tuple.
+- Operators can run the affected stores against real services: `verify:release` passes both standalone Redis and Postgres lanes. For a release claiming sharded Redis or Valkey behavior, the matching cluster/failover or Valkey lane also passes; retain the server versions and configuration with those results. Relevant disconnect, retry, erasure, lease-loss and recovery regressions must pass rather than relying on a throughput result alone.
+- Operators have a measured capacity envelope for the changed hot paths: retain the baseline/candidate runs, workload shape, environment, throughput and latency distribution, errors and recovery under load. The affected benchmark must show no unexplained regression. Results from another workload or a shared noisy host are not proof of a speedup or fleet-wide capacity.
+- Consumers receive a qualified ecosystem tuple: the lead compatibility row names exact adapter, extensions and realtime artifacts and matching qualification heads. Its cross-repository gate is green at those heads, and wire/persistence revisions remain compatible. A `workspace` compatibility row is a development declaration, not publication or qualification evidence.
+- Maintainers can account for failures and changes: operational error references and diagnostics match the shipped code; README, MIGRATION and changelog describe the exact artifact; documented migration/rollback procedures cover its storage and wire changes. No known reachable defect is left without a documented workaround and an explicit acceptance decision.
+- Publication and routing identities are reconciled: all published versions have their immutable registry row and changelog heading, the candidate has retained-artifact/provenance evidence, and the required consumer checks pass before `next` or `latest` moves. A missing evidence item blocks promotion; do not weaken a gate in the change claiming readiness.
+
+These are release acceptance conditions, not claims that the current development checkout is ready for stable publication.
+
 ## Identity and branch roles
 
 - `dev` contains development candidates; prerelease versions use `publishConfig.tag: next`.

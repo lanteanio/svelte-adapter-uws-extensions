@@ -37,7 +37,7 @@ before replacing an in-memory primitive.
 - **Database change notifications** - Postgres LISTEN/NOTIFY forwarded straight to WebSocket clients
 - **Prometheus metrics** - expose extension metrics for scraping, with no collection work when disabled
 
-**Documentation:** [Release history](./CHANGELOG.md) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
+**Documentation:** [Release history](./CHANGELOG.md) | [Release acceptance](./docs/releasing.md#release-scope-and-acceptance) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
 
 **Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
 
