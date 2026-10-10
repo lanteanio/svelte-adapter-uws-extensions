@@ -361,6 +361,28 @@ LISTEN/advisory locks. See [session budgets and shutdown](docs/postgres-support.
 
 ## 4. Silent behaviour changes to audit
 
+### Metric identifiers collapse to bounded classes
+
+**Symptom.** Dashboards and alerts selecting a raw topic, group, tenant or lock
+key stop matching new series. `createMetrics().mapTopic` and the lock/leader
+`mapKey` defaults now return `all` instead of the identifier. Built-in topic,
+group and rate-limit `tenant_id` labels use that mapping, including a custom
+registry without `mapTopic`.
+
+**Action.** Update selectors to the aggregate label, or supply an explicit
+mapper that returns a fixed set of non-identifying classes with a safe fallback
+for every other value. Lock and leader use their own `mapKey` option. An explicit
+identity mapper restores raw labels, but also restores disclosure and unbounded
+cardinality; use it only as a deliberate operator decision.
+
+`presence_total_online` sums per-topic online user counts across mapped topics
+and attached trackers, so the same user on two topics counts twice.
+`ws_topic_publish_rate` and `ws_topic_publish_bytes` sum sampled topics within
+each mapped class. Update dashboards that assumed a series represented one
+raw topic. Purging payloads does not erase previously scraped series; apply
+your monitoring backend's retention or deletion policy to historical labels.
+See [cardinality control](./README.md#cardinality-control) for a bounded mapper.
+
 ### Malformed relay envelopes are parse errors, not assertion violations
 
 An inbound pub/sub or sharded envelope without a string `instanceId` printed an

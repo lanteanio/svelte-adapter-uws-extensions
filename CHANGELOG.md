@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Metric identifier defaults now collapse to `all`.** `mapTopic` covers built-in topic, group and rate-limit tenant labels; lock/leader `mapKey` also defaults to `all`. Presence online and WebSocket publish gauges sum counts or sampled rates within mapped classes. Update raw-label dashboards and alerts, or provide an explicit mapper to restore chosen classes; an identity mapper explicitly restores raw-label privacy and cardinality risks. See the metric migration note for historical-series retention.
+
 ### Changed
 
 - Enforce sampled publish-rate admission with conservative per-instance bounds when top-topic displays omit a topic. Preserve display rankings, bound cache growth, and fail closed for missing or inconsistent peer totals.

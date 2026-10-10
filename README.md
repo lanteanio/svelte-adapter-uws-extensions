@@ -961,7 +961,7 @@ Additive and wire-compatible: a deployment that never calls `update()` sends the
 | `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator - a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
 | `staleCleanedTotal` | Reserved for backward compatibility. Always `0` since per-field staleness is now enforced atomically by Redis via `HPEXPIRE` rather than by an application-side cleanup script. The field stays for callers that read it.|
 
-The same numbers are exposed as Prometheus when a `metrics` registry is attached: `presence_total_online{topic="..."}` (gauge), `presence_heartbeat_latency_ms` (gauge). The former `presence_stale_cleaned_total` counter is no longer registered.
+With a `metrics` registry, `presence_total_online{topic="all"}` sums per-topic online user counts by mapped class; a user on two topics counts twice. `presence_heartbeat_latency_ms` is a gauge. The former `presence_stale_cleaned_total` counter is no longer registered.
 
 Two additional counters track the diff-protocol behavior:
 
@@ -3280,14 +3280,14 @@ Metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*` and label names must match `[
 
 #### Cardinality control
 
-If your topics are user-generated (e.g. `room:abc123`), per-topic labels will grow unbounded. Use `mapTopic` to collapse them:
+Identifier labels default to `all`. To distinguish a bounded set of non-identifying classes, use `mapTopic` with a safe fallback for every unmatched topic:
 
 ```js
 const metrics = createMetrics({
   mapTopic: (topic) => {
     if (topic.startsWith('room:')) return 'room:*';
     if (topic.startsWith('user:')) return 'user:*';
-    return topic;
+    return 'other';
   }
 });
 ```
@@ -3370,7 +3370,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `presence_leaves_total` | counter | `topic` | Leave events |
 | `presence_heartbeats_total` | counter | | Heartbeat refresh cycles |
 | `presence_stale_cleaned_total` | counter | | Stale entries removed by cleanup |
-| `presence_total_online` | gauge | `topic` | Unique users present per topic on this instance |
+| `presence_total_online` | gauge | `topic` | Sum of per-topic online user counts by mapped class on this instance |
 | `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms |
 | `presence_keyspace_cleanups_total` | counter | | Topic hash removals that triggered an empty-list emit (keyspace mode only) |
 
