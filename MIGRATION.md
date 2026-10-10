@@ -783,9 +783,13 @@ These close real security bugs in idiomatic 0.4 code paths.
 **Storage layout.** The pre-fix per-topic hash was `presence:{topic}` with fields keyed by `{instanceId}|{userKey}`. The new layout splits storage:
 
 - `presence:topic:{topic}` HASH, field=`userKey`, value=JSON `{data, ts}`. One field per unique user on the topic. Backs `list()` / `count()`.
-- `presence:user:{topic}:{userKey}` HASH, field=`instanceId`, value=`ts`. One field per instance currently presenting this user. Backs the leave HLEN check.
+- `presence:user:{topic}:{userKey}` HASH, field=`instanceId`, value=opaque membership token. One field per instance currently presenting this user. Backs the leave HLEN check.
 
-Both hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is gone; keys implicitly disappear when their last field expires.
+- `presence:pending:{topic}` HASH, field=`userKey`, value=private identity generations and committed-identity fence. It is excluded from roster reads.
+
+Permit all three key families in Redis ACL patterns before upgrading. The private pending hash is required for joins; preserve it alongside presence state during backup and restore. Legacy writers cannot provide the full identity-ordering guarantee, so update every writer and receiver.
+
+All three hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is gone; keys implicitly disappear when their last field expires.
 
 **How to migrate.**
 

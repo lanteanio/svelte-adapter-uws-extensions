@@ -103,7 +103,7 @@ export function makePublicData(transientFields) {
  */
 export function setLocalData(topicData, key, data) {
 	const existing = topicData.get(key);
-	const next = existing ? { data, fields: existing.fields } : { data, fields: null };
+	const next = existing ? { data, fields: existing.fields, authorityToken: existing.authorityToken, fieldRevisions: existing.fieldRevisions } : { data, fields: null };
 	if (existing?.remoteIdentity && deepEqual(existing.data, data)) {
 		next.remoteIdentity = true;
 		if (existing.legacyData) next.legacyData = existing.legacyData;

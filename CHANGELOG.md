@@ -102,6 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redis presence releases half-open breaker probes when a join is abandoned by a closing socket, sync is denied, or Redis version detection fails, so other users of the shared breaker can recover normally.
 
+- Redis presence joins with changed selected identity on another instance update every peer roster. Preserve receiver durable fields when identity relays arrive late, and condition partial-tab identity restores on the current committed identity without invalidating concurrent joins. Document the required `presence:pending:{topic}` ACL key family and opaque membership tokens.
+
 - Redis presence preserves unrelated Unicode and punctuation update names when the identity key has no ASCII letters or digits after lowercasing. Nonempty folded identity aliases remain reserved across updates, relays and snapshots.
 
 - Failed Redis presence joins no longer overwrite newer identities or strand membership. Commit identity after admission with bounded private generations, conditional cleanup and final leave notifications while preserving durable update storage.

@@ -68,7 +68,7 @@ import { WsClosedError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
-import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
+import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, RESTORE_IDENTITY_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
@@ -399,6 +399,7 @@ export function createPresence(client, options = {}) {
 	// true means that public data is already the complete selected identity.
 	function identityPayload(key, entry) {
 		const payload = { key, data: publicData(entry), identity: entry.fields ? entry.data : true };
+		if (entry.authorityToken) payload.authority = entry.authorityToken;
 		if (entry.fields) {
 			const fields = newFieldMap();
 			for (const name of Object.keys(entry.fields)) {
@@ -491,6 +492,39 @@ export function createPresence(client, options = {}) {
 		if (!localCounts.has(topic) && !syncCounts.has(topic)) await unsubscribeFromTopic(topic);
 	}
 
+	async function restoreIdentity(topic, key, newest, cached, platform) {
+		const expected = cached.data;
+		const legacy = cached.legacyData;
+		const authority = cached.authorityToken;
+		cached.fieldRevisions ||= newFieldMap();
+		const revisions = { ...cached.fieldRevisions };
+		try {
+			const result = await evalCached(redis, RESTORE_IDENTITY_SCRIPT, 3,
+				userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
+				instanceId, key, JSON.stringify(expected), JSON.stringify(newest), now(), presenceTtlMs, authority || '', instanceId + ':' + (++joinSequence)
+			);
+			const topicData = localData.get(topic);
+			const current = topicData?.get(key);
+			if (!result?.[0] || current !== cached || current.data !== expected || current.legacyData !== legacy || current.authorityToken !== authority) return;
+			const restored = parseEntries({ [key]: result[0] }, fieldNames.fromServer).get(key);
+			if (!restored) return;
+			setLocalData(topicData, key, restored.data);
+			const entry = topicData.get(key);
+			entry.authorityToken = result[1];
+			if (restored.fields) {
+				entry.fields ||= newFieldMap();
+				for (const name of Object.keys(restored.fields)) {
+					if (entry.fieldRevisions[name] === revisions[name]) {
+						entry.fields[name] = restored.fields[name];
+						entry.fieldRevisions[name] = (entry.fieldRevisions[name] || 0) + 1;
+					}
+				}
+			}
+			bufferDiff(topic, 'join', key, publicData(entry), platform);
+			await publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, entry));
+		} catch { /* leave remains local if Redis is unavailable */ }
+	}
+
 	async function leaveTopic(ws, platform, topic) {
 		const connTopics = wsTopics.get(ws);
 		// Peel one role at a time: a participant leave removes ONLY the participant
@@ -562,19 +596,7 @@ export function createPresence(client, options = {}) {
 						const newest = findOtherWsData(topic, key, ws);
 						const cached = topicData.get(key);
 						if (newest && cached && !cached.remoteIdentity && !deepEqual(newest, cached.data)) {
-							setLocalData(topicData, key, newest);
-							const ts = now();
-							try {
-								await evalCached(redis,
-									JOIN_SCRIPT, 3,
-									userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
-									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
-								);
-								bufferDiff(topic, 'join', key, newest, platform);
-								publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, topicData.get(key)));
-							} catch {
-								setLocalData(topicData, key, cached.data);
-							}
+							await restoreIdentity(topic, key, newest, cached, platform);
 						}
 					}
 				}
@@ -693,21 +715,7 @@ export function createPresence(client, options = {}) {
 		}
 
 		for (const { topic, key, newest, cached } of deferredRestores) {
-			const topicData = localData.get(topic);
-			if (!topicData) continue;
-			setLocalData(topicData, key, newest);
-			const ts = now();
-			try {
-				await evalCached(redis,
-					JOIN_SCRIPT, 3,
-					userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
-					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
-				);
-				bufferDiff(topic, 'join', key, newest, platform);
-				pendingUpdatedRelays.push(publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, topicData.get(key))));
-			} catch {
-				setLocalData(topicData, key, cached.data);
-			}
+			pendingUpdatedRelays.push(restoreIdentity(topic, key, newest, cached, platform));
 		}
 
 		// Step 2: async Redis cleanup. Local state is already clean so the
@@ -927,6 +935,7 @@ export function createPresence(client, options = {}) {
 
 			let isNewUser = false;
 			let identityChanged = false;
+			let authorityToken;
 			let reservedIdentity = false;
 			const currentEntry = localData.get(topic)?.get(key);
 
@@ -1030,6 +1039,7 @@ export function createPresence(client, options = {}) {
 					try { current = await finalize(); } catch { current = await finalize(); }
 					if (!current?.[0]) throw new Error('presence join expired before identity commit');
 					isNewUser = current[1] === 1;
+					authorityToken = current[2];
 					all = { ...all, [key]: current[0] };
 				} catch (err) {
 					b?.failure(err);
@@ -1063,6 +1073,7 @@ export function createPresence(client, options = {}) {
 				setLocalData(topicData, key, stored ? stored.data : data);
 				committed = topicData.get(key);
 			}
+			if (authorityToken !== undefined) committed.authorityToken = authorityToken;
 			if (matchesSelection) {
 				// join already encoded this selection for its eager JSON check.
 				// Reuse it for the next local join's identity equality guard.
@@ -1077,6 +1088,7 @@ export function createPresence(client, options = {}) {
 			if (stored?.fields) {
 				const committed = topicData.get(key);
 				committed.fields = Object.assign(newFieldMap(), committed.fields, stored.fields);
+				if (committed.fieldRevisions) for (const name of Object.keys(stored.fields)) committed.fieldRevisions[name] = (committed.fieldRevisions[name] || 0) + 1;
 				committed.fieldsBytes = undefined;
 			}
 			reservation.committed = true;
@@ -1296,7 +1308,10 @@ export function createPresence(client, options = {}) {
 			const changed = changedDurable && changedTransient ? { ...changedDurable, ...changedTransient } : (changedDurable || changedTransient);
 
 			if (totalBytes > maxTotalFieldsBytes) return;
-			for (const k of Object.keys(changed)) entry.fields[k] = changed[k];
+			for (const k of Object.keys(changed)) {
+				entry.fields[k] = changed[k];
+				if (entry.fieldRevisions) entry.fieldRevisions[k] = (entry.fieldRevisions[k] || 0) + 1;
+			}
 			entry.fieldsBytes = totalBytes;
 
 			// Local fan-out: buffer the update diff (durable + transient together)

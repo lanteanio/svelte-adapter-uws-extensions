@@ -24,6 +24,7 @@ import { isCluster } from '../../shared/cluster.js';
 import { createBusValidator } from '../../shared/bus-validate.js';
 import { mergeFields, newFieldMap } from './field-policy.js';
 import { INTERNAL_EVENTS } from './lua.js';
+import { makePublicData, parseEntries, deepEqual } from './data.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../../shared/redis-subscriber.js';
@@ -105,7 +106,7 @@ function isRecord(value) {
 function isValidPresencePayload(event, payload) {
 	if (!isRecord(payload) || typeof payload.key !== 'string') return false;
 	if (event === INTERNAL_EVENTS.JOIN || event === INTERNAL_EVENTS.UPDATED) {
-		return isRecord(payload.data) && (payload.identity === undefined || payload.identity === true || isRecord(payload.identity)) && (payload.fields === undefined || isRecord(payload.fields));
+		return isRecord(payload.data) && (payload.identity === undefined || payload.identity === true || isRecord(payload.identity)) && (payload.fields === undefined || isRecord(payload.fields)) && (payload.authority === undefined || typeof payload.authority === 'string');
 	}
 	if (event === INTERNAL_EVENTS.LEAVE) {
 		return payload.data === null || isRecord(payload.data);
@@ -135,6 +136,44 @@ function isValidPresencePayload(event, payload) {
  * }} deps
  */
 export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspaceNotifications, bufferDiff, bufferUpdate, localData, emit, eventChannel, mKeyspaceCleanups, acceptsField, transientFields = new Set() }) {
+	const publicData = makePublicData(transientFields);
+	const fieldReads = new Map();
+	function reconcileFields(topic, key, entry) {
+		let reads = fieldReads.get(topic);
+		if (!reads) fieldReads.set(topic, reads = new Map());
+		const pending = reads.get(key);
+		if (pending) { pending.again = true; return; }
+		const request = { again: false };
+		reads.set(key, request);
+		entry.fieldRevisions ||= newFieldMap();
+		const revisions = { ...entry.fieldRevisions };
+		void (async () => {
+			try {
+				const raw = await client.redis.hget(client.key('presence:topic:{' + topic + '}'), key);
+				if (disposed || !activePlatform || localData.get(topic)?.get(key) !== entry || !raw) return;
+				const stored = parseEntries({ [key]: raw }, acceptsField).get(key);
+				if (!stored?.fields) return;
+				let changed = false;
+				for (const name of Object.keys(stored.fields)) {
+					if (transientFields.has(name) || entry.fieldRevisions[name] !== revisions[name] || deepEqual(entry.fields?.[name], stored.fields[name])) continue;
+					(entry.fields ||= newFieldMap())[name] = stored.fields[name];
+					entry.fieldRevisions[name] = (entry.fieldRevisions[name] || 0) + 1;
+					changed = true;
+				}
+				if (changed) {
+					entry.fieldsBytes = undefined;
+					bufferDiff(topic, 'join', key, publicData(entry), activePlatform);
+				}
+			} catch { /* retain the last known fields when Redis is unavailable */ }
+			finally {
+				reads.delete(key);
+				if (!reads.size) fieldReads.delete(topic);
+				const current = localData.get(topic)?.get(key);
+				if (request.again && !disposed && current && activePlatform) reconcileFields(topic, key, current);
+			}
+		})();
+	}
+
 	// Redis subscriber for cross-instance join/leave events
 	/** @type {import('ioredis').Redis | null} */
 	let subscriber = null;
@@ -629,19 +668,27 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
 						const snapshot = mergeFields(newFieldMap(), payload.data);
 						const localEntry = localData.get(topic)?.get(payload.key);
+						let reconcile = false;
 						if (localEntry) {
 							// Public roster values cannot identify fields shadowing selected
 							// data. New peers carry both independent parts explicitly.
 							localEntry.remoteIdentity = true;
+							localEntry.authorityToken = typeof payload.authority === 'string' ? payload.authority : undefined;
 							localEntry.serializedIdentity = undefined;
 							if (payload.identity !== undefined) {
 								localEntry.data = payload.identity === true ? snapshot : mergeFields(newFieldMap(), payload.identity);
 								delete localEntry.legacyData;
-								if (localEntry.fields || payload.fields) {
-									const fields = newFieldMap();
-									if (localEntry.fields) mergeFields(fields, localEntry.fields, name => transientFields.has(name));
-									if (payload.fields) mergeFields(fields, payload.fields, name => acceptsField(name) && !transientFields.has(name));
-									localEntry.fields = Object.keys(fields).length ? fields : null;
+								if (payload.fields) {
+									localEntry.fields ||= newFieldMap();
+									for (const name of Object.keys(payload.fields)) {
+										if (!acceptsField(name) || transientFields.has(name)) continue;
+										if (Object.hasOwn(localEntry.fields, name)) {
+											if (!deepEqual(localEntry.fields[name], payload.fields[name])) reconcile = true;
+										} else {
+											localEntry.fields[name] = payload.fields[name];
+											if (localEntry.fieldRevisions) localEntry.fieldRevisions[name] = (localEntry.fieldRevisions[name] || 0) + 1;
+										}
+									}
 								}
 							} else {
 								// Older peers expose only a public snapshot. Keep it separate
@@ -649,13 +696,13 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 								localEntry.legacyData = snapshot;
 								for (const name of Object.keys(localEntry.fields || {})) {
 									if (transientFields.has(name)) continue;
-									if (Object.prototype.hasOwnProperty.call(payload.data, name)) localEntry.fields[name] = payload.data[name];
-									else delete localEntry.fields[name];
+									if (Object.prototype.hasOwnProperty.call(payload.data, name) && !deepEqual(localEntry.fields[name], payload.data[name])) reconcile = true;
 								}
 							}
 							localEntry.fieldsBytes = undefined;
 						}
-						bufferDiff(topic, 'join', payload.key, snapshot, activePlatform);
+						bufferDiff(topic, 'join', payload.key, localEntry ? publicData(localEntry) : snapshot, activePlatform);
+						if (reconcile) reconcileFields(topic, payload.key, localEntry);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {
 						bufferDiff(topic, 'leave', payload.key, payload.data === null ? null : mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.FIELDS) {
@@ -689,6 +736,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 									// identity or a private field in every roster frame.
 									mergeFields(localEntry.fields, durable, acceptsField);
 									mergeFields(localEntry.fields, transient, acceptsField);
+									if (localEntry.fieldRevisions) for (const name of Object.keys(changed)) localEntry.fieldRevisions[name] = (localEntry.fieldRevisions[name] || 0) + 1;
 									localEntry.fieldsBytes = undefined;
 								}
 							}
@@ -756,6 +804,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		// Set first: a sweep awaiting MYID/psubscribe, or a `+node`/error-driven
 		// reconcile, must not repopulate keyspaceSubs with connections nothing quits.
 		disposed = true;
+		fieldReads.clear();
 		if (idleTimer) {
 			clearTimer(idleTimer);
 			idleTimer = null;

@@ -86,7 +86,7 @@ return {first and 1 or 0, raw or false, reserved and 1 or 0, version, metadata.e
 /**
  * Promote a successfully admitted generation using current durable fields.
  * The private incarnation fences expired/recreated membership. A legacy writer
- * that changes public identity remains authoritative. Returns {entry, created};
+ * that changes public identity remains authoritative. Returns {entry, created, authority};
  * the created token makes a lost-reply retry report the same first promotion.
  * KEYS: membership, topic, pending hashes. ARGV: instance, user, token,
  * incarnation, generation, selected JSON, timestamp, field TTL.
@@ -103,7 +103,7 @@ local value = decode(raw)
 local metadata = decode(redis.call('HGET', pendingKey, user))
 if not metadata then return false end
 if metadata.epoch ~= epoch or (tonumber(metadata.version) or 0) < version then return false end
-if not sameIdentity(metadata.data, value and value.data) then return raw and {raw, 0} or false end
+if not sameIdentity(metadata.data, value and value.data) then return raw and {raw, 0, ''} or false end
 local fallback = version == 0 and not value
 if fallback or version > (tonumber(metadata.committedVersion) or 0) then
   local incoming = {data=cjson.decode(ARGV[6]), ts=math.max(value and tonumber(value.ts) or 0, ts)}
@@ -116,7 +116,7 @@ if fallback or version > (tonumber(metadata.committedVersion) or 0) then
   redis.call('HSET', pendingKey, user, cjson.encode(metadata))
   redis.call('HPEXPIRE', pendingKey, ttl, 'FIELDS', 1, user)
 end
-return raw and {raw, metadata.createdToken == token and 1 or 0} or false
+return raw and {raw, metadata.createdToken == token and 1 or 0, metadata.committedToken or ''} or false
 `;
 
 /**
@@ -145,6 +145,36 @@ if private then
   committed = ok and type(value) == 'table' and value.committedToken == token
 end
 return {raw or false, committed and 1 or 0, 0}
+`;
+
+/**
+ * Restore a surviving local tab only while its prior identity is authoritative.
+ * Membership and pending join generations remain untouched. A reserved join can
+ * still finalize after this write; a committed peer identity prevents the write.
+ * KEYS: membership, topic, pending hashes. ARGV: instance, user, expected identity,
+ * selected identity, timestamp, field TTL, expected authority, new authority.
+ * Returns {writtenEntry, authority}, or false.
+ */
+export const RESTORE_IDENTITY_SCRIPT = `
+-- PRESENCE_RESTORE
+${IDENTITY_HELPERS}
+local userKey, topicKey, pendingKey = KEYS[1], KEYS[2], KEYS[3]
+local user, ttl = ARGV[2], tonumber(ARGV[6])
+if not redis.call('HGET', userKey, ARGV[1]) then return false end
+local value = decode(redis.call('HGET', topicKey, user))
+if not value or not sameIdentity(value.data, cjson.decode(ARGV[3])) then return false end
+local metadata = decode(redis.call('HGET', pendingKey, user))
+if not metadata or not ARGV[7] or ARGV[7] == '' or metadata.committedToken ~= ARGV[7] then return false end
+if not sameIdentity(metadata.data, value.data) then return false end
+value.data = cjson.decode(ARGV[4])
+value.ts = math.max(tonumber(value.ts) or 0, tonumber(ARGV[5]))
+local raw = cjson.encode(value)
+redis.call('HSET', topicKey, user, raw)
+redis.call('HPEXPIRE', topicKey, ttl, 'FIELDS', 1, user)
+metadata.data, metadata.committedToken = value.data, ARGV[8]
+redis.call('HSET', pendingKey, user, cjson.encode(metadata))
+redis.call('HPEXPIRE', pendingKey, ttl, 'FIELDS', 1, user)
+return {raw, ARGV[8]}
 `;
 
 /**

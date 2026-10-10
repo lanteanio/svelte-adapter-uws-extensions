@@ -23,7 +23,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } 
 import { createBackendClient, resetBackendKeys, setBackendConfig } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../src/redis/presence.js';
-import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, LEAVE_SCRIPT } from '../../../src/redis/presence/lua.js';
+import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, RESTORE_IDENTITY_SCRIPT, LEAVE_SCRIPT } from '../../../src/redis/presence/lua.js';
 import { evalCached, evalCachedName } from '../../../src/shared/eval-cached.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -889,7 +889,7 @@ describeIntegration('redis presence (integration)', () => {
 			const user = userHashKey('room', 'alice'), topic = topicHashKey('room'), pending = client.key('presence:pending:{room}');
 			const ts = Date.now(), ttl = 60000;
 			const result = await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, 'modern', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Modern' }, ts, identityToken: 'modern' }), ts, ttl, 'modern');
-			await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, 'legacy', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Legacy' }, ts: ts + 1 }), ts + 1, ttl);
+			await evalCached(client.redis, JOIN_SCRIPT, 2, user, topic, 'legacy', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Legacy' }, ts: ts + 1 }), ts + 1, ttl);
 			await evalCached(client.redis, FINALIZE_JOIN_SCRIPT, 3, user, topic, pending, 'modern', 'alice', 'modern', result[4], result[3], JSON.stringify({ id: 'alice', name: 'Modern' }), ts, ttl);
 			expect(await makeTracker().list('room')).toEqual([{ id: 'alice', name: 'Legacy' }]);
 			expect(JSON.parse(await client.redis.hget(topic, 'alice')).identityEpoch).toBeUndefined();
@@ -1013,6 +1013,97 @@ describeIntegration('redis presence (integration)', () => {
 				expect(attempts).toBe(2);
 				expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'Alice' }]);
 			} finally { client.redis[command] = finalize; }
+		});
+
+		for (const closeAll of [false, true]) for (const sameInstance of [false, true]) it('keeps a pending join valid through partial leave in real Redis, closeAll=' + closeAll + ', sameInstance=' + sameInstance, async () => {
+			const a = makeTracker({ binary: false, heartbeat: 100 }), b = makeTracker({ binary: false, heartbeat: 100 });
+			const pb = mockPlatform();
+			const old = mockWs({ id: 'alice', name: 'Old' }), recent = mockWs({ id: 'alice', name: 'Recent' });
+			await a.join(old, 'room', platform); await a.join(recent, 'room', platform);
+			await a.update(old, 'room', { color: 'blue' }, platform);
+			const hgetall = client.redis.hgetall.bind(client.redis);
+			let release;
+			try {
+				let sawRead, hold = true;
+				const reading = new Promise(resolve => { sawRead = resolve; });
+				client.redis.hgetall = key => {
+					if (hold && key === topicHashKey('room')) {
+						hold = false; sawRead();
+						return new Promise(resolve => { release = () => resolve(hgetall(key)); });
+					}
+					return hgetall(key);
+				};
+				const joining = (sameInstance ? a : b).join(mockWs({ id: 'alice', name: 'Newest' }), 'room', sameInstance ? platform : pb);
+				await reading;
+				await a.leave(recent, platform, closeAll ? undefined : 'room');
+				release();
+				await joining;
+				const expected = { id: 'alice', name: 'Newest', color: 'blue' };
+				expect(await a.list('room')).toEqual([expected]);
+				await vi.waitFor(() => {
+					for (const p of sameInstance ? [platform] : [platform, pb]) expect(p.published.findLast(frame => frame.event === 'heartbeat')?.data.alice).toEqual(expected);
+				});
+			} finally { release?.(); client.redis.hgetall = hgetall; }
+		});
+
+		for (const closeAll of [false, true]) for (const afterWrite of [false, true]) it('keeps newer peer identity through a delayed native restore, closeAll=' + closeAll + ', afterWrite=' + afterWrite, async () => {
+			const a = makeTracker({ binary: false, heartbeat: 100 }), b = makeTracker({ binary: false, heartbeat: 100 }), pb = mockPlatform();
+			const old = mockWs({ id: 'alice', name: 'Old' }), recent = mockWs({ id: 'alice', name: 'Recent' });
+			await a.join(old, 'room', platform); await a.join(recent, 'room', platform);
+			const command = evalCachedName(client.redis, RESTORE_IDENTITY_SCRIPT), restore = client.redis[command].bind(client.redis);
+			let raced = false;
+			client.redis[command] = async (...args) => {
+				raced = true;
+				const result = afterWrite ? await restore(...args) : undefined;
+				await b.join(mockWs({ id: 'alice', name: 'Newest' }), 'room', pb);
+				await vi.waitFor(() => expect(platform.published.findLast(frame => frame.event === 'heartbeat')?.data.alice?.name).toBe('Newest'));
+				return afterWrite ? result : restore(...args);
+			};
+			try {
+				await a.leave(recent, platform, closeAll ? undefined : 'room');
+				expect(raced).toBe(true);
+				expect(await a.list('room')).toEqual([{ id: 'alice', name: 'Newest' }]);
+				await vi.waitFor(() => {
+					for (const p of [platform, pb]) expect(p.published.findLast(frame => frame.event === 'heartbeat')?.data.alice).toEqual({ id: 'alice', name: 'Newest' });
+				});
+			} finally { client.redis[command] = restore; }
+		});
+
+		it('fences a partial restore after an equal-identity peer generation commits', async () => {
+			const a = makeTracker(), b = makeTracker(), pb = mockPlatform();
+			const old = mockWs({ id: 'alice', name: 'Old' }), recent = mockWs({ id: 'alice', name: 'Recent' });
+			await a.join(old, 'room', platform); await a.join(recent, 'room', platform);
+			const publish = client.redis.publish.bind(client.redis);
+			client.redis.publish = () => Promise.resolve(0);
+			try {
+				await b.join(mockWs({ id: 'alice', name: 'Recent' }), 'room', pb);
+				await a.leave(recent, platform, 'room');
+				expect(await a.list('room')).toEqual([{ id: 'alice', name: 'Recent' }]);
+			} finally { client.redis.publish = publish; }
+		});
+
+		it('keeps durable updates when a native identity relay arrives later', async () => {
+			const a = makeTracker({ binary: false, heartbeat: 100 }), b = makeTracker({ binary: false, heartbeat: 100 }), pb = mockPlatform();
+			const ws = mockWs({ id: 'alice', name: 'Old' });
+			await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', platform); await b.join(ws, 'room', pb);
+			await b.update(ws, 'room', { color: 'blue' }, pb);
+			const publish = client.redis.publish.bind(client.redis);
+			let held;
+			client.redis.publish = (channel, raw) => {
+				if (JSON.parse(raw).event === 'updated') { held = [channel, raw]; return Promise.resolve(0); }
+				return publish(channel, raw);
+			};
+			try {
+				await a.join(mockWs({ id: 'alice', name: 'New' }), 'room', platform);
+				await b.update(ws, 'room', { color: 'red' }, pb);
+				await publish(...held);
+				const expected = { id: 'alice', name: 'New', color: 'red' };
+				await vi.waitFor(() => expect(pb.published.findLast(frame => frame.event === 'diff' && frame.data.joins.alice)?.data.joins.alice).toEqual(expected));
+				await vi.waitFor(() => {
+					for (const p of [platform, pb]) expect(p.published.findLast(frame => frame.event === 'heartbeat')?.data.alice).toEqual(expected);
+				});
+				expect(await a.list('room')).toEqual([expected]);
+			} finally { client.redis.publish = publish; }
 		});
 
 		it('JOIN_SCRIPT preserves durable fields across a newer-data overwrite (real Lua)', async () => {

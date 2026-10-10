@@ -1056,6 +1056,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					return evalStreamReplayPublish(numKeys, args);
 				}
 				if (script.includes('PRESENCE_FINALIZE')) return evalPresenceFinalize(args, numKeys);
+				if (script.includes('PRESENCE_RESTORE')) return evalPresenceRestore(args, numKeys);
 				if (script.includes('PRESENCE_ROLLBACK')) return evalPresenceRollback(args, numKeys);
 				// Presence JOIN (Design G: per-user hash + per-topic hash, HPEXPIRE field TTL)
 				if (script.includes('PRESENCE_JOIN') && script.includes('HPEXPIRE')) {
@@ -1668,7 +1669,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			if (!metadata) return null;
 			const version = Number(versionArg), ts = Number(tsArg);
 			if (metadata.epoch !== epoch || (Number(metadata.version) || 0) < version) return null;
-			if (!isDeepStrictEqual(metadata.data, previous?.data)) return raw ? [raw, 0] : null;
+			if (!isDeepStrictEqual(metadata.data, previous?.data)) return raw ? [raw, 0, ''] : null;
 			if ((version === 0 && !previous) || version > (Number(metadata.committedVersion) || 0)) {
 				const incoming = { data: JSON.parse(data), ts: Math.max(Number(previous?.ts) || 0, ts) };
 				if (previous?.fields && typeof previous.fields === 'object') incoming.fields = previous.fields;
@@ -1678,7 +1679,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				setPresenceField(topicHashKey, user, raw, ttl);
 				setPresenceField(pendingKey, user, JSON.stringify(metadata), ttl);
 			}
-			return raw ? [raw, metadata.createdToken === token ? 1 : 0] : null;
+			return raw ? [raw, metadata.createdToken === token ? 1 : 0, metadata.committedToken || ''] : null;
 		}
 
 		// live.forget owner force-evict - removes the user's membership fields,
@@ -1720,6 +1721,25 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			h.delete('q');
 			if (h.size === 0) hashes.delete(key);
 			return ['', 'vacated', removed + 1];
+		}
+
+		function evalPresenceRestore(args, numKeys) {
+			const [membershipKey, topicKey, pendingKey] = args;
+			const [instance, user, expected, selected, ts, ttl, authority, token] = args.slice(numKeys);
+			for (const key of [membershipKey, topicKey, pendingKey]) pruneExpiredFields(key);
+			if (!hashes.get(membershipKey)?.has(instance)) return null;
+			const value = parsePresenceEntry(hashes.get(topicKey)?.get(user));
+			if (!value || !isDeepStrictEqual(value.data, JSON.parse(expected))) return null;
+			const metadata = parsePresenceEntry(hashes.get(pendingKey)?.get(user));
+			if (!metadata || !authority || metadata.committedToken !== authority) return null;
+			if (!isDeepStrictEqual(metadata.data, value.data)) return null;
+			value.data = JSON.parse(selected);
+			value.ts = Math.max(Number(value.ts) || 0, Number(ts));
+			const raw = JSON.stringify(value);
+			setPresenceField(topicKey, user, raw, ttl);
+			metadata.data = value.data; metadata.committedToken = token;
+			setPresenceField(pendingKey, user, JSON.stringify(metadata), ttl);
+			return [raw, token];
 		}
 
 		function evalPresenceRollback(args, numKeys = 2) {

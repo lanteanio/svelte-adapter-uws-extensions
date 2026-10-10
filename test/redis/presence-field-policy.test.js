@@ -240,7 +240,7 @@ describe('presence cross-instance bus ingress', () => {
 
 	it.each([0, 1])('counts internal identity metadata in the exact outbound byte limit (short by %s)', async shortBy => {
 		const data = { id: 'near-cap', name: '\u00e9'.repeat(100) };
-		const envelope = { instanceId: '0'.repeat(16), topic: 'room', event: 'join', payload: { key: data.id, data, identity: true } };
+		const envelope = { instanceId: '0'.repeat(16), topic: 'room', event: 'join', payload: { key: data.id, data, identity: true, authority: '0'.repeat(16) + ':1' } };
 		const bytes = Buffer.byteLength(JSON.stringify(envelope));
 		const maxEnvelopeBytes = bytes - shortBy;
 		const client = mockRedisClient();
