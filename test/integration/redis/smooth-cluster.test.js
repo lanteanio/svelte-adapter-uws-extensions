@@ -57,6 +57,19 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		return c;
 	}
 
+	// Redis deadlines live on the backend clock, which can lag the host under
+	// VM contention. Observe the actual key on its owning node; never renew it.
+	async function waitForExpiry(key) {
+		let ttl;
+		await waitFor(async () => {
+			ttl = await client.redis.pttl(client.key(key));
+			if (ttl === -1) throw new Error('Expected an expiring smooth key: ' + key);
+			return ttl === -2;
+		}, 10_000).catch(error => {
+			throw new Error('Smooth key did not expire: ' + key + ', last PTTL=' + ttl, { cause: error });
+		});
+	}
+
 	function recorder(c) {
 		const commands = [];
 		const syncs = [];
@@ -158,7 +171,7 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		expect(await a.acquireOwner('__smooth:room:ttl')).toBe(true);
 		expect(await b.acquireOwner('__smooth:room:ttl')).toBe(false);
 		// Let A's lease lapse without renewal; B can then take over with a fresh authority.
-		await wait(450);
+		await waitForExpiry('smooth:owner:__smooth:room:ttl');
 		expect(await b.acquireOwner('__smooth:room:ttl')).toBe(true);
 	});
 
@@ -303,7 +316,7 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		const T = '__smooth:snap:ttl';
 		await a.writeSnapshot(T, [{ key: 'p', state: { v: 1 } }]);
 		expect(await a.readSnapshot(T)).toEqual([{ key: 'p', state: { v: 1 } }]); // present now
-		await wait(450);
+		await waitForExpiry('smooth:snap:' + T);
 		expect(await a.readSnapshot(T)).toBeNull(); // self-expired
 	});
 
@@ -313,12 +326,12 @@ describe('redis smooth cluster coordinator (integration)', () => {
 		const T = '__smooth:snap:handoff';
 		const catalog = [{ key: 'p1', state: { x: 9 } }, { key: 'p2', state: { x: 4 } }];
 
-		// A owns the topic and debounce-persists its catalog.
+		// A owns the topic and persists its catalog without renewing the lease.
 		expect(await a.acquireOwner(T)).toBe(true);
 		await a.writeSnapshot(T, catalog);
 
 		// A goes quiet; its lease lapses and B takes over with a fresh authority.
-		await wait(450);
+		await waitForExpiry('smooth:owner:' + T);
 		expect(await b.acquireOwner(T)).toBe(true);
 
 		// The fresh owner recovers the previous owner's state instead of starting empty.
