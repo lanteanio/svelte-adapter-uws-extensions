@@ -1,7 +1,8 @@
-#!/usr/bin/env node
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parse } from 'acorn';
+import { TELEMETRY_LEVELS } from '../src/shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS, EXTENSIONS_ERROR_REGISTRY } from '../src/error-registry.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -20,8 +21,8 @@ const EVENT_SCAN_EXCLUDED = Object.freeze(['src/error-registry.js']);
 const EVENT_LITERAL = /event: '([a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+)'/;
 const EVENT_CONTEXT_LINES = 6;
 
-const FAILURE_SEVERITIES = new Set(['fatal', 'error', 'warn', 'warning']);
-const INFORMATIONAL_SEVERITIES = new Set(['debug', 'info', 'trace']);
+const FAILURE_SEVERITIES = new Set(['fatal', 'error', 'warn']);
+const INFORMATIONAL_SEVERITIES = new Set(['debug', 'info']);
 
 function eventScanFiles() {
 	const files = [];
@@ -34,6 +35,34 @@ function eventScanFiles() {
 	};
 	for (const directory of EVENT_SCAN_DIRECTORIES) walk(directory);
 	return files.filter((file) => !EVENT_SCAN_EXCLUDED.includes(file)).sort();
+}
+
+/** Validate literal diagnostic severities without treating comments as code. */
+export function auditDiagnosticSeverities(source, file = '<source>') {
+	const errors = [];
+	const allowed = new Set(TELEMETRY_LEVELS);
+	const pending = [parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: true })];
+	while (pending.length) {
+		const node = pending.pop();
+		if (node.type === 'Property' && node.kind === 'init') {
+			const key = node.computed || node.key.type === 'Literal' ? node.key.value : node.key.name;
+			const value = node.value;
+			if (key === 'severity' && value.type === 'Literal' && typeof value.value === 'string' && !allowed.has(value.value)) {
+				errors.push(`${file}:${value.loc.start.line}: invalid diagnostic severity ${JSON.stringify(value.value)}`);
+			}
+		}
+		for (const value of Object.values(node)) {
+			if (Array.isArray(value)) {
+				for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+			} else if (value && typeof value.type === 'string') pending.push(value);
+		}
+	}
+	return errors.sort();
+}
+
+export function auditRuntimeDiagnosticSeverities() {
+	return [...eventScanFiles(), 'src/error-registry.js'].flatMap((file) =>
+		auditDiagnosticSeverities(readFileSync(join(root, file), 'utf8'), file));
 }
 
 /**
@@ -372,6 +401,8 @@ export function errorReferenceMatches(onDisk, generated) {
 }
 
 export function checkErrorReference({ write = false } = {}) {
+	const severityErrors = auditRuntimeDiagnosticSeverities();
+	if (severityErrors.length) throw new Error(severityErrors.join('\n'));
 	const expected = renderErrorReference();
 	if (write) writeFileSync(outputPath, expected);
 	const actual = existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : '';

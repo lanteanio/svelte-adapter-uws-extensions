@@ -6,7 +6,7 @@ import { mockWs } from './helpers/mock-ws.js';
 import { createConnectionRegistry } from '../src/redis/registry.js';
 import { createGroup } from '../src/redis/groups.js';
 import { CircuitBrokenError } from '../src/shared/breaker.js';
-import { setOperationalEventSink } from '../src/shared/diagnostic.js';
+import { setOperationalEventSink, emitRegisteredFailure, TELEMETRY_LEVELS } from '../src/shared/diagnostic.js';
 import {
 	EXTENSIONS_ERROR_IDS,
 	EXTENSIONS_ERROR_REGISTRY,
@@ -15,6 +15,8 @@ import {
 	extensionsErrorDefinition
 } from '../src/error-registry.js';
 import {
+	auditDiagnosticSeverities,
+	auditRuntimeDiagnosticSeverities,
 	errorReferenceMatches,
 	findGhostRegistryEntries,
 	findUnindexedFailures,
@@ -358,5 +360,38 @@ describe('console call-site gate', () => {
 		const source = "console.log('[extensions] listening on ' + port);\nconsole.info('[extensions] ready');\n";
 		const { failures } = auditConsoleFailures(source, 'redis/widget.js', new Map());
 		expect(failures).toEqual([]);
+	});
+});
+
+
+describe('diagnostic severity contract', () => {
+	it('accepts only real telemetry levels at every literal emission and registry declaration', () => {
+		expect(auditRuntimeDiagnosticSeverities()).toEqual([]);
+		for (const severity of TELEMETRY_LEVELS) {
+			expect(auditDiagnosticSeverities(`emit({ severity: '${severity}' });`)).toEqual([]);
+		}
+	});
+
+	it('rejects syslog aliases and ignores documentation and unrelated level fields', () => {
+		for (const severity of ['warning', 'critical', 'notice', 'err', 'trace']) {
+			expect(auditDiagnosticSeverities(`emit({ severity: '${severity}' });`, 'fixture.js')).toEqual([
+				`fixture.js:1: invalid diagnostic severity "${severity}"`
+			]);
+		}
+		expect(auditDiagnosticSeverities('emit({ "severity": "warning" });')).toHaveLength(1);
+		expect(auditDiagnosticSeverities('emit({ ["severity"]: "warning" });')).toHaveLength(1);
+		expect(auditDiagnosticSeverities("/** severity: 'warning' */\nconst x = { level: 'siege' }; // severity: 'critical'\n")).toEqual([]);
+	});
+
+	it('delivers a registered warning to the operational sink', () => {
+		const records = [];
+		setOperationalEventSink((record) => records.push(record));
+		try {
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_KEYSPACE_EVENTS_OFF);
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({ severity: 'warn', event: 'redis.presence.keyspace-events.off' });
+		} finally {
+			setOperationalEventSink(null);
+		}
 	});
 });
