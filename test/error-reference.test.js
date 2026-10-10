@@ -378,6 +378,9 @@ describe('diagnostic severity contract', () => {
 				`fixture.js:1: invalid diagnostic severity "${severity}"`
 			]);
 		}
+		for (const literal of ['null', '3', 'false', '1n']) {
+			expect(auditDiagnosticSeverities(`emit({ severity: ${literal} });`)).toHaveLength(1);
+		}
 		expect(auditDiagnosticSeverities('emit({ "severity": "warning" });')).toHaveLength(1);
 		expect(auditDiagnosticSeverities('emit({ ["severity"]: "warning" });')).toHaveLength(1);
 		expect(auditDiagnosticSeverities("/** severity: 'warning' */\nconst x = { level: 'siege' }; // severity: 'critical'\n")).toEqual([]);

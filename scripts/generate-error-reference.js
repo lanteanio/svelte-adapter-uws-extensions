@@ -47,8 +47,8 @@ export function auditDiagnosticSeverities(source, file = '<source>') {
 		if (node.type === 'Property' && node.kind === 'init') {
 			const key = node.computed || node.key.type === 'Literal' ? node.key.value : node.key.name;
 			const value = node.value;
-			if (key === 'severity' && value.type === 'Literal' && typeof value.value === 'string' && !allowed.has(value.value)) {
-				errors.push(`${file}:${value.loc.start.line}: invalid diagnostic severity ${JSON.stringify(value.value)}`);
+			if (key === 'severity' && value.type === 'Literal' && !allowed.has(value.value)) {
+				errors.push(`${file}:${value.loc.start.line}: invalid diagnostic severity ${typeof value.value === 'string' ? JSON.stringify(value.value) : String(value.value)}`);
 			}
 		}
 		for (const value of Object.values(node)) {
@@ -61,7 +61,9 @@ export function auditDiagnosticSeverities(source, file = '<source>') {
 }
 
 export function auditRuntimeDiagnosticSeverities() {
-	return [...eventScanFiles(), 'src/error-registry.js'].flatMap((file) =>
+	// Registry entries have separate validation: thrown errors intentionally use
+	// null because they are not diagnostic emissions. Runtime literals do not.
+	return eventScanFiles().flatMap((file) =>
 		auditDiagnosticSeverities(readFileSync(join(root, file), 'utf8'), file));
 }
 
