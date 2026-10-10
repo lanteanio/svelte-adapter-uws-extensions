@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound PostgreSQL retention by rows, queries and transaction deadlines; coordinate replicas with transaction locks, traverse replay topics fairly, and expose aggregate cleanup outcomes. Add the replay expiry index to automatic and manual schemas.
+
 - Add identifier-free aggregate breaker state and transition metrics with cleanup, plus native PostgreSQL active, idle and capacity gauges that deduplicate shared pools.
 - Clarify that enqueue creates a fresh task receipt and forwards its idempotency key to handlers; only run uses the optional result cache. Verify independent submissions against PostgreSQL.
 

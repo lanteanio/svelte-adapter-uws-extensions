@@ -14,7 +14,7 @@
 			"initialization": "first store operation",
 			"ready": false,
 			"changeClass": "additive columns and indexes",
-			"additions": ["svti_replay.user_id TEXT", "svti_replay_seq.epoch BIGINT NOT NULL DEFAULT 0", "idx_svti_replay_user(user_id)"],
+			"additions": ["svti_replay.user_id TEXT", "svti_replay_seq.epoch BIGINT NOT NULL DEFAULT 0", "idx_svti_replay_user(user_id)", "idx_svti_replay_created_at(created_at)"],
 			"rollbackLimit": "Column-only old readers remain possible; old reset/resume code does not honor the new epoch. Do not mix reset authorities."
 		},
 		{

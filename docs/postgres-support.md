@@ -116,7 +116,7 @@ The minimum server is PostgreSQL 16 for every row below.
 
 | Store | Change from 0.5.10 | Initialization with `autoMigrate: true` | Startup gate |
 | --- | --- | --- | --- |
-| Replay | Adds event `user_id`, lookup index and sequence `epoch` with default 0. | First store operation. | No `ready()`; apply/verify schema before opening traffic. |
+| Replay | Adds event `user_id`, identity and retention indexes, and sequence `epoch` with default 0. | First store operation. | No `ready()`; apply/verify schema before opening traffic. |
 | Idempotency | Adds `user_id`, `tenant_id`, `owner_token` and tenant/user index. | Starts at construction. | Await `store.ready()`. |
 | Jobs | Adds nullable `traceparent` and `tracestate`. | First store operation. | No `ready()`; apply/verify schema before starting producers/workers. |
 | Tasks | Adds nullable trace columns, `user_id` and user index. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
@@ -151,6 +151,7 @@ not just an `ALTER TABLE` fragment.
 ```sql
 ALTER TABLE svti_replay ADD COLUMN IF NOT EXISTS user_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_svti_replay_user ON svti_replay (user_id);
+CREATE INDEX IF NOT EXISTS idx_svti_replay_created_at ON svti_replay (created_at);
 ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE svti_idempotency ADD COLUMN IF NOT EXISTS user_id TEXT;
 ALTER TABLE svti_idempotency ADD COLUMN IF NOT EXISTS tenant_id TEXT;
