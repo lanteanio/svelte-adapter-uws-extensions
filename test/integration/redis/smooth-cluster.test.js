@@ -73,27 +73,33 @@ describe('redis smooth cluster coordinator (integration)', () => {
 	function recorder(c) {
 		const commands = [];
 		const syncs = [];
+		const warmups = new Set();
 		const syncReplies = [];
 		const broadcasts = [];
 		const acks = [];
 		const leaves = [];
 		c.onMessage({
 			onCommand: (wireTopic, identity, originInstance, batch) => commands.push({ wireTopic, identity, originInstance, batch }),
-			onSync: (wireTopic, identity, originInstance, corr) => syncs.push({ wireTopic, identity, originInstance, corr }),
+			onSync: (wireTopic, identity, originInstance, corr) => {
+				if (wireTopic === '__smooth:warmup') warmups.add(originInstance);
+				else syncs.push({ wireTopic, identity, originInstance, corr });
+			},
 			onSyncReply: (wireTopic, corr, payload) => syncReplies.push({ wireTopic, corr, payload }),
 			onBroadcast: (wireTopic, event, data, excludeIdentity, seq, ownerInstance) => broadcasts.push({ wireTopic, event, data, excludeIdentity, seq, ownerInstance }),
 			onAck: (wireTopic, identity, payload) => acks.push({ wireTopic, identity, payload }),
 			onLeave: (wireTopic, identity, originInstance) => leaves.push({ wireTopic, identity, originInstance })
 		});
-		return { commands, syncs, syncReplies, broadcasts, acks, leaves };
+		return { commands, syncs, syncReplies, broadcasts, acks, leaves, warmups };
 	}
 
 	/** Force both subscribers to attach before the first asserted publish. */
 	async function warmup(a, b, ra, rb) {
-		a.requestSync('__smooth:warmup', 'w', a.instanceId, 'w');
-		b.requestSync('__smooth:warmup', 'w', b.instanceId, 'w');
-		await wait(100);
-		ra.syncs.length = 0; rb.syncs.length = 0;
+		await waitFor(() => {
+			if (ra.warmups.has(b.instanceId) && rb.warmups.has(a.instanceId)) return true;
+			a.requestSync('__smooth:warmup', 'w', a.instanceId, 'w');
+			b.requestSync('__smooth:warmup', 'w', b.instanceId, 'w');
+			return false;
+		});
 	}
 
 	it('forwards a command batch across connections, echo-suppressing the sender', async () => {
@@ -321,11 +327,13 @@ describe('redis smooth cluster coordinator (integration)', () => {
 	});
 
 	it('warm handoff: a fresh owner recovers the previous owner snapshot across a TTL lapse', async () => {
-		const a = track(createSmoothCluster(client, { leaseMs: 300 }));
-		const b = track(createSmoothCluster(client, { leaseMs: 300 }));
+		const a = track(createSmoothCluster(client, { leaseMs: 300, snapshotTtlMs: 60_000 }));
+		const b = track(createSmoothCluster(client, { leaseMs: 300, snapshotTtlMs: 60_000 }));
 		const T = '__smooth:snap:handoff';
 		const catalog = [{ key: 'p1', state: { x: 9 } }, { key: 'p2', state: { x: 4 } }];
 
+		// Snapshot expiry has its own test. Keep this snapshot alive throughout
+		// the bounded ownership poll, including host stalls or backend clock catch-up.
 		// A owns the topic and persists its catalog without renewing the lease.
 		expect(await a.acquireOwner(T)).toBe(true);
 		await a.writeSnapshot(T, catalog);
