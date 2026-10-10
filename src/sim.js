@@ -441,9 +441,9 @@ export async function runRedisSim(config = {}) {
 					},
 					clients: () => inst.clients.slice(),
 					publish: (t, e, d, o) => { recordPublish(i, t); return inst.wrapped.publish(t, e, d, o); },
-					publishBatched: (m) => {
+					publishBatched: (m, options) => {
 						if (Array.isArray(m)) for (const msg of m) recordPublish(i, msg && msg.topic);
-						return inst.wrapped.publishBatched(m);
+						return inst.wrapped.publishBatched(m, options);
 					},
 					// The bus-wrapped platform (publishing through it relays cross-instance)
 					// and the stateful plugins constructed against the shared store, so a

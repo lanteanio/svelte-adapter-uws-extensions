@@ -56,6 +56,12 @@ process.stdout.write(version);
 import { createDistributedSession, type DistributedSessionOptions } from 'svelte-adapter-uws-extensions/redis/session';
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
+import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
+const platform = mockPlatform();
+platform.publishBatched([{ topic: 'room', event: 'changed' }], { compress: true });
+const compressed: boolean | undefined = platform.publishedBatches[0].options?.compress;
+// @ts-expect-error Compression must be boolean.
+platform.publishBatched([], { compress: 'true' });
 declare const redis: RedisClient;
 interface SessionData { userId: string; count: number }
 const options: DistributedSessionOptions<SessionData> = { forgetUserId: data => data.userId };

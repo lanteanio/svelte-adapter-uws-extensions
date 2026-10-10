@@ -5,7 +5,7 @@
 // the guarded hypotheses without firing, a planted leftover-refed-work run
 // fires steady.no-quiescence, and a folded run still reproduces bit-for-bit
 // under its seed (the determinism self-gate).
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
 	faultClasses,
 	checkTimeMonotonic,
@@ -232,4 +232,19 @@ describe('steadystate - integration through runRedisSim / runPgSim', () => {
 		const rerun = await replayPgSim(original);
 		expect(rerun.reproduced).toBe(true);
 	});
+});
+
+
+it('forwards compression through every Redis simulation instance facade', async () => {
+	await runRedisSim({ seed: 'batch-compression', scenario: async api => {
+		for (let i = 0; i < api.instances; i++) {
+			const instance = api.instance(i);
+			const publish = vi.spyOn(instance.platform, 'publishBatched');
+			const messages = [{ topic: 'room', event: 'changed', data: i }];
+			const options = { compress: true };
+			instance.publishBatched(messages, options);
+			expect(publish).toHaveBeenCalledWith(messages, options);
+			publish.mockRestore();
+		}
+	} });
 });
