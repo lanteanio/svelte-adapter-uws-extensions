@@ -171,6 +171,14 @@ only its named Compose project, using that setup's exact Compose file.
 `gate:cross-repo` requires local adapter and realtime checkouts and package-manager
 network access. It reports which checks used installed tarballs and which ran in
 each repository's own checkout. Use `--strict` when missing prerequisites must fail.
+The `--quick` gate packs and installs the three working trees, checks their peers
+and declarations, then runs a native WebSocket contract from that clean consumer.
+The adapter's pinned canonical uWebSockets.js binding is a required dependency
+for this gate. Realtime's message hook routes through two extension buses sharing
+the Redis test helper, and both local and remote clients must receive the exact
+ordered values. This contract requires no backend service; native backend lanes
+remain separate. Use `--rungs contracts` to run only this contract and its packing
+and installation prerequisites.
 Never edit a sibling repository as part of this checkout's change; route the
 required change to its owner with the expected contract and verification evidence.
 

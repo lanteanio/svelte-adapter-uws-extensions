@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Exercise native WebSocket delivery through the packed adapter, realtime message hook and extensions relay in the quick ecosystem gate, with required canonical native bindings and local/remote value, order and count checks.
+
 - Bound Redis relay retention to 8,192 envelopes and 8 MiB per bus, including unsettled submissions. Drain FIFO chunks with event-loop yields, preserve local delivery under overload, and expose aggregate queue depth, bytes and oldest age.
 
 - Bound PostgreSQL dead-letter cleanup after writes and while idle, preserve committed capture receipts through cleanup failures, and exclude expired records from reads while physical backlogs drain.

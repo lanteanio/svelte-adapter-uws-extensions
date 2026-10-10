@@ -23,8 +23,10 @@
  *   peers    the resolved peer graph carries no problem against a head.
  *   types    a consumer importing every public subpath of the three PACKED
  *            heads typechecks under `strict`.
+ *   contracts native WebSocket delivery through the packed realtime message
+ *            hook and extensions bus preserves local and remote values/order.
  *
- * Those four are the cross-head proof: they run against the tarballs. The rest
+ * Those five are the cross-head proof: they run against the tarballs. The rest
  * re-run each repo's own suite IN ITS OWN TREE, where the sibling heads come
  * from that tree's node_modules (the registry), NOT from the packed heads:
  *
@@ -55,7 +57,7 @@
  *                        automatically, so `--rungs types` also packs and
  *                        installs.
  *   --quick              Only the rungs that prove the heads work together
- *                        (pack, install, peers, types).
+ *                        (pack, install, peers, types, contracts).
  *   --work-dir <path>    Where tarballs and the consumer are built.
  *                        Default: .cross-repo-gate/ under this repo.
  *   --require-clean      Fail unless every head, and a bunserve checkout when
@@ -173,11 +175,12 @@ function help() {
  * decides what a failure means. A spawn error is surfaced in `stderr` rather
  * than swallowed, otherwise a rung reports a bare "failed" with no cause.
  */
-function run(cmd, args, cwd, { env, shell = false } = {}) {
+function run(cmd, args, cwd, { env, shell = false, timeout } = {}) {
 	const r = spawnSync(cmd, shell ? args.map(quoteArg) : args, {
 		cwd,
 		encoding: 'utf8',
 		shell,
+		timeout,
 		maxBuffer: 64 * 1024 * 1024,
 		env: env ? { ...process.env, ...env } : process.env
 	});
@@ -348,6 +351,14 @@ function rungInstall() {
 	state.consumer = consumer;
 
 	const deps = { ...CONSUMER_PEERS };
+	const adapter = state.repos['svelte-adapter-uws'].pkg;
+	const native = adapter.optionalDependencies?.['uWebSockets.js'] || adapter.dependencies?.['uWebSockets.js'];
+	if (typeof native !== 'string' || !/^https:\/\/github\.com\/uNetworking\/uWebSockets\.js\/archive\/refs\/tags\/v[\d.]+\.tar\.gz$/.test(native)) {
+		record('install', FAIL, 'the adapter must declare a pinned canonical uWebSockets.js tarball');
+		return false;
+	}
+	// The native binding is mandatory here even when it is optional for apps.
+	deps['uWebSockets.js'] = native;
 	for (const name of HEADS) deps[name] = `file:${state.tarballs[name].replace(/\\/g, '/')}`;
 
 	writeFileSync(
@@ -586,6 +597,19 @@ function parseTscErrors(text) {
 	return out;
 }
 
+function rungContracts() {
+	const fixture = join(state.consumer, 'cross-repo-runtime.mjs');
+	writeFileSync(fixture, readFileSync(join(HERE, 'scripts', 'fixtures', 'cross-repo-runtime.mjs')));
+	const r = run(process.execPath, [fixture], state.consumer, { env: { REQUIRE_UWS: '1' }, timeout: 30000 });
+	if (r.code !== 0 || !r.stdout.includes('Packed runtime contract passed:')) {
+		record('contracts', FAIL, 'packed native WebSocket delivery contract failed', r.stdout + '\n' + r.stderr);
+		return false;
+	}
+	const native = readPkg(join(state.consumer, 'node_modules', 'uWebSockets.js'));
+	record('contracts', PASS, `native uWebSockets.js ${native?.version || 'loaded'}; packed realtime hook and extensions bus delivered six ordered values to each local/remote client`);
+	return true;
+}
+
 /**
  * Run one npm script in each head's OWN tree. The siblings there come from that
  * tree's node_modules, i.e. the registry, so this rung says nothing about the
@@ -730,6 +754,7 @@ const RUNGS = [
 	{ name: 'install', quick: true, needs: ['pack'], run: rungInstall },
 	{ name: 'peers', quick: true, needs: ['install'], run: rungPeers },
 	{ name: 'types', quick: true, needs: ['install'], run: rungTypes },
+	{ name: 'contracts', quick: true, needs: ['install'], run: rungContracts },
 	{ name: 'check', quick: false, needs: [], run: () => rungPerRepo('check', 'check', 'own check passes') },
 	{ name: 'unit', quick: false, needs: [], run: () => rungPerRepo('unit', 'test', 'own unit suite passes') },
 	{ name: 'realtime-e2e', quick: false, needs: [], run: rungRealtimeE2E },
