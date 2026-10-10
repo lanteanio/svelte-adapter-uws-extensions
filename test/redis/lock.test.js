@@ -332,7 +332,7 @@ describe('redis distributed lock', () => {
 				});
 			} finally {
 				releaseHolder();
-				await staleRun;
+				await expect(staleRun).rejects.toBeInstanceOf(LockLostError);
 			}
 
 			expect(holderSignal.aborted).toBe(true);
@@ -358,7 +358,7 @@ describe('redis distributed lock', () => {
 			await sleep(15);
 			await client.redis.del(client.key('lock:contested'));
 
-			await result;
+			await expect(result).rejects.toBeInstanceOf(LockLostError);
 			expect(lostError).toBeInstanceOf(LockLostError);
 			expect(lostError.key).toBe('contested');
 		});
@@ -380,10 +380,55 @@ describe('redis distributed lock', () => {
 			// Force-takeover by another instance.
 			await client.redis.set(client.key('lock:k'), 'foreign-token', 'XX');
 
-			await result;
+			await expect(result).rejects.toBeInstanceOf(LockLostError);
 			// Foreign-token still in place: our release skipped, AND the
 			// compare-and-delete shape would have refused anyway.
 			expect(await client.redis.get(client.key('lock:k'))).toBe('foreign-token');
+		});
+
+
+		it('rejects a successful callback when the final release discovers a takeover', async () => {
+			const lock = createDistributedLock(client, { heartbeatMs: 60000 });
+			await expect(lock.withLock('late', async () => {
+				await client.redis.set(client.key('lock:late'), 'successor', 'XX');
+				return 'finished';
+			})).rejects.toBeInstanceOf(LockLostError);
+			expect(await client.redis.get(client.key('lock:late'))).toBe('successor');
+		});
+
+		it('preserves a callback error when cleanup also confirms ownership loss', async () => {
+			const original = new Error('operation failed');
+			const lock = createDistributedLock(client, { heartbeatMs: 60000 });
+			await expect(lock.withLock('late', async () => {
+				await client.redis.del(client.key('lock:late'));
+				throw original;
+			})).rejects.toBe(original);
+		});
+
+		it('waits for a pending heartbeat verdict before reporting callback completion', async () => {
+			const lock = createDistributedLock(client, { defaultTtlMs: 1000, heartbeatMs: 5 });
+			const realEval = client.redis.eval.bind(client.redis);
+			let entered, finishHeartbeat, finishCallback;
+			const started = new Promise((resolve) => { entered = resolve; });
+			const heartbeatGate = new Promise((resolve) => { finishHeartbeat = resolve; });
+			client.redis.eval = async (script, ...args) => {
+				if (script.includes("'PEXPIRE'")) {
+					entered();
+					await heartbeatGate;
+				}
+				return realEval(script, ...args);
+			};
+			const pending = lock.withLock('pending', () => new Promise((resolve) => { finishCallback = resolve; }));
+			let settled = false;
+			void pending.then(() => { settled = true; }, () => { settled = true; });
+			await started;
+			await client.redis.set(client.key('lock:pending'), 'successor', 'XX');
+			finishCallback('finished');
+			await sleep(1);
+			expect(settled).toBe(false);
+			finishHeartbeat();
+			await expect(pending).rejects.toBeInstanceOf(LockLostError);
+			expect(await client.redis.get(client.key('lock:pending'))).toBe('successor');
 		});
 
 		it('continues running fn through a transient eval failure on heartbeat', async () => {
@@ -433,7 +478,7 @@ describe('redis distributed lock', () => {
 			let inFlightHeartbeats = 0;
 			let maxConcurrentHeartbeats = 0;
 			client.redis.eval = async (script, ...args) => {
-				const isHeartbeat = script.includes("'pexpire'");
+				const isHeartbeat = script.includes("'PEXPIRE'");
 				if (isHeartbeat) {
 					inFlightHeartbeats++;
 					maxConcurrentHeartbeats = Math.max(maxConcurrentHeartbeats, inFlightHeartbeats);
@@ -522,7 +567,7 @@ describe('redis distributed lock', () => {
 			});
 			await sleep(15);
 			await client.redis.del(client.key('lock:orders:42'));
-			await result;
+			await expect(result).rejects.toBeInstanceOf(LockLostError);
 
 			const out = await metrics.serialize();
 			expect(out).toMatch(/lock_lost_total\{key_class="orders"\}\s+1/);

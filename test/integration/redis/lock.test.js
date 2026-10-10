@@ -178,7 +178,7 @@ describe('redis distributed lock (integration)', () => {
 			await wait(50);
 			await client.redis.del(client.key('lock:contested'));
 
-			await result;
+			await expect(result).rejects.toBeInstanceOf(LockLostError);
 			expect(lostError).toBeInstanceOf(LockLostError);
 			expect(lostError.key).toBe('contested');
 		});
@@ -199,10 +199,10 @@ describe('redis distributed lock (integration)', () => {
 				heartbeatMs: 60_000
 			});
 
-			await lock.withLock('takeover', async () => {
+			await expect(lock.withLock('takeover', async () => {
 				// Mid-flight foreign takeover via XX (only overwrites existing).
 				await client.redis.set(client.key('lock:takeover'), 'foreign-token', 'XX');
-			});
+			})).rejects.toBeInstanceOf(LockLostError);
 
 			// Our release ran (heartbeat never fired, lost===false) but its
 			// compare-and-delete refused: foreign value still in place.

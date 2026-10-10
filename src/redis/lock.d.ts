@@ -80,6 +80,8 @@ export class LockAcquireTimeoutError extends Error {
  * Surfaced via `controller.abort(new LockLostError(key))` on the
  * `signal` passed to the user fn when the heartbeat detects we no
  * longer own the key (operator force-takeover, TTL elapsed, etc.).
+ * Also rejects `withLock` after an otherwise successful callback when the
+ * heartbeat or final compare-and-delete confirms ownership loss.
  */
 export class LockLostError extends Error {
 	readonly key: string;
@@ -103,8 +105,9 @@ export interface DistributedLock {
 	 * `AbortSignal` fires with a `LockLostError`. User code should
 	 * react via `signal.aborted` or `signal.addEventListener('abort')`.
 	 *
-	 * `fn`'s return value is forwarded through. Errors thrown by `fn`
-	 * propagate after the lock is released.
+	 * `fn`'s return value is forwarded only while ownership remains valid.
+	 * A confirmed loss rejects with `LockLostError` even if `fn` ignored its
+	 * signal. Errors thrown by `fn` retain precedence after cleanup.
 	 *
 	 * @example
 	 * ```js

@@ -2312,7 +2312,7 @@ await lock.withLock('order-42', async (signal) => {
 1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` - atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
 2. **Retry.** On collision (someone else holds the key), sleep `retryDelayMs` and try again. After `maxWaitMs` total wait, throw `LockAcquireTimeoutError`.
 3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. If the heartbeat returns 0 (we no longer own the key - operator force-takeover, TTL elapsed before we could refresh), the supplied `AbortSignal` fires with a `LockLostError` and the heartbeat stops.
-4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless).
+4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless). A heartbeat already in flight finishes before the call settles. If the heartbeat or release confirms ownership loss, an otherwise successful callback rejects with `LockLostError`; a callback error retains precedence.
 
 The `AbortSignal` shape is the cluster-correctness story: when the heartbeat detects loss, your code learns immediately and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
 
@@ -2346,7 +2346,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 #### Errors
 
 - **`LockAcquireTimeoutError`** - thrown by `withLock` when `maxWaitMs` elapses without a successful acquire. Properties: `key`, `waitedMs`.
-- **`LockLostError`** - surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it's up to your code to react. Property: `key`.
+- **`LockLostError`** - surfaced via `signal.reason` (and `controller.abort(...)` on the user fn's signal) when the heartbeat detects we no longer own the key. The user fn keeps running through this; it must react to prevent further effects. An otherwise successful `withLock()` rejects with this error after confirmed loss, including loss detected at release. Property: `key`.
 
 #### Metrics
 

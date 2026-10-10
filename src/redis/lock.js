@@ -70,7 +70,7 @@ export class LockAcquireTimeoutError extends Error {
 
 export class LockLostError extends Error {
 	constructor(key) {
-		super(`lock: lost ownership of "${key}" (heartbeat detected force-takeover or TTL elapsed)`);
+		super(`lock: lost ownership of "${key}" (lease ownership changed or TTL elapsed)`);
 		this.name = 'LockLostError';
 		this.key = key;
 	}
@@ -129,7 +129,7 @@ export function createDistributedLock(client, options = {}) {
 	const mAcquired = m?.counter('lock_acquired_total', 'Locks acquired by key class', ['key_class']);
 	const mWait = m?.histogram('lock_acquire_wait_ms', 'Time waited from withLock call to successful acquire (ms)');
 	const mTimeouts = m?.counter('lock_acquire_timeouts_total', 'withLock calls that exceeded maxWaitMs without acquiring', ['key_class']);
-	const mLost = m?.counter('lock_lost_total', 'Locks lost mid-flight via heartbeat detection', ['key_class']);
+	const mLost = m?.counter('lock_lost_total', 'Locks whose lease ownership was lost', ['key_class']);
 
 	function fullKey(key) {
 		return client.key(keyPrefix + key);
@@ -203,6 +203,8 @@ export function createDistributedLock(client, options = {}) {
 		}
 
 		let lost = false;
+		let stopped = false;
+		let lostError;
 		// Chain-style heartbeat: a `setInterval(async ...)` callback running
 		// slower than the interval produces concurrent Redis evals against
 		// the same fence key, races the breaker accounting, and breaks the
@@ -210,16 +212,17 @@ export function createDistributedLock(client, options = {}) {
 		// assumes. Instead, queue each refresh onto the previous one's promise
 		// chain so a slow tick never overlaps itself. Mirrors leader.js#tick
 		// (see leader.js:174-179 for the canonical pattern).
-		let inFlight = Promise.resolve();
+		let inFlight = null;
 		async function heartbeatTick() {
-			if (lost) return;
+			if (lost || stopped) return;
 			try {
 				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
 				breaker?.success();
 				if (Number(r) !== 1) {
 					lost = true;
+					lostError = new LockLostError(key);
 					mLost?.inc({ key_class: keyClass });
-					controller.abort(new LockLostError(key));
+					controller.abort(lostError);
 				}
 			} catch (err) {
 				breaker?.failure(err);
@@ -230,17 +233,21 @@ export function createDistributedLock(client, options = {}) {
 			}
 		}
 		const heartbeatTimer = setIntervalTimer(() => {
-			inFlight = inFlight.then(heartbeatTick).catch(() => {});
+			inFlight = (inFlight || Promise.resolve()).then(heartbeatTick).catch(() => {});
 		}, heartbeatMs);
 		if (heartbeatTimer.unref) heartbeatTimer.unref();
 
+		let result;
 		try {
-			return await fn(controller.signal);
+			result = await fn(controller.signal);
 		} finally {
+			stopped = true;
 			clearIntervalTimer(heartbeatTimer);
+			// Finish a refresh already on the wire; queued ticks see stopped and
+			// do no work. A late loss verdict must precede the caller's result.
+			if (inFlight) await inFlight;
 			if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
-			// `lost === true` is set only inside the heartbeat callback,
-			// which then calls controller.abort(...). The signal must
+			// A loss verdict always calls controller.abort(...). The signal must
 			// always be aborted by the time we observe `lost`. The reverse
 			// is not true: an external signal may have aborted the
 			// controller without lostLock firing. No context: the lock key is the
@@ -248,7 +255,13 @@ export function createDistributedLock(client, options = {}) {
 			assert(!lost || controller.signal.aborted, 'lock.heartbeat.signal-aborted-iff-lost');
 			if (!lost) {
 				try {
-					await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);
+					const released = await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);
+					if (Number(released) !== 1) {
+						lost = true;
+						lostError = new LockLostError(key);
+						mLost?.inc({ key_class: keyClass });
+						controller.abort(lostError);
+					}
 					breaker?.success();
 				} catch (err) {
 					breaker?.failure(err);
@@ -258,6 +271,8 @@ export function createDistributedLock(client, options = {}) {
 				}
 			}
 		}
+		if (lost) throw lostError;
+		return result;
 	}
 
 	return { withLock };
