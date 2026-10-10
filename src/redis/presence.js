@@ -1392,7 +1392,12 @@ export function createPresence(client, options = {}) {
 				}
 				await tracker.join(ws, topic, platform);
 			},
-			message(ws, { data, platform }) {
+			message(ws, { data, msg, platform }) {
+				let env = msg && typeof msg === 'object' ? msg : null;
+				if (!env && data && typeof data === 'object' && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) env = data;
+				if (!env) {
+					try { env = JSON.parse(new TextDecoder().decode(data)); } catch { return; }
+				}
 				// Client-initiated reconnect-snapshot. The presence plugin
 				// client sends `{type:'presence-snapshot', topic}` on every
 				// status==='open' (initial connect + reconnect). Re-emits
@@ -1408,15 +1413,17 @@ export function createPresence(client, options = {}) {
 				// apps call `presence.join('global')` from the `open` hook
 				// which fires on every reconnect; per-board presence does
 				// not have an equivalent auto-rejoin.
-				if (data && data.type === 'presence-snapshot' && typeof data.topic === 'string') {
-					tracker.sync(ws, data.topic, platform).catch(() => { /* surfaced via breaker */ });
+				if (env && env.type === 'presence-snapshot' && typeof env.topic === 'string') {
+					tracker.sync(ws, env.topic, platform).catch(() => { /* surfaced via breaker */ });
+					return true;
 				}
-				if (data && data.type === 'presence-update' && typeof data.topic === 'string' && data.fields && typeof data.fields === 'object') {
+				if (env && env.type === 'presence-update' && typeof env.topic === 'string' && env.fields && typeof env.fields === 'object') {
 					// Client-pushed field update (mirrors the in-memory presence
 					// plugin). `update` takes only the names clientUpdateFields lists,
 					// self-gates on membership and field shape, then splits
 					// durable/transient and relays the change cross-instance.
-					tracker.update(ws, data.topic, data.fields, platform, true).catch(() => { /* surfaced via breaker */ });
+					tracker.update(ws, env.topic, env.fields, platform, true).catch(() => { /* surfaced via breaker */ });
+					return true;
 				}
 			},
 			async unsubscribe(ws, topic, { platform }) {

@@ -878,7 +878,7 @@ export async function close(ws, { platform }) {
 | `flushDiffs()` | Drain the pending `diff` buffer synchronously. Use in graceful-shutdown paths or tests that need the diff to land before the await chain continues. |
 | `clear()` | Reset all presence state |
 | `destroy()` | Stop heartbeat and subscriber |
-| `hooks` | `{ subscribe, close }` - ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
+| `hooks` | `{ subscribe, message, unsubscribe, close }` - ready-made WebSocket hooks. Destructure for one-line `hooks.ws.js` setup. |
 
 #### Field-level updates
 
@@ -1005,12 +1005,12 @@ CONFIG SET notify-keyspace-events Eg
 
 #### Zero-config hooks
 
-Instead of writing `subscribe` and `close` handlers manually, destructure `presence.hooks`:
+Instead of writing presence handlers manually, destructure `presence.hooks`:
 
 ```js
 // src/hooks.ws.js
 import { presence } from '$lib/server/presence';
-export const { subscribe, close } = presence.hooks;
+export const { subscribe, message, unsubscribe, close } = presence.hooks;
 ```
 
 `subscribe` handles both regular topics (calls `join`) and `__presence:*` topics (calls `sync` so the client gets the current list). `close` calls `leave`.

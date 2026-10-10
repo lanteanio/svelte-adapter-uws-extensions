@@ -296,7 +296,7 @@ export interface RedisPresenceTracker {
 	 */
 	hooks: {
 		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<string | undefined>;
-		message(ws: any, ctx: { data: any; platform: Platform }): void;
+		message(ws: any, ctx: { data: any; msg?: any; platform: Platform }): true | undefined;
 		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};
