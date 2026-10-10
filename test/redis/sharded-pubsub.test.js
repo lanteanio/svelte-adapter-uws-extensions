@@ -744,7 +744,7 @@ describe('redis sharded bus', () => {
 
 			const delivered = platformB.published.filter((entry) => entry.event === 'msg');
 			expect(delivered.map((entry) => entry.data)).toEqual([data, data]);
-			expect(platformB.traceOperations.map((op) => op.options.parent)).toEqual([null, null]);
+			expect(platformB.traceOperations.map((op) => op.options.parent)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
 			expect(warn.mock.calls[0][0]).toContain('event=redis.sharded-pubsub.trace-context.omitted');
 			warn.mockRestore();

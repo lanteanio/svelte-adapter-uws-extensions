@@ -354,7 +354,11 @@ export function createPubSubBus(client, options = {}) {
 	}
 
 	function deliverTraced(parsed) {
-		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', carriedTraceContext(parsed), REDIS_TRACE_ATTRIBUTES,
+		const parent = carriedTraceContext(parsed);
+		// A null parent means current context to the adapter. Delivery without
+		// a carrier must not inherit the subscriber's activation request span.
+		if (parent === null) return deliverEnvelope(parsed);
+		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed));
 	}
 

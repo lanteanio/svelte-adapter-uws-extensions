@@ -381,7 +381,11 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	function deliverTraced(parsed, channel) {
-		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', carriedTraceContext(parsed), REDIS_TRACE_ATTRIBUTES,
+		const parent = carriedTraceContext(parsed);
+		// A null parent means current context to the adapter. Delivery without
+		// a carrier must not inherit the subscriber's activation request span.
+		if (parent === null) return deliverEnvelope(parsed, channel);
+		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed, channel));
 	}
 

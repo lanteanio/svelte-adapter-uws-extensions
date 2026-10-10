@@ -588,7 +588,9 @@ none. The context always comes from the Platform: the buses take no
 Without a provider the buses do no trace work at all: a publish reads no
 context and relays an envelope without trace fields, and trace fields on an
 inbound envelope are ignored. Envelopes without trace fields remain
-valid, so mixed-version clusters interoperate. Trace fields stay outside
+valid, so mixed-version clusters interoperate. Even with a provider, delivery
+without a valid carried context creates no consumer operation; it does not
+attribute the message to the context used to activate the subscriber. Trace fields stay outside
 `data`: an application payload property named `traceparent` remains ordinary
 application data and is never trusted as transport context.
 

@@ -674,7 +674,7 @@ describe('redis pubsub bus', () => {
 
 			const delivered = remote.published.filter((entry) => entry.event === 'msg');
 			expect(delivered.map((entry) => entry.data)).toEqual([data, data]);
-			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([null, null]);
+			expect(remote.traceOperations.map((op) => op.options.parent)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
 			expect(warn.mock.calls[0][0]).toContain('event=redis.pubsub.trace-context.omitted');
 			expect(JSON.parse(warn.mock.calls[0][0].slice(warn.mock.calls[0][0].indexOf('{'))).attributes).toEqual({ maxEnvelopeBytes: 600 });
