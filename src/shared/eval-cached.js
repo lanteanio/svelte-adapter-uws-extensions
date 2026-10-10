@@ -17,13 +17,18 @@
  * @module svelte-adapter-uws-extensions/shared/eval-cached
  */
 
-/** @type {WeakMap<any, { commands: Map<string, string>, seq: number }>} */
+/** @type {WeakMap<any, { commands: Map<string, string>, names: Set<string>, seq: number }>} */
 const registries = new WeakMap();
+
+/** Whether a method was defined by this cache, with a dynamic key count first. */
+export function isCachedCommand(redis, name) {
+	return registries.get(redis)?.names.has(name) ?? false;
+}
 
 function registryFor(redis) {
 	let reg = registries.get(redis);
 	if (!reg) {
-		reg = { commands: new Map(), seq: 0 };
+		reg = { commands: new Map(), names: new Set(), seq: 0 };
 		registries.set(redis, reg);
 	}
 	return reg;
@@ -47,6 +52,7 @@ export function evalCachedName(redis, script) {
 		name = 'ecmd' + (reg.seq++);
 		redis.defineCommand(name, { lua: script });
 		reg.commands.set(script, name);
+		reg.names.add(name);
 	}
 	return name;
 }

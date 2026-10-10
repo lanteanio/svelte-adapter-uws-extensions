@@ -60,11 +60,17 @@ blocking workloads; do not share that connection with request-path rate limits,
 locks, or writes that need a bounded response.
 
 Independent multi-slot work shares a limit of eight in-flight pipelines or routed
-commands per client. Pipelines contain at most 256 commands. Cluster work groups
-known keys by their current owner allocation and retries only explicit MOVED/ASK
+commands per client, with at most four assigned to one known Cluster owner.
+Pipelines contain at most 256 commands. Ready work for other owners can use free
+slots while one owner stalls; each failed batch returns error tuples alongside
+successful results. Cluster work groups known keys by their current owner allocation and retries only explicit MOVED/ASK
 refusals; transport failures do not replay ambiguous writes. Missing topology
-uses bounded individual routing. Presence and registry TTL heartbeats run one
-refresh at a time, coalescing missed ticks into one rerun with current membership.
+uses bounded individual routing. Presence and registry TTL heartbeats, cursor
+cleanup sweeps, and periodic cursor snapshot writes each run one refresh at a time, coalescing missed ticks into one
+rerun with current membership or the latest pending cursor values. Externally
+constructed Cluster clients retain their caller-selected deadlines; configure
+finite command and socket deadlines on their node connections. Capacity stays
+charged until the underlying operation settles.
 Presence heartbeat latency includes Redis completion. Keep the heartbeat-to-TTL
 margin large enough for the complete refresh at your deployment's cardinality.
 

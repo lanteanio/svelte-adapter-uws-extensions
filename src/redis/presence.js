@@ -354,7 +354,11 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		await execMultiSlot(redis, commands).catch(() => {});
+		await execMultiSlot(redis, commands).then(results => {
+			const error = firstCommandError(results);
+			if (error) b?.failure(error);
+			else if (commands.length) b?.success();
+		}).catch(error => b?.failure(error));
 		if (publishFailed === 0) {
 			heartbeatPublishReported = false;
 		} else if (!heartbeatPublishReported) {
@@ -749,7 +753,9 @@ export function createPresence(client, options = {}) {
 		if (!skipPipeline) {
 			try {
 				results = await execMultiSlot(redis, commands);
-				b?.success();
+				const error = firstCommandError(results);
+				if (error) b?.failure(error);
+				else b?.success();
 			} catch (err) {
 				b?.failure(err);
 			}

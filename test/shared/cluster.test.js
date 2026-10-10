@@ -147,7 +147,7 @@ it.each([true, false])('only retries a pipeline rejected before writes (topology
 	const error = new Error(mismatch ? 'All keys in the pipeline should belong to the same slots allocation group' : 'connection lost after write');
 	const redis = { nodes: () => [], slots, async get(key) { calls.push(key); return 'value'; }, pipeline() { return { get() { return this; }, async exec() { throw error; } }; } };
 	if (mismatch) expect(await execMultiSlot(redis, [['get', 'a']])).toEqual([[null, 'value']]);
-	else await expect(execMultiSlot(redis, [['get', 'a']])).rejects.toBe(error);
+	else expect(await execMultiSlot(redis, [['get', 'a']])).toEqual([[error, undefined]]);
 	expect(calls).toEqual(mismatch ? ['a'] : []);
 });
 
@@ -164,9 +164,40 @@ it('waits for already-started batches before reporting one batch failure', async
 	} };
 	let settled = false;
 	const pending = execMultiSlot(redis, Array.from({ length: MAX_REDIS_PIPELINE_COMMANDS * 2 }, (_, i) => ['get', String(i)]))
-		.catch(error => { settled = true; return error; });
+		.then(result => { settled = true; return result; });
 	await flush();
 	expect(settled).toBe(false);
 	release();
-	expect(await pending).toBe(failure);
+	const results = await pending;
+	expect(results.slice(0, MAX_REDIS_PIPELINE_COMMANDS)).toEqual(Array.from({ length: MAX_REDIS_PIPELINE_COMMANDS }, () => [failure, undefined]));
+	expect(results.slice(MAX_REDIS_PIPELINE_COMMANDS)).toEqual(Array.from({ length: MAX_REDIS_PIPELINE_COMMANDS }, (_, i) => [null, String(MAX_REDIS_PIPELINE_COMMANDS + i)]));
+});
+
+
+it('keeps healthy owners progressing through a large stalled owner and concurrent calls', async () => {
+	const slots = [];
+	slots[keySlot('{slow}:key')] = ['slow'];
+	slots[keySlot('{fast}:key')] = ['fast'];
+	const waiting = [];
+	let slowActive = 0, peakSlow = 0, fastCompleted = 0;
+	const redis = { nodes: () => [], slots, pipeline() {
+		const keys = [];
+		return { get(key) { keys.push(key); return this; }, exec() {
+			const results = keys.map(key => [null, key]);
+			if (keys[0].startsWith('{fast}')) { fastCompleted += keys.length; return Promise.resolve(results); }
+			slowActive++; peakSlow = Math.max(peakSlow, slowActive);
+			return new Promise(resolve => waiting.push(() => { slowActive--; resolve(results); }));
+		} };
+	} };
+	const count = MAX_REDIS_PIPELINE_COMMANDS * 20;
+	const slow = Array.from({ length: count }, () => ['get', '{slow}:key']);
+	const fast = Array.from({ length: count }, () => ['get', '{fast}:key']);
+	let done = false;
+	const pending = execMultiSlot(redis, [...slow, ...fast]).finally(() => { done = true; });
+	await flush();
+	expect(fastCompleted).toBe(count);
+	expect(peakSlow).toBeLessThan(MAX_REDIS_INFLIGHT_BATCHES);
+	expect(await execMultiSlot(redis, [['get', '{fast}:key']])).toEqual([[null, '{fast}:key']]);
+	while (!done) { waiting.splice(0).forEach(release => release()); await flush(); }
+	expect(await pending).toHaveLength(count * 2);
 });

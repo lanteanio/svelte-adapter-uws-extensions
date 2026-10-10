@@ -3,6 +3,7 @@
  */
 
 import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from './caps.js';
+import { isCachedCommand } from './eval-cached.js';
 
 /**
  * True when the client is an ioredis Cluster (vs a standalone Redis).
@@ -17,21 +18,37 @@ export function isCluster(redis) {
 
 const executionQueues = new WeakMap();
 
-function withExecutionSlot(redis, run) {
+// Leave half the client budget available when one Cluster allocation stalls.
+const MAX_NODE_BATCHES = Math.max(1, Math.floor(MAX_REDIS_INFLIGHT_BATCHES / 2));
+function withExecutionSlot(redis, run, owner = null) {
 	let state = executionQueues.get(redis);
-	if (!state) { state = { active: 0, queue: [] }; executionQueues.set(redis, state); }
+	if (!state) { state = { active: 0, owners: new Map(), queue: [] }; executionQueues.set(redis, state); }
+	const available = group => group === null || (state.owners.get(group) || 0) < MAX_NODE_BATCHES;
+	const drain = () => {
+		for (let i = 0; state.active < MAX_REDIS_INFLIGHT_BATCHES && i < state.queue.length;) {
+			const next = state.queue[i];
+			if (!available(next.owner)) { i++; continue; }
+			state.queue.splice(i, 1);
+			next.start();
+		}
+	};
 	const start = () => {
 		state.active++;
+		if (owner !== null) state.owners.set(owner, (state.owners.get(owner) || 0) + 1);
 		let result;
 		try { result = run(); } catch (error) { result = Promise.reject(error); }
 		return Promise.resolve(result).finally(() => {
 			state.active--;
-			state.queue.shift()?.();
+			if (owner !== null) {
+				const left = state.owners.get(owner) - 1;
+				if (left) state.owners.set(owner, left); else state.owners.delete(owner);
+			}
+			drain();
 		});
 	};
-	if (state.active < MAX_REDIS_INFLIGHT_BATCHES) return start();
+	if (state.active < MAX_REDIS_INFLIGHT_BATCHES && available(owner)) return start();
 	return new Promise((resolve, reject) => {
-		state.queue.push(() => start().then(resolve, reject));
+		state.queue.push({ owner, start: () => start().then(resolve, reject) });
 	});
 }
 
@@ -42,7 +59,8 @@ function allocationGroup(redis, command) {
 	const method = command[0];
 	if (method === 'publish') return UNKEYED_GROUP;
 	const key = FIRST_KEY_METHODS.has(method) ? command[1]
-		: (method === 'eval' || method === 'evalsha') && Number(command[2]) > 0 ? command[3] : null;
+		: (method === 'eval' || method === 'evalsha') && Number(command[2]) > 0 ? command[3]
+		: isCachedCommand(redis, method) && Number(command[1]) > 0 ? command[2] : null;
 	if (typeof key !== 'string' || !Array.isArray(redis.slots)) return null;
 	const prefix = redis.options?.keyPrefix || '';
 	if (typeof prefix !== 'string') return null;
@@ -57,7 +75,8 @@ function allocationGroup(redis, command) {
  * `['eval', SCRIPT, 2, k1, k2, arg]` or `['hpexpire', key, ms, 'FIELDS', 1, f]`.
  *
  * Commands are split into bounded pipelines with one shared concurrency budget
- * per client. Cluster pipelines contain keys assigned to the same current node
+ * per client, with half that budget available to any one known Cluster allocation.
+ * Cluster pipelines contain keys assigned to the same current node
  * allocation group; missing topology falls back to individually routed commands.
  * Explicit MOVED/ASK refusals retry only the refused command through Cluster,
  * never successful writes or ambiguous transport failures.
@@ -78,7 +97,7 @@ export async function execMultiSlot(redis, commands) {
 			const pipe = redis.pipeline();
 			for (const [method, ...args] of commands) pipe[method](...args);
 			return pipe.exec();
-		});
+		}).catch(error => commands.map(() => [error, undefined]));
 	}
 	const groups = new Map();
 	if (!clustered) groups.set('standalone', commands.map((_, i) => i));
@@ -91,9 +110,9 @@ export async function execMultiSlot(redis, commands) {
 			indexes.push(i);
 		}
 	}
-	const entries = groups.entries();
-	let current = entries.next();
-	let offset = 0;
+	const entries = Array.from(groups, ([group, indexes]) => ({ group, indexes, offset: 0 }));
+	let cursor = 0;
+	const scheduled = new Map();
 	const results = new Array(commands.length);
 	async function individual(index) {
 		const [method, ...args] = commands[index];
@@ -101,11 +120,22 @@ export async function execMultiSlot(redis, commands) {
 		catch (error) { results[index] = [error, undefined]; }
 	}
 	async function worker() {
-		while (!current.done) {
-			const [group, indexes] = current.value;
+		while (entries.length) {
+			let searched = 0;
+			while (searched < entries.length && clustered && entries[cursor].group !== ROUTED_COMMANDS && (scheduled.get(entries[cursor].group) || 0) >= MAX_NODE_BATCHES) {
+				cursor = (cursor + 1) % entries.length;
+				searched++;
+			}
+			// Active workers resume the remaining groups when their calls settle.
+			if (searched === entries.length) return;
+			const entry = entries[cursor];
+			const { group, indexes, offset } = entry;
 			const batch = indexes.slice(offset, offset + (group === ROUTED_COMMANDS ? 1 : MAX_REDIS_PIPELINE_COMMANDS));
-			offset += batch.length;
-			if (offset === indexes.length) { current = entries.next(); offset = 0; }
+			entry.offset += batch.length;
+			if (entry.offset === indexes.length) entries.splice(cursor, 1);
+			else cursor++;
+			if (cursor >= entries.length) cursor = 0;
+			scheduled.set(group, (scheduled.get(group) || 0) + 1);
 			await withExecutionSlot(redis, async () => {
 				if (group === ROUTED_COMMANDS) { await individual(batch[0]); return; }
 				let replies;
@@ -122,13 +152,16 @@ export async function execMultiSlot(redis, commands) {
 						for (const index of batch) await individual(index);
 						return;
 					}
-					throw error;
+					for (const index of batch) results[index] = [error, undefined];
+					return;
 				}
 				for (let i = 0; i < batch.length; i++) {
 					const reply = replies[i];
 					if (clustered && /^(MOVED|ASK) \d+ /.test(reply?.[0]?.message || '')) await individual(batch[i]);
 					else results[batch[i]] = reply;
 				}
+			}, clustered && group !== ROUTED_COMMANDS ? group : null).finally(() => {
+				scheduled.set(group, scheduled.get(group) - 1);
 			});
 		}
 	}

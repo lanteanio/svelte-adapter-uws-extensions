@@ -27,7 +27,7 @@ import { createLruMap } from '../shared/lru-map.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplicationGrouped, createResumeHook } from '../shared/replay-helpers.js';
-import { execMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { decodeSortedSetMember } from '../shared/replay-envelope.js';
@@ -219,7 +219,12 @@ export function createReplay(client, options = {}) {
 	// standalone, per-node fan-out on Cluster (each epoch key is single-slot;
 	// the BATCH may cross slots, which is exactly what execMultiSlot handles).
 	async function currentEpochs(topics) {
-		const res = await withBreaker(b, () => execMultiSlot(redis, topics.map((t) => ['get', epochKey(t)])));
+		const res = await withBreaker(b, async () => {
+			const results = await execMultiSlot(redis, topics.map((t) => ['get', epochKey(t)]));
+			const error = firstCommandError(results);
+			if (error) throw error;
+			return results;
+		});
 		const out = new Map();
 		for (let i = 0; i < topics.length; i++) {
 			const [err, val] = res[i];

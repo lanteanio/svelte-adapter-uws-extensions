@@ -22,7 +22,7 @@
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
-import { execMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { createLruMap } from '../shared/lru-map.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
@@ -291,7 +291,12 @@ export function createStreamReplay(client, options = {}) {
 	// standalone, per-node fan-out on Cluster (each epoch key is single-slot;
 	// the BATCH may cross slots, which is exactly what execMultiSlot handles).
 	async function currentEpochs(topics) {
-		const res = await withBreaker(b, () => execMultiSlot(redis, topics.map((t) => ['get', epochKey(t)])));
+		const res = await withBreaker(b, async () => {
+			const results = await execMultiSlot(redis, topics.map((t) => ['get', epochKey(t)]));
+			const error = firstCommandError(results);
+			if (error) throw error;
+			return results;
+		});
 		const out = new Map();
 		for (let i = 0; i < topics.length; i++) {
 			const [err, val] = res[i];

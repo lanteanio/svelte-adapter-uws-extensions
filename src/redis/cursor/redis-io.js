@@ -15,7 +15,8 @@
  */
 
 import { now, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from '../../shared/runtime.js';
-import { evalCached } from '../../shared/eval-cached.js';
+import { coalescedWork } from '../../shared/coalesced-work.js';
+import { evalCachedName } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
@@ -234,42 +235,31 @@ export function createRedisIo({
 	/** @type {'all' | 'some' | null} */
 	let cleanupReported = null;
 
+	const cleanup = coalescedWork(async () => {
+		if (disposed || activeTopics.size === 0) return;
+		const topics = [...activeTopics];
+		const command = evalCachedName(redis, CLEANUP_SCRIPT);
+		const nowTs = now();
+		const results = await execMultiSlot(redis, topics.map(topic => [command, 1, hashKey(topic), nowTs, cursorTtlMs]));
+		let first = null;
+		let failed = 0;
+		for (let i = 0; i < results.length; i++) {
+			if (!results[i][0]) continue;
+			failed++;
+			first ??= { err: results[i][0], redact: [hashKey(topics[i]), topics[i]] };
+		}
+		if (first === null) { cleanupReported = null; return; }
+		const scope = failed === results.length ? 'all' : 'some';
+		if (cleanupReported !== null && !(cleanupReported === 'all' && scope === 'some')) return;
+		cleanupReported = scope;
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, {
+			error: first.err, redact: first.redact, attributes: { failed, topics: results.length }
+		});
+	}, error => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, { error }));
+
 	function startCleanupTimer() {
 		if (cleanupTimer) return;
-		cleanupTimer = setIntervalTimer(() => {
-			const nowTs = now();
-			const runs = [];
-			for (const topic of activeTopics) {
-				const key = hashKey(topic);
-				runs.push(evalCached(redis, CLEANUP_SCRIPT, 1, key, nowTs, cursorTtlMs).then(
-					() => null,
-					(err) => ({ err, redact: [key, topic] })
-				));
-			}
-			if (runs.length === 0) return;
-			Promise.all(runs).then((results) => {
-				let first = null;
-				let failed = 0;
-				for (const r of results) {
-					if (r === null) continue;
-					failed++;
-					first ??= r;
-				}
-				if (first === null) {
-					cleanupReported = null;
-					return;
-				}
-				const scope = failed === results.length ? 'all' : 'some';
-				if (cleanupReported !== null && !(cleanupReported === 'all' && scope === 'some')) return;
-				cleanupReported = scope;
-				// The key embeds the topic; cut it should the error repeat it.
-				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, {
-					error: first.err,
-					redact: first.redact,
-					attributes: { failed, topics: results.length }
-				});
-			});
-		}, cleanupInterval);
+		cleanupTimer = setIntervalTimer(cleanup, cleanupInterval);
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
@@ -290,7 +280,8 @@ export function createRedisIo({
 		if (snapshotTimer.unref) snapshotTimer.unref();
 	}
 
-	function flushSnapshot() {
+	const flushSnapshot = coalescedWork(() => {
+		if (disposed) return;
 		if (redisPending.size === 0) return;
 		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; } }
 		const pending = redisPending;
@@ -310,8 +301,8 @@ export function createRedisIo({
 			queued += entries.size;
 		}
 		if (queued === 0) return;
-		execMultiSlot(redis, commands).then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
-	}
+		return execMultiSlot(redis, commands).then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
+	});
 
 	function queueSnapshot(topic, key, user, data) {
 		if (snapshotIntervalMs === 0) {
@@ -441,6 +432,8 @@ export function createRedisIo({
 	/** Terminal teardown (tracker destroy()): stop timers, quit the subscriber. */
 	function dispose() {
 		disposed = true;
+		cleanup.stop();
+		flushSnapshot.stop();
 		if (recoveryTimer !== null) clearTimer(recoveryTimer);
 		recoveryTimer = null;
 		if (subscribeRetryTimer !== null) clearTimer(subscribeRetryTimer);
