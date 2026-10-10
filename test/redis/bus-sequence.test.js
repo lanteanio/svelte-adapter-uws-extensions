@@ -3,8 +3,8 @@
 // authoritative number crosses as `s` so every instance stamps the same seq;
 // `seq: false` crosses as `s: false` so the frame stays without one
 // everywhere; anything else carries nothing and each instance stamps its own
-// counter, as before (`null` and a bigint among them: adapter releases before
-// next.95 stamp the counter for both). On one worker the local publish gets
+// counter, as before. Null disables sequencing and bigint authorities cross
+// as numbers. On one worker the local publish gets
 // the caller's options untouched.
 
 import { describe, it, expect } from 'vitest';
@@ -50,7 +50,9 @@ describe('carriedSeq and receivedSeq', () => {
 	it('carry an authority as a number, seq: false as false, and anything else as nothing', () => {
 		expect(carriedSeq(9)).toBe(9);
 		expect(carriedSeq(false)).toBe(false);
-		for (const seq of [9n, null, true, undefined, '9']) expect(carriedSeq(seq), String(seq)).toBeUndefined();
+		expect(carriedSeq(9n)).toBe(9);
+		expect(carriedSeq(null)).toBe(false);
+		for (const seq of [true, undefined, '9']) expect(carriedSeq(seq), String(seq)).toBeUndefined();
 	});
 
 	it('take a positive safe integer or false, and leave anything else to the counter', () => {
@@ -90,9 +92,9 @@ describe.each(BUSES.flatMap(([name, ...rest]) => [[name, ...rest, false], [name 
 		['no options', undefined, { relay: false }],
 		['seq: true', { seq: true }, { relay: false }],
 		['seq: false', { seq: false }, { relay: false, seq: false }],
-		['seq: null', { seq: null }, { relay: false }],
+		['seq: null', { seq: null }, { relay: false, seq: false }],
 		['seq: 12', { seq: 12 }, { relay: false, seq: 12 }],
-		['seq: 12n', { seq: 12n }, { relay: false }],
+		['seq: 12n', { seq: 12n }, { relay: false, seq: 12 }],
 		['jitterMs and seq', { seq: false, jitterMs: 40 }, { relay: false, seq: false, jitterMs: 40 }]
 	])('a publish with %s reaches the peer with the same seq choice', async (_label, options, delivered) => {
 		const { b, a, wrapped, close } = await pair('bs1:');

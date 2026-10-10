@@ -55,18 +55,18 @@ export const LOCAL_DEFAULT = MULTI_WORKER_RUNTIME ? Object.freeze({ seq: false }
 
 /**
  * The `s` field a bus envelope carries for a publish's `seq` option: the
- * number for an authoritative seq, `false` for `seq: false`, and `undefined`
- * (omitted) otherwise. Those two are the spellings every supported adapter
- * reads the same way; `null` and a bigint are omitted, because releases
- * before next.95 stamp the counter for both, so the origin's own frame may
- * carry a counter value the bus cannot know.
+ * number for an authoritative number or bigint, `false` for `seq: false`
+ * or `seq: null`, and `undefined` (omitted) otherwise. The local platform
+ * validates the authority before the bus carries it, including the safe
+ * integer bound for bigint values.
  *
  * @param {unknown} seq
  * @returns {number | false | undefined}
  */
 export function carriedSeq(seq) {
 	if (typeof seq === 'number') return seq;
-	if (seq === false) return false;
+	if (seq === false || seq === null) return false;
+	if (typeof seq === 'bigint') return Number(seq);
 	return undefined;
 }
 
