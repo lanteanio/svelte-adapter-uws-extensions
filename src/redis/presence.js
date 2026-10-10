@@ -160,6 +160,7 @@ export function createPresence(client, options = {}) {
 		emit,
 		localData,
 		publicData,
+		transientFields,
 		mt,
 		mDiffCoalesced,
 		mDiffFrames

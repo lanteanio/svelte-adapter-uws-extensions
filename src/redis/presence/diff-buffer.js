@@ -22,12 +22,13 @@ import { mergeFields, newFieldMap } from './field-policy.js';
  *   emit: (fullTopic: string, event: string, data: any, platform: any, opts?: any) => void,
  *   localData: Map<string, Map<string, { data: Record<string, any>, fields: Record<string, any> | null }>>,
  *   publicData: (entry: { data: Record<string, any>, fields?: Record<string, any> | null }) => Record<string, any>,
+ *   transientFields?: Set<string>,
  *   mt: ((topic: string) => string) | undefined,
  *   mDiffCoalesced: { inc: (labels: Record<string, string>) => void } | null | undefined,
  *   mDiffFrames: { inc: (labels: Record<string, string>) => void } | null | undefined
  * }} deps
  */
-export function createDiffBuffer({ emit, localData, publicData, mt, mDiffCoalesced, mDiffFrames }) {
+export function createDiffBuffer({ emit, localData, publicData, transientFields = new Set(), mt, mDiffCoalesced, mDiffFrames }) {
 	/**
 	 * Per-topic pending diff buffer: latest op per key wins. Joins and
 	 * leaves on the same key in one event-loop iteration collapse so the
@@ -111,7 +112,7 @@ export function createDiffBuffer({ emit, localData, publicData, mt, mDiffCoalesc
 				// cross-instance field update landing in the same tick as the relayed
 				// join / updated event for that user is silently lost.
 				if (!localData.get(topic)?.get(key) && prev.data && typeof prev.data === 'object') {
-					mergeFields(prev.data, changed);
+					mergeFields(prev.data, changed, (name) => !transientFields.has(name));
 					armDiffFlush(platform);
 				}
 				return;
