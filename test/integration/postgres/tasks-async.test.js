@@ -263,27 +263,28 @@ describe('postgres tasks async path (integration)', () => {
 			expect(res.rows[0].n).toBe(8);
 		});
 
-		it('leaves pending rows in running state when no local handler is registered', async () => {
+		it('leaves unsupported rows pending while a locally registered handler makes progress', async () => {
 			const enqueuer = makeRunner();
 			const id = await enqueuer.enqueue('remote-only', { input: null });
 
-			// Dispatcher with no registration for 'remote-only'.
-			makeRunner({ dispatchInterval: 30 });
+			const known = await enqueuer.enqueue('local-only', { input: null });
+			// A successful local dispatch proves the sweep ran past the unknown row.
+			const dispatcher = makeRunner({ dispatchInterval: 30 });
+			dispatcher.register('local-only', async () => 'done');
 
 			await waitFor(async () => {
 				const r = await client.query(
-					`SELECT status, attempts FROM ${TABLE} WHERE svti_tasks_id = $1`, [id]
+					`SELECT status, attempts FROM ${TABLE} WHERE svti_tasks_id = $1`, [known]
 				);
-				return r.rows[0].status === 'running';
+				return r.rows[0].status === 'committed';
 			});
 
 			const res = await client.query(
 				`SELECT status, attempts FROM ${TABLE} WHERE svti_tasks_id = $1`,
 				[id]
 			);
-			expect(res.rows[0].status).toBe('running');
-			// Attempts bumped from 0 by the claim CTE even though no handler ran.
-			expect(res.rows[0].attempts).toBe(1);
+			expect(res.rows[0].status).toBe('pending');
+			expect(res.rows[0].attempts).toBe(0);
 		});
 	});
 

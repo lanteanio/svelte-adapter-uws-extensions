@@ -463,12 +463,12 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		});
 	}
 
-	async function claimPending(limit) {
+	async function claimPending(limit, registeredNames) {
 		const res = await client.query({
-			name: 'tasks_claim_pending_' + table,
+			name: 'tasks_claim_registered_' + table,
 			text: `WITH claimed AS (
 			         SELECT svti_tasks_id FROM ${table}
-			          WHERE status = 'pending'
+			          WHERE status = 'pending' AND name = ANY($3::text[])
 			          ORDER BY created_at ASC
 			          LIMIT $1
 			          FOR UPDATE SKIP LOCKED
@@ -483,17 +483,18 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
 			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
 			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
-			values: [limit, fenceTtl]
+			values: [limit, fenceTtl, registeredNames]
 		});
 		return res.rows;
 	}
 
-	async function reclaimStuck(limit) {
+	async function reclaimStuck(limit, registeredNames) {
 		const res = await client.query({
-			name: 'tasks_reclaim_' + table,
+			name: 'tasks_reclaim_registered_' + table,
 			text: `WITH claimed AS (
 			         SELECT svti_tasks_id FROM ${table}
 			          WHERE status = 'running' AND fence_expires_at < now()
+			          AND name = ANY($3::text[])
 			          ORDER BY fence_expires_at ASC
 			          LIMIT $1
 			          FOR UPDATE SKIP LOCKED
@@ -507,7 +508,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
 			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
 			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
-			values: [limit, fenceTtl]
+			values: [limit, fenceTtl, registeredNames]
 		});
 		return res.rows;
 	}

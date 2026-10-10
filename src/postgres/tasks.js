@@ -92,9 +92,9 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {import('../redis/fence.js').RedisFenceProvider} [fence] - Optional external fence provider (e.g. `createRedisFence`). When set, the runner pairs Postgres heartbeats with the provider's heartbeat so a force-takeover via the external store is detected immediately.
  * @property {number} [fenceTtl=60] - Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler is running.
  * @property {number} [heartbeatInterval] - ms between fence heartbeats. Defaults to fenceTtl * 1000 / 3.
- * @property {number} [recoveryInterval=30000] - ms between recovery sweeps. 0 disables.
+ * @property {number} [recoveryInterval=30000] - ms between recovery sweeps for locally registered names. 0 disables.
  * @property {number} [recoveryBatchSize=10] - Max rows reclaimed per sweep.
- * @property {number} [dispatchInterval=5000] - ms between dispatch sweeps (claim pending rows). 0 disables.
+ * @property {number} [dispatchInterval=5000] - ms between dispatch sweeps (claim pending rows for locally registered names). 0 disables.
  * @property {number} [dispatchBatchSize=10] - Max pending rows claimed per sweep.
  * @property {number} [awaitPollInterval=500] - ms between row reads while awaiting a task's terminal state.
  * @property {number} [awaitTimeout=60000] - ms after which await() rejects if the task is still not terminal. 0 = no timeout.
@@ -612,12 +612,12 @@ export function createTaskRunner(client, options = {}) {
 	}
 
 	async function recoveryTick() {
-		if (recoveryRunning || destroyed) return;
+		if (recoveryRunning || destroyed || handlers.size === 0) return;
 		if (b && !b.isHealthy) return;
 		recoveryRunning = true;
 		try {
 			await sql.ensureTable();
-			const reclaimed = await sql.reclaimStuck(recoveryBatchSize);
+			const reclaimed = await sql.reclaimStuck(recoveryBatchSize, [...handlers.keys()]);
 			b?.success();
 			sweepFailing.recovery = false;
 			for (const row of reclaimed) {
@@ -625,7 +625,7 @@ export function createTaskRunner(client, options = {}) {
 				// reclaimStuck transitioned status from 'running' (with stale
 				// fence) to 'running' (with fresh fence + incremented
 				// attempts). Fire the state-change so observers see the
-				// retry boundary even if no handler is registered locally.
+				// retry boundary for this worker's registered handler.
 				fireStateChange({
 					taskId: row.id,
 					name: row.name,
@@ -635,15 +635,6 @@ export function createTaskRunner(client, options = {}) {
 					requestId: row.request_id ?? null,
 					traceContext
 				});
-				const reg = handlers.get(row.name);
-				if (!reg) {
-					// Unknown handler in this process.  Leave the row in
-					// 'running' state with our reclaimed fence; another
-					// instance with the handler registered will pick it up
-					// when our fence expires, or the next sweep here will
-					// retry.  No-op rather than fail-the-row-permanently.
-					continue;
-				}
 				mRecovered?.inc({ name: row.name });
 				// Run in the background; do not await all reclaimed rows
 				// serially or one slow handler stalls the sweep.
@@ -670,20 +661,20 @@ export function createTaskRunner(client, options = {}) {
 	}
 
 	async function dispatchTick() {
-		if (dispatchRunning || destroyed) return;
+		if (dispatchRunning || destroyed || handlers.size === 0) return;
 		if (b && !b.isHealthy) return;
 		dispatchRunning = true;
 		try {
 			await sql.ensureTable();
-			const claimed = await sql.claimPending(dispatchBatchSize);
+			const claimed = await sql.claimPending(dispatchBatchSize, [...handlers.keys()]);
 			b?.success();
 			sweepFailing.dispatch = false;
 			for (const row of claimed) {
 				const traceContext = carriedTraceContext(row);
 				// claimPending transitioned status from 'pending' to 'running'
-				// in the CTE update. Fire state-change for every claimed row
-				// so observers see the dispatch even when no handler is
-				// registered locally.
+				// in the CTE update. Only names registered in this process are
+				// eligible, before LIMIT is applied, so other worker tiers do
+				// not consume this sweep's slots or have their fences renewed.
 				fireStateChange({
 					taskId: row.id,
 					name: row.name,
@@ -693,13 +684,6 @@ export function createTaskRunner(client, options = {}) {
 					requestId: row.request_id ?? null,
 					traceContext
 				});
-				if (!handlers.has(row.name)) {
-					// Unknown handler in this process.  Leave the row in
-					// 'running' state with our claimed fence; another instance
-					// with the handler registered will pick it up when our
-					// fence expires.
-					continue;
-				}
 				mDispatched?.inc({ name: row.name });
 				runRegisteredTask(
 					row.name,

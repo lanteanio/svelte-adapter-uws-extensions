@@ -986,6 +986,7 @@ describe('postgres tasks sweep failure report', () => {
 			recoveryInterval: 2000,
 			cleanupInterval: 3000
 		});
+		runner.register('worker', async () => null);
 		try {
 			const dispatch = ticks.get(1000);
 			const recovery = ticks.get(2000);

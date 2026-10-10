@@ -235,13 +235,11 @@ describe('postgres tasks (enqueue / await / dispatch)', () => {
 
 			await new Promise((resolve) => setTimeout(resolve, 100));
 
-			// The dispatch CTE claimed the row (transitioned to running) but
-			// the runner found no handler and left it in 'running' state.
-			// Another instance with the handler can pick it up later via
-			// the recovery sweep when its fence expires.
+			// This worker does not take an incompatible row's fence. A worker
+			// with the handler can dispatch it without waiting for recovery.
 			const row = client._getTaskRows().get(id);
-			expect(row.status).toBe('running');
-			expect(row.attempts).toBe(1);
+			expect(row.status).toBe('pending');
+			expect(row.attempts).toBe(0);
 
 			r.destroy();
 		});

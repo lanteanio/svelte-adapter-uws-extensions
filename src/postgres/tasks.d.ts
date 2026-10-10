@@ -113,11 +113,11 @@ export interface TaskRunnerOptions {
 	fenceTtl?: number;
 	/** ms between fence heartbeats. @default fenceTtl * 1000 / 3 */
 	heartbeatInterval?: number;
-	/** ms between recovery sweeps. 0 disables. @default 30000 */
+	/** ms between recovery sweeps for locally registered names. 0 disables. @default 30000 */
 	recoveryInterval?: number;
 	/** Max rows reclaimed per sweep. @default 10 */
 	recoveryBatchSize?: number;
-	/** ms between dispatch sweeps (claim pending rows enqueued via enqueue()). 0 disables. @default 5000 */
+	/** ms between dispatch sweeps for locally registered names enqueued via enqueue(). 0 disables. @default 5000 */
 	dispatchInterval?: number;
 	/** Max pending rows claimed per dispatch sweep. @default 10 */
 	dispatchBatchSize?: number;
@@ -295,14 +295,14 @@ export interface TaskRunner {
 	/**
 	 * Run a registered task inline. Awaits the handler's result. The
 	 * current process is the worker; if it dies the recovery sweep on
-	 * any live instance reclaims the row and re-drives the handler.
+	 * a live instance with that handler registered reclaims the row and re-drives it.
 	 */
 	run<TResult = unknown>(name: string, options: TaskRunOptions): Promise<TResult>;
 
 	/**
 	 * Enqueue a task without running it inline. Returns the taskId. The
-	 * dispatch sweep on any live instance picks up the row and runs the
-	 * handler in the background. Pair with `await(taskId)` to block on
+	 * dispatch sweep on an instance with that name registered picks up the
+	 * row and runs the handler in the background. Pair with `await(taskId)` to block on
 	 * completion, or fire-and-forget for jobs whose result no caller is
 	 * waiting on.
 	 */
@@ -361,7 +361,7 @@ export interface TaskRunner {
 	 * (when a Redis fence provider is configured) releases the Redis
 	 * mirror key, so the in-flight handler's heartbeat aborts via
 	 * `AbortSignal` on its very next tick instead of waiting for the
-	 * Postgres deadline. The recovery sweep on any live instance then
+	 * Postgres deadline. A live instance with that handler registered then
 	 * reclaims the row and re-drives the handler under the registered
 	 * retry policy.
 	 *
@@ -390,8 +390,8 @@ export class TaskInFlightError extends Error {
 
 /**
  * Thrown by run() when no handler is registered for the given name.
- * Recovery does not throw on unknown names because the handler may live
- * on a different deployment.
+ * Dispatch and recovery skip unknown names before claiming; the handler
+ * may live on a different deployment.
  */
 export class UnknownTaskError extends Error {
 	taskName: string;

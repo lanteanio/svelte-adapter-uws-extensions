@@ -608,12 +608,13 @@ export function mockPgClient(options = {}) {
 		// invisible, so two concurrent claimers get disjoint sets. Ordering is
 		// deterministic (FIFO by created_at, then row id as a stable tie-break).
 		if (sql.includes('WITH claimed') && sql.includes("WHERE status = 'pending'")) {
+			const names = sql.includes('name = ANY($3::text[])') ? new Set(values[2]) : null;
 			const limit = Number(values[0]);
 			const ttlSec = Number(values[1]);
 			const ts = now();
 			const pending = [];
 			for (const row of taskRows.values()) {
-				if (row.status !== 'pending') continue;
+				if (row.status !== 'pending' || (names && !names.has(row.name))) continue;
 				if (isRowLockedByOther('task', row.id, connId)) continue;
 				pending.push(row);
 			}
@@ -649,12 +650,13 @@ export function mockPgClient(options = {}) {
 		// Task reclaim: stuck-row sweep with CTE + gen_random_uuid(). Same
 		// SKIP LOCKED row-lock model as claim-pending above.
 		if (sql.includes('WITH claimed') && sql.includes('gen_random_uuid()')) {
+			const names = sql.includes('name = ANY($3::text[])') ? new Set(values[2]) : null;
 			const limit = Number(values[0]);
 			const ttlSec = Number(values[1]);
 			const ts = now();
 			const stuck = [];
 			for (const row of taskRows.values()) {
-				if (!(row.status === 'running' && row.fence_expires_at < ts)) continue;
+				if (!(row.status === 'running' && row.fence_expires_at < ts) || (names && !names.has(row.name))) continue;
 				if (isRowLockedByOther('task', row.id, connId)) continue;
 				stuck.push(row);
 			}
