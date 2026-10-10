@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { wallEpoch, randomU32, setTimer } from '../shared/runtime.js';
 import { keySlot } from '../shared/cluster.js';
 
@@ -1050,9 +1051,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('xadd') && script.includes('MAXLEN')) {
 					return evalStreamReplayPublish(numKeys, args);
 				}
+				if (script.includes('PRESENCE_FINALIZE')) return evalPresenceFinalize(args, numKeys);
+				if (script.includes('PRESENCE_ROLLBACK')) return evalPresenceRollback(args, numKeys);
 				// Presence JOIN (Design G: per-user hash + per-topic hash, HPEXPIRE field TTL)
 				if (script.includes('PRESENCE_JOIN') && script.includes('HPEXPIRE')) {
-					return evalPresenceJoinG(args);
+					return evalPresenceJoinG(args, numKeys);
 				}
 				// Presence UPDATE (field-level durable merge into the per-topic hash value)
 				if (script.includes('PRESENCE_UPDATE')) {
@@ -1061,7 +1064,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// Presence LEAVE (Design G: HDEL + HLEN check, no scan)
 				if (script.includes('HDEL') && script.includes('HLEN')
 					&& !script.includes('HPEXPIRE') && !script.includes('hdel')) {
-					return evalPresenceLeaveG(args);
+					return evalPresenceLeaveG(args, numKeys);
 				}
 				// Presence join script (hset + expire, no dedup scan) - legacy
 				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
@@ -1597,62 +1600,81 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		// Mirrors the Lua semantics: HSET + HPEXPIRE on userHash; newer-ts
 		// conditional HSET on topicHash; HPEXPIRE on topicHash; returns 1 iff
 		// userHash was empty before (caller broadcasts a join).
-		function evalPresenceJoinG(args) {
-			const userHashKey = args[0];
-			const topicHashKey = args[1];
-			const instanceId = args[2];
-			const userKeyStr = args[3];
-			const topicHashValue = args[4];
-			const newTs = Number(args[5]);
-			const ttlMs = Number(args[6]);
-
-			// HLEN check (after pruning expired fields)
-			pruneExpiredFields(userHashKey);
-			const userHash = hashes.get(userHashKey);
-			const wasEmpty = !userHash || userHash.size === 0;
-
-			// HSET userHash + HPEXPIRE
-			if (!hashes.has(userHashKey)) hashes.set(userHashKey, new Map());
-			hashes.get(userHashKey).set(instanceId, String(newTs));
-			clearFieldExpiry(userHashKey, [instanceId]);
-			let ex = hashFieldExpiry.get(userHashKey);
-			if (!ex) { ex = new Map(); hashFieldExpiry.set(userHashKey, ex); }
-			ex.set(instanceId, serverNowMs() + ttlMs);
-
-			// Newer-ts conditional set on topicHash, preserving any durable
-			// fields already stored for the user (mirrors JOIN_SCRIPT's
-			// fields-preservation across a newer-data overwrite).
-			pruneExpiredFields(topicHashKey);
-			const topicHash = hashes.get(topicHashKey);
-			let shouldWrite = true;
-			let existingParsed = null;
-			if (topicHash && topicHash.has(userKeyStr)) {
-				try {
-					existingParsed = JSON.parse(topicHash.get(userKeyStr));
-					const existingTs = Number(existingParsed.ts) || 0;
-					if (newTs < existingTs) shouldWrite = false;
-				} catch { existingParsed = null; /* corrupted - allow overwrite */ }
+		function evalPresenceJoinG(args, numKeys = 2) {
+			const [userHashKey, topicHashKey] = args, pendingKey = numKeys === 3 ? args[2] : null;
+			const [instanceId, user, raw, ts, ttl, token] = args.slice(numKeys);
+			if (pendingKey) pruneExpiredFields(pendingKey);
+			pruneExpiredFields(userHashKey); pruneExpiredFields(topicHashKey);
+			const first = !hashes.get(userHashKey)?.size;
+			setPresenceField(userHashKey, instanceId, String(token ?? ts), ttl);
+			const existing = hashes.get(topicHashKey)?.get(user);
+			const previous = parsePresenceEntry(existing);
+			if (!token) {
+				const wrote = !previous || Number(ts) >= (Number(previous.ts) || 0);
+				if (wrote) {
+					const incoming = JSON.parse(raw);
+					if (previous?.fields && typeof previous.fields === 'object') incoming.fields = previous.fields;
+					setPresenceField(topicHashKey, user, JSON.stringify(incoming), ttl);
+					removePresenceField(pendingKey, user);
+				} else if (existing) setPresenceField(topicHashKey, user, existing, ttl);
+				return [first ? 1 : 0, existing || null, wrote ? 1 : 0, 0, '', 0];
 			}
-			if (shouldWrite) {
-				let valueToWrite = topicHashValue;
-				if (existingParsed && existingParsed.fields && typeof existingParsed.fields === 'object') {
-					try {
-						const incoming = JSON.parse(topicHashValue);
-						incoming.fields = existingParsed.fields;
-						valueToWrite = JSON.stringify(incoming);
-					} catch { /* keep topicHashValue */ }
-				}
-				if (!hashes.has(topicHashKey)) hashes.set(topicHashKey, new Map());
-				hashes.get(topicHashKey).set(userKeyStr, valueToWrite);
-				clearFieldExpiry(topicHashKey, [userKeyStr]);
+			let metadata = parsePresenceEntry(hashes.get(pendingKey)?.get(user));
+			if (first || !metadata || !isDeepStrictEqual(metadata.data, previous?.data)) {
+				metadata = { epoch: token, version: 0, committedVersion: 0, ts: previous?.ts || 0, data: previous?.data };
 			}
-			// Always refresh TTL on topicHash field (even when write was skipped
-			// for newer-ts, to keep the field alive on heartbeat).
-			let tex = hashFieldExpiry.get(topicHashKey);
-			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
-			tex.set(userKeyStr, serverNowMs() + ttlMs);
+			const reserved = Number(ts) >= Math.max(Number(metadata.ts) || 0, Number(previous?.ts) || 0);
+			let version = 0;
+			if (reserved) {
+				version = (Number(metadata.version) || 0) + 1;
+				metadata.version = version; metadata.ts = Number(ts); metadata.token = token;
+			}
+			setPresenceField(pendingKey, user, JSON.stringify(metadata), ttl);
+			if (existing) setPresenceField(topicHashKey, user, existing, ttl);
+			return [first ? 1 : 0, existing || null, reserved ? 1 : 0, version, metadata.epoch, previous ? 0 : 1];
+		}
 
-			return [wasEmpty ? 1 : 0, existingParsed ? JSON.stringify(existingParsed) : null, shouldWrite ? 1 : 0];
+		function parsePresenceEntry(raw) {
+			try { const value = JSON.parse(raw); return value && typeof value === 'object' ? value : null; }
+			catch { return null; }
+		}
+
+		function removePresenceField(key, field) {
+			if (!key) return;
+			hashes.get(key)?.delete(field); clearFieldExpiry(key, [field]);
+			if (hashes.get(key)?.size === 0) hashes.delete(key);
+		}
+
+		function setPresenceField(key, field, value, ttl) {
+			if (!hashes.has(key)) hashes.set(key, new Map());
+			hashes.get(key).set(field, value);
+			let expiry = hashFieldExpiry.get(key);
+			if (!expiry) { expiry = new Map(); hashFieldExpiry.set(key, expiry); }
+			expiry.set(field, serverNowMs() + Number(ttl));
+		}
+
+		function evalPresenceFinalize(args, numKeys = 2) {
+			const [userHashKey, topicHashKey] = args, pendingKey = numKeys === 3 ? args[2] : null;
+			const [instanceId, user, token, epoch, versionArg, data, tsArg, ttl] = args.slice(numKeys);
+			if (pendingKey) pruneExpiredFields(pendingKey);
+			pruneExpiredFields(userHashKey); pruneExpiredFields(topicHashKey);
+			if (!hashes.get(userHashKey)?.has(instanceId)) return null;
+			let raw = hashes.get(topicHashKey)?.get(user);
+			const previous = parsePresenceEntry(raw), metadata = parsePresenceEntry(hashes.get(pendingKey)?.get(user));
+			if (!metadata) return null;
+			const version = Number(versionArg), ts = Number(tsArg);
+			if (metadata.epoch !== epoch || (Number(metadata.version) || 0) < version) return null;
+			if (!isDeepStrictEqual(metadata.data, previous?.data)) return raw ? [raw, 0] : null;
+			if ((version === 0 && !previous) || version > (Number(metadata.committedVersion) || 0)) {
+				const incoming = { data: JSON.parse(data), ts: Math.max(Number(previous?.ts) || 0, ts) };
+				if (previous?.fields && typeof previous.fields === 'object') incoming.fields = previous.fields;
+				if (!previous) metadata.createdToken = token;
+				metadata.data = incoming.data; metadata.committedVersion = version; metadata.committedToken = token;
+				raw = JSON.stringify(incoming);
+				setPresenceField(topicHashKey, user, raw, ttl);
+				setPresenceField(pendingKey, user, JSON.stringify(metadata), ttl);
+			}
+			return raw ? [raw, metadata.createdToken === token ? 1 : 0] : null;
 		}
 
 		// live.forget owner force-evict - removes the user's membership fields,
@@ -1696,13 +1718,31 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			return ['', 'vacated', removed + 1];
 		}
 
+		function evalPresenceRollback(args, numKeys = 2) {
+			const [userHashKey, topicHashKey] = args, pendingKey = numKeys === 3 ? args[2] : null;
+			const [instanceId, user, token, remove] = args.slice(numKeys);
+			if (pendingKey) pruneExpiredFields(pendingKey);
+			pruneExpiredFields(userHashKey); pruneExpiredFields(topicHashKey);
+			const members = hashes.get(userHashKey);
+			if (remove === '1' && members?.get(instanceId) === token) removePresenceField(userHashKey, instanceId);
+			if (!members?.size) {
+				const removed = hashes.get(topicHashKey)?.get(user);
+				removePresenceField(pendingKey, user); removePresenceField(topicHashKey, user);
+				return [removed || null, 0, removed ? 1 : 0];
+			}
+			const raw = hashes.get(topicHashKey)?.get(user);
+			const metadata = parsePresenceEntry(hashes.get(pendingKey)?.get(user));
+			return [raw || null, metadata?.committedToken === token ? 1 : 0, 0];
+		}
+
 		// Presence LEAVE (Design G) - HDEL my instanceId from per-user hash,
 		// HLEN check, conditional HDEL from per-topic hash if zero remaining.
-		function evalPresenceLeaveG(args) {
+		function evalPresenceLeaveG(args, numKeys = 2) {
 			const userHashKey = args[0];
 			const topicHashKey = args[1];
-			const instanceId = args[2];
-			const userKeyStr = args[3];
+			const pendingKey = numKeys === 3 ? args[2] : null;
+			const instanceId = args[numKeys];
+			const userKeyStr = args[numKeys + 1];
 
 			pruneExpiredFields(userHashKey);
 			const userHash = hashes.get(userHashKey);
@@ -1715,13 +1755,15 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const remaining = hashes.get(userHashKey);
 			const isFullyGone = !remaining || remaining.size === 0;
 			if (isFullyGone) {
+				removePresenceField(pendingKey, userKeyStr);
 				const topicHash = hashes.get(topicHashKey);
+				const visible = topicHash?.has(userKeyStr);
 				if (topicHash) {
 					topicHash.delete(userKeyStr);
 					clearFieldExpiry(topicHashKey, [userKeyStr]);
 					if (topicHash.size === 0) hashes.delete(topicHashKey);
 				}
-				return 1;
+				return visible ? 1 : 0;
 			}
 			return 0;
 		}

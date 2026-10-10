@@ -13,7 +13,7 @@
 /**
  * Create the per-instance (topic, key) -> ws reverse index.
  *
- * @param {Map<any, Map<string, { key: string, data: Record<string, any> }>>} wsTopics
+ * @param {Map<any, Map<string, { key: string, data: Record<string, any>, committed?: boolean }>>} wsTopics
  *   The shared per-connection topic map, read by findOtherWsData to recover a
  *   surviving connection's data. Passed by reference; mutated elsewhere.
  * @returns {{
@@ -76,7 +76,7 @@ export function createLocalIndex(wsTopics) {
 		for (const ws of set) {
 			if (ws === exceptWs) continue;
 			const entry = wsTopics.get(ws)?.get(topic);
-			if (entry && entry.key === userKey) newest = entry.data;
+			if (entry && entry.committed !== false && entry.key === userKey) newest = entry.data;
 		}
 		return newest;
 	}

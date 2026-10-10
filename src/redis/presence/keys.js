@@ -1,9 +1,9 @@
 /**
  * Redis key + channel builders for the Redis-backed presence tracker.
  *
- * The `{topic}` brace in the two hash keys is a Redis Cluster hash tag: it
+ * The `{topic}` brace in the hash keys is a Redis Cluster hash tag: it
  * colocates a topic's per-topic hash and every per-user hash for that topic
- * onto a single slot, so the two-key JOIN/LEAVE Lua evals stay on one node.
+ * onto a single slot, so the JOIN/LEAVE Lua evals stay on one node.
  * The `:userKey` suffix sits OUTSIDE the brace on purpose - it must not widen
  * the tag. `eventChannel` is deliberately NOT tagged: cross-instance pub/sub
  * fans out across the cluster rather than colocating with a topic's slot. Keep
@@ -19,6 +19,7 @@
  * @param {import('../index.js').RedisClient} client
  * @returns {{
  *   topicHashKey: (topic: string) => string,
+ *   pendingHashKey: (topic: string) => string,
  *   userHashKey: (topic: string, userKey: string) => string,
  *   eventChannel: (topic: string) => string
  * }}
@@ -30,14 +31,19 @@ export function makeKeys(client) {
 	}
 
 	// Per-user hash for a topic: one field per instance currently presenting this
-	// user. HLEN drives the JOIN/LEAVE broadcast decision.
+	// user. HLEN decides when the final membership leaves.
 	function userHashKey(topic, userKey) {
 		return client.key('presence:user:{' + topic + '}:' + userKey);
+	}
+
+	// Private identity generations never enlarge the public UPDATE payload.
+	function pendingHashKey(topic) {
+		return client.key('presence:pending:{' + topic + '}');
 	}
 
 	function eventChannel(topic) {
 		return client.key('presence:events:' + topic);
 	}
 
-	return { topicHashKey, userHashKey, eventChannel };
+	return { topicHashKey, userHashKey, pendingHashKey, eventChannel };
 }

@@ -19,12 +19,14 @@
  * shape, so a single client decoder works for both single-instance and
  * cluster deployments.
  *
- * Storage layout (two hashes per topic, Redis 7.4+ HEXPIRE for per-field TTL):
- *   - `{prefix}presence:topic:{topic}` - hash, field=userKey, value=JSON{data,ts}
+ * Storage layout (Redis 7.4+ HEXPIRE for per-field TTL):
+ *   - `{prefix}presence:topic:{topic}` - hash, field=userKey, value=JSON{data,ts,fields?}
  *       One entry per unique user on the topic. Backs `list()` / `count()`.
- *   - `{prefix}presence:user:{topic}:{userKey}` - hash, field=instanceId, value=ts
- *       One entry per instance currently presenting this user. Backs JOIN/LEAVE
- *       broadcast decision (HLEN check).
+ *   - `{prefix}presence:pending:{topic}` - hash, field=userKey, private identity generations
+ *       and committed-identity fence. Per-user expiry, excluded from public roster reads.
+ *   - `{prefix}presence:user:{topic}:{userKey}` - hash, field=instanceId, value=membership token
+ *       One entry per instance presenting or reserving this user. HLEN determines
+ *       final-membership removal; first public identity commit determines JOIN.
  *
  * Per-field TTLs via HPEXPIRE replace the previous timestamp-filter scan in
  * the Lua leave script: stale entries from a crashed instance auto-expire
@@ -66,7 +68,7 @@ import { WsClosedError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
-import { JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
+import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
@@ -163,7 +165,7 @@ export function createPresence(client, options = {}) {
 		mJoins, mJoinsAborted, mLeaves, mHeartbeats, mTotalOnline, mHeartbeatLatency,
 		mKeyspaceCleanups, mDiffFrames, mDiffCoalesced, mSelfPreserveActive, mSelfPreserveHeld,
 		mSelfPreserveActivations, selfPreservation, wsTopics, localCounts,
-		localData, syncObservers, syncCounts, topicHashKey, userHashKey, eventChannel,
+		localData, syncObservers, syncCounts, topicHashKey, userHashKey, pendingHashKey, eventChannel,
 		coalesceHgetall
 	} = ctx;
 
@@ -408,6 +410,7 @@ export function createPresence(client, options = {}) {
 	}
 
 	// Reuse the eager identity encoding when building the Redis entry.
+	let joinSequence = 0;
 	function storedValue(serializedData, ts) {
 		return serializedData === undefined ? JSON.stringify({ ts })
 			: '{"data":' + serializedData + ',"ts":' + JSON.stringify(ts) + '}';
@@ -428,71 +431,64 @@ export function createPresence(client, options = {}) {
 		await redis.publish(ch, msg).catch(() => {});
 	}
 
-	/**
-	 * Full undo of a staged join. Rolls back local state, reverts the Redis
-	 * state to its pre-join shape (full leave if this was the first local
-	 * connection, data-restore via JOIN_SCRIPT if there were other tabs
-	 * already presenting this user), publishes a compensating leave event
-	 * if a join was broadcast, and unsubscribes from the topic's Redis
-	 * channel when no local observers remain.
-	 */
-	async function undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, didPublishJoin, platform) {
+	/** Remove this reservation and clean up only membership still owned by it. */
+	async function undoJoin(ws, topic, key, reservation, write, platform) {
 		const connTopics = wsTopics.get(ws);
-		if (connTopics) {
+		if (connTopics?.get(topic) === reservation) {
 			connTopics.delete(topic);
 			if (connTopics.size === 0) wsTopics.delete(ws);
-		}
-		indexRemove(topic, key, ws);
-		const counts = localCounts.get(topic);
-		if (counts) {
-			if (prevCount === 0) {
-				counts.delete(key);
-			} else {
-				counts.set(key, prevCount);
+			indexRemove(topic, key, ws);
+			if (!syncObservers.get(ws)?.has(topic)) {
+				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
+				removeWsSubscription(ws, '__presence:' + topic);
 			}
-			if (counts.size === 0) {
-				localCounts.delete(topic);
-				activeTopics.delete(topic);
-			}
+			const counts = localCounts.get(topic);
+			const remaining = (counts?.get(key) || 0) - 1;
+			if (remaining > 0) counts.set(key, remaining);
+			else counts?.delete(key);
+			if (counts?.size === 0) { localCounts.delete(topic); activeTopics.delete(topic); }
 		}
+		const removeMembership = !localCounts.get(topic)?.has(key);
 		const topicData = localData.get(topic);
-		if (topicData) {
-			if (prevData !== undefined) {
-				setLocalData(topicData, key, prevData);
-			} else {
-				topicData.delete(key);
-			}
+		if (removeMembership && topicData) {
+			topicData.delete(key);
 			if (topicData.size === 0) localData.delete(topic);
 		}
-		if (prevCount > 0 && prevData !== undefined) {
-			// Other local tabs still present this user. Restore the per-topic
-			// hash data to prevData via JOIN_SCRIPT (which handles HSET +
-			// HPEXPIRE atomically). Per-user hash field for this instance is
-			// already present from the now-rolled-back join; the script's
-			// idempotent HSET refreshes its TTL.
-			const ts = now();
-			const value = JSON.stringify({ data: prevData, ts });
-			await evalCached(redis,
-				JOIN_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
-				instanceId, key, value, ts, presenceTtlMs
-			).catch(() => {});
-		} else {
-			// This was the first local presence for this user on this topic.
-			// LEAVE_SCRIPT removes our instance's entry on the per-user hash
-			// and clears the per-topic hash field if HLEN dropped to zero.
-			await evalCached(redis,
-				LEAVE_SCRIPT, 2, userHashKey(topic, key), topicHashKey(topic),
-				instanceId, key
-			).catch(() => {});
+		const cached = topicData?.get(key);
+		const cachedIdentity = cached?.data;
+		const cachedLegacy = cached?.legacyData;
+		// A read-only duplicate can outlive the last committed local tab.
+		// Resolve its inherited membership only on failure, then recheck local
+		// reservations before conditionally removing that exact Redis token.
+		if (!write && removeMembership) {
+			const token = await redis.hget(userHashKey(topic, key), instanceId).catch(() => null);
+			if (token && !localCounts.get(topic)?.has(key)) write = { token };
 		}
-		if (didPublishJoin) {
-			mLeaves?.inc({ topic: mt(topic) });
-			bufferDiff(topic, 'leave', key, data, platform);
-			await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data });
+		if (write) {
+			const result = await evalCached(redis, ROLLBACK_JOIN_SCRIPT, 3,
+				userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic), instanceId, key,
+				write.token, removeMembership ? '1' : '0', presenceTtlMs
+			).catch(() => null);
+			if (result?.[0]) {
+				const restored = parseEntries({ [key]: result[0] }, fieldNames.fromServer).get(key);
+				const current = localData.get(topic)?.get(key);
+				// A later relay or local join owns any cache it changed while the
+				// compensation was in flight. Never replace that newer identity.
+				if (restored && current && current === cached && current.data === cachedIdentity && current.legacyData === cachedLegacy && !deepEqual(current.data, restored.data)) {
+					setLocalData(localData.get(topic), key, restored.data);
+					localData.get(topic).get(key).remoteIdentity = true;
+				}
+				if (restored && result[2] === 1) {
+					mLeaves?.inc({ topic: mt(topic) });
+					const data = publicData(restored);
+					bufferDiff(topic, 'leave', key, data, platform);
+					await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data });
+				} else if (restored && result[1] === 1) {
+					await publishEvent(topic, INTERNAL_EVENTS.UPDATED, identityPayload(key, restored));
+				}
+			}
 		}
-		if (!localCounts.has(topic) && !syncCounts.has(topic)) {
-			await unsubscribeFromTopic(topic);
-		}
+		if (!localCounts.has(topic) && !syncCounts.has(topic)) await unsubscribeFromTopic(topic);
 	}
 
 	async function leaveTopic(ws, platform, topic) {
@@ -544,8 +540,8 @@ export function createPresence(client, options = {}) {
 					if (!skipLeaveRedis) {
 						try {
 							userGone = await evalCached(redis,
-								LEAVE_SCRIPT, 2,
-								userHashKey(topic, key), topicHashKey(topic),
+								LEAVE_SCRIPT, 3,
+								userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
 								instanceId, key
 							);
 							b?.success();
@@ -570,8 +566,8 @@ export function createPresence(client, options = {}) {
 							const ts = now();
 							try {
 								await evalCached(redis,
-									JOIN_SCRIPT, 2,
-									userHashKey(topic, key), topicHashKey(topic),
+									JOIN_SCRIPT, 3,
+									userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
 									instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 								);
 								bufferDiff(topic, 'join', key, newest, platform);
@@ -703,8 +699,8 @@ export function createPresence(client, options = {}) {
 			const ts = now();
 			try {
 				await evalCached(redis,
-					JOIN_SCRIPT, 2,
-					userHashKey(topic, key), topicHashKey(topic),
+					JOIN_SCRIPT, 3,
+					userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
 					instanceId, key, JSON.stringify({ data: newest, ts }), ts, presenceTtlMs
 				);
 				bufferDiff(topic, 'join', key, newest, platform);
@@ -733,8 +729,8 @@ export function createPresence(client, options = {}) {
 		const commands = [];
 		for (const { topic, key } of pendingLeaves) {
 			commands.push([
-				'eval', LEAVE_SCRIPT, 2,
-				userHashKey(topic, key), topicHashKey(topic),
+				'eval', LEAVE_SCRIPT, 3,
+				userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
 				instanceId, key
 			]);
 		}
@@ -857,12 +853,10 @@ export function createPresence(client, options = {}) {
 				throw new Error('redis presence: select() must return JSON-serializable data');
 			}
 
-			// Snapshot state for rollback
+			// Reserve this connection independently of concurrent joins.
 			const existingCounts = localCounts.get(topic);
 			const prevCount = existingCounts ? (existingCounts.get(key) || 0) : 0;
-			const existingTopicData = localData.get(topic);
-			const prevEntry = existingTopicData ? existingTopicData.get(key) : undefined;
-			const prevData = prevEntry ? prevEntry.data : undefined;
+			let joinWrite = null;
 
 			// Stage local state for dedup and refcounting only.
 			// localData and activeTopics are deferred until the join is
@@ -877,7 +871,8 @@ export function createPresence(client, options = {}) {
 				connTopics = new Map();
 				wsTopics.set(ws, connTopics);
 			}
-			connTopics.set(topic, { key, data });
+			const reservation = { key, data, committed: false };
+			connTopics.set(topic, reservation);
 			indexAdd(topic, key, ws);
 
 			let counts = existingCounts;
@@ -896,7 +891,7 @@ export function createPresence(client, options = {}) {
 			try {
 				cancelAdmission = guardBreaker(b);
 			} catch (err) {
-				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throw err;
 			}
 
@@ -907,7 +902,7 @@ export function createPresence(client, options = {}) {
 				await ensureRedis74();
 			} catch (err) {
 				b?.failure(err);
-				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throw err;
 			}
 
@@ -915,7 +910,7 @@ export function createPresence(client, options = {}) {
 				await subscribeToTopic(topic, platform);
 			} catch (err) {
 				b?.failure(err);
-				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throw err;
 			}
 
@@ -926,28 +921,30 @@ export function createPresence(client, options = {}) {
 			if (!wsTopics.has(ws)) throwWsClosed(topic, cancelAdmission);
 
 			try { ws.getBufferedAmount(); } catch {
-				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throwWsClosed(topic, cancelAdmission);
 			}
 
-			let didRedisWrite = false;
 			let isNewUser = false;
 			let identityChanged = false;
-			let wroteIdentity = false;
+			let reservedIdentity = false;
 			const currentEntry = localData.get(topic)?.get(key);
 
 			if (prevCount === 0) {
 				const ts = now();
+				joinWrite = { token: instanceId + ':' + (++joinSequence) };
 				const value = storedValue(serializedData, ts);
 				try {
 					const joinResult = await evalCached(redis,
-						JOIN_SCRIPT, 2,
-						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key, value, ts, presenceTtlMs
+						JOIN_SCRIPT, 3,
+						userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
+						instanceId, key, value, ts, presenceTtlMs, joinWrite.token
 					);
-					didRedisWrite = true;
+					joinWrite.version = joinResult[3];
+					joinWrite.epoch = joinResult[4];
+					joinWrite.fallback = !joinResult[2] && joinResult[5] === 1;
 					isNewUser = joinResult[0] === 1;
-					wroteIdentity = joinResult[2] === 1;
+					reservedIdentity = joinResult[2] === 1;
 					if (!isNewUser && joinResult[2] === 1) {
 						let previous;
 						try { previous = JSON.parse(joinResult[1]); } catch { /* replace malformed data */ }
@@ -955,7 +952,7 @@ export function createPresence(client, options = {}) {
 					}
 				} catch (err) {
 					b?.failure(err);
-					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+					await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 					throw err;
 				}
 
@@ -963,34 +960,33 @@ export function createPresence(client, options = {}) {
 					// ws closed during the eval. Roll back our Redis write so
 					// the per-user hash entry does not linger past TTL, then
 					// surface the abort to the caller.
-					await evalCached(redis,
-						LEAVE_SCRIPT, 2,
-						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key
-					).catch(() => {});
+					await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 					throwWsClosed(topic, cancelAdmission);
 				}
-			} else if (currentEntry?.legacyData || (currentEntry && currentEntry.serializedIdentity !== serializedData && !deepEqual(currentEntry.data, data))) {
+			} else if (!currentEntry || currentEntry?.legacyData || (currentEntry && currentEntry.serializedIdentity !== serializedData && !deepEqual(currentEntry.data, data))) {
 				// Defer cache changes and notifications until the authoritative
 				// read-back commits, just as on a first local join.
 				try {
 					const ts = now();
+					joinWrite = { token: instanceId + ':' + (++joinSequence) };
 					const joinResult = await evalCached(redis,
-						JOIN_SCRIPT, 2,
-						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key, storedValue(serializedData, ts), ts, presenceTtlMs
+						JOIN_SCRIPT, 3,
+						userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
+						instanceId, key, storedValue(serializedData, ts), ts, presenceTtlMs, joinWrite.token
 					);
-					didRedisWrite = true;
-					wroteIdentity = joinResult[2] === 1;
-					identityChanged = wroteIdentity;
-					if (wroteIdentity && currentEntry?.legacyData) {
+					joinWrite.version = joinResult[3];
+					joinWrite.epoch = joinResult[4];
+					joinWrite.fallback = !joinResult[2] && joinResult[5] === 1;
+					reservedIdentity = joinResult[2] === 1;
+					identityChanged = reservedIdentity;
+					if (reservedIdentity && currentEntry?.legacyData) {
 						let previous;
 						try { previous = JSON.parse(joinResult[1]); } catch { /* replace malformed data */ }
 						identityChanged = !previous || !deepEqual(previous.data, data);
 					}
 				} catch (err) {
 					b?.failure(err);
-					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
+					await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 					throw err;
 				}
 			}
@@ -998,10 +994,9 @@ export function createPresence(client, options = {}) {
 			let all;
 			try {
 				all = await coalesceHgetall(topic);
-				b?.success();
 			} catch (err) {
 				b?.failure(err);
-				await undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throw err;
 			}
 
@@ -1009,7 +1004,7 @@ export function createPresence(client, options = {}) {
 			try {
 				ws.subscribe('__presence:' + topic);
 			} catch {
-				await undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, false, platform);
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throwWsClosed(topic, cancelAdmission);
 			}
 			// Mirror into the subscription registry so the adapter's binary
@@ -1020,15 +1015,37 @@ export function createPresence(client, options = {}) {
 			// If ws closed after subscribe, leave() already handled
 			// local cleanup and leave events. Just clean the Redis state.
 			if (!wsTopics.has(ws)) {
-				if (didRedisWrite) {
-					evalCached(redis,
-						LEAVE_SCRIPT, 2,
-						userHashKey(topic, key), topicHashKey(topic),
-						instanceId, key
-					).catch(() => {});
-				}
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throwWsClosed(topic, cancelAdmission);
 			}
+
+			if (reservedIdentity || joinWrite?.fallback) {
+				try {
+					const finalize = () => evalCached(redis, FINALIZE_JOIN_SCRIPT, 3,
+						userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic), instanceId, key,
+						joinWrite.token, joinWrite.epoch, joinWrite.version, serializedData, now(), presenceTtlMs);
+					// Finalization is idempotent. A lost reply must be reconciled
+					// before compensating; rollback never undoes a committed value.
+					let current;
+					try { current = await finalize(); } catch { current = await finalize(); }
+					if (!current?.[0]) throw new Error('presence join expired before identity commit');
+					isNewUser = current[1] === 1;
+					all = { ...all, [key]: current[0] };
+				} catch (err) {
+					b?.failure(err);
+					await undoJoin(ws, topic, key, reservation, joinWrite, platform);
+					throw err;
+				}
+			}
+			if (wsTopics.get(ws)?.get(topic) !== reservation) {
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
+				throwWsClosed(topic, cancelAdmission);
+			}
+			try { ws.getBufferedAmount(); } catch {
+				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
+				throwWsClosed(topic, cancelAdmission);
+			}
+			b?.success();
 
 			// Commit localData and activeTopics now that the join is
 			// fully committed. The heartbeat reads from these, so they
@@ -1050,7 +1067,7 @@ export function createPresence(client, options = {}) {
 				// join already encoded this selection for its eager JSON check.
 				// Reuse it for the next local join's identity equality guard.
 				committed.serializedIdentity = serializedData;
-				if (wroteIdentity) {
+				if (reservedIdentity) {
 					committed.remoteIdentity = false;
 					delete committed.legacyData;
 				}
@@ -1062,6 +1079,7 @@ export function createPresence(client, options = {}) {
 				committed.fields = Object.assign(newFieldMap(), committed.fields, stored.fields);
 				committed.fieldsBytes = undefined;
 			}
+			reservation.committed = true;
 			activeTopics.add(topic);
 
 			// Buffer join only after the operation is fully committed.
@@ -1414,10 +1432,20 @@ export function createPresence(client, options = {}) {
 				throw new Error('redis presence: purgeUser user id must not contain NUL or glob metacharacters (* ? [ ] \\)');
 			}
 			const prefix = client.key('presence:user:{');
+			const pendingPrefix = client.key('presence:pending:{');
 			const suffix = '}:' + userId;
 			let keys;
 			try {
+				const pendingKeys = await scanKeys(redis, pendingPrefix + '*}');
 				keys = await scanKeys(redis, prefix + '*' + suffix);
+				const seen = new Set(keys);
+				for (const pending of pendingKeys) {
+					if (!pending.startsWith(pendingPrefix) || !pending.endsWith('}')) continue;
+					const topic = pending.slice(pendingPrefix.length, -1);
+					if (!topicInTenant(tenantId, topic) || !(await redis.hget(pending, userId))) continue;
+					const member = userHashKey(topic, userId);
+					if (!seen.has(member)) { seen.add(member); keys.push(member); }
+				}
 			} catch { return 0; }
 			let n = 0;
 			for (const k of keys) {
@@ -1429,7 +1457,8 @@ export function createPresence(client, options = {}) {
 					// data is still there, so the topic is not counted as erased.
 					const err = firstCommandError(await execMultiSlot(redis, [
 						['del', userHashKey(topic, userId)],
-						['hdel', topicHashKey(topic), userId]
+						['hdel', topicHashKey(topic), userId],
+						['hdel', pendingHashKey(topic), userId]
 					]));
 					if (err) throw err;
 					b?.success();

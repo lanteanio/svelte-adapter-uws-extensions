@@ -23,6 +23,8 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } 
 import { createBackendClient, resetBackendKeys, setBackendConfig } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../src/redis/presence.js';
+import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, LEAVE_SCRIPT } from '../../../src/redis/presence/lua.js';
+import { evalCached, evalCachedName } from '../../../src/shared/eval-cached.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
 import { captureRegistered } from '../../helpers/diagnostic-line.js';
@@ -44,8 +46,8 @@ function leaveDiffsFor(platform, key) {
 }
 
 // Runs on both backends: the per-topic keys (presence:topic:{topic} and
-// presence:user:{topic}:{userKey}) share a {topic} hash tag, so the 2-key
-// JOIN / LEAVE / UPDATE Lua scripts co-locate on a single slot in a cluster.
+// presence:user:{topic}:{userKey}) share a {topic}
+// hash tag, so the JOIN / LEAVE / UPDATE Lua scripts co-locate on a single slot in a cluster.
 const describeIntegration = describe;
 
 describeIntegration('redis presence (integration)', () => {
@@ -110,7 +112,7 @@ describeIntegration('redis presence (integration)', () => {
 			expect(parsed.data).toEqual({ id: 'alice', name: 'Alice' });
 			expect(typeof parsed.ts).toBe('number');
 
-			// Per-user hash: one field per instanceId. Value is the ts (string).
+			// Per-user hash: one field per instanceId, holding its membership token.
 			// Field name shape: 16 lower-hex chars (8 random bytes -> hex).
 			const userFields = await client.redis.hkeys(userHashKey('room', 'alice'));
 			expect(userFields).toHaveLength(1);
@@ -706,6 +708,311 @@ describeIntegration('redis presence (integration)', () => {
 			await vi.waitFor(() => {
 				for (const p of [pa, pb]) expect(p.published.some(frame => frame.event === 'heartbeat' && frame.data.alice?.name === 'Badge' && frame.data.alice.color === 'red')).toBe(true);
 			});
+		});
+
+		it.each([
+			{ selected: 'Old', local: true, peer: 'New', expected: 'New' },
+			{ selected: 'Failed', local: true, peer: 'New', expected: 'New' },
+			{ selected: 'Failed', local: false, expected: 'Old' },
+			{ selected: 'Failed', local: true, fields: true, expected: 'Old' }
+		])('compensates only a failed join own identity write: %j', async scenario => {
+			const pa = mockPlatform(), pb = mockPlatform();
+			const a = makeTracker({ heartbeat: 100 }), b = makeTracker();
+			const peer = mockWs({ id: 'alice', name: 'Old' });
+			await b.join(peer, 'room', pb);
+			if (scenario.local) await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', pa);
+			await b.update(peer, 'room', { color: 'blue' }, pb);
+			const hgetall = client.redis.hgetall.bind(client.redis);
+			let release, sawRead;
+			const read = new Promise(resolve => { sawRead = resolve; });
+			let hold = true;
+			client.redis.hgetall = key => {
+				if (hold && key === topicHashKey('room')) {
+					hold = false; sawRead();
+					return new Promise((resolve, reject) => { release = () => reject(new Error('snapshot unavailable')); });
+				}
+				return hgetall(key);
+			};
+			try {
+				const pending = a.join(mockWs({ id: 'alice', name: scenario.selected }), 'room', pa).catch(error => error);
+				await read;
+				if (scenario.peer) await b.join(mockWs({ id: 'alice', name: scenario.peer }), 'room', pb);
+				if (scenario.fields) await b.update(peer, 'room', { color: 'red' }, pb);
+				release();
+				expect(await pending).toMatchObject({ message: 'snapshot unavailable' });
+				const expected = { id: 'alice', name: scenario.expected, color: scenario.fields ? 'red' : 'blue' };
+				expect(await a.list('room')).toEqual([expected]);
+				expect(await b.list('room')).toEqual([expected]);
+				const [ttl] = await client.redis.hpttl(topicHashKey('room'), 'FIELDS', 1, 'alice');
+				expect(ttl).toBeGreaterThan(0);
+				if (scenario.local) {
+					pa.reset();
+					await vi.waitFor(() => expect(pa.published.some(frame => frame.event === 'heartbeat' && frame.data.alice?.name === expected.name && frame.data.alice.color === expected.color)).toBe(true));
+				}
+			} finally { client.redis.hgetall = hgetall; }
+		});
+
+		it.each([false, true])('restores a lost JOIN reply without replacing newer peer data: %s', async peerWins => {
+			const a = makeTracker(), b = makeTracker();
+			const pa = mockPlatform(), pb = mockPlatform();
+			const peer = mockWs({ id: 'alice', name: 'Old' });
+			await b.join(peer, 'room', pb);
+			await b.update(peer, 'room', { color: 'blue' }, pb);
+			const command = evalCachedName(client.redis, JOIN_SCRIPT);
+			const evaluate = client.redis[command].bind(client.redis);
+			let lose = true;
+			client.redis[command] = async (...args) => {
+				const result = await evaluate(...args);
+				if (lose) {
+					lose = false;
+					expect(JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice')).data.name).toBe('Old');
+					if (peerWins) await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+					else await b.update(peer, 'room', { color: 'red' }, pb);
+					throw new Error('JOIN reply lost');
+				}
+				return result;
+			};
+			try {
+				await expect(a.join(mockWs({ id: 'alice', name: 'Failed' }), 'room', pa)).rejects.toThrow('JOIN reply lost');
+				expect(await b.list('room')).toEqual([{ id: 'alice', name: peerWins ? 'New' : 'Old', color: peerWins ? 'blue' : 'red' }]);
+				expect(await client.redis.hlen(userHashKey('room', 'alice'))).toBe(1);
+
+			} finally { client.redis[command] = evaluate; }
+		});
+
+		it.each(['both-fail-older-first', 'both-fail-newer-first', 'rollback-before-finalize', 'finalize-before-rollback', 'newer-commits-first', 'fresh-incarnation'])('bounds concurrent identity recovery in real Lua: %s', async scenario => {
+			const user = userHashKey('room', 'alice'), topic = topicHashKey('room'), pending = client.key('presence:pending:{room}');
+			const ts = Date.now(), ttl = 60000;
+			const operations = new Map();
+			async function join(name) {
+				const token = name + ':1';
+				const result = await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, name, 'alice', JSON.stringify({ data: { id: 'alice', name }, ts, identityToken: token }), ts, ttl, token);
+				operations.set(name, { token, version: result[3], epoch: result[4] });
+			}
+			const finalize = name => {
+				const op = operations.get(name);
+				return evalCached(client.redis, FINALIZE_JOIN_SCRIPT, 3, user, topic, pending, name, 'alice', op.token, op.epoch, op.version, JSON.stringify({ id: 'alice', name }), ts, ttl);
+			};
+			const rollback = name => evalCached(client.redis, ROLLBACK_JOIN_SCRIPT, 3, user, topic, pending, name, 'alice', operations.get(name).token, '1', ttl);
+			let expected;
+			if (scenario.startsWith('both-fail')) {
+				await join('Stable'); await finalize('Stable');
+				await join('A'); await join('B');
+				for (const name of scenario.endsWith('older-first') ? ['A', 'B'] : ['B', 'A']) await rollback(name);
+				expected = 'Stable';
+			} else {
+				await join('A');
+				if (scenario === 'fresh-incarnation') await evalCached(client.redis, LEAVE_SCRIPT, 3, user, topic, pending, 'A', 'alice');
+				await join('B');
+				if (scenario === 'rollback-before-finalize') {
+					await rollback('B');
+					expect(await makeTracker().list('room')).toEqual([]);
+					expect(await makeTracker().count('room')).toBe(0);
+					await finalize('A'); expected = 'A';
+				} else if (scenario === 'finalize-before-rollback') {
+					await finalize('A'); await rollback('B'); expected = 'A';
+				} else {
+					await finalize('B');
+					if (scenario === 'fresh-incarnation') {
+						await client.redis.hset(user, 'A', 'replacement');
+						expect(await finalize('A')).toBeNull();
+					} else await finalize('A');
+					expected = 'B';
+				}
+			}
+			const value = JSON.parse(await client.redis.hget(topic, 'alice'));
+			expect(value.data.name).toBe(expected);
+			expect(value.identityPending).toBeUndefined();
+			expect(value.identityBaseline).toBeUndefined();
+			expect(await makeTracker().list('room')).toEqual([{ id: 'alice', name: expected }]);
+			expect(await makeTracker().count('room')).toBe(1);
+		});
+
+		it.each(['owner-fails-first', 'fallback-first', 'owner-commits', 'new-incarnation', 'placeholder-admission'])('keeps clock-skew fallback bounded: %s', async scenario => {
+			const user = userHashKey('room', 'alice'), topic = topicHashKey('room'), pending = client.key('presence:pending:{room}'), ttl = 60000;
+			const join = (name, ts) => evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, name, 'alice', JSON.stringify({ data: { id: 'alice', name }, ts, identityToken: name }), ts, ttl, name);
+			const owner = await join('A', 200), fallback = await join('B', 100);
+			expect(fallback[2]).toBe(0);
+			expect(fallback[5]).toBe(1);
+			const finalize = (name, result, ts) => evalCached(client.redis, FINALIZE_JOIN_SCRIPT, 3, user, topic, pending, name, 'alice', name, result[4], result[3], JSON.stringify({ id: 'alice', name }), ts, ttl);
+			const rollback = () => evalCached(client.redis, ROLLBACK_JOIN_SCRIPT, 3, user, topic, pending, 'A', 'alice', 'A', '1', ttl);
+			if (scenario === 'owner-fails-first') { await rollback(); await finalize('B', fallback, 100); }
+			else if (scenario === 'fallback-first') { await finalize('B', fallback, 100); await rollback(); }
+			else if (scenario === 'owner-commits') { await finalize('A', owner, 200); await finalize('B', fallback, 100); }
+			else if (scenario === 'placeholder-admission') {
+				await rollback();
+				const later = await join('C', 50);
+				expect(later[2]).toBe(0); expect(later[5]).toBe(1);
+				await finalize('C', later, 50); await finalize('B', fallback, 100);
+			}
+			else {
+				await evalCached(client.redis, LEAVE_SCRIPT, 3, user, topic, pending, 'A', 'alice');
+				await evalCached(client.redis, LEAVE_SCRIPT, 3, user, topic, pending, 'B', 'alice');
+				const fresh = await join('C', 300); await finalize('C', fresh, 300);
+				await client.redis.hset(user, 'B', 'replacement');
+				expect(await finalize('B', fallback, 100)).toBeNull();
+			}
+			expect(await makeTracker().list('room')).toEqual([{ id: 'alice', name: scenario === 'owner-commits' ? 'A' : scenario === 'new-incarnation' || scenario === 'placeholder-admission' ? 'C' : 'B' }]);
+		});
+
+		it.each(['last-leave', 'purge', 'clear', 'expiry'])('cleans hidden pending metadata independently: %s', async action => {
+			const topic = '@t/one/room', pending = client.key('presence:pending:{' + topic + '}');
+			const other = client.key('presence:pending:{@t/two/room}');
+			const metadata = JSON.stringify({ data: null, ts: Date.now(), identityEpoch: 'abandoned', identityVersion: 2, identityCommittedVersion: 0 });
+			await client.redis.hset(pending, 'alice', metadata, 'bob', metadata);
+			await client.redis.hpexpire(pending, action === 'expiry' ? 150 : 60000, 'FIELDS', 1, 'alice');
+			await client.redis.hpexpire(pending, 60000, 'FIELDS', 1, 'bob');
+			await client.redis.hset(other, 'alice', metadata);
+			await client.redis.hpexpire(other, 60000, 'FIELDS', 1, 'alice');
+			const tracker = makeTracker();
+			if (action === 'last-leave') {
+				await client.redis.hset(userHashKey(topic, 'alice'), 'instance', 'token');
+				await evalCached(client.redis, LEAVE_SCRIPT, 3, userHashKey(topic, 'alice'), topicHashKey(topic), pending, 'instance', 'alice');
+			} else if (action === 'purge') expect(await tracker.purgeUser('one', 'alice')).toBe(1);
+			else if (action === 'clear') await tracker.clear();
+			else {
+				// Refresh another field while Alice expires; a topic-wide TTL
+				// must not keep an abandoned user's metadata indefinitely.
+				await client.redis.hpexpire(pending, 60000, 'FIELDS', 1, 'bob');
+				await waitRedisMs(client, 200);
+			}
+			expect(await client.redis.hget(pending, 'alice')).toBeNull();
+			if (action !== 'clear') {
+				expect(await client.redis.hget(pending, 'bob')).toBe(metadata);
+				expect(await client.redis.hget(other, 'alice')).toBe(metadata);
+			}
+			expect(await tracker.count(topic)).toBe(0);
+			expect(await tracker.list(topic)).toEqual([]);
+		});
+
+		it('keeps a later legacy writer authoritative during modern finalization', async () => {
+			const user = userHashKey('room', 'alice'), topic = topicHashKey('room'), pending = client.key('presence:pending:{room}');
+			const ts = Date.now(), ttl = 60000;
+			const result = await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, 'modern', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Modern' }, ts, identityToken: 'modern' }), ts, ttl, 'modern');
+			await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, 'legacy', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Legacy' }, ts: ts + 1 }), ts + 1, ttl);
+			await evalCached(client.redis, FINALIZE_JOIN_SCRIPT, 3, user, topic, pending, 'modern', 'alice', 'modern', result[4], result[3], JSON.stringify({ id: 'alice', name: 'Modern' }), ts, ttl);
+			expect(await makeTracker().list('room')).toEqual([{ id: 'alice', name: 'Legacy' }]);
+			expect(JSON.parse(await client.redis.hget(topic, 'alice')).identityEpoch).toBeUndefined();
+		});
+
+		it.each(['Stable', 'Changed'])('broadcasts the last visible leave after a pending %s join fails', async selected => {
+			const tracker = makeTracker(), observer = makeTracker(), remote = mockPlatform();
+			const anchor = mockWs({ id: 'alice', name: 'Stable' });
+			await tracker.join(anchor, 'room', platform);
+			await observer.sync(mockWs({ id: 'observer' }), 'room', remote);
+			const hgetall = client.redis.hgetall.bind(client.redis);
+			let release;
+			try {
+				let sawRead;
+				const reading = new Promise(resolve => { sawRead = resolve; });
+				let hold = true;
+				client.redis.hgetall = key => {
+					if (hold && key === topicHashKey('room')) {
+						hold = false; sawRead();
+						return new Promise((resolve, reject) => { release = () => reject(new Error('snapshot failed')); });
+					}
+					return hgetall(key);
+				};
+				const joining = tracker.join(mockWs({ id: 'alice', name: selected }), 'room', platform).catch(error => error);
+				await reading;
+				await tracker.leave(anchor, platform, 'room');
+				release();
+				expect((await joining).message).toBe('snapshot failed');
+				expect(await tracker.count('room')).toBe(0);
+				expect(await client.redis.hlen(userHashKey('room', 'alice'))).toBe(0);
+				await vi.waitFor(() => expect(leaveDiffsFor(remote, 'alice')).toHaveLength(1));
+				expect(leaveDiffsFor(remote, 'alice')[0].data.leaves.alice.name).toBe('Stable');
+			} finally { release?.(); client.redis.hgetall = hgetall; }
+		});
+
+		it('retains a same-identity replacement admitted after failed cleanup was submitted', async () => {
+			const tracker = makeTracker(), anchor = mockWs({ id: 'alice', name: 'Stable' });
+			const replacement = mockWs({ id: 'alice', name: 'Stable' });
+			await tracker.join(anchor, 'room', platform);
+			const hgetall = client.redis.hgetall.bind(client.redis), command = evalCachedName(client.redis, ROLLBACK_JOIN_SCRIPT);
+			const rollback = client.redis[command].bind(client.redis);
+			let release, replace = true;
+			try {
+				let sawRead;
+				const reading = new Promise(resolve => { sawRead = resolve; });
+				let hold = true;
+				client.redis.hgetall = key => {
+					if (hold && key === topicHashKey('room')) {
+						hold = false; sawRead();
+						return new Promise((resolve, reject) => { release = () => reject(new Error('snapshot failed')); });
+					}
+					return hgetall(key);
+				};
+				client.redis[command] = async (...args) => {
+					if (replace) { replace = false; await tracker.join(replacement, 'room', platform); }
+					return rollback(...args);
+				};
+				const joining = tracker.join(mockWs({ id: 'alice', name: 'Stable' }), 'room', platform).catch(error => error);
+				await reading;
+				await tracker.leave(anchor, platform, 'room');
+				release();
+				expect((await joining).message).toBe('snapshot failed');
+				expect(replace).toBe(false);
+				expect(await client.redis.hlen(userHashKey('room', 'alice'))).toBe(1);
+				expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'Stable' }]);
+				await tracker.leave(replacement, platform, 'room');
+				expect(await tracker.count('room')).toBe(0);
+			} finally { release?.(); client.redis.hgetall = hgetall; client.redis[command] = rollback; }
+		});
+
+		it('keeps private metadata off durable updates and fences expired generations', async () => {
+			const user = userHashKey('room', 'alice'), topic = topicHashKey('room'), pending = client.key('presence:pending:{room}');
+			const ts = Date.now(), ttl = 60000;
+			const tracker = makeTracker(), ws = mockWs({ id: 'alice', name: 'Stable' });
+			await tracker.join(ws, 'room', platform);
+			const result = await evalCached(client.redis, JOIN_SCRIPT, 3, user, topic, pending, 'delayed', 'alice', JSON.stringify({ data: { id: 'alice', name: 'Delayed' }, ts }), ts, ttl, 'delayed');
+			expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'Stable' }]);
+			await tracker.update(ws, 'room', { color: 'red' }, platform);
+			const value = JSON.parse(await client.redis.hget(topic, 'alice'));
+			expect(Object.keys(value).sort()).toEqual(['data', 'fields', 'ts']);
+			expect(value.fields).toEqual({ color: 'red' });
+			await client.redis.hpexpire(pending, 1, 'FIELDS', 1, 'alice');
+			await new Promise(resolve => setTimeout(resolve, 10));
+			expect(await evalCached(client.redis, FINALIZE_JOIN_SCRIPT, 3, user, topic, pending, 'delayed', 'alice', 'delayed', result[4], result[3], JSON.stringify({ id: 'alice', name: 'Delayed' }), ts, ttl)).toBeNull();
+			expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'Stable', color: 'red' }]);
+		});
+
+		it.each([false, true])('fences a legacy replacement after a lost finalization reply, replaced=%s', async replaced => {
+			const tracker = makeTracker(), ws = mockWs({ id: 'alice', name: 'Modern' });
+			const command = evalCachedName(client.redis, FINALIZE_JOIN_SCRIPT), finalize = client.redis[command].bind(client.redis);
+			let lose = true;
+			client.redis[command] = async (...args) => {
+				const result = await finalize(...args);
+				if (lose) {
+					lose = false;
+					const hash = topicHashKey('room'), old = JSON.parse(await client.redis.hget(hash, 'alice'));
+					// A real legacy writer does not know or clear the private hash.
+					const data = replaced ? { id: 'alice', name: 'Legacy' } : { name: old.data.name, id: old.data.id };
+					await client.redis.hset(hash, 'alice', JSON.stringify({ data, ts: old.ts + 1, fields: { color: 'red' } }));
+					throw new Error('finalization reply lost');
+				}
+				return result;
+			};
+			try {
+				await tracker.join(ws, 'room', platform);
+				expect(await tracker.list('room')).toEqual([{ id: 'alice', name: replaced ? 'Legacy' : 'Modern', color: 'red' }]);
+			} finally { client.redis[command] = finalize; }
+		});
+
+		it('reconciles a lost real finalization reply idempotently', async () => {
+			const tracker = makeTracker(), command = evalCachedName(client.redis, FINALIZE_JOIN_SCRIPT);
+			const finalize = client.redis[command].bind(client.redis);
+			let attempts = 0;
+			client.redis[command] = async (...args) => {
+				const result = await finalize(...args);
+				if (++attempts === 1) throw new Error('finalize reply lost');
+				return result;
+			};
+			try {
+				await tracker.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
+				expect(attempts).toBe(2);
+				expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'Alice' }]);
+			} finally { client.redis[command] = finalize; }
 		});
 
 		it('JOIN_SCRIPT preserves durable fields across a newer-data overwrite (real Lua)', async () => {

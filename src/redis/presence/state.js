@@ -239,7 +239,7 @@ export function createPresenceState(client, options = {}) {
 
 	/**
 	 * Per-connection state: which topics they've joined and their key on each.
-	 * @type {Map<any, Map<string, { key: string, data: Record<string, any> }>>}
+	 * @type {Map<any, Map<string, { key: string, data: Record<string, any>, committed?: boolean }>>}
 	 */
 	const wsTopics = new Map();
 
@@ -283,9 +283,9 @@ export function createPresenceState(client, options = {}) {
 	const hgetallInflight = new Map();
 
 	// Redis key + channel builders. The {topic} hash-tag colocation that keeps a
-	// topic's two keys on one cluster slot lives in keys.js (kept in lockstep with
+	// topic's keys on one cluster slot lives in keys.js (kept in lockstep with
 	// the KEYS arity documented in lua.js).
-	const { topicHashKey, userHashKey, eventChannel } = makeKeys(client);
+	const { topicHashKey, userHashKey, pendingHashKey, eventChannel } = makeKeys(client);
 
 	function coalesceHgetall(topic) {
 		const key = topicHashKey(topic);
@@ -340,6 +340,7 @@ export function createPresenceState(client, options = {}) {
 		hgetallInflight,
 		topicHashKey,
 		userHashKey,
+		pendingHashKey,
 		eventChannel,
 		coalesceHgetall
 	};
