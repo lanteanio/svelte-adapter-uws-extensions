@@ -810,8 +810,8 @@ export function createShardedBus(client, options = {}) {
 		if (reconcileTimer.unref) reconcileTimer.unref();
 	}
 
-	function watchShardState() {
-		const generation = subGeneration;
+	function watchShardState(generation) {
+		if (!subOpen || generation !== subGeneration || shardStateTimer !== null) return;
 		function tick() {
 			if (!subOpen || generation !== subGeneration) return;
 			shardStateTimer = null;
@@ -844,10 +844,11 @@ export function createShardedBus(client, options = {}) {
 	async function subEnsure() {
 		if (subReady) return;
 		subOpen = true;
+		const generation = subGeneration;
 		if (isCluster(client.redis)) {
 			if (subLiveness === null) subLiveness = watchLiveness('sharded-pubsub', () => subByNodeId.values(), closeConnection, { identify: (s) => subIdOf.get(s) });
 			await subRefreshTopology();
-			watchShardState();
+			watchShardState(generation);
 		} else {
 			subStandalone = openSubscriber(client, 'sharded-pubsub');
 			subStandalone.on('error', subOnError);

@@ -28,7 +28,8 @@ it('reconciles silent shard loss and stops old watchdogs across deactivate and r
 	const bus = createShardedBus(client);
 	const flush = async () => { for (let n = 0; n < 30; n++) await Promise.resolve(); };
 	try {
-		await bus.activate(mockPlatform());
+		await Promise.all([bus.activate(mockPlatform()), bus.activate(mockPlatform())]);
+		expect([...timers].filter((h) => h.ms === 1000)).toHaveLength(1);
 		await bus.follow('room');
 		const oldTick = [...timers].find((h) => h.ms === 1000);
 		expect(oldTick).toBeDefined();
@@ -40,7 +41,8 @@ it('reconciles silent shard loss and stops old watchdogs across deactivate and r
 		expect(subscriber._shardedChannels.has('uws:sharded:room')).toBe(true);
 		await bus.deactivate();
 		expect([...timers].filter((h) => h.ms === 1000)).toHaveLength(0);
-		await bus.activate(mockPlatform());
+		await Promise.all([bus.activate(mockPlatform()), bus.activate(mockPlatform())]);
+		expect([...timers].filter((h) => h.ms === 1000)).toHaveLength(1);
 		await bus.follow('room');
 		const count = timers.size;
 		oldTick.cb();
