@@ -1,3 +1,4 @@
+import { probeCancellation } from './breaker-admission.js';
 /**
  * Circuit breaker for svelte-adapter-uws-extensions.
  *
@@ -110,7 +111,7 @@ export function createCircuitBreaker(options = {}) {
 
 	// Per-key state. The default key '' is the single global breaker - every existing
 	// (no-key) caller hits exactly this one slot, so behavior is byte-identical.
-	/** @type {Map<string, { state: string, failures: number, probeBudget: number, resetTimer: any }>} */
+	/** @type {Map<string, { state: string, failures: number, probeBudget: number, resetTimer: any, generation: number }>} */
 	const states = new Map();
 	function stateFor(key) {
 		const k = key || '';
@@ -131,7 +132,7 @@ export function createCircuitBreaker(options = {}) {
 					}
 				}
 			}
-			s = { state: 'healthy', failures: 0, probeBudget: 0, resetTimer: null };
+			s = { state: 'healthy', failures: 0, probeBudget: 0, resetTimer: null, generation: 0 };
 			states.set(k, s);
 		}
 		return s;
@@ -144,6 +145,7 @@ export function createCircuitBreaker(options = {}) {
 		const from = s.state;
 		if (from === to) return;
 		s.state = to;
+		s.generation++;
 		for (const listener of listeners) {
 			try { listener(from, to); } catch { /* don't let one listener break the others */ }
 		}
@@ -159,7 +161,7 @@ export function createCircuitBreaker(options = {}) {
 		if (s.resetTimer.unref) s.resetTimer.unref();
 	}
 
-	return {
+	const breaker = {
 		get state() { return stateFor('').state; },
 		get isHealthy() { return stateFor('').state === 'healthy'; },
 		get failures() { return stateFor('').failures; },
@@ -232,4 +234,19 @@ export function createCircuitBreaker(options = {}) {
 			}
 		}
 	};
+	probeCancellation.set(breaker, (key) => {
+		const state = stateFor(key);
+		if (state.state !== 'probing') return noCancellation;
+		const generation = state.generation;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (stateFor(key) === state && state.state === 'probing' && state.generation === generation) {
+				state.probeBudget = Math.min(probeConcurrency, state.probeBudget + 1);
+			}
+		};
+	});
+	return breaker;
+
 }

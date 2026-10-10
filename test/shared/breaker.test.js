@@ -1,3 +1,4 @@
+import { guardBreaker } from '../../src/shared/breaker-admission.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createCircuitBreaker, CircuitBrokenError, withBreaker } from '../../src/shared/breaker.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
@@ -800,5 +801,42 @@ describe('circuit breaker', () => {
 			replay.destroy();
 			breaker.destroy();
 		});
+	});
+});
+
+
+describe('cancelled breaker admissions', () => {
+	it('returns one probe without giving a backend verdict', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		try {
+			breaker.failure(new Error('offline'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const cancel = guardBreaker(breaker);
+			expect(() => breaker.guard()).toThrow(CircuitBrokenError);
+			cancel();
+			expect(breaker.state).toBe('probing');
+			expect(breaker.failures).toBe(1);
+			breaker.guard();
+			cancel();
+			expect(() => breaker.guard()).toThrow(CircuitBrokenError);
+		} finally {
+			breaker.destroy();
+		}
+	});
+
+	it('cannot release a probe from a later generation', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		try {
+			breaker.failure(new Error('offline'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const cancel = guardBreaker(breaker);
+			breaker.failure(new Error('still offline'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			breaker.guard();
+			cancel();
+			expect(() => breaker.guard()).toThrow(CircuitBrokenError);
+		} finally {
+			breaker.destroy();
+		}
 	});
 });
