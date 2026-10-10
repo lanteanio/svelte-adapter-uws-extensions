@@ -54,3 +54,25 @@ it.each(['missing', 'changed'])('preserves native deadlines when the private com
 		await new Promise((resolve) => server.close(resolve));
 	}
 });
+
+
+it('rolls back every offline pipeline member when admission reaches capacity', async () => {
+	const sockets = new Set();
+	const server = createServer(socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const client = createRedisClient({ url: 'redis://127.0.0.1:' + server.address().port, autoShutdown: false, options: { lazyConnect: true } });
+	const singles = [], callbacks = [vi.fn(), vi.fn(), vi.fn()];
+	try {
+		for (let i = 0; i < MAX_REDIS_QUEUED_COMMANDS - 1; i++) singles.push(client.redis.ping().catch(error => error));
+		const pipeline = client.redis.pipeline();
+		callbacks.forEach(callback => pipeline.ping(callback));
+		const reply = pipeline.exec();
+		expect(client.redis.offlineQueue.length).toBe(MAX_REDIS_QUEUED_COMMANDS - 1);
+		expect((await reply).every(([error]) => error instanceof ConnectionError)).toBe(true);
+		callbacks.forEach(callback => expect(callback).toHaveBeenCalledTimes(1));
+	} finally {
+		client.redis.disconnect(); await Promise.all(singles);
+		for (const socket of sockets) socket.destroy();
+		await new Promise(resolve => server.close(resolve));
+	}
+});

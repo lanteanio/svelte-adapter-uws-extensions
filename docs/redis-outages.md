@@ -18,15 +18,19 @@ immediately after construction to wait for initial connection setup.
 | Main connection after first ready | No offline buffering | New commands fail promptly while disconnected. |
 
 The queue cap also applies during initial setup and to subscriber duplicates.
-A rejected command that is still in the offline queue is removed, so a timed-out
-startup write is not sent when Redis eventually becomes ready. Sent commands
-remain in their protocol queue until their replies arrive or the connection
-closes. A timeout cannot prove that Redis did not execute a command already sent;
+A rejected command that is still in the offline queue is removed; if it belongs
+to a pipeline, every still-unsent member is rejected together. Startup writes
+whose deadlines expire are not sent after recovery. When a sent command times
+out, the client fails all work pending on that connection and retires its socket
+before reconnecting. This preserves reply ordering and prevents rejected writes
+or blocking WAIT commands from being resent. A timeout cannot prove that Redis
+did not execute a command already sent;
 use idempotency or fencing for effects whose repetition would be unsafe.
 
 Failures reject the calling promise through the existing ioredis errors,
 extensions `TimeoutError` for shared command deadlines, or `ConnectionError` for
-queue-cap admission. This gives a configured breaker and
+queue-cap admission. Deadline errors expose `code: 'OPERATION_TIMEOUT'`,
+`service: 'redis'` and the configured deadline as `ms`. This gives a configured breaker and
 `localFloorOnStorageFailure` rate limiter a failure to handle. The floor remains
 an explicit application choice; its allowance is per process. Store durable work
 in the task or outbox store instead of using an offline connection queue as a
@@ -59,7 +63,11 @@ main connection after its first ready event. Explicit `false` disables buffering
 from construction, so callers must wait for `ready` before sending normal commands.
 The infinite retry and disabled deadline settings above are opt-ins for dedicated
 blocking workloads; do not share that connection with request-path rate limits,
-locks, or writes that need a bounded response.
+locks, or writes that need a bounded response. Replay `replicationTimeoutMs`
+sets the Redis WAIT timeout, while command and socket deadlines still apply.
+Setting it to `0` disables only the Redis-side WAIT timeout, not client deadlines.
+Choose explicit connection deadlines longer than the required replication wait.
+Externally constructed Redis or Cluster clients retain their own policies.
 
 Independent multi-slot work shares a limit of eight in-flight pipelines or routed
 commands per client, with at most four assigned to one known Cluster owner.

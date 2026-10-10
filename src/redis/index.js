@@ -34,8 +34,10 @@ function supportsSharedDeadlines() {
 }
 
 // ioredis rejects timed-out commands without removing them from its offline
-// queue. Remove only still-unsent entries; sent commands stay in protocol order.
+// queue. Unsent pipelines must be cancelled as a whole: ioredis only writes
+// their buffered bytes after every member has passed through sendCommand.
 function boundOfflineQueue(redis, keepOfflineQueue) {
+	const rejectedPipelines = new WeakMap();
 	const send = redis.sendCommand;
 	if (typeof send !== 'function') return;
 	// One timer per connection, including pipelines. Native per-command timers
@@ -53,17 +55,43 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		due = at;
 		timer = setTimer(expire, Math.max(0, at - monotonicNow()));
 	}
+	function retireConnection(error) {
+		// A reply timeout cannot free one protocol slot safely. Retire the socket
+		// and its whole queue before reconnecting, so rejected writes and WAIT
+		// never re-enter ioredis's unanswered-command resend path.
+		redis.flushQueue(error);
+		const previous = redis.prevCommandQueue;
+		if (previous && previous !== redis.commandQueue) {
+			let entry;
+			while ((entry = previous.shift())) entry.command.reject(error);
+			redis.prevCommandQueue = null;
+		}
+		// A reconnect delay already has a retry scheduled and no live socket
+		// to retire. Preserve that native retry and only close live connections.
+		if (redis.status !== 'reconnecting' && redis.stream && !redis.stream.destroyed) redis.disconnect(true);
+	}
+	function wasSent(command) {
+		for (const queue of [redis.commandQueue, redis.prevCommandQueue]) {
+			if (!queue) continue;
+			for (let i = 0; i < queue.length; i++) if (queue.peekAt(i).command === command) return true;
+		}
+		return false;
+	}
 	function expire() {
 		timer = null;
 		due = Infinity;
 		const now = monotonicNow();
-		let next = Infinity;
 		for (const [command, deadline] of pending) {
-			if (deadline <= now) command.reject(new TimeoutError('redis', 'command', redis.options.commandTimeout));
-			else next = Math.min(next, deadline);
+			if (deadline > now) continue;
+			const error = new TimeoutError('redis', 'command', redis.options.commandTimeout);
+			if (wasSent(command)) retireConnection(error);
+			else command.reject(error);
 		}
+		let next = Infinity;
+		for (const deadline of pending.values()) next = Math.min(next, deadline);
 		if (next !== Infinity) arm(next);
 	}
+
 	function setDeadline(ms) {
 		if (!Number.isFinite(ms)) return nativeTimeout.call(this, ms);
 		if (pending.has(this)) return;
@@ -85,6 +113,9 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 			command.setTimeout = setDeadline;
 			command._clearTimers = clearDeadline;
 		}
+		if (!sharedDeadlines) command.promise.catch(error => {
+			if (error?.message === 'Command timed out' && wasSent(command)) retireConnection(error);
+		});
 		return send.call(this, command, stream);
 	}
 	if (!keepOfflineQueue) redis.on('ready', () => {
@@ -92,22 +123,33 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		// Offline admission no longer needs checking after first ready.
 		redis.sendCommand = sendTimed;
 	});
+	function cancelOffline(command, stream, error) {
+		const pipeline = stream?.isPipeline ? stream : null;
+		if (pipeline) {
+			if (rejectedPipelines.has(pipeline)) return;
+			rejectedPipelines.set(pipeline, error);
+		}
+		const queue = redis.offlineQueue;
+		for (let i = queue.length - 1; i >= 0; i--) {
+			const entry = queue.peekAt(i);
+			if (entry.command !== command && (!pipeline || entry.stream !== pipeline)) continue;
+			queue.remove(i, 1);
+			entry.command.reject(error);
+		}
+	}
 	redis.sendCommand = function (command, stream) {
-		if (this.status === 'ready') return sendTimed.call(this, command, stream);
+		if (stream?.isPipeline && rejectedPipelines.has(stream)) {
+			command.reject(rejectedPipelines.get(stream));
+			return command.promise;
+		}
 		const reply = sendTimed.call(this, command, stream);
 		const queue = this.offlineQueue;
 		if (queue?.peekAt(queue.length - 1)?.command !== command) return reply;
 		if (queue.length > MAX_REDIS_QUEUED_COMMANDS) {
-			queue.pop();
-			command.reject(new ConnectionError('redis', 'offline command queue capacity exceeded'));
+			cancelOffline(command, stream, new ConnectionError('redis', 'offline command queue capacity exceeded'));
 			return reply;
 		}
-		command.promise.catch(() => {
-			const queued = this.offlineQueue;
-			for (let i = 0; i < queued.length; i++) {
-				if (queued.peekAt(i).command === command) { queued.remove(i, 1); break; }
-			}
-		});
+		command.promise.catch(error => cancelOffline(command, stream, error));
 		return reply;
 	};
 }

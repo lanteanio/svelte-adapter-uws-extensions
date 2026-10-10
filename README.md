@@ -703,7 +703,7 @@ The same `resumeHook()` and the same reset-detection are available on the Postgr
 | `maxDataBytes` | `262144` | Per-message payload cap, applied by every replay backend (Redis sorted-set, Redis stream, Postgres) so the contract does not differ by which one a deployment runs. Rejects with `ReplaySerializationError`; on the Postgres store `publishBatch` enforces it too. Must be a positive integer - `NaN` and `0` are refused rather than silently disabling the cap. |
 | `durability` | - | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
 | `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
-| `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` blocks indefinitely (Redis WAIT semantics). |
+| `replicationTimeoutMs` | `1000` | Per-publish replication timeout in ms. `0` disables the Redis WAIT timeout; configured client command/socket deadlines still apply. |
 
 #### Stream backend
 
