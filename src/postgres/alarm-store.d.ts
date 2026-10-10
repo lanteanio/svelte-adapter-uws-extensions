@@ -16,6 +16,8 @@ export interface AlarmRow {
 	topic: string;
 	at: number;
 	meta: AlarmMeta | null;
+	/** Exact positive decimal string; never convert it to a JavaScript number. */
+	generation: string;
 }
 
 export interface PgAlarmStoreOptions {
@@ -37,17 +39,21 @@ export interface PgAlarmStoreOptions {
 export interface PgAlarmStore extends PostgresStoreReadiness {
 	/** Migrate and validate, or validate read-only when autoMigrate is false. */
 	ready(): Promise<void>;
-	/** Persist (or replace) the alarm for `topic`, due at epoch-ms `at`. */
-	set(topic: string, at: number, meta?: AlarmMeta | null): Promise<void>;
+	/** Reserve a durable generation without changing the scheduled row; rejects at signed-64-bit exhaustion. */
+	nextGeneration(topic: string): Promise<string>;
+	/** Return the current row with its generation, or null. */
+	get(topic: string): Promise<AlarmRow | null>;
+	/** Commit only the latest reservation newer than the retained watermark; false for stale writes. */
+	set(topic: string, at: number, meta: AlarmMeta | null | undefined, generation: string): Promise<boolean>;
 	/**
-	 * Remove the alarm for `topic`. Returns whether THIS call removed a present row
+	 * Remove only the matching current generation. Returns whether THIS call removed a present row
 	 * - the atomic claim guaranteeing single-fire between the in-memory timer and
 	 * the recovery poll.
 	 */
-	delete(topic: string): Promise<boolean>;
+	delete(topic: string, generation: string): Promise<boolean>;
 	/** Return the alarms whose `at <= nowMs` (capped at `dueBatch`) for the poll. */
 	due(nowMs: number): Promise<AlarmRow[]>;
-	/** Remove every persisted alarm. */
+	/** Remove every pending alarm and invalidate reservations, retaining generation authority. */
 	clear(): Promise<void>;
 	/** No-op (no background loop); present for parity with the other factories. */
 	destroy(): Promise<void>;

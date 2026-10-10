@@ -9,8 +9,7 @@
  * data-access object - mirroring how `redis/registry` backs `live.push` routing
  * and `redis/idempotency` backs `live.idempotent`.
  *
- * Storage layout (two keys, one Redis hash slot via the `{alarms}` tag so a
- * cluster keeps them co-located and the claim stays atomic):
+ * Storage layout (five keys, one Redis hash slot via the `{alarms}` tag):
  *   - `{alarms}:due`  ZSET  score = `at` (epoch-ms), member = wire topic. The
  *     recovery poll reads `ZRANGEBYSCORE -inf now` to find overdue alarms.
  *   - `{alarms}:meta` HASH  field = wire topic, value = `JSON({ at, meta })`. Holds
@@ -18,29 +17,28 @@
  *     poll needs to re-find `onAlarm` after a restart. A present `alarmId` is
  *     authoritative; recovery does not fall back to the path.
  *
- * Single-fire: `delete(topic)` is the atomic claim - `ZREM` returns 1 only for the
- * caller that actually removed the member. This fences successful claims only;
- * handler delivery and generation-aware replacement belong to the realtime layer.
+ *   - `{alarms}:reserved`, `:committed`, `:current` HASHes hold exact decimal
+ *     generation strings. Reservation and committed watermarks survive deletion
+ *     and clear. Legacy schedules acquire generation 1 without rewriting meta.
+ * `set` accepts only the latest reservation above the committed watermark;
+ * `delete(topic, generation)` removes only the observed scheduled generation.
  *
  * @module svelte-adapter-uws-extensions/redis/alarm-store
  */
 
 import { withBreaker } from '../shared/breaker.js';
-import { keySlot, firstCommandError } from '../shared/cluster.js';
+import { keySlot } from '../shared/cluster.js';
+import { assertAlarmGeneration } from '../shared/alarm-generation.js';
+import { ALARM_GENERATION_SCRIPT } from './_alarm-scripts.js';
 
-// MULTI execution errors are returned per command, not rejected by ioredis.
-function assertExec(results) {
-	if (!results) throw new Error('redis alarm store: transaction was not executed');
-	const error = firstCommandError(results);
-	if (error) throw error;
-}
+const COMMAND = 'orderedAlarmGenerationV1';
 
 /** Default cap on the rows returned by one `due(now)` sweep. */
 const DEFAULT_DUE_BATCH = 100;
 
 /**
  * @typedef {Object} RedisAlarmStoreOptions
- * @property {string} [keyPrefix='alarm:'] - Prefix prepended (after the client keyPrefix) to the two alarm keys.
+ * @property {string} [keyPrefix='alarm:'] - Prefix prepended (after the client keyPrefix) to the alarm keys.
  * @property {number} [dueBatch=100] - Max alarms returned per `due(now)` sweep (the leader poll drains the rest on subsequent ticks).
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional metrics registry (Prometheus).
@@ -50,13 +48,16 @@ const DEFAULT_DUE_BATCH = 100;
  * @typedef {Object} AlarmRow
  * @property {string} topic
  * @property {number} at
+ * @property {string} generation
  * @property {{ alarmId?: string, path?: string, tenantId?: string | null } | null} meta
  */
 
 /**
  * @typedef {Object} RedisAlarmStore
- * @property {(topic: string, at: number, meta?: any) => Promise<void>} set
- * @property {(topic: string) => Promise<boolean>} delete
+ * @property {(topic: string) => Promise<string>} nextGeneration
+ * @property {(topic: string) => Promise<AlarmRow | null>} get
+ * @property {(topic: string, at: number, meta: any, generation: string) => Promise<boolean>} set
+ * @property {(topic: string, generation: string) => Promise<boolean>} delete
  * @property {(nowMs: number) => Promise<AlarmRow[]>} due
  * @property {() => Promise<void>} clear
  * @property {() => Promise<void>} destroy
@@ -87,88 +88,70 @@ export function createAlarmStore(client, options = {}) {
 	const mClaimed = m?.counter('alarm_store_claimed_total', 'Alarms claimed (delete removed a present row)');
 	const mDue = m?.counter('alarm_store_due_total', 'Due alarms returned to the recovery poll');
 
-	// Co-located on one slot via the `{alarms}` hash tag, so the MULTI claim
-	// (ZREM + HDEL) is atomic on a cluster and never spans nodes. The two keys
-	// share a byte-identical prefix through the tag, so a standard `client.key`
-	// always co-locates them - but a custom client whose `key()` rewrites keys
-	// asymmetrically could split them and silently break the claim (a cross-slot
-	// MULTI no-ops the off-node command). Fail fast at construction instead.
-	const dueKey = client.key(keyPrefix + '{alarms}:due');
-	const metaKey = client.key(keyPrefix + '{alarms}:meta');
-	if (keySlot(dueKey) !== keySlot(metaKey)) {
-		throw new Error(
-			'redis alarm store: the due-index and meta keys hash to different cluster slots ' +
-			`("${dueKey}" vs "${metaKey}"); the atomic claim requires them co-located. ` +
-			'This usually means a custom client.key() broke the {alarms} hash tag.'
-		);
+	const keys = ['due', 'meta', 'reserved', 'committed', 'current']
+		.map(name => client.key(keyPrefix + '{alarms}:' + name));
+	if (keys.some(key => keySlot(key) !== keySlot(keys[0]))) {
+		throw new Error('redis alarm store: alarm keys hash to different cluster slots; atomic operations require them co-located');
 	}
+	if (typeof redis[COMMAND] !== 'function') redis.defineCommand(COMMAND, { lua: ALARM_GENERATION_SCRIPT });
+	const execute = (operation, ...args) => withBreaker(b, () => redis[COMMAND](keys.length, ...keys, operation, ...args));
 
 	function assertTopic(topic) {
 		if (typeof topic !== 'string' || topic.length === 0) {
 			throw new Error('redis alarm store: topic must be a non-empty string');
 		}
 	}
+	function assertTime(at) {
+		if (typeof at !== 'number' || !Number.isFinite(at)) {
+			throw new Error('redis alarm store: at must be a finite epoch-ms number');
+		}
+	}
+	function decode(row) {
+		if (!row.length) return null;
+		const [topic, score, raw, generation] = row;
+		let at = Number(score), meta = null;
+		if (raw) {
+			try {
+				const parsed = JSON.parse(raw);
+				if (parsed && typeof parsed.at === 'number' && Number.isFinite(parsed.at)) at = parsed.at;
+				meta = parsed && parsed.meta != null ? parsed.meta : null;
+			} catch { /* retain corrupt metadata as an unresolved bare row */ }
+		}
+		return { topic, at, meta, generation };
+	}
 
 	return {
-		async set(topic, at, meta) {
+		async nextGeneration(topic) {
 			assertTopic(topic);
-			if (typeof at !== 'number' || !Number.isFinite(at)) {
-				throw new Error('redis alarm store: at must be a finite epoch-ms number');
-			}
-			await withBreaker(b, async () => {
-				const payload = JSON.stringify({ at, meta: meta ?? null });
-				// Write the meta + the due-index as one atomic unit (same slot) so a
-				// crash can never leave a due member without its resolver metadata.
-				const res = await redis.multi().hset(metaKey, topic, payload).zadd(dueKey, at, topic).exec();
-				assertExec(res);
-			});
-			mSet?.inc();
+			return execute('next', topic);
 		},
-
-		async delete(topic) {
+		async get(topic) {
 			assertTopic(topic);
-			return withBreaker(b, async () => {
-				const res = await redis.multi().zrem(dueKey, topic).hdel(metaKey, topic).exec();
-				assertExec(res);
-				// res[0] = [err, zremCount]. The ZREM count IS the atomic claim: exactly
-				// one caller sees 1, everyone else sees 0.
-				const n = res && res[0] ? Number(res[0][1]) : 0;
-				const claimed = n === 1;
-				if (claimed) mClaimed?.inc();
-				return claimed;
-			});
+			return decode(await execute('get', topic));
 		},
-
+		async set(topic, at, meta, generation) {
+			assertTopic(topic);
+			assertTime(at);
+			assertAlarmGeneration(generation, 'redis alarm store');
+			const committed = (await execute('set', topic, generation, at, JSON.stringify({ at, meta: meta ?? null }))) === 1;
+			if (committed) mSet?.inc();
+			return committed;
+		},
+		async delete(topic, generation) {
+			assertTopic(topic);
+			assertAlarmGeneration(generation, 'redis alarm store');
+			const removed = (await execute('delete', topic, generation)) === 1;
+			if (removed) mClaimed?.inc();
+			return removed;
+		},
 		async due(nowMs) {
-			return withBreaker(b, async () => {
-				const topics = await redis.zrangebyscore(dueKey, '-inf', nowMs, 'LIMIT', 0, dueBatch);
-				if (!topics || topics.length === 0) return [];
-				const metas = await redis.hmget(metaKey, ...topics);
-				/** @type {AlarmRow[]} */
-				const out = [];
-				for (let i = 0; i < topics.length; i++) {
-					const raw = metas[i];
-					let at = nowMs;
-					let meta = null;
-					if (raw) {
-						try {
-							const parsed = JSON.parse(raw);
-							if (parsed && typeof parsed.at === 'number') at = parsed.at;
-							meta = parsed && parsed.meta != null ? parsed.meta : null;
-						} catch { /* corrupt payload -> surface as a bare row; recovery retains it unresolved */ }
-					}
-					out.push({ topic: topics[i], at, meta });
-				}
-				if (out.length) mDue?.inc(out.length);
-				return out;
-			});
+			assertTime(nowMs);
+			const rows = (await execute('due', nowMs, dueBatch)).map(decode);
+			if (rows.length) mDue?.inc(rows.length);
+			return rows;
 		},
-
 		async clear() {
-			await withBreaker(b, async () => {
-				const res = await redis.multi().del(dueKey).del(metaKey).exec();
-				assertExec(res);
-			});
+			await execute('clear');
 		},
 
 		// No background loop to tear down - the recovery poll lives in the realtime

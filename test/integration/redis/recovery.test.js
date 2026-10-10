@@ -23,7 +23,12 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	await replay.publish({ publish() { return true; } }, 'private-room', 'message', { hidden: 'private-payload' });
 	const stream = createReplay(source, { storage: 'stream', size: 10, ttl: 600 });
 	await stream.publish({ publish() { return true; } }, 'stream-room', 'message', { value: 1 });
-	await createAlarmStore(source).set('private-room', Date.now() + 60000, { alarmId: 'notify' });
+	const alarms = createAlarmStore(source);
+	await alarms.set('private-room', Date.now() + 60000, { alarmId: 'notify' }, await alarms.nextGeneration('private-room'));
+	const deletedGeneration = await alarms.nextGeneration('private-deleted');
+	await alarms.set('private-deleted', 1, null, deletedGeneration);
+	await alarms.delete('private-deleted', deletedGeneration);
+	const pendingGeneration = await alarms.nextGeneration('private-deleted');
 	await createDeadLetter(source).add({ webhookId: 'delivery', topic: 'private-room', event: 'message', data: { value: 4 }, attempts: 1, error: 'failure' });
 	const records = [];
 	for (const key of await scanKeys(source.redis, source.key('*'))) {
@@ -32,7 +37,7 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	for (const record of records) {
 		await restored.redis.restore(restored.key(record.key), record.expiresAt < 0 ? 0 : record.expiresAt, Buffer.from(record.dump, 'base64'), ...(record.expiresAt < 0 ? [] : ['ABSTTL']));
 	}
-	const config = { schemaVersion: 1, redis: { keyPrefix: restored.key(''), families: ['replay','alarms','dead-letter'], minimumKeys: { replay: 4, alarms: 2, 'dead-letter': 3 } } };
+	const config = { schemaVersion: 1, redis: { keyPrefix: restored.key(''), families: ['replay','alarms','dead-letter'], minimumKeys: { replay: 4, alarms: 5, 'dead-letter': 3 } } };
 	let report;
 	if (typeof restored.redis.nodes === 'function') report = await runVerification(config, { redis: restored.redis });
 	else {
@@ -46,6 +51,18 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	expect(report.ok, JSON.stringify(report)).toBe(true);
 	expect(report.redis.scannedKeys).toBe(records.length);
 	expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|recovery-restored:/);
+	const restoredAlarms = createAlarmStore(restored);
+	expect(await restoredAlarms.get('private-deleted')).toBeNull();
+	expect(await restoredAlarms.nextGeneration('private-deleted')).toBe((BigInt(pendingGeneration) + 1n).toString());
+	expect(await restoredAlarms.set('private-deleted', 1, null, pendingGeneration)).toBe(false);
+	await restored.redis.hset(restored.key('alarm:{alarms}:committed'), 'private-room', '0');
+	const corruptAlarm = await runVerification(config, { redis: restored.redis });
+	expect(corruptAlarm.ok).toBe(false);
+	expect(corruptAlarm.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
+	await restored.redis.hset(restored.key('alarm:{alarms}:committed'), 'private-room', '1');
+	await restored.redis.hdel(restored.key('alarm:{alarms}:reserved'), 'private-room');
+	const missingAuthority = await runVerification(config, { redis: restored.redis });
+	expect(missingAuthority.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
 	await restored.redis.del(restored.key('replay:seq:{private-room}'));
 	const partial = await runVerification(config, { redis: restored.redis });
 	expect(partial.ok).toBe(false);
@@ -56,7 +73,7 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	const artifact = JSON.stringify({ schemaVersion: 1, records });
 	mkdirSync('source/recovery-drill', { recursive: true });
 	writeFileSync('source/recovery-drill/redis-dump.json', artifact + '\n');
-	writeFileSync('source/recovery-drill/redis-report.json', JSON.stringify({ archiveSha256: createHash('sha256').update(artifact).digest('hex'), restored: report, partial, unpaired }, null, 2) + '\n');
+	writeFileSync('source/recovery-drill/redis-report.json', JSON.stringify({ archiveSha256: createHash('sha256').update(artifact).digest('hex'), restored: report, corruptAlarm, missingAuthority, partial, unpaired }, null, 2) + '\n');
 	await resetBackendKeys(restored);
 	await restored.redis.set(restored.key('dlq:seq:{dlq}'), 'not-an-integer');
 	const empty = await runVerification({ schemaVersion: 1, redis: { keyPrefix: restored.key(''), families: ['dead-letter'] } }, { redis: restored.redis });

@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Alarm stores require ordered generations.** Reserve with `nextGeneration(topic)` and pass the exact string to `set` and `delete`; stop old topic-only writers before rollout. PostgreSQL migration version 3 and three Redis authority hashes retain counters after deletion or clear. Restore authority with schedules and the migration ledger; see the alarm generation migration guide.
+
 - **Metric identifier defaults now collapse to `all`.** `mapTopic` covers built-in topic, group and rate-limit tenant labels; lock/leader `mapKey` also defaults to `all`. Presence online and WebSocket publish gauges sum counts or sampled rates within mapped classes. Update raw-label dashboards and alerts, or provide an explicit mapper to restore chosen classes; an identity mapper explicitly restores raw-label privacy and cardinality risks. See the metric migration note for historical-series retention.
 
 ### Changed
+
+- Verify retained alarm generation authority during recovery, including deleted and pending topics, bounded Redis hash reads and archive/restore continuity checks.
 
 - Reject reserved `byuser:` session tokens before Redis access, including lifecycle cookie loads, and refuse legacy index collisions before erasure deletes any token. Document reconciliation of historical collisions.
 

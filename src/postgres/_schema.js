@@ -70,7 +70,25 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		main.indexes.push(identity); constraints.push(indexSql(table, identity));
 		constraints.push(`DROP INDEX CONCURRENTLY IF EXISTS ${obsolete.name}`);
 	}
-	for (const [offset, statements] of [baseline, constraints].entries()) {
+	schema.checkpoints = { 1: schema.baseline, 2: schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] })) };
+	const versions = [baseline, constraints];
+	if (store === 'alarm-store') {
+		const authority = { name: `${table}_generations`, columns: [text('topic', true), ['reserved', 'bigint', true, '0'], ['committed', 'bigint', true, '0']], primary: ['topic'], indexes: [], checks: [check('authority', 'reserved >= 0 AND committed >= 0 AND reserved >= committed')], privileges: ['SELECT', 'INSERT', 'UPDATE'] };
+		main.columns = [...main.columns, ['generation', 'bigint', true]];
+		main.checks = [check('generation', 'generation > 0')];
+		schema.tables.push(authority);
+		const generations = [
+			`CREATE TABLE IF NOT EXISTS ${authority.name} (${authority.columns.map(columnSql).join(', ')}, PRIMARY KEY (topic))`,
+			`DO $migration$ BEGIN LOCK TABLE ${authority.name} IN EXCLUSIVE MODE; LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE; ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS generation BIGINT; INSERT INTO ${authority.name} (topic, reserved, committed) SELECT topic, 1, 1 FROM ${table} WHERE generation IS NULL ON CONFLICT (topic) DO NOTHING; UPDATE ${table} a SET generation = 1 FROM ${authority.name} g WHERE a.topic = g.topic AND a.generation IS NULL AND g.reserved = 1 AND g.committed = 1; ALTER TABLE ${table} ALTER COLUMN generation SET NOT NULL; IF EXISTS (SELECT 1 FROM ${table} a LEFT JOIN ${authority.name} g ON g.topic = a.topic WHERE g.topic IS NULL OR a.generation <> g.committed OR g.reserved < g.committed) THEN RAISE EXCEPTION 'postgres alarm store: incompatible generation authority'; END IF; END $migration$`
+		];
+		for (const relation of [main, authority]) for (const entry of relation.checks) {
+			generations.push(`DO $migration$ BEGIN ALTER TABLE ${relation.name} ADD CONSTRAINT ${entry.name} CHECK (${entry.expression}) NOT VALID; EXCEPTION WHEN duplicate_object THEN NULL; END $migration$`);
+			generations.push(`ALTER TABLE ${relation.name} VALIDATE CONSTRAINT ${entry.name}`);
+		}
+		versions.push(generations);
+		schema.checkpoints[3] = schema.tables;
+	}
+	for (const [offset, statements] of versions.entries()) {
 		const version = offset + 1;
 		const checksum = createHash('sha256').update(JSON.stringify({ store, version, statements })).digest('hex');
 		schema.versions.push({ version, checksum, statements });

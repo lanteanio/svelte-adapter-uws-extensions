@@ -46,6 +46,7 @@ export async function migrate(client, options) {
 		validateLedger(rows, schema);
 		for (const version of schema.versions) {
 			if (rows.some(row => row.version === version.version)) continue;
+			const checkpoint = { tables: schema.checkpoints[version.version] };
 			for (const statement of version.statements) {
 				if (statement.startsWith('DROP INDEX CONCURRENTLY')) {
 					const name = statement.split(' ').at(-1);
@@ -58,7 +59,7 @@ export async function migrate(client, options) {
 				}
 				if (statement.startsWith('CREATE') && statement.includes('INDEX CONCURRENTLY')) {
 					const table = / ON (\w+) /.exec(statement)[1];
-					await validateColumns({ query }, { tables: schema.tables.filter(relation => relation.name === table) }, schema);
+					await validateColumns({ query }, { tables: checkpoint.tables.filter(relation => relation.name === table) }, schema);
 					const name = /INDEX CONCURRENTLY IF NOT EXISTS (\w+)/.exec(statement)[1];
 					const invalid = await query('SELECT i.indisvalid, i.indrelid = to_regclass($2) AS owned FROM pg_index i WHERE i.indexrelid = to_regclass($1)', [name, table]);
 					// A failed concurrent build leaves an invalid index. Only its own
@@ -74,7 +75,7 @@ export async function migrate(client, options) {
 				}
 				await query(statement);
 			}
-			await validateCatalog({ query }, version.version === 1 ? { tables: schema.baseline } : schema, schema);
+			await validateCatalog({ query }, checkpoint, schema);
 			await query(`INSERT INTO ${LEDGER} (table_name, store, version, checksum) VALUES ($1, $2, $3, $4)`, [schema.table, schema.store, version.version, version.checksum]);
 		}
 		await validateCatalog({ query }, schema);

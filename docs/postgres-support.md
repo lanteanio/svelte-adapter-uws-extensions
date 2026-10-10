@@ -187,7 +187,9 @@ connection for migrations because migration coordination uses a session lock.
 
 `postgresMigrations({ store, table })` returns the versioned SQL and SHA-256
 checksums. Version 1 establishes the existing baseline and additive columns;
-version 2 adds constraints and replay uniqueness. Idempotency states are
+version 2 adds constraints and replay uniqueness. Alarm-store version 3 adds
+[ordered generation authority](./alarm-generations.md); other stores remain at
+version 2. Idempotency states are
 `pending`/`committed`; task states are `pending`/`running`/`committed`/`failed`.
 Jobs and tasks require nonnegative attempts. Job claim timestamps must both be
 null or both present with expiry at or after claim time. Replay's unique
@@ -197,7 +199,8 @@ migrations never delete or rewrite them to make validation succeed.
 
 The ledger columns are `table_name`, `store`, `version`, `checksum` and
 `applied_at`, with primary key `(table_name, version)`. A replay ledger entry
-also covers its `_seq` companion. Migrations are serialized per database/schema
+also covers its `_seq` companion; an alarm entry covers `_generations`.
+Migrations are serialized per database/schema
 with bounded advisory-lock polling. Each version is recorded only after its
 schema validates; checksum drift, gaps, future versions and missing tables
 after an applied migration fail closed. Restore the ledger with its stores.

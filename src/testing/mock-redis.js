@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { wallEpoch, randomU32, setTimer } from '../shared/runtime.js';
 import { keySlot } from '../shared/cluster.js';
+import { evaluateAlarmGeneration } from './_alarm-generation.js';
 
 /**
  * The matcher SCAN MATCH, KEYS and PSUBSCRIBE all run through in Redis,
@@ -995,6 +996,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			// command can observe a half-applied script. Keep every evaluator
 			// synchronous; introducing an `await` inside one would break this.
 			async eval(script, numKeys, ...args) {
+				if (script.includes('ORDERED_ALARM_GENERATIONS_V1')) {
+					return evaluateAlarmGeneration(args, { sortedSets, hashes });
+				}
 				// live.forget cluster owner force-evict (membership HDEL +
 				// in-script ownership check + leave-mirrored succession).
 				// Marker-dispatched first: the script also mentions HDEL/HSET/

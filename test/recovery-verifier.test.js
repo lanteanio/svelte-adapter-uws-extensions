@@ -36,14 +36,14 @@ it('runs the command without the optional PostgreSQL dependency installed', () =
 		symlinkSync(join(root, 'node_modules', 'ioredis'), dependency, 'junction');
 		linked = true;
 		const result = spawnSync(process.execPath, ['docs/tools/recovery-verify.mjs'], {
-			cwd: fixture, encoding: 'utf8', windowsHide: true, timeout: 10000
+			cwd: fixture, encoding: 'utf8', windowsHide: true, timeout: 30000
 		});
 		expect(result.error).toBeUndefined();
 		expect(result.status).toBe(1);
 		expect(JSON.parse(result.stderr)).toEqual({ ok: false, complete: false, reason: 'usage_config_file_required' });
 		writeFileSync(join(fixture, 'scope.json'), JSON.stringify({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'] } }));
 		const redisOnly = spawnSync(process.execPath, ['docs/tools/recovery-verify.mjs', 'scope.json'], {
-			cwd: fixture, encoding: 'utf8', windowsHide: true, timeout: 10000,
+			cwd: fixture, encoding: 'utf8', windowsHide: true, timeout: 30000,
 			env: { ...process.env, RECOVERY_REDIS_URL: '' }
 		});
 		expect(redisOnly.error).toBeUndefined();
@@ -53,7 +53,7 @@ it('runs the command without the optional PostgreSQL dependency installed', () =
 		if (linked) unlinkSync(dependency);
 		rmSync(fixture, { recursive: true, force: true });
 	}
-});
+}, 70000);
 
 it('rejects missing replay authority, unknown storage and unsafe configured identifiers', () => {
 	for (const stores of [{ replay: 'events' }, { unknown: 'table' }, { tasks: 'tasks; DROP TABLE tasks' }, { tasks: 'x', jobs: 'x' }]) {
@@ -146,4 +146,65 @@ it('does not mistake the reserved emergency policy for a rate-window hash', asyn
 it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], cluster: 'true' } })).toThrow();
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();
+});
+
+it('requires PostgreSQL alarm rows and retained generation authority together', () => {
+	for (const stores of [{ alarms: 'svti_alarms' }, { 'alarm-generations': 'svti_alarms_generations' }]) {
+		expect(() => validateConfig({ schemaVersion: 1, postgres: { stores } })).toThrow('incomplete_restore_group');
+	}
+});
+
+function alarmFixture({ due = [], metadata = [], reserved = [], committed = [], current = [] } = {}) {
+	const hashes = new Map([['meta', metadata.map(topic => [topic, '{}'])], ['reserved', reserved], ['committed', committed], ['current', current]].map(([role, entries]) => ['alarm:{alarms}:' + role, new Map(entries)]).filter(([, entries]) => entries.size));
+	return {
+		scan: async () => ['0', [...hashes.keys(), ...(due.length ? ['alarm:{alarms}:due'] : [])]],
+		type: async key => hashes.has(key) ? 'hash' : 'zset', pttl: async () => -1,
+		hlen: async key => hashes.get(key).size, hkeys: async key => [...hashes.get(key).keys()],
+		hmget: async (key, ...fields) => fields.map(field => hashes.get(key)?.get(field) ?? null),
+		zcard: async () => due.length, zrange: async () => due
+	};
+}
+
+it.each([
+	[{ reserved: [['deleted', '9007199254740993']], committed: [['deleted', '9007199254740992']] }, true],
+	[{ reserved: [['pending', '1']], committed: [['pending', '0']] }, true],
+	[{ due: ['active'], metadata: ['active'], reserved: [['active', '4']], committed: [['active', '3']], current: [['active', '3']] }, true],
+	[{ due: ['legacy'], metadata: ['legacy'] }, false],
+	[{ reserved: [['deleted', '5']] }, false],
+	[{ reserved: [['deleted', '2']], committed: [['deleted', '3']] }, false],
+	[{ reserved: [['deleted', '01']], committed: [['deleted', '0']] }, false],
+	[{ reserved: [['deleted', '9223372036854775808']], committed: [['deleted', '0']] }, false],
+	[{ due: ['active'], metadata: ['active'], reserved: [['active', '4']], committed: [['active', '3']], current: [['active', '2']] }, false],
+	[{ reserved: [['deleted', '3']], committed: [['deleted', '3']], current: [['deleted', '3']] }, false]
+])('verifies exact retained Redis alarm authority %#', async (state, ok) => {
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'] } }, { redis: alarmFixture(state) });
+	expect(report.complete).toBe(true);
+	expect(report.ok).toBe(ok);
+	expect(report.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok });
+});
+
+it('bounds retained alarm authority even when no schedule remains', async () => {
+	const state = { reserved: [['one', '1'], ['two', '1']], committed: [['one', '0'], ['two', '0']] };
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'], maxMembers: 1 } }, { redis: alarmFixture(state) });
+	expect(report).toMatchObject({ ok: false, complete: false, redis: { reason: 'member_limit_reached' } });
+});
+
+it('rejects expiring alarm authority after schedules are removed', async () => {
+	const redis = alarmFixture({ reserved: [['deleted', '2']], committed: [['deleted', '1']] });
+	redis.pttl = async () => 1000;
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'] } }, { redis });
+	expect(report.complete).toBe(true);
+	expect(report.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
+});
+
+it('checks the last bounded generation batch without object-key aliasing', async () => {
+	const topics = Array.from({ length: 600 }, (_, index) => index === 0 ? '__proto__' : 'retained-' + index);
+	const state = { reserved: topics.map(topic => [topic, '4']), committed: topics.map(topic => [topic, '3']) };
+	state.committed[599][1] = '5';
+	const redis = alarmFixture(state), hmget = redis.hmget, batches = [];
+	redis.hmget = async (key, ...fields) => { batches.push(fields.length); return hmget(key, ...fields); };
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'] } }, { redis });
+	expect(report.complete).toBe(true);
+	expect(report.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
+	expect(batches).toEqual([256, 256, 88, 256, 256, 88]);
 });

@@ -14,7 +14,12 @@
 				"checksum": "text",
 				"applied_at": "timestamp with time zone"
 			},
-			"indexColumns": [["table_name", "version"]],
+			"indexColumns": [
+				[
+					"table_name",
+					"version"
+				]
+			],
 			"restoreGroup": "postgres-schema"
 		},
 		{
@@ -178,11 +183,27 @@
 				"topic": "text",
 				"fire_at": "bigint",
 				"meta": "jsonb",
-				"tenant": "text"
+				"tenant": "text",
+				"generation": "bigint"
 			},
 			"indexColumns": [
 				[
 					"fire_at"
+				]
+			],
+			"restoreGroup": "postgres-alarms"
+		},
+		{
+			"id": "alarm-generations",
+			"table": "svti_alarms_generations",
+			"columns": {
+				"topic": "text",
+				"reserved": "bigint",
+				"committed": "bigint"
+			},
+			"indexColumns": [
+				[
+					"topic"
 				]
 			],
 			"restoreGroup": "postgres-alarms"
@@ -261,10 +282,25 @@
 					"id": "metadata",
 					"type": "hash",
 					"template": "<prefix>{alarms}:meta"
+				},
+				{
+					"id": "reserved",
+					"type": "hash",
+					"template": "<prefix>{alarms}:reserved"
+				},
+				{
+					"id": "committed",
+					"type": "hash",
+					"template": "<prefix>{alarms}:committed"
+				},
+				{
+					"id": "current",
+					"type": "hash",
+					"template": "<prefix>{alarms}:current"
 				}
 			],
 			"defaultPrefix": "alarm:",
-			"notes": "Restore schedule and resolver metadata together; reconcile external side effects before enabling due work."
+			"notes": "Restore schedule, resolver metadata and all generation hashes together, including authority for deleted or pending topics. Do not expire allocation or commit watermarks. Reconcile external side effects before enabling due work."
 		},
 		{
 			"id": "idempotency",

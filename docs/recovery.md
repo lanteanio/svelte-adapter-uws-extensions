@@ -16,7 +16,7 @@ describes upgrade and initialization behavior.
 | Redis replay | Sorted-set or stream buffer, sequence, epoch and producer idempotency hashes for each topic | Preserve epochs even when buffers have expired. An absent legacy epoch means zero. |
 | Jobs and tasks | Complete rows, serial sequences where used, ownership/fence state, and any application result cache | Stop old workers and reconcile effects that completed outside the database. |
 | Idempotency and sessions | Results/session records, expiry and erasure indexes | Reapply erasures and revocations newer than the backup; reconcile pending owners. |
-| Alarms | Schedule plus resolver metadata | Reconcile already executed callbacks before enabling due work. |
+| Alarms | Schedule, metadata and all retained generation authority; PostgreSQL also needs its migration ledger | Preserve watermarks for deleted and pending topics; reconcile executed callbacks before enabling due work. |
 | Dead letters | Records, ordered index, ID authority and erasure tombstones | Reapply later erasures before redelivery. |
 | Presence, routing, cursors and leases | Rebuild from current authenticated connections and processes | Isolate old owners and reconnect clients. Restoring bytes does not restore a socket. |
 | Groups, smoothing and admission controls | Apply the manifest's family-specific reconciliation policy | Preserve closure decisions and expiry; establish current ownership and policy. |
@@ -80,7 +80,8 @@ implementation.
 
 Save a private JSON scope file describing the stores actually deployed. Omit a
 backend that is not used. PostgreSQL names may be schema-qualified; all components
-must be lowercase SQL identifiers. Replay requires both event and sequence tables.
+must be lowercase SQL identifiers. Replay requires both event and sequence tables;
+alarms require both `alarms` and `alarm-generations` tables.
 Redis keyPrefix is the client prefix. The optional prefixes map replaces each
 family's store-level prefix, including empty strings.
 
@@ -101,7 +102,7 @@ family's store-level prefix, including empty strings.
     "keyPrefix": "application:",
     "families": ["replay", "alarms", "sessions"],
     "prefixes": { "sessions": "auth:" },
-    "minimumKeys": { "replay": 2, "alarms": 2 },
+    "minimumKeys": { "replay": 2, "alarms": 5 },
     "maxKeys": 10000,
     "maxScanCalls": 10000,
     "maxMembers": 10000,
@@ -126,13 +127,18 @@ Redis Cluster mode starts from the configured seed and scans every discovered
 primary; advertised endpoints must be reachable.
 
 PostgreSQL checks table presence, column types, valid index leading columns,
-serial counters and replay sequence authority using bigint-safe comparisons.
+serial counters, replay sequence authority and alarm generation authority using
+bigint-safe comparisons.
 It takes one repeatable-read snapshot. It does not certify every constraint,
 partial-index predicate, row payload or external side effect.
 
 Redis checks selected family key types, optional minimum key counts, replay
-sequence authority and exact membership pairing for alarms and dead letters.
-It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS and
+sequence authority, exact membership pairing for alarms and dead letters, and
+canonical alarm generation watermarks and current membership. Retained generation
+hashes must not expire, even after all schedules are deleted. Legacy alarms without
+generation authority fail this package version's verification; use the matching
+pre-upgrade manifest when restoring an older artifact.
+It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS, HMGET and
 ZRANGE; Cluster mode also reads CLUSTER SLOTS. Driver handshake commands are
 required too. It may read individual stored replay entries to obtain sequence
 metadata, but never includes them in the report.

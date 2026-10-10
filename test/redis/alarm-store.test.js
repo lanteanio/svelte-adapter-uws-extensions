@@ -1,110 +1,63 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createAlarmStore } from '../../src/redis/alarm-store.js';
+import { alarmGenerationContract } from '../helpers/alarm-generation-contract.js';
 
-describe('redis durable alarm store', () => {
-	let client;
-	let store;
-
+describe.each([false, true])('redis ordered alarms (cluster=%s)', cluster => {
+	let client, store, peer;
 	beforeEach(() => {
-		client = mockRedisClient('app:');
+		client = mockRedisClient('app:', { cluster });
 		store = createAlarmStore(client);
+		peer = createAlarmStore(client);
 	});
+	alarmGenerationContract(() => [store, peer], () => client);
 
-	it('persists an alarm and returns it from due() once overdue', async () => {
-		await store.set('room:1', 1000, { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' });
-		expect(await store.due(999)).toEqual([]); // not yet due
-		const due = await store.due(1000);
-		expect(due).toEqual([{ topic: 'room:1', at: 1000, meta: { alarmId: 'room-expiry', path: 'rooms/x', tenantId: 'acme' } }]);
+	it('returns only due rows within the configured batch', async () => {
+		const bounded = createAlarmStore(client, { dueBatch: 2 });
+		for (const [topic, at] of [['a', 1], ['b', 2], ['c', 3]]) {
+			await bounded.set(topic, at, null, await bounded.nextGeneration(topic));
+		}
+		expect(await bounded.due(0)).toEqual([]);
+		expect((await bounded.due(10)).map(row => row.topic)).toEqual(['a', 'b']);
 	});
-
-	it('delete() is the atomic claim: true once, then false', async () => {
-		await store.set('room:claim', 1000, { path: 'p' });
-		expect(await store.delete('room:claim')).toBe(true);
-		expect(await store.delete('room:claim')).toBe(false);
-		expect(await store.due(2000)).toEqual([]); // gone from the due index
+	it('retains a legacy bare row with its indexed timestamp and generation', async () => {
+		await client.redis.zadd(client.key('alarm:{alarms}:due'), 500, 'bare');
+		expect(await store.due(1000)).toEqual([{ topic: 'bare', at: 500, meta: null, generation: '1' }]);
 	});
-
-	it('set() replaces the pending alarm (one per topic)', async () => {
-		await store.set('room:r', 1000, { path: 'p' });
-		await store.set('room:r', 5000, { path: 'p2' });
-		expect(await store.due(2000)).toEqual([]); // moved out to 5000
-		const due = await store.due(5000);
-		expect(due).toEqual([{ topic: 'room:r', at: 5000, meta: { path: 'p2' } }]);
-	});
-
-	it('due() honors the dueBatch cap', async () => {
-		const s = createAlarmStore(client, { dueBatch: 2 });
-		await s.set('a', 1, null);
-		await s.set('b', 2, null);
-		await s.set('c', 3, null);
-		expect((await s.due(100)).length).toBe(2);
-	});
-
-	it('clear() removes everything', async () => {
-		await store.set('x', 1, null);
-		await store.set('y', 2, null);
-		await store.clear();
-		expect(await store.due(100)).toEqual([]);
-	});
-
-	it('surfaces a bare row when the meta is missing (so the poll can GC it)', async () => {
-		// A zset member with no meta hash entry (corruption / partial external write).
-		await client.redis.zadd(client.key('alarm:{alarms}:due'), 500, 'room:bare');
-		expect(await store.due(1000)).toEqual([{ topic: 'room:bare', at: 1000, meta: null }]);
-	});
-
-	it('validates inputs', async () => {
-		await expect(store.set('', 1)).rejects.toThrow(/non-empty/);
-		await expect(store.set('t', NaN)).rejects.toThrow(/finite/);
+	it('validates topics, times, options and canonical bounded generations', async () => {
+		await expect(store.nextGeneration('')).rejects.toThrow(/non-empty/);
+		await expect(store.get('')).rejects.toThrow(/non-empty/);
+		await expect(store.set('room', NaN, null, '1')).rejects.toThrow(/finite/);
+		await expect(store.due(Infinity)).rejects.toThrow(/finite/);
+		for (const generation of [undefined, null, 1, '', '0', '01', '-1', '+1', '1.0', '9223372036854775808']) {
+			await expect(store.set('room', 1, null, generation)).rejects.toThrow(/generation/);
+			await expect(store.delete('room', generation)).rejects.toThrow(/generation/);
+		}
 		expect(() => createAlarmStore(client, { dueBatch: 0 })).toThrow(/positive integer/);
 		expect(() => createAlarmStore(client, { keyPrefix: 5 })).toThrow(/keyPrefix/);
 	});
-
-	it('stays single-slot on a cluster: the claim and due() are atomic across nodes', async () => {
-		// Without the `{alarms}` hash tag the due-index + meta keys would land on
-		// different nodes, and a MULTI would silently no-op the off-node command -
-		// so delete() would mis-report the claim. The tag co-locates them.
-		const cclient = mockRedisClient('app:', { cluster: true, nodeCount: 3 });
-		const cstore = createAlarmStore(cclient);
-		await cstore.set('room:c', 1000, { path: 'p' });
-		expect(await cstore.due(1000)).toEqual([{ topic: 'room:c', at: 1000, meta: { path: 'p' } }]);
-		expect(await cstore.delete('room:c')).toBe(true); // ZREM + HDEL both applied on one node
-		expect(await cstore.due(2000)).toEqual([]);
+	it.each(['due', 'meta', 'reserved', 'committed', 'current'])('checks the slot of the %s key', suffix => {
+		client.key = name => name.endsWith(':' + suffix) ? '{other}:' + name : name;
+		expect(() => createAlarmStore(client)).toThrow(/different cluster slots/);
 	});
-});
-
-
-describe('alarm transaction integrity', () => {
-	it('rejects asymmetric custom key mappings before opening a transaction', () => {
-		const client = mockRedisClient('app:');
-		client.key = (key) => key.endsWith(':due') ? '{left}:due' : '{right}:meta';
-		expect(() => createAlarmStore(client)).toThrow('different cluster slots');
+	it.each(['nextGeneration', 'get', 'set', 'delete', 'due', 'clear'])('%s propagates a rejected script without changing the row', async method => {
+		const generation = await store.nextGeneration('room');
+		await store.set('room', 1, { path: 'keep' }, generation);
+		const before = await store.get('room');
+		const args = { nextGeneration: ['room'], get: ['room'], set: ['room', 2, null, generation], delete: ['room', generation], due: [10], clear: [] };
+		vi.spyOn(client.redis, 'eval').mockRejectedValueOnce(new Error('NOPERM'));
+		await expect(store[method](...args[method])).rejects.toThrow('NOPERM');
+		expect(await store.get('room')).toEqual(before);
 	});
-	it('claims through one MULTI containing ZREM and HDEL', async () => {
-		const client = mockRedisClient('app:');
-		const tx = { zrem: vi.fn().mockReturnThis(), hdel: vi.fn().mockReturnThis(), exec: vi.fn().mockResolvedValue([[null, 1], [null, 1]]) };
-		client.redis.multi = vi.fn(() => tx);
-		const store = createAlarmStore(client);
-		expect(await store.delete('room')).toBe(true);
-		expect(client.redis.multi).toHaveBeenCalledTimes(1);
-		expect(tx.zrem).toHaveBeenCalledWith('app:alarm:{alarms}:due', 'room');
-		expect(tx.hdel).toHaveBeenCalledWith('app:alarm:{alarms}:meta', 'room');
-		expect(tx.exec).toHaveBeenCalledTimes(1);
+	it('retains a committed generation when its reply is lost and refuses replay', async () => {
+		const generation = await store.nextGeneration('room');
+		const evaluate = client.redis.eval.bind(client.redis);
+		vi.spyOn(client.redis, 'eval').mockImplementationOnce(async (...args) => {
+			await evaluate(...args);
+			throw new Error('reply lost');
+		});
+		await expect(store.set('room', 1, null, generation)).rejects.toThrow('reply lost');
+		expect(await peer.get('room')).toEqual({ topic: 'room', at: 1, meta: null, generation });
+		expect(await peer.set('room', 2, null, generation)).toBe(false);
 	});
-	for (const method of ['set', 'delete', 'clear']) {
-		for (const failedCommand of [0, 1, null]) {
-			it(`${method} rejects transaction failure in command ${failedCommand}`, async () => {
-				const client = mockRedisClient('app:');
-				const error = new Error('NOPERM');
-				const results = failedCommand === null ? null : [[null, 1], [null, 1]];
-				if (results) results[failedCommand] = [error, null];
-				const tx = { exec: vi.fn().mockResolvedValue(results) };
-				for (const cmd of ['hset', 'zadd', 'zrem', 'hdel', 'del']) tx[cmd] = () => tx;
-				client.redis.multi = () => tx;
-				const store = createAlarmStore(client);
-				await expect(store[method]('room', 1)).rejects.toThrow(failedCommand === null ? 'not executed' : 'NOPERM');
-			});
-		}
-	}
 });

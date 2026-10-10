@@ -137,6 +137,18 @@ type gate now fails any runtime export its declaration omits.
 
 ## 2. Needs an operational step
 
+### Ordered alarm generations
+
+Alarm stores now require `nextGeneration(topic)`, generation-aware
+`set(topic, at, meta, generation)` and `delete(topic, generation)`, plus
+`get(topic)`. Stop old topic-only writers before deploying the matching realtime
+runtime. PostgreSQL migration version 3 retains allocator and commit watermarks
+in the companion `_generations` table and assigns generation `1` to legacy rows.
+Redis retains authority in three hashes alongside schedule and metadata keys.
+Restore authority together with alarms and the PostgreSQL migration ledger,
+including counters for deleted or pending topics. See [the generation contract
+and rollout guide](docs/alarm-generations.md).
+
 ### Jobs and tasks tables gain trace columns; tasks gain erasure identity
 
 Only for tables created or migrated outside the package, with

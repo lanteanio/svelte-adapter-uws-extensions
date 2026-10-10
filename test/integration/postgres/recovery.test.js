@@ -33,7 +33,11 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 		dlq = createDeadLetter(source, { cleanupInterval: 0 });
 		await dlq.add({ webhookId: 'delivery', topic: 'private-room', event: 'message', data: { value: 4 }, attempts: 1, error: 'failure' });
 		const alarms = createAlarmStore(source); await alarms.ready();
-		await alarms.set('private-room', Date.now() + 60000, { alarmId: 'notify' });
+		await alarms.set('private-room', Date.now() + 60000, { alarmId: 'notify' }, await alarms.nextGeneration('private-room'));
+		const deletedGeneration = await alarms.nextGeneration('private-deleted');
+		await alarms.set('private-deleted', 1, null, deletedGeneration);
+		await alarms.delete('private-deleted', deletedGeneration);
+		const pendingGeneration = await alarms.nextGeneration('private-deleted');
 		const dump = execFileSync('docker', ['exec', container, 'pg_dump', '-U', 'test', '-d', 'recovery_source', '-Fc'], { windowsHide: true, timeout: 30000 });
 		execFileSync('docker', ['exec', '-i', container, 'pg_restore', '-U', 'test', '-d', 'recovery_restored', '--exit-on-error', '--no-owner', '--no-acl'], { input: dump, windowsHide: true, timeout: 30000 });
 		const readerUrl = new URL(connection('recovery_restored'));
@@ -51,12 +55,24 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			env: { ...process.env, RECOVERY_POSTGRES_URL: readerUrl.href }
 		}));
 		expect(report.ok, JSON.stringify(report)).toBe(true);
-		expect(Object.keys(report.postgres.observations)).toHaveLength(8);
-		expect(report.postgres.observations['schema-migrations'].rows).toBe('12');
+		expect(Object.keys(report.postgres.observations)).toHaveLength(9);
+		expect(report.postgres.observations['schema-migrations'].rows).toBe('13');
 		expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|private-key/);
 		await expect(reader.query('DELETE FROM svti_tasks')).rejects.toMatchObject({ code: '25006' });
 		const restored = createPgClient({ connectionString: connection('recovery_restored'), autoShutdown: false });
 		try {
+			const restoredAlarms = createAlarmStore(restored, { autoMigrate: false });
+			expect(await restoredAlarms.get('private-deleted')).toBeNull();
+			expect(await restoredAlarms.nextGeneration('private-deleted')).toBe((BigInt(pendingGeneration) + 1n).toString());
+			expect(await restoredAlarms.set('private-deleted', 1, null, pendingGeneration)).toBe(false);
+			await restored.query("UPDATE svti_alarms_generations SET committed = 0 WHERE topic = 'private-room'");
+			const corruptAlarm = await runVerification(config, { postgres: reader });
+			expect(corruptAlarm.ok).toBe(false);
+			expect(corruptAlarm.postgres.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
+			await restored.query("UPDATE svti_alarms_generations SET committed = 1 WHERE topic = 'private-room'");
+			await restored.query("DELETE FROM svti_alarms_generations WHERE topic = 'private-room'");
+			const missingAuthority = await runVerification(config, { postgres: reader });
+			expect(missingAuthority.postgres.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
 			await restored.query('DELETE FROM svti_replay_seq');
 			const partial = await runVerification(config, { postgres: reader });
 			expect(partial.ok).toBe(false);
@@ -66,7 +82,7 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			expect(stale.postgres.checks).toContainEqual({ scope: 'jobs', name: 'serial_sequence_authority', ok: false });
 			mkdirSync('source/recovery-drill', { recursive: true });
 			writeFileSync('source/recovery-drill/postgres.dump', dump);
-			writeFileSync('source/recovery-drill/postgres-report.json', JSON.stringify({ archiveSha256: createHash('sha256').update(dump).digest('hex'), restored: report, partial, stale }, null, 2) + '\n');
+			writeFileSync('source/recovery-drill/postgres-report.json', JSON.stringify({ archiveSha256: createHash('sha256').update(dump).digest('hex'), restored: report, corruptAlarm, missingAuthority, partial, stale }, null, 2) + '\n');
 		} finally { await restored.end(); }
 	} finally {
 		replay?.destroy(); tasks?.destroy(); cache?.destroy(); dlq?.destroy?.();

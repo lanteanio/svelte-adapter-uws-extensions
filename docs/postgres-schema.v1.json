@@ -93,15 +93,18 @@
 		{
 			"subpath": "postgres/alarm-store",
 			"tables": [
-				"svti_alarms"
+				"svti_alarms",
+				"svti_alarms_generations"
 			],
+			"restoreTogether": true,
 			"initialization": "construction",
 			"ready": true,
 			"changeClass": "new store since source release",
 			"additions": [
-				"store table and fire_at index"
+				"store table and fire_at index",
+				"version 3: generation BIGINT NOT NULL; retained topic/reserved/committed authority; legacy rows start at generation 1"
 			],
-			"rollbackLimit": "The source release has no corresponding PostgreSQL store. Reconcile due alarms and side effects before changing schedulers."
+			"rollbackLimit": "Stop topic-only writers before generation migration. Retain alarm rows, generation authority and ledger together; reconcile pending alarms and effects before changing schedulers."
 		}
 	],
 	"ledger": {
@@ -119,8 +122,10 @@
 		],
 		"versions": [
 			1,
-			2
+			2,
+			3
 		],
+		"version3Stores": ["postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true
 	}

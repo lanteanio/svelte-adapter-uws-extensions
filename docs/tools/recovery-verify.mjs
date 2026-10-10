@@ -13,6 +13,8 @@ const sqlName = name => name.split('.').map(quote).join('.');
 const escapeRegex = text => text.replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
 const escapeGlob = text => text.replace(/[\\*?\[\]]/g, '\\$&');
 const integer = text => typeof text === 'string' && /^\d+$/.test(text);
+const generation = (text, zero = false) => typeof text === 'string' && text.length <= 19
+	&& ((zero && text === '0') || /^[1-9][0-9]*$/.test(text)) && BigInt(text) <= 9223372036854775807n;
 function fail(code) { throw Object.assign(new Error(code), { recoveryCode: code }); }
 function bound(value, fallback, max) {
 	if (value === undefined) return fallback;
@@ -36,6 +38,7 @@ export function validateConfig(config) {
 			return { ...spec, table };
 		});
 		if (Boolean(stores.replay) !== Boolean(stores['replay-sequence'])) fail('incomplete_restore_group');
+		if (Boolean(stores.alarms) !== Boolean(stores['alarm-generations'])) fail('incomplete_restore_group');
 		if (new Set(Object.values(stores)).size !== Object.keys(stores).length) fail('overlapping_tables');
 	}
 	if (config.redis) {
@@ -105,6 +108,12 @@ export async function verifyPostgres(client, specs, remaining = () => {}) {
 			const authority = sqlName(specs.find(item => item.id === 'replay-sequence').table);
 			const broken = (await query('SELECT EXISTS(SELECT 1 FROM ' + rows + ' r LEFT JOIN ' + authority + ' s USING(topic) WHERE s.topic IS NULL OR s.seq<r.seq OR s.epoch<0) AS broken')).rows[0].broken;
 			check(result, 'replay', 'sequence_authority', !broken);
+		}
+		if (valid.has('alarms') && valid.has('alarm-generations')) {
+			const rows = sqlName(specs.find(item => item.id === 'alarms').table);
+			const authority = sqlName(specs.find(item => item.id === 'alarm-generations').table);
+			const broken = (await query('SELECT EXISTS(SELECT 1 FROM ' + authority + ' WHERE reserved IS NULL OR committed IS NULL OR reserved<0 OR committed<0 OR reserved<committed) OR EXISTS(SELECT 1 FROM ' + rows + ' a LEFT JOIN ' + authority + ' g USING(topic) WHERE g.topic IS NULL OR a.generation IS NULL OR a.generation<=0 OR a.generation<>g.committed) AS broken')).rows[0].broken;
+			check(result, 'alarms', 'generation_authority', !broken);
 		}
 		await query('ROLLBACK');
 	} catch (error) {
@@ -185,7 +194,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 			check(result, spec.id, 'key_types', stats.wrongTypes === 0);
 			check(result, spec.id, 'minimum_keys', stats.keys >= (config.minimumKeys[spec.id] ?? 0));
 		}
-		let replayOk = true, pairOk = true;
+		let replayOk = true, pairOk = true, alarmOk = true;
 		for (const { family, roles } of groups.values()) {
 			remaining();
 			if (family === 'replay') {
@@ -214,12 +223,41 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 				const fields = new Set(hash ? await read('hkeys', hash) : []);
 				const members = sorted ? await read('zrange', sorted, 0, -1) : [];
 				pairOk &&= members.every(member => fields.has(member));
+				if (family === 'alarms') {
+					const authority = [];
+					for (const role of ['reserved', 'committed', 'current']) {
+						const key = roles[role], values = new Map();
+						if (key) {
+							alarmOk &&= await read('pttl', key) === -1;
+							if (Number(await read('hlen', key)) > config.maxMembers) fail('member_limit_reached');
+							const topics = await read('hkeys', key);
+							if (topics.length > config.maxMembers) fail('member_limit_reached');
+							for (let offset = 0; offset < topics.length; offset += 256) {
+								const batch = topics.slice(offset, offset + 256);
+								const entries = await read('hmget', key, ...batch);
+								batch.forEach((topic, index) => values.set(topic, entries[index]));
+							}
+						}
+						authority.push(values);
+					}
+					const [reserved, committed, current] = authority;
+					alarmOk &&= reserved.size === committed.size && current.size === members.length;
+					for (const [topic, value] of reserved) {
+						const watermark = committed.get(topic);
+						alarmOk &&= generation(value) && generation(watermark, true) && BigInt(value) >= BigInt(watermark);
+					}
+					for (const topic of members) {
+						const value = current.get(topic);
+						alarmOk &&= generation(value) && value === committed.get(topic) && reserved.has(topic);
+					}
+				}
 				if (family === 'dead-letter' && (roles.sequence || hashCount)) {
 					const seq = roles.sequence ? await read('get', roles.sequence) : null;
 					pairOk &&= integer(seq) && members.every(member => integer(member) && BigInt(member) <= BigInt(seq));
 				}
 			}
 		}
+		if (config.specs.some(spec => spec.id === 'alarms')) check(result, 'alarms', 'generation_authority', alarmOk);
 		if (config.specs.some(spec => spec.id === 'replay')) check(result, 'replay', 'sequence_authority', replayOk);
 		if (config.specs.some(spec => ['alarms','dead-letter'].includes(spec.id))) check(result, 'redis', 'paired_membership', pairOk);
 		if (before !== await topology(redis)) fail('topology_changed');

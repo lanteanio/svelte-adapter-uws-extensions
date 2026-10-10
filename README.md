@@ -1581,12 +1581,12 @@ configureAlarm({
 });
 ```
 
-The realtime layer owns the in-memory timers and a leader-gated recovery poll; the store runs no background loop. `delete(topic)` atomically removes the pending row and returns true to at most one successful claimant. This is a storage claim guarantee, not exactly-once handler delivery: a crash after claiming can lose delivery, and a caller that runs its handler after a store error can duplicate delivery. Redis transaction command errors reject the operation. PostgreSQL callers using repeatable-read or serializable transactions must handle serialization failures (`40001`). Replacement generations and stale-timer fencing require coordination in the realtime layer.
+The realtime layer owns timers and recovery; the store runs no background loop. Reserve with `nextGeneration(topic)`, then await `set(topic, at, meta, generation)`; it returns false for stale reservations. `get(topic)` and `due(now)` include exact decimal-string generations. `delete(topic, generation)` claims only that current generation, fencing stale timers and preventing old writes from resurrecting cancelled alarms. `clear()` invalidates reservations while retaining generation history. These storage claims do not guarantee handler delivery after a crash. See [generation contracts, rollout and recovery](docs/alarm-generations.md).
 
-- **Redis.** A due-index ZSET (`{alarms}:due`, scored by the deadline) + a meta hash (`{alarms}:meta`), co-located on one slot via the `{alarms}` hash tag so the claim (`ZREM` + `HDEL`) is atomic on a cluster. The two keys are asserted same-slot at construction, so a custom `client.key()` cannot silently split the claim.
-- **Postgres.** An auto-migrated `svti_alarms(topic, fire_at, meta, tenant)` table indexed on `fire_at`; the claim is `DELETE ... RETURNING`, and `due(now)` is a `fire_at <= now ORDER BY fire_at LIMIT` range scan.
+- **Redis.** The due-index ZSET (`{alarms}:due`) and metadata hash (`{alarms}:meta`) share a slot with three generation hashes: `{alarms}:reserved`, `{alarms}:committed` and `{alarms}:current`. Atomic scripts reserve generations, conditionally commit or delete a schedule, and read its metadata with its generation. All five keys are checked for the same slot at construction.
+- **Postgres.** Version 3 adds `generation` to `svti_alarms(topic, fire_at, meta, tenant, generation)` and retains allocation/commit watermarks in `svti_alarms_generations`. Writes and conditional claims serialize through authority rows; `due(now)` uses the `fire_at` range index. Restore both tables with the migration ledger.
 
-Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres; default `svti_alarms`), `dueBatch` (max alarms swept per poll, default 100), `autoMigrate` (Postgres, default true), `breaker`, `metrics`. Needs `svelte-realtime >= 0.6.0-next.45` for the recovery poll that reads `due`.
+Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres; default `svti_alarms`), `dueBatch` (max alarms swept per poll, default 100), `autoMigrate` (Postgres, default true), `breaker`, `metrics`. Requires a realtime build implementing `nextGeneration`, `get` and generation-qualified mutations; stop old topic-only writers before adoption.
 
 ## Cursor
 

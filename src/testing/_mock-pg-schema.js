@@ -66,6 +66,11 @@ export function mockPgSchema() {
 		}
 		if (sql.startsWith('DROP INDEX')) { indexes.delete(sql.split(' ').at(-1)); return result([]); }
 		if (sql.startsWith('DO $migration$')) {
+			const addition = /ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (generation BIGINT);/.exec(sql);
+			if (addition) {
+				const columns = tables.get(addition[1]);
+				if (!columns.some(entry => entry.column_name === 'generation')) columns.push(column(addition[2] + ' NOT NULL'));
+			}
 			const match = /ALTER TABLE (\w+) ADD CONSTRAINT (\w+) CHECK \((.*)\) NOT VALID;/.exec(sql);
 			if (match && !checks.has(match[2])) checks.set(match[2], { table: match[1], name: match[2], expression: match[3], valid: false });
 			return result([]);

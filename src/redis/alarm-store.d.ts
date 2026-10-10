@@ -15,11 +15,13 @@ export interface AlarmRow {
 	topic: string;
 	at: number;
 	meta: AlarmMeta | null;
+	/** Positive decimal-string generation allocated by this store. */
+	generation: string;
 }
 
 export interface RedisAlarmStoreOptions {
 	/**
-	 * Prefix prepended (after the client `keyPrefix`) to the two alarm keys. Lets
+	 * Prefix prepended (after the client `keyPrefix`) to the alarm keys. Lets
 	 * two logical alarm stores on one ioredis client stay separate.
 	 * @default 'alarm:'
 	 */
@@ -42,17 +44,20 @@ export interface RedisAlarmStoreOptions {
  * leader-gated recovery poll lives in the realtime layer.
  */
 export interface RedisAlarmStore {
-	/** Persist (or replace) the alarm for `topic`, due at epoch-ms `at`. */
-	set(topic: string, at: number, meta?: AlarmMeta | null): Promise<void>;
+	/** Reserve a never-reused generation, leaving the current schedule unchanged. Rejects at signed BIGINT exhaustion. */
+	nextGeneration(topic: string): Promise<string>;
+	/** Read the current scheduled row, or null. Adopts legacy generation authority on first read. */
+	get(topic: string): Promise<AlarmRow | null>;
+	/** Commit only the latest reservation above the retained committed watermark. */
+	set(topic: string, at: number, meta: AlarmMeta | null, generation: string): Promise<boolean>;
 	/**
-	 * Remove the alarm for `topic`. Returns whether THIS call removed a present row
-	 * - the atomic claim guaranteeing single-fire between the in-memory timer and
-	 * the recovery poll.
+	 * Remove only the matching scheduled generation. Allocation and committed
+	 * watermarks survive deletion so delayed writes cannot resurrect it.
 	 */
-	delete(topic: string): Promise<boolean>;
+	delete(topic: string, generation: string): Promise<boolean>;
 	/** Return the alarms whose `at <= nowMs` (capped at `dueBatch`) for the poll. */
 	due(nowMs: number): Promise<AlarmRow[]>;
-	/** Remove every persisted alarm. */
+	/** Maintenance operation: remove schedules and invalidate reservations, traversing retained topic history atomically. */
 	clear(): Promise<void>;
 	/** No-op (no background loop); present for parity with the other factories. */
 	destroy(): Promise<void>;
