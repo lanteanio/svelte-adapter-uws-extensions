@@ -196,6 +196,14 @@ Do **not** deploy 0.6 alongside 0.5 instances sharing one Redis for longer than
 your idempotency TTL: during that window the two derive different keys for the
 same identity.
 
+### Other PostgreSQL stores and readiness
+
+Replay adds a user identity and sequence epoch; idempotency adds erasure identity
+and owner tokens. Alarms and dead letters add PostgreSQL stores. Review the
+[per-store migration matrix](./docs/postgres-support.md#schema-transitions-and-readiness)
+and manual SQL before disabling automatic migration. A resolved `ready()` with
+`autoMigrate: false` does not verify the database schema.
+
 ## 3. Fails on a call that used to succeed
 
 ### Redis clients bound waits and disconnected buffering

@@ -104,3 +104,108 @@ Owned `createPgClient({ connectionString })` instances stop registered bridges, 
 An externally supplied `pool` remains caller-owned: wrapper `end()` is still a no-op, including for its standalone sessions. In your application shutdown hook, await each `bridge.deactivate()` and manually created standalone client's `end()` before awaiting the external `pool.end()`. Do not create a new standalone client only to close it. Pool checkout leases still require the caller's `release()` before a pool can finish closing.
 
 Reconnect and election operations never overlap within one bridge. Failed connections use a jittered delay from `reconnectInterval` up to twice that baseline; `0` requests immediate retries. Both intervals must fit the native timer maximum of `2147483647` ms, and jitter is capped at that maximum. Healthy advisory followers poll at `pollInterval`; a leader checks liveness without repeatedly acquiring its already-held advisory lock. A retry waiting on its jitter timer is not bypassed by election polling. `autoReconnect: false` stops automatic retries after loss; an explicit awaited `activate()` can retry. Keep the owned connection/query deadlines enabled, or provide equivalent finite standalone options when using an external pool, so backend waits have a deadline.
+
+## Schema transitions and readiness
+
+The [schema transition manifest](./postgres-schema.v1.json) describes this
+package's 0.6 candidate relative to stable 0.5.10. It ships with the package;
+retain it with the exact tarball digest and application lockfile. It is a
+release description, **not an applied database migration ledger**. The stores
+have no shared schema-version row, checksum ledger or all-store transaction.
+The minimum server is PostgreSQL 16 for every row below.
+
+| Store | Change from 0.5.10 | Initialization with `autoMigrate: true` | Startup gate |
+| --- | --- | --- | --- |
+| Replay | Adds event `user_id`, lookup index and sequence `epoch` with default 0. | First store operation. | No `ready()`; apply/verify schema before opening traffic. |
+| Idempotency | Adds `user_id`, `tenant_id`, `owner_token` and tenant/user index. | Starts at construction. | Await `store.ready()`. |
+| Jobs | Adds nullable `traceparent` and `tracestate`. | First store operation. | No `ready()`; apply/verify schema before starting producers/workers. |
+| Tasks | Adds nullable trace columns, `user_id` and user index. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
+| Dead letter | New PostgreSQL store in this release series. | First store operation. | No `ready()`; provision/verify its complete schema. |
+| Alarms | New PostgreSQL store in this release series. | Starts at construction. | Await `store.ready()` before scheduling. |
+
+`autoMigrate: false` disables DDL; existing `ready()` methods resolve immediately
+and do not inspect columns, types, indexes or privileges. The read-only server
+preflight above checks only the server version. Neither result certifies schema
+readiness. Constructors and ordinary reads can perform DDL when automatic
+migration is enabled, so do not use an arbitrary store call as a read-only probe.
+Notification activation verifies its own dedicated session and LISTEN/election,
+not any durable store's schema or missed-event reconciliation.
+
+For a controlled rollout, resolve the configured table names and `search_path`,
+compare column types/defaults/nullability and valid indexes with the target
+schema, and verify the actual runtime role's operation privileges. Use explicit
+column-only `SELECT ... LIMIT 0` queries plus PostgreSQL catalogs under a
+read-only transaction; do not invoke migrations merely to inspect production.
+The built-in drift guard checks selected column names, not their types or index
+shape. Own the DDL in one deployment step and await its completion before
+admitting application traffic with `autoMigrate: false`.
+
+### Existing replay and idempotency tables
+
+Alongside the [jobs/tasks migration](../MIGRATION.md#jobs-and-tasks-tables-gain-trace-columns-tasks-gain-erasure-identity),
+apply these additions when managing the schema yourself. Names below are the
+defaults; substitute each configured table name, including replay's `_seq`
+companion. Fresh dead-letter and alarm stores need their complete README schemas,
+not just an `ALTER TABLE` fragment.
+
+```sql
+ALTER TABLE svti_replay ADD COLUMN IF NOT EXISTS user_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_svti_replay_user ON svti_replay (user_id);
+ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE svti_idempotency ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE svti_idempotency ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+ALTER TABLE svti_idempotency ADD COLUMN IF NOT EXISTS owner_token TEXT;
+CREATE INDEX IF NOT EXISTS idx_svti_idempotency_user ON svti_idempotency (tenant_id, user_id);
+```
+
+These additions preserve old values; they do not infer ownership. Historical
+null identity columns need trusted application backfill or expiry before erasure
+can cover those records. Do not invent owner tokens for an in-flight old writer.
+Stop old idempotency producers, drain their pending ownership windows, and
+reconcile retained results before the new token-aware writers take over.
+
+### Mixed versions, downgrade and restore
+
+Additive SQL is not proof of mixed-writer safety. The rehearsal verifies old
+jobs/tasks rows and column-only readers, plus preserved replay sequence values
+and idempotency results. It does not certify concurrent old/new worker binaries.
+Old idempotency writers do not honor the new owner token; old replay reset/resume
+code does not honor epochs. Keep one compatible writer cohort for those stores.
+There is no destructive down migration: leave added columns and indexes in place,
+stop new producers, drain active work, then revert dependants in the order in the
+[migration guide](../MIGRATION.md#rollback-and-fleet-compatibility).
+
+Restore replay events together with their sequence/epoch table. Restoring only
+one can reuse sequence numbers or claim history that is absent. Restore task
+rows with their fence, attempt, status, input/result and idempotency mappings
+from a coordinated application recovery point. A database restore cannot undo
+external side effects: reconcile payment/email/job outcomes before retrying
+work. New alarm and dead-letter tables have no old PostgreSQL implementation;
+preserve them and define application reconciliation instead of deleting data
+as a downgrade shortcut. Backup freshness, RPO and RTO require a measured host
+restore drill; this package's disposable tests do not establish them.
+
+### Failed-migration tabletop
+
+1. Rehearse against an isolated restored copy and the exact candidate tarball.
+   Pause producers and retention workers; save the source snapshot and schema.
+2. Inject a missing-column or denied-DDL failure. Await the available `ready()`
+   gates and keep application readiness false on rejection. For a lazy store,
+   run the deployment's explicit schema verifier before enabling it.
+3. Inventory committed DDL: automatic initialization issues separate statements,
+   so a later failure can leave earlier additions in place. Do not assume an
+   all-or-nothing migration or drop a data-bearing table because a drift error
+   mentions a conflicting object. Correct the schema/privileges deliberately.
+4. Reapply idempotent additions, construct fresh store instances, and re-run the
+   startup gates. A rejected one-shot `ready()` promise on an old instance stays
+   rejected. Validate old records and an isolated new operation before admitting
+   traffic; inspect role, index and storage errors rather than overriding them.
+5. If validation fails, stop the candidate and follow the downgrade boundaries
+   above. Retain the error, artifact/lockfile digests, applied statements and
+   recovery decision as incident evidence; exclude credentials and payload data.
+
+The live `test/integration/postgres/migration-readiness.test.js` regression covers
+old replay/idempotency schemas and the failed-schema/disabled-migration boundary.
+The [packed rehearsal](../MIGRATION.md#executable-rehearsal) covers both automatic
+and documented manual jobs/tasks upgrades. Run both on the actual PostgreSQL
+version before deployment; neither substitutes for a host restore drill.

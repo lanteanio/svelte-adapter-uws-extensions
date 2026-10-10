@@ -201,7 +201,9 @@ export function createReplay(client, options = {}) {
 				seq   BIGINT NOT NULL DEFAULT 0,
 				epoch BIGINT NOT NULL DEFAULT 0
 			)
-		`, { table: seqTable, columns: ['topic', 'seq', 'epoch'] });
+		`, { table: seqTable, columns: ['topic', 'seq'] });
+		// The pre-migration guard above checks only legacy columns; requiring epoch
+		// there would reject an old table before this ALTER can upgrade it.
 		// Additive migration for an already-deployed seq table created before the
 		// epoch column existed. Idempotent and runs under the same migrated-once
 		// guard, so a fresh table (just created above) is a no-op and an old one

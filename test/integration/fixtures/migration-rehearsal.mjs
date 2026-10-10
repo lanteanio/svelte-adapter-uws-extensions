@@ -5,7 +5,7 @@ import { createJobQueue } from 'svelte-adapter-uws-extensions/postgres/jobs';
 import { createTaskRunner } from 'svelte-adapter-uws-extensions/postgres/tasks';
 
 const fixture = JSON.parse(readFileSync(new URL('./migration-0.5.10.json', import.meta.url), 'utf8'));
-const migration = readFileSync(new URL('./MIGRATION.md', import.meta.url), 'utf8');
+const migration = readFileSync(new URL('./MIGRATION.md', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const manual = migration.match(/```sql\n(ALTER TABLE svti_jobs[\s\S]+?)\n```/)?.[1];
 assert.ok(manual, 'The manual migration must come from the shipped guide');
 const client = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false });
