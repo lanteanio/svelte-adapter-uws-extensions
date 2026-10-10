@@ -2257,7 +2257,7 @@ Keeping `acquireTtl` comfortably above the handler's worst-case latency makes le
 
 #### Pairing with the Dedup plugin
 
-The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`) is the single-instance fallback for the same contract. The shape is identical, so swapping the backend is a one-line change. Use the in-memory plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`) synchronously claims message IDs and exposes `claim` / `has` / `delete` / `size` / `clear`. This distributed idempotency store has a different contract: await `acquire` and handle its pending, cached-result, or acquired slot; acquired slots require `commit` or `abort`. Moving between them requires adapting the caller's control flow. Use the bundled plugin for process-local message deduplication and this store for cross-instance operation results.
 
 ---
 
@@ -2772,7 +2772,7 @@ if (s) s.lastSeen = Date.now();   // persisted once, on disconnect
 
 #### Pairing with the bundled Session plugin
 
-The shape is identical: same `get` / `set` / `delete` / `touch` / `clear` names, same sliding-TTL semantics. The Redis-backed methods return `Promise<T>` while the bundled plugin's are synchronous, so a swap requires `await` on the call sites - but otherwise the contract is shared. Use the bundled plugin for tests and single-process deployments; reach for this store the moment a second instance enters the picture.
+The stores share `get` / `set` / `delete` / `touch` / `clear` names and sliding-TTL semantics. Redis-backed storage methods return promises and require `await`; the bundled plugin is synchronous and additionally exposes `size()`, which the distributed store omits. The distributed store also provides `purgeUser`, `create`, `withHooks`, and `of` for erasure and connection lifecycle integration. Review these differences when replacing a process-local session store with Redis.
 
 #### Pairing with the connection registry
 

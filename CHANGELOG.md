@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Clarify that bundled deduplication and distributed idempotency use different caller contracts, and list asynchronous session storage, omitted size introspection, and added lifecycle members.
+
 - Preserve a newer peer-selected presence identity when an older local tab closes. Redis relays carry selected identity separately from durable fields, including shadowing fields and updates missed before the relay. Updated receivers retain legacy public snapshots separately and reconcile selected identity on a later local join; update all receivers for the full guarantee.
 
 - Keep subscriber PING silence detection active when bounded Redis commands time out.
