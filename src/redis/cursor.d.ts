@@ -4,6 +4,8 @@ import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface RedisCursorOptions {
+	/** Maximum JSON data size in UTF-8 bytes. Invalid, over-depth, or oversized updates are dropped. Default 8192. */
+	maxDataBytes?: number;
 	/**
 	 * Minimum ms between broadcasts per user per topic.
 	 * Trailing-edge timer ensures the final position is always sent.

@@ -31,6 +31,7 @@ function defaultCursorSelect(obj) {
 
 /**
  * @typedef {Object} ResolvedCursorOptions
+ * @property {number} maxDataBytes
  * @property {number} throttleMs
  * @property {number} topicThrottleMs
  * @property {number} snapshotIntervalMs
@@ -59,6 +60,10 @@ function defaultCursorSelect(obj) {
  * @returns {ResolvedCursorOptions}
  */
 export function resolveCursorOptions(options = {}) {
+	const maxDataBytes = options.maxDataBytes ?? 8192;
+	if (!Number.isInteger(maxDataBytes) || maxDataBytes < 1) {
+		throw new Error('redis cursor: maxDataBytes must be a positive integer');
+	}
 	const throttleMs = options.throttle ?? 16;
 	const topicThrottleMs = options.topicThrottle ?? 16;
 	const snapshotIntervalMs = options.snapshotIntervalMs ?? 100;
@@ -207,6 +212,7 @@ export function resolveCursorOptions(options = {}) {
 	const perSubscriberWalk = bpEnabled || viewportEnabled;
 
 	return Object.freeze({
+		maxDataBytes,
 		throttleMs,
 		topicThrottleMs,
 		snapshotIntervalMs,

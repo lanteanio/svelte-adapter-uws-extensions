@@ -1630,6 +1630,7 @@ export function close(ws, { platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `throttle` | `16` | Minimum ms between broadcasts per user per topic. 60Hz default matches the world-state tick so an individual cursor stays smooth at the per-peer wire rate. |
+| `maxDataBytes` | `8192` | Maximum cursor data JSON size in UTF-8 bytes. Invalid JSON values, data deeper than 64 levels, and oversized updates are silently dropped. Must be a positive integer. |
 | `topicThrottle` | `16` | World-state tick rate in ms. Each topic emits at most one bulk frame per window, carrying the latest position for every cursor that moved. Raise to 33 (30Hz) for high-density rooms; 0 disables the tick. |
 | `minMove` | `0` (off) | Drop a move at ingest when the cursor has not moved at least this far (Chebyshev distance) from the position the subscriber last saw, so sub-pixel wobble is never fanned out or relayed across instances. A debounced settle delivers the final resting position once when movement stops, so a still cursor is never stranded at a stale point. Measured against the last broadcast position, so a slow drift still delivers every `minMove` units. |
 | `position` | reads `data.x` / `data.y` | Extract the `{ x, y }` coordinate from cursor `data` for `minMove` and `viewport`. A frame with no extractable finite coordinate is always delivered. |

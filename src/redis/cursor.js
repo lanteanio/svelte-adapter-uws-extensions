@@ -58,6 +58,7 @@ import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LA
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 import { EVENTS } from './cursor/events.js';
 import { _warnCursorHooksMessageShape } from './cursor/diagnostics.js';
+import { exceedsDepth, MAX_PROJECTION_DEPTH } from '../shared/sensitive-names.js';
 import { resolveCursorOptions } from './cursor/options.js';
 import { createRemoveBuffer } from './cursor/remove-buffer.js';
 import { createRedisIo } from './cursor/redis-io.js';
@@ -72,6 +73,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
 
 /**
  * @typedef {Object} RedisCursorOptions
+ * @property {number} [maxDataBytes=8192] - Maximum JSON data size in UTF-8 bytes; invalid or oversized updates are dropped.
  * @property {number} [throttle=16] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
  *   Default 16 (60Hz) matches the world-state tick rate so an individual cursor's
@@ -150,6 +152,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
  */
 export function createCursor(client, options = {}) {
 	const {
+		maxDataBytes,
 		throttleMs,
 		topicThrottleMs,
 		snapshotIntervalMs,
@@ -672,6 +675,12 @@ export function createCursor(client, options = {}) {
 			// pays one Map lookup.
 			if (typeof topic !== 'string' || topic.length === 0) return;
 			if (!topics.has(topic) && !isFramableTopic(topic)) return;
+			if (data !== undefined && data !== null) {
+				try {
+					if (Buffer.byteLength(JSON.stringify(data)) > maxDataBytes) return;
+					if (exceedsDepth(data, MAX_PROJECTION_DEPTH)) return;
+				} catch { return; }
+			}
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);
 
