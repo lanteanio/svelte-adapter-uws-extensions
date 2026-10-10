@@ -165,4 +165,24 @@ describe('presence relayed joins', () => {
 		} finally { a.destroy(); vi.useRealTimers(); }
 	});
 
+	it('recounts durable field bytes after an identical local join reads missed fields', async () => {
+		const client = mockRedisClient();
+		const a = createPresence(client, { maxTotalFieldsBytes: 60 });
+		const b = createPresence(client);
+		const pa = mockPlatform(), pb = mockPlatform();
+		const wa = mockWs({ id: 'alice' }), wb = mockWs({ id: 'alice' });
+		try {
+			await a.join(wa, 'room', pa);
+			await b.join(wb, 'room', pb);
+			await a.update(wa, 'room', { color: 'blue' }, pa);
+			const publish = client.redis.publish.bind(client.redis);
+			client.redis.publish = (channel, raw) => JSON.parse(raw).event === 'fields' ? Promise.resolve(0) : publish(channel, raw);
+			await b.update(wb, 'room', { color: 'x'.repeat(40) }, pb);
+			client.redis.publish = publish;
+			await a.join(mockWs({ id: 'alice' }), 'room', pa);
+			await a.update(wa, 'room', { shape: 'circle' }, pa);
+			expect(await a.list('room')).toEqual([{ id: 'alice', color: 'x'.repeat(40) }]);
+		} finally { a.destroy(); b.destroy(); }
+	});
+
 });

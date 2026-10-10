@@ -1060,6 +1060,7 @@ export function createPresence(client, options = {}) {
 			if (stored?.fields) {
 				const committed = topicData.get(key);
 				committed.fields = Object.assign(newFieldMap(), committed.fields, stored.fields);
+				committed.fieldsBytes = undefined;
 			}
 			activeTopics.add(topic);
 
