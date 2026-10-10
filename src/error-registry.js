@@ -732,11 +732,11 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST,
 		event: 'redis.pubsub.relay-batch.burst', component: 'runtime.redis.pubsub', severity: 'warn',
-		problemPrefix: 'One event-loop iteration queued more relay publishes than the per-tick bound.',
-		cause: 'Code published in a tight synchronous loop without yielding, so the whole burst landed in one tick.',
-		consequence: 'Everything is still relayed, as one pipelined batch at the end of the iteration; memory and latency spike for that tick. Reported once per bus.',
-		automaticRecovery: 'Yes; the batch drains every tick.',
-		nextAction: 'Find the publish-in-loop and yield between chunks, or send the list as one envelope with publishBatched.',
+		problemPrefix: 'The Redis relay queue refused a new envelope at its retained entry or byte bound.',
+		cause: 'Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.',
+		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.',
+		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released.',
+		nextAction: 'Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.',
 		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-relay-burst', link: 'https://svti.me/pubsub-burst'
 	}),
 	direct({
@@ -752,11 +752,11 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 	direct({
 		id: EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST,
 		event: 'redis.sharded-pubsub.relay-batch.channel-burst', component: 'runtime.redis.sharded-pubsub', severity: 'warn',
-		problemPrefix: 'One event-loop iteration queued publishes for more distinct shard channels than the per-tick bound.',
-		cause: 'One synchronous burst published to that many distinct topics, which usually means a topic name built from a value that is unique per message.',
-		consequence: 'Everything is still published; the tick batch grows with the number of channels. Reported once per bus.',
-		automaticRecovery: 'Yes; the batch drains every tick.',
-		nextAction: 'Look for a topic-cardinality leak: a topic name that embeds a per-message id instead of a per-room one.',
+		problemPrefix: 'The sharded Redis relay queue refused a new envelope at its retained entry or byte bound.',
+		cause: 'Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.',
+		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.',
+		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released.',
+		nextAction: 'Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-relay-burst', link: 'https://svti.me/sharded-bus-burst'
 	}),
 	direct({

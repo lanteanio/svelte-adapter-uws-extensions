@@ -6,21 +6,17 @@ import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 
-// The production bounds are sized for real clusters (a million relay entries,
-// ten million index values), far past what a unit test can drive. Lowering them
+// The production index bounds are sized for real clusters (up to
+// ten million values), far past what a unit test can drive. Lowering them
 // here runs each module's real path up to its bound, so the advisory it prints
 // there is the one an operator would see.
 vi.mock('../../src/shared/caps.js', async (importOriginal) => ({
 	...(await importOriginal()),
-	MAX_PUBSUB_RELAY_BATCH_PER_TICK: 3,
-	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK: 3,
 	MAX_REGISTRY_INDEX_VALUES_PER_KEY: 3,
 	MAX_REGISTRY_USER_INDEX: 3,
 	MAX_AGGREGATOR_REMOTE_INSTANCES: 3
 }));
 
-const { createPubSubBus } = await import('../../src/redis/pubsub.js');
-const { createShardedBus } = await import('../../src/redis/sharded-pubsub.js');
 const { createConnectionRegistry } = await import('../../src/redis/registry.js');
 const { createPublishRateAggregator } = await import('../../src/redis/publish-rate.js');
 const { createMetrics } = await import('../../src/prometheus/index.js');
@@ -40,35 +36,6 @@ afterEach(() => {
 });
 
 describe('cap advisories are registered diagnostics', () => {
-	it('pubsub: a relay burst reaching the per-tick bound reports once', async () => {
-		const bus = createPubSubBus(mockRedisClient('adv-pubsub:'));
-		const wrapped = bus.wrap(mockPlatform());
-		const lines = await warnings(async () => {
-			for (let i = 0; i < 6; i++) wrapped.publish('user:42:inbox', 'msg', { i });
-			await settle();
-		});
-		expect(lines).toHaveLength(1);
-		const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST);
-		expect(record.attributes).toEqual({ entries: 3 });
-		// Topics can embed user ids and stay out of the line.
-		expect(lines[0]).not.toContain('user:42');
-		await bus.deactivate?.();
-	});
-
-	it('sharded bus: a burst across the per-tick channel bound reports once', async () => {
-		const bus = createShardedBus(mockRedisClient('adv-sharded:'));
-		const wrapped = bus.wrap(mockPlatform());
-		const lines = await warnings(async () => {
-			for (let i = 0; i < 6; i++) wrapped.publish('user:' + i + ':inbox', 'msg', { i });
-			await settle();
-		});
-		expect(lines).toHaveLength(1);
-		const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST);
-		expect(record.attributes).toEqual({ channels: 3 });
-		expect(lines[0]).not.toContain('user:');
-		await bus.deactivate?.();
-	});
-
 	it('registry: the attribute bucket and the user index report once each at their bounds', async () => {
 		const platform = mockPlatform();
 		const registry = createConnectionRegistry(mockRedisClient('adv-registry:'), {

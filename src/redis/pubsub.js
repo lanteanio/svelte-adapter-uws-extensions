@@ -10,12 +10,12 @@
  */
 
 import { assert } from '../shared/assert.js';
-import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
+import { randomBytes, now, monotonicNow } from '../shared/runtime.js';
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
-import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
+import { createRelayQueue } from './_relay-queue.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { createRelayMetrics } from './_relay-metrics.js';
-import { firstCommandError } from '../shared/cluster.js';
+import { firstCommandError, isCluster } from '../shared/cluster.js';
 import {
 	REDIS_TRACE_ATTRIBUTES,
 	injectTraceContext,
@@ -170,8 +170,8 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
 
-	// Tick relay batching: coalesce Redis publishes within a single
-	// event-loop iteration into one pipelined round trip. Each envelope
+	// Bounded FIFO relay batching: coalesce Redis publishes within a single
+	// event-loop iteration into bounded pipelined round trips. Each envelope
 	// tracks its underlying message count so the relayed-messages counter
 	// stays accurate when batch envelopes carry many messages each.
 	//
@@ -185,12 +185,11 @@ export function createPubSubBus(client, options = {}) {
 	// after the poll phase has dispatched every ready socket message in the
 	// current iteration. Same structural choice the 0.5.7 cursor always-tick
 	// rewrite locked in.
-	/** @type {Array<{msg: string, count: number}>} */
-	let relayBatch = [];
-	/** @type {ReturnType<typeof setTimeout> | null} */
-	let relayTimer = null;
-	let relayBatchWarnFired = false;
-
+	const relayQueue = createRelayQueue({
+		submit: flushRelay, metrics: m, prefix: 'pubsub',
+		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
+		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST, { attributes })
+	});
 	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
 	// fit without another scan of the common small-message path.
 	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
@@ -208,17 +207,7 @@ export function createPubSubBus(client, options = {}) {
 		}
 		envelopeOversized = false;
 		assert(count >= 1, 'pubsub.relay-batch.count-positive', { count });
-		relayBatch.push({ msg, count });
-		if (relayBatch.length >= MAX_PUBSUB_RELAY_BATCH_PER_TICK && !relayBatchWarnFired) {
-			relayBatchWarnFired = true;
-			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST, {
-				attributes: { entries: relayBatch.length }
-			});
-		}
-		if (relayTimer === null) {
-			relayTimer = setTimer(flushRelay, 0);
-			if (relayTimer.unref) relayTimer.unref();
-		}
+		relayQueue.push(msg, count);
 	}
 
 	// Relay one envelope from inside a producer operation, carrying its trace
@@ -438,14 +427,22 @@ export function createPubSubBus(client, options = {}) {
 		return relayable;
 	}
 
-	function flushRelay() {
-		const batch = relayBatch;
-		relayBatch = [];
-		if (relayTimer !== null) {
-			clearTimer(relayTimer);
-			relayTimer = null;
-		}
-		if (batch.length === 0) return;
+	// A keyless Cluster pipeline may choose a different origin for each chunk.
+	// Its reply does not fence gossip from that origin, so keep a ready master
+	// for successive chunks. Borrow the existing node; its deadlines and
+	// lifecycle remain owned by the caller's Cluster.
+	const clusteredPublisher = isCluster(client.redis);
+	let publisher = null;
+	function relayPublisher() {
+		if (!clusteredPublisher) return client.redis;
+		const masters = /** @type {any} */ (client.redis).nodes('master');
+		if (publisher?.status === 'ready' && masters.includes(publisher)) return publisher;
+		publisher = masters.find(node => node.status === 'ready') || null;
+		if (!publisher) throw new Error('No ready Redis Cluster publisher');
+		return publisher;
+	}
+
+	function flushRelay(batch) {
 		let totalMessages = 0;
 		for (let i = 0; i < batch.length; i++) totalMessages += batch[i].count;
 		if (b) {
@@ -457,18 +454,18 @@ export function createPubSubBus(client, options = {}) {
 			b?.failure(err);
 		};
 		try {
+			const redis = relayPublisher();
 			if (batch.length === 1) {
-				client.redis.publish(channel, batch[0].msg).then(() => {
+				return redis.publish(channel, batch[0].msg).then(() => {
 					mBatchSize?.observe(1);
 					mRelayed?.inc(totalMessages);
 					relayMetrics?.settled(started, 1, 0, 0);
 					b?.success();
 				}).catch(failed);
-				return;
 			}
-			const pipe = client.redis.pipeline();
+			const pipe = redis.pipeline();
 			for (let i = 0; i < batch.length; i++) pipe.publish(channel, batch[i].msg);
-			pipe.exec().then((results) => {
+			return pipe.exec().then((results) => {
 				mBatchSize?.observe(batch.length);
 				const err = firstCommandError(results);
 				if (err === null) {
@@ -911,12 +908,7 @@ export function createPubSubBus(client, options = {}) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;
 			}
-			if (relayTimer !== null) {
-				clearTimer(relayTimer);
-				relayTimer = null;
-			}
-			if (relayMetrics && relayBatch.length) relayMetrics.dropped('deactivated', relayBatch.length, relayBatch.reduce((sum, entry) => sum + entry.count, 0));
-			relayBatch = [];
+			relayQueue.clear();
 			if (!active || !subscriber) return;
 			active = false;
 			activePlatform = null;

@@ -76,10 +76,10 @@ export const MAX_CURSOR_DIRTY_PER_TOPIC = 1_000_000;
 // Outbound batches that are drained every microtask. Crossing the cap
 // signals something allocated the entire cap's worth in one tick (leak).
 
-/** Channels in one sharded-bus microtask batch. */
+/** Legacy advisory threshold retained for compatibility; relay queues enforce internal entry/byte limits. */
 export const MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK = 1_000_000;
 
-/** Entries in one pubsub relay microtask batch. */
+/** Legacy advisory threshold retained for compatibility; relay queues enforce internal entry/byte limits. */
 export const MAX_PUBSUB_RELAY_BATCH_PER_TICK = 1_000_000;
 
 // - Structural caps ---------------------------------------------------------

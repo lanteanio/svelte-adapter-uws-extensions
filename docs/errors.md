@@ -84,9 +84,9 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-PUBLISH-RATE-REMOTE-CAP](#extensions-err-publish-rate-remote-cap) | `redis.publish-rate.remote-instances-capped` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.publish-rate event=redis.publish-rate.remote-instances-capped severity=warn] The publish-rate aggregator reached its sibling-instance bound; stale entries are evicted and envelopes past the bound are dropped.` |
 | [EXTENSIONS-ERR-REGISTRY-INDEX-BUCKET](#extensions-err-registry-index-bucket) | `redis.registry.index-bucket.large` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.registry event=redis.registry.index-bucket.large severity=warn] A registry secondary-index bucket is very large and keeps growing.` |
 | [EXTENSIONS-ERR-REGISTRY-USER-INDEX](#extensions-err-registry-user-index) | `redis.registry.user-index.large` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.registry event=redis.registry.user-index.large severity=warn] The cluster-wide registry user index is very large and keeps growing.` |
-| [EXTENSIONS-ERR-PUBSUB-RELAY-BURST](#extensions-err-pubsub-relay-burst) | `redis.pubsub.relay-batch.burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] One event-loop iteration queued more relay publishes than the per-tick bound.` |
+| [EXTENSIONS-ERR-PUBSUB-RELAY-BURST](#extensions-err-pubsub-relay-burst) | `redis.pubsub.relay-batch.burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] The Redis relay queue refused a new envelope at its retained entry or byte bound.` |
 | [EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED](#extensions-err-pubsub-system-channel-refused) | `redis.pubsub.system-channel.refused` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.system-channel.refused severity=warn] A connection was not subscribed to the bus's systemChannel, so it gets no degraded or recovered events.` |
-| [EXTENSIONS-ERR-SHARDED-RELAY-BURST](#extensions-err-sharded-relay-burst) | `redis.sharded-pubsub.relay-batch.channel-burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] One event-loop iteration queued publishes for more distinct shard channels than the per-tick bound.` |
+| [EXTENSIONS-ERR-SHARDED-RELAY-BURST](#extensions-err-sharded-relay-burst) | `redis.sharded-pubsub.relay-batch.channel-burst` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] The sharded Redis relay queue refused a new envelope at its retained entry or byte bound.` |
 | [EXTENSIONS-ERR-REDIS-DUPLICATES](#extensions-err-redis-duplicates) | `redis.client.duplicates.excessive` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.client event=redis.client.duplicates.excessive severity=warn] One Redis client has spawned more duplicate connections than a process should need.` |
 | [EXTENSIONS-ERR-SMOOTH-OWNER-FALLBACK](#extensions-err-smooth-owner-fallback) | `redis.smooth.relay-owner.unresolved` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.smooth event=redis.smooth.relay-owner.unresolved severity=warn] The smooth relay channel owner could not be resolved; publishes are pinned to a fallback master.` |
 | [EXTENSIONS-ERR-RESUME-TOPICS-TRUNCATED](#extensions-err-resume-topics-truncated) | `replay.resume.topics-truncated` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.replay event=replay.resume.topics-truncated severity=warn] A resume request presented more topics than the per-request bound; the remainder were not resumed.` |
@@ -904,11 +904,11 @@ the stable ID tag on the line):
 ## `EXTENSIONS-ERR-PUBSUB-RELAY-BURST`
 
 - **Code/event:** `redis.pubsub.relay-batch.burst`
-- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] One event-loop iteration queued more relay publishes than the per-tick bound.`
-- **Cause:** Code published in a tight synchronous loop without yielding, so the whole burst landed in one tick.
-- **Consequence:** Everything is still relayed, as one pipelined batch at the end of the iteration; memory and latency spike for that tick. Reported once per bus.
-- **Automatic recovery:** Yes; the batch drains every tick.
-- **Next action:** Find the publish-in-loop and yield between chunks, or send the list as one envelope with publishBatched.
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] The Redis relay queue refused a new envelope at its retained entry or byte bound.`
+- **Cause:** Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.
+- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.
+- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released.
+- **Next action:** Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.
 - **Operator shortlink:** `https://svti.me/pubsub-burst`
 - **Runtime help:** `docs/errors.md#extensions-err-pubsub-relay-burst`
 - **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
@@ -929,11 +929,11 @@ the stable ID tag on the line):
 ## `EXTENSIONS-ERR-SHARDED-RELAY-BURST`
 
 - **Code/event:** `redis.sharded-pubsub.relay-batch.channel-burst`
-- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] One event-loop iteration queued publishes for more distinct shard channels than the per-tick bound.`
-- **Cause:** One synchronous burst published to that many distinct topics, which usually means a topic name built from a value that is unique per message.
-- **Consequence:** Everything is still published; the tick batch grows with the number of channels. Reported once per bus.
-- **Automatic recovery:** Yes; the batch drains every tick.
-- **Next action:** Look for a topic-cardinality leak: a topic name that embeds a per-message id instead of a per-room one.
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] The sharded Redis relay queue refused a new envelope at its retained entry or byte bound.`
+- **Cause:** Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.
+- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.
+- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released.
+- **Next action:** Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.
 - **Operator shortlink:** `https://svti.me/sharded-bus-burst`
 - **Runtime help:** `docs/errors.md#extensions-err-sharded-relay-burst`
 - **Runtime sources:** [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)

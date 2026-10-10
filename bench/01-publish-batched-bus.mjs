@@ -82,10 +82,14 @@ async function waitFor(fn, timeoutMs = 30000) {
 async function runProfile({ name, batchSize, makeMessages, drive }) {
 	const channel = 'bench:' + Math.random().toString(16).slice(2);
 	const ctx = await setup(channel);
+	const roundsPerBurst = Math.max(1, Math.floor(4096 / batchSize));
 
 	// Warmup
-	for (let i = 0; i < WARMUP; i++) drive(ctx.wrapped, makeMessages(i));
-	await waitFor(() => ctx.platformB.published.length >= WARMUP * batchSize);
+	for (let start = 0; start < WARMUP; start += roundsPerBurst) {
+		const end = Math.min(WARMUP, start + roundsPerBurst);
+		for (let i = start; i < end; i++) drive(ctx.wrapped, makeMessages(i));
+		await waitFor(() => ctx.platformB.published.length >= end * batchSize);
+	}
 
 	ctx.platformA.reset();
 	ctx.platformB.reset();
@@ -93,10 +97,16 @@ async function runProfile({ name, batchSize, makeMessages, drive }) {
 	const pubsBefore = await readPublishStat(ctx.pubClient);
 	const expected = ITERATIONS * batchSize;
 	const emitStart = performance.now();
-	for (let i = 0; i < ITERATIONS; i++) {
-		drive(ctx.wrapped, makeMessages(i));
+	let emitMs = 0;
+	for (let start = 0; start < ITERATIONS; start += roundsPerBurst) {
+		const end = Math.min(ITERATIONS, start + roundsPerBurst);
+		const burstStart = performance.now();
+		for (let i = start; i < end; i++) drive(ctx.wrapped, makeMessages(i));
+		emitMs += performance.now() - burstStart;
+		// Keep both variants inside relay admission while measuring delivery
+		// of every event. A synchronous unlimited burst measures overload loss.
+		await waitFor(() => ctx.platformB.published.length >= end * batchSize);
 	}
-	const emitEnd = performance.now();
 
 	await waitFor(() => ctx.platformB.published.length >= expected);
 	const recvEnd = performance.now();
@@ -104,7 +114,7 @@ async function runProfile({ name, batchSize, makeMessages, drive }) {
 
 	const result = {
 		name,
-		emitMs: emitEnd - emitStart,
+		emitMs,
 		e2eMs: recvEnd - emitStart,
 		pubCount: pubsAfter - pubsBefore,
 		events: expected,

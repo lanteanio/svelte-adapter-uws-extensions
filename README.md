@@ -3635,9 +3635,9 @@ Saturation behavior is matched to each data structure's contract:
 - **State the protocol depends on** (`userToInstance` for `sendTo` routing, the secondary index buckets, the cluster-wide user index): **warn-only**. Eviction would corrupt routing or matching, so a single structured `console.warn` fires the first time the cap is crossed - surfacing the leak shape - and the index keeps growing.
 - **State with overwrite-by-key contract**: not currently used in extensions (this saturation shape lives in the adapter's `WS_COALESCED` and the throttle/debounce plugins).
 - **State bounded by the caller** (registry pending requests, presence ws, cursor ws, sharded bus topics, groups local members): **reject new** - the adding caller surfaces an explicit error, and the saturated entry is not added.
-- **Per-tick microtask batches** (sharded bus relay, pubsub relay): **warn-only** - the batch is drained every microtask, so reaching the cap in one tick means a synchronous burst leak; the warn surfaces it without dropping any in-flight publishes.
+- **Redis relay queues** (standard and sharded buses): **withhold newest relay** beyond 8,192 retained envelopes or 8 MiB encoded bytes, including unsettled submissions. Local delivery remains intact; bounded FIFO chunks yield between submissions. See [relay limits and metrics](docs/relay-metrics.md#bounded-admission-and-draining).
 
-Caps live as named constants in `shared/caps.js`. They are not currently configurable per-instance; if a real workload needs a tighter or looser bound for a specific module, raise an issue and we'll add a per-factory option.
+General caps live in `shared/caps.js`; relay queue limits are internal to the queue. These limits are not configurable per instance.
 
 | Cap | Default | Saturation | Notes |
 |---|---|---|---|
@@ -3646,8 +3646,8 @@ Caps live as named constants in `shared/caps.js`. They are not currently configu
 | `MAX_REGISTRY_USER_INDEX` | 100_000_000 | warn-only | cluster-wide; eviction would mis-route `sendTo` |
 | `MAX_REGISTRY_INDEX_VALUES_PER_KEY` | 10_000_000 | warn-only | per-attribute-key bucket in the secondary index |
 | `MAX_SHARDED_BUS_TOPICS` | 10_000_000 | reject new | `follow` / `followBatch` reject distinct-new past the cap |
-| `MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK` | 1_000_000 | warn-only | per-microtask outbound batch |
-| `MAX_PUBSUB_RELAY_BATCH_PER_TICK` | 1_000_000 | warn-only | per-microtask outbound batch |
+| Redis relay envelopes per bus | 8_192 | withhold new relay | queued plus unsettled submissions; local delivery remains intact |
+| Redis relay encoded bytes per bus | 8 MiB | withhold new relay | exact UTF-8 bytes; chunks yield between submissions |
 | `MAX_PRESENCE_WS` | 10_000_000 | reject new | per-instance ws joins |
 | `MAX_PRESENCE_TOPICS` | 10_000_000 | reject new | per-instance topic count |
 | `MAX_CURSOR_WS` | 10_000_000 | reject new | per-instance ws cursor activity |

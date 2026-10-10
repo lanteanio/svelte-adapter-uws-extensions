@@ -26,12 +26,10 @@ import { guardBreaker } from '../shared/breaker-admission.js';
 import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { parseRedisVersion } from '../shared/redis-version.js';
-import {
-	MAX_SHARDED_BUS_TOPICS,
-	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
-} from '../shared/caps.js';
+import { MAX_SHARDED_BUS_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { createRelayMetrics } from './_relay-metrics.js';
+import { createRelayQueue } from './_relay-queue.js';
 import { execMultiSlot, firstCommandError, isCluster, keySlot } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
@@ -216,11 +214,9 @@ export function createShardedBus(client, options = {}) {
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
 	const wsFollows = new WeakMap();
 
-	// One-shot warn flag for the per-tick batch cap.
-	let batchChannelsWarnFired = false;
 
-	// Per-channel tick batch: coalesce SPUBLISHes for the same channel
-	// within one event-loop iteration into a single pipelined call. Each
+	// Bounded FIFO tick batches: coalesce SPUBLISHes across channels
+	// within one event-loop iteration into bounded pipelined calls. Each
 	// entry tracks the underlying topic list so the relayed-messages
 	// counter stays accurate when batch envelopes carry many messages.
 	//
@@ -232,11 +228,11 @@ export function createShardedBus(client, options = {}) {
 	// phase, which fires only after the poll phase has dispatched every
 	// ready socket message in the current iteration. Same structural
 	// choice the 0.5.7 cursor always-tick rewrite locked in.
-	/** @type {Map<string, Array<{msg: string, topics: string[]}>>} */
-	let channelBatches = new Map();
-	/** @type {ReturnType<typeof setTimeout> | null} */
-	let relayTimer = null;
-
+	const relayQueue = createRelayQueue({
+		submit: flushRelay, metrics: m, prefix: 'sharded_pubsub',
+		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
+		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST, { attributes })
+	});
 	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
 	// fit without another scan of the common small-message path.
 	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
@@ -253,22 +249,7 @@ export function createShardedBus(client, options = {}) {
 			return;
 		}
 		envelopeOversized = false;
-		let arr = channelBatches.get(channel);
-		if (!arr) {
-			arr = [];
-			channelBatches.set(channel, arr);
-		}
-		arr.push({ msg, topics });
-		if (channelBatches.size >= MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK && !batchChannelsWarnFired) {
-			batchChannelsWarnFired = true;
-			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST, {
-				attributes: { channels: channelBatches.size }
-			});
-		}
-		if (relayTimer === null) {
-			relayTimer = setTimer(flushRelay, 0);
-			if (relayTimer.unref) relayTimer.unref();
-		}
+		relayQueue.push(msg, topics.length, channel, topics);
 	}
 
 	// Relay one envelope on its shard channel from inside a producer operation,
@@ -481,34 +462,19 @@ export function createShardedBus(client, options = {}) {
 		return topics;
 	}
 
-	function droppedBatches(batches, reason) {
-		if (!relayMetrics) return;
-		let envelopes = 0, messages = 0;
-		for (const entries of batches.values()) for (const entry of entries) {
-			envelopes++; messages += entry.topics.length;
-		}
-		relayMetrics.dropped(reason, envelopes, messages);
-	}
-
-	function flushRelay() {
-		const batches = channelBatches;
-		channelBatches = new Map();
-		if (relayTimer !== null) {
-			clearTimer(relayTimer);
-			relayTimer = null;
-		}
-		if (batches.size === 0) return;
+	function flushRelay(batch) {
 		if (b) {
-			try { b.guard(); } catch { droppedBatches(batches, 'breaker_open'); return; }
-		}
-		// Route each SPUBLISH to the node owning its channel's slot.
-		const commands = [];
-		const commandTopics = [];
-		for (const [ch, entries] of batches) {
-			for (const { msg, topics } of entries) {
-				commands.push(['spublish', ch, msg]);
-				commandTopics.push(topics);
+			try { b.guard(); } catch {
+				if (relayMetrics) relayMetrics.dropped('breaker_open', batch.length, batch.reduce((sum, entry) => sum + entry.count, 0));
+				return;
 			}
+		}
+		// Submit one bounded FIFO chunk; the next waits for its actual outcome.
+		const commands = new Array(batch.length);
+		const commandTopics = new Array(batch.length);
+		for (let i = 0; i < batch.length; i++) {
+			commands[i] = ['spublish', batch[i].channel, batch[i].msg];
+			commandTopics[i] = batch[i].topics;
 		}
 		const started = relayMetrics?.start();
 		const failed = (err) => {
@@ -520,7 +486,7 @@ export function createShardedBus(client, options = {}) {
 			b?.failure(err);
 		};
 		try {
-			execMultiSlot(client.redis, commands).then((results) => {
+			return execMultiSlot(client.redis, commands).then((results) => {
 				let failedEnvelopes = 0, failedMessages = 0;
 				for (let c = 0; c < commandTopics.length; c++) {
 					const topics = commandTopics[c];
@@ -1011,17 +977,12 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function deactivate() {
+		relayQueue.clear();
 		if (!active) return;
 		active = false;
 		activePlatform = null;
 		subscribedChannels.clear();
 		await subClose();
-		droppedBatches(channelBatches, 'deactivated');
-		channelBatches = new Map();
-		if (relayTimer !== null) {
-			clearTimer(relayTimer);
-			relayTimer = null;
-		}
 		followCounts.clear();
 		channelRefcounts.clear();
 		pendingChannels.clear();
