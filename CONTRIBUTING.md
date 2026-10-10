@@ -11,12 +11,18 @@ Install Node 22 or newer, Git, and Docker with Compose v2. Start Docker before
 running a backend lane. A fresh clone needs one dependency installation:
 
 ```sh
-git clone https://github.com/lanteanio/svelte-adapter-uws-extensions.git
+git clone --branch dev --single-branch https://github.com/lanteanio/svelte-adapter-uws-extensions.git
 cd svelte-adapter-uws-extensions
 npm ci
+npm run preflight
 npm run smoke
 npm run verify:fast
 ```
+
+Stop if the preflight fails. It checks the installed adapter's Node, operating
+system, architecture, Linux libc and native addon requirements. The
+[first-success guide](docs/getting-started.md) includes expected output and
+prerequisite fixes.
 
 There is no build step: the package ships the JavaScript and adjacent declarations
 under `src/`. `npm run smoke` exercises the same cursor join, move, read and remove
@@ -60,7 +66,7 @@ The table below is generated from `package.json` and `.github/workflows/`.
 the workflow, run `node scripts/check-contributor-map.js --write` and inspect the diff.
 
 <!-- verification-inventory:start -->
-Hosted jobs: `external-links`, `suite`.
+Hosted jobs: `external-links`, `suite`, `onboarding`.
 
 | Command | Script expansion | Coverage |
 |---|---|---|
@@ -71,9 +77,9 @@ Hosted jobs: `external-links`, `suite`.
 | `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Local |
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
 | `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Hosted |
-| `npm run verify:full` | `verify:pr`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
 | `npm run verify:postgres` | `test:integration:postgres` | Local |
-| `npm run verify:pr` | `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke` | Hosted |
+| `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke` | Hosted |
 | `npm run verify:redis` | `test:integration:redis` | Local |
 | `npm run verify:unit` | `test` | Hosted |
 | `npm run verify:valkey` | `test:integration:valkey` | Local |

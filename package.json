@@ -233,9 +233,9 @@
 		"check:format": "node scripts/check-formatting.js",
 		"check:contributor-map": "node scripts/check-contributor-map.js",
 		"verify:fast": "npm run check",
-		"verify:docs": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node node_modules/vitest/vitest.mjs run test/contribution-tooling.test.js test/check-links.test.js test/documentation-contract.test.js test/external-links.test.js --no-cache",
+		"verify:docs": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node node_modules/vitest/vitest.mjs run test/contribution-tooling.test.js test/check-links.test.js test/documentation-contract.test.js test/external-links.test.js test/onboarding-contract.test.js test/onboarding-route.test.js --no-cache",
 		"verify:unit": "npm test -- --no-cache",
-		"verify:pr": "npm run verify:fast && npm run verify:unit && npm run smoke",
+		"verify:pr": "npm run preflight && npm run verify:fast && npm run verify:unit && npm run smoke",
 		"verify:redis": "npm run test:integration:redis",
 		"verify:postgres": "npm run test:integration:postgres",
 		"verify:valkey": "npm run test:integration:valkey",
@@ -244,7 +244,8 @@
 		"verify:full": "npm run verify:pr && npm run verify:redis && npm run verify:postgres && npm run verify:valkey && npm run verify:cluster && npm run verify:valkey-cluster",
 		"check:links": "node scripts/check-links.js",
 		"check:links:external": "node scripts/check-external-links.js --concurrency=4 --timeout-ms=15000 --max-redirects=6",
-		"check:documentation": "node scripts/check-documentation-contract.js"
+		"check:documentation": "node scripts/check-documentation-contract.js",
+		"preflight": "svelte-adapter-uws-preflight"
 	},
 	"engines": {
 		"node": ">=22.0.0"
