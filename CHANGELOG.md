@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Preserve shell command boundaries in the release workflow guard, reject invalid release events before Git lookup, and document revoking registry tokens after trusted publication is configured.
+
 - Document contribution ownership, dependencies and review through public issues and pull requests, with explicit clean-source verification for coordinated changes.
 
 - Verify retained alarm generation authority during recovery, including deleted and pending topics, bounded Redis hash reads and archive/restore continuity checks.

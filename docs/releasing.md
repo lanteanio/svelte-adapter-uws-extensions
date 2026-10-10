@@ -43,6 +43,8 @@ Before the first authorized release, configure the npm trusted publisher for pac
 
 Follow the [npm trusted-publisher setup](https://docs.npmjs.com/trusted-publishers/) for the account-side identity. Use public GitHub-hosted runners and npm trusted publishing/OIDC; there is no token fallback. The workflow fails closed if trust, environment approval, identity, tests, artifact transfer, or provenance publication fails. Configure trust and review the concrete candidate before pushing a release tag.
 
+After verifying trusted publication, revoke existing automation tokens with publish access and disable token publication for this package in npm. Remove registry tokens from repository and environment secrets. Keep the OIDC workflow as the sole publication identity; a local lifecycle check does not prevent someone holding a valid token from publishing unrelated bytes.
+
 ## Candidate promotion and recovery
 
 After quarantine publication, install the exact `package@version` in a clean consumer, run preflight and the affected real-backend route, inspect npm provenance/integrity against the retained evidence, and verify the coordinated ecosystem tuple. Only then may an authorized maintainer move `next` or `latest` to that immutable version. A failed candidate stays out of those channels; fix it under a new version.

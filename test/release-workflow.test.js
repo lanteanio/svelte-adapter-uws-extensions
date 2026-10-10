@@ -411,6 +411,14 @@ describe('trusted release workflow', () => {
 	});
 });
 
+it('rejects a publish command split before its quarantine and provenance flags', () => {
+	const publish = 'npm publish "release-artifacts/${{ needs.verify.outputs.filename }}"';
+	const mutated = workflow.replace('run: ' + publish + ' --tag candidate --provenance --ignore-scripts',
+		'run: |\n          ' + publish + '\n          --tag candidate --provenance --ignore-scripts');
+	expect(mutated).not.toBe(workflow);
+	expect(validateReleaseWorkflow(mutated, pkg, policy).length).toBeGreaterThan(0);
+});
+
 describe('release source identity', () => {
 	it('accepts only the canonical annotated version tag on a clean exact commit', () => {
 		expect(validateReleaseContext(context, pkg, git)).toEqual([]);
@@ -444,13 +452,15 @@ describe('release source identity', () => {
 			cwd: fileURLToPath(new URL('..', import.meta.url)),
 			encoding: 'utf8',
 			windowsHide: true,
-			env: { ...process.env, GITHUB_EVENT_NAME: 'pull_request', GITHUB_REF: '', GITHUB_REF_TYPE: '', GITHUB_REF_NAME: '', GITHUB_SHA: '' }
+			env: { ...process.env, GIT_DIR: fileURLToPath(new URL('../source/missing-release-repository', import.meta.url)), GITHUB_EVENT_NAME: 'pull_request', GITHUB_REF: '', GITHUB_REF_TYPE: '', GITHUB_REF_NAME: '', GITHUB_SHA: '' }
 		});
 		expect(result.error).toBeUndefined();
 		expect(result.status).not.toBe(0);
 		const output = (result.stderr || '') + (result.stdout || '');
 		expect(output).toContain('release event must be push');
 		expect(output).not.toContain('ERR_MODULE_NOT_FOUND');
+		expect(output).not.toContain('could not verify release lineage');
+		expect(output).not.toContain('not a git repository');
 	}, 30_000);
 
 	it('rejects a branch, retagged package version, lightweight tag, dirty tree, or wrong commit', () => {

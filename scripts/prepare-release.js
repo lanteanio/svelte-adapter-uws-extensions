@@ -14,7 +14,7 @@ const packagePath = resolve(root, 'package.json');
 const expectedRepository = 'lanteanio/svelte-adapter-uws-extensions';
 const expectedRepositoryUrl = 'git+https://github.com/lanteanio/svelte-adapter-uws-extensions.git';
 
-export function validateReleaseContext(env, pkg, git) {
+function validateReleaseRequest(env, pkg) {
 	const errors = [];
 	const expectedTag = pkg.name + '@' + pkg.version;
 	if (env.GITHUB_EVENT_NAME !== 'push') errors.push('release event must be push');
@@ -27,6 +27,11 @@ export function validateReleaseContext(env, pkg, git) {
 	if (pkg.private === true) errors.push('private package cannot use the public release workflow');
 	if (pkg.repository?.url !== expectedRepositoryUrl) errors.push('package repository URL does not match GitHub identity');
 	if (semver.valid(pkg.version) !== pkg.version) errors.push('package version is not canonical SemVer');
+	return errors;
+}
+
+export function validateReleaseContext(env, pkg, git) {
+	const errors = validateReleaseRequest(env, pkg);
 	const channel = semver.prerelease(pkg.version) === null ? 'latest' : 'next';
 	const sourceBranch = channel === 'latest' ? 'origin/main' : 'origin/dev';
 	if (pkg.publishConfig?.tag !== channel) errors.push('publishConfig tag disagrees with version channel');
@@ -74,6 +79,8 @@ function isAncestor(commit, branch) {
 
 function main() {
 	const pkg = JSON.parse(readFileSync(packagePath, 'utf8'));
+	const requestErrors = validateReleaseRequest(process.env, pkg);
+	if (requestErrors.length > 0) throw new Error(requestErrors.join('\n- '));
 	const ref = process.env.GITHUB_REF || '';
 	const sourceBranch = semver.prerelease(pkg.version) === null ? 'origin/main' : 'origin/dev';
 	const details = {

@@ -28,7 +28,7 @@ function sameKeys(value, expected) {
 }
 
 function normalized(value) {
-	return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+	return typeof value === 'string' ? value.replace(/\r\n/g, '\n').replace(/\n$/, '') : '';
 }
 
 // The one mutable script between verification and publication, so a single
@@ -50,7 +50,7 @@ const PACK_RUN = [
 	"'tarball=' + $tarball >> $env:GITHUB_OUTPUT",
 	"'filename=' + $filename >> $env:GITHUB_OUTPUT",
 	"'sha256=' + $sha256 >> $env:GITHUB_OUTPUT"
-].join(' ');
+].join('\n');
 
 // The transfer between the two jobs is the one place the verified bytes leave
 // this workflow's control. download-artifact's own digest check reports a
@@ -68,7 +68,7 @@ const DIGEST_RUN = [
 	'$actual = (Get-FileHash -LiteralPath $tarball -Algorithm SHA256).Hash.ToLowerInvariant()',
 	"if ($actual -ne $expected) { throw 'downloaded tarball is not the verified artifact' }",
 	"'verified digest ' + $actual"
-].join(' ');
+].join('\n');
 
 // Each entry is the COMPLETE step: its key inventory is closed to exactly the
 // keys named here. A step-level `if:` skips the verifier, `continue-on-error:`
