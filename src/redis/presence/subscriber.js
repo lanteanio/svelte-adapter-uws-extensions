@@ -626,6 +626,8 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 					// publicData, which drops these names too, so only a forged
 					// envelope loses anything.
 					if (ev === INTERNAL_EVENTS.JOIN || ev === INTERNAL_EVENTS.UPDATED) {
+						const localEntry = localData.get(topic)?.get(payload.key);
+						if (localEntry) localEntry.data = mergeFields(newFieldMap(), payload.data);
 						bufferDiff(topic, 'join', payload.key, mergeFields(newFieldMap(), payload.data), activePlatform);
 					} else if (ev === INTERNAL_EVENTS.LEAVE) {
 						bufferDiff(topic, 'leave', payload.key, payload.data === null ? null : mergeFields(newFieldMap(), payload.data), activePlatform);

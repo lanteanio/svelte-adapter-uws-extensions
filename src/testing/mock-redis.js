@@ -1646,7 +1646,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			if (!tex) { tex = new Map(); hashFieldExpiry.set(topicHashKey, tex); }
 			tex.set(userKeyStr, serverNowMs() + ttlMs);
 
-			return wasEmpty ? 1 : 0;
+			return [wasEmpty ? 1 : 0, existingParsed ? JSON.stringify(existingParsed) : null, shouldWrite ? 1 : 0];
 		}
 
 		// live.forget owner force-evict - removes the user's membership fields,

@@ -22,9 +22,9 @@
  * ARGV[4] = ts (numeric, for the conditional set)
  * ARGV[5] = ttlMs (numeric, for HPEXPIRE)
  *
- * Returns 1 if this was the FIRST instance to present this user on the
+ * Returns {firstInstance, previousEntry, wroteIdentity}. firstInstance is 1 if this was the FIRST instance to present this user on the
  * topic (HLEN was 0 before our HSET) -> caller broadcasts a join. Returns
- * 0 if the user was already present from another instance or another
+ * firstInstance is 0 if the user was already present from another instance or another
  * tab on this instance via an idempotent re-run.
  *
  * The conditional set on the topic hash preserves the "newer data wins"
@@ -83,7 +83,7 @@ if shouldWrite then
 end
 redis.call('HPEXPIRE', topicKey, ttlMs, 'FIELDS', 1, userKeyStr)
 
-return wasEmpty and 1 or 0
+return {wasEmpty and 1 or 0, existing or false, shouldWrite and 1 or 0}
 `;
 
 /**

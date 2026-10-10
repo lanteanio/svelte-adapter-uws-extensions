@@ -869,6 +869,7 @@ export function createPresence(client, options = {}) {
 
 			let didRedisWrite = false;
 			let isNewUser = false;
+			let identityChanged = false;
 			// `serializedData` is computed above to surface non-JSON-serializable
 			// data eagerly via the throw. The body below stringifies the full
 			// {data, ts} envelope per call since ts is fresh.
@@ -877,18 +878,18 @@ export function createPresence(client, options = {}) {
 				const ts = now();
 				const value = JSON.stringify({ data, ts });
 				try {
-					const wasEmpty = await evalCached(redis, 
+					const joinResult = await evalCached(redis, 
 						JOIN_SCRIPT, 2,
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key, value, ts, presenceTtlMs
 					);
 					didRedisWrite = true;
-					// `wasEmpty === 1` means this instance was the FIRST to
-					// present this user on the topic across the cluster; only
-					// then do we broadcast a join. Same-user-already-on-another-
-					// instance returns 0 and the script's HSET still updates
-					// the per-topic data via newer-ts-wins.
-					isNewUser = wasEmpty === 1;
+					isNewUser = joinResult[0] === 1;
+					if (!isNewUser && joinResult[2] === 1) {
+						let previous;
+						try { previous = JSON.parse(joinResult[1]); } catch { /* replace malformed data */ }
+						identityChanged = !previous || !deepEqual(previous.data, data);
+					}
 				} catch (err) {
 					b?.failure(err);
 					await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
@@ -975,7 +976,13 @@ export function createPresence(client, options = {}) {
 				topicData = new Map();
 				localData.set(topic, topicData);
 			}
-			setLocalData(topicData, key, data);
+			const entries = parseEntries(all, fieldNames.fromServer);
+			const stored = entries.get(key);
+			setLocalData(topicData, key, prevCount === 0 && stored ? stored.data : data);
+			if (stored?.fields) {
+				const committed = topicData.get(key);
+				committed.fields = Object.assign(newFieldMap(), committed.fields, stored.fields);
+			}
 			activeTopics.add(topic);
 
 			// Buffer join only after the operation is fully committed.
@@ -986,13 +993,16 @@ export function createPresence(client, options = {}) {
 			if (isNewUser) {
 				mJoins?.inc({ topic: mt(topic) });
 				bufferDiff(topic, 'join', key, data, platform);
-				await publishEvent(topic, INTERNAL_EVENTS.JOIN, { key, data });
+				await publishEvent(topic, INTERNAL_EVENTS.JOIN, { key, data: publicData(topicData.get(key)) });
+			} else if (identityChanged) {
+				const current = publicData(topicData.get(key));
+				bufferDiff(topic, 'join', key, current, platform);
+				await publishEvent(topic, INTERNAL_EVENTS.UPDATED, { key, data: current });
 			}
 
 			// Send current snapshot to this connection. Flat `{[key]: data}`
 			// shape mirrors the adapter's bundled presence plugin so a single
 			// client decoder handles both implementations.
-			const entries = parseEntries(all, fieldNames.fromServer);
 			/** @type {Record<string, Record<string, any>>} */
 			const state = Object.create(null);
 			for (const [userKey, entry] of entries) {

@@ -19,7 +19,7 @@
  * API contract end-to-end (including the Valkey version gate); this file is
  * additive and asserts properties that only show up on a real server.
  */
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { createBackendClient, resetBackendKeys, setBackendConfig } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createPresence } from '../../../src/redis/presence.js';
@@ -664,6 +664,27 @@ describeIntegration('redis presence (integration)', () => {
 
 			const parsed = JSON.parse(await client.redis.hget(topicHashKey('room'), 'alice'));
 			expect(parsed.fields).toBeUndefined();
+		});
+
+		it('relays a cross-instance identity change and retains it in heartbeats', async () => {
+			const pa = mockPlatform();
+			const pb = mockPlatform();
+			const a = makeTracker({ heartbeat: 100 });
+			const b = makeTracker({ heartbeat: 100 });
+			const alice = mockWs({ id: 'alice', name: 'Alice' });
+			await a.join(alice, 'room', pa);
+			await a.update(alice, 'room', { color: 'red' }, pa);
+			a.flushDiffs();
+			pa.reset();
+			await wait(2);
+			await b.join(mockWs({ id: 'alice', name: 'Albert' }), 'room', pb);
+			const expected = { id: 'alice', name: 'Albert', color: 'red' };
+			await vi.waitFor(() => {
+				for (const p of [pa, pb]) {
+					expect(joinDiffsFor(p, 'alice').some((f) => JSON.stringify(f.data.joins.alice) === JSON.stringify(expected))).toBe(true);
+					expect(p.published.some((f) => f.event === 'heartbeat' && f.data.alice?.name === 'Albert' && f.data.alice.color === 'red')).toBe(true);
+				}
+			});
 		});
 
 		it('JOIN_SCRIPT preserves durable fields across a newer-data overwrite (real Lua)', async () => {
