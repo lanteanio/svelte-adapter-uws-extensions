@@ -45,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reserve Redis idempotency's by-user index namespace so caller acquisitions and purges cannot corrupt erasure indexes. Preserve existing data and document recovery of historical collisions.
+
 - Allow legacy PostgreSQL replay sequence tables to reach the additive epoch migration. Add per-store schema/readiness and downgrade guidance, with real automatic/manual migration and failed-readiness regressions.
 
 - Complete the 0.5-to-0.6 migration guidance and packed PostgreSQL schema rehearsal, including the previously omitted manual task user_id column and erasure index. Document current bounds, tenant limitations and rollback steps.
