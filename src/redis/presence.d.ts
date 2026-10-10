@@ -243,6 +243,8 @@ export interface RedisPresenceTracker {
 	 * cluster (DEL the per-user hash + HDEL the topic hash + broadcast a leave).
 	 * Matches when the configured `key` field makes the presence key equal the
 	 * userId. Returns the number of topics the user was removed from.
+	 * A tenant matches only `@t/<tenantId>/` topics; null matches only topics
+	 * outside the tenant namespace.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 

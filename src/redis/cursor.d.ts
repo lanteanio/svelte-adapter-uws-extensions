@@ -197,6 +197,8 @@ export interface RedisCursorTracker {
 	 * cluster, matching the userId against `value.user` (a string equal to the
 	 * userId, or an object whose `id`/`userId` equals it). Returns cursor
 	 * entries removed.
+	 * A tenant matches only `@t/<tenantId>/` topics; null matches only topics
+	 * outside the tenant namespace.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 

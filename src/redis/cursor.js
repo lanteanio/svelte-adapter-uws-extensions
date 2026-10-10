@@ -50,6 +50,7 @@ import {
 	clearTimer,
 } from '../shared/runtime.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
+import { topicInTenant } from '../shared/tenant-topic.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError, SubscribeDeniedError } from '../shared/errors.js';
@@ -1124,8 +1125,8 @@ export function createCursor(client, options = {}) {
 		 * broadcast (via removeKeysBatch, cluster-correct) so subscribers drop the
 		 * cursor. A select() output that does not surface the userId as a string or
 		 * an id/userId field is not addressable here (document your select shape).
-		 * `tenantId` is accepted for the uniform contract; cursor keys carry no
-		 * tenant segment.
+		 * A tenant matches only `@t/<tenantId>/` topics; null matches only
+		 * topics outside the tenant namespace.
 		 * @param {string | null} tenantId
 		 * @param {string} userId
 		 * @returns {Promise<number>} cursor entries removed
@@ -1139,6 +1140,7 @@ export function createCursor(client, options = {}) {
 			for (const fullKey of keys) {
 				if (!fullKey.startsWith(prefix) || !fullKey.endsWith('}')) continue;
 				const topic = fullKey.slice(prefix.length, fullKey.length - 1);
+				if (!topicInTenant(tenantId, topic)) continue;
 				let all;
 				try { all = await redis.hgetall(fullKey); } catch { continue; }
 				if (!all) continue;

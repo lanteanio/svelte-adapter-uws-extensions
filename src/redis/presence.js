@@ -55,6 +55,7 @@ import {
 } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
+import { topicInTenant } from '../shared/tenant-topic.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -1332,8 +1333,8 @@ export function createPresence(client, options = {}) {
 		 *
 		 * Matches when the configured `keyField` makes the presence key equal the
 		 * userId (the default `id` case); a custom key that is not the userId is
-		 * not addressable here. Presence keys are not tenant-segmented, so
-		 * `tenantId` is accepted for the uniform store contract but does not scope.
+		 * not addressable here. A tenant matches only `@t/<tenantId>/` topics;
+		 * null matches only topics outside the tenant namespace.
 		 * An actively-present forgotten user on a PEER instance may keep a stale
 		 * in-memory roster entry until they disconnect; the durable Redis state is
 		 * erased and a leave is broadcast.
@@ -1368,6 +1369,7 @@ export function createPresence(client, options = {}) {
 			for (const k of keys) {
 				if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
 				const topic = k.slice(prefix.length, k.length - suffix.length);
+				if (!topicInTenant(tenantId, topic)) continue;
 				try {
 					// A refused DEL or HDEL resolves as a per-command error; the user's
 					// data is still there, so the topic is not counted as erased.
