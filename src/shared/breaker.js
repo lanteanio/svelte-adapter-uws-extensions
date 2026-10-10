@@ -236,7 +236,7 @@ export function createCircuitBreaker(options = {}) {
 	};
 	probeCancellation.set(breaker, (key) => {
 		const state = stateFor(key);
-		if (state.state !== 'probing') return noCancellation;
+		if (state.state !== 'probing') return undefined;
 		const generation = state.generation;
 		let released = false;
 		return () => {
