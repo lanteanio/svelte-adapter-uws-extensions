@@ -21,12 +21,10 @@
  *   )
  *   + index on (topic) and (failed_at)
  *
- * The collection is bounded by `max` (the oldest captured row, by id, is evicted
- * first) and an optional `ttlMs`. Both are enforced on write - a webhook DLQ is
- * low-volume, so the per-add trim is cheap and a no-op until over the cap - and
- * the TTL is additionally swept by a periodic timer so an idle queue self-cleans
- * within `ttlMs + cleanupInterval` instead of retaining payloads until the next
- * failure.
+ * Retention uses `max` (oldest captured id first) and optional `ttlMs`.
+ * Writes and periodic maintenance share bounded cleanup transactions; large
+ * backlogs drain over multiple passes. Reads exclude expired records even while
+ * physical deletion is pending. Replica maintenance uses a per-table lock.
  *
  * Retention clocks off the DATABASE (`now()`), never the caller-supplied
  * `failedAt`: a skewed or hostile producer stamp can then neither mass-evict
@@ -38,19 +36,18 @@
 
 import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
-import { setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { scheduleCleanup } from './_cleanup.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
 
 /**
  * @typedef {Object} PgDeadLetterOptions
  * @property {string} [table='svti_dead_letter'] - Table name.
- * @property {number} [max=1000] - Max retained records (oldest evicted first).
+ * @property {number} [max=1000] - Retention target (oldest ids evicted in bounded passes).
  * @property {number} [ttlMs=0] - Drop records older than this many ms (0 = no TTL).
- *   Enforced on each write against the database clock, plus a periodic sweep so
- *   an idle queue still self-cleans.
+ *   Reads exclude expired rows; bounded write-time and idle cleanup delete them.
  * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
- * @property {number} [cleanupInterval=60000] - How often the TTL sweep runs (ms).
- *   0 disables the timer (write-time enforcement remains). Ignored when `ttlMs` is 0.
+ * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded
+ *   cleanup passes (ms). 0 disables the timer; write-time cleanup remains.
  * @property {object} [breaker] - Circuit breaker for fault isolation.
  * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
  */
@@ -128,28 +125,43 @@ export function createDeadLetter(client, options = {}) {
 		};
 	}
 
-	let cleanupTimer = null;
-	let cleanupRunning = false;
-	if (ttlMs > 0 && cleanupInterval > 0) {
-		cleanupTimer = setIntervalTimer(async () => {
-			if (cleanupRunning) return;
-			if (b && !b.isHealthy) return;
-			cleanupRunning = true;
-			try {
-				await ensureTable();
-				await client.query(
-					`DELETE FROM ${table} WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1`,
-					[ttlMs]
-				);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-			} finally {
-				cleanupRunning = false;
-			}
-		}, cleanupInterval);
-		if (cleanupTimer.unref) cleanupTimer.unref();
+	async function trimExpired(budget) {
+		if (ttlMs === 0) return;
+		while (budget.available) {
+			const limit = budget.limit;
+			const count = await budget.remove(`WITH expired AS (
+				SELECT ${pkCol} FROM ${table}
+				WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1
+				ORDER BY failed_at, ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${table} d USING expired WHERE d.${pkCol} = expired.${pkCol}`, [ttlMs, limit]);
+			if (count < limit) break;
+		}
 	}
+	async function trimSize(budget) {
+		while (budget.available) {
+			const limit = budget.limit;
+			const count = await budget.remove(`WITH excess AS (
+				SELECT ${pkCol} FROM ${table}
+				WHERE ${pkCol} <= (SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} DESC OFFSET $1 LIMIT 1)
+				ORDER BY ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${table} d USING excess WHERE d.${pkCol} = excess.${pkCol}`, [max, limit]);
+			if (count < limit) break;
+		}
+	}
+	let ttlFirst = true;
+	const cleanup = scheduleCleanup({
+		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
+		ready: ensureTable, healthy: () => !b || b.isHealthy,
+		success: () => b?.success(), failure: error => b?.failure(error),
+		async work(budget) {
+			const first = ttlFirst ? trimExpired : trimSize;
+			const second = ttlFirst ? trimSize : trimExpired;
+			ttlFirst = !ttlFirst;
+			await first(budget);
+			await second(budget);
+		}
+	});
+	const liveRows = ttlMs > 0 ? `failed_at >= (extract(epoch from now()) * 1000)::bigint - ${ttlMs}` : 'TRUE';
 
 	return {
 		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
@@ -177,19 +189,7 @@ export function createDeadLetter(client, options = {}) {
 			// from here: a failed size/TTL delete - or an open breaker - must not
 			// reject an add whose record already persisted, or the caller retries
 			// and double-captures. Mirrors the Redis backend's evict().catch().
-			// Size trim: keep the newest `max` rows (by id). The OFFSET subquery
-			// returns the (max+1)-th newest id, or NULL when under the cap (a no-op).
-			await withBreaker(b, () => client.query(
-				`DELETE FROM ${table} WHERE ${pkCol} <= (SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} DESC OFFSET $1 LIMIT 1)`,
-				[max]
-			)).catch(() => { /* capture already persisted */ });
-			// TTL sweep against the database clock, never the producer stamp.
-			if (ttlMs > 0) {
-				await withBreaker(b, () => client.query(
-					`DELETE FROM ${table} WHERE failed_at < (extract(epoch from now()) * 1000)::bigint - $1`,
-					[ttlMs]
-				)).catch(() => { /* capture already persisted */ });
-			}
+			await cleanup.run().catch(() => { /* capture already persisted */ });
 			mAdded?.inc({ topic: mt(rec.topic) });
 			return String(res.rows[0][pkCol]);
 		},
@@ -197,7 +197,7 @@ export function createDeadLetter(client, options = {}) {
 		/** @param {string} id */
 		async get(id) {
 			await ensureTable();
-			const res = await withBreaker(b, () => client.query(`SELECT * FROM ${table} WHERE ${pkCol} = $1`, [id]));
+			const res = await withBreaker(b, () => client.query(`SELECT * FROM ${table} WHERE ${pkCol} = $1 AND ${liveRows}`, [id]));
 			return rowToRecord(res.rows[0]);
 		},
 
@@ -212,8 +212,8 @@ export function createDeadLetter(client, options = {}) {
 		async count(filter) {
 			await ensureTable();
 			const res = (filter && filter.topic !== undefined)
-				? await withBreaker(b, () => client.query(`SELECT count(*)::int AS n FROM ${table} WHERE topic = $1`, [filter.topic]))
-				: await withBreaker(b, () => client.query(`SELECT count(*)::int AS n FROM ${table}`));
+				? await withBreaker(b, () => client.query(`SELECT count(*)::int AS n FROM ${table} WHERE topic = $1 AND ${liveRows}`, [filter.topic]))
+				: await withBreaker(b, () => client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${liveRows}`));
 			return res.rows[0].n;
 		},
 
@@ -222,18 +222,18 @@ export function createDeadLetter(client, options = {}) {
 			await ensureTable();
 			const limit = Number.isInteger(filter.limit) && filter.limit > 0 ? filter.limit : 100;
 			const res = (filter.topic !== undefined)
-				? await withBreaker(b, () => client.query(`SELECT * FROM ${table} WHERE topic = $1 ORDER BY ${pkCol} DESC LIMIT $2`, [filter.topic, limit]))
-				: await withBreaker(b, () => client.query(`SELECT * FROM ${table} ORDER BY ${pkCol} DESC LIMIT $1`, [limit]));
+				? await withBreaker(b, () => client.query(`SELECT * FROM ${table} WHERE topic = $1 AND ${liveRows} ORDER BY ${pkCol} DESC LIMIT $2`, [filter.topic, limit]))
+				: await withBreaker(b, () => client.query(`SELECT * FROM ${table} WHERE ${liveRows} ORDER BY ${pkCol} DESC LIMIT $1`, [limit]));
 			return res.rows.map(rowToRecord);
 		},
 
 		async summary() {
 			await ensureTable();
 			const totals = await withBreaker(b, () => client.query(
-				`SELECT count(*)::int AS total, min(failed_at) AS oldest, max(failed_at) AS newest FROM ${table}`
+				`SELECT count(*)::int AS total, min(failed_at) AS oldest, max(failed_at) AS newest FROM ${table} WHERE ${liveRows}`
 			));
 			const byTopicRows = await withBreaker(b, () => client.query(
-				`SELECT topic, count(*)::int AS n FROM ${table} GROUP BY topic`
+				`SELECT topic, count(*)::int AS n FROM ${table} WHERE ${liveRows} GROUP BY topic`
 			));
 			/** @type {Record<string, number>} */
 			const byTopic = {};
@@ -273,12 +273,9 @@ export function createDeadLetter(client, options = {}) {
 			await withBreaker(b, () => client.query(`DELETE FROM ${table}`));
 		},
 
-		/** Stop the TTL sweep timer. */
+		/** Stop retention maintenance. */
 		destroy() {
-			if (cleanupTimer) {
-				clearIntervalTimer(cleanupTimer);
-				cleanupTimer = null;
-			}
+			cleanup.stop();
 		}
 	};
 }

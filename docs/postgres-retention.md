@@ -1,6 +1,6 @@
 # PostgreSQL retention cleanup
 
-Replay, idempotency and task stores run bounded background maintenance after
+Replay, idempotency, task and dead-letter stores run bounded background maintenance after
 schema initialization. `cleanupInterval` is the maximum jitter delay in
 milliseconds between settled passes, including the first pass. Each delay is
 chosen independently between 1 ms and that maximum; `0` disables the timer.
@@ -35,6 +35,30 @@ cleanup alternate priority. Larger backlogs drain over several passes; cleanup
 is not a hard physical-storage cap or an exact expiry alarm. Replay publish-time
 trimming and logical read-expiry checks keep their existing behavior.
 
+Dead-letter writes use the same bounded maintenance as idle passes. Concurrent
+writes share local cleanup ownership. Writes arriving during a leading pass
+queue at most one trailing bounded pass, without extending the original write's
+wait or adding recurring timers. `destroy()` cancels a queued trailing pass.
+TTL selection uses `failed_at`; size cleanup retains the newest `max`
+ids. The two policies alternate priority. `get`, `count`, `list` and `summary`
+exclude expired rows using database time, including when physical cleanup has
+not finished. The idle timer runs even when TTL is disabled so an oversized
+queue can drain after writes stop. An acknowledged INSERT keeps its returned
+id when cleanup fails, times out or loses ownership to another replica.
+With `cleanupInterval: 0`, residual backlog needs another write to trigger
+cleanup, including writes that arrive during the trailing pass. `max` is a
+retention target, not a strict post-write physical row count.
+
+Bounded transactions add round trips to isolated dead-letter captures. A local
+PostgreSQL 16 Docker benchmark on 2026-10-10 used a 100-record target, a one-hour
+TTL and five alternating samples of 250 captures. Median elapsed time per
+sequential capture was 2.40 ms with unbounded deletes and 6.50 ms with bounded
+transactions. At eight concurrent captures, elapsed time per capture improved
+from 0.429 ms to 0.368 ms through coalescing; median sample p95 latency improved
+from 3.69 ms to 2.12 ms. This trades 4.1 ms of sequential capture latency for
+bounded housekeeping on the failed-delivery path; it is not a latency-neutral
+change or a production capacity estimate.
+
 With automatic migration disabled, add the replay TTL index to the configured
 replay table before enabling maintenance (the default name is shown):
 
@@ -50,7 +74,7 @@ Pass the same metrics registry through each store's existing `metrics` option:
 | `postgres_cleanup_rows_total` | counter | `store` | Deleted rows after acknowledged COMMIT. |
 | `postgres_cleanup_duration_seconds` | histogram | `store` | Whole maintenance tick duration, including initialization and checkout. |
 
-`store` is one of `replay`, `idempotency` or `tasks`; table names and payloads are
+`store` is one of `replay`, `idempotency`, `tasks` or `dead-letter`; table names and payloads are
 never metric labels. A lost COMMIT reply can leave an unknown outcome, so the row
 counter is an acknowledged-deletion count. Investigate repeated errors, sustained
 budget exhaustion and growing table size together. Contention alone is expected

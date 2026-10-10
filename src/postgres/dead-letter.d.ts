@@ -5,19 +5,19 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export interface PgDeadLetterOptions {
 	/** Table name. @default 'svti_dead_letter' */
 	table?: string;
-	/** Max retained records (oldest evicted first). @default 1000 */
+	/** Retention target; oldest ids are evicted in bounded passes. @default 1000 */
 	max?: number;
 	/**
-	 * Drop records older than this many ms (0 = no TTL). Enforced on each write
-	 * against the database clock, plus a periodic sweep so an idle queue still
-	 * self-cleans. @default 0
+	 * Drop records older than this many ms (0 = no TTL). Reads exclude expired
+	 * rows using the database clock. Bounded cleanup deletes them after writes
+	 * and while idle. @default 0
 	 */
 	ttlMs?: number;
 	/** Auto-create the table on first use. @default true */
 	autoMigrate?: boolean;
 	/**
-	 * How often the TTL sweep runs (ms). 0 disables the timer (write-time
-	 * enforcement remains). Ignored when `ttlMs` is 0. @default 60000
+	 * Maximum jitter delay between bounded cleanup passes (ms). 0 disables
+	 * the timer; write-time cleanup remains. @default 60000
 	 */
 	cleanupInterval?: number;
 	/** Circuit breaker for fault isolation. */
@@ -61,7 +61,7 @@ export interface PgDeadLetterStore {
 	/** Right-to-erasure: delete every record stamped with a user's id (needs `forgetUserId`). */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
-	/** Stop the TTL sweep timer. */
+	/** Stop retention maintenance. */
 	destroy(): void;
 }
 

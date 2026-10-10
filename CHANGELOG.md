@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound PostgreSQL dead-letter cleanup after writes and while idle, preserve committed capture receipts through cleanup failures, and exclude expired records from reads while physical backlogs drain.
+
 - Document Redis and PostgreSQL credential overlap, fresh-connection verification, client draining, rollback and independent emergency access.
 
 - Bound PostgreSQL retention by rows, queries and transaction deadlines; coordinate replicas with transaction locks, traverse replay topics fairly, and expose aggregate cleanup outcomes. Add the replay expiry index to automatic and manual schemas.

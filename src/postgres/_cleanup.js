@@ -84,7 +84,7 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 	}
 }
 
-export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work }) {
+export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work, coalesce = false }) {
 	if (!Number.isInteger(interval) || interval < 0 || interval > 2147483647) {
 		throw new Error('postgres cleanup: cleanupInterval must be an integer between 0 and 2147483647');
 	}
@@ -93,14 +93,22 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 	const duration = metrics?.histogram('postgres_cleanup_duration_seconds', 'PostgreSQL retention pass duration in seconds', ['store']);
 	let stopped = false;
 	let timer;
+	let trailingTimer;
+	let trailingRequested = false;
 	let running = false;
 	function schedule() {
 		if (stopped || interval === 0) return;
 		timer = setTimer(tick, Math.max(1, Math.ceil(randomFloat() * interval)));
 		timer?.unref?.();
 	}
-	async function tick() {
-		if (stopped || running) return;
+	async function run(trailing = false) {
+		if (stopped) return;
+		if (running) {
+			if (coalesce) trailingRequested = true;
+			return;
+		}
+		// A new leading pass also covers writes awaiting the queued pass.
+		if (!trailing) { clearTimer(trailingTimer); trailingTimer = undefined; }
 		running = true;
 		const start = monotonicNow();
 		try {
@@ -117,9 +125,19 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 		} finally {
 			duration?.observe({ store: kind }, (monotonicNow() - start) / 1000);
 			running = false;
-			schedule();
+			// A leading pass may queue one extra bounded pass. Writes during that
+			// trailing pass cannot extend the chain or the original caller's wait.
+			if (!stopped && !trailing && trailingRequested) {
+				trailingTimer = setTimer(() => { trailingTimer = undefined; return run(true); }, 1);
+				trailingTimer?.unref?.();
+			}
+			trailingRequested = false;
 		}
 	}
+	async function tick() {
+		await run();
+		schedule();
+	}
 	schedule();
-	return { tick, stop() { stopped = true; clearTimer(timer); } };
+	return { tick, run, stop() { stopped = true; clearTimer(timer); clearTimer(trailingTimer); } };
 }

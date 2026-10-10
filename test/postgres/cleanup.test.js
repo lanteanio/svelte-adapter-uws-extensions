@@ -62,6 +62,41 @@ describe('bounded PostgreSQL maintenance', () => {
 		cleanup.stop(); const calls = client.connect.mock.calls.length; await scheduled.at(-1).cb(); expect(client.connect).toHaveBeenCalledTimes(calls);
 		expect(cleared).toContain(scheduled.at(-1));
 	});
+	it('write-triggered maintenance does not create extra timers and shares local ownership', async () => {
+		const scheduled = []; const { client } = checkout(); let finish;
+		const pending = new Promise(resolve => { finish = resolve; });
+		const work = vi.fn(() => pending);
+		setRuntimeEnv({ timers: { set: (cb, ms) => { const timer = { cb, ms }; scheduled.push(timer); return timer; }, clear() {} } });
+		const cleanup = scheduleCleanup({ client, table: 'cache', kind: 'dead-letter', interval: 1000, ready: async () => {}, work });
+		try {
+			const first = cleanup.run();
+			await vi.waitFor(() => expect(work).toHaveBeenCalledTimes(1));
+			await cleanup.run();
+			expect(client.connect).toHaveBeenCalledTimes(1);
+			finish(); await first;
+			const timers = scheduled.length;
+			await cleanup.run();
+			// Only the checkout deadline is added, not another recurring timer.
+			expect(scheduled).toHaveLength(timers + 1);
+		} finally { finish(); cleanup.stop(); }
+	});
+	it('coalesces only one trailing pass and stop cancels a queued pass', async () => {
+		vi.useFakeTimers();
+		const { client } = checkout(); let cleanup;
+		const work = vi.fn(async () => { await cleanup.run(); });
+		cleanup = scheduleCleanup({ client, table: 'cache', kind: 'dead-letter', interval: 0, coalesce: true, ready: async () => {}, work });
+		try {
+			await cleanup.run();
+			expect(work).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(work).toHaveBeenCalledTimes(2);
+			expect(vi.getTimerCount()).toBe(0);
+			await cleanup.run();
+			expect(work).toHaveBeenCalledTimes(3);
+			cleanup.stop(); await vi.advanceTimersByTimeAsync(1000);
+			expect(work).toHaveBeenCalledTimes(3);
+		} finally { cleanup.stop(); }
+	});
 	it('the public idempotency store retains live entries while draining expired rows over multiple bounded ticks', async () => {
 		let tick; setRuntimeEnv({ rng: { float: () => 1 }, timers: { set: cb => { tick = cb; return {}; }, clear: () => {} } });
 		const client = mockPgClient(); const store = createIdempotencyStore(client, { cleanupInterval: 1000 }); await store.ready();
