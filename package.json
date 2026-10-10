@@ -215,7 +215,7 @@
 		"CHANGELOG.md"
 	],
 	"scripts": {
-		"check": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js",
+		"check": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js && npm run check:publish",
 		"check:errors": "node scripts/generate-error-reference.js --check",
 		"pretest": "npm run check",
 		"test": "vitest run",
@@ -249,7 +249,8 @@
 		"check:lockfile": "node scripts/check-lockfile.js",
 		"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit",
 		"prepublishOnly": "npm run check",
-		"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration"
+		"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
+		"check:publish": "publint && attw --pack . --profile esm-only"
 	},
 	"engines": {
 		"node": ">=22.0.0"
@@ -265,9 +266,11 @@
 		"pg": "^8.0.0"
 	},
 	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.5",
 		"acorn": "^8.16.0",
 		"markdown-it": "15.0.2",
 		"parse5": "8.0.0",
+		"publint": "^0.3.22",
 		"semver": "7.7.4",
 		"svelte-adapter-uws": "0.6.0-next.95",
 		"typescript": "5.9.3",

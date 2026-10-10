@@ -120,7 +120,7 @@ const PUBLISH_STEPS = [
 // they run BEFORE the verification steps, where their effects are still
 // tested.
 const EXPECTED_SCRIPTS = {
-	"check": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js",
+	"check": "npm run check:documentation && npm run check:links && npm run check:format && npm run check:contributor-map && node scripts/generate-error-reference.js --check && node scripts/check-types.js && node scripts/check-diagnostic-attribution.js && node scripts/check-console-index.js && node scripts/check-determinism.js && node scripts/check-slugs.js && node scripts/check-vocabulary.js && node --no-warnings --experimental-vm-modules scripts/check-syntax.js && node scripts/check-release-workflow.js && npm run check:publish",
 	"check:errors": "node scripts/generate-error-reference.js --check",
 	"pretest": "npm run check",
 	"test": "vitest run",
@@ -154,7 +154,8 @@ const EXPECTED_SCRIPTS = {
 	"check:lockfile": "node scripts/check-lockfile.js",
 	"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit",
 	"prepublishOnly": "npm run check",
-	"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration"
+	"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
+	"check:publish": "publint && attw --pack . --profile esm-only"
 };
 
 function checkSteps(errors, jobName, job, expected) {

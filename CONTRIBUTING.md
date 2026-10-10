@@ -78,12 +78,12 @@ Hosted jobs: `dependencies`, `external-links`, `verify`, `publish`, `suite`, `on
 | `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Local |
 | `npm run verify:dependencies` | `check:lockfile` | Hosted |
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
-| `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Hosted |
-| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish` | Hosted |
+| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
 | `npm run verify:postgres` | `test:integration:postgres` | Local |
-| `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke` | Hosted |
+| `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke` | Hosted |
 | `npm run verify:redis` | `test:integration:redis` | Local |
-| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres` | Hosted |
+| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres` | Hosted |
 | `npm run verify:unit` | `test` | Hosted |
 | `npm run verify:valkey` | `test:integration:valkey` | Local |
 | `npm run verify:valkey-cluster` | `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
