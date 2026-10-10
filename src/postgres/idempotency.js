@@ -181,8 +181,18 @@ export function createIdempotencyStore(client, options = {}) {
 		if (cleanupTimer.unref) cleanupTimer.unref();
 	}
 
-	function commitFor(idempotencyKey, ownerToken) {
+	function commitFor(idempotencyKey, ownerToken, resultTtl) {
 		return async function commit(result) {
+			if (resultTtl === 0) {
+				const res = await withBreaker(b, () => client.query({
+					name: 'idem_discard_' + table,
+					text: `DELETE FROM ${table} WHERE svti_idempotency_key = $1 AND owner_token = $2`,
+					values: [idempotencyKey, ownerToken]
+				}));
+				if (!res || res.rowCount === 0) throw new IdempotencyLeaseLostError(idempotencyKey);
+				mCommits?.inc();
+				return;
+			}
 			const payload = JSON.stringify(result === undefined ? null : result);
 			const bytes = Buffer.byteLength(payload);
 			if (bytes > maxResultBytes) {
@@ -201,7 +211,7 @@ export function createIdempotencyStore(client, options = {}) {
 				              result = $2::jsonb,
 				              expires_at = now() + ($3 || ' seconds')::interval
 				        WHERE svti_idempotency_key = $1 AND owner_token = $4`,
-				values: [idempotencyKey, payload, ttl, ownerToken]
+				values: [idempotencyKey, payload, resultTtl, ownerToken]
 			}));
 			if (!res || res.rowCount === 0) {
 				throw new IdempotencyLeaseLostError(idempotencyKey);
@@ -272,12 +282,13 @@ export function createIdempotencyStore(client, options = {}) {
 	}
 
 	return {
-		async acquire(idempotencyKey, _ttlSec, meta) {
+		async acquire(idempotencyKey, ttlSec, meta) {
 			validateKey(idempotencyKey);
-			// Right-to-erasure: the realtime idempotent wrapper passes the raw
-			// (user, tenant) so the row records who it belongs to. The 2nd arg is
-			// the per-call ttl the in-memory store honours; Postgres uses the
-			// store-level ttl, so it is ignored here.
+			const resultTtl = ttlSec === undefined ? ttl : ttlSec;
+			if (!Number.isInteger(resultTtl) || resultTtl < 0) {
+				throw new Error('postgres idempotency: ttlSec must be a non-negative integer');
+			}
+			// The caller's user and tenant identify the row for erasure.
 			const userId = meta && typeof meta.user === 'string' ? meta.user : null;
 			const tenantId = meta && typeof meta.tenant === 'string' ? meta.tenant : null;
 
@@ -304,7 +315,7 @@ export function createIdempotencyStore(client, options = {}) {
 				mAcquired?.inc();
 				return {
 					acquired: true,
-					commit: commitFor(idempotencyKey, outcome.ownerToken),
+					commit: commitFor(idempotencyKey, outcome.ownerToken, resultTtl),
 					abort: abortFor(idempotencyKey, outcome.ownerToken)
 				};
 			}

@@ -84,6 +84,7 @@ export interface RedisIdempotencyStore {
 	 * optional `meta` records the committing user for `live.forget` right-to-
 	 * erasure (the realtime idempotent wrapper supplies it).
 	 */
+	/** ttlSec overrides the store default; zero releases the lease without retaining a result. Must be a non-negative integer. */
 	acquire<T = unknown>(key: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. */
 	purge(key: string): Promise<void>;

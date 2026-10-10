@@ -28,6 +28,7 @@ export interface PgIdempotencyStore {
 	 * shapes. The optional `meta` records the committing user (denormalized into
 	 * user_id/tenant_id columns) for `live.forget` right-to-erasure.
 	 */
+	/** ttlSec overrides the store default; zero releases the lease without retaining a result. Must be a non-negative integer. */
 	acquire<T = unknown>(idempotencyKey: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. */
 	purge(idempotencyKey: string): Promise<void>;

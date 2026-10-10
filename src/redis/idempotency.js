@@ -235,8 +235,12 @@ export function createIdempotencyStore(client, options = {}) {
 	}
 
 	return {
-		async acquire(userKey, _ttlSec, meta) {
+		async acquire(userKey, ttlSec, meta) {
 			validateKey(userKey);
+			const resultTtl = ttlSec === undefined ? ttl : ttlSec;
+			if (!Number.isInteger(resultTtl) || resultTtl < 0) {
+				throw new Error('redis idempotency: ttlSec must be a non-negative integer');
+			}
 			const k = fullKey(userKey);
 			// The realtime idempotent wrapper passes the raw (user, tenant) so this
 			// committed key can be recorded under the user for right-to-erasure.
@@ -267,6 +271,12 @@ export function createIdempotencyStore(client, options = {}) {
 				return {
 					acquired: true,
 					async commit(result) {
+						if (resultTtl === 0) {
+							const won = await withBreaker(b, () => evalCached(redis, ABORT_SCRIPT, 1, k, ownerToken));
+							if (won !== 1) throw new IdempotencyLeaseLostError(userKey);
+							mCommits?.inc();
+							return;
+						}
 						const payload = JSON.stringify(result === undefined ? null : result);
 						const bytes = Buffer.byteLength(payload);
 						if (bytes > maxResultBytes) {
@@ -287,7 +297,7 @@ export function createIdempotencyStore(client, options = {}) {
 						// successor re-acquired, the token no longer matches and the
 						// script leaves their slot untouched (returns 0).
 						const won = await withBreaker(b, () =>
-							evalCached(redis, COMMIT_SCRIPT, 1, k, ownerToken, payload, ttl)
+							evalCached(redis, COMMIT_SCRIPT, 1, k, ownerToken, payload, resultTtl)
 						);
 						if (won !== 1) {
 							// The pending slot expired and a successor re-acquired it
@@ -316,8 +326,8 @@ export function createIdempotencyStore(client, options = {}) {
 							// entry's lifetime; the whole-key fallback slides instead,
 							// so on old servers a busy user's index is bounded by their
 							// LAST commit rather than per entry.
-							if (hexOk) tx.hpexpire(idxKey, ttl * 1000, 'FIELDS', 1, k);
-							else tx.expire(idxKey, ttl);
+							if (hexOk) tx.hpexpire(idxKey, resultTtl * 1000, 'FIELDS', 1, k);
+							else tx.expire(idxKey, resultTtl);
 							await tx.exec().catch(() => { /* index best-effort; the cache entry is committed */ });
 						}
 						mCommits?.inc();

@@ -2092,6 +2092,9 @@ If your handler needs durable result tracking and crash recovery, and its effect
 
 ## Idempotency store
 
+Both durable stores honor `acquire(key, ttlSec)`: omit `ttlSec` to use the store's default retention, or pass a non-negative integer number of seconds. Zero retains the pending lease while work runs, then `commit()` releases it without caching the result. A stale owner cannot release or overwrite its successor's lease.
+
+
 Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Use it for HTTP/RPC retries, webhook redeliveries, and any handler where the caller may legitimately repeat a request that must execute at most once - charge-customer, send-email, create-order.
 
 The store exposes three states via `acquire(key)`:
