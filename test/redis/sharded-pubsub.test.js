@@ -1149,3 +1149,92 @@ describe('redis sharded bus', () => {
 		});
 	});
 });
+
+
+describe.each(['subscribe', 'subscribeBatch'])('failed sharded %s ownership', (hook) => {
+	it('allows retry and does not unfollow another socket after failure', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		let subscriber;
+		const duplicate = client.redis.duplicate.bind(client.redis);
+		client.redis.duplicate = (...args) => {
+			subscriber = duplicate(...args);
+			return subscriber;
+		};
+		const bus = createShardedBus(client);
+		await bus.activate(platform);
+		const subscribe = subscriber.ssubscribe.bind(subscriber);
+		const a = {}, b = {};
+		const follow = (ws) => bus.hooks[hook](ws, hook === 'subscribe' ? 'chat' : ['chat']);
+		try {
+			subscriber.ssubscribe = async () => { throw new Error('offline'); };
+			await expect(follow(a)).rejects.toThrow('offline');
+			subscriber.ssubscribe = subscribe;
+			await follow(b);
+			await bus.hooks.close(a);
+			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+			expect(platform.published).toHaveLength(1);
+			await follow(a);
+			await bus.hooks.close(b);
+			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+			expect(platform.published).toHaveLength(2);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+});
+
+describe.each(['follow', 'followBatch'])('sharded %s breaker admission', (method) => {
+	it('rolls back a denied guard without recording another failure', async () => {
+		const client = mockRedisClient();
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const bus = createShardedBus(client, { breaker });
+		const platform = mockPlatform();
+		await bus.activate(platform);
+		const follow = () => bus[method](method === 'follow' ? 'chat' : ['chat']);
+		try {
+			breaker.failure(new Error('offline'));
+			const failure = vi.spyOn(breaker, 'failure');
+			await expect(follow()).rejects.toThrow();
+			expect(failure).not.toHaveBeenCalled();
+			breaker.reset();
+			await follow();
+			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+			expect(platform.published).toHaveLength(1);
+			await bus.unfollow('chat');
+			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+			expect(platform.published).toHaveLength(1);
+		} finally {
+			await bus.deactivate();
+			breaker.destroy();
+		}
+	});
+
+	it('returns a cancelled probe when the bus closes during subscribe', async () => {
+		const client = mockRedisClient();
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		let resolveSubscribe;
+		const duplicate = client.redis.duplicate.bind(client.redis);
+		client.redis.duplicate = (...args) => {
+			const sub = duplicate(...args);
+			sub.ssubscribe = () => new Promise((resolve) => { resolveSubscribe = resolve; });
+			return sub;
+		};
+		const bus = createShardedBus(client, { breaker });
+		await bus.activate(mockPlatform());
+		try {
+			breaker.failure(new Error('offline'));
+			await settle();
+			const pending = bus[method](method === 'follow' ? 'chat' : ['chat']);
+			const rejected = expect(pending).rejects.toThrow('closed during follow');
+			await bus.deactivate();
+			resolveSubscribe(1);
+			await rejected;
+			expect(breaker.state).toBe('probing');
+			expect(() => breaker.guard()).not.toThrow();
+		} finally {
+			await bus.deactivate();
+			breaker.destroy();
+		}
+	});
+});

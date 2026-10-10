@@ -806,6 +806,17 @@ describe('circuit breaker', () => {
 
 
 describe('cancelled breaker admissions', () => {
+	it('keeps healthy and absent breakers usable when work is cancelled', () => {
+		const breaker = createCircuitBreaker();
+		const cancel = guardBreaker(breaker);
+		cancel();
+		cancel();
+		expect(breaker.state).toBe('healthy');
+		expect(() => breaker.guard()).not.toThrow();
+		expect(() => guardBreaker(undefined)()).not.toThrow();
+		breaker.destroy();
+	});
+
 	it('returns one probe without giving a backend verdict', async () => {
 		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
 		try {

@@ -1,3 +1,4 @@
+import { guardBreaker } from '../shared/breaker-admission.js';
 /**
  * Sharded Redis pub/sub bus for svelte-adapter-uws.
  *
@@ -933,16 +934,23 @@ export function createShardedBus(client, options = {}) {
 		if (chCount > 0) return;
 
 		subscribedChannels.add(channel);
-		b?.guard();
+		const generation = subGeneration;
+		let cancel;
 		try {
+			cancel = guardBreaker(b);
 			await subSubscribe([channel]);
+			if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
 			b?.success();
 			mFollows?.inc();
 		} catch (err) {
-			b?.failure(err);
+			if (generation !== subGeneration) {
+				cancel?.();
+				throw err;
+			}
+			if (cancel) b?.failure(err);
 			subscribedChannels.delete(channel);
 			channelRefcounts.delete(channel);
-			followCounts.set(topic, count);
+			followCounts.delete(topic);
 			throw err;
 		}
 	}
@@ -1002,18 +1010,25 @@ export function createShardedBus(client, options = {}) {
 
 		if (channelsToSubscribe.length === 0) return;
 
-		b?.guard();
+		const generation = subGeneration;
+		let cancel;
 		try {
+			cancel = guardBreaker(b);
 			// ioredis accepts multiple channels in one ssubscribe call; this
 			// collapses N new-channel subscribes into one round trip when the
 			// caller's topics span multiple shards.
 			await subSubscribe(channelsToSubscribe);
+			if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
 			// A channel unfollowed while the batch was subscribing stays out.
 			for (const ch of channelsToSubscribe) if (channelRefcounts.has(ch)) subscribedChannels.add(ch);
 			b?.success();
 			mFollows?.inc(channelsToSubscribe.length);
 		} catch (err) {
-			b?.failure(err);
+			if (generation !== subGeneration) {
+				cancel?.();
+				throw err;
+			}
+			if (cancel) b?.failure(err);
 			// Roll back every refcount bump we did under this call so the
 			// caller can retry without leaking stale counts.
 			for (const topic of touchedTopics) {
@@ -1415,7 +1430,13 @@ export function createShardedBus(client, options = {}) {
 				}
 				if (topics.has(topic)) return;
 				topics.add(topic);
-				await follow(topic);
+				try {
+					await follow(topic);
+				} catch (err) {
+					topics.delete(topic);
+					if (topics.size === 0 && wsFollows.get(ws) === topics) wsFollows.delete(ws);
+					throw err;
+				}
 			},
 			async subscribeBatch(ws, topics) {
 				if (!Array.isArray(topics) || topics.length === 0) return;
@@ -1432,7 +1453,13 @@ export function createShardedBus(client, options = {}) {
 					fresh.push(topic);
 				}
 				if (fresh.length === 0) return;
-				await followBatch(fresh);
+				try {
+					await followBatch(fresh);
+				} catch (err) {
+					for (const topic of fresh) wsTopics.delete(topic);
+					if (wsTopics.size === 0 && wsFollows.get(ws) === wsTopics) wsFollows.delete(ws);
+					throw err;
+				}
 			},
 			async unsubscribe(ws, topic) {
 				const topics = wsFollows.get(ws);
