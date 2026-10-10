@@ -334,7 +334,7 @@ export function mockPgClient(options = {}) {
 			const expiresAt = idemNow() + acquireTtlSec * 1000;
 			const existing = idemRows.get(key);
 			if (!existing || existing.expires_at < idemNow()) {
-				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt, owner_token: ownerToken });
+				idemRows.set(key, { status: 'pending', result: null, expires_at: expiresAt, owner_token: ownerToken, user_id: values[2] ?? null, tenant_id: values[3] ?? null });
 				return { rows: [{ owner_token: ownerToken }], rowCount: 1 };
 			}
 			return { rows: [], rowCount: 0 };
@@ -407,6 +407,18 @@ export function mockPgClient(options = {}) {
 				return { rows: [], rowCount: 1 };
 			}
 			return { rows: [], rowCount: 0 };
+		}
+
+		// Tenant-scoped erasure includes pending ownership and NULL tenants.
+		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE user_id = $2 AND tenant_id IS NOT DISTINCT FROM $1')) {
+			let count = 0;
+			for (const [key, row] of idemRows) {
+				if (row.user_id === values[1] && row.tenant_id === (values[0] ?? null)) {
+					idemRows.delete(key);
+					count++;
+				}
+			}
+			return { rows: [], rowCount: count };
 		}
 
 		// Purge: DELETE FROM ... WHERE svti_idempotency_key = $1 (key-only, unconditional).
