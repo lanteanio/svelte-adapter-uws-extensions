@@ -248,6 +248,20 @@ describe('PostgreSQL pool admission and deadlines', () => {
 		expect(clock).not.toHaveBeenCalled();
 	});
 
+	it('distinguishes multi-second query and checkout tails with built-in buckets', async () => {
+		let time = 0;
+		setRuntimeEnv({ clock: { monotonic: () => time } });
+		const metrics = createMetrics({ defaultBuckets: [1000] });
+		const pool = { query: async () => { time += 12000; return { rows: [] }; }, connect: async () => { time += 40000; return { release() {} }; } };
+		const client = createPgClient({ pool, metrics });
+		await client.query('SELECT 1'); await client.connect();
+		const output = metrics.serialize();
+		expect(output).toContain('postgres_operation_duration_seconds_bucket{operation="query",result="ok",le="10"} 0');
+		expect(output).toContain('postgres_operation_duration_seconds_bucket{operation="query",result="ok",le="30"} 1');
+		expect(output).toContain('postgres_operation_duration_seconds_bucket{operation="connect",result="ok",le="30"} 0');
+		expect(output).toContain('postgres_operation_duration_seconds_bucket{operation="connect",result="ok",le="60"} 1');
+	});
+
 	it('lets a caller deadline trip a breaker for a never-settling external query without releasing admission', async () => {
 		const pool = poolWith(deferred());
 		const client = createPgClient({ pool, maxInFlight: 1 });

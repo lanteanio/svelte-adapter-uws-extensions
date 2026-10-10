@@ -83,7 +83,7 @@ Pass the existing Prometheus registry as `metrics`. Labels use only the fixed op
 | Metric | Meaning |
 | --- | --- |
 | `postgres_operations_in_flight{operation}` | Actual unsettled wrapper work, including cancelled caller waits. |
-| `postgres_pool_waiters` | Driver checkout queue depth at scrape time; shared pools are counted once per registry. |
+| `postgres_pool_waiters` | Driver checkout queue depth at scrape time; shared pools are counted once per returned gauge. |
 | `postgres_pool_connections{state}` | Native connections in fixed `active` and `idle` states, including direct pool checkouts. |
 | `postgres_pool_capacity` | Sum of configured pool connection limits. |
 | `postgres_operation_duration_seconds{operation,result}` | Underlying settlement latency in seconds; result is `ok`, `error` or `timeout`. |
@@ -92,7 +92,9 @@ Pass the existing Prometheus registry as `metrics`. Labels use only the fixed op
 
 Duration and timeout metrics follow actual settlement, so an aborted caller can leave the in-flight gauge positive without producing a duration observation yet. Driver queue depth also includes direct use of the underlying pool. Metrics are optional; the uninstrumented path does not read a clock or scrape pool state.
 
-Pool gauges count each native pool once per registry, omit ended or collected pools, and exclude unavailable fields on custom pool implementations. A checked-out client remains active after the wrapper's connect operation has settled; use these gauges for pool utilization rather than the wrapper in-flight count. Pool names and connection strings are never labels.
+Pool gauges count each native pool once per returned gauge, including registry facades such as `{ ...metrics }` and facades that share only some instruments. They omit ended or collected pools, clean up collected registration handles without requiring a scrape, and exclude unavailable fields on custom pool implementations. A checked-out client remains active after the wrapper's connect operation has settled; use these gauges for pool utilization rather than the wrapper in-flight count. Pool names and connection strings are never labels.
+
+Operation durations declare explicit seconds buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]`, independently of registry defaults. The upper bounds cover the default checkout plus query deadlines; durations above 60 seconds remain in `+Inf`. A custom registry bucket cap must allow at least 14 bounds for this instrument.
 
 ## Notification sessions and shutdown
 

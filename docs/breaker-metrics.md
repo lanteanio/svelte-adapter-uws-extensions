@@ -17,11 +17,13 @@ stop contributing immediately; aggregate transitions remain cumulative. Keys,
 tenant identifiers and backend errors never become labels. Custom structural
 breakers expose their default state only because their partitions are private.
 
-Multiple breakers can share a registry. Wiring the same breaker and registry
-again is reference-counted: it neither doubles state counts nor installs another
-transition listener. Each returned cleanup function is idempotent; the final one
-removes that binding. Different registries remain independent. A registry does
-not retain an otherwise unreachable breaker. All three state samples are present immediately. All six transition samples
+Multiple breakers can share a registry, including facades such as `{ ...metrics }`.
+Bindings are reference-counted independently by the returned state gauge and
+transition counter: sharing either instrument does not double its observations.
+Each returned cleanup function is idempotent; the final reference removes that
+instrument's binding. Distinct instruments remain independent. A registry retains
+neither unreachable breakers nor their registration handles, even without scrapes.
+All three state samples are present immediately. All six transition samples
 are initialized to zero before their first event, so an
 idle healthy backend is distinguishable from absent instrumentation.
 

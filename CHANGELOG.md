@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Alarm stores require ordered generations.** Reserve with `nextGeneration(topic)` and pass the exact string to `set` and `delete`; stop old topic-only writers before rollout. PostgreSQL migration version 3 and three Redis authority hashes retain counters after deletion or clear. Restore authority with schedules and the migration ledger; see the alarm generation migration guide.
 
+- **Duration histogram defaults now use seconds, and `lock_acquire_wait_ms` is replaced by `lock_acquire_wait_seconds`.** Update lock queries and divide millisecond thresholds by 1000. Supply explicit buckets for application count, byte or millisecond histograms; historical bucket counts cannot be converted to the new layout. See the [metric migration guidance](MIGRATION.md#duration-metric-migration).
+
 - **Metric identifier defaults now collapse to `all`.** `mapTopic` covers built-in topic, group and rate-limit tenant labels; lock/leader `mapKey` also defaults to `all`. Presence online and WebSocket publish gauges sum counts or sampled rates within mapped classes. Update raw-label dashboards and alerts, or provide an explicit mapper to restore chosen classes; an identity mapper explicitly restores raw-label privacy and cardinality risks. See the metric migration note for historical-series retention.
 
 ### Changed
@@ -18,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verify retained alarm generation authority during recovery, including deleted and pending topics, bounded Redis hash reads and archive/restore continuity checks.
 
 - Reject reserved `byuser:` session tokens before Redis access, including lifecycle cookie loads, and refuse legacy index collisions before erasure deletes any token. Document reconciliation of historical collisions.
+
+- Give Redis relay durations explicit seconds buckets through 10 seconds and PostgreSQL operation durations bounds through 60 seconds, independently of registry defaults.
 
 - Enforce sampled publish-rate admission with conservative per-instance bounds when top-topic displays omit a topic. Preserve display rankings, bound cache growth, and fail closed for missing or inconsistent peer totals.
 
@@ -81,6 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Claim durable worker tasks only when a thread is available, keeping excess rows eligible for later dispatch instead of failing them at the foreground queue deadline. Retain reservations through retries and database settlement, and replace crashed threads without failing unrelated queued jobs.
+
+- Preserve all PostgreSQL pool and breaker observations across registry facades, deduplicate shared instruments independently, and reclaim dead registration handles without requiring scrapes.
 
 - Redis presence preserves unrelated Unicode and punctuation update names when the identity key has no ASCII letters or digits after lowercasing. Nonempty folded identity aliases remain reserved across updates, relays and snapshots.
 

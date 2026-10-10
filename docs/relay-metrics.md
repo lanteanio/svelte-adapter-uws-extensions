@@ -31,7 +31,9 @@ messages are intentional local delivery and do not increment these gap counters.
 
 Duration starts immediately before Redis submission and ends at settlement. It
 excludes the coalescing wait and reports seconds, including rejected flushes.
-The histogram uses the registry's configured buckets. These metrics never label
+The histogram declares explicit seconds buckets
+`[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]`, independently
+of registry defaults. Durations above 10 seconds remain in `+Inf`. These metrics never label
 payloads, topics, channel names, error messages or user identifiers. With metrics
 disabled, relay duration does not read the clock.
 

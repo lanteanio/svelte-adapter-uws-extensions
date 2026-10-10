@@ -3272,7 +3272,7 @@ The predicate receives `(res, req)` and returns truthy to allow or falsy to deny
 |---|---|---|
 | `prefix` | `''` | Prefix for all metric names |
 | `mapTopic` | `() => 'all'` | Map topic, group and tenant identifiers to bounded, non-identifying label classes. |
-| `defaultBuckets` | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1]` | Duration buckets in seconds. For count, byte or millisecond observations, supply explicit buckets (or retain the former `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` via this option). Historical bucket counts cannot be converted to the new layout. |
+| `defaultBuckets` | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1]` | Duration buckets in seconds. Built-in Redis relay and PostgreSQL operation durations declare their own bounds through 10 and 60 seconds respectively. For count, byte or millisecond observations, supply explicit buckets (or retain the former `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` via this option). Historical bucket counts cannot be converted to the new layout. |
 | `maxSeries` | `10_000` | Per-metric series cap; past this, new labelsets are dropped and `prometheus_series_dropped_total{metric}` counts them. Pass `Infinity` to disable. |
 | `maxBuckets` | `32` | Maximum buckets a histogram may declare. Throws at registration if exceeded. Pass `Infinity` to disable. |
 

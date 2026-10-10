@@ -1,14 +1,15 @@
 import { ConnectionError } from '../shared/errors.js';
 import { monotonicNow } from '../shared/runtime.js';
 
-// A registry may be shared by several wrappers/pools. Scrape their actual
-// driver queues once per pool without retaining otherwise unreachable pools.
+// Registry facades may return the same gauges. Each gauge owns its collector;
+// scrape each pool once without retaining otherwise unreachable pools.
 const poolCollectors = new WeakMap();
+const durationBuckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60];
 
 export function createPoolOperations(pool, maxInFlight, metrics, redactError) {
 	let inFlight = 0;
 	const active = metrics?.gauge('postgres_operations_in_flight', 'Unsettled PostgreSQL wrapper operations', ['operation']);
-	const duration = metrics?.histogram('postgres_operation_duration_seconds', 'PostgreSQL wrapper operation duration in seconds', ['operation', 'result']);
+	const duration = metrics?.histogram('postgres_operation_duration_seconds', 'PostgreSQL wrapper operation duration in seconds', ['operation', 'result'], durationBuckets);
 	const timeouts = metrics?.counter('postgres_operation_timeouts_total', 'PostgreSQL driver timeout failures', ['operation']);
 	const rejected = metrics?.counter('postgres_admission_rejected_total', 'PostgreSQL operations rejected before admission or cancelled by the caller', ['operation', 'reason']);
 	if (metrics) registerPoolMetrics(metrics, pool);
@@ -114,50 +115,54 @@ function isTimeout(error) {
 // Keep the scrape closure outside the operation factory: its lexical context
 // must never contain that factory's strong pool reference.
 function registerPoolMetrics(metrics, pool) {
-	let pools = poolCollectors.get(metrics);
-	if (!pools) {
-		pools = new Set();
-		poolCollectors.set(metrics, pools);
-		installPoolCollectors(metrics, pools);
+	registerPoolGauge(metrics.gauge('postgres_pool_waiters', 'PostgreSQL driver pool checkout waiters'), pool, 'waiters');
+	registerPoolGauge(metrics.gauge('postgres_pool_connections', 'PostgreSQL driver connections by state', ['state']), pool, 'connections');
+	registerPoolGauge(metrics.gauge('postgres_pool_capacity', 'Configured PostgreSQL pool connection capacity'), pool, 'capacity');
+}
+
+function registerPoolGauge(gauge, pool, kind) {
+	let registration = poolCollectors.get(gauge);
+	if (!registration) {
+		registration = createPoolCollector(gauge, kind);
+		poolCollectors.set(gauge, registration);
 	}
+	const { pools, finalizer } = registration;
 	let registered = false;
 	for (const ref of pools) {
 		const current = ref.deref();
-		if (!current) pools.delete(ref);
+		if (!current || current.ended) { pools.delete(ref); finalizer.unregister(ref); }
 		else if (current === pool) registered = true;
 	}
-	if (!registered) pools.add(new WeakRef(pool));
+	if (!registered && !pool.ended) {
+		const ref = new WeakRef(pool);
+		pools.add(ref);
+		finalizer.register(pool, ref, ref);
+	}
 }
 
-function installPoolCollectors(metrics, pools) {
-	const waiters = metrics.gauge('postgres_pool_waiters', 'PostgreSQL driver pool checkout waiters');
-	const connections = metrics.gauge('postgres_pool_connections', 'PostgreSQL driver connections by state', ['state']);
-	const capacity = metrics.gauge('postgres_pool_capacity', 'Configured PostgreSQL pool connection capacity');
-	function visit(fn) {
+function createPoolCollector(gauge, kind) {
+	const pools = new Set();
+	// Owned by this gauge's registration, so discarded registries do not leave
+	// finalizer records in a global collector for a still-live shared pool.
+	const finalizer = new FinalizationRegistry(ref => pools.delete(ref));
+	gauge.collect(() => {
+		let count = 0, idle = 0;
 		for (const ref of pools) {
 			const pool = ref.deref();
-			if (!pool) pools.delete(ref);
-			else if (!pool.ended) fn(pool);
+			if (!pool || pool.ended) { pools.delete(ref); finalizer.unregister(ref); continue; }
+			if (kind === 'waiters') {
+				if (Number.isFinite(pool.waitingCount)) count += pool.waitingCount;
+			} else if (kind === 'capacity') {
+				if (Number.isFinite(pool.options?.max)) count += Math.max(0, pool.options.max);
+			} else if (Number.isFinite(pool.totalCount) && Number.isFinite(pool.idleCount)) {
+				idle += Math.max(0, pool.idleCount);
+				count += Math.max(0, pool.totalCount - pool.idleCount);
+			}
 		}
-	}
-	waiters.collect(() => {
-		let count = 0;
-		visit(pool => { if (Number.isFinite(pool.waitingCount)) count += pool.waitingCount; });
-		waiters.set(count);
+		if (kind === 'connections') {
+			gauge.set({ state: 'idle' }, idle);
+			gauge.set({ state: 'active' }, count);
+		} else gauge.set(count);
 	});
-	connections.collect(() => {
-		let idle = 0, active = 0;
-		visit(pool => {
-			if (!Number.isFinite(pool.totalCount) || !Number.isFinite(pool.idleCount)) return;
-			idle += Math.max(0, pool.idleCount);
-			active += Math.max(0, pool.totalCount - pool.idleCount);
-		});
-		connections.set({ state: 'idle' }, idle);
-		connections.set({ state: 'active' }, active);
-	});
-	capacity.collect(() => {
-		let count = 0;
-		visit(pool => { if (Number.isFinite(pool.options?.max)) count += Math.max(0, pool.options.max); });
-		capacity.set(count);
-	});
+	return { pools, finalizer };
 }

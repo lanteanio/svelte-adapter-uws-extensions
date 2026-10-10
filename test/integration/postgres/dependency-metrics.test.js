@@ -6,26 +6,27 @@ import { createCircuitBreaker, withBreaker } from '../../../src/shared/breaker.j
 it('measures direct native checkout utilization and stops counting an ended pool', async () => {
 	const metrics = createMetrics();
 	const client = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, metrics, options: { max: 2 } });
-	createPgClient({ pool: client.pool, autoShutdown: false, metrics });
-	let first, second;
+	createPgClient({ pool: client.pool, autoShutdown: false, metrics: { ...metrics } });
+	const other = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, metrics: { ...metrics }, options: { max: 1 } });
+	let first, second, third;
 	try {
-		expect(metrics.serialize()).toContain('postgres_pool_capacity 2');
-		first = await client.pool.connect(); second = await client.pool.connect();
-		expect(metrics.serialize()).toContain('postgres_pool_connections{state="active"} 2');
+		expect(metrics.serialize()).toContain('postgres_pool_capacity 3');
+		first = await client.pool.connect(); second = await client.pool.connect(); third = await other.pool.connect();
+		expect(metrics.serialize()).toContain('postgres_pool_connections{state="active"} 3');
 		const pending = client.query('SELECT 42 AS value');
 		expect(metrics.serialize()).toContain('postgres_pool_waiters 1');
 		first.release(); first = null;
 		await expect(pending).resolves.toMatchObject({ rows: [{ value: 42 }] });
-		expect(metrics.serialize()).toContain('postgres_pool_connections{state="active"} 1');
+		expect(metrics.serialize()).toContain('postgres_pool_connections{state="active"} 2');
 		expect(metrics.serialize()).toContain('postgres_pool_connections{state="idle"} 1');
-	} finally { first?.release(); second?.release(); await client.end(); }
+	} finally { first?.release(); second?.release(); third?.release(); await Promise.all([client.end(), other.end()]); }
 	const output = metrics.serialize();
 	expect(output).toContain('postgres_pool_capacity 0');
 	expect(output).toContain('postgres_pool_connections{state="active"} 0');
 	expect(output).toContain('postgres_pool_connections{state="idle"} 0');
 });
 
-it('distinguishes a real database refusal from an idle healthy breaker', async () => {
+it('distinguishes a real database query error from an idle healthy breaker', async () => {
 	const metrics = createMetrics(), breaker = createCircuitBreaker({ failureThreshold: 1 });
 	const stop = wireBreakerMetrics(breaker, metrics);
 	const client = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, metrics });

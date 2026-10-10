@@ -51,6 +51,16 @@ for (const [name, factory, prefix, method] of [
 		expect(metrics.serialize()).not.toContain('private-room');
 		expect(metrics.serialize()).not.toContain('user@example.test');
 	});
+	it('distinguishes relay tails above one second independently of registry defaults', async () => {
+		metrics = createMetrics({ defaultBuckets: [1000] });
+		const wrapped = setup();
+		const original = client.redis[method].bind(client.redis);
+		client.redis[method] = (...args) => { clock += 3500; return original(...args); };
+		wrapped.publish('room', 'event', 1); await flush();
+		expect(count('_relay_duration_seconds_bucket', 'le="2.5"')).toBe(0);
+		expect(count('_relay_duration_seconds_bucket', 'le="5"')).toBe(1);
+		expect(count('_relay_duration_seconds_bucket', 'le="10"')).toBe(1);
+	});
 	it('counts a rejected whole pipeline once per envelope, then records recovery', async () => {
 		const wrapped = setup();
 		const pipeline = client.redis.pipeline.bind(client.redis);

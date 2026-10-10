@@ -710,6 +710,21 @@ Run your test suite, then check:
 
 ---
 
+## Duration metric migration
+
+Generic histogram defaults now describe seconds with fractional bounds from
+`0.001` through `1`. Supply explicit buckets for count, byte or millisecond
+observations, or set `defaultBuckets` to the former
+`[1, 5, 10, 25, 50, 100, 250, 500, 1000]` for application histograms that need it.
+Built-in Redis relay durations use explicit bounds through 10 seconds and
+PostgreSQL operations through 60 seconds, independently of that default.
+
+Replace `lock_acquire_wait_ms` queries with `lock_acquire_wait_seconds` and
+convert millisecond alert thresholds to seconds by dividing by 1000. The new
+metric's `_sum` already reports seconds; `_count` is unchanged.
+Historical bucket counts cannot be converted to a new layout. Use matching
+bounds across producers before comparing histogram quantiles during a rollout.
+
 # 0.4.x to 0.5.x
 
 This guide is organized by **tier**. Most apps only need to read the first two sections.
