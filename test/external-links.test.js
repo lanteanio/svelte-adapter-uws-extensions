@@ -37,3 +37,20 @@ describe('scheduled external documentation checks', () => {
 		expect(workflow).toContain('contents: read');
 	});
 });
+
+
+it('retains and verifies owned sibling Markdown fragments', async () => {
+	const base = 'https://github.com/lanteanio/svelte-adapter-uws';
+	const links = collectExternalUrls([{ relative: 'README.md', text: '[live](' + base + '#testing) [dead](' + base + '#retired)' }]);
+	expect([...links.urls.keys()]).toEqual([base + '#testing', base + '#retired']);
+	const fetchImpl = async () => new Response('<h2 id="user-content-testing">Testing</h2>', { headers: { 'content-type': 'text/html' } });
+	expect((await crawlUrl(base + '#testing', { fetchImpl })).ok).toBe(true);
+	expect((await crawlUrl(base + '#retired', { fetchImpl })).kind).toBe('missing-fragment');
+	expect((await crawlUrl(base + '/blob/dev/README.md#retired', { fetchImpl })).kind).toBe('missing-fragment');
+});
+
+it('reports malformed owned fragments without interrupting the remaining crawl', async () => {
+	const urls = ['https://github.com/lanteanio/svelte-adapter-uws#bad%ZZ', 'https://example.com/valid'];
+	const results = await crawlExternalLinks(urls, { fetchImpl: async () => new Response('ok') });
+	expect(results.map(result => result.kind)).toEqual(['invalid-url', 'ok']);
+});

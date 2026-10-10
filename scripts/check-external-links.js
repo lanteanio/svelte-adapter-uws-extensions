@@ -12,17 +12,31 @@ import { isIP } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { documentationFiles, linksOf } from './check-links.js';
+import { parseFragment } from 'parse5';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_REDIRECTS = 6;
 const DEFAULT_BODY_LIMIT = 256 * 1024;
 
+function ownedMarkdownFragment(url) {
+	return url.hostname === 'github.com' && /^\/lanteanio\/(?:svelte-adapter-uws|svelte-realtime)(?:\/?|\/blob\/[^/]+\/[^?#]+\.md)$/.test(url.pathname) && url.hash && !/^#L\d+(?:-L\d+)?$/.test(url.hash);
+}
+function htmlHasFragment(html, fragment) {
+	const targets = new Set([fragment, 'user-content-' + fragment]);
+	let found = false;
+	function visit(node) {
+		if ((node.attrs || []).some(attribute => (attribute.name === 'id' || (node.tagName === 'a' && attribute.name === 'name')) && targets.has(attribute.value))) found = true;
+		for (const child of node.childNodes || []) visit(child);
+	}
+	visit(parseFragment(html));
+	return found;
+}
 function normalizedHttpUrl(target) {
 	const url = new URL(target.startsWith('//') ? 'https:' + target : target);
 	if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
 	if (url.username || url.password) throw new Error('credentials are not allowed in documentation URLs');
-	url.hash = '';
+	if (!ownedMarkdownFragment(url)) url.hash = '';
 	return url.href;
 }
 
@@ -152,7 +166,14 @@ export async function crawlUrl(startUrl, options = {}) {
 	const fetchImpl = options.fetchImpl || globalThis.fetch;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
-	const bodyLimit = options.bodyLimit ?? DEFAULT_BODY_LIMIT;
+	let fragment = null;
+	try {
+		const source = new URL(startUrl.startsWith('//') ? 'https:' + startUrl : startUrl);
+		if (ownedMarkdownFragment(source)) fragment = decodeURIComponent(source.hash.slice(1));
+	} catch (error) {
+		return { ok: false, kind: 'invalid-url', url: startUrl, redirects: [], detail: error.message };
+	}
+	const bodyLimit = options.bodyLimit ?? (fragment ? 2 * 1024 * 1024 : DEFAULT_BODY_LIMIT);
 	const allowPrivate = options.allowPrivate === true;
 	const redirects = [];
 	const seen = new Set();
@@ -226,6 +247,7 @@ export async function crawlUrl(startUrl, options = {}) {
 		if (redirects.length) {
 			return { ok: false, kind: 'redirect', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `redirects to ${current}` };
 		}
+		if (fragment && (!html || !htmlHasFragment(body, fragment))) return { ok: false, kind: 'missing-fragment', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `owned Markdown page does not expose #${fragment} within the ${bodyLimit}-byte inspection limit` };
 		return { ok: true, kind: 'ok', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `HTTP ${response.status}` };
 	}
 }

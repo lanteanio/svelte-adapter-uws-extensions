@@ -9,8 +9,9 @@
 // collapses hyphen runs rejects a link that works today, and a rule that
 // replaces punctuation instead of deleting it accepts one that does not.
 
-import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import {
@@ -115,8 +116,6 @@ describe('resolving one link', () => {
 	});
 
 	// The defect this was written for: a section renamed, the link left behind.
-	// (The historical dead anchor that motivated it, #origin-validation, is now
-	// deliberately alive again as a compatibility target in the real README.)
 	it('rejects an anchor no heading produces', () => {
 		expect(checkLink('README.md', '#renamed-away-heading', docs)).toContain('no heading in README.md');
 	});
@@ -178,3 +177,46 @@ it('validates GitHub Markdown fragments against the named tree', () => {
 	expect(checkLink('README.md', base + 'dev/README.md#what-you-get', new Map())).toBeNull();
 	expect(checkLink('README.md', base + 'main/README.md#not-a-real-heading', new Map())).toContain('No source heading');
 });
+
+
+
+it('runs the CLI against tracked and packaged documentation inventories', () => {
+	const root = fileURLToPath(new URL('..', import.meta.url));
+	const workRoot = join(root, '.cross-repo-gate');
+	mkdirSync(workRoot, { recursive: true });
+	const work = mkdtempSync(join(workRoot, 'link-inventory-'));
+	const put = (relative, text) => {
+		const target = join(work, relative);
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(target, text);
+	};
+	const git = (...args) => execFileSync('git', ['-C', work, ...args], { stdio: 'pipe', windowsHide: true });
+	const run = () => spawnSync(process.execPath, ['scripts/check-links.js'], { cwd: work, encoding: 'utf8', windowsHide: true });
+	try {
+		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'MIGRATION.md', 'docs'] }));
+		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[Guide](docs/guide.md)\n');
+		put('MIGRATION.md', '# Migration\n[Overview](README.md)\n');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Local](../private.md)\n');
+		put('docs/main-source-tree.v1.json', JSON.stringify({ commit: '0'.repeat(40), paths: [], anchors: {} }));
+		put('.gitignore', 'ignored.md\n');
+		put('private.md', '# Local scratch\n');
+		put('ignored.md', '# Ignored scratch\n');
+		put('scripts/check-links.js', readFileSync(join(root, 'scripts/check-links.js'), 'utf8'));
+		git('init', '--initial-branch=docs-fixture');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'docs', '.gitignore', 'scripts');
+		let result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('docs/guide.md:3');
+		expect(result.stderr).toContain('relative target absent from the staged tree');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Local](../ignored.md)\n');
+		result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('relative target absent from the staged tree');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n');
+		expect(run().status).toBe(0);
+		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'docs'] }));
+		result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('target omitted from package: MIGRATION.md');
+	} finally { rmSync(work, { recursive: true, force: true }); }
+}, 30_000);

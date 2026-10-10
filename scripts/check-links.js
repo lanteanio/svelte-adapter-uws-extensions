@@ -454,6 +454,8 @@ export function checkLink(rel, target, docs, options = {}) {
 	const status = ownedPathStatus(resolved);
 	if (status === 'outside') return `path leaves repository: ${resolved}`;
 	if (status === 'missing') return `no such file with exact case: ${resolved}`;
+	const tracked = stagedTree();
+	if (tracked && !treeContains(tracked, resolved)) return `relative target absent from the staged tree (the git index): ${resolved}`;
 	if (options.packagedDocs?.has(rel) && options.packagedFiles && !packageContains(resolved, options.packagedFiles)) {
 		return `target omitted from package: ${resolved}`;
 	}

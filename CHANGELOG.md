@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Validate relative documentation targets against the staged file inventory and preserve owned sibling Markdown fragments in scheduled link checks.
+
 - Version the documentation route manifest, pin reader-path purposes and compatibility ownership, and reject native-version facts outside generated blocks or missing documentation gates.
 
 - Mark the legacy testing request-ID constant deprecated in emitted declarations and direct consumers to the platform request ID instead of its internal carrier.

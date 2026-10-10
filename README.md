@@ -4189,7 +4189,7 @@ export function message(ws, { data, platform }) {
 }
 ```
 
-Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race - the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission) section for the handshake-tier reference.
+Connections that make it past the handshake are not exempt from message-tier shedding, and message-tier shedding cannot rescue a connection that lost the handshake race - the layers compose without overlap. See the adapter's [Layered admission](https://github.com/lanteanio/svelte-adapter-uws#layered-admission-upgrade-path--message-path) section for the handshake-tier reference.
 
 ---
 
