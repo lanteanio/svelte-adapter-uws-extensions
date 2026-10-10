@@ -1,3 +1,4 @@
+import type { PostgresStoreReadiness } from './index.js';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
@@ -278,7 +279,7 @@ export interface TaskAwaitOptions {
 	timeout?: number;
 }
 
-export interface TaskRunner {
+export interface TaskRunner extends PostgresStoreReadiness {
 	/**
 	 * Register a task handler. Throws if the name is taken or invalid.
 	 *
@@ -321,17 +322,7 @@ export interface TaskRunner {
 	 */
 	await<TResult = unknown>(taskId: string, options?: TaskAwaitOptions): Promise<TResult>;
 
-	/**
-	 * Resolves once the runner's auto-migration has completed (or
-	 * immediately if `autoMigrate: false`). The migration is kicked off
-	 * at construction so a separate code path can read the runner's
-	 * table before the first `run()` / `enqueue()` / `await()` call --
-	 * UI dashboards polling the table on a tick, status pages reading
-	 * counts at boot, etc.
-	 *
-	 * Idempotent. Subsequent calls return the same promise (or a
-	 * resolved one once the migration has landed).
-	 */
+	/** Await automatic migration, or read-only schema validation with autoMigrate: false. */
 	ready(): Promise<void>;
 
 	/**

@@ -28,7 +28,8 @@
  * @module svelte-adapter-uws-extensions/postgres/idempotency
  */
 
-import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
+import { createStoreSchema } from './migrations.js';
 import { withBreaker } from '../shared/breaker.js';
 import { randomUuid } from '../shared/runtime.js';
 import { scheduleCleanup } from './_cleanup.js';
@@ -104,54 +105,11 @@ export function createIdempotencyStore(client, options = {}) {
 	const mCommits = m?.counter('idempotency_commits_total', 'Results committed');
 	const mAborts = m?.counter('idempotency_aborts_total', 'Slots aborted');
 
-	let migrated = false;
+	const schema = createStoreSchema(client, 'idempotency', table, autoMigrate);
+	const ensureTable = schema.ensure;
 
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				svti_idempotency_key TEXT        PRIMARY KEY,
-				status               TEXT        NOT NULL,
-				result               JSONB,
-				expires_at           TIMESTAMPTZ NOT NULL
-			)
-		`, { table, columns: ['svti_idempotency_key', 'status', 'result', 'expires_at'] });
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_expires_at ON ${table} (expires_at)
-		`);
-		// Right-to-erasure columns: the committed result JSONB may itself be
-		// PII, and the opaque PK cannot be substring-matched, so `live.forget`
-		// purges by these denormalized columns instead. BOTH are needed - a
-		// userId alone cannot disambiguate one user across tenants. The realtime
-		// idempotent wrapper supplies them via acquire's `meta`; legacy rows
-		// stay NULL (unforgettable until they expire, same as a pre-upgrade
-		// deployment). ADD COLUMN IF NOT EXISTS forward-migrates existing tables.
-		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
-		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tenant_id TEXT`);
-			// Owner token: a distinct UUID minted per acquire and matched by
-			// commit/abort so an owner whose acquireTtl expired (and whose row a
-			// successor took over) cannot overwrite or delete the successor's row.
-			// Legacy rows stay NULL until they expire, same as the columns above; a
-			// legacy owner's commit/abort simply no-ops/throws once a successor has
-			// re-stamped a fresh token.
-			await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS owner_token TEXT`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (tenant_id, user_id)
-		`);
-		migrated = true;
-	}
+	if (autoMigrate) schema.ready().catch(() => {});
 
-	// One-shot ready() promise: kicks off ensureTable() at construction so
-	// callers that need the table to exist before they start polling can
-	// `await idempotency.ready()`. Subsequent ensureTable() calls are
-	// no-ops via the migrated flag.
-	const readyPromise = autoMigrate ? ensureTable() : Promise.resolve();
-	// A caller that never awaits ready() must not crash the process if this
-	// eager migration rejects (e.g. the table is dropped concurrently): the
-	// failure is non-fatal because acquire() / clear() / purge() each re-run
-	// ensureTable() and surface the error on first real use. An explicit
-	// ready() awaiter still observes the rejection - it receives readyPromise.
-	readyPromise.catch(() => {});
 
 	function validateKey(idempotencyKey) {
 		if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
@@ -366,9 +324,8 @@ export function createIdempotencyStore(client, options = {}) {
 			});
 		},
 
-		ready() {
-			return readyPromise;
-		},
+		ready: schema.ready,
+		status: schema.status,
 
 		destroy() {
 			cleanup.stop();

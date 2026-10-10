@@ -26,7 +26,8 @@
  * @module svelte-adapter-uws-extensions/postgres/jobs
  */
 
-import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
+import { createStoreSchema } from './migrations.js';
 import { withBreaker } from '../shared/breaker.js';
 import {
 	POSTGRES_TRACE_ATTRIBUTES,
@@ -76,53 +77,8 @@ export function createJobQueue(client, options = {}) {
 	const mCompleted = m?.counter('jobs_completed_total', 'Jobs completed (deleted)', ['queue']);
 	const mFailed = m?.counter('jobs_failed_total', 'Jobs released via fail() for retry', ['queue']);
 
-	let migrated = false;
-
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				svti_jobs_id  BIGSERIAL   PRIMARY KEY,
-				queue         TEXT        NOT NULL,
-				payload       JSONB,
-				request_id    TEXT,
-				traceparent   TEXT,
-				tracestate    TEXT,
-				claimed_at    TIMESTAMPTZ,
-				claimed_until TIMESTAMPTZ,
-				attempts      INTEGER     NOT NULL DEFAULT 0,
-				created_at    TIMESTAMPTZ DEFAULT now()
-			)
-		`, {
-			table,
-			// `request_id` is intentionally NOT in the expected set: it's
-			// added by the ALTER TABLE on the very next line for forward-
-			// migrated next.1 deployments, so the table may legitimately
-			// pre-exist without it before the ALTER runs.
-			columns: ['svti_jobs_id', 'queue', 'payload', 'claimed_at', 'claimed_until', 'attempts', 'created_at']
-		});
-		// Forward-migrate existing 0.5.0-next.1 deployments.
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
-		`);
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS traceparent TEXT
-		`);
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tracestate TEXT
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_queue_pending
-			    ON ${table} (queue, svti_jobs_id)
-			    WHERE claimed_at IS NULL
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_visibility
-			    ON ${table} (claimed_until)
-			    WHERE claimed_at IS NOT NULL
-		`);
-		migrated = true;
-	}
+	const schema = createStoreSchema(client, 'jobs', table, autoMigrate);
+	const ensureTable = schema.ensure;
 
 	function asArray(idOrIds) {
 		return Array.isArray(idOrIds) ? idOrIds : [idOrIds];
@@ -188,6 +144,8 @@ export function createJobQueue(client, options = {}) {
 	}
 
 	return {
+		ready: schema.ready,
+		status: schema.status,
 		async enqueue(queue, payload, opts = {}) {
 			if (typeof queue !== 'string' || queue.length === 0) {
 				throw new Error('postgres jobs: queue must be a non-empty string');

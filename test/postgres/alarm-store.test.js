@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createAlarmStore } from '../../src/postgres/alarm-store.js';
+import { mockPgClient } from '../../src/testing/mock-pg.js';
 
 // A focused in-memory Postgres double implementing exactly the statements the
 // alarm store issues (DDL no-op, INSERT ... ON CONFLICT, DELETE ... RETURNING,
@@ -11,6 +12,7 @@ import { createAlarmStore } from '../../src/postgres/alarm-store.js';
 function fakePg() {
 	const rows = new Map(); // topic -> { fire_at, meta, tenant }
 	return {
+		...mockPgClient(),
 		rows,
 		query: async (q) => {
 			const text = (typeof q === 'string' ? q : q.text).replace(/\s+/g, ' ').trim();

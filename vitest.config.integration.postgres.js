@@ -9,6 +9,7 @@ export default defineConfig({
 		include: ['test/integration/postgres/**/*.test.js'],
 		exclude: [...configDefaults.exclude],
 		globalSetup: ['./test/integration/global-setup-postgres.js'],
+		setupFiles: ['./test/integration/postgres/setup-schema.js'],
 		fileParallelism: false,
 		isolate: true,
 		pool: 'forks',

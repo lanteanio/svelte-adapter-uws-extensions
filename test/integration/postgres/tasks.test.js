@@ -1,3 +1,4 @@
+import { forgetFixtureMigrations } from '../helpers/postgres-schema.js';
 /**
  * Integration tests for postgres/tasks against a real Postgres 16 server.
  *
@@ -62,10 +63,9 @@ describe('postgres tasks core (integration)', () => {
 
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh runners racing their first run() both succeed', async () => {
-			// CREATE TABLE IF NOT EXISTS races on concurrent first calls.
-			// ensureTable() catches 23505 / 42P07 / 42710 and treats the
-			// table as already-existing.
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			// Concurrent cold starts serialize migration under the schema advisory lock,
+			// then validate the same completed schema and ledger before writing.
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 
 			const a = createTaskRunner(client, {
 				recoveryInterval: 0, cleanupInterval: 0, dispatchInterval: 0

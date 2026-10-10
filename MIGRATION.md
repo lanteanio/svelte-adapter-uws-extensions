@@ -152,8 +152,12 @@ and task `run` / `enqueue` too whenever the call carries a trace context.
 created them, in two nullable columns. Tasks also persist `user_id` for erasure;
 without it, task inserts fail even when no trace context is supplied.
 
-**Action.** Before deploying, run for each jobs and tasks table (defaults
-shown):
+**Action.** Run `migrate(client, { store: 'jobs' })` and
+`migrate(client, { store: 'tasks' })` with the deployment role before disabling
+automatic migration. Pass `table` for custom names. This applies the complete
+versioned schema, including constraints and indexes; see
+[schema transitions and readiness](docs/postgres-support.md#schema-transitions-and-readiness).
+The historical nullable-column additions are:
 
 ```sql
 ALTER TABLE svti_jobs  ADD COLUMN IF NOT EXISTS traceparent TEXT;
@@ -201,8 +205,10 @@ same identity.
 Replay adds a user identity and sequence epoch; idempotency adds erasure identity
 and owner tokens. Alarms and dead letters add PostgreSQL stores. Review the
 [per-store migration matrix](./docs/postgres-support.md#schema-transitions-and-readiness)
-and manual SQL before disabling automatic migration. A resolved `ready()` with
-`autoMigrate: false` does not verify the database schema.
+and deployment migrations before disabling automatic migration. Every store's
+`ready()` with `autoMigrate: false` verifies its schema and runtime privileges
+read-only; a present migration ledger also requires SELECT access and known
+versions/checksums. Await this gate before serving traffic.
 
 ## 3. Fails on a call that used to succeed
 
@@ -611,7 +617,7 @@ npm exec -- vitest run --config vitest.config.integration.postgres.js test/integ
 The PostgreSQL test packs the current checkout, imports only that extracted
 package, and supplies the installed dependency tree. It starts an isolated real
 PostgreSQL service through the integration harness. It seeds the jobs/tasks
-schema from stable 0.5.10, tests automatic migration and the manual SQL above,
+schema from stable 0.5.10, tests automatic migration and deployment migrations,
 then verifies old rows survive, new trace context round-trips, and a legacy
 column-only query still reads the same data. Removing a trace-column migration
 must fail the corresponding rehearsal. It does not run an entire old binary or

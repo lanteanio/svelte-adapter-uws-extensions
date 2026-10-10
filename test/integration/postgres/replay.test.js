@@ -1,3 +1,4 @@
+import { forgetFixtureMigrations } from '../helpers/postgres-schema.js';
 /**
  * Integration tests for postgres/replay against a real Postgres 16 server.
  *
@@ -33,7 +34,7 @@ describe('postgres replay (integration)', () => {
 	beforeEach(async () => {
 		// Drop and recreate per test so DDL stays the source of truth and
 		// no row from a previous test can leak in.
-		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+		await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 		await client.query(`DROP TABLE IF EXISTS ${TABLE}_seq`);
 		platform = mockPlatform();
 		replay = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0 });
@@ -44,7 +45,7 @@ describe('postgres replay (integration)', () => {
 	});
 
 	afterAll(async () => {
-		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+		await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 		await client.query(`DROP TABLE IF EXISTS ${TABLE}_seq`);
 		await client.end();
 	});
@@ -100,11 +101,9 @@ describe('postgres replay (integration)', () => {
 
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh instances racing their first publish both succeed', async () => {
-			// CREATE TABLE IF NOT EXISTS races on concurrent first calls: both
-			// connections pass the existence check, both run the create, the
-			// loser raises 23505 / 42P07 / 42710. ensureTable() catches those
-			// codes and treats the table as already-existing.
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			// Concurrent cold starts serialize migration under the schema advisory lock,
+			// then validate the same completed schema and ledger before writing.
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 			await client.query(`DROP TABLE IF EXISTS ${TABLE}_seq`);
 
 			const a = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0 });

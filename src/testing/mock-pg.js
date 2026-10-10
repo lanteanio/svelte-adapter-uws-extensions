@@ -1,4 +1,5 @@
 import { wallEpoch, randomUuid, microtask, setTimer } from '../shared/runtime.js';
+import { mockPgSchema } from './_mock-pg-schema.js';
 
 /**
  * In-memory mock that implements the PgClient interface.
@@ -26,6 +27,7 @@ import { wallEpoch, randomUuid, microtask, setTimer } from '../shared/runtime.js
  * slice-based stub silently hid.
  */
 export function mockPgClient(options = {}) {
+	const schemaQuery = mockPgSchema();
 	// Optional seeded fault engine for cross-instance LISTEN/NOTIFY delivery (a
 	// simulation harness passes one). When set, each notification delivery to a
 	// listener is drawn independently and deferred on the seam timer
@@ -218,6 +220,8 @@ export function mockPgClient(options = {}) {
 		}
 		if (!values) values = [];
 		const sql = textOrObj.trim().replace(/\s+/g, ' ');
+		const schemaResult = schemaQuery(sql, values, connId);
+		if (schemaResult) return schemaResult;
 
 		// Transaction-control statements. On the shared autocommit client these
 		// are no-ops (the mock does not model atomicity; the integration tier
@@ -1401,6 +1405,7 @@ export function mockPgClient(options = {}) {
 	}
 
 	function releaseConn(connId) {
+		schemaQuery.release(connId);
 		for (const [key, owner] of transactionLocks) if (owner === connId) transactionLocks.delete(key);
 		for (const [lockId, holder] of advisoryLocks) {
 			if (holder === connId) advisoryLocks.delete(lockId);
@@ -1409,6 +1414,7 @@ export function mockPgClient(options = {}) {
 	}
 
 	const client = {
+		async check() { return { serverVersionNum: 160015 }; },
 		// `pool.connect()` returns a pinned-connection wrapper. The pinned
 		// connection has its own connection identity, so row locks a claim CTE
 		// takes inside its BEGIN..COMMIT window stay held against concurrent

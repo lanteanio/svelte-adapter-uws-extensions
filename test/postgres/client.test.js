@@ -13,6 +13,17 @@ vi.mock('pg', () => {
 const { createPgClient } = await import('../../src/postgres/index.js');
 
 describe('createPgClient', () => {
+	it.each(['150012', 'malformed', undefined])('refuses an unsupported or malformed server identity %s', async version => {
+		const pool = { query: vi.fn(async () => ({ rows: [{ server_version_num: version }] })), end: vi.fn(), on: vi.fn() };
+		await expect(createPgClient({ pool }).check()).rejects.toThrow('PostgreSQL 16 or newer');
+	});
+	it('checks supported servers read-only with an explicit finite deadline', async () => {
+		const pool = { query: vi.fn(async () => ({ rows: [{ server_version_num: '160015' }] })), end: vi.fn(), on: vi.fn() };
+		const client = createPgClient({ pool });
+		await expect(client.check({ timeoutMs: 1234 })).resolves.toEqual({ serverVersionNum: 160015 });
+		expect(pool.query.mock.calls[0][0]).toMatchObject({ text: 'SHOW server_version_num', query_timeout: 1234 });
+		await expect(client.check({ timeoutMs: 0 })).rejects.toThrow('positive');
+	});
 	it('returns a client with the expected API', () => {
 		const client = createPgClient({ connectionString: 'postgres://localhost/test' });
 		expect(client.pool).toBeDefined();

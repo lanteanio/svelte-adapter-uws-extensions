@@ -1,3 +1,4 @@
+import type { PostgresStoreReadiness } from './index.js';
 import type { Platform } from 'svelte-adapter-uws';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
@@ -128,7 +129,7 @@ export type ResumeHook = (
 	}
 ) => Promise<Record<string, number> | undefined>;
 
-export interface PgReplayBuffer {
+export interface PgReplayBuffer extends PostgresStoreReadiness {
 	/**
 	 * Publish a message through the buffer. Stores it in Postgres with a
 	 * sequence number, then calls platform.publish() as normal.

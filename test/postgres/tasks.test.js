@@ -609,7 +609,8 @@ describe('postgres tasks', () => {
 			r.destroy();
 		});
 
-		it('resolves immediately when autoMigrate is false', async () => {
+		it('validates the deployed schema when autoMigrate is false', async () => {
+			await runner.ready();
 			const r = createTaskRunner(client, { autoMigrate: false, recoveryInterval: 0, cleanupInterval: 0 });
 			await expect(r.ready()).resolves.toBeUndefined();
 			r.destroy();
@@ -764,6 +765,7 @@ describe('postgres tasks', () => {
 				fence: fenceProvider
 			});
 			r.register('slow', async () => new Promise((res) => setTimeout(res, 1000)));
+			await r.ready();
 			const promise = r.run('slow', { input: null });
 
 			await new Promise((res) => setTimeout(res, 10));

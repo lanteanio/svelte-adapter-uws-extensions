@@ -686,6 +686,7 @@ describe('postgres replay', () => {
 		});
 
 		it('clear deletes data and bumps every epoch inside one BEGIN/COMMIT transaction', async () => {
+			await replay.ready();
 			// Spy on pool.connect() to capture the transaction-control statements.
 			const seen = [];
 			const origConnect = client.pool.connect.bind(client.pool);
@@ -721,6 +722,7 @@ describe('postgres replay', () => {
 		});
 
 		it('clearTopic deletes data and bumps the epoch inside one BEGIN/COMMIT transaction', async () => {
+			await replay.ready();
 			const seen = [];
 			const origConnect = client.pool.connect.bind(client.pool);
 			client.pool.connect = async () => {

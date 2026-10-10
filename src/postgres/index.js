@@ -14,6 +14,7 @@ import { ConnectionError } from '../shared/errors.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+export { migrate, validateSchema, postgresMigrations, postgresReadiness } from './migrations.js';
 
 const { Pool, Client } = pg;
 
@@ -147,6 +148,14 @@ export function createPgClient(opts) {
 		pool,
 
 		query: operations.query,
+
+		async check({ timeoutMs = 5000 } = {}) {
+			if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw new TypeError('postgres check: timeoutMs must be a positive timer-sized integer');
+			const result = await operations.query({ text: 'SHOW server_version_num', query_timeout: timeoutMs }, undefined, { signal: AbortSignal.timeout(timeoutMs) });
+			const version = result.rows[0]?.server_version_num;
+			if (typeof version !== 'string' || !/^\d{5,6}$/.test(version) || Number(version) < 160000) throw new Error('postgres check: PostgreSQL 16 or newer is required');
+			return { serverVersionNum: Number(version) };
+		},
 
 		/**
 		 * Acquire a dedicated connection from the pool. Use this rather than

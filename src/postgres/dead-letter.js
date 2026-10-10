@@ -34,8 +34,9 @@
  * @module svelte-adapter-uws-extensions/postgres/dead-letter
  */
 
-import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker } from '../shared/breaker.js';
+import { createStoreSchema } from './migrations.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
 
@@ -87,28 +88,8 @@ export function createDeadLetter(client, options = {}) {
 	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
 
-	let migrated = false;
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				${pkCol}   BIGSERIAL PRIMARY KEY,
-				webhook_id TEXT,
-				topic      TEXT   NOT NULL,
-				event      TEXT,
-				data       JSONB,
-				attempts   INT    NOT NULL DEFAULT 0,
-				error      TEXT,
-				failed_at  BIGINT NOT NULL
-			)
-		`, { table, columns: [pkCol, 'webhook_id', 'topic', 'event', 'data', 'attempts', 'error', 'failed_at'] });
-		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_topic ON ${table} (topic)`);
-		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_failed_at ON ${table} (failed_at)`);
-		// Right-to-erasure column (added via ALTER so existing tables forward-migrate).
-		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
-		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
-		migrated = true;
-	}
+	const schema = createStoreSchema(client, 'dead-letter', table, autoMigrate);
+	const ensureTable = schema.ensure;
 
 	/** Map a DB row (snake_case, bigints-as-strings) to the camelCase record. */
 	function rowToRecord(row) {
@@ -164,6 +145,8 @@ export function createDeadLetter(client, options = {}) {
 	const liveRows = ttlMs > 0 ? `failed_at >= (extract(epoch from now()) * 1000)::bigint - ${ttlMs}` : 'TRUE';
 
 	return {
+		ready: schema.ready,
+		status: schema.status,
 		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
 		async add(rec) {
 			await ensureTable();

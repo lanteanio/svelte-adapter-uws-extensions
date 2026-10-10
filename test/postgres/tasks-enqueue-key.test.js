@@ -10,10 +10,11 @@ function create(client, options = {}) {
 
 describe('queued task idempotency keys', () => {
 	it('persists independent submissions and forwards the same key without using the run result cache', async () => {
-		vi.useFakeTimers(); const client = mockPgClient();
+		const client = mockPgClient();
 		const idempotency = { acquire: vi.fn(async () => { throw new Error('enqueue and dispatch must not consult the run cache'); }) };
 		const first = create(client, { idempotency }), second = create(client, { idempotency });
 		await Promise.all([first.ready(), second.ready()]);
+		vi.useFakeTimers();
 		const ids = await Promise.all([
 			first.enqueue('send', { input: { submission: 1 }, idempotencyKey: 'same-operation' }),
 			second.enqueue('send', { input: { submission: 2 }, idempotencyKey: 'same-operation' })

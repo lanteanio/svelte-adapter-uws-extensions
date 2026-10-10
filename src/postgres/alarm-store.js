@@ -24,7 +24,8 @@
  * @module svelte-adapter-uws-extensions/postgres/alarm-store
  */
 
-import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
+import { createStoreSchema } from './migrations.js';
 import { withBreaker } from '../shared/breaker.js';
 
 /** Default cap on the rows returned by one `due(now)` sweep. */
@@ -68,31 +69,9 @@ export function createAlarmStore(client, options = {}) {
 	const mClaimed = m?.counter('alarm_store_claimed_total', 'Alarms claimed (delete removed a present row)');
 	const mDue = m?.counter('alarm_store_due_total', 'Due alarms returned to the recovery poll');
 
-	let migrated = false;
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		// `topic` is the natural primary key: this is a single-row-per-topic
-		// aggregate (one pending alarm per topic), so a surrogate `_id` would add
-		// no identity and a second index. A documented divergence from the
-		// `<tablename>_id` surrogate-key convention the row-per-event tables
-		// (svti_replay, svti_jobs, svti_tasks, svti_dead_letter) follow; the
-		// idempotency table (`svti_idempotency_key`) and the replay counter
-		// (`svti_replay_seq`.topic) are the same single-row-per-key kind.
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				topic   TEXT   PRIMARY KEY,
-				fire_at BIGINT NOT NULL,
-				meta    JSONB,
-				tenant  TEXT
-			)
-		`, { table, columns: ['topic', 'fire_at', 'meta', 'tenant'] });
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_fire_at ON ${table} (fire_at)
-		`);
-		migrated = true;
-	}
-	const readyPromise = autoMigrate ? ensureTable() : Promise.resolve();
-	readyPromise.catch(() => {});
+	const schema = createStoreSchema(client, 'alarm-store', table, autoMigrate);
+	const ensureTable = schema.ensure;
+	if (autoMigrate) schema.ready().catch(() => {});
 
 	function assertTopic(topic) {
 		if (typeof topic !== 'string' || topic.length === 0) {
@@ -101,7 +80,8 @@ export function createAlarmStore(client, options = {}) {
 	}
 
 	return {
-		ready: () => readyPromise,
+		ready: schema.ready,
+		status: schema.status,
 
 		async set(topic, at, meta) {
 			assertTopic(topic);

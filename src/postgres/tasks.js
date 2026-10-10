@@ -313,18 +313,8 @@ export function createTaskRunner(client, options = {}) {
 
 	const sql = createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, serializeErrorCause, maxPayloadBytes });
 
-	// One-shot ready() promise: kicks off ensureTable() at construction so
-	// callers that need the table to exist before they start polling
-	// (dashboards, status pages) can `await runner.ready()` without
-	// triggering a no-op task. Subsequent ensureTable() calls inside the
-	// state machine are no-ops via the migrated flag in createTaskSql.
-	const readyPromise = autoMigrate ? sql.ensureTable() : Promise.resolve();
-	// Attach a no-op catch so a runner that is only enqueued-to (and never awaits
-	// ready()) cannot surface a construction-time migration failure as an unhandled
-	// rejection that crashes the process. ready() returns the ORIGINAL readyPromise
-	// (below), so a caller that DOES await it still observes the real error. Mirrors
-	// the idempotency store's construction-time migration guard.
-	readyPromise.catch(() => {});
+	if (autoMigrate) sql.schema.ready().catch(() => {});
+
 
 	/**
 	 * Centralized state-change emitter. Errors thrown from the listener
@@ -970,9 +960,8 @@ export function createTaskRunner(client, options = {}) {
 			}
 		},
 
-		ready() {
-			return readyPromise;
-		},
+		ready: sql.schema.ready,
+		status: sql.schema.status,
 
 		async list(listOptions = {}) {
 			const filterName = listOptions.name;

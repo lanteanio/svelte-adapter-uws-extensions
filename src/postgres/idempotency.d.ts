@@ -1,3 +1,4 @@
+import type { PostgresStoreReadiness } from './index.js';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
@@ -22,7 +23,7 @@ export interface PgIdempotencyOptions {
 	maxResultBytes?: number;
 }
 
-export interface PgIdempotencyStore {
+export interface PgIdempotencyStore extends PostgresStoreReadiness {
 	/**
 	 * Try to claim ownership of an idempotency key. Returns one of three slot
 	 * shapes. The optional `meta` records the committing user (denormalized into
@@ -36,12 +37,7 @@ export interface PgIdempotencyStore {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Drop every row in the store's table. */
 	clear(): Promise<void>;
-	/**
-	 * Resolves once the store's auto-migration has completed (or
-	 * immediately if `autoMigrate: false`). The migration is kicked off
-	 * at construction so callers that need the table to exist before
-	 * they start polling can `await store.ready()`. Idempotent.
-	 */
+	/** Await automatic migration, or read-only schema validation with autoMigrate: false. */
 	ready(): Promise<void>;
 	/** Stop the cleanup timer (call on shutdown if not relying on autoShutdown). */
 	destroy(): void;

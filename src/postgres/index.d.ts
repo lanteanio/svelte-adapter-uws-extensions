@@ -37,6 +37,8 @@ export interface PgOperationOptions {
 }
 
 export interface PgClient {
+	/** Bounded read-only connectivity and PostgreSQL 16+ check. */
+	check(options?: { timeoutMs?: number }): Promise<{ serverVersionNum: number }>;
 	/** The underlying pg Pool. */
 	readonly pool: Pool;
 	/** Run a query. */
@@ -65,3 +67,39 @@ export interface PgClient {
  * Create a Postgres client with lifecycle management.
  */
 export function createPgClient(options: PgClientOptions): PgClient;
+
+export type PostgresStore = 'replay' | 'idempotency' | 'jobs' | 'tasks' | 'dead-letter' | 'alarm-store';
+export interface PostgresSchemaOptions {
+	store: PostgresStore;
+	/** Defaults to the corresponding store factory's table name. */
+	table?: string;
+}
+export interface PostgresMigration {
+	version: number;
+	checksum: string;
+	statements: string[];
+}
+export interface PostgresMigrationOptions extends PostgresSchemaOptions {
+	/** Database lock wait limit in milliseconds. Positive and finite. @default 5000 */
+	lockTimeoutMs?: number;
+	/** Database execution limit per statement in milliseconds. Positive and finite. @default 30000 */
+	statementTimeoutMs?: number;
+}
+export interface PostgresStoreStatus {
+	state: 'idle' | 'checking' | 'ready' | 'failed';
+	error: Error | null;
+}
+export interface PostgresStoreReadiness {
+	/** Migrate automatically, or inspect the schema read-only when autoMigrate is false. Failed calls can be retried. */
+	ready(): Promise<void>;
+	/** Initialization state; a successful check is a point-in-time result. */
+	status(): PostgresStoreStatus;
+}
+/** Ordered, checksummed SQL for the selected store. Does not access the database. */
+export function postgresMigrations(options: PostgresSchemaOptions): PostgresMigration[];
+/** Apply resumable migrations with a schema-owner client and a dedicated session. */
+export function migrate(client: PgClient, options: PostgresMigrationOptions): Promise<void>;
+/** Read-only catalog, required privileges and present migration-ledger validation. */
+export function validateSchema(client: PgClient, options: PostgresSchemaOptions): Promise<void>;
+/** Check connectivity and await all supplied store readiness gates. Rejects with AggregateError for store failures. */
+export function postgresReadiness(client: PgClient, components?: readonly Pick<PostgresStoreReadiness, 'ready'>[]): Promise<void>;

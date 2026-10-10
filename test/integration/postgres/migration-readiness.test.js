@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { createPgClient } from '../../../src/postgres/index.js';
+import { createPgClient, migrate } from '../../../src/postgres/index.js';
 import { createReplay } from '../../../src/postgres/replay.js';
 import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 import { createTaskRunner } from '../../../src/postgres/tasks.js';
@@ -13,6 +13,7 @@ async function migrateManually(client, base, table) {
 	expect(statements.length).toBeGreaterThan(0);
 	for (let repeat = 0; repeat < 2; repeat++) {
 		for (const sql of statements) await client.query(sql.replaceAll(base, table));
+		await migrate(client, { store: base === 'svti_replay' ? 'replay' : 'idempotency', table });
 	}
 }
 function connect() { return createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false }); }
@@ -61,7 +62,7 @@ describe('PostgreSQL migration readiness', () => {
 		}
 	});
 
-	it('rejects failed automatic initialization while disabled migration does not certify schema readiness', async () => {
+	it('rejects incomplete schemas with automatic migration enabled or disabled', async () => {
 		const client = connect(), table = 'migration_incomplete_tasks';
 		const options = { table, dispatchInterval: 0, recoveryInterval: 0, cleanupInterval: 0 };
 		let automatic, manual;
@@ -70,7 +71,7 @@ describe('PostgreSQL migration readiness', () => {
 			automatic = createTaskRunner(client, options);
 			await expect(automatic.ready()).rejects.toThrow('missing expected column');
 			manual = createTaskRunner(client, { ...options, autoMigrate: false });
-			await expect(manual.ready()).resolves.toBeUndefined();
+			await expect(manual.ready()).rejects.toThrow('missing expected column');
 			await expect(manual.list()).rejects.toThrow();
 		} finally {
 			automatic?.destroy(); manual?.destroy();

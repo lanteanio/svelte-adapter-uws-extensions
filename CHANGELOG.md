@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add serialized, versioned PostgreSQL migrations with a checksum ledger, bounded dedicated sessions, resumable concurrent indexes, state/attempt/claim constraints, and unique replay `(topic, seq)` identities. Existing incompatible data fails validation without automatic repair.
+- Add PostgreSQL server and aggregate readiness gates, uniform store `ready()`/`status()`, and read-only schema/privilege validation with `autoMigrate: false` for separate deployment and runtime roles.
+
 - Collect isolated PostgreSQL query plans, statement I/O and maintenance evidence with deterministic skew and churn, bounded work and private-schema cleanup.
 
 - Report corrupt Redis replay entries and cursor input, snapshot, relay and background failures through bounded operational diagnostics and finite reason/stage counters without exposing payloads or identifiers.

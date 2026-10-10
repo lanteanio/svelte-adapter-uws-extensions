@@ -32,7 +32,8 @@
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
 
-import { safeCreate, assertSafeTableName } from '../shared/pg-migrate.js';
+import { assertSafeTableName } from '../shared/pg-migrate.js';
+import { createStoreSchema } from './migrations.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { createLruMap } from '../shared/lru-map.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -171,50 +172,8 @@ export function createReplay(client, options = {}) {
 		? m?.counter('replay_storage_fallbacks_total', 'Publishes that fell back to local fanout when storage failed', ['topic'])
 		: null;
 
-	let migrated = false;
-
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				${pkCol} BIGSERIAL   PRIMARY KEY,
-				topic    TEXT        NOT NULL,
-				seq      BIGINT      NOT NULL,
-				event    TEXT        NOT NULL,
-				data     JSONB,
-				created_at TIMESTAMPTZ DEFAULT now()
-			)
-		`, { table, columns: [pkCol, 'topic', 'seq', 'event', 'data', 'created_at'] });
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)
-		`);
-		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_created_at ON ${table} (created_at)`);
-		// Right-to-erasure column (ALTER so existing buffers forward-migrate).
-		await safeCreate(client, `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT`);
-		await safeCreate(client, `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)`);
-		// `topic` is the natural primary key: one counter row per topic, so a
-		// surrogate `_id` would add no identity. A documented divergence from the
-		// `<tablename>_id` convention the event table (svti_replay) follows - the
-		// same single-row-per-key shape as svti_alarms and svti_idempotency.
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${seqTable} (
-				topic TEXT   PRIMARY KEY,
-				seq   BIGINT NOT NULL DEFAULT 0,
-				epoch BIGINT NOT NULL DEFAULT 0
-			)
-		`, { table: seqTable, columns: ['topic', 'seq'] });
-		// The pre-migration guard above checks only legacy columns; requiring epoch
-		// there would reject an old table before this ALTER can upgrade it.
-		// Additive migration for an already-deployed seq table created before the
-		// epoch column existed. Idempotent and runs under the same migrated-once
-		// guard, so a fresh table (just created above) is a no-op and an old one
-		// gains the column with a safe default.
-		await safeCreate(client, `
-			ALTER TABLE ${seqTable}
-			  ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0
-		`);
-		migrated = true;
-	}
+	const schema = createStoreSchema(client, 'replay', table, autoMigrate);
+	const ensureTable = schema.ensure;
 
 	let cleanupTopic = '';
 	let ttlFirst = true;
@@ -377,6 +336,8 @@ export function createReplay(client, options = {}) {
 	}
 
 	const tracker = {
+		ready: schema.ready,
+		status: schema.status,
 		async publish(platform, topic, event, data) {
 			// Serialize and size-check before the storage try-block. Caller-input
 			// failures must not enter the breaker or trigger local fan-out.

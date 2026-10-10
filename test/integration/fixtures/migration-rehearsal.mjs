@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
+import { createPgClient, migrate, postgresReadiness } from 'svelte-adapter-uws-extensions/postgres';
 import { createJobQueue } from 'svelte-adapter-uws-extensions/postgres/jobs';
 import { createTaskRunner } from 'svelte-adapter-uws-extensions/postgres/tasks';
 
@@ -27,9 +27,12 @@ try {
 				const sql = manual.replaceAll('svti_jobs', jobsTable).replaceAll('svti_tasks', tasksTable);
 				await client.query(sql);
 				await client.query(sql); // A retry must be safe.
+				await migrate(client, { store: 'jobs', table: jobsTable });
+				await migrate(client, { store: 'tasks', table: tasksTable });
 			}
 			const jobs = createJobQueue(client, { table: jobsTable, autoMigrate });
 			runner = createTaskRunner(client, { table: tasksTable, autoMigrate, dispatchInterval: 0, recoveryInterval: 0 });
+			await postgresReadiness(client, [jobs, runner]);
 			const newJob = await jobs.enqueue('new', { fresh: true }, { traceContext });
 			const newTask = await runner.enqueue('new', { input: { fresh: true }, traceContext });
 			assert.deepEqual(await runner.await('00000000-0000-4000-8000-000000000001'), { old: true });
@@ -53,6 +56,7 @@ try {
 		} finally {
 			runner?.destroy();
 			await client.query(`DROP TABLE IF EXISTS ${jobsTable}, ${tasksTable}`);
+			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = ANY($1)', [[jobsTable, tasksTable]]);
 		}
 	}
 } finally {

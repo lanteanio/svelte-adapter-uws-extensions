@@ -12,7 +12,7 @@
  * @module svelte-adapter-uws-extensions/postgres/_tasks-sql
  */
 
-import { safeCreate } from '../shared/pg-migrate.js';
+import { createStoreSchema } from './migrations.js';
 import { serialiseError, unserialisableErrorShape } from './_tasks-errors.js';
 import { MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 
@@ -155,69 +155,8 @@ export const MIN_TASK_PAYLOAD_BYTES = Math.max(
  * }} ctx
  */
 export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, serializeErrorCause = false, maxPayloadBytes = MAX_STORE_PAYLOAD_BYTES }) {
-	let migrated = false;
-
-	async function ensureTable() {
-		if (migrated || !autoMigrate) return;
-		await safeCreate(client, `
-			CREATE TABLE IF NOT EXISTS ${table} (
-				svti_tasks_id        UUID         PRIMARY KEY,
-				name                 TEXT         NOT NULL,
-				input                JSONB,
-				svti_idempotency_key TEXT,
-				request_id           TEXT,
-				traceparent          TEXT,
-				tracestate           TEXT,
-				status               TEXT         NOT NULL,
-				result               JSONB,
-				error                JSONB,
-				fence                UUID         NOT NULL,
-				fence_expires_at     TIMESTAMPTZ  NOT NULL,
-				attempts             INT          NOT NULL DEFAULT 1,
-				created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
-				updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
-			)
-		`, {
-			table,
-			// `request_id` is intentionally NOT in the expected set: it's
-			// added by the ALTER TABLE below for forward-migrated next.1
-			// deployments, so the table may legitimately pre-exist without
-			// it before the ALTER runs.
-			columns: ['svti_tasks_id', 'name', 'input', 'svti_idempotency_key', 'status', 'result', 'error', 'fence', 'fence_expires_at', 'attempts', 'created_at', 'updated_at']
-		});
-		// Forward-migrate existing 0.5.0-next.1 deployments. ADD COLUMN IF NOT
-		// EXISTS is idempotent on Postgres 9.6+; safeCreate swallows the
-		// duplicate-column error path on older versions defensively.
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS request_id TEXT
-		`);
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS traceparent TEXT
-		`);
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tracestate TEXT
-		`);
-		// Right-to-erasure column: a task input may carry the enqueuing user's PII,
-		// so row DELETE is the only clean erasure. Stamped from the runner's
-		// forgetUserId extractor; ADD COLUMN IF NOT EXISTS forward-migrates.
-		await safeCreate(client, `
-			ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS user_id TEXT
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id)
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_running_fence
-			    ON ${table} (fence_expires_at)
-			 WHERE status = 'running'
-		`);
-		await safeCreate(client, `
-			CREATE INDEX IF NOT EXISTS idx_${table}_terminal_updated
-			    ON ${table} (updated_at)
-			 WHERE status IN ('committed', 'failed')
-		`);
-		migrated = true;
-	}
+	const schema = createStoreSchema(client, 'tasks', table, autoMigrate);
+	const ensureTable = schema.ensure;
 
 	/**
 	 * Takes the already-encoded input that run() validated at its caller
@@ -535,6 +474,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 
 	return {
 		ensureTable,
+		schema,
 		insertAttempt,
 		rearmAttempt,
 		heartbeatFence,

@@ -1,3 +1,4 @@
+import { forgetFixtureMigrations } from '../helpers/postgres-schema.js';
 /**
  * Integration tests for postgres/jobs against a real Postgres 16 server.
  *
@@ -41,16 +42,15 @@ describe('postgres jobs (integration)', () => {
 	});
 
 	afterAll(async () => {
-		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+		await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 		await client.end();
 	});
 
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh queues racing their first enqueue both succeed', async () => {
-			// CREATE TABLE IF NOT EXISTS races on concurrent first calls.
-			// ensureTable() catches 23505 / 42P07 / 42710 and treats the
-			// table as already-existing.
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			// Concurrent cold starts serialize migration under the schema advisory lock,
+			// then validate the same completed schema and ledger before writing.
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 
 			const a = createJobQueue(client, { table: TABLE });
 			const b = createJobQueue(client, { table: TABLE });

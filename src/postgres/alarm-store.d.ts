@@ -1,3 +1,4 @@
+import type { PostgresStoreReadiness } from './index.js';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
@@ -33,8 +34,8 @@ export interface PgAlarmStoreOptions {
  * (`configureAlarm({ store })`). Pure data-access - no background loop; the
  * leader-gated recovery poll lives in the realtime layer.
  */
-export interface PgAlarmStore {
-	/** Resolves once the table has been ensured (autoMigrate). */
+export interface PgAlarmStore extends PostgresStoreReadiness {
+	/** Migrate and validate, or validate read-only when autoMigrate is false. */
 	ready(): Promise<void>;
 	/** Persist (or replace) the alarm for `topic`, due at epoch-ms `at`. */
 	set(topic: string, at: number, meta?: AlarmMeta | null): Promise<void>;

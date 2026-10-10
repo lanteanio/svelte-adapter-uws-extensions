@@ -5,62 +5,123 @@
 	"sourceRelease": "0.5.10",
 	"sourceGitHead": "a7d5df37b016988ef238bccddfcd037acc51af93",
 	"postgresMinimum": 16,
-	"appliedMigrationLedger": false,
+	"appliedMigrationLedger": true,
 	"stores": [
 		{
 			"subpath": "postgres/replay",
-			"tables": ["svti_replay", "svti_replay_seq"],
+			"tables": [
+				"svti_replay",
+				"svti_replay_seq"
+			],
 			"restoreTogether": true,
-			"initialization": "first store operation",
-			"ready": false,
+			"initialization": "first store operation or ready()",
+			"ready": true,
 			"changeClass": "additive columns and indexes",
-			"additions": ["svti_replay.user_id TEXT", "svti_replay_seq.epoch BIGINT NOT NULL DEFAULT 0", "idx_svti_replay_user(user_id)", "idx_svti_replay_created_at(created_at)"],
+			"additions": [
+				"svti_replay.user_id TEXT",
+				"svti_replay_seq.epoch BIGINT NOT NULL DEFAULT 0",
+				"idx_svti_replay_user(user_id)",
+				"idx_svti_replay_created_at(created_at)",
+				"UNIQUE idx_svti_replay_identity(topic,seq); replaces idx_svti_replay_topic_seq"
+			],
 			"rollbackLimit": "Column-only old readers remain possible; old reset/resume code does not honor the new epoch. Do not mix reset authorities."
 		},
 		{
 			"subpath": "postgres/idempotency",
-			"tables": ["svti_idempotency"],
+			"tables": [
+				"svti_idempotency"
+			],
 			"initialization": "construction",
 			"ready": true,
 			"changeClass": "additive columns and indexes",
-			"additions": ["user_id TEXT", "tenant_id TEXT", "owner_token TEXT", "idx_svti_idempotency_user(tenant_id,user_id)"],
+			"additions": [
+				"user_id TEXT",
+				"tenant_id TEXT",
+				"owner_token TEXT",
+				"idx_svti_idempotency_user(tenant_id,user_id)",
+				"CHECK status IN ('pending','committed')"
+			],
 			"rollbackLimit": "Old writers do not honor owner tokens or record erasure identity. Drain pending owners and reconcile retained results before downgrade."
 		},
 		{
 			"subpath": "postgres/jobs",
-			"tables": ["svti_jobs"],
-			"initialization": "first store operation",
-			"ready": false,
+			"tables": [
+				"svti_jobs"
+			],
+			"initialization": "first store operation or ready()",
+			"ready": true,
 			"changeClass": "additive nullable columns",
-			"additions": ["traceparent TEXT", "tracestate TEXT"],
+			"additions": [
+				"traceparent TEXT",
+				"tracestate TEXT",
+				"CHECK attempts >= 0",
+				"CHECK claim timestamps are both null or both present with claimed_until >= claimed_at"
+			],
 			"rollbackLimit": "Retain nullable columns; old rows and column-only readers are rehearsed. Drain workers before changing binaries."
 		},
 		{
 			"subpath": "postgres/tasks",
-			"tables": ["svti_tasks"],
+			"tables": [
+				"svti_tasks"
+			],
 			"initialization": "construction",
 			"ready": true,
 			"changeClass": "additive columns and indexes",
-			"additions": ["traceparent TEXT", "tracestate TEXT", "user_id TEXT", "idx_svti_tasks_user(user_id)"],
+			"additions": [
+				"traceparent TEXT",
+				"tracestate TEXT",
+				"user_id TEXT",
+				"idx_svti_tasks_user(user_id)",
+				"CHECK status IN ('pending','running','committed','failed')",
+				"CHECK attempts >= 0"
+			],
 			"rollbackLimit": "Retain nullable columns; old terminal rows and column-only readers are rehearsed. Drain handlers and preserve fence/receipt data."
 		},
 		{
 			"subpath": "postgres/dead-letter",
-			"tables": ["svti_dead_letter"],
-			"initialization": "first store operation",
-			"ready": false,
+			"tables": [
+				"svti_dead_letter"
+			],
+			"initialization": "first store operation or ready()",
+			"ready": true,
 			"changeClass": "new store since source release",
-			"additions": ["store table and topic, failed_at, user_id indexes"],
+			"additions": [
+				"store table and topic, failed_at, user_id indexes"
+			],
 			"rollbackLimit": "The source release has no corresponding PostgreSQL store. Preserve captured evidence; do not drop it to downgrade."
 		},
 		{
 			"subpath": "postgres/alarm-store",
-			"tables": ["svti_alarms"],
+			"tables": [
+				"svti_alarms"
+			],
 			"initialization": "construction",
 			"ready": true,
 			"changeClass": "new store since source release",
-			"additions": ["store table and fire_at index"],
+			"additions": [
+				"store table and fire_at index"
+			],
 			"rollbackLimit": "The source release has no corresponding PostgreSQL store. Reconcile due alarms and side effects before changing schedulers."
 		}
-	]
+	],
+	"ledger": {
+		"table": "svti_schema_migrations",
+		"key": [
+			"table_name",
+			"version"
+		],
+		"columns": [
+			"table_name",
+			"store",
+			"version",
+			"checksum",
+			"applied_at"
+		],
+		"versions": [
+			1,
+			2
+		],
+		"checksum": "sha256",
+		"restoreWithStores": true
+	}
 }

@@ -31,7 +31,7 @@ npm run preflight:postgres
 
 The command issues only `SHOW server_version_num`, refuses a missing/malformed identity or a version below 16, and closes its single connection. Connection and query waits are bounded to five seconds. It prints the numeric server version and the tested baseline, never the connection URL. The standalone Postgres integration setup performs the same check before any store tests initialize tables.
 
-For an application using the installed package, the equivalent read-only check uses the existing client API:
+For an application using the installed package, use the bounded read-only client check:
 
 ```js
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
@@ -42,11 +42,8 @@ const database = createPgClient({
   options: { max: 1, connectionTimeoutMillis: 5000, query_timeout: 5000, statement_timeout: 5000 }
 });
 try {
-  const { rows } = await database.query('SHOW server_version_num');
-  const version = rows[0]?.server_version_num;
-  if (typeof version !== 'string' || !/^\d{5,6}$/.test(version) || Number(version) < 160000) {
-    throw new Error('PostgreSQL 16 or newer is required before store initialization');
-  }
+  const { serverVersionNum } = await database.check();
+  console.log(serverVersionNum);
 } finally {
   await database.end();
 }
@@ -114,42 +111,119 @@ Reconnect and election operations never overlap within one bridge. Failed connec
 ## Schema transitions and readiness
 
 The [schema transition manifest](./postgres-schema.v1.json) describes this
-package's 0.6 candidate relative to stable 0.5.10. It ships with the package;
-retain it with the exact tarball digest and application lockfile. It is a
-release description, **not an applied database migration ledger**. The stores
-have no shared schema-version row, checksum ledger or all-store transaction.
-The minimum server is PostgreSQL 16 for every row below.
+package's 0.6 candidate relative to stable 0.5.10. Retain it with the exact
+tarball digest and application lockfile. Applied migrations are recorded in
+`svti_schema_migrations` in the configured schema. PostgreSQL 16 is the minimum
+server for every store.
 
 | Store | Change from 0.5.10 | Initialization with `autoMigrate: true` | Startup gate |
 | --- | --- | --- | --- |
-| Replay | Adds event `user_id`, identity and retention indexes, and sequence `epoch` with default 0. | First store operation. | No `ready()`; apply/verify schema before opening traffic. |
+| Replay | Adds event `user_id`, unique identity and retention indexes, and sequence `epoch` with default 0. | First store operation or `ready()`. | Await `store.ready()`. |
 | Idempotency | Adds `user_id`, `tenant_id`, `owner_token` and tenant/user index. | Starts at construction. | Await `store.ready()`. |
-| Jobs | Adds nullable `traceparent` and `tracestate`. | First store operation. | No `ready()`; apply/verify schema before starting producers/workers. |
+| Jobs | Adds nullable trace columns, nonnegative attempts and consistent claim timestamps. | First store operation or `ready()`. | Await `queue.ready()`. |
 | Tasks | Adds nullable trace columns, `user_id` and user index. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
-| Dead letter | New PostgreSQL store in this release series. | First store operation. | No `ready()`; provision/verify its complete schema. |
+| Dead letter | New PostgreSQL store in this release series. | First store operation or `ready()`. | Await `store.ready()`. |
 | Alarms | New PostgreSQL store in this release series. | Starts at construction. | Await `store.ready()` before scheduling. |
 
-`autoMigrate: false` disables DDL; existing `ready()` methods resolve immediately
-and do not inspect columns, types, indexes or privileges. The read-only server
-preflight above checks only the server version. Neither result certifies schema
-readiness. Constructors and ordinary reads can perform DDL when automatic
-migration is enabled, so do not use an arbitrary store call as a read-only probe.
-Notification activation verifies its own dedicated session and LISTEN/election,
-not any durable store's schema or missed-event reconciliation.
+Every durable store exposes `ready()` and `status()`. With automatic migration
+enabled, readiness migrates and validates the schema. With `autoMigrate: false`,
+readiness issues only catalog reads: required columns, types, nullability,
+defaults, primary keys, valid indexes, CHECK expressions, operation privileges
+and serial-sequence privileges must match. When a ledger exists, readiness also
+verifies its selected table's versions and checksums; grant runtime SELECT on
+the ledger. Compatible manually provisioned schemas may have no ledger.
+Readiness rejects unknown required columns, CHECK constraints, unique indexes,
+foreign keys and exclusion constraints because they can reject valid store writes.
+This conservative policy also rejects required extra columns with automatic defaults.
+Extra columns must be nullable ordinary columns without defaults, identity or
+generated expressions; ordinary nonunique indexes are allowed. Migration
+checkpoints permit already installed constraints from this package's later known
+versions, so complete manual provisioning and interrupted upgrades remain adoptable.
+Ordinary operations with automatic migration disabled
+retain their existing behavior; explicitly await readiness before traffic.
 
-For a controlled rollout, resolve the configured table names and `search_path`,
-compare column types/defaults/nullability and valid indexes with the target
-schema, and verify the actual runtime role's operation privileges. Use explicit
-column-only `SELECT ... LIMIT 0` queries plus PostgreSQL catalogs under a
-read-only transaction; do not invoke migrations merely to inspect production.
-The built-in drift guard checks selected column names, not their types or index
-shape. Own the DDL in one deployment step and await its completion before
-admitting application traffic with `autoMigrate: false`.
+`status()` returns `{ state, error }`, where state is `idle`, `checking`, `ready`
+or `failed`. Concurrent readiness calls share work; a failed call can be retried.
+Successful readiness is cached for that store instance. Use
+`validateSchema(client, { store, table })` for a fresh read-only validation, with
+a ten-second bound per catalog operation. This is a point-in-time check, not a
+continuous availability guarantee.
+It checks the declared schema and direct privileges, not deployment-specific
+trigger behavior or row-level security policies.
+
+Use `client.check({ timeoutMs: 5000 })` for a bounded server preflight returning
+`{ serverVersionNum }`. `postgresReadiness(client, stores)` checks the server,
+then awaits every store and reports all store failures in an `AggregateError`.
+Notification bridges retain their separate awaited `activate()` gate for their
+dedicated session and LISTEN/election.
+
+### Separate deployment and runtime roles
+
+Run migrations with an owner/deployment role before starting runtime stores:
+
+```js
+import { createPgClient, migrate, postgresReadiness } from 'svelte-adapter-uws-extensions/postgres';
+import { createJobQueue } from 'svelte-adapter-uws-extensions/postgres/jobs';
+
+const deployment = createPgClient({ connectionString: process.env.DATABASE_MIGRATION_URL });
+try {
+  await migrate(deployment, { store: 'jobs', table: 'svti_jobs' });
+} finally {
+  await deployment.end();
+}
+const runtime = createPgClient({ connectionString: process.env.DATABASE_URL });
+const jobs = createJobQueue(runtime, { autoMigrate: false });
+await postgresReadiness(runtime, [jobs]);
+```
+
+`store` is one of `replay`, `idempotency`, `jobs`, `tasks`, `dead-letter` or
+`alarm-store`; `table` defaults to the documented store table. Keep the same
+table names and `search_path` in deployment and runtime. Grant the runtime role
+schema USAGE and required table DML, plus USAGE or UPDATE on serial sequences;
+grant SELECT on an existing migration ledger, without DDL ownership. Use a direct/session-pooled
+connection for migrations because migration coordination uses a session lock.
+
+### Versioned migration behavior
+
+`postgresMigrations({ store, table })` returns the versioned SQL and SHA-256
+checksums. Version 1 establishes the existing baseline and additive columns;
+version 2 adds constraints and replay uniqueness. Idempotency states are
+`pending`/`committed`; task states are `pending`/`running`/`committed`/`failed`.
+Jobs and tasks require nonnegative attempts. Job claim timestamps must both be
+null or both present with expiry at or after claim time. Replay's unique
+`(topic, seq)` index replaces its redundant nonunique index. Invalid existing
+rows or duplicate identities require deliberate operator reconciliation;
+migrations never delete or rewrite them to make validation succeed.
+
+The ledger columns are `table_name`, `store`, `version`, `checksum` and
+`applied_at`, with primary key `(table_name, version)`. A replay ledger entry
+also covers its `_seq` companion. Migrations are serialized per database/schema
+with bounded advisory-lock polling. Each version is recorded only after its
+schema validates; checksum drift, gaps, future versions and missing tables
+after an applied migration fail closed. Restore the ledger with its stores.
+Validation uses schema names and catalogs, without persisting relation OIDs.
+
+DDL uses separate autocommit statements, allowing `CREATE INDEX CONCURRENTLY`.
+CHECK constraints are added `NOT VALID` before validation. Interrupted work can
+be retried; an invalid concurrent index is rebuilt only when its name, owning
+table and shape match the expected index. Conflicting objects are refused.
+Earlier successful statements can remain after a later failure; migration is
+not an all-or-nothing transaction.
+
+Every migration uses a dedicated checkout, with a ten-second checkout deadline,
+a default five-second lock deadline and a default thirty-second statement
+deadline. Override `lockTimeoutMs` and `statementTimeoutMs` with positive finite
+integer millisecond values up to `2147482647`; migration bounds cannot be disabled.
+Driver query deadlines allow one additional second for server errors. The
+checkout is destroyed on success or failure so session locks and settings
+cannot leak into runtime queries. Busy tables can make a bounded migration fail;
+rehearse DDL on a restored copy and schedule a suitable deployment window.
 
 ### Existing replay and idempotency tables
 
 Alongside the [jobs/tasks migration](../MIGRATION.md#jobs-and-tasks-tables-gain-trace-columns-tasks-gain-erasure-identity),
-apply these additions when managing the schema yourself. Names below are the
+these additions show the historical nullable-column transition. Use `migrate()`
+for the complete schema, constraints and indexes. Names below are the
 defaults; substitute each configured table name, including replay's `_seq`
 companion. Fresh dead-letter and alarm stores need their complete README schemas,
 not just an `ALTER TABLE` fragment.
@@ -196,16 +270,14 @@ restore drill; this package's disposable tests do not establish them.
 
 1. Rehearse against an isolated restored copy and the exact candidate tarball.
    Pause producers and retention workers; save the source snapshot and schema.
-2. Inject a missing-column or denied-DDL failure. Await the available `ready()`
-   gates and keep application readiness false on rejection. For a lazy store,
-   run the deployment's explicit schema verifier before enabling it.
+2. Inject a missing-column or denied-DDL failure. Await every store's `ready()`
+   gate and keep application readiness false on rejection.
 3. Inventory committed DDL: automatic initialization issues separate statements,
    so a later failure can leave earlier additions in place. Do not assume an
    all-or-nothing migration or drop a data-bearing table because a drift error
    mentions a conflicting object. Correct the schema/privileges deliberately.
-4. Reapply idempotent additions, construct fresh store instances, and re-run the
-   startup gates. A rejected one-shot `ready()` promise on an old instance stays
-   rejected. Validate old records and an isolated new operation before admitting
+4. Correct the cause, retry `migrate()` and re-run the startup gates. Failed
+   `ready()` calls are retryable. Validate old records and a new operation before admitting
    traffic; inspect role, index and storage errors rather than overriding them.
 5. If validation fails, stop the candidate and follow the downgrade boundaries
    above. Retain the error, artifact/lockfile digests, applied statements and

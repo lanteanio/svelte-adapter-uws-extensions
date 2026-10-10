@@ -1,3 +1,4 @@
+import { forgetFixtureMigrations } from '../helpers/postgres-schema.js';
 /**
  * Integration tests for the Postgres right-to-erasure (`live.forget`) purge
  * paths against a real Postgres 16 server.
@@ -39,11 +40,11 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 		let store;
 
 		beforeEach(async () => {
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 			store = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
 		});
 		afterEach(() => { if (store) store.destroy(); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		it('deletes only the (tenant,user) rows and matches NULL tenant via IS NOT DISTINCT FROM', async () => {
 			await store.acquire('k-alice-t1', 60, { user: 'alice', tenant: 't1' });
@@ -74,10 +75,10 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 		const TABLE = 'svti_idem_fwdmig_it';
 		let s;
 		afterEach(() => { if (s) s.destroy(); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		it('migrates a pre-existing table, then stamps + erases', async () => {
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 			// A table created by a pre-erasure deployment: base columns only, no
 			// user_id / tenant_id. Constructing the store must ALTER it forward.
 			await client.query(`CREATE TABLE ${TABLE} (
@@ -102,8 +103,8 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 
 	describe('dead-letter.purgeUser', () => {
 		const TABLE = 'svti_dlq_forget_it';
-		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
+		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		const rec = (u) => ({ webhookId: 'w', topic: 'hooks', event: 'e', data: { user: u }, attempts: 1, error: 'boom', failedAt: 1 });
 
@@ -128,7 +129,7 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 
 	describe('replay.purgeUser', () => {
 		const TABLE = 'svti_replay_forget_it';
-		const drop = async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_seq`); };
+		const drop = async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_seq`); await forgetFixtureMigrations(client, [TABLE]); };
 		beforeEach(drop);
 		afterAll(drop);
 
@@ -147,9 +148,9 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 	describe('tasks.purgeUser', () => {
 		const TABLE = 'svti_tasks_forget_it';
 		let runner;
-		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
+		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
 		afterEach(() => { if (runner) runner.destroy(); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		it('deletes the task rows the forgetUserId extractor maps to the user', async () => {
 			// Never call start() - we only enqueue (inserts pending rows stamped with

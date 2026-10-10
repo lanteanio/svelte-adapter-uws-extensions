@@ -200,7 +200,7 @@ export const redis = createRedisClient({
 
 ## Postgres client
 
-Factory that wraps [pg](https://github.com/brianc/node-postgres) Pool with lifecycle management. Two construction modes:
+Factory that wraps [pg](https://github.com/brianc/node-postgres) Pool with lifecycle management. Use `await pg.check()` for the server preflight and `await postgresReadiness(pg, stores)` before traffic. Every durable store has `ready()` and `status()`. A deployment role can apply versioned DDL with `migrate(pg, { store, table })`; runtime stores with `autoMigrate: false` validate schema and privileges when `ready()` is awaited. See [schema transitions and readiness](docs/postgres-support.md#schema-transitions-and-readiness). Two construction modes:
 
 ```js
 // src/lib/server/pg.js
@@ -1784,7 +1784,7 @@ export const replay = createReplay(pg, {
 
 #### Schema
 
-The table is created automatically on first use (if `autoMigrate` is true):
+Automatic migration creates the base table below and its versioned constraints/indexes. Use `migrate()` for the complete schema when managing DDL separately:
 
 ```sql
 CREATE TABLE IF NOT EXISTS svti_replay (
@@ -2039,7 +2039,7 @@ For long-running jobs that need more visibility headroom, call `jobs.extend(id, 
 
 #### Schema
 
-The table is created automatically on first use (if `autoMigrate` is true):
+Automatic migration creates the base table below and its versioned constraints/indexes. Use `migrate()` for the complete schema when managing DDL separately:
 
 ```sql
 CREATE TABLE IF NOT EXISTS svti_jobs (
@@ -2062,7 +2062,7 @@ CREATE INDEX IF NOT EXISTS idx_svti_jobs_visibility
 
 Existing deployments forward-migrate the `request_id`, `traceparent`,
 and `tracestate` columns via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-on first use; idempotent and zero-downtime. Rows created by older releases
+on first use; bounded DDL can fail on busy tables. Rows created by older releases
 claim with `traceContext: null`.
 
 With `autoMigrate: false`, apply those nullable columns before deploying this
@@ -2903,7 +2903,7 @@ background dispatch/recovery should start structural consumer operations.
 
 #### Schema
 
-The table is created automatically on first use (if `autoMigrate` is true):
+Automatic migration creates the base table below and its versioned constraints/indexes. Use `migrate()` for the complete schema when managing DDL separately:
 
 ```sql
 CREATE TABLE IF NOT EXISTS svti_tasks (

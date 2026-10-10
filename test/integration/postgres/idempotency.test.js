@@ -1,3 +1,4 @@
+import { forgetFixtureMigrations } from '../helpers/postgres-schema.js';
 /**
  * Integration tests for postgres/idempotency against a real Postgres 16 server.
  *
@@ -40,7 +41,7 @@ describe('postgres idempotency (integration)', () => {
 	beforeEach(async () => {
 		// Drop and recreate per test so DDL is exercised and rows from
 		// other tests cannot leak in.
-		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+		await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 		store = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
 	});
 
@@ -49,7 +50,7 @@ describe('postgres idempotency (integration)', () => {
 	});
 
 	afterAll(async () => {
-		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+		await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 		await client.end();
 	});
 
@@ -70,10 +71,10 @@ describe('postgres idempotency (integration)', () => {
 
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh stores racing their first acquire both succeed', async () => {
-			// CREATE TABLE IF NOT EXISTS races on concurrent first calls.
-			// ensureTable() catches 23505 / 42P07 / 42710 and treats the
-			// table as already-existing.
-			await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+			// Concurrent cold starts serialize migration under the schema advisory lock,
+			// then validate the same completed schema and ledger before writing.
+			await store.ready(); store.destroy();
+			await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]);
 
 			const a = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
 			const b = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });

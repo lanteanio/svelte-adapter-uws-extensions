@@ -21,6 +21,7 @@ function metric(metrics, store, rows) { expect(metrics.serialize()).toContain(`p
 it('two store replicas skip the held table lock, then drain only 1,000 expired rows per pass', async () => {
 	const ticks = timers(), metrics = createMetrics();
 	const a = createIdempotencyStore(client, { table: tables[0], cleanupInterval: 1000, metrics });
+	await a.ready();
 	const peer = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false });
 	const b = createIdempotencyStore(peer, { table: tables[0], cleanupInterval: 1000, metrics });
 	let holder;

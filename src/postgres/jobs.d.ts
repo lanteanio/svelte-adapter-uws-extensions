@@ -1,3 +1,4 @@
+import type { PostgresStoreReadiness } from './index.js';
 import type { PgClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
@@ -75,7 +76,7 @@ export interface EnqueueOptions {
 /** Exact job-id input. Numbers must be safe integers; use string/bigint above 2^53. */
 export type JobIdInput = string | number | bigint;
 
-export interface JobQueue {
+export interface JobQueue extends PostgresStoreReadiness {
 	/** Insert a job; returns the job id. */
 	enqueue(queue: string, payload: unknown, opts?: EnqueueOptions): Promise<string | number>;
 
