@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { validateManifest, validateReadme, renderEntries, renderTopics, replaceBlock } from '../scripts/check-documentation-contract.js';
+import { validateManifest, validateReadme, validatePackageScripts, governedNativeRefs, renderEntries, renderTopics, replaceBlock } from '../scripts/check-documentation-contract.js';
 import { anchorsOf } from '../scripts/check-links.js';
 const read = (path) => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
-const pkg = JSON.parse(read('package.json')), manifest = JSON.parse(read('docs/documentation.v1.json')), catalog = JSON.parse(read('docs/public-entries.v1.json')), readme = read('README.md');
+const pkg = JSON.parse(read('package.json')), manifest = JSON.parse(read('docs/documentation.v2.json')), catalog = JSON.parse(read('docs/public-entries.v1.json')), readme = read('README.md');
 describe('documentation entry contract', () => {
 	it('pins the actual README length and fails when one line is added', () => {
 		expect(validateManifest(manifest, pkg)).toEqual([]);
@@ -17,6 +17,10 @@ describe('documentation entry contract', () => {
 	it('rejects swapped, duplicated, wrongly owned or unsafe routes', () => {
 		for (const mutate of [
 			(m) => m.paths.reverse(),
+			(m) => { m.paths[0].type = 'Banana'; },
+			(m) => { m.compatibilitySource = 'elsewhere'; },
+			(m) => { m.extra = true; },
+			(m) => { m.schemaVersion = 1; },
 			(m) => { m.paths[1].destination = m.paths[0].destination; },
 			(m) => { m.paths[0].owner = 'elsewhere'; },
 			(m) => { m.paths[3].destination = 'http://svelte-realtime.dev/tutorial'; },
@@ -37,7 +41,23 @@ describe('documentation entry contract', () => {
 		expect(renderTopics(readme + '\n```md\n## Fake heading\n```')).not.toContain('Fake heading');
 	});
 	it('rejects missing, duplicate and reversed block markers', () => {
-		for (const source of ['', '<!-- x:end -->\n<!-- x:start -->', '<!-- x:start -->\n<!-- x:start -->\n<!-- x:end -->']) expect(() => replaceBlock(source, 'x', '')).toThrow();
+		for (const source of ['prefix <!-- x:start -->\n<!-- x:end -->', '<!-- x:start -->\n<!-- x:end --> trailing', '', '<!-- x:end -->\n<!-- x:start -->', '<!-- x:start -->\n<!-- x:start -->\n<!-- x:end -->']) expect(() => replaceBlock(source, 'x', '')).toThrow();
+	});
+	it('rejects native version facts outside every generated compatibility block', () => {
+		const refs = governedNativeRefs([{ uwebsockets: 'https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v20.69.0.tar.gz' }]);
+		expect(refs).toEqual(['v20.69.0']);
+		for (const fact of ['Native v25.3.1', 'Use 20.69', 'Use 20.69.3', 'https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v40.1.2.tar.gz']) {
+			expect(validateReadme(readme + '\n' + fact, { ...manifest, readmeMaxLines: 10000 }, refs)).toContain('Native compatibility facts must stay in generated compatibility blocks');
+		}
+		expect(validateReadme(readme, manifest, refs)).toEqual([]);
+	});
+	it('requires the standard scripts to execute the guard exactly once', () => {
+		expect(validatePackageScripts(pkg)).toEqual([]);
+		for (const key of ['check', 'verify:docs', 'check:documentation']) {
+			for (const value of ['', pkg.scripts[key] + ' && ' + pkg.scripts[key]]) {
+				expect(validatePackageScripts({ ...pkg, scripts: { ...pkg.scripts, [key]: value } }).length).toBeGreaterThan(0);
+			}
+		}
 	});
 	it('resolves collisions between suffix-bearing and repeated headings', () => {
 		const source = '## Topic\n## Topic-1\n## Topic\n';

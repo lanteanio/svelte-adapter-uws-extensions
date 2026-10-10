@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Version the documentation route manifest, pin reader-path purposes and compatibility ownership, and reject native-version facts outside generated blocks or missing documentation gates.
+
 - Mark the legacy testing request-ID constant deprecated in emitted declarations and direct consumers to the platform request ID instead of its internal carrier.
 
 - Clarify asynchronous shared-store operations, group and cursor setup, lock leases, session TTL options, and the distinct message-deduplication contract when replacing in-memory plugins.
