@@ -96,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Require degradation notices to contain a non-ignorable letter or number and well-formed Unicode; reject blank symbols, standalone marks, malformed surrogates and line separators while preserving shaping joiners alongside text.
 
+- Redis presence releases half-open breaker probes when a join is abandoned by a closing socket, sync is denied, or Redis version detection fails, so other users of the shared breaker can recover normally.
+
 - Redis presence preserves unrelated Unicode and punctuation update names when the identity key has no ASCII letters or digits after lowercasing. Nonempty folded identity aliases remain reserved across updates, relays and snapshots.
 
 - Failed Redis presence joins no longer overwrite newer identities or strand membership. Commit identity after admission with bounded private generations, conditional cleanup and final leave notifications while preserving durable update storage.
