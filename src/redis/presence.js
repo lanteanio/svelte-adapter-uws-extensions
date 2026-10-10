@@ -58,6 +58,7 @@ import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
@@ -731,7 +732,8 @@ export function createPresence(client, options = {}) {
 	// five callsites need the same metric label and the same typed error;
 	// inlining a helper avoids drift between them and keeps each callsite
 	// single-line.
-	function throwWsClosed(topic) {
+	function throwWsClosed(topic, cancelAdmission) {
+		cancelAdmission();
 		mJoinsAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
 		throw new WsClosedError('presence.join', topic);
 	}
@@ -839,8 +841,9 @@ export function createPresence(client, options = {}) {
 			}
 			counts.set(key, prevCount + 1);
 
+			let cancelAdmission;
 			try {
-				b?.guard();
+				cancelAdmission = guardBreaker(b);
 			} catch (err) {
 				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
 				throw err;
@@ -852,6 +855,7 @@ export function createPresence(client, options = {}) {
 				// as any other startup-time misconfiguration.
 				await ensureRedis74();
 			} catch (err) {
+				b?.failure(err);
 				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
 				throw err;
 			}
@@ -868,11 +872,11 @@ export function createPresence(client, options = {}) {
 			// ran leaveAll, which swept localCounts / wsTopics for this ws;
 			// no compensating undoJoin needed. Throw so the caller sees the
 			// abort instead of a silent success.
-			if (!wsTopics.has(ws)) throwWsClosed(topic);
+			if (!wsTopics.has(ws)) throwWsClosed(topic, cancelAdmission);
 
 			try { ws.getBufferedAmount(); } catch {
 				await undoJoin(ws, topic, key, data, prevCount, prevData, false, false, platform);
-				throwWsClosed(topic);
+				throwWsClosed(topic, cancelAdmission);
 			}
 
 			let didRedisWrite = false;
@@ -913,7 +917,7 @@ export function createPresence(client, options = {}) {
 						userHashKey(topic, key), topicHashKey(topic),
 						instanceId, key
 					).catch(() => {});
-					throwWsClosed(topic);
+					throwWsClosed(topic, cancelAdmission);
 				}
 			} else if (prevData !== undefined && !deepEqual(prevData, data)) {
 				// Same instance, same user, different `select()` output.
@@ -956,7 +960,7 @@ export function createPresence(client, options = {}) {
 				ws.subscribe('__presence:' + topic);
 			} catch {
 				await undoJoin(ws, topic, key, data, prevCount, prevData, didRedisWrite, false, platform);
-				throwWsClosed(topic);
+				throwWsClosed(topic, cancelAdmission);
 			}
 			// Mirror into the subscription registry so the adapter's binary
 			// publish walk delivers to this member (native membership alone is
@@ -973,7 +977,7 @@ export function createPresence(client, options = {}) {
 						instanceId, key
 					).catch(() => {});
 				}
-				throwWsClosed(topic);
+				throwWsClosed(topic, cancelAdmission);
 			}
 
 			// Commit localData and activeTopics now that the join is
@@ -1042,7 +1046,6 @@ export function createPresence(client, options = {}) {
 			if (typeof topic !== 'string' || topic.startsWith('__')) return;
 			// No frame can carry such a topic; the adapter's own code for it.
 			if (!isFramableTopic(topic)) return 'INVALID_TOPIC';
-			b?.guard();
 			// Authorize against the REAL topic before granting tap-channel
 			// membership (mirrors in-memory presence sync + the cursor snapshot):
 			// the presence-snapshot message is otherwise an un-authorized path to
@@ -1072,6 +1075,7 @@ export function createPresence(client, options = {}) {
 				if (denial === false) return 'FORBIDDEN';
 				if (denial) return denial;
 			}
+			b?.guard();
 			try {
 				await subscribeToTopic(topic, platform);
 			} catch (err) {
