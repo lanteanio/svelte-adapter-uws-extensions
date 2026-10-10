@@ -33,3 +33,37 @@ Follow the [npm trusted-publisher setup](https://docs.npmjs.com/trusted-publishe
 After quarantine publication, install the exact `package@version` in a clean consumer, run preflight and the affected real-backend route, inspect npm provenance/integrity against the retained evidence, and verify the coordinated ecosystem tuple. Only then may an authorized maintainer move `next` or `latest` to that immutable version. A failed candidate stays out of those channels; fix it under a new version.
 
 For an incident, capture the currently routed version and integrity before changing anything. Restore the intended dist-tag to the previously verified immutable version, reinstall that exact artifact, and follow [MIGRATION](../MIGRATION.md) for storage/wire compatibility. Moving a dist-tag does not roll back persistent data or already installed consumers. A stable hotfix starts from the recorded stable release tag, receives a new version and the same verification, and its source change is merged back to `dev` through review.
+
+## Preflight and freeze
+
+Choose a canonical npm SemVer without build metadata. Freeze the reviewed source SHA and run the full release verification contract above. Append a `proposed` candidate event with its SHA, planned exact tag, target channel, UTC time and evidence. The development package version may still equal a previously published baseline; its value alone never proves publication or candidate readiness. Change version, lockfile and publication channel together before preparing an actual new candidate.
+
+Once tagged, source changes require a new version and candidate. Append `tagged` only after the annotated tag actually exists. Never delete, reuse, or retarget a release tag. Do not invent future events, timestamps, digests or successful runs in order to prepare the manifest.
+
+## Prerelease publication
+
+For a prerelease, freeze on `dev` and target `next`. The verified workflow publishes the retained tarball to `candidate` first. Only after actual registry metadata exists, append the immutable published row and `published` candidate event. Preserve its npm `gitHead`, integrity, shasum and publication time from the primary registry record; link the exact workflow run and retained digest in Notes. Append the corresponding `candidate` routing event. Every non-legacy published identity needs the complete `proposed -> tagged -> published` lifecycle and candidate quarantine route.
+
+After exact-artifact consumer verification and ecosystem review, append a forward routing event for moving `next`. Record the observed old and new versions and the operation's UTC time. Normal promotion must strictly increase npm SemVer precedence. Perform coordinated family promotion in dependency order: adapter, extensions, then realtime. Each owner retains its own verification evidence.
+
+## Stable promotion
+
+Freeze the reviewed stable source on `main`, select a fresh stable version and set `publishConfig.tag` to `latest`. Run the same verification and quarantine lifecycle. Stable promotion publishes a new immutable version; it does not rename a prerelease or infer sibling compatibility from one package's suite. Move `latest` only after exact-artifact acceptance and the reviewed compatibility tuple. Record the previous and new immutable identities in the routing event.
+
+## Abort
+
+Before publication, append `aborted` to a proposed or tagged candidate, record the failure evidence and leave existing tags intact. After registry publication, retain the published identity even if acceptance fails. Record `routing-aborted` for the quarantined artifact, remove or restore the candidate pointer as recorded, and prepare fixes under a new version. Never use `npm unpublish` as an abort or rollback procedure.
+
+## Stable hotfix
+
+Fork from the recorded immutable stable release tag, apply the smallest reviewed repair, and choose a new stable version. Verify, quarantine and promote through the same gates. Merge the repair back to `dev` through review before resuming ordinary development promotion; retain links to both the stable change and merge-back. An unreviewed development head is not a substitute for the stable incident baseline.
+
+## Dist-tag rollback
+
+Record the actual current channel pointer and both registry identities before a rollback. Append a `rollback` event whose From version matches that pointer and whose To version is an already published, verified artifact. Restore the channel to that exact version, then reinstall and test it in the affected deployment. This routing operation does not revert persistent storage, wire changes or consumers which already installed another version; apply the migration/restore procedure separately when needed. Never rewrite an old published row to describe the new route.
+
+## Manifest maintenance
+
+[release-manifest.md](./release-manifest.md) is append-only. Candidate decisions, immutable published identities and routing events are separate tables. Historical `legacy-none` rows are checked against the captured npm baseline; no historical Git tags or routing movements are fabricated. Preserve every published row and append future identities only after registry confirmation. To correct an event, append a complete `correction` event with its own ID/time, the original event ID, corrected event/time and complete corrected payload; never edit the event in place. The state validator applies corrections and then checks route continuity and candidate identity.
+
+Every published version has exactly one dated heading in CHANGELOG. An unpublished candidate or superseded version carries its explicit not-published marker immediately under the heading. When registry publication is confirmed, remove that marker and append the published identity together. `node scripts/check-release-ledger.js` validates this offline, including lifecycle transitions, immutable identities, quarantine, monotonic promotion and rollback continuity; it runs in `npm run check`. The ledger is evidence recorded after actions, not authorization to publish or move a channel.

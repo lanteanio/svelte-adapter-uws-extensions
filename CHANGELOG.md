@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Redis clients require ioredis 5.10.1 or later and default to finite command/retry deadlines and bounded offline buffering. Rejected unsent startup commands are removed before recovery.
+
 - Generate the declared compatibility tuple and installation pins from the installed adapter manifest; use fractional-second histogram defaults and lock acquisition seconds, retaining explicit count/millisecond buckets.
 
 - Keep metric identifiers private by default, mark the legacy testing request-ID constant deprecated, and document actionable replay-denial state.
@@ -24,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
+
+- Standard and sharded buses enforce complete outbound relay envelope caps, preserve local and cross-instance `compress: false`, and withhold oversized relays with failure reporting. Simulation forwards batch compression and packed mock declarations expose the matching recordings.
+- Sharded subscription admission restores a replacement follower that arrives while an unwanted subscription is being removed. Failed admissions roll back only their own reservations, and cancelled or successful half-open breaker probes release ownership.
+- Topic broadcasts reject oversized request envelopes before dispatch and report and withhold oversized reply envelopes instead of allowing fleet-wide silent drops.
+
+- Expire and reconcile remote registry attributes even when close or erase notifications are lost; live local socket ownership remains authoritative.
 
 - Refresh vulnerable development dependencies and reject successful lock callbacks after confirmed lease ownership loss.
 
@@ -49,9 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0-next.64] - 2026-09-11
 
+*Not published to npm; development candidate.*
+
 ### Breaking Changes
 
-- **The adapter peer floor is raised to `svelte-adapter-uws >= 0.6.0-next.91`.** That release ships `svelte-adapter-uws/observability` (the process-wide operational event sink, the canonical diagnostic grammar, the W3C trace helpers, and the published pressure-reason table) and the Platform `trace` / `traceContext` surface. Admission control reads its reason list from that entry point at runtime.
+- **The adapter peer floor is raised to `svelte-adapter-uws >= 0.6.0-next.95`.** It includes `svelte-adapter-uws/observability` (the process-wide operational event sink, the canonical diagnostic grammar, the W3C trace helpers, and the published pressure-reason table) and the Platform `trace` / `traceContext` surface. Admission control reads its reason list from that entry point at runtime.
 - **Every failure this package logs prints the adapter's canonical diagnostic grammar.** Assertion lines and every operational failure start with `[lantean/diagnostic source=svelte-adapter-uws-extensions component=... event=... severity=...]`, followed by a fixed message and a one-line JSON record. The `[extensions/assert]` / `[extensions/fatal]` / `[extensions/devAssert]` heads and every per-module prose prefix (`[redis replay]`, `[postgres tasks]`, `[prometheus]`, `[registry]`, `[publish-rate]`, `redis ratelimit:`, `presence:`, `groups ...` and the rest) are gone; values the prose interpolated are record `attributes`, raw topics and user ids are not logged, and a shortlink a line used to print is in its `docs/errors.md` entry. A channel or key built from a topic or a client identity is cut from a Redis error that echoes it, a custom NOTIFY parser's error is reported by name and code without its text (which can quote the payload), and cursor cleanup and group heartbeat failures are reported once per failure streak instead of once per topic or group on every tick. Connection errors on the Redis and Postgres connections this package creates print this way too, instead of ioredis's `Unhandled error event` line. Routing keyed on the old prefixes needs the `event=` keys, all listed in `docs/errors.md`; `parseDiagnostic()` from `svelte-adapter-uws/observability` reads the new lines and still recognizes the old families during the 0.6 window. `devAssert` reports at `severity=error` under `event=invariant.violated` with `category=development.assertion`, matching the adapter. Three one-shot configuration advisories (presence private key field, sensitive `userData` key, cursor `hooks.message` wiring) keep their prose under an `[extensions]` or `[redis/cursor]` tag, and the diagnostic pipeline's own last-resort lines print `[extensions] ...` with a stable ID.
 - **Thrown registry and circuit-breaker messages end with a stable ID and reference route.** The connection registry's `request()` and `requestSession()` errors for an invalid target or event, an offline target, the pending cap and a cross-instance timeout, the invalid-target errors of `send()` and `sendCoalesced()`, and `CircuitBrokenError` now end with ` [EXTENSIONS-ERR-...] See: docs/errors.md#...`; the text before the suffix is unchanged. Other registry errors, including the other `send()`, `sendCoalesced()` and `sendTo()` validation errors, carry no suffix. Code comparing `err.message` for equality must match the prefix, the ID, or the error class instead.
 - **Jobs and tasks tables gain nullable `traceparent` and `tracestate` columns.** With the default `autoMigrate: true` they are added on first use. With `autoMigrate: false`, run `ALTER TABLE <table> ADD COLUMN IF NOT EXISTS traceparent TEXT` and the same for `tracestate`, on each jobs and tasks table (`svti_jobs` / `svti_tasks` by default), before deploying: without them `jobs.claim`, task `list` and the task runner's dispatch and recovery sweeps fail with `column "traceparent" does not exist`, and so does any enqueue or run that carries a trace context.
@@ -95,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Presence, cursor, groups, both buses, replay and the notify bridge work on a multi-worker adapter.** Such an adapter refuses any publish that would draw its per-worker sequence counter, and these modules published their own frames without saying otherwise: every presence diff was dropped by the flush that caught the error, and every heartbeat, cursor frame, group event and message a bus received from another instance threw. Each frame they publish now declares its choice. Presence, cursor and groups frames and the bus's `degraded` / `recovered` frames carry `seq: false`, as the adapter's own plugins' frames do. A notification, or a message a bus relays without a seq, is delivered with `seq: false` on such a runtime; a single worker still stamps its counter on it. A replay publish keeps the buffer's seq when it goes through the bus-wrapped platform. Each worker runs its own copy of these modules with its own Redis subscriber and is an instance like any other: cursor frames, group events and bus publishes go to the other workers through the module's Redis relay and pass `relay: false` (ignored on a single worker), so the adapter's in-process relay does not deliver them a second time, and what Redis does not carry misses the other workers as it misses the other instances. The bus leaves the adapter's relay on only for a frame its receivers refuse by rule, such as a `__` topic it does not admit. The `degraded` / `recovered` frames pass `relay: false` as well and go to the worker whose breaker changed. Tests run the modules' publish paths, as one worker of a two-worker runtime, against the adapter's own sequence rule, and a scan of `src` fails on a `publish` or `publishWire` call or a batch entry written without options, or with options it can read that do not declare a seq.
 - **A Redis cursor instance whose connections only watch receives the other instances' cursors.** The relay subscription opened on the instance's first cursor move, so an instance whose clients had only attached, or on a multi-worker adapter such a worker, showed the attach snapshot and nothing after it. `attach()` and the `__cursor:` subscribe hook now open it: the socket is subscribed and sent its TIME and YOU frames at once, so cursors on its own instance work while the relay opens, and the roster is read once the relay is open, so a join relayed from then on reaches the socket live. A subscription that could not open (the breaker open, SUBSCRIBE refused) is retried with a backoff from one to thirty seconds while a connection on the instance uses the cursor, instead of waiting for a local move.
-- **Both buses carry each publish's seq choice to the other instances.** The sharded bus dropped the `seq` a replay publish passed, and both buses dropped it, along with `jitterMs`, from every entry of `batch()` and `publishBatched()`, so subscribers on other instances got their own counter's number instead of the buffer's and gap-filled against the wrong numbers on resume. A `seq: false` publish, a shared-codec `publishWire` included, now arrives without a seq on every instance as well: the envelope carries `s: false`, which an older peer ignores. `null` and a bigint are not carried, because adapter releases before next.95 stamp the counter for both; the receiving worker applies its default, its counter on a single worker and no seq on a multi-worker one. A malformed carried seq is treated as no seq.
+- **Both buses carry each publish's seq choice to the other instances.** The sharded bus dropped the `seq` a replay publish passed, and both buses dropped it, along with `jitterMs`, from every entry of `batch()` and `publishBatched()`, so subscribers on other instances got their own counter's number instead of the buffer's and gap-filled against the wrong numbers on resume. A `seq: false` publish, a shared-codec `publishWire` included, now arrives without a seq on every instance as well: the envelope carries `s: false`, which an older peer ignores. `null` is carried as an explicit unsequenced choice, and bigint sequence authorities within the safe integer range are normalized to numbers, matching the adapter next.95 floor. A malformed carried seq is treated as no seq.
 - **`bus.wrap(platform).topic(name)` helpers behave like the adapter's.** They dropped their options argument, so a scoped publish could not declare `seq: false` on a multi-worker adapter; `increment()` and `decrement()` without an amount published `undefined` instead of `1`; and none returned the publish result. `mockPlatform().topic()` matches as well, and `mockPlatform().batch()` forwards each entry's options as the adapter's `batch()` does.
 - **Presence and cursor ignore a topic no frame can carry, and one failing topic no longer stops the others.** The adapter throws when it frames a topic containing a double quote, a backslash or a control character, and the wire subscribe path refuses such topics, but a direct `presence.join()` accepted one. Every heartbeat then threw out of its timer, which ends a Node process in the default mode, and skipped the Redis TTL refresh for every topic on the instance, so its whole roster could expire; a direct `cursor.update()` with such a topic stopped the cursor tick for later topics the same way. `presence.join()` now ignores such a topic, as it ignores a `__` topic, and `cursor.update()` drops it, as it now also drops a non-string or empty topic. When a heartbeat or cursor tick publish throws for any reason, the other topics and the TTL refresh go ahead and the failure is reported once per streak as `redis.presence.heartbeat.publish-failed` (`EXTENSIONS-ERR-PRESENCE-HEARTBEAT-PUBLISH`) or `redis.cursor.flush.failed` (`EXTENSIONS-ERR-CURSOR-FLUSH`); a failure there was an uncaught exception before.
 - **Admission control recognizes every adapter pressure reason.** The exported frozen `PRESSURE_REASONS` tuple is read from the adapter's published `PRESSURE_REASON_CODES` at load time and drives runtime validation: `NONE`, `SUBSCRIBERS`, `PUBLISH_RATE`, `PSI`, `CPU_QUOTA`, `CAPACITY`, and `MEMORY`. Rules can therefore shed under kernel stalls, container quota throttling, or protection capacity instead of rejecting those names at startup or silently admitting them at runtime, and a reason the adapter adds later is accepted at runtime without a release here. The `PressureReason` type lists the reasons of the supported adapter release, as the adapter's own `pressure.reason` type does.
@@ -245,6 +255,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Redis dead-letter store completes right-to-erasure against a delivery that raced a purge.** A webhook delivery already in flight when `live.forget` swept the store would, on failing AFTER the purge, re-insert the erased user's payload - the durable/cluster store had no defense (the in-memory store already carries a forget tombstone). `purgeUser` now writes a per-user forget tombstone (`{prefix}dlq:purged:<user>` = server time at purge, `forgetTombstoneMs` TTL, default 10 minutes) before deleting the user's records, and `add` drops (resolves `null`) a record whose delivery started before that purge. The purge time and the delivery start are reconciled onto the shared Redis server clock, so the check holds across a cluster where the delivering and purging instances differ (a per-process monotonic start alone is not comparable between instances). A delivery started after the purge, and other users, are unaffected. The residual - a single delivery whose total retry duration outlives the tombstone - is now a configurable window: raise `forgetTombstoneMs` above your max retry budget to close it.
 
 ## [0.6.0-next.59] - 2026-07-14
+
+*Not published to npm; superseded before release.*
 
 ### Fixed
 
@@ -413,6 +425,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0-next.41] - 2026-07-05
 
+*Not published to npm; superseded before release.*
+
 ### Added
 
 - **The pub/sub bus now forwards `platform.authorizeWireSubscribe()` through the wrapped platform.** The adapter gained an opt-in wire-subscribe authorization policy (a client's raw `subscribe` frame is honored only for a topic the server already authorized for that connection); a framework arms it once at init via `platform.authorizeWireSubscribe()`. In a clustered deployment the framework holds the bus-wrapped platform, so the wrap (and the sharded-bus wrap) now forward this method to the real adapter. Version-gated (`? : undefined`): against an older adapter without the method the wrap simply omits it and the framework's optional-chained call is a no-op. The mock platform's parity surface (`PLATFORM_KEYS`) gains `authorizeWireSubscribe` so the CI wrap-parity test keeps both wraps honest.
@@ -482,6 +496,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`./redis/alarm-store` and `./postgres/alarm-store`: durable stores for `live.alarm`.** `createAlarmStore(client)` persists each room's pending alarm so it survives a process restart and fires once cluster-wide. Wire it into svelte-realtime (`>= 0.6.0-next.45`) with `configureAlarm({ store: createAlarmStore(client), leader: () => leader.isLeader() })`; the realtime layer owns the in-memory timers + the leader-gated recovery poll, and the store is a pure data-access object (`set(topic, at, meta)` / `delete(topic)` / `due(now)`) with no background loop. Single-fire is guaranteed by the atomic claim: `delete(topic)` returns whether THIS call removed the row (Redis `ZREM` count / Postgres `DELETE ... RETURNING` rowCount), so the precise in-memory timer and the recovery poll can never double-fire. The Redis store keeps a due-index ZSET + a meta hash co-located on one slot via an `{alarms}` hash tag (asserted at construction so a custom `client.key()` cannot silently split the claim across nodes); the Postgres store uses an auto-migrated `svti_alarms(topic, fire_at, meta, tenant)` table indexed on `fire_at`. The two backends are drop-in interchangeable behind the same seam.
+
+## [0.6.0-next.34] - 2026-06-26
+
+Historical notes were consolidated under [0.6.0-next.35](#060-next35---2026-06-26). This heading restores the distinct published identity; it does not assign every consolidated change to this version.
+
+## [0.6.0-next.33] - 2026-06-26
+
+Historical notes were consolidated under [0.6.0-next.35](#060-next35---2026-06-26). This heading restores the distinct published identity; it does not assign every consolidated change to this version.
 
 ## [0.6.0-next.32] - 2026-06-26
 
@@ -636,6 +658,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`createMetrics()` now rejects a same-name re-registration with a different label shape at registration time.** Registration was idempotent by name only: a second `counter('x', ...)` with different `labelNames` silently returned the existing instrument, and every subsequent emit from that caller then threw label-validation errors - surfacing at the first emit in production instead of at startup. A label-shape collision now throws the same way a type collision always has (label order does not matter; same name + same label set still returns the existing instrument).
+
+## [0.6.0-next.15] - 2026-06-12
+
+Historical notes were consolidated under [0.6.0-next.16](#060-next16---2026-06-12). This heading restores the distinct published identity; it does not assign every consolidated change to this version.
+
+## [0.6.0-next.14] - 2026-06-12
+
+Historical notes were consolidated under [0.6.0-next.16](#060-next16---2026-06-12). This heading restores the distinct published identity; it does not assign every consolidated change to this version.
 
 ## [0.6.0-next.13] - 2026-06-10
 
@@ -882,6 +912,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`bus.wrap(platform)` now forwards `platform.redis` and `platform.presence` on the wrapped seam (live getters), matching the existing `replay` forwarding.** Pre-fix, only `replay` was forwarded. Framework code that stashes conventions on the source platform in init - e.g. `platform.redis = redis.redis` to enable `svelte-realtime`'s cluster-shared `live.room({ presence })` Redis HASH - found those conventions on the source platform but NOT on the wrapped platform that `createMessage({ platform: bus.wrap })` hands to per-message ctx. The framework's `_clusterPresenceAcquire` / `_clusterPresenceList` then saw `ctx.platform.redis === undefined` and fell through to the in-memory `_presenceRef` Map, silently negating the cluster-presence fix. The bug manifested in any multi-replica deploy that wired `platform.redis` correctly in init but still saw per-replica "Online" rosters in chat / room demos. The fix adds live getters for `redis` and `presence` to the wrapped object so post-wrap reassignment on the source platform also propagates - same pattern the existing `replay` getter uses.
+
+## [0.5.0] - 2026-05-16
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
 
 ## [0.5.0-next.16] - 2026-05-16
 
@@ -1380,6 +1414,34 @@ The JS API for `enqueue()` / `claim()` / `await()` results is unchanged (SQL ali
 
 ---
 
-## [0.1.9] and earlier
+## [0.1.9] - 2026-03-15
 
-See [git history](https://github.com/lanteanio/svelte-adapter-uws-extensions/commits/main) for changes prior to 0.4.0.
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.8] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.7] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.6] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.5] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.4] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.3] - 2026-03-15
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
+
+## [0.1.2] - 2026-03-14
+
+Separate release notes were not retained. The immutable npm source and artifact identity is recorded in the [release manifest](./docs/release-manifest.md).
