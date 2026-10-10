@@ -401,16 +401,17 @@ describe('redis idempotency purgeUser', () => {
 });
 
 describe('redis idempotency byuser index field TTL', () => {
-	it('bounds each index field to its own cache entry lifetime (per-field TTL, Redis 7.4+)', async () => {
+	it('bounds each index field to the pending plus cache lifetime (per-field TTL, Redis 7.4+)', async () => {
 		const client = mockRedisClient('test:');
 		const store = createIdempotencyStore(client, { ttl: 100 });
 		const slot = await store.acquire('k1', undefined, { user: 'u-1', tenant: 't1' });
 		await slot.commit({ ok: 1 });
 
-		const idxKey = client.key('idem:byuser:t1\0u-1');
-		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:k1'));
+		const idxKey = client.key('idem:byuser:v2\0t1\0u-1');
+		const owner = (await client.redis.hkeys(idxKey)).find(field => field.startsWith('__idem_pending__:'));
+		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, owner);
 		expect(ttlMs).toBeGreaterThan(0);
-		expect(ttlMs).toBeLessThanOrEqual(100 * 1000);
+		expect(ttlMs).toBeLessThanOrEqual(160 * 1000);
 	});
 
 	it('falls back to a whole-key TTL on a pre-7.4 server, and purge still works', async () => {
@@ -420,8 +421,9 @@ describe('redis idempotency byuser index field TTL', () => {
 		const slot = await store.acquire('k1', undefined, { user: 'u-1', tenant: 't1' });
 		await slot.commit({ ok: 1 });
 
-		const idxKey = client.key('idem:byuser:t1\0u-1');
-		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:k1'));
+		const idxKey = client.key('idem:byuser:v2\0t1\0u-1');
+		const owner = (await client.redis.hkeys(idxKey)).find(field => field.startsWith('__idem_pending__:'));
+		const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, owner);
 		expect(ttlMs).toBe(-1); // field present, no per-field TTL (whole-key EXPIRE path)
 		expect(await store.purgeUser('t1', 'u-1')).toBe(1);
 	});
@@ -432,7 +434,9 @@ describe('redis idempotency byuser index field TTL', () => {
 		const storeModern = createIdempotencyStore(modern, { ttl: 100 });
 		const s1 = await storeModern.acquire('k', undefined, { user: 'u', tenant: 't' });
 		await s1.commit(1);
-		const [modernTtl] = await modern.redis.hpttl(modern.key('idem:byuser:t\0u'), 'FIELDS', 1, modern.key('idem:k'));
+		const modernIndex = modern.key('idem:byuser:v2\0t\0u');
+		const modernOwner = (await modern.redis.hkeys(modernIndex)).find(field => field.startsWith('__idem_pending__:'));
+		const [modernTtl] = await modern.redis.hpttl(modernIndex, 'FIELDS', 1, modernOwner);
 		expect(modernTtl).toBeGreaterThan(0);
 
 		const old = mockRedisClient('test:');
@@ -440,7 +444,9 @@ describe('redis idempotency byuser index field TTL', () => {
 		const storeOld = createIdempotencyStore(old, { ttl: 100 });
 		const s2 = await storeOld.acquire('k', undefined, { user: 'u', tenant: 't' });
 		await s2.commit(1);
-		const [oldTtl] = await old.redis.hpttl(old.key('idem:byuser:t\0u'), 'FIELDS', 1, old.key('idem:k'));
+		const oldIndex = old.key('idem:byuser:v2\0t\0u');
+		const oldOwner = (await old.redis.hkeys(oldIndex)).find(field => field.startsWith('__idem_pending__:'));
+		const [oldTtl] = await old.redis.hpttl(oldIndex, 'FIELDS', 1, oldOwner);
 		expect(oldTtl).toBe(-1);
 		expect(await storeOld.purgeUser('t', 'u')).toBe(1); // fallback path still purgeable
 	});

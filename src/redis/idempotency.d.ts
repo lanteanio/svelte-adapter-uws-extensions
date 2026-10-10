@@ -21,9 +21,8 @@ export interface IdempotencySlotAcquired {
 	acquired: true;
 	/**
 	 * Store the result and start the long TTL. Call exactly once. Rejects with
-	 * `IdempotencyLeaseLostError` if this owner's `acquireTtl` expired and a
-	 * successor re-acquired the key before the commit (the common case - a
-	 * handler that finishes within `acquireTtl` - never rejects).
+	 * `IdempotencyLeaseLostError` if this owner's pending lease expired,
+	 * was erased, or was replaced by a successor before the commit.
 	 */
 	commit(result: unknown): Promise<void>;
 	/**
@@ -64,8 +63,8 @@ export class IdempotencyResultTooLargeError extends Error {
 }
 
 /**
- * Thrown by `commit(result)` when the caller lost its lease: the `acquireTtl`
- * expired and a successor re-acquired the key before this owner committed.
+ * Thrown when an acquisition is revoked before its handle is returned, or by
+ * `commit(result)` after its pending lease expired, was erased or was replaced.
  * Cross-backend (Redis + Postgres); catch on
  * `err.code === 'IDEMPOTENCY_LEASE_LOST'` regardless of backend. `abort()`
  * never throws on lease loss - it is a silent no-op.
@@ -81,8 +80,9 @@ export class IdempotencyLeaseLostError extends Error {
 export interface RedisIdempotencyStore {
 	/**
 	 * Try to claim ownership of a key. Returns one of three slot shapes. The
-	 * optional `meta` records the committing user for `live.forget` right-to-
-	 * erasure (the realtime idempotent wrapper supplies it).
+	 * optional `meta` registers pending ownership for `live.forget` right-to-
+	 * erasure (the realtime idempotent wrapper supplies it). Registration errors
+	 * reject acquisition; a concurrent erasure can reject with IDEMPOTENCY_LEASE_LOST.
 	 * Keys beginning with byuser: are reserved for the erasure index and rejected.
 	 * ttlSec overrides the store default; zero releases the lease without retaining
 	 * a result. Must be a non-negative integer.
@@ -90,7 +90,7 @@ export interface RedisIdempotencyStore {
 	acquire<T = unknown>(key: string, ttlSec?: number, meta?: { user?: string; tenant?: string | null }): Promise<IdempotencySlot<T>>;
 	/** Drop a single cached result. Keys beginning with byuser: are reserved and rejected. */
 	purge(key: string): Promise<void>;
-	/** Right-to-erasure: delete every cached result this user committed. */
+	/** Revoke pending owners and erase their cached results. Rejects incomplete erasure for retry. */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Drop every key under this store's prefix. */
 	clear(): Promise<void>;

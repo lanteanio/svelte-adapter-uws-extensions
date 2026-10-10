@@ -36,7 +36,7 @@ describe('redis idempotency (integration)', () => {
 			const store = createIdempotencyStore(client);
 			await (await store.acquire('long', 60, { user: 'alice' })).commit('long');
 			await (await store.acquire('short', 1, { user: 'alice' })).commit('short');
-			const index = client.key('idem:byuser:' + String.fromCharCode(0) + 'alice');
+			const index = client.key('idem:byuser:v2' + String.fromCharCode(0) + String.fromCharCode(0) + 'alice');
 			expect(await client.redis.pttl(index)).toBeGreaterThan(55_000);
 			await waitRedisMs(client.redis, 1100);
 			expect(await store.purgeUser(null, 'alice')).toBeGreaterThanOrEqual(1);
@@ -236,15 +236,17 @@ describe('redis idempotency (integration)', () => {
 		// Proves the HPEXPIRE call shape against the real server (the mock
 		// cannot catch an argument-order mistake the server would reject).
 		// The Valkey tiers re-run this on a real Valkey 9.0+.
-		it('each index field carries a real per-field TTL bounded by the entry ttl', async () => {
+		it('each index field has a TTL covering the pending lease and result lifetime', async () => {
 			const store = createIdempotencyStore(client, { ttl: 30 });
 			const slot = await store.acquire('idx-k', undefined, { user: 'u-idx', tenant: 't1' });
 			await slot.commit({ ok: 1 });
 
-			const idxKey = client.key('idem:byuser:t1\0u-idx');
-			const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, client.key('idem:idx-k'));
+			const idxKey = client.key('idem:byuser:v2\0t1\0u-idx');
+			const owner = (await client.redis.hkeys(idxKey)).find(field => field.startsWith('__idem_pending__:'));
+			expect(owner).toBeDefined();
+			const [ttlMs] = await client.redis.hpttl(idxKey, 'FIELDS', 1, owner);
 			expect(ttlMs).toBeGreaterThan(0);
-			expect(ttlMs).toBeLessThanOrEqual(30 * 1000);
+			expect(ttlMs).toBeLessThanOrEqual(90 * 1000);
 
 			expect(await store.purgeUser('t1', 'u-idx')).toBe(1);
 			expect((await store.acquire('idx-k')).acquired).toBe(true);

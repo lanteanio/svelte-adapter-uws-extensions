@@ -999,6 +999,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('ORDERED_ALARM_GENERATIONS_V1')) {
 					return evaluateAlarmGeneration(args, { sortedSets, hashes });
 				}
+
+				if (script.includes('IDEM_OWNERSHIP')) return evalIdempotencyOwnership(args);
+				if (script.includes('IDEM_ERASE_OWNER')) return evalIdempotencyErase(args, false);
+				if (script.includes('IDEM_ERASE_LEGACY')) return evalIdempotencyErase(args, true);
 				// live.forget cluster owner force-evict (membership HDEL +
 				// in-script ownership check + leave-mirrored succession).
 				// Marker-dispatched first: the script also mentions HDEL/HSET/
@@ -2116,20 +2120,93 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			return out;
 		}
 
-		// Idempotency acquire Lua script simulation
-		// args layout: [key, ownerToken, acquireTtlSec, pendingPrefix]
-		// Returns: [1, '', 0] acquired, [0, '', 1] pending, [0, value, 0] cached result.
-		// Pending is detected by the prefix (each owner writes a distinct token),
-		// matching the real ACQUIRE_SCRIPT's string.sub check.
-		// TTL is not simulated; tests that exercise expiry should mutate the
-		// store directly or call the store's purge/clear surface.
+		// Ownership scripts model pending/result string expiry and per-field TTL.
+		// Whole-hash expiry remains native-only, like this double's EXPIRE surface.
+		function evalIdempotencyOwnership([key, op, owner, primary, ttlMs, hex]) {
+			pruneExpiredFields(key);
+			let h = hashes.get(key);
+			let unarmed = Number(h?.get('@unarmed') ?? 0);
+			let expires = Number(h?.get('@expires') ?? 0);
+			if ((h && (!h.has('@unarmed') || !h.has('@expires')))
+				|| !Number.isSafeInteger(unarmed) || unarmed < 0
+				|| !Number.isSafeInteger(expires) || expires < 0) throw new Error('invalid idempotency ownership metadata');
+			const current = h?.get(owner);
+			if (op === 'register') {
+				if (current !== undefined) return current === 'u' + primary ? 1 : 0;
+				if (unarmed === Number.MAX_SAFE_INTEGER) throw new Error('invalid idempotency ownership count');
+				if (!h) { h = new Map(); hashes.set(key, h); }
+				h.set(owner, 'u' + primary);
+				h.set('@unarmed', String(unarmed + 1));
+				h.set('@expires', String(expires));
+				return 1;
+			}
+			if (op === 'arm') {
+				if (current === 'a' + primary) return 1;
+				if (current !== 'u' + primary) return 0;
+				if (unarmed < 1) throw new Error('invalid idempotency ownership count');
+				const ttl = Number(ttlMs);
+				if (!Number.isFinite(ttl) || ttl < 1 || ttl > Number.MAX_SAFE_INTEGER - serverNowMs()) throw new Error('invalid idempotency ownership lifetime');
+				expires = Math.max(expires, serverNowMs() + ttl);
+				h.set(owner, 'a' + primary);
+				h.set('@unarmed', String(unarmed - 1));
+				h.set('@expires', String(expires));
+				if (String(hex) === '1') {
+					if (!hashFieldExpiry.has(key)) hashFieldExpiry.set(key, new Map());
+					hashFieldExpiry.get(key).set(owner, serverNowMs() + ttl);
+				}
+				return 1;
+			}
+			if (op === 'drop') {
+				if (current === undefined) return 0;
+				if (current[0] === 'u' || current[0] === 'U') {
+					if (unarmed < 1) throw new Error('invalid idempotency ownership count');
+					unarmed--;
+				}
+				h.delete(owner);
+				clearFieldExpiry(key, [owner]);
+				h.set('@unarmed', String(unarmed));
+				if (h.size <= 2) hashes.delete(key);
+				return 1;
+			}
+			if (op === 'revoke') {
+				const claims = [...(h ?? [])].filter(([field]) => field !== '@unarmed' && field !== '@expires');
+				for (const [, value] of claims) if (!'uaUA'.includes(value[0])) throw new Error('invalid idempotency ownership record');
+				for (const [field, value] of claims) {
+					h.set(field, value[0].toUpperCase() + value.slice(1));
+					clearFieldExpiry(key, [field]);
+				}
+				if (claims.length === 0) hashes.delete(key);
+				return claims.flatMap(([field, value]) => [field, value.slice(1)]);
+			}
+			throw new Error('invalid idempotency ownership operation');
+		}
+
+		function evalIdempotencyErase([key, owner, prefix, pendingPrefix], legacy) {
+			pruneExpiredString(key);
+			const value = store.get(key);
+			let matches = value === owner;
+			if (legacy) matches = matches && !value.startsWith(prefix) && !value.startsWith(pendingPrefix);
+			else if (typeof value === 'string' && value.startsWith(prefix)) {
+				let envelope;
+				try { envelope = JSON.parse(value.slice(prefix.length)); } catch { throw new Error('invalid idempotency result envelope'); }
+				if (!Array.isArray(envelope) || typeof envelope[0] !== 'string') throw new Error('invalid idempotency result envelope');
+				matches = envelope[0] === owner;
+			}
+			if (!matches) return 0;
+			store.delete(key);
+			stringExpiry.delete(key);
+			return 1;
+		}
+
 		function evalIdempotencyAcquire(args) {
 			const key = args[0];
 			const ownerToken = args[1];
 			const prefix = args[3];
+			pruneExpiredString(key);
 			const existing = store.get(key);
 			if (existing === undefined) {
 				store.set(key, ownerToken);
+				stringExpiry.set(key, serverNowMs() + Number(args[2]) * 1000);
 				return [1, '', 0];
 			}
 			if (typeof existing === 'string' && existing.startsWith(prefix)) {
@@ -2146,8 +2223,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const key = args[0];
 			const ownerToken = args[1];
 			const value = args[2];
+			pruneExpiredString(key);
 			if (store.get(key) === ownerToken) {
 				store.set(key, value);
+				stringExpiry.set(key, serverNowMs() + Number(args[3]) * 1000);
 				return 1;
 			}
 			return 0;
@@ -2160,8 +2239,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		function evalIdempotencyAbort(args) {
 			const key = args[0];
 			const ownerToken = args[1];
+			pruneExpiredString(key);
 			if (store.get(key) === ownerToken) {
 				store.delete(key);
+				stringExpiry.delete(key);
 				return 1;
 			}
 			return 0;

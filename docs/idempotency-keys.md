@@ -16,8 +16,9 @@ prefixes configured by the application.
 
 ## Existing data
 
-Normal cache and index keys retain their existing Redis layout. There is no bulk
-rewrite, scan, or automatic deletion during construction or rejected calls.
+The prefix guard does not rewrite or delete stored data. The owner-erasure
+protocol uses versioned values and indexes; follow its [coordinated upgrade](./idempotency-erasure.md#stored-format-and-coordinated-upgrade) before changing writers.
+Construction and rejected caller-key validation do not scan or delete data.
 Applications that previously used caller keys beginning with `byuser:` must stop
 issuing those keys and choose an application-owned key format. Drain pending work
 and account for cached-result TTLs before retrying operations under new keys;

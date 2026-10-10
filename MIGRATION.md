@@ -256,6 +256,16 @@ versions/checksums. Await this gate before serving traffic.
 
 ## 3. Fails on a call that used to succeed
 
+### Redis idempotency retains pending ownership through erasure
+
+User-indexed acquisitions now register ownership before exposing a handler lease.
+`purgeUser` revokes pending claims as well as committed results; late commits
+reject with `IDEMPOTENCY_LEASE_LOST`. Index and erasure failures reject for retry.
+Primary keys retain their locations, but committed envelopes and ownership
+indexes have a new format. Stop old writers and drain handlers before deploying;
+legacy JSON reads remain supported, while mixed writers and rollback need an
+operator-led reconciliation plan. See [ownership, failure and upgrade rules](./docs/idempotency-erasure.md).
+
 ### Redis idempotency reserves its erasure-index namespace
 
 Redis `acquire()` and `purge()` now reject caller keys beginning with the exact

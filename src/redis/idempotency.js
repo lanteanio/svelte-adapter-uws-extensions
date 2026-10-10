@@ -22,15 +22,15 @@
  *     commit and abort compare-and-set/delete against it - a stale owner whose
  *     `acquireTtl` expired and whose slot a successor re-acquired cannot
  *     overwrite (commit) or release (abort) that successor's slot.
- *   - Committed: JSON.stringify(result) (always begins with a valid JSON token).
- * The two cases are distinguishable because the pending prefix begins with `_`,
- * which is never a valid leading JSON token, so a committed value can never be
- * mistaken for a pending slot.
+ *   - Committed: a versioned envelope retaining the owner token and JSON result.
+ *     Legacy JSON results remain readable; old writers must be drained on upgrade.
+ * Distinct non-JSON prefixes separate pending ownership and versioned results.
  *
  * @module svelte-adapter-uws-extensions/redis/idempotency
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
+import { RESULT_PREFIX, ACQUIRE_SCRIPT, COMMIT_SCRIPT, ABORT_SCRIPT, OWNERSHIP_SCRIPT, ERASE_SCRIPT, LEGACY_ERASE_SCRIPT } from './_idempotency-ownership.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -41,84 +41,6 @@ import { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../sh
 export { IdempotencyResultTooLargeError, IdempotencyLeaseLostError };
 
 const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
-
-/**
- * Lua script for atomic acquire.
- *
- * KEYS[1] = idempotency key
- * ARGV[1] = owner token (`__idem_pending__:<uuid>`) written into the pending slot
- * ARGV[2] = acquireTtl (seconds)
- * ARGV[3] = pending prefix (`__idem_pending__`)
- *
- * Pending is detected by the ARGV[3] PREFIX (not equality): every owner writes
- * a distinct token, so an equality check against one owner's token would never
- * recognise another owner's pending slot.
- *
- * Returns one of:
- *   { 1, '',    0 }  acquired (caller runs work)
- *   { 0, '',    1 }  pending  (another caller is mid-flight)
- *   { 0, value, 0 }  result   (cached, value is JSON)
- */
-const ACQUIRE_SCRIPT = `
-local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
-if ok then
-  return {1, '', 0}
-end
-local v = redis.call('GET', KEYS[1])
-if v ~= false and string.sub(v, 1, string.len(ARGV[3])) == ARGV[3] then
-  return {0, '', 1}
-end
-return {0, v, 0}
-`;
-
-/**
- * Lua compare-and-set for commit. Writes the committed result under the long
- * TTL only if this owner still holds the pending slot (its token is still
- * stored). Returns 1 on success, 0 if the lease was lost (a successor
- * re-acquired) - the caller then throws IdempotencyLeaseLostError.
- *
- * KEYS[1] = idempotency key
- * ARGV[1] = owner token
- * ARGV[2] = committed value (JSON)
- * ARGV[3] = ttl (seconds)
- */
-const COMMIT_SCRIPT = `
--- IDEM_COMMIT
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-  return 1
-end
-return 0
-`;
-
-/**
- * Lua compare-and-delete for abort. Releases the pending slot only if this
- * owner still holds it. Returns 1 if released, 0 if the lease was already
- * lost - a no-op the caller ignores (nothing of ours to release).
- *
- * KEYS[1] = idempotency key
- * ARGV[1] = owner token
- */
-const ABORT_SCRIPT = `
--- IDEM_ABORT
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('DEL', KEYS[1])
-  return 1
-end
-return 0
-`;
-
-// Old servers lack per-field hash expiry. Never shorten the shared index
-// below an earlier result's remaining lifetime when later results use less TTL.
-const INDEX_SCRIPT = `
--- IDEM_INDEX
-redis.call('HSET', KEYS[1], ARGV[1], '1')
-local ttl = tonumber(ARGV[2])
-if redis.call('PTTL', KEYS[1]) < ttl then
-  redis.call('PEXPIRE', KEYS[1], ttl)
-end
-return 1
-`;
 
 const PENDING_PREFIX = '__idem_pending__';
 
@@ -201,20 +123,12 @@ export function createIdempotencyStore(client, options = {}) {
 		return client.key(keyPrefix + userKey);
 	}
 
-	// Right-to-erasure reverse index: a Redis HASH per (tenant, user) whose FIELDS
-	// are the FULL cache keys that user committed, so `live.forget` can delete
-	// exactly a user's entries instead of substring-matching the opaque key (a
-	// collision could over-delete or miss). A hash (vs a set) keeps it portable
-	// and lets fields carry TTLs. The store has no sweep loop (pure EX TTL), so
-	// each index field expires with its own cache entry via per-field HPEXPIRE
-	// (Redis 7.4+ / Valkey 9.0+); older servers fall back to a whole-key maximum
-	// expiry, where a busy user's writes keep every field alive - fields can then
-	// outlive their cache entries, and any stale field is a no-op DEL on purge.
-	// The composite index key is NUL-delimited, so neither segment may
-	// contain NUL - otherwise distinct (tenant,user) pairs collide
-	// (('a\0b','c') === ('a','b\0c')) and one identity's purgeUser deletes
-	// another's committed results. Same guard as ratelimit's bucketKey,
-	// enforced at the store boundary.
+	// A v2 per-user hash records every pending owner before primary acquisition.
+	// Fields carry owner tokens, values carry state + full primary key. Unarmed
+	// registrations keep the hash persistent; acknowledged claims use a safe
+	// primary-lifetime bound. Old one-NUL indexes remain readable for migration.
+	// Neither tenant nor user may contain NUL, preserving both identity and
+	// version boundaries without changing Redis Cluster routing restrictions.
 	function validateForgetIdentity(tenantId, userId) {
 		if (tenantId != null && String(tenantId).indexOf('\0') !== -1) {
 			throw new Error('redis idempotency: tenant id must not contain a NUL byte (it is the index-key delimiter)');
@@ -233,8 +147,13 @@ export function createIdempotencyStore(client, options = {}) {
 		return tenantId == null ? '' : String(tenantId);
 	}
 
-	function byUserKey(tenantId, userId) {
+	function legacyByUserKey(tenantId, userId) {
 		return client.key(keyPrefix + 'byuser:' + tenantSegment(tenantId) + '\0' + userId);
+	}
+
+	function byUserKey(tenantId, userId) {
+		// Two NUL delimiters make this disjoint from every legacy one-NUL index.
+		return client.key(keyPrefix + 'byuser:v2\0' + tenantSegment(tenantId) + '\0' + userId);
 	}
 
 	function validateKey(userKey) {
@@ -273,9 +192,36 @@ export function createIdempotencyStore(client, options = {}) {
 			// stale token and can neither overwrite (commit) nor release (abort)
 			// the successor's slot.
 			const ownerToken = PENDING_PREFIX + ':' + randomUuid();
-			const raw = await withBreaker(b, () =>
-				evalCached(redis, ACQUIRE_SCRIPT, 1, k, ownerToken, acquireTtl, PENDING_PREFIX)
-			);
+			const idxKey = forgetUser !== null ? byUserKey(forgetTenant, forgetUser) : null;
+			const ownership = (op, ...args) => withBreaker(b, () =>
+				evalCached(redis, OWNERSHIP_SCRIPT, 1, idxKey, op, ownerToken, k, ...args));
+			let raw;
+			if (idxKey !== null) {
+				// Cache hits need no new owner registration. A miss is only a hint:
+				// the later SET NX still decides ownership atomically.
+				const existing = await withBreaker(b, () => redis.get(k));
+				if (existing !== null) raw = existing.startsWith(PENDING_PREFIX) ? [0, '', 1] : [0, existing, 0];
+			}
+			if (raw === undefined) {
+				if (idxKey !== null && await ownership('register') !== 1) throw new IdempotencyLeaseLostError(userKey);
+				// A command error can have an ambiguous outcome. Keep its durable
+				// registration so a later purge can retry erasing the primary.
+				raw = await withBreaker(b, () =>
+					evalCached(redis, ACQUIRE_SCRIPT, 1, k, ownerToken, acquireTtl, PENDING_PREFIX));
+				if (idxKey !== null) {
+					if (raw[0] === 1) {
+						const hexOk = await hexpireProbe.ready();
+						// Start the retention bound AFTER primary SET acknowledgement.
+						// If purge revoked registration during a delayed SET, never
+						// return a handle that could run work or commit afterward.
+						const armed = await ownership('arm', (acquireTtl + resultTtl) * 1000, hexOk ? '1' : '0');
+						if (armed !== 1) {
+							await withBreaker(b, () => evalCached(redis, ABORT_SCRIPT, 1, k, ownerToken));
+							throw new IdempotencyLeaseLostError(userKey);
+						}
+					} else await ownership('drop');
+				}
+			}
 
 			const status = raw[0];
 			const value = raw[1];
@@ -289,6 +235,7 @@ export function createIdempotencyStore(client, options = {}) {
 						if (resultTtl === 0) {
 							const won = await withBreaker(b, () => evalCached(redis, ABORT_SCRIPT, 1, k, ownerToken));
 							if (won !== 1) throw new IdempotencyLeaseLostError(userKey);
+							if (idxKey !== null) await ownership('drop');
 							mCommits?.inc();
 							return;
 						}
@@ -302,58 +249,24 @@ export function createIdempotencyStore(client, options = {}) {
 							// store in a coherent state.
 							throw new IdempotencyResultTooLargeError(bytes, maxResultBytes);
 						}
-						// Resolve the per-field-TTL probe concurrently with the CAS so
-						// its (first-call-only) latency hides under the commit round
-						// trip; it is only awaited if the CAS wins and an index write
-						// follows.
-						const hexReady = forgetUser !== null ? hexpireProbe.ready() : null;
-						// Compare-and-set: only write the result if this owner still
-						// holds the pending slot. If the acquireTtl expired and a
-						// successor re-acquired, the token no longer matches and the
-						// script leaves their slot untouched (returns 0).
+						const envelope = RESULT_PREFIX + '[' + JSON.stringify(ownerToken) + ',' + payload + ']';
+						// Purge deletes by owner token on this same primary slot. If
+						// it wins before a delayed commit, this CAS cannot recreate
+						// the key; if commit wins first, purge recognizes its owner.
 						const won = await withBreaker(b, () =>
-							evalCached(redis, COMMIT_SCRIPT, 1, k, ownerToken, payload, resultTtl)
-						);
-						if (won !== 1) {
-							// The pending slot expired and a successor re-acquired it
-							// before this owner committed; refuse rather than clobber.
-							throw new IdempotencyLeaseLostError(userKey);
-						}
-						// Record the committed key under its user for right-to-erasure -
-						// only now that the CAS won, so the index never references a key
-						// this owner did not commit. Gating on the win is what keeps the
-						// Redis backend in line with Postgres, where the user_id lives on
-						// the row the token-guarded UPDATE could not have touched on a
-						// lost lease: a stale index field here would point at the cache
-						// key the SUCCESSOR now owns, so this user's purgeUser would
-						// delete another user's result. The cost is one extra round trip
-						// on the authenticated-commit path (the CAS and the index cannot
-						// share a batch - they hash to different slots and a cross-slot
-						// MULTI fails on Redis Cluster); it is a per-effectful-operation
-						// commit, not a hot loop. Best-effort: a failure must not fail
-						// the already-committed result.
-						if (forgetUser !== null) {
-							const idxKey = byUserKey(forgetTenant, forgetUser);
-							const hexOk = await hexReady;
-							if (hexOk) {
-								const tx = redis.multi();
-								tx.hset(idxKey, k, '1');
-								tx.hpexpire(idxKey, resultTtl * 1000, 'FIELDS', 1, k);
-								await tx.exec().catch(() => { /* cache entry already committed */ });
-							} else {
-								await evalCached(redis, INDEX_SCRIPT, 1, idxKey, k, resultTtl * 1000)
-									.catch(() => { /* index best-effort; cache entry already committed */ });
-							}
-						}
+							evalCached(redis, COMMIT_SCRIPT, 1, k, ownerToken, envelope, resultTtl));
+						if (won !== 1) throw new IdempotencyLeaseLostError(userKey);
 						mCommits?.inc();
 					},
 					async abort() {
 						// Compare-and-delete: release the slot only if this owner
 						// still holds it. A token mismatch (a successor re-acquired)
 						// is a silent no-op - never delete their slot.
-						await withBreaker(b, () =>
+						const removed = await withBreaker(b, () =>
 							evalCached(redis, ABORT_SCRIPT, 1, k, ownerToken)
 						);
+						// An abort after commit must not drop that result's index.
+						if (removed === 1 && idxKey !== null) await ownership('drop');
 						mAborts?.inc();
 					}
 				};
@@ -367,7 +280,11 @@ export function createIdempotencyStore(client, options = {}) {
 			mHits?.inc();
 			let parsed;
 			try {
-				parsed = JSON.parse(value);
+				if (typeof value === 'string' && value.startsWith(RESULT_PREFIX)) {
+					const envelope = JSON.parse(value.slice(RESULT_PREFIX.length));
+					if (!Array.isArray(envelope) || envelope.length !== 2 || typeof envelope[0] !== 'string') throw new Error('invalid idempotency result envelope');
+					parsed = envelope[1];
+				} else parsed = JSON.parse(value);
 			} catch {
 				// Stored value is not JSON: treat as missing so the caller can retry.
 				return { acquired: false, pending: true };
@@ -381,28 +298,55 @@ export function createIdempotencyStore(client, options = {}) {
 		},
 
 		/**
-		 * Right-to-erasure: delete every cached result this user committed, found
-		 * via the byuser SET index. Each cache key is deleted individually so the
-		 * cluster routes each DEL to its own slot (a single cross-slot pipeline
-		 * would silently no-op). `tenantId` disambiguates the user across tenants.
+		 * Right-to-erasure: revoke pending owners and delete their cached results.
+		 * Index revocation and each owner-checked primary deletion run separately
+		 * on their respective Redis slots. Failures retain retryable ownership.
+		 * `tenantId` disambiguates the user across tenants.
 		 * @param {string | null} tenantId
 		 * @param {string} userId
-		 * @returns {Promise<number>} cache entries removed
+		 * @returns {Promise<number>} pending or committed primary entries removed
 		 */
 		async purgeUser(tenantId, userId) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
 			validateForgetIdentity(tenantId, userId);
 			return withBreaker(b, async () => {
 				const idxKey = byUserKey(tenantId, userId);
-				const keys = await redis.hkeys(idxKey);
-				if (!keys || keys.length === 0) {
-					await redis.del(idxKey);
-					return 0;
+				const legacyKey = legacyByUserKey(tenantId, userId);
+				const legacyKeys = await redis.hkeys(legacyKey);
+				const prefix = client.key(keyPrefix);
+				for (const key of legacyKeys) {
+					if (!key.startsWith(prefix)) throw new Error('redis idempotency: invalid legacy index key');
+					validateKey(key.slice(prefix.length));
 				}
-				// Per-key DEL: each key routes to its own slot under cluster mode.
-				const results = await Promise.all(keys.map((k) => redis.del(k)));
-				await redis.del(idxKey);
-				return results.reduce((n, r) => n + (r > 0 ? 1 : 0), 0);
+				const claims = await evalCached(redis, OWNERSHIP_SCRIPT, 1, idxKey, 'revoke', '', '');
+				let removed = 0;
+				// Revoke first, then delete by owner on each primary slot. Retain
+				// every unacknowledged deletion for a retry; never DEL the whole
+				// index because another acquisition may have registered meanwhile.
+				let next = 0, failed = false, failure;
+				// Bound cross-slot work. Stop admitting owners on the first failure,
+				// then await every admitted chain before reporting that failure.
+				await Promise.all(Array.from({ length: Math.min(8, claims.length / 2) }, async () => {
+					while (!failed && next < claims.length) {
+						const i = next;
+						next += 2;
+						const owner = claims[i], key = claims[i + 1];
+						try {
+							const count = Number(await evalCached(redis, ERASE_SCRIPT, 1, key, owner, RESULT_PREFIX));
+							removed += count;
+							await evalCached(redis, OWNERSHIP_SCRIPT, 1, idxKey, 'drop', owner, key);
+						} catch (error) {
+							if (!failed) { failed = true; failure = error; }
+						}
+					}
+				}));
+				if (failed) throw failure;
+				for (const key of legacyKeys) {
+					const value = await redis.get(key);
+					if (value !== null) removed += Number(await evalCached(redis, LEGACY_ERASE_SCRIPT, 1, key, value, RESULT_PREFIX, PENDING_PREFIX));
+					await redis.hdel(legacyKey, key);
+				}
+				return removed;
 			});
 		},
 

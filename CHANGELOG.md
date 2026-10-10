@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Redis idempotency uses versioned result envelopes and ownership indexes.** Drain old writers before upgrading. Pending claims are revoked by user erasure, delayed commits are fenced, and incomplete index operations reject for retry. See the [ownership migration](docs/idempotency-erasure.md#stored-format-and-coordinated-upgrade).
+
 - **PostgreSQL stores validate a versioned schema before automatic initialization completes.** Review legacy rows and operator-added restrictions, preserve the migration ledger, and use a direct/session-pooled migration connection. Automatic migration failures now stay latched until an explicit `ready()` retry or store recreation; migrate large tables before traffic with explicit DDL bounds. See the PostgreSQL preflight in the migration guide.
 
 - **Alarm stores require ordered generations.** Reserve with `nextGeneration(topic)` and pass the exact string to `set` and `delete`; stop old topic-only writers before rollout. PostgreSQL migration version 3 and three Redis authority hashes retain counters after deletion or clear. Restore authority with schedules and the migration ledger; see the alarm generation migration guide.
