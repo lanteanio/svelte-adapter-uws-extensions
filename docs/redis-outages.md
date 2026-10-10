@@ -19,8 +19,9 @@ remain in their protocol queue until their replies arrive or the connection
 closes. A timeout cannot prove that Redis did not execute a command already sent;
 use idempotency or fencing for effects whose repetition would be unsafe.
 
-Failures reject the calling promise through the existing ioredis errors or
-`ConnectionError` for queue-cap admission. This gives a configured breaker and
+Failures reject the calling promise through the existing ioredis errors,
+extensions `TimeoutError` for shared command deadlines, or `ConnectionError` for
+queue-cap admission. This gives a configured breaker and
 `localFloorOnStorageFailure` rate limiter a failure to handle. The floor remains
 an explicit application choice; its allowance is per process. Store durable work
 in the task or outbox store instead of using an offline connection queue as a

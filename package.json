@@ -260,7 +260,7 @@
 	},
 	"dependencies": {
 		"@types/pg": "8.23.1",
-		"ioredis": "^5.0.0"
+		"ioredis": "^5.10.1"
 	},
 	"optionalDependencies": {
 		"pg": "^8.0.0"
