@@ -6,10 +6,12 @@ Redis and Postgres extensions for [svelte-adapter-uws](https://github.com/lantea
 
 The core adapter keeps everything in-process memory. That works great for
 single-server deployments, but the moment you scale to multiple instances you
-need shared state. This package provides Redis and Postgres implementations
-with the same operational contracts after construction. They are not
-constructor-identical drop-ins: each backend has an explicit factory and client
-setup because connection ownership, persistence, and failure handling differ.
+need shared state. This package provides Redis and Postgres counterparts with
+backend-specific factories and client setup. Moving from memory to a shared
+backend also changes some calls: distributed session methods are asynchronous
+and have no `size` property; distributed locks use expiring leases and omit
+`held`, `size`, and `clear`. Check each extension's API and failure behavior
+before replacing an in-memory primitive.
 
 ## What you get
 
@@ -252,9 +254,11 @@ are stable regardless of the physical name.
 
 ---
 
-## Authorization model
+<a id="authorization-model"></a>
 
-Every extension in this package is an **authorization-free primitive**. None of them know who the caller is, what roles the caller has, or whether the requested action is allowed - they execute whatever the caller passes against the shared Redis or Postgres backend. Calling `replay.replay(ws, topic, since)`, `idempotency.handle(key, fn)`, `lock.withLock(key, fn)`, or `queue.enqueue(task)` is no more an authorization check than `redis.GET key` or `pg.query('SELECT ...')` is one.
+## Authorize every extension call
+
+Authorize the caller before invoking an extension. These primitives do not define your application's user, role, or tenant policy. Replay additionally calls `platform.checkSubscribe(ws, topic)` and fails closed, but that check still depends on the policy your application installs. An identity-shaped key does not prove the caller owns the resource.
 
 Your message handler is the gate. Identity is established at connect time by the adapter's [`upgrade()` hook](https://github.com/lanteanio/svelte-adapter-uws#authentication) and stashed on the socket via `ws.getUserData()`. Your `message()` handler reads that identity, decides whether the action is allowed, and **only then** invokes the extension:
 
@@ -266,26 +270,32 @@ export async function message(ws, { data }) {
   const { action, input } = JSON.parse(Buffer.from(data).toString());
   const { userId, role } = ws.getUserData() ?? {};
 
-  // 1. Authentication: did upgrade() reject? If not, ws.getUserData() is non-empty.
+  // 1. Read the identity established by upgrade().
   if (!userId) return;
 
   // 2. Authorization: this handler decides. The extension does not.
-  if (action === 'place-order' && !canPlaceOrders(userId, role)) return;
+  if (action !== 'place-order' || !canPlaceOrders(userId, role)) return;
+  if (!isValidOrderInput(input)) return; // Application schema and size limits.
 
-  // 3. Only now is the extension invoked. The key is prefixed with the
-  //    trusted userId so a wire-supplied clientOrderId cannot collide
-  //    with another user's namespace.
-  const key = `order:${userId}:${input.clientOrderId}`;
+  // 3. Only now is the extension invoked. A structured tuple keeps the
+  //    trusted userId separate from the validated order ID, even when
+  //    either contains a delimiter.
+  const key = JSON.stringify(['order', userId, input.clientOrderId]);
   await idempotency.handle(key, () => persistOrder(userId, input));
 }
 ```
 
-Higher-level frameworks built on this adapter (e.g. [`svelte-realtime`](https://github.com/lanteanio/svelte-realtime)) wrap this pattern: `ctx.user` is the same identity object the adapter's `upgrade()` hook returned, and the framework's `_guard` / `live.public()` / `// realtime-allow-public` machinery is the authorization layer at the RPC seam. The extensions below still do not gate anything themselves; the framework's auth lives outside them.
+Higher-level frameworks built on this adapter (e.g. [`svelte-realtime`](https://github.com/lanteanio/svelte-realtime)) wrap this pattern: `ctx.user` is the same identity object the adapter's `upgrade()` hook returned, and the framework's `_guard` / `live.public()` / `// realtime-allow-public` machinery is the authorization layer at the RPC seam. The framework supplies that policy; any additional replay check uses the platform's configured policy.
 
-Two failure modes deserve specific call-out for distributed extensions:
+Apply these checks at the handler boundary:
 
-- **Key collisions across tenants on a shared backend.** A `lock.withLock('account:42', ...)` call on a shared Redis hits the same lock entry regardless of which app instance or which tenant issued it. If your handler builds the key from a wire field without checking ownership, an unauthorized caller can grab the lock and stall any legitimate owner. Derive keys from a trusted prefix (`account:${assertedAccountId(ctx, payload.accountId)}`), and consider per-tenant key prefixes on the client itself (`createRedisClient({ keyPrefix: \`tenant:${tenantId}:\` })`) when you operate one Redis across multiple tenants - see [shared-Redis tenancy notes](#operational-notes-for-shared-redis-tenancy) for the deployment shape.
-- **Replay / pub-sub fanout to unauthorized subscribers.** A subscribe gate is still your responsibility. The pub/sub bus broadcasts whatever publishes arrive to whoever is subscribed; `replay()` authorizes each topic through the platform's `checkSubscribe` and fails closed when the platform cannot answer - but it is your subscribe hook that makes that check say no. Gate topic-subscribe in your handler before invoking the extension.
+| Risk | Action before calling the extension |
+| --- | --- |
+| A caller guesses another user's lock or idempotency key | Check resource ownership, then derive the key from trusted identity and resource IDs. Never accept a complete backend key from the wire. |
+| Tenants share a Redis or Postgres backend | Derive topics and keys from an authorized tenant. Use a per-tenant Redis client prefix where appropriate; see [shared-Redis tenancy notes](#operational-notes-for-shared-redis-tenancy). |
+| A subscriber receives another tenant's live or replayed messages | Authorize topic subscriptions and publishes. Supply the platform subscribe policy that replay checks before reading history. |
+| A queued task or webhook receives a caller-supplied URL or payload | Validate the payload, authorize its target, and enforce the application's outbound destination policy before enqueueing or dispatching. |
+| A caller invokes an operator or control-plane operation | Restrict route access and require explicit operator authorization before clears, erasure, task controls, or administrative broadcasts. |
 
 The same pattern applies to every extension in this README: read identity, decide, derive keys/topics from trusted identity prefixes, **then** invoke. An extension that "looks like an auth gate" by virtue of accepting an identity-shaped key is just substituting whatever string the caller hands it.
 
@@ -299,7 +309,7 @@ Distributes `platform.publish()` calls across multiple server instances via Redi
 
 Multiple `publish()` calls within the same event-loop tick are coalesced into a single Redis pipeline via microtask batching. This means a form action that publishes to three topics results in one pipelined round trip, not three independent commands.
 
-> **Authorization:** the bus delivers whatever publishes arrive to whoever is subscribed. It does not gate topic-subscribe or topic-publish. If a topic should be limited to a subset of users, enforce that in your subscribe / message handler. See [Authorization model](#authorization-model).
+> **Authorization:** the bus delivers whatever publishes arrive to whoever is subscribed. It does not gate topic-subscribe or topic-publish. If a topic should be limited to a subset of users, enforce that in your subscribe / message handler. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -435,7 +445,7 @@ The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) 
 
 **Requires Redis 7+.** `activate()` runs `INFO server` and throws on older servers; use `createPubSubBus` for Redis 6 / older Valkey.
 
-> **Authorization:** same as the unsharded bus - the sharded variant is a delivery optimization, not an access gate. Gate `follow(topic)` calls and publishes in your handler. See [Authorization model](#authorization-model).
+> **Authorization:** same as the unsharded bus - the sharded variant is a delivery optimization, not an access gate. Gate `follow(topic)` calls and publishes in your handler. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -567,7 +577,7 @@ Sequence numbers are incremented atomically via a Lua script (`INCR` + `ZADD` + 
 
 When a client requests replay, the buffer checks whether the client's last-seen sequence is older than the oldest buffered entry. If it is (the buffer was trimmed past the client's position), a `truncated` event fires on `__replay:{topic}` before any `msg` events, so the client knows it missed messages and can do a full reload. This also fires when the buffer is completely empty but the sequence counter has advanced past the client's position (e.g. all entries expired via TTL).
 
-> **Authorization:** `replay()` authorizes before reading the buffer: it runs `platform.checkSubscribe(ws, topic)` per topic and **fails closed** - a platform that cannot answer (no `checkSubscribe`, or an authorizer that throws) is treated as a denial. A denied topic emits a `denied` event on `__replay:{topic}` and resolves `undefined` (no watermark) instead of history. Gate the topic-subscribe in your handler as before; the replay gate is the second line that keeps a guessed topic name from yielding the buffer. See [Authorization model](#authorization-model).
+> **Authorization:** `replay()` authorizes before reading the buffer: it runs `platform.checkSubscribe(ws, topic)` per topic and **fails closed** - a platform that cannot answer (no `checkSubscribe`, or an authorizer that throws) is treated as a denial. A denied topic emits a `denied` event on `__replay:{topic}` and resolves `undefined` (no watermark) instead of history. Gate the topic-subscribe in your handler as before; the replay gate is the second line that keeps a guessed topic name from yielding the buffer. See [Authorize every extension call](#authorize-every-extension-call).
 
 The same gap state is exposed as a callable: `gap(topic, lastSeenSeq)` returns `{ truncated, missingFrom }` without driving a full WebSocket replay. Useful for SSR loaders that want to decide between an incremental `since()` fetch and a full reload before the page even opens its socket.
 
@@ -796,7 +806,7 @@ Same API as the core `createPresence` plugin, but backed by Redis hashes. Presen
 
 **Requires Redis 7.4+ or Valkey 9.0+.** Uses the per-field hash TTL primitive (`HEXPIRE` family) so staleness is enforced atomically by the server rather than by an application-side cleanup script. Redis shipped these commands in 7.4; Valkey shipped them in 9.0 (and pins `redis_version` at `7.2.4` forever while reporting its real version in `valkey_version`, so the activation probe is server-aware - a Valkey 9.0 server is accepted even though its `redis_version` reads `7.2.4`). `createPresence` runs `INFO server` on first use and throws on older servers; fall back to the in-memory `createPresence` from `svelte-adapter-uws/plugins/presence` for single-instance deployments on older servers.
 
-> **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorization model](#authorization-model).
+> **Authorization:** same as the in-memory presence plugin - the plugin shows whoever subscribes to the topic. Gate topic-subscribe in your handler. The `select` callback only chooses which fields of `ws.getUserData()` to publish; it does not gate identity. See [Authorize every extension call](#authorize-every-extension-call).
 
 With no `select`, presence copies only the configured `key` field into a roster entry, and only when its value is a string or a finite number; cursor copies only an own `id` the same way. Display names, avatars, profiles, the client address and everything else the upgrade hook returned stay on the server until a `select` names them. An explicit `select` is the application's own policy and its result is used as-is, so write it as an allowlist: `select: (ud) => ({ id: ud.id, name: ud.name })`. It receives the connection's userData unchanged, and what it returns is what peers see and what Redis stores. The in-memory plugins follow the same rule, so a roster keeps its shape when an app moves from one process to a cluster. The one exception is presence, which drops top-level `__`-prefixed, `constructor` and `prototype` names from the result: its cross-instance relay and its read-back from Redis drop them too, so the local join does the same and a user looks alike on every instance.
 
@@ -1253,7 +1263,7 @@ The session map is **independent of userId**: a connection may carry a userId, a
 
 Same API as the core `createRateLimit` plugin, but backed by Redis using an atomic Lua script. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.
 
-> **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorization model](#authorization-model).
+> **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -1403,7 +1413,7 @@ if (!allowed) {
 
 Same API as the core `createGroup` plugin, but membership is stored in Redis so groups work across multiple server instances. Local WebSocket tracking is maintained per-instance, and cross-instance events are relayed via Redis pub/sub.
 
-> **Authorization:** the `onJoin` hook is the join-decision site; the plugin itself does not authorize. Returning a role admits the socket; throwing rejects. See [Authorization model](#authorization-model).
+> **Authorization:** the `onJoin` hook is the join-decision site; the plugin itself does not authorize. Returning a role admits the socket; throwing rejects. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -1563,7 +1573,7 @@ Out of the box the broadcast path is a 60Hz world-state tick: each topic emits a
 
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
 
-> **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorization model](#authorization-model).
+> **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorize every extension call](#authorize-every-extension-call).
 
 With no `select`, a cursor's identity is only its own `id` (a string or finite number), in both the catalog/join frame and the Redis cursor snapshot. An explicit `select` defines the identity your UI needs and is used as-is, as described in [Presence](#presence).
 
@@ -1728,7 +1738,7 @@ Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq
 
 Same gap detection behavior as the Redis replay buffer: if the client's last-seen sequence is older than the oldest buffered row, or the buffer is empty but the sequence counter has advanced, a `truncated` event fires before replay. The standalone `gap(topic, lastSeenSeq)` probe is also available with the same `{ truncated, missingFrom }` shape; the gap query uses the `(topic, seq)` index for an O(log n) seek rather than scanning the buffer.
 
-> **Authorization:** same as the Redis replay buffer - `replay()` runs `platform.checkSubscribe(ws, topic)` per topic and fails closed when the platform cannot authorize; a denied topic emits `denied` on `__replay:{topic}` and yields no history. Gate topic-subscribe in your handler. See [Authorization model](#authorization-model).
+> **Authorization:** same as the Redis replay buffer - `replay()` runs `platform.checkSubscribe(ws, topic)` per topic and fails closed when the platform cannot authorize; a denied topic emits `denied` on `__replay:{topic}` and yields no history. Gate topic-subscribe in your handler. See [Authorize every extension call](#authorize-every-extension-call).
 
 The aggregate-vs-broadcast guidance from the [Redis replay section](#aggregate-vs-broadcast-topics) applies equally here - one topic per aggregate keeps the buffer size budget meaningful and gap detection actionable.
 
@@ -1805,7 +1815,7 @@ Listens on a Postgres channel for notifications and forwards them to `platform.p
 
 Uses a standalone connection (not from the pool) since LISTEN requires a persistent connection that stays open for the lifetime of the bridge.
 
-> **Authorization:** the bridge forwards every NOTIFY payload from Postgres straight to `platform.publish()`. The trigger that emits the NOTIFY is the trust boundary - if your trigger fires on every row mutation regardless of tenant, the published topic must encode the tenant so subscribers see only their own data, AND your subscribe gate must enforce that tenants only subscribe to their own topics. Treating a NOTIFY payload as "already authenticated because it came from the DB" is incorrect; the DB does not know who is subscribing. See [Authorization model](#authorization-model).
+> **Authorization:** the bridge forwards every NOTIFY payload from Postgres straight to `platform.publish()`. The trigger that emits the NOTIFY is the trust boundary - if your trigger fires on every row mutation regardless of tenant, the published topic must encode the tenant so subscribers see only their own data, AND your subscribe gate must enforce that tenants only subscribe to their own topics. Treating a NOTIFY payload as "already authenticated because it came from the DB" is incorrect; the DB does not know who is subscribing. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -1945,7 +1955,7 @@ If your real-time events are driven by database writes and you do not need Redis
 
 The shape: enqueue jobs into a named queue, claim batches atomically, mark complete (delete) or fail (release for retry). Visibility timeout means a worker that crashes mid-processing has its claim auto-expire so another worker can pick the job up. Max-attempts and dead-letter behavior are intentionally NOT baked in - the `attempts` counter is exposed on every claim, callers track it and decide when to give up.
 
-> **Authorization:** the queue does not check who is allowed to enqueue. If your handler calls `queue.enqueue('emails', payload)` with a wire-supplied payload, an attacker can enqueue arbitrary background work for your workers to execute. Validate every enqueue at the handler boundary; treat the `claimed` payload server-side as untrusted input. See [Authorization model](#authorization-model).
+> **Authorization:** the queue does not check who is allowed to enqueue. If your handler calls `queue.enqueue('emails', payload)` with a wire-supplied payload, an attacker can enqueue arbitrary background work for your workers to execute. Validate every enqueue at the handler boundary; treat the `claimed` payload server-side as untrusted input. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -2094,7 +2104,7 @@ A short `acquireTtl` (default 60 seconds) bounds how long a pending slot can hol
 
 Two backends share the same contract: pick whichever your stack already runs. The adapter's in-memory `Dedup` plugin is the zero-config fallback for single-instance deployments.
 
-> **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always derive the key from a trusted identity prefix - e.g. `\`order:${userId}:${payload.clientOrderId}\``. See [Authorization model](#authorization-model).
+> **Authorization:** the idempotency key is whatever the caller passes. If your handler builds the key from a wire field without prefixing the trusted userId (e.g. `key: payload.clientOrderId`), one user can collide with another's slot and block their next legitimate request - or read their cached result if `acquire` returns the prior commit. Always derive the key from a trusted identity prefix - e.g. `\`order:${userId}:${payload.clientOrderId}\``. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup (Redis)
 
@@ -2226,9 +2236,9 @@ The adapter's in-memory `createDedup` plugin (`svelte-adapter-uws/plugins/dedup`
 
 ## Distributed lock
 
-Cluster-wide **cooperative** locking primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; this is the Redis-backed swap for multi-instance deployments. Distinct from `redis/fence`: the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose cooperative lock any user code can grab. It gives mutual exclusion while every holder stays responsive to its lease - but it is a TTL lease with cooperative release, not a hard fencing mutex under a process stall. See [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex).
+Cluster-wide **cooperative** locking primitive. The adapter ships an in-memory `Lock` plugin that serializes `withLock(key, fn)` per key on a single instance via a `Map<string, Promise>`; the Redis implementation coordinates multiple instances. Its `withLock` call is asynchronous, can fail to acquire or lose its lease, and passes an `AbortSignal` to the callback. It does not expose the in-memory `held`, `size`, or `clear` operations. Distinct from `redis/fence`: the fence module is task-runner-specific (one fence per `taskId`, paired with the Postgres state machine); this is a general-purpose cooperative lock any user code can grab. It gives mutual exclusion while every holder stays responsive to its lease - but it is a TTL lease with cooperative release, not a hard fencing mutex under a process stall. See [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex).
 
-> **Authorization:** `withLock(key, fn)` serializes whoever calls it under that key; it does not check whether the caller owns the resource the key represents. A wire-supplied lock key lets an attacker grab a lock on a resource they don't own and stall any legitimate owner. Derive lock keys from a trusted prefix - e.g. `\`account:${assertedAccountId(ctx, payload.accountId)}\``. See [Authorization model](#authorization-model).
+> **Authorization:** `withLock(key, fn)` serializes whoever calls it under that key; it does not check whether the caller owns the resource the key represents. A wire-supplied lock key lets an attacker grab a lock on a resource they don't own and stall any legitimate owner. Derive lock keys from a trusted prefix - e.g. `\`account:${assertedAccountId(ctx, payload.accountId)}\``. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -2639,11 +2649,11 @@ Rejections count under `admission_rejected_total{reason="CLOCK_TRIPPED"}`. Any o
 
 ## Distributed session
 
-Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; this is the Redis-backed swap for multi-instance deployments where a session created on instance A must be readable from instance B after a load-balancer hop.
+Cluster-wide session store with sliding TTL. The adapter ships an in-memory `Session` plugin (`svelte-adapter-uws/plugins/session`) that holds `Map<token, data>` in process memory; the Redis implementation lets a session created on instance A be read on instance B after a load-balancer hop. All store operations are asynchronous and can fail on backend access. Await `get`, `set`, `touch`, `delete`, and `clear`; there is no synchronous `size` property for the distributed keyspace. Stored data must be JSON-serializable.
 
 Pairs with [Connection registry](#connection-registry): when both are wired, the session provides the durable per-user state (survives disconnect, persists across reconnect, available before a WS even opens), while the registry provides the live "where is this user right now" pointer (only meaningful while the WS is connected). They answer different questions and compose without overlap.
 
-> **Authorization:** the session store maps tokens to data. Producing the token-to-user binding (your auth layer) and validating the token before lookup (your `upgrade()` hook or middleware) are NOT the plugin's job. If your handler calls `session.get(payload.token)` with a wire-supplied token without first confirming the caller owns it, an attacker can lift any active token they happen to know and impersonate its owner. See [Authorization model](#authorization-model).
+> **Authorization:** the session store maps tokens to data. Producing the token-to-user binding (your auth layer) and validating the token before lookup (your `upgrade()` hook or middleware) are NOT the plugin's job. If your handler calls `session.get(payload.token)` with a wire-supplied token without first confirming the caller owns it, an attacker can lift any active token they happen to know and impersonate its owner. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 
@@ -2792,7 +2802,7 @@ Wraps an effectful operation in a state machine that survives process crashes an
 
 **Task names must match `/^[a-zA-Z][a-zA-Z0-9_-]*$/`** - start with a letter, then letters/digits/underscores/hyphens. Names starting with `_` or a digit are rejected at `register()` time. Trips test fixtures most often (`__noop` -> `noop`).
 
-> **Authorization:** `run(taskName, args)` executes the registered handler with whatever args the caller passes. If your message handler forwards a wire payload straight to `run(...)` without validating that the caller is allowed to invoke this task and own the inputs, an attacker can drive arbitrary registered tasks with arbitrary inputs - charge an account they don't own, send a webhook on someone else's behalf. The handler is server-trusted; the args are not. Validate at the handler boundary, treat args server-side as untrusted input. See [Authorization model](#authorization-model).
+> **Authorization:** `run(taskName, args)` executes the registered handler with whatever args the caller passes. If your message handler forwards a wire payload straight to `run(...)` without validating that the caller is allowed to invoke this task and own the inputs, an attacker can drive arbitrary registered tasks with arbitrary inputs - charge an account they don't own, send a webhook on someone else's behalf. The handler is server-trusted; the args are not. Validate at the handler boundary, treat args server-side as untrusted input. See [Authorize every extension call](#authorize-every-extension-call).
 
 Three guarantees:
 

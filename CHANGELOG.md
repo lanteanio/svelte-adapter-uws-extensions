@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Authorization guidance now starts with handler checks and trusted key derivation. Distributed session and lock introductions spell out asynchronous calls, omitted local introspection, and lease failures.
+
 - The adapter peer floor is now 0.6.0-next.95 so null and bigint sequence choices behave consistently across instances.
 
 ### Fixed
