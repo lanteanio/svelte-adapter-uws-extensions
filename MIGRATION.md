@@ -96,6 +96,22 @@ local and relayed publications consistent.
 upgrade. The ecosystem packages move together (see the version table in the
 README).
 
+### PostgreSQL custom table names are limited to 42 bytes
+
+**Symptom.** A PostgreSQL store factory rejects a custom `table` name longer
+than 42 ASCII bytes, before its first database operation.
+
+**Why.** Generated index names add prefixes and suffixes; longer table names
+can make PostgreSQL silently truncate distinct index names to the same value.
+The existing ASCII identifier and reserved-namespace checks still apply.
+
+**Action.** Keep default names, or choose a shorter custom name. For an existing
+store, rehearse a coordinated database migration with all writers stopped;
+account for its generated indexes, companion tables and migration-ledger identity,
+then run the schema readiness check. Changing only the option points at another
+table and does not move existing rows. Keep the previous mapping and backup for
+rollback; never restart old writers against a separate stale table.
+
 ### `capabilityCookie` refuses a weak secret
 
 **Symptom.** `capability-cookie: secret must be at least 16 characters` or
@@ -168,6 +184,38 @@ type gate now fails any runtime export its declaration omits.
 `{ points, interval }` for a tighter per-instance budget).
 
 ## 2. Needs an operational step
+
+### Redis keys now use Cluster hash tags
+
+**Symptom.** Presence, groups and cursors appear empty after upgrading; replay
+cannot serve the previous history even though old Redis keys remain.
+
+**Why.** Presence, groups, sorted-set replay, stream replay and cursor storage
+now use hash-tagged keys so each entity's multi-key scripts run on one Cluster
+slot. For example, `replay:seq:room` becomes `replay:seq:{room}` and
+`replay:buf:room` becomes `replay:buf:{room}`, under the same configured
+prefix. The package does not automatically discover or convert old namespaces.
+Sorted-set replay defaults to no TTL, so its old buffers need not expire.
+
+**Action.** Stop all old writers and disconnect their clients before switching
+namespaces. Snapshot the old data, prefixes and topic mapping. For ephemeral
+presence, groups and cursors, deliberately rebuild membership from reconnected
+clients. Preserve or deliberately recreate group metadata and closed-state
+tombstones under application policy before reopening group traffic. For retained
+replay, choose either a rehearsed data migration or an
+explicit history reset with client rehydration. Migrate history together with
+its sequence and any existing epoch/dedup authority; copying only buffer entries
+can reuse sequence numbers or repeat a producer's publish. Resetting history
+also requires invalidating saved client offsets; do not let a new sequence space
+silently continue an old one.
+
+Inventory the exact key families for both installed versions. A Cluster rename
+across old/new slots is not a general migration strategy; use an operator-owned
+copy/restore procedure that preserves values and expiration semantics, validate
+it with writes paused, then switch the whole fleet. Keep old keys isolated until
+rollback is no longer needed and delete them through an explicit retention plan.
+No data conversion is needed on a fresh Redis namespace. The PostgreSQL rehearsal
+below does not exercise this Redis transition.
 
 ### Ordered alarm generations
 
@@ -255,6 +303,73 @@ read-only; a present migration ledger also requires SELECT access and known
 versions/checksums. Await this gate before serving traffic.
 
 ## 3. Fails on a call that used to succeed
+
+### Presence selection must return an object
+
+**Symptom.** `presence.join()` throws `TypeError` when `select` returns
+`null`, `undefined`, a string or another non-object value.
+
+**Why.** The selected value becomes public roster data; a scalar entry cannot
+be read back as the expected roster record.
+
+**Action.** Return a non-null object with explicitly allowed public fields,
+including the configured identity key, and ensure it is JSON-serializable. Use
+an empty object when no selected fields are needed. The default selector already
+satisfies the contract; no change is needed unless a custom selector returns an
+invalid value. Deploy the corrected selector before the package upgrade.
+
+### Presence and cursor inputs have finite default bounds
+
+**Symptom.** Oversized presence updates or excess joins are ignored, diffs arrive
+in small batches, or cursor updates disappear before publication.
+
+**Why.** Presence defaults to `maxFieldsBytes: 8192` per update,
+`maxTotalFieldsBytes: 65536` per user's accumulated fields,
+`maxTopicsPerConnection: 100` and `topicThrottle: 16` milliseconds. Cursor
+`maxDataBytes` defaults to `8192` UTF-8 JSON bytes. Unserializable, oversized
+or excessively nested cursor update data is dropped before staging. An invalid
+`maxDataBytes` throws at construction; it must be a positive integer.
+
+**Action.** Measure real payloads and topic fan-out before rollout, trim public
+fields, and split application state from cursor movement. Set explicit positive
+integer presence budgets or cursor `maxDataBytes` only after sizing them for
+your workload; raising the byte bound does not remove depth or serialization
+checks. Presence `topicThrottle: 0` requests a next-timer-turn flush rather
+than synchronous delivery. Valid smaller inputs need no change. Retain explicit
+configuration across rollback; already dropped updates cannot be recovered by
+changing versions, so refresh state from its application authority.
+
+### Oversized batched publications throw before delivery
+
+**Symptom.** A wrapped Redis pub/sub or sharded bus `publishBatched()` call
+throws `RangeError` when its encoded relay envelope exceeds
+`maxEnvelopeBytes`, before the batch is delivered locally.
+
+**Why.** Admitting only part of a batch would let local and remote recipients
+observe different publications.
+
+**Action.** Bound batches by encoded bytes, including envelope overhead, split
+large batches where application ordering permits, and handle rejection at the
+publisher. Ordinary non-batched oversize relay handling is a separate contract;
+do not rely on it to accept a batched call. Small batches need no change.
+Keep the same application limits during rollback to avoid restoring divergent
+local/remote behavior.
+
+### Conflicting metric registration fails immediately
+
+**Symptom.** Creating an instrument with an existing metric name throws an
+`already registered with different ...` error during module setup.
+
+**Why.** One name in a registry must retain its type, labels, help text, limits
+and histogram buckets. Reusing an incompatible instrument previously concealed
+the mismatch until observation or produced misleading series.
+
+**Action.** Centralize each metric definition and make repeated registrations
+identical, or give different instruments distinct names. Review custom
+histogram defaults alongside the [duration migration](#duration-metric-migration)
+and the metric-label defaults below. Matching re-registration remains supported.
+Keep the reconciled definitions on rollback; a version change does not reconcile
+historical series or make conflicting definitions equivalent.
 
 ### Redis idempotency retains pending ownership through erasure
 
@@ -736,6 +851,14 @@ while any 0.6 instance is running. This additive change does not make every
 storage format interchangeable: the Redis idempotency key transition still
 requires the same TTL drain in either direction. A snapshot restore can discard
 post-snapshot writes; reconcile those with downstream side effects before use.
+
+The hash-tagged Redis namespaces need their own rollback plan. Old binaries
+read the old, now stale keys; leaving those keys in place is not a safe rollback.
+Pause all writers, reconcile post-upgrade history and sequence/epoch authority
+back into a verified old-format dataset, or restore a coordinated snapshot and
+account for lost writes and downstream effects. A deliberate replay reset must
+force clients to rehydrate. Never mix old and new writers or automatically
+revive stranded no-TTL replay buffers.
 
 Do not assume rolling wire compatibility merely because sockets connect.
 Selected presence identity is now carried separately from durable fields;

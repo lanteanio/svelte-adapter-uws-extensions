@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Complete the current migration path for hash-tagged Redis storage, custom PostgreSQL table names, presence and cursor limits, batched publication rejection, and metric registration conflicts.
+
 - Point task-runner requirements at the supported PostgreSQL subpath matrix instead of a conflicting minimum.
 
 - Keep release history and companion guides reachable from the package overview, add reciprocal navigation, and enforce those routes in the documentation link gate.

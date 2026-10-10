@@ -39,7 +39,7 @@ before replacing an in-memory primitive.
 
 **Documentation:** [Code examples](./docs/code-examples.md) | [Release history](./CHANGELOG.md) | [Release acceptance](./docs/releasing.md#release-scope-and-acceptance) | [Migration guide](./MIGRATION.md) | [Public entry points](./docs/public-entries.md) | [Contributing](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/CONTRIBUTING.md)
 
-**Upgrading from 0.4.x?** See the [migration guide](./MIGRATION.md) for every breaking change between 0.4.x and 0.5.x.
+**Upgrading from 0.5.x?** Start with the [0.5-to-0.6 migration guide](./MIGRATION.md#05x-to-06x) for prerequisites, required changes and rollback.
 
 For translation, privacy, incidents, releases and capacity testing, use the
 [ecosystem integration resources](./docs/integration-resources.md).
