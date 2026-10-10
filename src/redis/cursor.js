@@ -62,6 +62,7 @@ import { exceedsDepth, MAX_PROJECTION_DEPTH } from '../shared/sensitive-names.js
 import { resolveCursorOptions } from './cursor/options.js';
 import { createRemoveBuffer } from './cursor/remove-buffer.js';
 import { createRedisIo } from './cursor/redis-io.js';
+import { createRoster } from './cursor/roster.js';
 import { createScheduler } from './cursor/scheduler.js';
 
 export { WsClosedError, SubscribeDeniedError };
@@ -276,6 +277,7 @@ export function createCursor(client, options = {}) {
 		const members = topicMembers.get(topic);
 		if (members && members.delete(ws) && members.size === 0) topicMembers.delete(topic);
 		if (!hasLocalInterest(topic)) {
+			roster.drop(topic);
 			const pending = topicFlush.get(topic);
 			if (!pending || pending.dirty.size === 0) {
 				topicFlush.delete(topic);
@@ -374,8 +376,11 @@ export function createCursor(client, options = {}) {
 	// ./cursor/remove-buffer.js for the setTimeout(0) cross-socket coalescing).
 	const { queueRemove, clear: clearRemoveBuffer } = createRemoveBuffer();
 
+	const roster = createRoster({ topics, instanceId, cursorTtl });
+
 	function onPeerMessage(parsed, platform) {
 		if (!hasLocalInterest(parsed.topic, platform)) return;
+		roster.record(parsed.topic, parsed.event, parsed.payload);
 		// Receiver-side coalescing for high-frequency cursor-position
 		// events. UPDATE / BULK enqueue into the local topic's
 		// inboundDirty map so the NEXT local flush emits one combined
@@ -418,6 +423,7 @@ export function createCursor(client, options = {}) {
 		cursorTtl,
 		snapshotIntervalMs,
 		activeTopics,
+		mergeRoster: roster.merge,
 		emit,
 		onMessage: onPeerMessage,
 		queueRemove,
@@ -585,6 +591,8 @@ export function createCursor(client, options = {}) {
 	 * @param {Promise<void>} [relayReady]
 	 */
 	async function emitSnapshot(ws, topic, platform, relayReady) {
+		try { ws.getBufferedAmount(); } catch { return; }
+		watchTopic(ws, topic);
 		// Server time first - even for an empty board - so the requester's
 		// smoothing clock is seeded before the first stamped position frame
 		// and the request/reply round trip is measurable. Rides the codec's
@@ -625,6 +633,7 @@ export function createCursor(client, options = {}) {
 		let cursors;
 		try {
 			cursors = await tracker.list(topic);
+			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: now() })])));
 		} catch {
 			return;
 		}
@@ -1144,6 +1153,7 @@ export function createCursor(client, options = {}) {
 					if (entry.settleTimer) clearTimer(entry.settleTimer);
 				}
 			}
+			roster.clear();
 			resetScheduler();
 			clearRemoveBuffer();
 			dirtyTopics.clear();
@@ -1167,6 +1177,7 @@ export function createCursor(client, options = {}) {
 					if (entry.settleTimer) clearTimer(entry.settleTimer);
 				}
 			}
+			roster.clear();
 			resetScheduler();
 			clearRemoveBuffer();
 			dirtyTopics.clear();

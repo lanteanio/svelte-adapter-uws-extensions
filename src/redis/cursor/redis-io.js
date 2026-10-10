@@ -36,7 +36,7 @@ const SUBSCRIBE_RETRY_MAX_MS = 30000;
  * @param {{
  *   client: import('../index.js').RedisClient, redis: import('ioredis').Redis,
  *   channel: string, instanceId: string, b: any, validator: any,
- *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>,
+ *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function,
  *   emit: Function, onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
  *   inUse: () => boolean
  * }} deps
@@ -51,6 +51,7 @@ export function createRedisIo({
 	cursorTtl,
 	snapshotIntervalMs,
 	activeTopics,
+	mergeRoster,
 	emit,
 	onMessage,
 	queueRemove,
@@ -97,26 +98,14 @@ export function createRedisIo({
 			results = await execMultiSlot(redis, commands);
 		} catch { return; }
 		if (!activePlatform) return;
-		const nowTs = now();
 		for (let i = 0; i < topicList.length; i++) {
-			const [, all] = results[i];
-			if (!all) continue;
+			const [err, all] = results[i];
+			if (err || !all) continue;
 			const topic = topicList[i];
-			const catalogEntries = [];
-			const positionEntries = [];
-			for (const key of Object.keys(all)) {
-				if (key.startsWith(instanceId + ':')) continue;
-				try {
-					const parsed = JSON.parse(all[key]);
-					if (parsed.ts && (nowTs - parsed.ts) <= cursorTtlMs) {
-						catalogEntries.push({ key, user: parsed.user });
-						positionEntries.push({ key, data: parsed.data });
-					}
-				} catch { /* skip */ }
-			}
-			if (catalogEntries.length > 0 && activePlatform) {
-				emit('__cursor:' + topic, EVENTS.CATALOG, catalogEntries, activePlatform);
-				emit('__cursor:' + topic, EVENTS.BULK, positionEntries, activePlatform);
+			const cursors = mergeRoster(topic, all);
+			if (activePlatform && cursors.some((entry) => !entry.key.startsWith(instanceId + ':'))) {
+				emit('__cursor:' + topic, EVENTS.CATALOG, cursors.map(({ key, user }) => ({ key, user })), activePlatform);
+				emit('__cursor:' + topic, EVENTS.BULK, cursors.map(({ key, data }) => ({ key, data })), activePlatform);
 			}
 		}
 	}
