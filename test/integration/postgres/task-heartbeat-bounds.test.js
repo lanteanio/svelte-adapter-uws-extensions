@@ -20,7 +20,7 @@ describe('task heartbeat blocked database renewal', () => {
 			return 'stale success';
 		});
 		const outcome = runner.run('blocked', { input: null }).catch(error => error);
-		let lock;
+		let lock, recovery;
 		try {
 			await entered.promise;
 			lock = await client.connect();
@@ -34,12 +34,19 @@ describe('task heartbeat blocked database renewal', () => {
 			lock.release(); lock = null;
 			finish.resolve();
 			expect((await outcome).message).toBe('fence lost');
-			const row = (await client.query(`SELECT status, result FROM ${table}`)).rows[0];
-			expect(row).toEqual({ status: 'failed', result: null });
+			const row = (await client.query(`SELECT svti_tasks_id AS id, status, result, fence, attempts FROM ${table}`)).rows[0];
+			expect(row).toMatchObject({ status: 'running', result: null, attempts: 1 });
+			recovery = createTaskRunner(client, { table, autoMigrate: false, fenceTtl: 1, heartbeatInterval: 100, dispatchInterval: 0, recoveryInterval: 20, cleanupInterval: 0 });
+			recovery.register('blocked', async () => 'recovered');
+			await expect(recovery.await(row.id, { timeout: 5000, pollInterval: 20 })).resolves.toBe('recovered');
+			const recovered = (await client.query(`SELECT status, fence, attempts FROM ${table}`)).rows[0];
+			expect(recovered).toMatchObject({ status: 'committed', attempts: 2 });
+			expect(recovered.fence).not.toBe(row.fence);
 		} finally {
 			if (lock) { await lock.query('ROLLBACK'); lock.release(); }
 			finish.resolve();
 			runner.destroy();
+			recovery?.destroy();
 			await outcome;
 			await client.query(`DROP TABLE IF EXISTS ${table}`);
 		}

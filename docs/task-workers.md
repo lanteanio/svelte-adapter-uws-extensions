@@ -46,6 +46,10 @@ not a replacement for the database's atomic fence checks: expiry makes a row
 eligible for recovery, and a different token prevents the old worker's commit.
 
 A handler that ignores a lost-fence signal cannot commit its returned success.
+Loss of renewal confidence abandons that attempt without marking its durable row
+failed or consuming the handler retry ladder. The row remains running until its
+PostgreSQL lease expires, then a recovery worker may claim a new fence. A confirmed
+successor's terminal result still wins over the old attempt's local outcome.
 Active worker capacity remains reserved until the handler actually settles.
 Handler exceptions retain their original errors. When an external fence renewal
 is already pending at handler completion, success waits for its result or the

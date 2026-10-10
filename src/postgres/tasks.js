@@ -75,6 +75,12 @@ import {
 
 export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 
+// Private control flow: a lost lease is not a terminal handler outcome.
+class AbandonedTaskAttempt {
+	constructor(error) { this.error = error; }
+}
+
+
 /**
  * @typedef {Object} TaskStateChangeEvent
  * @property {string} taskId
@@ -378,6 +384,11 @@ export function createTaskRunner(client, options = {}) {
 			if (fenceProvider) await heartbeat.finish();
 			if (heartbeatLost || !heartbeat.valid()) throw controller.signal.reason;
 			return result;
+		} catch (error) {
+			// Preserve the caller's original error, but do not fail or rearm a row
+			// after ownership confidence was lost. Recovery owns its next attempt.
+			if (heartbeatLost || !heartbeat.valid()) throw new AbandonedTaskAttempt(error);
+			throw error;
 		} finally {
 			heartbeat.stop();
 			if (!controller.signal.aborted) controller.abort();
@@ -395,10 +406,16 @@ export function createTaskRunner(client, options = {}) {
 	// returns null if the row is not yet terminal - no polling, so a fenced-out
 	// background worker never piles readback load onto the winner during a
 	// fence-expiry storm.
-	async function readCanonicalTerminal(taskId, name, poll) {
+	async function readCanonicalTerminal(taskId, name, poll, abandonedFence) {
 		const start = monotonicNow();
 		while (true) {
-			const row = await sql.readRow(taskId);
+			let row;
+			try { row = await sql.readRow(taskId); } catch (error) {
+				// Without an authoritative read after abandonment, retain the
+				// attempt's original error instead of replacing it with read failure.
+				if (abandonedFence !== undefined) return null;
+				throw error;
+			}
 			if (row && row.status === 'committed') {
 				mRunCommit?.inc({ name });
 				return { result: row.result };
@@ -407,6 +424,9 @@ export function createTaskRunner(client, options = {}) {
 				mRunFail?.inc({ name });
 				throw deserialiseError(row.error);
 			}
+			// A confidence lapse leaves our own running row for recovery. Only a
+			// successor's fence needs canonical polling on this abandonment path.
+			if (abandonedFence !== undefined && row?.fence === abandonedFence) return null;
 			// Not terminal (missing / pending / running under the new fence).
 			if (!poll) return null;
 			if (awaitTimeout > 0 && monotonicNow() - start >= awaitTimeout) {
@@ -495,6 +515,11 @@ export function createTaskRunner(client, options = {}) {
 				try {
 					result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit, leaseStarted);
 				} catch (err) {
+					if (err instanceof AbandonedTaskAttempt) {
+						const canonical = await readCanonicalTerminal(taskId, name, awaitCanonical, fence);
+						if (canonical) return canonical.result;
+						throw err.error;
+					}
 					handlerError = err;
 				}
 

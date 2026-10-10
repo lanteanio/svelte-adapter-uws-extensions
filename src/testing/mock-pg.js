@@ -633,7 +633,7 @@ export function mockPgClient(options = {}) {
 
 		// Task read: status, result, error, attempts, request_id
 		if (
-			sql.startsWith('SELECT status, result, error, attempts, request_id FROM') &&
+			/^SELECT status, result, error, attempts, request_id(?:, fence)? FROM/.test(sql) &&
 			sql.includes('WHERE svti_tasks_id = $1')
 		) {
 			const taskId = values[0];
@@ -645,7 +645,8 @@ export function mockPgClient(options = {}) {
 					result: row.result,
 					error: row.error,
 					attempts: row.attempts,
-					request_id: row.request_id ?? null
+					request_id: row.request_id ?? null,
+					...(sql.includes('request_id, fence') ? { fence: row.fence } : {})
 				}],
 				rowCount: 1
 			};

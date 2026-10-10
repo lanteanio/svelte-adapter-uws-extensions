@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- Task `heartbeatInterval` must be an integer from zero up to, but not including, the fence lifetime in milliseconds. Zero keeps the default; invalid, fractional and lease-length overrides now throw.
+
 - **Redis idempotency uses versioned result envelopes and ownership indexes.** Drain old writers before upgrading. Pending claims are revoked by user erasure, delayed commits are fenced, and incomplete index operations reject for retry. See the [ownership migration](docs/idempotency-erasure.md#stored-format-and-coordinated-upgrade).
 
 - **PostgreSQL stores validate a versioned schema before automatic initialization completes.** Review legacy rows and operator-added restrictions, preserve the migration ledger, and use a direct/session-pooled migration connection. Automatic migration failures now stay latched until an explicit `ready()` retry or store recreation; migrate large tables before traffic with explicit DDL bounds. See the PostgreSQL preflight in the migration guide.
@@ -115,6 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Keep local PostgreSQL admission rejections out of backend breaker health and return abandoned half-open probes. Document and verify PgBouncer startup-parameter compatibility with inherited server role deadlines, including dedicated sessions.
+
+- Leave PostgreSQL tasks recoverable after renewal confidence is lost instead of marking them permanently failed or spending handler retries. Preserve authoritative successor outcomes and original handler errors.
 
 - PostgreSQL readiness requires UPDATE on replay and dead-letter tables because retention locks selected rows. Document exact runtime grants and validate all six stores through a separate non-owner login, including cleanup and recovery.
 

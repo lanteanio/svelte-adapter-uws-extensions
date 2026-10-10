@@ -371,6 +371,21 @@ and the metric-label defaults below. Matching re-registration remains supported.
 Keep the reconciled definitions on rollback; a version change does not reconcile
 historical series or make conflicting definitions equivalent.
 
+### Task heartbeat intervals must fit the lease
+
+`heartbeatInterval` must be an integer from `0` up to, but not including,
+`fenceTtl * 1000`; negative, fractional, non-finite and lease-length intervals
+now throw at construction. Zero retains the default interval. Replace invalid
+values with a positive integer below the lease lifetime and leave time for
+backend latency.
+
+A missed renewal confidence deadline aborts the handler and abandons the current
+attempt without permanently failing its durable row or spending handler retries.
+Recovery can reclaim it after the database lease expires. Handlers must stop on
+the abort signal and keep effects idempotent; a late local success is discarded.
+An existing successor still supplies the canonical outcome. See [task renewal
+confidence](./docs/task-workers.md#fence-renewal-confidence).
+
 ### Redis idempotency retains pending ownership through erasure
 
 User-indexed acquisitions now register ownership before exposing a handler lease.

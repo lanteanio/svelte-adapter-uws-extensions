@@ -265,7 +265,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	async function readRow(taskId) {
 		const res = await client.query({
 			name: 'tasks_read_' + table,
-			text: `SELECT status, result, error, attempts, request_id FROM ${table} WHERE svti_tasks_id = $1`,
+			text: `SELECT status, result, error, attempts, request_id, fence FROM ${table} WHERE svti_tasks_id = $1`,
 			values: [taskId]
 		});
 		return res.rows[0] || null;

@@ -72,6 +72,7 @@ describe('task heartbeat bounds', () => {
 		expect(signal.aborted).toBe(true);
 		expect(fence.heartbeat).toHaveBeenCalledTimes(1);
 		expect((await outcome).message).toBe('handler cancelled');
+		expect([...client._getTaskRows().values()][0].status).toBe('running');
 		blocked.resolve(true);
 		await vi.advanceTimersByTimeAsync(2000);
 		expect(query.mock.calls.filter(([config]) => config?.name?.startsWith('tasks_heartbeat_'))).toHaveLength(0);
@@ -88,7 +89,46 @@ describe('task heartbeat bounds', () => {
 		expect(signal.aborted).toBe(true);
 		done.resolve('stale success');
 		expect((await outcome).message).toBe('fence lost');
-		expect([...client._getTaskRows().values()][0].status).toBe('failed');
+		expect([...client._getTaskRows().values()][0].status).toBe('running');
+	});
+	it('does not consume handler retries after a renewal confidence lapse', async () => {
+		const entered = deferred(), done = deferred();
+		const query = client.query.bind(client);
+		client.query = (config, values) => config?.name?.startsWith('tasks_heartbeat_') ? new Promise(() => {}) : query(config, values);
+		const handler = vi.fn(async () => { entered.resolve(); return done.promise; });
+		make().register('work', handler, { retry: { maxAttempts: 3, backoff: () => 0 } });
+		const outcome = runner.run('work', { input: null }).catch(error => error);
+		await entered.promise;
+		await vi.advanceTimersByTimeAsync(900);
+		done.resolve('unsafe');
+		expect((await outcome).message).toBe('fence lost');
+		expect(handler).toHaveBeenCalledTimes(1);
+		expect([...client._getTaskRows().values()][0]).toMatchObject({ status: 'running', attempts: 1 });
+	});
+	it.each(['read failure', 'successor failure'])('preserves outcome precedence after abandonment and %s', async mode => {
+		const entered = deferred(), original = new Error('original handler failure');
+		const query = client.query.bind(client);
+		client.query = (config, values) => {
+			if (config?.name?.startsWith('tasks_heartbeat_')) return new Promise(() => {});
+			if (mode === 'read failure' && config?.name?.startsWith('tasks_read_')) throw new Error('read unavailable');
+			return query(config, values);
+		};
+		make().register('work', async ({ signal }) => {
+			entered.resolve();
+			await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+			if (mode === 'successor failure') {
+				const row = [...client._getTaskRows().values()][0];
+				row.fence = 'successor'; row.status = 'failed'; row.error = { name: 'Error', message: 'canonical failure' };
+			}
+			throw original;
+		});
+		const outcome = runner.run('work', { input: null }).catch(error => error);
+		await entered.promise;
+		await vi.advanceTimersByTimeAsync(900);
+		if (mode === 'read failure') {
+			expect(await outcome).toBe(original);
+			expect([...client._getTaskRows().values()][0].status).toBe('running');
+		} else expect((await outcome).message).toBe('canonical failure');
 	});
 	it.each([0, 800])('keeps a healthy lease with interval %s', async interval => {
 		const entered = deferred(), done = deferred();
@@ -114,7 +154,7 @@ describe('task heartbeat bounds', () => {
 		if (mode === 'lost') blocked.resolve(false);
 		else await vi.advanceTimersByTimeAsync(800);
 		expect((await outcome).message).toBe('fence lost');
-		expect([...client._getTaskRows().values()][0].status).toBe('failed');
+		expect([...client._getTaskRows().values()][0].status).toBe('running');
 		blocked.resolve(true);
 	});
 	it('does not execute a handler after acquiring the external fence consumed the confidence budget', async () => {
@@ -135,7 +175,7 @@ describe('task heartbeat bounds', () => {
 			return 'stale success';
 		});
 		await expect(runner.run('work', { input: null })).rejects.toThrow('fence lost');
-		expect([...client._getTaskRows().values()][0].status).toBe('failed');
+		expect([...client._getTaskRows().values()][0].status).toBe('running');
 	});
 	it.each([-1, NaN, Infinity, 1000, 1.5])('rejects unsafe heartbeat interval %s', interval => {
 		expect(() => make({ heartbeatInterval: interval })).toThrow('heartbeatInterval');
