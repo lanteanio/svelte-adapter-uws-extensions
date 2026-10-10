@@ -9,17 +9,19 @@ remain the pool configuration options.
 
 An inline `run()` that cannot reserve capacity throws `RangeError` before its
 row is inserted. Use `enqueue()` for bursts that should wait durably in Postgres.
-Dispatch and recovery reserve capacity before claiming worker rows; saturated
-pools leave rows eligible for another compatible worker. Inline handlers keep
-their remaining sweep budget when a worker pool has little capacity available.
+Dispatch and recovery reserve idle or spawnable threads before claiming worker
+rows; saturated pools leave rows eligible for another compatible worker. Inline
+handlers keep their remaining sweep budget when a worker pool has little capacity available.
 Reservations span retries and are released on success, failure and SQL errors.
 
-A job waiting for a thread for 30 seconds rejects with `TimeoutError`. Its handler
-is never started after that deadline. Queued jobs whose signal aborts are removed
+A foreground job waiting for a thread for 30 seconds rejects with `TimeoutError`.
+Its handler is never started after that deadline. Queued jobs whose signal aborts are removed
 and rejected immediately. Active jobs receive the abort signal cooperatively;
 a handler that ignores it continues occupying capacity until it returns or its
-worker exits. Worker errors, unexpected exits and failed IPC messages settle
-waiting callers. Destroying a runner terminates active and idle worker threads.
+worker exits. A durable claim retains its thread reservation through retries and
+database settlement. A crashed worker rejects its active job; a replacement
+continues unrelated queued jobs in order. Retiring threads count against the pool
+size until they stop. Destroying a runner terminates active and idle worker threads.
 
 With the runner's metrics registry enabled, `tasks_worker_queue_jobs`,
 `tasks_worker_active` and `tasks_worker_reserved_bytes` expose current pressure.

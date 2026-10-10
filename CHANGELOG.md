@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claim durable worker tasks only when a thread is available, keeping excess rows eligible for later dispatch instead of failing them at the foreground queue deadline. Retain reservations through retries and database settlement, and replace crashed threads without failing unrelated queued jobs.
+
 - Redis presence preserves unrelated Unicode and punctuation update names when the identity key has no ASCII letters or digits after lowercasing. Nonempty folded identity aliases remain reserved across updates, relays and snapshots.
 
 - Failed Redis presence joins no longer overwrite newer identities or strand membership. Commit identity after admission with bounded private generations, conditional cleanup and final leave notifications while preserving durable update storage.

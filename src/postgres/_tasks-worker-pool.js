@@ -60,28 +60,36 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 	const idle = new Set();
 	const inFlight = new Map();
 	const queue = new Map();
+	const reservedQueue = new Map();
 	const permits = new Set();
 	const idleTimers = new WeakMap();
 	const retireWorkers = new WeakMap();
 	const retirementErrors = new WeakMap();
 	let reservedBytes = 0;
+	let heldThreads = 0;
 	let destroyed = false;
 
 	function capacity(bytes) {
 		return destroyed ? 0 : Math.max(0, Math.min(maxJobs - permits.size, Math.floor((maxBytes - reservedBytes) / Math.max(1, bytes))));
 	}
-	function reserve(bytes) {
+	function threadCapacity(bytes) {
+		return Math.max(0, Math.min(capacity(bytes), size - permits.size, unreservedThreads()));
+	}
+	function reserve(bytes, thread = false) {
 		if (destroyed) throw new Error('task runner destroyed');
-		if (permits.size >= maxJobs || bytes > maxBytes - reservedBytes) {
+		if (permits.size >= maxJobs || bytes > maxBytes - reservedBytes || (thread && threadCapacity(bytes) === 0)) {
 			mRejected?.inc({ reason: 'capacity' });
 			throw new RangeError('postgres tasks: worker admission capacity exceeded');
 		}
-		const permit = { bytes, release() {
+		const permit = { bytes, thread, held: thread, running: false, release() {
 			if (!permits.delete(permit)) return;
+			if (permit.held) { permit.held = false; heldThreads--; }
 			reservedBytes -= bytes;
 			mBytes?.inc(-bytes);
+			drainQueue();
 		} };
 		permits.add(permit);
+		if (thread) heldThreads++;
 		reservedBytes += bytes;
 		mBytes?.inc(bytes);
 		return permit;
@@ -91,7 +99,7 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 		if (timer) { clearTimer(timer); idleTimers.delete(worker); }
 	}
 	function unqueue(job) {
-		if (!queue.delete(job.id)) return false;
+		if (!queue.delete(job.id) && !reservedQueue.delete(job.id)) return false;
 		clearTimer(job.timer);
 		job.timer = null;
 		mQueued?.inc(-1);
@@ -99,20 +107,36 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 	}
 	function continueWorker(worker) {
 		if (destroyed || !workers.has(worker) || retirementErrors.has(worker)) return;
-		const next = queue.size ? queue.values().next().value : undefined;
-		if (next) { unqueue(next); dispatch(worker, next); return; }
 		idle.add(worker);
+		drainQueue();
+		if (!idle.has(worker)) return;
+		clearIdleTimer(worker);
 		if (idleTimeout === 0) return;
 		const timer = setTimer(() => {
 			if (!idle.delete(worker)) return;
-			workers.delete(worker);
 			idleTimers.delete(worker);
-			worker.terminate().catch(() => {});
+			const error = new Error('postgres tasks: idle worker retired');
+			retirementErrors.set(worker, error);
+			worker.terminate().then(() => retireWorkers.get(worker)(error), () => {});
 		}, idleTimeout);
 		timer.unref?.();
 		idleTimers.set(worker, timer);
 	}
+	function unreservedThreads() {
+		return idle.size + size - workers.size - heldThreads;
+	}
+	function drainQueue() {
+		while (!destroyed && idle.size + size - workers.size > 0) {
+			const next = reservedQueue.values().next().value
+				|| (unreservedThreads() > 0 ? queue.values().next().value : undefined);
+			if (!next) return;
+			unqueue(next);
+			try { dispatch(idle.values().next().value || spawnWorker(), next); }
+			catch (error) { next.reject(error); }
+		}
+	}
 	function dispatch(worker, job) {
+		if (job.permit.thread) { job.permit.held = false; heldThreads--; }
 		clearIdleTimer(worker);
 		idle.delete(worker);
 		job.worker = worker;
@@ -151,19 +175,23 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 				mActive?.inc(-1);
 				job.reject(error);
 			}
-			if (workers.size === 0) for (const job of queue.values()) {
-				unqueue(job);
-				job.reject(error);
-			}
+			drainQueue();
 		}
 		retireWorkers.set(worker, retire);
-		worker.on('error', retire);
+		worker.on('error', error => {
+			if (!workers.has(worker)) return;
+			retirementErrors.set(worker, error);
+			idle.delete(worker);
+			clearIdleTimer(worker);
+		});
 		worker.on('exit', () => retire(retirementErrors.get(worker) || new Error('postgres tasks: worker exited before completing its task')));
 		return worker;
 	}
 	return {
 		capacity,
+		threadCapacity,
 		reserve,
+		reserveThread(bytes) { return reserve(bytes, true); },
 		run(ctx, permit) {
 			if (destroyed) return Promise.reject(new Error('task runner destroyed'));
 			if (ctx.signal?.aborted) return Promise.reject(ctx.signal.reason || new Error('aborted'));
@@ -171,11 +199,20 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 			try {
 				permit ??= reserve(Buffer.byteLength(JSON.stringify(ctx.input ?? null)));
 				if (!permits.has(permit)) throw new Error('postgres tasks: worker admission expired');
+				if (permit.running) throw new Error('postgres tasks: worker reservation already executing');
+				permit.running = true;
 			} catch (error) { return Promise.reject(error); }
 			return new Promise((resolve, reject) => {
 				const id = randomUuid();
-				const cleanup = () => { ctx.signal?.removeEventListener('abort', onAbort); if (ownsPermit) permit.release(); };
-				const job = { id, ctx, timer: null, worker: null,
+				const cleanup = () => {
+					permit.running = false;
+					ctx.signal?.removeEventListener('abort', onAbort);
+					// A durable claim retains its thread through SQL commits and
+					// retry backoff, so another caller cannot queue its next attempt.
+					if (permit.thread && !permit.held && permits.has(permit)) { permit.held = true; heldThreads++; }
+					if (ownsPermit) permit.release();
+				};
+				const job = { id, ctx, permit, timer: null, worker: null,
 					resolve(value) { cleanup(); resolve(value); },
 					reject(error) { cleanup(); reject(error); } };
 				const onAbort = () => {
@@ -197,9 +234,16 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 				};
 				ctx.signal?.addEventListener('abort', onAbort, { once: true });
 				try {
-					const worker = idle.values().next().value;
-					if (worker) dispatch(worker, job);
-					else if (workers.size < size) dispatch(spawnWorker(), job);
+					if (permit.thread) {
+						if (idle.size + size - workers.size > 0) dispatch(idle.values().next().value || spawnWorker(), job);
+						else {
+							// Failed termination can leave a poisoned thread physically
+							// alive between attempts. Keep the claimed retry abortable
+							// until that thread exits, without a foreground queue deadline.
+							reservedQueue.set(id, job);
+							mQueued?.inc(1);
+						}
+					} else if (queue.size === 0 && reservedQueue.size === 0 && unreservedThreads() > 0) dispatch(idle.values().next().value || spawnWorker(), job);
 					else {
 						queue.set(id, job);
 						mQueued?.inc(1);
@@ -219,6 +263,7 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 			for (const job of inFlight.values()) { mActive?.inc(-1); job.reject(new Error('task runner destroyed')); }
 			inFlight.clear();
 			for (const job of queue.values()) { unqueue(job); job.reject(new Error('task runner destroyed')); }
+			for (const job of reservedQueue.values()) { unqueue(job); job.reject(new Error('task runner destroyed')); }
 			for (const worker of workers) { clearIdleTimer(worker); worker.terminate().catch(() => {}); }
 			workers.clear();
 			idle.clear();

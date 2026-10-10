@@ -68,13 +68,14 @@ it('expires queued work without replaying it when capacity returns', async () =>
 	expect(Worker.instances[0].dispatched).toHaveLength(1);
 });
 
-it('settles running and queued work when the last worker exits without an error event', async () => {
+it('settles the active job and replaces the last worker for queued work after an exit', async () => {
 	const p = pool();
 	const first = p.run({ input: 1 }).catch(error => error);
 	const second = p.run({ input: 2 }).catch(error => error);
 	Worker.instances[0].emit('exit', 0);
 	expect((await first).message).toContain('worker exited');
-	expect((await second).message).toContain('worker exited');
+	expect(Worker.instances[1].dispatched[0].input).toBe(2);
+	finish(Worker.instances[1]); expect(await second).toBe('ok');
 	expect(p.capacity(1)).toBe(257);
 	const third = p.run({ input: 3 }); finish(Worker.instances[1]); await third;
 });
@@ -179,7 +180,8 @@ it('retires a worker whose abort message fails without leaking admission or thro
 	expect(p.capacity(1)).toBe(255);
 	Worker.instances[0].finishTermination();
 	expect((await active).message).toBe('abort send failed');
-	expect((await queued).message).toBe('abort send failed');
+	expect(Worker.instances[1].dispatched[0].input).toBe('next');
+	finish(Worker.instances[1]); expect(await queued).toBe('ok');
 	expect(Worker.instances[0].terminated).toBe(true);
 	expect(p.capacity(1)).toBe(257);
 });
@@ -221,5 +223,208 @@ it('retains a worker whose termination request fails until its exit event', asyn
 	expect(p.capacity(1)).toBe(256);
 	worker.emit('exit', 1);
 	expect((await active).message).toBe('abort send failed');
+	expect(p.capacity(1)).toBe(257);
+});
+
+it.each(['dispatch', 'recovery'])('keeps excess durable %s rows outside the timed worker queue at default payload limits', async (mode) => {
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+	const { runner, client, ticks } = runnerSetup();
+	const ids = [];
+	for (let i = 0; i < 3; i++) ids.push(await runner.enqueue('work', { input: i }));
+	if (mode === 'recovery') for (const id of ids) Object.assign(client._getTaskRows().get(id), { status: 'running', attempts: 2, fence_expires_at: Date.now() - 1000 });
+	await ticks.get(mode === 'dispatch' ? 1000 : 2000)();
+	for (let i = 0; i < 5; i++) await flush();
+	expect(Worker.instances[0].dispatched).toHaveLength(1);
+	await vi.advanceTimersByTimeAsync(31000);
+	for (const id of ids.slice(1)) expect(client._getTaskRows().get(id)).toMatchObject({ status: mode === 'dispatch' ? 'pending' : 'running', attempts: mode === 'dispatch' ? 0 : 2 });
+	finish(Worker.instances[0]);
+	for (let i = 0; i < 5; i++) await flush();
+	expect(client._getTaskRows().get(ids[0]).status).toBe('committed');
+});
+
+it('keeps a thread reserved across a held durable SQL claim while a direct caller arrives', async () => {
+	const { runner, client, ticks } = runnerSetup();
+	const id = await runner.enqueue('work', { input: 'durable' });
+	const query = client.query.bind(client); let release, entered;
+	const held = new Promise(resolve => { entered = resolve; });
+	client.query = async (...args) => {
+		if (args[0]?.name?.startsWith('tasks_claim_registered_')) { entered(); await new Promise(resolve => { release = resolve; }); }
+		return query(...args);
+	};
+	const dispatch = ticks.get(1000)(); await held;
+	const direct = runner.run('work', { input: 'direct' }).catch(error => error);
+	for (let i = 0; i < 5; i++) await flush();
+	try { expect(Worker.instances.flatMap(worker => worker.dispatched)).toEqual([]); }
+	finally { release(); await dispatch; }
+	await vi.waitFor(() => expect(Worker.instances[0]?.dispatched).toHaveLength(1));
+	expect(Worker.instances[0].dispatched[0].input).toBe('durable');
+	finish(Worker.instances[0]);
+	await vi.waitFor(() => expect(client._getTaskRows().get(id).status).toBe('committed'));
+	expect(Worker.instances[0].dispatched[1].input).toBe('direct');
+	finish(Worker.instances[0]); expect(await direct).toBe('ok');
+});
+
+it('replaces an exited thread for queued jobs without rejecting or overtaking them', async () => {
+	const p = pool();
+	const first = p.run({ input: 'crash' }).catch(error => error);
+	const second = p.run({ input: 'second' }).catch(error => error);
+	Worker.instances[0].emit('exit', 1);
+	expect((await first).message).toContain('worker exited');
+	expect(Worker.instances).toHaveLength(2);
+	const third = p.run({ input: 'third' }).catch(error => error);
+	expect(Worker.instances[1].dispatched[0].input).toBe('second');
+	finish(Worker.instances[1]); expect(await second).toBe('ok');
+	expect(Worker.instances[1].dispatched[1].input).toBe('third');
+	finish(Worker.instances[1]); expect(await third).toBe('ok');
+});
+
+it.each(['empty', 'error'])('releases a held sweep thread after an %s claim so queued direct work can start', async (outcome) => {
+	const { runner, client, metrics, ticks } = runnerSetup();
+	await runner.enqueue('work', { input: 'durable' });
+	const query = client.query.bind(client); let release, entered;
+	const held = new Promise(resolve => { entered = resolve; });
+	client.query = async (...args) => {
+		if (args[0]?.name?.startsWith('tasks_claim_registered_')) {
+			entered(); await new Promise(resolve => { release = resolve; });
+			if (outcome === 'error') throw new Error('claim unavailable');
+			return { rows: [], rowCount: 0 };
+		}
+		return query(...args);
+	};
+	const dispatch = ticks.get(1000)(); await held;
+	const direct = runner.run('work', { input: 'direct' }).catch(error => error);
+	for (let i = 0; i < 5; i++) await flush();
+	expect(Worker.instances).toHaveLength(0);
+	release(); await dispatch;
+	await vi.waitFor(() => expect(Worker.instances[0]?.dispatched).toHaveLength(1));
+	expect(Worker.instances[0].dispatched[0].input).toBe('direct');
+	finish(Worker.instances[0]); expect(await direct).toBe('ok');
+	expect(metrics.serialize()).toContain('tasks_worker_reserved_bytes 0');
+});
+
+it('invalidates a held thread reservation when destroyed before the claim returns', async () => {
+	const { runner, client, metrics, ticks } = runnerSetup();
+	await runner.enqueue('work', { input: 'durable' });
+	const query = client.query.bind(client); let release, entered;
+	const held = new Promise(resolve => { entered = resolve; });
+	client.query = async (...args) => {
+		if (args[0]?.name?.startsWith('tasks_claim_registered_')) { entered(); await new Promise(resolve => { release = resolve; }); }
+		return query(...args);
+	};
+	const dispatch = ticks.get(1000)(); await held;
+	const direct = runner.run('work', { input: 'direct' }).catch(error => error);
+	for (let i = 0; i < 5; i++) await flush();
+	runner.destroy(); release(); await dispatch;
+	expect((await direct).message).toContain('destroyed');
+	for (let i = 0; i < 5; i++) await flush();
+	expect(Worker.instances).toHaveLength(0);
+	expect(metrics.serialize()).toContain('tasks_worker_reserved_bytes 0');
+});
+
+it('retains a durable retry thread while direct work waits through the backoff', async () => {
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+	const { runner, client, ticks } = runnerSetup();
+	runner.register('retry', null, { worker: { path, pool: { idleTimeout: 0 } }, retry: { maxAttempts: 2, backoff: () => 1000 } });
+	const id = await runner.enqueue('retry', { input: 'durable' });
+	await ticks.get(1000)();
+	for (let i = 0; i < 5; i++) await flush();
+	const worker = Worker.instances[0];
+	worker.emit('message', { type: 'error', id: worker.dispatched[0].id, error: { message: 'retry me' } });
+	for (let i = 0; i < 5; i++) await flush();
+	const direct = runner.run('retry', { input: 'direct' }).catch(error => error);
+	for (let i = 0; i < 5; i++) await flush();
+	expect(worker.dispatched).toHaveLength(1);
+	await vi.advanceTimersByTimeAsync(1000);
+	expect(worker.dispatched[1].input).toBe('durable');
+	finish(worker);
+	for (let i = 0; i < 5; i++) await flush();
+	expect(client._getTaskRows().get(id)).toMatchObject({ status: 'committed', attempts: 2 });
+	expect(worker.dispatched[2].input).toBe('direct');
+	finish(worker); expect(await direct).toBe('ok');
+});
+
+it.each(['active', 'idle'])('waits for physical exit after a fatal error from an %s thread', async (state) => {
+	const p = pool();
+	const active = p.run({ input: 'first' }).catch(error => error);
+	const worker = Worker.instances[0];
+	if (state === 'idle') { finish(worker); await active; }
+	const failure = new Error('fatal worker failure');
+	worker.emit('error', failure);
+	expect(p.threadCapacity(1)).toBe(0);
+	expect(() => p.reserveThread(1)).toThrow(RangeError);
+	const next = p.run({ input: 'next' });
+	expect(Worker.instances).toHaveLength(1);
+	expect(worker.dispatched).toHaveLength(1);
+	worker.emit('exit', 1);
+	if (state === 'active') expect(await active).toBe(failure);
+	expect(Worker.instances).toHaveLength(2);
+	expect(Worker.instances[1].dispatched[0].input).toBe('next');
+	finish(Worker.instances[1]); expect(await next).toBe('ok');
+	expect(p.capacity(1)).toBe(257);
+});
+
+it.each(['acknowledged', 'rejected'])('counts an idle retiring thread until termination is %s and the thread stops', async (outcome) => {
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+	const p = createWorkerPool({ path, pool: { idleTimeout: 10 } }, 'retire');
+	owned.push(p);
+	const first = p.run({ input: 'first' });
+	const worker = Worker.instances[0];
+	worker.deferTermination = outcome === 'acknowledged';
+	worker.failTermination = outcome === 'rejected';
+	finish(worker); await first;
+	await vi.advanceTimersByTimeAsync(10);
+	expect(worker.terminated).toBe(true);
+	expect(p.threadCapacity(1)).toBe(0);
+	const next = p.run({ input: 'next' });
+	expect(Worker.instances).toHaveLength(1);
+	if (outcome === 'acknowledged') worker.finishTermination();
+	else worker.emit('exit', 0);
+	expect(Worker.instances).toHaveLength(2);
+	finish(Worker.instances[1]); expect(await next).toBe('ok');
+	expect(p.capacity(1)).toBe(257);
+});
+
+it('does not reserve a new thread while a completed poisoned worker is still physically alive', async () => {
+	const p = pool(), controller = new AbortController();
+	const active = p.run({ input: 'busy', signal: controller.signal });
+	const worker = Worker.instances[0]; worker.failAbort = true; worker.failTermination = true;
+	controller.abort(); await flush();
+	finish(worker); await active;
+	expect(p.threadCapacity(1)).toBe(0);
+	expect(() => p.reserveThread(1)).toThrow(RangeError);
+	expect(Worker.instances).toHaveLength(1);
+	worker.emit('exit', 1);
+	expect(p.threadCapacity(1)).toBe(1);
+});
+
+it.each(['resume', 'abort'])('keeps an existing reserved retry bounded and abortable while a poisoned worker awaits exit: %s', async (outcome) => {
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+	const p = pool(), controller = new AbortController();
+	const permit = p.reserveThread(1);
+	const active = p.run({ input: 'busy', signal: controller.signal }, permit).catch(error => error);
+	const worker = Worker.instances[0]; worker.failAbort = true; worker.failTermination = true;
+	controller.abort(); await flush();
+	worker.emit('message', { type: 'error', id: worker.dispatched[0].id, error: { message: 'retry me' } });
+	expect((await active).message).toBe('retry me');
+	const retryController = new AbortController(); let settled = false;
+	const retried = p.run({ input: 'retry', signal: retryController.signal }, permit)
+		.then(value => { settled = true; return value; }, error => { settled = true; return error; });
+	expect(Worker.instances).toHaveLength(1);
+	await expect(p.run({ input: 'duplicate' }, permit)).rejects.toThrow('reservation already executing');
+	await vi.advanceTimersByTimeAsync(31000);
+	expect(settled).toBe(false);
+	if (outcome === 'abort') {
+		const reason = new Error('fence lost'); retryController.abort(reason);
+		expect(await retried).toBe(reason);
+		permit.release(); worker.emit('exit', 1);
+		expect(Worker.instances).toHaveLength(1);
+	} else {
+		worker.emit('exit', 1);
+		expect(Worker.instances).toHaveLength(2);
+		expect(Worker.instances[1].dispatched[0].input).toBe('retry');
+		finish(Worker.instances[1]); expect(await retried).toBe('ok');
+		expect(Worker.instances[1].dispatched).toHaveLength(1);
+		permit.release();
+	}
 	expect(p.capacity(1)).toBe(257);
 });

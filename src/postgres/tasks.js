@@ -606,7 +606,7 @@ export function createTaskRunner(client, options = {}) {
 		let batchLimit = limit;
 		for (const [name, reg] of handlers) {
 			if (!reg.pool) { names.push(name); inlineNames.push(name); continue; }
-			const available = reg.pool.capacity(maxPayloadBytes);
+			const available = reg.pool.threadCapacity(maxPayloadBytes);
 			if (available === 0) continue;
 			names.push(name);
 			pools.set(name, reg.pool);
@@ -616,11 +616,12 @@ export function createTaskRunner(client, options = {}) {
 		const reserved = new Map();
 		try {
 			// Reserve before SQL awaits: dispatch, recovery and inline callers
-			// share these permits, including time spent claiming and retrying.
+			// share input permits. Sweeps also retain an immediately usable thread
+			// through the claim and retries instead of entering the timed queue.
 			for (const [name, pool] of pools) {
 				const permits = [];
 				reserved.set(name, permits);
-				for (let i = 0; i < batchLimit; i++) permits.push(pool.reserve(maxPayloadBytes));
+				for (let i = 0; i < batchLimit; i++) permits.push(pool.reserveThread(maxPayloadBytes));
 			}
 			const leaseStarted = monotonicNow();
 			const rows = await sql[method](batchLimit, names);
