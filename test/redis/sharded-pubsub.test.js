@@ -1336,3 +1336,42 @@ it('clears successful admission flags when a released channel cleanup fails', as
 		expect(platform.published).toHaveLength(1);
 	} finally { await bus.deactivate(); }
 });
+
+describe('sharded channel binding', () => {
+	it.each(['single', 'wire', 'coalesced', 'batch'])('rejects forged topics in %s envelopes', async (kind) => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const bus = createShardedBus(client);
+		await bus.activate(platform);
+		await bus.follow('public:room');
+		try {
+			platform.forEachSubscriber = (_topic, fn) => fn({});
+			platform.sendCoalesced = vi.fn();
+			const forged = { topic: 'private:payroll', event: 'msg', data: 'forged' };
+			const env = { instanceId: 'peer', ...forged };
+			if (kind === 'wire') Object.assign(env, { wire: true, capability: 'missing' });
+			if (kind === 'coalesced') env.coalesced = true;
+			if (kind === 'batch') env.batch = [forged];
+			await client.redis.spublish('uws:sharded:public', JSON.stringify(env));
+			expect(platform.published).toEqual([]);
+			expect(platform.publishedBatches).toEqual([]);
+			expect(platform.sendCoalesced).not.toHaveBeenCalled();
+		} finally { await bus.deactivate(); }
+	});
+
+	it('keeps valid batch members and supports custom shard keys', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const bus = createShardedBus(client, { shardKey: (topic) => topic.split('/')[0] });
+		await bus.activate(platform);
+		await bus.follow('tenantA/room');
+		try {
+			await client.redis.spublish('uws:sharded:tenantA', JSON.stringify({ instanceId: 'peer', batch: [
+				{ topic: 'tenantB/payroll', event: 'msg', data: 'forged' },
+				{ topic: 'tenantA/room', event: 'msg', data: 'valid' }
+			] }));
+			expect(platform.publishedBatches).toHaveLength(1);
+			expect(platform.publishedBatches[0].messages.map((message) => message.topic)).toEqual(['tenantA/room']);
+		} finally { await bus.deactivate(); }
+	});
+});

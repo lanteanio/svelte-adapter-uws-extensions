@@ -295,13 +295,13 @@ export function createShardedBus(client, options = {}) {
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
-	function deliverEnvelope(parsed) {
+	function deliverEnvelope(parsed, channel) {
 		// Coalesced relay: re-coalesce onto local subscribers (latest-value-
 		// wins per ws+key), mirroring the publishing instance's sendCoalesced.
 		// Precedes the batch/single branches so a coalesced frame is never
 		// broadcast.
 		if (parsed.coalesced === true) {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -328,7 +328,7 @@ export function createShardedBus(client, options = {}) {
 		// codec is not registered here (a pure-subscriber instance) - still a
 		// correct delivery. Precedes the batch/single branches.
 		if (parsed.wire === true) {
-			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -346,7 +346,7 @@ export function createShardedBus(client, options = {}) {
 			const local = [];
 			for (let i = 0; i < parsed.batch.length; i++) {
 				const m = parsed.batch[i];
-				if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+				if (!m || !validator.acceptEnvelope(m.topic, m.event) || channelFor(m.topic) !== channel) {
 					mParseErrors?.inc();
 					continue;
 				}
@@ -369,7 +369,7 @@ export function createShardedBus(client, options = {}) {
 				}
 			}
 		} else {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || channelFor(parsed.topic) !== channel) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -380,9 +380,9 @@ export function createShardedBus(client, options = {}) {
 		}
 	}
 
-	function deliverTraced(parsed) {
+	function deliverTraced(parsed, channel) {
 		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', carriedTraceContext(parsed), REDIS_TRACE_ATTRIBUTES,
-			() => deliverEnvelope(parsed));
+			() => deliverEnvelope(parsed, channel));
 	}
 
 	// One publish as the bus relays it. The de-herd window (`j`) and the seq
@@ -499,8 +499,8 @@ export function createShardedBus(client, options = {}) {
 				// context only matters to a tracing provider: with one, delivery is a
 				// consumer operation parented on the producer's context; without one
 				// the trace fields are ignored and nothing is allocated for them.
-				if (activeTracing) deliverTraced(parsed);
-				else deliverEnvelope(parsed);
+				if (activeTracing) deliverTraced(parsed, ch);
+				else deliverEnvelope(parsed, ch);
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
 				// is observable instead of silently swallowed.
