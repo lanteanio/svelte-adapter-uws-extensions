@@ -51,6 +51,7 @@ export interface DeadLetterRecord {
  * svelte-realtime >= 0.6.0-next.40.
  */
 export interface PgDeadLetterStore {
+	/** Returns the committed row ID even if later retention cleanup fails. A rejected insert can still have an ambiguous transport outcome; add() has no caller deduplication key. */
 	add(rec: Omit<DeadLetterRecord, 'id'>): Promise<string>;
 	get(id: string): Promise<DeadLetterRecord | null>;
 	remove(id: string): Promise<boolean>;

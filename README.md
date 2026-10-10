@@ -1747,7 +1747,7 @@ import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-le
 configureWebhooks({ deadLetter: createDeadLetter(pgClient, { max: 1000 }) });
 ```
 
-Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention mirrors the Redis variant with the database's `now()` as the clock: both bounds run on each write, the `failedAt` stamp is clamped at insert, and a periodic sweep (stopped via `destroy()`) clears an idle queue without waiting for the next failure.
+Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention mirrors the Redis variant with the database's `now()` as the clock: both bounds run on each write, the `failedAt` stamp is clamped at insert, and a periodic sweep (stopped via `destroy()`) clears an idle queue without waiting for the next failure. `add()` returns the committed row ID even if subsequent retention cleanup fails; the bounds can remain exceeded until cleanup recovers. A lost insert reply can still leave an unknown capture outcome: this API has no caller deduplication key, so a blind retry may duplicate a record.
 
 ---
 
