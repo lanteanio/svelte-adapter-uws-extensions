@@ -994,29 +994,37 @@ export function createShardedBus(client, options = {}) {
 					cancel = guardBreaker(b);
 					await subSubscribe(fresh);
 					if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
-					// Ownership can change during cleanup I/O. Reconcile the actual
-					// subscription set until it matches the latest reservations, then
-					// publish admission flags and release pendingChannels without yielding.
-					const active = new Set(fresh);
-					for (;;) {
-						const release = fresh.filter(channel => active.has(channel) && !channelRefcounts.has(channel));
-						const restore = fresh.filter(channel => !active.has(channel) && channelRefcounts.has(channel));
-						if (release.length === 0 && restore.length === 0) break;
-						if (release.length) {
-							for (const channel of release) {
-								await subUnsubscribe(channel);
-								active.delete(channel);
-								if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
-							}
-						}
-						if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
-						if (restore.length) {
-							await subSubscribe(restore);
-							for (const channel of restore) active.add(channel);
-						}
-						if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+					let needsCleanup = false;
+					for (const channel of fresh) {
+						if (channelRefcounts.has(channel)) subscribedChannels.add(channel);
+						else needsCleanup = true;
 					}
-					for (const channel of active) subscribedChannels.add(channel);
+					if (needsCleanup) {
+						// Ownership can change during cleanup I/O. Keep all these
+						// channels pending until physical subscriptions and reservations
+						// agree, then publish flags and release admission without yielding.
+						for (const channel of fresh) subscribedChannels.delete(channel);
+						const active = new Set(fresh);
+						for (;;) {
+							const release = fresh.filter(channel => active.has(channel) && !channelRefcounts.has(channel));
+							const restore = fresh.filter(channel => !active.has(channel) && channelRefcounts.has(channel));
+							if (release.length === 0 && restore.length === 0) break;
+							if (release.length) {
+								for (const channel of release) {
+									await subUnsubscribe(channel);
+									active.delete(channel);
+									if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+								}
+							}
+							if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+							if (restore.length) {
+								await subSubscribe(restore);
+								for (const channel of restore) active.add(channel);
+							}
+							if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+						}
+						for (const channel of active) subscribedChannels.add(channel);
+					}
 					b?.success();
 					mFollows?.inc(fresh.length);
 				} catch (err) {
