@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound multi-slot Redis work to eight concurrent batches and 256 commands per pipeline. Coalesce presence heartbeat and registry TTL refresh work and include completed I/O in heartbeat timing. Retry only explicitly refused routing operations without replaying successful writes.
 
 - Classify every README code block, compile and check supported APIs, and execute standalone examples against the packed artifact. Explicit fragment exceptions remain bounded.
-- Redis presence enforces maxUpdateBytes (8192), maxFieldsBytes (65536), maxTopicsPerConnection (100), and topicThrottle (16 ms); set topicThrottle: 0 for immediate diff flushing.
+- Redis presence enforces maxFieldsBytes (8192), maxTotalFieldsBytes (65536), maxTopicsPerConnection (100), and topicThrottle (16 ms); set topicThrottle: 0 for immediate diff flushing.
 
 - Declare PostgreSQL 16 as the tested server baseline across Postgres subpaths, replace the incorrect 9.5 job-queue claim, and add a read-only server-version preflight before integration initialization.
 
