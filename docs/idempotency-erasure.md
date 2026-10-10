@@ -1,5 +1,7 @@
 # Redis idempotency ownership and erasure
 
+[Package overview](../README.md)
+
 `acquire(key, ttl, { tenant, user })` registers its owner before creating a pending
 primary value. An acquisition returns a handle only after checking that its
 registration has not been revoked. `purgeUser(tenant, user)` revokes
