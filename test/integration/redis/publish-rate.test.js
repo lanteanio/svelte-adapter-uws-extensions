@@ -11,6 +11,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { createBackendClient } from '../helpers/backend.js';
 import { createPublishRateAggregator } from '../../../src/redis/publish-rate.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { createAdmissionControl } from '../../../src/shared/admission.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
@@ -58,6 +59,23 @@ describe('redis publish-rate aggregator (integration)', () => {
 		aggs.push(a);
 		return { agg: a, platform: p };
 	}
+
+	it('admits omitted topics using remote total bounds and refreshes them over Redis', async () => {
+		const { agg: observer, platform } = makeAgg([], { topN: 1 });
+		const { agg: sender, platform: remotePlatform } = makeAgg(Array.from({ length: 5 }, (_, index) => ({ topic: 'remote:' + index, messagesPerSec: 100, bytesPerSec: 0 })));
+		remotePlatform._setPressure({ ...remotePlatform.pressure, publishRate: 3000 });
+		await observer.activate(platform);
+		await sender.activate(remotePlatform);
+		const admission = createAdmissionControl({ aggregator: observer, classes: { hot: { clusterTopPublisher: { threshold: 100 } } } });
+		await sender._broadcastNow();
+		await expect.poll(() => observer.topPublishers.length).toBe(1);
+		expect(observer.rateOf('omitted')).toBe(0);
+		expect(admission.shouldAccept('hot', platform, { topic: 'omitted' })).toBe(false);
+		remotePlatform._setPressure({ ...remotePlatform.pressure, publishRate: 0, topPublishers: [] });
+		await sender._broadcastNow();
+		await expect.poll(() => observer.topPublishers.length).toBe(0);
+		expect(admission.shouldAccept('hot', platform, { topic: 'omitted' })).toBe(true);
+	});
 
 	it('cross-instance broadcast: instance A sees instance B s slice over real Redis', async () => {
 		const { agg: aggA, platform: pA } = makeAgg([

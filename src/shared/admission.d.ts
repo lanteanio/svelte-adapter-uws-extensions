@@ -24,7 +24,9 @@ export interface PressureSnapshot {
 /**
  * Cluster-aware rule shape: this class is rejected when the
  * `topic` argument's cluster-wide messagesPerSec (summed across
- * contributing instances) is at or above `threshold`. Requires the
+ * contributing instances, conservatively bounded for omitted topics) is at
+ * or above `threshold`. The built-in aggregator can reject cold topics while
+ * sampled instances are busy; it is not a distributed quota. Requires the
  * controller to be constructed with an `aggregator` (typically from
  * `redis/publish-rate`) and `shouldAccept` to be called with a
  * `{topic}` third argument.
@@ -58,6 +60,7 @@ export type AdmissionRule =
 	| ClusterTopPublisherRule
 	| ClockTrippedRule;
 
+/** Custom sources must return a conservative rate for enforcement, including omitted topics. */
 export interface PublishRateAggregatorLike {
 	rateOf(topic: string): number;
 }

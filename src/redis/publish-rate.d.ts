@@ -94,8 +94,8 @@ export interface PublishRateAggregator {
 
 	/**
 	 * Cluster-wide messagesPerSec for a topic, or 0 if the topic is not
-	 * in the merged top-N. Used by the cluster `topPublisher` admission
-	 * rule for per-topic load shedding.
+	 * in the merged top-N. This display value does not prove an omitted topic
+	 * is idle. Built-in admission uses conservative per-instance total bounds.
 	 */
 	rateOf(topic: string): number;
 

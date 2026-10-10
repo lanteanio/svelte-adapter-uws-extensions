@@ -16,6 +16,7 @@
  */
 
 import { PRESSURE_REASON_CODES } from 'svelte-adapter-uws/observability';
+import { admissionRateReader } from './_publish-rate-admission.js';
 
 /**
  * Every pressure reason the adapter can report, in the adapter's own order,
@@ -156,6 +157,7 @@ export function createAdmissionControl(options) {
 
 	const mAccepted = metrics?.counter('admission_accepted_total', 'Admissions accepted', ['class']);
 	const mRejected = metrics?.counter('admission_rejected_total', 'Admissions rejected', ['class', 'reason']);
+	const clusterRateOf = needsAggregator ? admissionRateReader(aggregator) : null;
 
 	return {
 		shouldAccept(className, platform, opts) {
@@ -181,7 +183,7 @@ export function createAdmissionControl(options) {
 						'shouldAccept must be called with a {topic: "..."} third argument.'
 					);
 				}
-				const rate = aggregator.rateOf(topic);
+				const rate = clusterRateOf(topic);
 				blocked = rate >= rule.threshold;
 				if (blocked) blockReason = 'CLUSTER_TOP_PUBLISHER';
 			} else if (rule && rule.kind === 'clockTripped') {

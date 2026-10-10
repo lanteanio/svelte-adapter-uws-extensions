@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Enforce sampled publish-rate admission with conservative per-instance bounds when top-topic displays omit a topic. Preserve display rankings, bound cache growth, and fail closed for missing or inconsistent peer totals.
+
 - Correct the task-cache migration note: only `run()` consults the result cache; `enqueue()` forwards its key without deduplicating durable receipts.
 
 - Document Redis and PostgreSQL recovery with versioned persistence and evidence manifests, bounded read-only verification, and real archive/restore drills that check expiry, sequence continuity and schema migration state.

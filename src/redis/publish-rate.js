@@ -13,12 +13,12 @@
  * looks the same locally as one that's only hot here - but it warrants
  * a different response. Cluster-wide pressure is genuine load; local-only
  * is a hot-shard signal. The cluster `topPublisher` admission rule
- * (`shared/admission.js`) reads the merged view to shed at the cluster
- * layer; the prometheus `wireClusterPublishRateMetrics` wirer exposes
+ * (`shared/admission.js`) uses per-instance sampled rates and total-rate bounds
+ * to shed at the cluster layer; the prometheus `wireClusterPublishRateMetrics` wirer exposes
  * the merged view as gauges alongside the per-instance ones.
  *
  * Wire envelope on `{channel}`:
- *   `{instanceId, ts, slice: [{topic, messagesPerSec, bytesPerSec}, ...]}`
+ *   `{instanceId, ts, publishRate, slice: [{topic, messagesPerSec, bytesPerSec}, ...]}`
  *
  * Receivers merge into a per-instanceId map; entries older than
  * `staleAfter` are aged out on each merge.
@@ -33,6 +33,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { registerAdmissionRate } from '../shared/_publish-rate-admission.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -113,7 +114,7 @@ export function createPublishRateAggregator(client, options = {}) {
 	/**
 	 * Per-remote-instance slice cache. Local slice is read fresh from
 	 * platform on each merge so it's always current.
-	 * @type {Map<string, { ts: number, slice: Array<{topic: string, messagesPerSec: number, bytesPerSec: number}> }>}
+	 * @type {Map<string, { ts: number, publishRate?: number, slice: Array<{topic: string, messagesPerSec: number, bytesPerSec: number}> }>}
 	 */
 	const remoteSlices = new Map();
 
@@ -146,6 +147,10 @@ export function createPublishRateAggregator(client, options = {}) {
 	let mergedCacheLocalRef = undefined;
 	let mergedRev = 0;
 	let mergedCacheRev = -1;
+	let admissionCache = null;
+	let admissionLocalRef;
+	let admissionLocalRate;
+	let admissionRev = -1;
 
 	/**
 	 * onPublishRate subscribers. Each holds a callback and the set of topics it
@@ -207,9 +212,10 @@ export function createPublishRateAggregator(client, options = {}) {
 		if (!activated) return;
 		const slice = snapshotLocalSlice();
 		const subs = snapshotLocalSubjects();
+		const publishRate = activePlatform?.pressure?.publishRate;
 		const payload = subs === null
-			? { instanceId, ts: wallEpoch(), slice }
-			: { instanceId, ts: wallEpoch(), slice, subs };
+			? { instanceId, ts: wallEpoch(), slice, publishRate }
+			: { instanceId, ts: wallEpoch(), slice, publishRate, subs };
 		const envelope = JSON.stringify(payload);
 		try {
 			await redis.publish(channel, envelope);
@@ -308,7 +314,7 @@ export function createPublishRateAggregator(client, options = {}) {
 			const slice = env.slice.length > MAX_REMOTE_SLICE_ENTRIES
 				? env.slice.slice(0, MAX_REMOTE_SLICE_ENTRIES)
 				: env.slice;
-			remoteSlices.set(env.instanceId, { ts, slice });
+			remoteSlices.set(env.instanceId, { ts, slice, publishRate: env.publishRate });
 			mergedRev++;
 			if (Array.isArray(env.subs)) {
 				const subsMap = new Map();
@@ -346,6 +352,7 @@ export function createPublishRateAggregator(client, options = {}) {
 		remoteSlices.clear();
 		remoteSubs.clear();
 		mergedRev++;
+		admissionCache = null;
 		// Reset each subscriber's over-set: after the merged view is torn down,
 		// a re-activate should treat a still-hot topic as a fresh crossing
 		// rather than suppress it against a stale pre-deactivate over-set.
@@ -425,7 +432,7 @@ export function createPublishRateAggregator(client, options = {}) {
 	}
 
 	/**
-	 * Lookup helper for the admission rule and other per-topic queries.
+	 * Lookup helper for display-oriented sampled per-topic queries.
 	 * Returns the cluster-wide messagesPerSec for a topic, summed across
 	 * contributing instances, or 0 if the topic is not in the merged
 	 * top-N. Pure memory lookup; no Redis traffic on the hot path. Reads the
@@ -440,6 +447,60 @@ export function createPublishRateAggregator(client, options = {}) {
 			if (merged[i].topic === topic) return merged[i].messagesPerSec;
 		}
 		return 0;
+	}
+
+	// A sampled topic contributes its reported rate; an omitted topic can
+	// contribute up to the instance's entire sampled publish rate. Both adapter
+	// counters cover the same logical-origin window. Missing/invalid totals
+	// (including old peers) provide no finite bound. Never infer zero from a
+	// truncated list, and never subtract large totals to derive small bounds.
+	function admissionSlice(slice, publishRate) {
+		const rates = new Map();
+		let sum = 0;
+		let valid = Array.isArray(slice);
+		for (const entry of slice ?? []) {
+			if (!entry || typeof entry.topic !== 'string') { valid = false; continue; }
+			const rate = entry.messagesPerSec;
+			if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rates.has(entry.topic)) {
+				valid = false;
+				rates.set(entry.topic, Infinity);
+				continue;
+			}
+			rates.set(entry.topic, rate);
+			sum += rate;
+		}
+		const omitted = valid && typeof publishRate === 'number' && Number.isFinite(publishRate) && publishRate >= 0 && publishRate >= sum
+			? publishRate : Infinity;
+		return { rates, omitted };
+	}
+
+	function rateForAdmission(topic) {
+		pruneStale();
+		const localRef = activePlatform?.pressure?.topPublishers;
+		const localRate = activePlatform?.pressure?.publishRate;
+		if (!admissionCache || admissionRev !== mergedRev || admissionLocalRef !== localRef || !Object.is(admissionLocalRate, localRate)) {
+			const slices = [admissionSlice(snapshotLocalSlice(), localRate)];
+			for (const entry of remoteSlices.values()) slices.push(admissionSlice(entry.slice, entry.publishRate));
+			const known = new Map();
+			let unknown = 0;
+			for (const slice of slices) {
+				unknown += slice.omitted;
+				for (const key of slice.rates.keys()) known.set(key, undefined);
+			}
+			admissionCache = { slices, known, unknown };
+			admissionRev = mergedRev;
+			admissionLocalRef = localRef;
+			admissionLocalRate = localRate;
+		}
+		const { slices, known, unknown } = admissionCache;
+		// Cache only sampled topics: arbitrary topic lookups cannot grow memory.
+		const cached = known.get(topic);
+		if (cached !== undefined) return cached;
+		if (!known.has(topic)) return unknown;
+		let total = 0;
+		for (const slice of slices) total += slice.rates.get(topic) ?? slice.omitted;
+		known.set(topic, total);
+		return total;
 	}
 
 	/**
@@ -527,7 +588,7 @@ export function createPublishRateAggregator(client, options = {}) {
 		evaluateCrossings();
 	}
 
-	return {
+	return registerAdmissionRate({
 		instanceId,
 		activate,
 		deactivate,
@@ -539,5 +600,5 @@ export function createPublishRateAggregator(client, options = {}) {
 		_broadcastNow() { return broadcastSlice(); },
 		/** Force an immediate crossing evaluation over the current merged view. Tests only. */
 		_evaluateCrossingsNow() { return evaluateCrossings(); }
-	};
+	}, rateForAdmission);
 }

@@ -3866,7 +3866,7 @@ export async function open(ws, { platform }) {
 |---|---|
 | `instanceId` | Stable id for this instance, used as the from-tag on outbound slice envelopes. |
 | `topPublishers` | Cluster-wide top publishers, merged from this instance's local slice (read fresh from `platform.pressure.topPublishers`) and the cached remote slices (stale entries dropped). Sorted descending by `messagesPerSec`, capped at `topN`. Each entry is `{topic, messagesPerSec, bytesPerSec, contributingInstances}`. Pure memory computation. |
-| `rateOf(topic)` | Cluster-wide messagesPerSec for a topic, or 0 if not in the merged top-N. Used by the `clusterTopPublisher` admission rule. |
+| `rateOf(topic)` | Sampled messagesPerSec for a topic in the merged top-N, or 0 outside that display. A zero does not establish that the topic is idle. |
 | `subscribersOf(topic)` | Cluster-wide subscriber count for a topic, summed across this instance's live local count (from the optional `subjects` callback) and cached non-stale remote contributions. Returns 0 when no `subjects` is wired and no remote instance has reported the topic. The sharded bus's `bus.subscribers(topic)` delegates here when an aggregator is wired. |
 | `onPublishRate(cb)` | Register a callback that fires when topics cross the configured cluster-wide `topicPublishRatePerSec` threshold (the cluster mirror of the adapter's per-instance `platform.onPublishRate(cb)`). Evaluated once per broadcast tick over the merged view, **edge-triggered**: a topic fires the tick it rises to or above the threshold and re-arms only after it drops below and rises again, so a persistently-hot topic fires once rather than every tick. `cb` receives the array of crossing `{topic, messagesPerSec, bytesPerSec, contributingInstances}` entries; a throwing callback is contained (logged, never breaks the timer or sibling subscribers). Returns an unsubscribe function. No-op when `topicPublishRatePerSec` is `false`. The admission rule sheds continuously; this is the event-push hook for acting on a crossing (alert, scale, targeted backpressure). |
 | `activate(platform)` | Open the subscriber and start the broadcast timer. Idempotent. |
@@ -3896,7 +3896,7 @@ Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; 
 
 #### Pairing with admission control
 
-`createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` consults `aggregator.rateOf(topic)` on every `shouldAccept` call. Memory-only lookup, no Redis traffic on the hot path. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
+`createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` uses a separate conservative bound from the built-in aggregator. Each instance contributes its sampled topic rate when present, or its entire sampled `publishRate` when omitted. Missing or inconsistent totals have no finite bound and cause rejection. The display cap cannot turn a hot omitted topic into zero. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
 
 #### Pairing with the sharded bus (cluster subscriber counts)
 
@@ -4148,7 +4148,7 @@ if (!ac.shouldAccept('nonCritical', platform, { topic: 'org:42:audit' })) {
 }
 ```
 
-The rule's check is a memory-only lookup (`aggregator.rateOf(topic)` against the merged top-N); no Redis traffic on the hot path. Rejected admissions surface in `admission_rejected_total{class, reason="CLUSTER_TOP_PUBLISHER"}`. See [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator) for aggregator setup.
+The built-in aggregator sums sampled rates and conservative whole-instance bounds for omitted topics; it can shed cold or new topics while an instance is busy. Legacy peers without a total fail closed for topics they omit until upgraded. Bounds use only the current local sample and non-stale remote samples, so this remains sampled load shedding, not a distributed quota or a guarantee during delivery gaps. Reads use memory only; cached topic entries are limited to the bounded sample, so unknown-topic lookups cannot grow it. Custom aggregators still supply their own `rateOf(topic)` and must return conservative enforcement values. Rejected admissions surface in `admission_rejected_total{class, reason="CLUSTER_TOP_PUBLISHER"}`. See [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator) for setup.
 
 #### Two-tier admission (handshake + message)
 
