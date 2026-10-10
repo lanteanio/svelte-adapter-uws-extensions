@@ -116,6 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject PostgreSQL notification startup when a connection error interrupts connect, advisory election or LISTEN, while keeping deliberate shutdown cancellation clean. Verify notification delivery through the documented PgBouncer session route.
+
 - Keep local PostgreSQL admission rejections out of backend breaker health and return abandoned half-open probes. Document and verify PgBouncer startup-parameter compatibility with inherited server role deadlines, including dedicated sessions.
 
 - Leave PostgreSQL tasks recoverable after renewal confidence is lost instead of marking them permanently failed or spending handler retries. Preserve authoritative successor outcomes and original handler errors.

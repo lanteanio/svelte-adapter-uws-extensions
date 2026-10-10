@@ -1,6 +1,8 @@
 import { afterEach, expect, it } from 'vitest';
 import { createPgClient } from '../../../src/postgres/index.js';
 import { createJobQueue } from '../../../src/postgres/jobs.js';
+import { createNotifyBridge } from '../../../src/postgres/notify.js';
+import { mockPlatform } from '../../helpers/mock-platform.js';
 
 const clients = [];
 function create(connectionString, options = {}) {
@@ -35,5 +37,23 @@ for (const mode of ['session', 'transaction']) {
 			expect((await standalone.query('SHOW statement_timeout')).rows[0].statement_timeout).toBe('125ms');
 			await expect(standalone.query('SELECT pg_sleep(1)')).rejects.toMatchObject({ code: '57014' });
 		} finally { await standalone.end(); }
+	});
+}
+
+for (const multiListener of ['all', 'advisory']) {
+	it('activates the ' + multiListener + ' notification bridge through the documented session proxy route', async () => {
+		const publisher = create(process.env.INTEGRATION_POSTGRES_URL);
+		const runtime = create(process.env.INTEGRATION_PGBOUNCER_SESSION_URL, { statement_timeout: 0 });
+		const channel = 'proxy_notify_' + multiListener;
+		const bridge = createNotifyBridge(runtime, { channel, multiListener, lockId: 814309, autoReconnect: false });
+		const platform = mockPlatform();
+		try {
+			await bridge.activate(platform);
+			await publisher.query('SELECT pg_notify($1, $2)', [channel, JSON.stringify({ topic: 'proxy', event: 'ready', data: { mode: multiListener } })]);
+			await expect.poll(() => platform.published.length, { timeout: 5000 }).toBe(1);
+			expect(platform.published[0]).toMatchObject({ topic: 'proxy', event: 'ready', data: { mode: multiListener } });
+			await runtime.end();
+			await expect(bridge.activate(platform)).rejects.toThrow('closing');
+		} finally { await bridge.deactivate(); }
 	});
 }

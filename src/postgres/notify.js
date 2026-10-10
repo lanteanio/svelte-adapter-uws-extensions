@@ -296,6 +296,7 @@ export function createNotifyBridge(client, options) {
 	function handleError(entry, error) {
 		if (!current(entry) || entry.failed) return;
 		entry.failed = true;
+		entry.failureError = error;
 		b?.failure(error);
 		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_NOTIFY_CONNECTION, { error, attributes: { channel } });
 		conn = null;
@@ -310,13 +311,14 @@ export function createNotifyBridge(client, options) {
 		// pg may leave connect() pending when end() interrupts startup. Stop our
 		// wait when closing, while retaining handlers for any late rejection.
 		return new Promise((resolve, reject) => {
-			entry.cancelWait = resolve;
-			if (entry.stopping) { entry.cancelWait = null; resolve(); }
+			const cancel = () => entry.failed ? reject(entry.failureError) : resolve();
+			entry.cancelWait = cancel;
+			if (entry.stopping) { entry.cancelWait = null; cancel(); }
 			Promise.resolve(operation).then((value) => {
-				if (entry.cancelWait === resolve) entry.cancelWait = null;
+				if (entry.cancelWait === cancel) entry.cancelWait = null;
 				resolve(value);
 			}, (error) => {
-				if (entry.cancelWait === resolve) entry.cancelWait = null;
+				if (entry.cancelWait === cancel) entry.cancelWait = null;
 				reject(error);
 			});
 		});
@@ -332,18 +334,18 @@ export function createNotifyBridge(client, options) {
 				entry = openEntry(epoch);
 				await waitEntry(entry, entry.client.connect());
 			}
-			if (!current(entry)) { await closeEntry(entry); return; }
+			if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
 			if (advisory) {
 				// Advisory locks are reentrant. Once acquired, check connection
 				// liveness without repeatedly incrementing the session lock count.
 				if (isLeader) await waitEntry(entry, entry.client.query('SELECT 1'));
 				else {
 					const result = await waitEntry(entry, entry.client.query('SELECT pg_try_advisory_lock($1) AS acquired', [lockId]));
-					if (!current(entry)) { await closeEntry(entry); return; }
+					if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
 					if (result.rows[0]?.acquired === true) {
 						entry.client.on('notification', onNotification);
 						await waitEntry(entry, entry.client.query(`LISTEN ${quotedChannel}`));
-						if (!current(entry)) { await closeEntry(entry); return; }
+						if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
 						entry.listening = true;
 						isLeader = true;
 					}
@@ -351,7 +353,7 @@ export function createNotifyBridge(client, options) {
 			} else if (!entry.listening) {
 				entry.client.on('notification', onNotification);
 				await waitEntry(entry, entry.client.query(`LISTEN ${quotedChannel}`));
-				if (!current(entry)) { await closeEntry(entry); return; }
+				if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
 				entry.listening = true;
 			}
 			if (current(entry)) b?.success();

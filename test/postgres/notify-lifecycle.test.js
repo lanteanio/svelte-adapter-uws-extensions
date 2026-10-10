@@ -129,6 +129,39 @@ describe('Postgres notification session lifecycle', () => {
 		state.connect = null; await bridge.activate(platform); expect(state.clients).toHaveLength(2);
 	});
 
+	it.each(['connect', 'listen', 'advisory'])('rejects an error event that precedes the %s startup promise rejection', async (stage) => {
+		const failure = new Error('socket failed during ' + stage), late = deferred();
+		const fail = connection => { connection.emit('error', failure); return late.promise; };
+		if (stage === 'connect') state.connect = fail;
+		else state.query = (connection, sql) => (stage === 'listen' ? sql.startsWith('LISTEN') : sql.includes('pg_try_advisory_lock')) ? fail(connection) : Promise.resolve({ rows: [{ acquired: true }] });
+		const breaker = createCircuitBreaker({ failureThreshold: 3 });
+		const report = vi.spyOn(breaker, 'failure');
+		const { bridge, platform } = setup({ multiListener: stage === 'advisory' ? 'advisory' : 'all', lockId: 7, autoReconnect: false, breaker });
+		try {
+			await expect(bridge.activate(platform)).rejects.toBe(failure);
+			expect(report).toHaveBeenCalledTimes(1);
+			late.reject(new Error('later driver rejection')); await tick();
+			await vi.advanceTimersByTimeAsync(1000); expect(state.clients).toHaveLength(1);
+			state.connect = state.query = null;
+			await bridge.activate(platform); expect(state.clients).toHaveLength(2);
+			expect(state.clients[1].queryCall).toHaveBeenCalledWith('LISTEN "lifecycle"');
+		} finally { late.resolve(); breaker.destroy(); }
+	});
+
+	it('rejects the interrupted startup and reconnects only after the old session closes', async () => {
+		const failure = new Error('startup disconnected'), close = deferred(), late = deferred();
+		state.query = connection => { connection.emit('error', failure); return late.promise; };
+		state.end = () => close.promise;
+		const { bridge, platform } = setup();
+		const activation = bridge.activate(platform), rejected = expect(activation).rejects.toBe(failure);
+		await tick(); await vi.advanceTimersByTimeAsync(1000); expect(state.clients).toHaveLength(1);
+		state.query = state.end = null; close.resolve(); await rejected;
+		late.reject(new Error('late query rejection')); await tick();
+		await vi.advanceTimersByTimeAsync(149); expect(state.clients).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1); expect(state.clients).toHaveLength(2);
+		expect(state.clients[1].queryCall).toHaveBeenCalledWith('LISTEN "lifecycle"');
+	});
+
 	it('starts follower election polling after an initial connection failure recovers', async () => {
 		state.connect = () => Promise.reject(new Error('initial failure'));
 		state.query = () => Promise.resolve({ rows: [{ acquired: false }] });
