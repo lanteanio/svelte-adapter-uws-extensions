@@ -716,7 +716,9 @@ describe('redis pubsub bus', () => {
 			const wrapped = origin.wrap(source);
 
 			wrapped.publish('chat', 'big', 'x'.repeat(1000));
-			expect(warn).not.toHaveBeenCalled();
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.pubsub.envelope.oversized');
+			warn.mockClear();
 
 			// The one report is still available for a genuine omission.
 			wrapped.publish('chat', 'near', 'x'.repeat(480));

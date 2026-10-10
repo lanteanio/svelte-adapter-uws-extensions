@@ -166,10 +166,20 @@ export function createTopicBroadcast(client, options = {}) {
 	 */
 	const pending = new Map();
 
-	function publish(obj) {
+	let envelopeOversized = false;
+	function publish(obj, msg = JSON.stringify(obj)) {
 		if (destroyed) return;
+		if (!validator.acceptRaw(msg)) {
+			if (!envelopeOversized) {
+				envelopeOversized = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.TOPIC_BROADCAST_ENVELOPE_OVERSIZED, {
+					attributes: { maxEnvelopeBytes: validator.maxBytes }
+				});
+			}
+			return;
+		}
+		envelopeOversized = false;
 		if (b) { try { b.guard(); } catch { return; } }
-		const msg = JSON.stringify(obj);
 		if (subscriberReady) subscriberReady.then(() => redis.publish(channel, msg).then(() => b?.success()).catch((err) => b?.failure(err)));
 		else redis.publish(channel, msg).then(() => b?.success()).catch((err) => b?.failure(err));
 	}
@@ -323,6 +333,12 @@ export function createTopicBroadcast(client, options = {}) {
 				);
 			}
 			const timeoutMs = positive(opts && opts.timeoutMs, defaultTimeoutMs);
+			const ref = randomBytes(12).toString('hex');
+			const request = { i: instanceId, k: KIND_REQUEST, ref, t: topic, e: event, d: data, ms: timeoutMs };
+			const encodedRequest = JSON.stringify(request);
+			if (!validator.acceptRaw(encodedRequest)) {
+				throw new RangeError('topic-broadcast: request exceeds maxEnvelopeBytes (' + validator.maxBytes + ')');
+			}
 			ensureSubscriber();
 
 			// Serve this instance's own subscribers concurrently with the fan-out.
@@ -342,7 +358,6 @@ export function createTopicBroadcast(client, options = {}) {
 				return await localPromise;
 			}
 
-			const ref = randomBytes(12).toString('hex');
 			const collected = [];
 			let finished = false;
 			let resolveDone;
@@ -371,7 +386,7 @@ export function createTopicBroadcast(client, options = {}) {
 			// known peer count to drain, an early straggler reply must not finish the
 			// collector, so a second straggler within the window is still gathered.
 			pending.set(ref, { collected, remaining, solePeer, finish: () => finish('complete') });
-			publish({ i: instanceId, k: KIND_REQUEST, ref, t: topic, e: event, d: data, ms: timeoutMs });
+			publish(request, encodedRequest);
 
 			await done;
 			const localReplies = await localPromise;

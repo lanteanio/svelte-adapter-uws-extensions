@@ -349,6 +349,9 @@ On an adapter that runs several worker threads, each worker loads its own copy o
 
 Such an adapter refuses any publish that would draw its per-worker sequence counter, and publishes through the bus follow the same rule: pass `{ seq: false }` for volatile events, or the seq an ordered source allocated, as the [replay buffer](#replay-buffer-redis) does. Through the bus, `relay: false` keeps a publish on this worker, so it is not the way to reach the other workers. The bus carries `seq: false` and `seq: null` as an unsequenced choice, and an authoritative number or bigint as a safe integer, so the frame is stamped the same everywhere. A counter-stamped frame arrives with no choice attached: a single worker stamps its own counter on it, a multi-worker one delivers it unsequenced. Scoped helpers take the options as their last argument, as on the adapter's platform.
 
+Redis buses retain local delivery when a serialized publish envelope exceeds `maxEnvelopeBytes`, skip the Redis relay, and report `redis.pubsub.envelope.oversized` once per consecutive oversized streak. The limit includes the whole `publishBatched` envelope (per shard channel for the sharded bus). A valid envelope resumes relay and re-arms the report. Keep payloads within the configured cap or raise it consistently on every instance; skipped envelopes do not reach remote instances or sibling workers. Topic broadcasts reject oversized requests before serving local subscribers; oversized replies are skipped with `redis.topic-broadcast.envelope.oversized` and may leave the requester waiting for its timeout.
+
+
 ```js
 distributed.publish('cursor:42', 'move', pos, { seq: false });
 distributed.topic('todos').created(todo, { seq: false });

@@ -187,7 +187,21 @@ export function createPubSubBus(client, options = {}) {
 	let relayTimer = null;
 	let relayBatchWarnFired = false;
 
+	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
+	// fit without another scan of the common small-message path.
+	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
+	let envelopeOversized = false;
 	function scheduleRelay(msg, count) {
+		if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+			if (!envelopeOversized) {
+				envelopeOversized = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
+					attributes: { maxEnvelopeBytes: validator.maxBytes }
+				});
+			}
+			return;
+		}
+		envelopeOversized = false;
 		assert(count >= 1, 'pubsub.relay-batch.count-positive', { count });
 		relayBatch.push({ msg, count });
 		if (relayBatch.length >= MAX_PUBSUB_RELAY_BATCH_PER_TICK && !relayBatchWarnFired) {
@@ -206,8 +220,8 @@ export function createPubSubBus(client, options = {}) {
 	// context when the encoded result still fits under maxEnvelopeBytes. Every
 	// receiving instance enforces that cap before parsing, so an envelope the
 	// trace fields push over it would be dropped by every peer; the message
-	// goes without them instead. An envelope over the cap on its own is relayed
-	// exactly as an untraced one is, and is not reported as an omission.
+	// goes without them instead. An envelope over the cap on its own is
+	// reported and dropped by scheduleRelay.
 	let traceOmissionReported = false;
 	function relayTraced(env, count, traceContext) {
 		if (traceContext === null) {

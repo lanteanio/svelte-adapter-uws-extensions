@@ -225,7 +225,21 @@ export function createShardedBus(client, options = {}) {
 	/** @type {ReturnType<typeof setTimeout> | null} */
 	let relayTimer = null;
 
+	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
+	// fit without another scan of the common small-message path.
+	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
+	let envelopeOversized = false;
 	function scheduleRelay(channel, msg, topics) {
+		if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+			if (!envelopeOversized) {
+				envelopeOversized = true;
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
+					attributes: { maxEnvelopeBytes: validator.maxBytes }
+				});
+			}
+			return;
+		}
+		envelopeOversized = false;
 		let arr = channelBatches.get(channel);
 		if (!arr) {
 			arr = [];
@@ -249,8 +263,7 @@ export function createShardedBus(client, options = {}) {
 	// maxEnvelopeBytes. Every receiving instance enforces that cap before
 	// parsing, so an envelope the trace fields push over it would be dropped by
 	// every peer; the message goes without them instead. An envelope over the
-	// cap on its own is relayed exactly as an untraced one is, and is not
-	// reported as an omission.
+	// cap on its own is reported and dropped by scheduleRelay.
 	let traceOmissionReported = false;
 	function relayTraced(channel, env, topics, traceContext) {
 		if (traceContext === null) {

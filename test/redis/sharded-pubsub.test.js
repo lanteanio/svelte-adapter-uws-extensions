@@ -758,7 +758,9 @@ describe('redis sharded bus', () => {
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
 			wrapped.publish('chat', 'big', 'x'.repeat(1000));
-			expect(warn).not.toHaveBeenCalled();
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0][0]).toContain('event=redis.pubsub.envelope.oversized');
+			warn.mockClear();
 
 			wrapped.publish('chat', 'near', 'x'.repeat(480));
 			expect(warn).toHaveBeenCalledOnce();

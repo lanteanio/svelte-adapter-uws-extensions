@@ -73,6 +73,8 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	SHARDED_SUBSCRIBER: 'EXTENSIONS-ERR-SHARDED-SUBSCRIBER',
 	SHARDED_CHANNEL_RECONCILE: 'EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE',
 	SHARDED_RECONCILE: 'EXTENSIONS-ERR-SHARDED-RECONCILE',
+	PUBSUB_ENVELOPE_OVERSIZED: 'EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED',
+	TOPIC_BROADCAST_ENVELOPE_OVERSIZED: 'EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED',
 	PUBSUB_TRACE_OMITTED: 'EXTENSIONS-ERR-PUBSUB-TRACE-OMITTED',
 	SHARDED_TRACE_OMITTED: 'EXTENSIONS-ERR-SHARDED-TRACE-OMITTED',
 	REDIS_REPLAY_STORAGE_FALLBACK: 'EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK',
@@ -596,6 +598,26 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until it completes. A subscriber error retries at once.',
 		nextAction: 'Check cluster health and run CLUSTER SLOTS from the instance, and check that the Redis user may run CLUSTER MYID (+cluster|myid); delivery resumes on its own once the slot map and the masters\' ids can be read.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-reconcile'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED,
+		event: 'redis.pubsub.envelope.oversized', component: 'runtime.redis.pubsub', severity: 'warn',
+		problemPrefix: 'A publish envelope exceeds maxEnvelopeBytes and was not relayed.',
+		cause: 'The serialized envelope exceeds the byte limit enforced by peers. The limit includes the whole batch envelope.',
+		consequence: 'Local delivery is retained, but remote instances and sibling workers miss this envelope. Reported once per oversized streak.',
+		automaticRecovery: 'The next envelope within the limit is relayed normally and re-arms the report.',
+		nextAction: 'Reduce publish or batch payload sizes, or raise maxEnvelopeBytes consistently on every instance.',
+		sources: ['src/redis/pubsub.js', 'src/redis/sharded-pubsub.js'], anchor: 'extensions-err-pubsub-envelope-oversized'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.TOPIC_BROADCAST_ENVELOPE_OVERSIZED,
+		event: 'redis.topic-broadcast.envelope.oversized', component: 'runtime.redis.topic-broadcast', severity: 'warn',
+		problemPrefix: 'A topic broadcast reply exceeds maxEnvelopeBytes and was not relayed.',
+		cause: 'The serialized reply envelope exceeds the byte limit enforced by peers.',
+		consequence: 'The requesting instance cannot collect these replies and may wait until its timeout. Reported once per oversized streak.',
+		automaticRecovery: 'The next envelope within the limit is relayed normally and re-arms the report.',
+		nextAction: 'Reduce subscriber reply sizes, or raise maxEnvelopeBytes consistently on every instance.',
+		sources: ['src/redis/topic-broadcast.js'], anchor: 'extensions-err-topic-broadcast-envelope-oversized'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.PUBSUB_TRACE_OMITTED,

@@ -6,7 +6,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 66 diagnostic events. Each is one canonical line
+- 68 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -71,6 +71,8 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-SHARDED-SUBSCRIBER](#extensions-err-sharded-subscriber) | `redis.sharded-pubsub.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.subscriber.failed severity=error] A sharded pub/sub subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE](#extensions-err-sharded-channel-reconcile) | `redis.sharded-pubsub.channel-reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.channel-reconcile.failed severity=error] A sharded pub/sub channel could not be re-subscribed on its new owner.` |
 | [EXTENSIONS-ERR-SHARDED-RECONCILE](#extensions-err-sharded-reconcile) | `redis.sharded-pubsub.reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.reconcile.failed severity=error] Sharded pub/sub reconciliation could not refresh slot ownership.` |
+| [EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED](#extensions-err-pubsub-envelope-oversized) | `redis.pubsub.envelope.oversized` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.envelope.oversized severity=warn] A publish envelope exceeds maxEnvelopeBytes and was not relayed.` |
+| [EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED](#extensions-err-topic-broadcast-envelope-oversized) | `redis.topic-broadcast.envelope.oversized` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.topic-broadcast event=redis.topic-broadcast.envelope.oversized severity=warn] A topic broadcast reply exceeds maxEnvelopeBytes and was not relayed.` |
 | [EXTENSIONS-ERR-PUBSUB-TRACE-OMITTED](#extensions-err-pubsub-trace-omitted) | `redis.pubsub.trace-context.omitted` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.trace-context.omitted severity=warn] Trace context was omitted from a relay envelope that would otherwise exceed maxEnvelopeBytes.` |
 | [EXTENSIONS-ERR-SHARDED-TRACE-OMITTED](#extensions-err-sharded-trace-omitted) | `redis.sharded-pubsub.trace-context.omitted` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.trace-context.omitted severity=warn] Trace context was omitted from a shard relay envelope that would otherwise exceed maxEnvelopeBytes.` |
 | [EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK](#extensions-err-redis-replay-storage-fallback) | `redis.replay.storage-fallback` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.storage-fallback severity=warn] Replay storage failed; the publish went to live subscribers without a replay sequence, so durability is degraded.` |
@@ -112,7 +114,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 66 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 68 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -151,6 +153,8 @@ Indexed events:
 - `redis.sharded-pubsub.subscriber.failed` - [EXTENSIONS-ERR-SHARDED-SUBSCRIBER](#extensions-err-sharded-subscriber)
 - `redis.sharded-pubsub.channel-reconcile.failed` - [EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE](#extensions-err-sharded-channel-reconcile)
 - `redis.sharded-pubsub.reconcile.failed` - [EXTENSIONS-ERR-SHARDED-RECONCILE](#extensions-err-sharded-reconcile)
+- `redis.pubsub.envelope.oversized` - [EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED](#extensions-err-pubsub-envelope-oversized)
+- `redis.topic-broadcast.envelope.oversized` - [EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED](#extensions-err-topic-broadcast-envelope-oversized)
 - `redis.pubsub.trace-context.omitted` - [EXTENSIONS-ERR-PUBSUB-TRACE-OMITTED](#extensions-err-pubsub-trace-omitted)
 - `redis.sharded-pubsub.trace-context.omitted` - [EXTENSIONS-ERR-SHARDED-TRACE-OMITTED](#extensions-err-sharded-trace-omitted)
 - `redis.replay.storage-fallback` - [EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK](#extensions-err-redis-replay-storage-fallback)
@@ -736,6 +740,30 @@ the stable ID tag on the line):
 - **Next action:** Check cluster health and run CLUSTER SLOTS from the instance, and check that the Redis user may run CLUSTER MYID (+cluster|myid); delivery resumes on its own once the slot map and the masters' ids can be read.
 - **Runtime help:** `docs/errors.md#extensions-err-sharded-reconcile`
 - **Runtime sources:** [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)
+
+<a id="extensions-err-pubsub-envelope-oversized"></a>
+## `EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED`
+
+- **Code/event:** `redis.pubsub.envelope.oversized`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.envelope.oversized severity=warn] A publish envelope exceeds maxEnvelopeBytes and was not relayed.`
+- **Cause:** The serialized envelope exceeds the byte limit enforced by peers. The limit includes the whole batch envelope.
+- **Consequence:** Local delivery is retained, but remote instances and sibling workers miss this envelope. Reported once per oversized streak.
+- **Automatic recovery:** The next envelope within the limit is relayed normally and re-arms the report.
+- **Next action:** Reduce publish or batch payload sizes, or raise maxEnvelopeBytes consistently on every instance.
+- **Runtime help:** `docs/errors.md#extensions-err-pubsub-envelope-oversized`
+- **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js), [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)
+
+<a id="extensions-err-topic-broadcast-envelope-oversized"></a>
+## `EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED`
+
+- **Code/event:** `redis.topic-broadcast.envelope.oversized`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.topic-broadcast event=redis.topic-broadcast.envelope.oversized severity=warn] A topic broadcast reply exceeds maxEnvelopeBytes and was not relayed.`
+- **Cause:** The serialized reply envelope exceeds the byte limit enforced by peers.
+- **Consequence:** The requesting instance cannot collect these replies and may wait until its timeout. Reported once per oversized streak.
+- **Automatic recovery:** The next envelope within the limit is relayed normally and re-arms the report.
+- **Next action:** Reduce subscriber reply sizes, or raise maxEnvelopeBytes consistently on every instance.
+- **Runtime help:** `docs/errors.md#extensions-err-topic-broadcast-envelope-oversized`
+- **Runtime sources:** [src/redis/topic-broadcast.js](../src/redis/topic-broadcast.js)
 
 <a id="extensions-err-pubsub-trace-omitted"></a>
 ## `EXTENSIONS-ERR-PUBSUB-TRACE-OMITTED`
