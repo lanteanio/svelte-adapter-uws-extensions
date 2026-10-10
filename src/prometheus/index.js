@@ -974,3 +974,5 @@ export function connectionMetricsHook(metrics, userClose) {
 // surface end-to-end.
 export { wireAssertionMetrics } from '../shared/assert.js';
 
+
+export { wireBreakerMetrics } from './_breaker-metrics.js';

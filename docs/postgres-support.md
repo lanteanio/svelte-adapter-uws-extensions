@@ -81,11 +81,15 @@ Pass the existing Prometheus registry as `metrics`. Labels use only the fixed op
 | --- | --- |
 | `postgres_operations_in_flight{operation}` | Actual unsettled wrapper work, including cancelled caller waits. |
 | `postgres_pool_waiters` | Driver checkout queue depth at scrape time; shared pools are counted once per registry. |
+| `postgres_pool_connections{state}` | Native connections in fixed `active` and `idle` states, including direct pool checkouts. |
+| `postgres_pool_capacity` | Sum of configured pool connection limits. |
 | `postgres_operation_duration_seconds{operation,result}` | Underlying settlement latency in seconds; result is `ok`, `error` or `timeout`. |
 | `postgres_operation_timeouts_total{operation}` | Recognized driver checkout, query-read and server statement timeout failures. |
 | `postgres_admission_rejected_total{operation,reason}` | Capacity rejection or caller cancellation; reason is `capacity` or `aborted`. |
 
 Duration and timeout metrics follow actual settlement, so an aborted caller can leave the in-flight gauge positive without producing a duration observation yet. Driver queue depth also includes direct use of the underlying pool. Metrics are optional; the uninstrumented path does not read a clock or scrape pool state.
+
+Pool gauges count each native pool once per registry, omit ended or collected pools, and exclude unavailable fields on custom pool implementations. A checked-out client remains active after the wrapper's connect operation has settled; use these gauges for pool utilization rather than the wrapper in-flight count. Pool names and connection strings are never labels.
 
 ## Notification sessions and shutdown
 

@@ -1,4 +1,5 @@
 import { probeCancellation } from './breaker-admission.js';
+import { breakerStates } from './breaker-observation.js';
 /**
  * Circuit breaker for svelte-adapter-uws-extensions.
  *
@@ -234,6 +235,7 @@ export function createCircuitBreaker(options = {}) {
 			}
 		}
 	};
+	breakerStates.set(breaker, states);
 	probeCancellation.set(breaker, (key) => {
 		const state = stateFor(key);
 		if (state.state !== 'probing') return undefined;

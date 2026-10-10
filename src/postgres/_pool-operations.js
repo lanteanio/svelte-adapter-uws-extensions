@@ -3,7 +3,7 @@ import { monotonicNow } from '../shared/runtime.js';
 
 // A registry may be shared by several wrappers/pools. Scrape their actual
 // driver queues once per pool without retaining otherwise unreachable pools.
-const waiterCollectors = new WeakMap();
+const poolCollectors = new WeakMap();
 
 export function createPoolOperations(pool, maxInFlight, metrics, redactError) {
 	let inFlight = 0;
@@ -11,7 +11,7 @@ export function createPoolOperations(pool, maxInFlight, metrics, redactError) {
 	const duration = metrics?.histogram('postgres_operation_duration_seconds', 'PostgreSQL wrapper operation duration in seconds', ['operation', 'result']);
 	const timeouts = metrics?.counter('postgres_operation_timeouts_total', 'PostgreSQL driver timeout failures', ['operation']);
 	const rejected = metrics?.counter('postgres_admission_rejected_total', 'PostgreSQL operations rejected before admission or cancelled by the caller', ['operation', 'reason']);
-	if (metrics) registerWaiters(metrics.gauge('postgres_pool_waiters', 'PostgreSQL driver pool checkout waiters'), pool);
+	if (metrics) registerPoolMetrics(metrics, pool);
 
 	function capacityError(operation) {
 		rejected?.inc({ operation, reason: 'capacity' });
@@ -113,12 +113,12 @@ function isTimeout(error) {
 
 // Keep the scrape closure outside the operation factory: its lexical context
 // must never contain that factory's strong pool reference.
-function registerWaiters(gauge, pool) {
-	let pools = waiterCollectors.get(gauge);
+function registerPoolMetrics(metrics, pool) {
+	let pools = poolCollectors.get(metrics);
 	if (!pools) {
 		pools = new Set();
-		waiterCollectors.set(gauge, pools);
-		installWaiterCollector(gauge, pools);
+		poolCollectors.set(metrics, pools);
+		installPoolCollectors(metrics, pools);
 	}
 	let registered = false;
 	for (const ref of pools) {
@@ -129,14 +129,35 @@ function registerWaiters(gauge, pool) {
 	if (!registered) pools.add(new WeakRef(pool));
 }
 
-function installWaiterCollector(gauge, pools) {
-	gauge.collect(() => {
-		let count = 0;
+function installPoolCollectors(metrics, pools) {
+	const waiters = metrics.gauge('postgres_pool_waiters', 'PostgreSQL driver pool checkout waiters');
+	const connections = metrics.gauge('postgres_pool_connections', 'PostgreSQL driver connections by state', ['state']);
+	const capacity = metrics.gauge('postgres_pool_capacity', 'Configured PostgreSQL pool connection capacity');
+	function visit(fn) {
 		for (const ref of pools) {
 			const pool = ref.deref();
 			if (!pool) pools.delete(ref);
-			else if (Number.isFinite(pool.waitingCount)) count += pool.waitingCount;
+			else if (!pool.ended) fn(pool);
 		}
-		gauge.set(count);
+	}
+	waiters.collect(() => {
+		let count = 0;
+		visit(pool => { if (Number.isFinite(pool.waitingCount)) count += pool.waitingCount; });
+		waiters.set(count);
+	});
+	connections.collect(() => {
+		let idle = 0, active = 0;
+		visit(pool => {
+			if (!Number.isFinite(pool.totalCount) || !Number.isFinite(pool.idleCount)) return;
+			idle += Math.max(0, pool.idleCount);
+			active += Math.max(0, pool.totalCount - pool.idleCount);
+		});
+		connections.set({ state: 'idle' }, idle);
+		connections.set({ state: 'active' }, active);
+	});
+	capacity.collect(() => {
+		let count = 0;
+		visit(pool => { if (Number.isFinite(pool.options?.max)) count += Math.max(0, pool.options.max); });
+		capacity.set(count);
 	});
 }

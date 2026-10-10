@@ -57,6 +57,12 @@ import { createDistributedSession, type DistributedSessionOptions } from 'svelte
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
+import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
+import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
+const stopBreakerMetrics: () => void = wireBreakerMetrics(createCircuitBreaker(), createMetrics());
+stopBreakerMetrics();
+// @ts-expect-error A breaker cannot be replaced by an arbitrary object.
+wireBreakerMetrics({}, createMetrics());
 const platform = mockPlatform();
 platform.publishBatched([{ topic: 'room', event: 'changed' }], { compress: true });
 const compressed: boolean | undefined = platform.publishedBatches[0].options?.compress;

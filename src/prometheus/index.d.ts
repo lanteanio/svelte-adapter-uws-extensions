@@ -194,3 +194,11 @@ export function connectionMetricsHook(
  * lives on this subpath.
  */
 export { wireAssertionMetrics } from '../shared/assert.js';
+
+/**
+ * Aggregate current breaker partitions and bounded state transitions without
+ * key labels. Repeated wiring of the same breaker/registry is reference-counted.
+ * Returns idempotent cleanup; call it when the metrics binding is no longer needed.
+ * Custom structural breakers expose their default state only.
+ */
+export function wireBreakerMetrics(breaker: import('../shared/breaker.js').CircuitBreaker, metrics: MetricsRegistry): () => void;

@@ -3949,7 +3949,7 @@ Both wirers (per-instance via `wirePublishRateMetrics`, cluster via `wireCluster
 
 ## Circuit breaker
 
-Prevents thundering herd when a backend goes down. When Redis or Postgres becomes unreachable, every extension that uses the breaker fails fast instead of queueing up timeouts, and fire-and-forget operations (heartbeats, relay flushes, cursor broadcasts) are skipped entirely.
+Prevents thundering herd when a backend goes down. When Redis or Postgres becomes unreachable, every extension that uses the breaker fails fast instead of queueing up timeouts, and fire-and-forget operations (heartbeats, relay flushes, cursor broadcasts) are skipped entirely. See [breaker metrics wiring](docs/breaker-metrics.md) for aggregate state and transitions.
 
 Three states:
 - **healthy** - everything works, requests go through
