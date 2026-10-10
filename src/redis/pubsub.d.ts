@@ -41,9 +41,10 @@ export interface PubSubBusOptions {
 	degradationPolicy?: DegradationPolicy;
 
 	/**
-	 * Reject inbound bus envelopes larger than this many bytes before
-	 * `JSON.parse` runs. Defends against a hostile co-tenant or
-	 * compromised peer flooding the bus with oversized payloads.
+	 * Bound inbound bus envelopes before `JSON.parse` and outbound relays
+	 * after encoding. `publishBatched` throws RangeError before any delivery
+	 * when a relay envelope exceeds this cap. Other oversized outbound
+	 * relays are withheld and reported while local delivery remains intact.
 	 * @default 1048576 (1 MB)
 	 */
 	maxEnvelopeBytes?: number;
@@ -76,6 +77,11 @@ export interface PubSubBus {
 	 *
 	 * Use this wrapped platform everywhere you call `publish()` or
 	 * `publishBatched()`.
+	 *
+	 * Batched relay envelopes are serialized and size-checked before any delivery.
+	 * `publishBatched` throws RangeError when any relay envelope exceeds
+	 * maxEnvelopeBytes; serialization errors also precede local delivery.
+	 * A batch whose entries all set relay:false is local-only and skips this cap.
 	 */
 	wrap(platform: Platform): Platform;
 

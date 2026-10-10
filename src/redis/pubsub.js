@@ -43,7 +43,7 @@ const ADAPTER_DENIAL_CODES = new Set(['UNAUTHENTICATED', 'FORBIDDEN', 'INVALID_T
  * @property {string | null | false} [systemChannel='__realtime'] - Topic used for auto-emitted `degraded` / `recovered` events on the local platform. Set to `null` or `false` to disable auto-emission.
  * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
  * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
- * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound envelopes before JSON.parse and outbound relays after encoding; oversized outbound relays are withheld and reported while local publishes remain delivered.
+ * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound JSON and outbound relay bytes. Oversized publishBatched calls throw RangeError before delivery; other oversized relays are withheld and reported while local delivery remains intact.
  * @property {boolean} [allowSystemTopics=false] - Default false: drop inbound envelopes whose topic starts with `__` apart from this bus's own `systemChannel`. Defense against bus-side topic injection on shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in via `allowSystemTopics: true`.
  */
 
@@ -107,6 +107,7 @@ export function createPubSubBus(client, options = {}) {
 	const mRelayed = m?.counter('pubsub_messages_relayed_total', 'Messages relayed to Redis');
 	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
 	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
+	const mBatchRejected = m?.counter('pubsub_batch_rejected_total', 'Batched publishes refused before local or remote delivery', ['reason']);
 	const mParseErrors = m?.counter('pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
 	const mBatchSize = m?.histogram('pubsub_relay_batch_size', 'Relay batch size per flush', [],
 		[1, 5, 10, 25, 50, 100, 250, 500, 1000]);
@@ -192,8 +193,8 @@ export function createPubSubBus(client, options = {}) {
 	// fit without another scan of the common small-message path.
 	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
 	let envelopeOversized = false;
-	function scheduleRelay(msg, count) {
-		if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+	function scheduleRelay(msg, count, checked = false) {
+		if (!checked && msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
 			if (!envelopeOversized) {
 				envelopeOversized = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
@@ -381,6 +382,39 @@ export function createPubSubBus(client, options = {}) {
 		return env;
 	}
 
+	const encodeBatch = mBatchRejected ? (env) => {
+		try { return JSON.stringify(env); } catch (err) {
+			mBatchRejected.inc({ reason: 'serialize' });
+			throw err;
+		}
+	} : JSON.stringify;
+
+	function oversizedBatch(env, traceContext) {
+		if (traceContext !== null) {
+			delete env.traceparent;
+			delete env.tracestate;
+			const plain = encodeBatch(env);
+			if (plain.length <= safeEnvelopeChars || validator.acceptRaw(plain)) {
+				if (!traceOmissionReported) {
+					traceOmissionReported = true;
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_TRACE_OMITTED, {
+						attributes: { maxEnvelopeBytes: validator.maxBytes }
+					});
+				}
+				return plain;
+			}
+		}
+		mBatchRejected?.inc({ reason: 'oversized' });
+		throw new RangeError('pubsub bus: batched relay envelope exceeds maxEnvelopeBytes');
+	}
+
+	function prepareBatch(batch, options, traceContext = null) {
+		const env = batchEnvelope(batch, options);
+		if (traceContext !== null) injectTraceContext(env, traceContext);
+		const msg = encodeBatch(env);
+		return msg.length <= safeEnvelopeChars || validator.acceptRaw(msg) ? msg : oversizedBatch(env, traceContext);
+	}
+
 	function wireEnvelope(topic, event, data, wire, options) {
 		const env = { instanceId, wire: true, capability: wire.capability, topic, event, data };
 		if (options && options.compress === true) /** @type {any} */ (env).compress = true;
@@ -393,6 +427,7 @@ export function createPubSubBus(client, options = {}) {
 		const relayable = [];
 		for (let i = 0; i < messages.length; i++) {
 			const m = messages[i];
+			if (!m) return null;
 			if (!m.options || m.options.relay !== false) {
 				relayable.push(relayEntry(m));
 			}
@@ -489,21 +524,15 @@ export function createPubSubBus(client, options = {}) {
 				return results;
 			}));
 			const publishBatchedTraced = (messages, options) => {
-				if (!Array.isArray(messages)) {
-					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
-				}
+				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
-				if (!relaysAny(messages)) {
-					platform.publishBatched(messages, options);
-					return;
-				}
-				// Local delivery first, as on the untraced path: the platform
-				// rejects a malformed entry with its own error before the relay
-				// list reads the entries.
+				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
 				traced((traceContext) => {
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
 					const relayable = relayableBatch(messages);
-					relayTraced(batchEnvelope(relayable, options), relayable.length, traceContext);
+					if (relayable === null) return platform.publishBatched(messages, options);
+					const msg = relayable.length ? prepareBatch(relayable, options, traceContext) : null;
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
+					if (msg !== null) scheduleRelay(msg, relayable.length, true);
 				});
 			};
 			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
@@ -536,23 +565,22 @@ export function createPubSubBus(client, options = {}) {
 			// whole list; receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
 			const publishBatchedUntraced = (messages, options) => {
-				if (!Array.isArray(messages)) {
-					throw new TypeError('pubsub bus: publishBatched requires an array of messages');
-				}
+				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
-
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-
-				const relayable = [];
+				const relayable = new Array(messages.length);
+				let count = 0;
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
-					if (!m.options || m.options.relay !== false) {
-						relayable.push(relayEntry(m));
-					}
+					if (!m) return platform.publishBatched(messages, options);
+					if (!m.options || m.options.relay !== false) relayable[count++] = relayEntry(m);
 				}
-				if (relayable.length === 0) return;
-
-				scheduleRelay(JSON.stringify(batchEnvelope(relayable, options)), relayable.length);
+				if (count === 0) return platform.publishBatched(messages, options);
+				if (count !== messages.length) relayable.length = count;
+				const env = batchEnvelope(relayable, options);
+				const msg = encodeBatch(env);
+				if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) oversizedBatch(env, null);
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
+				scheduleRelay(msg, relayable.length, true);
 			};
 			const tracing = traceEnabled(platform);
 			const batch = tracing ? batchTraced : batchUntraced;

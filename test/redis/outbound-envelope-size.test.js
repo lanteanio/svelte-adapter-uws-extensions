@@ -12,7 +12,7 @@ const factories = [
 ];
 
 for (const traced of [false, true]) describe.each(factories)('%s outbound envelope limits, traced=' + traced, (_name, createBus) => {
-	it.each(['publish', 'batch', 'publishBatched', 'publishWire', 'relayCoalesced'])('reports and skips oversized %s relays, then recovers', async (method) => {
+	it.each(['publish', 'batch', 'publishWire', 'relayCoalesced'])('reports and skips oversized %s relays, then recovers', async (method) => {
 		const client = mockRedisClient();
 		const a = mockPlatform(), b = mockPlatform();
 		a.trace.enabled = traced;
@@ -57,16 +57,16 @@ for (const traced of [false, true]) describe.each(factories)('%s outbound envelo
 		}
 	});
 
-	it('checks the complete wire batch envelope', async () => {
+	it('rejects an oversized complete wire batch envelope before local delivery', async () => {
 		const client = mockRedisClient();
 		const a = mockPlatform();
 		a.trace.enabled = traced;
 		const bus = createBus(client, { maxEnvelopeBytes: 320 });
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
-			bus.wrap(a).publishBatched(Array.from({ length: 4 }, () => ({ topic: 'chat', event: 'msg', data: 'x'.repeat(50) })));
-			expect(warn).toHaveBeenCalledOnce();
-			expect(a.published).toHaveLength(4);
+			expect(() => bus.wrap(a).publishBatched(Array.from({ length: 4 }, () => ({ topic: 'chat', event: 'msg', data: 'x'.repeat(50) })))).toThrow(RangeError);
+			expect(warn).not.toHaveBeenCalled();
+			expect(a.published).toHaveLength(0);
 		} finally {
 			await bus.deactivate();
 			warn.mockRestore();

@@ -111,6 +111,7 @@ export function createShardedBus(client, options = {}) {
 	const mRelayed = m?.counter('sharded_pubsub_messages_relayed_total', 'Messages SPUBLISHed', ['topic']);
 	const mReceived = m?.counter('sharded_pubsub_messages_received_total', 'Messages received via SSUBSCRIBE', ['topic']);
 	const mEchoSuppressed = m?.counter('sharded_pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
+	const mBatchRejected = m?.counter('sharded_pubsub_batch_rejected_total', 'Batched publishes refused before local or remote delivery', ['reason']);
 	const mParseErrors = m?.counter('sharded_pubsub_parse_errors_total', 'Malformed envelopes dropped on receive');
 	const mFollows = m?.counter('sharded_pubsub_ssubscribes_total', 'SSUBSCRIBE calls');
 	const mUnfollows = m?.counter('sharded_pubsub_sunsubscribes_total', 'SUNSUBSCRIBE calls');
@@ -238,8 +239,8 @@ export function createShardedBus(client, options = {}) {
 	// fit without another scan of the common small-message path.
 	const safeEnvelopeChars = Math.floor(validator.maxBytes / 3);
 	let envelopeOversized = false;
-	function scheduleRelay(channel, msg, topics) {
-		if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+	function scheduleRelay(channel, msg, topics, checked = false) {
+		if (!checked && msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
 			if (!envelopeOversized) {
 				envelopeOversized = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
@@ -411,6 +412,39 @@ export function createShardedBus(client, options = {}) {
 		const env = { instanceId, batch };
 		if (options?.compress === true) /** @type {any} */ (env).compress = true;
 		return env;
+	}
+
+	const encodeBatch = mBatchRejected ? (env) => {
+		try { return JSON.stringify(env); } catch (err) {
+			mBatchRejected.inc({ reason: 'serialize' });
+			throw err;
+		}
+	} : JSON.stringify;
+
+	function oversizedBatch(env, traceContext) {
+		if (traceContext !== null) {
+			delete env.traceparent;
+			delete env.tracestate;
+			const plain = encodeBatch(env);
+			if (plain.length <= safeEnvelopeChars || validator.acceptRaw(plain)) {
+				if (!traceOmissionReported) {
+					traceOmissionReported = true;
+					emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_TRACE_OMITTED, {
+						attributes: { maxEnvelopeBytes: validator.maxBytes }
+					});
+				}
+				return plain;
+			}
+		}
+		mBatchRejected?.inc({ reason: 'oversized' });
+		throw new RangeError('sharded bus: batched relay envelope exceeds maxEnvelopeBytes');
+	}
+
+	function prepareBatch(batch, options, traceContext = null) {
+		const env = batchEnvelope(batch, options);
+		if (traceContext !== null) injectTraceContext(env, traceContext);
+		const msg = encodeBatch(env);
+		return msg.length <= safeEnvelopeChars || validator.acceptRaw(msg) ? msg : oversizedBatch(env, traceContext);
 	}
 
 	function wireEnvelope(topic, event, data, wire, opts) {
@@ -1238,23 +1272,25 @@ export function createShardedBus(client, options = {}) {
 				return results;
 			}));
 			const publishBatchedTraced = (messages, options) => {
-				if (!Array.isArray(messages)) {
-					throw new TypeError('sharded bus: publishBatched requires an array of messages');
-				}
+				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
-				if (!relaysAny(messages)) {
-					platform.publishBatched(messages, options);
-					return;
-				}
-				// Local delivery first, as on the untraced path: the platform
-				// rejects a malformed entry with its own error before shardKey or
-				// the relay list sees the entries.
+				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
 				traced((traceContext) => {
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-					const byChannel = batchesByChannel(messages);
-					for (const [ch, batch] of byChannel) {
-						relayTraced(ch, batchEnvelope(batch, options), batchTopics(batch), traceContext);
+					// Preserve the platform's malformed-entry error without touching shard routing.
+					for (let i = 0; i < messages.length; i++) {
+						if (!messages[i]) return platform.publishBatched(messages, options);
 					}
+					const byChannel = batchesByChannel(messages);
+					// Keep channel, checked bytes and topics together until every channel passes.
+					const prepared = new Array(byChannel.size * 3);
+					let index = 0;
+					for (const [channel, batch] of byChannel) {
+						prepared[index++] = channel;
+						prepared[index++] = prepareBatch(batch, options, traceContext);
+						prepared[index++] = batchTopics(batch);
+					}
+					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
+					for (let i = 0; i < prepared.length; i += 3) scheduleRelay(prepared[i], prepared[i + 1], prepared[i + 2], true);
 				});
 			};
 			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
@@ -1288,20 +1324,22 @@ export function createShardedBus(client, options = {}) {
 			// per call. Receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
 			const publishBatchedUntraced = (messages, options) => {
-				if (!Array.isArray(messages)) {
-					throw new TypeError('sharded bus: publishBatched requires an array of messages');
-				}
+				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
 				if (messages.length === 0) return;
-
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-
-				const byChannel = batchesByChannel(messages);
-
-				for (const [ch, batch] of byChannel) {
-					const topics = new Array(batch.length);
-					for (let i = 0; i < batch.length; i++) topics[i] = batch[i].topic;
-					scheduleRelay(ch, JSON.stringify(batchEnvelope(batch, options)), topics);
+				for (let i = 0; i < messages.length; i++) {
+					if (!messages[i]) return platform.publishBatched(messages, options);
 				}
+				const byChannel = batchesByChannel(messages);
+				// Keep channel, checked bytes and topics together until every channel passes.
+				const prepared = new Array(byChannel.size * 3);
+				let index = 0;
+				for (const [channel, batch] of byChannel) {
+					prepared[index++] = channel;
+					prepared[index++] = prepareBatch(batch, options);
+					prepared[index++] = batchTopics(batch);
+				}
+				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
+				for (let i = 0; i < prepared.length; i += 3) scheduleRelay(prepared[i], prepared[i + 1], prepared[i + 2], true);
 			};
 			const tracing = traceEnabled(platform);
 			const batch = tracing ? batchTraced : batchUntraced;

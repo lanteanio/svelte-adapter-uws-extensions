@@ -697,7 +697,7 @@ describe('redis sharded bus', () => {
 			expect(origin.traceOperations).toEqual([]);
 		});
 
-		it('delivers a traced batch locally before shardKey or the relay reads the entries', () => {
+		it('preflights traced batches and preserves platform errors for malformed entries', () => {
 			const order = [];
 			const bus = createShardedBus(client, { shardKey: (topic) => { order.push('shardKey'); return topic; } });
 			const origin = tracedPlatform({ traceparent: TRACE_A });
@@ -712,7 +712,7 @@ describe('redis sharded bus', () => {
 			const wrapped = bus.wrap(origin);
 
 			wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }]);
-			expect(order).toEqual(['local', 'shardKey']);
+			expect(order).toEqual(['shardKey', 'local']);
 
 			// A null entry or a non-array counts as relaying, so each takes the
 			// traced path and reaches the platform, whose own error comes back
