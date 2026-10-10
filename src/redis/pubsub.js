@@ -14,6 +14,7 @@ import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { MAX_PUBSUB_RELAY_BATCH_PER_TICK } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { createRelayMetrics } from './_relay-metrics.js';
 import { firstCommandError } from '../shared/cluster.js';
 import {
 	REDIS_TRACE_ATTRIBUTES,
@@ -104,6 +105,7 @@ export function createPubSubBus(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
+	const relayMetrics = createRelayMetrics(m, 'pubsub');
 	const mRelayed = m?.counter('pubsub_messages_relayed_total', 'Messages relayed to Redis');
 	const mReceived = m?.counter('pubsub_messages_received_total', 'Messages received from Redis');
 	const mEchoSuppressed = m?.counter('pubsub_echo_suppressed_total', 'Messages dropped by echo suppression');
@@ -195,6 +197,7 @@ export function createPubSubBus(client, options = {}) {
 	let envelopeOversized = false;
 	function scheduleRelay(msg, count, checked = false) {
 		if (!checked && msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+			relayMetrics?.dropped('envelope_oversized', 1, count);
 			if (!envelopeOversized) {
 				envelopeOversized = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
@@ -442,44 +445,49 @@ export function createPubSubBus(client, options = {}) {
 			clearTimer(relayTimer);
 			relayTimer = null;
 		}
-		if (b) {
-			try { b.guard(); } catch { return; }
-		}
+		if (batch.length === 0) return;
 		let totalMessages = 0;
 		for (let i = 0; i < batch.length; i++) totalMessages += batch[i].count;
-
-		if (batch.length === 1) {
-			client.redis.publish(channel, batch[0].msg).then(() => {
-				mBatchSize?.observe(1);
-				mRelayed?.inc(totalMessages);
-				b?.success();
-			}).catch((err) => { b?.failure(err); });
-			return;
+		if (b) {
+			try { b.guard(); } catch { relayMetrics?.dropped('breaker_open', batch.length, totalMessages); return; }
 		}
-		const pipe = client.redis.pipeline();
-		for (let i = 0; i < batch.length; i++) {
-			pipe.publish(channel, batch[i].msg);
-		}
-		pipe.exec().then((results) => {
-			mBatchSize?.observe(batch.length);
-			// A refused PUBLISH resolves as a per-command error; count only the
-			// messages that went out, and report the failure as the single-publish
-			// path above does.
-			const err = firstCommandError(results);
-			if (err === null) {
-				mRelayed?.inc(totalMessages);
-				b?.success();
+		const started = relayMetrics?.start();
+		const failed = (err) => {
+			relayMetrics?.settled(started, batch.length, batch.length, totalMessages);
+			b?.failure(err);
+		};
+		try {
+			if (batch.length === 1) {
+				client.redis.publish(channel, batch[0].msg).then(() => {
+					mBatchSize?.observe(1);
+					mRelayed?.inc(totalMessages);
+					relayMetrics?.settled(started, 1, 0, 0);
+					b?.success();
+				}).catch(failed);
 				return;
 			}
-			let relayed = 0;
-			for (let i = 0; i < batch.length; i++) {
-				if (!results[i][0]) relayed += batch[i].count;
-			}
-			if (relayed > 0) mRelayed?.inc(relayed);
-			b?.failure(err);
-		}).catch((err) => { b?.failure(err); });
+			const pipe = client.redis.pipeline();
+			for (let i = 0; i < batch.length; i++) pipe.publish(channel, batch[i].msg);
+			pipe.exec().then((results) => {
+				mBatchSize?.observe(batch.length);
+				const err = firstCommandError(results);
+				if (err === null) {
+					mRelayed?.inc(totalMessages);
+					relayMetrics?.settled(started, batch.length, 0, 0);
+					b?.success();
+					return;
+				}
+				let relayed = 0, failedEnvelopes = 0;
+				for (let i = 0; i < batch.length; i++) {
+					if (!results[i][0]) relayed += batch[i].count;
+					else failedEnvelopes++;
+				}
+				if (relayed > 0) mRelayed?.inc(relayed);
+				relayMetrics?.settled(started, batch.length, failedEnvelopes, totalMessages - relayed);
+				b?.failure(err);
+			}).catch(failed);
+		} catch (err) { failed(err); }
 	}
-
 	const bus = {
 		wrap(platform) {
 			// The relaying methods below are the untraced relay: they read no
@@ -907,6 +915,7 @@ export function createPubSubBus(client, options = {}) {
 				clearTimer(relayTimer);
 				relayTimer = null;
 			}
+			if (relayMetrics && relayBatch.length) relayMetrics.dropped('deactivated', relayBatch.length, relayBatch.reduce((sum, entry) => sum + entry.count, 0));
 			relayBatch = [];
 			if (!active || !subscriber) return;
 			active = false;

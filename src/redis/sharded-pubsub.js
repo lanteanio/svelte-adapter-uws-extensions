@@ -31,6 +31,7 @@ import {
 	MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK
 } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { createRelayMetrics } from './_relay-metrics.js';
 import { execMultiSlot, firstCommandError, isCluster, keySlot } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
@@ -107,6 +108,7 @@ export function createShardedBus(client, options = {}) {
 
 	const b = options.breaker;
 	const m = options.metrics;
+	const relayMetrics = createRelayMetrics(m, 'sharded_pubsub');
 	const mt = m?.mapTopic || (() => 'all');
 	const mRelayed = m?.counter('sharded_pubsub_messages_relayed_total', 'Messages SPUBLISHed', ['topic']);
 	const mReceived = m?.counter('sharded_pubsub_messages_received_total', 'Messages received via SSUBSCRIBE', ['topic']);
@@ -241,6 +243,7 @@ export function createShardedBus(client, options = {}) {
 	let envelopeOversized = false;
 	function scheduleRelay(channel, msg, topics, checked = false) {
 		if (!checked && msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) {
+			relayMetrics?.dropped('envelope_oversized', 1, topics.length);
 			if (!envelopeOversized) {
 				envelopeOversized = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_ENVELOPE_OVERSIZED, {
@@ -478,6 +481,15 @@ export function createShardedBus(client, options = {}) {
 		return topics;
 	}
 
+	function droppedBatches(batches, reason) {
+		if (!relayMetrics) return;
+		let envelopes = 0, messages = 0;
+		for (const entries of batches.values()) for (const entry of entries) {
+			envelopes++; messages += entry.topics.length;
+		}
+		relayMetrics.dropped(reason, envelopes, messages);
+	}
+
 	function flushRelay() {
 		const batches = channelBatches;
 		channelBatches = new Map();
@@ -485,37 +497,46 @@ export function createShardedBus(client, options = {}) {
 			clearTimer(relayTimer);
 			relayTimer = null;
 		}
+		if (batches.size === 0) return;
 		if (b) {
-			try { b.guard(); } catch { return; }
+			try { b.guard(); } catch { droppedBatches(batches, 'breaker_open'); return; }
 		}
-		// Each sharded channel is owned by the shard that holds its slot, so a
-		// SPUBLISH must land on that node. A single pipeline would be delivered
-		// to one node and silently drop the channels owned elsewhere, so route
-		// each SPUBLISH per owning-node on a cluster (one pipeline on standalone).
+		// Route each SPUBLISH to the node owning its channel's slot.
 		const commands = [];
-		const commandTopics = []; // index-aligned with commands, for the relayed counter
+		const commandTopics = [];
 		for (const [ch, entries] of batches) {
 			for (const { msg, topics } of entries) {
 				commands.push(['spublish', ch, msg]);
 				commandTopics.push(topics);
 			}
 		}
-		execMultiSlot(client.redis, commands).then((results) => {
-			// A refused SPUBLISH resolves as a per-command error (on a cluster
-			// every command is issued on its own); count only what went out.
-			for (let c = 0; c < commandTopics.length; c++) {
-				if (results[c] && results[c][0]) continue;
-				const topics = commandTopics[c];
-				for (let i = 0; i < topics.length; i++) {
-					mRelayed?.inc({ topic: mt(topics[i]) });
-				}
+		const started = relayMetrics?.start();
+		const failed = (err) => {
+			if (relayMetrics) {
+				let messages = 0;
+				for (const topics of commandTopics) messages += topics.length;
+				relayMetrics.settled(started, commands.length, commands.length, messages);
 			}
-			const err = firstCommandError(results);
-			if (err) b?.failure(err);
-			else b?.success();
-		}).catch((err) => { b?.failure(err); });
+			b?.failure(err);
+		};
+		try {
+			execMultiSlot(client.redis, commands).then((results) => {
+				let failedEnvelopes = 0, failedMessages = 0;
+				for (let c = 0; c < commandTopics.length; c++) {
+					const topics = commandTopics[c];
+					if (results[c] && results[c][0]) {
+						failedEnvelopes++; failedMessages += topics.length;
+						continue;
+					}
+					for (let i = 0; i < topics.length; i++) mRelayed?.inc({ topic: mt(topics[i]) });
+				}
+				relayMetrics?.settled(started, commands.length, failedEnvelopes, failedMessages);
+				const err = firstCommandError(results);
+				if (err) b?.failure(err);
+				else b?.success();
+			}).catch(failed);
+		} catch (err) { failed(err); }
 	}
-
 	function handleSMessage(ch, message) {
 			if (!ch.startsWith(channelPrefix) || !validator.acceptRaw(message)) {
 				mParseErrors?.inc();
@@ -995,6 +1016,7 @@ export function createShardedBus(client, options = {}) {
 		activePlatform = null;
 		subscribedChannels.clear();
 		await subClose();
+		droppedBatches(channelBatches, 'deactivated');
 		channelBatches = new Map();
 		if (relayTimer !== null) {
 			clearTimer(relayTimer);

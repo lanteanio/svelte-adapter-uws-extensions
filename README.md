@@ -3331,7 +3331,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 
 #### Metrics reference
 
-**Pub/sub bus**
+**Pub/sub bus** ([relay outcomes, delivery gaps and durations](docs/relay-metrics.md))
 
 | Metric | Type | Description |
 |---|---|---|
@@ -3773,7 +3773,7 @@ Every Redis and Postgres extension accepts an optional `breaker` option - a shar
 
 | Extension | Awaited operations (join, consume, publish) | Fire-and-forget operations |
 |---|---|---|
-| **Pub/sub bus** | `wrap().publish()` queues to local platform only; relay to Redis is skipped silently | Microtask relay flush is skipped entirely |
+| **Pub/sub bus** | `wrap().publish()` keeps local delivery | Relay flush is skipped; configured metrics record breaker refusal and affected messages |
 | **Presence** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh and stale cleanup are skipped |
 | **Replay buffer** | `publish()` / `replay()` / `seq()` throw `CircuitBrokenError` | - |
 | **Rate limiting** | `consume()` throws `CircuitBrokenError` (fail-closed - requests are blocked, not allowed through) | - |
