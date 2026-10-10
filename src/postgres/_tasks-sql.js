@@ -276,9 +276,10 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		return res.rowCount > 0;
 	}
 
-	async function heartbeatFence(taskId, fence) {
+	async function heartbeatFence(taskId, fence, timeoutMs) {
 		const res = await client.query({
 			name: 'tasks_heartbeat_' + table,
+			query_timeout: timeoutMs,
 			text: `UPDATE ${table}
 			          SET fence_expires_at = now() + ($3 || ' seconds')::interval,
 			              updated_at = now()

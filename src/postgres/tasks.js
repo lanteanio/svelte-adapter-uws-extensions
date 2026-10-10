@@ -55,6 +55,7 @@ import {
 	deserialiseError,
 	serialiseErrorSafe
 } from './_tasks-errors.js';
+import { startTaskHeartbeat } from './_tasks-heartbeat.js';
 import { createWorkerPool } from './_tasks-worker-pool.js';
 import { createTaskSql, encodeTaskPayload, MIN_TASK_PAYLOAD_BYTES } from './_tasks-sql.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -91,7 +92,7 @@ export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
  * @property {import('../redis/idempotency.js').RedisIdempotencyStore | import('./idempotency.js').PgIdempotencyStore} [idempotency] - Optional cache for committed results.
  * @property {import('../redis/fence.js').RedisFenceProvider} [fence] - Optional external fence provider (e.g. `createRedisFence`). When set, the runner pairs Postgres heartbeats with the provider's heartbeat so a force-takeover via the external store is detected immediately.
  * @property {number} [fenceTtl=60] - Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler is running.
- * @property {number} [heartbeatInterval] - ms between fence heartbeats. Defaults to fenceTtl * 1000 / 3.
+ * @property {number} [heartbeatInterval] - Positive integer ms between coalesced fence heartbeats, below the fence lifetime. Zero uses the default, fenceTtl * 1000 / 3.
  * @property {number} [recoveryInterval=30000] - ms between recovery sweeps for locally registered names. 0 disables.
  * @property {number} [recoveryBatchSize=10] - Max rows reclaimed per sweep.
  * @property {number} [dispatchInterval=5000] - ms between dispatch sweeps (claim pending rows for locally registered names). 0 disables.
@@ -228,7 +229,10 @@ export function createTaskRunner(client, options = {}) {
 	assertSafeTableName(table, 'postgres tasks');
 
 	const fenceTtl = options.fenceTtl || 60;
-	const heartbeatInterval = options.heartbeatInterval || Math.max(1000, Math.floor(fenceTtl * 1000 / 3));
+	const heartbeatInterval = (options.heartbeatInterval === 0 ? undefined : options.heartbeatInterval) ?? Math.min(2147483647, Math.max(1, Math.floor(fenceTtl * 1000 / 3)));
+	if (!Number.isSafeInteger(heartbeatInterval) || heartbeatInterval < 1 || heartbeatInterval > 2147483647 || heartbeatInterval >= fenceTtl * 1000) {
+		throw new TypeError('postgres tasks: heartbeatInterval must be a positive integer below fenceTtl in milliseconds');
+	}
 	const recoveryInterval = options.recoveryInterval !== undefined ? options.recoveryInterval : 30000;
 	const recoveryBatchSize = options.recoveryBatchSize || 10;
 	const dispatchInterval = options.dispatchInterval !== undefined ? options.dispatchInterval : 5000;
@@ -345,44 +349,33 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit) {
+	async function executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit, leaseStarted) {
 		const reg = handlers.get(name);
 		if (!reg) throw new UnknownTaskError(name);
 
 		const controller = new AbortController();
-		let heartbeatId = null;
 		let heartbeatLost = false;
-
-		if (heartbeatInterval > 0) {
-			heartbeatId = setIntervalTimer(async () => {
-				try {
-					if (fenceProvider) {
-						const externalOk = await fenceProvider.heartbeat(taskId, fence, fenceTtl);
-						if (!externalOk) {
-							heartbeatLost = true;
-							mFenceLost?.inc({ name });
-							controller.abort(new Error('fence lost'));
-							clearIntervalTimer(heartbeatId);
-							return;
-						}
-					}
-					const stillOurs = await sql.heartbeatFence(taskId, fence);
-					if (!stillOurs) {
-						heartbeatLost = true;
-						mFenceLost?.inc({ name });
-						controller.abort(new Error('fence lost'));
-						clearIntervalTimer(heartbeatId);
-					}
-				} catch {
-					// transient heartbeat failure: skip this tick.  If the
-					// fence truly expires another worker will reclaim.
+		const heartbeat = startTaskHeartbeat({
+			interval: heartbeatInterval,
+			ttlMs: fenceTtl * 1000,
+			started: leaseStarted,
+			async renew(valid, remaining) {
+				if (fenceProvider) {
+					const externalOk = await fenceProvider.heartbeat(taskId, fence, fenceTtl);
+					if (!externalOk || !valid()) return false;
 				}
-			}, heartbeatInterval);
-			if (heartbeatId.unref) heartbeatId.unref();
-		}
+				return sql.heartbeatFence(taskId, fence, remaining());
+			},
+			onLost() {
+				heartbeatLost = true;
+				mFenceLost?.inc({ name });
+				controller.abort(new Error('fence lost'));
+			}
+		});
 
 		try {
-			return await runTraceOperation(tracePlatform, 'postgres.tasks.execute', 'consumer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => reg.executor({
+			if (!heartbeat.valid()) throw controller.signal.reason;
+			const result = await runTraceOperation(tracePlatform, 'postgres.tasks.execute', 'consumer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => reg.executor({
 					input,
 					idempotencyKey,
 					requestId: requestId ?? null,
@@ -392,8 +385,11 @@ export function createTaskRunner(client, options = {}) {
 					attempt
 				}, workerPermit)
 			);
+			if (fenceProvider) await heartbeat.finish();
+			if (heartbeatLost || !heartbeat.valid()) throw controller.signal.reason;
+			return result;
 		} finally {
-			if (heartbeatId) clearIntervalTimer(heartbeatId);
+			heartbeat.stop();
 			if (!controller.signal.aborted) controller.abort();
 		}
 	}
@@ -431,7 +427,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput, workerPermit) {
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput, workerPermit, initialLeaseStarted) {
 		try {
 			const reg = handlers.get(name);
 			if (!reg) throw new UnknownTaskError(name);
@@ -445,6 +441,7 @@ export function createTaskRunner(client, options = {}) {
 				let handlerError;
 				let firedTransitionThisIter = null; // 'insert' | 'rearm' | null
 				let rearmLost = false;
+				let leaseStarted = attempt === startingAttempt && initialLeaseStarted !== undefined ? initialLeaseStarted : monotonicNow();
 				await withBreaker(b, async () => {
 					if (fence === null || fence === undefined) {
 						// Entry path from run(): row does not exist yet.
@@ -506,7 +503,7 @@ export function createTaskRunner(client, options = {}) {
 				mRunStart?.inc({ name });
 
 				try {
-					result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit);
+					result = await executeAttempt(name, input, idempotencyKey, taskId, fence, attempt, requestId, traceContext, tracePlatform, workerPermit, leaseStarted);
 				} catch (err) {
 					handlerError = err;
 				}
@@ -635,11 +632,12 @@ export function createTaskRunner(client, options = {}) {
 				reserved.set(name, permits);
 				for (let i = 0; i < batchLimit; i++) permits.push(pool.reserve(maxPayloadBytes));
 			}
+			const leaseStarted = monotonicNow();
 			const rows = await sql[method](batchLimit, names);
 			b?.success();
 			sweepFailing[method === 'claimPending' ? 'dispatch' : 'recovery'] = false;
 			for (const row of rows) {
-				yield { row, permit: reserved.get(row.name)?.pop() };
+				yield { row, permit: reserved.get(row.name)?.pop(), leaseStarted };
 			}
 		} finally {
 			for (const permits of reserved.values()) for (const permit of permits) permit.release();
@@ -647,7 +645,8 @@ export function createTaskRunner(client, options = {}) {
 		// A nearly full worker pool must not shrink the inline handlers' sweep.
 		// Fill its remaining budget after the mixed FIFO claim has been started.
 		if (inlineNames.length && batchLimit < limit) {
-			for (const row of await sql[method](limit - batchLimit, inlineNames)) yield { row };
+			const leaseStarted = monotonicNow();
+			for (const row of await sql[method](limit - batchLimit, inlineNames)) yield { row, leaseStarted };
 		}
 	}
 	async function recoveryTick() {
@@ -656,7 +655,7 @@ export function createTaskRunner(client, options = {}) {
 		recoveryRunning = true;
 		try {
 			await sql.ensureTable();
-			for await (const { row, permit } of claimWithCapacity('reclaimStuck', recoveryBatchSize)) {
+			for await (const { row, permit, leaseStarted } of claimWithCapacity('reclaimStuck', recoveryBatchSize)) {
 				const traceContext = carriedTraceContext(row);
 				// reclaimStuck transitioned status from 'running' (with stale
 				// fence) to 'running' (with fresh fence + incremented
@@ -683,7 +682,7 @@ export function createTaskRunner(client, options = {}) {
 					row.fence,
 					row.request_id,
 					traceContext,
-					defaultTracePlatform, false, undefined, permit
+					defaultTracePlatform, false, undefined, permit, leaseStarted
 				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});
@@ -702,7 +701,7 @@ export function createTaskRunner(client, options = {}) {
 		dispatchRunning = true;
 		try {
 			await sql.ensureTable();
-			for await (const { row, permit } of claimWithCapacity('claimPending', dispatchBatchSize)) {
+			for await (const { row, permit, leaseStarted } of claimWithCapacity('claimPending', dispatchBatchSize)) {
 				const traceContext = carriedTraceContext(row);
 				// claimPending transitioned status from 'pending' to 'running'
 				// in the CTE update. Only names registered in this process are
@@ -727,7 +726,7 @@ export function createTaskRunner(client, options = {}) {
 					row.fence,
 					row.request_id,
 					traceContext,
-					defaultTracePlatform, false, undefined, permit
+					defaultTracePlatform, false, undefined, permit, leaseStarted
 				).catch(() => {
 					// Failure is recorded on the row; nothing else to do here.
 				});

@@ -2952,7 +2952,7 @@ ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate TEXT;
 | `table` | `'svti_tasks'` | Table name |
 | `idempotency` | - | An idempotency store ([above](#idempotency-store)). When provided, results are cached per `idempotencyKey`. Strongly recommended. |
 | `fenceTtl` | `60` | Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler runs. |
-| `heartbeatInterval` | `fenceTtl * 1000 / 3` | ms between fence heartbeats |
+| `heartbeatInterval` | `fenceTtl * 1000 / 3` | Positive integer ms below the fence lifetime; zero uses the default, slow renewals coalesce and a missed confidence deadline aborts the handler |
 | `recoveryInterval` | `30000` | ms between recovery sweeps. 0 disables. |
 | `recoveryBatchSize` | `10` | Max rows reclaimed per sweep |
 | `dispatchInterval` | `5000` | ms between dispatch sweeps that claim `enqueue`d pending rows. 0 disables. |

@@ -25,3 +25,25 @@ With the runner's metrics registry enabled, `tasks_worker_queue_jobs`,
 `tasks_worker_active` and `tasks_worker_reserved_bytes` expose current pressure.
 `tasks_worker_rejected_total` counts `capacity`, `timeout` and `abort` outcomes.
 These metrics aggregate registered pools and have no task-input or user labels.
+
+## Fence renewal confidence
+
+Heartbeats coalesce: one renewal runs at a time and at most one tick waits behind
+it. SQL renewal has a driver deadline bounded by the remaining confidence budget.
+The watchdog measures elapsed time from before the database claim or renewal,
+including any external fence acquisition and renewal latency. It aborts the handler
+before that conservative budget expires, even if a backend promise never settles.
+A slow response cannot grant a fresh lifetime after time already spent waiting.
+
+Use a positive integer `heartbeatInterval` below `fenceTtl * 1000`; zero retains
+the default of one third of the lease lifetime. An interval close to the lifetime
+leaves little room for backend latency. The watchdog is conservative confidence,
+not a replacement for the database's atomic fence checks: expiry makes a row
+eligible for recovery, and a different token prevents the old worker's commit.
+
+A handler that ignores a lost-fence signal cannot commit its returned success.
+Active worker capacity remains reserved until the handler actually settles.
+Handler exceptions retain their original errors. When an external fence renewal
+is already pending at handler completion, success waits for its result or the
+watchdog deadline; late ownership loss is not silently discarded. Shutdown stops
+future ticks and late external replies cannot start another database renewal.

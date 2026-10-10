@@ -111,7 +111,7 @@ export interface TaskRunnerOptions {
 	onStateChange?(event: TaskStateChangeEvent): void | Promise<void>;
 	/** Per-attempt fence lifetime in seconds. Heartbeat extends it while the handler is running. @default 60 */
 	fenceTtl?: number;
-	/** ms between fence heartbeats. @default fenceTtl * 1000 / 3 */
+	/** Positive integer milliseconds between coalesced fence heartbeats, below fenceTtl * 1000 and at most 2147483647. Zero uses the default. Slow renewals cannot overlap; a missed safety deadline aborts the handler. @default fenceTtl * 1000 / 3 */
 	heartbeatInterval?: number;
 	/** ms between recovery sweeps for locally registered names. 0 disables. @default 30000 */
 	recoveryInterval?: number;
