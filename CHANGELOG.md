@@ -1,5 +1,7 @@
 # Changelog
 
+[Package overview](README.md) | [Migration guide](MIGRATION.md)
+
 All notable changes to `svelte-adapter-uws-extensions` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -20,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Metric identifier defaults now collapse to `all`.** `mapTopic` covers built-in topic, group and rate-limit tenant labels; lock/leader `mapKey` also defaults to `all`. Presence online and WebSocket publish gauges sum counts or sampled rates within mapped classes. Update raw-label dashboards and alerts, or provide an explicit mapper to restore chosen classes; an identity mapper explicitly restores raw-label privacy and cardinality risks. See the metric migration note for historical-series retention.
 
 ### Changed
+
+- Keep release history and companion guides reachable from the package overview, add reciprocal navigation, and enforce those routes in the documentation link gate.
 
 - Remove competing manual README categories and add a consolidated production-hardening route to the canonical guide and supported extension controls.
 

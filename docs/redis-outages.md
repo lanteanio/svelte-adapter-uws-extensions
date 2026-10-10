@@ -1,5 +1,7 @@
 # Redis outage policy
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 For replacing credentials and subscriber connections with a tested rollback path,
 see [Database credential rotation](./credential-rotation.md).
 

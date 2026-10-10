@@ -1,5 +1,7 @@
 # Database credential rotation
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 The application owns database credentials and client replacement. Updating a
 secret in a vault or deployment environment does not reconfigure a running Redis
 client, its subscriber duplicates, a PostgreSQL pool, or a dedicated notification

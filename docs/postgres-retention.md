@@ -1,5 +1,7 @@
 # PostgreSQL retention cleanup
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Replay, idempotency, task and dead-letter stores run bounded background maintenance after
 schema initialization. `cleanupInterval` is the maximum jitter delay in
 milliseconds between settled passes, including the first pass. Each delay is

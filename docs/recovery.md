@@ -1,5 +1,7 @@
 # Storage recovery
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Use the [persistence manifest](./persistence.v1.json) from the same installed
 package as the application. Its schema version describes the inventory format;
 the enclosing package version identifies the implementation. The verifier reports

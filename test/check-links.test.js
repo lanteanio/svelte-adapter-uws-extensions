@@ -25,7 +25,8 @@ import {
 	resolvableMainCommit,
 	onMainLine,
 	documentationFiles,
-	packageFiles
+	packageFiles,
+	validateDocumentationMap
 } from '../scripts/check-links.js';
 
 describe('heading slugs follow GitHub exactly', () => {
@@ -193,9 +194,11 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 	const git = (...args) => execFileSync('git', ['-C', work, ...args], { stdio: 'pipe', windowsHide: true });
 	const run = () => spawnSync(process.execPath, ['scripts/check-links.js'], { cwd: work, encoding: 'utf8', windowsHide: true });
 	try {
-		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'MIGRATION.md', 'docs'] }));
-		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[Guide](docs/guide.md)\n');
-		put('MIGRATION.md', '# Migration\n[Overview](README.md)\n');
+		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs'] }));
+		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[History](CHANGELOG.md)\n[Entries](docs/public-entries.md)\n[Guide](docs/guide.md)\n');
+		put('MIGRATION.md', '# Migration\n[Overview](README.md)\n[History](CHANGELOG.md)\n');
+		put('CHANGELOG.md', '# History\n[Overview](README.md)\n');
+		put('docs/public-entries.md', '# Entries\n[Overview](../README.md)\n');
 		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Local](../private.md)\n');
 		put('docs/main-source-tree.v1.json', JSON.stringify({ commit: '0'.repeat(40), paths: [], anchors: {} }));
 		put('.gitignore', 'ignored.md\n');
@@ -203,7 +206,7 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 		put('ignored.md', '# Ignored scratch\n');
 		put('scripts/check-links.js', readFileSync(join(root, 'scripts/check-links.js'), 'utf8'));
 		git('init', '--initial-branch=docs-fixture');
-		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'docs', '.gitignore', 'scripts');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', '.gitignore', 'scripts');
 		let result = run();
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain('docs/guide.md:3');
@@ -220,3 +223,32 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 		expect(result.stderr).toContain('target omitted from package: MIGRATION.md');
 	} finally { rmSync(work, { recursive: true, force: true }); }
 }, 30_000);
+
+
+it('protects package navigation, reciprocal parent links and reachable companion docs', () => {
+	const source = new Map([
+		['README.md', { text: '[History](CHANGELOG.md) [Migration](MIGRATION.md) [Entries](docs/public-entries.md)' }],
+		['MIGRATION.md', { text: '[Overview](README.md) [History](CHANGELOG.md)' }],
+		['CHANGELOG.md', { text: '[Overview](README.md)' }],
+		['docs/public-entries.md', { text: '[Overview](../README.md) [Guide](guide.md)' }],
+		['docs/guide.md', { text: '[Overview](../README.md)' }]
+	]);
+	const packaged = new Set(source.keys());
+	expect(validateDocumentationMap(source, packaged)).toEqual([]);
+	for (const [file, expected] of [
+		['README.md', 'README.md must link to CHANGELOG.md'],
+		['MIGRATION.md', 'MIGRATION.md must link to README.md'],
+		['CHANGELOG.md', 'CHANGELOG.md must link to README.md'],
+		['docs/guide.md', 'docs/guide.md needs a package overview or public-entry parent link']
+	]) {
+		const docs = new Map(source); docs.set(file, { text: '' });
+		expect(validateDocumentationMap(docs, packaged)).toContain(expected);
+	}
+	const selfLinkedCatalog = new Map(source);
+	selfLinkedCatalog.set('docs/public-entries.md', { text: '[Self](public-entries.md) [Guide](guide.md)' });
+	expect(validateDocumentationMap(selfLinkedCatalog, packaged)).toContain('docs/public-entries.md needs a package overview or public-entry parent link');
+	const orphan = new Map(source); orphan.set('docs/orphan.md', { text: '[Overview](../README.md)' });
+	expect(validateDocumentationMap(orphan, packaged)).toContain('docs/orphan.md is unreachable from README.md');
+	packaged.delete('CHANGELOG.md');
+	expect(validateDocumentationMap(source, packaged)).toContain('CHANGELOG.md must be included in the package');
+});

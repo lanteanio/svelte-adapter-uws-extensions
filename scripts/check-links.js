@@ -471,6 +471,46 @@ export function checkLink(rel, target, docs, options = {}) {
 	return doc.anchors.has(decodedAnchor) ? null : `no heading in ${resolved} produces #${anchor}`;
 }
 
+
+/** Reader routes must work from the package overview and back again. */
+export function validateDocumentationMap(docs, packagedFiles) {
+	const edges = new Map();
+	for (const [file, doc] of docs) {
+		const targets = new Set();
+		for (const { target } of linksOf(doc.text)) {
+			if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(target)) continue;
+			try {
+				const route = decodeURIComponent(target.split(/[?#]/)[0]);
+				const path = posix.normalize(posix.join(posix.dirname(file), route));
+				if (docs.has(path)) targets.add(path);
+			} catch { /* The ordinary link checker reports malformed escapes. */ }
+		}
+		edges.set(file, targets);
+	}
+	const errors = [];
+	for (const target of ['CHANGELOG.md', 'MIGRATION.md', 'docs/public-entries.md']) {
+		if (!edges.get('README.md')?.has(target)) errors.push('README.md must link to ' + target);
+	}
+	for (const target of ['README.md', 'CHANGELOG.md']) {
+		if (!edges.get('MIGRATION.md')?.has(target)) errors.push('MIGRATION.md must link to ' + target);
+	}
+	if (!edges.get('CHANGELOG.md')?.has('README.md')) errors.push('CHANGELOG.md must link to README.md');
+	if (!packagedFiles.has('CHANGELOG.md')) errors.push('CHANGELOG.md must be included in the package');
+	const reached = new Set(['README.md']), pending = ['README.md'];
+	while (pending.length) {
+		for (const target of edges.get(pending.shift()) || []) {
+			if (!reached.has(target)) { reached.add(target); pending.push(target); }
+		}
+	}
+	for (const file of docs.keys()) {
+		if (!file.startsWith('docs/') || !file.endsWith('.md')) continue;
+		if (!reached.has(file)) errors.push(file + ' is unreachable from README.md');
+		const parents = edges.get(file);
+		if (!parents?.has('README.md') && (file === 'docs/public-entries.md' || !parents?.has('docs/public-entries.md'))) errors.push(file + ' needs a package overview or public-entry parent link');
+	}
+	return errors;
+}
+
 function writeMainTree() {
 	const commit = resolvableMainCommit();
 	if (commit === null) {
@@ -518,7 +558,7 @@ function main() {
 	}
 
 	let total = 0;
-	const broken = [];
+	const broken = validateDocumentationMap(docs, packagedFiles).map(failure => ({ rel: 'documentation map', line: 1, target: '', failure }));
 	for (const [rel, doc] of docs) {
 		for (const { line, target } of linksOf(doc.text)) {
 			total++;

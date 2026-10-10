@@ -1,5 +1,7 @@
 # Release manifest
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 This append-only ledger records registry identities separately from candidate decisions and movable channel routes. Historical identities were backfilled from the [npm registry](https://registry.npmjs.org/svelte-adapter-uws-extensions); their exact baseline is retained in [release-identities.v1.json](./release-identities.v1.json). `legacy-none` means no historical Git tag was recorded; no tag or candidate event has been fabricated. Target channel identifies the SemVer release class, not a claim about historical dist-tag movements.
 
 Follow [the release procedure](./releasing.md) for future events. All timestamps are canonical UTC. Evidence must identify the reviewed run or primary registry record. Rows are immutable; append correction/routing events rather than editing identity history.

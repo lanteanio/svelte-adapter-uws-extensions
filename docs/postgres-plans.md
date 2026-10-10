@@ -1,5 +1,7 @@
 # PostgreSQL query and maintenance evidence
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Run the repository collector against an isolated PostgreSQL 16 or newer database
 on the intended deployment class. It creates a private schema, initializes the
 real stores, seeds deterministic skew and update churn, exercises their queries,

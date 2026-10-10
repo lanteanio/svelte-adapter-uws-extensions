@@ -1,5 +1,7 @@
 # Redis session tokens
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 The exact, case-sensitive token prefix `byuser:` belongs to the right-to-erasure
 index. `get`, `set`, `touch` and `delete` reject such tokens before Redis access,
 including with a custom or empty store `keyPrefix`. Lifecycle cookie loads apply

@@ -1,5 +1,7 @@
 # Operational error codes
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Branch on an error's `code` when deciding how to handle a recoverable failure. Messages are for people and can change independently of these codes. The existing error names, messages, causes and operation fields remain available. A diagnostic ID in the [error reference](./errors.md) identifies a logging site; it is separate from an error object's `code`.
 
 | Code | Produced by | Meaning |

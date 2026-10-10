@@ -1,5 +1,7 @@
 # Durable alarm generations
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Redis and PostgreSQL alarm stores reserve an ordered generation before each
 schedule. Keep generation values as strings; converting them to JavaScript
 numbers loses precision. The supported range is `1` through

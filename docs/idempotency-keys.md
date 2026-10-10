@@ -1,5 +1,7 @@
 # Redis idempotency keys
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 The Redis store reserves keys beginning with the exact, case-sensitive prefix
 `byuser:` for its right-to-erasure reverse index. `acquire()` and `purge()` reject
 such caller keys before issuing Redis commands, including when a custom or empty

@@ -1,5 +1,7 @@
 # Error reference
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Search this page with the exact stable ID, event, or beginning of the line you saw.
 Three kinds of failure are indexed here, each with its cause, what it means for traffic,
 whether anything recovers on its own, and what to do next:

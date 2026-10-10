@@ -1,5 +1,7 @@
 # Redis relay metrics
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Both buses expose these additional metrics when their existing `metrics` option
 is enabled. Replace `<bus>` with `pubsub` or `sharded_pubsub`.
 

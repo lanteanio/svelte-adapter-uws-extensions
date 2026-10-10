@@ -1,5 +1,7 @@
 # Task worker admission
 
+[Package overview](../README.md) | [Public entry points](public-entries.md)
+
 Worker threads run one handler at a time and spawn lazily up to the registered
 pool size. The pool admits at most `size + 256` jobs, including capacity reserved
 while database claims, execution, retries and commits settle. Reserved input
