@@ -2894,8 +2894,7 @@ export const actions = {
 ```
 
 Pass `platform` (the SvelteKit `event.platform`) to capture the
-originating request id and live W3C trace context automatically. They land on
-the durable task row and surface as `ctx.requestId` and
+originating request id and live W3C trace context automatically. They land on the durable task row and surface as `ctx.requestId` and
 `ctx.traceContext` in every handler attempt, including dispatch and
 recovery on another instance. Override explicitly via `requestId` or
 `traceContext`; explicit `traceContext: null` suppresses Platform
@@ -2912,10 +2911,11 @@ CREATE TABLE IF NOT EXISTS svti_tasks (
   name                 TEXT         NOT NULL,
   input                JSONB,
   svti_idempotency_key TEXT,
+  user_id              TEXT,                    -- application erasure identity, or null
   request_id           TEXT,                    -- originating platform.requestId, or null
   traceparent          TEXT,                    -- validated W3C context, or null
   tracestate           TEXT,
-  status               TEXT         NOT NULL,  -- 'running' | 'committed' | 'failed'
+  status               TEXT         NOT NULL,  -- 'pending' | 'running' | 'committed' | 'failed'
   result               JSONB,
   error                JSONB,
   fence                UUID         NOT NULL,
@@ -2930,14 +2930,14 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
     ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
 
-Existing deployments forward-migrate `request_id`, `traceparent`, and `tracestate` with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Older rows remain readable and expose `traceContext: null`.
-
-With `autoMigrate: false`, apply those nullable columns before deploying this reader: the state query reads `request_id`, and the list query and the dispatch and recovery sweeps read all three, even for older rows:
+With `autoMigrate: false`, apply the nullable additions below before deploying. Automatic migration adds the same columns and index. Old rows retain null trace context and erasure identity; backfill `user_id` from trusted application identity when historical task erasure is required.
 
 ```sql
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS request_id TEXT;
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS traceparent TEXT;
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS user_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
 ```
 
 #### Options

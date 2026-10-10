@@ -1068,20 +1068,20 @@
 		},
 		{
 			"document": "README.md",
-			"fingerprint": "7b5ec937e8d0a4dd33ff0f775ec42d5b8e07870adea66c7c15a88c6cf8ab150b",
+			"fingerprint": "306f4b40451a466a86907e413373d98a8a7a86b7636cf9d1a9a5dd57886982db",
 			"occurrence": 1,
 			"language": "sql",
-			"line": 2909,
+			"line": 2908,
 			"section": "svelte-adapter-uws-extensions > Task runner > Schema",
 			"classification": "command",
 			"channel": "manual-command"
 		},
 		{
 			"document": "README.md",
-			"fingerprint": "d28b396d2557803ddb263f3e48c8868908ee1c3ce3cd9576fb78aa2ff5b0234f",
+			"fingerprint": "921c06f0f612cce70e4e0c46c815af054d6cb80775408200aa8f7dea42295c8b",
 			"occurrence": 1,
 			"language": "sql",
-			"line": 2937,
+			"line": 2935,
 			"section": "svelte-adapter-uws-extensions > Task runner > Schema",
 			"classification": "command",
 			"channel": "manual-command"

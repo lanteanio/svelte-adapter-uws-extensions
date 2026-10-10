@@ -2,7 +2,7 @@
 
 [Package overview](./README.md) | [Release history](./CHANGELOG.md)
 
-- **[0.5.x to 0.6.x](#05x-to-06x)** - current release.
+- **[0.5.x to 0.6.x](#05x-to-06x)** - current prerelease migration.
 - **[0.4.x to 0.5.x](#04x-to-05x)** - previous release.
 
 ---
@@ -19,12 +19,31 @@ not at all.
 
 Every item lists the **symptom** you will actually see and the **action**.
 
+## Prerequisites and upgrade order
+
+Use Node.js 22 or later, the adapter's matching native addon, and the exact
+candidate tuple in the [README compatibility table](./README.md#version-compatibility).
+The adapter's manifest is the tuple authority; a peer range alone is not an
+integration-tested tuple. PostgreSQL 16 is the tested database baseline. Use the
+Redis/Valkey backend tier you actually deploy when rehearsing the upgrade.
+
+Save the current lockfile, application configuration, database backup and Redis
+persistence snapshot before changing versions. Stop application producers and
+drain active task/job handlers before the idempotency transition below. Upgrade
+the adapter first, extensions second, and svelte-realtime last, following each
+package's migration guide. Pin the selected artifacts in one lockfile and test
+that application build; do not combine independently chosen prereleases.
+
+The local [packed schema rehearsal](#executable-rehearsal) covers this package's
+additive PostgreSQL transition. It does not certify application authorization,
+Redis data conversion, native addon loading, or a mixed-version fleet.
+
 ## 1. Fails at startup
 
 These fail at install, at import, or from a factory, so they fail on the
 deploy rather than in production traffic. Fix them before you ship.
 
-### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.91`
+### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.95`
 
 **Symptom.** `npm ERR! ERESOLVE unable to resolve dependency tree` (or a peer
 warning under `--legacy-peer-deps`) naming `svelte-adapter-uws`, at install
@@ -32,14 +51,16 @@ time. On an older adapter that slipped past the peer check, `import` of
 `svelte-adapter-uws-extensions/admission` fails with
 `ERR_PACKAGE_PATH_NOT_EXPORTED` for `svelte-adapter-uws/observability`.
 
-**Why.** Two releases raised the floor. `0.6.0-next.87` implements the
+**Why.** Several releases raised the floor. `0.6.0-next.87` implements the
 observer-lane mode `{ requireGrant: true }` that the presence and cursor
 snapshot lanes pass to `checkSubscribe`; an older adapter silently ignores
 the option and re-opens the pure-grant roster exposure. `0.6.0-next.91` ships
 `svelte-adapter-uws/observability`, and admission control reads the adapter's
-pressure-reason table from that entry point.
+pressure-reason table from that entry point. `0.6.0-next.95` supplies the
+sequence authority contract for explicit `null` and `bigint` choices, keeping
+local and relayed publications consistent.
 
-**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.91` or later in the same
+**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.95` or later in the same
 upgrade. The ecosystem packages move together (see the version table in the
 README).
 
@@ -60,9 +81,11 @@ so `'dev'` was accepted.
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-The floor deliberately does **not** apply to `previousSecret`, which only ever
-verifies. That is what lets you rotate *away* from a weak secret without signing
-every live session out.
+The same strength checks apply to `previousSecret`: accepting a forged old-key
+cookie would bypass the new signing key. Rotate between strong keys using
+`previousSecret`; when replacing a weak key, omit it and require clients to
+obtain a new cookie. Both keys need at least 16 characters, at least eight
+distinct characters, and must not be recognized placeholders.
 
 ### `capabilityCookie` refuses a malformed `cookieName` / `path` / `sameSite`
 
@@ -114,7 +137,7 @@ type gate now fails any runtime export its declaration omits.
 
 ## 2. Needs an operational step
 
-### Jobs and tasks tables gain trace columns
+### Jobs and tasks tables gain trace columns; tasks gain erasure identity
 
 Only for tables created or migrated outside the package, with
 `autoMigrate: false`. With the default `autoMigrate: true` the columns are
@@ -126,7 +149,8 @@ added on first use.
 and task `run` / `enqueue` too whenever the call carries a trace context.
 
 **Why.** Jobs and tasks persist the W3C trace context of the call that
-created them, in two nullable columns.
+created them, in two nullable columns. Tasks also persist `user_id` for erasure;
+without it, task inserts fail even when no trace context is supplied.
 
 **Action.** Before deploying, run for each jobs and tasks table (defaults
 shown):
@@ -136,10 +160,15 @@ ALTER TABLE svti_jobs  ADD COLUMN IF NOT EXISTS traceparent TEXT;
 ALTER TABLE svti_jobs  ADD COLUMN IF NOT EXISTS tracestate  TEXT;
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS traceparent TEXT;
 ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate  TEXT;
+ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS user_id     TEXT;
+CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
 ```
 
-Both are nullable and idempotent to add, so 0.5 instances keep working against
-the migrated table during a rolling deploy.
+These nullable additions preserve existing rows and can be applied repeatedly.
+Old column-only readers continue to work; this is not a whole-fleet compatibility
+guarantee. Existing task rows have null `user_id`: backfill from trusted
+application identity if they must participate in user erasure. The package
+cannot infer that identity from arbitrary historical input.
 
 ### Redis idempotency key derivation changed
 
@@ -155,9 +184,10 @@ either segment (the composite key is NUL-delimited, so `('a\0b','c')` and
 
 **Action.** Pick one:
 
-- **Drain.** Stop enqueuing new idempotent work, let in-flight entries expire
-  past their TTL, then deploy. Clean, and the only option if a duplicate
-  execution is unacceptable.
+- **Drain.** Stop all producers of idempotent work, finish active handlers, and
+  verify that both pending entries and retained committed results have expired
+  under their actual TTLs before deploying. Waiting only for handler completion
+  is insufficient. Use this path when duplicate execution is unacceptable.
 - **Accept one re-execution.** Entries written before the upgrade fall back to a
   cache miss and run once more. Fine when your handlers are themselves
   idempotent against the downstream.
@@ -167,6 +197,32 @@ your idempotency TTL: during that window the two derive different keys for the
 same identity.
 
 ## 3. Fails on a call that used to succeed
+
+### Redis clients bound waits and disconnected buffering
+
+Owned clients default to 5-second command, connection and socket timeouts,
+one retry per request, and at most 4096 offline queued commands per connection.
+Once the main connection first becomes ready, offline queuing is disabled unless
+explicitly enabled in driver options; subscriber duplicates keep bounded buffering. Review long-running commands and outage behavior before rollout; see
+[Redis outage behavior](./docs/redis-outages.md) for overrides and ambiguous
+write outcomes. A timeout after a write was sent does not prove it was rejected.
+
+### Worker admission and fence confidence are bounded
+
+Worker pools reserve jobs and input bytes before durable claims. Saturated foreground worker
+calls reject before inserting a task; enqueue work that should wait durably.
+Queued workers expire after 30 seconds. Handlers must honor their abort signal:
+a lost-fence handler cannot commit a returned success even if it ignores abort.
+Review heartbeat intervals against backend latency and lease lifetime; see
+[worker admission and fence renewal](./docs/task-workers.md) for exact limits.
+
+### PostgreSQL notification startup is awaited
+
+Await bridge activation in application initialization. An owned PostgreSQL client
+now stops its bridges and standalone sessions before closing its pool; await
+shutdown too. LISTEN and advisory ownership need a dedicated session-compatible
+connection, not transaction pooling. Budget these sessions separately from the
+query pool; see [PostgreSQL support](./docs/postgres-support.md).
 
 ### Owned PostgreSQL pools bound admission and waits
 
@@ -447,14 +503,18 @@ result - `return presence.hooks.subscribe(ws, topic, ctx)` - or the socket stays
 subscribed to a topic the platform refused. `cursor.hooks.subscribe` is the
 same. Both are typed `Promise<string | undefined>` now.
 
-### Right-to-erasure is tenant-scoped everywhere
+### Replay and dead-letter erasure uses the tenant topic namespace
 
-`purgeUser(tenantId, userId)` previously deleted on `user_id` alone in the Redis
-and Postgres replay buffers and dead-letter queues, so one `purgeUser('acme', u)`
-erased that user's buffered events and dead letters in **every other tenant**.
-All four now apply the rule the sibling legs already used. **A deployment that
-uses no tenants is unaffected**: no topic carries the prefix, so the untenanted
-scope still matches all of them.
+Redis and Postgres replay buffers and dead-letter queues now restrict deletion
+to topics beginning with `@t/<tenantId>/`. A null tenant matches only topics
+outside `@t/`; it does not mean all tenants. Verify that stored wire topics
+use the intended namespace before relying on tenant-specific erasure.
+
+This is not a blanket guarantee for every store: task rows have no tenant
+column and task `purgeUser` ignores its tenant argument. Use a tenant-qualified
+user identity there and audit the application's erasure fan-out. Redis
+forget-tombstone behavior and stores whose identity is not topic-derived must
+also be checked against their own contract.
 
 ### `createClusterClock` prefixes `leaderKey`
 
@@ -521,6 +581,49 @@ find them: <!-- vocabulary-allow: a rename note must name the superseded option 
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from 'svelte-adapter-uws-extensions/redis/lease-scripts';
 ```
 
+## Executable rehearsal
+
+From this checkout with dependencies installed and Docker running:
+
+```sh
+npm exec -- vitest run test/migration-imports.test.js
+npm exec -- vitest run --config vitest.config.integration.postgres.js test/integration/postgres/migration-rehearsal.test.js
+```
+
+The PostgreSQL test packs the current checkout, imports only that extracted
+package, and supplies the installed dependency tree. It starts an isolated real
+PostgreSQL service through the integration harness. It seeds the jobs/tasks
+schema from stable 0.5.10, tests automatic migration and the manual SQL above,
+then verifies old rows survive, new trace context round-trips, and a legacy
+column-only query still reads the same data. Removing a trace-column migration
+must fail the corresponding rehearsal. It does not run an entire old binary or
+prove all old/new wire combinations interoperable.
+
+For concurrent local suites, set `INTEGRATION_COMPOSE_PROJECT` and
+`INTEGRATION_POSTGRES_HOST_PORT` to unused values. The harness removes only its
+named stack. Run the remaining backend integration lanes used by your application
+before production rollout.
+
+## Rollback and fleet compatibility
+
+Keep the pre-upgrade lockfile and artifact digests until the deployment passes
+its application canary. Roll back dependants in reverse order: realtime,
+extensions, then adapter. Stop producers and drain handlers first; restoring an
+old process while a new handler still owns work can duplicate side effects.
+
+The added nullable trace columns can remain when rolling back. Do not drop them
+while any 0.6 instance is running. This additive change does not make every
+storage format interchangeable: the Redis idempotency key transition still
+requires the same TTL drain in either direction. A snapshot restore can discard
+post-snapshot writes; reconcile those with downstream side effects before use.
+
+Do not assume rolling wire compatibility merely because sockets connect.
+Selected presence identity is now carried separately from durable fields;
+update all receivers for its full identity guarantee. Confirm relayed compression,
+sequence authority, authorization denials and reconnect/replay behavior on the
+exact deployment tuple. Preserve prefixes, table names and tenant topic mapping
+unless you separately migrate their data.
+
 ## After upgrading to 0.6
 
 Run your test suite, then check:
@@ -532,8 +635,8 @@ Run your test suite, then check:
 - `registry.send` / `sendCoalesced` / `group.publish` call sites are awaited.
 - Purge-scope and tenant-isolation tests, against the corrected SCAN matcher.
 - A custom platform implements `checkSubscribe`.
-- Jobs and tasks tables you migrate yourself have the `traceparent` and
-  `tracestate` columns.
+- Jobs and tasks tables you migrate yourself have `traceparent` and
+  `tracestate`; tasks also have `user_id` and its lookup index.
 - Log routing and alerting keyed on the old prose prefixes route on `event=`.
 
 ---

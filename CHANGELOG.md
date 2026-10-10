@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Complete the 0.5-to-0.6 migration guidance and packed PostgreSQL schema rehearsal, including the previously omitted manual task user_id column and erasure index. Document current bounds, tenant limitations and rollback steps.
+
 - Owned PostgreSQL clients stop notification bridges and close standalone sessions before their pool. Serialize notification startup and recovery, cancel pending startup on shutdown, release abandoned breaker probes, and prevent late reactivation. Add bounded reconnect jitter and document session-pooling requirements.
 
 - Coalesce task fence renewals and abort on lost renewal confidence, including time spent acquiring a lease. Pending external renewal cannot be discarded by a returning handler, and an ignored abort cannot commit stale success.

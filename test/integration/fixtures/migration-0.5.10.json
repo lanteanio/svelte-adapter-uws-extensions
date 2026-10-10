@@ -1,0 +1,6 @@
+{
+	"version": "0.5.10",
+	"gitHead": "a7d5df37b016988ef238bccddfcd037acc51af93",
+	"jobs": "CREATE TABLE IF NOT EXISTS ${table} (\n\t\t\t\tsvti_jobs_id  BIGSERIAL   PRIMARY KEY,\n\t\t\t\tqueue         TEXT        NOT NULL,\n\t\t\t\tpayload       JSONB,\n\t\t\t\trequest_id    TEXT,\n\t\t\t\tclaimed_at    TIMESTAMPTZ,\n\t\t\t\tclaimed_until TIMESTAMPTZ,\n\t\t\t\tattempts      INTEGER     NOT NULL DEFAULT 0,\n\t\t\t\tcreated_at    TIMESTAMPTZ DEFAULT now()\n\t\t\t)",
+	"tasks": "CREATE TABLE IF NOT EXISTS ${table} (\n\t\t\t\tsvti_tasks_id        UUID         PRIMARY KEY,\n\t\t\t\tname                 TEXT         NOT NULL,\n\t\t\t\tinput                JSONB,\n\t\t\t\tsvti_idempotency_key TEXT,\n\t\t\t\trequest_id           TEXT,\n\t\t\t\tstatus               TEXT         NOT NULL,\n\t\t\t\tresult               JSONB,\n\t\t\t\terror                JSONB,\n\t\t\t\tfence                UUID         NOT NULL,\n\t\t\t\tfence_expires_at     TIMESTAMPTZ  NOT NULL,\n\t\t\t\tattempts             INT          NOT NULL DEFAULT 1,\n\t\t\t\tcreated_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),\n\t\t\t\tupdated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()\n\t\t\t)"
+}
