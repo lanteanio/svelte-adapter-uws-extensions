@@ -4,7 +4,7 @@
  * Raises the per-request cost for a bot hitting `/ws` directly from "one TCP+TLS
  * handshake" to "load the HTML page, run its JS, present a short-lived signed
  * cookie". The HTML page response sets a signed cookie (an HMAC of
- * `sessionId | issuedAt | salt`); the WebSocket upgrade hook verifies it in O(1)
+ * `nonce | issuedAt | salt`); the WebSocket upgrade hook verifies it in O(1)
  * with one HMAC computation and a constant-time compare, before any backend
  * lookup. A client with no valid cookie is rejected at sub-microsecond cost.
  *
@@ -55,16 +55,16 @@ function unb64u(s) {
 }
 
 /**
- * Compute the signature over `sessionId | issuedAt | salt` with one secret.
+ * Compute the signature over `nonce | issuedAt | salt` with one secret.
  *
  * @param {string} secret
- * @param {string} sessionId
+ * @param {string} nonce
  * @param {number} issuedAt
  * @param {string} salt
  */
-function sign(secret, sessionId, issuedAt, salt) {
+function sign(secret, nonce, issuedAt, salt) {
 	return createHmac('sha256', secret)
-		.update(sessionId + '|' + issuedAt + '|' + salt)
+		.update(nonce + '|' + issuedAt + '|' + salt)
 		.digest('base64url');
 }
 
@@ -330,34 +330,15 @@ export function capabilityCookie(options) {
 	};
 
 	/**
-	 * Resolve a stable session id for the request. Reuses an existing
-	 * `event.locals.sessionId` / `event.locals.session?.id` when present so the
-	 * cookie binds to the real session; otherwise mints a fresh random id (the
-	 * cookie's job here is capability, not identity).
+	 * Build the signed cookie value `nonce.issuedAt.salt.sig`.
 	 *
-	 * @param {any} event
-	 */
-	function sessionIdFor(event) {
-		const locals = event && event.locals;
-		if (locals) {
-			if (typeof locals.sessionId === 'string' && locals.sessionId) return locals.sessionId;
-			if (locals.session && typeof locals.session.id === 'string' && locals.session.id) {
-				return locals.session.id;
-			}
-		}
-		return randomBytes(12).toString('base64url');
-	}
-
-	/**
-	 * Build the signed cookie value `sessionId.issuedAt.salt.sig`.
-	 *
-	 * @param {string} sessionId
+	 * @param {string} nonce
 	 * @param {number} issuedAt
 	 */
-	function encode(sessionId, issuedAt) {
+	function encode(nonce, issuedAt) {
 		const salt = randomBytes(SALT_BYTES).toString('base64url');
-		const sig = sign(secret, sessionId, issuedAt, salt);
-		return b64u(sessionId) + '.' + issuedAt + '.' + salt + '.' + sig;
+		const sig = sign(secret, nonce, issuedAt, salt);
+		return b64u(nonce) + '.' + issuedAt + '.' + salt + '.' + sig;
 	}
 
 	/**
@@ -380,9 +361,9 @@ export function capabilityCookie(options) {
 		if (parts.length !== 4) return burnAndFail();
 		const [sidB64, issuedRaw, salt, presentedSig] = parts;
 
-		let sessionId;
+		let nonce;
 		try {
-			sessionId = unb64u(sidB64);
+			nonce = unb64u(sidB64);
 		} catch {
 			return burnAndFail();
 		}
@@ -394,15 +375,15 @@ export function capabilityCookie(options) {
 		// expired or forged - the check order no longer separates the two by
 		// timing. Expiry stays independent of the secret: an expired cookie is
 		// invalid even when signed with the current key.
-		const expectCurrent = sign(secret, sessionId, issuedAt, salt);
+		const expectCurrent = sign(secret, nonce, issuedAt, salt);
 		let authentic = safeEqual(expectCurrent, presentedSig);
 		if (!authentic && previousSecret) {
-			const expectPrev = sign(previousSecret, sessionId, issuedAt, salt);
+			const expectPrev = sign(previousSecret, nonce, issuedAt, salt);
 			authentic = safeEqual(expectPrev, presentedSig);
 		}
 		if (!authentic) return null;
 		if (now() - issuedAt > ttlMs) return null;
-		return { sessionId, issuedAt };
+		return { nonce, issuedAt };
 	}
 
 	function serializeCookie(value) {
@@ -416,25 +397,16 @@ export function capabilityCookie(options) {
 		return out;
 	}
 
-	return {
-		issue(event, response) {
-			const sessionId = sessionIdFor(event);
-			appendSetCookie(response, serializeCookie(encode(sessionId, now())));
-		},
+	// Every response gets a fresh capability unrelated to application identity.
+	// Refresh never copies a legacy cookie's decoded session identifier.
+	function issue(_event, response) {
+		const nonce = randomBytes(16).toString('base64url');
+		appendSetCookie(response, serializeCookie(encode(nonce, now())));
+	}
 
-		refresh(event, response) {
-			// Re-issue from a still-valid presented cookie so a mid-session secret
-			// rotation or near-expiry never strands a reconnect. Falls back to a
-			// fresh issue when no valid cookie is present.
-			const header =
-				event && event.request && typeof event.request.headers?.get === 'function'
-					? event.request.headers.get('cookie')
-					: null;
-			const presented = readCookie(header, cookieName);
-			const decoded = presented ? decode(presented) : null;
-			const sessionId = decoded ? decoded.sessionId : sessionIdFor(event);
-			appendSetCookie(response, serializeCookie(encode(sessionId, now())));
-		},
+	return {
+		issue,
+		refresh: issue,
 
 		verify(cookieHeader, opts) {
 			const required = !!(opts && opts.required);

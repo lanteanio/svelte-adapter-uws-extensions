@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { capabilityCookie } from '../src/capability-cookie.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
 import { EXTENSIONS_ERROR_IDS } from '../src/error-registry.js';
@@ -138,16 +138,21 @@ describe('capabilityCookie', () => {
 			expect(sc).toContain('Max-Age=300');
 		});
 
-		it('binds the cookie to a locals session id when present', () => {
+		it.each([{ sessionId: 'sess-abc' }, { session: { id: 'sess-abc' } }])('never copies an application session into a capability: %o', (locals) => {
 			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const res = mockResponse();
-			cap.issue(mockEvent({ locals: { sessionId: 'sess-abc' } }), res);
+			cap.issue(mockEvent({ locals }), res);
 			const value = cookieValueFrom(res.setCookies[0]);
-			// The encoded sessionId is the first base64url field; decode it back.
+			// The first field contains only a random capability nonce.
 			const raw = value.slice((COOKIE_NAME + '=').length);
 			const sidField = raw.split('.')[0];
 			const decodedSid = Buffer.from(sidField, 'base64url').toString('utf8');
-			expect(decodedSid).toBe('sess-abc');
+			expect(decodedSid).not.toBe('sess-abc');
+			expect(Buffer.from(decodedSid, 'base64url')).toHaveLength(16);
+			const another = mockResponse();
+			cap.issue(mockEvent({ locals }), another);
+			expect(cookieValueFrom(another.setCookies[0]).split('.')[0]).not.toBe(value.split('.')[0]);
+			expect(cap.verify(value, { required: true })).toBe(true);
 		});
 
 		it('supports a plain setHeader-style response', () => {
@@ -287,7 +292,7 @@ describe('capabilityCookie', () => {
 	});
 
 	describe('refresh', () => {
-		it('re-issues preserving the session id from a still-valid cookie', () => {
+		it('refreshes with a new nonce rather than preserving the previous capability', () => {
 			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const issueRes = mockResponse();
 			cap.issue(mockEvent({ locals: { sessionId: 'keep-me' } }), issueRes);
@@ -300,7 +305,25 @@ describe('capabilityCookie', () => {
 			const refreshed = cookieValueFrom(refreshRes.setCookies[0]);
 			const raw = refreshed.slice((COOKIE_NAME + '=').length);
 			const sid = Buffer.from(raw.split('.')[0], 'base64url').toString('utf8');
-			expect(sid).toBe('keep-me');
+			expect(sid).not.toBe('keep-me');
+			expect(refreshed.split('.')[0]).not.toBe(issued.split('.')[0]);
+			expect(cap.verify(refreshed, { required: true })).toBe(true);
+		});
+
+		it('verifies legacy cookies but never copies their session id when refreshing', () => {
+			const secret = 'a3f9c1d7e5b2408695ecfa71d3b8402c';
+			const cap = capabilityCookie({ secret });
+			const sessionId = 'private-application-session';
+			const timestamp = Date.now();
+			const salt = 'legacy-salt';
+			const sig = createHmac('sha256', secret).update(sessionId + '|' + timestamp + '|' + salt).digest('base64url');
+			const legacy = COOKIE_NAME + '=' + Buffer.from(sessionId).toString('base64url') + '.' + timestamp + '.' + salt + '.' + sig;
+			expect(cap.verify(legacy, { required: true })).toBe(true);
+			const response = mockResponse();
+			cap.refresh(mockEvent({ cookie: legacy, locals: { sessionId } }), response);
+			const refreshed = cookieValueFrom(response.setCookies[0]);
+			const payload = refreshed.slice(COOKIE_NAME.length + 1).split('.')[0];
+			expect(Buffer.from(payload, 'base64url').toString('utf8')).not.toBe(sessionId);
 			expect(cap.verify(refreshed, { required: true })).toBe(true);
 		});
 

@@ -1,7 +1,7 @@
 import type { MetricsRegistry } from './prometheus/index.js';
 
 export interface CapabilityCookieOptions {
-	/** HMAC secret. Required, non-empty. */
+	/** HMAC secret. At least 16 characters and 8 distinct characters; use a cryptographically generated key. */
 	secret: string;
 	/** Cookie lifetime in seconds. @default 300 */
 	ttlSeconds?: number;
@@ -25,8 +25,8 @@ export interface CapabilityCookieOptions {
 	 * `capability_cookie_misses_total{reason}` with reasons `missing` (cookie
 	 * absent while `required`) and `invalid` (cookie presented but failed to
 	 * verify - bad signature, malformed, or expired). Expired is deliberately
-	 * not its own reason: expiry is checked before the signature, so the
-	 * split would be forgeable by the sender.
+	 * not its own reason; expired and unauthentic cookies share the same
+	 * admission failure signal.
 	 */
 	metrics?: MetricsRegistry;
 }
@@ -39,7 +39,7 @@ export interface CapabilityCookieVerifyOptions {
 export interface CapabilityCookie {
 	/** Set the capability cookie on a fresh page response. */
 	issue(event: any, response: any): void;
-	/** Re-issue from a still-valid presented cookie; falls back to a fresh issue. */
+	/** Issue a fresh capability nonce, including when refreshing a legacy cookie. */
 	refresh(event: any, response: any): void;
 	/**
 	 * Validate a presented `Cookie` header value. Accepts a cookie signed by the
@@ -49,7 +49,7 @@ export interface CapabilityCookie {
 }
 
 /**
- * Build a capability-cookie issuer/verifier. HMAC of `sessionId | issuedAt | salt`
+ * Build a capability-cookie issuer/verifier. HMAC of `nonce | issuedAt | salt`
  * via `node:crypto`; no Redis dependency.
  */
 export function capabilityCookie(options: CapabilityCookieOptions): CapabilityCookie;

@@ -4232,11 +4232,11 @@ An unknown posture string degrades to the `normal` budget, so forwarding an unex
 
 ### Capability cookie
 
-`capabilityCookie` (`svelte-adapter-uws-extensions/capability-cookie`) raises the per-request cost for a bot hitting `/ws` directly from "one TCP+TLS handshake" to "load the HTML page, run its JS, present a short-lived signed cookie". The page response sets a signed cookie (an HMAC of `sessionId | issuedAt | salt` via `node:crypto`); the upgrade hook verifies it in O(1) before any backend lookup. This stops commodity DDoS toolkits that target `/ws` directly. It does **not** stop a headless-browser attacker that actually runs the page JS - a stated limitation, not a gap.
+`capabilityCookie` (`svelte-adapter-uws-extensions/capability-cookie`) raises the per-request cost for a bot hitting `/ws` directly from "one TCP+TLS handshake" to "load the HTML page, run its JS, present a short-lived signed cookie". The page response sets a signed cookie (an HMAC of `nonce | issuedAt | salt` via `node:crypto`); the upgrade hook verifies it in O(1) before any backend lookup. This stops commodity DDoS toolkits that target `/ws` directly. It does **not** stop a headless-browser attacker that actually runs the page JS - a stated limitation, not a gap.
 
-No Redis dependency: the whole point is to reject before any backend work.
+No Redis dependency: the whole point is to reject before any backend work. Each issued or refreshed cookie contains a fresh random nonce, never an application session identifier. It is an admission capability, not proof of an authenticated user; keep normal authentication in the upgrade hook.
 
-Generate the secret once and keep it out of the repo. It must be at least 32 characters and must be actual entropy - a padded placeholder is refused at startup, because an observer holds both the cookie's message and its signature and can grind a weak secret offline at memory speed:
+Generate the secret once and keep it out of the repo. It must be at least 16 characters with at least 8 distinct characters and must be actual entropy - a padded placeholder is refused at startup, because an observer holds both the cookie's message and its signature and can grind a weak secret offline at memory speed:
 
 ```sh
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -4275,7 +4275,7 @@ export function upgrade({ headers, platform }) {
 
 If the HMAC secret rotates or the cookie expires mid-session, a WS reconnect would otherwise fail. The module ships two answers, both in-scope (not a follow-on):
 
-- `cap.refresh(event, response)` re-issues the cookie from a still-valid session, re-signing under the current secret.
+- `cap.refresh(event, response)` issues a fresh nonce under the current secret. Existing cookies remain verifiable until expiry, but their payload is never copied into a refreshed cookie.
 - The verifier accepts cookies signed by either the current **or** the immediately-previous secret during a rotation window. Configure the old secret as `previousSecret` for the duration of the window, then drop it.
 
 ```js
@@ -4297,7 +4297,7 @@ const cap = capabilityCookie({
 | `secure` | `true` | Set the `Secure` attribute. |
 | `sameSite` | `'Lax'` | SameSite policy (`'Strict'` / `'Lax'` / `'None'`). Matched case-insensitively and normalized. |
 | `path` | `'/'` | Cookie path. Must start with `/` and contain only printable ASCII other than whitespace, `;`, `,` and `"`. Percent-encode anything outside that set: a header value is bytes, and a raw NUL or non-ASCII path makes the header layer throw on every issued cookie. |
-| `metrics` | - | Prometheus registry. Registers `capability_cookie_misses_total{reason}`: `missing` counts an absent cookie only when `required` (a first visit in normal posture is not a miss), `invalid` counts every presented cookie that fails to verify, required or not. Expired cookies land under `invalid` - expiry is checked before the signature, so a separate `expired` reason would be forgeable by the sender; `refresh()` on page responses keeps live users out of that bucket. |
+| `metrics` | - | Prometheus registry. Registers `capability_cookie_misses_total{reason}`: `missing` counts an absent cookie only when `required` (a first visit in normal posture is not a miss), `invalid` counts every presented cookie that fails to verify, required or not. Expired cookies land under `invalid`, sharing the same admission failure signal as unauthentic cookies; `refresh()` on page responses keeps live users out of that bucket. |
 
 #### API
 

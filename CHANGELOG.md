@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Capability cookies contain fresh random nonces instead of application session identifiers, including when an older cookie is refreshed. Existing valid cookies remain verifiable until expiry.
+
 - Re-registering a metric name now rejects conflicting help text, series caps, histogram buckets, negative-value policy, or bucket caps. Registry drop accounting reserves its counter name so a user metric cannot replace it.
 
 - Redis buses preserve batch compression options on local and remote delivery.
