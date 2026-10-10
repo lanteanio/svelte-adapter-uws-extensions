@@ -1375,3 +1375,42 @@ describe('sharded channel binding', () => {
 		} finally { await bus.deactivate(); }
 	});
 });
+
+
+it.each(['subscribe', 'subscribeBatch'])('restores admission when a new %s arrives during abandoned subscription cleanup', async hook => {
+	const client = mockRedisClient();
+	let subscriber;
+	const duplicate = client.redis.duplicate.bind(client.redis);
+	client.redis.duplicate = (...args) => (subscriber = duplicate(...args));
+	const platform = mockPlatform();
+	const bus = createShardedBus(client);
+	await bus.activate(platform);
+	const subscribe = subscriber.ssubscribe.bind(subscriber);
+	const unsubscribe = subscriber.sunsubscribe.bind(subscriber);
+	let releaseSubscribe, releaseUnsubscribe;
+	subscriber.ssubscribe = (...channels) => new Promise(resolve => { releaseSubscribe = () => resolve(subscribe(...channels)); });
+	subscriber.sunsubscribe = (...channels) => new Promise(resolve => { releaseUnsubscribe = () => resolve(unsubscribe(...channels)); });
+	const a = {}, b = {}, c = {};
+	const follow = ws => bus.hooks[hook](ws, hook === 'subscribe' ? 'chat' : ['chat']);
+	try {
+		const first = follow(a);
+		await bus.hooks.close(a);
+		releaseSubscribe();
+		await settle();
+		expect(releaseUnsubscribe).toBeTypeOf('function');
+		let admitted = false;
+		const second = follow(b).then(() => { admitted = true; });
+		await settle();
+		expect(admitted).toBe(false);
+		subscriber.ssubscribe = subscribe;
+		subscriber.sunsubscribe = unsubscribe;
+		releaseUnsubscribe();
+		await Promise.all([first, second]);
+		await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+		expect(platform.published).toHaveLength(1);
+		await follow(c);
+		await bus.hooks.close(b);
+		await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+		expect(platform.published).toHaveLength(2);
+	} finally { await bus.deactivate(); }
+});

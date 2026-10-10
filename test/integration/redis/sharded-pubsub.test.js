@@ -90,6 +90,39 @@ describeIntegration('redis sharded pubsub bus (integration)', () => {
 		});
 	});
 
+	it.skipIf(isClusterBackend())('admits a replacement follower after an abandoned subscription finishes unsubscribing', async () => {
+		const channelPrefix = uniqueChannelPrefix('replacement');
+		let releaseSubscribe, releaseUnsubscribe;
+		const wrapped = { ...client, duplicate(...args) {
+			const sub = client.duplicate(...args);
+			const subscribe = sub.ssubscribe.bind(sub);
+			const unsubscribe = sub.sunsubscribe.bind(sub);
+			sub.ssubscribe = (...channels) => new Promise(resolve => {
+				releaseSubscribe = () => { sub.ssubscribe = subscribe; resolve(subscribe(...channels)); };
+			});
+			sub.sunsubscribe = (...channels) => new Promise(resolve => {
+				releaseUnsubscribe = () => { sub.sunsubscribe = unsubscribe; resolve(unsubscribe(...channels)); };
+			});
+			return sub;
+		} };
+		const bus = track(createShardedBus(wrapped, { channelPrefix }));
+		const platform = mockPlatform();
+		await bus.activate(platform);
+		const first = bus.follow('chat');
+		await bus.unfollow('chat');
+		releaseSubscribe();
+		await waitFor(() => !!releaseUnsubscribe);
+		const second = bus.followBatch(['chat']);
+		releaseUnsubscribe();
+		await Promise.all([first, second]);
+		await client.redis.spublish(channelPrefix + 'chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
+		await waitFor(() => platform.published.length === 1);
+		await bus.follow('chat');
+		await bus.unfollow('chat');
+		await client.redis.spublish(channelPrefix + 'chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
+		await waitFor(() => platform.published.length === 2);
+	});
+
 	describe('SPUBLISH / SSUBSCRIBE delivery', () => {
 		it('round-trips a payload between two buses on per-topic channels', async () => {
 			const channelPrefix = uniqueChannelPrefix('two');
