@@ -79,6 +79,15 @@ import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 
+const EMPTY_FIELDS = Object.freeze(Object.create(null));
+
+function fieldValueBytes(value) {
+	if (value === null) return 4;
+	if (typeof value === 'boolean') return value ? 4 : 5;
+	if (typeof value === 'number') return Number.isFinite(value) ? String(value).length : 4;
+	return Buffer.byteLength(JSON.stringify(value) ?? '');
+}
+
 export { WsClosedError };
 
 /**
@@ -362,13 +371,16 @@ export function createPresence(client, options = {}) {
 	});
 	const { subscribeToTopic, unsubscribeFromTopic } = subscriberCtx;
 
+	// UTF-8 needs at most three bytes per UTF-16 code unit.
+	const safeEnvelopeChars = Math.floor(maxEnvelopeBytes / 3);
+	const safeFieldsChars = Math.floor(maxFieldsBytes / 3);
 	async function publishEvent(topic, event, payload) {
 		const ch = eventChannel(topic);
 		const msg = JSON.stringify({ instanceId, topic, event, payload });
 		// Hold outbound events to the bound every peer enforces inbound.
 		// Publishing past it fans out locally and to no remote instance,
 		// which reads as a partial roster rather than as an error.
-		if (Buffer.byteLength(msg) > maxEnvelopeBytes) {
+		if (msg.length > safeEnvelopeChars && Buffer.byteLength(msg) > maxEnvelopeBytes) {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_ENVELOPE_OVERSIZED, {
 				attributes: { event, bytes: Buffer.byteLength(msg), maxEnvelopeBytes }
 			});
@@ -1161,8 +1173,8 @@ export function createPresence(client, options = {}) {
 			const entry = topicData && topicData.get(key);
 			if (!entry) return;
 			try {
-				if (Buffer.byteLength(JSON.stringify(effective)) > maxFieldsBytes) return;
-				if (exceedsDepth(effective, MAX_PROJECTION_DEPTH)) return;
+				const encoded = JSON.stringify(effective);
+				if (encoded.length > safeFieldsChars && Buffer.byteLength(encoded) > maxFieldsBytes) return;
 			} catch { return; }
 			if (!entry.fields) entry.fields = newFieldMap();
 			// Per-field change detection against this instance's field view. Only
@@ -1170,46 +1182,48 @@ export function createPresence(client, options = {}) {
 			// field-level delta). Durable and transient changes are split: durable
 			// is persisted to Redis so a cross-instance state read includes it;
 			// transient is relay-only and never persisted.
-			/** @type {Record<string, any>} */
-			const changedDurable = newFieldMap();
-			/** @type {Record<string, any>} */
-			const changedTransient = newFieldMap();
-			let any = false;
-			for (const k of Object.keys(effective)) {
-				// The server rule: the allowlist when there is one, otherwise no
-				// identity and no credential, personal-data or transport name. A
-				// client frame has already been cut down to listed names, which
-				// this passes. The relay and the read-back apply the same rule.
-				if (!fieldNames.fromServer(k)) {
-					if (warnReservedField) warnReservedField(k);
-					continue;
-				}
-				const v = effective[k];
-				if (!deepEqual(entry.fields[k], v)) {
-					if (transientFields.has(k)) changedTransient[k] = v;
-					else changedDurable[k] = v;
-					any = true;
-				}
-			}
-			if (!any) return;
-			const changed = { ...changedDurable, ...changedTransient };
+			/** @type {Record<string, any> | null} */
+			let changedDurable = null;
+			/** @type {Record<string, any> | null} */
+			let changedTransient = null;
 			let totalBytes = entry.fieldsBytes;
-			try {
-				if (totalBytes === undefined) {
-					totalBytes = 0;
+			if (totalBytes === undefined) {
+				totalBytes = 0;
+				try {
 					for (const k of Object.keys(entry.fields)) {
-						totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2 + Buffer.byteLength(JSON.stringify(entry.fields[k]) ?? '');
+						totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2 + fieldValueBytes(entry.fields[k]);
+					}
+				} catch { return; }
+			}
+			let any = false;
+			let nested = false;
+			try {
+				for (const k of Object.keys(effective)) {
+					const v = effective[k];
+					if (v !== null && typeof v === 'object') nested = true;
+					// The server rule: the allowlist when there is one, otherwise no
+					// identity and no credential, personal-data or transport name. A
+					// client frame has already been cut down to listed names, which
+					// this passes. The relay and the read-back apply the same rule.
+					if (!fieldNames.fromServer(k)) {
+						if (warnReservedField) warnReservedField(k);
+						continue;
+					}
+					if (!deepEqual(entry.fields[k], v)) {
+						totalBytes += fieldValueBytes(v);
+						if (Object.prototype.hasOwnProperty.call(entry.fields, k)) totalBytes -= fieldValueBytes(entry.fields[k]);
+						else totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2;
+						if (transientFields.has(k)) (changedTransient ??= newFieldMap())[k] = v;
+						else (changedDurable ??= newFieldMap())[k] = v;
+						any = true;
 					}
 				}
-				for (const k of Object.keys(changed)) {
-					totalBytes += Buffer.byteLength(JSON.stringify(changed[k]) ?? '');
-					if (Object.prototype.hasOwnProperty.call(entry.fields, k)) {
-						totalBytes -= Buffer.byteLength(JSON.stringify(entry.fields[k]) ?? '');
-					} else totalBytes += Buffer.byteLength(JSON.stringify(k)) + 2;
-				}
 			} catch { return; }
+			if (!any || (nested && exceedsDepth(effective, MAX_PROJECTION_DEPTH))) return;
+			const changed = changedDurable && changedTransient ? { ...changedDurable, ...changedTransient } : (changedDurable || changedTransient);
+
 			if (totalBytes > maxTotalFieldsBytes) return;
-			Object.assign(entry.fields, changed);
+			for (const k of Object.keys(changed)) entry.fields[k] = changed[k];
 			entry.fieldsBytes = totalBytes;
 
 			// Local fan-out: buffer the update diff (durable + transient together)
@@ -1221,8 +1235,7 @@ export function createPresence(client, options = {}) {
 			// state read (HGETALL) reconstructs them. Best-effort under the breaker:
 			// the field still relays + buffers locally if the write is skipped, and
 			// a later durable update reconciles the cross-instance read.
-			const durableKeys = Object.keys(changedDurable);
-			if (durableKeys.length > 0) {
+			if (changedDurable) {
 				let skip = false;
 				if (b) { try { b.guard(); } catch { skip = true; } }
 				if (!skip) {
@@ -1243,7 +1256,7 @@ export function createPresence(client, options = {}) {
 			// subscribers see the same field-level update. The receiving instance
 			// buffers it as an `updates` diff entry and, if it also presents the
 			// user, merges the durable value into its own field view.
-			await publishEvent(topic, INTERNAL_EVENTS.FIELDS, { key, durable: changedDurable, transient: changedTransient });
+			await publishEvent(topic, INTERNAL_EVENTS.FIELDS, { key, durable: changedDurable || EMPTY_FIELDS, transient: changedTransient || EMPTY_FIELDS });
 		},
 
 		async list(topic) {

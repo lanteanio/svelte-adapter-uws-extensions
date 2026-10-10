@@ -65,6 +65,28 @@ describe('presence resource limits', () => {
 		await tracker.update(ws, 'room', { color: 'x' }, platform);
 		expect(await tracker.list('room')).toEqual([{ id: 'alice', color: 'x' }]);
 	});
+	for (const value of [true, false, null, 0, -0, -1.25, 1e30, Infinity]) {
+		it(`charges scalar JSON bytes exactly for ${value}`, async () => {
+			const bytes = Buffer.byteLength(JSON.stringify({ value })) - 1;
+			const { tracker, platform, ws } = await setup({ maxTotalFieldsBytes: bytes });
+			await tracker.update(ws, 'room', { value }, platform);
+			tracker.flushDiffs();
+			expect(platform.published).toHaveLength(1);
+			const blocked = await setup({ maxTotalFieldsBytes: bytes - 1 });
+			await blocked.tracker.update(blocked.ws, 'room', { value }, blocked.platform);
+			blocked.tracker.flushDiffs();
+			expect(blocked.platform.published).toEqual([]);
+		});
+	}
+	it('drops a getter that throws after JSON serialization without changing state', async () => {
+		const { tracker, platform, ws } = await setup();
+		let reads = 0;
+		const fields = { get value() { if (++reads > 1) throw new Error('unreadable'); return 1; } };
+		await expect(tracker.update(ws, 'room', fields, platform)).resolves.toBeUndefined();
+		tracker.flushDiffs();
+		expect(platform.published).toEqual([]);
+		expect(await tracker.list('room')).toEqual([{ id: 'alice' }]);
+	});
 	it('limits a connection before selecting or opening another topic', async () => {
 		const select = vi.fn((u) => ({ id: u.id }));
 		const { tracker, platform, ws } = await setup({ maxTopicsPerConnection: 1, select });
