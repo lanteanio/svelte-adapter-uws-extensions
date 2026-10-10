@@ -554,17 +554,39 @@ If your app uses `createPresence` and you cannot upgrade Redis immediately, pin 
 
 **What changed.** Every `replay()` implementation (Redis sorted-set, Redis streams, Postgres) now calls `platform.checkSubscribe(ws, topic)` first. On denial, it sends a single `{event:'denied', data:{code:<denial>, reqId}}` frame on `__replay:{topic}` and returns without reading the buffer. Pre-fix, an attacker could send a crafted `lastSeenSeqs` map and read history for a topic they could not subscribe to live.
 
-**How to migrate.** Client-side replay stores must handle the new `denied` event in addition to existing `truncated` / `end` events. Treat it similarly to `truncated`:
+**How to migrate.** Track denial separately from truncation: authorization failed, so automatic retries cannot make the cached content current. Preserve the denial code and request ID for support, mark the affected content stale, stop replay-dependent writes, and expose a visible, politely announced notice with an ordinary keyboard-accessible recovery link. Use your application's actual account/access route and localized copy.
 
+Mount the notice before replay starts so later text updates are announced:
+
+<!-- replay-denial-markup -->
+```html
+<p id="replay-notice" role="status" aria-live="polite" aria-atomic="true"></p>
+<p id="replay-action" hidden><a href="/account">Review sign-in and access</a></p>
+<section id="replay-content" data-stale="false" aria-describedby="replay-notice">Cached content</section>
+```
+
+<!-- replay-denial-consumer -->
 ```js
+// One state/controller per topic. Set reqId when starting that topic's replay.
+const replayState = { status: 'loading', reqId: 'resume-1', code: null, stale: true, canWrite: false };
+const notice = document.querySelector('#replay-notice');
+const action = document.querySelector('#replay-action');
+const content = document.querySelector('#replay-content');
+content.dataset.stale = 'true';
+
 function onReplayFrame(event, data) {
-  if (event === 'denied') {
-    return;
-  }
+  // An older replay response must not overwrite the current request's state.
+  if (data.reqId !== replayState.reqId || event !== 'denied') return;
+  Object.assign(replayState, { status: 'denied', code: data.code, reqId: data.reqId, stale: true, canWrite: false });
+  content.dataset.stale = 'true';
+  notice.textContent = 'Updates are unavailable because access was denied. Displayed content may be out of date. Review your sign-in and access before trying again.';
+  action.hidden = false;
 }
 ```
 
-Older adapters lacking `checkSubscribe` degrade gracefully to the previous behavior.
+Bind replay-dependent editing controls to `canWrite`. Keep the notice and stale marker until a newly authorized replay or snapshot has actually completed; an old `end` frame or a restored WebSocket connection alone does not prove that content is current. Do not move focus when the notice appears. The link remains available in the normal tab order.
+
+Custom platforms without `checkSubscribe` fail closed and receive a denial; implement the documented authorization hook before enabling replay.
 
 ### Tasks `idempotencyKey` is now namespaced by task name, with a 256-char cap
 

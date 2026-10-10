@@ -13,7 +13,7 @@ function run(command, args, cwd) {
 	return result.stdout;
 }
 
-it('typechecks session inference and Postgres from the packed package', () => {
+it('resolves its boot-banner version and typechecks consumers from the packed package', () => {
 	const workRoot = join(root, '.cross-repo-gate');
 	mkdirSync(workRoot, { recursive: true });
 	const work = mkdtempSync(join(workRoot, 'declarations-'));
@@ -27,6 +27,31 @@ it('typechecks session inference and Postgres from the packed package', () => {
 		renameSync(join(work, 'package'), join(work, 'node_modules/svelte-adapter-uws-extensions'));
 		const manifest = JSON.parse(readFileSync(join(work, 'node_modules/svelte-adapter-uws-extensions/package.json'), 'utf8'));
 		expect(manifest.dependencies['@types/pg']).toEqual(expect.any(String));
+		writeFileSync(join(work, 'version-consumer.mjs'), `
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const entry = import.meta.resolve('svelte-adapter-uws-extensions/testing');
+if (!entry.startsWith('file:') || !existsSync(fileURLToPath(entry))) throw new Error('Missing testing entry');
+let directory = dirname(fileURLToPath(entry));
+let version;
+for (let depth = 0; depth < 12; depth++) {
+  const candidate = join(directory, 'package.json');
+  if (existsSync(candidate)) {
+    const pkg = JSON.parse(readFileSync(candidate, 'utf8'));
+    if (pkg.name === 'svelte-adapter-uws-extensions' && typeof pkg.version === 'string') {
+      version = pkg.version;
+      break;
+    }
+  }
+  const parent = dirname(directory);
+  if (parent === directory) break;
+  directory = parent;
+}
+if (!version) throw new Error('Testing entry has no readable owning package version');
+process.stdout.write(version);
+`);
+		expect(run(process.execPath, ['version-consumer.mjs'], work)).toBe(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version);
 		writeFileSync(join(work, 'consumer.ts'), `
 import { createDistributedSession, type DistributedSessionOptions } from 'svelte-adapter-uws-extensions/redis/session';
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';

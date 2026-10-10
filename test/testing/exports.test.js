@@ -42,7 +42,7 @@ describe('testing/index re-exports', () => {
 		expect(extensionsTesting.computePressureReason).toBeUndefined();
 	});
 
-	it('WS_REQUEST_ID_KEY is the string carrier the adapter stamps on userData', () => {
+	it('retains the deprecated request-id constant value', () => {
 		expect(extensionsTesting.WS_REQUEST_ID_KEY).toBe('__adapter_uws_request_id__');
 	});
 

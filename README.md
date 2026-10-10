@@ -128,7 +128,7 @@ The three ecosystem packages move together. Bump them as a group:
 | `^0.5.8` | `^0.5.0` | `^0.5.0` | Stable. Node 22+ required. |
 | `0.6.0-next.95` | `0.6.0-next.95` | `0.6.0-next.64` | Coordinated development candidate. Node 22+ required. Redis 7+ or Valkey 7.2+ for `createShardedBus` / `createFunctionLibrary`. Redis 7.4+ or Valkey 9.0+ for `createPresence` (per-field HEXPIRE). |
 
-Mixed-version installs are rejected at install time with a peer-dep warning.
+For mixed-version reports, first capture the adapter boot banner package tuple (also available as `platform.introspect().versions`) and compare the resolved versions with this table. Peer-dependency warnings identify unsupported installs.
 
 ## Installation
 
@@ -150,12 +150,9 @@ npm install pg
 ```
 
 Requires `svelte-adapter-uws >= 0.6.0-next.95` as a peer dependency.
-The exact command above is the deterministic first-success route for this
-release.
+The exact command above is the deterministic first-success route for this release.
 
-For a complete working example, follow [First success](docs/getting-started.md):
-run the shared-cursor flow without a server, then against a temporary Redis
-container, with expected output and cleanup included.
+For a complete working example, follow [First success](docs/getting-started.md): run the shared-cursor flow without a server, then against a temporary Redis container, with expected output and cleanup included.
 
 After prerequisites pass, choose the documented Redis or Postgres factory for
 the primitive you need. Existing publish/subscribe/replay call sites keep their
@@ -4770,13 +4767,13 @@ import {
   collapseByCoalesceKey, resolveRequestId, createChaosState,
   // userData slot constants
   WS_SUBSCRIPTIONS, WS_COALESCED, WS_SESSION_ID, WS_PENDING_REQUESTS,
-  WS_STATS, WS_PLATFORM, WS_CAPS, WS_REQUEST_ID_KEY,
+  WS_STATS, WS_PLATFORM, WS_CAPS,
   // Plus the in-memory mocks
   mockRedisClient, mockPlatform, mockWs, mockPgClient
 } from 'svelte-adapter-uws-extensions/testing';
 ```
 
-The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing-your-own-handlers) for the per-helper reference.
+`WS_REQUEST_ID_KEY` remains available as a deprecated compatibility constant; it no longer names a runtime slot. Read `userData[WS_PLATFORM].requestId` instead. The re-exported names are the exact same identities as the adapter source (`expect(extensionsTesting.wrapBatchEnvelope).toBe(adapterTesting.wrapBatchEnvelope)`); a surface-lock test in this package pins the set so a future adapter refactor that drops one fails here. See the adapter's [testing entry point docs](https://github.com/lanteanio/svelte-adapter-uws#testing-your-own-handlers) for the per-helper reference.
 
 `createTestServer` is intentionally not re-exported - it boots a real uWebSockets.js instance, which is the adapter's responsibility; import it directly from `svelte-adapter-uws/testing` if you need it.
 

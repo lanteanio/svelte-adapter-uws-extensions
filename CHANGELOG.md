@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep metric identifiers private by default, mark the legacy testing request-ID constant deprecated, and document actionable replay-denial state.
+
 - The first-success guide runs the installed adapter preflight before separate mock and real Redis demonstrations, with the same command sequence in a minimum-profile CI job.
 
 - Documentation now has generated reader paths, complete topic and public-entry indexes, and an exact README size limit. Release history ships in the package; local links are checked on every test run and external links have a separate scheduled crawl.
@@ -58,6 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An explicit `select` is used as-is.** Its result no longer passes through `stripInternal()`, which also dropped ordinary names such as `authorName` and `authoredAt`, and it receives the connection's userData unchanged, `remoteAddress` included, so return only the fields peers should see. Presence still drops top-level `__`-prefixed, `constructor` and `prototype` names, as its cross-instance relay and its read-back from Redis do. Neither tracker logs a warning about sensitive-looking keys in a `select` result any more.
 
 ### Added
+
+- Verify boot-banner version discovery from a packed consumer installation.
 
 - **The README routes launch and topology changes to the ecosystem capacity kit.** Its open-arrival proof covers Redis/Postgres and relay telemetry in the same artifact as the deployment shape, peak p50/p95/p99 and errors, the first resource to saturate, and recovery under continuing traffic.
 - **Durable-store privacy defaults now join one ecosystem contract.** The adapter-owned processing inventory and host worksheet expose no-TTL replay and dead-letter defaults, 48-hour idempotency, seven-day terminal tasks, event-bounded alarms, and the `forgetUserId` / `purgeUser` prerequisites. Redis/Postgres providers, replicas, backups, regions, and transfers remain deployment-owned records instead of implied package guarantees.

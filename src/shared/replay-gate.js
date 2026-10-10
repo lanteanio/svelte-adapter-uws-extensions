@@ -21,7 +21,7 @@
  * @param {any} ws
  * @param {string} topic
  * @param {any} platform
- * @param {string | undefined} reqId
+ * @param {string | number | undefined} reqId
  * @returns {Promise<boolean>}
  */
 /**
@@ -78,11 +78,11 @@ export async function checkReplayAccess(ws, topic, platform, reqId) {
  * @param {string} topic
  * @param {any} platform
  * @param {string} code
- * @param {string | undefined} reqId
+ * @param {string | number | undefined} reqId
  */
 function sendDenial(ws, topic, platform, code, reqId) {
 	try {
-		platform?.send?.(ws, '__replay:' + topic, 'denied', { code, reqId: reqId || undefined });
+		platform?.send?.(ws, '__replay:' + topic, 'denied', { code, reqId: reqId ?? undefined });
 	} catch {
 		// Socket closed, or a platform without send: the denial itself is
 		// what matters and it has already been decided.

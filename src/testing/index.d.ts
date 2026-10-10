@@ -28,9 +28,11 @@ export {
 	WS_PENDING_REQUESTS,
 	WS_STATS,
 	WS_PLATFORM,
-	WS_CAPS,
-	WS_REQUEST_ID_KEY
+	WS_CAPS
 } from 'svelte-adapter-uws/testing';
+
+/** @deprecated Use userData[WS_PLATFORM].requestId; this constant no longer names a runtime slot. */
+export { WS_REQUEST_ID_KEY } from 'svelte-adapter-uws/testing';
 
 // - Mock Redis ---------------------------------------------------------------
 
