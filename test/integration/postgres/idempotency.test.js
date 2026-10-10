@@ -50,6 +50,21 @@ describe('postgres idempotency (integration)', () => {
 		await client.end();
 	});
 
+	it.each([undefined, 0, 5, 864000])('per-acquire retention %s replaces the pending lease', async (ttl) => {
+
+		const slot = await store.acquire('retention', ttl);
+		expect((await store.acquire('retention')).pending).toBe(true);
+		await slot.commit({ ok: true });
+		if (ttl === 0) {
+			expect((await store.acquire('retention')).acquired).toBe(true);
+		} else {
+			expect(await store.acquire('retention')).toEqual({ acquired: false, result: { ok: true } });
+			const { rows } = await client.query(`SELECT EXTRACT(EPOCH FROM (expires_at - now())) AS remaining FROM ${TABLE} WHERE svti_idempotency_key = $1`, ['retention']);
+			expect(Number(rows[0].remaining)).toBeGreaterThan((ttl ?? 172800) - 2);
+			expect(Number(rows[0].remaining)).toBeLessThanOrEqual(ttl ?? 172800);
+		}
+	});
+
 	describe('concurrent first-use (CREATE TABLE race-safety)', () => {
 		it('two fresh stores racing their first acquire both succeed', async () => {
 			// CREATE TABLE IF NOT EXISTS races on concurrent first calls.

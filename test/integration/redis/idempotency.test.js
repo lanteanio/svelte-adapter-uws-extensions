@@ -29,6 +29,21 @@ describe('redis idempotency (integration)', () => {
 		await client.quit();
 	});
 
+	it.each([undefined, 0, 5, 864000])('per-acquire retention %s replaces the pending lease', async (ttl) => {
+		const store = createIdempotencyStore(client);
+		const slot = await store.acquire('retention', ttl);
+		expect((await store.acquire('retention')).pending).toBe(true);
+		await slot.commit({ ok: true });
+		if (ttl === 0) {
+			expect((await store.acquire('retention')).acquired).toBe(true);
+		} else {
+			expect(await store.acquire('retention')).toEqual({ acquired: false, result: { ok: true } });
+			const remaining = await client.redis.pttl(client.key('idem:retention'));
+			expect(remaining).toBeGreaterThan((ttl ?? 172800) * 1000 - 2000);
+			expect(remaining).toBeLessThanOrEqual((ttl ?? 172800) * 1000);
+		}
+	});
+
 	describe('ACQUIRE_SCRIPT three-state flow', () => {
 		it('first acquire returns acquired with commit + abort', async () => {
 			const store = createIdempotencyStore(client);
