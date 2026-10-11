@@ -324,6 +324,7 @@ export function createPresence(client, options = {}) {
 				for (const userKey of data.keys()) {
 					commands.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
 					commands.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
+					commands.push(['hpexpire', pendingHashKey(topic), presenceTtlMs, 'FIELDS', 1, userKey]);
 				}
 				if (subscriberCtx.activePlatform) {
 					// Publish a `{userKey: data}` map (instead of a key-only

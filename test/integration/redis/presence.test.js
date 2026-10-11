@@ -98,6 +98,25 @@ describeIntegration('redis presence (integration)', () => {
 		return client.key('presence:user:{' + topic + '}:' + userKey);
 	}
 
+	it('restores surviving tab identity after heartbeat extends the original TTL', async () => {
+		const a = makeTracker({ heartbeat: 100, ttl: 1, binary: false });
+		const b = makeTracker({ heartbeat: 100, ttl: 1, binary: false });
+		const peer = mockPlatform();
+		const old = mockWs({ id: 'alice', name: 'Old' }), recent = mockWs({ id: 'alice', name: 'Recent' });
+		await b.join(mockWs({ id: 'bob', name: 'Bob' }), 'room', peer);
+		await a.join(old, 'room', platform);
+		await a.join(recent, 'room', platform);
+		await wait(1500);
+		expect(await client.redis.hget(client.key('presence:pending:{room}'), 'alice')).not.toBeNull();
+		await a.leave(recent, platform, 'room');
+		await vi.waitFor(() => {
+			a.flushDiffs(); b.flushDiffs();
+			expect(joinDiffsFor(peer, 'alice').at(-1)?.data.joins.alice.name).toBe('Old');
+		});
+		for (const tracker of [a, b]) expect(await tracker.list('room')).toContainEqual({ id: 'alice', name: 'Old' });
+		for (const p of [platform, peer]) expect(joinDiffsFor(p, 'alice').at(-1)?.data.joins.alice).toEqual({ id: 'alice', name: 'Old' });
+	});
+
 	describe('Design G storage layout', () => {
 		it('writes the user to the per-topic hash (field=userKey) and per-user hash (field=instanceId)', async () => {
 			const presence = makeTracker({ ttl: 120 });

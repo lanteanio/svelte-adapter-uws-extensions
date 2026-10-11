@@ -5,6 +5,24 @@ import { mockWs } from '../../src/testing/mock-ws.js';
 import { mockPlatform } from '../../src/testing/mock-platform.js';
 
 describe('presence relayed joins', () => {
+	it.each([false, true])('restores a surviving tab identity after its original TTL (closeAll=%s)', async closeAll => {
+		vi.useFakeTimers();
+		const client = mockRedisClient();
+		const options = { binary: false, select: u => ({ id: u.id, name: u.name }), heartbeat: 100, ttl: 1 };
+		const a = createPresence(client, options), b = createPresence(client, options);
+		const pa = mockPlatform(), pb = mockPlatform();
+		const old = mockWs({ id: 'alice', name: 'Old' }), recent = mockWs({ id: 'alice', name: 'Recent' });
+		try {
+			await b.join(mockWs({ id: 'bob' }), 'room', pb);
+			await a.join(old, 'room', pa);
+			await a.join(recent, 'room', pa);
+			await vi.advanceTimersByTimeAsync(1500);
+			await a.leave(recent, pa, closeAll ? undefined : 'room');
+			a.flushDiffs(); b.flushDiffs();
+			for (const tracker of [a, b]) expect(await tracker.list('room')).toContainEqual({ id: 'alice', name: 'Old' });
+			for (const platform of [pa, pb]) expect(platform.published.findLast(frame => frame.event === 'diff' && frame.data.joins.alice)?.data.joins.alice).toEqual({ id: 'alice', name: 'Old' });
+		} finally { a.destroy(); b.destroy(); vi.useRealTimers(); }
+	});
 	it('keeps transient fields out of same-turn join rosters on both instances', async () => {
 		const client = mockRedisClient();
 		const options = { binary: false, transient: ['typing'] };

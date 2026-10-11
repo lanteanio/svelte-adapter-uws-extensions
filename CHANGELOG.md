@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Presence heartbeats retain identity authority so a surviving tab can restore its selected identity after the original field TTL.
+
 - Sharded subscription admission restores channels lost while another subscription reply is pending and ignores confirmations from ended connections.
 
 - Redis cursor declarations include viewport culling, backpressure options, viewport accessors, and fan-out statistics.
