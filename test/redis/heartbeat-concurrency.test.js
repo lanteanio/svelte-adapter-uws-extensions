@@ -11,7 +11,7 @@ import { keySlot, coalescedMultiSlot } from '../../src/shared/cluster.js';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 afterEach(resetRuntimeEnv);
 
-it.each([false, true])('reports completion after every owner and errors before supersession (failure %s)', async failure => {
+it.each([false, true])('reports completion after every owner and errors while a newer tick waits (failure %s)', async failure => {
 	const client = mockRedisClient();
 	const redis = client.redis;
 	redis.nodes = () => [redis];
