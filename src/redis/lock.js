@@ -9,7 +9,10 @@
  * to bail, but is advisory. For strict single-writer correctness across a
  * stall, make the protected resource reject stale writes, or use the
  * task runner (Postgres fence). The internal fence token guards release and
- * heartbeat only; it is not surfaced to `fn`.
+ * heartbeat only; it is not surfaced to `fn`. With `fence: true`, a separate
+ * persistent monotonic counter is passed as the callback's second argument.
+ * Cooperating holders must use the same Redis client keyPrefix so they share
+ * counter history. The client-relative lock-fences: namespace is reserved.
  *
  * Distinct from `redis/fence`: fence is task-runner-specific
  * (one fence per `taskId`, paired with the Postgres state machine);
@@ -42,6 +45,7 @@ import {
 
 /**
  * @typedef {Object} DistributedLockOptions
+ * @property {boolean} [fence=false] - Pass a persistent monotonic fence as the callback's second argument. The sink must atomically reject stale fences.
  * @property {string} [keyPrefix='lock:'] - Prefix prepended (after the client keyPrefix) to every lock key.
  * @property {number} [defaultTtlMs=30000] - Default TTL on a held lock in milliseconds. Heartbeat refreshes this back to the original value before it elapses. Override per call via `withLock(key, fn, { ttlMs })`.
  * @property {number} [retryDelayMs=50] - Sleep between acquire retries when the key is held by another instance.
@@ -121,9 +125,11 @@ export function createDistributedLock(client, options = {}) {
 	if (options.mapKey !== undefined && typeof options.mapKey !== 'function') {
 		throw new Error('lock: mapKey must be a function');
 	}
+	if (options.fence !== undefined && typeof options.fence !== 'boolean') throw new TypeError('lock: fence must be a boolean');
 	const mapKey = options.mapKey || (() => 'all');
 	const breaker = options.breaker;
 	const redis = client.redis;
+	const counterPrefix = client.key('lock-fences:');
 
 	const m = options.metrics;
 	const mAcquired = m?.counter('lock_acquired_total', 'Locks acquired by key class', ['key_class']);
@@ -151,12 +157,16 @@ export function createDistributedLock(client, options = {}) {
 		if (!Number.isFinite(callMaxWaitMs) || callMaxWaitMs < 0) {
 			throw new Error('lock.withLock: maxWaitMs must be a non-negative number (ms)');
 		}
+		const useFence = callOpts.fence ?? options.fence ?? false;
+		if (typeof useFence !== 'boolean') throw new TypeError('lock.withLock: fence must be a boolean');
+		let orderedFence;
 		const externalSignal = callOpts.signal;
 		if (externalSignal && externalSignal.aborted) {
 			throw externalSignal.reason || new Error('lock.withLock: aborted before acquire');
 		}
 
 		const fullK = fullKey(key);
+		if (fullK.startsWith(counterPrefix)) throw new TypeError('lock: lock-fences: is reserved for monotonic counters');
 		const keyClass = mapKey(key);
 		const fenceToken = randomBytes(16).toString('hex');
 
@@ -176,6 +186,22 @@ export function createDistributedLock(client, options = {}) {
 				throw err;
 			}
 			if (result === 'OK') {
+				if (useFence) {
+					try {
+						const counterKey = counterPrefix + Buffer.from(fullK).toString('base64url');
+						orderedFence = await redis.incr(counterKey);
+						if (!Number.isSafeInteger(orderedFence) || orderedFence < 1) throw new RangeError('lock: fence counter must be a positive safe integer');
+						// A delayed increment may arrive after another holder acquired.
+						// Validate ownership AFTER it, then enforce the conservative
+						// lease deadline below before exposing the fence to user code.
+						// Separate single-key commands also work across Cluster slots.
+						if (await redis.get(fullK) !== fenceToken) throw new LockLostError(key);
+					} catch (error) {
+						breaker?.failure(error);
+						try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken); } catch (releaseError) { breaker?.failure(releaseError); }
+						throw error;
+					}
+				}
 				acknowledgedAt = monotonicNow();
 				mWait?.observe((acknowledgedAt - start) / 1000);
 				mAcquired?.inc({ key_class: keyClass });
@@ -268,7 +294,7 @@ export function createDistributedLock(client, options = {}) {
 
 		let result;
 		try {
-			result = await fn(controller.signal);
+			result = await (useFence ? fn(controller.signal, orderedFence) : fn(controller.signal));
 		} finally {
 			settledAt = monotonicNow();
 			stopped = true;

@@ -40,6 +40,51 @@ describe('redis distributed lock (integration)', () => {
 		await client.quit();
 	});
 
+	it('keeps persistent ordered fences across clients without requiring same-slot keys', async () => {
+		const other = createBackendClient({ keyPrefix: 'inttest-lock:' });
+		try {
+			const first = createDistributedLock(client, { fence: true });
+			const second = createDistributedLock(other, { fence: true });
+			const read = (signal, fence) => fence;
+			await expect(first.withLock('ordered', read)).resolves.toBe(1);
+			await expect(second.withLock('ordered', read)).resolves.toBe(2);
+			await expect(second.withLock('ordered:fence', read)).resolves.toBe(1);
+			expect(await client.redis.pttl(client.key('lock-fences:' + Buffer.from(client.key('lock:ordered')).toString('base64url')))).toBe(-1);
+			await expect(first.withLock('ordered', read)).resolves.toBe(3);
+		} finally { await other.quit(); }
+	});
+
+	it('lets an atomic sink reject an old holder after a successor commits', async () => {
+		const other = createBackendClient({ keyPrefix: 'inttest-lock:' });
+		const sinkKey = client.key('sink-order');
+		const write = (redis, fence) => redis.eval(`
+local previous = tonumber(redis.call('GET', KEYS[1]) or '0')
+local next = tonumber(ARGV[1])
+if next <= previous then return 0 end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+`, 1, sinkKey, fence);
+		let release, entered;
+		const started = new Promise(resolve => { entered = resolve; });
+		const gate = new Promise(resolve => { release = resolve; });
+		const stale = createDistributedLock(client, { fence: true, heartbeatMs: 60000 }).withLock('ordered-sink', async (_, fence) => {
+			entered();
+			await gate;
+			expect(await write(client.redis, fence)).toBe(0);
+		});
+		const rejected = expect(stale).rejects.toBeInstanceOf(LockLostError);
+		try {
+			await started;
+			await client.redis.del(client.key('lock:ordered-sink'));
+			await createDistributedLock(other, { fence: true }).withLock('ordered-sink', async (_, fence) => {
+				expect(await write(other.redis, fence)).toBe(1);
+			});
+			release();
+			await rejected;
+			expect(await client.redis.get(sinkKey)).toBe('2');
+		} finally { release(); await other.quit(); }
+	});
+
 	describe('acquire (SET ... NX PX)', () => {
 		it('writes the prefixed key with a real PX TTL while held', async () => {
 			const lock = createDistributedLock(client, { defaultTtlMs: 5000 });

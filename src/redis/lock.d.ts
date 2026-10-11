@@ -4,6 +4,17 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 
 export interface DistributedLockOptions {
 	/**
+	 * Pass a persistent monotonic fence as the callback's second argument.
+	 * The protected sink must atomically reject fences older than its last
+	 * accepted fence. Counter keys have no TTL and must not be deleted or
+	 * rolled back while the sink retains their values. The client-relative
+	 * `lock-fences:` namespace is reserved for these counters. All holders
+	 * protecting the same resource must use the same Redis client keyPrefix.
+	 * @default false
+	 */
+	fence?: boolean;
+
+	/**
 	 * Prefix prepended (after the client `keyPrefix`) to every lock key.
 	 * @default 'lock:'
 	 */
@@ -53,6 +64,9 @@ export interface DistributedLockOptions {
 }
 
 export interface WithLockOptions {
+	/** Override whether this call receives a monotonic fence. */
+	fence?: boolean;
+
 	/** Override the holder TTL for this call. */
 	ttlMs?: number;
 
@@ -124,7 +138,7 @@ export interface DistributedLock {
 	 */
 	withLock<T>(
 		key: string,
-		fn: (signal: AbortSignal) => Promise<T> | T,
+		fn: (signal: AbortSignal, fence?: number) => Promise<T> | T,
 		options?: WithLockOptions
 	): Promise<T>;
 }

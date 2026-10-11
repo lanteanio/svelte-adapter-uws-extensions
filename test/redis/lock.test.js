@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import {
 	createDistributedLock,
@@ -299,6 +299,100 @@ describe('redis distributed lock', () => {
 			await sleep(5);
 			expect(signalSeen.aborted).toBe(true);
 			await result;
+		});
+	});
+
+	describe('monotonic fences', () => {
+		it('is opt-in and preserves the one-argument callback by default', async () => {
+			const increment = vi.spyOn(client.redis, 'incr');
+			const lock = createDistributedLock(client);
+			const callback = vi.fn(() => 'ok');
+			await expect(lock.withLock('plain', callback)).resolves.toBe('ok');
+			expect(callback.mock.calls[0]).toHaveLength(1);
+			expect(increment).not.toHaveBeenCalled();
+		});
+
+		it('increments across independent factories and permits a per-call override', async () => {
+			const first = createDistributedLock(client, { fence: true });
+			const second = createDistributedLock(client);
+			const read = (signal, fence) => fence;
+			await expect(first.withLock('ordered', read)).resolves.toBe(1);
+			await expect(second.withLock('ordered', read, { fence: true })).resolves.toBe(2);
+			await expect(first.withLock('ordered', read, { fence: false })).resolves.toBeUndefined();
+			await expect(second.withLock('ordered', read, { fence: true })).resolves.toBe(3);
+			expect(await client.redis.get(client.key('lock-fences:' + Buffer.from(client.key('lock:ordered')).toString('base64url')))).toBe('3');
+		});
+
+		it('shares a counter between factory prefixes that name the same lease', async () => {
+			const first = createDistributedLock(client, { fence: true });
+			const alias = createDistributedLock(client, { keyPrefix: '', fence: true });
+			const read = (_, fence) => fence;
+			await expect(first.withLock('alias', read)).resolves.toBe(1);
+			await expect(alias.withLock('lock:alias', read)).resolves.toBe(2);
+			await expect(first.withLock('alias', read)).resolves.toBe(3);
+		});
+
+		it('keeps suffix-named leases separate from persistent counters', async () => {
+			const lock = createDistributedLock(client, { fence: true });
+			const read = (_, fence) => fence;
+			await expect(lock.withLock('x', read)).resolves.toBe(1);
+			await expect(lock.withLock('x:fence', read)).resolves.toBe(1);
+			await expect(lock.withLock('x', read)).resolves.toBe(2);
+			const unprefixed = createDistributedLock(client, { keyPrefix: '' });
+			await expect(unprefixed.withLock('lock-fences:any', () => {})).rejects.toThrow(/reserved/);
+			await expect(createDistributedLock(client, { keyPrefix: 'lock-' }).withLock('fences:any', () => {})).rejects.toThrow(/reserved/);
+		});
+
+		it('releases its lease without calling user code when increment fails', async () => {
+			const failure = new Error('counter unavailable');
+			vi.spyOn(client.redis, 'incr').mockRejectedValueOnce(failure);
+			const callback = vi.fn();
+			await expect(createDistributedLock(client, { fence: true }).withLock('failed', callback)).rejects.toBe(failure);
+			expect(callback).not.toHaveBeenCalled();
+			expect(await client.redis.get(client.key('lock:failed'))).toBeNull();
+		});
+
+		it('refuses unsafe integer counters without invoking user code', async () => {
+			await client.redis.set(client.key('lock-fences:' + Buffer.from(client.key('lock:overflow')).toString('base64url')), String(Number.MAX_SAFE_INTEGER));
+			const callback = vi.fn();
+			await expect(createDistributedLock(client, { fence: true }).withLock('overflow', callback)).rejects.toBeInstanceOf(RangeError);
+			expect(callback).not.toHaveBeenCalled();
+			expect(await client.redis.get(client.key('lock:overflow'))).toBeNull();
+		});
+
+		it('refuses a delayed former holder even when its counter exceeds its successor', async () => {
+			const increment = client.redis.incr.bind(client.redis);
+			let unblock, entered;
+			const admitted = new Promise(resolve => { entered = resolve; });
+			const gate = new Promise(resolve => { unblock = resolve; });
+			vi.spyOn(client.redis, 'incr').mockImplementationOnce(async key => { entered(); await gate; return increment(key); });
+			const callback = vi.fn();
+			const first = createDistributedLock(client, { fence: true }).withLock('delayed', callback);
+			const verdict = expect(first).rejects.toBeInstanceOf(LockLostError);
+			await admitted;
+			await client.redis.del(client.key('lock:delayed'));
+			await expect(createDistributedLock(client, { fence: true }).withLock('delayed', (_, fence) => fence)).resolves.toBe(1);
+			unblock();
+			await verdict;
+			expect(callback).not.toHaveBeenCalled();
+			expect(await client.redis.get(client.key('lock-fences:' + Buffer.from(client.key('lock:delayed')).toString('base64url')))).toBe('2');
+		});
+
+		it('refuses a counter reply outside the conservative lease deadline', async () => {
+			let clock = 0;
+			setRuntimeEnv({ clock: { monotonic: () => clock } });
+			const increment = client.redis.incr.bind(client.redis);
+			vi.spyOn(client.redis, 'incr').mockImplementationOnce(async key => { clock = 100; return increment(key); });
+			const callback = vi.fn();
+			try {
+				await expect(createDistributedLock(client, { fence: true, defaultTtlMs: 50 }).withLock('expired', callback)).rejects.toBeInstanceOf(LockLostError);
+				expect(callback).not.toHaveBeenCalled();
+			} finally { resetRuntimeEnv(); }
+		});
+
+		it('rejects non-boolean fence options', async () => {
+			expect(() => createDistributedLock(client, { fence: 'yes' })).toThrow(TypeError);
+			await expect(createDistributedLock(client).withLock('x', () => {}, { fence: 1 })).rejects.toThrow(TypeError);
 		});
 	});
 
