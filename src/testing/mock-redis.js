@@ -1122,7 +1122,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// Idempotency abort (compare-and-delete: DEL iff owner token matches).
 				// Its DEL would otherwise look like the fence-release script; the
 				// IDEM_ABORT marker keeps them distinct and is matched first.
-				if (script.includes('IDEM_ABORT')) {
+				if (script.includes('IDEM_ABORT') || script.includes('SESSION_ERASE_RECORD')) {
 					return evalIdempotencyAbort(args);
 				}
 				// Fence heartbeat (refresh PEXPIRE iff value matches)
@@ -1146,7 +1146,12 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const matchIdx = args.indexOf('MATCH');
 				const pattern = matchIdx !== -1 ? args[matchIdx + 1] : '*';
 
-				const allKeys = [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()];
+				const typeIdx = args.indexOf('TYPE');
+				const type = typeIdx === -1 ? null : args[typeIdx + 1];
+				const maps = { string: store, zset: sortedSets, hash: hashes, stream: streams };
+				const allKeys = type === null
+					? [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()]
+					: [...(maps[type]?.keys() ?? [])];
 				const matched = allKeys.filter((k) => globMatch(pattern, k));
 				return ['0', matched];
 			},

@@ -23,9 +23,26 @@
  * @module svelte-adapter-uws-extensions/redis/session
  */
 
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanAndUnlink, scanBatches } from '../shared/redis-scan.js';
+import { evalCached } from '../shared/eval-cached.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { randomBytes, wallEpoch } from '../shared/runtime.js';
+
+// Delete only the exact record inspected; a concurrent replacement survives.
+const ERASE_RECORD = `
+-- SESSION_ERASE_RECORD
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('UNLINK', KEYS[1])
+end
+return 0
+`;
+
+function incompleteIndex(cause) {
+	const error = new Error('session: erasure index incomplete', { cause });
+	error.code = 'ERASURE_INDEX_INCOMPLETE';
+	error.erasureIndexIncomplete = true;
+	return error;
+}
 
 // Per-connection slot for the loaded session on `ws.getUserData()`. `Symbol.for`
 // so a duplicated module instance (SvelteKit bundles dep files into build/)
@@ -147,8 +164,12 @@ export function createDistributedSession(client, options = {}) {
 	async function indexToken(data, token) {
 		if (!forgetUserId) return;
 		let uid;
-		try { uid = forgetUserId(data); } catch { return; }
-		if (typeof uid !== 'string' || uid.length === 0) return;
+		try { uid = forgetUserId(data); } catch (err) { throw incompleteIndex(err); }
+		return indexOwner(uid, token);
+	}
+	async function indexOwner(uid, token) {
+		if (uid == null || uid === '') return;
+		if (typeof uid !== 'string') throw incompleteIndex();
 		const idxKey = byUserKey(uid);
 		try {
 			const hexOk = await hexpireProbe.ready();
@@ -156,9 +177,12 @@ export function createDistributedSession(client, options = {}) {
 			tx.hset(idxKey, token, '1');
 			if (hexOk) tx.hpexpire(idxKey, ttlMs, 'FIELDS', 1, token);
 			else tx.pexpire(idxKey, ttlMs);
-			await tx.exec();
+			const result = await tx.exec();
+			if (!Array.isArray(result) || result.some((row) => !Array.isArray(row) || row[0])) {
+				throw new Error('session: index transaction failed');
+			}
 			breaker?.success();
-		} catch (err) { breaker?.failure(err); /* index best-effort; the session is written */ }
+		} catch (err) { breaker?.failure(err); throw incompleteIndex(err); }
 	}
 
 	function validateToken(token) {
@@ -237,33 +261,12 @@ export function createDistributedSession(client, options = {}) {
 				// session outlives its index entry and escapes purgeUser. touch
 				// carries no data, so the owning user is derived with one extra
 				// GET - only incurred when erasure indexing is wired, and
-				// best-effort: an index miss must not fail the touch.
+				// required: an index failure must fail the touch.
 				try {
 					const raw = await redis.get(key);
 					breaker?.success();
-					if (raw != null) {
-						let p;
-						let parsed = false;
-						try {
-							p = JSON.parse(raw);
-							parsed = true;
-						} catch { /* corrupt record: nothing to index */ }
-						if (parsed) {
-							// touch cannot tell raw-layer data from a lifecycle record
-							// ({ d, c }) without reading it, and the shapes can collide
-							// (raw data may itself carry `d`/`c`). A shape guess mis-indexes
-							// the collision and lets the record's TTL slide while its index
-							// field expires - a purgeUser escape. Index against both candidate
-							// shapes instead; indexToken is a no-op when the extractor finds
-							// no owner, so whichever layer this actually is gets its index
-							// field slid and neither can escape erasure.
-							await indexToken(p, token);
-							if (p !== null && typeof p === 'object' && 'd' in p && 'c' in p) {
-								await indexToken(p.d, token);
-							}
-						}
-					}
-				} catch (err) { breaker?.failure(err); }
+					if (raw != null) await indexOwner(recordOwner(raw), token);
+				} catch (err) { breaker?.failure(err); throw incompleteIndex(err); }
 			}
 			return refreshed;
 		} catch (err) {
@@ -342,7 +345,7 @@ export function createDistributedSession(client, options = {}) {
 		}
 		if (refreshOnGet) {
 			try { await redis.pexpire(key, ttlMs); breaker?.success(); } catch (err) { breaker?.failure(err); }
-			// Slide the index field with the record (see get()); best-effort.
+			// Slide the index field with the record (see get()).
 			await indexToken(rec.d, token);
 		}
 		return { data: rec.d, createdAt };
@@ -479,10 +482,32 @@ export function createDistributedSession(client, options = {}) {
 		return session ? session.data : null;
 	}
 
+	function recordOwner(raw) {
+		let data;
+		try { data = JSON.parse(raw); } catch (err) { throw incompleteIndex(err); }
+		// The raw and lifecycle APIs share a key format. Refuse ambiguous
+		// historical records rather than attributing one user's data to another.
+		const candidates = [data];
+		if (data && typeof data === 'object' && 'd' in data && 'c' in data) candidates.push(data.d);
+		const owners = new Set();
+		let failure;
+		for (const candidate of candidates) {
+			try {
+				const owner = forgetUserId(candidate);
+				if (owner != null && owner !== '') {
+					if (typeof owner !== 'string') throw incompleteIndex();
+					owners.add(owner);
+				}
+			} catch (err) { failure = err; }
+		}
+		if (owners.size > 1 || (owners.size === 0 && failure)) throw incompleteIndex(failure);
+		return owners.values().next().value;
+	}
+
 	/**
 	 * Right-to-erasure (`live.forget`): revoke every session a user holds. Reads
-	 * the per-user token index (maintained when a `forgetUserId` extractor is
-	 * configured) and UNLINKs each token, then drops the index. A no-op when no
+	 * the per-user token index and scans primary records to recover missing index
+	 * entries. Deletes compare the inspected bytes so replacements survive. A no-op when no
 	 * extractor is wired - session values are opaque to the store, so without one
 	 * a user's tokens are not addressable. `tenantId` is accepted for the uniform
 	 * store contract; the index is keyed by raw userId.
@@ -493,20 +518,40 @@ export function createDistributedSession(client, options = {}) {
 	async function purgeUser(tenantId, userId) {
 		if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
 		const idxKey = byUserKey(userId);
-		let tokens;
-		try { tokens = await redis.hkeys(idxKey); breaker?.success(); }
-		catch (err) { breaker?.failure(err); return 0; }
-		if (!tokens || tokens.length === 0) {
-			try { await redis.unlink(idxKey); } catch { /* best-effort */ }
-			return 0;
-		}
-		// Refuse legacy namespace collisions before deleting any indexed key.
-		// An old caller token may otherwise name another user's index.
+		const tokens = await redis.hkeys(idxKey).catch((err) => {
+			breaker?.failure(err);
+			throw incompleteIndex(err);
+		});
 		for (const token of tokens) validateToken(token);
-		// Per-token UNLINK: each token key routes to its own slot under cluster.
-		const results = await Promise.all(tokens.map((t) => redis.unlink(fullKey(t)).catch(() => 0)));
-		try { await redis.unlink(idxKey); } catch { /* best-effort */ }
-		return results.reduce((n, r) => n + (Number(r) > 0 ? 1 : 0), 0);
+		try {
+			// The primary record is authoritative. A missing/expired index field
+			// or an earlier failed MULTI cannot hide it. Scan bounded batches on
+			// every cluster master, retaining no whole-keyspace list in memory.
+			const prefix = client.key(keyPrefix);
+			const pattern = prefix.replace(/[\\*?\[\]]/g, '\\$&') + '*';
+			let removed = 0;
+			await scanBatches(redis, pattern, async (keys) => {
+				for (const key of keys) {
+					if (!key.startsWith(prefix) || key.slice(prefix.length).startsWith('byuser:')) continue;
+					for (let attempt = 0; attempt < 8; attempt++) {
+						const raw = await redis.get(key);
+						if (raw === null || recordOwner(raw) !== userId) break;
+						if (Number(await evalCached(redis, ERASE_RECORD, 1, key, raw)) === 1) {
+							removed++;
+							break;
+						}
+						if (attempt === 7) throw incompleteIndex();
+					}
+				}
+			}, 'string');
+			for (const token of tokens) await redis.hdel(idxKey, token);
+			breaker?.success();
+			return removed;
+		} catch (err) {
+			breaker?.failure(err);
+			if (err?.erasureIndexIncomplete) throw err;
+			throw incompleteIndex(err);
+		}
 	}
 
 	return {

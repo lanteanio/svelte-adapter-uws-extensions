@@ -8,11 +8,14 @@ import { isCluster } from './cluster.js';
  * @param {import('ioredis').Redis} node
  * @param {string} pattern
  * @param {(keys: string[]) => Promise<void> | void} onKeys
+ * @param {string} [type] - Optional Redis key type filter.
  */
-async function scanNodeBatches(node, pattern, onKeys) {
+async function scanNodeBatches(node, pattern, onKeys, type) {
 	let cursor = '0';
 	do {
-		const [nextCursor, keys] = await node.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+		const args = ['MATCH', pattern, 'COUNT', 100];
+		if (type) args.push('TYPE', type);
+		const [nextCursor, keys] = await node.scan(cursor, ...args);
 		cursor = nextCursor;
 		if (keys.length > 0) await onKeys(keys);
 	} while (cursor !== '0');
@@ -131,4 +134,17 @@ export async function scanUnlinkExcept(redis, pattern, keep, onKept) {
 			}
 		});
 	}
+}
+
+/**
+ * Visit bounded batches across every primary without collecting all keys.
+ * @param {any} redis
+ * @param {string} pattern
+ * @param {(keys: string[]) => Promise<void> | void} onKeys
+ * @param {string} [type] - Optional Redis key type filter.
+ */
+export async function scanBatches(redis, pattern, onKeys, type) {
+	const targets = scanTargets(redis);
+	if (targets.length === 0) throw new Error('redis scan: no primary nodes available');
+	for (const node of targets) await scanNodeBatches(node, pattern, onKeys, type);
 }

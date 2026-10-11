@@ -66,7 +66,10 @@ export interface DistributedSessionOptions<T = unknown> {
 	/**
 	 * Right-to-erasure: extract the owning userId from session data at write time
 	 * so `live.forget` can revoke every session a user holds. Without it, sessions
-	 * are not user-purgeable (the token is opaque to the store).
+	 * are not user-purgeable (the token is opaque to the store). The extractor also
+	 * runs during erasure recovery and must identify stored data consistently.
+	 * Writes and TTL refreshes reject with `code: 'ERASURE_INDEX_INCOMPLETE'`
+	 * and `erasureIndexIncomplete: true` when index maintenance fails.
 	 */
 	forgetUserId?: (data: T) => string | null | undefined;
 
@@ -94,7 +97,7 @@ export interface DistributedSession<T = unknown> {
 	set(token: string, data: T): Promise<void>;
 
 	/**
-	 * Extend TTL without reading data. Returns `true` if the entry was
+	 * Extend TTL, reading data when erasure indexing is configured. Returns `true` if the entry was
 	 * present and refreshed, `false` if the token was missing or already
 	 * expired.
 	 */
@@ -112,9 +115,16 @@ export interface DistributedSession<T = unknown> {
 	 * Not a hot-path operation; use for graceful-shutdown teardowns,
 	 * test harnesses, or operator-initiated wipes.
 	 */
-	/** Right-to-erasure: revoke every session a user holds (needs `forgetUserId`). */
-	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
+
+	/**
+	 * Revoke every session a user holds (needs `forgetUserId`). Scans primary
+	 * records in bounded batches across all Redis primaries to recover missing
+	 * index entries. Cost scales with the Redis keyspace. Ambiguous ownership,
+	 * corrupt records and Redis failures reject with ERASURE_INDEX_INCOMPLETE.
+	 * User IDs are globally unique; tenantId does not partition this legacy store.
+	 */
+	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
 	 * Mint a NEW session server-side and return its opaque 256-bit CSPRNG token.
