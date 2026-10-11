@@ -45,7 +45,7 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * @property {number} [ttl=0] - TTL in seconds for replay keys (0 = no expiry)
  * @property {'replicated'} [durability] - Opt into per-publish replication signalling. After the write, runs `WAIT minReplicas replicationTimeoutMs`; throws `ReplicationTimeoutError` and skips the local broadcast when fewer than `minReplicas` replicas ack.
  * @property {number} [minReplicas=1] - Minimum replicas that must ack before publish is considered durable. Required when `durability: 'replicated'`.
- * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` blocks indefinitely (Redis WAIT semantics).
+ * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` disables the Redis WAIT timeout; client command and socket deadlines still apply (5000 ms by default).
  * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, shared by sorted-set and stream storage.
  */
 

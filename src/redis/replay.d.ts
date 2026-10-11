@@ -34,8 +34,9 @@ export interface RedisReplayOptions {
 	 */
 	minReplicas?: number;
 	/**
-	 * Per-publish replication timeout in milliseconds. `0` blocks
-	 * indefinitely (Redis WAIT semantics). Only consulted when
+	 * Per-publish replication timeout in milliseconds. `0` disables only the
+	 * Redis WAIT timeout; client command and socket deadlines still apply
+	 * (5000 ms by default). Only consulted when
 	 * `durability: 'replicated'`.
 	 * @default 1000
 	 */
