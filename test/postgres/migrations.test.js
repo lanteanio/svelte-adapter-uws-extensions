@@ -59,6 +59,18 @@ describe('PostgreSQL migration contracts', () => {
 		expect(client.connect).toHaveBeenCalledTimes(2);
 		expect(jobs.status()).toEqual({ state: 'ready', error: null });
 	});
+	it.each(['PG_CAPACITY_EXCEEDED', '08006', '40001', '53300', '55P03', '57014', '57P01', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'])('retries automatic initialization after transient %s', async code => {
+		const client = mockPgClient();
+		const connect = client.connect;
+		const failure = Object.assign(new Error('temporary initialization refusal'), { code });
+		client.connect = vi.fn().mockRejectedValueOnce(failure).mockImplementation(connect);
+		const jobs = createJobQueue(client);
+		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+		expect(jobs.status()).toEqual({ state: 'idle', error: failure });
+		await jobs.enqueue('test', { recovered: true });
+		expect(client.connect).toHaveBeenCalledTimes(2);
+		expect(jobs.status()).toEqual({ state: 'ready', error: null });
+	});
 	it('keeps disabled automatic migration read-only and reports an absent schema', async () => {
 		const client = mockPgClient();
 		client.connect = vi.fn(client.connect);

@@ -170,7 +170,7 @@ Ordinary operations with automatic migration disabled
 retain their existing behavior; explicitly await readiness before traffic.
 
 `status()` returns `{ state, error }`, where state is `idle`, `checking`, `ready`
-or `failed`. Concurrent readiness calls share work. Failed automatic initialization is latched for ordinary operations, including retention ticks; they reject the stored error without repeating DDL. After repairing the cause, explicitly retry `ready()` or recreate the store.
+or `failed`. Concurrent readiness calls share work. Schema, data and privilege failures are latched for ordinary operations, including retention ticks; they reject the stored error without repeating DDL. After repairing the cause, explicitly retry `ready()` or recreate the store. Recognized temporary admission, connection, resource, transaction, shutdown and lock/query deadline failures return to `idle`; the next operation retries the resumable migration through the same single flight, with exponential backoff from 100 ms to five seconds.
 Successful readiness is cached for that store instance. Use
 `validateSchema(client, { store, table })` for a fresh read-only validation, with
 a ten-second bound per catalog operation. This is a point-in-time check, not a

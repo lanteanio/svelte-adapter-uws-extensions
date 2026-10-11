@@ -191,19 +191,32 @@ export async function postgresReadiness(client, components = []) {
 }
 
 export function createStoreSchema(client, store, table, automatic) {
-	let state = 'idle', failure = null, pending = null, complete = false;
+	const retryable = error => error?.code === 'PG_CAPACITY_EXCEEDED'
+		|| error?.name === 'TimeoutError'
+		|| ['Query read timeout', 'Connection terminated unexpectedly', 'Connection terminated', 'Connection terminated due to connection timeout', 'timeout exceeded when trying to connect'].includes(error?.message)
+		|| /^(08|40|53)/.test(error?.code ?? '')
+		|| ['55P03', '57014', '57P01', '57P02', '57P03', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error?.code);
+	let state = 'idle', failure = null, pending = null, complete = false, retryAt = 0, retryDelay = 0;
 	function ready() {
 		if (complete) return Promise.resolve();
 		if (pending) return pending;
 		state = 'checking'; failure = null;
-		pending = (automatic ? migrate(client, { store, table }) : validateSchema(client, { store, table }))
-			.then(() => { complete = true; state = 'ready'; }, error => { state = 'failed'; failure = error; throw error; })
+		pending = Promise.resolve().then(async () => {
+			const delay = retryAt - monotonicNow();
+			if (delay > 0) await new Promise(resolve => setTimer(resolve, delay));
+			return automatic ? migrate(client, { store, table }) : validateSchema(client, { store, table });
+		})
+			.then(() => { complete = true; state = 'ready'; }, error => {
+				state = retryable(error) ? 'idle' : 'failed'; failure = error;
+				if (state === 'idle') { retryDelay = Math.min(retryDelay ? retryDelay * 2 : 100, 5000); retryAt = monotonicNow() + retryDelay; }
+				throw error;
+			})
 			.finally(() => { pending = null; });
 		return pending;
 	}
 	return {
-		// Failed DDL stays failed for ordinary traffic. Only an explicit startup
-		// gate retries after the operator has repaired schema/data/privileges.
+		// Schema/data/privilege errors need explicit repair. Transient connection,
+		// admission and lock failures retry on the next ordinary operation.
 		ensure: automatic ? () => state === 'failed' ? Promise.reject(failure) : ready() : () => Promise.resolve(),
 		ready,
 		status: () => ({ state, error: failure })

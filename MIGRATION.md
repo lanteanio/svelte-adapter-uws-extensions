@@ -64,7 +64,7 @@ privileges from runtime access and permits transaction pooling for ordinary
 queries, subject to the client's connection settings. Notification bridges still
 need their own persistent session.
 
-A failed automatic migration is latched for ordinary store operations. After
+An automatic migration that fails schema, data or privilege validation is latched for ordinary store operations. Recognized transient admission, connection, resource, transaction and deadline failures retry with shared exponential backoff from 100 ms to five seconds. After
 repairing the cause, explicitly retry `ready()` or recreate the store; requests
 and retention ticks do not repeatedly rebuild an invalid index. Successful
 readiness remains cached. See [PostgreSQL support](docs/postgres-support.md#schema-transitions-and-readiness)

@@ -4,6 +4,7 @@ import { createPgClient, migrate } from '../../../src/postgres/index.js';
 import { createReplay } from '../../../src/postgres/replay.js';
 import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 import { createTaskRunner } from '../../../src/postgres/tasks.js';
+import { createJobQueue } from '../../../src/postgres/jobs.js';
 
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/migration-0.5.10.json', import.meta.url), 'utf8'));
 const guide = readFileSync(new URL('../../../docs/postgres-support.md', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
@@ -19,6 +20,20 @@ async function migrateManually(client, base, table) {
 function connect() { return createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false }); }
 
 describe('PostgreSQL migration readiness', () => {
+	it('recovers automatic initialization after owned pool admission fills', async () => {
+		const client = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, maxInFlight: 1 });
+		const jobs = createJobQueue(client, { table: 'migration_capacity_jobs' });
+		const held = client.query('SELECT pg_sleep(0.2)');
+		try {
+			await expect(jobs.enqueue('test', {})).rejects.toMatchObject({ code: 'PG_CAPACITY_EXCEEDED' });
+			expect(jobs.status().state).toBe('idle');
+		} finally { await held; }
+		try {
+			await jobs.enqueue('test', { recovered: true });
+			expect(jobs.status().state).toBe('ready');
+			expect(await jobs.claim('test')).toMatchObject([{ payload: { recovered: true } }]);
+		} finally { await client.end(); }
+	});
 	it.each([true, false])('preserves old replay authority through migration (automatic=%s)', async (autoMigrate) => {
 		const client = connect();
 		const table = 'migration_replay', seqTable = table + '_seq';
