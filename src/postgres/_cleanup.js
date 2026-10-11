@@ -90,7 +90,7 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 	}
 	const runs = metrics?.counter('postgres_cleanup_runs_total', 'PostgreSQL retention passes by outcome', ['store', 'result']);
 	const removed = metrics?.counter('postgres_cleanup_rows_total', 'Rows committed by PostgreSQL retention cleanup', ['store']);
-	const duration = metrics?.histogram('postgres_cleanup_duration_seconds', 'PostgreSQL retention pass duration in seconds', ['store']);
+	const duration = metrics?.histogram('postgres_cleanup_duration_seconds', 'PostgreSQL retention pass duration in seconds', ['store'], [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]);
 	let stopped = false;
 	let timer;
 	let trailingTimer;

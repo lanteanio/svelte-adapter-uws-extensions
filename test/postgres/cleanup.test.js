@@ -117,4 +117,20 @@ describe('bounded PostgreSQL maintenance', () => {
 		} finally { first.stop(); second.stop(); }
 	});
 
+	it('separates slow cleanup durations above one second', async () => {
+		let clock = 0, elapsed = 1500;
+		setRuntimeEnv({ clock: { monotonic: () => clock } });
+		const { client } = checkout(), metrics = createMetrics();
+		const cleanup = scheduleCleanup({ client, table: 'cache', kind: 'idempotency', interval: 0, metrics,
+			ready: async () => { clock += elapsed; }, work: async () => {} });
+		try {
+			await cleanup.run(); elapsed = 6000; await cleanup.run();
+			const text = metrics.serialize();
+			expect(text).toContain('postgres_cleanup_duration_seconds_bucket{store="idempotency",le="1"} 0');
+			expect(text).toContain('postgres_cleanup_duration_seconds_bucket{store="idempotency",le="2.5"} 1');
+			expect(text).toContain('postgres_cleanup_duration_seconds_bucket{store="idempotency",le="10"} 2');
+			expect(text).toContain('postgres_cleanup_duration_seconds_bucket{store="idempotency",le="60"} 2');
+		} finally { cleanup.stop(); }
+	});
+
 });

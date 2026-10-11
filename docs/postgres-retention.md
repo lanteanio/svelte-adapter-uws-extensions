@@ -87,3 +87,8 @@ when replicas share a table; `waiting` means this client already has a pending
 maintenance checkout. Neither waiting nor stopped passes reset breaker health. Query `pg_stat_user_tables`, index validity, database
 logs and replication lag before reducing cleanup intervals; tuning the timer does
 not repair missing indexes or insufficient database capacity.
+
+The cleanup duration histogram uses seconds with buckets at 0.001, 0.005, 0.01,
+0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30 and 60, plus infinity. Duration
+includes schema readiness and checkout, so slow initialization remains visible
+above the normal one-second maintenance budget.
