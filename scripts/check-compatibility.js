@@ -64,6 +64,14 @@ export function replaceBlocks(source, blocks) {
 	return source;
 }
 
+export function renderMigrationBlocks(rows) {
+	const current = rows.find(row => row.current === 'true');
+	return {
+		'migration-floor': '### The adapter peer floor is `svelte-adapter-uws >= ' + current.adapter_version + '`',
+		'migration-action': '**Action.** Bump `svelte-adapter-uws` to `' + current.adapter_version + '` or later in the same\nupgrade. The ecosystem packages move together (see the version table in the\nREADME).'
+	};
+}
+
 export function installedCompatibility() {
 	let directory = dirname(fileURLToPath(import.meta.resolve('svelte-adapter-uws/testing')));
 	for (let depth = 0; depth < 12; depth++) {
@@ -83,10 +91,12 @@ function main() {
 	const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 	const { adapter, rows } = installedCompatibility();
 	validateCompatibility(rows, pkg, adapter, { release: process.argv.includes('--release') });
-	const path = join(root, 'README.md'), source = readFileSync(path, 'utf8');
-	const expected = replaceBlocks(source, renderBlocks(rows));
-	if (process.argv.includes('--write')) writeFileSync(path, expected);
-	else if (source !== expected) throw new Error('Compatibility blocks are stale; run node scripts/check-compatibility.js --write');
+	for (const [name, blocks] of [['README.md', renderBlocks(rows)], ['MIGRATION.md', renderMigrationBlocks(rows)]]) {
+		const path = join(root, name), source = readFileSync(path, 'utf8');
+		const expected = replaceBlocks(source, blocks);
+		if (process.argv.includes('--write')) writeFileSync(path, expected);
+		else if (source !== expected) throw new Error(name + ' compatibility blocks are stale; run node scripts/check-compatibility.js --write');
+	}
 	console.log('check-compatibility: declared tuple, Node engine, native pin and adapter peer floor match the installed manifest' + (process.argv.includes('--release') ? '; publication version matches' : ''));
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

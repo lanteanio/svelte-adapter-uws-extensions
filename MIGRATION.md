@@ -75,7 +75,9 @@ for the catalog contract, migration limits and role setup.
 These fail at install, at import, or from a factory, so they fail on the
 deploy rather than in production traffic. Fix them before you ship.
 
+<!-- compatibility-migration-floor:start -->
 ### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.95`
+<!-- compatibility-migration-floor:end -->
 
 **Symptom.** `npm ERR! ERESOLVE unable to resolve dependency tree` (or a peer
 warning under `--legacy-peer-deps`) naming `svelte-adapter-uws`, at install
@@ -92,9 +94,11 @@ pressure-reason table from that entry point. `0.6.0-next.95` supplies the
 sequence authority contract for explicit `null` and `bigint` choices, keeping
 local and relayed publications consistent.
 
+<!-- compatibility-migration-action:start -->
 **Action.** Bump `svelte-adapter-uws` to `0.6.0-next.95` or later in the same
 upgrade. The ecosystem packages move together (see the version table in the
 README).
+<!-- compatibility-migration-action:end -->
 
 ### PostgreSQL custom table names are limited to 42 bytes
 

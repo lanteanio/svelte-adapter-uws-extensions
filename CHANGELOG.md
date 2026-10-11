@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redis bus `publishBatched` ignores non-array input, matching the adapter with tracing enabled or disabled.
 
+- Generate the migration guide's adapter prerequisites from the installed compatibility manifest and reject stale version instructions.
+
 - Gate Redis publication, replay and presence command counts against standalone and Cluster backends, including sixfold workload and subscriber scaling.
 
 - Require the declared Node prerequisite for development checks and the exact ecosystem package version before publication.

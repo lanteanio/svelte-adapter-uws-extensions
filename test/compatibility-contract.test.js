@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { installedCompatibility, parseCompatibility, renderBlocks, replaceBlocks, validateCompatibility } from '../scripts/check-compatibility.js';
+import { installedCompatibility, parseCompatibility, renderBlocks, renderMigrationBlocks, replaceBlocks, validateCompatibility } from '../scripts/check-compatibility.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+const migration = readFileSync(new URL('../MIGRATION.md', import.meta.url), 'utf8');
 const { adapter, rows } = installedCompatibility();
 const currentIndex = rows.findIndex(row => row.current === 'true');
 const change = edit => { const next = structuredClone(rows); edit(next[currentIndex], next); return next; };
@@ -16,9 +17,17 @@ describe('installed adapter compatibility declaration', () => {
 	it('pins the declared train, installation and peer floor before tests and publication', () => {
 		expect(validateCompatibility(rows, pkg, adapter)).toEqual(rows[currentIndex]);
 		expect(replaceBlocks(readme, renderBlocks(rows))).toBe(readme);
+		expect(replaceBlocks(migration, renderMigrationBlocks(rows))).toBe(migration);
 		expect(pkg.scripts.check.split(' && ')).toContain('node scripts/check-compatibility.js');
 		expect(pkg.scripts.pretest).toBe('npm run check');
 		expect(pkg.scripts.prepublishOnly).toBe('node scripts/check-compatibility.js --release && npm run check');
+	});
+
+	it('updates both migration prerequisites when the adapter floor changes', () => {
+		const future = change(row => { row.adapter_version = '0.6.0-next.999'; });
+		const expected = replaceBlocks(migration, renderMigrationBlocks(future));
+		expect(expected).toContain('### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.999`');
+		expect(expected).toContain('**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.999`');
 	});
 
 	it.each(['table', 'install', 'floor'])('detects hand-edited %s content and refuses duplicate or missing ownership markers', name => {
@@ -55,6 +64,7 @@ describe('installed adapter compatibility declaration', () => {
 			mkdirSync(join(fixture, 'scripts'));
 			copyFileSync(new URL('../scripts/check-compatibility.js', import.meta.url), join(fixture, 'scripts/check-compatibility.js'));
 			writeFileSync(join(fixture, 'README.md'), readme);
+			writeFileSync(join(fixture, 'MIGRATION.md'), migration);
 			writeFileSync(join(fixture, 'package.json'), JSON.stringify({ ...pkg, version: '0.0.0' }));
 			symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(fixture, 'node_modules'), 'junction');
 			const run = args => spawnSync(process.execPath, [join(fixture, 'scripts/check-compatibility.js'), ...args], { encoding: 'utf8', timeout: 15000, windowsHide: true });
@@ -65,6 +75,12 @@ describe('installed adapter compatibility declaration', () => {
 			writeFileSync(join(fixture, 'package.json'), JSON.stringify({ ...pkg, version: rows[currentIndex].extensions_version }));
 			const matched = run(['--release']);
 			expect(matched.status, matched.stderr).toBe(0);
+			writeFileSync(join(fixture, 'MIGRATION.md'), migration.replace(renderMigrationBlocks(rows)['migration-action'], 'Incorrect minimum version'));
+			const drift = run([]);
+			expect(drift.status).toBe(1);
+			expect(drift.stderr).toContain('MIGRATION.md compatibility blocks are stale');
+			expect(run(['--write']).status).toBe(0);
+			expect(readFileSync(join(fixture, 'MIGRATION.md'), 'utf8')).toBe(migration);
 		} finally { rmSync(fixture, { recursive: true, force: true }); }
 	}, 30000);
 
