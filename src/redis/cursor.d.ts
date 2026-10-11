@@ -96,6 +96,10 @@ export interface RedisCursorOptions {
 	 * @default 0
 	 */
 	minMove?: number;
+	/** Per-subscriber viewport culling. Disabled by default; padding and cell default to 256. */
+	viewport?: boolean | { enabled?: boolean; padding?: number; cell?: number };
+	/** Skip subscribers whose buffered bytes exceed the cap. Disabled by default. */
+	backpressure?: boolean | { enabled?: boolean; maxBufferedBytes?: number };
 }
 
 export interface CursorEntry {
@@ -219,6 +223,11 @@ export interface RedisCursorTracker {
 	 */
 	list(topic: string): Promise<CursorEntry[]>;
 
+	/** Record a subscriber's viewport. Malformed rectangles are ignored; zoom defaults to 1. */
+	viewport(ws: any, topic: string, rect: { x: number; y: number; w: number; h: number; zoom?: number }): void;
+	/** Last reported viewport, or null if this subscriber has not reported one. */
+	viewportFor(ws: any, topic: string): { x: number; y: number; w: number; h: number; zoom: number } | null;
+
 	/** Clear all cursor state (local and Redis). */
 	clear(): Promise<void>;
 
@@ -253,6 +262,10 @@ export interface RedisCursorTracker {
 		dirtyTopicsCurrent: number;
 		activeTopicsTotal: number;
 		jitterDropped: number;
+		viewportsReported: number;
+		perSubscriberFlushes: number;
+		bpSkips: number;
+		culledEntriesDropped: number;
 	};
 
 	/**

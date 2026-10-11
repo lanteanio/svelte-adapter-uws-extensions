@@ -56,6 +56,7 @@ process.stdout.write(version);
 		writeFileSync(join(work, 'consumer.ts'), `
 import { createDistributedSession, type DistributedSessionOptions } from 'svelte-adapter-uws-extensions/redis/session';
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';
+import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
 import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
@@ -73,6 +74,16 @@ platform.publishBatched([], { compress: 'true' });
 // @ts-expect-error Coalescing keys must be strings.
 platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 1 }]);
 declare const redis: RedisClient;
+const cursor = createCursor(redis, { viewport: { enabled: true, padding: 64, cell: 128 }, backpressure: { enabled: true, maxBufferedBytes: 4096 } });
+createCursor(redis, { viewport: true, backpressure: true });
+cursor.viewport({}, 'room', { x: 0, y: 0, w: 100, h: 100 });
+cursor.viewport({}, 'room', { x: 0, y: 0, w: 100, h: 100, zoom: 2 });
+const rect: { x: number; y: number; w: number; h: number; zoom: number } | null = cursor.viewportFor({}, 'room');
+const cursorStats: number[] = [cursor.stats().viewportsReported, cursor.stats().perSubscriberFlushes, cursor.stats().bpSkips, cursor.stats().culledEntriesDropped];
+// @ts-expect-error Viewport width must be numeric.
+cursor.viewport({}, 'room', { x: 0, y: 0, w: '100', h: 100 });
+// @ts-expect-error Backpressure enablement must be boolean.
+createCursor(redis, { backpressure: { enabled: 'true' } });
 interface SessionData { userId: string; count: number }
 const options: DistributedSessionOptions<SessionData> = { forgetUserId: data => data.userId };
 const explicit = createDistributedSession<SessionData>(redis, options);

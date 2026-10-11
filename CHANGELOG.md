@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Redis cursor declarations include viewport culling, backpressure options, viewport accessors, and fan-out statistics.
+
 - Redis bus `publishBatched` ignores non-array input, matching the adapter with tracing enabled or disabled.
 
 - Require the declared Node prerequisite for development checks and the exact ecosystem package version before publication.
