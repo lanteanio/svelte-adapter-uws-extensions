@@ -213,6 +213,7 @@ export function createDistributedLock(client, options = {}) {
 
 		let lost = false;
 		let stopped = false;
+		let settledAt;
 		let lostError;
 		// One timer caps its next wake-up at the last confirmed lease deadline,
 		// including while a Redis reply is pending. Refreshes never queue up.
@@ -223,8 +224,8 @@ export function createDistributedLock(client, options = {}) {
 				const sentAt = monotonicNow();
 				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
 				breaker?.success();
-				if (lost) return;
-				if (Number(r) !== 1 || monotonicNow() >= leaseDeadline) {
+				if (lost || (stopped && !finishWaiter)) return;
+				if (Number(r) !== 1 || (settledAt ?? monotonicNow()) >= leaseDeadline) {
 					lost = true;
 					lostError = new LockLostError(key);
 					mLost?.inc({ key_class: keyClass });
@@ -245,6 +246,11 @@ export function createDistributedLock(client, options = {}) {
 			if (lost) return;
 			const remaining = leaseDeadline - monotonicNow();
 			if (remaining <= 0) {
+				if (stopped && settledAt < leaseDeadline) {
+					finishWaiter?.();
+					finishWaiter = undefined;
+					return;
+				}
 				lost = true;
 				lostError = new LockLostError(key);
 				mLost?.inc({ key_class: keyClass });
@@ -264,11 +270,12 @@ export function createDistributedLock(client, options = {}) {
 		try {
 			result = await fn(controller.signal);
 		} finally {
+			settledAt = monotonicNow();
 			stopped = true;
 			// Keep deadline observation alive while an admitted refresh settles.
 			// Expiry releases this wait even if the transport never replies.
 			if (inFlight && !lost) {
-				if (monotonicNow() >= leaseDeadline) {
+				if (settledAt >= leaseDeadline) {
 					lost = true;
 					lostError = new LockLostError(key);
 					mLost?.inc({ key_class: keyClass });
@@ -283,7 +290,11 @@ export function createDistributedLock(client, options = {}) {
 			// controller without lostLock firing. No context: the lock key is the
 			// application's, and it can embed a user or an order id.
 			assert(!lost || controller.signal.aborted, 'lock.heartbeat.signal-aborted-iff-lost');
-			if (!lost) {
+			if (!lost && inFlight) {
+				// The callback completed inside its lease, but its refresh never
+				// replied. Release best-effort without delaying completed work.
+				void evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken).catch(err => breaker?.failure(err));
+			} else if (!lost) {
 				try {
 					const released = await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);
 					if (Number(released) !== 1) {
@@ -295,9 +306,8 @@ export function createDistributedLock(client, options = {}) {
 					breaker?.success();
 				} catch (err) {
 					breaker?.failure(err);
-					// Only a positive release proves ownership beyond the conservative
-					// deadline; a failed command cannot support a successful result.
-					if (monotonicNow() >= leaseDeadline) {
+					// Cleanup latency cannot invalidate work completed inside the lease.
+					if (settledAt >= leaseDeadline) {
 						lost = true;
 						lostError = new LockLostError(key);
 						mLost?.inc({ key_class: keyClass });

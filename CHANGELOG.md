@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve a Redis lock callback's successful result when it completed inside the confirmed lease and only cleanup exceeded the deadline.
+
 ### Breaking Changes
 
 - Task `heartbeatInterval` must be an integer from zero up to, but not including, the fence lifetime in milliseconds. Zero keeps the default; invalid, fractional and lease-length overrides now throw.

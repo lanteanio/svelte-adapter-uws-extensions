@@ -51,6 +51,13 @@ it('allows best-effort release errors before the confirmed deadline', async () =
 	await expect(lock.withLock('key', () => { now = 50; return 'done'; })).resolves.toBe('done');
 });
 
+it('preserves completion inside the lease when release fails after its deadline', async () => {
+	const lock = createDistributedLock(client, { defaultTtlMs: 100 }); let signal;
+	client.redis.eval = async () => { now = 150; throw new Error('late failure'); };
+	await expect(lock.withLock('key', s => { signal = s; now = 90; return 'done'; })).resolves.toBe('done');
+	expect(signal.aborted).toBe(false);
+});
+
 it('allows an authoritative release to confirm ownership after the local conservative deadline', async () => {
 	const lock = createDistributedLock(client, { defaultTtlMs: 100 });
 	await expect(lock.withLock('key', () => { now = 120; return 'done'; })).resolves.toBe('done');
@@ -77,14 +84,16 @@ it('anchors a successful renewal to its send time rather than reply time', async
 	expect(outcome.error).toBeInstanceOf(LockLostError); expect(signal.aborted).toBe(true);
 });
 
-it('settles at expiry when the callback finished but its heartbeat never replied', async () => {
+it('preserves completed work at expiry when its heartbeat never replied', async () => {
 	const started = deferred(), finish = deferred(), entered = deferred(), reply = deferred();
+	let signal;
 	client.redis.eval = async () => { entered.resolve(); await reply.promise; return 1; };
 	const lock = createDistributedLock(client, { defaultTtlMs: 100, heartbeatMs: 20 });
-	const result = lock.withLock('key', async () => { started.resolve(); await finish.promise; return 'done'; }).then(value => ({ value }), error => ({ error }));
+	const result = lock.withLock('key', async s => { signal = s; started.resolve(); await finish.promise; return 'done'; }).then(value => ({ value }), error => ({ error }));
 	await started.promise; now = 20; tick(); await entered.promise; finish.resolve(); await flush();
 	now = 120; tick(); const outcome = await result; reply.resolve(); await flush();
-	expect(outcome.error).toBeInstanceOf(LockLostError);
+	expect(outcome.value).toBe('done');
+	expect(signal.aborted).toBe(false);
 });
 
 it('never starts a callback after a stale acquisition acknowledgement', async () => {
