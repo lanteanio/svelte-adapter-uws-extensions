@@ -39,6 +39,14 @@ schema teardown runs afterward. Increase cardinality within the documented range
 only on a host that can complete this bounded collection. A failed run creates no
 success artifact. The CLI omits raw database errors and connection information.
 
+The native test uses 100,000 rows per store and rejects claim, recovery and
+cleanup scans visiting 5,000 or more rows, as well as temporary spills. This
+is a deterministic regression bound for this fixture, not a production latency
+guarantee. Task migration version 3 adds a partial pending-row index ordered
+by creation time; apply it before runtime readiness when automatic migrations
+are disabled. Alarm evidence includes generation allocation and its retained
+authority table.
+
 The native test is executable with the repository integration configuration:
 
 ~~~text

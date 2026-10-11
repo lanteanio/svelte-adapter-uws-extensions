@@ -353,3 +353,7 @@ version before deployment; neither substitutes for a host restore drill.
 
 For backup scope, coupled restore groups and the read-only verification command,
 see [Storage recovery](./recovery.md).
+
+Task migration version 3 creates the partial pending-task creation-time index
+concurrently. Apply the full migration before runtime readiness with automatic
+migrations disabled; it preserves the earlier migration checksums.

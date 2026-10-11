@@ -15,7 +15,7 @@ import { createDeadLetter } from '../src/postgres/dead-letter.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../src/shared/runtime.js';
 import { verifyPostgresVersion } from './check-postgres-support.js';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_dead_letter'];
+const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_alarms_generations', 'plan_dead_letter'];
 const digest = value => createHash('sha256').update(value).digest('hex');
 const sqlText = value => String(value).trim().replace(/\s+/g, ' ');
 const numeric = value => value === undefined ? undefined : Number(value);
@@ -45,8 +45,9 @@ async function seed(client, rows) {
 		SELECT md5('task-'||i)::uuid,CASE WHEN i%20=0 THEN 'cold' ELSE 'hot' END,jsonb_build_object('value',i),CASE (i/20)%4 WHEN 0 THEN 'running' WHEN 1 THEN 'pending' WHEN 2 THEN 'committed' ELSE 'failed' END,md5('fence-'||i)::uuid,now()-interval '1 minute',now()-interval '1 hour' FROM generate_series(1,$1::int) i`, [rows]);
 	await client.query(`INSERT INTO plan_idempotency(svti_idempotency_key,status,result,expires_at)
 		SELECT 'key-'||i,'committed',jsonb_build_object('value',i),now()+interval '1 second'*CASE WHEN i%5=0 THEN -3600 ELSE 3600 END FROM generate_series(1,$1::int) i`, [rows]);
-	await client.query(`INSERT INTO plan_alarms(topic,fire_at,meta)
-		SELECT 'alarm-'||i,(extract(epoch from now())*1000)::bigint+CASE WHEN i%20=0 THEN -1000 ELSE 3600000 END,jsonb_build_object('value',i) FROM generate_series(1,$1::int) i`, [rows]);
+	await client.query(`INSERT INTO plan_alarms(topic,fire_at,meta,generation)
+		SELECT 'alarm-'||i,(extract(epoch from now())*1000)::bigint+CASE WHEN i%20=0 THEN -1000 ELSE 3600000 END,jsonb_build_object('value',i),1 FROM generate_series(1,$1::int) i`, [rows]);
+	await client.query('INSERT INTO plan_alarms_generations(topic,reserved,committed) SELECT topic,1,1 FROM plan_alarms');
 	await client.query(`INSERT INTO plan_dead_letter(topic,event,data,failed_at)
 		SELECT CASE WHEN i%20=0 THEN 'cold' ELSE 'hot' END,'event',jsonb_build_object('value',i),(extract(epoch from now())*1000)::bigint-i*1000 FROM generate_series(1,$1::int) i`, [rows]);
 	// Deterministic update churn leaves dead tuples for the before-vacuum sample.
@@ -87,7 +88,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		throw new Error('PostgreSQL plan collection exceeded its 60-second budget'); };
 	const record = (input, values) => {
 		const text = typeof input === 'string' ? input : input.text;
-		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms|dead_letter)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !text.includes('pg_try_advisory_xact_lock')) {
+		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms(?:_generations)?|dead_letter)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !text.includes('pg_try_advisory_xact_lock')) {
 			const fingerprint = digest(sqlText(text)), key = label + ':' + fingerprint;
 			if (!queries.has(key)) {
 				if (queries.size >= 128)
@@ -168,9 +169,10 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		await capture('idempotency.commit', () => slot.commit({ ok: true }));
 		const abort = await idem.acquire('abort-key');
 		await capture('idempotency.abort', () => abort.abort());
-		await capture('alarms.set', () => alarms.set('new-alarm', Date.now() + 1000, { value: 1 }));
+		const generation = await capture('alarms.reserve', () => alarms.nextGeneration('new-alarm'));
+		await capture('alarms.set', () => alarms.set('new-alarm', Date.now() + 1000, { value: 1 }, generation));
 		await capture('alarms.due', () => alarms.due(Date.now()));
-		await capture('alarms.delete', () => alarms.delete('alarm-20'));
+		await capture('alarms.delete', () => alarms.delete('alarm-20', '1'));
 		const id = await capture('deadLetter.add', () => dlq.add({ webhookId: 'hook', topic: 'hot', event: 'event', data: { value: 1 }, attempts: 1, error: 'timeout' }));
 		await capture('deadLetter.get', () => dlq.get(id));
 		await capture('deadLetter.list', () => dlq.list({ topic: 'cold', limit: 25 }));

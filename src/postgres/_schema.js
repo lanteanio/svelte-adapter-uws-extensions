@@ -70,6 +70,12 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 	}
 	schema.checkpoints = { 1: schema.baseline, 2: schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] })) };
 	const versions = [baseline, constraints];
+	if (store === 'tasks') {
+		const pending = index('pending_created', ['created_at'], "status = 'pending'");
+		main.indexes.push(pending);
+		versions.push([indexSql(table, pending)]);
+		schema.checkpoints[3] = schema.tables;
+	}
 	if (store === 'alarm-store') {
 		const authority = { name: `${table}_generations`, columns: [text('topic', true), ['reserved', 'bigint', true, '0'], ['committed', 'bigint', true, '0']], primary: ['topic'], indexes: [], checks: [check('authority', 'reserved >= 0 AND committed >= 0 AND reserved >= committed')], privileges: ['SELECT', 'INSERT', 'UPDATE'] };
 		main.columns = [...main.columns, ['generation', 'bigint', true]];

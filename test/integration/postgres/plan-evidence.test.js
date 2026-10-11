@@ -9,7 +9,7 @@ afterAll(async () => { await client.query('DROP TABLE public.plan_jobs'); await 
 function nodes(plan) { return [plan, ...(plan.children || []).flatMap(nodes)]; }
 it('captures real plans, statement I/O and churn across all durable stores in an owned schema', async () => {
 	const before = (await client.query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'plan_probe_%' ORDER BY nspname")).rows;
-	const report = await collectPostgresPlans({ connectionString: process.env.INTEGRATION_POSTGRES_URL, rows: 5000 });
+	const report = await collectPostgresPlans({ connectionString: process.env.INTEGRATION_POSTGRES_URL, rows: 100000 });
 	expect(report.server.major).toBeGreaterThanOrEqual(16);
 	expect(report.plans.length).toBeGreaterThan(30);
 	for (const store of ['replay', 'jobs', 'tasks', 'idempotency', 'alarms', 'deadLetter'])
@@ -21,16 +21,28 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 		expect(statements.length).toBeGreaterThan(0);
 		expect(statements.some(p => nodes(p.plan).some(n => n.index)), operation).toBe(true);
 	}
+	for (const operation of ['jobs.claim.hot', 'jobs.claim.cold', 'tasks.claim', 'tasks.reclaim', 'replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup']) {
+		const statements = report.plans.filter(p => p.operation === operation);
+		expect(statements.length, operation).toBeGreaterThan(0);
+		for (const statement of statements) {
+			const scans = nodes(statement.plan).filter(n => n.relation && n.node.includes('Scan'));
+			for (const scan of scans) {
+				const visited = ((scan.actualRows || 0) + (scan.filteredRows || 0)) * (scan.loops || 1);
+				expect(visited, operation + ': ' + JSON.stringify(scan)).toBeLessThan(5000);
+			}
+			expect(nodes(statement.plan).every(n => !(n.tempReads || n.tempWrites)), operation).toBe(true);
+		}
+	}
 	expect(report.statementStats.available).toBe(true);
 	expect(report.statementStats.records.length).toBeGreaterThan(0);
 	expect(report.statementStats.records.some(r => r.calls > 0 && r.shared_blks_hit > 0)).toBe(true);
 	expect((await client.query('SELECT marker FROM public.plan_jobs')).rows).toEqual([{marker:'preserve-existing'}]);
-	expect(report.storage).toHaveLength(7);
+	expect(report.storage).toHaveLength(8);
 	expect(report.sourceSha256['replay.js']).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.collectorSha256).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.lockfileSha256).toMatch(/^[a-f0-9]{64}$/);
-	expect(report.vacuum).toHaveLength(7);
-	expect(report.afterVacuum).toHaveLength(7);
+	expect(report.vacuum).toHaveLength(8);
+	expect(report.afterVacuum).toHaveLength(8);
 	expect(report.afterVacuum.map(row => row.relname)).toEqual(report.tableHealth.map(row => row.relname));
 	for (const row of report.afterVacuum) {
 		expect(Number.isFinite(Number(row.n_dead_tup))).toBe(true);

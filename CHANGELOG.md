@@ -130,6 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Index pending PostgreSQL task dispatch through a new migration and assert bounded claim, recovery and cleanup scans at 100,000 rows per store. Update alarm plan collection for ordered generations.
+
 - Extend PostgreSQL cleanup duration histogram buckets through 60 seconds to distinguish slow initialization and checkout waits.
 
 - Follow exhausted PostgreSQL retention passes with at most 100 ms of jitter so maintenance can drain a backlog. `cleanupInterval` is a maximum randomized delay, including startup, and requires an integer.
