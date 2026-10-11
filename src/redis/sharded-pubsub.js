@@ -1257,7 +1257,7 @@ export function createShardedBus(client, options = {}) {
 				return results;
 			}));
 			const publishBatchedTraced = (messages, options) => {
-				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
+				if (!Array.isArray(messages)) return;
 				if (messages.length === 0) return;
 				messages = collapseByCoalesceKey(messages);
 				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
@@ -1310,7 +1310,7 @@ export function createShardedBus(client, options = {}) {
 			// per call. Receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
 			const publishBatchedUntraced = (messages, options) => {
-				if (!Array.isArray(messages)) throw new TypeError('sharded bus: publishBatched requires an array of messages');
+				if (!Array.isArray(messages)) return;
 				if (messages.length === 0) return;
 				messages = collapseByCoalesceKey(messages);
 				for (let i = 0; i < messages.length; i++) {

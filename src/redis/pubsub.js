@@ -531,7 +531,7 @@ export function createPubSubBus(client, options = {}) {
 				return results;
 			}));
 			const publishBatchedTraced = (messages, options) => {
-				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
+				if (!Array.isArray(messages)) return;
 				if (messages.length === 0) return;
 				messages = collapseByCoalesceKey(messages);
 				if (!relaysAny(messages)) { platform.publishBatched(messages, options); return; }
@@ -573,7 +573,7 @@ export function createPubSubBus(client, options = {}) {
 			// whole list; receivers fan out via local `platform.publishBatched`
 			// for one wire frame per subscriber. Empty arrays no-op.
 			const publishBatchedUntraced = (messages, options) => {
-				if (!Array.isArray(messages)) throw new TypeError('pubsub bus: publishBatched requires an array of messages');
+				if (!Array.isArray(messages)) return;
 				if (messages.length === 0) return;
 				messages = collapseByCoalesceKey(messages);
 				const relayable = new Array(messages.length);
