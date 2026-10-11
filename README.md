@@ -3278,6 +3278,8 @@ The predicate receives `(res, req)` and returns truthy to allow or falsy to deny
 
 Metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*` and label names must match `[a-zA-Z_][a-zA-Z0-9_]*` (no `__` prefix). Invalid names throw at registration time. HELP text containing backslashes or newlines is escaped automatically.
 
+Use `gauge.remove(labels?)` when a sample becomes unavailable. It removes only the matching validated label set, leaves the metric family registered, and is safe to repeat. A later `set` recreates the sample; missing data is never published as zero or `NaN`.
+
 #### Cardinality control
 
 Identifier labels default to `all`. To distinguish a bounded set of non-identifying classes, use `mapTopic` with a safe fallback for every unmatched topic:

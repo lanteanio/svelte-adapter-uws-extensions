@@ -39,6 +39,8 @@ export interface Counter {
 }
 
 export interface Gauge {
+	/** Remove only this sample; set() recreates it without re-registering the metric. */
+	remove(labels?: Record<string, string>): void;
 	/** Set the gauge to an absolute value. */
 	set(labels: Record<string, string>, n: number): void;
 	set(n: number): void;

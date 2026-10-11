@@ -272,6 +272,11 @@ class Gauge {
 		this.collectFn = fn;
 	}
 
+	remove(labels) {
+		validateLabels(labels, this.labelNames, this.name);
+		this.samples.delete(labelKey(labels));
+	}
+
 	serialize() {
 		if (this.collectFn) {
 			this.samples.clear();
