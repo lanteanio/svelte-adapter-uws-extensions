@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep registry cohort expiry leases across overlapping owner migrations and reconcile them on heartbeats without blocking ordinary cohort sends on Redis reads.
+
 - Add `Gauge.remove(labels?)` to retract unavailable samples while preserving metric registration and allowing later numeric samples.
 
 - Preserve a Redis lock callback's successful result when it completed inside the confirmed lease and only cleanup exceeded the deadline.

@@ -379,7 +379,7 @@ export function createConnectionRegistry(client, options) {
 	function applyOpenEvent(userId, ownerInstanceId, attrs) {
 		if (destroyed) return;
 		indexChecks.delete(userId);
-		if (!localUsers.has(userId)) {
+		if (ownerInstanceId !== instanceId || !localUsers.has(userId)) {
 			const expiresAt = monotonicNow() + ttl * 1000;
 			remoteIndex.set(userId, { owner: ownerInstanceId, expiresAt });
 			nextIndexCheck = Math.min(nextIndexCheck, expiresAt);
@@ -698,6 +698,10 @@ export function createConnectionRegistry(client, options) {
 		const due = [];
 		nextIndexCheck = Infinity;
 		for (const [userId, record] of remoteIndex) {
+			if (localUsers.has(userId)) {
+				nextIndexCheck = Math.min(nextIndexCheck, now + heartbeatInterval);
+				continue;
+			}
 			if (record.expiresAt > now) {
 				nextIndexCheck = Math.min(nextIndexCheck, record.expiresAt);
 				continue;
@@ -1437,10 +1441,6 @@ export function createConnectionRegistry(client, options) {
 			throw new Error('registry.sendTo: criteria must include at least one attribute key');
 		}
 
-		if (indexRefresh || (nextIndexCheck !== Infinity && monotonicNow() >= nextIndexCheck)) {
-			const refresh = reconcileIndex();
-			if (refresh) return refresh.then(() => sendTo(norm, topic, event, data));
-		}
 		const matches = resolveMatches(norm);
 		if (matches.size === 0) {
 			mSendTo?.inc({ result: 'empty' });

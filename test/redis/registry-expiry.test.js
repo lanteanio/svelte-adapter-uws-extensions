@@ -57,20 +57,26 @@ it('expires dead owners in a sibling with no local users and without a lookup', 
 	await send();
 	expect(publishes).toEqual([]);
 });
-it('checks expired matches before sendTo even when the heartbeat has not fired', async () => {
+it('sends without a Redis read between expiry and the next heartbeat', async () => {
 	await openRemote();
 	await client.redis.del(client.key('conns:remote'));
 	now = 1001;
+	await send();
+	expect(publishes).toHaveLength(1);
+	await tick();
+	publishes.length = 0;
 	await send();
 	expect(publishes).toEqual([]);
 });
 it('retains a living peer and reconciles migrated attributes from authoritative rows', async () => {
 	await openRemote();
 	now = 1001;
+	await tick();
 	await send();
 	expect(publishes).toHaveLength(1);
 	await client.redis.hset(client.key('conns:remote'), 'instanceId', 'fedcba9876543210', 'attrs', JSON.stringify({ role: 'editor' }));
 	now = 2002;
+	await tick();
 	await send();
 	expect(publishes).toHaveLength(1);
 	await send({ role: 'editor' });
@@ -89,6 +95,7 @@ it.each(['close', 'forget', 'open', 'destroy'])('a pending reconciliation cannot
 		} });
 	};
 	now = 1001;
+	await tick();
 	const sending = send();
 	await flush();
 	if (action === 'destroy') await registry.destroy();
@@ -107,6 +114,7 @@ it('drops expired attributes on read failure and recovers living peers by a late
 		if (key === 'exec') return async () => { throw new Error('offline'); }; return target[key];
 	} }); };
 	now = 1001;
+	await tick();
 	await send();
 	expect(publishes).toEqual([]);
 	client.redis.pipeline = pipeline;
@@ -124,6 +132,33 @@ it('never expires locally connected users when Redis is absent', async () => {
 	expect(platform.sent).toHaveLength(1);
 });
 
+it('expires a foreign owner after its overlapping local connection closes', async () => {
+	const ws = mockWs({ userId: 'migrated', sessionId: 'session', attrs: { email } });
+	await registry.hooks.open(ws, { platform });
+	await openRemote('migrated');
+	now = 1001;
+	await tick();
+	await send();
+	expect(platform.sent).toHaveLength(1);
+	await registry.hooks.close(ws, { platform });
+	await client.redis.del(client.key('conns:migrated'));
+	now = 1101;
+	await tick();
+	await send();
+	expect(publishes).toEqual([]);
+});
+
+it('keeps steady cohort sends free of revalidation reads as remote leases become due', async () => {
+	for (let i = 0; i < 100; i++) { now = i * 10; await openRemote('remote-' + i); }
+	const read = client.redis.hgetall.bind(client.redis);
+	let reads = 0;
+	client.redis.hgetall = (...args) => { reads++; return read(...args); };
+	for (now = 1000; now < 2000; now += 10) await send();
+	expect(reads).toBe(0);
+	await tick();
+	expect(reads).toBe(100);
+});
+
 it('bounds refresh batches and shares one refresh across concurrent sends', async () => {
 	for (let i = 0; i < 205; i++) await openRemote('remote-' + i);
 	const pipeline = client.redis.pipeline.bind(client.redis);
@@ -138,6 +173,7 @@ it('bounds refresh batches and shares one refresh across concurrent sends', asyn
 		} });
 	};
 	now = 1001;
+	await tick();
 	await Promise.all([send(), send()]);
 	expect(sizes).toEqual([100, 100, 5]);
 	expect(publishes).toHaveLength(2);
