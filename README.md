@@ -1602,6 +1602,8 @@ Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres;
 
 Redis-backed counterpart to the core `createCursor` plugin. Await `attach(ws, topic, platform)` before sending updates so subscription admission and the shared snapshot complete. Cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
 
+Presence `join()` and cursor `update()` reject topic names containing quotes, backslashes or control characters with `TypeError` before retaining state. Presence `sync()` and cursor `snapshot()` silently ignore invalid topic names before authorization or reads.
+
 Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
@@ -3318,7 +3320,7 @@ wirePublishRateMetrics(platform, metrics, { topN: 10 });
 export const close = connectionMetricsHook(metrics);
 ```
 
-`wirePublishRateMetrics` registers `ws_topic_publish_rate{topic="..."}` and `ws_topic_publish_bytes{topic="..."}` gauges that read `platform.pressure.topPublishers` at scrape time - no continuous accounting on the publish hot path. The `topN` cap (default 10) bounds gauge cardinality; the registry's `mapTopic` (or an inline `mapTopic` option) can further collapse user-generated topic names.
+`wirePublishRateMetrics` registers `ws_topic_publish_rate{topic="..."}` and `ws_topic_publish_bytes{topic="..."}` gauges that read `platform.pressure.topPublishers` at scrape time - no continuous accounting on the publish hot path. The `topN` cap (default 10) bounds gauge cardinality; topic labels default to `all`, including custom registries without `mapTopic`. An explicit `mapTopic` (on the registry or inline) can opt into bounded topic categories.
 
 `connectionMetricsHook(metrics, userClose?)` returns a close-hook that emits per-connection histograms (`ws_connection_duration_seconds`, `ws_connection_messages_in` / `_out`, `ws_connection_bytes_in` / `_out`) plus a `ws_connection_close_total{code}` counter from the close-ctx fields the adapter populates. Compose with your own close logic by passing a function as the second argument; it runs after the metrics are recorded:
 
@@ -4364,6 +4366,8 @@ configureForget({
 ```
 
 `createForgetStore` attempts every store even if one fails, then rejects if any failed (svelte-realtime maps that to `FORGET_STORE_FAILED` - retry the erasure), and returns a per-store removal-count breakdown. Each store exposes `purgeUser(tenantId, userId)`:
+
+Session erasure scans string records in bounded batches across all Redis primaries, so missing reverse-index entries do not hide sessions. Its Redis ACL needs `SCAN` and scripting permissions. Corrupt or ambiguous records and Redis failures reject with `code: 'ERASURE_INDEX_INCOMPLETE'` and `erasureIndexIncomplete: true`; retry after repair. Session user IDs remain globally unique: `tenantId` does not partition this store.
 
 **`tenantId` format.** Either `null` for the untenanted scope, or a string of up to 64 characters from `[a-zA-Z0-9_.:-]` - so domains (`acme.com`) and namespaced ids (`acme:eu`) are fine. The scope is decided by a prefix match on the wire topic (`@t/<tenantId>/<topic>`), which is why `/` is refused: it would make tenant `a` and tenant `a/b` both match `@t/a/b/x`, and one tenant's erasure would reach another's rooms. A non-string is refused rather than coerced - on an erasure path a silent miss is worse than a loud failure, because the data was written under whatever representation the writer used. Stringify at the call site with that same representation.
 

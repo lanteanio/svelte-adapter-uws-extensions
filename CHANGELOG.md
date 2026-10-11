@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recover Redis session erasure from missing reverse-index entries, report incomplete index operations, and preserve concurrently replaced sessions.
+
+- Reject unframeable presence and cursor topic names before retaining state, and ignore invalid observer snapshots before authorization.
+
+- Pin identifier-free topic labels for custom metric registries across cursor, stream replay, sharded pub/sub and Postgres replay.
+
 - Keep registry cohort expiry leases across overlapping owner migrations and reconcile them on heartbeats without blocking ordinary cohort sends on Redis reads.
 
 - Add `Gauge.remove(labels?)` to retract unavailable samples while preserving metric registration and allowing later numeric samples.
