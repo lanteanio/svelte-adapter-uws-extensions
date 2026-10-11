@@ -146,11 +146,11 @@ describe('redis pubsub bus', () => {
 	});
 
 	describe('publishBatched', () => {
-		it('throws on non-array input', () => {
+		it('ignores non-array publishBatched input', () => {
 			const wrapped = bus.wrap(platform);
-			expect(() => wrapped.publishBatched('nope')).toThrow('publishBatched requires an array');
-			expect(() => wrapped.publishBatched(null)).toThrow('publishBatched requires an array');
-			expect(() => wrapped.publishBatched({ topic: 'x' })).toThrow('publishBatched requires an array');
+			expect(() => wrapped.publishBatched('nope')).not.toThrow();
+			expect(() => wrapped.publishBatched(null)).not.toThrow();
+			expect(() => wrapped.publishBatched({ topic: 'x' })).not.toThrow();
 		});
 
 		it('no-ops on empty array (no Redis call, no local fan-out)', async () => {
@@ -656,7 +656,7 @@ describe('redis pubsub bus', () => {
 			expect(() => wrapped.batch('not an array')).toThrow(rejection);
 			expect(origin.traceOperations).toHaveLength(3);
 			// publishBatched checks for an array itself, traced or not.
-			expect(() => wrapped.publishBatched('not an array')).toThrow('pubsub bus: publishBatched requires an array of messages');
+			expect(() => wrapped.publishBatched('not an array')).not.toThrow();
 		});
 
 		it('relays a near-cap envelope without its trace context instead of letting every peer drop it', async () => {

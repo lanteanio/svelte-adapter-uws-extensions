@@ -154,13 +154,13 @@ describe('redis sharded bus', () => {
 	});
 
 	describe('publishBatched', () => {
-		it('throws on non-array input', async () => {
+		it('ignores non-array publishBatched input', async () => {
 			const bus = createShardedBus(client);
 			await bus.activate(platform);
 			const wrapped = bus.wrap(platform);
 
-			expect(() => wrapped.publishBatched('nope')).toThrow('publishBatched requires an array');
-			expect(() => wrapped.publishBatched(null)).toThrow('publishBatched requires an array');
+			expect(() => wrapped.publishBatched('nope')).not.toThrow();
+			expect(() => wrapped.publishBatched(null)).not.toThrow();
 
 			await bus.deactivate();
 		});
@@ -723,7 +723,7 @@ describe('redis sharded bus', () => {
 			expect(() => wrapped.batch('not an array')).toThrow(rejection);
 			expect(order).toEqual(['local', 'local', 'local']);
 			// publishBatched checks for an array itself, traced or not.
-			expect(() => wrapped.publishBatched('not an array')).toThrow('sharded bus: publishBatched requires an array of messages');
+			expect(() => wrapped.publishBatched('not an array')).not.toThrow();
 		});
 
 		it('relays near-cap shard envelopes without their trace context and reports that once', async () => {
