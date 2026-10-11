@@ -96,9 +96,9 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 	let trailingTimer;
 	let trailingRequested = false;
 	let running = false;
-	function schedule() {
+	function schedule(maxDelay = interval) {
 		if (stopped || interval === 0) return;
-		timer = setTimer(tick, Math.max(1, Math.ceil(randomFloat() * interval)));
+		timer = setTimer(tick, Math.max(1, Math.ceil(randomFloat() * maxDelay)));
 		timer?.unref?.();
 	}
 	async function run(trailing = false) {
@@ -119,6 +119,7 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 			runs?.inc({ store: kind, result: result.result });
 			if (result.rows) removed?.inc({ store: kind }, result.rows);
 			if (result.result !== 'waiting' && result.result !== 'stopped') success?.();
+			return result;
 		} catch (error) {
 			runs?.inc({ store: kind, result: 'error' });
 			failure?.(error);
@@ -135,8 +136,8 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 		}
 	}
 	async function tick() {
-		await run();
-		schedule();
+		const outcome = await run();
+		schedule(outcome?.result === 'budget' ? Math.min(interval, 100) : interval);
 	}
 	schedule();
 	return { tick, run, stop() { stopped = true; clearTimer(timer); clearTimer(trailingTimer); } };

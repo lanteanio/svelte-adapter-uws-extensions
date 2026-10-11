@@ -6,7 +6,10 @@ Replay, idempotency, task and dead-letter stores run bounded background maintena
 schema initialization. `cleanupInterval` is the maximum jitter delay in
 milliseconds between settled passes, including the first pass. Each delay is
 chosen independently between 1 ms and that maximum; `0` disables the timer.
-Use an integer no larger than 2147483647. Call the store's `destroy()` when its
+When a pass exhausts its row, query or time budget, the next timer uses at most
+100 ms of jitter instead of the normal interval. This continues until a pass
+finishes, errors or loses ownership, allowing a backlog to drain at the database's
+measured maintenance capacity. Use an integer no larger than 2147483647. Call the store's `destroy()` when its
 owner shuts down. Destroy prevents later passes; an active pass stops between bounded maintenance
 operations. An already-started operation (deadline setup and its statement) may
 finish before its checkout closes.

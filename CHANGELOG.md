@@ -126,6 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Follow exhausted PostgreSQL retention passes with at most 100 ms of jitter so maintenance can drain a backlog. `cleanupInterval` is a maximum randomized delay, including startup, and requires an integer.
+
 - Avoid rewriting settled PostgreSQL alarm generation history during administrative clear.
 
 - Reject PostgreSQL notification startup when a connection error interrupts connect, advisory election or LISTEN, while keeping deliberate shutdown cancellation clean. Verify notification delivery through the documented PgBouncer session route.

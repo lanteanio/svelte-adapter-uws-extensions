@@ -93,3 +93,23 @@ it('a hot early replay topic cannot starve retention for later topics', async ()
 		expect((await client.query(`SELECT seq::int FROM ${tables[2]} WHERE topic='z' ORDER BY seq`)).rows).toEqual([{seq:4},{seq:5}]);
 	} finally { replay.destroy(); }
 });
+
+
+it('accelerates exhausted passes until incoming expired rows and the backlog drain', async () => {
+	const ticks = timers();
+	const store = createIdempotencyStore(client, { table: tables[0], cleanupInterval: 2000 });
+	try {
+		await store.ready();
+		await client.query(`INSERT INTO ${tables[0]} (svti_idempotency_key,status,expires_at) SELECT 'initial-'||i,'committed',now()-interval '1 hour' FROM generate_series(1,3000) i`);
+		let tick = ticks[0];
+		for (let pass = 0; pass < 5; pass++) {
+			await client.query(`INSERT INTO ${tables[0]} (svti_idempotency_key,status,expires_at) SELECT $1||i,'committed',now()-interval '1 hour' FROM generate_series(1,500) i`, ['arrival-' + pass + '-']);
+			await tick.cb();
+			tick = ticks.at(-1);
+			expect(tick.ms).toBe(100);
+		}
+		await tick.cb();
+		expect((await client.query(`SELECT count(*)::int AS remaining FROM ${tables[0]}`)).rows[0].remaining).toBe(0);
+		expect(ticks.at(-1).ms).toBe(2000);
+	} finally { store.destroy(); }
+});
