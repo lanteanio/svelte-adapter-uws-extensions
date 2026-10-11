@@ -190,7 +190,7 @@ export function createAlarmStore(client, options = {}) {
 					await query(`LOCK TABLE ${authority} IN EXCLUSIVE MODE`);
 					const invalid = await query(`SELECT a.topic FROM ${table} a LEFT JOIN ${authority} g ON g.topic = a.topic WHERE g.topic IS NULL OR a.generation <> g.committed LIMIT 1`);
 					if (invalid.rows.length) throw new Error('postgres alarm store: missing or incompatible generation authority for existing alarm');
-					await query(`UPDATE ${authority} SET committed = reserved`);
+					await query(`UPDATE ${authority} SET committed = reserved WHERE committed <> reserved`);
 					await query(`DELETE FROM ${table}`);
 					await query('COMMIT');
 					failed = false;

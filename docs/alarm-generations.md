@@ -54,6 +54,9 @@ writes that commit while it waits even if the connection defaults to stronger
 isolation. Authority is locked before the alarm table, checkout is bounded to ten seconds, lock waits to five seconds,
 and each statement to ten seconds. Failure rolls back and discards the checkout;
 rollback waits at most one second before the connection is discarded.
+Clear scans retained authority but updates only outstanding reservations, avoiding
+row rewrites and WAL for settled history. Its scan cost still grows with lifetime
+topic cardinality; run it during planned maintenance rather than request handling.
 
 Restore the alarm table, authority table and migration ledger from the same
 recovery point. Retained authority includes deleted topics and reservations that

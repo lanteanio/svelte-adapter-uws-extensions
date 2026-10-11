@@ -95,6 +95,16 @@ describe('PostgreSQL ordered alarm generations', () => {
 		expect(await second.get('room')).toMatchObject({ generation: current });
 		expect(await second.set('room', 2, null, pending)).toBe(true);
 	});
+	it('clears without rewriting settled generation history at scale', async () => {
+		await ready();
+		await a.query("INSERT INTO svti_alarms_generations (topic, reserved, committed) SELECT 'history:' || n, 1, 1 FROM generate_series(1, 100000) n");
+		await a.query('CREATE TABLE history_versions AS SELECT topic, xmin::text AS version FROM svti_alarms_generations');
+		const pending = await first.nextGeneration('pending');
+		await first.clear();
+		await first.clear();
+		expect(await first.set('pending', 1, null, pending)).toBe(false);
+		expect((await a.query('SELECT count(*)::int AS changed FROM svti_alarms_generations g JOIN history_versions h USING (topic) WHERE g.xmin::text <> h.version')).rows[0].changed).toBe(0);
+	});
 	it('clear uses READ COMMITTED even when the checkout defaults to REPEATABLE READ', async () => {
 		await ready();
 		const generation = await first.nextGeneration('room'), writer = await b.connect();
