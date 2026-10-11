@@ -1,6 +1,6 @@
 // A topic with a double quote, a backslash or a control character cannot be
 // put into a frame: the adapter throws when it builds the envelope. Presence
-// and cursor ignore such a topic where it enters, and their timers keep going
+// and cursor reject such a topic where it enters, and their timers keep going
 // for every other topic, and report, when one topic's publish throws.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -43,32 +43,52 @@ function reports(warn, event) {
 afterEach(() => vi.restoreAllMocks());
 
 describe('presence and an unframeable topic', () => {
-	it('join() ignores it without storing anything', async () => {
+	it('join() rejects it before selecting data or storing anything', async () => {
 		const client = mockRedisClient('uf1:');
 		const platform = mockPlatform();
-		const presence = createPresence(client, { select: (u) => ({ id: u.id }) });
+		const select = vi.fn((u) => ({ id: u.id }));
+		const presence = createPresence(client, { select });
 		for (const topic of BAD) {
-			await expect(presence.join(mockWs({ id: 'alice' }), topic, platform)).resolves.toBeUndefined();
+			const ws = mockWs({ id: 'alice' });
+			await expect(presence.join(ws, topic, platform)).rejects.toThrow(TypeError);
+			expect([...ws._topics]).toEqual([]);
 		}
 		const keys = [...client._hashes.keys()].filter((k) => k.startsWith('uf1:'));
 		const online = presence.metrics().totalOnline;
 		presence.destroy();
 		expect(keys).toEqual([]);
 		expect(online).toBe(0);
+		expect(select).not.toHaveBeenCalled();
 		expect(platform.published).toEqual([]);
 		expect(platform.sent).toEqual([]);
 	});
 
-	it('sync() resolves INVALID_TOPIC and subscribes nothing', async () => {
+	it('sync() silently returns before authorization and subscribes nothing', async () => {
 		const client = mockRedisClient('uf2:');
 		const platform = mockPlatform();
 		const presence = createPresence(client, { select: (u) => ({ id: u.id }) });
 		const ws = mockWs({ id: 'observer' });
-		const denial = await presence.sync(ws, 'say "hi"', platform);
+		const authorize = vi.spyOn(platform, 'checkSubscribe');
+		for (const topic of BAD) await expect(presence.sync(ws, topic, platform)).resolves.toBeUndefined();
 		presence.destroy();
-		expect(denial).toBe('INVALID_TOPIC');
+		expect(authorize).not.toHaveBeenCalled();
 		expect([...ws._topics]).toEqual([]);
 		expect(platform.sent).toEqual([]);
+	});
+
+	it('continues flushing healthy diffs after an earlier topic fails', async () => {
+		const client = mockRedisClient('uf-diff:');
+		const platform = platformFailingFor('__presence:room-alpha', ['diff']);
+		const presence = createPresence(client, { select: (u) => ({ id: u.id }), topicThrottle: 10000 });
+		try {
+			for (let round = 0; round < 2; round++) {
+				await presence.join(mockWs({ id: 'alice-' + round }), 'room-alpha', platform);
+				await presence.join(mockWs({ id: 'bob-' + round }), 'room-beta', platform);
+				expect(() => presence.flushDiffs()).not.toThrow();
+				const diff = platform.published.filter((frame) => frame.topic === '__presence:room-beta' && frame.event === 'diff').at(-1);
+				expect(diff.data.joins['bob-' + round]).toEqual({ id: 'bob-' + round });
+			}
+		} finally { presence.destroy(); }
 	});
 
 	it('keeps beating and refreshing every TTL when one topic cannot be published, and reports it once', async () => {
@@ -98,19 +118,45 @@ describe('presence and an unframeable topic', () => {
 });
 
 describe('cursor and an unframeable topic', () => {
-	it('update() drops it without storing anything', () => {
+	it('update() rejects it without storing anything', () => {
 		const client = mockRedisClient('uf4:');
 		const platform = mockPlatform();
 		const subscriber = vi.spyOn(client.redis, 'duplicate');
 		const cursor = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
-		for (const topic of [...BAD, '', undefined, 7]) {
+		for (const topic of BAD) {
+			expect(() => cursor.update(mockWs({ id: '1' }), topic, { x: 1 }, platform)).toThrow(TypeError);
+		}
+		for (const topic of ['', undefined, 7]) {
 			expect(cursor.update(mockWs({ id: '1' }), topic, { x: 1 }, platform)).toBeUndefined();
+		}
+		for (const topic of BAD) {
+			expect(cursor.update(mockWs({ id: '1' }), topic, { x: 1n }, platform)).toBeUndefined();
+			expect(cursor.update(mockWs({ id: '1' }), topic, { text: 'x'.repeat(100000) }, platform)).toBeUndefined();
 		}
 		const active = cursor.stats().activeTopicsTotal;
 		cursor.destroy();
 		expect(active).toBe(0);
 		expect(subscriber).not.toHaveBeenCalled();
 		expect(platform.published).toEqual([]);
+	});
+
+	it('snapshot() silently rejects invalid names before authorization or retained state', async () => {
+		const client = mockRedisClient('uf-snapshot:');
+		const platform = mockPlatform();
+		const authorize = vi.spyOn(platform, 'checkSubscribe');
+		const subscriber = vi.spyOn(client.redis, 'duplicate');
+		const cursor = createCursor(client);
+		const ws = mockWs({ id: 'observer' });
+		try {
+			for (const topic of [...BAD, '__cursor:room', undefined, 7]) {
+				await expect(cursor.snapshot(ws, topic, platform)).resolves.toBeUndefined();
+			}
+			expect(authorize).not.toHaveBeenCalled();
+			expect(subscriber).not.toHaveBeenCalled();
+			expect(cursor.stats().activeTopicsTotal).toBe(0);
+			expect([...ws._topics]).toEqual([]);
+			expect(platform.sent).toEqual([]);
+		} finally { cursor.destroy(); }
 	});
 
 	it('reports a topic that keeps failing once, whatever phase the other topics flush on', async () => {

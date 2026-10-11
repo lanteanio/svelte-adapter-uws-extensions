@@ -750,19 +750,18 @@ export function createCursor(client, options = {}) {
 		},
 
 		update(ws, topic, data, platform) {
-			// Dropped before anything is staged. A non-string or empty topic, as
-			// the in-memory cursor drops it, and one no frame can carry, which a
-			// staged topic would make every flush fail on. The character check
+			// Drop non-string and empty names before staging state. Reject names
+			// no frame can carry before allocating a topic. The character check
 			// runs only for a topic not yet tracked, so a frame on a live topic
 			// pays one Map lookup.
 			if (typeof topic !== 'string' || topic.length === 0) { inputDropped('invalid_envelope', 'update'); return; }
-			if (!topics.has(topic) && !isFramableTopic(topic)) { inputDropped('invalid_envelope', 'update'); return; }
 			if (data !== undefined && data !== null) {
 				try {
 					if (Buffer.byteLength(JSON.stringify(data)) > maxDataBytes) { inputDropped('data_limit', 'update'); return; }
 					if (exceedsDepth(data, MAX_PROJECTION_DEPTH)) { inputDropped('data_limit', 'update'); return; }
 				} catch { inputDropped('serialization_failed', 'update'); return; }
 			}
+			if (!topics.has(topic) && !isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, or control characters');
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);
 
@@ -1030,6 +1029,7 @@ export function createCursor(client, options = {}) {
 		},
 
 		async snapshot(ws, topic, platform) {
+			if (typeof topic !== 'string' || topic.startsWith('__') || !isFramableTopic(topic)) return;
 			// OBSERVER lane: `{ requireGrant: true }`. Without it, a pure-grant
 			// deployment - wire-subscribe authorization armed and no app
 			// `subscribe` hook - has no hook for the gate to consult, so the

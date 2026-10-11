@@ -836,11 +836,9 @@ export function createPresence(client, options = {}) {
 	/** @type {RedisPresenceTracker} */
 	const tracker = {
 		async join(ws, topic, platform) {
+			if (typeof topic !== 'string') throw new TypeError('Topic must be a string');
+			if (!isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, or control characters');
 			if (topic.startsWith('__')) return;
-			// Ignored, like a `__` topic: no frame can carry it, so its roster
-			// could never be sent and every heartbeat for it would fail. The wire
-			// subscribe path refuses such topics before this hook runs.
-			if (!isFramableTopic(topic)) return;
 
 			let connTopics = wsTopics.get(ws);
 			if (connTopics && connTopics.has(topic)) return;
@@ -1148,8 +1146,7 @@ export function createPresence(client, options = {}) {
 			// there is no roster to send and no event channel to open for one.
 			// Before the breaker guard, which would otherwise spend a probe.
 			if (typeof topic !== 'string' || topic.startsWith('__')) return;
-			// No frame can carry such a topic; the adapter's own code for it.
-			if (!isFramableTopic(topic)) return 'INVALID_TOPIC';
+			if (!isFramableTopic(topic)) return;
 			// Authorize against the REAL topic before granting tap-channel
 			// membership (mirrors in-memory presence sync + the cursor snapshot):
 			// the presence-snapshot message is otherwise an un-authorized path to
