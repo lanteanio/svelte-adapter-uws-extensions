@@ -1391,6 +1391,8 @@ await limiter.emergency.clear();             // back to neutral
 await limiter.emergency.get();               // currently stored factor (1 = neutral)
 ```
 
+The unscoped fixed-window bucket name `emergency` is reserved for this control value. Bucket operations reject that name; tenant-scoped buckets can still use it. Limiter `clear()` preserves the emergency factor; clear it explicitly with `emergency.clear()`. Existing emergency keys keep their value and TTL during upgrades.
+
 ```js
 // Ops script without a limiter instance: same shared key.
 import { createRateLimitEmergency } from 'svelte-adapter-uws-extensions/redis/ratelimit';

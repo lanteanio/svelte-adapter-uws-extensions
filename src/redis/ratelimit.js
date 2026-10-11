@@ -11,7 +11,7 @@
  * @module svelte-adapter-uws-extensions/redis/ratelimit
  */
 
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanUnlinkExcept } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
@@ -542,6 +542,9 @@ export function createRateLimit(client, options) {
 	// validates at its own boundary, enforced here too so the property does not silently
 	// depend on the caller's resolver. The check short-circuits on the null (default) path.
 	function bucketKey(key, tenantId) {
+		if (!tenantId && mode.infix === 'ratelimit:' && key === 'emergency') {
+			throw new TypeError('redis ratelimit: emergency is reserved for the fleet-wide scale');
+		}
 		if (tenantId && tenantId.indexOf('\0') !== -1) {
 			throw new Error('redis ratelimit: tenant id must not contain a NUL byte (it is the bucket-key delimiter)');
 		}
@@ -686,7 +689,10 @@ export function createRateLimit(client, options) {
 				throw new Error('redis ratelimit: clear tenant id must not be empty - call clear() with no argument to clear every tenant');
 			}
 			const suffix = tenantId ? tenantId + '\0*' : '*';
-			await withBreaker(b, () => scanAndUnlink(redis, client.key(SCRIPT_VERSION + ':' + mode.infix + suffix)));
+			const emergencyKey = client.key('v1:ratelimit:emergency');
+			await withBreaker(b, () => scanUnlinkExcept(redis,
+				client.key(SCRIPT_VERSION + ':' + mode.infix + suffix),
+				key => key === emergencyKey, () => {}));
 		},
 
 		// Operator surface for the fleet-wide emergency factor. `set(0.2)`

@@ -36,6 +36,26 @@ describe('ratelimit emergency scale', () => {
 	});
 
 	describe('operator surface', () => {
+		it('reserves the unscoped window bucket name across bucket operations', async () => {
+			const limiter = createRateLimit(client, { points: 10, interval: 60000, keyBy: () => 'emergency' });
+			await limiter.emergency.set(0.25);
+			await expect(limiter.consume(mockWs())).rejects.toThrow(/reserved/);
+			await expect(limiter.peek(mockWs())).rejects.toThrow(/reserved/);
+			for (const method of ['reset', 'ban', 'unban']) await expect(limiter[method]('emergency')).rejects.toThrow(/reserved/);
+			expect(await limiter.emergency.get()).toBe(0.25);
+		});
+
+		it('preserves the existing emergency scale through global and tenant clears', async () => {
+			const limiter = createRateLimit(client, { points: 10, interval: 60000, keyBy: () => 'emergency', tenant: () => 'tenant' });
+			await client.redis.set(client.key('v1:ratelimit:emergency'), '0.25');
+			await limiter.consume(mockWs());
+			await limiter.clear('tenant');
+			expect(await limiter.emergency.get()).toBe(0.25);
+			await limiter.clear();
+			expect(await limiter.emergency.get()).toBe(0.25);
+			await limiter.emergency.clear();
+			expect(await limiter.emergency.get()).toBe(1);
+		});
 		it('set/get/clear round-trips the shared key', async () => {
 			const emergency = createRateLimitEmergency(client);
 			expect(await emergency.get()).toBe(1);

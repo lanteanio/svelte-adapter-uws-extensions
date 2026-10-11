@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- Reserve the unscoped fixed-window rate-limit key `emergency` for the fleet-wide scale. Bucket operations reject it, and global limiter clears preserve the scale and its TTL.
+
 - Task `heartbeatInterval` must be an integer from zero up to, but not including, the fence lifetime in milliseconds. Zero keeps the default; invalid, fractional and lease-length overrides now throw.
 
 - **Redis idempotency uses versioned result envelopes and ownership indexes.** Drain old writers before upgrading. Pending claims are revoked by user erasure, delayed commits are fenced, and incomplete index operations reject for retry. See the [ownership migration](docs/idempotency-erasure.md#stored-format-and-coordinated-upgrade).
