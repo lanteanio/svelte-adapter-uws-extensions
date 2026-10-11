@@ -42,6 +42,7 @@ describe('ratelimit emergency scale', () => {
 			await expect(limiter.consume(mockWs())).rejects.toThrow(/reserved/);
 			await expect(limiter.peek(mockWs())).rejects.toThrow(/reserved/);
 			for (const method of ['reset', 'ban', 'unban']) await expect(limiter[method]('emergency')).rejects.toThrow(/reserved/);
+			await expect(limiter.reset({ toString: () => 'emergency' })).rejects.toThrow(/reserved/);
 			expect(await limiter.emergency.get()).toBe(0.25);
 		});
 
