@@ -4,6 +4,11 @@ import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { scanKeys } from '../../../src/shared/redis-scan.js';
+import { createDistributedSession } from '../../../src/redis/session.js';
+import { createConnectionRegistry } from '../../../src/redis/registry.js';
+import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+import { mockWs } from '../../helpers/mock-ws.js';
+import { mockPlatform } from '../../helpers/mock-platform.js';
 import { createReplay } from '../../../src/redis/replay.js';
 import { createAlarmStore } from '../../../src/redis/alarm-store.js';
 import { createDeadLetter } from '../../../src/redis/dead-letter.js';
@@ -80,4 +85,28 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	expect(empty.complete).toBe(true);
 	expect(empty.ok).toBe(false);
 	expect(empty.redis.checks).toContainEqual({ scope: 'redis', name: 'paired_membership', ok: false });
+});
+
+it('verifies session records and registry routing with their default prefixes', async () => {
+	await resetBackendKeys(source);
+	const sessions = createDistributedSession(source, { forgetUserId: data => data.userId });
+	const token = await sessions.create({ userId: 'user' });
+	const registry = createConnectionRegistry(source, {
+		identify: ws => ws.getUserData().userId,
+		sessionIdentify: ws => ws.getUserData().appSession,
+		heartbeat: 60000
+	});
+	try {
+		await registry.hooks.open(mockWs({ userId: 'user', appSession: 'byuser:routing-token', [WS_SESSION_ID]: 'connection-token' }), { platform: mockPlatform() });
+		expect(await source.redis.type(source.key('sess:' + token))).toBe('string');
+		expect(await source.redis.type(source.key('sess:byuser:routing-token'))).toBe('hash');
+		for (const families of [['sessions'], ['registry'], ['sessions', 'registry']]) {
+			const report = await runVerification({ schemaVersion: 1, redis: {
+				keyPrefix: source.key(''), families,
+				minimumKeys: Object.fromEntries(families.map(id => [id, 2]))
+			} }, { redis: source.redis });
+			expect(report.ok, JSON.stringify(report)).toBe(true);
+			for (const id of families) expect(report.redis.observations[id].keys).toBe(2);
+		}
+	} finally { await registry.destroy(); }
 });

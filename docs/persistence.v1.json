@@ -376,7 +376,7 @@
 				}
 			],
 			"defaultPrefix": "",
-			"notes": "Routing references live instances. Reconnect clients; configure distinct prefixes from durable session storage."
+			"notes": "Routing references live instances. Reconnect clients. The verifier distinguishes default sess: routing hashes from durable session strings by Redis type. Distinct prefixes prevent identical token and session IDs from colliding."
 		},
 		{
 			"id": "cursor",
