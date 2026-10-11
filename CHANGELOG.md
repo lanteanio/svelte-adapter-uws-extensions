@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sharded subscription admission restores channels lost while another subscription reply is pending and ignores confirmations from ended connections.
+
 - Redis cursor declarations include viewport culling, backpressure options, viewport accessors, and fan-out statistics.
 
 - Redis bus `publishBatched` ignores non-array input, matching the adapter with tracing enabled or disabled.

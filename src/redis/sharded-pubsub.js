@@ -737,6 +737,8 @@ export function createShardedBus(client, options = {}) {
 		// The bus closed while the subscribe was in flight: its connections are
 		// already quit.
 		if (generation !== subGeneration) return;
+		// A reply queued before the connection ended cannot confirm its replacement.
+		if (subByNodeId.get(ownerId) !== conn) return;
 		// A reconcile retry can outlive the last unfollow. Shared admissions
 		// instead retain every physical subscription until all channels settle:
 		// another follower can arrive while a different channel is still pending.
@@ -1015,7 +1017,7 @@ export function createShardedBus(client, options = {}) {
 					if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
 					let needsCleanup = false;
 					for (const channel of fresh) {
-						if (channelRefcounts.has(channel)) subscribedChannels.add(channel);
+						if (channelRefcounts.has(channel) && (!isCluster(client.redis) || channelNode.has(channel))) subscribedChannels.add(channel);
 						else needsCleanup = true;
 					}
 					if (needsCleanup) {
@@ -1025,6 +1027,9 @@ export function createShardedBus(client, options = {}) {
 						for (const channel of fresh) subscribedChannels.delete(channel);
 						const active = new Set(fresh);
 						for (;;) {
+							if (isCluster(client.redis)) {
+								for (const channel of active) if (!channelNode.has(channel)) active.delete(channel);
+							}
 							const release = fresh.filter(channel => active.has(channel) && !channelRefcounts.has(channel));
 							const restore = fresh.filter(channel => !active.has(channel) && channelRefcounts.has(channel));
 							if (release.length === 0 && restore.length === 0) break;

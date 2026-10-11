@@ -6,36 +6,66 @@ import { mockPlatform } from '../helpers/mock-platform.js';
 const settle = async () => { for (let index = 0; index < 40; index++) await Promise.resolve(); };
 const channel = topic => 'uws:sharded:' + topic;
 
-async function cluster() {
+async function cluster(split = false) {
 	const client = mockRedisClient();
-	const node = client.redis.duplicate();
-	const slots = [[0, 16383, ['127.0.0.1', 6379, 'master']]];
-	node.cluster = async command => command === 'MYID' ? 'master' : slots;
-	client.redis.nodes = () => [node];
-	client.redis.cluster = node.cluster;
+	const nodes = Array.from({ length: split ? 2 : 1 }, () => client.redis.duplicate());
+	const slots = split ? [[0, 8191, ['127.0.0.1', 6379, 'master0']], [8192, 16383, ['127.0.0.1', 6380, 'master1']]] : [[0, 16383, ['127.0.0.1', 6379, 'master0']]];
+	nodes.forEach((node, index) => { node.cluster = async command => command === 'MYID' ? 'master' + index : slots; });
+	client.redis.nodes = () => nodes;
+	client.redis.cluster = nodes[0].cluster;
 	client.redis.refreshSlotsCache = callback => callback?.();
 	const subscriptions = new Map(), unsubscriptions = new Map();
+	const subscribers = [];
 	let holdUnsubscribe = false;
-	const duplicate = node.duplicate.bind(node);
-	node.duplicate = (...args) => {
-		const subscriber = duplicate(...args);
-		subscriber.status = 'ready';
-		subscriber.condition = { subscriber: { channels: () => [...subscriber._shardedChannels] } };
-		const subscribe = subscriber.ssubscribe.bind(subscriber);
-		const unsubscribe = subscriber.sunsubscribe.bind(subscriber);
-		subscriber.ssubscribe = name => new Promise(resolve => subscriptions.set(name, () => {
-			subscriptions.delete(name); resolve(subscribe(name));
-		}));
-		subscriber.sunsubscribe = name => holdUnsubscribe ? new Promise(resolve => unsubscriptions.set(name, () => {
-			unsubscriptions.delete(name); resolve(unsubscribe(name));
-		})) : unsubscribe(name);
-		return subscriber;
-	};
+	for (const node of nodes) {
+		const duplicate = node.duplicate.bind(node);
+		node.duplicate = (...args) => {
+			const subscriber = duplicate(...args);
+			subscribers.push(subscriber);
+			subscriber.status = 'ready';
+			subscriber.condition = { subscriber: { channels: () => [...subscriber._shardedChannels] } };
+			const subscribe = subscriber.ssubscribe.bind(subscriber);
+			const unsubscribe = subscriber.sunsubscribe.bind(subscriber);
+			subscriber.ssubscribe = name => new Promise(resolve => subscriptions.set(name, () => {
+				subscriptions.delete(name); resolve(subscriber.status === 'end' ? undefined : subscribe(name));
+			}));
+			subscriber.sunsubscribe = name => holdUnsubscribe ? new Promise(resolve => unsubscriptions.set(name, () => {
+				unsubscriptions.delete(name); resolve(unsubscribe(name));
+			})) : unsubscribe(name);
+			return subscriber;
+			};
+	}
 	const platform = mockPlatform();
 	const bus = createShardedBus(client);
 	await bus.activate(platform);
-	return { client, bus, platform, subscriptions, unsubscriptions, holdCleanup() { holdUnsubscribe = true; }, resumeCleanup() { holdUnsubscribe = false; } };
+	return { client, bus, platform, subscriptions, unsubscriptions, subscribers, holdCleanup() { holdUnsubscribe = true; }, resumeCleanup() { holdUnsubscribe = false; } };
 }
+
+it.each([false, true])('restores a confirmed channel whose connection ends before a sibling reply (split=%s)', async split => {
+	const { bus, client, platform, subscriptions, subscribers } = await cluster(split);
+	let pending;
+	try {
+		pending = bus.hooks.subscribeBatch({}, ['a', 'b']);
+		await settle();
+		subscriptions.get(channel('a'))();
+		await settle();
+		const old = subscribers.find(subscriber => subscriber._shardedChannels.has(channel('a')));
+		old.status = 'end';
+		old._shardedChannels.clear();
+		old._listeners.get('end')();
+		subscriptions.get(channel('b'))();
+		await settle();
+		for (const release of [...subscriptions.values()]) release();
+		await pending;
+		await client.redis.spublish(channel('a'), JSON.stringify({ instanceId: 'peer', topic: 'a', event: 'msg', data: 'a' }));
+		await client.redis.spublish(channel('b'), JSON.stringify({ instanceId: 'peer', topic: 'b', event: 'msg', data: 'b' }));
+		expect(platform.published.map(entry => entry.data)).toEqual(['a', 'b']);
+	} finally {
+		for (const release of subscriptions.values()) release();
+		await bus.deactivate();
+		await Promise.allSettled([pending]);
+	}
+});
 
 it.each([false, true])('retains cluster channels until a multi-channel admission settles (restore=%s)', async restore => {
 	const state = await cluster();
