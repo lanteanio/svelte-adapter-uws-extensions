@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redis bus `publishBatched` ignores non-array input, matching the adapter with tracing enabled or disabled.
 
+- Gate Redis publication, replay and presence command counts against standalone and Cluster backends, including sixfold workload and subscriber scaling.
+
 - Require the declared Node prerequisite for development checks and the exact ecosystem package version before publication.
 
 - Complete the current migration path for hash-tagged Redis storage, custom PostgreSQL table names, presence and cursor limits, batched publication rejection, and metric registration conflicts.
