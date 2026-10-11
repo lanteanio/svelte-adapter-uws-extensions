@@ -41,7 +41,7 @@ import {
 } from '../shared/runtime.js';
 import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, coalescedMultiSlot } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
@@ -864,26 +864,23 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	const refreshTtls = coalescedWork(async () => {
+	function heartbeatCommands() {
+		const commands = [];
+		for (const userId of localUsers.keys()) commands.push(['expire', userKey(userId), ttl]);
+		for (const sessionId of appSessionToWs.keys()) commands.push(['expire', sessionKey(sessionId), ttl]);
+		return commands;
+	}
+	const refreshCommands = coalescedMultiSlot(redis, (err) => {
+		if (!err) breaker?.success();
+	}, (err) => breaker?.failure(err), heartbeatCommands);
+	const refreshTtls = coalescedWork(() => {
 		if (destroyed) return;
-		if (localUsers.size === 0 && appSessionToWs.size === 0) return;
+		if (localUsers.size === 0 && appSessionToWs.size === 0) { refreshCommands([]); return; }
 		if (!withBreakerGuard()) return;
 		// Refresh TTL on every locally-owned entry (users + app sessions). A
 		// pipeline keeps this to one round trip regardless of N.
-		const commands = [];
-		for (const userId of localUsers.keys()) {
-			commands.push(['expire', userKey(userId), ttl]);
-		}
-		for (const sessionId of appSessionToWs.keys()) {
-			commands.push(['expire', sessionKey(sessionId), ttl]);
-		}
-		await execMultiSlot(redis, commands).then((results) => {
-			// A refused EXPIRE resolves as a per-command error, not a rejection.
-			const err = firstCommandError(results);
-			if (err) breaker?.failure(err);
-			else breaker?.success();
-		}).catch((err) => breaker?.failure(err));
-	});
+		refreshCommands(heartbeatCommands());
+	}, error => breaker?.failure(error));
 
 	function heartbeatTick() {
 		if (destroyed) return;
@@ -1698,6 +1695,7 @@ export function createConnectionRegistry(client, options) {
 		},
 		async destroy() {
 			destroyed = true;
+			refreshCommands.stop();
 			refreshTtls.stop();
 			if (heartbeatTimer) {
 				clearIntervalTimer(heartbeatTimer);

@@ -68,6 +68,60 @@ function allocationGroup(redis, command) {
 	return Array.isArray(owners) && owners.length ? owners.join(';') : null;
 }
 
+/** Keep one running refresh and the latest pending refresh per Redis owner. */
+export function coalescedMultiSlot(redis, onComplete, onError = () => {}, refreshPending) {
+	const states = new Map();
+	let stopped = false;
+	function complete(cycle, error) {
+		if (error && !cycle.error) { cycle.error = error; onError(error); }
+		if (--cycle.remaining === 0) onComplete(cycle.error, cycle.context);
+	}
+	function start(owner, state, refresh = false) {
+		let { commands, cycle } = state.pending;
+		state.pending = null;
+		if (refresh && refreshPending) {
+			try {
+				const clustered = isCluster(redis);
+				commands = refreshPending().filter(command => (clustered ? allocationGroup(redis, command) : null) === owner);
+			} catch (error) { states.delete(owner); complete(cycle, error); return; }
+		}
+		if (!commands.length) { states.delete(owner); complete(cycle, null); return; }
+		state.running = true;
+		execMultiSlot(redis, commands).then(results => complete(cycle, firstCommandError(results)), error => complete(cycle, error))
+			.catch(onError).finally(() => {
+				state.running = false;
+				if (!stopped && state.pending) start(owner, state, true);
+				else states.delete(owner);
+			});
+	}
+	function submit(commands, context) {
+		if (stopped) return;
+		const groups = new Map();
+		const clustered = isCluster(redis);
+		for (const command of commands) {
+			const owner = clustered ? allocationGroup(redis, command) : null;
+			let group = groups.get(owner);
+			if (!group) { group = []; groups.set(owner, group); }
+			group.push(command);
+		}
+		// A departed local member must not survive in an older queued refresh.
+		for (const state of states.values()) state.pending = null;
+		const cycle = { remaining: groups.size, error: null, context };
+		// Superseded cycles are intentionally not reported as complete.
+		for (const [owner, group] of groups) {
+			let state = states.get(owner);
+			if (!state) { state = { running: false, pending: null }; states.set(owner, state); }
+			state.pending = { commands: group, cycle };
+			if (!state.running) start(owner, state);
+		}
+	}
+	submit.stop = () => {
+		stopped = true;
+		for (const state of states.values()) state.pending = null;
+	};
+	return submit;
+}
+
 /**
  * Execute a set of independent single-slot commands and return their results
  * in ioredis pipeline shape: an array of `[err, value]` tuples index-aligned

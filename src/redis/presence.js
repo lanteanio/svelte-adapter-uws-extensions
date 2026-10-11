@@ -58,7 +58,7 @@ import {
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
-import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, coalescedMultiSlot } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -224,7 +224,26 @@ export function createPresence(client, options = {}) {
 	// same class without retaining departed topic labels or work on every tick.
 	const stopOnlineMetric = mTotalOnline ? collectOnlineMetric(mTotalOnline, mt, localCounts) : null;
 
-	const heartbeatTick = coalescedWork(async () => {
+	function heartbeatCommands() {
+		const commands = [];
+		for (const topic of activeTopics) {
+			const data = localData.get(topic);
+			if (!data) continue;
+			const topicHash = topicHashKey(topic);
+			for (const userKey of data.keys()) {
+				commands.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
+				commands.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
+				commands.push(['hpexpire', pendingHashKey(topic), presenceTtlMs, 'FIELDS', 1, userKey]);
+			}
+		}
+		return commands;
+	}
+	const refreshCommands = coalescedMultiSlot(redis, (error, tickStart) => {
+		if (!error) b?.success();
+		lastHeartbeatLatency = monotonicNow() - tickStart;
+		mHeartbeatLatency?.set(lastHeartbeatLatency);
+	}, error => b?.failure(error), heartbeatCommands);
+	const heartbeatTick = coalescedWork(() => {
 		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
 		// Detect dead connections whose close handler never fired.
@@ -312,7 +331,6 @@ export function createPresence(client, options = {}) {
 		// cleanup pass: per-field HPEXPIRE auto-removes fields whose owning
 		// instance stopped heartbeating, exactly the behavior the previous
 		// CLEANUP_SCRIPT simulated at every tick.
-		const commands = [];
 		let publishFailed = 0;
 		let published = 0;
 		let firstPublishError = null;
@@ -320,12 +338,6 @@ export function createPresence(client, options = {}) {
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
 			if (data && data.size > 0) {
-				const topicHash = topicHashKey(topic);
-				for (const userKey of data.keys()) {
-					commands.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
-					commands.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
-					commands.push(['hpexpire', pendingHashKey(topic), presenceTtlMs, 'FIELDS', 1, userKey]);
-				}
 				if (subscriberCtx.activePlatform) {
 					// Publish a `{userKey: data}` map (instead of a key-only
 					// array) so a client whose entry aged out between
@@ -355,11 +367,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		await execMultiSlot(redis, commands).then(results => {
-			const error = firstCommandError(results);
-			if (error) b?.failure(error);
-			else if (commands.length) b?.success();
-		}).catch(error => b?.failure(error));
+		refreshCommands(heartbeatCommands(), tickStart);
 		if (publishFailed === 0) {
 			heartbeatPublishReported = false;
 		} else if (!heartbeatPublishReported) {
@@ -370,9 +378,7 @@ export function createPresence(client, options = {}) {
 				attributes: { failed: publishFailed, topics: published }
 			});
 		}
-		lastHeartbeatLatency = monotonicNow() - tickStart;
-		mHeartbeatLatency?.set(lastHeartbeatLatency);
-	});
+	}, error => b?.failure(error));
 	const heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
@@ -1531,6 +1537,7 @@ export function createPresence(client, options = {}) {
 
 		destroy() {
 			stopOnlineMetric?.();
+			refreshCommands.stop();
 			heartbeatTick.stop();
 			clearIntervalTimer(heartbeatTimer);
 			if (consistencyAuditor) consistencyAuditor.stop();
