@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- Redis clients disable automatic replay of unanswered sent commands by default. Connection loss rejects them with `ConnectionError`; explicit `autoResendUnfulfilledCommands: true` restores ioredis replay behavior for workloads that tolerate repeated writes.
+
 - Reserve the unscoped fixed-window rate-limit key `emergency` for the fleet-wide scale. Bucket operations reject it, and global limiter clears preserve the scale and its TTL.
 
 - **Redis clients now fail promptly during outages after their first ready event.** Defaults are one retry, 5000 ms command/connect/socket deadlines and at most 4096 buffered startup commands. The main connection stops offline buffering after first ready. Command deadlines reject with `TimeoutError` and `code: 'OPERATION_TIMEOUT'`; `WAIT 0` remains subject to client deadlines. See [Redis outage policy](docs/redis-outages.md).

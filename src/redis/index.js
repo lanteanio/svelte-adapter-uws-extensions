@@ -77,6 +77,17 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		}
 		return false;
 	}
+	redis.on('close', () => {
+		if (redis.options.autoResendUnfulfilledCommands) return;
+		const error = new ConnectionError('redis', 'connection closed before the command reply; execution is uncertain');
+		const previous = redis.prevCommandQueue;
+		redis.flushQueue(error, { offlineQueue: false });
+		if (previous && previous !== redis.commandQueue) {
+			let entry;
+			while ((entry = previous.shift())) entry.command.reject(error);
+		}
+		redis.prevCommandQueue = null;
+	});
 	function expire() {
 		timer = null;
 		due = Infinity;
@@ -159,7 +170,7 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
  * @property {string} [url='redis://localhost:6379'] - Redis connection URL
  * @property {string} [keyPrefix=''] - Prefix for all keys written by extensions
  * @property {boolean} [autoShutdown=true] - Listen for `sveltekit:shutdown` and disconnect
- * @property {import('ioredis').RedisOptions} [options] - Override ioredis defaults: one retry, 5s command/connect/socket deadlines, bounded startup buffering and no offline buffering after first ready
+ * @property {import('ioredis').RedisOptions} [options] - Override ioredis defaults: one retry, 5s command/connect/socket deadlines, no automatic replay of unanswered commands, bounded startup buffering and no offline buffering after first ready
  */
 
 /**
@@ -194,6 +205,7 @@ export function createRedisClient(options = {}) {
 
 	/** @type {import('ioredis').RedisOptions} */
 	const redisOpts = {
+		autoResendUnfulfilledCommands: false,
 		maxRetriesPerRequest: 1,
 		commandTimeout: 5000,
 		connectTimeout: 5000,

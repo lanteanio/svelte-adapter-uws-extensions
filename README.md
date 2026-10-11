@@ -191,6 +191,8 @@ export const redis = createRedisClient({
 | `redis.redis` | The underlying ioredis instance |
 | `redis.key(k)` | Returns `keyPrefix + k` |
 | `redis.duplicate(overrides?)` | New subscriber connection with bounded offline buffering and finite deadlines. Pass ioredis options to override defaults. |
+
+Sent commands whose reply is lost on connection reset reject with a typed connection error instead of being automatically replayed. See the [Redis outage policy](docs/redis-outages.md) for deadlines and explicit replay overrides.
 | `redis.quit()` | Gracefully disconnect all connections |
 
 ---

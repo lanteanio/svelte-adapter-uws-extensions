@@ -14,6 +14,7 @@ immediately after construction to wait for initial connection setup.
 | `commandTimeout` | `5000` ms | Reject a command whose reply has not arrived. |
 | `connectTimeout` | `5000` ms | Bound a TCP connection attempt. |
 | `socketTimeout` | `5000` ms | Close a socket that stops returning expected data. |
+| `autoResendUnfulfilledCommands` | `false` | Reject sent commands on connection loss instead of replaying uncertain writes. |
 | Offline command admission | At most `4096` per connection | Reject excess admission with `ConnectionError`. |
 | Main connection after first ready | No offline buffering | New commands fail promptly while disconnected. |
 
@@ -26,6 +27,13 @@ before reconnecting. This preserves reply ordering and prevents rejected writes
 or blocking WAIT commands from being resent. A timeout cannot prove that Redis
 did not execute a command already sent;
 use idempotency or fencing for effects whose repetition would be unsafe.
+
+A connection reset, including a socket deadline, rejects unanswered sent commands
+with `ConnectionError` before reconnect. This also applies when `commandTimeout`
+exceeds `socketTimeout`: the socket deadline wins without resending a write.
+Prefer `commandTimeout <= socketTimeout` so normal deadline failures carry the
+command's `TimeoutError`. Explicit `autoResendUnfulfilledCommands: true` restores
+ioredis replay behavior and can repeat writes whose reply was lost.
 
 Failures reject the calling promise through the existing ioredis errors,
 extensions `TimeoutError` for shared command deadlines, or `ConnectionError` for

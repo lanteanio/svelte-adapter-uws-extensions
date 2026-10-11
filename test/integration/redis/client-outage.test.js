@@ -226,10 +226,29 @@ it.each([false, true])('does not resend a timed-out applied write (already recon
 		const result = client.redis.incr(key).catch(error => error);
 		await vi.waitFor(async () => expect(await admin.redis.get(key)).toBe('1'));
 		if (reconnecting) { client.redis.stream.destroy(); await closed; }
-		expect(await result).toMatchObject({ code: 'OPERATION_TIMEOUT', ms: 150 });
+		expect(await result).toMatchObject(reconnecting ? { name: 'ConnectionError' } : { code: 'OPERATION_TIMEOUT', ms: 150 });
 		await vi.waitFor(() => expect(retired).toBe(true), { timeout: 500 });
 		gate.inbound = false;
 		await closed; await ready(client.redis);
+		expect(await client.redis.ping()).toBe('PONG');
+		expect(await admin.redis.get(key)).toBe('1');
+	} finally { await admin.redis.del(key); await fixture.close(); }
+});
+
+it.each(['reset', 'socket deadline'])('does not resend an applied write after %s', async cause => {
+	const fixture = await proxyClient(cause === 'reset' ? {} : { commandTimeout: 1000, socketTimeout: 100 });
+	const { client, admin, gate } = fixture;
+	const key = 'inttest-outage:reset-applied-write';
+	try {
+		await admin.redis.del(key);
+		await client.redis.ping();
+		gate.inbound = true;
+		const result = client.redis.incr(key).catch(error => error);
+		await vi.waitFor(async () => expect(await admin.redis.get(key)).toBe('1'));
+		if (cause === 'reset') client.redis.stream.destroy();
+		expect(await result).toMatchObject({ name: 'ConnectionError' });
+		gate.inbound = false;
+		await ready(client.redis);
 		expect(await client.redis.ping()).toBe('PONG');
 		expect(await admin.redis.get(key)).toBe('1');
 	} finally { await admin.redis.del(key); await fixture.close(); }

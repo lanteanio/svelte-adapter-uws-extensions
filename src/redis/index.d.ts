@@ -7,7 +7,7 @@ export interface RedisClientOptions {
 	keyPrefix?: string;
 	/** Listen for `sveltekit:shutdown` and disconnect. @default true */
 	autoShutdown?: boolean;
-	/** Override ioredis defaults: one retry, 5s command/connect/socket deadlines, bounded startup buffering and no offline buffering after first ready. */
+	/** Override ioredis defaults: one retry, 5s command/connect/socket deadlines, no automatic replay of unanswered commands, bounded startup buffering and no offline buffering after first ready. */
 	options?: RedisOptions;
 }
 
