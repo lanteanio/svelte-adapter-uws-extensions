@@ -542,7 +542,8 @@ export function createRateLimit(client, options) {
 	// validates at its own boundary, enforced here too so the property does not silently
 	// depend on the caller's resolver. The check short-circuits on the null (default) path.
 	function bucketKey(key, tenantId) {
-		if (!tenantId && mode.infix === 'ratelimit:' && String(key) === 'emergency') {
+		key = String(key);
+		if (!tenantId && mode.infix === 'ratelimit:' && key === 'emergency') {
 			throw new TypeError('redis ratelimit: emergency is reserved for the fleet-wide scale');
 		}
 		if (tenantId && tenantId.indexOf('\0') !== -1) {
