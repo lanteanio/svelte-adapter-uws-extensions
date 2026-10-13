@@ -7,6 +7,7 @@ import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { keySlot, coalescedByOwner } from '../../src/shared/cluster.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 afterEach(resetRuntimeEnv);
@@ -56,6 +57,12 @@ function captureHeartbeat(clock = {}) {
 	return () => [...intervals].find(timer => timer.delay === 17).fn;
 }
 const recordingBreaker = () => ({ state: 'healthy', isHealthy: true, guard() {}, success: vi.fn(), failure: vi.fn(), subscribe() { return () => {}; } });
+const openBreaker = breaker => Object.assign(breaker, {
+	state: 'broken', isHealthy: false, guard() { throw new Error('circuit broken'); }
+});
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// The key that places a tracker's member `slow` on the slow owner.
+const slowKey = (kind, client) => kind === 'presence' ? client.key('presence:topic:{slow}') : client.key('conns:slow');
 function heartbeatTracker(kind, client, options = {}) {
 	return kind === 'presence' ? createPresence(client, { key: 'id', heartbeat: 17, ...options })
 		: createConnectionRegistry(client, { identify: ws => ws.getUserData().id, heartbeat: 17, ...options });
@@ -121,6 +128,31 @@ it('completes an empty submit at once and drops refreshes queued behind a busy o
 		expect(completed).toEqual(['queued', 'empty', 'first']);
 		expect(execs.slow).toBe(1);
 	} finally { refresh.stop(); }
+});
+
+it('keeps an owner refreshing when its observers throw', async () => {
+	const client = mockRedisClient();
+	const { execs } = ownedCluster(client, [], { stalled: new Set(), error: new Error('refused') });
+	const unhandled = [];
+	const onUnhandled = error => unhandled.push(error);
+	process.on('unhandledRejection', onUnhandled);
+	const observer = () => { throw new Error('observer failed'); };
+	const refresh = coalescedByOwner(client.redis, {
+		key: key => key,
+		commands: (key, out) => { out.push(['expire', key, 30]); },
+		onError: observer, onSettled: observer, onComplete: observer
+	});
+	try {
+		refresh(['healthy'], 1); await flush(); await flush();
+		expect(refresh.busySince()).toBe(Infinity);
+		refresh(['healthy'], 2); await flush(); await flush();
+		expect(execs.healthy).toBe(2);
+		expect(refresh.busySince()).toBe(Infinity);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+		refresh.stop();
+	}
 });
 
 it('routes each item once and sends its commands without grouping them again', async () => {
@@ -337,4 +369,83 @@ it.each([['presence', 3], ['registry', 12]])('%s routes each heartbeat unit once
 		expect(execs.healthy).toBe(1);
 		expect(lookups).toBe(units);
 	} finally { await tracker.destroy(); }
+});
+
+it.each(['presence', 'registry'])('%s leaves a probing breaker its probe when a tick reaches no owner', async kind => {
+	const tickFn = captureHeartbeat();
+	const client = mockRedisClient();
+	const platform = mockPlatform();
+	const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+	const tracker = heartbeatTracker(kind, client, { breaker });
+	await joinTracker(kind, tracker, 'slow', 'slow', platform);
+	await flush();
+	const { held, execs } = ownedCluster(client, [slowKey(kind, client)]);
+	const tick = tickFn();
+	try {
+		tick(); await flush();
+		expect(execs.slow).toBe(1);
+		// Something else trips the shared breaker, which then probes.
+		breaker.failure(new Error('unrelated failure'));
+		await sleep(5);
+		expect(breaker.state).toBe('probing');
+		tick(); await flush();
+		expect(execs.slow).toBe(1);
+		// Nothing answered, so nothing closed the breaker, and its probe is left.
+		expect(breaker.state).toBe('probing');
+		expect(() => breaker.guard()).not.toThrow();
+	} finally {
+		for (const release of held.splice(0)) await release();
+		await tracker.destroy();
+		breaker.destroy();
+	}
+});
+
+it.each(['presence', 'registry'])('%s reports no breaker success for a tick that reached no owner', async kind => {
+	const tickFn = captureHeartbeat();
+	const client = mockRedisClient();
+	const platform = mockPlatform();
+	const breaker = recordingBreaker();
+	const tracker = heartbeatTracker(kind, client, { breaker });
+	await joinTracker(kind, tracker, 'slow', 'slow', platform);
+	await flush();
+	const { held } = ownedCluster(client, [slowKey(kind, client)]);
+	const tick = tickFn();
+	try {
+		tick(); await flush();
+		breaker.success.mockClear();
+		tick(); await flush();
+		expect(breaker.success).not.toHaveBeenCalled();
+		await held.shift()(); await flush();
+		// The stalled refresh answers for its own tick; the newest items rerun.
+		expect(breaker.success).toHaveBeenCalledTimes(1);
+		await held.shift()(); await flush();
+		expect(breaker.success).toHaveBeenCalledTimes(2);
+	} finally {
+		for (const release of held.splice(0)) await release();
+		await tracker.destroy();
+	}
+});
+
+it.each(['presence', 'registry'])('%s skips a refresh that waited for a busy owner while the breaker is open', async kind => {
+	const tickFn = captureHeartbeat();
+	const client = mockRedisClient();
+	const platform = mockPlatform();
+	const breaker = recordingBreaker();
+	const tracker = heartbeatTracker(kind, client, { breaker });
+	await joinTracker(kind, tracker, 'slow', 'slow', platform);
+	await flush();
+	const { held, execs } = ownedCluster(client, [slowKey(kind, client)]);
+	const tick = tickFn();
+	try {
+		tick(); await flush();
+		tick(); await flush();
+		expect(execs.slow).toBe(1);
+		openBreaker(breaker);
+		await held.shift()(); await flush();
+		expect(execs.slow).toBe(1);
+		expect(held).toHaveLength(0);
+	} finally {
+		for (const release of held.splice(0)) await release();
+		await tracker.destroy();
+	}
 });

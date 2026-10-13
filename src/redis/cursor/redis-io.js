@@ -18,6 +18,7 @@ import { now, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from 
 import { evalCachedName } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot, firstCommandError, coalescedByOwner } from '../../shared/cluster.js';
+import { guardBreaker } from '../../shared/breaker-admission.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
@@ -286,36 +287,48 @@ export function createRedisIo({
 	}
 
 	// A topic's pending values stay in redisPending, merging the newest ones,
-	// until a write for its owner starts and takes them.
+	// until a write for its owner starts and takes them. A topic also waits for
+	// its previous write to answer, so a write still on its way to an owner the
+	// slot has left never lands after a newer one.
+	/** @type {Set<string>} hash keys with a snapshot write in flight */
+	const writing = new Set();
 	const writeSnapshots = coalescedByOwner(redis, {
 		key: hashKey,
 		commands(topic, out) {
 			const entries = redisPending.get(topic);
 			if (!entries) return;
+			const key = hashKey(topic);
+			if (writing.has(key)) return;
 			redisPending.delete(topic);
 			const args = [];
-			for (const [key, entry] of entries) {
-				try { args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts })); }
+			for (const [field, entry] of entries) {
+				try { args.push(field, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts })); }
 				catch { inputDropped('serialization_failed', 'snapshot_write'); }
 			}
 			if (args.length === 0) return;
-			const key = hashKey(topic);
+			writing.add(key);
 			out.push(['hset', key, ...args], ['expire', key, cursorTtl]);
 		},
 		// A write that waited for its owner skips while the breaker is not
 		// healthy; the next flush decides on the values it left pending.
-		current: b ? () => b.isHealthy : null,
+		admit: b ? () => b.isHealthy : null,
 		onError(err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); },
+		onSettled(commands) {
+			for (const command of commands) if (command[0] === 'hset') writing.delete(command[1]);
+		},
 		onComplete(write) {
 			if (write.total > 0 && write.error === null) b?.success();
+			// A flush that reached no owner returns the probe it was admitted with.
+			write.context?.();
 		}
 	});
 
 	function flushSnapshot() {
 		if (disposed) return;
 		if (redisPending.size === 0) return;
-		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; } }
-		writeSnapshots(Array.from(redisPending.keys()));
+		let releaseAdmission;
+		try { releaseAdmission = guardBreaker(b); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; }
+		writeSnapshots(Array.from(redisPending.keys()), releaseAdmission);
 	}
 
 	function queueSnapshot(topic, key, user, data) {

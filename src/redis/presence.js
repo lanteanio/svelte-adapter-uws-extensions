@@ -131,7 +131,7 @@ export { WsClosedError };
 /**
  * @typedef {Object} PresenceMetricsSnapshot
  * @property {number} totalOnline - Sum of unique-users-per-topic across all topics this instance is locally tracking. Same user in two topics counts as two; per-topic counts sum cleanly.
- * @property {number} heartbeatLatencyMs - Duration of the most recent heartbeat tick in milliseconds.
+ * @property {number} heartbeatLatencyMs - Duration of the most recent heartbeat tick in milliseconds, including Redis completion; while a refresh from an earlier tick is still outstanding, the age of the oldest such refresh.
  * @property {number} staleCleanedTotal - Reserved for backward compatibility. Always 0 in this build: staleness is enforced by Redis per-field HPEXPIRE rather than an application-side cleanup script, so there is nothing to count.
  */
 
@@ -246,6 +246,9 @@ export function createPresence(client, options = {}) {
 	const refreshTopics = coalescedByOwner(redis, {
 		key: topicHashKey,
 		commands: heartbeatCommands,
+		// A refresh that waited for a busy owner runs only while the breaker is
+		// healthy, as a tick does.
+		admit: b ? () => b.isHealthy : null,
 		onError: error => b?.failure(error),
 		onComplete(cycle) {
 			if (cycle.total > 0 && cycle.error === null) b?.success();

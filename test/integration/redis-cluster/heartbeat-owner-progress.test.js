@@ -5,6 +5,7 @@ import { createConnectionRegistry } from '../../../src/redis/registry.js';
 import { createPresence } from '../../../src/redis/presence.js';
 import { createRedisIo } from '../../../src/redis/cursor/redis-io.js';
 import { keySlot } from '../../../src/shared/cluster.js';
+import { createCircuitBreaker } from '../../../src/shared/breaker.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -149,6 +150,51 @@ it('keeps cursor snapshots and sweeps landing on a healthy master while another 
 		expect(Date.now() - started).toBeLessThan(2500);
 	} finally {
 		io?.dispose();
+		await resetBackendKeys(client);
+		await client.quit();
+	}
+});
+
+it.each(['cursor', 'registry', 'presence'])('%s leaves a probing breaker its probe while the only master it writes to is paused', async kind => {
+	const interval = captureIntervals();
+	const client = clusterRedisClient('probe-' + kind + ':');
+	const redis = client.redis;
+	const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+	const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+	let tracker, io;
+	try {
+		await redis.cluster('info');
+		let tick, pausedKey;
+		if (kind === 'cursor') {
+			io = createRedisIo({ client, redis, b: breaker, cursorTtl: 30, snapshotIntervalMs: 50, activeTopics: new Set(['room']) });
+			pausedKey = io.hashKey('room');
+			tick = x => { io.queueSnapshot('room', 'k', {}, { x }); io.flushSnapshot(); };
+		} else if (kind === 'registry') {
+			tracker = createConnectionRegistry(client, { identify: ws => ws.getUserData().id, heartbeat: 17, ttl: 30, breaker });
+			await tracker.hooks.open(mockWs({ id: 'user', [WS_SESSION_ID]: 'user' }), { platform: mockPlatform() });
+			pausedKey = client.key('conns:user');
+			tick = interval(17);
+		} else {
+			tracker = createPresence(client, { key: 'id', heartbeat: 17, ttl: 30, breaker });
+			await tracker.join(mockWs({ id: 'user' }), 'room', mockPlatform());
+			pausedKey = client.key('presence:topic:{room}');
+			tick = interval(17);
+		}
+		await pauseOwnerOf(redis, pausedKey);
+		tick(1);
+		await sleep(50);
+		// Something else trips the shared breaker, which then probes.
+		breaker.failure(new Error('unrelated failure'));
+		await sleep(20);
+		expect(breaker.state).toBe('probing');
+		tick(2);
+		await sleep(50);
+		expect(breaker.state).toBe('probing');
+		expect(() => breaker.guard()).not.toThrow();
+	} finally {
+		io?.dispose();
+		await tracker?.destroy();
+		breaker.destroy();
 		await resetBackendKeys(client);
 		await client.quit();
 	}

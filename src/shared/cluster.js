@@ -98,39 +98,55 @@ function ownerName(owners) {
  * share that key's slot. Idle owners start at once and form one cycle. An
  * owner that is still busy keeps only the newest items, which run as their own
  * cycle when its refresh settles, after `current(item)` drops the ones no
- * longer wanted and with the state that `commands` reads at that moment. Each
- * submit discards every older pending refresh, so nothing a newer submit left
- * out runs later.
+ * longer wanted and with the state that `commands` reads at that moment; when
+ * `admit()` is false then, they are dropped without a cycle. Each submit
+ * discards every older pending refresh, so nothing a newer submit left out
+ * runs later.
  *
- * `onError` hears the first failure of each cycle when it happens.
- * `onComplete` receives `{ context, error, failed, total, failedCommand,
- * deferred }` once every refresh the cycle started has settled: `total` and
- * `failed` count its commands, and `deferred` counts the owners it found busy.
- * `submit.busySince()` is the monotonic start of the oldest refresh still
- * running, or Infinity.
+ * `onError` hears the first failure of each cycle when it happens, and
+ * `onSettled(commands, results)` each refresh once it answers (`results` is
+ * null when the call failed as a whole). `onComplete` receives `{ context,
+ * error, failed, total, failedCommand, deferred }` once every refresh the
+ * cycle started has settled: `total` and `failed` count its commands, and
+ * `deferred` counts the owners it found busy. These three may throw without
+ * stopping the refreshes. `submit.busySince()` is the monotonic start of the
+ * oldest refresh still running, or Infinity.
  *
  * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
  * @param {{
  *   key: (item: any) => string,
  *   commands?: ((item: any, out: Array<[string, ...any]>) => void) | null,
  *   current?: ((item: any) => boolean) | null,
- *   onError?: (error: any) => void,
- *   onComplete?: (cycle: { context: any, error: any, failed: number, total: number, failedCommand: any[] | null, deferred: number }) => void
+ *   admit?: (() => boolean) | null,
+ *   onError?: ((error: any) => void) | null,
+ *   onSettled?: ((commands: Array<[string, ...any]>, results: Array<[Error | null, any]> | null) => void) | null,
+ *   onComplete?: ((cycle: { context: any, error: any, failed: number, total: number, failedCommand: any[] | null, deferred: number }) => void) | null
  * }} options
  */
-export function coalescedByOwner(redis, { key, commands = null, current = null, onError = () => {}, onComplete = () => {} }) {
+export function coalescedByOwner(redis, {
+	key, commands = null, current = null, admit = null, onError = null, onSettled = null, onComplete = null
+}) {
 	/** @type {Map<string | null, { since: number | null, pending: { items: any[], context: any } | null }>} */
 	const owners = new Map();
 	let stopped = false;
 	const cycleFor = context => ({ context, error: null, failed: 0, total: 0, failedCommand: null, deferred: 0, open: 1 });
+	// An observer that throws must not leave an owner marked busy.
+	function notify(callback, a, b) {
+		if (callback === null) return;
+		try { callback(a, b); } catch { /* the refresh state stays consistent */ }
+	}
+	function admitted() {
+		if (admit === null) return true;
+		try { return admit(); } catch { return false; }
+	}
 	function release(cycle) {
-		if (--cycle.open === 0) onComplete(cycle);
+		if (--cycle.open === 0) notify(onComplete, cycle);
 	}
 	function fail(cycle, error, command) {
 		if (cycle.error !== null) return;
 		cycle.error = error;
 		cycle.failedCommand = command;
-		onError(error);
+		notify(onError, error);
 	}
 	function settled(cycle, list, results) {
 		cycle.total += list.length;
@@ -138,29 +154,30 @@ export function coalescedByOwner(redis, { key, commands = null, current = null, 
 			const error = results[i] && results[i][0];
 			if (error) { cycle.failed++; fail(cycle, error, list[i]); }
 		}
+		notify(onSettled, list, results);
 	}
 	function rejected(cycle, list, error) {
 		cycle.total += list.length;
 		cycle.failed += list.length;
 		fail(cycle, error, list[0]);
+		notify(onSettled, list, null);
 	}
 	function run(owner, state, list, cycle) {
 		cycle.open++;
 		state.since = monotonicNow();
 		execOwner(redis, owner, list)
 			.then(results => settled(cycle, list, results), error => rejected(cycle, list, error))
-			.catch(onError)
-			.then(() => {
+			.finally(() => {
 				state.since = null;
-				try { release(cycle); } finally { runPending(owner, state); }
-			})
-			.catch(onError);
+				release(cycle);
+				runPending(owner, state);
+			});
 	}
 	function runPending(owner, state) {
 		if (state.since !== null) return;
 		const next = state.pending;
 		state.pending = null;
-		if (stopped || next === null) { owners.delete(owner); return; }
+		if (stopped || next === null || !admitted()) { owners.delete(owner); return; }
 		const cycle = cycleFor(next.context);
 		const list = [];
 		try {

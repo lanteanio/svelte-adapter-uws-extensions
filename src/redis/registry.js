@@ -43,6 +43,7 @@ import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { execMultiSlot, firstCommandError, coalescedByOwner } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
 	MAX_REGISTRY_SESSIONS_PER_INSTANCE,
@@ -875,21 +876,27 @@ export function createConnectionRegistry(client, options) {
 	const refreshKeys = coalescedByOwner(redis, {
 		key: (command) => command[1],
 		current: (command) => ownsKey(command[1]),
+		// A refresh that waited for a busy owner runs only while the breaker is
+		// healthy; a tick probes through its own admission.
+		admit: breaker ? () => breaker.isHealthy : null,
 		onError: (err) => breaker?.failure(err),
 		onComplete(cycle) {
 			if (cycle.total > 0 && cycle.error === null) breaker?.success();
+			// A tick that reached no owner returns the probe it was admitted with.
+			cycle.context?.();
 		}
 	});
 	const refreshTtls = coalescedWork(() => {
 		if (destroyed) return;
 		if (localUsers.size === 0 && appSessionToWs.size === 0) { refreshKeys([]); return; }
-		if (!withBreakerGuard()) return;
+		let releaseAdmission;
+		try { releaseAdmission = guardBreaker(breaker); } catch { return; }
 		// Refresh TTL on every locally-owned entry (users + app sessions) in
 		// bounded pipelines, one refresh at a time per Redis owner.
 		const commands = [];
 		for (const userId of localUsers.keys()) commands.push(['expire', userKey(userId), ttl]);
 		for (const sessionId of appSessionToWs.keys()) commands.push(['expire', sessionKey(sessionId), ttl]);
-		refreshKeys(commands);
+		refreshKeys(commands, releaseAdmission);
 	}, error => breaker?.failure(error));
 
 	function heartbeatTick() {
