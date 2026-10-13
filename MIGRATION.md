@@ -421,6 +421,46 @@ writers paused, reconcile those tokens and affected index hashes against trusted
 application records; the upgrade does not reconstruct missing ownership mappings
 or automatically delete colliding data. See [session token rules](./docs/session-tokens.md).
 
+### Presence join and cursor attach reject when the socket closes mid-call
+
+`presence.join()` and `cursor.attach()` reject with `WsClosedError`
+(`err.code === 'WS_CLOSED'`) when the connection closes before the call commits;
+releases before 0.5.5 returned without an error. State is rolled
+back before the rejection. Await both calls and handle that code, usually by
+ignoring it: a call left unawaited in an `open` or `subscribe` hook turns a client
+hanging up mid-join into an unhandled rejection, which ends a Node process in the
+default mode.
+
+### Redis sessions index before writing
+
+With `forgetUserId`, `set`, `create` and `touch` reject with
+`code: 'ERASURE_INDEX_INCOMPLETE'` when the extractor throws, returns anything
+other than a string, `null` or `undefined`, or the index write fails, and then
+store or extend nothing. Nothing was written, so retrying is safe; `err.cause`
+holds the underlying error. Return a numeric user id as a string and keep `null`
+for anonymous data, for example `(d) => d?.userId == null ? null : String(d.userId)`.
+The extractor receives the session data as stored, after a JSON round trip (no
+class methods or prototype getters, dates as strings), when a session is written
+as well as when it is purged.
+
+`get` and lifecycle loads never reject because of the index. `purgeUser` reads
+only the user's index: a session the index does not list, such as one written by
+an earlier release whose index write failed or while `forgetUserId` was unset,
+gains an index field on its next `set`, `touch`, sliding `get` or lifecycle
+load, and otherwise expires within `ttlMs`. The store cannot list tokens; if the
+application keeps a record of issued tokens, touch each live one once after all
+writers run this release to make it addressable sooner (`touch` also extends that
+session by `ttlMs`). Index fields expire one minute after their record.
+
+### Redis locks reserve the `lock-fences:` namespace
+
+`withLock()` rejects a key when the factory `keyPrefix` followed by the key begins
+with `lock-fences:`, the namespace under the client prefix that holds the durable
+fence counters. The check applies even to calls without fencing. The
+default factory prefix `lock:` never reaches it; only a factory `keyPrefix` such as
+`''` or `lock-` combined with a matching key does. Deploy the renamed keys on the
+current release before upgrading.
+
 ### Redis clients bound waits and disconnected buffering
 
 Owned clients default to 5-second command, connection and socket timeouts,
@@ -824,6 +864,12 @@ find them: <!-- vocabulary-allow: a rename note must name the superseded option 
 | `buggified` (per-run flag and summary counter) | `faulted` | <!-- vocabulary-allow: rename table, superseded option name -->
 
 ## 6. New, no action required
+
+### Distributed locks can hand out monotonic fences
+
+**What changed.** `createDistributedLock` accepts `fence: true` on the factory or a call; the callback then receives a durable, increasing integer as its second argument. Callers that do not opt in make no extra Redis round trip; the only change for them is the reserved `lock-fences:` namespace (see "Redis locks reserve the `lock-fences:` namespace").
+
+**How to migrate.** No action. Before enabling it, read the [fencing contract](./docs/distributed-locks.md#monotonic-fencing): counters have no TTL, must survive eviction, failover and restore alongside the protected resource's history, and every holder must share one client `keyPrefix`. A rollback below 0.6.0-next.64 ignores the option, and callbacks then receive `undefined`; make the protected resource reject a missing fence before relying on it.
 
 ### The lease Lua scripts are public at `redis/lease-scripts`
 

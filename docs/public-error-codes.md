@@ -21,6 +21,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `TASK_FENCE_LOST` | PostgreSQL task execution | Another worker owns the task and its canonical outcome was not available before the deadline. |
 | `IDEMPOTENCY_RESULT_TOO_LARGE` | Redis and PostgreSQL idempotency | The encoded result exceeds the configured byte cap. |
 | `IDEMPOTENCY_LEASE_LOST` | Redis and PostgreSQL idempotency | The pending slot is no longer owned by this call. |
+| `ERASURE_INDEX_INCOMPLETE` | Redis sessions with `forgetUserId` | `set`, `create` or `touch` stored or extended nothing because `forgetUserId` threw or returned a non-string, or the erasure index write failed; or `purgeUser` could not erase every indexed session. `err.cause` holds the underlying error; retry after repairing it. |
 | `WS_CLOSED` | Presence and cursor operations | The socket closed during the operation; the operation rolled back. |
 | `SUBSCRIBE_DENIED` | Presence and cursor operations | The platform refused access to the underlying topic. |
 | `WEBHOOK_CIRCUIT_OPEN` | Redis webhook controls | Delivery was refused while the target's breaker was open. |

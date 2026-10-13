@@ -20,6 +20,7 @@ describes upgrade and initialization behavior.
 | Idempotency and sessions | Results/session records, expiry and erasure indexes | Reapply erasures and revocations newer than the backup; reconcile pending owners. |
 | Alarms | Schedule, metadata and all retained generation authority; PostgreSQL also needs its migration ledger | Preserve watermarks for deleted and pending topics; reconcile executed callbacks before enabling due work. |
 | Dead letters | Records, ordered index, ID authority and erasure tombstones | Reapply later erasures before redelivery. |
+| Lock fence counters | `lock-fences:` counters, together with each protected resource's accepted-fence history | Never restore a counter below a fence its resource accepted; set a lagging counter to at least that fence before fenced writers resume. See [monotonic fencing](./distributed-locks.md#monotonic-fencing). |
 | Presence, routing, cursors and leases | Rebuild from current authenticated connections and processes | Isolate old owners and reconnect clients. Restoring bytes does not restore a socket. |
 | Groups, smoothing and admission controls | Apply the manifest's family-specific reconciliation policy | Preserve closure decisions and expiry; establish current ownership and policy. |
 

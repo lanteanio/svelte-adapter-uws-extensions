@@ -182,7 +182,7 @@ export const redis = createRedisClient({
 | `url` | `'redis://localhost:6379'` | Redis connection URL |
 | `keyPrefix` | `''` | Prefix for all keys |
 | `autoShutdown` | `true` | Disconnect on `sveltekit:shutdown` |
-| `options` | One retry; 5s deadlines | Override the [bounded Redis outage policy](docs/redis-outages.md). |
+| `options` | One retry; 5s deadlines | Override the [bounded Redis outage policy](docs/redis-outages.md). By default a sent command whose reply is lost on connection reset rejects with a typed connection error instead of being replayed. |
 
 #### API
 
@@ -192,8 +192,6 @@ export const redis = createRedisClient({
 | `redis.key(k)` | Returns `keyPrefix + k` |
 | `redis.duplicate(overrides?)` | New subscriber connection with bounded offline buffering and finite deadlines. Pass ioredis options to override defaults. |
 | `redis.quit()` | Gracefully disconnect all connections |
-
-Sent commands whose reply is lost on connection reset reject with a typed connection error instead of being automatically replayed. See the [Redis outage policy](docs/redis-outages.md) for deadlines and explicit replay overrides.
 
 ---
 
@@ -908,9 +906,9 @@ export async function close(ws, { platform }) {
 
 | Method | Description |
 |---|---|
-| `join(ws, topic, platform)` | Add connection to presence |
+| `join(ws, topic, platform)` | Add connection to presence. Rejects with `TypeError`, before retaining state, for a topic containing double quotes, backslashes or control characters. |
 | `leave(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
-| `sync(ws, topic, platform)` | Send list without joining |
+| `sync(ws, topic, platform)` | Send list without joining. Ignores an invalid topic name before authorization or reads. |
 | `update(ws, topic, fields, platform)` | Set dynamic fields on the present user as a field-level delta. See [Field-level updates](#field-level-updates). |
 | `list(topic)` | Get current users |
 | `count(topic)` | Count unique users |
@@ -966,7 +964,7 @@ Additive and wire-compatible: a deployment that never calls `update()` sends the
 | Field | Description |
 |---|---|
 | `totalOnline` | Sum of unique-users-per-topic across all topics this instance is locally tracking. The same user in two topics counts twice; per-topic counts sum cleanly. |
-| `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds. Useful as a rough Redis-health indicator - a tick that suddenly takes longer than usual is likely waiting on a slow Redis. |
+| `heartbeatLatencyMs` | Duration of the most recent heartbeat tick in milliseconds, including Redis completion. While a refresh from an earlier tick is still outstanding on some Redis owner, the age of the oldest such refresh, so a stalled owner shows as a growing value. Useful as a rough Redis-health indicator. |
 | `staleCleanedTotal` | Reserved for backward compatibility. Always `0` since per-field staleness is now enforced atomically by Redis via `HPEXPIRE` rather than by an application-side cleanup script. The field stays for callers that read it.|
 
 With a `metrics` registry, `presence_total_online{topic="all"}` sums per-topic online user counts by mapped class; a user on two topics counts twice. `presence_heartbeat_latency_ms` is a gauge. The former `presence_stale_cleaned_total` counter is no longer registered.
@@ -1602,8 +1600,6 @@ Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres;
 
 Redis-backed counterpart to the core `createCursor` plugin. Await `attach(ws, topic, platform)` before sending updates so subscription admission and the shared snapshot complete. Cursor positions are shared across instances via Redis. Each instance throttles locally (same leading/trailing edge logic as the core), then relays broadcasts through Redis pub/sub so subscribers on other instances see cursor updates.
 
-Presence `join()` and cursor `update()` reject topic names containing quotes, backslashes or control characters with `TypeError` before retaining state. Presence `sync()` and cursor `snapshot()` silently ignore invalid topic names before authorization or reads.
-
 Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
 Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
@@ -1691,7 +1687,7 @@ export function close(ws, { platform }) {
 |---|---|
 | `attach(ws, topic, platform)` | Opt the connection into receiving cursor updates for `topic` (subscribes to `__cursor:{topic}` server-side and sends a snapshot). Required for any client to see cursor frames. |
 | `detach(ws, topic, platform)` | Stop the connection from receiving updates for `topic`. Only needed for explicit leave; uWS handles disconnect cleanup. |
-| `update(ws, topic, data, platform)` | Broadcast cursor position (throttled per user per topic) |
+| `update(ws, topic, data, platform)` | Broadcast cursor position (throttled per user per topic). Throws `TypeError`, before retaining state, for a topic containing double quotes, backslashes or control characters; `snapshot()` ignores such a topic before authorization or reads. |
 | `viewport(ws, topic, rect)` | Record a subscriber's viewport rect `{ x, y, w, h, zoom }` so viewport culling delivers only the cursors inside it. Auto-handled when you route a `{ type: 'cursor-viewport', topic, rect }` frame through `cursor.hooks.message`, or call it directly. |
 | `viewportFor(ws, topic)` | The subscriber's last reported viewport rect for a topic, or `null`. |
 | `remove(ws, platform, topic?)` | Remove from a specific topic, or all topics if omitted |
@@ -2284,10 +2280,7 @@ export const lock = createDistributedLock(redis, {
 
 #### Raw lease scripts (advanced)
 
-Most applications should use `createDistributedLock`, `createLeader`, or the
-other lease-backed primitives. Tooling that deliberately calls `redis.eval`
-can import the shared, value-guarded Lua scripts from the supported public
-subpath:
+Tooling that deliberately calls `redis.eval` can import the value-guarded Lua scripts the lock, leader and smooth-cluster primitives run ([arguments and results](docs/distributed-locks.md#raw-lease-scripts)):
 
 ```js
 import {
@@ -2295,12 +2288,6 @@ import {
   LEASE_RELEASE_SCRIPT
 } from 'svelte-adapter-uws-extensions/redis/lease-scripts';
 ```
-
-`LEASE_RENEW_SCRIPT` takes one key, the expected holder value, and a TTL in
-milliseconds; `LEASE_RELEASE_SCRIPT` takes one key and the expected holder
-value. Each returns `1` only when the stored value still belongs to that holder,
-otherwise `0`. The lock, leader, and smooth-cluster primitives run these exact
-scripts, so a direct caller shares their value-guarded semantics.
 
 #### Use
 
@@ -2319,18 +2306,24 @@ await lock.withLock('order-42', async (signal) => {
 
 #### How it works
 
-1. **Acquire.** `SET <fullKey> <fenceToken> NX PX <ttlMs>` - atomic test-and-set with a TTL. The fence token is a per-call random UUID so a stale heartbeat or release from a previous holder can never affect a new holder.
-2. **Retry.** On collision (someone else holds the key), sleep `retryDelayMs` and try again. After `maxWaitMs` total wait, throw `LockAcquireTimeoutError`.
-3. **Hold.** While `fn` is running, a heartbeat tick every `heartbeatMs` (defaults to `defaultTtlMs / 3`) refreshes the TTL via Lua-atomic `if get == fenceToken then pexpire end`. A monotonic deadline starts when each acquire or renewal is sent. If no renewal is confirmed before that deadline, or Redis reports lost ownership, the supplied `AbortSignal` fires with `LockLostError`; a delayed reply cannot revive it.
-4. **Release.** On `fn`'s completion (success or error), Lua-atomic `if get == fenceToken then del end` releases the key. Skipped if we already lost ownership (no-op via the compare guard regardless). A heartbeat already in flight settles before the call finishes, bounded by its last confirmed lease deadline. Confirmed loss or a callback completing past its deadline with an unconfirmed release rejects with `LockLostError`; a callback error retains precedence. Cleanup delays alone do not invalidate work completed within its confirmed lease. If a refresh remains unanswered at that deadline, release runs best-effort without extending the cleanup wait.
-
-The `AbortSignal` shape is the cluster-correctness story: when a heartbeat detects loss or the local lease deadline expires, your code learns and can bail instead of continuing to mutate state another holder now thinks it owns. Listen for the `abort` event or check `signal.aborted` at long-running checkpoints.
+The [lease protocol](docs/distributed-locks.md#lease-protocol) describes acquisition, heartbeats, release and how the `AbortSignal` reports loss.
 
 #### Cooperative, not a hard mutex
 
-`withLock` is a TTL lease with *cooperative* release, not a fencing mutex. The lease auto-expires after `ttlMs` so a crashed holder cannot block the cluster forever - but that same expiry means a holder that STALLS past `ttlMs` (a long GC pause, a blocked event loop, a paused debugger) loses the lease while still executing, and a successor can acquire and run the same critical section concurrently. The `AbortSignal` is how the framework tells such a holder to bail, but it is advisory: code that ignores the signal, or is blocked and never observes it, keeps running. The fence token is internal - it guards the release and heartbeat so a stale holder cannot free or refresh a new holder's key; it is not surfaced to `fn` and does not fence the resource `fn` mutates.
+`withLock` is a TTL lease with cooperative release. A holder that stalls past `ttlMs` (a long GC pause, a blocked event loop) loses the lease while still executing, and a successor can run the same critical section concurrently; the `AbortSignal` tells the holder to stop but cannot halt code that ignores it. When the protected resource must be single-writer even across a stall, keep the operation idempotent, have the resource reject stale writes with a [monotonic fence](#monotonic-fencing), or use `createTaskRunner`, whose Postgres fence enforces at-most-once commits. See [stalled holders](docs/distributed-locks.md#stalled-holders).
 
-So `withLock` gives mutual exclusion under normal operation (responsive holders, no pause longer than `ttlMs`), not a hard guarantee across a stall. When a critical section must be strictly single-writer even across a stall, the protected resource itself must reject stale writes - keep the operation idempotent, or have the sink compare a monotonically increasing version and reject anything not greater - or use `createTaskRunner`, whose Postgres fence enforces at-most-once at the database.
+#### Monotonic fencing
+
+Set `fence: true` on the factory or an individual call to receive a monotonically increasing integer as the callback's second argument:
+
+```js
+const fencedLock = createDistributedLock(redis, { fence: true }); // fence: number
+await fencedLock.withLock('order-42', async (signal, fence) => {
+  if (!signal.aborted) await saveOrderWithFence(42, fence);
+});
+```
+
+The resource must store that integer atomically with the write and reject any value not greater than its last accepted fence; the fence cannot stop a stalled holder, only let the resource refuse its writes. Counters are durable Redis keys with no TTL under the reserved `lock-fences:` namespace. Read the [fencing contract](docs/distributed-locks.md#monotonic-fencing) for key layout, eviction, failover and restore requirements before enabling it.
 
 #### Options
 
@@ -2342,6 +2335,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 | `maxWaitMs` | `5000` | Total time to wait before throwing `LockAcquireTimeoutError`. Override per call via `withLock(key, fn, { maxWaitMs })`. |
 | `heartbeatMs` | `defaultTtlMs / 3` | Heartbeat refresh interval. Default keeps margin for one missed beat. |
 | `mapKey` | `() => 'all'` | Map lock key names to bounded label values for metric cardinality. |
+| `fence` | `false` | Pass a durable monotonic fence as the callback's second argument. Requires atomic stale-write rejection by the protected sink. |
 | `breaker` | - | Optional circuit breaker for the Redis ops. |
 | `metrics` | - | Optional Prometheus metrics registry. |
 
@@ -2350,6 +2344,7 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 | Option | Description |
 |---|---|
 | `ttlMs` | Override the holder TTL for this call. |
+| `fence` | Override monotonic fencing for this call. |
 | `maxWaitMs` | Override the maximum acquire wait for this call. |
 | `signal` | External cancellation signal. Aborts the acquire loop and the inner-`fn` execution; the lock is still released cleanly on the way out (we held it; we give it back). |
 
@@ -2362,17 +2357,14 @@ So `withLock` gives mutual exclusion under normal operation (responsive holders,
 
 | Metric | Description |
 |---|---|
-| `lock_acquired_total{key_class}` | Counter of successful acquires. `key_class` is `mapKey(key)`. |
-| `lock_acquire_wait_seconds` | Histogram of successful acquisition wait in seconds, with explicit fractional buckets. Replaces `lock_acquire_wait_ms`: migrate queries and thresholds by dividing milliseconds by 1000. |
+| `lock_acquired_total{key_class}` | Counter of successful acquires, recorded when the lease `SET` succeeds (before any fence allocation). `key_class` is `mapKey(key)`. |
+| `lock_acquire_wait_seconds` | Histogram of successful acquisition wait in seconds, up to the lease `SET` and excluding fence allocation, with explicit fractional buckets. Replaces `lock_acquire_wait_ms`: migrate queries and thresholds by dividing milliseconds by 1000. |
 | `lock_acquire_timeouts_total{key_class}` | Counter of `withLock` calls that exceeded `maxWaitMs` without acquiring. |
-| `lock_lost_total{key_class}` | Counter of locks lost through heartbeat/release detection or an expired renewal deadline. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
+| `lock_lost_total{key_class}` | Counter of locks lost through heartbeat/release detection, an expired renewal deadline, or a failed ownership check before a fenced callback starts. A non-zero rate signals operator force-takeover or holder TTL elapsing - both indicate `defaultTtlMs` should be raised or work should be split into smaller chunks. |
 
 #### When to use which
 
-- **`createDistributedLock`** when business logic needs "at most one responsive instance runs this critical section at a time" - dedicated lookups against rate-limited APIs, periodic cluster work that should not overlap while holders observe their leases, transactional state machines that don't fit `createTaskRunner`'s shape. Cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)); strict single-writer effects require downstream fencing or idempotency.
-- **`createTaskRunner`** when work needs durable result tracking and retries across crashes. Handler execution is at least once after lease expiry: the Postgres fence rejects a stale canonical-result commit, but it cannot undo an external effect already started by that attempt. Observe the abort signal and pass the stable `idempotencyKey` or a fencing token to the downstream system.
-- **`createIdempotencyStore`** when the contract is "this operation has a result, and a retry within the TTL must return the same result." Mutex semantics are not the goal - caching the outcome is.
-- **`createLeader`** (next section) when the question is "which one of N workers should fire this scheduled job right now," not "who runs this critical section." Distinct from `withLock`: leader is a long-lived synchronous observer, lock is a request-scoped serializer.
+Use the lock for "at most one responsive instance runs this critical section", [`createLeader`](#leader-election) for "which one worker fires this scheduled job", `createTaskRunner` for durable results and retries, and `createIdempotencyStore` for replaying one result. The [coordination guide](docs/distributed-locks.md#choosing-a-coordination-primitive) compares their guarantees.
 
 ---
 
@@ -2461,10 +2453,7 @@ GC-pause caveat: a long stop-the-world pause on the leader can cause brief overl
 
 #### When to use which
 
-- **`createLeader`** for "exactly one of N workers fires this scheduled job." Cluster-wide singleton observation. The primitive holds long-lived state (the lease); the consumer polls `isLeader()` synchronously at every tick.
-- **`createDistributedLock`** for "at most one of N workers runs this critical section right now." Per-call cooperative serialization around a function that returns. The primitive holds the lease while the function runs and forwards its return value only without lease loss; it is cooperative, not a hard mutex under a holder stall (see [Cooperative, not a hard mutex](#cooperative-not-a-hard-mutex)).
-
-Both use the same backing Lua scripts and the same lease semantics; they differ in consumer shape (long-lived observer vs. scoped serializer).
+The leader is a long-lived observer for "exactly one of N workers fires this scheduled job"; [`createDistributedLock`](#distributed-lock) serializes one function for "at most one worker runs this critical section". Both run the same lease scripts. The [coordination guide](docs/distributed-locks.md#choosing-a-coordination-primitive) compares them with the task runner and idempotency store.
 
 ---
 
@@ -3379,7 +3368,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `presence_heartbeats_total` | counter | | Heartbeat refresh cycles |
 | `presence_stale_cleaned_total` | counter | | Stale entries removed by cleanup |
 | `presence_total_online` | gauge | `topic` | Sum of per-topic online user counts by mapped class on this instance |
-| `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms |
+| `presence_heartbeat_latency_ms` | gauge | | Duration of the most recent heartbeat tick in ms, or the age of the oldest refresh still outstanding |
 | `presence_keyspace_cleanups_total` | counter | | Topic hash removals that triggered an empty-list emit (keyspace mode only) |
 
 **Replay buffer (Redis and Postgres)** - [Redis corrupt-input counters and diagnostics](docs/input-drops.md)
@@ -4367,7 +4356,7 @@ configureForget({
 
 `createForgetStore` attempts every store even if one fails, then rejects if any failed (svelte-realtime maps that to `FORGET_STORE_FAILED` - retry the erasure), and returns a per-store removal-count breakdown. Each store exposes `purgeUser(tenantId, userId)`:
 
-Session erasure scans string records in bounded batches across all Redis primaries, so missing reverse-index entries do not hide sessions. Its Redis ACL needs `SCAN` and scripting permissions. Corrupt or ambiguous records and Redis failures reject with `code: 'ERASURE_INDEX_INCOMPLETE'` and `erasureIndexIncomplete: true`; retry after repair. Session user IDs remain globally unique: `tenantId` does not partition this store.
+Session erasure reads only the purged user's reverse index. Every session write and TTL refresh updates that index before the record, so it covers every session written or refreshed before the purge reads the index, and the purge never scans the keyspace; a session written while its user's purge runs can survive that purge, and when it reuses a token the purge was erasing it also loses its index field until its next refresh or expiry. An indexed record is deleted only while its stored value still names that user, which needs Redis scripting permission. Redis failures, unreadable or unattributable records in that user's index, and records that keep changing during the purge reject with `code: 'ERASURE_INDEX_INCOMPLETE'` and `erasureIndexIncomplete: true` after the user's other reachable sessions are revoked (none are when the index read itself fails); retry after repair. Session user IDs remain globally unique: `tenantId` does not partition this store.
 
 **`tenantId` format.** Either `null` for the untenanted scope, or a string of up to 64 characters from `[a-zA-Z0-9_.:-]` - so domains (`acme.com`) and namespaced ids (`acme:eu`) are fine. The scope is decided by a prefix match on the wire topic (`@t/<tenantId>/<topic>`), which is why `/` is refused: it would make tenant `a` and tenant `a/b` both match `@t/a/b/x`, and one tenant's erasure would reach another's rooms. A non-string is refused rather than coerced - on an erasure path a silent miss is worse than a loud failure, because the data was written under whatever representation the writer used. Stringify at the call site with that same representation.
 
@@ -4385,7 +4374,7 @@ With the extractor, the session indexes each token per user at write time, the R
 
 The Redis dead-letter store also closes the in-flight-delivery race: a webhook whose delivery was already running when `purgeUser` swept the store would otherwise re-insert the erased payload when it fails moments later. `purgeUser` writes a per-user forget tombstone (server time at purge, a window set by `forgetTombstoneMs`, default 10 minutes) before deleting, and `add` drops a record whose delivery started before that purge. The purge time and the delivery start are compared on the shared Redis server clock, so it holds across a cluster where the delivering and purging instances differ. A delivery started after the purge is unaffected. The residual: a single delivery whose total retry duration outlives the tombstone window resurrects the payload once the tombstone expires - raise `forgetTombstoneMs` above your max retry budget to close it.
 
-The session and idempotency per-user indexes stay in lockstep with their entries: each index field carries the same TTL as the session/cache entry it points at (per-field `HPEXPIRE` on Redis 7.4+ / Valkey 9.0+, with a whole-key sliding TTL fallback on older servers), and every path that slides an entry's TTL - `set`, `get`, `touch`, a lifecycle load - slides its index field too. A session kept alive by activity therefore always remains addressable by `purgeUser`, at the cost of one extra index write per refreshing read when the extractor is configured. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
+The session and idempotency per-user indexes stay in lockstep with their entries, with per-field `HPEXPIRE` on Redis 7.4+ / Valkey 9.0+ and a whole-key sliding TTL fallback on older servers. Every path that slides an entry's TTL - `set`, `get`, `touch`, a lifecycle load - refreshes its index field too. A session index field is written or refreshed before its record is written or slid and lives one minute longer than the record; `set`, `create` and `touch` reject rather than store or extend a session whose index write failed, while `get` and lifecycle loads return the session without extending it. A session kept alive by activity therefore always remains addressable by `purgeUser`, at the cost of one extra index write per refresh, one read per `touch`, and one parse of the serialized value per `set` or `create`, when the extractor is configured. CRDT documents are not purgeable here - merged edits in a shared document are not surgically erasable; use svelte-realtime's `onForget` hook to delete app-owned documents. Needs `svelte-realtime >= 0.6.0-next.51`.
 
 ### Cluster room state: owner succession and presence rosters
 
