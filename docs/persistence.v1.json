@@ -468,6 +468,18 @@
 			"notes": "Lease tokens cannot certify that a previous process or its external work stopped. Reconcile side effects before reacquisition."
 		},
 		{
+			"id": "lock-fences",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "counter",
+					"type": "string",
+					"template": "lock-fences:<key>"
+				}
+			],
+			"notes": "Durable monotonic counters without TTL; key is base64url of the full physical lease key. Preserve with the protected resource's accepted-fence history and never restore a counter below a fence that resource accepted. Exclude from eviction."
+		},
+		{
 			"id": "leader",
 			"restore": "rebuild",
 			"roles": [

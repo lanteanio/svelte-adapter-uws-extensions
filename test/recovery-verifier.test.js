@@ -102,6 +102,21 @@ it('validates retained dead-letter counters even when no records remain', async 
 		expect(report.redis.checks).toContainEqual({ scope: 'redis', name: 'paired_membership', ok: report.ok });
 	}
 });
+it('requires every lock fence counter to be a persistent positive safe integer', async () => {
+	const cases = [['1', -1, true], ['9007199254740991', -1, true], ['7', 60000, false], ['0', -1, false], ['007', -1, false], ['abc', -1, false], ['9007199254740992', -1, false]];
+	for (const [value, ttl, ok] of cases) {
+		const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['lock-fences'] } }, {
+			redis: {
+				scan: async () => ['0', ['lock-fences:b3RoZXI', 'lock-fences:bG9jazpvcmRlcg']], type: async () => 'string',
+				pttl: async key => key.endsWith('b3RoZXI') ? -1 : ttl,
+				get: async key => key.endsWith('b3RoZXI') ? '3' : value
+			}
+		});
+		expect(report.complete).toBe(true);
+		expect(report.ok).toBe(ok);
+		expect(report.redis.checks).toContainEqual({ scope: 'lock-fences', name: 'counter_authority', ok });
+	}
+});
 it('does not call a missing configured namespace a successful expected restore', async () => {
 	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minimumKeys: { sessions: 1 } } }, {
 		redis: { scan: async () => ['0', []] }

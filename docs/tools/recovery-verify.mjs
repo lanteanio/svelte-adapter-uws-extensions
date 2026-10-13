@@ -150,7 +150,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 	const result = section(), groups = new Map(), seen = new Set(), patterns = matchers(config);
 	// These built-in namespaces overlap by default but have distinct Redis types.
 	const sessionPatterns = matchers({ ...config, specs: manifest.redis.filter(spec => spec.id === 'sessions' || spec.id === 'registry') });
-	let calls = 0, matched = 0, ambiguous = 0;
+	let calls = 0, matched = 0, ambiguous = 0, fenceOk = true;
 	const read = async (command, ...args) => { remaining(); const value = await redis[command](...args); remaining(); return value; };
 	try {
 		remaining(); const before = await topology(redis); remaining();
@@ -198,6 +198,12 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 					if (ttl === -2) { result.complete = false; result.reason = 'keys_changed'; }
 					else if (ttl === -1) stats.persistentKeys++; else stats.expiringKeys++;
 					if (type !== role.type) { stats.wrongTypes++; continue; }
+					if (spec.id === 'lock-fences') {
+						// Each counter stands alone: persistent and a positive safe integer.
+						const value = await read('get', key);
+						fenceOk &&= ttl === -1 && integer(value) && value[0] !== '0' && Number.isSafeInteger(Number(value));
+						continue;
+					}
 					const values = pattern.regex.exec(key).slice(1);
 					const topic = values[pattern.names.indexOf('topic')] ?? '';
 					const groupId = spec.id + '\0' + topic;
@@ -277,6 +283,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 		}
 		if (config.specs.some(spec => spec.id === 'alarms')) check(result, 'alarms', 'generation_authority', alarmOk);
 		if (config.specs.some(spec => spec.id === 'replay')) check(result, 'replay', 'sequence_authority', replayOk);
+		if (config.specs.some(spec => spec.id === 'lock-fences')) check(result, 'lock-fences', 'counter_authority', fenceOk);
 		if (config.specs.some(spec => ['alarms','dead-letter'].includes(spec.id))) check(result, 'redis', 'paired_membership', pairOk);
 		if (before !== await topology(redis)) fail('topology_changed');
 		remaining(); check(result, 'redis', 'unambiguous_namespaces', ambiguous === 0);
