@@ -829,7 +829,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		cause: 'The metric named in the attributes has as many distinct label sets as its maxSeries allows.',
 		consequence: 'Existing series keep updating; observations for any new label set are dropped. prometheus_series_dropped_total counts the drops. Reported once per metric.',
 		automaticRecovery: 'None while the cap holds.',
-		nextAction: 'Raise maxSeries if the cardinality is legitimate, or pass mapTopic so topic labels stay bounded.',
+		nextAction: 'Raise maxSeries if the cardinality is legitimate; otherwise map labels to fewer classes (a custom mapTopic or mapKey can produce unbounded values, while the default collapses identifiers to all).',
 		sources: ['src/prometheus/index.js'], anchor: 'extensions-err-prometheus-series-cap'
 	}),
 	direct({
