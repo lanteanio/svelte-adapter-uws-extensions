@@ -8,7 +8,7 @@
  * successor can acquire and overlap it. The `AbortSignal` tells such a holder
  * to bail, but is advisory. For strict single-writer correctness across a
  * stall, make the protected resource reject stale writes, or use the
- * task runner (Postgres fence). The internal fence token guards release and
+ * task runner (Postgres fence). The internal lease token guards release and
  * heartbeat only; it is not surfaced to `fn`. With `fence: true`, a separate
  * persistent monotonic counter is passed as the callback's second argument.
  * Cooperating holders must use the same Redis client keyPrefix so they share
@@ -18,10 +18,10 @@
  * (one fence per `taskId`, paired with the Postgres state machine);
  * this lock is a general-purpose primitive any user code can grab.
  *
- * Backing primitive: `SET <key> <fenceToken> NX PX <ttlMs>` to acquire,
- * Lua-atomic `if get == fenceToken then del end` to release. While the
+ * Backing primitive: `SET <key> <leaseToken> NX PX <ttlMs>` to acquire,
+ * Lua-atomic `if get == leaseToken then del end` to release. While the
  * holder is running, a heartbeat tick refreshes the TTL via Lua-atomic
- * `if get == fenceToken then pexpire end`. If the heartbeat reports
+ * `if get == leaseToken then pexpire end`. If the heartbeat reports
  * "no longer ours" (operator force-takeover, TTL elapsed before our
  * heartbeat could refresh, etc.), the supplied `AbortSignal` fires so
  * the user code can bail.
@@ -168,7 +168,7 @@ export function createDistributedLock(client, options = {}) {
 		const fullK = fullKey(key);
 		if (fullK.startsWith(counterPrefix)) throw new TypeError('lock: lock-fences: is reserved for monotonic counters');
 		const keyClass = mapKey(key);
-		const fenceToken = randomBytes(16).toString('hex');
+		const leaseToken = randomBytes(16).toString('hex');
 
 		// Acquire loop. Timing uses `monotonicNow()` (a `performance.now()`-backed
 		// counter) so a backward NTP step between successive reads cannot make
@@ -179,35 +179,41 @@ export function createDistributedLock(client, options = {}) {
 		while (true) {
 			let result;
 			try {
-				result = await redis.set(fullK, fenceToken, 'NX', 'PX', ttlMs);
+				result = await redis.set(fullK, leaseToken, 'NX', 'PX', ttlMs);
 				breaker?.success();
 			} catch (err) {
 				breaker?.failure(err);
 				throw err;
 			}
 			if (result === 'OK') {
+				acknowledgedAt = monotonicNow();
+				mWait?.observe((acknowledgedAt - start) / 1000);
+				mAcquired?.inc({ key_class: keyClass });
 				if (useFence) {
 					try {
 						const counterKey = counterPrefix + Buffer.from(fullK).toString('base64url');
-						orderedFence = await redis.incr(counterKey);
+						const reply = await redis.incr(counterKey);
+						// A client created with `stringNumbers: true` replies with a
+						// decimal string; Number() of one past 2^53 is not a safe integer.
+						orderedFence = typeof reply === 'string' && /^[1-9]\d*$/.test(reply) ? Number(reply) : reply;
 						if (!Number.isSafeInteger(orderedFence) || orderedFence < 1) throw new RangeError('lock: fence counter must be a positive safe integer');
 						// A delayed increment may arrive after another holder acquired.
 						// Validate ownership AFTER it, then enforce the conservative
 						// lease deadline below before exposing the fence to user code.
 						// Separate single-key commands also work across Cluster slots.
-						if (await redis.get(fullK) !== fenceToken) throw new LockLostError(key);
+						if (await redis.get(fullK) !== leaseToken) throw new LockLostError(key);
 					} catch (error) {
-						breaker?.failure(error);
-						try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken); } catch (releaseError) { breaker?.failure(releaseError); }
+						// Our own verdicts are not backend failures.
+						if (error instanceof LockLostError) mLost?.inc({ key_class: keyClass });
+						else if (!(error instanceof RangeError)) breaker?.failure(error);
+						try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, leaseToken); } catch (releaseError) { breaker?.failure(releaseError); }
 						throw error;
 					}
+					acknowledgedAt = monotonicNow();
 				}
-				acknowledgedAt = monotonicNow();
-				mWait?.observe((acknowledgedAt - start) / 1000);
-				mAcquired?.inc({ key_class: keyClass });
 				if (acknowledgedAt >= leaseDeadline) {
 					mLost?.inc({ key_class: keyClass });
-					try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken); } catch (error) { breaker?.failure(error); }
+					try { await evalCached(redis, RELEASE_SCRIPT, 1, fullK, leaseToken); } catch (error) { breaker?.failure(error); }
 					throw new LockLostError(key);
 				}
 				break;
@@ -248,7 +254,7 @@ export function createDistributedLock(client, options = {}) {
 			try {
 				if (lost || stopped) return;
 				const sentAt = monotonicNow();
-				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, fenceToken, ttlMs);
+				const r = await evalCached(redis, HEARTBEAT_SCRIPT, 1, fullK, leaseToken, ttlMs);
 				breaker?.success();
 				if (lost || (stopped && !finishWaiter)) return;
 				if (Number(r) !== 1 || (settledAt ?? monotonicNow()) >= leaseDeadline) {
@@ -319,10 +325,10 @@ export function createDistributedLock(client, options = {}) {
 			if (!lost && inFlight) {
 				// The callback completed inside its lease, but its refresh never
 				// replied. Release best-effort without delaying completed work.
-				void evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken).catch(err => breaker?.failure(err));
+				void evalCached(redis, RELEASE_SCRIPT, 1, fullK, leaseToken).catch(err => breaker?.failure(err));
 			} else if (!lost) {
 				try {
-					const released = await evalCached(redis, RELEASE_SCRIPT, 1, fullK, fenceToken);
+					const released = await evalCached(redis, RELEASE_SCRIPT, 1, fullK, leaseToken);
 					if (Number(released) !== 1) {
 						lost = true;
 						lostError = new LockLostError(key);

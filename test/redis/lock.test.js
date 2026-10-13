@@ -394,6 +394,66 @@ describe('redis distributed lock', () => {
 			expect(() => createDistributedLock(client, { fence: 'yes' })).toThrow(TypeError);
 			await expect(createDistributedLock(client).withLock('x', () => {}, { fence: 1 })).rejects.toThrow(TypeError);
 		});
+
+		it('accepts decimal-string counter replies from stringNumbers clients', async () => {
+			const increment = client.redis.incr.bind(client.redis);
+			vi.spyOn(client.redis, 'incr').mockImplementation(async key => String(await increment(key)));
+			const lock = createDistributedLock(client, { fence: true });
+			await expect(lock.withLock('strings', (_, fence) => fence)).resolves.toBe(1);
+			await expect(lock.withLock('strings', (_, fence) => fence)).resolves.toBe(2);
+		});
+
+		it('refuses a decimal-string counter past the safe integer range', async () => {
+			vi.spyOn(client.redis, 'incr').mockResolvedValueOnce('9007199254740992');
+			const callback = vi.fn();
+			await expect(createDistributedLock(client, { fence: true }).withLock('strings-overflow', callback)).rejects.toBeInstanceOf(RangeError);
+			expect(callback).not.toHaveBeenCalled();
+			expect(await client.redis.get(client.key('lock:strings-overflow'))).toBeNull();
+		});
+
+		it('refuses a non-canonical decimal counter reply', async () => {
+			vi.spyOn(client.redis, 'incr').mockResolvedValueOnce('01');
+			const callback = vi.fn();
+			await expect(createDistributedLock(client, { fence: true }).withLock('canonical', callback)).rejects.toBeInstanceOf(RangeError);
+			expect(callback).not.toHaveBeenCalled();
+		});
+
+		it('measures acquisition wait up to the lease, not through the counter step', async () => {
+			let now = 0;
+			setRuntimeEnv({ clock: { monotonic: () => now } });
+			const metrics = createMetrics();
+			const set = client.redis.set.bind(client.redis);
+			client.redis.set = async (...args) => { now += 5; return set(...args); };
+			const increment = client.redis.incr.bind(client.redis);
+			vi.spyOn(client.redis, 'incr').mockImplementationOnce(async key => { now += 400; return increment(key); });
+			try {
+				await expect(createDistributedLock(client, { fence: true, metrics }).withLock('timed', (_, fence) => fence)).resolves.toBe(1);
+				expect(metrics.serialize()).toContain('lock_acquire_wait_seconds_sum 0.005');
+			} finally {
+				resetRuntimeEnv();
+			}
+		});
+
+		it('counts an ownership loss found after the counter step without failing the breaker', async () => {
+			const metrics = createMetrics();
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			vi.spyOn(client.redis, 'get').mockResolvedValueOnce('another-holder');
+			const lock = createDistributedLock(client, { fence: true, metrics, breaker, mapKey: (k) => k.split(':')[0] });
+			const callback = vi.fn();
+			await expect(lock.withLock('orders:7', callback)).rejects.toBeInstanceOf(LockLostError);
+			expect(callback).not.toHaveBeenCalled();
+			const out = await metrics.serialize();
+			expect(out).toMatch(/lock_acquired_total\{key_class="orders"\}\s+1/);
+			expect(out).toMatch(/lock_lost_total\{key_class="orders"\}\s+1/);
+			expect(breaker.state).toBe('healthy');
+		});
+
+		it('does not count an unusable counter value against the breaker', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			vi.spyOn(client.redis, 'incr').mockResolvedValueOnce(0);
+			await expect(createDistributedLock(client, { fence: true, breaker }).withLock('zero', vi.fn())).rejects.toBeInstanceOf(RangeError);
+			expect(breaker.state).toBe('healthy');
+		});
 	});
 
 	describe('withLock: heartbeat / lost lock', () => {
