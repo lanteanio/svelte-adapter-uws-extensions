@@ -259,7 +259,7 @@
 		"node": ">=22.0.0"
 	},
 	"peerDependencies": {
-		"svelte-adapter-uws": ">=0.6.0-next.95"
+		"svelte-adapter-uws": ">=0.6.0-next.96"
 	},
 	"dependencies": {
 		"@types/pg": "8.23.1",
@@ -275,7 +275,7 @@
 		"parse5": "8.0.0",
 		"publint": "^0.3.22",
 		"semver": "7.7.4",
-		"svelte-adapter-uws": "0.6.0-next.95",
+		"svelte-adapter-uws": "0.6.0-next.96",
 		"typescript": "5.9.3",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0",

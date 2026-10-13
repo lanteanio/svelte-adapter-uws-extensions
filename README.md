@@ -125,8 +125,8 @@ The three ecosystem packages move together. Bump them as a group:
 | `svelte-adapter-uws` | `svelte-realtime` | `svelte-adapter-uws-extensions` | Notes |
 |---|---|---|---|
 | `0.4.x` | `0.4.x` | `0.4.x` | legacy |
-| `0.5.8` | `0.5.x` | `0.5.x` | stable; Node >=22.0.0 |
-| `0.6.0-next.95` | `0.6.0-next.90` | `0.6.0-next.63` | Declared current train; Node >=22.0.0. Redis 7+ / Valkey 7.2+ for sharded pub/sub and functions; Redis 7.4+ / Valkey 9.0+ for presence. |
+| `0.5.10` | `0.5.x` | `0.5.x` | stable; Node >=22.0.0 |
+| `0.6.0-next.96` | `0.6.0-next.91` | `0.6.0-next.64` | Declared current train; Node >=22.0.0. Redis 7+ / Valkey 7.2+ for sharded pub/sub and functions; Redis 7.4+ / Valkey 9.0+ for presence. |
 
 Generated from the installed adapter's `docs/compatibility.v1.csv`. Provenance `workspace` describes the declared train, not proof of coordinated publication. Confirm the exact versions are published before installing.
 <!-- compatibility-table:end -->
@@ -137,7 +137,7 @@ For mixed-version reports, first capture the adapter boot banner package tuple (
 
 <!-- compatibility-install:start -->
 ```bash
-npm install svelte-adapter-uws@0.6.0-next.95 svelte-adapter-uws-extensions@0.6.0-next.63 ioredis
+npm install svelte-adapter-uws@0.6.0-next.96 svelte-adapter-uws-extensions@0.6.0-next.64 ioredis
 npm install https://github.com/uNetworking/uWebSockets.js/archive/refs/tags/v20.69.0.tar.gz
 npm exec -- svelte-adapter-uws-preflight
 ```
@@ -152,7 +152,7 @@ npm install pg
 ```
 
 <!-- compatibility-floor:start -->
-Requires `svelte-adapter-uws >= 0.6.0-next.95` as a peer dependency.
+Requires `svelte-adapter-uws >= 0.6.0-next.96` as a peer dependency.
 <!-- compatibility-floor:end -->
 For a complete working example, follow [First success](docs/getting-started.md): run the shared-cursor flow without a server, then against a temporary Redis container, with expected output and cleanup included.
 

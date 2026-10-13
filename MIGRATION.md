@@ -76,7 +76,7 @@ These fail at install, at import, or from a factory, so they fail on the
 deploy rather than in production traffic. Fix them before you ship.
 
 <!-- compatibility-migration-floor:start -->
-### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.95`
+### The adapter peer floor is `svelte-adapter-uws >= 0.6.0-next.96`
 <!-- compatibility-migration-floor:end -->
 
 **Symptom.** `npm ERR! ERESOLVE unable to resolve dependency tree` (or a peer
@@ -95,7 +95,7 @@ sequence authority contract for explicit `null` and `bigint` choices, keeping
 local and relayed publications consistent.
 
 <!-- compatibility-migration-action:start -->
-**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.95` or later in the same
+**Action.** Bump `svelte-adapter-uws` to `0.6.0-next.96` or later in the same
 upgrade. The ecosystem packages move together (see the version table in the
 README).
 <!-- compatibility-migration-action:end -->

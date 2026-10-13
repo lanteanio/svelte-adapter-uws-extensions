@@ -381,6 +381,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The pub/sub bus's open hook contains a `platform.subscribe` for its `systemChannel` that throws or rejects, as an older adapter did when the connection closed mid-subscribe. It reports `INTERNAL_ERROR` as `redis.pubsub.system-channel.refused` on a bus with a breaker and still activates the bus, where it used to leave an unhandled rejection that ends the process.
 
+- A diagnostic message cut at its 512-character limit no longer ends in a space, matching the adapter, so `parseDiagnostic()` reads the line back.
+
 ## [0.6.0-next.63] - 2026-07-30
 
 ### Breaking Changes

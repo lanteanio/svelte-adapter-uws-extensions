@@ -8,9 +8,8 @@
 // The first test compares the two files as text, so any change on the
 // adapter's side fails here, including a list entry no generated name would
 // exercise. When it fails after an adapter upgrade, copy the adapter's file
-// over ours again, leaving out noteDroppedField: nothing here reports drops,
-// so it would be a warning that never fires. The second block asks both
-// copies the same questions over a generated corpus.
+// over ours again. The second block asks both copies the same questions over a
+// generated corpus.
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -20,24 +19,11 @@ import * as adapter from '../../node_modules/svelte-adapter-uws/src/plugins/_sha
 const adapterUrl = new URL('../../node_modules/svelte-adapter-uws/src/plugins/_shared/sensitive.js', import.meta.url);
 const oursUrl = new URL('../../src/shared/sensitive-names.js', import.meta.url);
 
-/** The adapter's source without noteDroppedField and the sentence that names it. */
-function withoutDropReporter(source) {
-	const sentence = ' * field. A caller that uses this matcher as a redactor can report such a drop\n' +
-		' * once by name via noteDroppedField; the identity-only defaults do not\n' +
-		' * enumerate non-identity fields and therefore do not emit drop warnings.\n';
-	const start = source.indexOf('/**\n * Warn-once state for {@link noteDroppedField}');
-	const end = source.indexOf('/**\n * Recursion budget for the default');
-	expect(source.includes(sentence), 'the sentence naming noteDroppedField moved').toBe(true);
-	expect(start, 'the noteDroppedField block moved').toBeGreaterThan(0);
-	expect(end, 'the noteDroppedField block moved').toBeGreaterThan(start);
-	return (source.slice(0, start) + source.slice(end)).replace(sentence, ' * field.\n');
-}
-
 describe('the field-name rules are the adapter\'s file', () => {
-	it('matches it line for line apart from noteDroppedField', () => {
+	it('matches it line for line', () => {
 		const theirs = readFileSync(adapterUrl, 'utf8').replace(/\r\n/g, '\n');
 		const mine = readFileSync(oursUrl, 'utf8').replace(/\r\n/g, '\n');
-		expect(mine).toBe(withoutDropReporter(theirs));
+		expect(mine).toBe(theirs);
 	});
 });
 
