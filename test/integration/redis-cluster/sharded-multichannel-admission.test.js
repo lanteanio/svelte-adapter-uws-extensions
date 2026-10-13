@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { createBackendClient } from '../helpers/backend.js';
+import { clusterClient } from '../helpers/cluster-client.js';
 import { createShardedBus } from '../../../src/redis/sharded-pubsub.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 
@@ -12,8 +12,20 @@ async function until(check) {
 	}
 }
 
+// The sharded bus duplicates per master node, never through client.duplicate.
+function busClient(keyPrefix) {
+	const redis = clusterClient();
+	return {
+		redis,
+		keyPrefix,
+		key: (k) => keyPrefix + k,
+		duplicate: (options) => clusterClient(options),
+		quit: () => redis.quit().catch(() => redis.disconnect())
+	};
+}
+
 it.each([false, true])('delivers after a multi-channel admission changes followers (restore=%s)', async restore => {
-	const client = createBackendClient({ keyPrefix: 'inttest-multichannel:' });
+	const client = busClient('inttest-multichannel:');
 	const subscriptions = new Map(), unsubscriptions = new Map();
 	const channel = topic => client.key('uws:sharded:' + topic);
 	let holdCleanup = false;
