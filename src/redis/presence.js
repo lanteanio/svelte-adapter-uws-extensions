@@ -58,7 +58,7 @@ import {
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
-import { execMultiSlot, firstCommandError, coalescedMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, coalescedByOwner } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -224,25 +224,34 @@ export function createPresence(client, options = {}) {
 	// same class without retaining departed topic labels or work on every tick.
 	const stopOnlineMetric = mTotalOnline ? collectOnlineMetric(mTotalOnline, mt, localCounts) : null;
 
-	function heartbeatCommands() {
-		const commands = [];
-		for (const topic of activeTopics) {
-			const data = localData.get(topic);
-			if (!data) continue;
-			const topicHash = topicHashKey(topic);
-			for (const userKey of data.keys()) {
-				commands.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
-				commands.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
-				commands.push(['hpexpire', pendingHashKey(topic), presenceTtlMs, 'FIELDS', 1, userKey]);
-			}
+	// A topic's keys share its `{topic}` hash tag (the join and leave scripts
+	// already need them in one slot), so a topic is one unit of owner routing.
+	function heartbeatCommands(topic, out) {
+		const data = activeTopics.has(topic) ? localData.get(topic) : undefined;
+		if (!data) return;
+		const topicHash = topicHashKey(topic);
+		const pendingHash = pendingHashKey(topic);
+		for (const userKey of data.keys()) {
+			out.push(['hpexpire', userHashKey(topic, userKey), presenceTtlMs, 'FIELDS', 1, instanceId]);
+			out.push(['hpexpire', topicHash, presenceTtlMs, 'FIELDS', 1, userKey]);
+			out.push(['hpexpire', pendingHash, presenceTtlMs, 'FIELDS', 1, userKey]);
 		}
-		return commands;
 	}
-	const refreshCommands = coalescedMultiSlot(redis, (error, tickStart) => {
-		if (!error) b?.success();
-		lastHeartbeatLatency = monotonicNow() - tickStart;
+	// The latency covers the tick's own Redis completion and any refresh still
+	// outstanding from an earlier tick, so a stuck owner shows as a growing value.
+	function reportHeartbeatLatency(tickStart) {
+		lastHeartbeatLatency = monotonicNow() - Math.min(tickStart, refreshTopics.busySince());
 		mHeartbeatLatency?.set(lastHeartbeatLatency);
-	}, error => b?.failure(error), heartbeatCommands);
+	}
+	const refreshTopics = coalescedByOwner(redis, {
+		key: topicHashKey,
+		commands: heartbeatCommands,
+		onError: error => b?.failure(error),
+		onComplete(cycle) {
+			if (cycle.total > 0 && cycle.error === null) b?.success();
+			reportHeartbeatLatency(cycle.context);
+		}
+	});
 	const heartbeatTick = coalescedWork(() => {
 		const tickStart = monotonicNow();
 		mHeartbeats?.inc();
@@ -316,8 +325,7 @@ export function createPresence(client, options = {}) {
 		}
 
 		if (b && !b.isHealthy) {
-			lastHeartbeatLatency = monotonicNow() - tickStart;
-			mHeartbeatLatency?.set(lastHeartbeatLatency);
+			reportHeartbeatLatency(tickStart);
 			return;
 		}
 		// HPEXPIRE refresh per locally-owned (topic, userKey). We do NOT
@@ -335,9 +343,11 @@ export function createPresence(client, options = {}) {
 		let published = 0;
 		let firstPublishError = null;
 		let firstFailedTopic = '';
+		const topics = [];
 		for (const topic of activeTopics) {
 			const data = localData.get(topic);
 			if (data && data.size > 0) {
+				topics.push(topic);
 				if (subscriberCtx.activePlatform) {
 					// Publish a `{userKey: data}` map (instead of a key-only
 					// array) so a client whose entry aged out between
@@ -367,7 +377,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		refreshCommands(heartbeatCommands(), tickStart);
+		refreshTopics(topics, tickStart);
 		if (publishFailed === 0) {
 			heartbeatPublishReported = false;
 		} else if (!heartbeatPublishReported) {
@@ -1537,7 +1547,7 @@ export function createPresence(client, options = {}) {
 
 		destroy() {
 			stopOnlineMetric?.();
-			refreshCommands.stop();
+			refreshTopics.stop();
 			heartbeatTick.stop();
 			clearIntervalTimer(heartbeatTimer);
 			if (consistencyAuditor) consistencyAuditor.stop();

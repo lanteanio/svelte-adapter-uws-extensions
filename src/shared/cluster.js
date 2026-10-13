@@ -4,6 +4,7 @@
 
 import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from './caps.js';
 import { isCachedCommand } from './eval-cached.js';
+import { monotonicNow } from './runtime.js';
 
 /**
  * True when the client is an ioredis Cluster (vs a standalone Redis).
@@ -58,66 +59,173 @@ const FIRST_KEY_METHODS = new Set(['spublish', 'get', 'set', 'del', 'unlink', 'e
 function allocationGroup(redis, command) {
 	const method = command[0];
 	if (method === 'publish') return UNKEYED_GROUP;
-	const key = FIRST_KEY_METHODS.has(method) ? command[1]
+	return keyOwner(redis, FIRST_KEY_METHODS.has(method) ? command[1]
 		: (method === 'eval' || method === 'evalsha') && Number(command[2]) > 0 ? command[3]
-		: isCachedCommand(redis, method) && Number(command[1]) > 0 ? command[2] : null;
+		: isCachedCommand(redis, method) && Number(command[1]) > 0 ? command[2] : null);
+}
+
+/** The current owner allocation of a key, or null when the topology does not name one. */
+function keyOwner(redis, key) {
 	if (typeof key !== 'string' || !Array.isArray(redis.slots)) return null;
 	const prefix = redis.options?.keyPrefix || '';
 	if (typeof prefix !== 'string') return null;
 	const owners = redis.slots[keySlot(prefix + key)];
-	return Array.isArray(owners) && owners.length ? owners.join(';') : null;
+	return Array.isArray(owners) && owners.length ? ownerName(owners) : null;
 }
 
-/** Keep one running refresh and the latest pending refresh per Redis owner. */
-export function coalescedMultiSlot(redis, onComplete, onError = () => {}, refreshPending) {
-	const states = new Map();
+// ioredis shares one node list across every slot of a range, so its joined
+// name is kept per list. A MOVED reply rewrites the list in place, which the
+// copy of its nodes detects.
+const ownerNames = new WeakMap();
+function ownerName(owners) {
+	const cached = ownerNames.get(owners);
+	if (cached !== undefined && cached.nodes.length === owners.length) {
+		let i = 0;
+		while (i < owners.length && cached.nodes[i] === owners[i]) i++;
+		if (i === owners.length) return cached.name;
+	}
+	const name = owners.join(';');
+	ownerNames.set(owners, { name, nodes: owners.slice() });
+	return name;
+}
+
+/**
+ * Keyed Redis refresh work with at most one running and one pending refresh
+ * per Redis owner, so an owner that stalls never holds back the others.
+ *
+ * `submit(items, context)` routes each item by `key(item)`. Each item is one
+ * command, or with `commands` the item appends its commands to `out`; they all
+ * share that key's slot. Idle owners start at once and form one cycle. An
+ * owner that is still busy keeps only the newest items, which run as their own
+ * cycle when its refresh settles, after `current(item)` drops the ones no
+ * longer wanted and with the state that `commands` reads at that moment. Each
+ * submit discards every older pending refresh, so nothing a newer submit left
+ * out runs later.
+ *
+ * `onError` hears the first failure of each cycle when it happens.
+ * `onComplete` receives `{ context, error, failed, total, failedCommand,
+ * deferred }` once every refresh the cycle started has settled: `total` and
+ * `failed` count its commands, and `deferred` counts the owners it found busy.
+ * `submit.busySince()` is the monotonic start of the oldest refresh still
+ * running, or Infinity.
+ *
+ * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
+ * @param {{
+ *   key: (item: any) => string,
+ *   commands?: ((item: any, out: Array<[string, ...any]>) => void) | null,
+ *   current?: ((item: any) => boolean) | null,
+ *   onError?: (error: any) => void,
+ *   onComplete?: (cycle: { context: any, error: any, failed: number, total: number, failedCommand: any[] | null, deferred: number }) => void
+ * }} options
+ */
+export function coalescedByOwner(redis, { key, commands = null, current = null, onError = () => {}, onComplete = () => {} }) {
+	/** @type {Map<string | null, { since: number | null, pending: { items: any[], context: any } | null }>} */
+	const owners = new Map();
 	let stopped = false;
-	function complete(cycle, error) {
-		if (error && !cycle.error) { cycle.error = error; onError(error); }
-		if (--cycle.remaining === 0) onComplete(cycle.error, cycle.context);
+	const cycleFor = context => ({ context, error: null, failed: 0, total: 0, failedCommand: null, deferred: 0, open: 1 });
+	function release(cycle) {
+		if (--cycle.open === 0) onComplete(cycle);
 	}
-	function start(owner, state, refresh = false) {
-		let { commands, cycle } = state.pending;
+	function fail(cycle, error, command) {
+		if (cycle.error !== null) return;
+		cycle.error = error;
+		cycle.failedCommand = command;
+		onError(error);
+	}
+	function settled(cycle, list, results) {
+		cycle.total += list.length;
+		for (let i = 0; results && i < results.length; i++) {
+			const error = results[i] && results[i][0];
+			if (error) { cycle.failed++; fail(cycle, error, list[i]); }
+		}
+	}
+	function rejected(cycle, list, error) {
+		cycle.total += list.length;
+		cycle.failed += list.length;
+		fail(cycle, error, list[0]);
+	}
+	function run(owner, state, list, cycle) {
+		cycle.open++;
+		state.since = monotonicNow();
+		execOwner(redis, owner, list)
+			.then(results => settled(cycle, list, results), error => rejected(cycle, list, error))
+			.catch(onError)
+			.then(() => {
+				state.since = null;
+				try { release(cycle); } finally { runPending(owner, state); }
+			})
+			.catch(onError);
+	}
+	function runPending(owner, state) {
+		if (state.since !== null) return;
+		const next = state.pending;
 		state.pending = null;
-		if (refresh && refreshPending) {
-			try {
-				const clustered = isCluster(redis);
-				commands = refreshPending().filter(command => (clustered ? allocationGroup(redis, command) : null) === owner);
-			} catch (error) { states.delete(owner); complete(cycle, error); return; }
-		}
-		if (!commands.length) { states.delete(owner); complete(cycle, null); return; }
-		state.running = true;
-		execMultiSlot(redis, commands).then(results => complete(cycle, firstCommandError(results)), error => complete(cycle, error))
-			.catch(onError).finally(() => {
-				state.running = false;
-				if (!stopped && state.pending) start(owner, state, true);
-				else states.delete(owner);
-			});
+		if (stopped || next === null) { owners.delete(owner); return; }
+		const cycle = cycleFor(next.context);
+		const list = [];
+		try {
+			for (const item of next.items) {
+				if (current !== null && !current(item)) continue;
+				if (commands === null) list.push(item);
+				else commands(item, list);
+			}
+		} catch (error) { list.length = 0; fail(cycle, error, null); }
+		if (list.length) run(owner, state, list, cycle);
+		else owners.delete(owner);
+		release(cycle);
 	}
-	function submit(commands, context) {
+	function submit(items, context) {
 		if (stopped) return;
-		const groups = new Map();
-		const clustered = isCluster(redis);
-		for (const command of commands) {
-			const owner = clustered ? allocationGroup(redis, command) : null;
-			let group = groups.get(owner);
-			if (!group) { group = []; groups.set(owner, group); }
-			group.push(command);
+		for (const state of owners.values()) state.pending = null;
+		const cycle = cycleFor(context);
+		// Per owner: the commands to send now, or the items a busy owner keeps.
+		/** @type {Map<string | null, { list: any[] | null, items: any[] | null }>} */
+		const parts = new Map();
+		const partFor = owner => {
+			let part = parts.get(owner);
+			if (part === undefined) {
+				const busy = (owners.get(owner)?.since ?? null) !== null;
+				part = busy ? { list: null, items: [] } : { list: [], items: null };
+				parts.set(owner, part);
+			}
+			return part;
+		};
+		try {
+			if (!isCluster(redis)) {
+				if (items.length) {
+					const part = partFor(null);
+					if (part.list === null) part.items = items;
+					else if (commands === null) part.list = items;
+					else for (const item of items) commands(item, part.list);
+				}
+			} else {
+				let lastOwner, part;
+				for (const item of items) {
+					const owner = keyOwner(redis, key(item));
+					if (owner !== lastOwner || part === undefined) { lastOwner = owner; part = partFor(owner); }
+					if (part.list === null) part.items.push(item);
+					else if (commands === null) part.list.push(item);
+					else commands(item, part.list);
+				}
+			}
+		} catch (error) { parts.clear(); fail(cycle, error, null); }
+		for (const [owner, { list, items: kept }] of parts) {
+			let state = owners.get(owner);
+			if (list === null) { state.pending = { items: kept, context }; cycle.deferred++; continue; }
+			if (list.length === 0) continue;
+			if (!state) { state = { since: null, pending: null }; owners.set(owner, state); }
+			run(owner, state, list, cycle);
 		}
-		// A departed local member must not survive in an older queued refresh.
-		for (const state of states.values()) state.pending = null;
-		const cycle = { remaining: groups.size, error: null, context };
-		// Superseded cycles are intentionally not reported as complete.
-		for (const [owner, group] of groups) {
-			let state = states.get(owner);
-			if (!state) { state = { running: false, pending: null }; states.set(owner, state); }
-			state.pending = { commands: group, cycle };
-			if (!state.running) start(owner, state);
-		}
+		release(cycle);
 	}
+	submit.busySince = () => {
+		let since = Infinity;
+		for (const state of owners.values()) if (state.since !== null && state.since < since) since = state.since;
+		return since;
+	};
 	submit.stop = () => {
 		stopped = true;
-		for (const state of states.values()) state.pending = null;
+		for (const state of owners.values()) state.pending = null;
 	};
 	return submit;
 }
@@ -153,18 +261,35 @@ export async function execMultiSlot(redis, commands) {
 			return pipe.exec();
 		}).catch(error => commands.map(() => [error, undefined]));
 	}
+	if (!clustered) return execGroups(redis, commands, [{ group: 'standalone', indexes: null, offset: 0 }], false);
 	const groups = new Map();
-	if (!clustered) groups.set('standalone', commands.map((_, i) => i));
-	else {
-		for (let i = 0; i < commands.length; i++) {
-			const group = allocationGroup(redis, commands[i]);
-			const id = group === null ? ROUTED_COMMANDS : group;
-			let indexes = groups.get(id);
-			if (!indexes) { indexes = []; groups.set(id, indexes); }
-			indexes.push(i);
-		}
+	for (let i = 0; i < commands.length; i++) {
+		const group = allocationGroup(redis, commands[i]);
+		const id = group === null ? ROUTED_COMMANDS : group;
+		let indexes = groups.get(id);
+		if (!indexes) { indexes = []; groups.set(id, indexes); }
+		indexes.push(i);
 	}
-	const entries = Array.from(groups, ([group, indexes]) => ({ group, indexes, offset: 0 }));
+	return execGroups(redis, commands, Array.from(groups, ([group, indexes]) => ({ group, indexes, offset: 0 })), true);
+}
+
+/**
+ * `execMultiSlot` for commands already grouped under one owner allocation
+ * (null when the topology names none), without grouping them again.
+ */
+function execOwner(redis, owner, commands) {
+	if (!isCluster(redis)) return execMultiSlot(redis, commands);
+	return execGroups(redis, commands, [{ group: owner === null ? ROUTED_COMMANDS : owner, indexes: null, offset: 0 }], true);
+}
+
+function indexRange(start, end) {
+	const range = new Array(end - start);
+	for (let i = start; i < end; i++) range[i - start] = i;
+	return range;
+}
+
+// Entries without `indexes` cover every command in order.
+async function execGroups(redis, commands, entries, clustered) {
 	let cursor = 0;
 	const scheduled = new Map();
 	const results = new Array(commands.length);
@@ -184,9 +309,11 @@ export async function execMultiSlot(redis, commands) {
 			if (searched === entries.length) return;
 			const entry = entries[cursor];
 			const { group, indexes, offset } = entry;
-			const batch = indexes.slice(offset, offset + (group === ROUTED_COMMANDS ? 1 : MAX_REDIS_PIPELINE_COMMANDS));
-			entry.offset += batch.length;
-			if (entry.offset === indexes.length) entries.splice(cursor, 1);
+			const size = indexes === null ? commands.length : indexes.length;
+			const end = Math.min(size, offset + (group === ROUTED_COMMANDS ? 1 : MAX_REDIS_PIPELINE_COMMANDS));
+			const batch = indexes === null ? indexRange(offset, end) : indexes.slice(offset, end);
+			entry.offset = end;
+			if (end === size) entries.splice(cursor, 1);
 			else cursor++;
 			if (cursor >= entries.length) cursor = 0;
 			scheduled.set(group, (scheduled.get(group) || 0) + 1);

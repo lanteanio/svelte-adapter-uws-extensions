@@ -141,6 +141,29 @@ it('groups cluster pipelines by current owner and retries only explicit routing 
 	expect(retried).toEqual(['c']);
 });
 
+it('groups by the node list ioredis rewrites in place after a MOVED reply', async () => {
+	// One node list shared by every slot of a range, as ioredis assigns them.
+	const rangeA = ['nodeA:6379', 'replicaA:6379'], rangeB = ['nodeB:6379', 'replicaB:6379'];
+	const slots = [];
+	slots[keySlot('a')] = rangeA;
+	slots[keySlot('b')] = rangeB;
+	const pipelines = [];
+	const redis = {
+		nodes: () => [], slots,
+		pipeline() {
+			const keys = [];
+			return { get(key) { keys.push(key); return this; }, async exec() { pipelines.push(keys); return keys.map(key => [null, key]); } };
+		}
+	};
+	const commands = [['get', 'a'], ['get', 'b']];
+	await execMultiSlot(redis, commands);
+	expect(pipelines).toEqual([['a'], ['b']]);
+	rangeA[0] = 'nodeB:6379';
+	rangeA[1] = 'replicaB:6379';
+	await execMultiSlot(redis, commands);
+	expect(pipelines.slice(2)).toEqual([['a', 'b']]);
+});
+
 it.each([true, false])('only retries a pipeline rejected before writes (topology mismatch: %s)', async mismatch => {
 	const slots = []; slots[keySlot('a')] = ['nodeA'];
 	const calls = [];

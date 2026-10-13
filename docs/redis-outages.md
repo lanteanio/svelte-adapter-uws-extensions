@@ -83,14 +83,24 @@ Pipelines contain at most 256 commands. Ready work for other owners can use free
 slots while one owner stalls; each failed batch returns error tuples alongside
 successful results. Cluster work groups known keys by their current owner allocation and retries only explicit MOVED/ASK
 refusals; transport failures do not replay ambiguous writes. Missing topology
-uses bounded individual routing. Presence and registry TTL heartbeats, cursor
-cleanup sweeps, and periodic cursor snapshot writes each run one refresh at a time, coalescing missed ticks into one
-rerun with current membership or the latest pending cursor values. Externally
-constructed Cluster clients retain their caller-selected deadlines; configure
-finite command and socket deadlines on their node connections. Capacity stays
-charged until the underlying operation settles.
-Presence heartbeat latency includes Redis completion. Keep the heartbeat-to-TTL
-margin large enough for the complete refresh at your deployment's cardinality.
+uses bounded individual routing.
+
+Presence and registry TTL heartbeats, cursor cleanup sweeps, and periodic
+cursor snapshot writes run at most one refresh per Cluster owner at a time (one
+in total on a standalone server). Owners that answer keep refreshing on every
+tick while another owner stalls. A tick that finds an owner still busy leaves
+it only the newest work, which runs once that owner's refresh settles, with
+current membership or the latest pending cursor values. Heartbeats and snapshot
+writes report one success or failure to the circuit breaker per tick, from the
+owners that tick reached, and one per deferred refresh when it settles.
+
+Externally constructed Cluster clients retain their caller-selected deadlines;
+configure finite command and socket deadlines on their node connections.
+Capacity stays charged until the underlying operation settles. Presence
+heartbeat latency includes Redis completion; while a refresh from an earlier
+tick is still outstanding, it reports the age of the oldest one, so a stalled
+owner shows as a growing value. Keep the heartbeat-to-TTL margin large enough
+for the complete refresh at your deployment's cardinality.
 
 For backup scope, coupled restore groups and the read-only verification command,
 see [Storage recovery](./recovery.md).

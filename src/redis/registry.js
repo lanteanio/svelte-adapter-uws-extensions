@@ -41,7 +41,7 @@ import {
 } from '../shared/runtime.js';
 import { assert } from '../shared/assert.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { execMultiSlot, firstCommandError, coalescedMultiSlot } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, coalescedByOwner } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import {
@@ -864,22 +864,32 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	function heartbeatCommands() {
+	// A refresh queued behind a busy Redis owner skips the entries that left
+	// this instance before it runs.
+	const userKeyPrefix = client.key(keyPrefix + 'conns:');
+	const sessionKeyPrefix = client.key(keyPrefix + 'sess:');
+	function ownsKey(key) {
+		if (key.startsWith(userKeyPrefix)) return localUsers.has(key.slice(userKeyPrefix.length));
+		return key.startsWith(sessionKeyPrefix) && appSessionToWs.has(key.slice(sessionKeyPrefix.length));
+	}
+	const refreshKeys = coalescedByOwner(redis, {
+		key: (command) => command[1],
+		current: (command) => ownsKey(command[1]),
+		onError: (err) => breaker?.failure(err),
+		onComplete(cycle) {
+			if (cycle.total > 0 && cycle.error === null) breaker?.success();
+		}
+	});
+	const refreshTtls = coalescedWork(() => {
+		if (destroyed) return;
+		if (localUsers.size === 0 && appSessionToWs.size === 0) { refreshKeys([]); return; }
+		if (!withBreakerGuard()) return;
+		// Refresh TTL on every locally-owned entry (users + app sessions) in
+		// bounded pipelines, one refresh at a time per Redis owner.
 		const commands = [];
 		for (const userId of localUsers.keys()) commands.push(['expire', userKey(userId), ttl]);
 		for (const sessionId of appSessionToWs.keys()) commands.push(['expire', sessionKey(sessionId), ttl]);
-		return commands;
-	}
-	const refreshCommands = coalescedMultiSlot(redis, (err) => {
-		if (!err) breaker?.success();
-	}, (err) => breaker?.failure(err), heartbeatCommands);
-	const refreshTtls = coalescedWork(() => {
-		if (destroyed) return;
-		if (localUsers.size === 0 && appSessionToWs.size === 0) { refreshCommands([]); return; }
-		if (!withBreakerGuard()) return;
-		// Refresh TTL on every locally-owned entry (users + app sessions). A
-		// pipeline keeps this to one round trip regardless of N.
-		refreshCommands(heartbeatCommands());
+		refreshKeys(commands);
 	}, error => breaker?.failure(error));
 
 	function heartbeatTick() {
@@ -1695,7 +1705,7 @@ export function createConnectionRegistry(client, options) {
 		},
 		async destroy() {
 			destroyed = true;
-			refreshCommands.stop();
+			refreshKeys.stop();
 			refreshTtls.stop();
 			if (heartbeatTimer) {
 				clearIntervalTimer(heartbeatTimer);

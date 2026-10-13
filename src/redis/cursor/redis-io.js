@@ -6,19 +6,18 @@
  *
  * SLOT-SENSITIVE. The cluster correctness invariants live here and MUST NOT be
  * altered: hashKey `cursor:{topic}` braces colocate one topic onto one slot;
- * the multi-slot batches go through execMultiSlot (NEVER a raw redis.pipeline(),
- * which silently no-ops other-node commands); the one single-slot pipeline in
- * queueSnapshot is the legacy per-flush path (same hashKey hset+expire); a
- * single global pub/sub channel, no ssubscribe.
+ * the multi-slot batches go through execMultiSlot or coalescedByOwner (NEVER a
+ * raw redis.pipeline(), which silently no-ops other-node commands); the one
+ * single-slot pipeline in queueSnapshot is the legacy per-flush path (same
+ * hashKey hset+expire); a single global pub/sub channel, no ssubscribe.
  *
  * @module svelte-adapter-uws-extensions/redis/cursor/redis-io
  */
 
 import { now, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from '../../shared/runtime.js';
-import { coalescedWork } from '../../shared/coalesced-work.js';
 import { evalCachedName } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
-import { execMultiSlot, firstCommandError } from '../../shared/cluster.js';
+import { execMultiSlot, firstCommandError, coalescedByOwner } from '../../shared/cluster.js';
 import { EVENTS } from './events.js';
 import { EXTENSIONS_ERROR_IDS } from '../../error-registry.js';
 import { emitRegisteredFailure } from '../../shared/diagnostic.js';
@@ -63,6 +62,7 @@ export function createRedisIo({
 }) {
 	const cursorTtlMs = cursorTtl * 1000;
 	const cleanupInterval = Math.max(cursorTtlMs, 10000);
+	const hashKeyPrefix = client.key('cursor:{');
 
 	/**
 	 * Coalesced HSET writes. Latest-wins per (topic, key). Drained on the
@@ -235,27 +235,32 @@ export function createRedisIo({
 	/** @type {'all' | 'some' | null} */
 	let cleanupReported = null;
 
-	const cleanup = coalescedWork(async () => {
-		if (disposed || activeTopics.size === 0) return;
-		const topics = [...activeTopics];
-		const command = evalCachedName(redis, CLEANUP_SCRIPT);
-		const nowTs = now();
-		const results = await execMultiSlot(redis, topics.map(topic => [command, 1, hashKey(topic), nowTs, cursorTtlMs]));
-		let first = null;
-		let failed = 0;
-		for (let i = 0; i < results.length; i++) {
-			if (!results[i][0]) continue;
-			failed++;
-			first ??= { err: results[i][0], redact: [hashKey(topics[i]), topics[i]] };
+	// Sweeps and snapshot writes run one at a time per Redis owner, so an owner
+	// that stops answering never holds back the topics on the others.
+	const sweepTopics = coalescedByOwner(redis, {
+		key: hashKey,
+		commands(topic, out) {
+			if (activeTopics.has(topic)) out.push([evalCachedName(redis, CLEANUP_SCRIPT), 1, hashKey(topic), now(), cursorTtlMs]);
+		},
+		onComplete(sweep) {
+			// A sweep that skipped a busy owner does not end a failure streak.
+			if (sweep.error === null) { if (sweep.total > 0 && sweep.deferred === 0) cleanupReported = null; return; }
+			const scope = sweep.failed === sweep.total ? 'all' : 'some';
+			if (cleanupReported !== null && !(cleanupReported === 'all' && scope === 'some')) return;
+			cleanupReported = scope;
+			const key = sweep.failedCommand?.[2];
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, {
+				error: sweep.error,
+				redact: typeof key === 'string' ? [key, key.slice(hashKeyPrefix.length, -1)] : [],
+				attributes: { failed: sweep.failed, topics: sweep.total }
+			});
 		}
-		if (first === null) { cleanupReported = null; return; }
-		const scope = failed === results.length ? 'all' : 'some';
-		if (cleanupReported !== null && !(cleanupReported === 'all' && scope === 'some')) return;
-		cleanupReported = scope;
-		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, {
-			error: first.err, redact: first.redact, attributes: { failed, topics: results.length }
-		});
-	}, error => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CURSOR_CLEANUP, { error }));
+	});
+
+	function cleanup() {
+		if (disposed || activeTopics.size === 0) return;
+		sweepTopics(Array.from(activeTopics));
+	}
 
 	function startCleanupTimer() {
 		if (cleanupTimer) return;
@@ -280,29 +285,38 @@ export function createRedisIo({
 		if (snapshotTimer.unref) snapshotTimer.unref();
 	}
 
-	const flushSnapshot = coalescedWork(() => {
-		if (disposed) return;
-		if (redisPending.size === 0) return;
-		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; } }
-		const pending = redisPending;
-		redisPending = new Map();
-		const commands = [];
-		let queued = 0;
-		for (const [topic, entries] of pending) {
-			if (entries.size === 0) continue;
+	// A topic's pending values stay in redisPending, merging the newest ones,
+	// until a write for its owner starts and takes them.
+	const writeSnapshots = coalescedByOwner(redis, {
+		key: hashKey,
+		commands(topic, out) {
+			const entries = redisPending.get(topic);
+			if (!entries) return;
+			redisPending.delete(topic);
 			const args = [];
 			for (const [key, entry] of entries) {
 				try { args.push(key, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts })); }
 				catch { inputDropped('serialization_failed', 'snapshot_write'); }
 			}
-			if (args.length === 0) continue;
-			commands.push(['hset', hashKey(topic), ...args]);
-			commands.push(['expire', hashKey(topic), cursorTtl]);
-			queued += entries.size;
+			if (args.length === 0) return;
+			const key = hashKey(topic);
+			out.push(['hset', key, ...args], ['expire', key, cursorTtl]);
+		},
+		// A write that waited for its owner skips while the breaker is not
+		// healthy; the next flush decides on the values it left pending.
+		current: b ? () => b.isHealthy : null,
+		onError(err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); },
+		onComplete(write) {
+			if (write.total > 0 && write.error === null) b?.success();
 		}
-		if (queued === 0) return;
-		return execMultiSlot(redis, commands).then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
 	});
+
+	function flushSnapshot() {
+		if (disposed) return;
+		if (redisPending.size === 0) return;
+		if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; } }
+		writeSnapshots(Array.from(redisPending.keys()));
+	}
 
 	function queueSnapshot(topic, key, user, data) {
 		if (snapshotIntervalMs === 0) {
@@ -432,8 +446,8 @@ export function createRedisIo({
 	/** Terminal teardown (tracker destroy()): stop timers, quit the subscriber. */
 	function dispose() {
 		disposed = true;
-		cleanup.stop();
-		flushSnapshot.stop();
+		sweepTopics.stop();
+		writeSnapshots.stop();
 		if (recoveryTimer !== null) clearTimer(recoveryTimer);
 		recoveryTimer = null;
 		if (subscribeRetryTimer !== null) clearTimer(subscribeRetryTimer);

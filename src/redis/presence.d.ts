@@ -148,7 +148,11 @@ export type PresenceWireEvent =
 export interface PresenceMetricsSnapshot {
 	/** Sum of unique-users-per-topic across all topics this instance is locally tracking. */
 	totalOnline: number;
-	/** Duration of the most recent heartbeat tick in milliseconds. */
+	/**
+	 * Duration of the most recent heartbeat tick in milliseconds, including Redis
+	 * completion. While a refresh from an earlier tick is still outstanding on
+	 * some Redis owner, the age of the oldest such refresh.
+	 */
 	heartbeatLatencyMs: number;
 	/** Cumulative count of stale fields removed by the heartbeat-driven cleanup script since startup. */
 	staleCleanedTotal: number;
