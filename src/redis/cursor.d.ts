@@ -184,9 +184,13 @@ export interface RedisCursorTracker {
 	/**
 	 * Broadcast a cursor position update. Throttled per user per topic.
 	 * Call this from your `message` hook when you receive cursor data.
-	 * A non-string or empty topic, and one containing a double quote, a
-	 * backslash or a control character, which no frame can carry, is dropped
-	 * without storing anything.
+	 * A non-string or empty topic, and data that is oversized, too deep or not
+	 * serializable as JSON, is dropped without storing anything; these checks
+	 * run first.
+	 *
+	 * @throws {TypeError} Topic contains quotes, backslashes, or control
+	 *   characters. Thrown after the data checks and before any state, timer or
+	 *   subscription is created.
 	 */
 	update(ws: any, topic: string, data: any, platform: Platform): void;
 

@@ -171,9 +171,11 @@ export class WsClosedError extends Error {
 export interface RedisPresenceTracker {
 	/**
 	 * Add a connection to a topic's presence.
-	 * Ignores `__`-prefixed topics, and topics containing a double quote, a
-	 * backslash or a control character, which no frame can carry. Idempotent.
+	 * Ignores `__`-prefixed topics. Idempotent.
 	 *
+	 * @throws {TypeError} Topic contains quotes, backslashes, or control
+	 *   characters. The returned promise rejects before any state, Redis
+	 *   command or subscription is created.
 	 * @throws {WsClosedError} (`err.code === 'WS_CLOSED'`) if the websocket
 	 *   closes during one of the internal async gaps (subscribe, Redis eval,
 	 *   snapshot fetch, ws.subscribe). Server state is rolled back before
@@ -193,11 +195,10 @@ export interface RedisPresenceTracker {
 	 * `undefined`. Return the value from a `hooks.subscribe` wiring so the
 	 * denial reaches the adapter and the subscribe itself is refused; a
 	 * caller that discards it leaves the socket subscribed to a topic the
-	 * platform refused, with only the roster withheld. A topic containing a
-	 * double quote, a backslash or a control character resolves
-	 * `'INVALID_TOPIC'`, since no frame can carry it. A `__`-prefixed topic
-	 * resolves `undefined` without a check and sends nothing: presence tracks
-	 * no such topic.
+	 * platform refused, with only the roster withheld. A non-string topic,
+	 * a `__`-prefixed topic, and a topic containing a double quote, a
+	 * backslash or a control character resolve `undefined` without a check
+	 * and send nothing: presence tracks no such topic.
 	 */
 	sync(ws: any, topic: string, platform: Platform): Promise<string | undefined>;
 
