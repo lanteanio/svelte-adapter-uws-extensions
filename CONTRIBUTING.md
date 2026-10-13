@@ -148,9 +148,10 @@ client integration seam and retain hot-path benchmark evidence before release.
 
 Integration commands create and tear down their own Compose stacks. Run tiers
 sequentially on one machine. The Redis and Postgres defaults use ports 56379 and
-55432; Valkey uses 56381. Redis Cluster uses 57000-57005 and subnet 172.30.0.0/24;
-Valkey Cluster uses 57100-57105 and subnet 172.31.0.0/24. Check for conflicts with
-other stacks before starting cluster tests. Do not stop another project's stack.
+55432; Valkey uses 56381. Redis Cluster uses 57000-57005 and subnet 10.249.0.0/24;
+Valkey Cluster uses 57100-57105 and subnet 10.249.1.0/24. Both subnets sit outside
+Docker's default address pools. Check for conflicts with other stacks before
+starting cluster tests. Do not stop another project's stack.
 
 For an isolated standalone run, choose both a free port and a unique project:
 
@@ -163,8 +164,9 @@ npm run verify:redis
 The matching variables are `INTEGRATION_POSTGRES_HOST_PORT`,
 `INTEGRATION_VALKEY_HOST_PORT`, `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, and
 `INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE`. Changing cluster host ports does not
-change their fixed bridge subnets. If a subnet overlaps another stack, use an
-isolated Docker host for that lane. The setup files under `test/integration/`
+change their bridge subnets; when a subnet overlaps another network, set
+`INTEGRATION_REDIS_CLUSTER_SUBNET` or `INTEGRATION_VALKEY_CLUSTER_SUBNET` to a free
+/24 prefix such as `10.250.0`. The setup files under `test/integration/`
 and their Compose files are the source of truth. If a run is interrupted, remove
 only its named Compose project, using that setup's exact Compose file.
 

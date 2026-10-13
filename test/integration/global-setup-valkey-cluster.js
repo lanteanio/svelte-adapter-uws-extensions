@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 // Brings up the 6-node Valkey cluster (docker-compose.valkey-cluster.yml) and
 // exposes the node list + natMap the same way, so the cluster-aware suites run
 // unchanged against Valkey. Distinct default ports (571xx) and bridge subnet
-// (172.31.0.0/24) let it sit beside the Redis cluster.
+// (INTEGRATION_VALKEY_CLUSTER_SUBNET, default 10.249.1) let it sit beside the
+// Redis cluster.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const composePath = path.join(__dirname, 'docker-compose.valkey-cluster.yml');
@@ -19,16 +20,24 @@ const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
 		? 'svelte-adapter-uws-extensions-valkey-cluster'
 		: `svelte-adapter-uws-ext-valkey-cluster-${BASE_PORT}`);
 
-// Static IPs (172.31.0.10 - 172.31.0.15) inside the bridge network; the natMap
+// Static IPs <subnet>.10 - <subnet>.15 inside the bridge network; the natMap
 // lets ioredis on the host translate them to 127.0.0.1:<host-port> on MOVED.
-const NAT_MAP = {
-	'172.31.0.10:6379': { host: '127.0.0.1', port: NODE_PORTS[0] },
-	'172.31.0.11:6379': { host: '127.0.0.1', port: NODE_PORTS[1] },
-	'172.31.0.12:6379': { host: '127.0.0.1', port: NODE_PORTS[2] },
-	'172.31.0.13:6379': { host: '127.0.0.1', port: NODE_PORTS[3] },
-	'172.31.0.14:6379': { host: '127.0.0.1', port: NODE_PORTS[4] },
-	'172.31.0.15:6379': { host: '127.0.0.1', port: NODE_PORTS[5] }
-};
+const DEFAULT_SUBNET = '10.249.1';
+// A bridge subnet is a /24 prefix such as 10.249.0; compose receives the same
+// value, so node addresses and the natMap always agree.
+function subnetPrefix(value, fallback) {
+	const prefix = value || fallback;
+	const parts = prefix.split('.');
+	if (parts.length !== 3 || parts.some((part) => !/^(0|[1-9]\d{0,2})$/.test(part) || Number(part) > 255)) {
+		throw new Error(`Expected a /24 subnet prefix such as 10.249.0, got ${prefix}`);
+	}
+	return prefix;
+}
+const SUBNET = subnetPrefix(process.env.INTEGRATION_VALKEY_CLUSTER_SUBNET, DEFAULT_SUBNET);
+const NAT_MAP = Object.fromEntries(NODE_PORTS.map((port, index) => [
+	`${SUBNET}.${10 + index}:6379`,
+	{ host: '127.0.0.1', port }
+]));
 
 function compose(args) {
 	const result = spawnSync(
@@ -39,6 +48,7 @@ function compose(args) {
 			encoding: 'utf8',
 			env: {
 				...process.env,
+				INTEGRATION_VALKEY_CLUSTER_SUBNET: SUBNET,
 				INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE: String(NODE_PORTS[0]),
 				INTEGRATION_VALKEY_CLUSTER_NODE_1_PORT: String(NODE_PORTS[1]),
 				INTEGRATION_VALKEY_CLUSTER_NODE_2_PORT: String(NODE_PORTS[2]),

@@ -1,7 +1,8 @@
 # Valkey Cluster integration test stack: 6 nodes (3 masters + 3 replicas),
 # the Valkey analogue of docker-compose.cluster.yml. A distinct bridge subnet
-# (172.31.0.0/24) and host-port range (571xx) let a Valkey cluster run beside
-# the Redis cluster (172.30.0.0/24, 570xx) without colliding. Static IPs let the
+# (INTEGRATION_VALKEY_CLUSTER_SUBNET, default 10.249.1.0/24) and host-port range
+# (571xx) let a Valkey cluster run beside the Redis cluster (10.249.0.0/24, 570xx)
+# without colliding. Static IPs let the
 # test client build a natMap translating each node's docker-internal IP back to
 # its host port (clients can't follow MOVED to internal bridge IPs otherwise).
 #
@@ -18,7 +19,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE:-57100}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.10
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.10
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -35,7 +36,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_NODE_1_PORT:-57101}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.11
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.11
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -52,7 +53,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_NODE_2_PORT:-57102}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.12
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.12
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -69,7 +70,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_NODE_3_PORT:-57103}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.13
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.13
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -86,7 +87,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_NODE_4_PORT:-57104}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.14
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.14
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -103,7 +104,7 @@ services:
       - "${INTEGRATION_VALKEY_CLUSTER_NODE_5_PORT:-57105}:6379"
     networks:
       cluster:
-        ipv4_address: 172.31.0.15
+        ipv4_address: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.15
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s
@@ -136,12 +137,12 @@ services:
       - -c
       - |
         valkey-cli --cluster create \
-          172.31.0.10:6379 \
-          172.31.0.11:6379 \
-          172.31.0.12:6379 \
-          172.31.0.13:6379 \
-          172.31.0.14:6379 \
-          172.31.0.15:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.10:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.11:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.12:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.13:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.14:6379 \
+          ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.15:6379 \
           --cluster-replicas 1 \
           --cluster-yes
     restart: "no"
@@ -151,4 +152,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.31.0.0/24
+        - subnet: ${INTEGRATION_VALKEY_CLUSTER_SUBNET:-10.249.1}.0/24

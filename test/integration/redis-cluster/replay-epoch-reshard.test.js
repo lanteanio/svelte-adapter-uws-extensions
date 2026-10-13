@@ -71,7 +71,7 @@ describe('replay epoch across a topic slot migration (cluster)', () => {
 			mastersById.set(await node.cluster('MYID'), node);
 		}
 		// Capture each master's cluster-internal address (the bridge-network IP
-		// the nodes announce, e.g. 172.30.0.10:6379) so a node-to-node MIGRATE
+		// the nodes announce, e.g. 10.249.0.10:6379) so a node-to-node MIGRATE
 		// can target it directly - MIGRATE runs inside the cluster network, not
 		// through the host NAT the client uses.
 		addrById = new Map();

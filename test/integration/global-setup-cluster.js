@@ -26,17 +26,27 @@ const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
 		? 'svelte-adapter-uws-extensions-cluster'
 		: `svelte-adapter-uws-ext-cluster-${BASE_PORT}`);
 
-// The cluster nodes use static IPs (172.30.0.10 - 172.30.0.15) inside the
-// bridge network. The natMap lets ioredis on the host translate those IPs
-// back to 127.0.0.1:<host-port> when it follows MOVED redirects.
-const NAT_MAP = {
-	'172.30.0.10:6379': { host: '127.0.0.1', port: NODE_PORTS[0] },
-	'172.30.0.11:6379': { host: '127.0.0.1', port: NODE_PORTS[1] },
-	'172.30.0.12:6379': { host: '127.0.0.1', port: NODE_PORTS[2] },
-	'172.30.0.13:6379': { host: '127.0.0.1', port: NODE_PORTS[3] },
-	'172.30.0.14:6379': { host: '127.0.0.1', port: NODE_PORTS[4] },
-	'172.30.0.15:6379': { host: '127.0.0.1', port: NODE_PORTS[5] }
-};
+// The cluster nodes use static IPs <subnet>.10 - <subnet>.15 inside the
+// bridge network (INTEGRATION_REDIS_CLUSTER_SUBNET, default 10.249.0, outside
+// Docker's default address pools). The natMap lets ioredis on the host
+// translate those IPs back to 127.0.0.1:<host-port> when it follows MOVED
+// redirects.
+const DEFAULT_SUBNET = '10.249.0';
+// A bridge subnet is a /24 prefix such as 10.249.0; compose receives the same
+// value, so node addresses and the natMap always agree.
+function subnetPrefix(value, fallback) {
+	const prefix = value || fallback;
+	const parts = prefix.split('.');
+	if (parts.length !== 3 || parts.some((part) => !/^(0|[1-9]\d{0,2})$/.test(part) || Number(part) > 255)) {
+		throw new Error(`Expected a /24 subnet prefix such as 10.249.0, got ${prefix}`);
+	}
+	return prefix;
+}
+const SUBNET = subnetPrefix(process.env.INTEGRATION_REDIS_CLUSTER_SUBNET, DEFAULT_SUBNET);
+const NAT_MAP = Object.fromEntries(NODE_PORTS.map((port, index) => [
+	`${SUBNET}.${10 + index}:6379`,
+	{ host: '127.0.0.1', port }
+]));
 
 function compose(args, opts = {}) {
 	const result = spawnSync(
@@ -47,6 +57,7 @@ function compose(args, opts = {}) {
 			encoding: 'utf8',
 			env: {
 				...process.env,
+				INTEGRATION_REDIS_CLUSTER_SUBNET: SUBNET,
 				INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE: String(NODE_PORTS[0]),
 				INTEGRATION_REDIS_CLUSTER_NODE_1_PORT: String(NODE_PORTS[1]),
 				INTEGRATION_REDIS_CLUSTER_NODE_2_PORT: String(NODE_PORTS[2]),
