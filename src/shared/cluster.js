@@ -99,9 +99,9 @@ function ownerName(owners) {
  * owner that is still busy keeps only the newest items, which run as their own
  * cycle when its refresh settles, after `current(item)` drops the ones no
  * longer wanted and with the state that `commands` reads at that moment; when
- * `admit()` is false then, they are dropped without a cycle. Each submit
- * discards every older pending refresh, so nothing a newer submit left out
- * runs later.
+ * `admit()` is false or throws then, they are dropped without a cycle. Each
+ * submit discards every older pending refresh, so nothing a newer submit left
+ * out runs later.
  *
  * `onError` hears the first failure of each cycle when it happens, and
  * `onSettled(commands, results)` each refresh once it answers (`results` is

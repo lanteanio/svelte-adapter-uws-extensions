@@ -252,7 +252,9 @@ export function createPresence(client, options = {}) {
 		onError: error => b?.failure(error),
 		onComplete(cycle) {
 			if (cycle.total > 0 && cycle.error === null) b?.success();
-			reportHeartbeatLatency(cycle.context);
+			// A tick that reached no owner returns the probe it was admitted with.
+			cycle.context.release();
+			reportHeartbeatLatency(cycle.context.tickStart);
 		}
 	});
 	const heartbeatTick = coalescedWork(() => {
@@ -327,7 +329,11 @@ export function createPresence(client, options = {}) {
 			}
 		}
 
-		if (b && !b.isHealthy) {
+		// The tick takes breaker admission, so a half-open breaker is probed by
+		// the heartbeat itself and closes once owners answer; a breaker that
+		// only heartbeat failures opened would otherwise never be probed.
+		let release;
+		try { release = guardBreaker(b); } catch {
 			reportHeartbeatLatency(tickStart);
 			return;
 		}
@@ -380,7 +386,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		refreshTopics(topics, tickStart);
+		refreshTopics(topics, { tickStart, release });
 		if (publishFailed === 0) {
 			heartbeatPublishReported = false;
 		} else if (!heartbeatPublishReported) {

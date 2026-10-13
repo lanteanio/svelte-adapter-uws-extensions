@@ -90,15 +90,18 @@ cursor snapshot writes run at most one refresh per Cluster owner at a time (one
 in total on a standalone server). Owners that answer keep refreshing on every
 tick while another owner stalls. A tick that finds an owner still busy leaves
 it only the newest work, which runs once that owner's refresh settles, with
-current membership or the latest pending cursor values; that waiting work is
-skipped while the circuit breaker is not healthy. A cursor topic is written
-again only after its previous snapshot write answered, so a write still on its
-way to a node the slot has left never lands after a newer one.
+current membership or the latest pending cursor values; waiting heartbeat and
+snapshot work is skipped while the circuit breaker is not healthy (cleanup
+sweeps do not consult the breaker). A cursor topic is written again only after
+its previous snapshot write answered or failed, so a write still on its way to
+a node the slot has left never lands after a newer one.
 
 Heartbeats and snapshot writes report one success or failure to the circuit
 breaker per tick, from the owners that tick reached, and one per waiting
-refresh when it settles. A tick that reaches no owner reports neither and does
-not use up a breaker probe.
+refresh that runs, when it settles. Each presence and registry heartbeat tick
+and each snapshot flush takes breaker admission, so a half-open breaker is
+probed by that work itself; a tick that reaches no owner reports neither and
+returns the probe it was admitted with.
 
 Externally constructed Cluster clients retain their caller-selected deadlines;
 configure finite command and socket deadlines on their node connections.

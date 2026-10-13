@@ -3773,7 +3773,7 @@ Every Redis and Postgres extension accepts an optional `breaker` option - a shar
 
 The breaker is a three-state machine: **healthy** (all requests pass through) -> **broken** after N consecutive failures (all requests fail fast via `CircuitBrokenError`) -> **probing** after a timeout (one request is allowed through to test recovery) -> back to **healthy** on success. See [Circuit breaker](#circuit-breaker) for configuration.
 
-A relay, snapshot, heartbeat or erasure batch that Redis answers with a refused command (READONLY after a failover, OOM, NOPERM) counts as a failure even though the pipeline itself resolves: the pub/sub and sharded relay flushes, cursor snapshot writes and removals, the registry heartbeat and presence `purgeUser` report it to the breaker; the groups heartbeat reports a failed beat; presence and cursor `purgeUser` do not count what Redis refused to delete as erased; and relayed-message counters count only what went out. The presence heartbeat and the group join TTL refresh stay best-effort.
+A relay, snapshot, heartbeat or erasure batch that Redis answers with a refused command (READONLY after a failover, OOM, NOPERM) counts as a failure even though the pipeline itself resolves: the pub/sub and sharded relay flushes, cursor snapshot writes and removals, the registry and presence heartbeats and presence `purgeUser` report it to the breaker; the groups heartbeat reports a failed beat; presence and cursor `purgeUser` do not count what Redis refused to delete as erased; and relayed-message counters count only what went out. The group join TTL refresh stays best-effort.
 
 #### Subscriptions across a reconnect
 
@@ -4002,7 +4002,7 @@ Failures from any extension contribute to the same breaker. When one trips it, a
 
 Awaited operations (join, consume, publish) call `guard()` before the Redis/Postgres call, `success()` after, and `failure()` in the catch block. When the circuit is broken, `guard()` throws `CircuitBrokenError` and the operation never reaches the backend.
 
-Fire-and-forget operations (heartbeat refresh, relay flush, cursor broadcast) check `isHealthy` and skip entirely when the circuit is not healthy. This prevents piling up commands on a dead connection.
+Fire-and-forget operations (heartbeat refresh, relay flush, cursor broadcast) are skipped entirely while the circuit is broken. This prevents piling up commands on a dead connection. While it is probing, the presence and registry heartbeats, cursor snapshot flushes, relay flushes and cursor broadcasts take a probe through `guard()` like awaited operations, so that work can close the circuit by itself; a heartbeat or snapshot flush that reaches no Redis owner returns its probe. The groups heartbeat waits until the circuit is healthy.
 
 #### Error handling
 
