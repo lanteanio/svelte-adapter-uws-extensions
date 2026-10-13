@@ -74,17 +74,21 @@ export interface DistributedSessionOptions<T = unknown> {
 	 * the close-time persist) writes the owner's index field before the record,
 	 * and every refresh (`touch`, a sliding `get` or lifecycle load) refreshes
 	 * it before extending the record's TTL; the field outlives the record by a
-	 * fixed minute. The extractor receives application data only: for a
-	 * lifecycle record (`create` / `withHooks`) it gets the session data, never
-	 * the stored wrapper. A raw `set` value that is exactly an object with `d`
-	 * and a numeric `c` has the lifecycle record's shape and is attributed by
-	 * its `d` in the same way.
+	 * fixed minute. The extractor receives application data only, as stored
+	 * after a JSON round trip, both when a session is indexed and when
+	 * `purgeUser` checks it (no class methods or prototype getters, dates as
+	 * strings): for a lifecycle record (`create` / `withHooks`) it gets the
+	 * session data, never the stored wrapper. A raw `set` value whose stored
+	 * JSON is exactly an object with `d` and a numeric `c` has the lifecycle
+	 * record's shape and is attributed by its `d` in the same way.
 	 *
-	 * Writes and `touch` reject with `code: 'ERASURE_INDEX_INCOMPLETE'` and
-	 * `erasureIndexIncomplete: true` when the extractor throws or returns a
-	 * non-string, or the index write fails; the record is then neither written
-	 * nor extended. A missing, `null` or empty owner leaves the session
-	 * unindexed. Reads never reject because of the index.
+	 * `set`, `create` and `touch` reject (the close-time persist skips its
+	 * write) with `code: 'ERASURE_INDEX_INCOMPLETE'` and
+	 * `erasureIndexIncomplete: true` when the extractor throws or returns
+	 * anything other than a string, `null` or `undefined`, or the index write
+	 * fails; the record is then neither written nor extended. A missing,
+	 * `null` or empty owner leaves the session unindexed. Reads never reject
+	 * because of the index.
 	 */
 	forgetUserId?: (data: T) => string | null | undefined;
 
@@ -156,8 +160,9 @@ export interface DistributedSession<T = unknown> {
 	 * Rejects with `code: 'ERASURE_INDEX_INCOMPLETE'` and
 	 * `erasureIndexIncomplete: true` when Redis fails, one of this user's
 	 * indexed records cannot be parsed or attributed, or a record keeps
-	 * changing during the purge. The user's other sessions are still revoked,
-	 * and the unresolved index fields stay for a retry. Rejects before deleting
+	 * changing during the purge. The user's other reachable sessions are still
+	 * revoked (none are when the index itself cannot be read), and the
+	 * unresolved index fields stay for a retry. Rejects before deleting
 	 * anything when the index holds a reserved `byuser:` token. User IDs are
 	 * globally unique; tenantId does not partition this legacy store.
 	 */

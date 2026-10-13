@@ -248,6 +248,15 @@ export function createDistributedSession(client, options = {}) {
 		if (owner !== null) await indexOwner(owner, token);
 	}
 
+	// Index serialized data the way purgeUser will read it back, so a getter,
+	// a toJSON or anything else JSON does not carry cannot index a session
+	// under an owner the purge then fails to recognize.
+	async function indexStored(raw, token) {
+		// An empty record holds no data and no owner, as purgeUser reads it.
+		if (!forgetUserId || raw === '') return;
+		await indexValue(JSON.parse(raw), token);
+	}
+
 	// Slide a stored record's TTL after refreshing its owner's index field, and
 	// reject without sliding when the field cannot be refreshed. The refresh
 	// writes the field rather than only extending it, so a record stored
@@ -310,10 +319,12 @@ export function createDistributedSession(client, options = {}) {
 	async function set(token, data) {
 		validateToken(token);
 		const key = fullKey(token);
-		const raw = JSON.stringify(data);
+		// A value with no JSON form (undefined) is stored as an empty record,
+		// which get reads as a miss, rather than as whatever the client makes of it.
+		const raw = JSON.stringify(data) ?? '';
 		// The index field is written first: a failed index write rejects before
 		// the record exists, so purgeUser can always find what set stored.
-		await indexValue(data, token);
+		await indexStored(raw, token);
 		try {
 			await redis.set(key, raw, 'PX', ttlMs);
 			breaker?.success();
@@ -440,7 +451,7 @@ export function createDistributedSession(client, options = {}) {
 		const record = { d: data, c: createdAt };
 		const raw = JSON.stringify(record);
 		// Index first, as in set().
-		await indexValue(record, token);
+		await indexStored(raw, token);
 		try {
 			await redis.set(key, raw, 'PX', ttlMs);
 			breaker?.success();
@@ -599,7 +610,8 @@ export function createDistributedSession(client, options = {}) {
 			for (let i = 0; i < pending.length; i++) {
 				const [err, raw] = reads[i];
 				if (err) { failure ??= err; continue; }
-				if (raw == null) { resolved.push(pending[i]); continue; }
+				// An empty record (a token set to undefined) holds no data and no owner.
+				if (raw == null || raw === '') { resolved.push(pending[i]); continue; }
 				let owner;
 				try { owner = recordOwner(JSON.parse(raw)); } catch (error) { failure ??= error; continue; }
 				if (owner === userId) owned.push({ token: pending[i], raw });

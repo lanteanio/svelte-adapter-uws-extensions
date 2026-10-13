@@ -418,7 +418,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 		const r = {
 			// String ops
-			async get(key) { pruneExpiredString(key); return store.get(key) || null; },
+			async get(key) { pruneExpiredString(key); return store.has(key) ? store.get(key) : null; },
 			async set(key, val, ...flags) {
 				// Real Redis SET accepts NX / XX / EX / PX / EXAT / PXAT / KEEPTTL
 				// flags. The mock honors the conditional gates (NX / XX) and now

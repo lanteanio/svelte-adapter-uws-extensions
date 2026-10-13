@@ -238,6 +238,43 @@ export function sessionErasureContract(getClient) {
 			expect(await indexOf(client, 'target')).toEqual([]);
 		});
 
+		it('indexes data by its stored JSON, as purgeUser reads it', async () => {
+			const client = getClient();
+			const sessions = createDistributedSession(client, options);
+			// JSON drops a prototype getter, so the stored record names nobody.
+			class Account { get userId() { return 'target'; } }
+			await sessions.set('getter', new Account());
+			const renamed = { userId: 'target', toJSON() { return { userId: 'renamed' }; } };
+			await sessions.set('renamed', renamed);
+			expect(await indexOf(client, 'target')).toEqual([]);
+			expect(await indexOf(client, 'renamed')).toEqual(['renamed']);
+			expect(await sessions.purgeUser(null, 'renamed')).toBe(1);
+			expect(await client.redis.get(client.key('sess:renamed'))).toBeNull();
+		});
+
+		it('indexes lifecycle records by their stored JSON, as purgeUser reads them', async () => {
+			const client = getClient();
+			const sessions = createDistributedSession(client, options);
+			class Account { get userId() { return 'target'; } }
+			const anonymous = await sessions.create(new Account());
+			const renamed = await sessions.create({ userId: 'target', toJSON() { return { userId: 'renamed' }; } });
+			expect(await indexOf(client, 'target')).toEqual([]);
+			expect(await indexOf(client, 'renamed')).toEqual([renamed]);
+			expect(await sessions.purgeUser(null, 'renamed')).toBe(1);
+			expect(await client.redis.get(client.key('sess:' + renamed))).toBeNull();
+			expect(await client.redis.get(client.key('sess:' + anonymous))).not.toBeNull();
+		});
+
+		it("does not let a token set to undefined block its previous owner's purge", async () => {
+			const client = getClient();
+			const sessions = createDistributedSession(client, options);
+			await sessions.set('tok', { userId: 'target' });
+			await sessions.set('other', { userId: 'target' });
+			await sessions.set('tok', undefined);
+			expect(await sessions.purgeUser(null, 'target')).toBe(1);
+			expect(await indexOf(client, 'target')).toEqual([]);
+		});
+
 		it('preserves a replacement written between inspection and deletion', async () => {
 			const client = getClient();
 			const sessions = createDistributedSession(client, options);
