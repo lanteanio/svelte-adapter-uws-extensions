@@ -253,6 +253,9 @@ export function createPubSubBus(client, options = {}) {
 			attributes: { reason: ADAPTER_DENIAL_CODES.has(denial) ? denial : 'APP_DEFINED' }
 		});
 	}
+	function reportSystemChannelFailure() {
+		reportSystemChannelRefusal('INTERNAL_ERROR');
+	}
 
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
@@ -933,11 +936,18 @@ export function createPubSubBus(client, options = {}) {
 				// delivery after the wire path was closed in adapter 0.5.0-next.21.
 				// The platform still runs the application's subscribe /
 				// subscribeBatch hook, which can refuse the topic. A refusal is
-				// not awaited; on a bus with a breaker it is reported.
+				// not awaited; on a bus with a breaker it is reported. A platform
+				// that throws or rejects (a socket closing mid-subscribe on older
+				// adapters) is reported the same way and never escapes as an
+				// unhandled rejection or stops the bus activating.
 				if (systemChannel) {
-					const denial = platform.subscribe(ws, systemChannel);
-					if (denial && typeof denial.then === 'function') denial.then(reportSystemChannelRefusal);
-					else reportSystemChannelRefusal(denial);
+					try {
+						const denial = platform.subscribe(ws, systemChannel);
+						if (denial && typeof denial.then === 'function') denial.then(reportSystemChannelRefusal, reportSystemChannelFailure);
+						else reportSystemChannelRefusal(denial);
+					} catch {
+						reportSystemChannelFailure();
+					}
 				}
 				await bus.activate(platform);
 			}

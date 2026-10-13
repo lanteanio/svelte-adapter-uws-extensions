@@ -1323,6 +1323,43 @@ describe('redis pubsub bus', () => {
 			await healthy.deactivate();
 		});
 
+		// A rejection that escaped would surface here instead of in the run.
+		async function unhandledDuring(fn) {
+			const seen = [];
+			const onUnhandled = (reason) => { seen.push(reason); };
+			process.on('unhandledRejection', onUnhandled);
+			try { await fn(); await settle(); } finally { process.off('unhandledRejection', onUnhandled); }
+			return seen;
+		}
+
+		it('contains a rejected systemChannel subscribe and still activates', async () => {
+			platform.subscribe = async () => { throw new Error('Invalid access of closed uWS.WebSocket'); };
+			const healthy = healthBus();
+			const activate = vi.spyOn(healthy, 'activate');
+			let lines;
+			const escaped = await unhandledDuring(async () => {
+				lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+			});
+
+			expect(escaped).toEqual([]);
+			expect(activate).toHaveBeenCalledWith(platform);
+			expect(lines).toHaveLength(1);
+			expect(registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED).attributes).toEqual({ reason: 'INTERNAL_ERROR' });
+
+			await healthy.deactivate();
+		});
+
+		it('contains a systemChannel subscribe that throws synchronously', async () => {
+			platform.subscribe = () => { throw new Error('platform failure'); };
+			const activate = vi.spyOn(bus, 'activate');
+			const escaped = await unhandledDuring(() => bus.hooks.open({ id: 'w1' }, { platform }));
+
+			expect(escaped).toEqual([]);
+			expect(activate).toHaveBeenCalledWith(platform);
+
+			await bus.deactivate();
+		});
+
 		it('reports nothing when the systemChannel subscribe succeeds', async () => {
 			platform.subscribe = async () => null;
 			const healthy = healthBus();
