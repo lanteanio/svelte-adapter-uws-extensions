@@ -5,8 +5,8 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export interface DistributedLockOptions {
 	/**
 	 * Pass a persistent monotonic fence as the callback's second argument.
-	 * The protected sink must atomically reject fences older than its last
-	 * accepted fence. Counter keys have no TTL and must not be deleted or
+	 * The protected sink must atomically reject fences not greater than its
+	 * last accepted fence. Counter keys have no TTL and must not be deleted or
 	 * rolled back while the sink retains their values. The client-relative
 	 * `lock-fences:` namespace is reserved for these counters. All holders
 	 * protecting the same resource must use the same Redis client keyPrefix.
@@ -109,7 +109,7 @@ export class LockLostError extends Error {
 export interface DistributedLock {
 	/**
 	 * Run `fn` while holding a cluster-wide COOPERATIVE lease on `key`.
-	 * Acquires via `SET <key> <fenceToken> NX PX <ttlMs>` with a retry loop;
+	 * Acquires via `SET <key> <leaseToken> NX PX <ttlMs>` with a retry loop;
 	 * releases via Lua compare-and-delete on completion.
 	 *
 	 * This is a TTL lease with cooperative release, not a hard fencing mutex:
@@ -144,8 +144,34 @@ export interface DistributedLock {
 }
 
 /**
+ * The lock returned for `fence: true`. Its callbacks receive a `number` fence
+ * unless a call passes `fence: false`; it is still a `DistributedLock`.
+ */
+export interface FencedDistributedLock extends DistributedLock {
+	withLock<T>(
+		key: string,
+		fn: (signal: AbortSignal) => Promise<T> | T,
+		options: WithLockOptions & { fence: false }
+	): Promise<T>;
+	withLock<T>(
+		key: string,
+		fn: (signal: AbortSignal, fence: number) => Promise<T> | T,
+		options?: WithLockOptions & { fence?: true }
+	): Promise<T>;
+	withLock<T>(
+		key: string,
+		fn: (signal: AbortSignal, fence?: number) => Promise<T> | T,
+		options?: WithLockOptions
+	): Promise<T>;
+}
+
+/**
  * Create a cluster-wide distributed lock factory.
  */
+export function createDistributedLock(
+	client: RedisClient,
+	options: DistributedLockOptions & { fence: true }
+): FencedDistributedLock;
 export function createDistributedLock(
 	client: RedisClient,
 	options?: DistributedLockOptions
