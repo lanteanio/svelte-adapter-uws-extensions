@@ -59,17 +59,32 @@ export interface DistributedSessionOptions<T = unknown> {
 	 * closed - the upgrade is refused; `'anonymous'` fails open - the connection
 	 * proceeds with no session. An unknown or expired token is NOT an error: it
 	 * is always a clean anonymous connection (load-only never creates a session).
+	 * A failed erasure-index refresh is not a load error either: the session
+	 * loads, and its TTL is not extended.
 	 * @default 'reject'
 	 */
 	onLoadError?: 'reject' | 'anonymous';
 
 	/**
-	 * Right-to-erasure: extract the owning userId from session data at write time
-	 * so `live.forget` can revoke every session a user holds. Without it, sessions
-	 * are not user-purgeable (the token is opaque to the store). The extractor also
-	 * runs during erasure recovery and must identify stored data consistently.
-	 * Writes and TTL refreshes reject with `code: 'ERASURE_INDEX_INCOMPLETE'`
-	 * and `erasureIndexIncomplete: true` when index maintenance fails.
+	 * Right-to-erasure: extract the owning userId from session data so
+	 * `live.forget` can revoke every session a user holds. Without it, sessions
+	 * are not user-purgeable (the token is opaque to the store).
+	 *
+	 * The store keeps a per-user index of tokens. Every write (`set`, `create`,
+	 * the close-time persist) writes the owner's index field before the record,
+	 * and every refresh (`touch`, a sliding `get` or lifecycle load) refreshes
+	 * it before extending the record's TTL; the field outlives the record by a
+	 * fixed minute. The extractor receives application data only: for a
+	 * lifecycle record (`create` / `withHooks`) it gets the session data, never
+	 * the stored wrapper. A raw `set` value that is exactly an object with `d`
+	 * and a numeric `c` has the lifecycle record's shape and is attributed by
+	 * its `d` in the same way.
+	 *
+	 * Writes and `touch` reject with `code: 'ERASURE_INDEX_INCOMPLETE'` and
+	 * `erasureIndexIncomplete: true` when the extractor throws or returns a
+	 * non-string, or the index write fails; the record is then neither written
+	 * nor extended. A missing, `null` or empty owner leaves the session
+	 * unindexed. Reads never reject because of the index.
 	 */
 	forgetUserId?: (data: T) => string | null | undefined;
 
@@ -86,6 +101,10 @@ export interface DistributedSession<T = unknown> {
 	 * Returns `null` for a missing token, an expired key, or a corrupt
 	 * (non-JSON) entry. The corrupt-entry path is treated as a miss so
 	 * the next `set` cleanly overwrites.
+	 *
+	 * Rejects only when Redis fails the read. With `forgetUserId`, the TTL
+	 * refresh first refreshes the owner's erasure-index field; when that
+	 * fails, `get` still resolves the data and leaves the TTL unchanged.
 	 */
 	get(token: string): Promise<T | null>;
 
@@ -93,13 +112,22 @@ export interface DistributedSession<T = unknown> {
 	 * Store or replace data for `token`. Resets the TTL via `SET PX`.
 	 * All token operations reject the reserved, case-sensitive `byuser:` prefix.
 	 * The data must be JSON-serializable.
+	 *
+	 * With `forgetUserId`, the owner's erasure-index field is written first, and
+	 * an extractor or index failure rejects with `code: 'ERASURE_INDEX_INCOMPLETE'`
+	 * before the record is written.
 	 */
 	set(token: string, data: T): Promise<void>;
 
 	/**
-	 * Extend TTL, reading data when erasure indexing is configured. Returns `true` if the entry was
-	 * present and refreshed, `false` if the token was missing or already
-	 * expired.
+	 * Extend TTL. Returns `true` if the entry was present and refreshed, `false`
+	 * if the token was missing or already expired.
+	 *
+	 * With `forgetUserId`, touch reads the record to find its owner and
+	 * refreshes the owner's erasure-index field before extending the TTL. An
+	 * extractor or index failure rejects with `code: 'ERASURE_INDEX_INCOMPLETE'`
+	 * and leaves the TTL unchanged; a corrupt (non-JSON) record returns `false`
+	 * and is not extended.
 	 */
 	touch(token: string): Promise<boolean>;
 
@@ -118,11 +146,20 @@ export interface DistributedSession<T = unknown> {
 	clear(): Promise<void>;
 
 	/**
-	 * Revoke every session a user holds (needs `forgetUserId`). Scans primary
-	 * records in bounded batches across all Redis primaries to recover missing
-	 * index entries. Cost scales with the Redis keyspace. Ambiguous ownership,
-	 * corrupt records and Redis failures reject with ERASURE_INDEX_INCOMPLETE.
-	 * User IDs are globally unique; tenantId does not partition this legacy store.
+	 * Revoke every session a user holds (needs `forgetUserId`; a no-op
+	 * returning 0 without it). Reads only this user's erasure index, never the
+	 * rest of the keyspace, so the cost scales with the user's own sessions.
+	 * An indexed record is deleted only while its stored bytes still name this
+	 * user; a record replaced for another user, or for none, is kept and only
+	 * leaves this user's index.
+	 *
+	 * Rejects with `code: 'ERASURE_INDEX_INCOMPLETE'` and
+	 * `erasureIndexIncomplete: true` when Redis fails, one of this user's
+	 * indexed records cannot be parsed or attributed, or a record keeps
+	 * changing during the purge. The user's other sessions are still revoked,
+	 * and the unresolved index fields stay for a retry. Rejects before deleting
+	 * anything when the index holds a reserved `byuser:` token. User IDs are
+	 * globally unique; tenantId does not partition this legacy store.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
@@ -134,7 +171,8 @@ export interface DistributedSession<T = unknown> {
 	 * client-presented token - is what makes the lifecycle immune to session
 	 * fixation. Stores a wrapped record (data + creation time); use the lifecycle
 	 * layer (`create` / `withHooks` / `of`) consistently rather than mixing raw
-	 * `set` / `get` on a minted token.
+	 * `set` / `get` on a minted token. Rejects like `set` when the erasure index
+	 * cannot be written, and then stores no session.
 	 */
 	create(data?: T): Promise<string>;
 
@@ -145,6 +183,8 @@ export interface DistributedSession<T = unknown> {
 	 * your `close` runs after the session is persisted. The session is loaded
 	 * LOAD-ONLY (an unknown token never creates one) and attached to the
 	 * connection for `of(ws)`; on close the (mutated) session is persisted once.
+	 * The close-time persist is best-effort: when it fails, including an
+	 * erasure-index failure, the stored session keeps its previous data.
 	 */
 	withHooks(userHooks?: SessionWsHooks): {
 		upgrade(ctx: UpgradeContext): Promise<unknown>;

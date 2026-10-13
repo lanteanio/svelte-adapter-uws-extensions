@@ -1119,9 +1119,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('IDEM_COMMIT')) {
 					return evalIdempotencyCommit(args);
 				}
-				// Idempotency abort (compare-and-delete: DEL iff owner token matches).
-				// Its DEL would otherwise look like the fence-release script; the
-				// IDEM_ABORT marker keeps them distinct and is matched first.
+				// Idempotency abort and session record erasure (compare-and-delete:
+				// DEL iff the stored value matches). Their DEL would otherwise look
+				// like the fence-release script; the markers keep them distinct and
+				// are matched first.
 				if (script.includes('IDEM_ABORT') || script.includes('SESSION_ERASE_RECORD')) {
 					return evalIdempotencyAbort(args);
 				}
@@ -1146,12 +1147,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const matchIdx = args.indexOf('MATCH');
 				const pattern = matchIdx !== -1 ? args[matchIdx + 1] : '*';
 
-				const typeIdx = args.indexOf('TYPE');
-				const type = typeIdx === -1 ? null : args[typeIdx + 1];
-				const maps = { string: store, zset: sortedSets, hash: hashes, stream: streams };
-				const allKeys = type === null
-					? [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()]
-					: [...(maps[type]?.keys() ?? [])];
+				const allKeys = [...store.keys(), ...sortedSets.keys(), ...hashes.keys(), ...streams.keys()];
 				const matched = allKeys.filter((k) => globMatch(pattern, k));
 				return ['0', matched];
 			},

@@ -576,9 +576,11 @@ describe('redis session byuser index field TTL', () => {
 		const session = createDistributedSession(client, { forgetUserId: extractor, ttlMs: 10000 });
 		await session.set('tok-1', { userId: 'u1' });
 
+		// The field outlives its record by a fixed minute: it is written first,
+		// so it must not lapse before a record written moments later.
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok-1');
-		expect(ttlMs).toBeGreaterThan(0);
-		expect(ttlMs).toBeLessThanOrEqual(10000);
+		expect(ttlMs).toBeGreaterThan(10000);
+		expect(ttlMs).toBeLessThanOrEqual(10000 + 60000);
 	});
 
 	it('falls back to a whole-key TTL on a pre-7.4 server, and purge still works', async () => {
@@ -617,7 +619,7 @@ describe('redis session byuser index field TTL', () => {
 
 		expect(await session.touch('tok')).toBe(true);
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
-		expect(ttlMs).toBeGreaterThan(9900); // re-armed by touch, not decayed since set
+		expect(ttlMs).toBeGreaterThan(69900); // re-armed by touch, not decayed since set
 		expect(await session.purgeUser(null, 'u1')).toBe(1);
 	});
 
@@ -629,7 +631,7 @@ describe('redis session byuser index field TTL', () => {
 
 		expect(await session.touch(token)).toBe(true);
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, token);
-		expect(ttlMs).toBeGreaterThan(9900);
+		expect(ttlMs).toBeGreaterThan(69900);
 	});
 
 	it('touch slides the index for raw data that collides with the lifecycle {d,c} shape', async () => {
@@ -643,7 +645,7 @@ describe('redis session byuser index field TTL', () => {
 
 		expect(await session.touch('tok')).toBe(true);
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
-		expect(ttlMs).toBeGreaterThan(9900); // re-armed by touch despite the {d,c} collision
+		expect(ttlMs).toBeGreaterThan(69900); // re-armed by touch despite the {d,c} collision
 		expect(await session.purgeUser(null, 'u1')).toBe(1);
 	});
 
@@ -655,7 +657,7 @@ describe('redis session byuser index field TTL', () => {
 
 		expect(await session.get('tok')).toEqual({ userId: 'u1' });
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
-		expect(ttlMs).toBeGreaterThan(9900);
+		expect(ttlMs).toBeGreaterThan(69900);
 	});
 
 	it('refreshOnGet: false leaves the index field decaying on reads', async () => {
@@ -666,7 +668,7 @@ describe('redis session byuser index field TTL', () => {
 
 		expect(await session.get('tok')).toEqual({ userId: 'u1' });
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, 'tok');
-		expect(ttlMs).toBeLessThanOrEqual(9900); // read did not re-arm the field
+		expect(ttlMs).toBeLessThanOrEqual(69900); // read did not re-arm the field
 	});
 
 	it('a lifecycle load (withHooks upgrade) refreshes the index field', async () => {
@@ -683,7 +685,7 @@ describe('redis session byuser index field TTL', () => {
 		const userData = await hooks.upgrade({ token });
 		expect(userData).toBeTruthy();
 		const [ttlMs] = await client.redis.hpttl(client.key('sess:byuser:u1'), 'FIELDS', 1, token);
-		expect(ttlMs).toBeGreaterThan(9900);
+		expect(ttlMs).toBeGreaterThan(69900);
 	});
 });
 

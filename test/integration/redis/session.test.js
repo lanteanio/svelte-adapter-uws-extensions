@@ -244,9 +244,11 @@ describe('redis distributed session (integration)', () => {
 			await sessions.set('tok-idx', { userId: 'u-idx' });
 
 			const idxKey = client.key('sess:byuser:u-idx');
+			// The field is written before the record and outlives it by a
+			// fixed minute, so it never lapses while the record lives.
 			const [ttl1] = await client.redis.hpttl(idxKey, 'FIELDS', 1, 'tok-idx');
-			expect(ttl1).toBeGreaterThan(0);
-			expect(ttl1).toBeLessThanOrEqual(30_000);
+			expect(ttl1).toBeGreaterThan(await client.redis.pttl(client.key('sess:tok-idx')));
+			expect(ttl1).toBeLessThanOrEqual(30_000 + 60_000);
 
 			// Let the field TTL decay on the server's clock, then touch: the
 			// field must re-arm alongside the record or a touch-kept session
@@ -254,7 +256,7 @@ describe('redis distributed session (integration)', () => {
 			await waitRedisMs(client, 600);
 			expect(await sessions.touch('tok-idx')).toBe(true);
 			const [ttl2] = await client.redis.hpttl(idxKey, 'FIELDS', 1, 'tok-idx');
-			expect(ttl2).toBeGreaterThan(30_000 - 500);
+			expect(ttl2).toBeGreaterThan(30_000 + 60_000 - 500);
 
 			expect(await sessions.purgeUser(null, 'u-idx')).toBe(1);
 			expect(await sessions.get('tok-idx')).toBe(null);
