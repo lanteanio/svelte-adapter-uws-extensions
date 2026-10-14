@@ -123,9 +123,9 @@ export function createIdempotencyStore(client, options = {}) {
 	// callers that need the table to exist before they start polling can
 	// `await idempotency.ready()`. Subsequent ensureTable() calls are
 	// no-ops via the migrated flag.
-	const readyPromise = autoMigrate
-		? ensureTable().catch((err) => { throw err; })
-		: Promise.resolve();
+	const readyPromise = autoMigrate ? ensureTable() : Promise.resolve();
+	// Observe eager failures without changing the promise returned by ready().
+	void readyPromise.catch(() => {});
 
 	function validateKey(idempotencyKey) {
 		if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {

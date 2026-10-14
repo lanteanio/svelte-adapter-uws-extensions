@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
+import { finishPostgres } from '../helpers/postgres-lifecycle.js';
 import { createTaskRunner, UnknownTaskError, TaskInFlightError } from '../../../postgres/tasks.js';
 import { createIdempotencyStore } from '../../../postgres/idempotency.js';
 
@@ -21,6 +22,13 @@ const TABLE = 'svti_tasks';
 describe('postgres tasks core (integration)', () => {
 	let client;
 	let runner;
+	const stores = [];
+
+	function makeStore(options) {
+		const store = createIdempotencyStore(client, options);
+		stores.push(store);
+		return store;
+	}
 
 	beforeAll(() => {
 		const url = process.env.INTEGRATION_POSTGRES_URL;
@@ -35,25 +43,21 @@ describe('postgres tasks core (integration)', () => {
 
 	beforeEach(async () => {
 		// Ensure the table exists then wipe between tests so rows do not
-		// leak across cases. Using an inline runner with autoMigrate=true
-		// guarantees the schema is present before TRUNCATE.
+		// leak across cases. Wait for the constructor migration before TRUNCATE.
 		const seed = createTaskRunner(client, {
 			recoveryInterval: 0,
 			cleanupInterval: 0,
 			dispatchInterval: 0
 		});
-		seed.register('noop', async () => null);
-		await seed.run('noop', { input: null });
-		seed.destroy();
+		await finishPostgres(seed);
 
 		await client.query(`TRUNCATE ${TABLE}`);
 	});
 
-	afterEach(() => {
-		if (runner) {
-			runner.destroy();
-			runner = undefined;
-		}
+	afterEach(async () => {
+		const current = runner;
+		runner = undefined;
+		await finishPostgres(current, ...stores.splice(0));
 	});
 
 	afterAll(async () => {
@@ -76,16 +80,17 @@ describe('postgres tasks core (integration)', () => {
 			a.register('echo', async ({ input }) => input);
 			b.register('echo', async ({ input }) => input);
 
-			const [resA, resB] = await Promise.all([
-				a.run('echo', { input: { who: 'a' } }),
-				b.run('echo', { input: { who: 'b' } })
-			]);
+			try {
+				const [resA, resB] = await Promise.all([
+					a.run('echo', { input: { who: 'a' } }),
+					b.run('echo', { input: { who: 'b' } })
+				]);
 
-			expect(resA).toEqual({ who: 'a' });
-			expect(resB).toEqual({ who: 'b' });
-
-			a.destroy();
-			b.destroy();
+				expect(resA).toEqual({ who: 'a' });
+				expect(resB).toEqual({ who: 'b' });
+			} finally {
+				await finishPostgres(a, b);
+			}
 		});
 	});
 
@@ -370,25 +375,20 @@ describe('postgres tasks core (integration)', () => {
 		let runnerB;
 
 		beforeEach(async () => {
-			store = createIdempotencyStore(client, {
+			store = makeStore({
 				cleanupInterval: 0,
 				autoMigrate: true
 			});
-			// Wipe the idempotency table too. ensureTable() runs implicitly
-			// on first acquire(); pre-clean so prior tests do not leak.
-			try {
-				await client.query('TRUNCATE svti_idempotency');
-			} catch {
-				// Table may not exist yet; ensure it then truncate.
-				await store.acquire('seed-key').then((s) => s.acquired && s.abort());
-				await client.query('TRUNCATE svti_idempotency');
-			}
+			await store.ready();
+			await client.query('TRUNCATE svti_idempotency');
 		});
 
-		afterEach(() => {
-			if (runnerA) { runnerA.destroy(); runnerA = undefined; }
-			if (runnerB) { runnerB.destroy(); runnerB = undefined; }
-			if (store) { store.destroy(); store = undefined; }
+		afterEach(async () => {
+			const current = [runnerA, runnerB];
+			runnerA = undefined;
+			runnerB = undefined;
+			store = undefined;
+			await finishPostgres(...current);
 		});
 
 		it('only one runner executes; the other returns the cached result', async () => {
@@ -468,15 +468,10 @@ describe('postgres tasks core (integration)', () => {
 		});
 	});
 
-	// Pre-fix bug: idempotencyKey was used verbatim as the cache slot
-	// across all task names. Codex's round-5 PoC confirmed that a caller
-	// running tasks.run('publicTask', {idempotencyKey:'abc'}) right after
-	// a privileged tasks.run('privateTask', {idempotencyKey:'abc'}) read
-	// the private result without ever running publicTask. The fix
-	// namespaces the cache slot by task name.
+	// Idempotency keys are scoped by task name so handlers cannot share cached results.
 	describe('cross-task idempotency isolation', () => {
 		it('same idempotencyKey on two task names returns DIFFERENT cached results', async () => {
-			const idemStore = createIdempotencyStore(client, { autoMigrate: true });
+			const idemStore = makeStore({ autoMigrate: true });
 			runner = createTaskRunner(client, {
 				idempotency: idemStore,
 				recoveryInterval: 0, cleanupInterval: 0, dispatchInterval: 0
@@ -507,7 +502,7 @@ describe('postgres tasks core (integration)', () => {
 
 		it('rejects idempotencyKey longer than 256 characters', async () => {
 			runner = createTaskRunner(client, {
-				idempotency: createIdempotencyStore(client, { autoMigrate: true }),
+				idempotency: makeStore({ autoMigrate: true }),
 				recoveryInterval: 0, cleanupInterval: 0, dispatchInterval: 0
 			});
 			runner.register('echo', async ({ input }) => input);

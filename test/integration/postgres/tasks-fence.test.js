@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createPgClient } from '../../../postgres/index.js';
+import { finishPostgres } from '../helpers/postgres-lifecycle.js';
 import { createTaskRunner } from '../../../postgres/tasks.js';
 
 function wait(ms) {
@@ -39,9 +40,7 @@ async function ensureTable(client) {
 		cleanupInterval: 0,
 		dispatchInterval: 0
 	});
-	seed.register('noop', async () => null);
-	await seed.run('noop', { input: null });
-	seed.destroy();
+	await finishPostgres(seed);
 }
 
 describe('postgres tasks fence semantics (integration)', () => {
@@ -65,8 +64,8 @@ describe('postgres tasks fence semantics (integration)', () => {
 		runners = [];
 	});
 
-	afterEach(() => {
-		for (const r of runners) r.destroy();
+	afterEach(async () => {
+		await finishPostgres(...runners);
 		runners = [];
 	});
 

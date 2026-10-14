@@ -15,6 +15,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
+import { finishPostgres } from '../helpers/postgres-lifecycle.js';
 import { createTaskRunner } from '../../../postgres/tasks.js';
 
 const echoUrl = new URL('../../helpers/workers/echo.js', import.meta.url);
@@ -41,9 +42,7 @@ async function ensureTable(client) {
 		cleanupInterval: 0,
 		dispatchInterval: 0
 	});
-	seed.register('noop', async () => null);
-	await seed.run('noop', { input: null });
-	seed.destroy();
+	await finishPostgres(seed);
 }
 
 describe('postgres tasks async path (integration)', () => {
@@ -67,8 +66,8 @@ describe('postgres tasks async path (integration)', () => {
 		runners = [];
 	});
 
-	afterEach(() => {
-		for (const r of runners) r.destroy();
+	afterEach(async () => {
+		await finishPostgres(...runners);
 		runners = [];
 	});
 

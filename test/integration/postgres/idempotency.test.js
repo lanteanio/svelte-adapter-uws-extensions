@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../postgres/index.js';
+import { finishPostgres } from '../helpers/postgres-lifecycle.js';
 import { createIdempotencyStore } from '../../../postgres/idempotency.js';
 
 function wait(ms) {
@@ -38,10 +39,11 @@ describe('postgres idempotency (integration)', () => {
 		// other tests cannot leak in.
 		await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
 		store = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
+		await store.ready();
 	});
 
-	afterEach(() => {
-		if (store) store.destroy();
+	afterEach(async () => {
+		await finishPostgres(store);
 	});
 
 	afterAll(async () => {
@@ -59,19 +61,20 @@ describe('postgres idempotency (integration)', () => {
 			const a = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
 			const b = createIdempotencyStore(client, { table: TABLE, cleanupInterval: 0 });
 
-			const [first, second] = await Promise.all([
-				a.acquire('race-key'),
-				b.acquire('race-key')
-			]);
+			try {
+				const [first, second] = await Promise.all([
+					a.acquire('race-key'),
+					b.acquire('race-key')
+				]);
 
-			// Exactly one should be acquired; the other sees pending.
-			const acquired = [first, second].filter((r) => r && r.acquired === true).length;
-			const pending = [first, second].filter((r) => r && r.acquired === false && r.pending === true).length;
-			expect(acquired).toBe(1);
-			expect(pending).toBe(1);
-
-			a.destroy();
-			b.destroy();
+				// Exactly one should be acquired; the other sees pending.
+				const acquired = [first, second].filter((r) => r && r.acquired === true).length;
+				const pending = [first, second].filter((r) => r && r.acquired === false && r.pending === true).length;
+				expect(acquired).toBe(1);
+				expect(pending).toBe(1);
+			} finally {
+				await finishPostgres(a, b);
+			}
 		});
 	});
 
@@ -227,7 +230,7 @@ describe('postgres idempotency (integration)', () => {
 				const second = await s.acquire('stuck');
 				expect(second.acquired).toBe(true);
 			} finally {
-				s.destroy();
+				await finishPostgres(s);
 			}
 		});
 
@@ -245,7 +248,7 @@ describe('postgres idempotency (integration)', () => {
 				const fresh = await s.acquire('ephemeral');
 				expect(fresh.acquired).toBe(true);
 			} finally {
-				s.destroy();
+				await finishPostgres(s);
 			}
 		});
 
@@ -261,7 +264,7 @@ describe('postgres idempotency (integration)', () => {
 				expect(second.acquired).toBe(false);
 				expect(second.pending).toBe(true);
 			} finally {
-				s.destroy();
+				await finishPostgres(s);
 			}
 		});
 
@@ -288,7 +291,7 @@ describe('postgres idempotency (integration)', () => {
 				// acquire deadline; tolerate clock drift.
 				expect(afterMs - beforeMs).toBeGreaterThan(3600 * 1000);
 			} finally {
-				s.destroy();
+				await finishPostgres(s);
 			}
 		});
 	});
@@ -313,7 +316,7 @@ describe('postgres idempotency (integration)', () => {
 				);
 				expect(count.rows[0].n).toBe(0);
 			} finally {
-				s.destroy();
+				await finishPostgres(s);
 			}
 		});
 	});
