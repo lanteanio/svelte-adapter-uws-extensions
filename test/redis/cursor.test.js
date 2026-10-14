@@ -508,6 +508,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.hooks.close(ws, { platform });
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
@@ -702,6 +703,65 @@ describe('redis cursor', () => {
 	});
 
 	describe('remove', () => {
+		for (const batched of [true, false]) {
+			it(`preserves local and remote removal origins with batched=${batched}`, async () => {
+				vi.useFakeTimers();
+				if (!batched) platform.publishBatched = undefined;
+				const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+				const ws = mockWs({ id: 'local' });
+				try {
+					c.update(ws, 'canvas', { x: 1 }, platform);
+					const localKey = platform.published.find((p) => p.event === 'join').data.key;
+					vi.advanceTimersByTime(1);
+					platform.reset();
+					const handler = client._pubsubHandlers.at(-1).listeners.get('message');
+					handler(client.key('cursor:events'), JSON.stringify({
+						instanceId: 'OTHER', topic: 'canvas', event: 'remove', payload: { key: 'OTHER:1' }
+					}));
+					await c.remove(ws, platform, 'canvas');
+					expect(platform.published.filter((p) => p.event === 'remove')).toEqual([]);
+					vi.advanceTimersByTime(1);
+					const removes = platform.published.filter((p) => p.event === 'remove');
+					expect(removes).toHaveLength(2);
+					expect(removes.find((p) => p.data.key === 'OTHER:1').options).toEqual({ relay: false });
+					expect(removes.find((p) => p.data.key === localKey).options).toBeUndefined();
+				} finally {
+					c.destroy();
+					vi.useRealTimers();
+				}
+			});
+
+			for (const remoteFirst of [true, false]) {
+				it(`retains local relay for duplicate removals with batched=${batched}, remoteFirst=${remoteFirst}`, async () => {
+					vi.useFakeTimers();
+					if (!batched) platform.publishBatched = undefined;
+					const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+					const ws = mockWs({ id: 'local' });
+					try {
+						c.update(ws, 'canvas', { x: 1 }, platform);
+						const localKey = platform.published.find((p) => p.event === 'join').data.key;
+						vi.advanceTimersByTime(1);
+						platform.reset();
+						const handler = client._pubsubHandlers.at(-1).listeners.get('message');
+						const remote = () => handler(client.key('cursor:events'), JSON.stringify({
+							instanceId: 'OTHER', topic: 'canvas', event: 'remove', payload: { key: localKey }
+						}));
+						if (remoteFirst) remote();
+						await c.remove(ws, platform, 'canvas');
+						if (!remoteFirst) remote();
+						vi.advanceTimersByTime(1);
+						const removes = platform.published.filter((p) => p.event === 'remove');
+						expect(removes).toHaveLength(1);
+						expect(removes[0].data).toEqual({ key: localKey });
+						expect(removes[0].options).toBeUndefined();
+					} finally {
+						c.destroy();
+						vi.useRealTimers();
+					}
+				});
+			}
+		}
+
 		it('removes ws from all topics and broadcasts removal', async () => {
 			const c = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
 			const ws = mockWs({ id: '1', name: 'Alice' });
@@ -711,6 +771,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform);
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(2);
@@ -794,6 +855,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform, 'canvas-a');
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((e) => e.event === 'remove');
 			expect(removes).toHaveLength(1);
@@ -1431,7 +1493,7 @@ describe('redis cursor', () => {
 			c.destroy();
 		});
 
-		it('CATALOG / JOIN / REMOVE bypass aggregation and publish immediately', () => {
+		it('JOIN publishes immediately and REMOVE waits for the next tick', () => {
 			vi.useFakeTimers();
 			const c = createCursor(client, { throttle: 0, topicThrottle: 100, snapshotIntervalMs: 0 });
 
@@ -1453,11 +1515,11 @@ describe('redis cursor', () => {
 				payload: { key: 'OTHER:1' }
 			}));
 
-			// Roster events are low-frequency; latency matters more than
-			// smoothness. They publish immediately, not on the next flush.
-			const events = platform.published.map((p) => p.event);
-			expect(events).toContain('join');
-			expect(events).toContain('remove');
+			expect(platform.published.map((p) => p.event)).toEqual(['join']);
+			vi.advanceTimersByTime(1);
+			expect(platform.published.filter((p) => p.event === 'remove')).toEqual([{
+				topic: '__cursor:canvas', event: 'remove', data: { key: 'OTHER:1' }, options: { relay: false }, batched: true
+			}]);
 			c.destroy();
 		});
 	});
@@ -1661,6 +1723,7 @@ describe('redis cursor', () => {
 			client.redis.hdel = async () => { throw new Error('hdel failed'); };
 
 			await c.remove(ws, platform, 'doc');
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((p) => p.event === 'remove');
 			expect(removes).toHaveLength(0);
@@ -1698,6 +1761,7 @@ describe('redis cursor', () => {
 			};
 
 			await c.remove(ws, platform);
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((p) => p.event === 'remove');
 			expect(removes).toHaveLength(0);
@@ -1715,6 +1779,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform, 'doc');
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((p) => p.event === 'remove');
 			expect(removes).toHaveLength(1);
@@ -1955,6 +2020,7 @@ describe('redis cursor', () => {
 			platform.reset();
 
 			await c.remove(ws, platform);
+			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			const removes = platform.published.filter((p) => p.event === 'remove');
 			expect(removes).toHaveLength(0);

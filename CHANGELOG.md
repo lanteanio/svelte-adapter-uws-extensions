@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve relay suppression for cursor removals received from another instance, including batched delivery.
+
 - Contain throwing or rejected system channel subscriptions in the pub/sub open hook while continuing bus activation. A bus with a circuit breaker reports the failure once without exposing the underlying error.
 
 ## [0.5.10] - 2026-05-24

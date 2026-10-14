@@ -357,9 +357,7 @@ describe('redis cursor (integration)', () => {
 			const wsB = mockWs({ id: 'bob' });
 
 			await trackerB.attach(wsB, 'canvas', platformB);
-			expect(platformB.subscribed.find(
-				(s) => s.ws === wsB && s.topic === '__cursor:canvas'
-			)).toBeDefined();
+			expect(wsB.isSubscribed('__cursor:canvas')).toBe(true);
 
 			// Ensure B's Redis subscriber is live before A publishes.
 			trackerB.update(wsB, 'canvas', { x: 0 }, platformB);

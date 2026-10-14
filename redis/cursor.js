@@ -222,7 +222,7 @@ export function createCursor(client, options = {}) {
 				// cycle, ms apart). Now one frame per subscriber per cycle
 				// regardless of worker count.
 				//
-				// CATALOG / JOIN / REMOVE stay immediate: low-frequency
+				// CATALOG / JOIN stay immediate: low-frequency
 				// roster events where coalescing would add latency without
 				// smoothness benefit.
 				if (parsed.event === EVENTS.UPDATE && parsed.payload && typeof parsed.payload.key === 'string') {
@@ -239,7 +239,7 @@ export function createCursor(client, options = {}) {
 					// this, a mass-disconnect on one instance produces an
 					// equally-sized O(N) immediate-publish storm on every
 					// other instance, propagating the OOM risk cluster-wide.
-					queueRemove(parsed.topic, parsed.payload.key, activePlatform);
+					queueRemove(parsed.topic, parsed.payload.key, activePlatform, false);
 				} else {
 					activePlatform.publish(
 						'__cursor:' + parsed.topic,
@@ -468,20 +468,23 @@ export function createCursor(client, options = {}) {
 	// impossible at the microtask level. `setTimeout(0)` lands in libuv's
 	// timers phase, which fires only after the poll phase has dispatched
 	// every ready socket event in the current iteration.
-	/** @type {Map<string, Set<string>>} */
+	/** @type {Map<string, Map<string, boolean>>} */
 	const pendingRemoves = new Map();
+	const noRelay = Object.freeze({ relay: false });
 	/** @type {ReturnType<typeof setTimeout> | null} */
 	let removeFlushTimer = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let removeFlushPlatform = null;
 
-	function queueRemove(topic, key, platform) {
-		let set = pendingRemoves.get(topic);
-		if (!set) {
-			set = new Set();
-			pendingRemoves.set(topic, set);
+	function queueRemove(topic, key, platform, shouldRelay = true) {
+		let keys = pendingRemoves.get(topic);
+		if (!keys) {
+			keys = new Map();
+			pendingRemoves.set(topic, keys);
 		}
-		set.add(key);
+		// A local removal must still relay when a duplicate remote removal
+		// for the same key arrives during this tick.
+		keys.set(key, keys.get(key) === true || shouldRelay);
 		removeFlushPlatform = platform;
 		if (removeFlushTimer === null) {
 			removeFlushTimer = setTimeout(flushPendingRemoves, 0);
@@ -506,13 +509,13 @@ export function createCursor(client, options = {}) {
 			// adapter does not expose publishBatched.
 			if (typeof platform.publishBatched === 'function') {
 				const messages = [];
-				for (const key of keys) {
-					messages.push({ topic: '__cursor:' + topic, event: EVENTS.REMOVE, data: { key } });
+				for (const [key, shouldRelay] of keys) {
+					messages.push({ topic: '__cursor:' + topic, event: EVENTS.REMOVE, data: { key }, options: shouldRelay ? undefined : noRelay });
 				}
 				try { platform.publishBatched(messages); } catch { /* platform unavailable mid-flight */ }
 			} else {
-				for (const key of keys) {
-					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }); } catch { /* swallow */ }
+				for (const [key, shouldRelay] of keys) {
+					try { platform.publish('__cursor:' + topic, EVENTS.REMOVE, { key }, shouldRelay ? undefined : noRelay); } catch { /* swallow */ }
 				}
 			}
 		}
