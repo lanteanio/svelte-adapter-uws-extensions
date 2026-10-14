@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPubSubBus } from '../../redis/pubsub.js';
@@ -858,6 +858,103 @@ describe('redis pubsub bus', () => {
 	});
 
 	describe('hooks.open', () => {
+		async function unhandledDuring(fn) {
+			const seen = [];
+			const onUnhandled = (reason) => { seen.push(reason); };
+			process.on('unhandledRejection', onUnhandled);
+			try {
+				await fn();
+				await new Promise((resolve) => setImmediate(resolve));
+			} finally {
+				process.off('unhandledRejection', onUnhandled);
+			}
+			return seen;
+		}
+
+		async function expectRelay() {
+			await client.redis.publish('uws:pubsub', JSON.stringify({
+				instanceId: 'other-instance', topic: 'chat', event: 'msg', data: { text: 'remote' }
+			}));
+			expect(platform.published).toEqual([{
+				topic: 'chat', event: 'msg', data: { text: 'remote' }, options: { relay: false }
+			}]);
+		}
+
+		it('contains a rejected systemChannel subscribe and still activates', async () => {
+			platform.subscribe = async () => { throw new Error('Invalid access of closed uWS.WebSocket'); };
+			const breaker = createCircuitBreaker();
+			const healthy = createPubSubBus(client, { breaker });
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const escaped = await unhandledDuring(async () => {
+					await healthy.hooks.open({ id: 'w1' }, { platform });
+					await healthy.hooks.open({ id: 'w2' }, { platform });
+				});
+				expect(escaped).toEqual([]);
+				expect(warn).toHaveBeenCalledTimes(1);
+				expect(warn.mock.calls[0]).toEqual([
+					'[redis.pubsub.system-channel.refused] INTERNAL_ERROR: system channel subscription failed; degraded/recovered events may not reach this connection.'
+				]);
+				expect(breaker.state).toBe('healthy');
+				await expectRelay();
+			} finally {
+				warn.mockRestore();
+				await healthy.deactivate();
+				breaker.destroy();
+			}
+		});
+
+		it('contains a systemChannel subscribe that throws synchronously', async () => {
+			platform.subscribe = () => { throw new Error('platform failure'); };
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const escaped = await unhandledDuring(() => bus.hooks.open({ id: 'w1' }, { platform }));
+				expect(escaped).toEqual([]);
+				expect(warn).not.toHaveBeenCalled();
+				await expectRelay();
+			} finally {
+				warn.mockRestore();
+				await bus.deactivate();
+			}
+		});
+
+		it('activates and relays before a pending systemChannel subscription settles', async () => {
+			let rejectSubscription;
+			platform.subscribe = () => new Promise((resolve, reject) => { rejectSubscription = reject; });
+			try {
+				const escaped = await unhandledDuring(async () => {
+					const completed = bus.hooks.open({ id: 'w1' }, { platform }).then(() => true, () => false);
+					try {
+						await new Promise((resolve) => setImmediate(resolve));
+						await expectRelay();
+					} finally {
+						rejectSubscription(new Error('socket closed'));
+						await completed;
+					}
+				});
+				expect(escaped).toEqual([]);
+			} finally {
+				await bus.deactivate();
+			}
+		});
+
+		it('contains a throwing diagnostic sink during subscription failure', async () => {
+			platform.subscribe = async () => { throw new Error('platform failure'); };
+			const breaker = createCircuitBreaker();
+			const healthy = createPubSubBus(client, { breaker });
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => { throw new Error('logger failed'); });
+			try {
+				const escaped = await unhandledDuring(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+				expect(escaped).toEqual([]);
+				expect(warn).toHaveBeenCalledTimes(1);
+				await expectRelay();
+			} finally {
+				warn.mockRestore();
+				await healthy.deactivate();
+				breaker.destroy();
+			}
+		});
+
 		it('exposes an async open hook', () => {
 			expect(bus.hooks).toBeDefined();
 			expect(typeof bus.hooks.open).toBe('function');

@@ -92,6 +92,14 @@ export function createPubSubBus(client, options = {}) {
 	const systemChannel = options.systemChannel === undefined ? '__realtime' : options.systemChannel;
 	const onDegraded = options.onDegraded;
 	const onRecovered = options.onRecovered;
+	let systemChannelFailureReported = false;
+	function reportSystemChannelFailure() {
+		if (!b || typeof b.subscribe !== 'function' || systemChannelFailureReported) return;
+		systemChannelFailureReported = true;
+		try {
+			console.warn('[redis.pubsub.system-channel.refused] INTERNAL_ERROR: system channel subscription failed; degraded/recovered events may not reach this connection.');
+		} catch { /* diagnostics must not interrupt activation */ }
+	}
 	if (onDegraded !== undefined && typeof onDegraded !== 'function') {
 		throw new Error('pubsub bus: onDegraded must be a function');
 	}
@@ -417,7 +425,16 @@ export function createPubSubBus(client, options = {}) {
 				// gate. Subscribing here is what restores `degraded` / `recovered`
 				// delivery after the wire path was closed in adapter 0.5.0-next.21.
 				if (systemChannel) {
-					platform.subscribe(ws, systemChannel);
+					// A socket can close before its subscription finishes. Keep bus
+					// activation independent of the per-connection result.
+					try {
+						const subscription = platform.subscribe(ws, systemChannel);
+						if (subscription && typeof subscription.then === 'function') {
+							subscription.then(undefined, reportSystemChannelFailure);
+						}
+					} catch {
+						reportSystemChannelFailure();
+					}
 				}
 				await bus.activate(platform);
 			}
