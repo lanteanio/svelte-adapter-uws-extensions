@@ -26,17 +26,15 @@ const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
 		? 'svelte-adapter-uws-extensions-cluster'
 		: `svelte-adapter-uws-ext-cluster-${BASE_PORT}`);
 
-// The cluster nodes use static IPs (172.30.0.10 - 172.30.0.15) inside the
-// bridge network. The natMap lets ioredis on the host translate those IPs
-// back to 127.0.0.1:<host-port> when it follows MOVED redirects.
-const NAT_MAP = {
-	'172.30.0.10:6379': { host: '127.0.0.1', port: NODE_PORTS[0] },
-	'172.30.0.11:6379': { host: '127.0.0.1', port: NODE_PORTS[1] },
-	'172.30.0.12:6379': { host: '127.0.0.1', port: NODE_PORTS[2] },
-	'172.30.0.13:6379': { host: '127.0.0.1', port: NODE_PORTS[3] },
-	'172.30.0.14:6379': { host: '127.0.0.1', port: NODE_PORTS[4] },
-	'172.30.0.15:6379': { host: '127.0.0.1', port: NODE_PORTS[5] }
-};
+// Use a separate /24 prefix for concurrent test stacks.
+const SUBNET = process.env.INTEGRATION_REDIS_CLUSTER_SUBNET || '10.249.0';
+if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(SUBNET) || SUBNET.split('.').some((part) => Number(part) > 255)) {
+	throw new Error('INTEGRATION_REDIS_CLUSTER_SUBNET must be a three-octet IPv4 prefix');
+}
+// Translate the cluster's internal addresses to ports reachable on the host.
+const NAT_MAP = Object.fromEntries(NODE_PORTS.map((port, index) => [
+	`${SUBNET}.${10 + index}:6379`, { host: '127.0.0.1', port }
+]));
 
 function compose(args, opts = {}) {
 	const result = spawnSync(
@@ -47,6 +45,7 @@ function compose(args, opts = {}) {
 			encoding: 'utf8',
 			env: {
 				...process.env,
+				INTEGRATION_REDIS_CLUSTER_SUBNET: SUBNET,
 				INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE: String(NODE_PORTS[0]),
 				INTEGRATION_REDIS_CLUSTER_NODE_1_PORT: String(NODE_PORTS[1]),
 				INTEGRATION_REDIS_CLUSTER_NODE_2_PORT: String(NODE_PORTS[2]),
@@ -108,13 +107,19 @@ export default async function setup() {
 	process.env.INTEGRATION_REDIS_CLUSTER_NAT_MAP = JSON.stringify(NAT_MAP);
 
 	console.log(`[integration-cluster] starting docker compose stack (project=${PROJECT_NAME})...`);
-	compose(['up', '-d', '--wait']);
-	console.log('[integration-cluster] containers healthy; waiting for cluster bootstrap...');
-	await waitForClusterReady();
-	console.log(
-		`[integration-cluster] cluster ready (${NODE_PORTS.length} nodes at ` +
-		`127.0.0.1:${NODE_PORTS[0]}-${NODE_PORTS[NODE_PORTS.length - 1]})`
-	);
+	try {
+		compose(['up', '-d', '--wait']);
+		console.log('[integration-cluster] containers healthy; waiting for cluster bootstrap...');
+		await waitForClusterReady();
+		console.log(
+			`[integration-cluster] cluster ready (${NODE_PORTS.length} nodes at ` +
+			`127.0.0.1:${NODE_PORTS[0]}-${NODE_PORTS[NODE_PORTS.length - 1]})`
+		);
+	} catch (error) {
+		try { compose(['down', '-v']); }
+		catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Integration startup and cleanup failed'); }
+		throw error;
+	}
 
 	return async () => {
 		console.log('[integration-cluster] tearing down docker compose stack...');

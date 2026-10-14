@@ -94,7 +94,9 @@ Postgres support is optional:
 npm install pg
 ```
 
-Requires `svelte-adapter-uws >= 0.2.0` as a peer dependency.
+Requires `svelte-adapter-uws ^0.5.8` as a peer dependency.
+
+SvelteKit 3 applications require `svelte-adapter-uws >=0.5.11 <0.6.0` and its Vite plugin (`svelte-adapter-uws/vite`). The same extensions APIs work in SvelteKit 2 and 3.
 
 ---
 
@@ -3187,11 +3189,13 @@ Per-tenant prefixes add a handful of bytes to every key name and every published
 
 ## Testing
 
-This repo runs tests in two layers. Both stay green; you can run either independently.
+Run the unit, backend, and packed SvelteKit consumer suites independently:
 
 ```bash
-npm test                  # mock layer (24 files, 861 tests, no services needed)
-npm run test:integration  # integration layer (real Redis 7 + Postgres 16 in Docker)
+npm test                         # unit tests, no services needed
+npm run test:integration          # real Redis 7.4 and Postgres 16
+npm run test:integration:cluster  # real Redis Cluster
+npm run test:integration:kit3     # packed Kit 3 consumer in production and dev
 ```
 
 ### Mock layer (`test/`)
@@ -3238,6 +3242,14 @@ Project name auto-derives from the port pair when overridden, so unique ports al
 4. In `afterAll`, `await client.quit()` / `await client.end()`.
 
 The integration layer is additive: the mock-based test for a module stays in place when you add the integration counterpart. They cover different failure modes.
+
+### Packed SvelteKit 3 consumer
+
+`npm run test:integration:kit3` packs this checkout, installs it in an isolated SvelteKit 3.0.1 application with adapter 0.5.11, and starts disposable Redis/Postgres containers. Two application instances exercise HTTP, WebSocket delivery, shared sessions, the connection registry, and both replay stores in production and Vite dev. Private environment variables are read at module scope. Generated files remain under `test/fixtures/kit3/.runtime/`.
+
+Set `KIT3_ADAPTER_TARBALL` to an absolute path to test a locally packed adapter 0.5.11 before publication. Run `npm run test:integration:kit3 -- --mutations` to verify that disabling the bus, registry, or either replay store fails the corresponding consumer check in both modes.
+
+The Redis Cluster suite accepts `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, `INTEGRATION_REDIS_CLUSTER_SUBNET` (a three-octet prefix such as `10.250.1`), and `INTEGRATION_COMPOSE_PROJECT` for isolated concurrent runs. Its default subnet is `10.249.0.0/24`.
 
 ### Testing your own code
 

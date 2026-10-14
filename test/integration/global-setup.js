@@ -56,10 +56,16 @@ export default async function setup() {
 	process.env.INTEGRATION_POSTGRES_URL = POSTGRES_URL;
 
 	console.log(`[integration] starting docker compose stack (project=${PROJECT_NAME})...`);
-	compose(['up', '-d', '--wait']);
-	console.log(
-		`[integration] stack ready (postgres :${POSTGRES_HOST_PORT}, redis :${REDIS_HOST_PORT})`
-	);
+	try {
+		compose(['up', '-d', '--wait']);
+		console.log(
+			`[integration] stack ready (postgres :${POSTGRES_HOST_PORT}, redis :${REDIS_HOST_PORT})`
+		);
+	} catch (error) {
+		try { compose(['down', '-v']); }
+		catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Integration startup and cleanup failed'); }
+		throw error;
+	}
 
 	return async () => {
 		console.log('[integration] tearing down docker compose stack...');

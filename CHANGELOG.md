@@ -7,13 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.11] - 2026-10-15
+
+### Changed
+
+- Document SvelteKit 3 support with svelte-adapter-uws 0.5.11 and its Vite plugin, and correct the adapter peer requirement.
+- Clarify the existing close behavior since 0.5.5: `presence.join()` and `cursor.attach()` reject with `WsClosedError` (`code: 'WS_CLOSED'`) when a socket closes during the call. Await or catch these promises in hooks.
+
 ### Fixed
 
-- Contain eager PostgreSQL task and idempotency initialization failures until callers await `ready()`, which still rejects with the original error.
-
 - Preserve relay suppression for cursor removals received from another instance, including batched delivery.
-
+- Contain eager PostgreSQL task and idempotency initialization failures until callers await `ready()`, which still rejects with the original error.
 - Contain throwing or rejected system channel subscriptions in the pub/sub open hook while continuing bus activation. A bus with a circuit breaker reports the failure once without exposing the underlying error.
+- Synchronize the development lockfile with the declared adapter peer, isolate unit tests from generated fixtures, and run standalone integration tests separately from Redis Cluster tests.
 
 ## [0.5.10] - 2026-05-24
 

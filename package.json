@@ -1,6 +1,6 @@
 {
   "name": "svelte-adapter-uws-extensions",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "publishConfig": {
     "tag": "latest"
   },
@@ -148,7 +148,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.config.integration.js",
-    "test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js"
+    "test:integration:cluster": "vitest run --config vitest.config.integration.cluster.js",
+    "test:integration:kit3": "node test/integration/kit3/run.mjs"
   },
   "engines": {
     "node": ">=22.0.0"

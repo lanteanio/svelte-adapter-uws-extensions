@@ -18,7 +18,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE:-57000}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.10
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.10
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -35,7 +35,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_NODE_1_PORT:-57001}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.11
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.11
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -52,7 +52,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_NODE_2_PORT:-57002}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.12
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.12
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -69,7 +69,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_NODE_3_PORT:-57003}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.13
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.13
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -86,7 +86,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_NODE_4_PORT:-57004}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.14
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.14
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -103,7 +103,7 @@ services:
       - "${INTEGRATION_REDIS_CLUSTER_NODE_5_PORT:-57005}:6379"
     networks:
       cluster:
-        ipv4_address: 172.30.0.15
+        ipv4_address: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.15
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -136,12 +136,12 @@ services:
       - -c
       - |
         redis-cli --cluster create \
-          172.30.0.10:6379 \
-          172.30.0.11:6379 \
-          172.30.0.12:6379 \
-          172.30.0.13:6379 \
-          172.30.0.14:6379 \
-          172.30.0.15:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.10:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.11:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.12:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.13:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.14:6379 \
+          ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.15:6379 \
           --cluster-replicas 1 \
           --cluster-yes
     restart: "no"
@@ -151,4 +151,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: ${INTEGRATION_REDIS_CLUSTER_SUBNET:-10.249.0}.0/24

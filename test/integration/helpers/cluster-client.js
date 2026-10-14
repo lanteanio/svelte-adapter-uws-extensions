@@ -2,7 +2,7 @@
 // natMap that global-setup-cluster.js exported via process.env.
 //
 // natMap is essential here: the docker-compose stack puts each node on a
-// static bridge-network IP (172.30.0.10 - 172.30.0.15) which the cluster
+// static bridge-network IP which the cluster
 // announces in MOVED redirects. Without the natMap, the ioredis client
 // running on the host cannot resolve those IPs and every redirect fails.
 import Redis from 'ioredis';
