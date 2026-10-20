@@ -253,8 +253,11 @@ export interface TaskRunner {
 	 * UI dashboards polling the table on a tick, status pages reading
 	 * counts at boot, etc.
 	 *
-	 * Idempotent. Subsequent calls return the same promise (or a
-	 * resolved one once the migration has landed).
+	 * Every call returns the same promise. If the construction-time
+	 * migration fails, it rejects with the original error and stays
+	 * rejected; the failure is not reported as an unhandled rejection
+	 * when nothing calls `ready()`. Operations that touch the table run
+	 * the migration again, so they can succeed after a transient failure.
 	 */
 	ready(): Promise<void>;
 

@@ -23,6 +23,7 @@ The core adapter keeps everything in-process memory. That works great for single
 
 **Getting started**
 - [Installation](#installation)
+- [SvelteKit 3](#sveltekit-3)
 
 **Clients**
 - [Redis client](#redis-client)
@@ -96,7 +97,43 @@ npm install pg
 
 Requires `svelte-adapter-uws ^0.5.8` as a peer dependency.
 
-SvelteKit 3 applications require `svelte-adapter-uws >=0.5.11 <0.6.0` and its Vite plugin (`svelte-adapter-uws/vite`). The same extensions APIs work in SvelteKit 2 and 3.
+SvelteKit 3 applications require `svelte-adapter-uws >=0.5.11 <0.6.0`, and WebSocket hooks need its Vite plugin (`svelte-adapter-uws/vite`). The same extensions APIs work in SvelteKit 2 and 3.
+
+### SvelteKit 3
+
+The `$lib/...` imports and the `svelte.config.js` adapter configuration in the examples below use SvelteKit 2 syntax. On Kit 3, pass the adapter to `sveltekit()` in `vite.config.js` and add the Vite plugin for WebSocket hooks, as shown in the adapter's [SvelteKit 3 setup](https://github.com/lanteanio/svelte-adapter-uws#sveltekit-3-setup). Kit 3 no longer creates the `$lib` alias, so map it in `package.json`:
+
+```json
+{
+  "imports": {
+    "#lib/*": "./src/lib/*"
+  }
+}
+```
+
+Then import `#lib/...` paths with the file extension: `$lib/server/redis` becomes `#lib/server/redis.js`.
+
+During Vite development, Kit 3 evaluates the server modules again after an edit to a server route, a page or a server module, and the adapter restarts WebSocket connections with close code 1012. Clients, buses and trackers created at module scope are created again. The previous instances stay active until something releases them: their Redis connections stay open, and a previous bus keeps relaying, so subscribers receive duplicate messages. In development, the adapter calls the `shutdown` export of `hooks.ws` for the replaced module, so release them there:
+
+```js
+// src/hooks.ws.js
+import { dev } from '$app/env';
+import { redis } from '#lib/server/redis.js';
+import { pg } from '#lib/server/pg.js';
+import { bus } from '#lib/server/bus.js';
+import { presence } from '#lib/server/presence.js';
+
+export async function shutdown() {
+  if (!dev) return;
+  await bus.deactivate();
+  presence.destroy();
+  await Promise.all([redis.quit(), pg.end()]);
+}
+```
+
+Keep the `dev` check. A production server calls `shutdown` before it closes WebSocket connections and drains in-flight requests, and their `close` hooks and handlers still use these clients. The default `autoShutdown` closes the clients on `sveltekit:shutdown`, which the adapter emits after the drain. The adapter does not wait for asynchronous `close` hooks before it exits, so a removal that needs more than one Redis round trip, such as a presence leave, can be cut short and then expires with its TTL.
+
+In development the adapter can run the replaced module's `close` hooks after its `shutdown`. The presence and registry close hooks ignore the released clients' errors, the entries they would remove expire with their TTL, and the restarted connections register again. Guard your own `close` code that would throw on a released client. Deactivate buses and destroy trackers that run timers before quitting the clients they use. `quit()` and `end()` also remove the client's `sveltekit:shutdown` listener, so repeated reloads do not accumulate listeners.
 
 ---
 
@@ -3050,13 +3087,13 @@ Requires Redis 7+. There is no built-in fallback to `EVALSHA` for older servers 
 
 ## Graceful shutdown
 
-All clients listen for the `sveltekit:shutdown` event and disconnect cleanly by default. You can disable this with `autoShutdown: false` and manage the lifecycle yourself.
+All clients listen for the `sveltekit:shutdown` event and disconnect cleanly by default. You can disable this with `autoShutdown: false` and manage the lifecycle yourself. Calling `quit()` or `end()` yourself removes that listener. On SvelteKit 3, also release them during development from the `shutdown` export of `hooks.ws`, so reloads do not leave them connected (see [SvelteKit 3](#sveltekit-3)).
 
 ```js
 // Manual shutdown
+presence.destroy();
 await redis.quit();
 await pg.end();
-presence.destroy();
 ```
 
 ---

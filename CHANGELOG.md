@@ -7,20 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.11] - 2026-10-15
+## [0.5.11] - 2026-10-20
 
 ### Changed
 
-- Document SvelteKit 3 support with svelte-adapter-uws 0.5.11 and its Vite plugin, and correct the adapter peer requirement.
+- Document SvelteKit 3 support with svelte-adapter-uws 0.5.11 and its Vite plugin: the Kit 3 configuration and `#lib` imports, and releasing clients, buses and trackers during development from the `shutdown` export of `hooks.ws`, which the adapter calls for the replaced module when an edit makes Kit 3 evaluate the server modules again. Production keeps closing clients through `autoShutdown` after in-flight requests drain.
+- The installation notes state the declared `svelte-adapter-uws ^0.5.8` peer requirement instead of `>= 0.2.0`. The declared peer range is unchanged.
 - Clarify the existing close behavior since 0.5.5: `presence.join()` and `cursor.attach()` reject with `WsClosedError` (`code: 'WS_CLOSED'`) when a socket closes during the call. Await or catch these promises in hooks.
 
 ### Fixed
 
-- Preserve relay suppression for cursor removals received from another instance, including batched delivery.
 - `createRedisClient().quit()` and `createPgClient().end()` remove the client's `sveltekit:shutdown` listener. Clients released by development reloads no longer accumulate listeners and trigger `MaxListenersExceededWarning`.
-- Contain eager PostgreSQL task and idempotency initialization failures until callers await `ready()`, which still rejects with the original error.
+- Preserve relay suppression for cursor removals received from another instance, including batched delivery.
+- A failed construction-time migration of the PostgreSQL task runner or idempotency store no longer surfaces as an unhandled rejection. `ready()` still rejects with the original error, and its documentation now states that it stays rejected while later operations on the table retry the migration.
 - Contain throwing or rejected system channel subscriptions in the pub/sub open hook while continuing bus activation. A bus with a circuit breaker reports the failure once without exposing the underlying error.
-- Synchronize the development lockfile with the declared adapter peer, isolate unit tests from generated fixtures, and run standalone integration tests separately from Redis Cluster tests.
 
 ## [0.5.10] - 2026-05-24
 

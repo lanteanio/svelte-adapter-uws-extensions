@@ -31,7 +31,13 @@ export interface PgIdempotencyStore {
 	 * Resolves once the store's auto-migration has completed (or
 	 * immediately if `autoMigrate: false`). The migration is kicked off
 	 * at construction so callers that need the table to exist before
-	 * they start polling can `await store.ready()`. Idempotent.
+	 * they start polling can `await store.ready()`.
+	 *
+	 * Every call returns the same promise. If the construction-time
+	 * migration fails, it rejects with the original error and stays
+	 * rejected; the failure is not reported as an unhandled rejection
+	 * when nothing calls `ready()`. Operations that touch the table run
+	 * the migration again, so they can succeed after a transient failure.
 	 */
 	ready(): Promise<void>;
 	/** Stop the cleanup timer (call on shutdown if not relying on autoShutdown). */
