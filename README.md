@@ -1764,7 +1764,7 @@ import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-le
 configureWebhooks({ deadLetter: createDeadLetter(pgClient, { max: 1000 }) });
 ```
 
-Same asynchronous interface and the options `max`, `ttlMs`, `breaker`, `metrics` and `forgetUserId`, plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention uses database time and clamps `failedAt` at insert. Reads exclude expired rows immediately; write and idle cleanup use [bounded transactions](docs/postgres-retention.md) to delete expired rows and the oldest ids beyond `max`. `cleanupInterval` sets the maximum jitter delay; `0` disables idle cleanup, so residual backlog needs later writes. Call `destroy()` to stop maintenance. `add()` returns the committed row ID if cleanup fails or another replica owns it. Physical bounds can remain exceeded while successive passes drain a backlog. A lost insert reply leaves an unknown capture outcome; blind retries may duplicate a record because this API has no caller deduplication key.
+Same asynchronous interface and the options `max`, `ttlMs`, `breaker`, `metrics` and `forgetUserId`, plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); migrations run automatically unless `autoMigrate: false`. Retention uses database time and clamps `failedAt` at insert. Reads exclude expired rows immediately; write and idle cleanup use [bounded transactions](docs/postgres-retention.md) to delete expired rows and the oldest ids beyond `max`. `cleanupInterval` sets the maximum jitter delay; `0` disables idle cleanup, so residual backlog needs later writes. Call `destroy()` to stop maintenance. `add()` returns the committed row ID if cleanup fails or another replica owns it. Physical bounds can remain exceeded while successive passes drain a backlog. A lost insert reply leaves an unknown capture outcome; blind retries may duplicate a record because this API has no caller deduplication key.
 
 ---
 
@@ -1793,7 +1793,7 @@ export const replay = createReplay(pg, {
   table: 'svti_replay',
   size: 1000,
   ttl: 86400,       // 24 hours
-  autoMigrate: true  // auto-create table
+  autoMigrate: true  // apply versioned migrations
 });
 ```
 
@@ -1832,7 +1832,7 @@ ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAU
 | `table` | `'svti_replay'` | Table name |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Row expiry in seconds (0 = never) |
-| `autoMigrate` | `true` | Auto-create table |
+| `autoMigrate` | `true` | Apply the versioned schema migrations automatically; `false` only validates an externally migrated schema on `ready()` ([readiness](docs/postgres-support.md#schema-transitions-and-readiness)) |
 | `cleanupInterval` | `60000` | Maximum jitter delay between bounded cleanup passes in ms (0 disables); [retention limits](docs/postgres-retention.md) |
 
 #### API
@@ -2084,21 +2084,19 @@ and `tracestate` columns via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
 on first use; bounded DDL can fail on busy tables. Rows created by older releases
 claim with `traceContext: null`.
 
-With `autoMigrate: false`, apply those nullable columns before deploying this
-reader, because its claim/list queries select them even for older rows:
-
-```sql
-ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS request_id TEXT;
-ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS traceparent TEXT;
-ALTER TABLE svti_jobs ADD COLUMN IF NOT EXISTS tracestate TEXT;
-```
+With `autoMigrate: false`, run `migrate(client, { store: 'jobs' })` with the
+deployment role before deploying this reader. Its claim/list queries select the
+trace columns even for older rows, and `ready()` also requires the versioned
+CHECK constraints and indexes, so applying only the nullable columns is not
+enough. `postgresMigrations({ store: 'jobs' })` lists the exact SQL; see
+[schema transitions and readiness](docs/postgres-support.md#schema-transitions-and-readiness).
 
 #### Options
 
 | Option | Default | Description |
 |---|---|---|
 | `table` | `'svti_jobs'` | Table name |
-| `autoMigrate` | `true` | Auto-create the table on first use |
+| `autoMigrate` | `true` | Apply the versioned schema migrations automatically; `false` only validates an externally migrated schema on `ready()` ([readiness](docs/postgres-support.md#schema-transitions-and-readiness)) |
 | `visibilityTimeout` | `30000` | Default ms a claim is held before another worker can re-claim |
 
 #### API
@@ -2177,7 +2175,7 @@ export const idempotency = createIdempotencyStore(pg, {
 
 The Postgres backend drains expired rows in bounded, jittered passes (maximum delay `cleanupInterval`, default 60s, 0 to disable). Stale pending rows clear over successive passes without manual intervention; [ownership, budgets and metrics](docs/postgres-retention.md).
 
-The Postgres table is created automatically on first use:
+Automatic migration creates the base table below; the versioned migrations add its constraints and later columns:
 
 ```sql
 CREATE TABLE IF NOT EXISTS svti_idempotency (
@@ -2225,7 +2223,7 @@ export async function placeOrder(input, ctx) {
 | `table` (Postgres) | `'svti_idempotency'` | Table name |
 | `ttl` | `172800` (48h) | Result cache lifetime in seconds |
 | `acquireTtl` | `60` | Pending-slot lifetime in seconds (anti-deadlock) |
-| `autoMigrate` (Postgres) | `true` | Auto-create the table on first use |
+| `autoMigrate` (Postgres) | `true` | Apply the versioned schema migrations automatically; `false` only validates an externally migrated schema on `ready()` ([readiness](docs/postgres-support.md#schema-transitions-and-readiness)) |
 | `cleanupInterval` (Postgres) | `60000` | Maximum jitter delay between bounded expired-row passes in ms (0 disables); [retention limits](docs/postgres-retention.md) |
 | `breaker` | - | Circuit breaker; bypassed when broken |
 | `metrics` | - | Prometheus registry; emits `idempotency_*_total` counters |
@@ -2942,15 +2940,7 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_terminal_updated
     ON svti_tasks (updated_at) WHERE status IN ('committed', 'failed');
 ```
 
-With `autoMigrate: false`, apply the nullable additions below before deploying. Automatic migration adds the same columns and index. Old rows retain null trace context and erasure identity; backfill `user_id` from trusted application identity when historical task erasure is required.
-
-```sql
-ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS request_id TEXT;
-ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS traceparent TEXT;
-ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS tracestate TEXT;
-ALTER TABLE svti_tasks ADD COLUMN IF NOT EXISTS user_id TEXT;
-CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
-```
+With `autoMigrate: false`, run `migrate(client, { store: 'tasks' })` with the deployment role before deploying. It adds the nullable trace and erasure columns, the user index, and the versioned CHECK constraints and indexes that `ready()` requires; the nullable columns alone do not pass readiness. `postgresMigrations({ store: 'tasks' })` lists the exact SQL; see [schema transitions and readiness](docs/postgres-support.md#schema-transitions-and-readiness). Old rows retain null trace context and erasure identity; backfill `user_id` from trusted application identity when historical task erasure is required.
 
 #### Options
 
@@ -2968,7 +2958,7 @@ CREATE INDEX IF NOT EXISTS idx_svti_tasks_user ON svti_tasks (user_id);
 | `awaitTimeout` | `60000` | ms after which `await()` rejects if the task is still not terminal. 0 = no timeout. |
 | `cleanupInterval` | `3600000` | Maximum jitter delay between bounded cleanup passes in ms. 0 disables; [retention limits](docs/postgres-retention.md). |
 | `rowTtl` | `604800` (7 days) | Seconds to keep terminal rows before deletion |
-| `autoMigrate` | `true` | Auto-create the table on first use. Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
+| `autoMigrate` | `true` | Apply the versioned schema migrations automatically; `false` only validates an externally migrated schema on `ready()` ([readiness](docs/postgres-support.md#schema-transitions-and-readiness)). Migration is kicked off at construction; `await tasks.ready()` to block until it lands. |
 | `serializeErrorCause` | `false` | Persist `error.cause` alongside name/message/stack/code on a failed task. Off by default: handlers routinely attach config-bearing causes (a connection error carries its DSN) and the stored row is re-served to dashboards by `await()` / `list()`. |
 | `maxPayloadBytes` | `262144` (256KB) | Byte ceiling on an encoded task `input` and `result`, and the point at which a persisted error is truncated to fit. Minimum 80 bytes, so a failed row can retain a valid terminal error shape. Worth setting deliberately, because the two sides fail differently - see below. |
 | `onStateChange` | - | Local-worker callback fired AFTER each state-machine transition commits. See [Live observation](#live-observation) below. |

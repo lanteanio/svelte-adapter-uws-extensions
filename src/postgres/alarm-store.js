@@ -8,7 +8,7 @@
  * store is the durable record the poll reads. It runs no background loop of its
  * own.
  *
- * Table schema (auto-created when autoMigrate is true):
+ * Table schema (migrated automatically when autoMigrate is true):
  *   svti_alarms (
  *     topic   TEXT   PRIMARY KEY,   -- the wire topic (already tenant-scoped)
  *     fire_at BIGINT NOT NULL,      -- epoch-ms deadline
@@ -37,7 +37,7 @@ const DEFAULT_DUE_BATCH = 100;
  * @typedef {Object} PgAlarmStoreOptions
  * @property {string} [table='svti_alarms'] - Table name. Must match `[a-zA-Z_][a-zA-Z0-9_]*`.
  * @property {number} [dueBatch=100] - Max alarms returned per `due(now)` sweep.
- * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional metrics registry (Prometheus).
  */

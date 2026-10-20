@@ -9,7 +9,7 @@ export type JobTracePlatform = TracePlatform;
 export interface JobQueueOptions {
 	/** Table name. @default 'svti_jobs' */
 	table?: string;
-	/** Auto-create table on first use. @default true */
+	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
 	/**
 	 * Default ms a claim is held before another worker can re-claim

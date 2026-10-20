@@ -17,7 +17,7 @@
  *      through to the handler, who forwards it to the downstream API
  *      so the side-effect target de-duplicates across retries too.
  *
- * Schema (auto-created):
+ * Schema (migrated automatically unless autoMigrate is false):
  *
  *   svti_tasks (
  *     svti_tasks_id        UUID         PRIMARY KEY,
@@ -109,7 +109,7 @@ class AbandonedTaskAttempt {
  * @property {number} [awaitTimeout=60000] - ms after which await() rejects if the task is still not terminal. 0 = no timeout.
  * @property {number} [cleanupInterval=3600000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {number} [rowTtl=604800] - Seconds to keep terminal rows (committed/failed) before deletion. Default 7 days.
- * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {(event: TaskStateChangeEvent) => void | Promise<void>} [onStateChange] - Local-worker callback fired AFTER each state-machine transition commits. The runner owns every transition; this callback is the in-process observer for UIs / metrics / logs without standing up `postgres/notify`. Errors thrown from the callback (or rejected promises) are caught and logged; they do NOT roll back the state machine. Cluster-wide fan-out is a separate concern - still wants `postgres/notify`.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional Prometheus metrics registry.

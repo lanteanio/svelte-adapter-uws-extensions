@@ -4,7 +4,7 @@
  * Same API as the core createReplay plugin, but stores messages in a
  * Postgres table for durable history that survives restarts.
  *
- * Table schema (auto-created if autoMigrate is true):
+ * Table schema (migrated automatically if autoMigrate is true):
  *   svti_replay (
  *     svti_replay_id BIGSERIAL PRIMARY KEY,
  *     topic          TEXT        NOT NULL,
@@ -88,7 +88,7 @@ const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
  * @property {string} [table='svti_replay'] - Table name
  * @property {number} [size=1000] - Max messages per topic
  * @property {number} [ttl=0] - TTL in seconds (0 = no expiry). Rows older than this are cleaned up periodically.
- * @property {boolean} [autoMigrate=true] - Auto-create table on first use
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, including each publishBatch entry.
  */

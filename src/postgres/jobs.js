@@ -10,7 +10,7 @@
  * semantics (idempotency, fence, retry); this queue is a lighter
  * batch-claim primitive. Pick the shape that fits the workload.
  *
- * Table schema (auto-created if autoMigrate is true):
+ * Table schema (migrated automatically if autoMigrate is true):
  *   svti_jobs (
  *     svti_jobs_id  BIGSERIAL   PRIMARY KEY,
  *     queue         TEXT        NOT NULL,
@@ -40,7 +40,7 @@ import {
 /**
  * @typedef {Object} JobQueueOptions
  * @property {string} [table='svti_jobs']
- * @property {boolean} [autoMigrate=true]
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [visibilityTimeout=30000] - Default ms a claim is held before another worker can re-claim
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics]
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker]

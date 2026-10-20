@@ -59,7 +59,7 @@ describe('PostgreSQL migration contracts', () => {
 		expect(client.connect).toHaveBeenCalledTimes(2);
 		expect(jobs.status()).toEqual({ state: 'ready', error: null });
 	});
-	it.each(['PG_CAPACITY_EXCEEDED', '08006', '40001', '53300', '55P03', '57014', '57P01', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'])('retries automatic initialization after transient %s', async code => {
+	it.each(['PG_CAPACITY_EXCEEDED', '08006', '40001', '53300', '55P03', '57014', '57P01', 'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN'])('retries automatic initialization after transient %s', async code => {
 		const client = mockPgClient();
 		const connect = client.connect;
 		const failure = Object.assign(new Error('temporary initialization refusal'), { code });
@@ -70,6 +70,45 @@ describe('PostgreSQL migration contracts', () => {
 		await jobs.enqueue('test', { recovered: true });
 		expect(client.connect).toHaveBeenCalledTimes(2);
 		expect(jobs.status()).toEqual({ state: 'ready', error: null });
+	});
+	function failingDdl(client, pattern, failure) {
+		const connect = client.connect;
+		let pending = true;
+		client.connect = vi.fn(async (...args) => {
+			const connection = await connect(...args);
+			const query = connection.query;
+			return { ...connection, query: (statement, values) => {
+				if (pending && pattern.test(statement.text ?? statement)) { pending = false; return Promise.reject(failure); }
+				return query(statement, values);
+			} };
+		});
+	}
+	it.each([
+		['statement timeout', Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' })],
+		['driver read timeout', new Error('Query read timeout')]
+	])('latches a DDL %s until an explicit readiness retry', async (_, failure) => {
+		const client = mockPgClient();
+		failingDdl(client, /VALIDATE CONSTRAINT/, failure);
+		const jobs = createJobQueue(client);
+		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+		expect(jobs.status()).toEqual({ state: 'failed', error: failure });
+		expect(client.connect).toHaveBeenCalledTimes(1);
+		await jobs.ready();
+		await jobs.enqueue('test', { repaired: true });
+		expect(client.connect).toHaveBeenCalledTimes(2);
+	});
+	it('retries a lock deadline hit by DDL and a statement timeout outside DDL', async () => {
+		for (const [pattern, code] of [[/ADD COLUMN/, '55P03'], [/pg_try_advisory_lock/, '57014']]) {
+			const client = mockPgClient();
+			const failure = Object.assign(new Error('temporary deadline'), { code });
+			failingDdl(client, pattern, failure);
+			const jobs = createJobQueue(client);
+			await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
+			expect(jobs.status()).toEqual({ state: 'idle', error: failure });
+			await jobs.enqueue('test', { recovered: true });
+			expect(client.connect).toHaveBeenCalledTimes(2);
+		}
 	});
 	it('keeps disabled automatic migration read-only and reports an absent schema', async () => {
 		const client = mockPgClient();

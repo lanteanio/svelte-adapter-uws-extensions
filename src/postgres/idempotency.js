@@ -16,7 +16,7 @@
  * deletes rows whose `expires_at` has passed, so stale pending rows
  * naturally clear without manual intervention.
  *
- * Table schema (auto-created if autoMigrate is true):
+ * Table schema (migrated automatically if autoMigrate is true):
  *   svti_idempotency (
  *     svti_idempotency_key TEXT        PRIMARY KEY,
  *     status               TEXT        NOT NULL,
@@ -51,7 +51,7 @@ const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
  *   the row is left in the pending state for the `acquireTtl` to expire. Same
  *   default and semantics as the Redis backend so the two stores are
  *   drop-in interchangeable. Pass `Infinity` to disable.
- * @property {boolean} [autoMigrate=true] - Auto-create table on first use.
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional circuit breaker.
  * @property {any} [metrics] - Optional metrics registry (Prometheus).

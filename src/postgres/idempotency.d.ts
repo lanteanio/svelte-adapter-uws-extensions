@@ -11,7 +11,7 @@ export interface PgIdempotencyOptions {
 	ttl?: number;
 	/** Pending-slot lifetime in seconds (anti-deadlock for crashed owners). @default 60 */
 	acquireTtl?: number;
-	/** Auto-create the table on first use. @default true */
+	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
 	/** Maximum jitter delay between bounded maintenance passes, in ms. 0 disables; integer up to 2147483647. @default 60000 */
 	cleanupInterval?: number;

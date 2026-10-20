@@ -25,7 +25,7 @@ export interface PgAlarmStoreOptions {
 	table?: string;
 	/** Max alarms returned per `due(now)` sweep. @default 100 */
 	dueBatch?: number;
-	/** Auto-create the table on first use. @default true */
+	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;

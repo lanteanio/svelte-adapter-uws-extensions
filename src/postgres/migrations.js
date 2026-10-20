@@ -4,6 +4,10 @@ import { monotonicNow, setTimer } from '../shared/runtime.js';
 
 const LEDGER = 'svti_schema_migrations';
 const LOCK = "hashtextextended(current_database() || ':' || current_schema() || ':svti_schema_migrations', 0)";
+// Statement deadlines hit by migration DDL. Retrying them under the same
+// bound repeats the same full-table work, so automatic initialization latches
+// them instead; an explicit migrate() with a raised bound is the remedy.
+const boundedDdl = new WeakSet();
 
 /** Inspect the ordered SQL and checksums without connecting to a database. */
 export function postgresMigrations(options) {
@@ -26,6 +30,10 @@ export async function migrate(client, options) {
 		if (disconnected) return Promise.reject(disconnected);
 		return connection.query({ text, values, query_timeout: timeoutMs });
 	};
+	const ddl = text => query(text).catch(error => {
+		if (error && typeof error === 'object' && (error.code === '57014' || error.message === 'Query read timeout')) boundedDdl.add(error);
+		throw error;
+	});
 	try {
 		await query("SELECT set_config('lock_timeout', $1, false), set_config('statement_timeout', $2, false)", [String(lockTimeoutMs), String(statementTimeoutMs)]);
 		const lockDeadline = monotonicNow() + lockTimeoutMs;
@@ -70,10 +78,10 @@ export async function migrate(client, options) {
 							?? schema.baseline.find(relation => relation.name === table).indexes.find(entry => entry.name === name);
 						const actual = (await readIndexes({ query }, table)).find(entry => entry.name === name);
 						if (!compatibleIndex({ ...actual, valid: true }, expected)) throw new Error(`postgres migrations: conflicting index ${name}`);
-						await query(`DROP INDEX CONCURRENTLY ${name}`);
+						await ddl(`DROP INDEX CONCURRENTLY ${name}`);
 					}
 				}
-				await query(statement);
+				await ddl(statement);
 			}
 			await validateCatalog({ query }, checkpoint, schema);
 			await query(`INSERT INTO ${LEDGER} (table_name, store, version, checksum) VALUES ($1, $2, $3, $4)`, [schema.table, schema.store, version.version, version.checksum]);
@@ -191,11 +199,11 @@ export async function postgresReadiness(client, components = []) {
 }
 
 export function createStoreSchema(client, store, table, automatic) {
-	const retryable = error => error?.code === 'PG_CAPACITY_EXCEEDED'
+	const retryable = error => !(error && typeof error === 'object' && boundedDdl.has(error)) && (error?.code === 'PG_CAPACITY_EXCEEDED'
 		|| error?.name === 'TimeoutError'
 		|| ['Query read timeout', 'Connection terminated unexpectedly', 'Connection terminated', 'Connection terminated due to connection timeout', 'timeout exceeded when trying to connect'].includes(error?.message)
 		|| /^(08|40|53)/.test(error?.code ?? '')
-		|| ['55P03', '57014', '57P01', '57P02', '57P03', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error?.code);
+		|| ['55P03', '57014', '57P01', '57P02', '57P03', 'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(error?.code));
 	let state = 'idle', failure = null, pending = null, complete = false, retryAt = 0, retryDelay = 0;
 	function ready() {
 		if (complete) return Promise.resolve();
@@ -215,8 +223,9 @@ export function createStoreSchema(client, store, table, automatic) {
 		return pending;
 	}
 	return {
-		// Schema/data/privilege errors need explicit repair. Transient connection,
-		// admission and lock failures retry on the next ordinary operation.
+		// Schema/data/privilege errors and DDL statement deadlines need explicit
+		// repair. Transient connection, admission and lock failures retry on the
+		// next ordinary operation.
 		ensure: automatic ? () => state === 'failed' ? Promise.reject(failure) : ready() : () => Promise.resolve(),
 		ready,
 		status: () => ({ state, error: failure })

@@ -8,7 +8,7 @@
  * cluster. Wire it with `configureWebhooks({ deadLetter: createDeadLetter(pgClient) })`
  * (needs svelte-realtime >= 0.6.0-next.40, which awaits the store interface).
  *
- * Table schema (auto-created when `autoMigrate` is true):
+ * Table schema (migrated automatically when `autoMigrate` is true):
  *   svti_dead_letter (
  *     svti_dead_letter_id BIGSERIAL PRIMARY KEY,
  *     webhook_id TEXT,
@@ -46,7 +46,7 @@ import { tenantTopicSql } from '../shared/tenant-topic.js';
  * @property {number} [max=1000] - Retention target (oldest ids evicted in bounded passes).
  * @property {number} [ttlMs=0] - Drop records older than this many ms (0 = no TTL).
  *   Reads exclude expired rows; bounded write-time and idle cleanup delete them.
- * @property {boolean} [autoMigrate=true] - Auto-create the table on first use.
+ * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded
  *   cleanup passes (ms). 0 disables the timer; write-time cleanup remains.
  * @property {object} [breaker] - Circuit breaker for fault isolation.

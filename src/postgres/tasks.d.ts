@@ -130,7 +130,7 @@ export interface TaskRunnerOptions {
 	cleanupInterval?: number;
 	/** Seconds to keep terminal rows (committed/failed) before deletion. @default 604800 (7 days) */
 	rowTtl?: number;
-	/** Auto-create the table on first use. @default true */
+	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
 	/**
 	 * Byte ceiling on an encoded task `input` and `result`, and the point at

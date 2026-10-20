@@ -14,7 +14,7 @@ export interface PgDeadLetterOptions {
 	 * and while idle. @default 0
 	 */
 	ttlMs?: number;
-	/** Auto-create the table on first use. @default true */
+	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
 	/**
 	 * Maximum jitter delay between bounded cleanup passes (ms). 0 disables
