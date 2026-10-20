@@ -45,6 +45,7 @@
  * @module svelte-adapter-uws-extensions/redis/presence
  */
 
+import { registerClusterHealth } from '../shared/cluster-dashboard.js';
 import {
 	randomBytes,
 	now,
@@ -1555,6 +1556,7 @@ export function createPresence(client, options = {}) {
 		},
 
 		destroy() {
+			stopDashboard();
 			stopOnlineMetric?.();
 			refreshTopics.stop();
 			heartbeatTick.stop();
@@ -1654,5 +1656,10 @@ export function createPresence(client, options = {}) {
 		}
 	};
 
+	const stopDashboard = registerClusterHealth('presence', () => ({
+		backend: 'redis', ...tracker.metrics(),
+		topics: activeTopics.size, selfPreservation: spActive,
+		heldConnections: spHeld.size
+	}));
 	return tracker;
 }

@@ -19,6 +19,7 @@
  * @module svelte-adapter-uws-extensions/redis/presence/subscriber
  */
 
+import { registerClusterHealth, redisConnectionState } from '../../shared/cluster-dashboard.js';
 import { setTimer, clearTimer, monotonicNow } from '../../shared/runtime.js';
 import { isCluster } from '../../shared/cluster.js';
 import { createBusValidator } from '../../shared/bus-validate.js';
@@ -801,6 +802,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	}
 
 	function dispose() {
+		stopDashboard();
 		// Set first: a sweep awaiting MYID/psubscribe, or a `+node`/error-driven
 		// reconcile, must not repopulate keyspaceSubs with connections nothing quits.
 		disposed = true;
@@ -843,6 +845,13 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		keyspaceSubscribed = false;
 		activePlatform = null;
 	}
+
+	const stopDashboard = registerClusterHealth('presence-subscriber', () => ({
+		backend: 'redis', connection: redisConnectionState(subscriber),
+		channels: subscribedChannels.size, keyspaceSubscribers: keyspaceSubs.size,
+		keyspaceReconciling: keyspaceReconciling !== null,
+		lagMs: null
+	}));
 
 	return {
 		subscribeToTopic,

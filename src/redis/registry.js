@@ -27,6 +27,7 @@
  * @module svelte-adapter-uws-extensions/redis/registry
  */
 
+import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { EXTENSIONS_ERROR_IDS, extensionsError } from '../error-registry.js';
 import { evalCached } from '../shared/eval-cached.js';
@@ -1556,6 +1557,14 @@ export function createConnectionRegistry(client, options) {
 		return recipients;
 	}
 
+	const stopDashboard = registerClusterHealth('registry', () => ({
+		backend: 'redis', subscriber: redisConnectionState(subscriber),
+		localConnections: sessionToWs.size, localUsers: localUsers.size,
+		knownUsers: userToInstance.size,
+		knownInstances: new Set(userToInstance.values()).size,
+		pendingRequests: pending.size
+	}));
+
 	const tracker = /** @type {ConnectionRegistry} */ ({
 		instanceId,
 		lookup,
@@ -1720,6 +1729,7 @@ export function createConnectionRegistry(client, options) {
 			}
 		},
 		async destroy() {
+			stopDashboard();
 			destroyed = true;
 			refreshKeys.stop();
 			refreshTtls.stop();

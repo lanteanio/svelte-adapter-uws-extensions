@@ -7,6 +7,7 @@
  * @module svelte-adapter-uws-extensions/postgres
  */
 
+import { registerClusterHealth, finiteReading } from '../shared/cluster-dashboard.js';
 import pg from 'pg';
 import { registerPgLifecycle } from './_client-lifecycle.js';
 import { createPoolOperations } from './_pool-operations.js';
@@ -113,8 +114,14 @@ export function createPgClient(opts) {
 	let ending = null;
 	const dedicated = new Set();
 	const lifecycle = { closing: false, stoppers: new Set() };
+	const stopDashboard = registerClusterHealth('postgres', () => ({
+		backend: 'postgres', ended: ended || pool.ended === true,
+		connections: finiteReading(pool.totalCount), idle: finiteReading(pool.idleCount),
+		waiters: finiteReading(pool.waitingCount), capacity: finiteReading(pool.options?.max)
+	}));
 
 	function end() {
+		stopDashboard();
 		// An externally supplied pool and its standalone sessions remain caller-owned.
 		if (!ownedPool) return Promise.resolve();
 		if (ending) return ending;

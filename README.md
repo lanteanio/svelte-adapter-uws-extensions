@@ -88,6 +88,7 @@ Search the [error reference](./docs/errors.md) for a stable diagnostic ID. Use [
 - [Cluster clock](#cluster-clock)
 - [Distributed session](#distributed-session)
 - [Task runner](#task-runner)
+- [Development dashboard](#development-dashboard)
 - [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator)
 - [Redis Functions](#redis-functions)
 - [Webhook delivery controls](#webhook-delivery-controls)
@@ -3177,6 +3178,21 @@ The provider exposes `acquire`/`heartbeat`/`release`. The runner pairs each with
 The Redis side uses two atomic Lua scripts: heartbeat is `if get == fence then pexpire end`, release is `if get == fence then del end`. No fence held by another owner can be released or refreshed by accident.
 
 ---
+
+## Development dashboard
+
+With `NODE_ENV=development`, active extensions contribute a `cluster-health`
+section to the adapter dashboard at `/__uws/dashboard`. It shows Redis connection
+and subscriber state, Postgres pool pressure, relay attachment and queue depth,
+leadership, clock skew, and anonymous registry and presence counts. Backend
+addresses, key prefixes, channel names, user identities and payloads are excluded.
+
+Each component reports its most recently initialized instance; recreating it during
+hot reload replaces its reading. `quit()`, `end()`, `deactivate()`, `stop()` and
+`destroy()` remove their own readings, and an older instance stopping cannot remove
+its replacement. The contributor makes no backend requests or background polls and
+uses the same runtime values as the metrics exporter. Unmeasured values are `null`
+rather than estimated. The adapter owns snapshot sequencing and rendering. Outside development, no contributor is registered.
 
 ## Prometheus metrics
 

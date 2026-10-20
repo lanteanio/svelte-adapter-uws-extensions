@@ -32,6 +32,7 @@
  * @module svelte-adapter-uws-extensions/redis/leader
  */
 
+import { registerClusterHealth } from '../shared/cluster-dashboard.js';
 import { randomBytes, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
@@ -132,6 +133,7 @@ export function createLeader(client, options = {}) {
 	let stopped = false;
 	let timer = null;
 	let inFlight = null;
+	const stopDashboard = registerClusterHealth('leader', () => ({ backend: 'redis', isLeader: _isLeader }));
 
 	function reportError(err, operation) {
 		mRenewalFailures?.inc({ key_class: keyClass });
@@ -204,6 +206,7 @@ export function createLeader(client, options = {}) {
 	async function stop() {
 		if (stopped) return;
 		stopped = true;
+		stopDashboard();
 		if (timer) {
 			clearIntervalTimer(timer);
 			timer = null;

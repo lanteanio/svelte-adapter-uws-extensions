@@ -1,3 +1,4 @@
+import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 /**
  * Redis pub/sub bus for svelte-adapter-uws.
@@ -173,6 +174,17 @@ export function createPubSubBus(client, options = {}) {
 
 	/** @type {boolean} */
 	let active = false;
+	let stopDashboard = null;
+	function startDashboard() {
+		if (stopDashboard) return;
+		stopDashboard = registerClusterHealth('pubsub', () => ({
+			backend: 'redis',
+			connection: redisConnectionState(client.redis),
+			attached: active,
+			subscriber: redisConnectionState(subscriber),
+			queue: relayQueue.state.snapshot()
+		}));
+	}
 
 	// The activation in flight, which overlapping activate() calls share, and
 	// the handle deactivate() cancels it with.
@@ -1029,6 +1041,7 @@ export function createPubSubBus(client, options = {}) {
 		},
 
 		async activate(platform) {
+			startDashboard();
 			// Always update the platform reference so remote messages
 			// are forwarded through the latest platform, even if a
 			// previous activate() already started the subscriber.
@@ -1043,6 +1056,8 @@ export function createPubSubBus(client, options = {}) {
 		},
 
 		async deactivate() {
+			stopDashboard?.();
+			stopDashboard = null;
 			wanted = false;
 			stopRetry();
 			retryMs = 0;

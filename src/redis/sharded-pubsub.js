@@ -1,3 +1,4 @@
+import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 /**
@@ -175,6 +176,20 @@ export function createShardedBus(client, options = {}) {
 	let subReady = false;
 	let shardStateTimer = null;
 	let active = false;
+	let stopDashboard = null;
+	function startDashboard() {
+		if (stopDashboard) return;
+		stopDashboard = registerClusterHealth('sharded-pubsub', () => ({
+			backend: 'redis',
+			connection: redisConnectionState(client.redis),
+			attached: active,
+			subscribers: subStandalone ? 1 : subByNodeId.size,
+			subscribedChannels: subscribedChannels.size,
+			pendingChannels: pendingChannels.size,
+			queue: relayQueue.state.snapshot()
+		}));
+	}
+
 	// The activation in flight, which overlapping activate() calls share, and
 	// the handle deactivate() cancels it with.
 	/** @type {Promise<void> | null} */
@@ -958,6 +973,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function activate(platform) {
+		startDashboard();
 		activePlatform = platform;
 		activeTracing = traceEnabled(platform);
 		if (active) return;
@@ -1052,6 +1068,8 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function deactivate() {
+		stopDashboard?.();
+		stopDashboard = null;
 		relayQueue.clear();
 		const pending = attempt;
 		attempt = null;

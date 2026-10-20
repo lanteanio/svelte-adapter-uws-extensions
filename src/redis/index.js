@@ -7,6 +7,7 @@
  * @module svelte-adapter-uws-extensions/redis
  */
 
+import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import Redis from 'ioredis';
 import { ConnectionError, TimeoutError } from '../shared/errors.js';
 import { MAX_REDIS_DUPLICATES_PER_CLIENT, MAX_REDIS_QUEUED_COMMANDS } from '../shared/caps.js';
@@ -235,10 +236,14 @@ export function createRedisClient(options = {}) {
 
 	/** @type {boolean} */
 	let shuttingDown = false;
+	const stopDashboard = registerClusterHealth('redis', () => ({
+		backend: 'redis', connection: redisConnectionState(redis), duplicates: duplicates.size
+	}));
 
 	async function quit() {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		stopDashboard();
 		const all = [redis, ...duplicates];
 		await Promise.allSettled(all.map((c) => c.quit().catch(() => c.disconnect())));
 		duplicates.clear();

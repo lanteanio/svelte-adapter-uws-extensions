@@ -11,6 +11,7 @@
  * @module svelte-adapter-uws-extensions/postgres/notify
  */
 
+import { registerClusterHealth, finiteReading } from '../shared/cluster-dashboard.js';
 import { onPgShutdown } from './_client-lifecycle.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 import { createBusValidator } from '../shared/bus-validate.js';
@@ -177,6 +178,17 @@ export function createNotifyBridge(client, options) {
 	/** @type {ReturnType<typeof setInterval> | null} */
 	let pollTimer = null;
 	let isLeader = false;
+	let stopDashboard = null;
+	function startDashboard() {
+		if (stopDashboard) return;
+		stopDashboard = registerClusterHealth('notify', () => ({
+			backend: 'postgres', attached: active, listening: conn?.listening === true,
+			leader: advisory ? isLeader : null,
+			poolConnections: finiteReading(client.pool?.totalCount),
+			poolIdle: finiteReading(client.pool?.idleCount),
+			poolWaiters: finiteReading(client.pool?.waitingCount)
+		}));
+	}
 
 	function defaultParse(payload) {
 		try {
@@ -422,6 +434,8 @@ export function createNotifyBridge(client, options) {
 	}
 
 	function deactivate() {
+		stopDashboard?.();
+		stopDashboard = null;
 		if (deactivating) return deactivating;
 		if (!active && !conn && !flight && closing.size === 0) return Promise.resolve();
 		active = false;
@@ -449,6 +463,7 @@ export function createNotifyBridge(client, options) {
 
 	return {
 		async activate(platform) {
+			startDashboard();
 			if (deactivating) await deactivating;
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);

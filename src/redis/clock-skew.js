@@ -29,6 +29,7 @@
  * @module svelte-adapter-uws-extensions/redis/clock-skew
  */
 
+import { registerClusterHealth } from '../shared/cluster-dashboard.js';
 import { wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -185,6 +186,7 @@ export function createClockSkewSampler(client, options = {}) {
 	let fenced = false;
 	let tripStreak = 0;
 	let calmStreak = 0;
+	const stopDashboard = registerClusterHealth('clock', () => ({ backend: 'redis', skewMs: lastSkew, fenced }));
 
 	/** @param {boolean} next */
 	function setFenced(next) {
@@ -272,6 +274,7 @@ export function createClockSkewSampler(client, options = {}) {
 	async function stop() {
 		if (stopped) return;
 		stopped = true;
+		stopDashboard();
 		if (timer) {
 			clearIntervalTimer(timer);
 			timer = null;

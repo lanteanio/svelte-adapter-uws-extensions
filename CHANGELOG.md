@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Registry `sendTo()` resolves to the dispatched recipient count and records `push_sendto_recipients_total`, including local recipients served before a remote-envelope refusal. Remote counts use the sender index and successful Redis publishes, without delivery acknowledgement.
+- The adapter dev dashboard includes a `cluster-health` section with backend connection state, relay attachment and queue pressure, leadership, clock skew, and anonymous registry and presence counts. Readings reuse runtime state, require no backend queries, and disappear when their component stops.
 
 - The Redis pub/sub and sharded bus wrappers forward `platform.authorizeDelivery` when the adapter provides it, bound to the original platform, so handlers that receive the wrapped platform can install recipient delivery checks. On an adapter without it the member stays `undefined`, so capability checks keep working.
 
