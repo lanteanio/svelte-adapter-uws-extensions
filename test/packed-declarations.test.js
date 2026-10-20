@@ -76,6 +76,12 @@ platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 1 }]);
 declare const redis: RedisClient;
 const cursor = createCursor(redis, { viewport: { enabled: true, padding: 64, cell: 128 }, backpressure: { enabled: true, maxBufferedBytes: 4096 } });
 createCursor(redis, { viewport: true, backpressure: true });
+createCursor(redis, { binary: false });
+createCursor(redis, { binary: true, dictionary: false });
+// @ts-expect-error The binary wire switch must be boolean.
+createCursor(redis, { binary: 'json' });
+// @ts-expect-error The dictionary wire switch must be boolean.
+createCursor(redis, { dictionary: 1 });
 cursor.viewport({}, 'room', { x: 0, y: 0, w: 100, h: 100 });
 cursor.viewport({}, 'room', { x: 0, y: 0, w: 100, h: 100, zoom: 2 });
 const rect: { x: number; y: number; w: number; h: number; zoom: number } | null = cursor.viewportFor({}, 'room');
