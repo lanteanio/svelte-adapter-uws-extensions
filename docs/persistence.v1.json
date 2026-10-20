@@ -288,6 +288,11 @@
 				{
 					"id": "erasure",
 					"type": "string",
+					"template": "dlq:purged:<scope>/<user>"
+				},
+				{
+					"id": "erasure-legacy",
+					"type": "string",
 					"template": "dlq:purged:<user>"
 				}
 			],

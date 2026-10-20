@@ -120,7 +120,7 @@ describe('redis dead-letter (integration)', () => {
 		expect(dropped).toBeNull();
 		expect(await dlq.count()).toBe(0);
 		// The tombstone key carries a real PX countdown.
-		const pttl = await client.redis.pttl(client.key('dlq:purged:u1'));
+		const pttl = await client.redis.pttl(client.key('dlq:purged:~/u1'));
 		expect(pttl).toBeGreaterThan(0);
 		expect(pttl).toBeLessThanOrEqual(60_000);
 	});
@@ -133,9 +133,35 @@ describe('redis dead-letter (integration)', () => {
 		// the drop-check finds nothing and the raced delivery is re-inserted. This
 		// is the parity residual - a delivery outliving the window resurrects.
 		await waitRedisMs(client, 400);
-		expect(await client.redis.pttl(client.key('dlq:purged:u1'))).toBe(-2); // gone
+		expect(await client.redis.pttl(client.key('dlq:purged:~/u1'))).toBe(-2); // gone
 		const resurrected = await dlq.add(rec({ data: { author: 'u1', body: 'PII' }, failedAt: await redisNowMs(client), startedAt }));
 		expect(resurrected).not.toBeNull();
 		expect(await dlq.count()).toBe(1);
+	});
+
+	it('scopes the tombstone by tenant on a real server', async () => {
+		const dlq = createDeadLetter(client, { forgetUserId: byAuthor, forgetTombstoneMs: 60_000 });
+		const startedAt = monotonicNow();
+		await dlq.purgeUser('acme', 'u1');
+		expect(await client.redis.pttl(client.key('dlq:purged:acme/u1'))).toBeGreaterThan(0);
+		const failedAt = await redisNowMs(client);
+		expect(await dlq.add(rec({ topic: '@t/acme/orders', data: { author: 'u1', body: 'PII' }, failedAt, startedAt }))).toBeNull();
+		expect(await dlq.add(rec({ topic: '@t/globex/orders', data: { author: 'u1', body: 'kept' }, failedAt, startedAt }))).not.toBeNull();
+		expect((await dlq.list()).map(r => r.topic)).toEqual(['@t/globex/orders']);
+	});
+
+	it('hides records past ttlMs from reads before any later add evicts them', async () => {
+		const dlq = createDeadLetter(client, { ttlMs: 400 });
+		const id = await dlq.add(rec({ topic: 'old', failedAt: await redisNowMs(client) }));
+		await waitRedisMs(client, 250);
+		// The second add re-arms the key backstop, so only the read cutoff
+		// hides the first record once it is past ttlMs.
+		const fresh = await dlq.add(rec({ topic: 'fresh', failedAt: await redisNowMs(client) }));
+		await waitRedisMs(client, 250);
+		expect(await dlq.get(id)).toBeNull();
+		expect(await dlq.get(fresh)).not.toBeNull();
+		expect(await dlq.count()).toBe(1);
+		expect((await dlq.list()).map(r => r.id)).toEqual([fresh]);
+		expect((await dlq.summary()).byTopic).toEqual({ fresh: 1 });
 	});
 });

@@ -319,6 +319,55 @@ describe('redis dead-letter forget tombstone (right-to-erasure completeness)', (
 		expect(await s.count()).toBe(0);
 	});
 
+	it("a purge in one tenant leaves another tenant's in-flight capture for the same user", async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();
+		clockMs += 5_000;
+		await s.purgeUser('acme', 'u1');
+		clockMs += 5_000;
+		expect(await s.add(drec({ topic: '@t/acme/orders', failedAt: clockMs, startedAt }))).toBeNull();
+		const otherTenant = await s.add(drec({ topic: '@t/globex/orders', failedAt: clockMs, startedAt }));
+		const untenanted = await s.add(drec({ topic: 'orders', failedAt: clockMs, startedAt }));
+		expect(otherTenant).not.toBeNull();
+		expect(untenanted).not.toBeNull();
+		expect((await s.list()).map(r => r.topic).sort()).toEqual(['@t/globex/orders', 'orders']);
+	});
+
+	it('an untenanted purge drops only untenanted in-flight captures', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();
+		clockMs += 5_000;
+		await s.purgeUser(null, 'u1');
+		clockMs += 5_000;
+		expect(await s.add(drec({ topic: 'orders', failedAt: clockMs, startedAt }))).toBeNull();
+		expect(await s.add(drec({ topic: '@t/acme/orders', failedAt: clockMs, startedAt }))).not.toBeNull();
+	});
+
+	it('honors a tombstone written under the unscoped key', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		const startedAt = monotonicNow();
+		clockMs += 5_000;
+		await client.redis.set(client.key('dlq:purged:u1'), String(clockMs), 'PX', DEFAULT_WINDOW);
+		clockMs += 5_000;
+		expect(await s.add(drec({ topic: '@t/acme/orders', failedAt: clockMs, startedAt }))).toBeNull();
+		expect(await s.add(drec({ topic: 'orders', failedAt: clockMs, startedAt }))).toBeNull();
+		expect(await s.count()).toBe(0);
+	});
+
+	it('hides expired records from every read before the next add evicts them', async () => {
+		const s = createDeadLetter(client, { ttlMs: 60_000 });
+		const oldId = await s.add(drec({ topic: 'a', failedAt: clockMs }));
+		clockMs += 30_000;
+		const newId = await s.add(drec({ topic: 'b', failedAt: clockMs }));
+		clockMs += 30_000; // the first record is now exactly ttlMs old
+		expect(await s.get(oldId)).toBeNull();
+		expect((await s.get(newId))?.topic).toBe('b');
+		expect(await s.count()).toBe(1);
+		expect(await s.count({ topic: 'a' })).toBe(0);
+		expect((await s.list()).map(r => r.id)).toEqual([newId]);
+		expect(await s.summary()).toEqual({ total: 1, byTopic: { b: 1 }, oldest: clockMs - 30_000, newest: clockMs - 30_000 });
+	});
+
 	it('documented residual: a delivery captured just past the tombstone window resurrects (tombstone PX-expired)', async () => {
 		const s = createDeadLetter(client, { forgetUserId: byAuthor });
 		const startedAt = monotonicNow();     // delivery starts before the purge

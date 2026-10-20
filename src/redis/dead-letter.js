@@ -29,12 +29,17 @@
  * re-arms a PEXPIRE on all three keys as a quiet-queue backstop, so an idle
  * DLQ self-cleans within `ttlMs` instead of retaining payloads indefinitely.
  *
- * Right-to-erasure completeness: `purgeUser` writes a per-user forget tombstone
- * (`{prefix}dlq:purged:<user>` = server time at purge, `forgetTombstoneMs` PX,
- * default 10 min) BEFORE it deletes the user's records, and `add` drops a record
- * whose delivery was in flight when that purge ran - otherwise a long-running
- * delivery that fails AFTER a `live.forget` would resurrect the erased payload.
- * The purge time and
+ * Reads apply the same server-clock cutoff, so with `ttlMs` set an expired
+ * record is never returned, counted or summarized, even before the next add
+ * evicts it.
+ *
+ * Right-to-erasure completeness: `purgeUser` writes a forget tombstone for the
+ * purged (tenant scope, user) pair (`{prefix}dlq:purged:<tenant or ~>/<user>` =
+ * server time at purge, `forgetTombstoneMs` PX, default 10 min) BEFORE it
+ * deletes the user's records, and `add` drops a record of that user in that
+ * scope whose delivery was in flight when that purge ran - otherwise a
+ * long-running delivery that fails AFTER a `live.forget` would resurrect the
+ * erased payload. The purge time and
  * the delivery start are both reconciled onto the shared Redis server clock, so
  * the check is correct across a cluster (a per-process monotonic start on its
  * own is not comparable between instances).
@@ -44,7 +49,7 @@
 
 import { withBreaker } from '../shared/breaker.js';
 import { monotonicNow } from '../shared/runtime.js';
-import { topicInTenant } from '../shared/tenant-topic.js';
+import { TENANT_TOPIC_NS, topicInTenant } from '../shared/tenant-topic.js';
 
 // A forget tombstone lives long enough to catch a webhook delivery that was
 // already in flight when `live.forget` ran and only fails (and would be
@@ -113,14 +118,44 @@ export function createDeadLetter(client, options = {}) {
 	const recsKey = client.key('dlq:recs:{dlq}');
 	const orderKey = client.key('dlq:order:{dlq}');
 
-	// Per-user forget tombstone. Keyed by the userId the `forgetUserId` extractor
-	// yields (NOT hash-tagged into the {dlq} slot: it is only ever read/written on
-	// its own, never in a multi with the collection keys). `add` looks it up under
-	// the same key, so both sides key on the bare userId - `tenantId` is accepted
-	// for signature parity but is not part of the extractor's output.
-	function purgedKey(userId) {
+	// Forget tombstone for one (tenant scope, user) pair. The purge deletes only
+	// records whose topic is inside its tenant scope, so the tombstone carries
+	// the same scope and `add` looks it up with the scope of the record's own
+	// topic: purging a user in one tenant never drops another tenant's capture
+	// for the same userId. `~` names the untenanted scope; neither `~` nor `/`
+	// can appear in a tenant id, so `<scope>/<user>` is unambiguous. Not
+	// hash-tagged into the {dlq} slot: it is only ever read or written on its own.
+	function purgedKey(scope, userId) {
+		return client.key('dlq:purged:' + scope + '/' + userId);
+	}
+	// Tombstones written before tombstones were scoped are keyed by the bare
+	// userId. `add` still honors them so a purge that ran on an earlier version
+	// keeps dropping late captures until its tombstone expires.
+	function legacyPurgedKey(userId) {
 		return client.key('dlq:purged:' + userId);
 	}
+	// The tenant scope of a record topic, as `topicInTenant` reads it: the
+	// tenant of an `@t/<tenant>/` topic, `~` for an untenanted topic, and null
+	// for a malformed tenant topic, which no purge scope can reach.
+	function topicScope(topic) {
+		if (typeof topic !== 'string') return null;
+		if (!topic.startsWith(TENANT_TOPIC_NS)) return '~';
+		const end = topic.indexOf('/', TENANT_TOPIC_NS.length);
+		return end > TENANT_TOPIC_NS.length ? topic.slice(TENANT_TOPIC_NS.length, end) : null;
+	}
+
+	async function serverTime() {
+		const t = await redis.time();
+		return Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+	}
+
+	// Records at or before this server-clock cutoff are expired: the same
+	// inclusive cutoff evict() applies. -Infinity without a ttlMs.
+	async function readCutoff() {
+		if (ttlMs === 0) return -Infinity;
+		return (await withBreaker(b, serverTime)) - ttlMs;
+	}
+	const live = (rec, cutoff) => rec !== null && !(rec.failedAt <= cutoff);
 
 	/** Merge the hash field key (the id) back into the parsed record. */
 	function parseRecord(id, json) {
@@ -178,8 +213,7 @@ export function createDeadLetter(client, options = {}) {
 			// path. The caller's failedAt is kept for display, clamped to
 			// (0, serverNow]: an implausible stamp (missing, non-finite, <= 0,
 			// or in the server's future) becomes serverNow.
-			const t = await withBreaker(b, () => redis.time());
-			const serverNow = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
+			const serverNow = await withBreaker(b, serverTime);
 
 			// Forget tombstone (right-to-erasure completeness): if this record's
 			// owning user was purged (live.forget) while this delivery was already
@@ -198,8 +232,14 @@ export function createDeadLetter(client, options = {}) {
 			if (forgetUserId) {
 				let uid;
 				try { uid = forgetUserId(rec); } catch { uid = undefined; }
-				if (typeof uid === 'string' && uid.length > 0) {
-					const tomb = await withBreaker(b, () => redis.get(purgedKey(uid)));
+				const scope = topicScope(rec.topic);
+				if (typeof uid === 'string' && uid.length > 0 && scope !== null) {
+					// Separate GETs: the two keys may live on different Cluster slots.
+					const [scoped, legacy] = await withBreaker(b, () => Promise.all([
+						redis.get(purgedKey(scope, uid)),
+						redis.get(legacyPurgedKey(uid))
+					]));
+					const tomb = scoped == null ? legacy : legacy == null ? scoped : String(Math.max(Number(scoped), Number(legacy)));
 					if (tomb != null) {
 						const purgeTime = Number(tomb);
 						const elapsed =
@@ -252,8 +292,9 @@ export function createDeadLetter(client, options = {}) {
 
 		/** @param {string} id */
 		async get(id) {
-			const json = await withBreaker(b, () => redis.hget(recsKey, String(id)));
-			return parseRecord(id, json);
+			const [cutoff, json] = await Promise.all([readCutoff(), withBreaker(b, () => redis.hget(recsKey, String(id)))]);
+			const rec = parseRecord(id, json);
+			return live(rec, cutoff) ? rec : null;
 		},
 
 		/** @param {string} id @returns {Promise<boolean>} */
@@ -268,14 +309,20 @@ export function createDeadLetter(client, options = {}) {
 
 		/** @param {{ topic?: string }} [filter] */
 		async count(filter) {
+			const cutoff = await readCutoff();
 			if (!filter || filter.topic === undefined) {
-				return await withBreaker(b, () => redis.zcard(orderKey));
+				if (cutoff === -Infinity) return await withBreaker(b, () => redis.zcard(orderKey));
+				const [card, expired] = await withBreaker(b, () => Promise.all([
+					redis.zcard(orderKey),
+					redis.zrangebyscore(orderKey, '-inf', cutoff)
+				]));
+				return Math.max(0, Number(card) - expired.length);
 			}
 			const vals = await withBreaker(b, () => redis.hvals(recsKey));
 			let n = 0;
 			for (const v of vals) {
 				const rec = parseRecord('0', v);
-				if (rec && rec.topic === filter.topic) n++;
+				if (live(rec, cutoff) && rec.topic === filter.topic) n++;
 			}
 			return n;
 		},
@@ -284,19 +331,21 @@ export function createDeadLetter(client, options = {}) {
 		async list(filter = {}) {
 			const limit = Number.isInteger(filter.limit) && filter.limit > 0 ? filter.limit : 100;
 			// Newest-first by failedAt via the order set, then hydrate from the hash.
+			const cutoff = await readCutoff();
 			const ids = await withBreaker(b, () => redis.zrevrange(orderKey, 0, -1));
 			if (!ids || ids.length === 0) return [];
 			const jsons = await withBreaker(b, () => redis.hmget(recsKey, ...ids));
 			const out = [];
 			for (let i = 0; i < ids.length && out.length < limit; i++) {
 				const rec = parseRecord(ids[i], jsons[i]);
-				if (!rec) continue;
+				if (!live(rec, cutoff)) continue;
 				if (filter.topic === undefined || rec.topic === filter.topic) out.push(rec);
 			}
 			return out;
 		},
 
 		async summary() {
+			const cutoff = await readCutoff();
 			const vals = await withBreaker(b, () => redis.hvals(recsKey));
 			/** @type {Record<string, number>} */
 			// Null-prototype so a stored topic named '__proto__' counts as
@@ -307,7 +356,7 @@ export function createDeadLetter(client, options = {}) {
 			let total = 0;
 			for (const v of vals) {
 				const rec = parseRecord('0', v);
-				if (!rec) continue;
+				if (!live(rec, cutoff)) continue;
 				total++;
 				byTopic[rec.topic] = (byTopic[rec.topic] || 0) + 1;
 				if (oldest === null || rec.failedAt < oldest) oldest = rec.failedAt;
@@ -336,9 +385,8 @@ export function createDeadLetter(client, options = {}) {
 				// window is the documented residual, sized by `forgetTombstoneMs`).
 				// Server clock (TIME), never the caller's, so add()'s server-clock
 				// comparison is skew-immune.
-				const time = await redis.time();
-				const serverNow = Number(time[0]) * 1000 + Math.floor(Number(time[1]) / 1000);
-				await redis.set(purgedKey(userId), String(serverNow), 'PX', forgetTombstoneMs);
+				const serverNow = await serverTime();
+				await redis.set(purgedKey(tenantId || '~', userId), String(serverNow), 'PX', forgetTombstoneMs);
 
 				const all = await redis.hgetall(recsKey);
 				if (!all) return 0;

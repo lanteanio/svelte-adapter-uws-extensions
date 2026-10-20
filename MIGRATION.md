@@ -928,9 +928,16 @@ use the intended namespace before relying on tenant-specific erasure.
 
 This is not a blanket guarantee for every store: task rows have no tenant
 column and task `purgeUser` ignores its tenant argument. Use a tenant-qualified
-user identity there and audit the application's erasure fan-out. Redis
-forget-tombstone behavior and stores whose identity is not topic-derived must
-also be checked against their own contract.
+user identity there and audit the application's erasure fan-out. Stores whose
+identity is not topic-derived must also be checked against their own contract.
+
+The Redis dead-letter forget tombstone follows the same scope. It is written
+at `dlq:purged:<tenantId or ~>/<userId>` and checked against the tenant of
+the captured record's topic. Tombstones under the earlier
+`dlq:purged:<userId>` key are still honored until they expire. During a
+rolling upgrade, an instance still on an earlier version reads only the
+earlier key, so a purge run by an upgraded instance does not drop that
+instance's late captures; finish the rollout before relying on it.
 
 ### `createClusterClock` prefixes `leaderKey`
 

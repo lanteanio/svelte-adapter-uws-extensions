@@ -5,7 +5,10 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export interface RedisDeadLetterOptions {
 	/** Max retained records (oldest evicted first). @default 1000 */
 	max?: number;
-	/** Drop records older than this many ms on write (0 = no TTL). @default 0 */
+	/**
+	 * Drop records older than this many ms on write (0 = no TTL). Reads
+	 * exclude expired records immediately. @default 0
+	 */
 	ttlMs?: number;
 	/** Circuit breaker for fault isolation. */
 	breaker?: CircuitBreaker;
@@ -18,7 +21,7 @@ export interface RedisDeadLetterOptions {
 	 */
 	forgetUserId?: (record: DeadLetterRecord) => string | null | undefined;
 	/**
-	 * How long a per-user forget tombstone lives (its PX). A delivery whose total
+	 * How long a forget tombstone for one user in one tenant scope lives (its PX). A delivery whose total
 	 * retry duration outlives this resurrects the erased payload once the tombstone
 	 * expires; size it above your max retry budget. @default 600000 (10 minutes)
 	 */
