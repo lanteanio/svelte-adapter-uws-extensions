@@ -66,7 +66,7 @@ privileges from runtime access and permits transaction pooling for ordinary
 queries, subject to the client's connection settings. Notification bridges still
 need their own persistent session.
 
-An automatic migration that fails schema, data or privilege validation is latched for ordinary store operations, as is a migration statement cancelled by its statement or driver read deadline: a large table needs an explicit `migrate()` with a raised `statementTimeoutMs`, not repeated rebuilds under the default bound. Recognized transient admission, connection (including `EAI_AGAIN` and `ECONNABORTED`), resource, transaction, lock deadline and catalog-query deadline failures retry with shared exponential backoff from 100 ms to five seconds. After
+An automatic migration that fails schema, data or privilege validation is latched for ordinary store operations, as is a migration statement cancelled by its statement deadline, or a concurrent index build that scanned the table and then hit its lock deadline waiting for a long-running transaction: a large table needs an explicit `migrate()` with a raised `statementTimeoutMs` or `lockTimeoutMs`, not repeated rebuilds under the default bounds. Recognized transient admission, connection (including `EAI_AGAIN` and `ECONNABORTED`), resource, transaction, driver read deadline, other lock deadline and catalog-query deadline failures retry with shared exponential backoff from 100 ms to five seconds. After
 repairing the cause, explicitly retry `ready()` or recreate the store; requests
 and retention ticks do not repeatedly rebuild an invalid index. Successful
 readiness remains cached. See [PostgreSQL support](docs/postgres-support.md#schema-transitions-and-readiness)

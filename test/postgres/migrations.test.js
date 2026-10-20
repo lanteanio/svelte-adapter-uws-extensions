@@ -71,24 +71,28 @@ describe('PostgreSQL migration contracts', () => {
 		expect(client.connect).toHaveBeenCalledTimes(2);
 		expect(jobs.status()).toEqual({ state: 'ready', error: null });
 	});
-	function failingDdl(client, pattern, failure) {
+	// built: what the index-state read after the failure reports (null = not consulted).
+	function failingDdl(client, pattern, failure, built = null) {
 		const connect = client.connect;
 		let pending = true;
+		client.indexReads = 0;
 		client.connect = vi.fn(async (...args) => {
 			const connection = await connect(...args);
 			const query = connection.query;
 			return { ...connection, query: (statement, values) => {
-				if (pending && pattern.test(statement.text ?? statement)) { pending = false; return Promise.reject(failure); }
+				const text = statement.text ?? statement;
+				if (pending && pattern.test(text)) { pending = false; return Promise.reject(failure); }
+				if (text.includes('indisready')) { client.indexReads++; return Promise.resolve({ rows: built === null ? [] : [{ built }] }); }
 				return query(statement, values);
 			} };
 		});
 	}
 	it.each([
-		['statement timeout', Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' })],
-		['driver read timeout', new Error('Query read timeout')]
-	])('latches a DDL %s until an explicit readiness retry', async (_, failure) => {
+		['statement timeout', /VALIDATE CONSTRAINT/, Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }), null],
+		['lock timeout after a concurrent index build', /CREATE INDEX CONCURRENTLY/, Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' }), true]
+	])('latches a DDL %s until an explicit readiness retry', async (_, pattern, failure, built) => {
 		const client = mockPgClient();
-		failingDdl(client, /VALIDATE CONSTRAINT/, failure);
+		failingDdl(client, pattern, failure, built);
 		const jobs = createJobQueue(client);
 		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
 		await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
@@ -98,14 +102,21 @@ describe('PostgreSQL migration contracts', () => {
 		await jobs.enqueue('test', { repaired: true });
 		expect(client.connect).toHaveBeenCalledTimes(2);
 	});
-	it('retries a lock deadline hit by DDL and a statement timeout outside DDL', async () => {
-		for (const [pattern, code] of [[/ADD COLUMN/, '55P03'], [/pg_try_advisory_lock/, '57014']]) {
+	it('retries a lock deadline hit by DDL, before a concurrent build, a statement timeout outside DDL, and a driver read timeout', async () => {
+		const cases = [
+			[/ADD COLUMN/, Object.assign(new Error('temporary deadline'), { code: '55P03' }), null, 0],
+			[/CREATE INDEX CONCURRENTLY/, Object.assign(new Error('temporary deadline'), { code: '55P03' }), false, 1],
+			[/CREATE INDEX CONCURRENTLY/, Object.assign(new Error('temporary deadline'), { code: '55P03' }), null, 1],
+			[/pg_try_advisory_lock/, Object.assign(new Error('temporary deadline'), { code: '57014' }), null, 0],
+			[/VALIDATE CONSTRAINT/, new Error('Query read timeout'), null, 0]
+		];
+		for (const [pattern, failure, built, reads] of cases) {
 			const client = mockPgClient();
-			const failure = Object.assign(new Error('temporary deadline'), { code });
-			failingDdl(client, pattern, failure);
+			failingDdl(client, pattern, failure, built);
 			const jobs = createJobQueue(client);
 			await expect(jobs.enqueue('test', {})).rejects.toBe(failure);
 			expect(jobs.status()).toEqual({ state: 'idle', error: failure });
+			expect(client.indexReads).toBe(reads);
 			await jobs.enqueue('test', { recovered: true });
 			expect(client.connect).toHaveBeenCalledTimes(2);
 		}

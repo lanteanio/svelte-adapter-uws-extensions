@@ -4,9 +4,12 @@ import { monotonicNow, setTimer } from '../shared/runtime.js';
 
 const LEDGER = 'svti_schema_migrations';
 const LOCK = "hashtextextended(current_database() || ':' || current_schema() || ':svti_schema_migrations', 0)";
-// Statement deadlines hit by migration DDL. Retrying them under the same
-// bound repeats the same full-table work, so automatic initialization latches
-// them instead; an explicit migrate() with a raised bound is the remedy.
+// Migration DDL failures that retrying under the same bounds would repeat
+// after the same full-table work: a statement deadline, or a lock deadline
+// hit by a concurrent index build after the build itself finished (it then
+// waits for older transactions, and the next attempt drops and rebuilds the
+// index). Automatic initialization latches them; ending the long transaction
+// or an explicit migrate() with raised bounds is the remedy.
 const boundedDdl = new WeakSet();
 
 /** Inspect the ordered SQL and checksums without connecting to a database. */
@@ -30,8 +33,16 @@ export async function migrate(client, options) {
 		if (disconnected) return Promise.reject(disconnected);
 		return connection.query({ text, values, query_timeout: timeoutMs });
 	};
-	const ddl = text => query(text).catch(error => {
-		if (error && typeof error === 'object' && (error.code === '57014' || error.message === 'Query read timeout')) boundedDdl.add(error);
+	const ddl = (text, index) => query(text).catch(async error => {
+		if (error && typeof error === 'object') {
+			if (error.code === '57014') boundedDdl.add(error);
+			else if (error.code === '55P03' && index) {
+				// indisready is set once the concurrent build has scanned the
+				// table; a lock deadline before that point costs nothing to retry.
+				const built = await query('SELECT i.indisready AND NOT i.indisvalid AS built FROM pg_index i WHERE i.indexrelid = to_regclass($1)', [index]).catch(() => null);
+				if (built?.rows[0]?.built === true) boundedDdl.add(error);
+			}
+		}
 		throw error;
 	});
 	try {
@@ -81,7 +92,7 @@ export async function migrate(client, options) {
 						await ddl(`DROP INDEX CONCURRENTLY ${name}`);
 					}
 				}
-				await ddl(statement);
+				await ddl(statement, /^CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS (\w+)/.exec(statement)?.[1]);
 			}
 			await validateCatalog({ query }, checkpoint, schema);
 			await query(`INSERT INTO ${LEDGER} (table_name, store, version, checksum) VALUES ($1, $2, $3, $4)`, [schema.table, schema.store, version.version, version.checksum]);

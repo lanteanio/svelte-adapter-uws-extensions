@@ -77,6 +77,41 @@ describe('PostgreSQL migration readiness', () => {
 		}
 	});
 
+	it('latches a concurrent index build that a long transaction keeps from finishing', async () => {
+		const client = connect(), table = 'migration_cic_replay', index = 'idx_migration_cic_replay_identity';
+		const replay = createReplay(client, { table, cleanupInterval: 0 });
+		const holder = client.createClient();
+		const oid = async () => (await client.query('SELECT to_regclass($1)::oid AS oid', [index])).rows[0].oid;
+		try {
+			await migrate(client, { store: 'replay', table });
+			await client.query("DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 2", [table]);
+			await client.query(`DROP INDEX IF EXISTS ${index}`);
+			await client.query(`CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)`);
+			await client.query(`INSERT INTO ${table} (topic, seq, event, data) SELECT 't' || (g % 10), g, 'e', '{}'::jsonb FROM generate_series(1, 1000) g`);
+			await holder.connect();
+			await holder.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+			await holder.query('SELECT 1');
+			const failure = await replay.seq('t1').catch(error => error);
+			expect(failure).toMatchObject({ code: '55P03' });
+			expect(replay.status()).toEqual({ state: 'failed', error: failure });
+			const built = await oid();
+			expect(built).not.toBeNull();
+			await expect(replay.seq('t1')).rejects.toBe(failure);
+			expect(await oid()).toBe(built);
+			await holder.query('ROLLBACK');
+			await replay.ready();
+			expect(await replay.seq('t1')).toBe(0);
+			expect(replay.status()).toEqual({ state: 'ready', error: null });
+			expect((await client.query('SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)', [index])).rows).toEqual([{ indisvalid: true }]);
+		} finally {
+			replay.destroy();
+			await holder.end().catch(() => {});
+			await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_seq`);
+			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1', [table]);
+			await client.end();
+		}
+	}, 30000);
+
 	it('rejects incomplete schemas with automatic migration enabled or disabled', async () => {
 		const client = connect(), table = 'migration_incomplete_tasks';
 		const options = { table, dispatchInterval: 0, recoveryInterval: 0, cleanupInterval: 0 };
