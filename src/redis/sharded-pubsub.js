@@ -737,8 +737,14 @@ export function createShardedBus(client, options = {}) {
 		// The bus closed while the subscribe was in flight: its connections are
 		// already quit.
 		if (generation !== subGeneration) return;
-		// A reply queued before the connection ended cannot confirm its replacement.
-		if (subByNodeId.get(ownerId) !== conn) return;
+		// A reply queued before the connection ended cannot confirm its
+		// replacement. An admission prunes a channel left without an owner
+		// connection itself; a reconciliation has to count it as failed, or
+		// nothing would subscribe it again.
+		if (subByNodeId.get(ownerId) !== conn) {
+			if (admissionOwnsCleanup) return;
+			throw new Error('sharded bus: the connection to the owner of slot ' + slot + ' ended during ssubscribe');
+		}
 		// A reconcile retry can outlive the last unfollow. Shared admissions
 		// instead retain every physical subscription until all channels settle:
 		// another follower can arrive while a different channel is still pending.
