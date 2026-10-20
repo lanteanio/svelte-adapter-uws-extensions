@@ -92,6 +92,21 @@ describe('diagnostic contract parity with the adapter', () => {
 		}
 	});
 
+	it('parses back a long message whichever character the length cut lands on', () => {
+		// A space at each position around the 512-character cut: every line
+		// must parse, and the message must be a fixed point of the normalizer
+		// the parser checks it against, so no trailing space survives the cut.
+		for (let at = 505; at <= 515; at++) {
+			const input = { ...SAMPLE, message: 'x'.repeat(at) + ' ' + 'y'.repeat(600 - at) };
+			const line = formatDiagnostic(input);
+			expect(line, `cut near a space at ${at}`).toBe(lead.formatDiagnostic(input));
+			const parsed = lead.parseDiagnostic(line);
+			expect(parsed?.format, `cut near a space at ${at}`).toBe('canonical');
+			expect(parsed.record.message.endsWith(' ')).toBe(false);
+			expect(parsed.record.message.length).toBeLessThanOrEqual(512);
+		}
+	});
+
 	it('is parsed by the adapter parser as a canonical record', () => {
 		const parsed = lead.parseDiagnostic(formatDiagnostic(SAMPLE));
 		expect(parsed?.format).toBe('canonical');
