@@ -132,7 +132,7 @@ export const redis = createRedisClient({
 | `redis.redis` | The underlying ioredis instance |
 | `redis.key(k)` | Returns `keyPrefix + k` |
 | `redis.duplicate(overrides?)` | New connection with same config. Pass ioredis options to override defaults. |
-| `redis.quit()` | Gracefully disconnect all connections |
+| `redis.quit()` | Gracefully disconnect all connections and remove the `sveltekit:shutdown` listener |
 
 ---
 
@@ -156,7 +156,7 @@ import pg from 'pg';
 const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
 
 export const wrapped = createPgClient({ pool });
-// pg.end() is a no-op now - the caller owns `pool`'s lifecycle.
+// wrapped.end() never closes `pool` - the caller owns its lifecycle.
 ```
 
 #### Options
@@ -164,8 +164,8 @@ export const wrapped = createPgClient({ pool });
 | Option | Default | Description |
 |---|---|---|
 | `connectionString` | - | Postgres connection string. Required UNLESS `pool` is provided. |
-| `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
-| `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Disconnect on `sveltekit:shutdown`. |
+| `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` never closes the pool. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
+| `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Call `end()` on `sveltekit:shutdown`. Only an owned pool is closed. |
 | `options` | `{}` | Extra pg Pool options. Ignored when `pool` is provided. |
 
 #### API
@@ -175,7 +175,7 @@ export const wrapped = createPgClient({ pool });
 | `pg.pool` | The underlying pg Pool (provided or owned). |
 | `pg.query(text, values?)` | Run a query. |
 | `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
-| `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
+| `pg.end()` | Gracefully close the pool and remove the `sveltekit:shutdown` listener. An externally-provided pool stays open. |
 
 ---
 

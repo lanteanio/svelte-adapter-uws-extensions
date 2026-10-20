@@ -35,7 +35,7 @@ describe('createPgClient', () => {
 		expect(client.pool).toBe(externalPool);
 	});
 
-	it('end() is a no-op when the pool was provided externally', async () => {
+	it('end() never closes a pool that was provided externally', async () => {
 		const externalPool = {
 			query: vi.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
 			end: vi.fn(() => Promise.resolve()),
@@ -71,6 +71,37 @@ describe('createPgClient', () => {
 	it('end is idempotent', async () => {
 		const client = createPgClient({ connectionString: 'postgres://localhost/test' });
 		await client.end();
+		await client.end();
+		expect(client.pool.end).toHaveBeenCalledTimes(1);
+	});
+
+	it('end() removes its sveltekit:shutdown listener', async () => {
+		const before = process.listenerCount('sveltekit:shutdown');
+		const clients = Array.from({ length: 3 }, () => createPgClient({ connectionString: 'postgres://localhost/test' }));
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before + 3);
+		await Promise.all(clients.map((client) => client.end()));
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before);
+	});
+
+	it('end() removes the listener of a wrapped pool without closing it', async () => {
+		const externalPool = {
+			query: vi.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+			end: vi.fn(() => Promise.resolve()),
+			on: vi.fn()
+		};
+		const before = process.listenerCount('sveltekit:shutdown');
+		const client = createPgClient({ pool: externalPool, autoShutdown: true });
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before + 1);
+		await client.end();
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before);
+		expect(externalPool.end).not.toHaveBeenCalled();
+	});
+
+	it('sveltekit:shutdown still ends a pool that was not released', async () => {
+		const client = createPgClient({ connectionString: 'postgres://localhost/test' });
+		process.emit('sveltekit:shutdown');
+		await Promise.resolve();
+		expect(client.pool.end).toHaveBeenCalledTimes(1);
 		await client.end();
 		expect(client.pool.end).toHaveBeenCalledTimes(1);
 	});

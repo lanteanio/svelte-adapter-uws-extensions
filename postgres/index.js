@@ -16,8 +16,8 @@ const { Pool, Client } = pg;
 /**
  * @typedef {Object} PgClientOptions
  * @property {string} [connectionString] - Postgres connection string. Required UNLESS `pool` is provided.
- * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` becomes a no-op.
- * @property {boolean} [autoShutdown=true] - Listen for `sveltekit:shutdown` and disconnect. Defaults to `false` when `pool` is provided.
+ * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` never closes it.
+ * @property {boolean} [autoShutdown=true] - Call `end()` on `sveltekit:shutdown`; only an owned pool is closed. Defaults to `false` when `pool` is provided.
  * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Ignored when `pool` is provided.
  */
 
@@ -25,7 +25,7 @@ const { Pool, Client } = pg;
  * @typedef {Object} PgClient
  * @property {import('pg').Pool} pool - The underlying pg Pool
  * @property {(text: string, values?: any[]) => Promise<import('pg').QueryResult>} query - Run a query
- * @property {() => Promise<void>} end - Gracefully close the pool. When the pool was provided externally, this is a no-op (the caller owns the lifecycle).
+ * @property {() => Promise<void>} end - Gracefully close the pool and remove the `sveltekit:shutdown` listener. When the pool was provided externally, the pool stays open (the caller owns the lifecycle).
  */
 
 /**
@@ -39,7 +39,7 @@ const { Pool, Client } = pg;
  *
  *   2. Pass `pool` (an existing `pg.Pool`): the client wraps the provided
  *      pool without constructing its own. `autoShutdown` defaults to `false`
- *      and `end()` is a no-op - the caller is responsible for closing the
+ *      and `end()` never closes it - the caller is responsible for closing the
  *      pool. Use this when your app already maintains a pool (e.g. shared
  *      with raw `pg` use elsewhere) and wants a single connection footprint
  *      against the database.
@@ -99,9 +99,11 @@ export function createPgClient(opts) {
 	async function end() {
 		if (ended) return;
 		ended = true;
+		// A client released by a development reload must not keep its listener.
+		if (typeof process !== 'undefined') process.removeListener('sveltekit:shutdown', end);
 		// Only close pools we own. The caller-provided pool is never ours
-		// to close; this is a deliberate no-op so graceful-shutdown paths
-		// can call end() unconditionally without worrying about ownership.
+		// to close; skipping it lets graceful-shutdown paths call end()
+		// unconditionally without worrying about ownership.
 		if (ownedPool) {
 			await pool.end();
 		}

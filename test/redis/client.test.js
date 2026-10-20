@@ -58,4 +58,21 @@ describe('createRedisClient', () => {
 		// Should only call quit once on the redis instance
 		expect(client.redis.quit).toHaveBeenCalledTimes(1);
 	});
+
+	it('quit() removes its sveltekit:shutdown listener', async () => {
+		const before = process.listenerCount('sveltekit:shutdown');
+		const clients = Array.from({ length: 3 }, () => createRedisClient());
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before + 3);
+		await Promise.all(clients.map((client) => client.quit()));
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before);
+	});
+
+	it('sveltekit:shutdown still quits a client that was not released', async () => {
+		const client = createRedisClient();
+		process.emit('sveltekit:shutdown');
+		await Promise.resolve();
+		expect(client.redis.quit).toHaveBeenCalledTimes(1);
+		await client.quit();
+		expect(client.redis.quit).toHaveBeenCalledTimes(1);
+	});
 });

@@ -20,7 +20,7 @@ export interface RedisClient {
 	key(key: string): string;
 	/** Create a new connection with the same config. Pass overrides to change options (e.g. `{ enableReadyCheck: false }` for subscriber clients). */
 	duplicate(overrides?: RedisOptions): Redis;
-	/** Gracefully disconnect all connections. */
+	/** Gracefully disconnect all connections and remove the `sveltekit:shutdown` listener. */
 	quit(): Promise<void>;
 }
 

@@ -9,7 +9,7 @@ export interface PgClientOptions {
 	 * another framework integration) and you want a single connection
 	 * footprint against the database. When provided, `autoShutdown`
 	 * defaults to `false` (the caller owns the pool's lifecycle) and
-	 * `end()` becomes a no-op.
+	 * `end()` never closes it.
 	 *
 	 * `connectionString` and `pool` are mutually exclusive in spirit, but
 	 * you may pass `connectionString` alongside `pool` to enable
@@ -17,7 +17,7 @@ export interface PgClientOptions {
 	 * losing the shared-pool ownership story.
 	 */
 	pool?: Pool;
-	/** Listen for `sveltekit:shutdown` and disconnect. @default `true` when the client owns the pool, `false` when `pool` is provided. */
+	/** Call `end()` on `sveltekit:shutdown`; only an owned pool is closed. @default `true` when the client owns the pool, `false` when `pool` is provided. */
 	autoShutdown?: boolean;
 	/** Extra pg Pool options. Ignored when `pool` is provided. */
 	options?: PoolConfig;
@@ -34,8 +34,9 @@ export interface PgClient {
 	 */
 	createClient(): Client;
 	/**
-	 * Gracefully close the pool. No-op when the client wraps an
-	 * externally-provided pool (the caller owns that lifecycle).
+	 * Gracefully close the pool and remove the `sveltekit:shutdown`
+	 * listener. Leaves an externally-provided pool open (the caller owns
+	 * that lifecycle).
 	 */
 	end(): Promise<void>;
 }
