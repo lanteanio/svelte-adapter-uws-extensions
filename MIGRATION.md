@@ -946,6 +946,18 @@ result - `return presence.hooks.subscribe(ws, topic, ctx)` - or the socket stays
 subscribed to a topic the platform refused. `cursor.hooks.subscribe` is the
 same. Both are typed `Promise<string | undefined>` now.
 
+`presence.sync` resolves `undefined` in every case, matching the bundled
+presence plugin: a refused topic sends no roster. A wrapper that returned
+`presence.sync(...)` to refuse a `__presence:*` subscribe returns
+`presence.hooks.subscribe(...)` instead.
+
+The `subscribe` hooks of presence, cursor and groups are marked as plugin side
+effects. Exporting them as-is no longer counts as the app taking over the topic
+decision, so with `authorizeWireSubscribe` armed the server-grant gate refuses
+a subscribe to any application topic the server did not grant. An app that
+relied on the plugin hook to let every topic through grants topics server-side
+or exports its own `subscribe` function.
+
 ### Replay and dead-letter erasure uses the tenant topic namespace
 
 Redis and Postgres replay buffers and dead-letter queues now restrict deletion

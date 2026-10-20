@@ -85,6 +85,10 @@ export interface RedisGroup {
 	 * `unsubscribe` auto-leaves when the client unsubscribes (requires core v0.4.0+).
 	 * `close` leaves the group on disconnect.
 	 *
+	 * `subscribe` is marked as a plugin side effect, so exporting it as-is does
+	 * not disarm an armed `authorizeWireSubscribe` server-grant gate for
+	 * application topics.
+	 *
 	 * @example
 	 * ```js
 	 * import { group } from '$lib/server/group';

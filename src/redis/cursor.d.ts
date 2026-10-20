@@ -7,6 +7,16 @@ export interface RedisCursorOptions {
 	/** Maximum JSON data size in UTF-8 bytes. Invalid, over-depth, or oversized updates are dropped. Default 8192. */
 	maxDataBytes?: number;
 	/**
+	 * Reject cursor `update()` calls whose `topic` string is longer than
+	 * this many characters. Generous for typical cursor-topic shapes
+	 * (`board:${boardId}:cursor`, etc.). The cap prevents an oversized
+	 * topic from anchoring a large internal string in the per-topic
+	 * cursor state map. `attach()` throws a `TypeError` for a longer name.
+	 *
+	 * @default 256
+	 */
+	maxTopicLength?: number;
+	/**
 	 * Minimum ms between broadcasts per user per topic.
 	 * Trailing-edge timer ensures the final position is always sent.
 	 * Default 16 (60Hz) matches the world-state tick rate so an individual
@@ -190,6 +200,9 @@ export interface RedisCursorTracker {
 	 * `hooks.message`, so a socket that never attached cannot write into the
 	 * room.
 	 *
+	 * @throws {TypeError} before authorizing, when `topic` is not a string,
+	 *   is empty or longer than `maxTopicLength`, starts with `__`, or
+	 *   contains a double quote, a backslash or a control character.
 	 * @throws {SubscribeDeniedError} (`err.code === 'SUBSCRIBE_DENIED'`, with
 	 *   `err.reason` carrying the platform's denial reason) if
 	 *   `platform.checkSubscribe` refuses `topic`.
@@ -322,8 +335,11 @@ export interface RedisCursorTracker {
 	 * app's "join room" RPC remains the path that does not depend on that
 	 * opt-in.
 	 *
-	 * It resolves to the platform's denial reason when authorization fails,
-	 * and to `undefined` otherwise. Wrapping it means RETURNING that value:
+	 * It resolves to `'INVALID_TOPIC'` for a name `attach()` would reject, to
+	 * the platform's denial reason when authorization fails, and to
+	 * `undefined` otherwise. It is marked as a plugin side effect, so
+	 * exporting it as-is does not disarm an armed `authorizeWireSubscribe`
+	 * server-grant gate for application topics. Wrapping it means RETURNING that value:
 	 * the adapter reads anything that is not `false` or a string as ALLOW, so
 	 * swallowing it withholds the snapshot while still subscribing the socket
 	 * to the broadcast channel - the larger half of what the gate prevents.

@@ -199,18 +199,16 @@ export interface RedisPresenceTracker {
 	/**
 	 * Send the current presence list without joining.
 	 *
-	 * Resolves to the platform's denial reason when `checkSubscribe` refuses
-	 * the topic (and to `'FORBIDDEN'` when the platform provides no
-	 * `checkSubscribe` at all - this lane fails closed), otherwise
-	 * `undefined`. Return the value from a `hooks.subscribe` wiring so the
-	 * denial reaches the adapter and the subscribe itself is refused; a
-	 * caller that discards it leaves the socket subscribed to a topic the
-	 * platform refused, with only the roster withheld. A non-string topic,
-	 * a `__`-prefixed topic, and a topic containing a double quote, a
-	 * backslash or a control character resolve `undefined` without a check
-	 * and send nothing: presence tracks no such topic.
+	 * Sends nothing when `platform.checkSubscribe` refuses the topic, and
+	 * nothing when the platform provides no `checkSubscribe` at all (this
+	 * lane fails closed). A non-string topic, a `__`-prefixed topic, and a
+	 * topic containing a double quote, a backslash or a control character
+	 * send nothing without a check: presence tracks no such topic. Resolves
+	 * `undefined` in every case. A subscribe wiring that must refuse the
+	 * `__presence:*` subscribe itself returns the result of
+	 * `hooks.subscribe`, which carries the denial reason.
 	 */
-	sync(ws: any, topic: string, platform: Platform): Promise<string | undefined>;
+	sync(ws: any, topic: string, platform: Platform): Promise<void>;
 
 	/**
 	 * Set dynamic fields on the present user (typing, a selection range, a lock
@@ -306,11 +304,19 @@ export interface RedisPresenceTracker {
 	 * `leave`.
 	 *
 	 * `subscribe` resolves to the platform's denial reason on a `__presence:*`
-	 * topic the caller may not observe, and to `undefined` otherwise. Wrapping
+	 * topic the caller may not observe, to `'INVALID_TOPIC'` when the topic
+	 * after the prefix is empty, `__`-prefixed, or contains a double quote, a
+	 * backslash or a control character, and to `undefined` otherwise. Wrapping
 	 * it means RETURNING that value: the adapter reads anything that is not
 	 * `false` or a string as ALLOW, so swallowing it withholds the roster
 	 * while still subscribing the socket to the tap channel and feeding it
 	 * every later diff.
+	 *
+	 * `subscribe` is marked as a plugin side effect, so exporting it as-is
+	 * does not count as the app taking over the topic decision: with
+	 * `authorizeWireSubscribe` armed, the server-grant gate stays in force for
+	 * every application topic. A wrapper function is app code and is not
+	 * marked; the gate steps aside for it as the adapter documents.
 	 *
 	 * @example
 	 * ```js

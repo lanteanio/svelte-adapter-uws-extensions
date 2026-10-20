@@ -23,7 +23,8 @@ describe('presence breaker admission', () => {
 			const tracker = createPresence(mockRedisClient(), { breaker });
 			cleanup.push(tracker);
 			const platform = denial === undefined ? {} : { checkSubscribe: async () => { if (denial === 'throw') throw new Error('denied'); return denial; } };
-			expect(await tracker.sync(mockWs({}), 'room', platform)).toBe(denial === 'DENIED' ? 'DENIED' : 'FORBIDDEN');
+			expect(await tracker.sync(mockWs({}), 'room', platform)).toBeUndefined();
+			expect(await tracker.hooks.subscribe(mockWs({}), '__presence:room', { platform })).toBe(denial === 'DENIED' ? 'DENIED' : 'FORBIDDEN');
 			expect(breaker.state).toBe('probing');
 			expect(() => breaker.guard()).not.toThrow();
 		});

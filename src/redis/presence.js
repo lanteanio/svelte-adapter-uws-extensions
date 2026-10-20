@@ -67,7 +67,7 @@ import { guardBreaker } from '../shared/breaker-admission.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
 import { WsClosedError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
-import { addWsSubscription, removeWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
+import { addWsSubscription, removeWsSubscription, OBSERVER_LANE, markSideEffectHooks } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
 import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, RESTORE_IDENTITY_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
 import { makeKeys } from './presence/keys.js';
@@ -859,6 +859,103 @@ export function createPresence(client, options = {}) {
 		consistencyAuditor.start();
 	}
 
+	/**
+	 * Emit the current roster for `topic` to one socket. Resolves the denial
+	 * reason when the platform refuses the topic: `hooks.subscribe` returns it
+	 * so a `__presence:` subscribe that reached the hook is refused rather than
+	 * landing with only the roster withheld. The public `sync` resolves void.
+	 * @returns {Promise<string | undefined>}
+	 */
+	async function syncRoster(ws, topic, platform) {
+		// Presence tracks no `__` topic (join and update skip them), so
+		// there is no roster to send and no event channel to open for one.
+		// Before the breaker guard, which would otherwise spend a probe.
+		if (typeof topic !== 'string' || topic.startsWith('__')) return;
+		if (!isFramableTopic(topic)) return;
+		// Authorize against the REAL topic before granting tap-channel
+		// membership (mirrors in-memory presence sync + the cursor snapshot):
+		// the presence-snapshot message is otherwise an un-authorized path to
+		// join __presence:{topic} and read its roster, around the wire-level
+		// `__`-subscribe block. Gate it on the same check a wire-subscribe to
+		// `topic` would run, before even opening the cross-instance Redis
+		// subscription. Fail CLOSED when the platform cannot authorize
+		// entirely: the adapter peer floor has provided checkSubscribe for
+		// many releases, so an absent check means a custom platform.
+		// Degrade availability, never authorization.
+		if (!platform || typeof platform.checkSubscribe !== 'function') return 'FORBIDDEN';
+		{
+			let denial;
+			// OBSERVER lane: this asks "may this connection SEE the roster
+			// it is requesting?", not "may it be granted the topic".
+			// Without the flag, a pure-grant deployment - wire-subscribe
+			// authorization armed and no app subscribe hook - has no hook
+			// for the gate to consult, so `checkSubscribe` allows every
+			// topic name and this lane hands any connected socket any
+			// room's roster. The peer floor implements the flag and its own
+			// bundled presence sync asks the same question, so this gate is
+			// load-bearing across the supported adapter range.
+			try { denial = await platform.checkSubscribe(ws, topic, OBSERVER_LANE); } catch { return 'FORBIDDEN'; }
+			// `false` is a denial in the adapter's subscribe-hook
+			// vocabulary; reading it as allow would invert the check on
+			// the custom platforms this branch exists for.
+			if (denial === false) return 'FORBIDDEN';
+			if (denial) return denial;
+		}
+		b?.guard();
+		try {
+			await subscribeToTopic(topic, platform);
+		} catch (err) {
+			b?.failure(err);
+			throw err;
+		}
+		let all;
+		try {
+			all = await coalesceHgetall(topic);
+			b?.success();
+		} catch (err) {
+			b?.failure(err);
+			throw err;
+		}
+		const presenceTopic = '__presence:' + topic;
+		const entries = parseEntries(all, fieldNames.fromServer);
+		/** @type {Record<string, Record<string, any>>} */
+		const state = Object.create(null);
+		for (const [userKey, entry] of entries) {
+			state[userKey] = publicData(entry);
+		}
+
+		let topics = syncObservers.get(ws);
+		if (!topics) {
+			topics = new Set();
+			syncObservers.set(ws, topics);
+		}
+		if (!topics.has(topic)) {
+			topics.add(topic);
+			syncCounts.set(topic, (syncCounts.get(topic) || 0) + 1);
+		}
+
+		try {
+			ws.subscribe(presenceTopic);
+			addWsSubscription(ws, presenceTopic);
+			emitTo(ws, presenceTopic, 'state', state, platform);
+		} catch {
+			const topics = syncObservers.get(ws);
+			if (topics && topics.has(topic)) {
+				topics.delete(topic);
+				if (topics.size === 0) syncObservers.delete(ws);
+				const count = (syncCounts.get(topic) || 1) - 1;
+				if (count <= 0) {
+					syncCounts.delete(topic);
+					if (!localCounts.has(topic)) {
+						await unsubscribeFromTopic(topic);
+					}
+				} else {
+					syncCounts.set(topic, count);
+				}
+			}
+		}
+	}
+
 	/** @type {RedisPresenceTracker} */
 	const tracker = {
 		async join(ws, topic, platform) {
@@ -1160,101 +1257,9 @@ export function createPresence(client, options = {}) {
 			return leaveAll(ws, platform);
 		},
 
-		/**
-		 * Emit the current roster for `topic` to one socket.
-		 * @returns {Promise<string | undefined>} The denial reason when the
-		 * platform refuses the topic, so a wire-subscribe caller can deny the
-		 * subscribe itself instead of only withholding the roster. Existing
-		 * callers that ignore the return value are unaffected.
-		 */
+		/** Emit the current roster for `topic` to one socket. */
 		async sync(ws, topic, platform) {
-			// Presence tracks no `__` topic (join and update skip them), so
-			// there is no roster to send and no event channel to open for one.
-			// Before the breaker guard, which would otherwise spend a probe.
-			if (typeof topic !== 'string' || topic.startsWith('__')) return;
-			if (!isFramableTopic(topic)) return;
-			// Authorize against the REAL topic before granting tap-channel
-			// membership (mirrors in-memory presence sync + the cursor snapshot):
-			// the presence-snapshot message is otherwise an un-authorized path to
-			// join __presence:{topic} and read its roster, around the wire-level
-			// `__`-subscribe block. Gate it on the same check a wire-subscribe to
-			// `topic` would run, before even opening the cross-instance Redis
-			// subscription. Fail CLOSED when the platform cannot authorize
-			// entirely: the adapter peer floor has provided checkSubscribe for
-			// many releases, so an absent check means a custom platform.
-			// Degrade availability, never authorization.
-			if (!platform || typeof platform.checkSubscribe !== 'function') return 'FORBIDDEN';
-			{
-				let denial;
-				// OBSERVER lane: this asks "may this connection SEE the roster
-				// it is requesting?", not "may it be granted the topic".
-				// Without the flag, a pure-grant deployment - wire-subscribe
-				// authorization armed and no app subscribe hook - has no hook
-				// for the gate to consult, so `checkSubscribe` allows every
-				// topic name and this lane hands any connected socket any
-				// room's roster. The peer floor implements the flag and its own
-				// bundled presence sync asks the same question, so this gate is
-				// load-bearing across the supported adapter range.
-				try { denial = await platform.checkSubscribe(ws, topic, OBSERVER_LANE); } catch { return 'FORBIDDEN'; }
-				// `false` is a denial in the adapter's subscribe-hook
-				// vocabulary; reading it as allow would invert the check on
-				// the custom platforms this branch exists for.
-				if (denial === false) return 'FORBIDDEN';
-				if (denial) return denial;
-			}
-			b?.guard();
-			try {
-				await subscribeToTopic(topic, platform);
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
-			let all;
-			try {
-				all = await coalesceHgetall(topic);
-				b?.success();
-			} catch (err) {
-				b?.failure(err);
-				throw err;
-			}
-			const presenceTopic = '__presence:' + topic;
-			const entries = parseEntries(all, fieldNames.fromServer);
-			/** @type {Record<string, Record<string, any>>} */
-			const state = Object.create(null);
-			for (const [userKey, entry] of entries) {
-				state[userKey] = publicData(entry);
-			}
-
-			let topics = syncObservers.get(ws);
-			if (!topics) {
-				topics = new Set();
-				syncObservers.set(ws, topics);
-			}
-			if (!topics.has(topic)) {
-				topics.add(topic);
-				syncCounts.set(topic, (syncCounts.get(topic) || 0) + 1);
-			}
-
-			try {
-				ws.subscribe(presenceTopic);
-				addWsSubscription(ws, presenceTopic);
-				emitTo(ws, presenceTopic, 'state', state, platform);
-			} catch {
-				const topics = syncObservers.get(ws);
-				if (topics && topics.has(topic)) {
-					topics.delete(topic);
-					if (topics.size === 0) syncObservers.delete(ws);
-					const count = (syncCounts.get(topic) || 1) - 1;
-					if (count <= 0) {
-						syncCounts.delete(topic);
-						if (!localCounts.has(topic)) {
-							await unsubscribeFromTopic(topic);
-						}
-					} else {
-						syncCounts.set(topic, count);
-					}
-				}
-			}
+			await syncRoster(ws, topic, platform);
 		},
 
 		async update(ws, topic, fields, platform, fromClient = false) {
@@ -1572,15 +1577,23 @@ export function createPresence(client, options = {}) {
 		// contract.
 		_consistencyAuditor: consistencyAuditor,
 
-		hooks: {
+		// The subscribe hook joins a roster; it never decides an application
+		// topic. Marked as a side effect so that re-exporting it, which is the
+		// documented wiring, does not make the adapter believe the app took
+		// over the topic decision and disarm the server-grant gate. It still
+		// refuses a `__presence:` subscribe it cannot authorize.
+		hooks: markSideEffectHooks({
 			async subscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__presence:')) {
 					const realTopic = topic.slice('__presence:'.length);
+					// A name presence never tracks has no roster to observe;
+					// refuse it before authorizing rather than landing the tap.
+					if (realTopic.length === 0 || realTopic.startsWith('__') || !isFramableTopic(realTopic)) return 'INVALID_TOPIC';
 					// Return the denial: the adapter treats anything that is
 					// not `false` or a string as ALLOW, so swallowing it would
 					// withhold the roster while still subscribing the socket
 					// to the tap channel and feeding it every later diff.
-					return await tracker.sync(ws, realTopic, platform);
+					return await syncRoster(ws, realTopic, platform);
 				}
 				await tracker.join(ws, topic, platform);
 			},
@@ -1653,7 +1666,7 @@ export function createPresence(client, options = {}) {
 			async close(ws, { platform }) {
 				await tracker.leave(ws, platform);
 			}
-		}
+		}, ['subscribe'])
 	};
 
 	const stopDashboard = registerClusterHealth('presence', () => ({

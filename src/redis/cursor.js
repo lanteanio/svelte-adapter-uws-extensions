@@ -55,7 +55,7 @@ import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { WsClosedError, SubscribeDeniedError, operationError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
-import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
+import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LANE, markSideEffectHooks } from '../shared/ws-subscriptions.js';
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
 import { EVENTS } from './cursor/events.js';
 import { _warnCursorHooksMessageShape } from './cursor/diagnostics.js';
@@ -78,6 +78,9 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
 /**
  * @typedef {Object} RedisCursorOptions
  * @property {number} [maxDataBytes=8192] - Maximum JSON data size in UTF-8 bytes; invalid or oversized updates are dropped.
+ * @property {number} [maxTopicLength=256] - Longest topic name, in UTF-16 code units, that
+ *   `update()` accepts; a longer one is dropped. The cap keeps an oversized name from
+ *   anchoring a large string in the per-topic cursor state.
  * @property {number} [throttle=16] - Minimum ms between broadcasts per user per topic.
  *   Trailing-edge timer fires to ensure the final position is always sent.
  *   Default 16 (60Hz) matches the world-state tick rate so an individual cursor's
@@ -157,6 +160,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
 export function createCursor(client, options = {}) {
 	const {
 		maxDataBytes,
+		maxTopicLength,
 		throttleMs,
 		topicThrottleMs,
 		snapshotIntervalMs,
@@ -523,6 +527,22 @@ export function createCursor(client, options = {}) {
 	} = scheduler;
 
 	/**
+	 * Why `topic` cannot be a cursor room, or null when it can. The rules are
+	 * update()'s: a non-empty string within `maxTopicLength` that a frame can
+	 * carry. A `__`-prefixed name is refused too: the tap channel for it would
+	 * be `__cursor:__...`, a second internal namespace.
+	 * @param {unknown} topic
+	 * @returns {string | null}
+	 */
+	function invalidTopicReason(topic) {
+		if (typeof topic !== 'string') return 'topic must be a string';
+		if (topic.length === 0 || topic.length > maxTopicLength) return 'topic must be 1-' + maxTopicLength + ' characters';
+		if (topic.startsWith('__')) return 'topic must not start with "__"';
+		if (!isFramableTopic(topic)) return 'Topic must not contain quotes, backslashes, or control characters';
+		return null;
+	}
+
+	/**
 	 * Authorize this connection against the REAL topic, the same check a
 	 * wire-subscribe to `topic` would run. Returns a denial reason, or null
 	 * when the connection may read and write the topic's cursor state.
@@ -712,6 +732,11 @@ export function createCursor(client, options = {}) {
 	/** @type {RedisCursorTracker} */
 	const tracker = {
 		async attach(ws, topic, platform) {
+			// Validate the name before authorizing, so a name no cursor frame
+			// can carry fails the way update() fails on it rather than reaching
+			// a platform that may not validate names itself.
+			const invalid = invalidTopicReason(topic);
+			if (invalid) throw new TypeError('cursor.attach: ' + invalid);
 			// Authorize BEFORE granting any membership. Subscribing first and
 			// checking afterwards would leave a denied connection subscribed to
 			// __cursor:{topic} (receiving every broadcast) and holding the
@@ -771,7 +796,7 @@ export function createCursor(client, options = {}) {
 			// no frame can carry before allocating a topic. The character check
 			// runs only for a topic not yet tracked, so a frame on a live topic
 			// pays one Map lookup.
-			if (typeof topic !== 'string' || topic.length === 0) { inputDropped('invalid_envelope', 'update'); return; }
+			if (typeof topic !== 'string' || topic.length === 0 || topic.length > maxTopicLength) { inputDropped('invalid_envelope', 'update'); return; }
 			if (data !== undefined && data !== null) {
 				try {
 					if (Buffer.byteLength(JSON.stringify(data)) > maxDataBytes) { inputDropped('data_limit', 'update'); return; }
@@ -1301,10 +1326,16 @@ export function createCursor(client, options = {}) {
 			return { ...statsSnapshot(), activeTopicsTotal: topics.size };
 		},
 
-		hooks: {
+		// The subscribe hook decides only its own `__cursor:` channel and never
+		// an application topic. Marked as a side effect so that exporting it
+		// does not make the adapter believe the app took over the topic
+		// decision and disarm the server-grant gate for every other topic.
+		hooks: markSideEffectHooks({
 			async subscribe(ws, topic, { platform }) {
 				if (topic.startsWith('__cursor:')) {
 					const realTopic = topic.slice('__cursor:'.length);
+					// Refuse a name attach() would reject before authorizing it.
+					if (invalidTopicReason(realTopic)) return 'INVALID_TOPIC';
 					// The adapter only routes a client wire-subscribe to a `__`
 					// topic when the app opted into `allowSystemTopicSubscribe`;
 					// authorize it exactly like attach() does.
@@ -1375,7 +1406,7 @@ export function createCursor(client, options = {}) {
 			close(ws, { platform }) {
 				return tracker.remove(ws, platform);
 			}
-		}
+		}, ['subscribe'])
 	};
 
 	return tracker;

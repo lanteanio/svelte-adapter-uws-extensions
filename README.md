@@ -1059,7 +1059,7 @@ import { presence } from '$lib/server/presence';
 export const { subscribe, message, unsubscribe, close } = presence.hooks;
 ```
 
-`subscribe` handles both regular topics (calls `join`) and `__presence:*` topics (calls `sync` so the client gets the current list). `close` calls `leave`.
+`subscribe` handles both regular topics (calls `join`) and `__presence:*` topics (sends the current list, and resolves the denial reason when the caller may not observe the topic). `close` calls `leave`. The exported `subscribe` is marked as a plugin side effect, so it does not disarm an armed `authorizeWireSubscribe` server-grant gate for application topics; a wrapper function like the one below is app code, and the gate steps aside for it.
 
 If you need custom logic (auth gating, logging), wrap the hooks:
 
@@ -1636,7 +1636,7 @@ export const cursors = createCursor(redis, {
 
 Cursor publishes go to the internal `__cursor:{topic}` channel. Clients receive those frames only if the extension has subscribed them server-side - the adapter's wire-level `__`-prefix gate intentionally denies client-sent `__cursor:` subscribe frames. Call `cursors.attach(ws, topic, platform)` from your "join room" RPC (mirroring `presence.join`); without it, every `update` fans out to an empty subscriber set.
 
-`attach` authorizes first: it runs the same `platform.checkSubscribe(ws, topic)` a wire subscribe would, and throws `SubscribeDeniedError` (`err.code === 'SUBSCRIBE_DENIED'`, `err.reason` carrying the platform's denial reason) without subscribing or emitting anything. Membership granted by `attach` (or by an authorized `hooks.subscribe`) is also what gates the high-frequency `cursor` / `cursor-viewport` frames, so a socket that never attached cannot write into a room. That gate lives in `cursors.hooks.message`, so route inbound frames through it rather than calling `cursors.update()` yourself - see the handler below.
+`attach` validates the name first and throws a `TypeError` for one `update()` would reject (empty, longer than `maxTopicLength`, `__`-prefixed, or carrying a double quote, backslash or control character). It then authorizes: it runs the same `platform.checkSubscribe(ws, topic)` a wire subscribe would, and throws `SubscribeDeniedError` (`err.code === 'SUBSCRIBE_DENIED'`, `err.reason` carrying the platform's denial reason) without subscribing or emitting anything. Membership granted by `attach` (or by an authorized `hooks.subscribe`) is also what gates the high-frequency `cursor` / `cursor-viewport` frames, so a socket that never attached cannot write into a room. That gate lives in `cursors.hooks.message`, so route inbound frames through it rather than calling `cursors.update()` yourself - see the handler below.
 
 ```js
 // src/lib/server/rpc.js (or wherever you handle joinBoard / leaveBoard)
@@ -1672,8 +1672,7 @@ export function message(ws, { data, platform }) {
 }
 
 export function close(ws, { platform }) {
-  cursors.remove(ws, platform);
-  // No per-topic detach needed - uWS releases all subscriptions on disconnect.
+  cursors.remove(ws, platform); // uWS releases every subscription on disconnect; no per-topic detach
 }
 ```
 
@@ -1683,6 +1682,7 @@ export function close(ws, { platform }) {
 |---|---|---|
 | `throttle` | `16` | Minimum ms between broadcasts per user per topic. 60Hz default matches the world-state tick so an individual cursor stays smooth at the per-peer wire rate. |
 | `maxDataBytes` | `8192` | Maximum cursor data JSON size in UTF-8 bytes. Invalid JSON values, data deeper than 64 levels, and oversized updates are silently dropped. Must be a positive integer. |
+| `maxTopicLength` | `256` | Longest topic name, in UTF-16 code units, that `update()` accepts; a longer one is dropped. `attach()` throws a `TypeError` for it. Must be a positive integer. |
 | `topicThrottle` | `16` | World-state tick rate in ms. Each topic emits at most one bulk frame per window, carrying the latest position for every cursor that moved. Raise to 33 (30Hz) for high-density rooms; 0 disables the tick. |
 | `minMove` | `0` (off) | Drop a move at ingest when the cursor has not moved at least this far (Chebyshev distance) from the position the subscriber last saw, so sub-pixel wobble is never fanned out or relayed across instances. A debounced settle delivers the final resting position once when movement stops, so a still cursor is never stranded at a stale point. Measured against the last broadcast position, so a slow drift still delivers every `minMove` units. |
 | `position` | reads `data.x` / `data.y` | Extract the `{ x, y }` coordinate from cursor `data` for `minMove` and `viewport`. A frame with no extractable finite coordinate is always delivered. |

@@ -96,7 +96,8 @@ describe('observer lane: which lanes ask to SEE rather than to be granted', () =
 		platform.checkSubscribeDenial = 'FORBIDDEN';
 		const presence = createPresence(mockRedisClient('ol6:'), { key: 'id', select: (u) => ({ id: u.id }) });
 
-		const denial = await presence.sync(mockWs({ id: 'watcher' }), 'room', platform);
+		await expect(presence.sync(mockWs({ id: 'watcher' }), 'room', platform)).resolves.toBeUndefined();
+		const denial = await presence.hooks.subscribe(mockWs({ id: 'watcher' }), '__presence:room', { platform });
 
 		expect(denial).toBe('FORBIDDEN');
 		expect(platform.sent.filter((s) => s.topic === '__presence:room')).toHaveLength(0);

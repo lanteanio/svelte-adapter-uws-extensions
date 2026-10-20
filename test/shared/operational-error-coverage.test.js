@@ -21,7 +21,8 @@ const invalidInputs = {
 	],
 	'redis/cursor.js': [
 		'redis cursor: select() must return JSON-serializable data',
-		'Topic must not contain quotes, backslashes, or control characters'
+		'Topic must not contain quotes, backslashes, or control characters',
+		'cursor.attach: '
 	],
 	'redis/pubsub.js': [
 		'pubsub bus: onDegraded must be a function', 'pubsub bus: onRecovered must be a function',

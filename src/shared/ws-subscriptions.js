@@ -73,6 +73,40 @@ export function hasWsSubscription(ws, topic) {
 export const OBSERVER_LANE = Object.freeze({ requireGrant: true });
 
 /**
+ * The adapter's marker for a `subscribe` / `subscribeBatch` hook that is a
+ * plugin SIDE EFFECT rather than the app's authorization decision.
+ *
+ * With `authorizeWireSubscribe` armed (non-strict), the adapter hands the
+ * topic decision to the app whenever the handler module exports a subscribe
+ * hook, and the server-grant gate steps aside. The documented wiring for
+ * presence, cursor and groups re-exports their `hooks.subscribe`, so an
+ * unmarked plugin hook made the adapter believe the app had taken over and
+ * disarmed the gate for every topic. A marked hook still runs, and may still
+ * refuse its own internal channel; it just does not count as the app's
+ * gate. An app that wraps a plugin hook in its own function is not marked,
+ * and the gate steps aside as documented. Registered symbol, so it is the
+ * same key the adapter reads regardless of module duplication.
+ */
+const WS_HOOK_SIDE_EFFECT_ONLY = Symbol.for('adapter-uws.hook.side-effect-only');
+
+/**
+ * Mark each named hook on `hooks` as a side effect rather than a decision.
+ * @template {Record<string, any>} T
+ * @param {T} hooks
+ * @param {string[]} names
+ * @returns {T} the same object
+ */
+export function markSideEffectHooks(hooks, names) {
+	for (const name of names) {
+		const fn = hooks[name];
+		if (typeof fn === 'function') {
+			Object.defineProperty(fn, WS_HOOK_SIDE_EFFECT_ONLY, { value: true, writable: true, enumerable: true, configurable: true });
+		}
+	}
+	return hooks;
+}
+
+/**
  * Mirror a native `ws.unsubscribe(topic)` into the registry, so the binary
  * publish walk stops delivering the moment native membership ends. Never
  * throws.

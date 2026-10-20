@@ -32,6 +32,7 @@ function defaultCursorSelect(obj) {
 /**
  * @typedef {Object} ResolvedCursorOptions
  * @property {number} maxDataBytes
+ * @property {number} maxTopicLength
  * @property {number} throttleMs
  * @property {number} topicThrottleMs
  * @property {number} snapshotIntervalMs
@@ -63,6 +64,10 @@ export function resolveCursorOptions(options = {}) {
 	const maxDataBytes = options.maxDataBytes ?? 8192;
 	if (!Number.isInteger(maxDataBytes) || maxDataBytes < 1) {
 		throw new Error('redis cursor: maxDataBytes must be a positive integer');
+	}
+	const maxTopicLength = options.maxTopicLength ?? 256;
+	if (!Number.isInteger(maxTopicLength) || maxTopicLength < 1) {
+		throw new Error('redis cursor: maxTopicLength must be a positive integer');
 	}
 	const throttleMs = options.throttle ?? 16;
 	const topicThrottleMs = options.topicThrottle ?? 16;
@@ -213,6 +218,7 @@ export function resolveCursorOptions(options = {}) {
 
 	return Object.freeze({
 		maxDataBytes,
+		maxTopicLength,
 		throttleMs,
 		topicThrottleMs,
 		snapshotIntervalMs,

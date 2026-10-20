@@ -23,7 +23,7 @@ import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
-import { addWsSubscription, removeWsSubscription } from '../shared/ws-subscriptions.js';
+import { addWsSubscription, removeWsSubscription, markSideEffectHooks } from '../shared/ws-subscriptions.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { firstCommandError } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -788,7 +788,11 @@ export function createGroup(client, name, options = {}) {
 			subscribedPlatform = null;
 		},
 
-		hooks: {
+		// The subscribe hook joins this group's own channel and never decides
+		// an application topic. Marked as a side effect so that exporting it
+		// does not make the adapter believe the app took over the topic
+		// decision and disarm the server-grant gate for every other topic.
+		hooks: markSideEffectHooks({
 			async subscribe(ws, topic, { platform }) {
 				if (topic === internalTopic) {
 					await group.join(ws, platform);
@@ -802,7 +806,7 @@ export function createGroup(client, name, options = {}) {
 			async close(ws, { platform }) {
 				await group.leave(ws, platform);
 			}
-		}
+		}, ['subscribe'])
 	};
 
 	return group;
