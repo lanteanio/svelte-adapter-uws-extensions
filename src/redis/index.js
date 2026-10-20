@@ -80,18 +80,33 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		return false;
 	}
 	// Status events are emitted in order, so this tracks whether the
-	// connection that just closed had reached ready. Before ready its queue
-	// holds only handshake commands (AUTH, SELECT, the INFO ready check) and
-	// user commands still wait unsent in the offline queue. Rejecting a
-	// handshake command makes ioredis treat the handshake as fatal and flush
-	// that offline queue, so only a ready connection's queue is uncertain.
+	// connection that just closed had reached ready. Before ready ioredis
+	// writes handshake commands (AUTH, SELECT, the INFO ready check) and any
+	// command flagged `loading` (PUBLISH, SUBSCRIBE, MULTI, ...); everything
+	// else waits unsent in the offline queue. Rejecting a handshake command
+	// makes ioredis treat the handshake as fatal and flush that offline queue,
+	// so handshake commands stay with ioredis's own retry. The other sent
+	// commands are uncertain, and ioredis neither resends them nor keeps them
+	// once the next connection starts, so they are rejected here even when
+	// unanswered-command resend is enabled; otherwise they never settle.
+	const Command = Redis.Command;
 	let connectionReady = false;
 	redis.on('ready', () => { connectionReady = true; });
 	redis.on('close', () => {
 		const wasReady = connectionReady;
 		connectionReady = false;
-		if (!wasReady || redis.options.autoResendUnfulfilledCommands) return;
 		const error = new ConnectionError('redis', 'connection closed before the command reply; execution is uncertain');
+		if (!wasReady) {
+			const queue = redis.commandQueue;
+			for (let i = queue.length - 1; i >= 0; i--) {
+				const entry = queue.peekAt(i);
+				if (Command.checkFlag('HANDSHAKE_COMMANDS', entry.command.name)) continue;
+				queue.remove(i, 1);
+				entry.command.reject(error);
+			}
+			return;
+		}
+		if (redis.options.autoResendUnfulfilledCommands) return;
 		const previous = redis.prevCommandQueue;
 		redis.flushQueue(error, { offlineQueue: false });
 		if (previous && previous !== redis.commandQueue) {

@@ -292,3 +292,40 @@ it('keeps an unsent startup write when the connection drops during the handshake
 		expect(JSON.stringify(sink.records)).not.toMatch(/uncertain/);
 	} finally { sink.stop(); await admin.redis.del(key); await fixture.close(); }
 });
+
+it('rejects a command written during the handshake when that connection drops before ready', async () => {
+	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 });
+	const { client, admin, gate } = fixture;
+	const key = 'inttest-outage:handshake-written';
+	const subscriber = admin.duplicate();
+	const received = [];
+	try {
+		await admin.redis.del(key);
+		await subscriber.subscribe('inttest-outage:handshake-channel');
+		subscriber.on('message', (_channel, message) => received.push(message));
+		gate.inbound = true;
+		client.redis.connect().catch(() => {});
+		await vi.waitFor(() => {
+			expect(client.redis.status).toBe('connect');
+			expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'info')).toBe(true);
+		}, { timeout: 2000 });
+		// PUBLISH is valid while Redis loads, so ioredis writes it before ready;
+		// SET waits in the offline queue.
+		const publish = client.redis.publish('inttest-outage:handshake-channel', 'during-handshake');
+		const write = client.redis.set(key, 'after-handshake');
+		publish.catch(() => {});
+		await vi.waitFor(() => expect(received).toEqual(['during-handshake']), { timeout: 2000 });
+		expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'publish')).toBe(true);
+		const closed = new Promise(resolve => client.redis.once('close', resolve));
+		const droppedAt = Date.now();
+		client.redis.stream.destroy();
+		await closed;
+		gate.inbound = false;
+		const error = await publish.then(() => null, error => error);
+		expect(error?.name).toBe('ConnectionError');
+		expect(error.message).toMatch(/uncertain/);
+		expect(Date.now() - droppedAt).toBeLessThan(1000);
+		expect(await write).toBe('OK');
+		expect(client.redis.status).toBe('ready');
+	} finally { subscriber.disconnect(); await admin.redis.del(key); await fixture.close(); }
+});
