@@ -882,7 +882,7 @@ describe('redis pubsub bus', () => {
 
 		it('contains a rejected systemChannel subscribe and still activates', async () => {
 			platform.subscribe = async () => { throw new Error('Invalid access of closed uWS.WebSocket'); };
-			const breaker = createCircuitBreaker();
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			const healthy = createPubSubBus(client, { breaker });
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 			try {
@@ -915,6 +915,30 @@ describe('redis pubsub bus', () => {
 			} finally {
 				warn.mockRestore();
 				await bus.deactivate();
+			}
+		});
+
+		it('reports a synchronous systemChannel subscribe failure once with a breaker', async () => {
+			platform.subscribe = () => { throw new Error('Invalid access of closed uWS.WebSocket'); };
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const healthy = createPubSubBus(client, { breaker });
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const escaped = await unhandledDuring(async () => {
+					await healthy.hooks.open({ id: 'w1' }, { platform });
+					await healthy.hooks.open({ id: 'w2' }, { platform });
+				});
+				expect(escaped).toEqual([]);
+				expect(warn).toHaveBeenCalledTimes(1);
+				expect(warn.mock.calls[0]).toEqual([
+					'[redis.pubsub.system-channel.refused] INTERNAL_ERROR: system channel subscription failed; degraded/recovered events may not reach this connection.'
+				]);
+				expect(breaker.state).toBe('healthy');
+				await expectRelay();
+			} finally {
+				warn.mockRestore();
+				await healthy.deactivate();
+				breaker.destroy();
 			}
 		});
 
