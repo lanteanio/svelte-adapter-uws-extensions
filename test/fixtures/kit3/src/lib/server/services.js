@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { dev } from '$app/env';
 import { KIT3_PRIVATE_VALUE, REDIS_URL, DATABASE_URL, TEST_NAMESPACE } from '$app/env/private';
 import { createRedisClient } from 'svelte-adapter-uws-extensions/redis';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
@@ -17,13 +18,23 @@ if (!environment || !redisUrl || !databaseUrl || !namespace) {
 	throw new Error('The server module loaded before its private environment was initialized');
 }
 
+// The development edit check rewrites this value.
+export const revision = 'initial';
 export const state = { id: randomUUID(), initialized: false, messages: 0 };
 let services;
 
 export function getServices() {
 	if (services) return services;
-	const redis = createRedisClient({ url: redisUrl, keyPrefix: namespace, autoShutdown: false });
-	const pg = createPgClient({ connectionString: databaseUrl, autoShutdown: false });
+	// Named connections let the runner check that shutdown releases them.
+	// Idle pg connections stay open, so a pool that is never ended stays visible.
+	const redis = createRedisClient({
+		url: redisUrl, keyPrefix: namespace,
+		options: { connectionName: namespace + 'client' }
+	});
+	const pg = createPgClient({
+		connectionString: databaseUrl,
+		options: { application_name: namespace + 'client', idleTimeoutMillis: 0 }
+	});
 	const bus = createPubSubBus(redis, { channel: namespace + 'bus' });
 	const registry = createConnectionRegistry(redis, {
 		identify: (ws) => ws.getUserData().userId,
@@ -39,8 +50,13 @@ export function getServices() {
 	return services;
 }
 
+export function liveServices() {
+	return services;
+}
+
+// Production keeps the clients until requests drain; autoShutdown closes them.
 export async function shutdown() {
-	if (!services) return;
+	if (!dev || !services) return;
 	await services.registry.destroy();
 	await services.bus.deactivate();
 	services.postgresReplay.destroy();

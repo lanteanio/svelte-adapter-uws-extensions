@@ -1,4 +1,4 @@
-import { environment, getServices, shutdown, state } from '#lib/server/services.js';
+import { environment, getServices, liveServices, revision, shutdown, state } from '#lib/server/services.js';
 
 export { shutdown };
 
@@ -16,7 +16,7 @@ export async function open(ws, ctx) {
 	await services.bus.hooks.open(ws, ctx);
 	await services.registry.hooks.open(ws, ctx);
 	ctx.platform.send(ws, 'fixture', 'ready', {
-		environment, graph: state.id, initialized: state.initialized,
+		environment, graph: state.id, initialized: state.initialized, revision,
 		userId: ws.getUserData().userId,
 		registry: services.registry.instanceId
 	});
@@ -42,6 +42,7 @@ export async function message(ws, { data, platform }) {
 	platform.send(ws, 'fixture', 'handled', { ref: command.ref });
 }
 
+// A connection that closes after shutdown must not create new clients.
 export async function close(ws, ctx) {
-	await getServices().registry.hooks.close(ws, ctx);
+	await liveServices()?.registry.hooks.close(ws, ctx);
 }

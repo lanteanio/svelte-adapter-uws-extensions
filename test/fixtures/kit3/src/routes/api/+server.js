@@ -1,8 +1,14 @@
 import { json } from '@sveltejs/kit';
-import { environment, getServices, state } from '#lib/server/services.js';
+import { environment, getServices, revision, state } from '#lib/server/services.js';
+
+// The development edit check rewrites this value.
+const route = 'initial';
 
 export function GET() {
-	return json({ environment, graph: state.id, initialized: state.initialized, messages: state.messages });
+	return json({
+		environment, graph: state.id, initialized: state.initialized, messages: state.messages,
+		revision, route, listeners: process.listenerCount('sveltekit:shutdown')
+	});
 }
 
 export async function POST({ request }) {
