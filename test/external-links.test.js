@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { externalLinksOf, collectExternalUrls, crawlUrl, crawlExternalLinks, looksLikeSoft404, publicUrlProblem } from '../scripts/check-external-links.js';
+import { externalLinksOf, collectExternalUrls, crawlUrl, crawlExternalLinks, looksLikeSoft404, publicUrlProblem, rawMarkdownUrl } from '../scripts/check-external-links.js';
 describe('scheduled external documentation checks', () => {
 	it('collects visible targets with deduplicated URLs', () => {
 		expect(externalLinksOf('`[not](https://example.com/no)`')).toEqual([]);
@@ -43,10 +43,32 @@ it('retains and verifies owned sibling Markdown fragments', async () => {
 	const base = 'https://github.com/lanteanio/svelte-adapter-uws';
 	const links = collectExternalUrls([{ relative: 'README.md', text: '[live](' + base + '#testing) [dead](' + base + '#retired)' }]);
 	expect([...links.urls.keys()]).toEqual([base + '#testing', base + '#retired']);
-	const fetchImpl = async () => new Response('<h2 id="user-content-testing">Testing</h2>', { headers: { 'content-type': 'text/html' } });
+	const fetched = [];
+	// The raw Markdown, as raw.githubusercontent.com serves it: anchors come
+	// from the heading-slug rule and explicit HTML anchors, never from the
+	// rendered page, which carries no heading ids for a README this large.
+	const markdown = [
+		'# Adapter', '',
+		'## Testing', '',
+		'## Layered admission (upgrade path / message path)', '',
+		'<a id="compat-anchor"></a>', ''
+	].join('\n');
+	const fetchImpl = async (url) => {
+		fetched.push(url);
+		return new Response(markdown, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+	};
 	expect((await crawlUrl(base + '#testing', { fetchImpl })).ok).toBe(true);
+	expect((await crawlUrl(base + '#layered-admission-upgrade-path--message-path', { fetchImpl })).ok).toBe(true);
+	expect((await crawlUrl(base + '#compat-anchor', { fetchImpl })).ok).toBe(true);
 	expect((await crawlUrl(base + '#retired', { fetchImpl })).kind).toBe('missing-fragment');
-	expect((await crawlUrl(base + '/blob/dev/README.md#retired', { fetchImpl })).kind).toBe('missing-fragment');
+	expect((await crawlUrl(base + '/blob/dev/docs/releasing.md#stable-promotion', { fetchImpl })).kind).toBe('missing-fragment');
+	expect(fetched).toContain('https://raw.githubusercontent.com/lanteanio/svelte-adapter-uws/HEAD/README.md');
+	expect(fetched).toContain('https://raw.githubusercontent.com/lanteanio/svelte-adapter-uws/dev/docs/releasing.md');
+	expect(fetched.every((url) => url.startsWith('https://raw.githubusercontent.com/'))).toBe(true);
+	// A rendered page answering in place of the Markdown never confirms a fragment.
+	const htmlImpl = async () => new Response('<h2 id="user-content-testing">Testing</h2>', { headers: { 'content-type': 'text/html' } });
+	expect((await crawlUrl(base + '#testing', { fetchImpl: htmlImpl })).kind).toBe('missing-fragment');
+	expect(rawMarkdownUrl(new URL('https://github.com/lanteanio/svelte-realtime/blob/main/CHANGELOG.md'))).toBe('https://raw.githubusercontent.com/lanteanio/svelte-realtime/main/CHANGELOG.md');
 });
 
 it('reports malformed owned fragments without interrupting the remaining crawl', async () => {

@@ -11,26 +11,28 @@ import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { documentationFiles, linksOf } from './check-links.js';
-import { parseFragment } from 'parse5';
+import { anchorsOf, documentationFiles, linksOf } from './check-links.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_REDIRECTS = 6;
 const DEFAULT_BODY_LIMIT = 256 * 1024;
+const MARKDOWN_BODY_LIMIT = 8 * 1024 * 1024;
 
 function ownedMarkdownFragment(url) {
 	return url.hostname === 'github.com' && /^\/lanteanio\/(?:svelte-adapter-uws|svelte-realtime)(?:\/?|\/blob\/[^/]+\/[^?#]+\.md)$/.test(url.pathname) && url.hash && !/^#L\d+(?:-L\d+)?$/.test(url.hash);
 }
-function htmlHasFragment(html, fragment) {
-	const targets = new Set([fragment, 'user-content-' + fragment]);
-	let found = false;
-	function visit(node) {
-		if ((node.attrs || []).some(attribute => (attribute.name === 'id' || (node.tagName === 'a' && attribute.name === 'name')) && targets.has(attribute.value))) found = true;
-		for (const child of node.childNodes || []) visit(child);
-	}
-	visit(parseFragment(html));
-	return found;
+/**
+ * The raw Markdown behind an owned sibling page. Its anchors are computed with
+ * the same heading-slug rule the local gate uses, because GitHub inlines no
+ * heading ids into a README page that large and serves blob views to
+ * anonymous requests unreliably, so the rendered page cannot answer.
+ */
+export function rawMarkdownUrl(url) {
+	const match = /^\/lanteanio\/(svelte-adapter-uws|svelte-realtime)(?:\/?|\/blob\/([^/]+)\/([^?#]+\.md))$/.exec(url.pathname);
+	if (!match) return null;
+	const [, repo, ref = 'HEAD', file = 'README.md'] = match;
+	return 'https://raw.githubusercontent.com/lanteanio/' + repo + '/' + ref + '/' + file;
 }
 function normalizedHttpUrl(target) {
 	const url = new URL(target.startsWith('//') ? 'https:' + target : target);
@@ -167,17 +169,21 @@ export async function crawlUrl(startUrl, options = {}) {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
 	let fragment = null;
+	let markdownSource = null;
 	try {
 		const source = new URL(startUrl.startsWith('//') ? 'https:' + startUrl : startUrl);
-		if (ownedMarkdownFragment(source)) fragment = decodeURIComponent(source.hash.slice(1));
+		if (ownedMarkdownFragment(source)) {
+			fragment = decodeURIComponent(source.hash.slice(1));
+			markdownSource = rawMarkdownUrl(source);
+		}
 	} catch (error) {
 		return { ok: false, kind: 'invalid-url', url: startUrl, redirects: [], detail: error.message };
 	}
-	const bodyLimit = options.bodyLimit ?? (fragment ? 2 * 1024 * 1024 : DEFAULT_BODY_LIMIT);
+	const bodyLimit = options.bodyLimit ?? (fragment ? MARKDOWN_BODY_LIMIT : DEFAULT_BODY_LIMIT);
 	const allowPrivate = options.allowPrivate === true;
 	const redirects = [];
 	const seen = new Set();
-	let current = normalizedHttpUrl(startUrl);
+	let current = markdownSource ?? normalizedHttpUrl(startUrl);
 	if (!current) return { ok: false, kind: 'invalid-url', url: startUrl, redirects, detail: 'URL is not HTTP(S)' };
 
 	for (;;) {
@@ -247,7 +253,7 @@ export async function crawlUrl(startUrl, options = {}) {
 		if (redirects.length) {
 			return { ok: false, kind: 'redirect', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `redirects to ${current}` };
 		}
-		if (fragment && (!html || !htmlHasFragment(body, fragment))) return { ok: false, kind: 'missing-fragment', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `owned Markdown page does not expose #${fragment} within the ${bodyLimit}-byte inspection limit` };
+		if (fragment && (html || !anchorsOf(body).has(fragment))) return { ok: false, kind: 'missing-fragment', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `no heading or anchor in ${current} produces #${fragment} within the ${bodyLimit}-byte inspection limit` };
 		return { ok: true, kind: 'ok', url: startUrl, finalUrl: current, status: response.status, redirects, detail: `HTTP ${response.status}` };
 	}
 }

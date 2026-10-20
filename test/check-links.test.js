@@ -215,6 +215,14 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 		result = run();
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain('relative target absent from the staged tree');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Folder](./)\n[Entries folder](../docs/)\n');
+		result = run();
+		expect(result.stderr).toBe('');
+		expect(result.status).toBe(0);
+		put('docs/guide.md', '# Guide\n[Overview](../README.md/)\n');
+		result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('relative target absent from the staged tree (the git index): README.md/');
 		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n');
 		expect(run().status).toBe(0);
 		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'docs'] }));

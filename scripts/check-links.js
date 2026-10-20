@@ -454,8 +454,17 @@ export function checkLink(rel, target, docs, options = {}) {
 	const status = ownedPathStatus(resolved);
 	if (status === 'outside') return `path leaves repository: ${resolved}`;
 	if (status === 'missing') return `no such file with exact case: ${resolved}`;
+	// A trailing slash names a directory (docs/, src/shared/). The index lists
+	// files only, so a directory is present when a tracked file lives under it,
+	// and a tracked FILE named with a trailing slash is not a directory.
+	const treePath = resolved.replace(/\/+$/, '');
 	const tracked = stagedTree();
-	if (tracked && !treeContains(tracked, resolved)) return `relative target absent from the staged tree (the git index): ${resolved}`;
+	if (tracked) {
+		const present = treePath !== resolved
+			? !tracked.has(treePath) && treeContains(tracked, treePath)
+			: treeContains(tracked, treePath);
+		if (!present) return `relative target absent from the staged tree (the git index): ${resolved}`;
+	}
 	if (options.packagedDocs?.has(rel) && options.packagedFiles && !packageContains(resolved, options.packagedFiles)) {
 		return `target omitted from package: ${resolved}`;
 	}
