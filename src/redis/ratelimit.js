@@ -477,10 +477,18 @@ export function createRateLimit(client, options) {
 	const bucketPrefix = SCRIPT_VERSION + ':' + (budget === 'tenant'
 		? mode.infix.slice(0, -1) + '-tenant:' : mode.infix);
 
+	// The adapter freezes attribution before the open hook. Cache both the
+	// attributed and unattributed answers to avoid a second native read per call.
+	const tenantIds = new WeakMap();
 	function resolveTenant(ws) {
 		if (tenant) return tenant(ws);
-		const id = attribution(ws)?.tenantId;
-		return typeof id === 'string' ? id : null;
+		let id = tenantIds.get(ws);
+		if (id === undefined) {
+			const raw = attribution(ws)?.tenantId;
+			id = typeof raw === 'string' ? raw : null;
+			if ((typeof ws === 'object' && ws !== null) || typeof ws === 'function') tenantIds.set(ws, id);
+		}
+		return id;
 	}
 
 	const b = options.breaker;

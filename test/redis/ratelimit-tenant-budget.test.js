@@ -134,6 +134,28 @@ describe('tenant budget identity', () => {
 		expect((await limiter.peek(socket('other'))).allowed).toBe(false);
 	});
 
+	for (const id of [null, 'alpha']) {
+		it(`reads immutable default attribution once per connection with tenant=${id}`, async () => {
+			const ws = attributed(id);
+			const get = vi.spyOn(ws, 'getUserData');
+			const limiter = createRateLimit(mockRedisClient(), { points: 1, interval: 60000, keyBy: () => 'same' });
+			expect((await limiter.consume(ws)).allowed).toBe(true);
+			expect((await limiter.consume(ws)).allowed).toBe(false);
+			expect((await limiter.peek(ws)).allowed).toBe(false);
+			expect(get).toHaveBeenCalledOnce();
+		});
+	}
+
+	it('keeps explicit tenant resolvers dynamic instead of caching their answers', async () => {
+		const resolve = vi.fn().mockReturnValueOnce('alpha').mockReturnValueOnce('beta').mockReturnValueOnce('alpha');
+		const limiter = createRateLimit(mockRedisClient(), { points: 1, interval: 60000, budget: 'tenant', tenant: resolve });
+		const ws = attributed('ignored');
+		expect((await limiter.consume(ws)).allowed).toBe(true);
+		expect((await limiter.consume(ws)).allowed).toBe(true);
+		expect((await limiter.consume(ws)).allowed).toBe(false);
+		expect(resolve).toHaveBeenCalledTimes(3);
+	});
+
 	it('refuses invalid budget values and missing or ambiguous tenant identifiers before Redis or fallback', async () => {
 		const client = mockRedisClient();
 		for (const budget of [null, 'global', '', false]) {

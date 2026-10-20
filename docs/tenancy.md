@@ -29,7 +29,7 @@ const verdict = await limiter.consume(ws);
 if (!verdict.allowed) return;
 ```
 
-`budget: 'principal'` remains the default and gives each `keyBy` result its own allowance inside the tenant namespace. Both modes use the adapter's frozen attribution when `tenant` is omitted. An explicit `tenant: ws => id` resolver overrides that source, including a null answer. Without attribution or a resolver, principal mode retains its unscoped keys; tenant mode rejects `consume` and `peek` because an unidentified connection cannot name a tenant allowance. Tenant ids must be non-empty strings without NUL bytes in tenant mode.
+`budget: 'principal'` remains the default and gives each `keyBy` result its own allowance inside the tenant namespace. Both modes use the adapter's frozen attribution when `tenant` is omitted and cache that immutable answer per connection. An explicit `tenant: ws => id` resolver overrides that source, including a null answer. Without attribution or a resolver, principal mode retains its unscoped keys; tenant mode rejects `consume` and `peek` because an unidentified connection cannot name a tenant allowance. Tenant ids must be non-empty strings without NUL bytes in tenant mode.
 
 Tenant mode never calls `keyBy`. `window`, `sliding`, and `gcra` keep their existing refill semantics, and both `consume` and read-only `peek` see the same shared state. All limiter instances sharing a namespace must agree on the budget and refill configuration. The emergency scale applies as before. A local storage-failure floor shares its allowance across that instance's tenant principals, but N instances can still allow N times the configured floor while Redis is unavailable.
 
