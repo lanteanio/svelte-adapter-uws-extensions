@@ -74,6 +74,9 @@ return 0
 
 // Restore only an absent registration. A surviving older socket must never
 // replace a newer owner or keep that owner's abandoned row alive forever.
+// Replies 2 when it restored the row, 1 when it renewed this instance's row,
+// 0 when another owner or transport holds it.
+const REGISTRATION_RESTORED = 2;
 const REFRESH_REGISTRATION = `
 -- REGISTRY_REFRESH
 local current = redis.call('hget', KEYS[1], 'instanceId')
@@ -81,6 +84,8 @@ if not current then
   redis.call('hset', KEYS[1], 'instanceId', ARGV[1], 'sessionId', ARGV[2], 'ts', ARGV[3])
   if ARGV[4] ~= '' then redis.call('hset', KEYS[1], 'attrs', ARGV[4])
   else redis.call('hdel', KEYS[1], 'attrs') end
+  redis.call('expire', KEYS[1], ARGV[5])
+  return 2
 elseif current ~= ARGV[1] or redis.call('hget', KEYS[1], 'sessionId') ~= ARGV[2] then
   return 0
 end
@@ -424,6 +429,42 @@ export function createConnectionRegistry(client, options) {
 		if (pendingOwner === null || pendingOwner === ownerInstanceId) indexChecks.delete(userId);
 		if (userToInstance.get(userId) !== ownerInstanceId) return;
 		removeIndex(userId);
+		if (ownerInstanceId !== instanceId) restoreLocalUser(userId);
+	}
+
+	/**
+	 * A peer that was the user's most recent owner closed them, which deleted
+	 * the Redis row and unindexed the user everywhere, though the user still
+	 * has a socket here. Index the user locally at once and run the heartbeat's
+	 * restore for this one registration now instead of on the next tick. The
+	 * restore writes the row only while it is absent, so a newer owner that
+	 * registered meanwhile keeps it; a restore that lands announces an open.
+	 * @param {string} userId
+	 */
+	function restoreLocalUser(userId) {
+		const command = localRefresh.get(userId);
+		if (destroyed || command === undefined) return;
+		applyOpenEvent(userId, instanceId, parseAttrsField(command[6]));
+		// A refused or failed restore is retried by the next heartbeat.
+		if (!withBreakerGuard()) return;
+		/** @type {Promise<any>} */ (redis[command[0]](...command.slice(1))).then(
+			(result) => { breaker?.success(); if (result === REGISTRATION_RESTORED) registrationRestored(command); },
+			(err) => breaker?.failure(err)
+		);
+	}
+
+	/**
+	 * Peers dropped the user on the close that removed the row, so a restored
+	 * row is announced like an open. Without `attributes` there is no index
+	 * and no events channel; the row alone restores routing.
+	 * @param {any[]} command the user's registration snapshot
+	 */
+	function registrationRestored(command) {
+		if (!attributes || !currentRefresh(command)) return;
+		const userId = command[2].slice(userKeyPrefix.length);
+		const attrs = parseAttrsField(command[6]);
+		applyOpenEvent(userId, instanceId, attrs);
+		publishEvent({ type: 'open', userId, instanceId, attrs });
 	}
 
 	// Right-to-erasure (`live.forget`): clear EVERY in-memory trace of a user on
@@ -907,6 +948,12 @@ export function createConnectionRegistry(client, options) {
 		// healthy; a tick probes through its own admission.
 		admit: breaker ? () => breaker.isHealthy : null,
 		onError: (err) => breaker?.failure(err),
+		onSettled(commands, results) {
+			for (let i = 0; results && i < results.length; i++) {
+				const result = results[i];
+				if (result && !result[0] && result[1] === REGISTRATION_RESTORED) registrationRestored(commands[i]);
+			}
+		},
 		onComplete(cycle) {
 			if (cycle.total > 0 && cycle.error === null) breaker?.success();
 			// A tick that reached no owner returns the probe it was admitted with.

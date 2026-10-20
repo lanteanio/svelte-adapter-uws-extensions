@@ -2303,6 +2303,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				h.set('sessionId', sessionId);
 				h.set('ts', String(ts));
 				if (attrs) h.set('attrs', attrs); else h.delete('attrs');
+				return 2;
 			} else if (current !== owner || h.get('sessionId') !== sessionId) return 0;
 			return 1;
 		}

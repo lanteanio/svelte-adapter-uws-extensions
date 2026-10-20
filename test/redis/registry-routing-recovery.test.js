@@ -46,6 +46,33 @@ it('restores the surviving no-attributes owner and routes peer sends and request
 	await reach(peer, pa, wa);
 });
 
+it('announces a heartbeat-restored row so peers route sendTo to the surviving owner again', async () => {
+	const attributes = () => ({ tenantId: 't' });
+	const a = registry({ attributes }), b = registry({ attributes }), peer = registry({ attributes });
+	const wa = socket('a'), wb = socket('b'), pa = mockPlatform();
+	await a.hooks.open(wa, { platform: pa });
+	await b.hooks.open(wb, { platform: mockPlatform() });
+	await peer.hooks.open(mockWs({}), { platform: mockPlatform() });
+	// The immediate restore on the peer close fails; the heartbeat must finish it.
+	const evalScript = client.redis.eval.bind(client.redis);
+	let failed = 0;
+	const spy = vi.spyOn(client.redis, 'eval').mockImplementation(async (script, ...args) => {
+		if (failed === 0 && String(script).includes('REGISTRY_REFRESH')) { failed++; throw new Error('offline'); }
+		return evalScript(script, ...args);
+	});
+	await b.hooks.close(wb);
+	await flush();
+	spy.mockRestore();
+	expect(failed).toBe(1);
+	await peer.sendTo({ tenantId: 't' }, 'room', 'before', 1);
+	expect(pa.sent.some(f => f.event === 'before')).toBe(false);
+	await tick();
+	await expect.poll(async () => {
+		await peer.sendTo({ tenantId: 't' }, 'room', 'after', 2);
+		return pa.sent.some(f => f.ws === wa && f.event === 'after');
+	}).toBe(true);
+});
+
 it('repairs a failed initial registration without requiring another open', async () => {
 	const a = registry(), wa = socket('a'), pa = mockPlatform();
 	const multi = client.redis.multi.bind(client.redis);

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
@@ -1804,6 +1804,76 @@ describe('redis connection registry', () => {
 				expect(out).toMatch(/push_sendto_total\{result="ok"\}\s+1/);
 			} finally {
 				await local.destroy();
+			}
+		});
+	});
+	describe('attributes / sendTo: a peer close for a user still connected here', () => {
+		it('keeps the local socket reachable and takes ownership back', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const a = createConnectionRegistry(client, opts);
+			const b = createConnectionRegistry(client, opts);
+			const pa = mockPlatform();
+			const pb = mockPlatform();
+			try {
+				const onA = wsWithSession({ userId: 'u', tenantId: 't' }, 'sa');
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				await a.hooks.open(onA, { platform: pa });
+				await b.hooks.open(onB, { platform: pb });
+				expect((await a.lookup('u'))?.instanceId).toBe(b.instanceId);
+
+				await b.hooks.close(onB, { platform: pb });
+
+				await a.sendTo({ tenantId: 't' }, 'room', 'ping', 1);
+				expect(pa.sent.filter((f) => f.ws === onA && f.event === 'ping')).toHaveLength(1);
+				await expect.poll(async () => (await b.lookup('u'))?.instanceId).toBe(a.instanceId);
+
+				await expect.poll(async () => {
+					await b.sendTo({ tenantId: 't' }, 'room', 'pong', 2);
+					return pa.sent.some((f) => f.ws === onA && f.event === 'pong');
+				}).toBe(true);
+			} finally {
+				await a.destroy();
+				await b.destroy();
+			}
+		});
+
+		it('leaves a row a newer owner wrote before the close arrived', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const a = createConnectionRegistry(client, opts);
+			const b = createConnectionRegistry(client, opts);
+			const pa = mockPlatform();
+			const rowKey = client.key('conns:u');
+			try {
+				const onA = wsWithSession({ userId: 'u', tenantId: 't' }, 'sa');
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				await a.hooks.open(onA, { platform: pa });
+				await b.hooks.open(onB, { platform: mockPlatform() });
+
+				// A third instance registers the user between B's row delete and
+				// the close announcement reaching A.
+				const publish = client.redis.publish.bind(client.redis);
+				const spy = vi.spyOn(client.redis, 'publish').mockImplementationOnce(async (channel, message) => {
+					await client.redis.hset(rowKey, 'instanceId', 'newer-instance', 'sessionId', 'sn');
+					return publish(channel, message);
+				});
+				await b.hooks.close(onB);
+				await new Promise((r) => setImmediate(r));
+
+				expect(await client.redis.hgetall(rowKey)).toMatchObject({ instanceId: 'newer-instance', sessionId: 'sn' });
+				expect(spy.mock.calls.filter(([, m]) => String(m).includes('"open"'))).toHaveLength(0);
+				spy.mockRestore();
+
+				await a.sendTo({ tenantId: 't' }, 'room', 'ping', 1);
+				expect(pa.sent.filter((f) => f.ws === onA && f.event === 'ping')).toHaveLength(1);
+			} finally {
+				await a.destroy();
+				await b.destroy();
 			}
 		});
 	});
