@@ -88,7 +88,10 @@ export interface PubSubBus {
 	/**
 	 * Start the Redis subscriber. Incoming messages from other instances
 	 * are forwarded to the local platform.publish(). Call once at startup.
-	 * Idempotent.
+	 * Idempotent; overlapping calls share one activation. Rejects when the
+	 * activation fails, which the bus then retries until deactivate(): on a
+	 * timer that backs off from 1 to 30 seconds, on the next call, and as soon
+	 * as its breaker admits a probe or recovers.
 	 */
 	activate(platform: Platform): Promise<void>;
 
@@ -109,6 +112,11 @@ export interface PubSubBus {
 	 * on client-sent subscribe frames. It still runs the app's subscribe /
 	 * subscribeBatch hook; on a bus with a breaker, a refusal is reported once as
 	 * `EXTENSIONS-ERR-PUBSUB-SYSTEM-CHANNEL-REFUSED`.
+	 *
+	 * The hook resolves when the bus cannot activate, so the connection stays
+	 * open with local delivery; the failure is reported once per failure
+	 * streak as `EXTENSIONS-ERR-PUBSUB-SUBSCRIBE` and retried as `activate()`
+	 * describes.
 	 */
 	hooks: {
 		open(ws: any, ctx: { platform: Platform }): Promise<void>;

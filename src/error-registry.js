@@ -102,6 +102,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	REDIS_SUBSCRIBER_SILENT: 'EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT',
 	REDIS_SUBSCRIBER_UNREACHABLE: 'EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE',
 	PUBSUB_SUBSCRIBER: 'EXTENSIONS-ERR-PUBSUB-SUBSCRIBER',
+	PUBSUB_SUBSCRIBE: 'EXTENSIONS-ERR-PUBSUB-SUBSCRIBE',
 	CRDT_SUBSCRIBER: 'EXTENSIONS-ERR-CRDT-SUBSCRIBER',
 	CRDT_SUBSCRIBE: 'EXTENSIONS-ERR-CRDT-SUBSCRIBE',
 	SMOOTH_SUBSCRIBE: 'EXTENSIONS-ERR-SMOOTH-SUBSCRIBE',
@@ -891,6 +892,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: REDIS_RECONNECTS,
 		nextAction: 'Inspect Redis connectivity and verify cross-instance delivery resumes.',
 		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-subscriber'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBE,
+		event: 'redis.pubsub.subscribe.failed', component: 'runtime.redis.pubsub', severity: 'error',
+		problemPrefix: 'The pub/sub bus could not subscribe to its channel.',
+		cause: 'SUBSCRIBE on the bus\'s dedicated connection was rejected: the Redis user may not subscribe to the channel (NOPERM), or the connection failed while subscribing. On a bus with a breaker, an open breaker refuses the activation before it reaches Redis.',
+		consequence: 'Publishes from other instances do not reach this instance until an activation succeeds; local publishes and the WebSocket connections are unaffected. Reported once per failure streak.',
+		automaticRecovery: 'The connection is closed. The bus activates again on the next open hook, on a retry that backs off from one to thirty seconds until deactivate(), and as soon as its breaker admits a probe or recovers; an activation that succeeds re-arms this report.',
+		nextAction: 'Check Redis connectivity and that the Redis user may SUBSCRIBE to the bus channel.',
+		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-subscribe'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.CRDT_SUBSCRIBER,

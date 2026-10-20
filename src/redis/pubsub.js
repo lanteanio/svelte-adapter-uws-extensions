@@ -11,7 +11,7 @@ import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
  */
 
 import { assert } from '../shared/assert.js';
-import { randomBytes, now, monotonicNow } from '../shared/runtime.js';
+import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { createRelayQueue } from './_relay-queue.js';
 import { createBusValidator } from '../shared/bus-validate.js';
@@ -33,6 +33,10 @@ import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions
 // The degraded / recovered frames report this worker's own breaker, so they go
 // to this worker's subscribers only, and they make no monotonic promise.
 const SYSTEM_FRAME = Object.freeze({ relay: false, seq: false });
+
+// The retry of a failed activation backs off between these.
+const ACTIVATE_RETRY_MIN_MS = 1000;
+const ACTIVATE_RETRY_MAX_MS = 30000;
 
 // The subscribe denial reasons the adapter declares (its SubscribeDenialReason
 // type) and INTERNAL_ERROR, its answer when a subscribe hook throws. Any
@@ -57,6 +61,8 @@ const ADAPTER_DENIAL_CODES = new Set(['UNAUTHENTICATED', 'FORBIDDEN', 'INVALID_T
  *   the Redis subscriber. Both calls are idempotent: per-connection subscribe
  *   is a no-op on repeat; activate early-outs after the first call. When
  *   `systemChannel` is `null` or `false`, only the activate step runs.
+ *   A failed activation does not reject the hook: it is reported once per
+ *   failure streak and retried, and the connection stays open.
  */
 
 /**
@@ -174,6 +180,16 @@ export function createPubSubBus(client, options = {}) {
 
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
+
+	// From activate() until deactivate(): a failed activation is retried, on a
+	// timer that backs off, and at once when the breaker lets a probe through or
+	// recovers. One report per failure streak.
+	let wanted = false;
+	let activateFailing = false;
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let retryTimer = null;
+	let retryDueAt = 0;
+	let retryMs = 0;
 
 	// Bounded FIFO relay batching: coalesce Redis publishes within a single
 	// event-loop iteration into bounded pipelined round trips. Each envelope
@@ -495,8 +511,10 @@ export function createPubSubBus(client, options = {}) {
 		} catch (err) { failed(err); }
 	}
 
-	// Emits degraded / recovered while the bus is active or activating.
+	// Emits degraded / recovered from activate() until deactivate(), and lets a
+	// failed activation try again once the breaker admits a probe.
 	function breakerChanged(from, to) {
+		if (!active && to !== 'broken') scheduleRetry(0);
 		if (from === 'healthy' && to !== 'healthy') {
 			if (onDegraded) {
 				try { onDegraded(); } catch { /* don't propagate user errors */ }
@@ -570,6 +588,85 @@ export function createPubSubBus(client, options = {}) {
 			// Malformed envelope; counted so a stream of bad messages
 			// is observable instead of silently swallowed.
 			mParseErrors?.inc();
+		}
+	}
+
+	// One activation: subscribe a fresh subscriber connection. A failure is
+	// reported once per failure streak and retried until deactivate().
+	async function startActivation() {
+		try {
+			if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
+				unsubscribeBreaker = b.subscribe(breakerChanged);
+			}
+			b?.guard();
+		} catch (err) {
+			activationFailed(err);
+			throw err;
+		}
+
+		const sub = openSubscriber(client, 'pubsub');
+		subscriber = sub;
+		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
+		sub.on('message', (ch, message) => receive(sub, ch, message));
+
+		try {
+			await sub.subscribe(channel);
+		} catch (err) {
+			// quit() is the likely one to reject here, since Redis is what just
+			// failed, and its handler runs after the slot is cleared, so it uses
+			// this connection rather than reading the slot.
+			if (subscriber === sub) subscriber = null;
+			sub.quit().catch(() => sub.disconnect());
+			activation = null;
+			b?.failure(err);
+			activationFailed(err);
+			throw err;
+		}
+		// Settle the shared state before the breaker runs its listeners,
+		// which may call activate() or deactivate() synchronously.
+		active = true;
+		activation = null;
+		activateFailing = false;
+		stopRetry();
+		retryMs = 0;
+		b?.success();
+	}
+
+	function activationFailed(err) {
+		if (!activateFailing) {
+			activateFailing = true;
+			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBE, { error: err });
+		}
+		retryMs = retryMs === 0 ? ACTIVATE_RETRY_MIN_MS : Math.min(retryMs * 2, ACTIVATE_RETRY_MAX_MS);
+		scheduleRetry(retryMs);
+	}
+
+	// Activate again after `delayMs`, unless the bus is active, activating or
+	// no longer wanted by then. A sooner request replaces a later one.
+	function scheduleRetry(delayMs) {
+		if (!wanted) return;
+		const dueAt = monotonicNow() + delayMs;
+		if (retryTimer !== null) {
+			if (dueAt >= retryDueAt) return;
+			clearTimer(retryTimer);
+		}
+		retryDueAt = dueAt;
+		retryTimer = setTimer(() => {
+			retryTimer = null;
+			if (!wanted || active || activation || !activePlatform) return;
+			const current = startActivation();
+			activation = current;
+			current.then(() => {}, () => {}).finally(() => {
+				if (activation === current) activation = null;
+			});
+		}, delayMs);
+		if (retryTimer.unref) retryTimer.unref();
+	}
+
+	function stopRetry() {
+		if (retryTimer !== null) {
+			clearTimer(retryTimer);
+			retryTimer = null;
 		}
 	}
 
@@ -892,45 +989,12 @@ export function createPubSubBus(client, options = {}) {
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);
+			wanted = true;
 			if (active) return;
 			// Connections that open together share one activation. A second
 			// subscriber would deliver every remote message again.
 			if (activation) return activation;
-			const current = (async () => {
-				b?.guard();
-
-				if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
-					unsubscribeBreaker = b.subscribe(breakerChanged);
-				}
-
-				const sub = openSubscriber(client, 'pubsub');
-				subscriber = sub;
-				sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
-				sub.on('message', (ch, message) => receive(sub, ch, message));
-
-				try {
-					await sub.subscribe(channel);
-				} catch (err) {
-					b?.failure(err);
-					activePlatform = null;
-					// quit() is the likely one to reject here, since Redis is what just
-					// failed, and its handler runs after the slot is cleared, so it uses
-					// this connection rather than reading the slot.
-					if (subscriber === sub) subscriber = null;
-					sub.quit().catch(() => sub.disconnect());
-					if (unsubscribeBreaker) {
-						unsubscribeBreaker();
-						unsubscribeBreaker = null;
-					}
-					activation = null;
-					throw err;
-				}
-				// Settle the shared state before the breaker runs its listeners,
-				// which may call activate() or deactivate() synchronously.
-				active = true;
-				activation = null;
-				b?.success();
-			})();
+			const current = startActivation();
 			activation = current;
 			try {
 				await current;
@@ -940,6 +1004,9 @@ export function createPubSubBus(client, options = {}) {
 		},
 
 		async deactivate() {
+			wanted = false;
+			stopRetry();
+			activateFailing = false;
 			if (unsubscribeBreaker) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;
@@ -977,7 +1044,14 @@ export function createPubSubBus(client, options = {}) {
 						reportSystemChannelFailure();
 					}
 				}
-				await bus.activate(platform);
+				// Local delivery does not need the bus, so a failed activation
+				// leaves the connection open: adapters do not await this hook, and
+				// a rejection would end the process on one that leaves it
+				// unhandled or close the connection on one that catches it. The
+				// activation reported the failure and retries it.
+				try {
+					await bus.activate(platform);
+				} catch { /* reported once per failure streak and retried */ }
 			}
 		}
 	};

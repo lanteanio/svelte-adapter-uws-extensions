@@ -8,7 +8,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 71 diagnostic events. Each is one canonical line
+- 72 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -102,6 +102,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT](#extensions-err-redis-subscriber-silent) | `redis.subscriber.silent` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.silent severity=error] A Redis subscriber connection stopped answering and was closed.` |
 | [EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE](#extensions-err-redis-subscriber-unreachable) | `redis.subscriber.unreachable` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.subscriber event=redis.subscriber.unreachable severity=error] No node of the Redis Cluster accepted a subscriber connection.` |
 | [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber) | `redis.pubsub.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.subscriber.failed severity=error] The pub/sub bus subscriber connection reported an error.` |
+| [EXTENSIONS-ERR-PUBSUB-SUBSCRIBE](#extensions-err-pubsub-subscribe) | `redis.pubsub.subscribe.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.subscribe.failed severity=error] The pub/sub bus could not subscribe to its channel.` |
 | [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber) | `redis.crdt.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.crdt event=redis.crdt.subscriber.failed severity=error] The CRDT relay subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber) | `redis.smooth.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.smooth event=redis.smooth.subscriber.failed severity=error] The smooth relay subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-TOPIC-BROADCAST-SUBSCRIBER](#extensions-err-topic-broadcast-subscriber) | `redis.topic-broadcast.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.topic-broadcast event=redis.topic-broadcast.subscriber.failed severity=error] The topic-broadcast subscriber connection reported an error.` |
@@ -119,7 +120,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 71 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 72 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -187,6 +188,7 @@ Indexed events:
 - `redis.subscriber.silent` - [EXTENSIONS-ERR-REDIS-SUBSCRIBER-SILENT](#extensions-err-redis-subscriber-silent)
 - `redis.subscriber.unreachable` - [EXTENSIONS-ERR-REDIS-SUBSCRIBER-UNREACHABLE](#extensions-err-redis-subscriber-unreachable)
 - `redis.pubsub.subscriber.failed` - [EXTENSIONS-ERR-PUBSUB-SUBSCRIBER](#extensions-err-pubsub-subscriber)
+- `redis.pubsub.subscribe.failed` - [EXTENSIONS-ERR-PUBSUB-SUBSCRIBE](#extensions-err-pubsub-subscribe)
 - `redis.crdt.subscriber.failed` - [EXTENSIONS-ERR-CRDT-SUBSCRIBER](#extensions-err-crdt-subscriber)
 - `redis.smooth.subscriber.failed` - [EXTENSIONS-ERR-SMOOTH-SUBSCRIBER](#extensions-err-smooth-subscriber)
 - `redis.topic-broadcast.subscriber.failed` - [EXTENSIONS-ERR-TOPIC-BROADCAST-SUBSCRIBER](#extensions-err-topic-broadcast-subscriber)
@@ -1101,6 +1103,18 @@ the stable ID tag on the line):
 - **Automatic recovery:** The Redis client owns reconnection; this handler records the failure.
 - **Next action:** Inspect Redis connectivity and verify cross-instance delivery resumes.
 - **Runtime help:** `docs/errors.md#extensions-err-pubsub-subscriber`
+- **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
+
+<a id="extensions-err-pubsub-subscribe"></a>
+## `EXTENSIONS-ERR-PUBSUB-SUBSCRIBE`
+
+- **Code/event:** `redis.pubsub.subscribe.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.subscribe.failed severity=error] The pub/sub bus could not subscribe to its channel.`
+- **Cause:** SUBSCRIBE on the bus's dedicated connection was rejected: the Redis user may not subscribe to the channel (NOPERM), or the connection failed while subscribing. On a bus with a breaker, an open breaker refuses the activation before it reaches Redis.
+- **Consequence:** Publishes from other instances do not reach this instance until an activation succeeds; local publishes and the WebSocket connections are unaffected. Reported once per failure streak.
+- **Automatic recovery:** The connection is closed. The bus activates again on the next open hook, on a retry that backs off from one to thirty seconds until deactivate(), and as soon as its breaker admits a probe or recovers; an activation that succeeds re-arms this report.
+- **Next action:** Check Redis connectivity and that the Redis user may SUBSCRIBE to the bus channel.
+- **Runtime help:** `docs/errors.md#extensions-err-pubsub-subscribe`
 - **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
 
 <a id="extensions-err-crdt-subscriber"></a>
