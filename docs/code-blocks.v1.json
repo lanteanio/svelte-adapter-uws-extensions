@@ -1363,11 +1363,11 @@
 		},
 		{
 			"document": "README.md",
-			"fingerprint": "1beba218a6f827ca4db57ab54d6f3fef015f2b8f81d7cb4f7758901c69f2e7fd",
+			"fingerprint": "965974999b626af1c923a7ce165baa327b5baaf588425283d7868f256d1c831b",
 			"occurrence": 1,
 			"language": "js",
 			"line": 3610,
-			"section": "svelte-adapter-uws-extensions > URL safety (SSRF) > DNS rebinding (the documented gap, and how to close it)",
+			"section": "svelte-adapter-uws-extensions > URL safety (SSRF) > Resolved destinations: the check names the address you connect to",
 			"classification": "syntax",
 			"channel": "acorn",
 			"reason": "not runnable: ambient-identifiers userWebhookUrl"

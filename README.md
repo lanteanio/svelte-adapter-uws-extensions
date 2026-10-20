@@ -310,9 +310,9 @@ The same pattern applies to every extension in this README: read identity, decid
 Follow the [production hardening guide](https://svelte-realtime.dev/guides/production-hardening) for proxy trust, enumeration-safe responses and deployment policy. Connect that policy to the supported extension APIs:
 
 - [Authorize every extension call](#authorize-every-extension-call) using server-established identity and tenant scope before accessing shared state.
-- Configure [capability cookies](#capability-cookie), including `previousSecret` during key rotation, and [cluster-clock fencing](#cluster-clock) for time-sensitive writes.
+- Configure [capability cookies](#capability-cookie), including `previousSecret` during key rotation, and [clock-skew self-fencing](#self-fencing-fence) (the sampler's `fence` option plus `attachClockFence(platform, skew)`), so a clustered `live.smooth` authority on a drifted clock hands its lease to a healthy sibling instead of stamping skewed time.
 - Combine [composite limits](#composite-limits-createcompositeratelimit), the [emergency scale](#emergency-scale-incident-switch), [message admission](#admission-control) and [upgrade admission](#upgrade-admission) with measured resource pressure and CPU quota.
-- For caller-influenced destinations, combine [URL validation and resolved-address checks](#url-safety-ssrf) with transport-level pinning of the verified address.
+- For caller-influenced destinations, [resolve the host once, check every address with `isAddressSafe`, and connect to a checked address](#resolved-destinations-the-check-names-the-address-you-connect-to) while the URL's hostname still sets `Host` and TLS SNI; `checkUrlResolved` returns no address to connect to.
 
 ---
 
@@ -3603,21 +3603,21 @@ isSafeUrl(url, { mode: 'allowlist', allow: ['hooks.partner.com', 'api.acme.io'] 
 isSafeUrl(url, { mode: 'off' });
 ```
 
-### DNS rebinding (the documented gap, and how to close it)
+### Resolved destinations: the check names the address you connect to
 
-The synchronous `isSafeUrl` / `checkUrl` classify the URL's **literal** host. A numeric IP (in any encoding) is normalised and range-checked; a DNS name is classified on its literal text only. That means a public-looking name that **resolves** to a private address (a DNS-rebinding attack) passes the literal check. The validator imports no `node:dns` -- it stays pure, synchronous, and isomorphic -- and the rebinding hole is closed by the async `checkUrlResolved`, which takes a resolver you supply:
+The synchronous `isSafeUrl` / `checkUrl` classify the URL's **literal** host. A numeric IP (in any encoding) is normalised and range-checked; a DNS name is classified on its literal text only, so a public-looking name that **resolves** to a private address (DNS rebinding) passes the literal check. The validator imports no `node:dns` on purpose - it stays pure, synchronous, and isomorphic - and resolution belongs to the caller, which owns the connection. Resolve once, check every address with `isAddressSafe`, and connect to a checked address while the URL's hostname still sets `Host` and TLS SNI, so no second lookup can answer differently:
 
 ```js
-import { checkUrlResolved } from 'svelte-adapter-uws-extensions/safe-url';
-import { promises as dns } from 'node:dns';
-
-const result = await checkUrlResolved(userWebhookUrl, {
-	resolve: (hostname) => dns.resolve(hostname)
-});
-// false for a name that resolves to 127.0.0.1 / 169.254.169.254 / an RFC1918 IP.
+import { checkUrl, isAddressSafe } from 'svelte-adapter-uws-extensions/safe-url';
+import { lookup } from 'node:dns/promises';
+import { request } from 'node:https';
+const url = new URL(userWebhookUrl);
+const addresses = checkUrl(url.href).safe ? await lookup(url.hostname.replace(/^\[|\]$/g, ''), { all: true }) : [];
+if (addresses.length === 0 || !addresses.every((a) => isAddressSafe(a.address))) throw new Error('blocked destination');
+const pin = addresses[0], req = request(url, { lookup: (_host, options, done) => (options.all ? done(null, [pin]) : done(null, pin.address, pin.family)) });
 ```
 
-`checkUrlResolved` runs the literal check first (so a private literal short-circuits without a lookup), then -- only for a DNS name -- resolves and re-checks every resolved address. A resolver that throws yields `{ safe: false, reason: 'unresolved-host' }`. In `mode: 'off'` the resolver path is skipped entirely, so the opt-out bypasses the range checks uniformly for both IP literals and DNS names. Note that even with a resolver this does not fully close the time-of-check-to-time-of-use window: a name can resolve to a public IP at check time and a private IP at fetch time. For a hard guarantee, pin the resolved address and connect to it directly.
+`checkUrlResolved(url, { resolve })` is the check-only form, for validating a URL before it is stored: it runs the literal check first (a private literal short-circuits without a lookup), then resolves a DNS name with the resolver you supply and re-checks every address. A resolver that throws yields `{ safe: false, reason: 'unresolved-host' }`. It returns only `{ safe, reason }`, never an address, so a request that resolves the name again can still land on a different one; connect the way the example does. In `mode: 'off'` the resolver path is skipped entirely, so the opt-out bypasses the range checks uniformly for both IP literals and DNS names.
 
 ---
 
