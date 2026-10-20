@@ -87,19 +87,30 @@ describe('redis distributed lock (integration)', () => {
 				const lockB = createDistributedLock(clientB, { retryDelayMs: 10, maxWaitMs: 5000 });
 
 				const order = [];
+				// Hand off on A's ACQUISITION, not on a fixed sleep. A 5ms gap
+				// asserted that A's SET NX round-trip beats 5ms, which is a
+				// statement about the machine, not about the lock - and it lost
+				// that race under full-suite load. Waiting for A to be inside
+				// the critical section makes "A holds it when B asks" a fact,
+				// so the strict order below is the lock excluding B rather than
+				// A happening to be first.
+				let aHoldsLock;
+				const aAcquired = new Promise((resolve) => { aHoldsLock = resolve; });
 				const a = lockA.withLock('shared', async () => {
 					order.push('a-start');
+					aHoldsLock();
 					await wait(80);
 					order.push('a-end');
 				});
-				// Microtask gap so A's SET NX lands first.
-				await wait(5);
+				await aAcquired;
 				const b = lockB.withLock('shared', async () => {
 					order.push('b-start');
 					order.push('b-end');
 				});
 
 				await Promise.all([a, b]);
+				// B asked while A demonstrably held the lock, so anything other
+				// than B running entirely after A is a failure to exclude.
 				expect(order).toEqual(['a-start', 'a-end', 'b-start', 'b-end']);
 			} finally {
 				await Promise.all([clientA.quit(), clientB.quit()]);
