@@ -29,7 +29,10 @@ did not execute a command already sent;
 use idempotency or fencing for effects whose repetition would be unsafe.
 
 A connection reset, including a socket deadline, rejects unanswered sent commands
-with `ConnectionError` before reconnect. This also applies when `commandTimeout`
+with `ConnectionError` before reconnect. This applies to connections that reached
+ready: a drop during the startup handshake rejects nothing, and commands issued
+during startup stay unsent in the offline queue until the next connection is
+ready. This also applies when `commandTimeout`
 exceeds `socketTimeout`: the socket deadline wins without resending a write.
 Prefer `commandTimeout <= socketTimeout` so normal deadline failures carry the
 command's `TimeoutError`. Explicit `autoResendUnfulfilledCommands: true` restores

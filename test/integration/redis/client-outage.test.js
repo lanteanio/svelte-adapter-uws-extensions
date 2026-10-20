@@ -266,3 +266,29 @@ it.each(['reset', 'socket deadline'])('does not resend an applied write after %s
 		expect(await admin.redis.get(key)).toBe('1');
 	} finally { await admin.redis.del(key); await fixture.close(); }
 });
+
+it('keeps an unsent startup write when the connection drops during the handshake', async () => {
+	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 });
+	const { client, admin, gate } = fixture;
+	const key = 'inttest-outage:handshake-drop';
+	const sink = captureRegistered();
+	try {
+		await admin.redis.del(key);
+		gate.inbound = true;
+		client.redis.connect().catch(() => {});
+		// The INFO ready check is sent and unanswered; the write waits unsent.
+		await vi.waitFor(() => {
+			expect(client.redis.status).toBe('connect');
+			expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'info')).toBe(true);
+		}, { timeout: 2000 });
+		const write = client.redis.set(key, 'after-handshake');
+		expect(client.redis.offlineQueue.toArray().some(entry => entry.command.name === 'set')).toBe(true);
+		const closed = new Promise(resolve => client.redis.once('close', resolve));
+		client.redis.stream.destroy();
+		await closed;
+		gate.inbound = false;
+		expect(await write).toBe('OK');
+		expect(await admin.redis.get(key)).toBe('after-handshake');
+		expect(JSON.stringify(sink.records)).not.toMatch(/uncertain/);
+	} finally { sink.stop(); await admin.redis.del(key); await fixture.close(); }
+});

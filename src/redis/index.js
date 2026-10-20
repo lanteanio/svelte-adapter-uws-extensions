@@ -79,8 +79,18 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		}
 		return false;
 	}
+	// Status events are emitted in order, so this tracks whether the
+	// connection that just closed had reached ready. Before ready its queue
+	// holds only handshake commands (AUTH, SELECT, the INFO ready check) and
+	// user commands still wait unsent in the offline queue. Rejecting a
+	// handshake command makes ioredis treat the handshake as fatal and flush
+	// that offline queue, so only a ready connection's queue is uncertain.
+	let connectionReady = false;
+	redis.on('ready', () => { connectionReady = true; });
 	redis.on('close', () => {
-		if (redis.options.autoResendUnfulfilledCommands) return;
+		const wasReady = connectionReady;
+		connectionReady = false;
+		if (!wasReady || redis.options.autoResendUnfulfilledCommands) return;
 		const error = new ConnectionError('redis', 'connection closed before the command reply; execution is uncertain');
 		const previous = redis.prevCommandQueue;
 		redis.flushQueue(error, { offlineQueue: false });
