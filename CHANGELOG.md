@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The documentation link gate accepts relative directory links written with a trailing slash (`docs/`, `src/shared/`) when a tracked file lives under that directory, and rejects a trailing slash after a file name. The scheduled external-link crawl reads anchors in the adapter and svelte-realtime documentation from their raw Markdown with the same heading-slug rule, instead of the rendered GitHub page, which carries no heading ids for READMEs that large. The README's session-fixation link points at the current OWASP page.
+- The README describes the Redis and Postgres dead-letter stores as the asynchronous form of svelte-realtime's `DeadLetterStore`, including `purgeUser` and the `forgetUserId` / `forgetTombstoneMs` options, and lists what the Postgres replay buffer adds (`publishBatch`, `ready()` / `status()`, `destroy()`) and lacks (`publishIdempotent`, `durability`) next to the Redis one, and which Redis replay methods go beyond the in-memory plugin.
 
 ## [0.6.0-next.64] - 2026-10-13
 

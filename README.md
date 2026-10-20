@@ -805,7 +805,7 @@ The data is in the buffer on the master regardless of the WAIT outcome - other i
 
 #### API
 
-All methods are async (they hit Redis). The API otherwise matches the core plugin exactly:
+All methods except `cachedEpoch` are async (they hit Redis). The core plugin's `publish` / `seq` / `since` / `replay` / `clear` / `clearTopic` keep their names and arguments; `gap` and the epoch reads are additions:
 
 | Method | Description |
 |---|---|
@@ -1735,7 +1735,7 @@ import { configureWebhooks } from 'svelte-realtime/server';
 configureWebhooks({ deadLetter: createDeadLetter(redisClient, { max: 1000 }) });
 ```
 
-It implements the same interface as the in-memory store (`add` / `get` / `remove` / `count` / `list` / `summary` / `clear`), so the admin `/__realtime/dlq` commands and `replayDeadLetter()` work unchanged. Needs `svelte-realtime >= 0.6.0-next.40` (which awaits the store interface).
+It is the asynchronous form of svelte-realtime's `DeadLetterStore`: the same methods (`add` / `get` / `remove` / `count` / `list` / `summary` / `purgeUser` / `clear`), each returning a Promise instead of a value. `svelte-realtime >= 0.6.0-next.40` awaits every store call, so the admin `/__realtime/dlq` commands and `replayDeadLetter()` work with it unchanged. `purgeUser` drops a user's records for `live.forget` when the `forgetUserId: (record) => userId` option is set; a per-user tombstone living `forgetTombstoneMs` (default `600000`, size it above your longest retry budget) also drops a delivery still in flight when the purge ran.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -1755,13 +1755,13 @@ import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-le
 configureWebhooks({ deadLetter: createDeadLetter(pgClient, { max: 1000 }) });
 ```
 
-Same interface and options (`max`, `ttlMs`, `breaker`, `metrics`) plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention uses database time and clamps `failedAt` at insert. Reads exclude expired rows immediately; write and idle cleanup use [bounded transactions](docs/postgres-retention.md) to delete expired rows and the oldest ids beyond `max`. `cleanupInterval` sets the maximum jitter delay; `0` disables idle cleanup, so residual backlog needs later writes. Call `destroy()` to stop maintenance. `add()` returns the committed row ID if cleanup fails or another replica owns it. Physical bounds can remain exceeded while successive passes drain a backlog. A lost insert reply leaves an unknown capture outcome; blind retries may duplicate a record because this API has no caller deduplication key.
+Same asynchronous interface and the options `max`, `ttlMs`, `breaker`, `metrics` and `forgetUserId`, plus `table` (default `svti_dead_letter`), `autoMigrate` (default `true`), and `cleanupInterval` (default `60000`); the table is auto-created on first use. Retention uses database time and clamps `failedAt` at insert. Reads exclude expired rows immediately; write and idle cleanup use [bounded transactions](docs/postgres-retention.md) to delete expired rows and the oldest ids beyond `max`. `cleanupInterval` sets the maximum jitter delay; `0` disables idle cleanup, so residual backlog needs later writes. Call `destroy()` to stop maintenance. `add()` returns the committed row ID if cleanup fails or another replica owns it. Physical bounds can remain exceeded while successive passes drain a backlog. A lost insert reply leaves an unknown capture outcome; blind retries may duplicate a record because this API has no caller deduplication key.
 
 ---
 
 ## Replay buffer (Postgres)
 
-Same API as the Redis replay buffer, but backed by a Postgres table. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table using `INSERT ... ON CONFLICT DO UPDATE`, so concurrent publishes from multiple instances produce strictly ordered sequences with no duplicates or gaps.
+The Redis replay buffer's methods, backed by a Postgres table, with three differences: it adds `publishBatch(platform, messages)`, which stores a burst for one or more topics in a single round trip, and the store lifecycle `ready()` / `status()` / `destroy()`; it has no `publishIdempotent`; and it has no `durability` option. Best suited for durable audit trails or history that needs to survive longer than Redis TTLs. Sequence numbers are generated atomically via a dedicated `_seq` table using `INSERT ... ON CONFLICT DO UPDATE`, so concurrent publishes from multiple instances produce strictly ordered sequences with no duplicates or gaps.
 
 Buffer trimming runs after each publish by deleting rows with `seq <= currentSeq - maxSize`. If the trim query fails, the publish still succeeds - the periodic background cleanup (configurable via `cleanupInterval`) catches any excess rows later.
 
@@ -1828,7 +1828,7 @@ ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAU
 
 #### API
 
-Same as [Replay buffer (Redis)](#api-3) - including `currentEpoch(topic)` / `cachedEpoch(topic)` and the per-topic reset detection - plus:
+Same as [Replay buffer (Redis)](#api-3) - including `currentEpoch(topic)` / `cachedEpoch(topic)` and the per-topic reset detection - plus `publishBatch(platform, messages)` (one atomic statement for `[{ topic, event, data }]`, per-topic seqs in caller order, rejected whole with nothing stored when one payload cannot be serialized), `ready()` / `status()`, and:
 
 | Method | Description |
 |---|---|
