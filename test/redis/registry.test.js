@@ -7,6 +7,7 @@ import { createMetrics } from '../../src/prometheus/index.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { createDistributedSession } from '../../src/redis/session.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 function wsWithSession(userData, sessionId) {
 	const ws = mockWs(userData);
@@ -1878,41 +1879,105 @@ describe('redis connection registry', () => {
 			}
 		});
 	});
-	describe('subscriber: a failed first SUBSCRIBE', () => {
-		it('tears the connection down and lets a later open subscribe again', async () => {
-			const realDuplicate = client.redis.duplicate.bind(client.redis);
-			let failNext = true;
-			const opened = [];
+	describe('subscriber: a refused SUBSCRIBE', () => {
+		const NOPERM = 'NOPERM this user has no permissions to access one of the channels';
+		let clock;
+		let realDuplicate;
+		let opened;
+		let refuse;
+
+		beforeEach(() => {
+			clock = 0;
+			setRuntimeEnv({ clock: { monotonic: () => clock } });
+			realDuplicate = client.redis.duplicate.bind(client.redis);
+			opened = [];
+			refuse = true;
 			client.redis.duplicate = (overrides) => {
 				const dup = realDuplicate(overrides);
 				opened.push(dup);
-				if (failNext) {
-					failNext = false;
-					dup.subscribe = async () => { throw new Error('NOPERM this user has no permissions to access one of the channels'); };
-				}
+				if (refuse) dup.subscribe = async () => { throw new Error(NOPERM); };
 				return dup;
 			};
+		});
+
+		afterEach(() => {
+			client.redis.duplicate = realDuplicate;
+			resetRuntimeEnv();
+		});
+
+		it('tears the connection down and lets a later open subscribe again', async () => {
+			const first = wsWithSession({ userId: 'u-a' }, 's-a');
+			await registry.hooks.open(first, { platform });
+			expect(opened).toHaveLength(1);
+
+			refuse = false;
+			clock += 60000;
+			const second = wsWithSession({ userId: 'u-b' }, 's-b');
+			await registry.hooks.open(second, { platform });
+			expect(opened).toHaveLength(2);
+
+			// The second subscriber is live: a send routed to this instance
+			// over its push channel reaches the local socket.
+			const remote = createConnectionRegistry(client, { identify: (ws) => ws.getUserData()?.userId, heartbeat: 60000, ttl: 90 });
 			try {
-				const first = wsWithSession({ userId: 'u-a' }, 's-a');
-				await expect(registry.hooks.open(first, { platform })).rejects.toThrow('NOPERM');
-				expect(opened).toHaveLength(1);
-
-				const second = wsWithSession({ userId: 'u-b' }, 's-b');
-				await registry.hooks.open(second, { platform });
-				expect(opened).toHaveLength(2);
-
-				// The second subscriber is live: a request routed to this
-				// instance over its push channel reaches the local socket.
-				const remote = createConnectionRegistry(client, { identify: (ws) => ws.getUserData()?.userId, heartbeat: 60000, ttl: 90 });
-				try {
-					await remote.send('u-b', 'room', 'hello', 1);
-					await new Promise((r) => setTimeout(r, 20));
-					expect(platform.sent.filter((f) => f.ws === second && f.event === 'hello')).toHaveLength(1);
-				} finally {
-					await remote.destroy();
-				}
+				await remote.send('u-b', 'room', 'hello', 1);
+				await expect.poll(() => platform.sent.filter((f) => f.ws === second && f.event === 'hello').length).toBe(1);
 			} finally {
-				client.redis.duplicate = realDuplicate;
+				await remote.destroy();
+			}
+		});
+
+		function withAttributes() {
+			return createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId }),
+				heartbeat: 60000,
+				ttl: 90
+			});
+		}
+
+		it('opens no further connection per call while the refusal persists', async () => {
+			const remote = withAttributes();
+			const local = withAttributes();
+			try {
+				// The peer subscribed fine; only this instance is refused.
+				refuse = false;
+				await remote.hooks.open(wsWithSession({ userId: 'u-away', tenantId: 't' }, 's-away'), { platform: mockPlatform() });
+				refuse = true;
+				const before = opened.length;
+				for (let i = 0; i < 5; i++) {
+					await local.hooks.open(wsWithSession({ userId: 'u-' + i, tenantId: 't' }, 's-' + i), { platform }).catch(() => {});
+					await local.send('u-away', 'room', 'e', i).catch(() => {});
+					await local.sendTo({ tenantId: 't' }, 'room', 'e', i).catch(() => {});
+					await local.sendCoalesced('u-away', { key: 'k', topic: 'room', event: 'e', data: i }).catch(() => {});
+					await expect(local.request('u-away', 'e', i)).rejects.toThrow('NOPERM');
+				}
+				expect(opened.length - before).toBe(1);
+
+				// Once the backoff runs out the next call retries, exactly once.
+				clock += 60000;
+				await local.hooks.open(wsWithSession({ userId: 'u-late', tenantId: 't' }, 's-late'), { platform });
+				expect(opened.length - before).toBe(2);
+			} finally {
+				await local.destroy();
+				await remote.destroy();
+			}
+		});
+
+		it('registers the socket and delivers locally while the subscription is refused', async () => {
+			const local = withAttributes();
+			try {
+				const ws = wsWithSession({ userId: 'u-local', tenantId: 't' }, 's-local');
+				await local.hooks.open(ws, { platform });
+				expect(await local.lookup('u-local')).toMatchObject({ instanceId: local.instanceId, sessionId: 's-local' });
+
+				await local.sendTo({ tenantId: 't' }, 'room', 'fanout', 1);
+				await local.send('u-local', 'room', 'direct', 1);
+				await local.sendCoalesced('u-local', { key: 'k', topic: 'room', event: 'coalesced', data: 1 });
+				expect(platform.sent.filter((f) => f.ws === ws && f.event === 'fanout')).toHaveLength(1);
+				expect(platform.sent.filter((f) => f.ws === ws && f.event === 'direct')).toHaveLength(1);
+			} finally {
+				await local.destroy();
 			}
 		});
 	});

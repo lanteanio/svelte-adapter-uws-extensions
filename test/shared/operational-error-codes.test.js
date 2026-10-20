@@ -60,6 +60,12 @@ describe.each(['request', 'requestSession'])('registry %s operational failures',
 		expect(error).toMatchObject({ name: 'Error', code: 'REGISTRY_REQUEST_TIMEOUT' });
 		expect(error.message).not.toContain('private-target');
 	});
+	it('identifies a remote request made after destroy', async () => {
+		const { client, value } = registry();
+		await route(client, method, 'private-target');
+		await value.destroy();
+		await expect(value[method]('private-target', 'event')).rejects.toMatchObject({ name: 'Error', code: 'REGISTRY_DESTROYED' });
+	});
 	it('identifies capacity refusal and terminal rejection of admitted requests', async () => {
 		const { client, value } = registry();
 		await route(client, method, 'private-target');

@@ -32,7 +32,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `REGISTRY_PENDING_LIMIT` | Registry request and requestSession | The instance pending-request limit is full; wait for existing requests to settle. |
 | `REGISTRY_REQUEST_TIMEOUT` | Registry request and requestSession | No reply arrived before the deadline; the remote outcome is unknown. |
 | `REGISTRY_REMOTE_ERROR` | Registry remote replies | The remote handler or owner rejected the request. The existing wire format carries its message, not its error class or code. |
-| `REGISTRY_DESTROYED` | Registry pending requests | The registry was destroyed before the request settled. |
+| `REGISTRY_DESTROYED` | Registry request and requestSession | The registry was destroyed before the request settled, or before it could open its reply subscription. |
 | `TASK_WORKER_CAPACITY_EXCEEDED` | PostgreSQL task worker admission | No job, byte or thread allowance is available. The error remains a RangeError. |
 | `TASK_RUNNER_DESTROYED` | PostgreSQL task workers | The worker pool has stopped; active, queued and new work is rejected. |
 | `TASK_WORKER_EXITED` | PostgreSQL task workers | The worker exited before its task completed; the operation outcome may be unknown. |

@@ -127,6 +127,8 @@ return redis.call('expire', KEYS[1], ARGV[5])
 
 const DEFAULT_TTL_SEC = 90;
 const DEFAULT_HEARTBEAT_MS = 30000;
+/** First retry delay after a refused registry SUBSCRIBE; doubles per refusal up to the heartbeat. */
+const SUBSCRIBE_RETRY_BASE_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
 
 /**
@@ -524,6 +526,14 @@ export function createConnectionRegistry(client, options) {
 	let subscriber = null;
 	/** @type {Promise<void> | null} the SUBSCRIBE of the current subscriber */
 	let subscriberReady = null;
+	/** Whether the current subscriber's SUBSCRIBE landed. */
+	let subscribed = false;
+	/** Consecutive refused SUBSCRIBE attempts, for the retry backoff. */
+	let subscribeFailures = 0;
+	/** Monotonic time before which no new subscriber is opened. */
+	let nextSubscribeAt = 0;
+	/** @type {unknown} the error of the last refused attempt */
+	let lastSubscribeError = null;
 	let heartbeatTimer = null;
 	let destroyed = false;
 
@@ -714,15 +724,33 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	/**
-	 * Open the subscriber once and resolve when its SUBSCRIBE landed. Callers
-	 * that arrive while it is in flight wait on the same attempt. A refused
-	 * or failed SUBSCRIBE tears the connection down and clears the slot, so
-	 * the next caller opens a fresh one instead of finding a subscriber that
-	 * never subscribed and returning early for the life of the process.
+	 * Open the subscriber once and return its SUBSCRIBE attempt. Callers that
+	 * arrive while it is in flight share the same attempt. A refused or failed
+	 * SUBSCRIBE tears the connection down and clears the slot, so a later call
+	 * opens a fresh one instead of finding a subscriber that never subscribed.
+	 *
+	 * Retries are bounded: after a refusal no new connection is opened until a
+	 * backoff (doubling from one second, capped at the heartbeat interval)
+	 * runs out, and the heartbeat retries on its own. Without the bound a
+	 * persistent refusal (an ACL that denies the channels) opened and tore
+	 * down one connection per call. Returns null while the backoff holds or
+	 * after destroy().
+	 *
+	 * The heartbeat starts on the first call, not on a landed SUBSCRIBE: TTL
+	 * refresh of the entries this instance writes does not depend on the
+	 * subscription.
+	 * @param {any} [platform]
+	 * @returns {Promise<void> | null}
 	 */
-	function ensureSubscriber(platform) {
+	function startSubscriber(platform) {
 		activePlatform = platform || activePlatform;
+		if (destroyed) return null;
+		if (!heartbeatTimer) {
+			heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
+			if (heartbeatTimer.unref) heartbeatTimer.unref();
+		}
 		if (subscriberReady) return subscriberReady;
+		if (subscribeFailures > 0 && monotonicNow() < nextSubscribeAt) return null;
 		const sub = openSubscriber(client, 'registry');
 		subscriber = sub;
 		sub.on('error', (err) => {
@@ -746,35 +774,65 @@ export function createConnectionRegistry(client, options) {
 		const ready = sub.subscribe(ownPushChannel, eventsChannel).then(() => {
 			// destroy() ran while the SUBSCRIBE was in flight.
 			if (subscriber !== sub) return;
-			afterSubscribed();
+			subscribed = true;
+			subscribeFailures = 0;
+			lastSubscribeError = null;
+			// Bootstrap the secondary index from existing entries. Subscribe
+			// first (so we don't miss live events fired during the SCAN), then
+			// SCAN; live events that race with the SCAN are idempotent under
+			// set semantics. Skipped when no `attributes` option was supplied
+			// since neither the index nor `sendTo` would have anything to do.
+			startBootstrap();
 		}, (err) => {
 			if (subscriber === sub) {
 				subscriber = null;
 				subscriberReady = null;
+				subscribeFailures++;
+				lastSubscribeError = err;
+				const backoff = SUBSCRIBE_RETRY_BASE_MS * 2 ** Math.min(subscribeFailures - 1, 20);
+				nextSubscribeAt = monotonicNow() + Math.min(backoff, heartbeatInterval);
 			}
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
 			throw err;
 		});
+		// A caller that does not await the attempt must not surface an
+		// unhandled rejection; the failure is recorded above.
+		ready.catch(() => {});
 		subscriberReady = ready;
 		return ready;
 	}
 
-	function afterSubscribed() {
-		// Bootstrap the secondary index from existing entries. Subscribe
-		// first (so we don't miss live events fired during the SCAN), then
-		// SCAN; live events that race with the SCAN are idempotent under
-		// set semantics. Skipped when no `attributes` option was supplied
-		// since neither the index nor `sendTo` would have anything to do.
-		startBootstrap();
+	/**
+	 * Wait for the subscriber where the caller needs the reply channel
+	 * (`request`, `requestSession`). Shares an in-flight attempt; while the
+	 * retry backoff holds it fails at once with the last refusal instead of
+	 * opening another connection.
+	 * @returns {Promise<void>}
+	 */
+	async function requireSubscriber() {
+		const ready = startSubscriber(activePlatform);
+		if (ready) return ready;
+		if (destroyed) throw operationError('REGISTRY_DESTROYED', 'registry: destroyed');
+		// Only the retry backoff returns no attempt, and it is set together
+		// with the refusal that started it.
+		throw lastSubscribeError;
+	}
 
-		if (!heartbeatTimer) {
-			heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
-			if (heartbeatTimer.unref) heartbeatTimer.unref();
-		}
+	/**
+	 * Let an in-flight or fresh SUBSCRIBE settle before this instance
+	 * advertises a user, so peers do not route to a push channel nobody
+	 * listens on yet. Never throws: registration and local delivery do not
+	 * depend on the subscription, and a refusal is retried with backoff.
+	 * @param {any} [platform]
+	 * @returns {Promise<void>}
+	 */
+	async function settleSubscriber(platform) {
+		const ready = startSubscriber(platform);
+		if (ready) { try { await ready; } catch { /* recorded; retried with backoff */ } }
 	}
 
 	function startBootstrap() {
-		if (destroyed || !attributes || bootstrapped || bootstrapPromise) return;
+		if (destroyed || !subscribed || !attributes || bootstrapped || bootstrapPromise) return;
 		bootstrapped = true;
 		bootstrapPromise = bootstrapIndex().catch(() => {
 			bootstrapped = false;
@@ -1000,6 +1058,7 @@ export function createConnectionRegistry(client, options) {
 
 	function heartbeatTick() {
 		if (destroyed) return;
+		if (!subscribed) startSubscriber(activePlatform);
 		startBootstrap();
 		reconcileIndex();
 		refreshTtls();
@@ -1225,7 +1284,7 @@ export function createConnectionRegistry(client, options) {
 		}
 
 		// Cross-instance: publish request, wait for reply on own push channel.
-		await ensureSubscriber(activePlatform);
+		await requireSubscriber();
 
 		// Per-instance cap on in-flight requests. Mirrors adapter's
 		// `WS_PENDING_REQUESTS` shape, scaled per-instance: a leaking
@@ -1330,7 +1389,7 @@ export function createConnectionRegistry(client, options) {
 		}
 
 		// Cross-instance: publish the request, await the reply on our push channel.
-		await ensureSubscriber(activePlatform);
+		await requireSubscriber();
 		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
 			mRequests?.inc({ result: 'error' });
 			throw operationError('REGISTRY_PENDING_LIMIT', extensionsError(
@@ -1417,7 +1476,9 @@ export function createConnectionRegistry(client, options) {
 		// per-key replacement happens on the receiver via the existing
 		// platform.sendCoalesced semantics, so a duplicate or out-of-order
 		// envelope from a flaky link just gets coalesced on arrival.
-		await ensureSubscriber(activePlatform);
+		// Publishing needs no subscription of our own; start it for the
+		// inbound side without making this call wait on or fail with it.
+		startSubscriber(activePlatform);
 		const envelope = {
 			type: 'coalesced',
 			sessionId: entry.sessionId,
@@ -1477,7 +1538,9 @@ export function createConnectionRegistry(client, options) {
 		// push channel. No reply path. A user that disconnects between the
 		// lookup and the receive surfaces as a `late` increment on the
 		// receiver side; this method does not surface that to the caller.
-		await ensureSubscriber(activePlatform);
+		// Publishing needs no subscription of our own; start it for the
+		// inbound side without making this call wait on or fail with it.
+		startSubscriber(activePlatform);
 		const envelope = {
 			type: 'send',
 			sessionId: entry.sessionId,
@@ -1585,7 +1648,9 @@ export function createConnectionRegistry(client, options) {
 			bucket.push(userId);
 		}
 
-		await ensureSubscriber(activePlatform);
+		// Publishing needs no subscription of our own; start it for the
+		// inbound side without making this call wait on or fail with it.
+		startSubscriber(activePlatform);
 
 		// Self bucket first, and never gated on the envelope encode. The
 		// encode bounds the REDIS envelope, so refusing an oversized payload
@@ -1703,7 +1768,7 @@ export function createConnectionRegistry(client, options) {
 		},
 		hooks: {
 			async open(ws, ctx) {
-				await ensureSubscriber(ctx?.platform);
+				await settleSubscriber(ctx?.platform);
 
 				// App-session registration (opt-in via `sessionIdentify`, independent
 				// of userId so an anonymous-but-sessioned connection still gets
@@ -1720,7 +1785,7 @@ export function createConnectionRegistry(client, options) {
 				}
 
 				// Closed-WS race: the ws may have closed during the
-				// `await ensureSubscriber` above. `identify(ws)` and the
+				// `await settleSubscriber` above. `identify(ws)` and the
 				// subsequent `ws.getUserData()` both throw on a freed
 				// native handle; bail silently rather than crashing the
 				// worker. No state to roll back yet.
@@ -1864,6 +1929,7 @@ export function createConnectionRegistry(client, options) {
 			indexChecks.clear();
 			bootstrapped = false;
 			subscriberReady = null;
+			subscribed = false;
 			if (subscriber) {
 				const sub = subscriber;
 				subscriber = null;
