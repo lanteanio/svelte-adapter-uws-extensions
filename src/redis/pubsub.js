@@ -748,6 +748,8 @@ export function createPubSubBus(client, options = {}) {
 				// cluster deployment. Version-gated: an older adapter without it
 				// degrades to a no-op (the framework optional-chains the call).
 				authorizeWireSubscribe: typeof platform.authorizeWireSubscribe === 'function' ? platform.authorizeWireSubscribe.bind(platform) : undefined,
+				// Preserve capability detection and the source platform receiver.
+				authorizeDelivery: typeof platform.authorizeDelivery === 'function' ? platform.authorizeDelivery.bind(platform) : undefined,
 				get maxPayloadLength() { return platform.maxPayloadLength; },
 				bufferedAmount: typeof platform.bufferedAmount === 'function' ? platform.bufferedAmount.bind(platform) : undefined,
 				get closedWsAborts() { return platform.closedWsAborts ?? 0; },

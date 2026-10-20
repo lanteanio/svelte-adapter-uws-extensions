@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The Redis pub/sub and sharded bus wrappers forward `platform.authorizeDelivery` when the adapter provides it, bound to the original platform, so handlers that receive the wrapped platform can install recipient delivery checks. On an adapter without it the member stays `undefined`, so capability checks keep working.
+
 ## [0.6.0-next.64] - 2026-10-13
 
 *Not published to npm; development candidate.*
