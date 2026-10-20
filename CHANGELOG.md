@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Redis pub/sub and sharded bus wrappers forward `platform.authorizeDelivery` when the adapter provides it, bound to the original platform, so handlers that receive the wrapped platform can install recipient delivery checks. On an adapter without it the member stays `undefined`, so capability checks keep working.
 
+### Added
+
+- `docs/postgres-support.md` has a PostgreSQL operations profile: a per-worker connection budget formula covering pools, notification sessions, standalone sessions, rolling-deploy surge, migrations and reserved slots (with the PgBouncer equivalents); WAL archiving and point-in-time recovery for the store tables and migration ledger; single-writer-endpoint failover behavior and the data-loss boundary of asynchronous replication; and the split between the stores' retention passes and the operator's autovacuum ownership.
+
 ### Changed
 
 - The LISTEN/NOTIFY bridge documentation states that delivery is at-most-once: notifications committed before `activate()` resolves, during a reconnect, or during an advisory leader handover are not delivered or replayed, and clients see no gap signal. Applications load authoritative state from the tables on subscribe or resume and use a row version to detect a missed change.

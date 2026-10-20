@@ -137,6 +137,98 @@ An externally supplied `pool` remains caller-owned: wrapper `end()` is still a n
 
 Reconnect and election operations never overlap within one bridge. Failed connections use a jittered delay from `reconnectInterval` up to twice that baseline; `0` requests immediate retries. Both intervals must fit the native timer maximum of `2147483647` ms, and jitter is capped at that maximum. Healthy advisory followers poll at `pollInterval`; a leader checks liveness without repeatedly acquiring its already-held advisory lock. A retry waiting on its jitter timer is not bypassed by election polling. `autoReconnect: false` stops automatic retries after loss; an explicit awaited `activate()` can retry. Keep the owned connection/query deadlines enabled, or provide equivalent finite standalone options when using an external pool, so backend waits have a deadline.
 
+## Operations profile
+
+This section states what the stores need from the database host. It does not
+replace the host's own runbooks; the measured values belong in the deployment's
+drill records.
+
+### Connection budget
+
+Every `createPgClient()` owns one pool per process. Each adapter worker that
+imports the module (one per worker thread or process) creates its own client, so
+count per worker, not per machine. node-postgres opens at most `options.max`
+pooled connections, 10 when unset. Store queries, retention passes, task and job
+operations, automatic migration and the notification startup probe all check
+out from that pool. Each active notification bridge and each `createClient()`
+session the application opens holds one more connection outside it.
+
+For W workers, each with clients whose pool limits sum to P, B active bridges
+and S standalone sessions, the application needs
+
+```text
+application = W x (P + B + S)
+```
+
+connections. During a rolling deploy old and new workers overlap, so use the
+surge count: W = steady workers + surge workers. The server must also hold the
+deployment migration connection (one per running `migrate()`), administrative,
+monitoring and backup logins, and its reserved slots:
+
+```text
+max_connections >= application + migrations + administration
+                   + superuser_reserved_connections + reserved_connections
+```
+
+Streaming replication senders are limited by `max_wal_senders` instead.
+
+Leave headroom for a replica that reconnects before the server has noticed the
+old session's loss. Advisory election does not reduce the budget: every follower
+keeps its session to retry the lock. Behind PgBouncer apply the left side to
+`max_client_conn`; session-mode routes then pin one server connection per client
+connection, while a transaction-mode route needs only its `default_pool_size`
+server connections per database and user. Notification bridges and migrations
+always need the session route; see [notification sessions](#notification-sessions-and-shutdown).
+
+### Backup, WAL archiving and point-in-time recovery
+
+The [storage recovery guide](./recovery.md) defines the restore groups and the
+read-only verifier; a logical dump alone gives a recovery point only at dump
+time. For a recovery point between dumps, run continuous WAL archiving with a
+base backup, as described in
+[continuous archiving and PITR](https://www.postgresql.org/docs/16/continuous-archiving.html),
+or the managed provider's equivalent. Every store table, the replay sequence
+table, the alarm generation table and `svti_schema_migrations` live in one
+database, so a single recovery target restores them consistently; keep them in
+one database and one backup set. A point-in-time restore is still a restore:
+stop writers, run the verifier, and reconcile effects outside the database as the
+recovery guide describes before traffic resumes. Record the archive's measured
+lag as the bound on data loss, and the measured restore duration as the
+recovery time.
+
+### High availability and failover
+
+Point the DSN at one writer endpoint that the HA tooling moves to the new
+primary (a DNS name, virtual IP or provider endpoint). Every store writes, and
+`pg_notify` and the migration ledger need a primary, so none of them can run
+against a read replica. During a failover, queries fail with connection errors
+that the store breakers count; pooled connections that broke are discarded and
+replaced on later checkouts. Automatic migration retries connection failures,
+including temporary name resolution while the endpoint moves. Notification
+bridges reconnect, confirm the new session and LISTEN again; advisory locks die
+with the old primary, so one follower takes leadership. Notifications committed
+during the switch are not delivered, as for any reconnect.
+
+With asynchronous replication a failover can lose transactions the old primary
+had already acknowledged. Treat such a failover like a restore to the promoted
+standby's last replayed transaction: replay sequences, task and job state and
+idempotency results can be behind what clients and other systems observed.
+Synchronous replication (`synchronous_commit` with a synchronous standby) avoids
+that loss at the cost of commit latency; choose it explicitly per deployment.
+
+### Autovacuum and retention ownership
+
+The stores delete expired and surplus rows in bounded background passes; see
+[retention cleanup](./postgres-retention.md). Those passes only delete rows.
+Reclaiming the space, keeping statistics current and preventing transaction ID
+wraparound remain the server's autovacuum work, owned by the database operator.
+Replay, idempotency, jobs and tasks tables receive steady inserts and deletes, so
+monitor their dead tuples, last autovacuum time and table growth, and tune
+per-table autovacuum thresholds where the server defaults fall behind. The
+[query and maintenance evidence](./postgres-plans.md) shows how to measure this
+for a workload. Do not run `VACUUM FULL` on a live store table: it takes an
+exclusive lock that blocks every store operation on that table until it ends.
+
 ## Schema transitions and readiness
 
 The [schema transition manifest](./postgres-schema.v1.json) describes this
