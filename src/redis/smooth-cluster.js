@@ -66,6 +66,7 @@ import { isCluster, keySlot } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_COMMAND = 'cmd';
@@ -143,11 +144,17 @@ export function createSmoothCluster(client, options = {}) {
 	};
 	/** @type {any} */
 	let subscriber = null;
+	let subscriberRequired = false;
 	/** @type {Promise<any> | null} */
 	let subscriberReady = null;
 	// One report per failure streak: every relay retries a failed subscribe.
 	let subscribeFailing = false;
 	let destroyed = false;
+	// Admissions waiting for subscription or owner discovery have no publish verdict.
+	const waitingPublishes = new Set();
+	const ignorePublishFailure = () => {};
+	const publishSucceeded = b ? () => b.success() : undefined;
+	const publishFailed = b ? (err) => b.failure(err) : ignorePublishFailure;
 
 	const onCluster = isCluster(redis);
 	// On a cluster, every publish goes through the SINGLE master that owns the
@@ -208,27 +215,58 @@ export function createSmoothCluster(client, options = {}) {
 	/** Publish one envelope, after the subscriber is up so we never miss a reply we caused. */
 	function publish(obj) {
 		if (destroyed) return;
-		if (b) { try { b.guard(); } catch { return; } }
-		const msg = JSON.stringify(obj);
-		if (!onCluster) {
-			// Standalone: one connection, PUBLISH delivered in order.
-			if (subscriberReady) subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
-			else redis.publish(channel, msg).catch(() => {});
-			return;
+		let releaseAdmission;
+		try { releaseAdmission = guardBreaker(b); } catch { return; }
+		let msg;
+		try { msg = JSON.stringify(obj); } catch (err) { releaseAdmission(); throw err; }
+		if (destroyed) { releaseAdmission(); return; }
+		// Healthy admissions own no recovery probe; only probing work needs cancellation tracking.
+		const trackProbe = b && b.state !== 'healthy';
+		let waiting = true;
+		let cancelled = false;
+		const cancel = trackProbe ? () => {
+			if (!waiting) return;
+			waiting = false;
+			cancelled = true;
+			waitingPublishes.delete(cancel);
+			releaseAdmission();
+		} : ignorePublishFailure;
+		const failed = trackProbe ? (err) => {
+			if (cancelled) return;
+			waiting = false;
+			waitingPublishes.delete(cancel);
+			b.failure(err);
+		} : publishFailed;
+		const send = (t) => {
+			if (destroyed || cancelled) { cancel(); return; }
+			waiting = false;
+			if (trackProbe) waitingPublishes.delete(cancel);
+			const rejected = onCluster ? (err) => {
+				// A failed pinned owner must be resolved again after failover.
+				if (t !== redis) pubTarget = null;
+				failed(err);
+			} : failed;
+			try {
+				Promise.resolve(t.publish(channel, msg)).then(publishSucceeded, rejected);
+			} catch (err) { rejected(err); }
+		};
+		const ready = (failure) => {
+			if (destroyed || cancelled) { cancel(); return; }
+			if (failure) { failed(failure.error); return; }
+			if (onCluster) resolvePubTarget().then(send, failed);
+			else send(redis);
+		};
+		if (trackProbe) waitingPublishes.add(cancel);
+		if (subscriberRequired && !subscriber) {
+			try { ensureSubscriber(); } catch (err) { failed(err); return; }
 		}
-		// Cluster: route through the pinned owner so publishes arrive in order.
-		const send = () => resolvePubTarget().then((t) => t.publish(channel, msg).catch(() => {
-			// The pinned node may have gone (failover / reshard); drop the cache so
-			// the next publish re-resolves the current owner. PUBLISH from any live
-			// node still reaches every subscriber.
-			if (t !== redis) pubTarget = null;
-		}));
-		if (subscriberReady) subscriberReady.then(send);
-		else send();
+		if (subscriberReady) subscriberReady.then(ready, failed);
+		else ready();
 	}
 
 	/** Bring up the relay subscriber once; idempotent. */
 	function ensureSubscriber() {
+		subscriberRequired = true;
 		if (subscriber || destroyed) return;
 		const sub = openSubscriber(client, 'smooth-cluster');
 		subscriber = sub;
@@ -286,7 +324,7 @@ export function createSmoothCluster(client, options = {}) {
 				}
 			}
 		});
-		subscriberReady = sub.subscribe(channel).then(() => { subscribeFailing = false; }, (err) => {
+		subscriberReady = sub.subscribe(channel).then(() => { subscribeFailing = false; return null; }, (err) => {
 			// Failed subscribe: tear down so the next relay re-subscribes fresh.
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
 			if (subscriber === sub) { subscriber = null; subscriberReady = null; }
@@ -295,6 +333,7 @@ export function createSmoothCluster(client, options = {}) {
 				subscribeFailing = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SMOOTH_SUBSCRIBE, { error: err });
 			}
+			return { error: err };
 		});
 	}
 
@@ -513,10 +552,15 @@ export function createSmoothCluster(client, options = {}) {
 		 */
 		async writeSnapshot(wireTopic, payload) {
 			if (destroyed) return;
-			if (b) { try { b.guard(); } catch { return; } }
+			let releaseAdmission;
+			try { releaseAdmission = guardBreaker(b); } catch { return; }
+			let encoded;
+			try { encoded = JSON.stringify(payload); } catch { releaseAdmission(); return; }
+			if (destroyed) { releaseAdmission(); return; }
 			try {
-				await redis.set(snapKey(wireTopic), JSON.stringify(payload), 'PX', snapshotTtlMs);
-			} catch { /* best-effort: the warm handoff is an optimization, not a correctness guarantee */ }
+				await redis.set(snapKey(wireTopic), encoded, 'PX', snapshotTtlMs);
+				if (b) b.success();
+			} catch (err) { if (b) b.failure(err); }
 		},
 
 		/**
@@ -530,18 +574,22 @@ export function createSmoothCluster(client, options = {}) {
 		async readSnapshot(wireTopic) {
 			if (destroyed) return null;
 			if (b) { try { b.guard(); } catch { return null; } }
+			let raw;
 			try {
-				const raw = await redis.get(snapKey(wireTopic));
-				return raw == null ? null : JSON.parse(raw);
-			} catch {
+				raw = await redis.get(snapKey(wireTopic));
+				if (b) b.success();
+			} catch (err) {
+				if (b) b.failure(err);
 				return null;
 			}
+			try { return raw == null ? null : JSON.parse(raw); } catch { return null; }
 		},
 
 		/** Tear down the subscriber. Idempotent. */
 		destroy() {
 			if (destroyed) return;
 			destroyed = true;
+			for (const cancel of waitingPublishes) cancel();
 			handlers = {
 				onCommand: null, onSync: null, onSyncReply: null,
 				onBroadcast: null, onAck: null, onLeave: null, onShoot: null
