@@ -417,6 +417,49 @@ describe('redis replay', () => {
 		});
 	});
 
+	describe('truncation for a hole inside the replayed range', () => {
+		async function publishFive() {
+			for (let i = 1; i <= 5; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			return client._sortedSets.get(client.key('replay:buf:{chat}'));
+		}
+		const frames = () => platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event);
+
+		it.each([0, 1])('reports a corrupt middle entry as truncated (sinceSeq %i)', async (sinceSeq) => {
+			const set = await publishFive();
+			set[2] = { score: 3, member: '{broken' };
+			platform.reset();
+			await replay.replay({}, 'chat', sinceSeq, platform);
+			expect(frames()).toEqual(['truncated', ...[1, 2, 4, 5].filter((seq) => seq > sinceSeq), 'end']);
+			expect(platform.sent.at(-1).data).toEqual({ truncated: true });
+		});
+
+		it('reports a missing middle entry as truncated', async () => {
+			const set = await publishFive();
+			set.splice(2, 1);
+			platform.reset();
+			await replay.replay({}, 'chat', 1, platform);
+			expect(frames()).toEqual(['truncated', 2, 4, 5, 'end']);
+		});
+
+		it('reports a corrupt newest entry as truncated', async () => {
+			const set = await publishFive();
+			set[4] = { score: 5, member: 'garbage' };
+			platform.reset();
+			const watermark = await replay.replay({}, 'chat', 2, platform);
+			expect(frames()).toEqual(['truncated', 3, 4, 'end']);
+			expect(watermark).toBe(4);
+		});
+
+		it('does not report a contiguous fill as truncated', async () => {
+			await publishFive();
+			for (const sinceSeq of [0, 2, 5]) {
+				platform.reset();
+				await replay.replay({}, 'chat', sinceSeq, platform);
+				expect(platform.sent.some((s) => s.event === 'truncated'), `sinceSeq ${sinceSeq}`).toBe(false);
+			}
+		});
+	});
+
 	describe('truncation with empty buffer', () => {
 		it('detects truncation when buffer is empty but seq has advanced', async () => {
 			for (let i = 1; i <= 3; i++) {

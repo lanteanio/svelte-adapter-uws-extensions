@@ -38,6 +38,14 @@ describeIntegration('redis replay (integration)', () => {
 		await client.quit();
 	});
 
+	it('reports a hole inside the replayed range as truncated', async () => {
+		for (let n = 1; n <= 4; n++) await replay.publish(platform, 'holes', 'change', { n });
+		await client.redis.zremrangebyscore(client.key('replay:buf:{holes}'), 2, 2);
+		platform.reset();
+		await replay.replay({}, 'holes', 0, platform);
+		expect(platform.sent.map((frame) => frame.event === 'msg' ? frame.data.seq : frame.event)).toEqual(['truncated', 1, 3, 4, 'end']);
+	});
+
 	it('correlates real stored history and an empty truncated end', async () => {
 		for (let n = 1; n <= 3; n++) await replay.publish(platform, 'wire', 'change', { n });
 		await replay.replay({}, 'wire', 0, platform, 'history');

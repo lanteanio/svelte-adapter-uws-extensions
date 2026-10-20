@@ -143,8 +143,15 @@ entries against a committed generation of their topic. Retained generation hashe
 all schedules are deleted. Legacy alarms without
 generation authority fail this package version's verification; use the matching
 pre-upgrade manifest when restoring an older artifact.
-It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS, HMGET and
-ZRANGE; Cluster mode also reads CLUSTER SLOTS. Driver handshake commands are
+It also scrubs each retained replay buffer and reports, without topics or payloads,
+`observations.replayEntries`: buffers and entries read, `corruptEntries` (entries
+the replay readers cannot decode; any fails the `decodable_entries` check) and
+`missingEntries` (seqs between the oldest retained entry and the sequence counter
+with no entry, which `purgeUser` erasure also leaves). Resuming clients receive a
+`truncated` frame for either. Repair a topic with `replay.clearTopic(topic)`, which
+drops its buffer and rotates its epoch so clients reload.
+It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS, HMGET,
+ZRANGE, XLEN and XRANGE; Cluster mode also reads CLUSTER SLOTS. Driver handshake commands are
 required too. It may read individual stored replay entries to obtain sequence
 metadata, but never includes them in the report.
 

@@ -32,6 +32,8 @@ it('runs the command without the optional PostgreSQL dependency installed', () =
 		mkdirSync(join(fixture, 'node_modules'));
 		copyFileSync(join(root, 'docs', 'tools', 'recovery-verify.mjs'), join(fixture, 'docs', 'tools', 'recovery-verify.mjs'));
 		copyFileSync(join(root, 'docs', 'persistence.v1.json'), join(fixture, 'docs', 'persistence.v1.json'));
+		mkdirSync(join(fixture, 'src', 'shared'), { recursive: true });
+		copyFileSync(join(root, 'src', 'shared', 'replay-envelope.js'), join(fixture, 'src', 'shared', 'replay-envelope.js'));
 		writeFileSync(join(fixture, 'package.json'), JSON.stringify({ name: 'svelte-adapter-uws-extensions', version: '0.0.0', type: 'module' }));
 		symlinkSync(join(root, 'node_modules', 'ioredis'), dependency, 'junction');
 		linked = true;
@@ -319,4 +321,30 @@ it('rejects a key that configured prefixes place in both families', async () => 
 	});
 	expect(report.ok).toBe(false);
 	expect(report.redis.checks).toContainEqual({ scope: 'redis', name: 'unambiguous_namespaces', ok: false });
+});
+
+it('counts undecodable and missing replay entries without reporting topics or payloads', async () => {
+	const member = (seq, data = { secret: 'private-payload' }) => JSON.stringify({ v: 1, seq, event: 'message', data });
+	const buffer = [[member(3), '3'], ['{broken private-payload', '4'], [member(6), '6']];
+	const stream = [['2-0', ['v', '1', 'event', 'message', 'data', '{}']], ['3-0', ['v', '99', 'event', 'message', 'data', '{}']]];
+	const keys = ['replay:seq:{private-room}', 'replay:buf:{private-room}', 'replay:seq:{stream-room}', 'replay:streambuf:{stream-room}'];
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['replay'] } }, {
+		redis: {
+			scan: async () => ['0', keys],
+			type: async key => key.includes(':seq:') ? 'string' : key.includes('streambuf') ? 'stream' : 'zset',
+			pttl: async () => -1,
+			get: async key => key.includes('private-room') ? '7' : '3',
+			zrevrange: async () => buffer.at(-1),
+			xrevrange: async () => [stream.at(-1)],
+			zcard: async () => buffer.length, xlen: async () => stream.length,
+			zrange: async () => buffer.flat(),
+			xrange: async () => stream
+		}
+	});
+	expect(report.complete).toBe(true);
+	// Sorted set: seq 4 corrupt, 5 and 7 missing. Stream: seq 3 in an unknown version.
+	expect(report.redis.observations.replayEntries).toEqual({ buffers: 2, entries: 5, corruptEntries: 2, missingEntries: 2 });
+	expect(report.redis.checks).toContainEqual({ scope: 'replay', name: 'sequence_authority', ok: true });
+	expect(report.redis.checks).toContainEqual({ scope: 'replay', name: 'decodable_entries', ok: false });
+	expect(JSON.stringify(report)).not.toMatch(/private-room|stream-room|private-payload/);
 });

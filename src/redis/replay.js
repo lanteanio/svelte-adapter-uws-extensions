@@ -30,7 +30,7 @@ import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, 
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
-import { decodeSortedSetMember } from '../shared/replay-envelope.js';
+import { decodeSortedSetMember, replayHasHole } from '../shared/replay-envelope.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
@@ -412,52 +412,28 @@ export function createReplay(client, options = {}) {
 			if (b) b.guard();
 			const bk = bufKey(topic);
 
-			// Pipeline the oldest-entry probe (for truncation detection)
-			// alongside the seq>sinceSeq fetch so this is one RTT and the
-			// returned data covers only what the client actually needs.
-			// Fetch a small slice for the oldest probe so corrupt entries
-			// at the head don't hide the actual oldest valid seq. The seq
-			// counter rides the same RTT: the empty-gap-fill truncation check
-			// and the watermark confirmation (see the return below) both need
-			// it, and resume is the reconnect-storm hot path, so it must not
-			// cost a second round trip. All three keys share the {topic} hash
-			// tag, so the pipeline stays single-slot on a cluster.
-			let oldestRaw, missedRaw, seqRaw;
+			// The seq counter rides the same RTT as the range read: hole
+			// detection, the empty-gap-fill truncation check and the watermark
+			// confirmation (see the return below) all need it, and resume is the
+			// reconnect-storm hot path, so it must not cost a second round trip.
+			// Both keys share the {topic} hash tag, so the pipeline stays
+			// single-slot on a cluster. The counter is read FIRST: a publish
+			// increments it and adds its entry in one script, so every seq the
+			// counter reports is already visible to the range read that follows,
+			// and an in-flight publish cannot pass for a missing entry.
+			let missedRaw, seqRaw;
 			try {
 				const pipe = redis.pipeline();
-				pipe.zrange(bk, 0, 9);
-				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
 				pipe.get(seqKey(topic));
+				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];
-				if (results[2][0]) throw results[2][0];
-				oldestRaw = results[0][1];
+				seqRaw = results[0][1];
 				missedRaw = results[1][1];
-				seqRaw = results[2][1];
 			} catch (err) {
 				b?.failure(err);
 				throw err;
-			}
-
-			let truncated = false;
-			let oldestSeq = null;
-			if (oldestRaw) {
-				for (let i = 0; i < oldestRaw.length; i++) {
-					// Probe for the oldest valid seq (truncation detection) only. A
-					// corrupt member here is counted by the missed-range scan below when
-					// it falls in the delivered range; counting it in both loops would
-					// double-report the same entry in replay_corruptions_total.
-					const decoded = decodeSortedSetMember(oldestRaw[i], topic);
-					if (decoded === null) { inputDropped('corrupt_entry', 'decode'); continue; }
-					oldestSeq = decoded.seq;
-					break;
-				}
-			}
-			if (oldestSeq !== null && sinceSeq > 0 && oldestSeq > sinceSeq + 1) {
-				mTruncations?.inc({ topic: mt(topic) });
-				truncated = true;
-				platform.send(ws, replayTopic, 'truncated', null);
 			}
 
 			const missed = [];
@@ -468,9 +444,9 @@ export function createReplay(client, options = {}) {
 			}
 
 			const currentSeq = seqRaw ? parseInt(seqRaw, 10) : 0;
-			if (oldestSeq === null && sinceSeq > 0 && missed.length === 0 && currentSeq > sinceSeq) {
+			const truncated = replayHasHole(missed, sinceSeq, currentSeq);
+			if (truncated) {
 				mTruncations?.inc({ topic: mt(topic) });
-				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
 			}
 			b?.success();

@@ -165,6 +165,48 @@ describe('redis replay (stream backend)', () => {
 			const truncated = platform.sent.filter((s) => s.event === 'truncated');
 			expect(truncated).toHaveLength(1);
 		});
+
+		describe('a hole inside the replayed range', () => {
+			async function publishFive() {
+				for (let i = 1; i <= 5; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+				return client._streams.get(client.key('replay:streambuf:{chat}'));
+			}
+			const frames = () => platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event);
+			const corrupt = (entry) => { entry.fields = entry.fields.map(([f, v]) => [f, f === 'v' ? '99' : v]); };
+
+			it.each([0, 1])('reports a corrupt middle entry as truncated (sinceSeq %i)', async (sinceSeq) => {
+				corrupt((await publishFive())[2]);
+				platform.reset();
+				await replay.replay({}, 'chat', sinceSeq, platform);
+				expect(frames()).toEqual(['truncated', ...[1, 2, 4, 5].filter((seq) => seq > sinceSeq), 'end']);
+				expect(platform.sent.at(-1).data).toEqual({ truncated: true });
+			});
+
+			it('reports a deleted middle entry as truncated', async () => {
+				await publishFive();
+				await client.redis.xdel(client.key('replay:streambuf:{chat}'), '3-0');
+				platform.reset();
+				await replay.replay({}, 'chat', 1, platform);
+				expect(frames()).toEqual(['truncated', 2, 4, 5, 'end']);
+			});
+
+			it('reports a corrupt newest entry as truncated', async () => {
+				corrupt((await publishFive())[4]);
+				platform.reset();
+				const watermark = await replay.replay({}, 'chat', 2, platform);
+				expect(frames()).toEqual(['truncated', 3, 4, 'end']);
+				expect(watermark).toBe(4);
+			});
+
+			it('does not report a contiguous fill as truncated', async () => {
+				await publishFive();
+				for (const sinceSeq of [0, 2, 5]) {
+					platform.reset();
+					await replay.replay({}, 'chat', sinceSeq, platform);
+					expect(platform.sent.some((s) => s.event === 'truncated'), `sinceSeq ${sinceSeq}`).toBe(false);
+				}
+			});
+		});
 	});
 
 	describe('gap', () => {

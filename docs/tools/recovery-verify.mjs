@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import Redis from 'ioredis';
+import { decodeSortedSetMember, decodeStreamFields } from '../../src/shared/replay-envelope.js';
 
 const bytes = readFileSync(new URL('../persistence.v1.json', import.meta.url));
 export const manifest = JSON.parse(bytes);
@@ -230,6 +231,44 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 						const last = await read('xrevrange', roles.stream, '+', '-', 'COUNT', 1);
 						if (last.length) replayOk &&= integer(seq) && BigInt(seq) >= BigInt(last[0][0].split('-')[0]);
 					}
+					// Read-only scrub of the retained entries: the replay readers drop
+					// an entry they cannot decode and resuming clients get a truncated
+					// frame for it, so count those and the seqs between the oldest
+					// retained entry and the counter that have no entry at all.
+					const scrub = result.observations.replayEntries ??= { buffers: 0, entries: 0, corruptEntries: 0, missingEntries: 0 };
+					const seqs = [];
+					scrub.buffers++;
+					if (roles.buffer) {
+						if (Number(await read('zcard', roles.buffer)) > config.maxMembers) fail('member_limit_reached');
+						const rows = await read('zrange', roles.buffer, 0, config.maxMembers - 1, 'WITHSCORES');
+						for (let i = 0; i < rows.length; i += 2) {
+							scrub.entries++;
+							const entry = decodeSortedSetMember(rows[i], '');
+							if (entry === null || String(entry.seq) !== rows[i + 1]) scrub.corruptEntries++;
+							if (integer(rows[i + 1])) seqs.push(BigInt(rows[i + 1]));
+						}
+					}
+					if (roles.stream) {
+						if (Number(await read('xlen', roles.stream)) > config.maxMembers) fail('member_limit_reached');
+						const rows = await read('xrange', roles.stream, '-', '+', 'COUNT', config.maxMembers);
+						for (const [id, flat] of rows) {
+							scrub.entries++;
+							const fields = {};
+							for (let i = 0; i < flat.length; i += 2) fields[flat[i]] = flat[i + 1];
+							const [ms, part] = id.split('-');
+							if (part !== '0' || !integer(ms) || decodeStreamFields(fields, Number(ms), '') === null) scrub.corruptEntries++;
+							if (integer(ms)) seqs.push(BigInt(ms));
+						}
+					}
+					if (seqs.length && integer(seq)) {
+						seqs.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+						let expected = seqs[0];
+						for (const value of seqs) {
+							if (value > expected) scrub.missingEntries += Number(value - expected);
+							if (value >= expected) expected = value + 1n;
+						}
+						if (BigInt(seq) >= expected) scrub.missingEntries += Number(BigInt(seq) - expected + 1n);
+					}
 				}
 			}
 			if (family === 'alarms' || family === 'dead-letter') {
@@ -282,6 +321,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 			check(result, 'alarms', 'execution_authority', executionOk);
 		}
 		if (config.specs.some(spec => spec.id === 'replay')) check(result, 'replay', 'sequence_authority', replayOk);
+		if (config.specs.some(spec => spec.id === 'replay')) check(result, 'replay', 'decodable_entries', !(result.observations.replayEntries?.corruptEntries > 0));
 		if (config.specs.some(spec => spec.id === 'lock-fences')) check(result, 'lock-fences', 'counter_authority', fenceOk);
 		if (config.specs.some(spec => ['alarms','dead-letter'].includes(spec.id))) check(result, 'redis', 'paired_membership', pairOk);
 		if (before !== await topology(redis)) fail('topology_changed');

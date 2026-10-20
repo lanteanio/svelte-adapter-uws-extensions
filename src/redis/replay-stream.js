@@ -28,7 +28,7 @@ import { createLruMap } from '../shared/lru-map.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS } from '../shared/caps.js';
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
-import { decodeStreamFields } from '../shared/replay-envelope.js';
+import { decodeStreamFields, replayHasHole } from '../shared/replay-envelope.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
@@ -551,23 +551,26 @@ export function createStreamReplay(client, options = {}) {
 			}
 			if (b) b.guard();
 
-			// The seq counter rides the same RTT as the range read: the
-			// empty-gap-fill truncation check and the watermark confirmation
-			// (see the return below) both need it, and resume is the
-			// reconnect-storm hot path, so it must not cost a second round
-			// trip. Both keys share the {topic} hash tag, so the pipeline
-			// stays single-slot on a cluster.
+			// The seq counter rides the same RTT as the range read: hole
+			// detection, the empty-gap-fill truncation check and the watermark
+			// confirmation (see the return below) all need it, and resume is the
+			// reconnect-storm hot path, so it must not cost a second round trip.
+			// Both keys share the {topic} hash tag, so the pipeline stays
+			// single-slot on a cluster. The counter is read FIRST: a publish
+			// increments it and adds its entry in one script, so every seq the
+			// counter reports is already visible to the range read that follows,
+			// and an in-flight publish cannot pass for a missing entry.
 			let entries, seqRaw;
 			try {
 				const startId = `(${sinceSeq}-0`;
 				const pipe = redis.pipeline();
-				pipe.xrange(bufKey(topic), startId, '+');
 				pipe.get(seqKey(topic));
+				pipe.xrange(bufKey(topic), startId, '+');
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];
-				entries = results[0][1];
-				seqRaw = results[1][1];
+				seqRaw = results[0][1];
+				entries = results[1][1];
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -580,15 +583,8 @@ export function createStreamReplay(client, options = {}) {
 				missed.push(decoded);
 			}
 
-			let truncated = false;
 			const currentSeq = seqRaw ? parseInt(seqRaw, 10) : 0;
-			if (sinceSeq > 0) {
-				if (missed.length > 0 && missed[0].seq > sinceSeq + 1) {
-					truncated = true;
-				} else if (missed.length === 0 && currentSeq > sinceSeq) {
-					truncated = true;
-				}
-			}
+			const truncated = replayHasHole(missed, sinceSeq, currentSeq);
 			b?.success();
 
 			if (truncated) {
