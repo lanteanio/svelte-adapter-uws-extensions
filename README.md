@@ -725,7 +725,7 @@ Each stream entry stores only the `event` and `data` fields. The topic is not st
 
 The stream backend works on Redis 5+; listpack encoding is the Redis 7+ default that delivers the memory win.
 
-**Persisted-envelope versioning:** every backend (Redis sorted-set, Redis stream, Postgres) stores replay entries as self-describing JSON (`{seq, topic, event, data}` / row columns), independent of the frozen binary wire protocol. The envelope carries no explicit version field today; readers MUST treat an absent version field as version 1. A future schema evolution adds a `v` field and read-time upcasting on top of that rule, so history persisted today - including with an unbounded `ttl: 0` retention - stays readable without migration.
+**Persisted-envelope versioning:** stored replay entries are self-describing and independent of the frozen binary wire protocol. Redis sorted-set members are `{v: 1, seq, event, data}` JSON, Redis stream entries carry a `v: 1` field next to `event` and `data`, and Postgres stores row columns. A Redis reader treats an absent `v` (entries written before the field existed) as version 1 and drops an entry with any other version as a gap, counted by `replay_corruptions_total`. A schema change raises `v` and upcasts older versions on read, so history persisted with an unbounded `ttl: 0` retention stays readable without migration.
 
 #### Migrating a sorted-set buffer to stream storage
 

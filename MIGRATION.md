@@ -24,7 +24,9 @@ Use Node.js 22 or later, the adapter's matching native addon, and the exact
 candidate tuple in the [README compatibility table](./README.md#version-compatibility).
 The adapter's manifest is the tuple authority; a peer range alone is not an
 integration-tested tuple. PostgreSQL 16 is the tested database baseline. Use the
-Redis/Valkey backend tier you actually deploy when rehearsing the upgrade.
+Redis/Valkey backend tier you actually deploy when rehearsing the upgrade. The
+`ioredis` dependency floor rose from `^5.0.0` to `^5.10.1`; raise any
+`overrides` or `resolutions` pin that holds it lower.
 
 Save the current lockfile, application configuration, database backup and Redis
 persistence snapshot before changing versions. Stop application producers and
@@ -199,7 +201,11 @@ now use hash-tagged keys so each entity's multi-key scripts run on one Cluster
 slot. For example, `replay:seq:room` becomes `replay:seq:{room}` and
 `replay:buf:room` becomes `replay:buf:{room}`, under the same configured
 prefix. The package does not automatically discover or convert old namespaces.
-Sorted-set replay defaults to no TTL, so its old buffers need not expire.
+Sorted-set and stream replay default to no TTL, so their old buffers never
+expire on their own; neither do old group metadata and closed tombstones. The
+groups event channel moved with its keys, from `group:<name>:events` to
+`group:{<name>}:events`, so 0.5 and 0.6 instances miss each other's group
+events while both run.
 
 **Action.** Stop all old writers and disconnect their clients before switching
 namespaces. Snapshot the old data, prefixes and topic mapping. For ephemeral
@@ -220,6 +226,107 @@ it with writes paused, then switch the whole fleet. Keep old keys isolated until
 rollback is no longer needed and delete them through an explicit retention plan.
 No data conversion is needed on a fresh Redis namespace. The PostgreSQL rehearsal
 below does not exercise this Redis transition.
+
+### Redis ACLs must cover the 0.6 key families and channels
+
+**Symptom.** `NOPERM` from joins, publishes, replay, idempotency, sessions or
+rate limits for a Redis user whose key and channel patterns were written for 0.5.
+
+**Why.** Hash-tagged keys change the per-entity key strings, and 0.6 adds key
+families: `replay:epoch:{<topic>}`; `presence:pending:{<topic>}`, the private
+identity generations and committed-identity fence that every join writes
+(excluded from roster reads); the idempotency and session erasure indexes under
+`<keyPrefix>byuser:` (`idem:byuser:v2...` and `sess:byuser:...` with the default
+prefixes) when erasure is wired; `lock-fences:<key>` for fenced locks; and
+`v1:ratelimit:emergency` for the emergency scale.
+
+**Action.** Grant the families your deployment uses. Key patterns sit under the
+client `keyPrefix`; where a factory has its own `keyPrefix` option, its default
+is shown and a custom value replaces it:
+
+| Module | Key patterns |
+|---|---|
+| Replay (sorted set and stream) | `replay:*` (sequence, buffer, stream buffer, epoch, producer cache) |
+| Presence | `presence:*` (roster, per-user connections, pending identity) |
+| Cursor, groups | `cursor:*`, `group:*` |
+| CRDT, smooth cluster | `crdt:*`, `smooth:*` |
+| Dead letters | `dlq:*` |
+| Alarms | `alarm:{alarms}:*` |
+| Idempotency, sessions | `idem:*`, `sess:*` (records and their `byuser:` erasure indexes) |
+| Connection registry | `conns:*`, `sess:*` (factory `keyPrefix` defaults to empty) |
+| Locks, leader, task fences | `lock:*`, `lock-fences:*`, `leader`, `fence:*` |
+| Cluster clock, topic broadcast | `clock:leader-offset`, `{topic-broadcast}:instances` |
+| Rate limits | `v1:ratelimit:*`, `v1:ratelimits:*`, `v1:ratelimitg:*`, `v1:ratelimitc:*`, `v1:upgrade-bucket:*` |
+| Webhook controls | `whbudget:*`, `whbreaker:*` |
+
+Channels need their own `&` patterns. The bus `channel` (`uws:pubsub`), the
+sharded bus `channelPrefix` (`uws:sharded:*`) and the publish-rate aggregator's
+`uws:pressure:rates` take no client prefix. Under the client prefix:
+`presence:events:*`, `group:*` (each group's `group:{<name>}:events`),
+`cursor:events`, `crdt:events`, `smooth:events`, `topic-broadcast:events`, and
+the registry's `__registry-events` and `__push:*`. `keyspaceNotifications` also
+needs `+psubscribe` and `&__keyevent@*__:del`. Back up `presence:pending` with
+the other presence keys; [storage recovery](./docs/recovery.md#restore-scope)
+gives each family's restore rule.
+
+### Presence keyspace cleanup listens for `del` events
+
+**Symptom.** With `keyspaceNotifications: true`, a topic whose last instance
+died keeps its stale roster on subscribers, and `redis.presence.keyspace-events.off`
+reports the server's flags where `CONFIG GET` is permitted.
+
+**Why.** The per-topic roster hash is now removed with a `del`, so the cleanup
+psubscribes `__keyevent@*__:del` on every master. 0.5 listened for `expired`
+and asked for `notify-keyspace-events Ex`, which carries no generic `del` event.
+
+**Action.** Run `CONFIG SET notify-keyspace-events Eg` on every master (or add
+`E` and `g` to the flags it has) and set it in `redis.conf`. During a rolling
+upgrade or rollback window, `Egx` serves both versions.
+
+### Redis relay queues are bounded
+
+**Symptom.** Under a publish burst, local subscribers receive a publication and
+other instances do not. `<bus>_messages_local_only_total{reason="queue_full"}`
+increments, and `redis.pubsub.relay-batch.burst` (or
+`redis.sharded-pubsub.relay-batch.channel-burst`) is reported once per bus.
+
+**Why.** Each pub/sub and sharded bus retains at most 8,192 relay envelopes or
+8 MiB of encoded bytes, including submissions Redis has not settled, so a Redis
+stall cannot grow process memory without bound. The limits are not configurable.
+
+**Action.** Alert on the counter and the event, keep bursts within the relay's
+throughput, and carry state that must reach every instance in a store with
+recovery (replay, presence) rather than in a bare publication. See
+[relay limits and metrics](./docs/relay-metrics.md#bounded-admission-and-draining).
+
+### The presence consistency auditor can restart a process
+
+**Symptom.** A production process exits with code 78 shortly after
+`redis.presence.local-index-desync` assertion lines.
+
+**Why.** Each Redis presence tracker audits its local member counts against its
+local reverse index every 5 seconds by default. A desync that persists across
+two consecutive audits of the same window is treated as unrecoverable
+bookkeeping and ends the process after the current callback unwinds; a single
+desync only logs and counts.
+
+**Action.** Run under a supervisor that restarts the process, and alert on exit
+code 78 and the assertion category. `consistencyAuditIntervalMs: 0` disables
+the auditor.
+
+### Mixed 0.5 and 0.6 fleets shed `clusterTopPublisher` classes
+
+**Symptom.** While any 0.5 instance still reports to the publish-rate
+aggregator, an admission class using `clusterTopPublisher` rejects every topic
+that 0.5 instance's sample does not list, cold ones included.
+
+**Why.** A 0.6 instance bounds a topic missing from a peer's sample by that
+peer's total `publishRate`. A 0.5 peer sends no total, so the bound is unknown
+and the rule fails closed.
+
+**Action.** Enable `clusterTopPublisher` only after the whole fleet runs 0.6,
+or accept the shedding for the length of the rollout. A stopped 0.5 instance's
+slice stops counting after `staleAfter`.
 
 ### Ordered alarm generations
 
@@ -269,32 +376,6 @@ Old column-only readers continue to work; this is not a whole-fleet compatibilit
 guarantee. Existing task rows have null `user_id`: backfill from trusted
 application identity if they must participate in user erasure. The package
 cannot infer that identity from arbitrary historical input.
-
-### Redis idempotency key derivation changed
-
-**Symptom.** None at boot. After the upgrade, idempotency entries written by
-0.5 instances are not found by 0.6 instances, so a request that was already
-committed executes a second time.
-
-**Why.** `acquire` filtered a non-string tenant while `purgeUser` coerced it, so
-a numeric tenant indexed under one key and erased under another and the erasure
-silently missed. Both sides now coerce identically, and NUL is rejected in
-either segment (the composite key is NUL-delimited, so `('a\0b','c')` and
-`('a','b\0c')` collided and one identity's purge deleted another's results).
-
-**Action.** Pick one:
-
-- **Drain.** Stop all producers of idempotent work, finish active handlers, and
-  verify that both pending entries and retained committed results have expired
-  under their actual TTLs before deploying. Waiting only for handler completion
-  is insufficient. Use this path when duplicate execution is unacceptable.
-- **Accept one re-execution.** Entries written before the upgrade fall back to a
-  cache miss and run once more. Fine when your handlers are themselves
-  idempotent against the downstream.
-
-Do **not** deploy 0.6 alongside 0.5 instances sharing one Redis for longer than
-your idempotency TTL: during that window the two derive different keys for the
-same identity.
 
 ### Other PostgreSQL stores and readiness
 
@@ -349,6 +430,10 @@ changing versions, so refresh state from its application authority.
 throws `RangeError` when its encoded relay envelope exceeds
 `maxEnvelopeBytes`, before the batch is delivered locally.
 
+The same call throws the serializer's `TypeError` before local delivery when an
+entry's `data` cannot be encoded as JSON (a `bigint`, a cycle); 0.5 delivered
+the batch locally first and then threw.
+
 **Why.** Admitting only part of a batch would let local and remote recipients
 observe different publications.
 
@@ -389,6 +474,22 @@ Recovery can reclaim it after the database lease expires. Handlers must stop on
 the abort signal and keep effects idempotent; a late local success is discarded.
 An existing successor still supplies the canonical outcome. See [task renewal
 confidence](./docs/task-workers.md#fence-renewal-confidence).
+
+### Redis idempotency identities must not contain NUL
+
+**Symptom.** `redis idempotency: tenant id must not contain a NUL byte (it is
+the index-key delimiter)` or the same for the user id, from a call that carries
+an erasure identity.
+
+**Why.** The erasure index joins tenant and user with NUL, so `('a\0b', 'c')`
+and `('a', 'b\0c')` would share one index and one identity's purge would delete
+another's results. A numeric tenant is coerced to a string on every path.
+
+**Action.** Keep NUL out of tenant and user ids. Result keys are unchanged:
+the primary key is still the factory `keyPrefix` plus your key, so 0.6 reads
+committed and pending entries written by 0.5 and no drain is needed for the key
+itself. The erasure index and committed-envelope format are covered in the next
+two sections.
 
 ### Redis idempotency retains pending ownership through erasure
 
@@ -534,10 +635,11 @@ non-string throws rather than being coerced.
 
 **Symptom.** `postgres tasks: input is N bytes, past the 262144-byte payload
 cap`, `postgres replay: data exceeds maxDataBytes`, `postgres jobs: batchSize
-must be at most 1000`, or a job id rejected as not a digit string.
+must be at most 1000`, `postgres jobs: at most 1000 ids per call, got N` from
+`complete`, `fail` or `extend`, or a job id rejected as not a digit string.
 
-**Why.** `jobs.claim` accepted any batch size while every way to finish the
-batch refused above 1000, so an oversized claim could only expire and be
+**Why.** Finishing calls now take at most 1000 ids, one statement's worth, and
+`jobs.claim` is held to the same size: a larger claim could only expire and be
 redelivered - re-running each job's side effects every cycle.
 
 **Action.** The task cap is now configurable: pass `maxPayloadBytes` to
@@ -549,6 +651,22 @@ either raise the bound to cover the largest result the task can produce, or
 return a reference (an object-store key, a row id) and keep the bytes out of the
 row. The minimum is 80 bytes, enough to retain a valid terminal error shape.
 `bigserial` ids beyond 2^53 - which pg returns as strings - are accepted.
+Split `complete` / `fail` / `extend` calls into chunks of at most 1000 ids.
+
+### Redis replay refuses payloads over 256 KiB
+
+**Symptom.** `replay.publish()` (and the stream backend's `publishIdempotent()`)
+rejects with `ReplaySerializationError` wrapping `redis replay: data exceeds
+maxDataBytes (262144 bytes)` (or `redis stream replay: ...`), where 0.5 stored
+the entry.
+
+**Why.** One bound on every replay backend keeps a single entry from growing
+Redis memory and the read-back cost of every resume. The check runs before
+storage is touched, so `localFanoutOnStorageFailure` does not apply to it and
+nothing is published.
+
+**Action.** Keep replayed payloads small (store a reference to large content),
+or set `maxDataBytes` on `createReplay` to the largest entry you intend to keep.
 
 ### Registry and groups throw on an oversized outbound envelope
 
@@ -559,6 +677,10 @@ previously resolved.
 **Why.** Publishing past the bound resolved as though delivered while every peer
 dropped the frame on receipt - a silent split-brain only the sender could
 detect.
+
+`registry.sendTo()` refuses the same way for a cross-instance match, after it has
+already delivered to the matching connections on the calling instance; a
+retry with a smaller payload delivers to those local users a second time.
 
 **Action.** `await` these calls, or attach a `.catch`. An unhandled rejection
 terminates the worker under Node's default, and the registry's own examples were
@@ -834,6 +956,33 @@ Property reads are unchanged, but `byTopic.hasOwnProperty(...)`,
 `Object.hasOwn(byTopic, t)` and `Object.keys(byTopic)`. A stored topic named
 `__proto__` previously hit the prototype setter instead of counting as data.
 
+### Module frames carry no sequence number
+
+Presence, cursor and groups frames, the bus's `degraded` / `recovered` frames,
+a coalesced value a bus delivers to a platform without `sendCoalesced`, and the
+local frames replay sends under `localFanoutOnStorageFailure` while storage is
+down are published with `seq: false`, as the adapter's bundled plugins' frames
+are. Clients rebuild these from snapshots and heartbeats; a client that read
+`seq` on them gets none and must stop relying on it.
+
+### Presence holds evictions after a mass disconnect
+
+When one heartbeat tick finds at least 15% of an instance's tracked sockets
+dead, and it tracks at least 8, presence treats it as a network event: leaves
+are held, with cluster TTLs refreshed, for up to 90 seconds so reconnecting
+clients keep their roster entries. A user who does not return is evicted when
+the hold ends. Tests and dashboards that expect an immediate leave after a
+mass disconnect need `selfPreservation: false`, or tuned `threshold`,
+`minPopulation` and `holdMaxMs`.
+
+### Cursor frames are membership-gated in `hooks.message`
+
+`cursor` and `cursor-viewport` frames from a client now require the membership
+that `attach` or the subscribe handshake grants. The gate lives in
+`cursors.hooks.message`; a `message` handler that calls `cursors.update()`
+directly, as earlier README examples did, skips it. Route those frames through
+`cursors.hooks.message`.
+
 ## 5. Test-only
 
 ### `mockRedisClient` SCAN matches the real matcher
@@ -913,8 +1062,10 @@ old process while a new handler still owns work can duplicate side effects.
 
 The added nullable trace columns can remain when rolling back. Do not drop them
 while any 0.6 instance is running. This additive change does not make every
-storage format interchangeable: the Redis idempotency key transition still
-requires the same TTL drain in either direction. A snapshot restore can discard
+storage format interchangeable: Redis idempotency results keep their keys, but
+committed envelopes and ownership indexes written by 0.6 need the reconciliation
+plan in [ownership, failure and upgrade rules](./docs/idempotency-erasure.md)
+before 0.5 writers return. A snapshot restore can discard
 post-snapshot writes; reconcile those with downstream side effects before use.
 
 The hash-tagged Redis namespaces need their own rollback plan. Old binaries
@@ -927,7 +1078,10 @@ revive stranded no-TTL replay buffers.
 
 Do not assume rolling wire compatibility merely because sockets connect.
 Selected presence identity is now carried separately from durable fields;
-update all receivers for its full identity guarantee. Confirm relayed compression,
+update all receivers for its full identity guarantee. Module frames carry
+`seq: false` on 0.6 and a counter seq on 0.5, so clients see both while the
+fleet is mixed. The groups event channel differs between the versions, so group
+events do not cross between them. Confirm relayed compression,
 sequence authority, authorization denials and reconnect/replay behavior on the
 exact deployment tuple. Preserve prefixes, table names and tenant topic mapping
 unless you separately migrate their data.
@@ -946,6 +1100,9 @@ Run your test suite, then check:
 - Jobs and tasks tables you migrate yourself have `traceparent` and
   `tracestate`; tasks also have `user_id` and its lookup index.
 - Log routing and alerting keyed on the old prose prefixes route on `event=`.
+- Redis ACLs cover the 0.6 key families and channels, and every master has
+  `notify-keyspace-events` with `E` and `g` when `keyspaceNotifications` is on.
+- Alerts exist for relay `queue_full` drops and for exit code 78.
 
 ---
 
@@ -990,13 +1147,9 @@ These close real security bugs in idiomatic 0.4 code paths.
 **Storage layout.** The pre-fix per-topic hash was `presence:{topic}` with fields keyed by `{instanceId}|{userKey}`. The new layout splits storage:
 
 - `presence:topic:{topic}` HASH, field=`userKey`, value=JSON `{data, ts}`. One field per unique user on the topic. Backs `list()` / `count()`.
-- `presence:user:{topic}:{userKey}` HASH, field=`instanceId`, value=opaque membership token. One field per instance currently presenting this user. Backs the leave HLEN check.
+- `presence:user:{topic}:{userKey}` HASH, field=`instanceId`, value=`ts`. One field per instance currently presenting this user. Backs the leave HLEN check.
 
-- `presence:pending:{topic}` HASH, field=`userKey`, value=private identity generations and committed-identity fence. It is excluded from roster reads.
-
-Permit all three key families in Redis ACL patterns before upgrading. The private pending hash is required for joins; preserve it alongside presence state during backup and restore. Legacy writers cannot provide the full identity-ordering guarantee, so update every writer and receiver.
-
-All three hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is gone; keys implicitly disappear when their last field expires.
+Both hashes have per-field TTLs via `HPEXPIRE`. The pre-fix whole-key EXPIRE is gone; keys implicitly disappear when their last field expires.
 
 **How to migrate.**
 
