@@ -274,6 +274,12 @@ export function createDistributedLock(client, options = {}) {
 			}
 		}
 		let heartbeatTimer;
+		// Wake at the heartbeat interval while more than one interval of lease
+		// remains. Closer to the deadline, wake halfway to it so a renewal is
+		// still sent before expiry: after a slow acquisition, after a failed
+		// renewal, or when a per-call ttlMs is shorter than heartbeatMs. The
+		// final wake lands on the deadline itself.
+		const nextWake = remaining => remaining > heartbeatMs ? heartbeatMs : Math.max(1, Math.floor(remaining / 2));
 		function heartbeatDue() {
 			if (lost) return;
 			const remaining = leaseDeadline - monotonicNow();
@@ -291,11 +297,11 @@ export function createDistributedLock(client, options = {}) {
 				finishWaiter = undefined;
 			} else {
 				if (!stopped && !inFlight) inFlight = Promise.resolve().then(heartbeatTick).catch(() => {});
-				heartbeatTimer = setTimer(heartbeatDue, Math.min(heartbeatMs, remaining));
+				heartbeatTimer = setTimer(heartbeatDue, nextWake(remaining));
 				if (heartbeatTimer.unref) heartbeatTimer.unref();
 			}
 		}
-		heartbeatTimer = setTimer(heartbeatDue, Math.min(heartbeatMs, leaseDeadline - acknowledgedAt));
+		heartbeatTimer = setTimer(heartbeatDue, nextWake(leaseDeadline - acknowledgedAt));
 		if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 		let result;
@@ -329,7 +335,10 @@ export function createDistributedLock(client, options = {}) {
 			} else if (!lost) {
 				try {
 					const released = await evalCached(redis, RELEASE_SCRIPT, 1, fullK, leaseToken);
-					if (Number(released) !== 1) {
+					// A missing key after the lease deadline is natural expiry and
+					// says nothing about work that settled inside the lease. Before
+					// the deadline, or for work that settled past it, it is loss.
+					if (Number(released) !== 1 && (settledAt >= leaseDeadline || monotonicNow() < leaseDeadline)) {
 						lost = true;
 						lostError = new LockLostError(key);
 						mLost?.inc({ key_class: keyClass });

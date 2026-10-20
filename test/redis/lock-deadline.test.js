@@ -143,3 +143,63 @@ it('rejects a renewal reply after the prior deadline even before its timer runs'
 	finish.resolve(); const outcome = await result;
 	expect(aborted).toBe(true); expect(outcome.error).toBeInstanceOf(LockLostError);
 });
+
+it('preserves completion inside the lease when a release reply of 0 arrives after natural expiry', async () => {
+	const lock = createDistributedLock(client, { defaultTtlMs: 100 }); let signal;
+	const realEval = client.redis.eval.bind(client.redis);
+	client.redis.eval = async (script, ...args) => { if (script.includes("'DEL'")) { now = 150; return 0; } return realEval(script, ...args); };
+	await expect(lock.withLock('key', s => { signal = s; now = 90; return 'done'; })).resolves.toBe('done');
+	expect(signal.aborted).toBe(false);
+});
+
+it('rejects when a release reply of 0 arrives inside the lease', async () => {
+	const lock = createDistributedLock(client, { defaultTtlMs: 100 }); let signal;
+	client.redis.eval = async (script) => { if (script.includes("'DEL'")) { now = 95; return 0; } return 1; };
+	await expect(lock.withLock('key', s => { signal = s; now = 90; return 'done'; })).rejects.toBeInstanceOf(LockLostError);
+	expect(signal.aborted).toBe(true);
+});
+
+it('rejects when a release reply of 0 follows a callback that settled past the deadline', async () => {
+	const lock = createDistributedLock(client, { defaultTtlMs: 100 });
+	client.redis.eval = async (script) => { if (script.includes("'DEL'")) { now = 150; return 0; } throw new Error('partition'); };
+	await expect(lock.withLock('key', () => { now = 110; return 'done'; })).rejects.toBeInstanceOf(LockLostError);
+});
+
+function preciseTimers() {
+	let due = Infinity;
+	const handle = { unref() {} };
+	setRuntimeEnv({ clock: { monotonic: () => now }, timers: {
+		setInterval() { throw new Error('unexpected interval'); }, clearInterval() {},
+		set(fn, ms) { tick = fn; due = now + ms; return handle; },
+		clear() { due = Infinity; }
+	} });
+	return async target => { while (due <= target) { now = due; due = Infinity; tick(); await flush(); } now = target; };
+}
+
+it('renews before the deadline when acquisition used most of the lease', async () => {
+	const advance = preciseTimers();
+	const set = client.redis.set.bind(client.redis), renewals = [];
+	client.redis.set = async (...args) => { const result = await set(...args); now = 90; return result; };
+	const realEval = client.redis.eval.bind(client.redis);
+	client.redis.eval = async (script, ...args) => { if (script.includes("'PEXPIRE'")) renewals.push(now); return realEval(script, ...args); };
+	const started = deferred(), finish = deferred(); let signal;
+	const lock = createDistributedLock(client, { defaultTtlMs: 100, heartbeatMs: 33 });
+	const result = lock.withLock('key', async s => { signal = s; started.resolve(); await finish.promise; return 'done'; }).then(value => ({ value }), error => ({ error }));
+	await started.promise; await advance(250);
+	const aborted = signal.aborted; finish.resolve(); const outcome = await result;
+	expect(renewals[0]).toBeLessThan(100);
+	expect(aborted).toBe(false); expect(outcome.value).toBe('done');
+});
+
+it('keeps renewing a per-call ttlMs shorter than heartbeatMs', async () => {
+	const advance = preciseTimers(), renewals = [];
+	const realEval = client.redis.eval.bind(client.redis);
+	client.redis.eval = async (script, ...args) => { if (script.includes("'PEXPIRE'")) renewals.push(now); return realEval(script, ...args); };
+	const started = deferred(), finish = deferred(); let signal;
+	const lock = createDistributedLock(client, { defaultTtlMs: 3000, heartbeatMs: 1000 });
+	const result = lock.withLock('key', async s => { signal = s; started.resolve(); await finish.promise; return 'done'; }, { ttlMs: 100 }).then(value => ({ value }), error => ({ error }));
+	await started.promise; await advance(500);
+	const aborted = signal.aborted; finish.resolve(); const outcome = await result;
+	expect(renewals.length).toBeGreaterThan(3);
+	expect(aborted).toBe(false); expect(outcome.value).toBe('done');
+});
