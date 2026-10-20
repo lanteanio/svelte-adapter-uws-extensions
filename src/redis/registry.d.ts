@@ -270,6 +270,13 @@ export interface ConnectionRegistry {
 	 * delivered". Retrying with a smaller payload re-delivers to the local
 	 * matches; the refusal is counted as `push_sendto_total{result="refused"}`.
 	 *
+	 * Resolves to the number of dispatched recipients: local sends that do not
+	 * throw plus indexed users on owners whose Redis publish succeeds. Remote
+	 * recipients are counted from the sender index, without acknowledgement;
+	 * membership changes or disconnected peers can prevent delivery. Zero
+	 * means no recipient was dispatched. `push_sendto_recipients_total` records
+	 * the same count, including local sends before an envelope refusal.
+	 *
 	 * @example
 	 * ```js
 	 * registry.sendTo({ tenantId: 't42' }, 'announcements', 'created', payload);
@@ -281,7 +288,7 @@ export interface ConnectionRegistry {
 		topic: string,
 		event: string,
 		data?: unknown
-	): Promise<void>;
+	): Promise<number>;
 
 	/** Count of users registered to THIS instance (local view, scrape-time). */
 	size(): number;

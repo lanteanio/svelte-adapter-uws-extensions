@@ -1163,7 +1163,7 @@ Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only re
 | `request(target, event, data?, opts?)` | Cluster-routed request/reply. Resolves with the reply. |
 | `send(target, topic, event, data?)` | Cluster-routed `platform.send` counterpart. Fire-and-forget. See [Targeted sends](#registry-targeted-sends) below. |
 | `sendCoalesced(target, message)` | Cluster-routed coalesce-by-key send. Fire-and-forget. See [Coalesced sends](#registry-coalesced-sends) below. |
-| `sendTo(criteria, topic, event, data?)` | Attribute-targeted broadcast across the cluster. Requires `attributes` option. See [Attribute-targeted broadcast](#registry-sendto) below. |
+| `sendTo(criteria, topic, event, data?)` | Attribute-targeted broadcast across the cluster; resolves to the dispatched recipient count. Requires `attributes` option. See [Attribute-targeted broadcast](#registry-sendto) below. |
 | `size()` | Count of users registered to THIS instance (local view, scrape-time). |
 | `instanceId` | Stable id for this instance, also the name of its push channel. |
 | `hooks.open` / `hooks.close` | Wire as ready-made WebSocket hooks. |
@@ -1236,7 +1236,7 @@ How it works:
 4. `sendTo(criteria, ...)` resolves matching userIds via the local index, groups them by their owning instance, fires once per owning instance on the existing `{prefix}__push:` channel: `{type:'sendTo', criteria, topic, event, data}`.
 5. Each receiving instance re-resolves matches against its own authoritative local index and calls `platform.send(ws, topic, event, data)` for each match. Authoritative-on-receiver matching tolerates one round of sender-index staleness from a fast user migration.
 
-`sendTo` is fire-and-forget. No reply, no acknowledgement, no per-target outcome. The single `push_sendto_total` counter records sender-side outcomes:
+`sendTo` resolves to a recipient count: local sends that do not throw plus users in the sender index for each owner whose Redis publish succeeds. Zero means no recipient was dispatched. Remote counts describe dispatched targets, without acknowledgement: the receiving index can change and peers can disconnect before delivery. `push_sendto_recipients_total` records the same count, including local sends completed before an oversized remote envelope throws. `push_sendto_total` records one sender-side outcome per call:
 
 | `result` label | Meaning |
 |---|---|
@@ -1262,7 +1262,8 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 | `push_late_replies_total` | Counter: replies that arrived after their request expired or migrated. |
 | `push_coalesced_total{result="ok|self|offline|late|error"}` | Outcomes for `sendCoalesced(...)`. `ok` is a successful cross-instance publish; `self` is a successful self-target; `offline` is a missing entry or local-ws-gone; `late` is a receive-side miss (sessionId not in the local map - target migrated/closed between dispatch and arrival); `error` is a Redis publish failure or a thrown `platform.sendCoalesced` on either side. |
 | `push_sends_total{result="ok|self|offline|late|error"}` | Outcomes for `send(...)`. Same result space as `push_coalesced_total` - `ok` cross-instance, `self` short-circuited locally, `offline` entry missing or local-ws-gone, `late` receive-side miss after migration, `error` Redis publish or local `platform.send` threw. |
-| `push_sendto_total{result="ok|empty|error"}` | Outcomes for `sendTo(...)`. `ok` is "at least one match resolved, all publishes succeeded (or only self-matches)"; `empty` is "no matches resolved by the local index"; `error` is "at least one Redis publish failed." Per-call counter, not per-target - one `sendTo` produces exactly one increment regardless of how many matches it fans out to. |
+| `push_sendto_total{result="ok|empty|error|refused"}` | Outcomes for `sendTo(...)`. `ok` is "at least one match resolved, all publishes succeeded (or only self-matches)"; `empty` is "no matches resolved by the local index"; `error` is "at least one Redis publish failed." Per-call counter, not per-target - one `sendTo` produces exactly one increment regardless of how many matches it fans out to. `refused` counts an oversized remote envelope after local delivery. |
+| `push_sendto_recipients_total` | Dispatched recipients: completed local sends plus sender-index users on owners with successful Redis publishes. Excludes throwing local sends and failed publishes; includes local sends before an envelope refusal. Remote delivery is unacknowledged. No user, cohort or topic labels. |
 
 #### Registry edge cases
 

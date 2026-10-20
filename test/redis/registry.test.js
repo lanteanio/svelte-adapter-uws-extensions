@@ -983,7 +983,7 @@ describe('redis connection registry', () => {
 				const big = { blob: 'x'.repeat(4096) };
 				await expect(
 					local.sendTo({ tenantId: 't42' }, 'announcements', 'created', big)
-				).resolves.toBeUndefined();
+				).resolves.toBe(1);
 				expect(platform.sent).toHaveLength(1);
 				expect(platform.sent[0].data).toBe(big);
 			} finally {

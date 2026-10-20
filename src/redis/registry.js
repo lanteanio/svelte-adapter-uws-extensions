@@ -196,6 +196,7 @@ export function createConnectionRegistry(client, options) {
 	const mCoalesced = m?.counter('push_coalesced_total', 'Cluster coalesced sends by outcome', ['result']);
 	const mSends = m?.counter('push_sends_total', 'Cluster sends by outcome', ['result']);
 	const mSendTo = m?.counter('push_sendto_total', 'Cluster attribute-targeted broadcasts by outcome', ['result']);
+	const mSendToRecipients = m?.counter('push_sendto_recipients_total', 'Recipients dispatched by attribute-targeted broadcasts');
 	const mBusDropped = m?.counter('push_bus_dropped_total', 'Inbound bus envelopes dropped at the boundary by reason', ['reason']);
 
 	function userKey(userId) {
@@ -1458,7 +1459,7 @@ export function createConnectionRegistry(client, options) {
 		const matches = resolveMatches(norm);
 		if (matches.size === 0) {
 			mSendTo?.inc({ result: 'empty' });
-			return;
+			return 0;
 		}
 
 		// Group matching userIds by their owning instance. Users without a
@@ -1493,6 +1494,7 @@ export function createConnectionRegistry(client, options) {
 		// before this loop also cancels delivery to sockets on THIS instance,
 		// which need no envelope at all - on a single-instance deployment
 		// that is every recipient, and sendTo fails where it used to work.
+		let recipients = 0;
 		const localUserIds = byOwner.get(instanceId);
 		if (localUserIds && activePlatform) {
 			for (const userId of localUserIds) {
@@ -1502,6 +1504,7 @@ export function createConnectionRegistry(client, options) {
 				if (!ws) continue;
 				try {
 					activePlatform.send(ws, topic, event, data);
+					recipients++;
 				} catch {
 					// fire-and-forget on the wire
 				}
@@ -1517,7 +1520,7 @@ export function createConnectionRegistry(client, options) {
 		// caller cannot distinguish from a complete one.
 		let raw;
 
-		for (const owner of byOwner.keys()) {
+		for (const [owner, userIds] of byOwner) {
 			if (owner === instanceId) continue;
 			if (raw === undefined) {
 				try {
@@ -1528,12 +1531,16 @@ export function createConnectionRegistry(client, options) {
 					// the two happened together - and a retry with a smaller
 					// payload will deliver to those local users a second time.
 					mSendTo?.inc({ result: 'refused' });
+					mSendToRecipients?.inc(recipients);
 					throw err;
 				}
 			}
 			remotePublishes.push(
 				redis.publish(pushChannel(owner), raw)
-					.then(() => breaker?.success())
+					.then(() => {
+						breaker?.success();
+						recipients += userIds.length;
+					})
 					.catch((err) => {
 						breaker?.failure(err);
 						publishErrored = true;
@@ -1545,6 +1552,8 @@ export function createConnectionRegistry(client, options) {
 			await Promise.all(remotePublishes);
 		}
 		mSendTo?.inc({ result: publishErrored ? 'error' : 'ok' });
+		mSendToRecipients?.inc(recipients);
+		return recipients;
 	}
 
 	const tracker = /** @type {ConnectionRegistry} */ ({
