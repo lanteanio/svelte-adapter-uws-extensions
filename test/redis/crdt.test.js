@@ -296,6 +296,28 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		expect(took).toBeGreaterThanOrEqual(150);
 		expect(took).toBeLessThan(1000);
 	});
+
+	it('keeps persisting when only a sync reply was refused, and answers the requester again once the relay recovers', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const b = instance({ breaker }, quiet);
+		await b.join(TOPIC);
+		await settle();
+		b.edit(TOPIC, 'k', 1);
+		await settle();
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true);
+
+		breaker.failure(new Error('redis down'));
+		const a = instance({}, quiet);
+		await a.join(TOPIC); // b's cold-join reply is refused
+		await settle();
+		expect(a.items(TOPIC)).toEqual({});
+		// No local edit of b's is missing anywhere, so its writes go on.
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true);
+
+		breaker.reset();
+		await until(() => 'k' in a.items(TOPIC));
+	});
 });
 
 describe('createCrdtCluster relay retry', () => {

@@ -32,7 +32,8 @@
  *     never harms a replica that lost nothing. Triggers: the breaker closing
  *     or probing, the subscriber restoring its channel, a failed or refused
  *     publish (retried with a backoff when nothing else signals recovery), and
- *     a freshly acquired persist lease.
+ *     a freshly acquired persist lease. A lost sync reply is not a resync:
+ *     the coordinator answers that requester again on recovery.
  *   - **One writer per topic.** Snapshot persistence is gated by a per-topic
  *     lease (`acquirePersist`): the lease holder is the sole persister for that
  *     topic, so two instances can never write divergent snapshots to the same
@@ -178,6 +179,10 @@ export function createCrdtCluster(client, options = {}) {
 	const unrelayed = new Set();
 	/** @type {Set<string>} topics whose replica may lack edits the peers sent */
 	const stale = new Set();
+	/** @type {Map<string, Map<string, { declKey: string, v: any[], c: string | undefined }>>} topic -> requester -> a sync reply the relay lost */
+	const owed = new Map();
+	/** @type {WeakMap<object, any[]>} sync reply envelope -> the state vector it answered */
+	const replyVectors = new WeakMap();
 	/** @type {Set<string>} topics waiting for a resync round */
 	const queue = new Set();
 	let activeRounds = 0;
@@ -188,9 +193,11 @@ export function createCrdtCluster(client, options = {}) {
 	let retryMs = 0;
 	/** @type {unknown} */
 	let lastRelayError = null;
+	// Counts lost relays, so a loop can tell that the relay just refused one.
+	let refusals = 0;
 	/** @type {{ declKey: string, topic: string, bytes: any } | null} */
 	let capture = null;
-	/** @type {{ declKey: string, topic: string, to: string, c: string | undefined, replied: boolean } | null} */
+	/** @type {{ declKey: string, topic: string, to: string, c: string | undefined, v: any[], replied: boolean } | null} */
 	let answering = null;
 
 	/** Remember a topic this instance holds, so a recovery can resync it. */
@@ -209,7 +216,7 @@ export function createCrdtCluster(client, options = {}) {
 		if (destroyed) return;
 		for (const [topic, declKey] of known) {
 			if (rounds.has(topic) || unrelayed.has(topic) || stale.has(topic) || queue.has(topic)) continue;
-			if (readState(declKey, topic) === null) known.delete(topic);
+			if (readState(declKey, topic) === null) { known.delete(topic); owed.delete(topic); }
 		}
 		sweepAt = Math.max(KNOWN_SWEEP_MIN, known.size * 2);
 	}
@@ -242,10 +249,18 @@ export function createCrdtCluster(client, options = {}) {
 	 */
 	function relayLost(obj, err) {
 		lastRelayError = err;
+		refusals++;
 		const topic = obj.t;
 		if (typeof topic === 'string' && known.has(topic)) {
 			if (obj.k === KIND_SYNC_REQUEST) stale.add(topic);
-			else if (Array.isArray(obj.b) && obj.b.length > 0) unrelayed.add(topic);
+			else if (obj.k === KIND_UPDATE && Array.isArray(obj.b) && obj.b.length > 0) unrelayed.add(topic);
+			else if (obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
+				// The requester lacks this instance's state, but no local
+				// edit is at risk: answer it again once the relay recovers.
+				let peers = owed.get(topic);
+				if (!peers) owed.set(topic, peers = new Map());
+				peers.set(obj.to, { declKey: obj.d, v: replyVectors.get(obj) ?? [], c: obj.c });
+			}
 		}
 		scheduleRetry();
 	}
@@ -339,12 +354,13 @@ export function createCrdtCluster(client, options = {}) {
 	/** Answer a peer's sync request through the realtime handler. */
 	function answerSyncRequest(parsed, declKey, topic) {
 		const from = parsed.i;
-		const ctx = { declKey, topic, to: from, c: typeof parsed.c === 'string' ? parsed.c : undefined, replied: false };
+		const v = Array.isArray(parsed.v) ? parsed.v : [];
+		const ctx = { declKey, topic, to: from, c: typeof parsed.c === 'string' ? parsed.c : undefined, v, replied: false };
 		if (handlers.onSyncRequest) {
 			const prev = answering;
 			answering = ctx;
 			try {
-				handlers.onSyncRequest(declKey, topic, Array.isArray(parsed.v) ? parsed.v : [], from);
+				handlers.onSyncRequest(declKey, topic, v, from);
 			} finally {
 				answering = prev;
 			}
@@ -450,6 +466,21 @@ export function createCrdtCluster(client, options = {}) {
 		for (const topic of unrelayed) queue.add(topic);
 		for (const topic of stale) queue.add(topic);
 		pump();
+		answerOwed();
+	}
+
+	/** Answer the sync requests whose replies the relay lost, again. */
+	function answerOwed() {
+		for (const [topic, peers] of owed) {
+			for (const [to, req] of peers) {
+				if (b && b.state === 'broken') { scheduleRetry(); return; }
+				peers.delete(to);
+				if (peers.size === 0) owed.delete(topic);
+				const before = refusals;
+				answerSyncRequest({ i: to, v: req.v, c: req.c }, req.declKey, topic);
+				if (refusals !== before) return; // refused again: re-owed, retried later
+			}
+		}
 	}
 
 	function scheduleRetry() {
@@ -524,6 +555,7 @@ export function createCrdtCluster(client, options = {}) {
 			if (answering && answering.to === toInstance && answering.topic === topic && answering.declKey === declKey) {
 				answering.replied = true;
 				if (answering.c !== undefined) env.c = answering.c;
+				replyVectors.set(env, answering.v);
 			}
 			publish(env);
 		},
@@ -575,6 +607,7 @@ export function createCrdtCluster(client, options = {}) {
 			queue.clear();
 			unrelayed.clear();
 			stale.clear();
+			owed.clear();
 			known.clear();
 			if (subscriber) {
 				const s = subscriber;
