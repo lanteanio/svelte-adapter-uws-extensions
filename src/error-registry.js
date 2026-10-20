@@ -833,10 +833,10 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST,
 		event: 'redis.pubsub.relay-batch.burst', component: 'runtime.redis.pubsub', severity: 'warn',
 		problemPrefix: 'The Redis relay queue refused a new envelope at its retained entry or byte bound.',
-		cause: 'Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.',
-		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.',
-		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released.',
-		nextAction: 'Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.',
+		cause: 'A publish, batch, coalesced or wire relay arrived while the queue already retained 8,192 envelopes, or while the envelopes it retains (queued, or submitted and not yet settled by Redis) left too few of its 8 MiB for this one. Sustained publishing faster than Redis accepts chunks causes it, and so does a single large envelope behind earlier queued work. publishBatched calls never reach this report: a call that does not fit is refused whole with RangeError before local delivery.',
+		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per refusal streak.',
+		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released; the next admitted envelope ends the streak and re-arms the report.',
+		nextAction: 'Reduce publish pressure or envelope sizes, inspect Redis latency and the relay queue metrics, and reconcile missed events from durable application state.',
 		sources: ['src/redis/pubsub.js'], anchor: 'extensions-err-pubsub-relay-burst', link: 'https://svti.me/pubsub-burst'
 	}),
 	direct({
@@ -853,10 +853,10 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		id: EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST,
 		event: 'redis.sharded-pubsub.relay-batch.channel-burst', component: 'runtime.redis.sharded-pubsub', severity: 'warn',
 		problemPrefix: 'The sharded Redis relay queue refused a new envelope at its retained entry or byte bound.',
-		cause: 'Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.',
-		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.',
-		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released.',
-		nextAction: 'Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.',
+		cause: 'A publish, batch, coalesced or wire relay arrived while the queue already retained 8,192 envelopes, or while the envelopes it retains (queued, or submitted and not yet settled by Redis) left too few of its 8 MiB for this one. Sustained publishing faster than Redis accepts chunks causes it, and so does a single large envelope behind earlier queued work. publishBatched calls never reach this report: a call that does not fit is refused whole with RangeError before local delivery.',
+		consequence: 'The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per refusal streak.',
+		automaticRecovery: 'Admission resumes as bounded chunks settle and retained capacity is released; the next admitted envelope ends the streak and re-arms the report.',
+		nextAction: 'Reduce publish pressure or envelope sizes, inspect Redis latency and the relay queue metrics, and reconcile missed events from durable application state.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-relay-burst', link: 'https://svti.me/sharded-bus-burst'
 	}),
 	direct({

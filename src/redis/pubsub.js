@@ -53,7 +53,7 @@ const ACTIVATE_RETRY_MAX_MS = 30000;
  * @property {string | null | false} [systemChannel='__realtime'] - Topic used for auto-emitted `degraded` / `recovered` events on the local platform. Set to `null` or `false` to disable auto-emission.
  * @property {() => void} [onDegraded] - Called once when the breaker leaves the healthy state. Requires a `breaker` to be passed.
  * @property {() => void} [onRecovered] - Called once when the breaker returns to the healthy state. Requires a `breaker` to be passed.
- * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound JSON and outbound relay bytes. Oversized publishBatched calls throw RangeError before delivery; other oversized relays are withheld and reported while local delivery remains intact.
+ * @property {number} [maxEnvelopeBytes=1048576] - Bound inbound JSON and outbound relay bytes. Oversized publishBatched calls, and calls the relay queue cannot admit, throw RangeError before delivery; other oversized relays are withheld and reported while local delivery remains intact.
  * @property {boolean} [allowSystemTopics=false] - Default false: drop inbound envelopes whose topic starts with `__` apart from this bus's own `systemChannel`. Defense against bus-side topic injection on shared-Redis deployments where a foreign publisher could otherwise inject forged `__signal:*` / `__rpc` / plugin-internal frames into the local platform. Apps that legitimately bus-relay user-defined `__`-prefixed topics (rare) can opt back in via `allowSystemTopics: true`.
  */
 
@@ -226,7 +226,7 @@ export function createPubSubBus(client, options = {}) {
 	// current iteration. Same structural choice the 0.5.7 cursor always-tick
 	// rewrite locked in.
 	const relayQueue = createRelayQueue({
-		submit: flushRelay, metrics: m, prefix: 'pubsub',
+		submit: flushRelay, metrics: m, prefix: 'pubsub', maxEnvelopeBytes: validator.maxBytes,
 		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
 		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST, { attributes })
 	});
@@ -438,6 +438,20 @@ export function createPubSubBus(client, options = {}) {
 		}
 		mBatchRejected?.inc({ reason: 'oversized' });
 		throw operationError('RELAY_ENVELOPE_TOO_LARGE', 'pubsub bus: batched relay envelope exceeds maxEnvelopeBytes', RangeError);
+	}
+
+	// Charge the relay queue for the call's envelope before any local
+	// delivery, so a publishBatched call is either delivered locally and
+	// relayed or refused outright; a local delivery that throws takes its
+	// relay back.
+	function admitBatch(msg, count) {
+		const entry = relayQueue.admitOne(msg, count);
+		if (entry === null) {
+			mBatchRejected?.inc({ reason: 'queue_full' });
+			throw operationError('RELAY_QUEUE_FULL', 'pubsub bus: relay queue is full; the batched publish was not delivered', RangeError);
+		}
+		envelopeOversized = false;
+		return entry;
 	}
 
 	function prepareBatch(batch, options, traceContext = null) {
@@ -777,9 +791,11 @@ export function createPubSubBus(client, options = {}) {
 				traced((traceContext) => {
 					const relayable = relayableBatch(messages);
 					if (relayable === null) return platform.publishBatched(messages, options);
-					const msg = relayable.length ? prepareBatch(relayable, options, traceContext) : null;
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-					if (msg !== null) scheduleRelay(msg, relayable.length, true);
+					if (relayable.length === 0) return platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
+					const msg = prepareBatch(relayable, options, traceContext);
+					const admitted = admitBatch(msg, relayable.length);
+					try { platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options); }
+					catch (err) { relayQueue.withdraw(admitted, 1); throw err; }
 				});
 			};
 			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
@@ -827,8 +843,9 @@ export function createPubSubBus(client, options = {}) {
 				const env = batchEnvelope(relayable, options);
 				const msg = encodeBatch(env);
 				if (msg.length > safeEnvelopeChars && !validator.acceptRaw(msg)) oversizedBatch(env, null);
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-				scheduleRelay(msg, relayable.length, true);
+				const admitted = admitBatch(msg, relayable.length);
+				try { platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options); }
+				catch (err) { relayQueue.withdraw(admitted, 1); throw err; }
 			};
 			const tracing = traceEnabled(platform);
 			const batch = tracing ? batchTraced : batchUntraced;

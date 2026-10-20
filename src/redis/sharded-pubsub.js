@@ -257,7 +257,7 @@ export function createShardedBus(client, options = {}) {
 	// ready socket message in the current iteration. Same structural
 	// choice the 0.5.7 cursor always-tick rewrite locked in.
 	const relayQueue = createRelayQueue({
-		submit: flushRelay, metrics: m, prefix: 'sharded_pubsub',
+		submit: flushRelay, metrics: m, prefix: 'sharded_pubsub', maxEnvelopeBytes: validator.maxBytes,
 		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
 		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST, { attributes })
 	});
@@ -451,6 +451,22 @@ export function createShardedBus(client, options = {}) {
 		}
 		mBatchRejected?.inc({ reason: 'oversized' });
 		throw operationError('RELAY_ENVELOPE_TOO_LARGE', 'sharded bus: batched relay envelope exceeds maxEnvelopeBytes', RangeError);
+	}
+
+	// Charge the relay queue for every shard envelope of the call before any
+	// local delivery, so a publishBatched call is either delivered locally and
+	// relayed on every channel or refused outright; a local delivery that
+	// throws takes its relays back.
+	function admitBatch(prepared) {
+		// Every entry relay:false: nothing to relay, nothing to charge.
+		if (prepared.length === 0) return null;
+		const first = relayQueue.admit(prepared);
+		if (first === null) {
+			mBatchRejected?.inc({ reason: 'queue_full' });
+			throw operationError('RELAY_QUEUE_FULL', 'sharded bus: relay queue is full; the batched publish was not delivered', RangeError);
+		}
+		envelopeOversized = false;
+		return first;
 	}
 
 	function prepareBatch(batch, options, traceContext = null) {
@@ -1382,15 +1398,18 @@ export function createShardedBus(client, options = {}) {
 					}
 					const byChannel = batchesByChannel(messages);
 					// Keep channel, checked bytes and topics together until every channel passes.
-					const prepared = new Array(byChannel.size * 3);
+					const prepared = new Array(byChannel.size * 4);
 					let index = 0;
 					for (const [channel, batch] of byChannel) {
-						prepared[index++] = channel;
+						const topics = batchTopics(batch);
 						prepared[index++] = prepareBatch(batch, options, traceContext);
-						prepared[index++] = batchTopics(batch);
+						prepared[index++] = topics.length;
+						prepared[index++] = channel;
+						prepared[index++] = topics;
 					}
-					platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-					for (let i = 0; i < prepared.length; i += 3) scheduleRelay(prepared[i], prepared[i + 1], prepared[i + 2], true);
+					const admitted = admitBatch(prepared);
+					try { platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options); }
+					catch (err) { relayQueue.withdraw(admitted, prepared.length / 4); throw err; }
 				});
 			};
 			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
@@ -1432,15 +1451,18 @@ export function createShardedBus(client, options = {}) {
 				}
 				const byChannel = batchesByChannel(messages);
 				// Keep channel, checked bytes and topics together until every channel passes.
-				const prepared = new Array(byChannel.size * 3);
+				const prepared = new Array(byChannel.size * 4);
 				let index = 0;
 				for (const [channel, batch] of byChannel) {
-					prepared[index++] = channel;
+					const topics = batchTopics(batch);
 					prepared[index++] = prepareBatch(batch, options);
-					prepared[index++] = batchTopics(batch);
+					prepared[index++] = topics.length;
+					prepared[index++] = channel;
+					prepared[index++] = topics;
 				}
-				platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options);
-				for (let i = 0; i < prepared.length; i += 3) scheduleRelay(prepared[i], prepared[i + 1], prepared[i + 2], true);
+				const admitted = admitBatch(prepared);
+				try { platform.publishBatched(relayedBatchLocally(messages, entryReachesSiblings), options); }
+				catch (err) { relayQueue.withdraw(admitted, prepared.length / 4); throw err; }
 			};
 			const tracing = traceEnabled(platform);
 			const batch = tracing ? batchTraced : batchUntraced;

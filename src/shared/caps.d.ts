@@ -9,8 +9,6 @@ export const MAX_REGISTRY_PENDING_REQUESTS: number;
 export const MAX_REGISTRY_USER_INDEX: number;
 export const MAX_REGISTRY_INDEX_VALUES_PER_KEY: number;
 export const MAX_SHARDED_BUS_TOPICS: number;
-export const MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK: number;
-export const MAX_PUBSUB_RELAY_BATCH_PER_TICK: number;
 export const MAX_PRESENCE_WS: number;
 export const MAX_PRESENCE_TOPICS: number;
 export const MAX_PRESENCE_TOPIC_KEY_INDEX: number;

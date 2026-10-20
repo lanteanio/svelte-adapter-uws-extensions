@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
 import { createMetrics } from '../../src/prometheus/index.js';
@@ -81,6 +81,60 @@ for (const [name, factory, prefix] of [['standard', createPubSubBus, 'pubsub'], 
 				expect(JSON.parse(s.sent[0][1]).traceparent).toBeUndefined();
 				expect(s.metrics.serialize()).not.toContain(prefix + '_batch_rejected_total{reason=');
 			} finally { captured.stop(); await s.close(); }
+		});
+		const big = 'x'.repeat(9 * 1024 * 1024);
+		const topicsOf = list => list.map(m => m.topic);
+		it.each([['large first', ['a', 'b']], ['large last', ['b', 'a']]])('relays a whole call above the queue byte budget on an idle bus (%s)', async (_, order) => {
+			const s = await setup(16 * 1024 * 1024);
+			try {
+				s.wrapped.publishBatched(order.map(topic => ({ topic, event: 'x', data: topic === 'a' ? big : 'small' })));
+				expect(topicsOf(s.source.published)).toEqual(order);
+				await vi.waitFor(() => expect(topicsOf(s.remote.published).sort()).toEqual(['a', 'b']));
+				expect(s.metrics.serialize()).not.toContain('reason="queue_full"');
+			} finally { await s.close(); }
+		});
+		it.each([['large first', ['a', 'b']], ['large last', ['b', 'a']]])('refuses the whole call when queued work leaves no room for it (%s)', async (_, order) => {
+			const s = await setup(16 * 1024 * 1024);
+			try {
+				s.wrapped.publish('c', 'x', 'queued first');
+				const call = () => s.wrapped.publishBatched(order.map(topic => ({ topic, event: 'x', data: topic === 'a' ? big : 'small' })));
+				expect(call).toThrow(expect.objectContaining({ name: 'RangeError', code: 'RELAY_QUEUE_FULL' }));
+				await flush();
+				expect(topicsOf(s.source.published)).toEqual(['c']);
+				expect(s.remote.published.filter(m => m.topic !== 'c')).toEqual([]);
+				expect(s.metrics.serialize()).toContain(prefix + '_batch_rejected_total{reason="queue_full"} 1');
+				expect(s.metrics.serialize()).not.toContain(prefix + '_messages_local_only_total{reason="queue_full"}');
+				// The refusal charged nothing: the same call goes through once the queue drains.
+				call();
+				expect(topicsOf(s.source.published)).toEqual(['c', ...order]);
+				await vi.waitFor(() => expect(topicsOf(s.remote.published).filter(t => t !== 'c').sort()).toEqual(['a', 'b']));
+			} finally { await s.close(); }
+		});
+		if (name === 'sharded') it('refuses a call whose shard envelopes together exceed the idle ceiling', async () => {
+			const s = await setup(16 * 1024 * 1024);
+			try {
+				expect(() => s.wrapped.publishBatched([{ topic: 'a', event: 'x', data: big }, { topic: 'b', event: 'x', data: big }])).toThrow(expect.objectContaining({ name: 'RangeError', code: 'RELAY_QUEUE_FULL' }));
+				await flush();
+				expect(s.source.published).toEqual([]);
+				expect(s.sent).toEqual([]);
+				expect(s.metrics.serialize()).toContain(prefix + '_batch_rejected_total{reason="queue_full"} 1');
+			} finally { await s.close(); }
+		});
+		it('takes the relay back when local delivery throws', async () => {
+			const s = await setup();
+			try {
+				const failure = new Error('local delivery failed');
+				const original = s.source.publishBatched;
+				s.source.publishBatched = () => { throw failure; };
+				expect(() => s.wrapped.publishBatched([{ topic: 'a', event: 'x', data: 1 }, { topic: 'b', event: 'x', data: 2 }])).toThrow(failure);
+				s.source.publishBatched = original;
+				await flush();
+				expect(s.sent).toEqual([]);
+				expect(s.remote.published).toEqual([]);
+				s.wrapped.publishBatched([{ topic: 'a', event: 'x', data: 3 }]);
+				await flush();
+				expect(s.remote.published.map(m => m.data)).toEqual([3]);
+			} finally { await s.close(); }
 		});
 	});
 }

@@ -27,8 +27,10 @@ prove that every remote recipient missed the message: a lost reply can follow a
 successful Redis publish. `backend_error` includes that ambiguous case as well as
 explicit backend refusals. `deactivated` records queued relays discarded when the
 bus closes. An oversized ordinary publish retains its local delivery and counts
-`envelope_oversized`; an oversized `publishBatched` rejects before delivery and
-increments the separate `*_batch_rejected_total` instead. Explicit `relay: false`
+`envelope_oversized`; an oversized `publishBatched`, or one the relay queue cannot
+admit, rejects before delivery and increments the separate
+`*_batch_rejected_total` (`reason`: `oversized`, `serialize`, `queue_full`)
+instead. Explicit `relay: false`
 messages are intentional local delivery and do not increment these gap counters.
 
 Duration starts immediately before Redis submission and ends at settlement. It
@@ -47,10 +49,19 @@ An envelope within `maxEnvelopeBytes` but larger than 8 MiB is admitted only whe
 the queue is empty; it occupies the queue alone until its submission settles.
 The retained byte ceiling is therefore `max(8 MiB, maxEnvelopeBytes)`.
 This bounds payload retention; it is not an exact JavaScript heap budget. A new
-envelope that would exceed either limit is withheld from Redis after its local
-delivery, including a locally accepted `publishBatched` call. Its logical
-messages count as `queue_full`. The existing burst diagnostic reports this loss
-once per bus even without metrics. Queue pressure does not fail the backend
+`publish`, `batch`, coalesced or wire envelope that would exceed either limit is
+withheld from Redis after its local delivery; its logical messages count as
+`queue_full`, and the burst diagnostic reports the loss once per refusal streak,
+even without metrics. The next admitted envelope ends the streak and re-arms it.
+
+`publishBatched` reserves room for every envelope of the call (one per shard
+channel on the sharded bus) before any local delivery. A call that does not fit
+behind the retained work, or whose envelopes together exceed
+`max(8 MiB, maxEnvelopeBytes)` on an idle queue, throws `RangeError` without
+delivering anything and counts `*_batch_rejected_total{reason="queue_full"}`;
+it can be retried once the queue drains. If local delivery itself throws, the
+reserved relays are withdrawn, so no peer receives a call this instance did not
+deliver. Queue pressure does not fail the backend
 breaker. There is no retry or replay of refused envelopes: reconcile from durable
 application state when missed events matter.
 

@@ -1035,10 +1035,10 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.pubsub.relay-batch.burst`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.relay-batch.burst severity=warn] The Redis relay queue refused a new envelope at its retained entry or byte bound.`
-- **Cause:** Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.
-- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.
-- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released.
-- **Next action:** Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.
+- **Cause:** A publish, batch, coalesced or wire relay arrived while the queue already retained 8,192 envelopes, or while the envelopes it retains (queued, or submitted and not yet settled by Redis) left too few of its 8 MiB for this one. Sustained publishing faster than Redis accepts chunks causes it, and so does a single large envelope behind earlier queued work. publishBatched calls never reach this report: a call that does not fit is refused whole with RangeError before local delivery.
+- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per refusal streak.
+- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released; the next admitted envelope ends the streak and re-arms the report.
+- **Next action:** Reduce publish pressure or envelope sizes, inspect Redis latency and the relay queue metrics, and reconcile missed events from durable application state.
 - **Operator shortlink:** `https://svti.me/pubsub-burst`
 - **Runtime help:** `docs/errors.md#extensions-err-pubsub-relay-burst`
 - **Runtime sources:** [src/redis/pubsub.js](../src/redis/pubsub.js)
@@ -1060,10 +1060,10 @@ the stable ID tag on the line):
 
 - **Code/event:** `redis.sharded-pubsub.relay-batch.channel-burst`
 - **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.relay-batch.channel-burst severity=warn] The sharded Redis relay queue refused a new envelope at its retained entry or byte bound.`
-- **Cause:** Publish admission exceeded Redis relay throughput or the backend has not settled an earlier chunk.
-- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per bus.
-- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released.
-- **Next action:** Reduce publish pressure, inspect Redis latency and queue metrics, and reconcile missed events from durable application state.
+- **Cause:** A publish, batch, coalesced or wire relay arrived while the queue already retained 8,192 envelopes, or while the envelopes it retains (queued, or submitted and not yet settled by Redis) left too few of its 8 MiB for this one. Sustained publishing faster than Redis accepts chunks causes it, and so does a single large envelope behind earlier queued work. publishBatched calls never reach this report: a call that does not fit is refused whole with RangeError before local delivery.
+- **Consequence:** The new relay is dropped while its completed local delivery remains intact; remote peers can miss it. Reported once per refusal streak.
+- **Automatic recovery:** Admission resumes as bounded chunks settle and retained capacity is released; the next admitted envelope ends the streak and re-arms the report.
+- **Next action:** Reduce publish pressure or envelope sizes, inspect Redis latency and the relay queue metrics, and reconcile missed events from durable application state.
 - **Operator shortlink:** `https://svti.me/sharded-bus-burst`
 - **Runtime help:** `docs/errors.md#extensions-err-sharded-relay-burst`
 - **Runtime sources:** [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)

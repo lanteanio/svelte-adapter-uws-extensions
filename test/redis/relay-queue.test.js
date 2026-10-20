@@ -113,6 +113,44 @@ describe('bounded relay admission and scheduling', () => {
 		expect(submit.mock.calls[1][0].map(e => e.msg)).toEqual(['new generation']);
 		q.clear(); resolve();
 	});
+	it('reports overflow once per refusal streak and re-arms after an admission', async () => {
+		let resolve;
+		const { queue: q, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
+		const large = 'x'.repeat(5 * 1024 * 1024);
+		expect(q.push(entry(large))).toBe(true);
+		expect(q.push(entry(large))).toBe(false);
+		expect(q.push(entry(large))).toBe(false);
+		expect(overflow).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(0);
+		resolve(); await Promise.resolve();
+		expect(q.push(entry(large))).toBe(true);
+		expect(q.push(entry(large))).toBe(false);
+		expect(overflow).toHaveBeenCalledTimes(2);
+		q.clear(); resolve();
+	});
+	it('admits a whole call or none of it, and withdraws an admitted call before it drains', async () => {
+		const submit = vi.fn(() => Promise.resolve()), dropped = vi.fn(), overflow = vi.fn();
+		const q = createRelayQueue({ submit, dropped, overflow, maxEnvelopeBytes: 12 * 1024 * 1024 });
+		const large = 'x'.repeat(5 * 1024 * 1024);
+		// Even an idle queue keeps its ceiling at max(8 MiB, maxEnvelopeBytes).
+		expect(q.admit([large, 1, 'a', ['a'], large, 1, 'b', ['b'], large, 1, 'c', ['c']])).toBeNull();
+		expect(q.state.snapshot().retained).toBe(0);
+		expect(q.admit([large, 1, 'a', ['a'], large, 1, 'b', ['b']])).not.toBeNull();
+		expect(q.state.snapshot().retained).toBe(2);
+		expect(q.admit(['small', 1, 'c', ['c']])).toBeNull();
+		expect(q.state.snapshot().retained).toBe(2);
+		expect(dropped).not.toHaveBeenCalled();
+		await vi.runAllTimersAsync();
+		expect(submit.mock.calls.map(call => call[0].map(e => e.channel))).toEqual([['a'], ['b']]);
+		const first = q.admit(['one', 1, 'a', ['a'], 'two', 1, 'b', ['b']]);
+		q.withdraw(first, 2);
+		expect(q.state.snapshot()).toMatchObject({ retained: 0, retainedBytes: 0 });
+		await vi.runAllTimersAsync();
+		expect(submit).toHaveBeenCalledTimes(2);
+		expect(q.admit(['three', 1, 'a', ['a']])).not.toBeNull();
+		await vi.runAllTimersAsync();
+		expect(submit.mock.calls[2][0].map(e => e.msg)).toEqual(['three']);
+	});
 	it('aggregates shared-registry depth, bytes and oldest age without identifying channels', async () => {
 		let clock = 0; setRuntimeEnv({ clock: { monotonic: () => clock } });
 		const metrics = createMetrics();

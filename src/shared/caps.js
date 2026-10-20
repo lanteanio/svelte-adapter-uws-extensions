@@ -72,16 +72,6 @@ export const MAX_PRESENCE_INFLIGHT_HGETALL = 1_000_000;
 /** Per-topic dirty cursor entries before flush-and-evict. */
 export const MAX_CURSOR_DIRTY_PER_TOPIC = 1_000_000;
 
-// - Per-tick microtask batch caps -------------------------------------------
-// Outbound batches that are drained every microtask. Crossing the cap
-// signals something allocated the entire cap's worth in one tick (leak).
-
-/** Legacy advisory threshold retained for compatibility; relay queues enforce internal entry/byte limits. */
-export const MAX_SHARDED_BUS_BATCH_CHANNELS_PER_TICK = 1_000_000;
-
-/** Legacy advisory threshold retained for compatibility; relay queues enforce internal entry/byte limits. */
-export const MAX_PUBSUB_RELAY_BATCH_PER_TICK = 1_000_000;
-
 // - Structural caps ---------------------------------------------------------
 // Configuration / wiring limits, not state-driven. Smaller numbers because
 // the legitimate scale is genuinely smaller (a Node process should never

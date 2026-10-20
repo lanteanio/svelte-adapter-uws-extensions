@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Redis presence heartbeat timer starts on the tracker's first `join` or `sync`, as the in-memory plugin's does, instead of at construction; a tracker that is never used runs no timer.
 
+### Changed
+
+- `publishBatched` on the Redis pub/sub and sharded buses reserves relay queue room for every envelope of the call (one per shard channel on the sharded bus) before any local delivery. A call the queue cannot admit, because queued relays leave too little of its 8,192 envelopes or 8 MiB, or because its envelopes together exceed `max(8 MiB, maxEnvelopeBytes)` on an idle queue, throws `RangeError` with `code` `RELAY_QUEUE_FULL` without delivering anything and increments `*_batch_rejected_total{reason="queue_full"}`. Such a call used to be delivered locally while some or all of its envelopes were dropped from the relay. A local delivery that throws withdraws the reserved relays.
+- The relay burst diagnostics (`redis.pubsub.relay-batch.burst`, `redis.sharded-pubsub.relay-batch.channel-burst`) report once per refusal streak instead of once per bus: the next admitted envelope re-arms them, so a later overload on the same bus is reported again. Their cause text names the retained bounds and the single-large-envelope case.
+
 ### Fixed
 
 - Presence, cursor, groups and the pub/sub system channel use the adapter's tracked subscription helpers instead of writing its registry directly. Native membership, the per-connection cap, shared-codec cohorts and subscription accounting now move together, preventing uncharged internal topics and negative close totals.

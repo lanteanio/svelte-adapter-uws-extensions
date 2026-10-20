@@ -488,7 +488,13 @@ observe different publications.
 
 **Action.** Bound batches by encoded bytes, including envelope overhead, split
 large batches where application ordering permits, and handle rejection at the
-publisher. Ordinary non-batched oversize relay handling is a separate contract;
+publisher (`code` is `RELAY_ENVELOPE_TOO_LARGE`). A `RangeError` with `code`
+`RELAY_QUEUE_FULL` is thrown, again before local delivery, when
+the bus's relay queue cannot admit the call because earlier relays still
+occupy it; that refusal is transient, so retry or shed the call once the queue
+drains (`*_batch_rejected_total{reason="queue_full"}` counts it). On the sharded
+bus a call whose shard envelopes together exceed `max(8 MiB, maxEnvelopeBytes)`
+is always refused; split it. Ordinary non-batched oversize relay handling is a separate contract;
 do not rely on it to accept a batched call. Small batches need no change.
 Keep the same application limits during rollback to avoid restoring divergent
 local/remote behavior.

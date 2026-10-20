@@ -42,7 +42,8 @@ export interface ShardedBusOptions {
 	/**
 	 * Bound inbound bus envelopes before `JSON.parse` and outbound relays
 	 * after encoding. `publishBatched` throws RangeError before any delivery
-	 * when any shard envelope exceeds this cap. Other oversized outbound
+	 * when any shard envelope exceeds this cap or the relay queue cannot
+	 * admit them all. Other oversized outbound
 	 * relays are withheld and reported while local delivery remains intact.
 	 * @default 1048576 (1 MB)
 	 */
@@ -78,6 +79,9 @@ export interface ShardedBus {
 	 * `publishBatched` throws RangeError when any relay envelope exceeds
 	 * maxEnvelopeBytes; serialization errors also precede local delivery.
 	 * A batch whose entries all set relay:false is local-only and skips this cap.
+	 * The call then reserves relay queue room for all of its envelopes before
+	 * delivering locally, and throws RangeError (code RELAY_QUEUE_FULL) without
+	 * delivering anything when the queue cannot admit them all.
 	 */
 	wrap(platform: Platform): Platform;
 
