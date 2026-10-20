@@ -1,0 +1,5 @@
+# Checkouts materialize LF on every platform, so `npm pack` from a fresh
+# clone produces files byte-identical to the committed blobs. The eol
+# attribute overrides core.autocrlf, so a clean clone behaves the same with or
+# without that global setting.
+* text=auto eol=lf
