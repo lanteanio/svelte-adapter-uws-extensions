@@ -162,7 +162,11 @@ export function mockPgClient(options = {}) {
 		// mutate the set we are iterating. Per-channel FIFO is preserved
 		// because each NOTIFY schedules its own flush in call order.
 		const snapshot = [...listeners];
-		if (notifyFaultEngine) {
+		// The notify bridge confirms each new session with a probe on a private
+		// svti_notify_probe_* channel. Relay faults model application traffic,
+		// and this double is a direct server whose sessions stay attached, so the
+		// probe is delivered without drawing on the fault engine.
+		if (notifyFaultEngine && !channel.startsWith('svti_notify_probe_')) {
 			// Fault-gated delivery: each listener's notification is drawn
 			// independently and deferred on the seam timer (refed so a delayed /
 			// reordered notify still lands before the run quiesces). A byte-flipped

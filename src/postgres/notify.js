@@ -15,7 +15,8 @@ import { registerClusterHealth, finiteReading } from '../shared/cluster-dashboar
 import { onPgShutdown } from './_client-lifecycle.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer, randomFloat } from '../shared/runtime.js';
+import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer, randomFloat, randomUuid } from '../shared/runtime.js';
+import { ConnectionError } from '../shared/errors.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { EXTERNAL_DELIVERY, LOCAL_DEFAULT } from '../shared/sequence-authority.js';
@@ -50,7 +51,9 @@ import {
 /**
  * @typedef {Object} NotifyBridge
  * @property {(platform: import('svelte-adapter-uws').Platform) => Promise<void>} activate -
- *   Start listening. Forwards notifications to platform.publish().
+ *   Start listening. Forwards notifications to platform.publish(). Rejects with
+ *   code `PG_NOTIFY_SESSION_UNSTABLE` when the session does not stay attached
+ *   to one backend (a transaction- or statement-pooling proxy).
  * @property {() => Promise<void>} deactivate -
  *   Stop listening and release the connection.
  */
@@ -100,6 +103,10 @@ import {
  *   FOR EACH ROW EXECUTE FUNCTION notify_table_change();
  * ```
  */
+// How long a new notification session waits for its own probe notification,
+// sent through the client's query route while the session is idle.
+const SESSION_PROBE_TIMEOUT_MS = 5000;
+
 export function createNotifyBridge(client, options) {
 	if (!options || typeof options.channel !== 'string' || options.channel.length === 0) {
 		throw new Error('notify bridge: channel must be a non-empty string');
@@ -298,7 +305,7 @@ export function createNotifyBridge(client, options) {
 	}
 
 	function openEntry(epoch) {
-		const entry = { client: client.createClient(), generation: epoch, closing: null, stopping: false, failed: false, listening: false };
+		const entry = { client: client.createClient(), generation: epoch, closing: null, stopping: false, failed: false, listening: false, confirmed: false };
 		entry.onError = (error) => handleError(entry, error);
 		entry.onEnd = () => handleError(entry, new Error('Postgres notification connection ended'));
 		entry.client.on('error', entry.onError);
@@ -338,6 +345,39 @@ export function createNotifyBridge(client, options) {
 		});
 	}
 
+	// A transaction- or statement-pooling proxy returns the backend to its pool
+	// after each statement, so LISTEN and session advisory locks stay behind on
+	// a backend this session no longer owns. Only a notification sent from
+	// another connection while this session is idle proves the backend stays
+	// attached; a check issued from this session can land on the same backend
+	// again and pass. The probe runs before any advisory lock is taken.
+	async function confirmSession(entry) {
+		const probe = 'svti_notify_probe_' + randomUuid().replace(/-/g, '');
+		const nonce = randomUuid();
+		let arrived, timer = null;
+		const received = new Promise((resolve) => { arrived = resolve; });
+		const onProbe = (msg) => { if (msg.channel === probe && msg.payload === nonce) arrived(true); };
+		entry.client.on('notification', onProbe);
+		try {
+			await waitEntry(entry, entry.client.query(`LISTEN "${probe}"`));
+			if (!current(entry)) return;
+			await waitEntry(entry, client.query('SELECT pg_notify($1, $2)', [probe, nonce]));
+			if (!current(entry)) return;
+			const deadline = new Promise((resolve) => { timer = setTimer(() => resolve(false), SESSION_PROBE_TIMEOUT_MS); });
+			const confirmed = await waitEntry(entry, Promise.race([received, deadline]));
+			if (!current(entry)) return;
+			if (confirmed !== true) {
+				const error = new ConnectionError('postgres', 'notification session is not stable: its probe notification never arrived, so a transaction- or statement-pooling proxy is likely in the route; use a direct or session-pooled connection');
+				error.code = 'PG_NOTIFY_SESSION_UNSTABLE';
+				throw error;
+			}
+			await waitEntry(entry, entry.client.query(`UNLISTEN "${probe}"`));
+		} finally {
+			if (timer) clearTimer(timer);
+			entry.client.removeListener('notification', onProbe);
+		}
+	}
+
 	async function step(epoch) {
 		await Promise.all([...closing]);
 		if (!active || generation !== epoch) return;
@@ -349,6 +389,11 @@ export function createNotifyBridge(client, options) {
 				await waitEntry(entry, entry.client.connect());
 			}
 			if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
+			if (!entry.confirmed) {
+				await confirmSession(entry);
+				if (!current(entry)) { await closeEntry(entry); if (entry.failed) throw entry.failureError; return; }
+				entry.confirmed = true;
+			}
 			if (advisory) {
 				// Advisory locks are reentrant. Once acquired, check connection
 				// liveness without repeatedly incrementing the session lock count.

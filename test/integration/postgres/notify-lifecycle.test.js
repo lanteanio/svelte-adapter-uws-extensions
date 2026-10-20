@@ -39,10 +39,12 @@ describe('Postgres dedicated notification sessions with the native driver', () =
 	});
 	it('advisory election uses one dedicated session per contender and releases them on shutdown', async () => {
 		const application_name = `notify_election_${process.pid}_${++identity}`;
-		const first = owner({ options: { application_name } }), second = owner({ options: { application_name } });
+		// Startup sends its confirmation probe through the pool; that connection
+		// goes idle and closes, leaving only the dedicated sessions.
+		const first = owner({ options: { application_name, idleTimeoutMillis: 10 } }), second = owner({ options: { application_name, idleTimeoutMillis: 10 } });
 		const options = { multiListener: 'advisory', lockId: 171305, pollInterval: 20 };
 		await Promise.all([bridge(first, options).activate(mockPlatform()), bridge(second, options).activate(mockPlatform())]);
-		expect(first.pool.totalCount).toBe(0); expect(second.pool.totalCount).toBe(0);
+		await until(() => first.pool.totalCount === 0 && second.pool.totalCount === 0);
 		const observer = admin();
 		const { rows } = await observer.query('SELECT pid FROM pg_stat_activity WHERE application_name = $1', [application_name]);
 		expect(rows).toHaveLength(2);

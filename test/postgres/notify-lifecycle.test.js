@@ -6,17 +6,32 @@ import { resetRuntimeEnv, setRuntimeEnv } from '../../src/shared/runtime.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { captureRegistered } from '../helpers/diagnostic-line.js';
 
-const state = vi.hoisted(() => ({ clients: [], events: [], connect: null, query: null, end: null }));
+const state = vi.hoisted(() => ({ clients: [], events: [], connect: null, query: null, end: null, probe: null, route: null }));
 vi.mock('pg', async () => {
 	const { EventEmitter } = await import('node:events');
+	// A notification session confirms itself with a probe sent through the
+	// pool; deliver it to every open session LISTENing on that channel.
+	// state.route replaces that delivery, as a transaction-pooling proxy would.
+	state.probe = (text, values) => {
+		if (/pg_notify/.test(text)) {
+			if (state.route) return state.route(values);
+			for (const client of state.clients) if (client.listening.has(values[0])) queueMicrotask(() => client.emit('notification', { channel: values[0], payload: values[1] }));
+		}
+		return Promise.resolve({ rows: [] });
+	};
 	class Pool extends EventEmitter {
-		query() { return Promise.resolve({ rows: [] }); }
+		query(text, values) { return state.probe(text, values); }
 		end = vi.fn(async () => { state.events.push('pool.end'); });
 	}
 	class Client extends EventEmitter {
 		constructor() { super(); this.endCall = this.end; this.queryCall = this.query; state.clients.push(this); }
+		listening = new Set();
 		connect = vi.fn(() => state.connect?.(this) ?? Promise.resolve());
-		query = vi.fn((sql) => state.query?.(this, sql) ?? Promise.resolve({ rows: [{ acquired: true }] }));
+		query = vi.fn((sql) => {
+			const match = /^(UN)?LISTEN "(.*)"$/.exec(sql);
+			if (match) match[1] ? this.listening.delete(match[2]) : this.listening.add(match[2]);
+			return state.query?.(this, sql) ?? Promise.resolve({ rows: [{ acquired: true }] });
+		});
 		end = vi.fn(async () => { state.events.push('client.end'); await state.end?.(this); this.emit('end'); });
 	}
 	return { default: { Pool, Client } };
@@ -24,11 +39,13 @@ vi.mock('pg', async () => {
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function tick() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
+// Session statements without the startup probe's private LISTEN/UNLISTEN.
+const calls = (client) => client.queryCall.mock.calls.map(([sql]) => sql).filter((sql) => !sql.includes('svti_notify_probe_'));
 
 describe('Postgres notification session lifecycle', () => {
 	let owners, bridges, diagnostics;
 	beforeEach(() => {
-		vi.useFakeTimers(); state.clients = []; state.events = []; state.connect = state.query = state.end = null;
+		vi.useFakeTimers(); state.clients = []; state.events = []; state.connect = state.query = state.end = state.route = null;
 		setRuntimeEnv({ rng: { float: () => 0.5 } }); owners = []; bridges = []; diagnostics = captureRegistered();
 	});
 	afterEach(async () => {
@@ -64,7 +81,7 @@ describe('Postgres notification session lifecycle', () => {
 		expect(state.events).toEqual(['client.end', 'pool.end']); expect(process.listeners('sveltekit:shutdown')).not.toContain(listener);
 	});
 	it('keeps externally supplied pools and sessions caller-owned', async () => {
-		const pool = { query: vi.fn(), end: vi.fn() };
+		const pool = { query: vi.fn((text, values) => state.probe(text, values)), end: vi.fn() };
 		const { owner, bridge, platform } = setup({}, { pool }); await bridge.activate(platform); await owner.end();
 		expect(pool.end).not.toHaveBeenCalled(); expect(state.clients[0].endCall).not.toHaveBeenCalled();
 		state.clients[0].emit('notification', { channel: 'lifecycle', payload: '{"topic":"x","event":"y"}' });
@@ -74,7 +91,7 @@ describe('Postgres notification session lifecycle', () => {
 		const gate = deferred(); state.connect = () => gate.promise;
 		const { bridge, platform } = setup(); const first = bridge.activate(platform); const second = bridge.activate(platform); await tick();
 		expect(state.clients).toHaveLength(1); expect(state.clients[0].queryCall).not.toHaveBeenCalled();
-		gate.resolve(); await Promise.all([first, second]); expect(state.clients[0].queryCall).toHaveBeenCalledTimes(1);
+		gate.resolve(); await Promise.all([first, second]); expect(calls(state.clients[0])).toEqual(['LISTEN "lifecycle"']);
 	});
 	it('stops during a never-settling connect without resurrecting a late LISTEN', async () => {
 		const gate = deferred(); state.connect = () => gate.promise;
@@ -108,7 +125,7 @@ describe('Postgres notification session lifecycle', () => {
 	it('does not overlap slow advisory polls or reacquire an already-held lock', async () => {
 		const { bridge, platform } = setup({ multiListener: 'advisory', lockId: 7, pollInterval: 10 }); await bridge.activate(platform);
 		const gate = deferred(); state.query = () => gate.promise; await vi.advanceTimersByTimeAsync(100);
-		expect(state.clients[0].queryCall.mock.calls.map(([sql]) => sql)).toEqual(['SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"', 'SELECT 1']);
+		expect(calls(state.clients[0])).toEqual(['SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"', 'SELECT 1']);
 		gate.resolve({ rows: [] }); await tick(); state.query = null;
 	});
 	it.each(['all', 'advisory'])('allows explicit retry with autoReconnect disabled in %s mode', async (multiListener) => {
@@ -133,7 +150,7 @@ describe('Postgres notification session lifecycle', () => {
 		const failure = new Error('socket failed during ' + stage), late = deferred();
 		const fail = connection => { connection.emit('error', failure); return late.promise; };
 		if (stage === 'connect') state.connect = fail;
-		else state.query = (connection, sql) => (stage === 'listen' ? sql.startsWith('LISTEN') : sql.includes('pg_try_advisory_lock')) ? fail(connection) : Promise.resolve({ rows: [{ acquired: true }] });
+		else state.query = (connection, sql) => (stage === 'listen' ? sql === 'LISTEN "lifecycle"' : sql.includes('pg_try_advisory_lock')) ? fail(connection) : Promise.resolve({ rows: [{ acquired: true }] });
 		const breaker = createCircuitBreaker({ failureThreshold: 3 });
 		const report = vi.spyOn(breaker, 'failure');
 		const { bridge, platform } = setup({ multiListener: stage === 'advisory' ? 'advisory' : 'all', lockId: 7, autoReconnect: false, breaker });
@@ -169,15 +186,15 @@ describe('Postgres notification session lifecycle', () => {
 		await expect(bridge.activate(platform)).rejects.toThrow('initial failure');
 		state.connect = null; await vi.advanceTimersByTimeAsync(150);
 		expect(state.clients).toHaveLength(2);
-		expect(state.clients[1].queryCall).toHaveBeenCalledTimes(1);
+		expect(calls(state.clients[1])).toHaveLength(1);
 		state.query = null; await vi.advanceTimersByTimeAsync(20);
-		expect(state.clients[1].queryCall.mock.calls.map(([sql]) => sql)).toEqual(['SELECT pg_try_advisory_lock($1) AS acquired', 'SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"']);
+		expect(calls(state.clients[1])).toEqual(['SELECT pg_try_advisory_lock($1) AS acquired', 'SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"']);
 	});
 
 	it('caps jitter at the native timer limit instead of overflowing into immediate retries', async () => {
 		const delays = [];
 		setRuntimeEnv({ rng: { float: () => 0.9 }, timers: { set: (callback, ms) => { delays.push(ms); return setTimeout(callback, ms); } } });
-		const { bridge, platform } = setup({ reconnectInterval: 2147483647 }); await bridge.activate(platform);
+		const { bridge, platform } = setup({ reconnectInterval: 2147483647 }); await bridge.activate(platform); delays.length = 0;
 		state.clients[0].emit('error', new Error('lost')); await tick();
 		expect(delays).toEqual([2147483647]);
 		await vi.advanceTimersByTimeAsync(1000); expect(state.clients).toHaveLength(1);
@@ -201,6 +218,39 @@ describe('Postgres notification session lifecycle', () => {
 			await bridge.activate(platform); expect(breaker.state).toBe('healthy');
 			gate.resolve({ rows: [] }); await tick();
 		} finally { gate.resolve({ rows: [] }); breaker.destroy(); }
+	});
+
+	it.each(['all', 'advisory'])('rejects a %s session whose probe never returns and takes no advisory lock', async (multiListener) => {
+		// A transaction-pooling proxy hands the LISTEN backend back to its pool,
+		// so a notification sent while the session is idle never reaches it.
+		state.route = () => Promise.resolve({ rows: [] });
+		const breaker = createCircuitBreaker({ failureThreshold: 5 });
+		const { bridge, platform } = setup({ multiListener, lockId: 7, autoReconnect: false, breaker });
+		try {
+			const activation = bridge.activate(platform), rejected = expect(activation).rejects.toMatchObject({ name: 'ConnectionError', code: 'PG_NOTIFY_SESSION_UNSTABLE' });
+			await vi.advanceTimersByTimeAsync(4999); expect(state.clients[0].endCall).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1); await rejected;
+			expect(calls(state.clients[0])).toEqual([]);
+			expect(state.clients[0].endCall).toHaveBeenCalledTimes(1);
+			state.route = null; await bridge.activate(platform);
+			expect(calls(state.clients[1])).toEqual(multiListener === 'advisory' ? ['SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"'] : ['LISTEN "lifecycle"']);
+		} finally { breaker.destroy(); }
+	});
+	it('ignores a probe payload that does not carry this session nonce', async () => {
+		state.route = ([channel]) => { for (const client of state.clients) client.emit('notification', { channel, payload: 'forged' }); return Promise.resolve({ rows: [] }); };
+		const { bridge, platform } = setup({ autoReconnect: false });
+		const rejected = expect(bridge.activate(platform)).rejects.toMatchObject({ code: 'PG_NOTIFY_SESSION_UNSTABLE' });
+		await vi.advanceTimersByTimeAsync(5000); await rejected;
+	});
+	it('confirms a reconnected session again before resuming LISTEN', async () => {
+		const { bridge, platform } = setup(); await bridge.activate(platform);
+		state.route = () => Promise.resolve({ rows: [] });
+		state.clients[0].emit('error', new Error('lost')); await tick();
+		await vi.advanceTimersByTimeAsync(150); expect(state.clients).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(5000); expect(calls(state.clients[1])).toEqual([]);
+		expect(state.clients[1].endCall).toHaveBeenCalledTimes(1);
+		state.route = null; await vi.advanceTimersByTimeAsync(300);
+		expect(calls(state.clients[2])).toEqual(['LISTEN "lifecycle"']);
 	});
 
 });

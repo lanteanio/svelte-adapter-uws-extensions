@@ -7,6 +7,20 @@ import { captureRegistered } from '../helpers/diagnostic-line.js';
 
 const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 
+// The bridge confirms a new session by LISTENing on a private probe channel
+// and sending pg_notify through the client's query route. These doubles keep
+// a pinned session, so the probe arrives like any other notification.
+function probeRoute(listening, emit) {
+	return async (text, values) => {
+		if (/pg_notify/.test(text) && listening.has(values[0])) queueMicrotask(() => emit(values[0], values[1]));
+		return { rows: [], rowCount: 0 };
+	};
+}
+function trackListen(listening, text) {
+	const match = /^(UN)?LISTEN "(.*)"$/.exec(text);
+	if (match) match[1] ? listening.delete(match[2]) : listening.add(match[2]);
+}
+
 /**
  * Cluster-scoped mock that simulates Postgres advisory-lock state across
  * multiple replicas. Each replica gets its own PgClient via
@@ -25,6 +39,7 @@ function mockCluster() {
 		let queries = [];
 		let isOpen = false;
 		const heldLocks = new Set();
+		let listening = new Set();
 
 		const mockClient = {
 			on(event, fn) {
@@ -43,6 +58,7 @@ function mockCluster() {
 			},
 			async query(text, values) {
 				queries.push({ text, values });
+				trackListen(listening, text);
 				if (text.includes('pg_try_advisory_lock')) {
 					const lockId = values[0];
 					const owner = advisoryLocks.get(lockId);
@@ -73,10 +89,13 @@ function mockCluster() {
 			createClient() {
 				connListeners = new Map();
 				queries = [];
+				listening = new Set();
 				heldLocks.clear();
 				return mockClient;
 			},
-			async query() { return { rows: [], rowCount: 0 }; },
+			query: probeRoute({ has: (channel) => listening.has(channel) }, (channel, payload) => {
+				for (const fn of connListeners.get('notification') || []) fn({ channel, payload });
+			}),
 			async end() {},
 			_mockClient: mockClient,
 			_getQueries() { return queries; },
@@ -115,6 +134,7 @@ function mockCluster() {
 function mockPgClient({ failConnect = false } = {}) {
 	let connListeners = new Map();
 	let queries = [];
+	let listening = new Set();
 
 	const mockClient = {
 		on(event, fn) {
@@ -132,6 +152,7 @@ function mockPgClient({ failConnect = false } = {}) {
 		},
 		async query(text) {
 			queries.push(text);
+			trackListen(listening, text);
 			return { rows: [], rowCount: 0 };
 		},
 		async end() {
@@ -144,9 +165,12 @@ function mockPgClient({ failConnect = false } = {}) {
 		createClient() {
 			connListeners = new Map();
 			queries = [];
+			listening = new Set();
 			return mockClient;
 		},
-		async query() { return { rows: [], rowCount: 0 }; },
+		query: probeRoute({ has: (channel) => listening.has(channel) }, (channel, payload) => {
+			for (const fn of connListeners.get('notification') || []) fn({ channel, payload });
+		}),
 		async end() {},
 
 		// Test helpers
@@ -235,7 +259,7 @@ describe('postgres notify bridge', () => {
 			await bridge.activate(platform);
 
 			const queries = client._getQueries();
-			expect(queries.some((q) => q.includes('LISTEN') && q.includes('changes'))).toBe(true);
+			expect(queries.some((q) => q === 'LISTEN "changes"')).toBe(true);
 		});
 
 		it('is idempotent', async () => {
@@ -527,7 +551,7 @@ describe('postgres notify bridge', () => {
 			await bridge.deactivate();
 
 			const queries = client._getQueries();
-			expect(queries).toEqual(['LISTEN "changes"']);
+			expect(queries).toEqual([expect.stringMatching(/^LISTEN "svti_notify_probe_[0-9a-f]{32}"$/), expect.stringMatching(/^UNLISTEN "svti_notify_probe_/), 'LISTEN "changes"']);
 			expect(end).toHaveBeenCalledTimes(1);
 		});
 
@@ -551,7 +575,7 @@ describe('postgres notify bridge', () => {
 
 	describe('breaker accounting', () => {
 		it('records failure() when LISTEN connection error fires', async () => {
-			const listeners = new Map();
+			const listeners = new Map(), listening = new Set();
 			const testClient = {
 				pool: {},
 				createClient() {
@@ -565,11 +589,11 @@ describe('postgres notify bridge', () => {
 							if (arr) { const i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1); }
 						},
 						async connect() {},
-						async query() { return { rows: [], rowCount: 0 }; },
+						async query(text) { trackListen(listening, text); return { rows: [], rowCount: 0 }; },
 						async end() {}
 					};
 				},
-				async query() { return { rows: [], rowCount: 0 }; },
+				query: probeRoute(listening, (channel, payload) => { for (const fn of listeners.get('notification') || []) fn({ channel, payload }); }),
 				async end() {}
 			};
 
@@ -668,7 +692,7 @@ describe('postgres notify bridge', () => {
 
 			const queries = a._getQueries();
 			expect(queries.some((q) => q.text.includes('pg_try_advisory_lock'))).toBe(true);
-			expect(queries.some((q) => q.text.includes('LISTEN'))).toBe(true);
+			expect(queries.some((q) => q.text === 'LISTEN "changes"')).toBe(true);
 			expect(cluster._advisoryLocks.get(42)).toBe(a._connId);
 		});
 
@@ -687,8 +711,8 @@ describe('postgres notify bridge', () => {
 			await bridgeA.activate(platform);
 			await bridgeB.activate(platform);
 
-			expect(a._getQueries().some((q) => q.text.includes('LISTEN'))).toBe(true);
-			expect(b._getQueries().some((q) => q.text.includes('LISTEN'))).toBe(false);
+			expect(a._getQueries().some((q) => q.text === 'LISTEN "changes"')).toBe(true);
+			expect(b._getQueries().some((q) => q.text === 'LISTEN "changes"')).toBe(false);
 			expect(cluster._advisoryLocks.get(42)).toBe(a._connId);
 
 			await bridgeA.deactivate();
@@ -747,7 +771,7 @@ describe('postgres notify bridge', () => {
 				await vi.advanceTimersByTimeAsync(150);
 
 				expect(cluster._advisoryLocks.get(42)).toBe(b._connId);
-				expect(b._getQueries().some((q) => q.text.includes('LISTEN'))).toBe(true);
+				expect(b._getQueries().some((q) => q.text === 'LISTEN "changes"')).toBe(true);
 
 				await bridgeB.deactivate();
 			} finally {

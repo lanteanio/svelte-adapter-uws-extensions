@@ -89,7 +89,12 @@ export interface NotifyBridgeOptions {
 }
 
 export interface NotifyBridge {
-	/** Await session setup before serving traffic. A healthy advisory follower resolves; connection/setup failures reject. Concurrent calls share startup. */
+	/**
+	 * Await session setup before serving traffic. A healthy advisory follower resolves; connection/setup failures reject.
+	 * Each new session must receive a probe notification sent through the client's query route while it is idle, before
+	 * any LISTEN or advisory lock; otherwise startup rejects with a `ConnectionError` whose code is
+	 * `PG_NOTIFY_SESSION_UNSTABLE` (a transaction- or statement-pooling proxy). Concurrent calls share startup.
+	 */
 	activate(platform: Platform): Promise<void>;
 
 	/** Await timer cancellation and session closure. Owned PgClient.end() calls this before closing its pool. */

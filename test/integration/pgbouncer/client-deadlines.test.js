@@ -57,3 +57,23 @@ for (const multiListener of ['all', 'advisory']) {
 		} finally { await bridge.deactivate(); }
 	});
 }
+
+for (const multiListener of ['all', 'advisory']) {
+	it('refuses the ' + multiListener + ' notification bridge through the transaction proxy route without leaking its lock', async () => {
+		const direct = create(process.env.INTEGRATION_POSTGRES_URL);
+		const proxied = create(process.env.INTEGRATION_PGBOUNCER_TRANSACTION_URL, { statement_timeout: 0 });
+		const channel = 'txmode_notify_' + multiListener, lockId = 814311;
+		const refused = createNotifyBridge(proxied, { channel, multiListener, lockId, autoReconnect: false });
+		await expect(refused.activate(mockPlatform())).rejects.toMatchObject({ name: 'ConnectionError', code: 'PG_NOTIFY_SESSION_UNSTABLE' });
+		await refused.deactivate();
+		const locks = await direct.query("SELECT count(*)::int AS held FROM pg_locks WHERE locktype = 'advisory' AND objid = $1", [lockId]);
+		expect(locks.rows[0].held).toBe(0);
+		const bridge = createNotifyBridge(direct, { channel, multiListener, lockId, autoReconnect: false });
+		const platform = mockPlatform();
+		try {
+			await bridge.activate(platform);
+			await direct.query('SELECT pg_notify($1, $2)', [channel, JSON.stringify({ topic: 'txmode', event: 'ready', data: { mode: multiListener } })]);
+			await expect.poll(() => platform.published.length, { timeout: 5000 }).toBe(1);
+		} finally { await bridge.deactivate(); }
+	});
+}

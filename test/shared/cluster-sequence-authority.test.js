@@ -601,12 +601,17 @@ function listeningPg() {
 		},
 		async end() {}
 	};
+	const notify = (channel, payload) => { for (const fn of listeners) fn({ channel, payload }); };
 	return {
 		pool: {},
 		createClient: () => conn,
-		async query() { return { rows: [], rowCount: 0 }; },
+		// The session-confirmation probe arrives like any other notification.
+		async query(text, values) {
+			if (String(text).includes('pg_notify')) queueMicrotask(() => notify(values[0], values[1]));
+			return { rows: [], rowCount: 0 };
+		},
 		async end() {},
-		notify(channel, payload) { for (const fn of listeners) fn({ channel, payload }); }
+		notify
 	};
 }
 
