@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve relay suppression for cursor removals received from another instance, including batched delivery.
 - A failed construction-time migration of the PostgreSQL task runner or idempotency store no longer surfaces as an unhandled rejection. `ready()` still rejects with the original error, and its documentation now states that it stays rejected while later operations on the table retry the migration.
 - Contain throwing or rejected system channel subscriptions in the pub/sub open hook while continuing bus activation. A bus with a circuit breaker reports the failure once without exposing the underlying error.
+- Releasing a presence, cursor or pub/sub subscriber whose `quit()` rejects, for example because its Redis client was already quit, no longer raises an unhandled rejection. The subscriber is disconnected instead.
 
 ## [0.5.10] - 2026-05-24
 

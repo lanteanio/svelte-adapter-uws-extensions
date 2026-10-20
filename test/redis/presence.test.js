@@ -1612,3 +1612,41 @@ describe('redis presence', () => {
 		});
 	});
 });
+
+describe('redis presence idle subscriber shutdown', () => {
+	it('disconnects a subscriber whose quit rejects without an unhandled rejection', async () => {
+		const client = mockRedisClient('test:');
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			sub.quit = () => Promise.reject(new Error('Connection is closed.'));
+			sub.disconnect = vi.fn();
+			subscribers.push(sub);
+			return sub;
+		};
+		const tracker = createPresence(client, { key: 'id', heartbeat: 60000, ttl: 180 });
+		const escaped = [];
+		const onUnhandled = (reason) => { escaped.push(reason); };
+		process.on('unhandledRejection', onUnhandled);
+		vi.useFakeTimers();
+		try {
+			const ws = mockWs({ id: '1', name: 'Alice' });
+			await tracker.join(ws, 'room', platform);
+			await tracker.leave(ws, platform, 'room');
+			await vi.advanceTimersByTimeAsync(10);
+			expect(subscribers).toHaveLength(1);
+			// The subscriber shuts down after 30 seconds without channels.
+			await vi.advanceTimersByTimeAsync(30000);
+			vi.useRealTimers();
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
+			expect(escaped).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+			process.off('unhandledRejection', onUnhandled);
+			tracker.destroy();
+		}
+	});
+});

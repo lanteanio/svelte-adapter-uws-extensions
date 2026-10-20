@@ -2034,3 +2034,34 @@ describe('redis cursor', () => {
 		});
 	});
 });
+
+describe('redis cursor subscriber teardown', () => {
+	it('disconnects a subscriber whose quit rejects without an unhandled rejection', async () => {
+		const client = mockRedisClient('test:');
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			sub.quit = () => Promise.reject(new Error('Connection is closed.'));
+			sub.disconnect = vi.fn();
+			subscribers.push(sub);
+			return sub;
+		};
+		const tracker = createCursor(client, { throttle: 100, topicThrottle: 0, snapshotIntervalMs: 0 });
+		const escaped = [];
+		const onUnhandled = (reason) => { escaped.push(reason); };
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			tracker.update(mockWs({ id: '1' }), 'canvas', { x: 1, y: 1 }, platform);
+			expect(subscribers).toHaveLength(1);
+			// Destroying after the client was quit makes the subscriber's quit reject.
+			tracker.destroy();
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
+			expect(escaped).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+});

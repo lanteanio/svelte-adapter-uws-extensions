@@ -1070,8 +1070,10 @@ export function createCursor(client, options = {}) {
 			dirtyTopics.clear();
 			topicFlush.clear();
 			if (subscriber) {
-				subscriber.quit().catch(() => subscriber.disconnect());
+				// The rejection handler runs after the field is cleared.
+				const sub = subscriber;
 				subscriber = null;
+				sub.quit().catch(() => sub.disconnect());
 			}
 			activePlatform = null;
 		},

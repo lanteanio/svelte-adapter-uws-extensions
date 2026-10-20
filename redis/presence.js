@@ -666,8 +666,10 @@ export function createPresence(client, options = {}) {
 				idleTimer = setTimeout(() => {
 					idleTimer = null;
 					if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
-						subscriber.quit().catch(() => subscriber.disconnect());
+						// The rejection handler runs after the field is cleared.
+						const sub = subscriber;
 						subscriber = null;
+						sub.quit().catch(() => sub.disconnect());
 					}
 				}, 30000);
 				if (idleTimer.unref) idleTimer.unref();
