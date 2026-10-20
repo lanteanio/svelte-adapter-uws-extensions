@@ -236,6 +236,69 @@ describe('Postgres notification session lifecycle', () => {
 			expect(calls(state.clients[1])).toEqual(multiListener === 'advisory' ? ['SELECT pg_try_advisory_lock($1) AS acquired', 'LISTEN "lifecycle"'] : ['LISTEN "lifecycle"']);
 		} finally { breaker.destroy(); }
 	});
+	it.each([
+		['an unconfirmed session', () => Promise.resolve({ rows: [] }), 'PG_NOTIFY_SESSION_UNSTABLE'],
+		['a read-only query route', () => Promise.reject(Object.assign(new Error('cannot execute NOTIFY during recovery'), { code: '25006' })), 'PG_NOTIFY_SESSION_UNSTABLE']
+	])('does not count %s as a dependency failure', async (_, route, code) => {
+		state.route = route;
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const report = vi.spyOn(breaker, 'failure');
+		const { bridge, platform } = setup({ autoReconnect: false, breaker });
+		try {
+			const rejected = expect(bridge.activate(platform)).rejects.toMatchObject({ name: 'ConnectionError', code });
+			await vi.advanceTimersByTimeAsync(5000); await rejected;
+			expect(report).not.toHaveBeenCalled(); expect(breaker.state).toBe('healthy');
+		} finally { breaker.destroy(); }
+	});
+	it('names the read-only query route and keeps the driver error as the cause', async () => {
+		const failure = Object.assign(new Error('cannot execute NOTIFY during recovery'), { code: '25006' });
+		state.route = () => Promise.reject(failure);
+		const { bridge, platform } = setup({ autoReconnect: false });
+		await expect(bridge.activate(platform)).rejects.toMatchObject({ code: 'PG_NOTIFY_SESSION_UNSTABLE', message: expect.stringContaining('read-only'), cause: expect.objectContaining({ code: '25006' }) });
+	});
+	it('names a different database as a cause of a probe that never arrives', async () => {
+		state.route = () => Promise.resolve({ rows: [] });
+		const { bridge, platform } = setup({ autoReconnect: false });
+		const rejected = expect(bridge.activate(platform)).rejects.toMatchObject({ message: expect.stringContaining('different database or server') });
+		await vi.advanceTimersByTimeAsync(5000); await rejected;
+	});
+	it('releases a half-open breaker probe when local pool admission refuses the probe', async () => {
+		const held = deferred();
+		state.route = ([channel, payload]) => {
+			if (channel === 'hold') return held.promise;
+			for (const client of state.clients) if (client.listening.has(channel)) queueMicrotask(() => client.emit('notification', { channel, payload }));
+			return Promise.resolve({ rows: [] });
+		};
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 20 });
+		const report = vi.spyOn(breaker, 'failure');
+		const { owner, bridge, platform } = setup({ autoReconnect: false, breaker }, { maxInFlight: 1 });
+		try {
+			breaker.failure(new Error('offline')); report.mockClear(); await vi.advanceTimersByTimeAsync(20);
+			const holding = owner.query('SELECT pg_notify($1, $2)', ['hold', 'x']);
+			await expect(bridge.activate(platform)).rejects.toMatchObject({ code: 'PG_CAPACITY_EXCEEDED' });
+			expect(report).not.toHaveBeenCalled();
+			held.resolve({ rows: [] }); await holding;
+			await bridge.activate(platform); expect(breaker.state).toBe('healthy');
+		} finally { held.resolve({ rows: [] }); breaker.destroy(); }
+	});
+	it('bounds sending the probe through a stalled query route by the same deadline', async () => {
+		let abandoned = null;
+		state.route = () => new Promise(() => {});
+		const breaker = createCircuitBreaker({ failureThreshold: 5 });
+		const report = vi.spyOn(breaker, 'failure');
+		const { owner, bridge, platform } = setup({ autoReconnect: false, breaker });
+		const query = owner.query;
+		owner.query = (text, values, options) => { abandoned = options?.signal; return query(text, values, options); };
+		try {
+			const activation = bridge.activate(platform);
+			const rejected = expect(activation).rejects.toMatchObject({ name: 'ConnectionError', message: expect.stringContaining('could not be sent through the query route within 5 seconds') });
+			await vi.advanceTimersByTimeAsync(4999); expect(state.clients[0].endCall).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1); await rejected;
+			expect(abandoned?.aborted).toBe(true);
+			expect(report).toHaveBeenCalledTimes(1);
+			expect(state.clients[0].endCall).toHaveBeenCalledTimes(1);
+		} finally { breaker.destroy(); }
+	});
 	it('ignores a probe payload that does not carry this session nonce', async () => {
 		state.route = ([channel]) => { for (const client of state.clients) client.emit('notification', { channel, payload: 'forged' }); return Promise.resolve({ rows: [] }); };
 		const { bridge, platform } = setup({ autoReconnect: false });

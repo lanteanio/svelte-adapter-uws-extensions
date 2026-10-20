@@ -1855,7 +1855,7 @@ listener's inherited context for delivery and any bus relay or async work.
 
 Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table - this module handles the listening side.
 
-Uses a dedicated session outside the pool. Await initialization and shutdown; use a direct or session-pooled DSN. Startup confirms the session with a probe notification sent through the client's query route, and rejects with code `PG_NOTIFY_SESSION_UNSTABLE` behind transaction or statement pooling. See [notification lifecycle and session budgets](docs/postgres-support.md#notification-sessions-and-shutdown).
+Uses a dedicated session outside the pool. Await initialization and shutdown; use a direct or session-pooled DSN. Startup confirms the session with a probe notification sent through the client's query route, and rejects with code `PG_NOTIFY_SESSION_UNSTABLE` behind transaction or statement pooling, or when the query route reaches a different database or a read-only standby. See [notification lifecycle and session budgets](docs/postgres-support.md#notification-sessions-and-shutdown).
 
 > **Authorization:** the bridge forwards every NOTIFY payload from Postgres straight to `platform.publish()`. The trigger that emits the NOTIFY is the trust boundary - if your trigger fires on every row mutation regardless of tenant, the published topic must encode the tenant so subscribers see only their own data, AND your subscribe gate must enforce that tenants only subscribe to their own topics. Treating a NOTIFY payload as "already authenticated because it came from the DB" is incorrect; the DB does not know who is subscribing. See [Authorize every extension call](#authorize-every-extension-call).
 

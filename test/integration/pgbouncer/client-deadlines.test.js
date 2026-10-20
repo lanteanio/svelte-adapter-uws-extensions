@@ -3,6 +3,7 @@ import { createPgClient } from '../../../src/postgres/index.js';
 import { createJobQueue } from '../../../src/postgres/jobs.js';
 import { createNotifyBridge } from '../../../src/postgres/notify.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { createCircuitBreaker } from '../../../src/shared/breaker.js';
 
 const clients = [];
 function create(connectionString, options = {}) {
@@ -63,9 +64,12 @@ for (const multiListener of ['all', 'advisory']) {
 		const direct = create(process.env.INTEGRATION_POSTGRES_URL);
 		const proxied = create(process.env.INTEGRATION_PGBOUNCER_TRANSACTION_URL, { statement_timeout: 0 });
 		const channel = 'txmode_notify_' + multiListener, lockId = 814311;
-		const refused = createNotifyBridge(proxied, { channel, multiListener, lockId, autoReconnect: false });
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const refused = createNotifyBridge(proxied, { channel, multiListener, lockId, autoReconnect: false, breaker });
 		await expect(refused.activate(mockPlatform())).rejects.toMatchObject({ name: 'ConnectionError', code: 'PG_NOTIFY_SESSION_UNSTABLE' });
 		await refused.deactivate();
+		// A routing error is not a dependency failure: a breaker shared with the stores stays closed.
+		expect(breaker.state).toBe('healthy'); breaker.destroy();
 		const locks = await direct.query("SELECT count(*)::int AS held FROM pg_locks WHERE locktype = 'advisory' AND objid = $1", [lockId]);
 		expect(locks.rows[0].held).toBe(0);
 		const bridge = createNotifyBridge(direct, { channel, multiListener, lockId, autoReconnect: false });

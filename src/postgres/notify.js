@@ -14,6 +14,7 @@
 import { registerClusterHealth, finiteReading } from '../shared/cluster-dashboard.js';
 import { onPgShutdown } from './_client-lifecycle.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
+import { pgFailure } from './_breaker.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { setTimer, clearTimer, setIntervalTimer, clearIntervalTimer, randomFloat, randomUuid } from '../shared/runtime.js';
 import { ConnectionError } from '../shared/errors.js';
@@ -350,32 +351,56 @@ export function createNotifyBridge(client, options) {
 	// a backend this session no longer owns. Only a notification sent from
 	// another connection while this session is idle proves the backend stays
 	// attached; a check issued from this session can land on the same backend
-	// again and pass. The probe runs before any advisory lock is taken.
+	// again and pass. The probe runs before any advisory lock is taken, and one
+	// deadline covers both sending it through the query route and receiving it.
 	async function confirmSession(entry) {
 		const probe = 'svti_notify_probe_' + randomUuid().replace(/-/g, '');
 		const nonce = randomUuid();
 		let arrived, timer = null;
+		const deadline = new AbortController();
 		const received = new Promise((resolve) => { arrived = resolve; });
 		const onProbe = (msg) => { if (msg.channel === probe && msg.payload === nonce) arrived(true); };
 		entry.client.on('notification', onProbe);
 		try {
 			await waitEntry(entry, entry.client.query(`LISTEN "${probe}"`));
 			if (!current(entry)) return;
-			await waitEntry(entry, client.query('SELECT pg_notify($1, $2)', [probe, nonce]));
+			const expired = new Promise((resolve) => {
+				timer = setTimer(() => {
+					const error = new ConnectionError('postgres', `notification session probe could not be sent through the query route within ${SESSION_PROBE_TIMEOUT_MS / 1000} seconds`);
+					deadline.abort(error);
+					resolve(false);
+				}, SESSION_PROBE_TIMEOUT_MS);
+			});
+			try {
+				// The signal abandons a pending pool checkout or query at the
+				// deadline; the race also bounds a client that ignores it.
+				const sent = client.query('SELECT pg_notify($1, $2)', [probe, nonce], { signal: deadline.signal });
+				await waitEntry(entry, Promise.race([sent, expired.then(() => Promise.reject(deadline.signal.reason))]));
+			} catch (error) {
+				// A read-only query route (a hot standby) cannot send the probe;
+				// that is a routing mismatch, not a dependency failure.
+				if (error?.code === '25006') throw unstableSession('the query route is read-only (for example a hot standby) and cannot send its probe notification; route queries to the primary the session listens on', error);
+				throw error;
+			}
 			if (!current(entry)) return;
-			const deadline = new Promise((resolve) => { timer = setTimer(() => resolve(false), SESSION_PROBE_TIMEOUT_MS); });
-			const confirmed = await waitEntry(entry, Promise.race([received, deadline]));
+			const confirmed = await waitEntry(entry, Promise.race([received, expired]));
 			if (!current(entry)) return;
 			if (confirmed !== true) {
-				const error = new ConnectionError('postgres', 'notification session is not stable: its probe notification never arrived, so a transaction- or statement-pooling proxy is likely in the route; use a direct or session-pooled connection');
-				error.code = 'PG_NOTIFY_SESSION_UNSTABLE';
-				throw error;
+				throw unstableSession('its probe notification sent through the query route never arrived; either a transaction- or statement-pooling proxy is in the session route (use a direct or session-pooled connection), or the query route reaches a different database or server than the session');
 			}
 			await waitEntry(entry, entry.client.query(`UNLISTEN "${probe}"`));
 		} finally {
 			if (timer) clearTimer(timer);
+			// Abandon a probe still waiting on the pool when shutdown interrupts it.
+			deadline.abort();
 			entry.client.removeListener('notification', onProbe);
 		}
+	}
+
+	function unstableSession(reason, cause) {
+		const error = new ConnectionError('postgres', 'notification session is not stable: ' + reason, cause);
+		error.code = 'PG_NOTIFY_SESSION_UNSTABLE';
+		return error;
 	}
 
 	async function step(epoch) {
@@ -417,7 +442,10 @@ export function createNotifyBridge(client, options) {
 			}
 			if (current(entry)) b?.success();
 		} catch (error) {
-			if (!entry?.failed && active && generation === epoch) b?.failure(error);
+			// Local admission refusals and an unconfirmable session (a routing
+			// configuration error that repeats on every reconnect) are not a
+			// dependency verdict; the finally block returns a half-open lease.
+			if (!entry?.failed && active && generation === epoch && error?.code !== 'PG_NOTIFY_SESSION_UNSTABLE') pgFailure(b, error);
 			if (conn === entry) { conn = null; isLeader = false; }
 			await closeEntry(entry);
 			throw error;

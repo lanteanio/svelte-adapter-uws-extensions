@@ -9,6 +9,8 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `CONNECTION_FAILED` | Redis and PostgreSQL client connection wrappers | The connection could not be established. |
 | `OPERATION_TIMEOUT` | Redis and PostgreSQL client timeout wrappers | The operation did not complete before its deadline. |
 | `CIRCUIT_BROKEN` | Circuit breaker | The breaker refused the operation while open. |
+| `PG_CAPACITY_EXCEEDED` | PostgreSQL client wrapper `query()` and `connect()` | The client's `maxInFlight` admission bound was full, so the call never reached PostgreSQL. Store breakers and the notification bridge do not count it as a dependency failure. Retry later or raise the bound. |
+| `PG_NOTIFY_SESSION_UNSTABLE` | PostgreSQL notification bridge `activate()` | The new notification session could not be confirmed: its probe notification, sent through the client's query route, never arrived (a transaction- or statement-pooling proxy in the session route, or a query route reaching a different database or server), or the query route is read-only. Fix the routing; the bridge's breaker does not count it as a dependency failure, and with `autoReconnect` the bridge keeps retrying. |
 | `REPLICATION_TIMEOUT` | Redis replay | Fewer replicas acknowledged than required. The primary may already hold the write. |
 | `REPLAY_STORAGE_FAILED` | Redis and PostgreSQL replay | Replay storage failed; inspect the cause when diagnosing the backend. |
 | `REPLAY_SERIALIZATION_FAILED` | Redis and PostgreSQL replay | The supplied data could not be serialized. Correct the input before retrying. |
