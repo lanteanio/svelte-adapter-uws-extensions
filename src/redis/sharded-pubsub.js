@@ -42,6 +42,7 @@ import {
 	carriedTraceContext,
 	liveTraceContext,
 	runTraceOperation,
+	withTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
@@ -398,9 +399,9 @@ export function createShardedBus(client, options = {}) {
 
 	function deliverTraced(parsed, receivedShard) {
 		const parent = carriedTraceContext(parsed);
-		// A null parent means current context to the adapter. Delivery without
-		// a carrier must not inherit the subscriber's activation request span.
-		if (parent === null) return deliverEnvelope(parsed, receivedShard);
+		// Clear the subscriber's inherited context, including async descendants
+		// of delivery, when no remote parent was carried.
+		if (parent === null) return withTraceContext(activePlatform, null, () => deliverEnvelope(parsed, receivedShard));
 		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed, receivedShard));
 	}

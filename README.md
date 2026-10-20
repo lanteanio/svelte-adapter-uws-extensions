@@ -575,8 +575,8 @@ Without a provider the buses do no trace work at all: a publish reads no
 context and relays an envelope without trace fields, and trace fields on an
 inbound envelope are ignored. Envelopes without trace fields remain
 valid, so mixed-version clusters interoperate. Even with a provider, delivery
-without a valid carried context creates no consumer operation; it does not
-attribute the message to the context used to activate the subscriber. Trace fields stay outside
+without a valid carried context clears the subscriber's inherited context
+for delivery and its async descendants, and creates no consumer operation. Trace fields stay outside
 `data`: an application payload property named `traceparent` remains ordinary
 application data and is never trusted as transport context.
 
@@ -1849,6 +1849,10 @@ Same as [Replay buffer (Redis)](#api-3) - including `currentEpoch(topic)` / `cac
 
 ## LISTEN/NOTIFY bridge
 
+With a tracing provider, notifications carrying a valid trace context start a
+consumer operation under that parent. Notifications without one clear the
+listener's inherited context for delivery and any bus relay or async work.
+
 Listens on a Postgres channel for notifications and forwards them to `platform.publish()`. You provide the trigger on your table - this module handles the listening side.
 
 Uses a dedicated session outside the pool. Await initialization and shutdown; use a direct or session-pooled DSN. See [notification lifecycle and session budgets](docs/postgres-support.md#notification-sessions-and-shutdown).
@@ -2906,6 +2910,8 @@ recovery on another instance. Override explicitly via `requestId` or
 `traceContext`; explicit `traceContext: null` suppresses Platform
 fallback. Configure a default `platform` on `createTaskRunner` when
 background dispatch/recovery should start structural consumer operations.
+Attempts without a valid stored parent start in a cleared context, so their
+consumer operation and nested work never inherit the worker timer's context.
 
 #### Schema
 

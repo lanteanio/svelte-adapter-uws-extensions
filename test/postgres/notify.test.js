@@ -328,10 +328,11 @@ describe('postgres notify bridge', () => {
 			expect(platform.published[0]).toEqual({ topic: 'rows', event: 'changed', data: 7, options: { relay: false } });
 			expect(platform.traceOperations.map((op) => op.options.parent)).toEqual([{ traceparent: OTHER }]);
 
-			// An explicit null starts a new trace even though the result carries one.
+			// An explicit null clears inherited context even when the result carries one.
 			explicit = null;
 			client._simulate('changes', JSON.stringify({ topic: 'rows', id: 8 }));
-			expect(platform.traceOperations.map((op) => op.options.parent)).toEqual([{ traceparent: OTHER }, null]);
+			expect(platform.traceOperations.map((op) => op.options.parent)).toEqual([{ traceparent: OTHER }]);
+			expect(platform.traceRestored).toEqual([null]);
 		});
 
 		it('ignores carrier fields on a Platform without a tracing provider', async () => {

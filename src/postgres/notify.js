@@ -23,6 +23,7 @@ import {
 	POSTGRES_TRACE_ATTRIBUTES,
 	normalizeTraceContext,
 	runTraceOperation,
+	withTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
 
@@ -253,8 +254,9 @@ export function createNotifyBridge(client, options) {
 				if (activeTracing) {
 					const hasExplicitTrace = Object.prototype.hasOwnProperty.call(result, 'traceContext');
 					const incomingTrace = normalizeTraceContext(hasExplicitTrace ? result.traceContext : result);
-					runTraceOperation(activePlatform, 'postgres.notify.receive', 'consumer', incomingTrace, POSTGRES_TRACE_ATTRIBUTES,
-						() => activePlatform.publish(result.topic, result.event, result.data, publishOpts));
+					const deliver = () => activePlatform.publish(result.topic, result.event, result.data, publishOpts);
+					if (incomingTrace === null) withTraceContext(activePlatform, null, deliver);
+					else runTraceOperation(activePlatform, 'postgres.notify.receive', 'consumer', incomingTrace, POSTGRES_TRACE_ATTRIBUTES, deliver);
 				} else {
 					activePlatform.publish(result.topic, result.event, result.data, publishOpts);
 				}

@@ -25,6 +25,7 @@ import {
 	carriedTraceContext,
 	liveTraceContext,
 	runTraceOperation,
+	withTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -394,9 +395,9 @@ export function createPubSubBus(client, options = {}) {
 
 	function deliverTraced(parsed) {
 		const parent = carriedTraceContext(parsed);
-		// A null parent means current context to the adapter. Delivery without
-		// a carrier must not inherit the subscriber's activation request span.
-		if (parent === null) return deliverEnvelope(parsed);
+		// Clear the subscriber's inherited context, including async descendants
+		// of delivery, when no remote parent was carried.
+		if (parent === null) return withTraceContext(activePlatform, null, () => deliverEnvelope(parsed));
 		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed));
 	}

@@ -173,8 +173,9 @@ function currentContext(platform, fallback) {
 
 /**
  * Run one producer/consumer operation through the adapter's structural trace
- * surface. With no provider it restores a valid parent through withContext
- * when available; with no context and no provider it is a direct callback.
+ * surface. Consumer operations without a carried parent clear inherited
+ * context before starting. Without a provider, consumers restore or clear
+ * context through withContext when available; producers retain their caller.
  *
  * @template T
  * @param {unknown} platform
@@ -187,34 +188,25 @@ function currentContext(platform, fallback) {
  */
 export function runTraceOperation(platform, name, kind, parent, attributes, fn) {
 	if (traceEnabled(platform)) {
+		if (kind === 'consumer' && parent === null) {
+			return withTraceContext(platform, null, () => platform.trace.run(name, { kind, parent, attributes }, () => fn(currentContext(platform, parent))));
+		}
 		return platform.trace.run(name, { kind, parent, attributes }, () => fn(currentContext(platform, parent)));
 	}
-	if (parent !== null) {
-		let withContext = null;
-		try {
-			if (typeof platform?.trace?.withContext === 'function') {
-				withContext = platform.trace.withContext.bind(platform.trace);
-			}
-		} catch {
-			// A tracing observer cannot break transport delivery.
-		}
-		if (withContext !== null) return withContext(parent, () => fn(parent));
-	}
+	if (parent !== null || kind === 'consumer') return withTraceContext(platform, parent, () => fn(parent));
 	return fn(parent);
 }
 
-/** Restore context without creating a span. */
+/** Restore or clear context without creating a span. */
 export function withTraceContext(platform, context, fn) {
-	if (context !== null) {
-		let withContext = null;
-		try {
-			if (typeof platform?.trace?.withContext === 'function') {
-				withContext = platform.trace.withContext.bind(platform.trace);
-			}
-		} catch {
-			// Trace integration is observational.
-		}
-		if (withContext !== null) return withContext(context, fn);
+	let trace;
+	let withContext;
+	try {
+		trace = platform?.trace;
+		withContext = trace?.withContext;
+	} catch {
+		// Trace integration is observational.
 	}
+	if (typeof withContext === 'function') return withContext.call(trace, context, fn);
 	return fn();
 }
