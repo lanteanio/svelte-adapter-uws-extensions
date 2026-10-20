@@ -350,6 +350,44 @@ describe('redis distributed session', () => {
 			expect(s.of(wsWith(ud2))).toEqual({ count: 5 });
 		});
 
+		it('a close after delete(token) does not recreate the session', async () => {
+			const s = createDistributedSession(client, idOpts);
+			const token = await s.create({ count: 0 });
+			const { upgrade, close } = s.withHooks();
+			const ud = await upgrade(ctxWith(token));
+			s.of(wsWith(ud)).count = 5;
+			await s.delete(token);
+			await close(wsWith(ud), {});
+			expect(await s.get(token)).toBe(null);
+			expect(client._store.has(client.key('sess:' + token))).toBe(false);
+		});
+
+		it('removes the index field again when the record vanishes during the close write', async () => {
+			const s = createDistributedSession(client, { ...idOpts, forgetUserId: (data) => data?.userId });
+			const token = await s.create({ userId: 'u-race' });
+			const { upgrade, close } = s.withHooks();
+			const ud = await upgrade(ctxWith(token));
+			await s.purgeUser(null, 'u-race');
+			const realExists = client.redis.exists.bind(client.redis);
+			// The record is present at the check and erased before the write.
+			await client.redis.set(client.key('sess:' + token), '{"d":{"userId":"u-race"},"c":1}');
+			client.redis.exists = async (...keys) => { const n = await realExists(...keys); await client.redis.del(...keys); return n; };
+			await close(wsWith(ud), {});
+			client.redis.exists = realExists;
+			expect(client._store.has(client.key('sess:' + token))).toBe(false);
+			expect(await client.redis.hkeys(client.key('sess:byuser:u-race'))).toEqual([]);
+		});
+
+		it('still persists an existing session on close with an owner index', async () => {
+			const s = createDistributedSession(client, { ...idOpts, forgetUserId: (data) => data?.userId });
+			const token = await s.create({ userId: 'u-live', count: 0 });
+			const { upgrade, close } = s.withHooks();
+			const ud = await upgrade(ctxWith(token));
+			s.of(wsWith(ud)).count = 3;
+			await close(wsWith(ud), {});
+			expect(await s.purgeUser(null, 'u-live')).toBe(1);
+		});
+
 		it('LOAD-ONLY: an unknown client token never creates a session (anti-fixation)', async () => {
 			const s = createDistributedSession(client, idOpts);
 			const { upgrade } = s.withHooks();

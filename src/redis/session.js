@@ -461,6 +461,47 @@ export function createDistributedSession(client, options = {}) {
 		}
 	}
 
+	// Update a record only while it still exists, so a session deleted while
+	// its socket was open (logout, or erasure purging the user) is never
+	// recreated by the close that follows. With an owner index, the existence
+	// check keeps an erased user's index from being written again, the index is
+	// still written before the record, and a record that vanishes between the
+	// check and the conditional write has the index field removed again.
+	async function updateRecord(token, data, createdAt) {
+		validateToken(token);
+		const key = fullKey(token);
+		const raw = JSON.stringify({ d: data, c: createdAt });
+		let written;
+		if (forgetUserId) {
+			try {
+				const present = Number(await redis.exists(key)) === 1;
+				breaker?.success();
+				if (!present) return;
+			} catch (err) {
+				breaker?.failure(err);
+				throw err;
+			}
+			await indexStored(raw, token);
+		}
+		try {
+			written = await redis.set(key, raw, 'PX', ttlMs, 'XX');
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		if (written != null || !forgetUserId) return;
+		const owner = recordOwner(JSON.parse(raw));
+		if (owner === null) return;
+		try {
+			await redis.hdel(byUserKey(owner), token);
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+	}
+
 	/**
 	 * Mint a NEW session server-side and return its opaque token (256-bit
 	 * CSPRNG via the runtime seam). Call at login - or in the adapter's
@@ -509,7 +550,7 @@ export function createDistributedSession(client, options = {}) {
 		const session = ud && ud[SESSION_SLOT];
 		if (!session || typeof session.token !== 'string') return;
 		// Best-effort: a close hook must never throw.
-		try { await writeRecord(session.token, session.data, session.createdAt); }
+		try { await updateRecord(session.token, session.data, session.createdAt); }
 		catch { /* not fatal at close; the next successful set re-persists */ }
 	}
 

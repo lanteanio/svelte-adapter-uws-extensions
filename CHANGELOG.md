@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Redis connection that drops during its startup handshake no longer rejects work with `ConnectionError`. Only the queue of a connection that reached ready is rejected as uncertain; commands issued during startup were never sent, so they stay queued and run once the reconnected client is ready.
 - A Redis lock whose callback settled inside its confirmed lease resolves with the callback result when the release reply of `0` arrives after the lease deadline. The key expired naturally; only a `0` reply inside the lease, or for a callback that settled past it, rejects with `LockLostError`.
 - A Redis lock sends its first renewal before the lease deadline when acquisition used most of the lease (slow `SET` reply, acquisition retries, or the extra round trips of `fence: true`). With less than one `heartbeatMs` of lease left, the next renewal goes out halfway to the deadline, which also keeps renewing a per-call `ttlMs` shorter than `heartbeatMs`.
+- `createDistributedSession(...).withHooks()` persists the session on close only while its record still exists (`SET ... XX`). A session deleted with `delete(token)` or erased by `purgeUser` while its socket was open is no longer recreated with a fresh TTL when that socket closes, and an erased user's token index is not written back.
 
 ## [0.6.0-next.64] - 2026-10-13
 

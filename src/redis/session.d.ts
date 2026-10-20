@@ -188,8 +188,10 @@ export interface DistributedSession<T = unknown> {
 	 * your `close` runs after the session is persisted. The session is loaded
 	 * LOAD-ONLY (an unknown token never creates one) and attached to the
 	 * connection for `of(ws)`; on close the (mutated) session is persisted once.
-	 * The close-time persist is best-effort: when it fails, including an
-	 * erasure-index failure, the stored session keeps its previous data.
+	 * The close-time persist only updates a record that still exists, so a
+	 * session deleted or erased while the socket was open stays gone. It is
+	 * best-effort: when it fails, including an erasure-index failure, the
+	 * stored session keeps its previous data.
 	 */
 	withHooks(userHooks?: SessionWsHooks): {
 		upgrade(ctx: UpgradeContext): Promise<unknown>;

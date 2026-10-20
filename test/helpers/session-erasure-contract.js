@@ -383,6 +383,24 @@ export function sessionErasureContract(getClient) {
 			});
 		}
 
+		for (const revoke of ['purgeUser', 'delete']) {
+			it(`a socket closing after ${revoke} does not recreate the session or its index`, async () => {
+				const client = getClient();
+				const sessions = createDistributedSession(client, { ...options, identify: (ctx) => ctx.token });
+				const token = await sessions.create({ userId: 'target', count: 0 });
+				const { upgrade, close } = sessions.withHooks();
+				const userData = await upgrade({ token });
+				const ws = { getUserData: () => userData };
+				sessions.of(ws).count = 1;
+				if (revoke === 'purgeUser') expect(await sessions.purgeUser(null, 'target')).toBe(1);
+				else await sessions.delete(token);
+				await close(ws, {});
+				expect(await client.redis.get(client.key('sess:' + token))).toBeNull();
+				if (revoke === 'purgeUser') expect(await indexOf(client, 'target')).toEqual([]);
+				expect((await sessions.withHooks().upgrade({ token }))).toEqual({});
+			});
+		}
+
 		it('counts one breaker failure per failed Redis operation and none for data errors', async () => {
 			const client = getClient();
 			const breaker = { failure: vi.fn(), success: vi.fn() };
