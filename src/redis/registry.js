@@ -1,3 +1,4 @@
+import { operationError } from '../shared/errors.js';
 /**
  * Cluster-wide connection registry + push-with-reply for svelte-adapter-uws.
  *
@@ -267,7 +268,7 @@ export function createConnectionRegistry(client, options) {
 	function encodeEnvelope(envelope) {
 		const raw = JSON.stringify(envelope);
 		if (Buffer.byteLength(raw) > maxEnvelopeBytes) {
-			throw new Error(
+			throw operationError('RELAY_ENVELOPE_TOO_LARGE',
 				`registry: outbound "${envelope?.type ?? 'event'}" envelope exceeds maxEnvelopeBytes ` +
 				`(${maxEnvelopeBytes} bytes); every peer would drop it on receipt`
 			);
@@ -1084,7 +1085,7 @@ export function createConnectionRegistry(client, options) {
 		mReplyLatency?.observe(elapsed);
 		if (env.error) {
 			mRequests?.inc({ result: 'error' });
-			slot.reject(new Error(String(env.error)));
+			slot.reject(operationError('REGISTRY_REMOTE_ERROR', String(env.error)));
 		} else {
 			mRequests?.inc({ result: 'ok' });
 			slot.resolve(env.data);
@@ -1129,7 +1130,7 @@ export function createConnectionRegistry(client, options) {
 		const entry = await lookup(target);
 		if (!entry) {
 			mRequests?.inc({ result: 'offline' });
-			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE, target + '" is offline'));
+			throw operationError('REGISTRY_TARGET_OFFLINE', extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE));
 		}
 
 		// Self-targeting: short-circuit to local platform.request, no Redis hop.
@@ -1137,7 +1138,7 @@ export function createConnectionRegistry(client, options) {
 			const ws = sessionToWs.get(entry.sessionId);
 			if (!ws || !activePlatform) {
 				mRequests?.inc({ result: 'offline' });
-				throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE, target + '" is offline'));
+				throw operationError('REGISTRY_TARGET_OFFLINE', extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE));
 			}
 			const start = monotonicNow();
 			try {
@@ -1160,7 +1161,7 @@ export function createConnectionRegistry(client, options) {
 		// the heap fills with pending entries.
 		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
 			mRequests?.inc({ result: 'error' });
-			throw new Error(extensionsError(
+			throw operationError('REGISTRY_PENDING_LIMIT', extensionsError(
 				EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_PENDING,
 				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
 			));
@@ -1188,7 +1189,7 @@ export function createConnectionRegistry(client, options) {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
-				reject(new Error(extensionsError(
+				reject(operationError('REGISTRY_REQUEST_TIMEOUT', extensionsError(
 					EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TIMEOUT,
 					timeoutMs + 'ms'
 				)));
@@ -1234,7 +1235,7 @@ export function createConnectionRegistry(client, options) {
 		const entry = await lookupSession(target);
 		if (!entry) {
 			mRequests?.inc({ result: 'offline' });
-			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE, target + '" is offline'));
+			throw operationError('REGISTRY_TARGET_OFFLINE', extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE));
 		}
 
 		// Self-targeting: the session migrated onto this instance; resolve locally.
@@ -1242,7 +1243,7 @@ export function createConnectionRegistry(client, options) {
 			const ws = appSessionToWs.get(target);
 			if (!ws || !activePlatform) {
 				mRequests?.inc({ result: 'offline' });
-				throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE, target + '" is offline'));
+				throw operationError('REGISTRY_TARGET_OFFLINE', extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE));
 			}
 			const start = monotonicNow();
 			try {
@@ -1260,7 +1261,7 @@ export function createConnectionRegistry(client, options) {
 		await ensureSubscriber(activePlatform);
 		if (pending.size >= MAX_REGISTRY_PENDING_REQUESTS) {
 			mRequests?.inc({ result: 'error' });
-			throw new Error(extensionsError(
+			throw operationError('REGISTRY_PENDING_LIMIT', extensionsError(
 				EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_PENDING,
 				MAX_REGISTRY_PENDING_REQUESTS + ' on this instance'
 			));
@@ -1285,7 +1286,7 @@ export function createConnectionRegistry(client, options) {
 			const timer = setTimer(() => {
 				if (!pending.delete(ref)) return;
 				mRequests?.inc({ result: 'timeout' });
-				reject(new Error(extensionsError(
+				reject(operationError('REGISTRY_REQUEST_TIMEOUT', extensionsError(
 					EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_TIMEOUT,
 					timeoutMs + 'ms'
 				)));
@@ -1765,7 +1766,7 @@ export function createConnectionRegistry(client, options) {
 			}
 			for (const slot of pending.values()) {
 				clearTimer(slot.timer);
-				slot.reject(new Error('registry: destroyed'));
+				slot.reject(operationError('REGISTRY_DESTROYED', 'registry: destroyed'));
 			}
 			pending.clear();
 			localUsers.clear();

@@ -684,6 +684,7 @@ describe('cluster-only failure paths', () => {
 
 		expect(sink.ids()).toEqual([EXTENSIONS_ERROR_IDS.SHARDED_SUBSCRIBER, EXTENSIONS_ERROR_IDS.SHARDED_CHANNEL_RECONCILE]);
 		expect(sink.records[1].attributes.error.message).toBe('sharded bus: no owning node for slot ' + keySlot(CHANNEL));
+		expect(sink.records[1].attributes.error.code).toBe('SHARDED_OWNER_UNAVAILABLE');
 		expect(JSON.stringify(sink.records)).not.toContain('user:42');
 		await bus.deactivate();
 	});
@@ -702,6 +703,7 @@ describe('cluster-only failure paths', () => {
 		expect(sink.records[1].attributes.error.message).toBe(
 			'sharded bus: ssubscribe on slot ' + keySlot(CHANNEL) + ' (retry) timed out (stale slot owner)'
 		);
+		expect(sink.records[1].attributes.error.code).toBe('SHARDED_OPERATION_TIMEOUT');
 		expect(JSON.stringify(sink.records)).not.toContain('user:42');
 		await bus.deactivate();
 	});

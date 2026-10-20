@@ -138,7 +138,7 @@ describe('generated extensions error reference', () => {
 			extensionsError('EXTENSIONS-ERR-REGISTRY-REQUEST-EVENT')
 		);
 		await expect(registry.request('offline-user', 'event')).rejects.toThrow(
-			extensionsError('EXTENSIONS-ERR-REGISTRY-REQUEST-OFFLINE', 'offline-user" is offline')
+			extensionsError('EXTENSIONS-ERR-REGISTRY-REQUEST-OFFLINE')
 		);
 		await expect(registry.requestSession('', 'event')).rejects.toThrow(
 			extensionsError('EXTENSIONS-ERR-REGISTRY-SESSION-TARGET')
@@ -147,7 +147,7 @@ describe('generated extensions error reference', () => {
 			extensionsError('EXTENSIONS-ERR-REGISTRY-SESSION-EVENT')
 		);
 		await expect(registry.requestSession('offline-session', 'event')).rejects.toThrow(
-			extensionsError('EXTENSIONS-ERR-REGISTRY-SESSION-OFFLINE', 'offline-session" is offline')
+			extensionsError('EXTENSIONS-ERR-REGISTRY-SESSION-OFFLINE')
 		);
 		await expect(registry.send('', 'topic', 'event')).rejects.toThrow(extensionsError('EXTENSIONS-ERR-REGISTRY-SEND-TARGET'));
 		await expect(registry.sendCoalesced('', { key: 'k', topic: 'topic', event: 'event' })).rejects.toThrow(

@@ -2,7 +2,7 @@
 
 [Package overview](../README.md) | [Public entry points](public-entries.md)
 
-Branch on an error's `code` when deciding how to handle a recoverable failure. Messages are for people and can change independently of these codes. The existing error names, messages, causes and operation fields remain available. A diagnostic ID in the [error reference](./errors.md) identifies a logging site; it is separate from an error object's `code`.
+Branch on an error's `code` when deciding how to handle a recoverable failure. Messages are for people and can change independently of these codes. Existing error names, causes and operation fields remain available. Registry offline messages omit target identifiers. A diagnostic ID in the [error reference](./errors.md) identifies a logging site; it is separate from an error object's `code`.
 
 | Code | Produced by | Meaning |
 | --- | --- | --- |
@@ -25,6 +25,33 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `WS_CLOSED` | Presence and cursor operations | The socket closed during the operation; the operation rolled back. |
 | `SUBSCRIBE_DENIED` | Presence and cursor operations | The platform refused access to the underlying topic. |
 | `WEBHOOK_CIRCUIT_OPEN` | Redis webhook controls | Delivery was refused while the target's breaker was open. |
+| `PG_CAPACITY_EXCEEDED` | PostgreSQL pool admission | The configured outstanding-operation limit is full; apply backpressure. This is a ConnectionError with a capacity-specific code. |
+| `PG_CLIENT_CLOSING` | PostgreSQL lifecycle registration | The client is closing and cannot own another long-lived consumer. |
+| `REGISTRY_TARGET_OFFLINE` | Registry request and requestSession | No live owner or local socket exists. The message excludes the target identifier. |
+| `REGISTRY_PENDING_LIMIT` | Registry request and requestSession | The instance pending-request limit is full; wait for existing requests to settle. |
+| `REGISTRY_REQUEST_TIMEOUT` | Registry request and requestSession | No reply arrived before the deadline; the remote outcome is unknown. |
+| `REGISTRY_REMOTE_ERROR` | Registry remote replies | The remote handler or owner rejected the request. The existing wire format carries its message, not its error class or code. |
+| `REGISTRY_DESTROYED` | Registry pending requests | The registry was destroyed before the request settled. |
+| `TASK_WORKER_CAPACITY_EXCEEDED` | PostgreSQL task worker admission | No job, byte or thread allowance is available. The error remains a RangeError. |
+| `TASK_RUNNER_DESTROYED` | PostgreSQL task workers | The worker pool has stopped; active, queued and new work is rejected. |
+| `TASK_WORKER_EXITED` | PostgreSQL task workers | The worker exited before its task completed; the operation outcome may be unknown. |
+| `TASK_WORKER_ADMISSION_EXPIRED` | PostgreSQL task workers | The supplied reservation was released before execution. |
+| `TASK_WORKER_RESERVATION_IN_USE` | PostgreSQL task workers | The supplied reservation already has an executing task. |
+| `OPERATION_ABORTED` | PostgreSQL task worker fallback | An abort without a supplied reason cancelled the work; supplied abort reasons remain unchanged. |
+| `ERASURE_INCOMPLETE` | Composed forget store | One or more stores failed. Inspect failures and partialCounts, repair the cause and retry. |
+| `REDIS_CONNECTION_CLOSED` | Managed Redis subscribers | The owned connection ended and cannot complete the queued operation. Native driver errors retain their own codes. |
+| `REDIS_CLUSTER_PUBLISHER_UNAVAILABLE` | Redis pub/sub relay | No ready master can publish this relay batch. |
+| `BUS_DEACTIVATED` | Redis pub/sub and sharded bus lifecycle | Deactivation interrupted activation or a pending shard follow. |
+| `BUS_NOT_ACTIVE` | Sharded bus follows | Activate the bus before following topics. |
+| `SHARDED_OWNER_UNAVAILABLE` | Sharded bus topology | The slot owner is not available in the current topology. |
+| `SHARDED_OWNER_CLOSED` | Sharded bus subscription | The owning connection ended while subscribing. |
+| `SHARDED_OPERATION_TIMEOUT` | Sharded bus topology and subscription | A bounded topology or subscription operation did not settle before its deadline. |
+| `SHARDED_TOPIC_CAPACITY_EXCEEDED` | Sharded bus follow | The instance distinct-topic allowance is full. |
+| `SHARDED_REDIS_VERSION_INVALID` | Sharded bus activation | The server version could not be read from INFO server. |
+| `SHARDED_REDIS_VERSION_UNSUPPORTED` | Sharded bus activation | The server is older than the required Redis 7. |
+| `CURSOR_TOPIC_CAPACITY_EXCEEDED` | Redis cursor update | The instance local-topic allowance is full. |
+| `CURSOR_CONNECTION_CAPACITY_EXCEEDED` | Redis cursor connection state | The instance local-connection allowance is full. |
+| `RELAY_ENVELOPE_TOO_LARGE` | Registry and Redis bus relay admission | The complete encoded envelope exceeds the configured peer limit. Bus batch failures remain RangeError; registry failures remain Error. |
 
 Task handler errors retain their code through worker-thread transport, state-change events, persisted JSON and `runner.await(taskId)`. Reconstructed errors preserve `name`, `message` and `code`, but are generic `Error` objects: do not rely on `instanceof LockLostError`, for example, after a worker or database boundary. Handler-supplied string codes are preserved.
 

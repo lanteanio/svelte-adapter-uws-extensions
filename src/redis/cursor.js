@@ -53,7 +53,7 @@ import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { MAX_CURSOR_WS, MAX_CURSOR_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
-import { WsClosedError, SubscribeDeniedError } from '../shared/errors.js';
+import { WsClosedError, SubscribeDeniedError, operationError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, hasWsSubscription, OBSERVER_LANE } from '../shared/ws-subscriptions.js';
 import { createCursorWireCodec } from 'svelte-adapter-uws/plugins/cursor';
@@ -306,7 +306,7 @@ export function createCursor(client, options = {}) {
 		let state = wsState.get(ws);
 		if (!state) {
 			if (wsState.size >= MAX_CURSOR_WS) {
-				throw new Error(
+				throw operationError('CURSOR_CONNECTION_CAPACITY_EXCEEDED',
 					`redis cursor: local ws count exceeded ${MAX_CURSOR_WS} on this instance`
 				);
 			}
@@ -797,7 +797,7 @@ export function createCursor(client, options = {}) {
 			let topicMap = topics.get(topic);
 			if (!topicMap) {
 				if (topics.size >= MAX_CURSOR_TOPICS) {
-					throw new Error(
+					throw operationError('CURSOR_TOPIC_CAPACITY_EXCEEDED',
 						`redis cursor: local topic count exceeded ${MAX_CURSOR_TOPICS} on this instance`
 					);
 				}

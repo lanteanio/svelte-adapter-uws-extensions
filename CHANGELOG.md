@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Registry heartbeats restore missing routing rows for still-connected users, including registries without attributes, while preserving newer owners and their TTLs. Queued recovery writes are discarded when the local connection closes, is replaced, or is erased before Redis dispatch.
 - `RedisPresenceOptions` declares the existing `consistencyAuditIntervalMs` option, with its 5000 ms default and `0` disable value, so TypeScript callers can configure the documented background auditor without a cast.
+- Recoverable registry, worker, PostgreSQL shutdown, erasure, subscriber and relay-capacity failures expose stable error codes. Registry offline messages omit target identifiers, and the operational error reference includes PostgreSQL pool-capacity refusals.
+
 - A Postgres notification bridge restarting during shutdown retains its dashboard reading when overlapping shutdown calls finish.
 - Redis cursors confirm hash-missing peer entries after a relay gap and send a removal when the peer remains absent, preventing lost departure messages from leaving ghost cursors. Reconnecting movers restore their snapshots and identities, retrying refused writes without waiting for more movement; movers idle beyond the cursor TTL announce themselves before their next position. Recovery also includes existing server-granted cursor subscribers that request snapshots.
 - `RedisCursorOptions` declares `binary` and `dictionary`, which `createCursor` already honored, with the in-memory cursor plugin's spelling and defaults (`true`), and the README lists both. TypeScript users can set them without a cast.

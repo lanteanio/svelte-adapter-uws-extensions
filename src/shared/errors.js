@@ -161,3 +161,13 @@ export class SubscribeDeniedError extends Error {
 		this.reason = reason;
 	}
 }
+
+/** Add a stable code without changing the existing error class. Internal only.
+ * @param {string} code
+ * @param {string} message
+ * @param {ErrorConstructor} [ErrorType]
+ * @returns {Error & { code: string }}
+ */
+export function operationError(code, message, ErrorType = Error) {
+	return Object.assign(new ErrorType(message), { code });
+}

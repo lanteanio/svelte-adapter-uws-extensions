@@ -1,3 +1,4 @@
+import { operationError } from '../shared/errors.js';
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 /**
@@ -442,7 +443,7 @@ export function createPubSubBus(client, options = {}) {
 			}
 		}
 		mBatchRejected?.inc({ reason: 'oversized' });
-		throw new RangeError('pubsub bus: batched relay envelope exceeds maxEnvelopeBytes');
+		throw operationError('RELAY_ENVELOPE_TOO_LARGE', 'pubsub bus: batched relay envelope exceeds maxEnvelopeBytes', RangeError);
 	}
 
 	function prepareBatch(batch, options, traceContext = null) {
@@ -483,7 +484,7 @@ export function createPubSubBus(client, options = {}) {
 		const masters = /** @type {any} */ (client.redis).nodes('master');
 		if (publisher?.status === 'ready' && masters.includes(publisher)) return publisher;
 		publisher = masters.find(node => node.status === 'ready') || null;
-		if (!publisher) throw new Error('No ready Redis Cluster publisher');
+		if (!publisher) throw operationError('REDIS_CLUSTER_PUBLISHER_UNAVAILABLE', 'No ready Redis Cluster publisher');
 		return publisher;
 	}
 
@@ -678,7 +679,7 @@ export function createPubSubBus(client, options = {}) {
 	}
 
 	function deactivatedError() {
-		return new Error('pubsub bus: deactivated during activation');
+		return operationError('BUS_DEACTIVATED', 'pubsub bus: deactivated during activation');
 	}
 
 	// Start an activation that overlapping activate() calls share.

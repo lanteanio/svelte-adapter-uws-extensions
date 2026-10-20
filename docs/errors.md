@@ -30,14 +30,14 @@ The adapter ships its own reference for its runtime at
 |---|---|---|
 | [EXTENSIONS-ERR-REGISTRY-REQUEST-TARGET](#extensions-err-registry-request-target) | `registry.request.invalid-target` | `registry.request: target must be a non-empty userId string` |
 | [EXTENSIONS-ERR-REGISTRY-REQUEST-EVENT](#extensions-err-registry-request-event) | `registry.request.invalid-event` | `registry.request: event must be a non-empty string` |
-| [EXTENSIONS-ERR-REGISTRY-REQUEST-OFFLINE](#extensions-err-registry-request-offline) | `registry.request.offline` | `registry.request: target user "` |
-| [EXTENSIONS-ERR-REGISTRY-REQUEST-PENDING](#extensions-err-registry-request-pending) | `registry.request.pending-cap` | `registry.request: pending requests exceeded ` |
-| [EXTENSIONS-ERR-REGISTRY-REQUEST-TIMEOUT](#extensions-err-registry-request-timeout) | `registry.request.timeout` | `registry.request: timed out after ` |
+| [EXTENSIONS-ERR-REGISTRY-REQUEST-OFFLINE](#extensions-err-registry-request-offline) | `REGISTRY_TARGET_OFFLINE` | `registry.request: target user is offline` |
+| [EXTENSIONS-ERR-REGISTRY-REQUEST-PENDING](#extensions-err-registry-request-pending) | `REGISTRY_PENDING_LIMIT` | `registry.request: pending requests exceeded ` |
+| [EXTENSIONS-ERR-REGISTRY-REQUEST-TIMEOUT](#extensions-err-registry-request-timeout) | `REGISTRY_REQUEST_TIMEOUT` | `registry.request: timed out after ` |
 | [EXTENSIONS-ERR-REGISTRY-SESSION-TARGET](#extensions-err-registry-session-target) | `registry.request-session.invalid-target` | `registry.requestSession: target must be a non-empty sessionId string` |
 | [EXTENSIONS-ERR-REGISTRY-SESSION-EVENT](#extensions-err-registry-session-event) | `registry.request-session.invalid-event` | `registry.requestSession: event must be a non-empty string` |
-| [EXTENSIONS-ERR-REGISTRY-SESSION-OFFLINE](#extensions-err-registry-session-offline) | `registry.request-session.offline` | `registry.requestSession: target session "` |
-| [EXTENSIONS-ERR-REGISTRY-SESSION-PENDING](#extensions-err-registry-session-pending) | `registry.request-session.pending-cap` | `registry.requestSession: pending requests exceeded ` |
-| [EXTENSIONS-ERR-REGISTRY-SESSION-TIMEOUT](#extensions-err-registry-session-timeout) | `registry.request-session.timeout` | `registry.requestSession: timed out after ` |
+| [EXTENSIONS-ERR-REGISTRY-SESSION-OFFLINE](#extensions-err-registry-session-offline) | `REGISTRY_TARGET_OFFLINE` | `registry.requestSession: target session is offline` |
+| [EXTENSIONS-ERR-REGISTRY-SESSION-PENDING](#extensions-err-registry-session-pending) | `REGISTRY_PENDING_LIMIT` | `registry.requestSession: pending requests exceeded ` |
+| [EXTENSIONS-ERR-REGISTRY-SESSION-TIMEOUT](#extensions-err-registry-session-timeout) | `REGISTRY_REQUEST_TIMEOUT` | `registry.requestSession: timed out after ` |
 | [EXTENSIONS-ERR-REGISTRY-SEND-TARGET](#extensions-err-registry-send-target) | `registry.send.invalid-target` | `registry.send: target must be a non-empty userId string` |
 | [EXTENSIONS-ERR-REGISTRY-SEND-COALESCED-TARGET](#extensions-err-registry-send-coalesced-target) | `registry.send-coalesced.invalid-target` | `registry.sendCoalesced: target must be a non-empty userId string` |
 | [EXTENSIONS-ERR-CIRCUIT-OPEN](#extensions-err-circuit-open) | `CIRCUIT_BROKEN` | `circuit breaker is open - backend unavailable` |
@@ -235,19 +235,19 @@ the stable ID tag on the line):
 <a id="extensions-err-registry-request-offline"></a>
 ## `EXTENSIONS-ERR-REGISTRY-REQUEST-OFFLINE`
 
-- **Code/event:** `registry.request.offline`
-- **Message prefix:** `registry.request: target user "`
+- **Code/event:** `REGISTRY_TARGET_OFFLINE`
+- **Message prefix:** `registry.request: target user is offline`
 - **Cause:** No live registry owner exists for the requested user, or its local socket has closed.
 - **Consequence:** The request is not delivered and the caller promise rejects.
-- **Automatic recovery:** None; the registry waits for a future connection open event.
-- **Next action:** Treat the user as offline and retry only after a new registry open event.
+- **Automatic recovery:** A new connection open registers an owner; a surviving local connection can restore an absent registration on its next heartbeat.
+- **Next action:** Treat the user as offline and retry after a registry lookup confirms a live owner.
 - **Runtime help:** `docs/errors.md#extensions-err-registry-request-offline`
 - **Runtime sources:** [src/redis/registry.js](../src/redis/registry.js)
 
 <a id="extensions-err-registry-request-pending"></a>
 ## `EXTENSIONS-ERR-REGISTRY-REQUEST-PENDING`
 
-- **Code/event:** `registry.request.pending-cap`
+- **Code/event:** `REGISTRY_PENDING_LIMIT`
 - **Message prefix:** `registry.request: pending requests exceeded `
 - **Cause:** This instance reached its bounded number of cluster requests awaiting replies.
 - **Consequence:** The new request is rejected so pending memory remains bounded.
@@ -259,7 +259,7 @@ the stable ID tag on the line):
 <a id="extensions-err-registry-request-timeout"></a>
 ## `EXTENSIONS-ERR-REGISTRY-REQUEST-TIMEOUT`
 
-- **Code/event:** `registry.request.timeout`
+- **Code/event:** `REGISTRY_REQUEST_TIMEOUT`
 - **Message prefix:** `registry.request: timed out after `
 - **Cause:** The remote owner did not return a reply inside the configured timeout.
 - **Consequence:** The caller promise rejects while the remote operation outcome remains unknown.
@@ -295,8 +295,8 @@ the stable ID tag on the line):
 <a id="extensions-err-registry-session-offline"></a>
 ## `EXTENSIONS-ERR-REGISTRY-SESSION-OFFLINE`
 
-- **Code/event:** `registry.request-session.offline`
-- **Message prefix:** `registry.requestSession: target session "`
+- **Code/event:** `REGISTRY_TARGET_OFFLINE`
+- **Message prefix:** `registry.requestSession: target session is offline`
 - **Cause:** No live registry owner exists for the requested application session, or its socket has closed.
 - **Consequence:** The request is not delivered and the caller promise rejects.
 - **Automatic recovery:** None; the registry waits for a future connection open event.
@@ -307,7 +307,7 @@ the stable ID tag on the line):
 <a id="extensions-err-registry-session-pending"></a>
 ## `EXTENSIONS-ERR-REGISTRY-SESSION-PENDING`
 
-- **Code/event:** `registry.request-session.pending-cap`
+- **Code/event:** `REGISTRY_PENDING_LIMIT`
 - **Message prefix:** `registry.requestSession: pending requests exceeded `
 - **Cause:** This instance reached its bounded number of session-routed requests awaiting replies.
 - **Consequence:** The new request is rejected so pending memory remains bounded.
@@ -319,7 +319,7 @@ the stable ID tag on the line):
 <a id="extensions-err-registry-session-timeout"></a>
 ## `EXTENSIONS-ERR-REGISTRY-SESSION-TIMEOUT`
 
-- **Code/event:** `registry.request-session.timeout`
+- **Code/event:** `REGISTRY_REQUEST_TIMEOUT`
 - **Message prefix:** `registry.requestSession: timed out after `
 - **Cause:** The remote session owner did not return a reply inside the configured timeout.
 - **Consequence:** The caller promise rejects while the remote operation outcome remains unknown.

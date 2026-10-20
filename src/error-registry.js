@@ -178,16 +178,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-request-event'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE,
-		event: 'registry.request.offline', messagePrefix: 'registry.request: target user "',
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE, code: 'REGISTRY_TARGET_OFFLINE',
+		event: 'registry.request.offline', messagePrefix: 'registry.request: target user is offline',
 		cause: 'No live registry owner exists for the requested user, or its local socket has closed.',
 		consequence: 'The request is not delivered and the caller promise rejects.',
-		automaticRecovery: 'None; the registry waits for a future connection open event.',
-		nextAction: 'Treat the user as offline and retry only after a new registry open event.',
+		automaticRecovery: 'A new connection open registers an owner; a surviving local connection can restore an absent registration on its next heartbeat.',
+		nextAction: 'Treat the user as offline and retry after a registry lookup confirms a live owner.',
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-request-offline'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_PENDING,
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_PENDING, code: 'REGISTRY_PENDING_LIMIT',
 		event: 'registry.request.pending-cap', messagePrefix: 'registry.request: pending requests exceeded ',
 		cause: 'This instance reached its bounded number of cluster requests awaiting replies.',
 		consequence: 'The new request is rejected so pending memory remains bounded.',
@@ -196,7 +196,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-request-pending'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TIMEOUT,
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TIMEOUT, code: 'REGISTRY_REQUEST_TIMEOUT',
 		event: 'registry.request.timeout', messagePrefix: 'registry.request: timed out after ',
 		cause: 'The remote owner did not return a reply inside the configured timeout.',
 		consequence: 'The caller promise rejects while the remote operation outcome remains unknown.',
@@ -225,8 +225,8 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-session-event'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE,
-		event: 'registry.request-session.offline', messagePrefix: 'registry.requestSession: target session "',
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_OFFLINE, code: 'REGISTRY_TARGET_OFFLINE',
+		event: 'registry.request-session.offline', messagePrefix: 'registry.requestSession: target session is offline',
 		cause: 'No live registry owner exists for the requested application session, or its socket has closed.',
 		consequence: 'The request is not delivered and the caller promise rejects.',
 		automaticRecovery: 'None; the registry waits for a future connection open event.',
@@ -234,7 +234,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-session-offline'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_PENDING,
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_PENDING, code: 'REGISTRY_PENDING_LIMIT',
 		event: 'registry.request-session.pending-cap', messagePrefix: 'registry.requestSession: pending requests exceeded ',
 		cause: 'This instance reached its bounded number of session-routed requests awaiting replies.',
 		consequence: 'The new request is rejected so pending memory remains bounded.',
@@ -243,7 +243,7 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		sources: ['src/redis/registry.js'], anchor: 'extensions-err-registry-session-pending'
 	}),
 	thrown({
-		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_TIMEOUT,
+		id: EXTENSIONS_ERROR_IDS.REGISTRY_SESSION_TIMEOUT, code: 'REGISTRY_REQUEST_TIMEOUT',
 		event: 'registry.request-session.timeout', messagePrefix: 'registry.requestSession: timed out after ',
 		cause: 'The remote session owner did not return a reply inside the configured timeout.',
 		consequence: 'The caller promise rejects while the remote operation outcome remains unknown.',

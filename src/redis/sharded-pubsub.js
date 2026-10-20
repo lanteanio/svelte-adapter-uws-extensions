@@ -1,3 +1,4 @@
+import { operationError } from '../shared/errors.js';
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
@@ -447,7 +448,7 @@ export function createShardedBus(client, options = {}) {
 			}
 		}
 		mBatchRejected?.inc({ reason: 'oversized' });
-		throw new RangeError('sharded bus: batched relay envelope exceeds maxEnvelopeBytes');
+		throw operationError('RELAY_ENVELOPE_TOO_LARGE', 'sharded bus: batched relay envelope exceeds maxEnvelopeBytes', RangeError);
 	}
 
 	function prepareBatch(batch, options, traceContext = null) {
@@ -703,7 +704,7 @@ export function createShardedBus(client, options = {}) {
 	function noOwner(slot) {
 		refreshSlotMap();
 		const unread = /** @type {any} */ (masterUnread);
-		return new Error('sharded bus: no owning node for slot ' + slot +
+		return operationError('SHARDED_OWNER_UNAVAILABLE', 'sharded bus: no owning node for slot ' + slot +
 			(unread === null ? '' : ' (a master did not give its id: ' + (unread?.message ?? String(unread)) + ')'));
 	}
 
@@ -714,7 +715,7 @@ export function createShardedBus(client, options = {}) {
 		let timer;
 		const timeout = new Promise((_, reject) => {
 			timer = setTimer(
-				() => reject(new Error('sharded bus: ' + label + ' timed out (' + reason + ')')),
+				() => reject(operationError('SHARDED_OPERATION_TIMEOUT', 'sharded bus: ' + label + ' timed out (' + reason + ')')),
 				SHARD_SUBSCRIBE_TIMEOUT_MS
 			);
 			if (timer.unref) timer.unref();
@@ -767,7 +768,7 @@ export function createShardedBus(client, options = {}) {
 		// nothing would subscribe it again.
 		if (subByNodeId.get(ownerId) !== conn) {
 			if (admissionOwnsCleanup) return;
-			throw new Error('sharded bus: the connection to the owner of slot ' + slot + ' ended during ssubscribe');
+			throw operationError('SHARDED_OWNER_CLOSED', 'sharded bus: the connection to the owner of slot ' + slot + ' ended during ssubscribe');
 		}
 		// A reconcile retry can outlive the last unfollow. Shared admissions
 		// instead retain every physical subscription until all channels settle:
@@ -1030,10 +1031,10 @@ export function createShardedBus(client, options = {}) {
 		}
 		const major = parseRedisVersion(info);
 		if (major === null) {
-			failed(new Error('could not parse Redis version'), new Error('sharded bus: could not parse Redis version from INFO server'));
+			failed(operationError('SHARDED_REDIS_VERSION_INVALID', 'could not parse Redis version'), operationError('SHARDED_REDIS_VERSION_INVALID', 'sharded bus: could not parse Redis version from INFO server'));
 		}
 		if (major < 7) {
-			failed(new Error(`Redis ${major} too old`), new Error(`sharded bus: requires Redis 7 or newer (server reports ${major}). Use createPubSubBus for older servers.`));
+			failed(operationError('SHARDED_REDIS_VERSION_UNSUPPORTED', `Redis ${major} too old`), operationError('SHARDED_REDIS_VERSION_UNSUPPORTED', `sharded bus: requires Redis 7 or newer (server reports ${major}). Use createPubSubBus for older servers.`));
 		}
 		if (self.cancelled) {
 			b?.success();
@@ -1064,7 +1065,7 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	function deactivatedError() {
-		return new Error('sharded bus: deactivated during activation');
+		return operationError('BUS_DEACTIVATED', 'sharded bus: deactivated during activation');
 	}
 
 	async function deactivate() {
@@ -1113,7 +1114,7 @@ export function createShardedBus(client, options = {}) {
 				try {
 					cancel = guardBreaker(b);
 					await subSubscribe(fresh);
-					if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+					if (generation !== subGeneration) throw operationError('BUS_DEACTIVATED', 'sharded bus: closed during follow');
 					let needsCleanup = false;
 					for (const channel of fresh) {
 						if (channelRefcounts.has(channel) && (!isCluster(client.redis) || channelNode.has(channel))) subscribedChannels.add(channel);
@@ -1136,15 +1137,15 @@ export function createShardedBus(client, options = {}) {
 								for (const channel of release) {
 									await subUnsubscribe(channel);
 									active.delete(channel);
-									if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+									if (generation !== subGeneration) throw operationError('BUS_DEACTIVATED', 'sharded bus: closed during follow');
 								}
 							}
-							if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+							if (generation !== subGeneration) throw operationError('BUS_DEACTIVATED', 'sharded bus: closed during follow');
 							if (restore.length) {
 								await subSubscribe(restore);
 								for (const channel of restore) active.add(channel);
 							}
-							if (generation !== subGeneration) throw new Error('sharded bus: closed during follow');
+							if (generation !== subGeneration) throw operationError('BUS_DEACTIVATED', 'sharded bus: closed during follow');
 						}
 						for (const channel of active) subscribedChannels.add(channel);
 					}
@@ -1171,10 +1172,10 @@ export function createShardedBus(client, options = {}) {
 	}
 
 	async function follow(topic) {
-		if (!subReady) throw new Error('sharded bus: activate() must be called before follow()');
+		if (!subReady) throw operationError('BUS_NOT_ACTIVE', 'sharded bus: activate() must be called before follow()');
 		const count = followCounts.get(topic) || 0;
 		if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) {
-			throw new Error('sharded bus: distinct topic count exceeded ' + MAX_SHARDED_BUS_TOPICS + ' on this instance');
+			throw operationError('SHARDED_TOPIC_CAPACITY_EXCEEDED', 'sharded bus: distinct topic count exceeded ' + MAX_SHARDED_BUS_TOPICS + ' on this instance');
 		}
 		followCounts.set(topic, count + 1);
 		if (count > 0 && (pendingTopics.size === 0 || !pendingTopics.has(topic))) return;
@@ -1219,7 +1220,7 @@ export function createShardedBus(client, options = {}) {
 	 */
 	async function followBatch(topics) {
 		if (!subReady) {
-			throw new Error('sharded bus: activate() must be called before followBatch()');
+			throw operationError('BUS_NOT_ACTIVE', 'sharded bus: activate() must be called before followBatch()');
 		}
 		if (!Array.isArray(topics)) {
 			throw new TypeError('sharded bus: followBatch requires an array of topics');

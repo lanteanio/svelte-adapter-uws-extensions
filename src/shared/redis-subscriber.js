@@ -1,3 +1,4 @@
+import { operationError } from './errors.js';
 /**
  * Subscriber connections that keep their channels across a reconnect.
  *
@@ -297,7 +298,7 @@ function endBetweenAttempts(conn) {
 	// disconnect() set it for a 'close' that is not coming.
 	conn.manuallyClosing = false;
 	conn.setStatus('end');
-	const error = new Error(CLOSED);
+	const error = operationError('REDIS_CONNECTION_CLOSED', CLOSED);
 	conn.flushQueue(error);
 	// Commands written to a connection that then closed, kept to be sent again
 	// on the next one. A connection that closed while it was ready shares this
@@ -425,7 +426,7 @@ export function guardSubscriber(conn, owner) {
 	const quit = conn.quit;
 	if (typeof quit === 'function') {
 		conn.quit = function (...args) {
-			subs.failHeld(new Error(CLOSED));
+			subs.failHeld(operationError('REDIS_CONNECTION_CLOSED', CLOSED));
 			if (conn.status === 'ready' || conn.status === 'connect') {
 				liveness.stop();
 				if (quitTimer === null) {
@@ -691,7 +692,7 @@ function trackSubscriptions(target, owner, kinds, { send, restore, isUp, handsha
 		end() {
 			ended = true;
 			cancelRetry();
-			failHeld(new Error(CLOSED));
+			failHeld(operationError('REDIS_CONNECTION_CLOSED', CLOSED));
 		},
 		/** Whether the owner holds any channel. */
 		holdsAny() {
@@ -790,7 +791,7 @@ function guardCluster(cluster, owner) {
 
 	const subs = trackSubscriptions(cluster, owner, CLUSTER_KINDS, {
 		send(name, args) {
-			if (closed) return Promise.reject(new Error(CLOSED));
+			if (closed) return Promise.reject(operationError('REDIS_CONNECTION_CLOSED', CLOSED));
 			return new Promise((resolve, reject) => {
 				const call = { name, args, attempts: 0, conn: null, resolve, reject };
 				if (current !== null) {
@@ -803,7 +804,7 @@ function guardCluster(cluster, owner) {
 		},
 		// Restores run right after a connection opens, or as retries while it is
 		// up, so there always is one.
-		restore: (name, args) => (current !== null ? run(current, name, args) : Promise.reject(new Error(CLOSED))),
+		restore: (name, args) => (current !== null ? run(current, name, args) : Promise.reject(operationError('REDIS_CONNECTION_CLOSED', CLOSED))),
 		isUp: () => current !== null && !faulted && current.status === 'ready'
 	});
 
@@ -930,7 +931,7 @@ function guardCluster(cluster, owner) {
 			const cut = [];
 			for (const call of sent) {
 				call.conn = null;
-				if (call.attempts >= maxAttempts) call.reject(new Error(CLOSED));
+				if (call.attempts >= maxAttempts) call.reject(operationError('REDIS_CONNECTION_CLOSED', CLOSED));
 				else cut.push(call);
 			}
 			sent = [];
@@ -1092,7 +1093,7 @@ function guardCluster(cluster, owner) {
 		waiting = [];
 		for (const call of calls) {
 			call.conn = null;
-			call.reject(new Error(CLOSED));
+			call.reject(operationError('REDIS_CONNECTION_CLOSED', CLOSED));
 		}
 		if (current !== null) {
 			const conn = current;

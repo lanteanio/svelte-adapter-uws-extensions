@@ -1,3 +1,4 @@
+import { operationError } from './errors.js';
 /**
  * Durable right-to-erasure store for `live.forget`.
  *
@@ -389,7 +390,7 @@ export function createForgetStore(stores, options) {
 				}
 			}
 			if (failures.length) {
-				const err = new Error(
+				const err = operationError('ERASURE_INCOMPLETE',
 					'createForgetStore: ' + failedUnits + ' of ' + (entries.length + (redis ? 2 : 0)) +
 					' store(s) failed to purge; the erasure is incomplete and must be retried'
 				);

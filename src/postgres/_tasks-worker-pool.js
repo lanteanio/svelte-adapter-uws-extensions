@@ -13,7 +13,7 @@
 import { Worker } from 'node:worker_threads';
 import { randomUuid, setTimer, clearTimer } from '../shared/runtime.js';
 import { deserialiseError } from './_tasks-errors.js';
-import { TimeoutError } from '../shared/errors.js';
+import { TimeoutError, operationError } from '../shared/errors.js';
 
 const HARNESS_URL = new URL('./_worker-harness.js', import.meta.url);
 
@@ -76,10 +76,10 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 		return Math.max(0, Math.min(capacity(bytes), size - permits.size, unreservedThreads()));
 	}
 	function reserve(bytes, thread = false) {
-		if (destroyed) throw new Error('task runner destroyed');
+		if (destroyed) throw operationError('TASK_RUNNER_DESTROYED', 'task runner destroyed');
 		if (permits.size >= maxJobs || bytes > maxBytes - reservedBytes || (thread && threadCapacity(bytes) === 0)) {
 			mRejected?.inc({ reason: 'capacity' });
-			throw new RangeError('postgres tasks: worker admission capacity exceeded');
+			throw operationError('TASK_WORKER_CAPACITY_EXCEEDED', 'postgres tasks: worker admission capacity exceeded', RangeError);
 		}
 		const permit = { bytes, thread, held: thread, running: false, release() {
 			if (!permits.delete(permit)) return;
@@ -184,7 +184,7 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 			idle.delete(worker);
 			clearIdleTimer(worker);
 		});
-		worker.on('exit', () => retire(retirementErrors.get(worker) || new Error('postgres tasks: worker exited before completing its task')));
+		worker.on('exit', () => retire(retirementErrors.get(worker) || operationError('TASK_WORKER_EXITED', 'postgres tasks: worker exited before completing its task')));
 		return worker;
 	}
 	return {
@@ -193,13 +193,13 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 		reserve,
 		reserveThread(bytes) { return reserve(bytes, true); },
 		run(ctx, permit) {
-			if (destroyed) return Promise.reject(new Error('task runner destroyed'));
-			if (ctx.signal?.aborted) return Promise.reject(ctx.signal.reason || new Error('aborted'));
+			if (destroyed) return Promise.reject(operationError('TASK_RUNNER_DESTROYED', 'task runner destroyed'));
+			if (ctx.signal?.aborted) return Promise.reject(ctx.signal.reason || operationError('OPERATION_ABORTED', 'aborted'));
 			const ownsPermit = !permit;
 			try {
 				permit ??= reserve(Buffer.byteLength(JSON.stringify(ctx.input ?? null)));
-				if (!permits.has(permit)) throw new Error('postgres tasks: worker admission expired');
-				if (permit.running) throw new Error('postgres tasks: worker reservation already executing');
+				if (!permits.has(permit)) throw operationError('TASK_WORKER_ADMISSION_EXPIRED', 'postgres tasks: worker admission expired');
+				if (permit.running) throw operationError('TASK_WORKER_RESERVATION_IN_USE', 'postgres tasks: worker reservation already executing');
 				permit.running = true;
 			} catch (error) { return Promise.reject(error); }
 			return new Promise((resolve, reject) => {
@@ -218,7 +218,7 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 				const onAbort = () => {
 					if (unqueue(job)) {
 						mRejected?.inc({ reason: 'abort' });
-						job.reject(ctx.signal.reason || new Error('aborted'));
+						job.reject(ctx.signal.reason || operationError('OPERATION_ABORTED', 'aborted'));
 					} else {
 						const active = inFlight.get(id);
 						if (active) {
@@ -260,10 +260,10 @@ export function createWorkerPool(workerOption, taskName, { metrics, maxPayloadBy
 		destroy() {
 			if (destroyed) return;
 			destroyed = true;
-			for (const job of inFlight.values()) { mActive?.inc(-1); job.reject(new Error('task runner destroyed')); }
+			for (const job of inFlight.values()) { mActive?.inc(-1); job.reject(operationError('TASK_RUNNER_DESTROYED', 'task runner destroyed')); }
 			inFlight.clear();
-			for (const job of queue.values()) { unqueue(job); job.reject(new Error('task runner destroyed')); }
-			for (const job of reservedQueue.values()) { unqueue(job); job.reject(new Error('task runner destroyed')); }
+			for (const job of queue.values()) { unqueue(job); job.reject(operationError('TASK_RUNNER_DESTROYED', 'task runner destroyed')); }
+			for (const job of reservedQueue.values()) { unqueue(job); job.reject(operationError('TASK_RUNNER_DESTROYED', 'task runner destroyed')); }
 			for (const worker of workers) { clearIdleTimer(worker); worker.terminate().catch(() => {}); }
 			workers.clear();
 			idle.clear();
