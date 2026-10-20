@@ -9,8 +9,8 @@ import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 describe('ratelimit clear scoping', () => {
 	it('refuses a tenant id that would widen the SCAN glob', async () => {
 		const rl = createRateLimit(mockRedisClient('rl:'), { points: 1, interval: 60, keyBy: (ws) => ws.getUserData().k });
-		// clear('*') is the whole finding: a nominally tenant-scoped call
-		// that wipes every tenant's buckets.
+		// clear('*') would be a nominally tenant-scoped call that wipes
+		// every tenant's buckets.
 		for (const bad of ['*', 'a?b', 'a[b]', 'a\\b', 'a\0b']) {
 			await expect(rl.clear(bad)).rejects.toThrow(/glob|NUL/);
 		}
@@ -67,7 +67,7 @@ describe('idempotency identity keys', () => {
 	});
 
 	it('stops the colliding purge from deleting the victim\'s committed result', async () => {
-		// The exact collision from the finding: ('a\0b','c') and
+		// The collision a plain delimiter allows: ('a\0b','c') and
 		// ('a','b\0c') produce the same NUL-delimited index key, so the
 		// attacker's own erasure would delete the victim's committed result
 		// and their retried charge would silently re-execute.

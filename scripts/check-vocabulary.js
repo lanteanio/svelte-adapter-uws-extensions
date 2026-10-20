@@ -37,12 +37,13 @@ import { dirname, resolve, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const verbose = process.argv.includes('--verbose');
 
-// Everything a consumer can read: the shipped tree, the shipped docs, and the
-// suites and benches whose describe() strings surface in test output.
-const SCAN_ROOTS = ['src', 'test', 'bench', 'docs'];
-const EXTRA_FILES = ['README.md', 'MIGRATION.md', 'CHANGELOG.md'];
+// Everything a reader can see: the shipped tree, the shipped docs, the suites
+// and benches whose describe() strings surface in test output, and the public
+// repository files (tooling scripts, workflows, issue and pull-request
+// templates, contributor and security policy).
+export const SCAN_ROOTS = ['src', 'test', 'bench', 'docs', 'scripts', '.github'];
+export const EXTRA_FILES = ['README.md', 'MIGRATION.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md'];
 
 const SKIP_SEGMENTS = new Set([
 	'node_modules', '.git', 'coverage', 'dist', 'build', '.svelte-kit',
@@ -116,34 +117,43 @@ const RULES = [
 			/\b(?:Phase|Tier|Batch|Slice|Keystone|Milestone) \d+\b/,
 			/\bper the [A-Z]\d+[a-z]? spec\b/,
 			/\bfor [A-Z]\d+[a-z]?\.$/,
-			/(?:^|\s)\/(?:simplify|code-review|security-review|ultrareview)\b/
+			/(?:^|\s)\/(?:simplify|code-review|security-review|ultrareview)\b/,
+			// Task-tracker keys and review labels. The prefixes are spelled
+			// out, so standard names of the same shape (UTF-8, SHA-256,
+			// CRC-32) never match.
+			/\b(?:RT|ABUSE|CS|DBOPS|DC|DEL|DOC|DS|DX|INC|LOAD|OBS|PRIV|SEC|SF)-\d+\b/
+		]
+	},
+	{
+		family: 'provenance',
+		hint: 'say what the code does, not where the change came from',
+		patterns: [
+			/\bworkstreams?\b/i,
+			/\bthe (?:reviewer|review|audit) (?:found|flagged|asked|caught|noted|reported)\b/i,
+			/\b(?:audit|review) findings?\b/i,
+			/\bthe finding\b/i,
+			/\bfiled upstream\b/i,
+			/\bthe card (?:asks|asked|says|said|wants)\b/i,
+			/\bbounced back\b/i,
+			/\bunlike the last batch\b/i,
+			/\bthese reviews\b/i
 		]
 	}
 ];
 
 const ALLOW_RE = /vocabulary-allow:\s*\S/;
 
-/** Recursively collect scannable files under `dir` (root-relative, slash paths). */
-function walk(dir, out) {
-	if (!existsSync(dir)) return;
-	for (const name of readdirSync(dir)) {
-		if (SKIP_SEGMENTS.has(name)) continue;
-		const abs = join(dir, name);
-		if (statSync(abs).isDirectory()) walk(abs, out);
-		else if (SCAN_EXT.test(name)) out.push(relative(root, abs).split(/[\\/]/).join('/'));
-	}
-}
-
-const files = [];
-for (const r of SCAN_ROOTS) walk(join(root, r), files);
-for (const f of EXTRA_FILES) if (existsSync(join(root, f))) files.push(f);
-files.sort();
-
-const hits = [];
-let allowed = 0;
-for (const rel of files) {
-	if (rel === SELF) continue;
-	const lines = readFileSync(join(root, rel), 'utf8').split(/\r?\n/);
+/**
+ * Scan one document's text. A line carrying a `vocabulary-allow:` marker with
+ * a reason is counted as allowed instead of reported.
+ *
+ * @param {string} text
+ * @returns {{ hits: { line: number, family: string, hint: string, term: string }[], allowed: number }}
+ */
+export function scanVocabulary(text) {
+	const hits = [];
+	let allowed = 0;
+	const lines = text.split(/\r?\n/);
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i];
 		for (const rule of RULES) {
@@ -151,28 +161,76 @@ for (const rel of files) {
 				const m = re.exec(line);
 				if (!m) continue;
 				if (ALLOW_RE.test(line)) { allowed++; continue; }
-				hits.push({ rel, line: i + 1, family: rule.family, hint: rule.hint, term: m[0].trim() });
+				hits.push({ line: i + 1, family: rule.family, hint: rule.hint, term: m[0].trim() });
 			}
 		}
 	}
+	return { hits, allowed };
 }
 
-const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-console.log(`check-vocabulary: ${pkg.name}@${pkg.version}`);
-console.log(`  ${files.length} file(s) scanned, ${RULES.reduce((n, r) => n + r.patterns.length, 0)} pattern(s), ${allowed} allow-marked line(s).`);
-
-if (hits.length) {
-	console.error(`\ncheck-vocabulary FAILED (${hits.length} hit(s)):`);
-	for (const rule of RULES) {
-		const own = hits.filter((h) => h.family === rule.family);
-		if (!own.length) continue;
-		console.error(`  ${rule.family} - ${rule.hint}`);
-		const show = verbose ? own : own.slice(0, 5);
-		for (const h of show) console.error(`      ${h.rel}:${h.line}  "${h.term}"`);
-		if (!verbose && own.length > 5) console.error(`      ... +${own.length - 5} more (--verbose)`);
+/** Recursively collect scannable files under `dir` (base-relative, slash paths). */
+function walk(base, dir, out) {
+	if (!existsSync(dir)) return;
+	for (const name of readdirSync(dir)) {
+		if (SKIP_SEGMENTS.has(name)) continue;
+		const abs = join(dir, name);
+		if (statSync(abs).isDirectory()) walk(base, abs, out);
+		else if (SCAN_EXT.test(name)) out.push(relative(base, abs).split(/[\\/]/).join('/'));
 	}
-	console.error(`  Reword the line, or append \`vocabulary-allow: <reason>\` when the term is genuinely correct.`);
-	process.exit(1);
 }
 
-console.log(`  OK - no borrowed vocabulary or planning references in the published surface.`);
+/**
+ * Every file the gate reads under `base`, sorted, excluding this script.
+ *
+ * @param {string} [base]
+ * @returns {string[]}
+ */
+export function vocabularyFiles(base = root) {
+	const files = [];
+	for (const r of SCAN_ROOTS) walk(base, join(base, r), files);
+	for (const f of EXTRA_FILES) if (existsSync(join(base, f))) files.push(f);
+	return files.filter((rel) => rel !== SELF).sort();
+}
+
+/**
+ * Scan every file the gate reads under `base`.
+ *
+ * @param {string} [base]
+ */
+export function scanTree(base = root) {
+	const files = vocabularyFiles(base);
+	const hits = [];
+	let allowed = 0;
+	for (const rel of files) {
+		const result = scanVocabulary(readFileSync(join(base, rel), 'utf8'));
+		allowed += result.allowed;
+		for (const hit of result.hits) hits.push({ rel, ...hit });
+	}
+	return { files, hits, allowed };
+}
+
+function main() {
+	const verbose = process.argv.includes('--verbose');
+	const { files, hits, allowed } = scanTree(root);
+	const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+	console.log(`check-vocabulary: ${pkg.name}@${pkg.version}`);
+	console.log(`  ${files.length} file(s) scanned, ${RULES.reduce((n, r) => n + r.patterns.length, 0)} pattern(s), ${allowed} allow-marked line(s).`);
+
+	if (hits.length) {
+		console.error(`\ncheck-vocabulary FAILED (${hits.length} hit(s)):`);
+		for (const rule of RULES) {
+			const own = hits.filter((h) => h.family === rule.family);
+			if (!own.length) continue;
+			console.error(`  ${rule.family} - ${rule.hint}`);
+			const show = verbose ? own : own.slice(0, 5);
+			for (const h of show) console.error(`      ${h.rel}:${h.line}  "${h.term}"`);
+			if (!verbose && own.length > 5) console.error(`      ... +${own.length - 5} more (--verbose)`);
+		}
+		console.error(`  Reword the line, or append \`vocabulary-allow: <reason>\` when the term is genuinely correct.`);
+		process.exit(1);
+	}
+
+	console.log(`  OK - no borrowed vocabulary or planning references in the published surface.`);
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
