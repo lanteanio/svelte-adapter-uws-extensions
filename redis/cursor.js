@@ -1132,7 +1132,9 @@ export function createCursor(client, options = {}) {
 				// the adapter dedups when the topic is already in the user data
 				// set) still gets a fresh catalog + bulk.
 				if (data && data.type === 'cursor-snapshot' && typeof data.topic === 'string') {
-					tracker.snapshot(ws, data.topic, platform);
+					// Fire-and-forget, so the rejection needs an owner here: an
+					// unhandled one terminates the worker.
+					tracker.snapshot(ws, data.topic, platform).catch(() => { /* snapshot is best-effort */ });
 					return;
 				}
 				// Silent no-op when the caller dispatches a parsed object whose
