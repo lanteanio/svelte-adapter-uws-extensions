@@ -1775,6 +1775,15 @@ export function createConnectionRegistry(client, options) {
 				}
 			},
 			async close(ws, _ctx) {
+				// Every Redis write this hook makes is issued before its first
+				// await and awaited together at the end. During a graceful
+				// shutdown the adapter does not wait for an async close hook, so
+				// only what is already on the wire reaches Redis; a write queued
+				// behind an earlier await is lost, and peers keep routing the
+				// user to this instance until it reconnects.
+				/** @type {Promise<void>[]} */
+				const writes = [];
+
 				// App-session drain (opt-in; independent of userId). The ws-identity
 				// guard means a session that already resumed on a newer socket is not
 				// deregistered by the older socket's late close - last-write-wins.
@@ -1783,12 +1792,12 @@ export function createConnectionRegistry(client, options) {
 					try { sessionId = sessionIdentify(ws); } catch { sessionId = null; }
 					if (sessionId != null && sessionId !== '' && appSessionToWs.get(sessionId) === ws) {
 						appSessionToWs.delete(sessionId);
-						await deleteSessionIfOurs(sessionId);
+						writes.push(deleteSessionIfOurs(sessionId));
 					}
 				}
 
 				const userId = identify(ws);
-				if (!userId) return;
+				if (!userId) { await Promise.all(writes); return; }
 				const sessionId = localUsers.get(userId);
 				// Same-instance reconnect guard: if the user's current local binding
 				// points at a DIFFERENT (newer) socket, this is a stale close after a
@@ -1802,7 +1811,7 @@ export function createConnectionRegistry(client, options) {
 				// unaffected (this instance still owns its local ws, so it drains and
 				// publishes a close that the new owner's applyCloseEvent owner-check
 				// correctly ignores).
-				if (sessionId && sessionToWs.get(sessionId) !== ws) return;
+				if (sessionId && sessionToWs.get(sessionId) !== ws) { await Promise.all(writes); return; }
 				if (sessionId) {
 					localUsers.delete(userId);
 					localRefresh.delete(userId);
@@ -1815,16 +1824,19 @@ export function createConnectionRegistry(client, options) {
 						{ localUsers: localUsers.size, sessionToWs: sessionToWs.size }
 					);
 				}
-				await deleteIfOurs(userId);
+				writes.push(deleteIfOurs(userId));
 				// Local index update and broadcast happen unconditionally
 				// once the local maps clear: the compare-and-delete above
 				// already protects the Redis row from clobbering a migrated
 				// entry, and the recipients of the close event guard with
-				// `applyCloseEvent`'s owner check before unindexing.
+				// `applyCloseEvent`'s owner check before unindexing. The
+				// PUBLISH follows the compare-and-delete on the same
+				// connection, so Redis runs them in that order.
 				if (attributes) {
 					applyCloseEvent(userId, instanceId);
-					await publishEvent({ type: 'close', userId, instanceId });
+					writes.push(publishEvent({ type: 'close', userId, instanceId }));
 				}
+				await Promise.all(writes);
 			}
 		},
 		async destroy() {

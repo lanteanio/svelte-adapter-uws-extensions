@@ -598,29 +598,41 @@ export function createPresence(client, options = {}) {
 						if (topicData.size === 0) localData.delete(topic);
 					}
 
+					let releaseChannel = false;
 					if (counts.size === 0) {
 						localCounts.delete(topic);
 						activeTopics.delete(topic);
-						if (!syncCounts.has(topic)) {
-							await unsubscribeFromTopic(topic);
-						}
+						releaseChannel = !syncCounts.has(topic);
 					}
 
+					// The removal is issued before the first await, so a close
+					// cut short by a shutdown still reaches Redis; the channel
+					// unsubscribe runs alongside it.
 					let userGone = -1;
 					let skipLeaveRedis = false;
 					if (b) { try { b.guard(); } catch { skipLeaveRedis = true; } }
+					let leaving = null;
 					if (!skipLeaveRedis) {
 						try {
-							userGone = await evalCached(redis,
+							leaving = evalCached(redis,
 								LEAVE_SCRIPT, 3,
 								userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
 								instanceId, key
 							);
+						} catch (err) {
+							b?.failure(err);
+						}
+					}
+					const released = releaseChannel ? unsubscribeFromTopic(topic) : null;
+					if (leaving) {
+						try {
+							userGone = await leaving;
 							b?.success();
 						} catch (err) {
 							b?.failure(err);
 						}
 					}
+					if (released) await released;
 
 					if (userGone === 1) {
 						mLeaves?.inc({ topic: mt(topic) });
@@ -764,14 +776,13 @@ export function createPresence(client, options = {}) {
 		// Lua time, so the total Redis-blocked time scales linearly with
 		// N (the disconnect count), not with N x M (where M was the topic
 		// hash size in the previous storage layout).
-		const unsubPromises = [];
-		for (const { needsUnsub, topic } of pendingLeaves) {
-			if (needsUnsub) {
-				unsubPromises.push(unsubscribeFromTopic(topic));
-			}
-		}
-		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
-
+		//
+		// The pipeline is issued before this function first awaits, and the
+		// channel unsubscribes start alongside it rather than ahead of it: a
+		// close hook during a graceful shutdown runs only up to its first
+		// await before the process exits, and the removal is what must reach
+		// Redis. Waiting on the unsubscribes first left every last-connection
+		// entry behind until its field TTL.
 		const commands = [];
 		for (const { topic, key } of pendingLeaves) {
 			commands.push([
@@ -781,12 +792,22 @@ export function createPresence(client, options = {}) {
 			]);
 		}
 
-		let results;
+		let leaving = null;
 		let skipPipeline = false;
 		if (b) { try { b.guard(); } catch { skipPipeline = true; } }
-		if (!skipPipeline) {
+		if (!skipPipeline) leaving = execMultiSlot(redis, commands);
+
+		const unsubPromises = [];
+		for (const { needsUnsub, topic } of pendingLeaves) {
+			if (needsUnsub) {
+				unsubPromises.push(unsubscribeFromTopic(topic));
+			}
+		}
+
+		let results;
+		if (leaving) {
 			try {
-				results = await execMultiSlot(redis, commands);
+				results = await leaving;
 				const error = firstCommandError(results);
 				if (error) b?.failure(error);
 				else b?.success();
@@ -794,6 +815,7 @@ export function createPresence(client, options = {}) {
 				b?.failure(err);
 			}
 		}
+		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
 
 		// Broadcast leave events only when Redis confirmed the user is
 		// completely gone. If results is null (Redis unavailable or
