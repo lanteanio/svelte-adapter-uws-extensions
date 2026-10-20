@@ -80,6 +80,34 @@ describe('cluster dashboard', () => {
 		expect(section()).toBeUndefined();
 	});
 
+	it('keeps a restarted bridge visible across overlapping shutdown calls', async () => {
+		const client = mockPgClient();
+		const createClient = client.createClient.bind(client);
+		const connections = [];
+		let finishClose;
+		const closing = new Promise(resolve => { finishClose = resolve; });
+		client.createClient = () => {
+			const connection = createClient();
+			if (connections.length === 0) {
+				const end = connection.end.bind(connection);
+				connection.end = async () => { await closing; return end(); };
+			}
+			connections.push(connection);
+			return connection;
+		};
+		const bridge = createNotifyBridge(client, { channel: 'changes' });
+		cleanups.push(() => { finishClose(); return bridge.deactivate(); });
+		const platform = mockPlatform();
+		await bridge.activate(platform);
+		const firstStop = bridge.deactivate();
+		const restarting = bridge.activate(platform);
+		const repeatedStop = bridge.deactivate();
+		finishClose();
+		await Promise.all([firstStop, restarting, repeatedStop]);
+		expect(connections).toHaveLength(2);
+		expect(section()?.notify).toMatchObject({ attached: true, listening: true });
+	});
+
 	it('uses the existing leader and clock readings', async () => {
 		const client = mockRedisClient();
 		const metrics = createMetrics();

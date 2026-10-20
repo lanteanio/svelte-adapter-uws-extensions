@@ -463,8 +463,8 @@ export function createNotifyBridge(client, options) {
 
 	return {
 		async activate(platform) {
-			startDashboard();
 			if (deactivating) await deactivating;
+			startDashboard();
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);
 			if (active) {
