@@ -1281,7 +1281,7 @@ For exact targeting (audit log, billing, transactional broadcasts), use `request
 
 #### Routing by app session
 
-Pass a `sessionIdentify(ws)` option and the registry also tracks a `sessionId -> instance` owner map (a `sess:{sessionId}` hash beside `conns:{userId}`), so `requestSession(sessionId, ...)` routes to whichever instance currently owns that session - the resume-aware counterpart of `request(userId, ...)`. It backs svelte-realtime's `live.push({ sessionId })` cluster routing.
+Pass a `sessionIdentify(ws)` option and the registry also tracks a `sessionId -> instance` owner map (a `regsess:{sessionId}` hash beside `conns:{userId}`, apart from the session store's `sess:` keys, so a `sessionIdentify` that returns the session-store token is safe), so `requestSession(sessionId, ...)` routes to whichever instance currently owns that session - the resume-aware counterpart of `request(userId, ...)`. It backs svelte-realtime's `live.push({ sessionId })` cluster routing.
 
 ```js
 export const registry = createConnectionRegistry(redis, {
@@ -1293,7 +1293,7 @@ export const registry = createConnectionRegistry(redis, {
 const reply = await registry.requestSession('sess-abc', 'reauth-required', { reason: 'rotated' });
 ```
 
-The session map is **independent of userId**: a connection may carry a userId, a session, both, or neither, and an anonymous-but-sessioned connection (no userId) still registers and is reachable by session. It is **opt-in** - with no `sessionIdentify` option the registry writes no `sess:` keys and the userId path is unchanged. Resume-aware by the same last-open-wins lifecycle as the userId path. Wire it into svelte-realtime with `live.configurePush({ remoteRegistry: registry })` - the realtime layer detects `requestSession` and routes `live.push({ sessionId })` / `live.notify({ sessionId })` cluster-wide; without it the sessionId target stays single-instance.
+The session map is **independent of userId**: a connection may carry a userId, a session, both, or neither, and an anonymous-but-sessioned connection (no userId) still registers and is reachable by session. It is **opt-in** - with no `sessionIdentify` option the registry writes no `regsess:` keys and the userId path is unchanged. Resume-aware by the same last-open-wins lifecycle as the userId path. Wire it into svelte-realtime with `live.configurePush({ remoteRegistry: registry })` - the realtime layer detects `requestSession` and routes `live.push({ sessionId })` / `live.notify({ sessionId })` cluster-wide; without it the sessionId target stays single-instance.
 
 ---
 
@@ -4513,7 +4513,7 @@ const idem = createIdempotencyStore(redis);          // keys: tenant-A:idem:...
 const registry = createConnectionRegistry(redis);    // keys: tenant-A:conns:...
 ```
 
-Each extension has its own per-extension default sub-prefix (`lock:`, `sess:`, `idem:`, `fence:`, `''` for registry) that stacks **after** the client's prefix, so two extensions on the same client cannot collide with each other either.
+Each extension has its own per-extension default sub-prefix (`lock:`, `sess:`, `idem:`, `fence:`, `''` for registry, whose keys start `conns:` and `regsess:`) that stacks **after** the client's prefix, so two extensions on the same client cannot collide with each other either.
 
 ### Channels (`channel` / `channelPrefix`)
 

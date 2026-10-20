@@ -90,7 +90,7 @@ describe('close hooks put their Redis writes on the wire before awaiting', () =>
 		cleanups.push(() => probe.quit());
 
 		expect(await client.redis.exists(client.key('conns:u1'))).toBe(1);
-		expect(await client.redis.exists(client.key('sess:app-1'))).toBe(1);
+		expect(await client.redis.exists(client.key('regsess:app-1'))).toBe(1);
 
 		const wire = cutAfterSync(client.redis);
 		const closing = registry.hooks.close(ws, { platform });
@@ -100,7 +100,7 @@ describe('close hooks put their Redis writes on the wire before awaiting', () =>
 		wire.restore();
 
 		expect(await client.redis.exists(client.key('conns:u1'))).toBe(0);
-		expect(await client.redis.exists(client.key('sess:app-1'))).toBe(0);
+		expect(await client.redis.exists(client.key('regsess:app-1'))).toBe(0);
 		expect(events).toEqual([expect.objectContaining({ type: 'close', userId: 'u1', instanceId: registry.instanceId })]);
 		void closing;
 	});

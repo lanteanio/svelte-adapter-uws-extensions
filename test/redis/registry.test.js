@@ -6,6 +6,7 @@ import { createConnectionRegistry } from '../../src/redis/registry.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+import { createDistributedSession } from '../../src/redis/session.js';
 
 function wsWithSession(userData, sessionId) {
 	const ws = mockWs(userData);
@@ -1912,6 +1913,32 @@ describe('redis connection registry', () => {
 				}
 			} finally {
 				client.redis.duplicate = realDuplicate;
+			}
+		});
+	});
+	describe('app-session routing beside the session store', () => {
+		it('keeps its own keys when the session id is the session-store token', async () => {
+			const r = createConnectionRegistry(client, {
+				identify: (ws) => ws.getUserData()?.userId,
+				sessionIdentify: (ws) => ws.getUserData()?.sid
+			});
+			const sessions = createDistributedSession(client);
+			try {
+				await sessions.set('tok-1', { userId: 'u-1' });
+				const ws = wsWithSession({ userId: 'u-1', sid: 'tok-1' }, 's-1');
+				await r.hooks.open(ws, { platform });
+
+				expect(await sessions.get('tok-1')).toEqual({ userId: 'u-1' });
+				expect((await r.lookupSession('tok-1'))?.instanceId).toBe(r.instanceId);
+
+				await sessions.clear();
+				expect((await r.lookupSession('tok-1'))?.instanceId).toBe(r.instanceId);
+				await sessions.set('tok-1', { userId: 'u-1', again: true });
+				expect((await r.lookupSession('tok-1'))?.instanceId).toBe(r.instanceId);
+				expect(await sessions.get('tok-1')).toEqual({ userId: 'u-1', again: true });
+			} finally {
+				await r.destroy();
+				sessions.destroy?.();
 			}
 		});
 	});

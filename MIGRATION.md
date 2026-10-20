@@ -191,6 +191,28 @@ type gate now fails any runtime export its declaration omits.
 
 ## 2. Needs an operational step
 
+### Connection registry session routing moves to `regsess:`
+
+**Symptom.** During a rolling deploy, `requestSession(sessionId, ...)` reports
+a session offline when an instance of the other version owns it.
+
+**Why.** With `sessionIdentify`, the registry stored its session owner hash at
+`sess:<sessionId>` under its own prefix (empty by default), the same key the
+session store writes for a token under its default `sess:` prefix. When
+`sessionIdentify` returned the session-store token, the two wrote one key with
+different types. Routing hashes now live at `regsess:<sessionId>`.
+
+**Action.** If your Redis ACL users list key patterns, add `~regsess:*` (under
+the client `keyPrefix` and the registry's own `keyPrefix`) before upgrading;
+without it every session routing write is refused. Nothing else is needed for
+data: routing entries are rebuilt from live connections and the old
+`sess:<sessionId>` hashes expire within the registry `ttl` (90 seconds by
+default). Finish the rollout before relying on
+`requestSession` across instances, or let clients reconnect once every
+instance runs this version. A recovery verification of a backup taken before
+the upgrade reports those old hashes as session keys of the wrong type; delete
+them or verify a backup taken after the upgrade.
+
 ### Redis keys now use Cluster hash tags
 
 **Symptom.** Presence, groups and cursors appear empty after upgrading; replay
@@ -255,7 +277,7 @@ is shown and a custom value replaces it:
 | Dead letters | `dlq:*` |
 | Alarms | `alarm:{alarms}:*` |
 | Idempotency, sessions | `idem:*`, `sess:*` (records and their `byuser:` erasure indexes) |
-| Connection registry | `conns:*`, `sess:*` (factory `keyPrefix` defaults to empty) |
+| Connection registry | `conns:*`, `regsess:*` (factory `keyPrefix` defaults to empty) |
 | Locks, leader, task fences | `lock:*`, `lock-fences:*`, `leader`, `fence:*` |
 | Cluster clock, topic broadcast | `clock:leader-offset`, `{topic-broadcast}:instances` |
 | Rate limits | `v1:ratelimit:*`, `v1:ratelimits:*`, `v1:ratelimitg:*` (per principal), `v1:ratelimit-tenant:*`, `v1:ratelimits-tenant:*`, `v1:ratelimitg-tenant:*` (`budget: 'tenant'`), `v1:ratelimitc:*` (composite), `v1:ratelimit-control:*`, `v1:upgrade-bucket:*` |

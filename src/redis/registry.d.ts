@@ -17,7 +17,7 @@ export interface RegistryOptions {
 	 * - a connection may carry a userId, a session, both, or neither.
 	 * Return `null` / `undefined` to skip a given connection.
 	 *
-	 * Omit the option entirely to disable session tracking: no `sess:`
+	 * Omit the option entirely to disable session tracking: no `regsess:`
 	 * keys are written, the heartbeat does no extra work, and the userId
 	 * path is byte-identical to a registry that never knew about sessions.
 	 */

@@ -60,7 +60,7 @@ describe('close hooks during a graceful shutdown (integration)', () => {
 			reader.destroy();
 		}
 		expect(await client.redis.exists(client.key('conns:u1'))).toBe(0);
-		expect(await client.redis.exists(client.key('sess:app-1'))).toBe(0);
+		expect(await client.redis.exists(client.key('regsess:app-1'))).toBe(0);
 		expect(events.filter((e) => e.type === 'close' && e.userId === 'u1')).toHaveLength(1);
 	});
 });

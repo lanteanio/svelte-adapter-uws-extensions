@@ -208,7 +208,7 @@ export function sessionErasureContract(getClient) {
 			expect(await sessions.purgeUser(null, 'nested')).toBe(1);
 		});
 
-		it('leaves registry routing hashes under the shared prefix alone', async () => {
+		it('leaves a hash it did not write under its prefix alone', async () => {
 			const client = getClient();
 			const sessions = createDistributedSession(client, options);
 			await sessions.set('tok', { userId: 'target' });

@@ -13,7 +13,7 @@ import { operationError } from '../shared/errors.js';
  *   - Hash `{prefix}conns:{userId}` with fields `instanceId`, `sessionId`, `ts`.
  *     Most-recent-connection-wins - a second device replaces the first.
  *     Sliding TTL refreshed on every `hooks.open` and on the heartbeat tick.
- *   - Hash `{prefix}sess:{sessionId}` with fields `instanceId`, `ts` (only when a
+ *   - Hash `{prefix}regsess:{sessionId}` with fields `instanceId`, `ts` (only when a
  *     `sessionIdentify` option is supplied). The resume-aware owner map for
  *     `requestSession(sessionId, ...)`; last-open-wins, same sliding TTL.
  *
@@ -95,7 +95,7 @@ return redis.call('expire', KEYS[1], ARGV[5])
 /**
  * @typedef {Object} RegistryOptions
  * @property {(ws: any) => string | null | undefined} identify - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them.
- * @property {(ws: any) => string | null | undefined} [sessionIdentify] - Opt-in: extract an app session id from a WebSocket so `requestSession(sessionId, ...)` can route cluster-wide. Independent of `identify` - a connection may carry a userId, a session, both, or neither. Return `null` / `undefined` to skip. Omit entirely to disable session tracking (no `sess:` keys, userId path unchanged).
+ * @property {(ws: any) => string | null | undefined} [sessionIdentify] - Opt-in: extract an app session id from a WebSocket so `requestSession(sessionId, ...)` can route cluster-wide. Independent of `identify` - a connection may carry a userId, a session, both, or neither. Return `null` / `undefined` to skip. Omit entirely to disable session tracking (no `regsess:` keys, userId path unchanged).
  * @property {(ws: any) => Record<string, string | number | boolean> | null | undefined} [attributes] - Extract per-user attributes captured at registration time. Used by `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped broadcasts. Shallow values only (string / number / boolean); compound queries are deliberately out of scope.
  * @property {string} [keyPrefix=''] - Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`.
  * @property {number} [ttl=90] - Expiry on registry entries in seconds. Should be greater than `heartbeat * 3` so a missed beat doesn't drop a live user.
@@ -181,7 +181,7 @@ export function createConnectionRegistry(client, options) {
 	// `sessionId -> instance` ownership map (independent of userId) so
 	// `requestSession(sessionId, ...)` can route to whichever instance currently
 	// owns a given app session - the resume-aware counterpart of `request(userId)`.
-	// Absent (the default), nothing changes: no `sess:` keys, no extra writes, and
+	// Absent (the default), nothing changes: no `regsess:` keys, no extra writes, and
 	// the userId path is byte-identical to a registry that never knew about sessions.
 	const sessionIdentify = options.sessionIdentify;
 	if (sessionIdentify !== undefined && typeof sessionIdentify !== 'function') {
@@ -225,7 +225,7 @@ export function createConnectionRegistry(client, options) {
 		return client.key(keyPrefix + 'conns:' + userId);
 	}
 	function sessionKey(sessionId) {
-		return client.key(keyPrefix + 'sess:' + sessionId);
+		return client.key(keyPrefix + 'regsess:' + sessionId);
 	}
 	// A reply channel is addressed by instance id, and an instance id is
 	// exactly what `randomBytes(8).toString('hex')` produces. Anything else
@@ -313,7 +313,7 @@ export function createConnectionRegistry(client, options) {
 	/**
 	 * Local app-session -> ws map (only populated when `sessionIdentify` is set).
 	 * Source of truth for the self-targeting short-circuit and the inbound
-	 * `request-session` resolution; the heartbeat refreshes each entry's `sess:`
+	 * `request-session` resolution; the heartbeat refreshes each entry's `regsess:`
 	 * TTL. Kept separate from `sessionToWs` (which is keyed by the adapter's
 	 * transport session id and stays strictly userId-driven) so the userId path's
 	 * `localUsers.size === sessionToWs.size` invariant is untouched.
@@ -615,7 +615,7 @@ export function createConnectionRegistry(client, options) {
 
 	/**
 	 * Record this instance as the owner of an app session. Stores
-	 * `{instanceId, ts}` under `sess:{sessionId}` with a sliding TTL - no
+	 * `{instanceId, ts}` under `regsess:{sessionId}` with a sliding TTL - no
 	 * transport id is stored because the inbound `request-session` path resolves
 	 * the socket by app-session id (via `appSessionToWs`) on the owning instance.
 	 * Most-recent-open-wins: a session that resumes on a new socket (anywhere in
@@ -957,7 +957,7 @@ export function createConnectionRegistry(client, options) {
 	// A refresh queued behind a busy Redis owner skips the entries that left
 	// this instance before it runs.
 	const userKeyPrefix = client.key(keyPrefix + 'conns:');
-	const sessionKeyPrefix = client.key(keyPrefix + 'sess:');
+	const sessionKeyPrefix = client.key(keyPrefix + 'regsess:');
 	function refreshKey(command) { return command[0] === 'expire' ? command[1] : command[2]; }
 	function currentRefresh(command) {
 		if (destroyed) return false;

@@ -273,24 +273,39 @@ it('checks the last bounded generation batch without object-key aliasing', async
 });
 
 for (const families of [['sessions'], ['registry'], ['sessions', 'registry']]) {
-	it(`disambiguates default session records and registry routing for ${families.join(', ')}`, async () => {
-		const keys = new Map([['sess:token', 'string'], ['sess:route', 'hash'], ['conns:user', 'hash'], ['sess:byuser:user', 'hash'], ['sess:byuser:routing', 'hash']]);
+	it(`classifies default session records and registry routing in their own namespaces for ${families.join(', ')}`, async () => {
+		const keys = new Map([['sess:token', 'string'], ['sess:byuser:user', 'hash'], ['regsess:route', 'hash'], ['conns:user', 'hash']]);
 		const commands = [];
 		const redis = {
 			scan: async () => { commands.push('scan'); return ['0', [...keys.keys()]]; },
 			type: async key => { commands.push('type'); return keys.get(key); },
-			pttl: async () => { commands.push('pttl'); return 60000; },
-			hmget: async key => { commands.push('hmget'); return key === 'sess:byuser:routing' ? ['worker', '123'] : [null, null]; }
+			pttl: async () => { commands.push('pttl'); return 60000; }
 		};
 		const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families, minimumKeys: Object.fromEntries(families.map(id => [id, 1])) } }, { redis });
 		expect(report.ok).toBe(true);
 		if (families.includes('sessions')) expect(report.redis.observations.sessions.keys).toBe(2);
-		if (families.includes('registry')) expect(report.redis.observations.registry.keys).toBe(3);
-		expect(commands.every(command => ['scan', 'type', 'pttl', 'hmget'].includes(command))).toBe(true);
+		if (families.includes('registry')) expect(report.redis.observations.registry.keys).toBe(2);
+		expect(commands.every(command => ['scan', 'type', 'pttl'].includes(command))).toBe(true);
 	});
 }
 
-it('still rejects a wrong type outside the shared default namespace', async () => {
+it('flags a hash in the session namespace as a wrong type', async () => {
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'] } }, {
+		redis: { scan: async () => ['0', ['sess:route']], type: async () => 'hash', pttl: async () => 60000 }
+	});
+	expect(report.ok).toBe(false);
+	expect(report.redis.checks).toContainEqual({ scope: 'sessions', name: 'key_types', ok: false });
+});
+
+it('flags a string in the registry routing namespace as a wrong type', async () => {
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['registry'] } }, {
+		redis: { scan: async () => ['0', ['regsess:token']], type: async () => 'string', pttl: async () => 60000 }
+	});
+	expect(report.ok).toBe(false);
+	expect(report.redis.checks).toContainEqual({ scope: 'registry', name: 'key_types', ok: false });
+});
+
+it('still rejects a wrong type under a configured session prefix', async () => {
 	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], prefixes: { sessions: 'auth:' } } }, {
 		redis: { scan: async () => ['0', ['auth:token']], type: async () => 'hash', pttl: async () => 60000 }
 	});
@@ -298,10 +313,9 @@ it('still rejects a wrong type outside the shared default namespace', async () =
 	expect(report.redis.checks).toContainEqual({ scope: 'sessions', name: 'key_types', ok: false });
 });
 
-it('rejects a shared hash that can be both an erasure index and a routing record', async () => {
-	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions', 'registry'] } }, {
-		redis: { scan: async () => ['0', ['sess:byuser:ambiguous']], type: async () => 'hash',
-			hmget: async () => ['1', '1'], pttl: async () => 60000 }
+it('rejects a key that configured prefixes place in both families', async () => {
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions', 'registry'], prefixes: { sessions: 'regsess:' } } }, {
+		redis: { scan: async () => ['0', ['regsess:shared']], type: async () => 'hash', pttl: async () => 60000 }
 	});
 	expect(report.ok).toBe(false);
 	expect(report.redis.checks).toContainEqual({ scope: 'redis', name: 'unambiguous_namespaces', ok: false });

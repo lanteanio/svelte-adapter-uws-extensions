@@ -133,7 +133,7 @@ it('verifies session records and registry routing with their default prefixes', 
 	try {
 		await registry.hooks.open(mockWs({ userId: 'user', appSession: 'byuser:routing-token', [WS_SESSION_ID]: 'connection-token' }), { platform: mockPlatform() });
 		expect(await source.redis.type(source.key('sess:' + token))).toBe('string');
-		expect(await source.redis.type(source.key('sess:byuser:routing-token'))).toBe('hash');
+		expect(await source.redis.type(source.key('regsess:byuser:routing-token'))).toBe('hash');
 		for (const families of [['sessions'], ['registry'], ['sessions', 'registry']]) {
 			const report = await runVerification({ schemaVersion: 1, redis: {
 				keyPrefix: source.key(''), families,

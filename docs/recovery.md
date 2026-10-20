@@ -152,13 +152,10 @@ Run against isolated restored state with writers stopped. Redis SCAN is not a
 snapshot. A topology change or disappearing key makes verification incomplete;
 stable topology alone cannot prove that writers were stopped. Per-field expiry
 is preserved by the backend's backup format, but the verifier's expiry summary
-counts whole-key TTLs only. With the default `sess:` namespaces, the verifier
-distinguishes durable session strings from registry routing hashes by Redis type,
-including when only one family is selected. Shared `byuser:` hashes are classified
-using bounded reads of routing ownership fields; ambiguous shapes fail verification.
-Distinct configured prefixes prevent
-a session token and routing session ID with identical text from sharing a key.
-Other overlapping namespaces and ambiguous hash roles still fail verification.
+counts whole-key TTLs only. Session records (`sess:`) and registry session
+routing (`regsess:`) have separate default namespaces; a key of the wrong Redis
+type in either fails verification. Configured prefixes that place one key in two
+families, and ambiguous hash roles, fail verification too.
 
 ## Interpret the report
 

@@ -41,7 +41,7 @@ function registry() {
 	return { client, value };
 }
 async function route(client, method, target, instanceId = 'absent-owner') {
-	await client.redis.hset(client.key((method === 'request' ? 'conns:' : 'sess:') + target), 'instanceId', instanceId, 'sessionId', 'transport', 'ts', Date.now());
+	await client.redis.hset(client.key((method === 'request' ? 'conns:' : 'regsess:') + target), 'instanceId', instanceId, 'sessionId', 'transport', 'ts', Date.now());
 }
 
 describe.each(['request', 'requestSession'])('registry %s operational failures', method => {

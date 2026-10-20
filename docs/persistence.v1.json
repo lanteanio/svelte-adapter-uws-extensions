@@ -416,11 +416,11 @@
 				{
 					"id": "session-routing",
 					"type": "hash",
-					"template": "<prefix>sess:<session>"
+					"template": "<prefix>regsess:<session>"
 				}
 			],
 			"defaultPrefix": "",
-			"notes": "Routing references live instances. Reconnect clients. The verifier distinguishes default sess: routing hashes from durable session strings by Redis type. Distinct prefixes prevent identical token and session IDs from colliding."
+			"notes": "Routing references live instances. Reconnect clients."
 		},
 		{
 			"id": "cursor",

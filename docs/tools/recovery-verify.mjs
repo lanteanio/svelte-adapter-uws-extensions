@@ -159,8 +159,6 @@ async function topology(redis) {
 /** Scan every Cluster master. Key metadata and member checks have explicit caps. */
 export async function verifyRedis(redis, config, remaining = () => {}) {
 	const result = section(), groups = new Map(), seen = new Set(), patterns = matchers(config);
-	// These built-in namespaces overlap by default but have distinct Redis types.
-	const sessionPatterns = matchers({ ...config, specs: manifest.redis.filter(spec => spec.id === 'sessions' || spec.id === 'registry') });
 	let calls = 0, matched = 0, ambiguous = 0, fenceOk = true;
 	const read = async (command, ...args) => { remaining(); const value = await redis[command](...args); remaining(); return value; };
 	try {
@@ -184,21 +182,6 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 					const type = await read('type', key);
 					if (type === 'none') { result.complete = false; result.reason = 'keys_changed'; continue; }
 					if (legacyScale) matches = matches.filter(item => type === 'string' ? item.spec.id !== 'rate-window' : item.spec.id !== 'emergency-scale');
-					const shared = sessionPatterns.filter(item => item.regex.test(key));
-					if (shared.some(item => item.spec.id === 'sessions' && item.role.id === 'session')
-						&& shared.some(item => item.spec.id === 'registry' && item.role.id === 'session-routing')
-					) {
-						let erasureIndex = shared.some(item => item.spec.id === 'sessions' && item.role.id === 'erasure-index');
-						if (type === 'hash' && erasureIndex) {
-							const [owner, stamp] = await read('hmget', key, 'instanceId', 'ts');
-							const indexShape = [owner, stamp].every(value => value === null || value === '1');
-							const routingShape = typeof owner === 'string' && owner.length > 0 && integer(stamp);
-							if (indexShape === routingShape) { ambiguous++; continue; }
-							erasureIndex = indexShape;
-						}
-						matches = matches.filter(item => !(item.spec.id === 'sessions' && type === 'hash' && !erasureIndex)
-							&& !(item.spec.id === 'registry' && item.role.id === 'session-routing' && (type === 'string' || erasureIndex)));
-					}
 					if (new Set(matches.map(item => item.spec.id)).size > 1) { ambiguous++; continue; }
 					const pattern = matches[0];
 					if (!pattern) continue;
