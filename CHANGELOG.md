@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis client `quit()` ends connections still opening or waiting to reconnect and rejects their queued commands, so shutdown settles without requiring bus deactivation first and queued writes cannot replay later. Ready connections drain gracefully, with any intervening connection loss ending them instead of starting another attempt. A client that has begun shutdown no longer opens duplicate connections.
+
 - A Postgres notification bridge restarting during shutdown retains its dashboard reading when overlapping shutdown calls finish.
 - Redis cursors confirm hash-missing peer entries after a relay gap and send a removal when the peer remains absent, preventing lost departure messages from leaving ghost cursors. Reconnecting movers restore their snapshots and identities, retrying refused writes without waiting for more movement; movers idle beyond the cursor TTL announce themselves before their next position. Recovery also includes existing server-granted cursor subscribers that request snapshots.
 - `RedisCursorOptions` declares `binary` and `dictionary`, which `createCursor` already honored, with the in-memory cursor plugin's spelling and defaults (`true`), and the README lists both. TypeScript users can set them without a cast.

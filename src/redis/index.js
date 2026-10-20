@@ -8,6 +8,7 @@
  */
 
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
+import { closeConnection } from '../shared/redis-subscriber.js';
 import Redis from 'ioredis';
 import { ConnectionError, TimeoutError } from '../shared/errors.js';
 import { MAX_REDIS_DUPLICATES_PER_CLIENT, MAX_REDIS_QUEUED_COMMANDS } from '../shared/caps.js';
@@ -245,7 +246,21 @@ export function createRedisClient(options = {}) {
 		shuttingDown = true;
 		stopDashboard();
 		const all = [redis, ...duplicates];
-		await Promise.allSettled(all.map((c) => c.quit().catch(() => c.disconnect())));
+		await Promise.allSettled(all.map(async (connection) => {
+			// A connection without a ready socket cannot drain through QUIT.
+			// Terminal shutdown cancels its next attempt and rejects its queue.
+			if (connection.status !== 'ready') {
+				closeConnection(connection);
+				return;
+			}
+			// The socket can close after this check but before QUIT is written.
+			// Never reconnect just to replay the work ahead of a queued QUIT.
+			const stopRetry = () => closeConnection(connection);
+			connection.once('reconnecting', stopRetry);
+			try { await connection.quit(); }
+			catch { closeConnection(connection); }
+			finally { connection.removeListener('reconnecting', stopRetry); }
+		}));
 		duplicates.clear();
 	}
 
@@ -262,6 +277,7 @@ export function createRedisClient(options = {}) {
 		},
 
 		duplicate(overrides) {
+			if (shuttingDown) throw new ConnectionError('redis', 'client is shut down');
 			// Subscriber connections must buffer their initial/reconnect admission.
 			const dup = redis.duplicate({ enableOfflineQueue: true, ...overrides });
 			boundOfflineQueue(dup, true);
