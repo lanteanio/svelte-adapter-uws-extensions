@@ -194,7 +194,7 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
  * @property {string} keyPrefix - The key prefix
  * @property {(key: string) => string} key - Prefix a key: `keyPrefix + key`
  * @property {(overrides?: import('ioredis').RedisOptions) => import('ioredis').Redis} duplicate - Create a new connection with the same config (for subscribers)
- * @property {() => Promise<void>} quit - Gracefully disconnect
+ * @property {() => Promise<void>} quit - Gracefully disconnect and remove the `sveltekit:shutdown` listener
  */
 
 /**
@@ -258,6 +258,8 @@ export function createRedisClient(options = {}) {
 		if (shuttingDown) return;
 		shuttingDown = true;
 		stopDashboard();
+		// A client released by a development reload must not keep its listener.
+		if (typeof process !== 'undefined') process.removeListener('sveltekit:shutdown', quit);
 		const all = [redis, ...duplicates];
 		await Promise.allSettled(all.map(async (connection) => {
 			// A connection without a ready socket cannot drain through QUIT.

@@ -14,8 +14,11 @@ const composePath = path.join(__dirname, 'docker-compose.valkey.yml');
 // A distinct default port (56381) from the Redis solo tier (56379) and the
 // cluster tier so a Valkey run can sit beside them without a clash.
 const VALKEY_HOST_PORT = Number(process.env.INTEGRATION_VALKEY_HOST_PORT) || 56381;
+// Suffixed like the other stacks so one exported project name never names
+// two compose projects.
 const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
-	|| `svelte-adapter-uws-ext-valkey-${VALKEY_HOST_PORT}`;
+	? `${process.env.INTEGRATION_COMPOSE_PROJECT}-valkey`
+	: `svelte-adapter-uws-ext-valkey-${VALKEY_HOST_PORT}`;
 const REDIS_URL = `redis://localhost:${VALKEY_HOST_PORT}`;
 
 function compose(args) {

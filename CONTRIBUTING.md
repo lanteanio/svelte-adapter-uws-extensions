@@ -161,7 +161,9 @@ $env:INTEGRATION_COMPOSE_PROJECT = 'extensions-local-check'
 npm run verify:redis
 ```
 
-The matching variables are `INTEGRATION_POSTGRES_HOST_PORT`,
+The Valkey, Redis Cluster, Valkey Cluster and PgBouncer stacks append `-valkey`,
+`-cluster`, `-valkey-cluster` and `-pgbouncer` to that project name. The matching
+variables are `INTEGRATION_POSTGRES_HOST_PORT`,
 `INTEGRATION_VALKEY_HOST_PORT`, `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, and
 `INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE`. Changing cluster host ports does not
 change their bridge subnets; when a subnet overlaps another network, set

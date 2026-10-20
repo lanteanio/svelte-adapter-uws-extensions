@@ -22,8 +22,8 @@ const { Pool, Client } = pg;
 /**
  * @typedef {Object} PgClientOptions
  * @property {string} [connectionString] - Postgres connection string. Required UNLESS `pool` is provided.
- * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` becomes a no-op.
- * @property {boolean} [autoShutdown=true] - Listen for `sveltekit:shutdown` and disconnect. Defaults to `false` when `pool` is provided.
+ * @property {import('pg').Pool} [pool] - An existing `pg.Pool` to wrap instead of constructing a new one. Use when your app already maintains a pool (raw `pg` use elsewhere, another framework integration) and you want a single connection footprint against the database. When provided, `autoShutdown` defaults to `false` (the caller owns the pool's lifecycle) and `end()` never closes it.
+ * @property {boolean} [autoShutdown=true] - Call `end()` on `sveltekit:shutdown`; only an owned pool is closed. Defaults to `false` when `pool` is provided.
  * @property {import('pg').PoolConfig} [options] - Extra pg Pool options. Owned defaults: 10s checkout, 30s query and statement deadlines; each accepts 0 to disable. Does not reconfigure an external pool; still configures standalone createClient() sessions when connectionString is supplied.
  * @property {number} [maxInFlight] - Maximum unsettled query/connect operations (100 owned, 0 external). 0 disables admission bounds.
  * @property {import('../prometheus/index.js').MetricsRegistry} [metrics] - Optional pool admission, waiter and duration metrics.
@@ -33,7 +33,7 @@ const { Pool, Client } = pg;
  * @typedef {Object} PgClient
  * @property {import('pg').Pool} pool - The underlying pg Pool
  * @property {(text: string | import('pg').QueryConfig, values?: any[], options?: { signal?: AbortSignal }) => Promise<import('pg').QueryResult>} query - Run a query
- * @property {() => Promise<void>} end - Stop registered notification bridges, close owned standalone sessions, then close the pool. When the pool was provided externally, this is a no-op (the caller owns the lifecycle).
+ * @property {() => Promise<void>} end - Stop registered notification bridges, close owned standalone sessions, then close the pool, and remove the `sveltekit:shutdown` listener. When the pool was provided externally, the pool and its sessions stay open (the caller owns the lifecycle).
  */
 
 /**
@@ -47,7 +47,7 @@ const { Pool, Client } = pg;
  *
  *   2. Pass `pool` (an existing `pg.Pool`): the client wraps the provided
  *      pool without constructing its own. `autoShutdown` defaults to `false`
- *      and `end()` is a no-op - the caller is responsible for closing the
+ *      and `end()` never closes it - the caller is responsible for closing the
  *      pool. Use this when your app already maintains a pool (e.g. shared
  *      with raw `pg` use elsewhere) and wants a single connection footprint
  *      against the database.
@@ -122,12 +122,13 @@ export function createPgClient(opts) {
 
 	function end() {
 		stopDashboard();
+		// A client released by a development reload must not keep its listener.
+		if (typeof process !== 'undefined') process.removeListener('sveltekit:shutdown', end);
 		// An externally supplied pool and its standalone sessions remain caller-owned.
 		if (!ownedPool) return Promise.resolve();
 		if (ending) return ending;
 		ended = true;
 		lifecycle.closing = true;
-		if (typeof process !== 'undefined') process.removeListener('sveltekit:shutdown', end);
 		ending = (async () => {
 			const stops = await Promise.allSettled([...lifecycle.stoppers].map((stop) => Promise.resolve().then(stop)));
 			lifecycle.stoppers.clear();

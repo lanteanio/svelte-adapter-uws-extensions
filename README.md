@@ -192,7 +192,7 @@ export const redis = createRedisClient({
 | `redis.redis` | The underlying ioredis instance |
 | `redis.key(k)` | Returns `keyPrefix + k` |
 | `redis.duplicate(overrides?)` | New subscriber connection with bounded offline buffering and finite deadlines. Pass ioredis options to override defaults. |
-| `redis.quit()` | Gracefully disconnect all connections |
+| `redis.quit()` | Gracefully disconnect all connections and remove the `sveltekit:shutdown` listener |
 
 ---
 
@@ -216,7 +216,7 @@ import PgDriver from 'pg';
 const pool = new PgDriver.Pool({ connectionString: env.DATABASE_URL });
 
 export const wrapped = createPgClient({ pool });
-// wrapped.end() is a no-op - the caller owns `pool`'s lifecycle.
+// wrapped.end() never closes `pool` - the caller owns its lifecycle.
 ```
 
 #### Options
@@ -224,8 +224,8 @@ export const wrapped = createPgClient({ pool });
 | Option | Default | Description |
 |---|---|---|
 | `connectionString` | - | Postgres connection string. Required UNLESS `pool` is provided. |
-| `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` becomes a no-op. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
-| `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Disconnect on `sveltekit:shutdown`. |
+| `pool` | - | An existing `pg.Pool` to wrap. When provided, `autoShutdown` defaults to `false` and `end()` never closes the pool. Pass `connectionString` alongside `pool` if you also need `createClient()`. |
+| `autoShutdown` | `true` (owned pool) / `false` (wrapped pool) | Call `end()` on `sveltekit:shutdown`. Only an owned pool is closed. |
 | `options` | 10s checkout; 30s query/statement | Owned pool deadlines; each accepts `0` to disable. Supplied pools keep their settings. See [pool bounds, cancellation and metrics](docs/postgres-support.md#pool-operation-bounds) for `maxInFlight` and `metrics`. |
 
 #### API
@@ -236,7 +236,7 @@ export const wrapped = createPgClient({ pool });
 | `pg.query(textOrConfig, values?, { signal }?)` | Run a query. An optional signal cancels the caller wait; SQL can still execute. |
 | `pg.connect({ signal }?)` | Acquire a dedicated pooled connection. Prefer this over `pool.connect()`: connection acquisition is the failure whose pg error text carries the DSN, and a raw handle bypasses redaction entirely. The returned client's `query` redacts too; `release` is unchanged. |
 | `pg.createClient()` | New standalone pg.Client with the same config. Throws when only `pool` was provided - pass `connectionString` alongside `pool` to enable this path. |
-| `pg.end()` | Gracefully close the pool. No-op when wrapping an externally-provided pool. |
+| `pg.end()` | Gracefully close the pool and remove the `sveltekit:shutdown` listener. An externally-provided pool stays open. |
 
 #### Schema conventions
 
@@ -4475,7 +4475,7 @@ Requires Redis 7+. There is no built-in fallback to `EVALSHA` for older servers 
 
 ## Graceful shutdown
 
-All clients listen for the `sveltekit:shutdown` event and disconnect cleanly by default. You can disable this with `autoShutdown: false` and manage the lifecycle yourself.
+All clients listen for the `sveltekit:shutdown` event and disconnect cleanly by default. You can disable this with `autoShutdown: false` and manage the lifecycle yourself. Calling `quit()` or `end()` yourself removes that listener, so clients created again on every development reload do not accumulate listeners.
 
 ```js
 // Manual shutdown
@@ -4675,7 +4675,7 @@ Each command is **one backend running one suite**. The Redis-backed plugins (`re
 
 The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; the Postgres plugins have no alternative backend to test against, so `test:integration:postgres` is simply their single command (no solo/variant split). All commands share the compose stack at [`test/integration/docker-compose.yml`](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/test/integration/docker-compose.yml) (Redis on `56379`, Postgres on `55432` - non-default host ports so they do not clash with a locally running server). Each per-backend `global-setup-*.js` runs `docker compose up -d --wait <service>` (just the one it needs) before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL`, and tears the stack down with `docker compose down -v` afterwards.
 
-The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine:
+The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine. The Redis and Postgres tiers use `INTEGRATION_COMPOSE_PROJECT` as given; the Valkey, Redis Cluster, Valkey Cluster and PgBouncer stacks append `-valkey`, `-cluster`, `-valkey-cluster` and `-pgbouncer`, so one exported value never names two compose projects:
 
 ```bash
 INTEGRATION_REDIS_HOST_PORT=56380 \

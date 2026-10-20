@@ -15,8 +15,11 @@ const composePath = path.join(__dirname, 'docker-compose.valkey-cluster.yml');
 const BASE_PORT = Number(process.env.INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE) || 57100;
 const NODE_PORTS = [BASE_PORT, BASE_PORT + 1, BASE_PORT + 2, BASE_PORT + 3, BASE_PORT + 4, BASE_PORT + 5];
 
+// Suffixed like the other stacks so one exported project name never names
+// two compose projects.
 const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
-	|| (BASE_PORT === 57100
+	? `${process.env.INTEGRATION_COMPOSE_PROJECT}-valkey-cluster`
+	: (BASE_PORT === 57100
 		? 'svelte-adapter-uws-extensions-valkey-cluster'
 		: `svelte-adapter-uws-ext-valkey-cluster-${BASE_PORT}`);
 

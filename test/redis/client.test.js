@@ -122,6 +122,16 @@ describe('createRedisClient connection errors', () => {
 	});
 });
 
+describe('createRedisClient shutdown listener', () => {
+	it('quit() removes its sveltekit:shutdown listener', async () => {
+		const before = process.listenerCount('sveltekit:shutdown');
+		const clients = Array.from({ length: 3 }, () => createRedisClient());
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before + 3);
+		await Promise.all(clients.map((client) => client.quit()));
+		expect(process.listenerCount('sveltekit:shutdown')).toBe(before);
+	});
+});
+
 describe('createRedisClient duplicate bound', () => {
 	it('reports once when the duplicate count reaches the bound', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

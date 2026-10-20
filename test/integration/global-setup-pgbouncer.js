@@ -7,7 +7,11 @@ const composePath = fileURLToPath(new URL('./docker-compose.pgbouncer.yml', impo
 const postgres = process.env.INTEGRATION_POSTGRES_HOST_PORT || '55432';
 const session = process.env.INTEGRATION_PGBOUNCER_SESSION_PORT || '55433';
 const transaction = process.env.INTEGRATION_PGBOUNCER_TRANSACTION_PORT || '55434';
-const project = process.env.INTEGRATION_COMPOSE_PROJECT || 'extensions-pgbouncer-' + postgres;
+// Suffixed like the other stacks so one exported project name never names
+// two compose projects.
+const project = process.env.INTEGRATION_COMPOSE_PROJECT
+	? process.env.INTEGRATION_COMPOSE_PROJECT + '-pgbouncer'
+	: 'extensions-pgbouncer-' + postgres;
 function compose(args) {
 	const result = spawnSync('docker', ['compose', '-p', project, '-f', composePath, ...args], { stdio: 'inherit', windowsHide: true });
 	if (result.error || result.status !== 0) throw result.error || new Error('PgBouncer compose failed: ' + args.join(' '));

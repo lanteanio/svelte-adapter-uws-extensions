@@ -9,7 +9,7 @@ const composePath = path.join(__dirname, 'docker-compose.cluster.yml');
 // when running multiple cluster stacks in parallel (worktree agents, CI
 // matrix slices, etc.):
 //   INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE=58000 \
-//   INTEGRATION_COMPOSE_PROJECT=my-slice-cluster \
+//   INTEGRATION_COMPOSE_PROJECT=my-stack \
 //   npm run test:integration:cluster
 const BASE_PORT = Number(process.env.INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE) || 57000;
 const NODE_PORTS = [
@@ -21,8 +21,11 @@ const NODE_PORTS = [
 	BASE_PORT + 5
 ];
 
+// The standalone stack reads the same variable, so this stack appends a
+// suffix: one exported project name never names two compose projects.
 const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
-	|| (BASE_PORT === 57000
+	? `${process.env.INTEGRATION_COMPOSE_PROJECT}-cluster`
+	: (BASE_PORT === 57000
 		? 'svelte-adapter-uws-extensions-cluster'
 		: `svelte-adapter-uws-ext-cluster-${BASE_PORT}`);
 
