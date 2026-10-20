@@ -43,11 +43,12 @@ const plugins = {
 	groups: (redis) => createGroup(redis, 'lobby')
 };
 
-async function start(plugin, wrap) {
+async function start(plugin, wrap, options = {}) {
 	const { createTestServer } = await import('svelte-adapter-uws/testing');
 	const subscribe = wrap ? (ws, topic, ctx) => plugin.hooks.subscribe(ws, topic, ctx) : plugin.hooks.subscribe;
 	const server = await createTestServer({
 		authorizeWireSubscribe: true,
+		...options,
 		handler: {
 			upgrade() { return { id: 'u1' }; },
 			subscribe,
@@ -76,6 +77,56 @@ describeUWS('plugin subscribe hooks keep the server-grant gate armed', () => {
 			const client = await connect(server.wsUrl);
 			client.send({ type: 'subscribe', topic: 'private-room', ref: 1 });
 			expect(await client.ack(1)).toMatchObject({ type: 'subscribed', topic: 'private-room' });
+		});
+	}
+});
+
+describeUWS('plugin channels under an armed server-grant gate', () => {
+	for (const allowSystemTopicSubscribe of [false, true]) {
+		it(`groups: a client joins through __group:<name> with the exported hook (allowSystemTopicSubscribe: ${allowSystemTopicSubscribe})`, async () => {
+			const group = createGroup(mockRedisClient('groups-own-' + allowSystemTopicSubscribe + ':'), 'lobby');
+			cleanups.push(() => group.destroy());
+			const server = await start(group, false, { allowSystemTopicSubscribe });
+			const client = await connect(server.wsUrl);
+			client.send({ type: 'subscribe', topic: '__group:lobby', ref: 1 });
+			expect(await client.ack(1)).toMatchObject({ type: 'subscribed', topic: '__group:lobby' });
+			expect(await group.count()).toBe(1);
+		});
+	}
+
+	it('groups: a full group refuses the subscribe', async () => {
+		const group = createGroup(mockRedisClient('groups-full:'), 'lobby', { maxMembers: 1 });
+		cleanups.push(() => group.destroy());
+		const server = await start(group, false);
+		const first = await connect(server.wsUrl);
+		first.send({ type: 'subscribe', topic: '__group:lobby', ref: 1 });
+		expect(await first.ack(1)).toMatchObject({ type: 'subscribed' });
+		const second = await connect(server.wsUrl);
+		second.send({ type: 'subscribe', topic: '__group:lobby', ref: 2 });
+		expect(await second.ack(2)).toMatchObject({ type: 'subscribe-denied', topic: '__group:lobby' });
+		expect(await group.count()).toBe(1);
+	});
+
+	it('groups: a __group: topic no group handles is refused', async () => {
+		const group = createGroup(mockRedisClient('groups-other:'), 'lobby');
+		cleanups.push(() => group.destroy());
+		const server = await start(group, false);
+		const client = await connect(server.wsUrl);
+		client.send({ type: 'subscribe', topic: '__group:elsewhere', ref: 1 });
+		expect(await client.ack(1)).toMatchObject({ type: 'subscribe-denied', topic: '__group:elsewhere' });
+	});
+
+	// Presence and cursor taps are not plugin-owned namespaces, as for the
+	// adapter's own presence and cursor plugins: with the gate armed the
+	// server joins a socket to them (join / attach / a granted topic).
+	for (const [name, topic] of [['presence', '__presence:room'], ['cursor', '__cursor:room']]) {
+		it(`${name}: a client subscribe to ${topic} is refused`, async () => {
+			const plugin = plugins[name](mockRedisClient(name + '-tap:'));
+			cleanups.push(() => plugin.destroy?.());
+			const server = await start(plugin, false, { allowSystemTopicSubscribe: true });
+			const client = await connect(server.wsUrl);
+			client.send({ type: 'subscribe', topic, ref: 1 });
+			expect(await client.ack(1)).toMatchObject({ type: 'subscribe-denied', topic });
 		});
 	}
 });

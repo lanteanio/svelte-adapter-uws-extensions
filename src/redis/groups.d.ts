@@ -81,7 +81,12 @@ export interface RedisGroup {
 	/**
 	 * Ready-made WebSocket hooks for zero-config group membership.
 	 *
-	 * `subscribe` auto-joins when the client subscribes to this group's internal topic.
+	 * `subscribe` auto-joins when the client subscribes to this group's internal
+	 * topic `__group:{name}`, and resolves `false` when the group is full or
+	 * closed. `__group:` is a registered plugin namespace, as for the adapter's
+	 * groups plugin: the client subscribe reaches this hook without
+	 * `allowSystemTopicSubscribe` and under an armed `authorizeWireSubscribe`
+	 * gate, and it lands only when `join()` subscribed the socket.
 	 * `unsubscribe` auto-leaves when the client unsubscribes (requires core v0.4.0+).
 	 * `close` leaves the group on disconnect.
 	 *
@@ -96,7 +101,7 @@ export interface RedisGroup {
 	 * ```
 	 */
 	hooks: {
-		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
+		subscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<false | void>;
 		unsubscribe(ws: any, topic: string, ctx: { platform: Platform }): Promise<void>;
 		close(ws: any, ctx: { platform: Platform }): Promise<void>;
 	};

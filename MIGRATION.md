@@ -980,6 +980,15 @@ a subscribe to any application topic the server did not grant. An app that
 relied on the plugin hook to let every topic through grants topics server-side
 or exports its own `subscribe` function.
 
+Groups keep working under the armed gate: `__group:` is a plugin-owned
+namespace, so a client subscribe to `__group:<name>` reaches the groups hook
+(without `allowSystemTopicSubscribe`) and lands when `join()` admitted the
+socket; a full or closed group is refused. Client subscribes to
+`__presence:<topic>` and `__cursor:<topic>` are refused while the gate is
+armed, even with `allowSystemTopicSubscribe`. Join sockets to those channels
+server-side with `presence.join` / `presence.sync` or `cursor.attach` from an
+RPC or a granted application topic.
+
 ### Replay and dead-letter erasure uses the tenant topic namespace
 
 Redis and Postgres replay buffers and dead-letter queues now restrict deletion

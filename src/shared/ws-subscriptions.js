@@ -119,3 +119,38 @@ export function removeWsSubscription(ws, topic) {
 		if (subs) subs.delete(topic);
 	} catch { /* socket already closed; nothing left to clean */ }
 }
+
+/**
+ * The adapter's registry of topic prefixes a plugin decides for itself.
+ *
+ * With `authorizeWireSubscribe` armed, the server-grant gate refuses a topic
+ * the server did not pre-authorize before any hook runs. A group is joined by
+ * the client subscribing to `__group:<name>`, and only the group's own
+ * subscribe hook authorizes that, so a marked groups hook would leave every
+ * group unjoinable under an armed gate. A registered prefix makes the gate
+ * defer to the hook for that namespace only; the adapter still refuses the
+ * subscribe when it lands unless the hook established tracked membership,
+ * and its system-topic guard admits the namespace without the broad
+ * `allowSystemTopicSubscribe` opt-out. Same globalThis slot and
+ * `Symbol.for` key the adapter reads, so the registration reaches it
+ * regardless of which module instance loaded first.
+ */
+const PLUGIN_OWNED_PREFIXES = Symbol.for('adapter-uws.plugin-owned-topic-prefixes');
+
+/**
+ * Declare that topics under `prefix` are decided by this package's own
+ * subscribe hook. Idempotent. The prefix must be `__<name>:`, the only shape
+ * the adapter accepts.
+ * @param {string} prefix
+ */
+export function registerPluginOwnedPrefix(prefix) {
+	if (typeof prefix !== 'string' || prefix.length > 64 || !/^__[A-Za-z][A-Za-z0-9_-]*:$/.test(prefix)) {
+		throw new Error('registerPluginOwnedPrefix: "' + String(prefix) + '" must match __<name>: with name [A-Za-z][A-Za-z0-9_-]*');
+	}
+	let set = /** @type {any} */ (globalThis)[PLUGIN_OWNED_PREFIXES];
+	if (!(set instanceof Set)) {
+		set = new Set();
+		Object.defineProperty(globalThis, PLUGIN_OWNED_PREFIXES, { value: set, writable: true, enumerable: true, configurable: true });
+	}
+	set.add(prefix);
+}

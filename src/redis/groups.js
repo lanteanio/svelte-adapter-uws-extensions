@@ -23,7 +23,7 @@ import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
 import { MAX_GROUPS_LOCAL_MEMBERS } from '../shared/caps.js';
-import { addWsSubscription, removeWsSubscription, markSideEffectHooks } from '../shared/ws-subscriptions.js';
+import { addWsSubscription, removeWsSubscription, markSideEffectHooks, registerPluginOwnedPrefix } from '../shared/ws-subscriptions.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { firstCommandError } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -31,6 +31,15 @@ import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
+
+// A group is joined by the client subscribing to `__group:<name>`, and only
+// this module's subscribe hook authorizes that. The hook is marked a side
+// effect so exporting it does not disarm the grant gate for other topics;
+// declaring the prefix keeps the gate from refusing the group's own channel
+// before the hook runs. The adapter's in-memory groups plugin registers the
+// same prefix. The subscribe still lands only when join() subscribed the
+// socket, so a refused, full or closed group is still refused.
+registerPluginOwnedPrefix('__group:');
 
 // Options for every frame a group publishes on its internal topic. The group's
 // own Redis channel carries each event to every other worker and instance, so
@@ -795,7 +804,7 @@ export function createGroup(client, name, options = {}) {
 		hooks: markSideEffectHooks({
 			async subscribe(ws, topic, { platform }) {
 				if (topic === internalTopic) {
-					await group.join(ws, platform);
+					return (await group.join(ws, platform)) ? undefined : false;
 				}
 			},
 			async unsubscribe(ws, topic, { platform }) {
