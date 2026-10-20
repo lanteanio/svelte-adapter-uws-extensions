@@ -24,9 +24,9 @@ export interface PressureSnapshot {
 /**
  * Cluster-aware rule shape: this class is rejected when the
  * `topic` argument's cluster-wide messagesPerSec (summed across
- * contributing instances, conservatively bounded for omitted topics) is at
- * or above `threshold`. The built-in aggregator can reject cold topics while
- * sampled instances are busy; it is not a distributed quota. Requires the
+ * contributing instances; an instance that omits the topic contributes the
+ * smaller of its sampled total and its slowest listed rate) is at or above
+ * `threshold`. It is sampled load shedding, not a distributed quota. Requires the
  * controller to be constructed with an `aggregator` (typically from
  * `redis/publish-rate`) and `shouldAccept` to be called with a
  * `{topic}` third argument.

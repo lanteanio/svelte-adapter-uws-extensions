@@ -58,7 +58,9 @@ describe('publish-rate admission beyond displayed topics', () => {
 		await remote([topicRate('known', 20)], 20000);
 		expect(accepts('known', 81)).toBe(true);
 		expect(accepts('known', 80)).toBe(false);
-		expect(accepts('unknown', 100)).toBe(false);
+		// An unlisted topic is no faster than the slowest topic each instance lists.
+		expect(accepts('unknown', 81)).toBe(true);
+		expect(accepts('unknown', 80)).toBe(false);
 	});
 
 	it('adds the whole sampled total for an instance that omits the requested topic', async () => {
@@ -110,6 +112,34 @@ describe('publish-rate admission beyond displayed topics', () => {
 		await remote([topicRate('different', 70)], 70);
 		expect(accepts('known', 100)).toBe(false);
 		expect(accepts('known', 131)).toBe(true);
+	});
+
+	it('bounds an omitted topic by the slowest listed topic, so cold topics stay admitted', async () => {
+		// One instance publishing 100 topics at 10/s each reports only its top 5.
+		const { accepts } = await setup(Array.from({ length: 5 }, (_, i) => topicRate(`cold:${i}`, 10)), 1000);
+		for (let i = 0; i < 100; i++) expect(accepts(`cold:${i}`, 100), `cold:${i}`).toBe(true);
+		expect(accepts('cold:99', 10)).toBe(false);
+	});
+
+	it('charges a listed topic only the slowest listed rate of each peer that omits it', async () => {
+		const { accepts, remote } = await setup([topicRate('hot', 50), topicRate('warm', 5)], 1000);
+		await remote([topicRate('other', 40), topicRate('slow', 3)], 2000);
+		expect(accepts('hot', 54)).toBe(true);
+		expect(accepts('hot', 53)).toBe(false);
+	});
+
+	it('falls back to the instance total when its slice is empty', async () => {
+		const { accepts, remote } = await setup([topicRate('known', 10)], 10);
+		await remote([], 40);
+		expect(accepts('known', 51)).toBe(true);
+		expect(accepts('known', 50)).toBe(false);
+	});
+
+	it('provides no finite bound for a slice that is not sorted descending', async () => {
+		const { accepts, remote } = await setup();
+		await remote([topicRate('low', 1), topicRate('high', 50)], 51);
+		expect(accepts('omitted', 1e12)).toBe(false);
+		expect(accepts('high', 51)).toBe(true);
 	});
 
 	it('does not treat malformed sampled rates as a known zero', async () => {

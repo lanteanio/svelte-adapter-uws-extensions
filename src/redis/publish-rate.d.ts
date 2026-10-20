@@ -95,7 +95,8 @@ export interface PublishRateAggregator {
 	/**
 	 * Cluster-wide messagesPerSec for a topic, or 0 if the topic is not
 	 * in the merged top-N. This display value does not prove an omitted topic
-	 * is idle. Built-in admission uses conservative per-instance total bounds.
+	 * is idle. Built-in admission bounds an omitted topic per instance by the
+	 * smaller of its sampled total and its slowest listed rate.
 	 */
 	rateOf(topic: string): number;
 

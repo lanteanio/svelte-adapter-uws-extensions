@@ -499,6 +499,26 @@ do not rely on it to accept a batched call. Small batches need no change.
 Keep the same application limits during rollback to avoid restoring divergent
 local/remote behavior.
 
+### `clusterTopPublisher` sheds topics missing from the sampled lists
+
+**Symptom.** `shouldAccept(class, platform, { topic })` on a class with a
+`clusterTopPublisher` rule returns `false` for a topic that no instance lists
+among its top publishers, where it used to return `true`; admission rejections
+rise in `admission_rejected_total{reason="CLUSTER_TOP_PUBLISHER"}`.
+
+**Why.** Each instance reports only its fastest topics. An omitted topic used
+to count as zero, so traffic spread over more topics than the sample holds was
+never shed. The built-in aggregator now charges an omitted topic, per instance,
+the smaller of that instance's sampled `publishRate` and its slowest listed
+topic's rate. A peer without a valid `publishRate` (an older release) gives no
+finite bound, so topics it omits are rejected until it is upgraded.
+
+**Action.** Upgrade every instance that shares the aggregator channel before
+relying on the rule, or expect the rule to shed omitted topics during the
+rollout. If cold topics are rejected afterwards, the listed topics are close to
+the threshold themselves: raise the threshold or spread that load. A custom
+aggregator keeps supplying its own `rateOf(topic)`.
+
 ### Conflicting metric registration fails immediately
 
 **Symptom.** Creating an instrument with an existing metric name throws an

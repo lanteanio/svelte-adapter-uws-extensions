@@ -3916,7 +3916,7 @@ Receivers merge into a per-`instanceId` map keyed on the broadcasting instance; 
 
 #### Pairing with admission control
 
-`createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` uses a separate conservative bound from the built-in aggregator. Each instance contributes its sampled topic rate when present, or its entire sampled `publishRate` when omitted. Missing or inconsistent totals have no finite bound and cause rejection. The display cap cannot turn a hot omitted topic into zero. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
+`createAdmissionControl({ aggregator, classes: { hot: { clusterTopPublisher: { threshold } } } })` uses a separate conservative bound from the built-in aggregator. Each instance contributes its sampled topic rate when present. When it omits the topic, it contributes the smaller of its sampled `publishRate` and the rate of the slowest topic it lists: the adapter lists its fastest topics in descending order, so an omitted one published no faster than that. Missing or inconsistent totals, and a list that is not in descending order, have no finite bound and cause rejection. The display cap cannot turn a hot omitted topic into zero. See [Cluster-aware shedding](#cluster-aware-shedding-clustertoppublisher-rule).
 
 #### Pairing with the sharded bus (cluster subscriber counts)
 
@@ -4168,7 +4168,7 @@ if (!ac.shouldAccept('nonCritical', platform, { topic: 'org:42:audit' })) {
 }
 ```
 
-The built-in aggregator sums sampled rates and conservative whole-instance bounds for omitted topics; it can shed cold or new topics while an instance is busy. Legacy peers without a total fail closed for topics they omit until upgraded. Bounds use only the current local sample and non-stale remote samples, so this remains sampled load shedding, not a distributed quota or a guarantee during delivery gaps. Reads use memory only; cached topic entries are limited to the bounded sample, so unknown-topic lookups cannot grow it. Custom aggregators still supply their own `rateOf(topic)` and must return conservative enforcement values. Rejected admissions surface in `admission_rejected_total{class, reason="CLUSTER_TOP_PUBLISHER"}`. See [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator) for setup.
+The built-in aggregator sums sampled rates and, for an instance that omits the topic, the smaller of that instance's total and its slowest listed rate; a cold topic is charged at most what the slowest listed topic published, so it is shed only when listed topics are near the threshold themselves. Legacy peers without a total fail closed for topics they omit until upgraded. Bounds use only the current local sample and non-stale remote samples, so this remains sampled load shedding, not a distributed quota or a guarantee during delivery gaps. Reads use memory only; cached topic entries are limited to the bounded sample, so unknown-topic lookups cannot grow it. Custom aggregators still supply their own `rateOf(topic)` and must return conservative enforcement values. Rejected admissions surface in `admission_rejected_total{class, reason="CLUSTER_TOP_PUBLISHER"}`. See [Cluster publish-rate aggregator](#cluster-publish-rate-aggregator) for setup.
 
 #### Two-tier admission (handshake + message)
 

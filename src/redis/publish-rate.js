@@ -449,14 +449,18 @@ export function createPublishRateAggregator(client, options = {}) {
 		return 0;
 	}
 
-	// A sampled topic contributes its reported rate; an omitted topic can
-	// contribute up to the instance's entire sampled publish rate. Both adapter
-	// counters cover the same logical-origin window. Missing/invalid totals
-	// (including old peers) provide no finite bound. Never infer zero from a
-	// truncated list, and never subtract large totals to derive small bounds.
+	// A sampled topic contributes its reported rate. The adapter reports the
+	// head of its per-topic rates sorted descending, so a topic it omits
+	// published no faster than the last one it lists, and no faster than the
+	// instance's whole sampled publish rate (both counters cover the same
+	// logical-origin window). An omitted topic is charged the smaller of the
+	// two. A slice that is not a valid descending list, or a missing/invalid
+	// total (including old peers), provides no finite bound. Never subtract
+	// large totals to derive small bounds.
 	function admissionSlice(slice, publishRate) {
 		const rates = new Map();
 		let sum = 0;
+		let last = Infinity;
 		let valid = Array.isArray(slice);
 		for (const entry of slice ?? []) {
 			if (!entry || typeof entry.topic !== 'string') { valid = false; continue; }
@@ -466,11 +470,13 @@ export function createPublishRateAggregator(client, options = {}) {
 				rates.set(entry.topic, Infinity);
 				continue;
 			}
+			if (rate > last) valid = false;
+			last = rate;
 			rates.set(entry.topic, rate);
 			sum += rate;
 		}
 		const omitted = valid && typeof publishRate === 'number' && Number.isFinite(publishRate) && publishRate >= 0 && publishRate >= sum
-			? publishRate : Infinity;
+			? Math.min(publishRate, last) : Infinity;
 		return { rates, omitted };
 	}
 
