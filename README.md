@@ -1141,7 +1141,7 @@ Mid-flight migration (user reconnects to a different instance between lookup and
 | `{prefix}__push:{instanceId}` | Pub/sub channel | Each instance subscribes to its own channel. Inbound messages dispatch by `envelope.type`. |
 | `{prefix}__registry-events` | Pub/sub channel | Shared across all instances. Carries `{type:'open' | 'close', userId, instanceId, attrs?}` envelopes so each instance can maintain a live secondary index for `sendTo(...)`. Skipped when no `attributes` option was supplied. |
 
-Compare-and-delete on `close`: a Lua-atomic check ensures the close hook only removes the registry entry when the stored `instanceId` still matches this instance. Prevents a stale close from clobbering a registration that already migrated to another instance via a fast laptop-then-phone reconnect.
+Compare-and-delete on `close` removes a routing row only when its stored `instanceId` still matches this instance, preserving a connection that migrated to a peer. Each heartbeat refreshes only the matching instance and transport session. If the row is absent, a still-connected local user restores its captured registration, including attributes. This restores `request`, `send` and `sendCoalesced` routing within one heartbeat after a newer owner disconnects or expires, including registries without `attributes`. An older connection does not overwrite or renew a newer owner's row. A queued refresh is discarded if its local connection closes, is replaced, or is erased before Redis dispatch.
 
 #### Options
 

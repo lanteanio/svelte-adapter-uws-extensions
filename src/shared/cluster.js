@@ -101,7 +101,9 @@ function ownerName(owners) {
  * longer wanted and with the state that `commands` reads at that moment; when
  * `admit()` is false or throws then, they are dropped without a cycle. Each
  * submit discards every older pending refresh, so nothing a newer submit left
- * out runs later.
+ * out runs later. `currentCommand` additionally checks each generated command
+ * after admission to the shared execution budget, immediately before dispatch.
+ * Skipped commands have null results and do not count toward cycle.total.
  *
  * `onError` hears the first failure of each cycle when it happens, and
  * `onSettled(commands, results)` each refresh once it answers (`results` is
@@ -117,14 +119,15 @@ function ownerName(owners) {
  *   key: (item: any) => string,
  *   commands?: ((item: any, out: Array<[string, ...any]>) => void) | null,
  *   current?: ((item: any) => boolean) | null,
+ *   currentCommand?: ((command: any[]) => boolean) | null,
  *   admit?: (() => boolean) | null,
  *   onError?: ((error: any) => void) | null,
- *   onSettled?: ((commands: Array<[string, ...any]>, results: Array<[Error | null, any]> | null) => void) | null,
+ *   onSettled?: ((commands: Array<[string, ...any]>, results: Array<[Error | null, any] | null> | null) => void) | null,
  *   onComplete?: ((cycle: { context: any, error: any, failed: number, total: number, failedCommand: any[] | null, deferred: number }) => void) | null
  * }} options
  */
 export function coalescedByOwner(redis, {
-	key, commands = null, current = null, admit = null, onError = null, onSettled = null, onComplete = null
+	key, commands = null, current = null, currentCommand = null, admit = null, onError = null, onSettled = null, onComplete = null
 }) {
 	/** @type {Map<string | null, { since: number | null, pending: { items: any[], context: any } | null }>} */
 	const owners = new Map();
@@ -150,6 +153,7 @@ export function coalescedByOwner(redis, {
 	}
 	function settled(cycle, list, results) {
 		cycle.total += list.length;
+		if (currentCommand !== null && results) for (const result of results) if (result === null) cycle.total--;
 		for (let i = 0; results && i < results.length; i++) {
 			const error = results[i] && results[i][0];
 			if (error) { cycle.failed++; fail(cycle, error, list[i]); }
@@ -165,7 +169,7 @@ export function coalescedByOwner(redis, {
 	function run(owner, state, list, cycle) {
 		cycle.open++;
 		state.since = monotonicNow();
-		execOwner(redis, owner, list)
+		execOwner(redis, owner, list, currentCommand)
 			.then(results => settled(cycle, list, results), error => rejected(cycle, list, error))
 			.finally(() => {
 				state.since = null;
@@ -294,9 +298,10 @@ export async function execMultiSlot(redis, commands) {
  * `execMultiSlot` for commands already grouped under one owner allocation
  * (null when the topology names none), without grouping them again.
  */
-function execOwner(redis, owner, commands) {
-	if (!isCluster(redis)) return execMultiSlot(redis, commands);
-	return execGroups(redis, commands, [{ group: owner === null ? ROUTED_COMMANDS : owner, indexes: null, offset: 0 }], true);
+function execOwner(redis, owner, commands, currentCommand) {
+	const clustered = isCluster(redis);
+	if (!clustered && currentCommand === null) return execMultiSlot(redis, commands);
+	return execGroups(redis, commands, [{ group: clustered && owner === null ? ROUTED_COMMANDS : owner, indexes: null, offset: 0 }], clustered, currentCommand);
 }
 
 function indexRange(start, end) {
@@ -306,11 +311,12 @@ function indexRange(start, end) {
 }
 
 // Entries without `indexes` cover every command in order.
-async function execGroups(redis, commands, entries, clustered) {
+async function execGroups(redis, commands, entries, clustered, currentCommand = null) {
 	let cursor = 0;
 	const scheduled = new Map();
 	const results = new Array(commands.length);
 	async function individual(index) {
+		if (currentCommand !== null && !currentCommand(commands[index])) { results[index] = null; return; }
 		const [method, ...args] = commands[index];
 		try { results[index] = [null, await redis[method](...args)]; }
 		catch (error) { results[index] = [error, undefined]; }
@@ -328,13 +334,23 @@ async function execGroups(redis, commands, entries, clustered) {
 			const { group, indexes, offset } = entry;
 			const size = indexes === null ? commands.length : indexes.length;
 			const end = Math.min(size, offset + (group === ROUTED_COMMANDS ? 1 : MAX_REDIS_PIPELINE_COMMANDS));
-			const batch = indexes === null ? indexRange(offset, end) : indexes.slice(offset, end);
+			let batch = indexes === null ? indexRange(offset, end) : indexes.slice(offset, end);
 			entry.offset = end;
 			if (end === size) entries.splice(cursor, 1);
 			else cursor++;
 			if (cursor >= entries.length) cursor = 0;
 			scheduled.set(group, (scheduled.get(group) || 0) + 1);
 			await withExecutionSlot(redis, async () => {
+				// Ownership may change while another plugin occupies the client budget.
+				// Validate immediately before issuing writes, including individually routed retries.
+				if (currentCommand !== null) {
+					batch = batch.filter(index => {
+						if (currentCommand(commands[index])) return true;
+						results[index] = null;
+						return false;
+					});
+					if (batch.length === 0) return;
+				}
 				if (group === ROUTED_COMMANDS) { await individual(batch[0]); return; }
 				let replies;
 				try {

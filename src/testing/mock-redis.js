@@ -1134,6 +1134,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes("redis.call('DEL', KEYS[1])") && script.includes('v == ARGV[1]')) {
 					return evalFenceRelease(args);
 				}
+				if (script.includes('REGISTRY_REFRESH')) return evalRegistryRefresh(args);
 				// Registry compare-and-delete (HGET instanceId, UNLINK iff matches)
 				if (script.includes("'hget'") && script.includes("'unlink'") && script.includes('current == ours')) {
 					return evalRegistryCompareDelete(args);
@@ -2274,6 +2275,20 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				return 1;
 			}
 			return 0;
+		}
+
+		function evalRegistryRefresh(args) {
+			const [key, owner, sessionId, ts, attrs] = args;
+			let h = hashes.get(key);
+			const current = h?.get('instanceId');
+			if (current === undefined) {
+				if (!h) { h = new Map(); hashes.set(key, h); }
+				h.set('instanceId', owner);
+				h.set('sessionId', sessionId);
+				h.set('ts', String(ts));
+				if (attrs) h.set('attrs', attrs); else h.delete('attrs');
+			} else if (current !== owner || h.get('sessionId') !== sessionId) return 0;
+			return 1;
 		}
 
 		// Registry compare-and-delete: only UNLINK if the stored

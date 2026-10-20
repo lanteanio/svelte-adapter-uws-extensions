@@ -2562,7 +2562,7 @@ describe('a command Redis refuses inside a batch is a failed command', () => {
 		}
 	});
 
-	it('connection registry heartbeat: a refused EXPIRE fails the breaker', async () => {
+	it('connection registry heartbeat: a refused refresh command fails the breaker', async () => {
 		const intervals = captureIntervals();
 		const client = mockRedisClient('fr-registry-refused:');
 		const breaker = recordingBreaker();
@@ -2573,7 +2573,7 @@ describe('a command Redis refuses inside a batch is a failed command', () => {
 			await registry.hooks.open(ws, { platform: mockPlatform() });
 			breaker.success.mockClear();
 			breaker.failure.mockClear();
-			client.redis.expire = async () => { throw readonly(); };
+			client.redis.eval = async () => { throw readonly(); };
 			for (const { cb } of intervals) cb();
 			await settle();
 			expect(breaker.failure).toHaveBeenCalledTimes(1);

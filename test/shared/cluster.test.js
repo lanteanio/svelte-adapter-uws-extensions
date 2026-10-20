@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { keySlot, isCluster, execMultiSlot } from '../../src/shared/cluster.js';
+import { keySlot, isCluster, execMultiSlot, coalescedByOwner } from '../../src/shared/cluster.js';
 import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from '../../src/shared/caps.js';
 
 describe('keySlot', () => {
@@ -223,4 +223,85 @@ it('keeps healthy owners progressing through a large stalled owner and concurren
 	expect(await execMultiSlot(redis, [['get', '{fast}:key']])).toEqual([[null, '{fast}:key']]);
 	while (!done) { waiting.splice(0).forEach(release => release()); await flush(); }
 	expect(await pending).toHaveLength(count * 2);
+});
+
+
+it.each(['standalone', 'cluster', 'unmapped'])('rechecks queued refresh commands at dispatch and excludes skipped writes from completion (%s)', async mode => {
+	const held = [];
+	const writes = [];
+	const redis = {
+		async get(key) { return new Promise(resolve => held.push(() => resolve(key))); },
+		pipeline() {
+			const commands = [];
+			return {
+				get(key) { commands.push(['get', key]); return this; },
+				set(key, value) { commands.push(['set', key, value]); return this; },
+				exec() {
+					if (commands[0][0] === 'get') return new Promise(resolve => held.push(() => resolve(commands.map(command => [null, command[1]]))));
+					writes.push(...commands);
+					return Promise.resolve(commands.map(() => [null, 'OK']));
+				}
+			};
+		},
+		async set(key, value) { writes.push(['set', key, value]); return 'OK'; }
+	};
+	if (mode !== 'standalone') {
+		redis.nodes = () => [];
+		redis.slots = [];
+		if (mode === 'cluster') {
+			for (let i = 0; i < 8; i++) redis.slots[keySlot('hold:' + i)] = ['owner:' + i];
+			for (const key of ['gone', 'kept']) redis.slots[keySlot(key)] = ['target'];
+		}
+	}
+	const busy = Array.from({ length: 8 }, (_, i) => execMultiSlot(redis, [['get', 'hold:' + i]]));
+	await flush();
+	expect(held).toHaveLength(8);
+	const current = new Set(['gone', 'kept']);
+	const complete = [];
+	const results = [];
+	const refresh = coalescedByOwner(redis, {
+		key: command => command[1],
+		currentCommand: command => current.has(command[1]),
+		onSettled: (commands, replies) => results.push(replies),
+		onComplete: cycle => complete.push(cycle)
+	});
+	refresh([['set', 'gone', 'stale'], ['set', 'kept', 'live']]);
+	current.delete('gone');
+	held.splice(0).forEach(release => release());
+	await Promise.all(busy);
+	await flush();
+	expect(writes).toEqual([['set', 'kept', 'live']]);
+	expect(complete).toMatchObject([{ total: 1, failed: 0, error: null }]);
+	expect(results.flat()).toContain(null);
+	current.clear();
+	refresh([['set', 'gone', 'stale']]);
+	await flush();
+	expect(complete.at(-1)).toMatchObject({ total: 0, failed: 0, error: null });
+	expect(writes).toHaveLength(1);
+	refresh.stop();
+});
+
+
+it('does not replay a refused command after its ownership changes before a topology retry', async () => {
+	const slots = []; slots[keySlot('user')] = ['owner'];
+	let current = true, finish;
+	const writes = [];
+	const completed = [];
+	const redis = {
+		nodes: () => [], slots,
+		async set(...args) { writes.push(args); return 'OK'; },
+		pipeline() { return { set() { return this; }, exec() { return new Promise(resolve => { finish = () => resolve([[new Error('MOVED 1 owner:6379'), null]]); }); } }; }
+	};
+	const refresh = coalescedByOwner(redis, {
+		key: command => command[1], currentCommand: () => current,
+		onComplete: cycle => completed.push(cycle)
+	});
+	refresh([['set', 'user', 'stale']]);
+	await flush();
+	current = false;
+	finish();
+	await flush();
+	expect(writes).toEqual([]);
+	expect(completed).toMatchObject([{ total: 0, failed: 0, error: null }]);
+	refresh.stop();
 });

@@ -30,7 +30,7 @@
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { EXTENSIONS_ERROR_IDS, extensionsError } from '../error-registry.js';
-import { evalCached } from '../shared/eval-cached.js';
+import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import {
 	randomBytes,
 	now as cachedNow,
@@ -69,6 +69,21 @@ if current == ours then
   return 1
 end
 return 0
+`;
+
+// Restore only an absent registration. A surviving older socket must never
+// replace a newer owner or keep that owner's abandoned row alive forever.
+const REFRESH_REGISTRATION = `
+-- REGISTRY_REFRESH
+local current = redis.call('hget', KEYS[1], 'instanceId')
+if not current then
+  redis.call('hset', KEYS[1], 'instanceId', ARGV[1], 'sessionId', ARGV[2], 'ts', ARGV[3])
+  if ARGV[4] ~= '' then redis.call('hset', KEYS[1], 'attrs', ARGV[4])
+  else redis.call('hdel', KEYS[1], 'attrs') end
+elseif current ~= ARGV[1] or redis.call('hget', KEYS[1], 'sessionId') ~= ARGV[2] then
+  return 0
+end
+return redis.call('expire', KEYS[1], ARGV[5])
 `;
 
 /**
@@ -286,6 +301,8 @@ export function createConnectionRegistry(client, options) {
 	 * @type {Map<string, string>}
 	 */
 	const localUsers = new Map();
+	// Immutable registration snapshots, also used to reject stale queued writes.
+	const localRefresh = new Map();
 
 	/**
 	 * Local app-session -> ws map (only populated when `sessionIdentify` is set).
@@ -422,6 +439,7 @@ export function createConnectionRegistry(client, options) {
 		const sessionId = localUsers.get(userId);
 		if (sessionId !== undefined) {
 			localUsers.delete(userId);
+			localRefresh.delete(userId);
 			sessionToWs.delete(sessionId);
 		}
 	}
@@ -473,6 +491,8 @@ export function createConnectionRegistry(client, options) {
 	async function setEntry(userId, sessionId, attrs) {
 		const key = userKey(userId);
 		const now = cachedNow();
+		const rawAttrs = attrs && Object.keys(attrs).length > 0 ? JSON.stringify(attrs) : '';
+		localRefresh.set(userId, [evalCachedName(redis, REFRESH_REGISTRATION), 1, key, instanceId, sessionId, now, rawAttrs, ttl]);
 		// Pipeline HSET (+ optional HDEL when attrs are absent) and EXPIRE
 		// into a single MULTI/EXEC round-trip. Pre-fix this was 2-3 awaited
 		// round-trips, which left a half-applied state observable to other
@@ -482,13 +502,13 @@ export function createConnectionRegistry(client, options) {
 		// transaction so either all three land or none of them do.
 		try {
 			const tx = redis.multi();
-			if (attrs && Object.keys(attrs).length > 0) {
+			if (rawAttrs) {
 				tx.hset(
 					key,
 					'instanceId', instanceId,
 					'sessionId', sessionId,
 					'ts', now,
-					'attrs', JSON.stringify(attrs)
+					'attrs', rawAttrs
 				);
 			} else {
 				tx.hset(key, 'instanceId', instanceId, 'sessionId', sessionId, 'ts', now);
@@ -871,13 +891,17 @@ export function createConnectionRegistry(client, options) {
 	// this instance before it runs.
 	const userKeyPrefix = client.key(keyPrefix + 'conns:');
 	const sessionKeyPrefix = client.key(keyPrefix + 'sess:');
-	function ownsKey(key) {
-		if (key.startsWith(userKeyPrefix)) return localUsers.has(key.slice(userKeyPrefix.length));
+	function refreshKey(command) { return command[0] === 'expire' ? command[1] : command[2]; }
+	function currentRefresh(command) {
+		if (destroyed) return false;
+		const key = refreshKey(command);
+		if (command[0] !== 'expire') return localRefresh.get(key.slice(userKeyPrefix.length)) === command;
 		return key.startsWith(sessionKeyPrefix) && appSessionToWs.has(key.slice(sessionKeyPrefix.length));
 	}
 	const refreshKeys = coalescedByOwner(redis, {
-		key: (command) => command[1],
-		current: (command) => ownsKey(command[1]),
+		key: refreshKey,
+		current: currentRefresh,
+		currentCommand: currentRefresh,
 		// A refresh that waited for a busy owner runs only while the breaker is
 		// healthy; a tick probes through its own admission.
 		admit: breaker ? () => breaker.isHealthy : null,
@@ -896,7 +920,7 @@ export function createConnectionRegistry(client, options) {
 		// Refresh TTL on every locally-owned entry (users + app sessions) in
 		// bounded pipelines, one refresh at a time per Redis owner.
 		const commands = [];
-		for (const userId of localUsers.keys()) commands.push(['expire', userKey(userId), ttl]);
+		for (const command of localRefresh.values()) commands.push(command);
 		for (const sessionId of appSessionToWs.keys()) commands.push(['expire', sessionKey(sessionId), ttl]);
 		refreshKeys(commands, releaseAdmission);
 	}, error => breaker?.failure(error));
@@ -1643,6 +1667,7 @@ export function createConnectionRegistry(client, options) {
 				const prevSession = localUsers.get(userId);
 				if (prevSession && prevSession !== sessionId) {
 					sessionToWs.delete(prevSession);
+					localRefresh.delete(userId);
 				}
 
 				// Per-instance state cap. Skip registration past the cap so a
@@ -1707,6 +1732,7 @@ export function createConnectionRegistry(client, options) {
 				if (sessionId && sessionToWs.get(sessionId) !== ws) return;
 				if (sessionId) {
 					localUsers.delete(userId);
+					localRefresh.delete(userId);
 					sessionToWs.delete(sessionId);
 					// Pairs with the open hook's two writes; either both maps
 					// reflect the user or neither does.
@@ -1743,6 +1769,7 @@ export function createConnectionRegistry(client, options) {
 			}
 			pending.clear();
 			localUsers.clear();
+			localRefresh.clear();
 			sessionToWs.clear();
 			appSessionToWs.clear();
 			userToInstance.clear();

@@ -6,6 +6,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
+import { isCachedCommand } from '../../src/shared/eval-cached.js';
 import { keySlot, coalescedByOwner } from '../../src/shared/cluster.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 
@@ -38,8 +39,10 @@ function ownedCluster(client, slowKeys, { stalled = new Set(['slow']), error = n
 				return pipe.exec();
 			};
 			if (typeof target[name] === 'function') return (...args) => {
-				refresh &&= REFRESH_METHODS.has(name);
-				if (typeof args[0] === 'string') keys.push(args[0]);
+				const cached = isCachedCommand(redis, name);
+				refresh &&= REFRESH_METHODS.has(name) || cached;
+				const key = args[cached ? 1 : 0];
+				if (typeof key === 'string') keys.push(key);
 				return target[name](...args);
 			};
 			return target[name];
@@ -257,8 +260,8 @@ it.each([['presence', false], ['registry', false], ['presence', true], ['registr
 		const commands = [];
 		return new Proxy(pipe, { get(target, key) {
 			if (key === 'exec') return () => {
-				if (!commands.every(command => command[0] === 'expire' || command[0] === 'hpexpire')) return pipe.exec();
-				if (commands.some(command => command[1].includes('slow'))) {
+				if (!commands.every(command => command[0] === 'expire' || command[0] === 'hpexpire' || isCachedCommand(client.redis, command[0]))) return pipe.exec();
+				if (commands.some(command => command[isCachedCommand(client.redis, command[0]) ? 2 : 1].includes('slow'))) {
 					slow++;
 					return new Promise(resolve => pending.push(async () => resolve(await pipe.exec())));
 				}
