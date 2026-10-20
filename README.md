@@ -805,7 +805,7 @@ The data is in the buffer on the master regardless of the WAIT outcome - other i
 
 #### API
 
-All methods except `cachedEpoch` are async (they hit Redis). The core plugin's `publish` / `seq` / `since` / `replay` / `clear` / `clearTopic` keep their names and arguments; `gap` and the epoch reads are additions:
+All methods except `cachedEpoch` are async (they hit Redis). The core plugin's `publish` / `seq` / `since` / `replay` / `clear` / `clearTopic` keep their names and arguments; `gap`, `purgeUser`, `resumeHook`, the epoch reads and, on the stream backend, `publishIdempotent` are additions:
 
 | Method | Description |
 |---|---|
@@ -818,6 +818,9 @@ All methods except `cachedEpoch` are async (they hit Redis). The core plugin's `
 | `cachedEpoch(topic)` | Sync read of the generation from the in-process cache |
 | `clear()` | Delete all replay data |
 | `clearTopic(topic)` | Delete replay data for one topic. Bumps the topic's epoch |
+| `purgeUser(tenantId, userId)` | Erase one user's buffered messages (needs `forgetUserId`); returns the count removed |
+| `resumeHook()` | Returns a hook for the WebSocket `resume` export; see [Session resumption](#session-resumption-resumehook) |
+| `publishIdempotent(platform, topic, event, data, options)` | Stream backend only: publish at most once per idempotency key; see above |
 
 ---
 
