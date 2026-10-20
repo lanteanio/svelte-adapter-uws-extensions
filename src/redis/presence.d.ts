@@ -41,6 +41,12 @@ export interface RedisPresenceOptions {
 	 * @default the `key` field only
 	 */
 	select?: (userData: any) => Record<string, any>;
+	/**
+	 * Background local presence consistency audit interval in ms. Set 0 to
+	 * disable the auditor entirely.
+	 * @default 5000
+	 */
+	consistencyAuditIntervalMs?: number;
 	/** Heartbeat interval in ms (refresh TTL). @default 30000 */
 	heartbeat?: number;
 	/** TTL in seconds for presence hash entries. @default 90 */

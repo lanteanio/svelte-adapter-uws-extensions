@@ -58,6 +58,7 @@ import { createDistributedSession, type DistributedSessionOptions } from 'svelte
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';
 import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
 import { createRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
+import { createPresence } from 'svelte-adapter-uws-extensions/redis/presence';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
 import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
@@ -79,6 +80,10 @@ createRateLimit(redis, { points: 3, interval: 1000, budget: 'tenant' });
 createRateLimit(redis, { points: 3, interval: 1000, budget: 'principal' });
 // @ts-expect-error A global budget is not a declared scope.
 createRateLimit(redis, { points: 3, interval: 1000, budget: 'global' });
+createPresence(redis, { consistencyAuditIntervalMs: 0 });
+createPresence(redis, { consistencyAuditIntervalMs: 5000 });
+// @ts-expect-error The consistency audit interval must be numeric.
+createPresence(redis, { consistencyAuditIntervalMs: '5000' });
 const cursor = createCursor(redis, { viewport: { enabled: true, padding: 64, cell: 128 }, backpressure: { enabled: true, maxBufferedBytes: 4096 } });
 createCursor(redis, { viewport: true, backpressure: true });
 createCursor(redis, { binary: false });
