@@ -64,6 +64,9 @@ const RECONCILE_RETRY_MAX_MS = 30000;
 // message path; no additional Redis commands or public options are needed.
 const SHARD_STATE_CHECK_MS = 1000;
 
+// How an activation step's race against deactivate() ended.
+const CANCELLED = Symbol('cancelled');
+
 /**
  * @typedef {Object} ShardedBusOptions
  * @property {string} [channelPrefix='uws:sharded:'] - Prefix for sharded pub/sub channels.
@@ -172,6 +175,12 @@ export function createShardedBus(client, options = {}) {
 	let subReady = false;
 	let shardStateTimer = null;
 	let active = false;
+	// The activation in flight, which overlapping activate() calls share, and
+	// the handle deactivate() cancels it with.
+	/** @type {Promise<void> | null} */
+	let activation = null;
+	/** @type {{ cancelled: boolean, cancel: () => void } | null} */
+	let attempt = null;
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 	// Whether activePlatform has a tracing provider, read once at activate.
@@ -213,7 +222,7 @@ export function createShardedBus(client, options = {}) {
 	/** @type {Promise<void> | null} in-flight topology refresh, shared by concurrent callers */
 	let topologyRefresh = null;
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
-	const wsFollows = new WeakMap();
+	let wsFollows = new WeakMap();
 
 
 	// Bounded FIFO tick batches: coalesce SPUBLISHes across channels
@@ -879,6 +888,8 @@ export function createShardedBus(client, options = {}) {
 		if (isCluster(client.redis)) {
 			if (subLiveness === null) subLiveness = watchLiveness('sharded-pubsub', () => subByNodeId.values(), closeConnection, { identify: (s) => subIdOf.get(s) });
 			await subRefreshTopology();
+			// A deactivate() during the refresh closed what this opened.
+			if (generation !== subGeneration) return;
 			watchShardState(generation);
 		} else {
 			subStandalone = openSubscriber(client, 'sharded-pubsub');
@@ -917,7 +928,7 @@ export function createShardedBus(client, options = {}) {
 		await withSubTimeout(conn.sunsubscribe(channel), 'sunsubscribe on slot ' + keySlot(channel)).catch(() => {});
 	}
 
-	async function subClose() {
+	function subClose() {
 		subOpen = false;
 		subGeneration++;
 		if (shardStateTimer !== null) { clearTimer(shardStateTimer); shardStateTimer = null; }
@@ -950,53 +961,117 @@ export function createShardedBus(client, options = {}) {
 		activePlatform = platform;
 		activeTracing = traceEnabled(platform);
 		if (active) return;
+		// Overlapping calls share one activation, so only one subscriber set is
+		// opened.
+		if (activation) return activation;
+		const current = startActivation();
+		activation = current;
+		const settled = () => {
+			if (activation === current) activation = null;
+		};
+		current.then(settled, settled);
+		return current;
+	}
 
-		b?.guard();
+	// One activation, which deactivate() cancels while it is in flight: the
+	// attempt settles on that signal rather than on Redis, which may not answer
+	// a closed connection's commands at all. The breaker hears one outcome for
+	// the activation: the INFO and subscriber setup's when they settled first,
+	// otherwise the admission is given back without a verdict.
+	async function startActivation() {
+		const self = { cancelled: false, cancel: () => {} };
+		const cancelled = new Promise((resolve) => {
+			self.cancel = () => {
+				self.cancelled = true;
+				resolve(CANCELLED);
+			};
+		});
+		attempt = self;
+		let release;
+		try {
+			release = guardBreaker(b);
+		} catch (err) {
+			if (attempt === self) attempt = null;
+			throw err;
+		}
+		const failed = (err, thrown = err) => {
+			b?.failure(err);
+			if (self.cancelled) throw deactivatedError();
+			attempt = null;
+			activePlatform = null;
+			activeTracing = false;
+			throw thrown;
+		};
 		let info;
 		try {
-			info = await client.redis.info('server');
+			info = await Promise.race([client.redis.info('server'), cancelled]);
 		} catch (err) {
-			b?.failure(err);
-			throw err;
+			failed(err);
+		}
+		if (info === CANCELLED) {
+			release();
+			throw deactivatedError();
 		}
 		const major = parseRedisVersion(info);
 		if (major === null) {
-			b?.failure(new Error('could not parse Redis version'));
-			throw new Error('sharded bus: could not parse Redis version from INFO server');
+			failed(new Error('could not parse Redis version'), new Error('sharded bus: could not parse Redis version from INFO server'));
 		}
 		if (major < 7) {
-			b?.failure(new Error(`Redis ${major} too old`));
-			throw new Error(`sharded bus: requires Redis 7 or newer (server reports ${major}). Use createPubSubBus for older servers.`);
+			failed(new Error(`Redis ${major} too old`), new Error(`sharded bus: requires Redis 7 or newer (server reports ${major}). Use createPubSubBus for older servers.`));
 		}
-		b?.success();
+		if (self.cancelled) {
+			b?.success();
+			throw deactivatedError();
+		}
 
+		let ensured;
 		try {
-			await subEnsure();
+			ensured = await Promise.race([subEnsure(), cancelled]);
 		} catch (err) {
 			// On a cluster subEnsure opens a subscriber per master before it reads
 			// the slot map, so a CLUSTER SLOTS failure leaves those connections
 			// open. deactivate() does nothing for a bus that never became active,
 			// so close them here.
-			b?.failure(err);
-			activePlatform = null;
-			activeTracing = false;
-			await subClose();
-			throw err;
+			if (!self.cancelled) subClose();
+			failed(err);
 		}
+		if (self.cancelled) {
+			// deactivate() closed what subEnsure opened.
+			if (ensured === CANCELLED) release();
+			else b?.success();
+			throw deactivatedError();
+		}
+		attempt = null;
 		active = true;
+		activation = null;
+		b?.success();
+	}
+
+	function deactivatedError() {
+		return new Error('sharded bus: deactivated during activation');
 	}
 
 	async function deactivate() {
 		relayQueue.clear();
-		if (!active) return;
+		const pending = attempt;
+		attempt = null;
+		activation = null;
+		if (pending) pending.cancel();
+		if (!active && !pending) return;
 		active = false;
 		activePlatform = null;
+		activeTracing = false;
 		subscribedChannels.clear();
-		await subClose();
+		// All of it before anything is awaited: an activate() meanwhile starts
+		// from a clean slate.
+		subClose();
 		followCounts.clear();
 		channelRefcounts.clear();
 		pendingChannels.clear();
 		pendingTopics.clear();
+		// A connection from before this deactivate() must not unfollow a topic
+		// that a connection after the next activate() follows.
+		wsFollows = new WeakMap();
 	}
 
 	// Reserve the shared promise before starting I/O, so every caller waits for

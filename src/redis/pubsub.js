@@ -27,12 +27,17 @@ import {
 } from '../shared/trace-context.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { openSubscriber } from '../shared/redis-subscriber.js';
+import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 
 // The degraded / recovered frames report this worker's own breaker, so they go
 // to this worker's subscribers only, and they make no monotonic promise.
 const SYSTEM_FRAME = Object.freeze({ relay: false, seq: false });
+
+// How an activation's SUBSCRIBE race ended.
+const SUBSCRIBED = Symbol('subscribed');
+const CANCELLED = Symbol('cancelled');
 
 // The retry of a failed activation backs off between these.
 const ACTIVATE_RETRY_MIN_MS = 1000;
@@ -169,9 +174,12 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {boolean} */
 	let active = false;
 
-	// The activation in flight, which overlapping activate() calls share.
+	// The activation in flight, which overlapping activate() calls share, and
+	// the handle deactivate() cancels it with.
 	/** @type {Promise<void> | null} */
 	let activation = null;
+	/** @type {{ cancelled: boolean, cancel: () => void } | null} */
+	let attempt = null;
 
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
@@ -572,12 +580,6 @@ export function createPubSubBus(client, options = {}) {
 				mEchoSuppressed?.inc();
 				return;
 			}
-			// A message can still arrive on the subscriber socket during the
-			// deactivate window (activePlatform is nulled before the UNSUBSCRIBE
-			// round-trip resolves). Drop it cleanly rather than dereferencing a
-			// null platform in a branch below (which the outer catch would
-			// swallow as a spurious parse error). Mirrors the sharded handler.
-			if (!activePlatform) return;
 			// Local delivery runs no application code, so a carried trace
 			// context only matters to a tracing provider: with one, delivery is
 			// a consumer operation parented on the producer's context; without
@@ -593,43 +595,89 @@ export function createPubSubBus(client, options = {}) {
 
 	// One activation: subscribe a fresh subscriber connection. A failure is
 	// reported once per failure streak and retried until deactivate().
+	// deactivate() cancels one in flight: it closes the connection at once,
+	// and the attempt settles on that signal, since a SUBSCRIBE that waits in
+	// the offline queue of a connection closed between two reconnect attempts
+	// never settles. The breaker hears exactly one outcome for each admission:
+	// the SUBSCRIBE's when it settled first, otherwise the admission is given
+	// back without a verdict.
 	async function startActivation() {
+		const self = { cancelled: false, cancel: () => {} };
+		const cancelled = new Promise((resolve) => {
+			self.cancel = () => {
+				self.cancelled = true;
+				resolve(CANCELLED);
+			};
+		});
+		attempt = self;
+		let release;
 		try {
 			if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
 				unsubscribeBreaker = b.subscribe(breakerChanged);
 			}
-			b?.guard();
+			release = guardBreaker(b);
 		} catch (err) {
+			if (attempt === self) attempt = null;
 			activationFailed(err);
 			throw err;
 		}
 
-		const sub = openSubscriber(client, 'pubsub');
+		let sub;
+		try {
+			sub = openSubscriber(client, 'pubsub');
+		} catch (err) {
+			// Nothing reached Redis, so the admission goes back without a verdict.
+			release();
+			if (attempt === self) attempt = null;
+			activationFailed(err);
+			throw err;
+		}
 		subscriber = sub;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => receive(sub, ch, message));
 
+		let outcome;
 		try {
-			await sub.subscribe(channel);
+			outcome = await Promise.race([sub.subscribe(channel).then(() => SUBSCRIBED), cancelled]);
 		} catch (err) {
-			// quit() is the likely one to reject here, since Redis is what just
-			// failed, and its handler runs after the slot is cleared, so it uses
-			// this connection rather than reading the slot.
-			if (subscriber === sub) subscriber = null;
-			sub.quit().catch(() => sub.disconnect());
-			activation = null;
 			b?.failure(err);
+			if (self.cancelled) throw deactivatedError();
+			attempt = null;
+			activation = null;
+			if (subscriber === sub) subscriber = null;
+			closeConnection(sub);
 			activationFailed(err);
 			throw err;
 		}
+		if (self.cancelled) {
+			if (outcome === SUBSCRIBED) b?.success();
+			else release();
+			throw deactivatedError();
+		}
 		// Settle the shared state before the breaker runs its listeners,
 		// which may call activate() or deactivate() synchronously.
+		attempt = null;
 		active = true;
 		activation = null;
 		activateFailing = false;
 		stopRetry();
 		retryMs = 0;
 		b?.success();
+	}
+
+	function deactivatedError() {
+		return new Error('pubsub bus: deactivated during activation');
+	}
+
+	// Start an activation that overlapping activate() calls share.
+	function beginActivation() {
+		const current = startActivation();
+		activation = current;
+		const settled = () => {
+			if (activation === current) activation = null;
+		};
+		current.then(settled, settled);
+		return current;
 	}
 
 	function activationFailed(err) {
@@ -654,11 +702,8 @@ export function createPubSubBus(client, options = {}) {
 		retryTimer = setTimer(() => {
 			retryTimer = null;
 			if (!wanted || active || activation || !activePlatform) return;
-			const current = startActivation();
-			activation = current;
-			current.then(() => {}, () => {}).finally(() => {
-				if (activation === current) activation = null;
-			});
+			// Reported and rescheduled by the activation itself.
+			beginActivation().catch(() => {});
 		}, delayMs);
 		if (retryTimer.unref) retryTimer.unref();
 	}
@@ -994,31 +1039,33 @@ export function createPubSubBus(client, options = {}) {
 			// Connections that open together share one activation. A second
 			// subscriber would deliver every remote message again.
 			if (activation) return activation;
-			const current = startActivation();
-			activation = current;
-			try {
-				await current;
-			} finally {
-				if (activation === current) activation = null;
-			}
+			return beginActivation();
 		},
 
 		async deactivate() {
 			wanted = false;
 			stopRetry();
+			retryMs = 0;
 			activateFailing = false;
 			if (unsubscribeBreaker) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;
 			}
 			relayQueue.clear();
-			if (!active || !subscriber) return;
+			// An activation in flight settles as cancelled, and a later activate()
+			// starts its own.
+			const pending = attempt;
+			attempt = null;
+			activation = null;
+			if (pending) pending.cancel();
 			active = false;
 			activePlatform = null;
 			const sub = subscriber;
 			subscriber = null;
-			await sub.unsubscribe(channel).catch(() => {});
-			await sub.quit().catch(() => sub.disconnect());
+			// Closed at once rather than with UNSUBSCRIBE and QUIT: those wait in
+			// the offline queue while Redis is unreachable, and closing the
+			// connection ends its subscriptions anyway.
+			if (sub) closeConnection(sub);
 		},
 
 		hooks: {

@@ -2626,25 +2626,22 @@ describe('teardown survives a refused quit', () => {
 		}
 	});
 
-	it('pub/sub bus: a deactivate still closing leaves the connection of a newer activation alone', async () => {
+	it('pub/sub bus: a deactivate leaves the connection of a newer activation alone', async () => {
 		const { client, duplicates } = recordingClient('fr-pubsub-race:');
 		const bus = createPubSubBus(client);
 		const platform = mockPlatform();
 		await bus.activate(platform);
 		const first = duplicates[0];
-		let release;
-		first.unsubscribe = () => new Promise((resolve) => { release = resolve; });
-		first.quit = vi.fn(async () => {});
+		first.disconnect = vi.fn();
 		const stopping = bus.deactivate();
 		await bus.activate(platform);
 		const second = duplicates[1];
-		second.quit = vi.fn(async () => {});
-		release();
+		second.disconnect = vi.fn();
 		await stopping;
-		expect(first.quit).toHaveBeenCalledTimes(1);
-		expect(second.quit).not.toHaveBeenCalled();
+		expect(first.disconnect).toHaveBeenCalledTimes(1);
+		expect(second.disconnect).not.toHaveBeenCalled();
 		await bus.deactivate();
-		expect(second.quit).toHaveBeenCalledTimes(1);
+		expect(second.disconnect).toHaveBeenCalledTimes(1);
 	});
 
 	it('cursor: dispose closes its connection when quit is refused', async () => {

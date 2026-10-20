@@ -1657,7 +1657,7 @@ describe('redis pubsub concurrent activation', () => {
 		const duplicate = client.duplicate.bind(client);
 		client.duplicate = (overrides) => {
 			const sub = duplicate(overrides);
-			sub.quit = vi.fn(() => Promise.resolve());
+			sub.disconnect = vi.fn();
 			subscribers.push(sub);
 			return sub;
 		};
@@ -1674,7 +1674,7 @@ describe('redis pubsub concurrent activation', () => {
 			await bus.activate(platform);
 			await deactivating;
 			expect(subscribers).toHaveLength(1);
-			expect(subscribers[0].quit).toHaveBeenCalledTimes(1);
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
 			await client.redis.publish('uws:pubsub', remote);
 			expect(platform.published.filter((p) => p.topic === 'chat')).toEqual([]);
 		} finally {
@@ -1683,21 +1683,16 @@ describe('redis pubsub concurrent activation', () => {
 		}
 	});
 
-	it('delivers once when activated while a deactivation is still closing', async () => {
+	it('delivers once when activated again while the closed subscriber still receives', async () => {
 		const client = mockRedisClient();
 		const platform = mockPlatform();
 		const subscribers = [];
 		const duplicate = client.duplicate.bind(client);
-		let releaseUnsubscribe;
 		client.duplicate = (overrides) => {
 			const sub = duplicate(overrides);
-			if (subscribers.length === 0) {
-				const unsubscribe = sub.unsubscribe.bind(sub);
-				sub.unsubscribe = (...args) => new Promise((resolve) => {
-					releaseUnsubscribe = () => unsubscribe(...args).then(resolve);
-				});
-				sub.quit = vi.fn(() => Promise.resolve());
-			}
+			// The mock connection keeps receiving after it is closed, as a real
+			// one can for messages already read off its socket.
+			sub.disconnect = vi.fn();
 			subscribers.push(sub);
 			return sub;
 		};
@@ -1706,17 +1701,139 @@ describe('redis pubsub concurrent activation', () => {
 			await bus.activate(platform);
 			const closing = bus.deactivate();
 			await bus.activate(platform);
-			// The old subscriber is still subscribed until its UNSUBSCRIBE completes.
 			await client.redis.publish('uws:pubsub', remote);
 			expect(platform.published).toHaveLength(1);
-			releaseUnsubscribe();
 			await closing;
 			expect(subscribers).toHaveLength(2);
-			expect(subscribers[0].quit).toHaveBeenCalledTimes(1);
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
 			await client.redis.publish('uws:pubsub', remote);
 			expect(platform.published).toHaveLength(2);
 		} finally {
 			await bus.deactivate();
 		}
+	});
+});
+
+describe('redis pubsub lifecycle', () => {
+	const remote = JSON.stringify({ instanceId: 'other-instance', topic: 'chat', event: 'msg', data: { text: 'remote' } });
+	const within = (promise, ms = 50) => Promise.race([
+		promise.then(() => 'resolved', (err) => 'rejected: ' + err.message),
+		new Promise((resolve) => setTimeout(() => resolve('pending'), ms))
+	]);
+
+	// Subscriber connections whose SUBSCRIBE settles only when the test says
+	// so, or never, as one waiting in the offline queue of a connection
+	// closed between two reconnect attempts.
+	function heldClient() {
+		const client = mockRedisClient();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			const subscribe = sub.subscribe.bind(sub);
+			sub.subscribe = (...channels) => new Promise((resolve, reject) => {
+				sub.settle = (err) => (err ? reject(err) : subscribe(...channels).then(resolve));
+			});
+			sub.disconnect = vi.fn();
+			subscribers.push(sub);
+			return sub;
+		};
+		return { client, subscribers };
+	}
+
+	it('stays inactive when deactivate() runs while an activation is in flight', async () => {
+		const { client, subscribers } = heldClient();
+		const platform = mockPlatform();
+		const bus = createPubSubBus(client);
+		const activating = bus.activate(platform);
+		await bus.deactivate();
+		subscribers[0].settle();
+		await expect(activating).rejects.toThrow('deactivated during activation');
+		expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
+		await client.redis.publish('uws:pubsub', remote);
+		expect(platform.published).toEqual([]);
+	});
+
+	it('settles an activation whose SUBSCRIBE never settles when deactivate() runs', async () => {
+		const { client } = heldClient();
+		const bus = createPubSubBus(client);
+		const activating = bus.activate(mockPlatform());
+		await bus.deactivate();
+		expect(await within(activating)).toBe('rejected: pubsub bus: deactivated during activation');
+	});
+
+	it('gives a cancelled activation\'s breaker probe back, so the breaker is not left probing with no probe', async () => {
+		const { client } = heldClient();
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		try {
+			breaker.failure(new Error('down'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(breaker.state).toBe('probing');
+			const bus = createPubSubBus(client, { breaker });
+			const activating = bus.activate(mockPlatform());
+			await bus.deactivate();
+			await within(activating);
+			expect(breaker.state).toBe('probing');
+			expect(() => breaker.guard()).not.toThrow();
+		} finally {
+			breaker.destroy();
+		}
+	});
+
+	it('gives the probe back when opening the subscriber connection throws', async () => {
+		const client = mockRedisClient();
+		client.duplicate = () => { throw new Error('duplicate failed'); };
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		try {
+			breaker.failure(new Error('down'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const bus = createPubSubBus(client, { breaker });
+			vi.spyOn(console, 'error').mockImplementation(() => {});
+			await expect(bus.activate(mockPlatform())).rejects.toThrow('duplicate failed');
+			await bus.deactivate();
+			expect(breaker.state).toBe('probing');
+			expect(() => breaker.guard()).not.toThrow();
+		} finally {
+			vi.restoreAllMocks();
+			breaker.destroy();
+		}
+	});
+
+	it('keeps announcing breaker changes after an activation that deactivate() cancelled', async () => {
+		const { client, subscribers } = heldClient();
+		const platform = mockPlatform();
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const bus = createPubSubBus(client, { breaker });
+		try {
+			const first = bus.activate(platform);
+			await bus.deactivate();
+			const second = bus.activate(platform);
+			for (const sub of subscribers) sub.settle();
+			await within(first);
+			await second;
+			breaker.failure(new Error('down'));
+			expect(platform.published.filter((p) => p.event === 'degraded')).toHaveLength(1);
+		} finally {
+			await bus.deactivate();
+			breaker.destroy();
+		}
+	});
+
+	it('resolves deactivate() without waiting for Redis', async () => {
+		const client = mockRedisClient();
+		const duplicate = client.duplicate.bind(client);
+		let sub;
+		client.duplicate = (overrides) => {
+			sub = duplicate(overrides);
+			sub.disconnect = vi.fn();
+			return sub;
+		};
+		const bus = createPubSubBus(client);
+		await bus.activate(mockPlatform());
+		// Redis unreachable: commands wait in the offline queue.
+		sub.unsubscribe = () => new Promise(() => {});
+		sub.quit = () => new Promise(() => {});
+		expect(await within(bus.deactivate())).toBe('resolved');
+		expect(sub.disconnect).toHaveBeenCalledTimes(1);
 	});
 });

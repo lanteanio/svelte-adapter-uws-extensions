@@ -95,7 +95,11 @@ export interface PubSubBus {
 	 */
 	activate(platform: Platform): Promise<void>;
 
-	/** Stop the Redis subscriber and clean up. */
+	/**
+	 * Stop the Redis subscriber and clean up. Closes its connection at once,
+	 * without waiting for Redis, and an activation still in flight rejects
+	 * instead of activating the bus.
+	 */
 	deactivate(): Promise<void>;
 
 	/**

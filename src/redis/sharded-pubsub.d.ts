@@ -83,11 +83,16 @@ export interface ShardedBus {
 
 	/**
 	 * Open the subscriber connection. Runs `INFO server` and throws
-	 * if the Redis version is older than 7. Idempotent.
+	 * if the Redis version is older than 7. Idempotent; overlapping calls
+	 * share one activation.
 	 */
 	activate(platform: Platform): Promise<void>;
 
-	/** Close the subscriber and release tracked state. */
+	/**
+	 * Close the subscriber and release tracked state, including the topics
+	 * `bus.hooks` tracked for each connection. An activation still in flight
+	 * rejects instead of activating the bus.
+	 */
 	deactivate(): Promise<void>;
 
 	/**
