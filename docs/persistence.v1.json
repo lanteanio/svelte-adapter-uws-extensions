@@ -629,10 +629,15 @@
 				{
 					"id": "scale",
 					"type": "string",
+					"template": "v1:ratelimit-control:emergency"
+				},
+				{
+					"id": "scale-legacy",
+					"type": "string",
 					"template": "v1:ratelimit:emergency"
 				}
 			],
-			"notes": "Restore only the intended current operator policy. This exact key takes precedence over the rate-window pattern."
+			"notes": "Restore only the intended current operator policy. The legacy key is a string written by an earlier version; a hash at that key is an ordinary rate-window bucket."
 		},
 		{
 			"id": "webhook-controls",

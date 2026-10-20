@@ -238,7 +238,7 @@ identity generations and committed-identity fence that every join writes
 (excluded from roster reads); the idempotency and session erasure indexes under
 `<keyPrefix>byuser:` (`idem:byuser:v2...` and `sess:byuser:...` with the default
 prefixes) when erasure is wired; `lock-fences:<key>` for fenced locks; and
-`v1:ratelimit:emergency` for the emergency scale.
+`v1:ratelimit-control:emergency` for the emergency scale.
 
 **Action.** Grant the families your deployment uses. Key patterns sit under the
 client `keyPrefix`; where a factory has its own `keyPrefix` option, its default
@@ -256,7 +256,7 @@ is shown and a custom value replaces it:
 | Connection registry | `conns:*`, `sess:*` (factory `keyPrefix` defaults to empty) |
 | Locks, leader, task fences | `lock:*`, `lock-fences:*`, `leader`, `fence:*` |
 | Cluster clock, topic broadcast | `clock:leader-offset`, `{topic-broadcast}:instances` |
-| Rate limits | `v1:ratelimit:*`, `v1:ratelimits:*`, `v1:ratelimitg:*`, `v1:ratelimitc:*`, `v1:upgrade-bucket:*` |
+| Rate limits | `v1:ratelimit:*`, `v1:ratelimit-control:*`, `v1:ratelimits:*`, `v1:ratelimitg:*`, `v1:ratelimitc:*`, `v1:upgrade-bucket:*` |
 | Webhook controls | `whbudget:*`, `whbreaker:*` |
 
 Channels need their own `&` patterns. The bus `channel` (`uws:pubsub`), the
@@ -327,6 +327,21 @@ and the rule fails closed.
 **Action.** Enable `clusterTopPublisher` only after the whole fleet runs 0.6,
 or accept the shedding for the length of the rollout. A stopped 0.5 instance's
 slice stops counting after `staleAfter`.
+### The rate-limit emergency factor moved to its own key
+
+**Symptom.** A Redis ACL that permits only `v1:ratelimit:*` refuses
+`emergency.set()`, and a backup that lists only the old key misses the factor.
+
+**Why.** The fleet-wide factor moved from `v1:ratelimit:emergency`, inside the
+fixed-window bucket keyspace, to `v1:ratelimit-control:emergency`, so a bucket
+named `emergency` and a limiter `clear()` can no longer reach it. A factor
+stored at the old key keeps applying while no new factor is set. Until the whole
+fleet is upgraded, an instance on an earlier version reads only the old key and
+does not see a factor set by an upgraded instance.
+
+**Action.** Permit `v1:ratelimit-control:*` under the client prefix in Redis ACL
+key patterns and backup scope before upgrading, and set incident factors from an
+upgraded instance once the rollout completes.
 
 ### Ordered alarm generations
 

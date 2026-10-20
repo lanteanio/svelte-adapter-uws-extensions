@@ -178,11 +178,12 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 					if (seen.size >= config.maxKeys) fail('key_limit_reached');
 					seen.add(key);
 					let matches = patterns.filter(item => item.regex.test(key));
-					// The exact operator policy key intentionally shares the rate-window prefix.
-					if (key === config.keyPrefix + 'v1:ratelimit:emergency') matches = matches.filter(item => item.spec.id !== 'rate-window');
+					// A legacy operator policy key shares the rate-window prefix; its type decides.
+					const legacyScale = key === config.keyPrefix + 'v1:ratelimit:emergency';
 					if (!matches.length) continue;
 					const type = await read('type', key);
 					if (type === 'none') { result.complete = false; result.reason = 'keys_changed'; continue; }
+					if (legacyScale) matches = matches.filter(item => type === 'string' ? item.spec.id !== 'rate-window' : item.spec.id !== 'emergency-scale');
 					const shared = sessionPatterns.filter(item => item.regex.test(key));
 					if (shared.some(item => item.spec.id === 'sessions' && item.role.id === 'session')
 						&& shared.some(item => item.spec.id === 'registry' && item.role.id === 'session-routing')

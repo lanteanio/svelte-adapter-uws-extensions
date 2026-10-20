@@ -158,6 +158,15 @@ it('does not mistake the reserved emergency policy for a rate-window hash', asyn
 	expect(report.ok).toBe(true);
 	expect(report.redis.matchedKeys).toBe(0);
 });
+it('classifies the emergency policy keys by name and type', async () => {
+	const keys = { 'v1:ratelimit-control:emergency': 'string', 'v1:ratelimit:emergency': 'hash' };
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['rate-window', 'emergency-scale'] } }, {
+		redis: { scan: async () => ['0', Object.keys(keys)], type: async key => keys[key], pttl: async () => -1 }
+	});
+	expect(report.redis.matchedKeys).toBe(2);
+	expect(report.redis.observations['rate-window']).toMatchObject({ keys: 1, wrongTypes: 0 });
+	expect(report.redis.observations['emergency-scale']).toMatchObject({ keys: 1, wrongTypes: 0 });
+});
 it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], cluster: 'true' } })).toThrow();
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();

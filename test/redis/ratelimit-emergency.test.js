@@ -36,19 +36,24 @@ describe('ratelimit emergency scale', () => {
 	});
 
 	describe('operator surface', () => {
-		it('reserves the unscoped window bucket name across bucket operations', async () => {
+		it('treats a bucket named emergency as an ordinary bucket', async () => {
 			const limiter = createRateLimit(client, { points: 10, interval: 60000, keyBy: () => 'emergency' });
-			await limiter.emergency.set(0.25);
-			await expect(limiter.consume(mockWs())).rejects.toThrow(/reserved/);
-			await expect(limiter.peek(mockWs())).rejects.toThrow(/reserved/);
-			for (const method of ['reset', 'ban', 'unban']) await expect(limiter[method]('emergency')).rejects.toThrow(/reserved/);
-			await expect(limiter.reset({ toString: () => 'emergency' })).rejects.toThrow(/reserved/);
-			expect(await limiter.emergency.get()).toBe(0.25);
+			await limiter.emergency.set(0.5);
+			await warmScale(limiter);
+			const consumed = await limiter.consume(mockWs());
+			expect(consumed.allowed).toBe(true);
+			expect(consumed.remaining).toBeLessThan(5); // scaled to 5 points
+			expect((await limiter.peek(mockWs())).remaining).toBe(consumed.remaining - 1);
+			await limiter.ban('emergency', 1000);
+			await limiter.unban('emergency');
+			await limiter.reset('emergency');
+			expect(await limiter.purgeUser(null, 'emergency')).toBe(0);
+			expect(await limiter.emergency.get()).toBe(0.5);
 		});
 
-		it('preserves the existing emergency scale through global and tenant clears', async () => {
+		it('keeps the factor through global and tenant clears', async () => {
 			const limiter = createRateLimit(client, { points: 10, interval: 60000, keyBy: () => 'emergency', tenant: () => 'tenant' });
-			await client.redis.set(client.key('v1:ratelimit:emergency'), '0.25');
+			await limiter.emergency.set(0.25);
 			await limiter.consume(mockWs());
 			await limiter.clear('tenant');
 			expect(await limiter.emergency.get()).toBe(0.25);
@@ -57,6 +62,23 @@ describe('ratelimit emergency scale', () => {
 			await limiter.emergency.clear();
 			expect(await limiter.emergency.get()).toBe(1);
 		});
+
+		it('honors a factor stored at the earlier key until set or clear replaces it', async () => {
+			const legacy = client.key('v1:ratelimit:emergency');
+			const limiter = createRateLimit(client, { points: 10, interval: 60000 });
+			await client.redis.set(legacy, '0.2');
+			expect(await limiter.emergency.get()).toBe(0.2);
+			await warmScale(limiter);
+			const ws = mockWs({ ip: '4.4.4.4' });
+			expect((await limiter.consume(ws)).remaining).toBe(1);
+			await limiter.emergency.set(0.5, { ttlMs: 50 });
+			expect(await client.redis.get(legacy)).toBeNull();
+			await client.redis.set(legacy, '0.2');
+			await limiter.emergency.clear();
+			expect(await client.redis.get(legacy)).toBeNull();
+			expect(await limiter.emergency.get()).toBe(1);
+		});
+
 		it('set/get/clear round-trips the shared key', async () => {
 			const emergency = createRateLimitEmergency(client);
 			expect(await emergency.get()).toBe(1);

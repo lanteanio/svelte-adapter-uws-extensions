@@ -29,9 +29,15 @@
 
 import { wallEpoch } from '../shared/runtime.js';
 
-// Shares the limiter script-version namespace: a future layout change moves
-// with the buckets it scales.
-const EMERGENCY_KEY = 'v1:ratelimit:emergency';
+// A namespace no limiter bucket key can produce: bucket keys live under
+// `v1:ratelimit:`, `v1:ratelimits:`, `v1:ratelimitg:` and `v1:ratelimitc:`, so
+// neither a bucket named `emergency` nor a limiter clear() can reach it.
+const EMERGENCY_KEY = 'v1:ratelimit-control:emergency';
+// Earlier versions stored the factor inside the fixed-window bucket keyspace.
+// A string there is a factor written by such a version and is still honored
+// while the current key is absent; a hash there is an ordinary bucket named
+// `emergency` (GET on it fails with WRONGTYPE) and is ignored.
+const LEGACY_EMERGENCY_KEY = 'v1:ratelimit:emergency';
 
 // The factor is clamped into a sane band on read AND write so a corrupt or
 // hostile value can neither zero out all traffic (0) nor disable limiting
@@ -58,6 +64,29 @@ export function _parseScale(raw) {
 }
 
 /**
+ * The factor an earlier version stored, or null when there is none. A bucket
+ * hash at the same key is not a factor: its WRONGTYPE reply reads as null.
+ * @param {import('ioredis').Redis} redis
+ * @param {string} legacyKey
+ * @returns {Promise<string | null>}
+ */
+async function readLegacy(redis, legacyKey) {
+	try { return await redis.get(legacyKey); } catch (error) {
+		if (/WRONGTYPE/.test(String(error?.message))) return null;
+		throw error;
+	}
+}
+
+/**
+ * Remove a factor an earlier version stored, leaving a bucket at that key alone.
+ * @param {import('ioredis').Redis} redis
+ * @param {string} legacyKey
+ */
+async function clearLegacy(redis, legacyKey) {
+	if (await readLegacy(redis, legacyKey) !== null) await redis.del(legacyKey);
+}
+
+/**
  * Lazily-refreshed reader for the shared factor. `current()` is synchronous
  * and never blocks a check: it returns the cached factor and, at most once
  * per refresh window, fires a background GET to refresh it. The first call
@@ -74,6 +103,7 @@ export function createEmergencyScaleReader(client, opts) {
 		throw new Error('redis ratelimit: emergency refreshMs must be a positive number');
 	}
 	const key = client.key(EMERGENCY_KEY);
+	const legacyKey = client.key(LEGACY_EMERGENCY_KEY);
 	const redis = client.redis;
 	let scale = 1;
 	let lastFetch = 0;
@@ -87,7 +117,7 @@ export function createEmergencyScaleReader(client, opts) {
 				lastFetch = now;
 				Promise.resolve()
 					.then(() => redis.get(key))
-					.then((raw) => { scale = _parseScale(raw); })
+					.then(async (raw) => { scale = _parseScale(raw ?? await readLegacy(redis, legacyKey)); })
 					.catch(() => { /* fail sticky: keep the last-known factor */ })
 					.then(() => { inflight = false; });
 			}
@@ -110,6 +140,7 @@ export function createEmergencyScaleReader(client, opts) {
  */
 export function createEmergencyScaleOps(client) {
 	const key = client.key(EMERGENCY_KEY);
+	const legacyKey = client.key(LEGACY_EMERGENCY_KEY);
 	const redis = client.redis;
 	return {
 		/**
@@ -131,12 +162,15 @@ export function createEmergencyScaleOps(client) {
 			} else {
 				await redis.set(key, String(scale));
 			}
+			// A factor from an earlier version would resurface once this one expires.
+			await clearLegacy(redis, legacyKey);
 		},
 		async clear() {
 			await redis.del(key);
+			await clearLegacy(redis, legacyKey);
 		},
 		async get() {
-			return _parseScale(await redis.get(key));
+			return _parseScale((await redis.get(key)) ?? await readLegacy(redis, legacyKey));
 		}
 	};
 }

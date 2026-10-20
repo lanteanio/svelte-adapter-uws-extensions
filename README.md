@@ -1400,7 +1400,7 @@ await limiter.emergency.clear();             // back to neutral
 await limiter.emergency.get();               // currently stored factor (1 = neutral)
 ```
 
-The unscoped fixed-window bucket name `emergency` is reserved for this control value. Bucket operations reject that name; tenant-scoped buckets can still use it. Limiter `clear()` preserves the emergency factor; clear it explicitly with `emergency.clear()`. Existing emergency keys keep their value and TTL during upgrades.
+The factor lives at `v1:ratelimit-control:emergency` under the client prefix, outside every limiter's bucket keyspace, so any bucket name (including `emergency`) is an ordinary bucket and limiter `clear()` never touches the factor; clear it explicitly with `emergency.clear()`. A factor stored by an earlier version at `v1:ratelimit:emergency` keeps applying while no current factor is set, until it expires or `emergency.set()`/`emergency.clear()` replaces it.
 
 ```js
 // Ops script without a limiter instance: same shared key.

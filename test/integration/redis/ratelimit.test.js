@@ -400,4 +400,30 @@ return {1, 0, 0}
 			expect((await lim.consume(ws)).allowed).toBe(false); // and only one
 		});
 	});
+
+	describe('emergency factor key', () => {
+		it('keeps a bucket named emergency apart from the factor', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60000, keyBy: () => 'emergency' });
+			expect((await lim.consume(fakeWs())).remaining).toBe(4);
+			// The bucket hash sits at the key earlier versions used for the factor.
+			expect(await client.redis.type(client.key('v1:ratelimit:emergency'))).toBe('hash');
+			expect(await lim.emergency.get()).toBe(1);
+			await lim.emergency.set(0.5);
+			await lim.emergency.clear();
+			expect(await client.redis.type(client.key('v1:ratelimit:emergency'))).toBe('hash');
+			await lim.emergency.set(0.5);
+			await lim.clear();
+			expect(await lim.emergency.get()).toBe(0.5);
+			expect(await client.redis.exists(client.key('v1:ratelimit:emergency'))).toBe(0);
+		});
+
+		it('honors and then retires a factor stored at the earlier key', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60000 });
+			await client.redis.set(client.key('v1:ratelimit:emergency'), '0.2');
+			expect(await lim.emergency.get()).toBe(0.2);
+			await lim.emergency.clear();
+			expect(await client.redis.exists(client.key('v1:ratelimit:emergency'))).toBe(0);
+			expect(await lim.emergency.get()).toBe(1);
+		});
+	});
 });
