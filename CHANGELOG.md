@@ -33,9 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Redis pub/sub and sharded bus wrappers forward `platform.authorizeDelivery` when the adapter provides it, bound to the original platform, so handlers that receive the wrapped platform can install recipient delivery checks. On an adapter without it the member stays `undefined`, so capability checks keep working.
 - Redis cursor `maxTopicLength` option (default 256, a positive integer, as the in-memory plugin's): `update()` drops a longer topic name.
 
+### Changed
+
+- The Redis presence heartbeat timer starts on the tracker's first `join` or `sync`, as the in-memory plugin's does, instead of at construction; a tracker that is never used runs no timer.
+
 ### Fixed
 
 - The Redis connection registry keeps a user reachable on an instance that still holds the user's socket when another instance, the most recent open, closes that user. The close removed the user from every instance's `sendTo` index and deleted the `conns:` row; the instance with the live socket now indexes the user locally at once and restores the row immediately instead of on the next heartbeat. A restore that writes the row, from that close or from a heartbeat, publishes an open so peers route `sendTo` to that instance again; a row a newer owner wrote meanwhile is left alone.
+- A Redis connection registry whose first subscriber SUBSCRIBE fails now closes that connection and subscribes again on the next call that needs it. It kept the unsubscribed connection and never retried, so the instance received no routed requests, sends or index events until restart.
 - Redis `cursor.attach()` validates the topic before authorizing it and throws a `TypeError` for a name `update()` would reject, an over-long one, or a `__`-prefixed one; it subscribed the socket to the tap channel for such a name when the platform did not validate it. Cursor and presence `hooks.subscribe` refuse such a name on their `__cursor:` / `__presence:` channel with `'INVALID_TOPIC'` before consulting the platform.
 
 - `docs/postgres-support.md` has a PostgreSQL operations profile: a per-worker connection budget formula covering pools, notification sessions, standalone sessions, rolling-deploy surge, migrations and reserved slots (with the PgBouncer equivalents); WAL archiving and point-in-time recovery for the store tables and migration ledger; single-writer-endpoint failover behavior and the data-loss boundary of asynchronous replication; and the split between the stores' retention passes and the operator's autovacuum ownership.

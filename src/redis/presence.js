@@ -399,8 +399,15 @@ export function createPresence(client, options = {}) {
 			});
 		}
 	}, error => b?.failure(error));
-	const heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
-	if (heartbeatTimer.unref) heartbeatTimer.unref();
+	// Started on the first join or sync, as the in-memory plugin does, so a
+	// tracker constructed at module load and never used runs no timer.
+	let heartbeatTimer = null;
+	let destroyed = false;
+	function startHeartbeat() {
+		if (heartbeatTimer !== null || destroyed) return;
+		heartbeatTimer = setIntervalTimer(heartbeatTick, heartbeatInterval);
+		if (heartbeatTimer.unref) heartbeatTimer.unref();
+	}
 
 	// Cross-instance subscriber: receives peers' join/leave/update events on the
 	// per-topic channels, routes them into the diff buffer, and forwards topic-key
@@ -872,6 +879,7 @@ export function createPresence(client, options = {}) {
 		// Before the breaker guard, which would otherwise spend a probe.
 		if (typeof topic !== 'string' || topic.startsWith('__')) return;
 		if (!isFramableTopic(topic)) return;
+		startHeartbeat();
 		// Authorize against the REAL topic before granting tap-channel
 		// membership (mirrors in-memory presence sync + the cursor snapshot):
 		// the presence-snapshot message is otherwise an un-authorized path to
@@ -962,6 +970,7 @@ export function createPresence(client, options = {}) {
 			if (typeof topic !== 'string') throw new TypeError('Topic must be a string');
 			if (!isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, or control characters');
 			if (topic.startsWith('__')) return;
+			startHeartbeat();
 
 			let connTopics = wsTopics.get(ws);
 			if (connTopics && connTopics.has(topic)) return;
@@ -1564,8 +1573,12 @@ export function createPresence(client, options = {}) {
 			stopDashboard();
 			stopOnlineMetric?.();
 			refreshTopics.stop();
+			destroyed = true;
 			heartbeatTick.stop();
-			clearIntervalTimer(heartbeatTimer);
+			if (heartbeatTimer !== null) {
+				clearIntervalTimer(heartbeatTimer);
+				heartbeatTimer = null;
+			}
 			if (consistencyAuditor) consistencyAuditor.stop();
 			subscriberCtx.dispose();
 			disposeDiffBuffer();

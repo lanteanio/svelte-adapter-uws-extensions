@@ -522,6 +522,8 @@ export function createConnectionRegistry(client, options) {
 
 	let activePlatform = null;
 	let subscriber = null;
+	/** @type {Promise<void> | null} the SUBSCRIBE of the current subscriber */
+	let subscriberReady = null;
 	let heartbeatTimer = null;
 	let destroyed = false;
 
@@ -711,14 +713,22 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	async function ensureSubscriber(platform) {
+	/**
+	 * Open the subscriber once and resolve when its SUBSCRIBE landed. Callers
+	 * that arrive while it is in flight wait on the same attempt. A refused
+	 * or failed SUBSCRIBE tears the connection down and clears the slot, so
+	 * the next caller opens a fresh one instead of finding a subscriber that
+	 * never subscribed and returning early for the life of the process.
+	 */
+	function ensureSubscriber(platform) {
 		activePlatform = platform || activePlatform;
-		if (subscriber) return;
-		subscriber = openSubscriber(client, 'registry');
-		subscriber.on('error', (err) => {
+		if (subscriberReady) return subscriberReady;
+		const sub = openSubscriber(client, 'registry');
+		subscriber = sub;
+		sub.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REGISTRY_SUBSCRIBER, { error: err });
 		});
-		subscriber.on('message', (ch, raw) => {
+		sub.on('message', (ch, raw) => {
 			if (ch === ownPushChannel) {
 				if (!busValidator.acceptRaw(raw)) return;
 				let envelope;
@@ -733,8 +743,23 @@ export function createConnectionRegistry(client, options) {
 				handleRegistryEvent(envelope);
 			}
 		});
-		await subscriber.subscribe(ownPushChannel, eventsChannel);
+		const ready = sub.subscribe(ownPushChannel, eventsChannel).then(() => {
+			// destroy() ran while the SUBSCRIBE was in flight.
+			if (subscriber !== sub) return;
+			afterSubscribed();
+		}, (err) => {
+			if (subscriber === sub) {
+				subscriber = null;
+				subscriberReady = null;
+			}
+			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
+			throw err;
+		});
+		subscriberReady = ready;
+		return ready;
+	}
 
+	function afterSubscribed() {
 		// Bootstrap the secondary index from existing entries. Subscribe
 		// first (so we don't miss live events fired during the SCAN), then
 		// SCAN; live events that race with the SCAN are idempotent under
@@ -1826,6 +1851,7 @@ export function createConnectionRegistry(client, options) {
 			remoteIndex.clear();
 			indexChecks.clear();
 			bootstrapped = false;
+			subscriberReady = null;
 			if (subscriber) {
 				const sub = subscriber;
 				subscriber = null;

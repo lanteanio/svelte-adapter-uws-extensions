@@ -1877,4 +1877,42 @@ describe('redis connection registry', () => {
 			}
 		});
 	});
+	describe('subscriber: a failed first SUBSCRIBE', () => {
+		it('tears the connection down and lets a later open subscribe again', async () => {
+			const realDuplicate = client.redis.duplicate.bind(client.redis);
+			let failNext = true;
+			const opened = [];
+			client.redis.duplicate = (overrides) => {
+				const dup = realDuplicate(overrides);
+				opened.push(dup);
+				if (failNext) {
+					failNext = false;
+					dup.subscribe = async () => { throw new Error('NOPERM this user has no permissions to access one of the channels'); };
+				}
+				return dup;
+			};
+			try {
+				const first = wsWithSession({ userId: 'u-a' }, 's-a');
+				await expect(registry.hooks.open(first, { platform })).rejects.toThrow('NOPERM');
+				expect(opened).toHaveLength(1);
+
+				const second = wsWithSession({ userId: 'u-b' }, 's-b');
+				await registry.hooks.open(second, { platform });
+				expect(opened).toHaveLength(2);
+
+				// The second subscriber is live: a request routed to this
+				// instance over its push channel reaches the local socket.
+				const remote = createConnectionRegistry(client, { identify: (ws) => ws.getUserData()?.userId, heartbeat: 60000, ttl: 90 });
+				try {
+					await remote.send('u-b', 'room', 'hello', 1);
+					await new Promise((r) => setTimeout(r, 20));
+					expect(platform.sent.filter((f) => f.ws === second && f.event === 'hello')).toHaveLength(1);
+				} finally {
+					await remote.destroy();
+				}
+			} finally {
+				client.redis.duplicate = realDuplicate;
+			}
+		});
+	});
 });
