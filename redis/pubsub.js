@@ -122,6 +122,9 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {boolean} */
 	let active = false;
 
+	/** @type {Promise<void> | null} */
+	let activation = null;
+
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 
@@ -296,105 +299,124 @@ export function createPubSubBus(client, options = {}) {
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
 			if (active) return;
-			b?.guard();
+			// Connections that open together share one activation. A second
+			// subscriber would deliver every remote message again.
+			if (activation) return activation;
+			const current = (async () => {
+				b?.guard();
 
-			if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
-				unsubscribeBreaker = b.subscribe((from, to) => {
-					if (from === 'healthy' && to !== 'healthy') {
-						if (onDegraded) {
-							try { onDegraded(); } catch { /* don't propagate user errors */ }
+				if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
+					unsubscribeBreaker = b.subscribe((from, to) => {
+						if (from === 'healthy' && to !== 'healthy') {
+							if (onDegraded) {
+								try { onDegraded(); } catch { /* don't propagate user errors */ }
+							}
+							if (systemChannel && activePlatform) {
+								activePlatform.publish(systemChannel, 'degraded', { at: Date.now() });
+								mDegraded?.inc();
+							}
+						} else if (from !== 'healthy' && to === 'healthy') {
+							if (onRecovered) {
+								try { onRecovered(); } catch { /* don't propagate user errors */ }
+							}
+							if (systemChannel && activePlatform) {
+								activePlatform.publish(systemChannel, 'recovered', { at: Date.now() });
+								mRecovered?.inc();
+							}
 						}
-						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'degraded', { at: Date.now() });
-							mDegraded?.inc();
-						}
-					} else if (from !== 'healthy' && to === 'healthy') {
-						if (onRecovered) {
-							try { onRecovered(); } catch { /* don't propagate user errors */ }
-						}
-						if (systemChannel && activePlatform) {
-							activePlatform.publish(systemChannel, 'recovered', { at: Date.now() });
-							mRecovered?.inc();
-						}
-					}
-				});
-			}
-
-			subscriber = client.duplicate({ enableReadyCheck: false });
-
-			subscriber.on('message', (ch, message) => {
-				if (ch !== channel) return;
-				// Pre-parse size guard. A bus subscriber that JSON.parses an
-				// arbitrarily large attacker payload pays parsing CPU + V8
-				// heap before any further validation can fire.
-				if (!validator.acceptRaw(message)) {
-					mParseErrors?.inc();
-					return;
+					});
 				}
-				try {
-					const parsed = JSON.parse(message);
-					assert(
-						typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string',
-						'pubsub.envelope.shape',
-						{ ch }
-					);
-					// Skip messages from this instance (echo suppression).
-					// One check per envelope; batched envelopes carry one
-					// instanceId for the whole batch.
-					if (parsed.instanceId === instanceId) {
-						mEchoSuppressed?.inc();
+
+				const sub = client.duplicate({ enableReadyCheck: false });
+				subscriber = sub;
+
+				sub.on('message', (ch, message) => {
+					// A replaced subscriber can still receive until it closes.
+					if (subscriber !== sub || ch !== channel) return;
+					// Pre-parse size guard. A bus subscriber that JSON.parses an
+					// arbitrarily large attacker payload pays parsing CPU + V8
+					// heap before any further validation can fire.
+					if (!validator.acceptRaw(message)) {
+						mParseErrors?.inc();
 						return;
 					}
-					// relay: false prevents the adapter from IPC-relaying to
-					// sibling workers, since each worker has its own Redis
-					// subscriber already receiving this envelope.
-					if (Array.isArray(parsed.batch)) {
-						const local = [];
-						for (let i = 0; i < parsed.batch.length; i++) {
-							const m = parsed.batch[i];
-							if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
-								mParseErrors?.inc();
-								continue;
-							}
-							local.push({
-								topic: m.topic,
-								event: m.event,
-								data: m.data,
-								options: { relay: false }
-							});
-						}
-						if (local.length === 0) return;
-						mReceived?.inc(local.length);
-						activePlatform.publishBatched(local);
-					} else {
-						if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
-							mParseErrors?.inc();
+					try {
+						const parsed = JSON.parse(message);
+						assert(
+							typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string',
+							'pubsub.envelope.shape',
+							{ ch }
+						);
+						// Skip messages from this instance (echo suppression).
+						// One check per envelope; batched envelopes carry one
+						// instanceId for the whole batch.
+						if (parsed.instanceId === instanceId) {
+							mEchoSuppressed?.inc();
 							return;
 						}
-						mReceived?.inc();
-						activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+						// relay: false prevents the adapter from IPC-relaying to
+						// sibling workers, since each worker has its own Redis
+						// subscriber already receiving this envelope.
+						if (Array.isArray(parsed.batch)) {
+							const local = [];
+							for (let i = 0; i < parsed.batch.length; i++) {
+								const m = parsed.batch[i];
+								if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+									mParseErrors?.inc();
+									continue;
+								}
+								local.push({
+									topic: m.topic,
+									event: m.event,
+									data: m.data,
+									options: { relay: false }
+								});
+							}
+							if (local.length === 0) return;
+							mReceived?.inc(local.length);
+							activePlatform.publishBatched(local);
+						} else {
+							if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+								mParseErrors?.inc();
+								return;
+							}
+							mReceived?.inc();
+							activePlatform.publish(parsed.topic, parsed.event, parsed.data, { relay: false });
+						}
+					} catch {
+						// Malformed envelope; counted so a stream of bad messages
+						// is observable instead of silently swallowed.
+						mParseErrors?.inc();
 					}
-				} catch {
-					// Malformed envelope; counted so a stream of bad messages
-					// is observable instead of silently swallowed.
-					mParseErrors?.inc();
-				}
-			});
+				});
 
-			try {
-				await subscriber.subscribe(channel);
-				b?.success();
-				active = true;
-			} catch (err) {
-				b?.failure(err);
-				activePlatform = null;
-				subscriber.quit().catch(() => subscriber.disconnect());
-				subscriber = null;
-				if (unsubscribeBreaker) {
-					unsubscribeBreaker();
-					unsubscribeBreaker = null;
+				try {
+					await sub.subscribe(channel);
+				} catch (err) {
+					b?.failure(err);
+					activePlatform = null;
+					// The rejection handler runs after the field is cleared, so it
+					// uses this connection rather than reading the field.
+					if (subscriber === sub) subscriber = null;
+					sub.quit().catch(() => sub.disconnect());
+					if (unsubscribeBreaker) {
+						unsubscribeBreaker();
+						unsubscribeBreaker = null;
+					}
+					activation = null;
+					throw err;
 				}
-				throw err;
+				// Settle the shared state before the breaker runs its listeners,
+				// which may call activate() or deactivate() synchronously.
+				active = true;
+				activation = null;
+				b?.success();
+			})();
+			activation = current;
+			try {
+				await current;
+			} finally {
+				if (activation === current) activation = null;
 			}
 		},
 
@@ -411,9 +433,12 @@ export function createPubSubBus(client, options = {}) {
 			if (!active || !subscriber) return;
 			active = false;
 			activePlatform = null;
-			await subscriber.unsubscribe(channel).catch(() => {});
-			await subscriber.quit().catch(() => subscriber.disconnect());
+			// Take the subscriber out before awaiting, so an activate() meanwhile
+			// starts its own and this one is the connection that gets closed.
+			const sub = subscriber;
 			subscriber = null;
+			await sub.unsubscribe(channel).catch(() => {});
+			await sub.quit().catch(() => sub.disconnect());
 		},
 
 		hooks: {

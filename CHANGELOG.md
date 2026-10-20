@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed construction-time migration of the PostgreSQL task runner or idempotency store no longer surfaces as an unhandled rejection. `ready()` still rejects with the original error, and its documentation now states that it stays rejected while later operations on the table retry the migration.
 - Contain throwing or rejected system channel subscriptions in the pub/sub open hook while continuing bus activation. A bus with a circuit breaker reports the failure once without exposing the underlying error.
 - Releasing a presence, cursor or pub/sub subscriber whose `quit()` rejects, for example because its Redis client was already quit, no longer raises an unhandled rejection. The subscriber is disconnected instead.
+- Connections that open while the pub/sub bus is still activating share its subscriber. Before, each created its own, so remote messages could reach local subscribers more than once and the extra Redis connections stayed open. Overlapping activations all reject with the subscribe error when it fails. An `activate()` while `deactivate()` is still closing the previous subscriber keeps its new subscriber; before, the pending `deactivate()` closed it and the bus stopped receiving remote messages. The closing subscriber no longer forwards messages either, and a `deactivate()` that a breaker listener runs while an activation succeeds now takes effect.
 
 ## [0.5.10] - 2026-05-24
 

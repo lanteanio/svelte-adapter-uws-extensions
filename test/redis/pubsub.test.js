@@ -1109,3 +1109,161 @@ describe('redis pubsub bus', () => {
 		});
 	});
 });
+
+describe('redis pubsub activation failure', () => {
+	it('disconnects a subscriber whose quit rejects without an unhandled rejection', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			sub.subscribe = () => Promise.reject(new Error('subscribe refused'));
+			sub.quit = () => Promise.reject(new Error('Connection is closed.'));
+			sub.disconnect = vi.fn();
+			subscribers.push(sub);
+			return sub;
+		};
+		const failing = createPubSubBus(client);
+		const escaped = [];
+		const onUnhandled = (reason) => { escaped.push(reason); };
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			await expect(failing.activate(platform)).rejects.toThrow('subscribe refused');
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(subscribers).toHaveLength(1);
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
+			expect(escaped).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+			await failing.deactivate();
+		}
+	});
+});
+
+describe('redis pubsub concurrent activation', () => {
+	const remote = JSON.stringify({ instanceId: 'other-instance', topic: 'chat', event: 'msg', data: { text: 'remote' } });
+
+	it('shares one subscriber between activations that overlap', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		let duplicates = 0;
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			duplicates++;
+			return duplicate(overrides);
+		};
+		const shared = createPubSubBus(client);
+		try {
+			await Promise.all([shared.activate(platform), shared.activate(platform), shared.activate(platform)]);
+			expect(duplicates).toBe(1);
+			await client.redis.publish('uws:pubsub', remote);
+			expect(platform.published).toHaveLength(1);
+		} finally {
+			await shared.deactivate();
+		}
+	});
+
+	it('rejects every overlapping activation with the subscribe error and releases the connection', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			sub.subscribe = () => Promise.reject(new Error('subscribe refused'));
+			sub.quit = () => Promise.reject(new Error('Connection is closed.'));
+			sub.disconnect = vi.fn();
+			subscribers.push(sub);
+			return sub;
+		};
+		// One failed SUBSCRIBE counts once, however many connections waited on it.
+		const breaker = createCircuitBreaker({ failureThreshold: 2 });
+		const failing = createPubSubBus(client, { breaker });
+		const escaped = [];
+		const onUnhandled = (reason) => { escaped.push(reason); };
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			const results = await Promise.allSettled([failing.activate(platform), failing.activate(platform)]);
+			expect(results.map((result) => result.reason?.message)).toEqual(['subscribe refused', 'subscribe refused']);
+			expect(breaker.state).toBe('healthy');
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(subscribers).toHaveLength(1);
+			expect(subscribers[0].disconnect).toHaveBeenCalledTimes(1);
+			expect(escaped).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+			breaker.destroy();
+		}
+	});
+
+	it('honours a deactivate() that a breaker listener runs while the activation succeeds', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			sub.quit = vi.fn(() => Promise.resolve());
+			subscribers.push(sub);
+			return sub;
+		};
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
+		const bus = createPubSubBus(client, { breaker });
+		let deactivating;
+		const unsubscribe = breaker.subscribe((from, to) => {
+			if (to === 'healthy') deactivating = bus.deactivate();
+		});
+		try {
+			breaker.failure(new Error('down'));
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(breaker.state).toBe('probing');
+			await bus.activate(platform);
+			await deactivating;
+			expect(subscribers).toHaveLength(1);
+			expect(subscribers[0].quit).toHaveBeenCalledTimes(1);
+			await client.redis.publish('uws:pubsub', remote);
+			expect(platform.published.filter((p) => p.topic === 'chat')).toEqual([]);
+		} finally {
+			unsubscribe();
+			breaker.destroy();
+		}
+	});
+
+	it('delivers once when activated while a deactivation is still closing', async () => {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		const subscribers = [];
+		const duplicate = client.duplicate.bind(client);
+		let releaseUnsubscribe;
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			if (subscribers.length === 0) {
+				const unsubscribe = sub.unsubscribe.bind(sub);
+				sub.unsubscribe = (...args) => new Promise((resolve) => {
+					releaseUnsubscribe = () => unsubscribe(...args).then(resolve);
+				});
+				sub.quit = vi.fn(() => Promise.resolve());
+			}
+			subscribers.push(sub);
+			return sub;
+		};
+		const bus = createPubSubBus(client);
+		try {
+			await bus.activate(platform);
+			const closing = bus.deactivate();
+			await bus.activate(platform);
+			// The old subscriber is still subscribed until its UNSUBSCRIBE completes.
+			await client.redis.publish('uws:pubsub', remote);
+			expect(platform.published).toHaveLength(1);
+			releaseUnsubscribe();
+			await closing;
+			expect(subscribers).toHaveLength(2);
+			expect(subscribers[0].quit).toHaveBeenCalledTimes(1);
+			await client.redis.publish('uws:pubsub', remote);
+			expect(platform.published).toHaveLength(2);
+		} finally {
+			await bus.deactivate();
+		}
+	});
+});
