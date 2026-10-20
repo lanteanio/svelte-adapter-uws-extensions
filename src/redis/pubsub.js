@@ -25,7 +25,7 @@ import {
 	carriedTraceContext,
 	liveTraceContext,
 	runTraceOperation,
-	withTraceContext,
+	bindTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -199,6 +199,7 @@ export function createPubSubBus(client, options = {}) {
 	let activePlatform = null;
 	// Whether activePlatform has a tracing provider, read once at activate.
 	let activeTracing = false;
+	let clearIncomingContext = null;
 
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
@@ -397,7 +398,7 @@ export function createPubSubBus(client, options = {}) {
 		const parent = carriedTraceContext(parsed);
 		// Clear the subscriber's inherited context, including async descendants
 		// of delivery, when no remote parent was carried.
-		if (parent === null) return withTraceContext(activePlatform, null, () => deliverEnvelope(parsed));
+		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed));
 		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed));
 	}
@@ -685,7 +686,11 @@ export function createPubSubBus(client, options = {}) {
 
 	// Start an activation that overlapping activate() calls share.
 	function beginActivation() {
-		const current = startActivation();
+		// Socket callbacks inherit this boundary, so normal carrier-less delivery
+		// can reuse the cleared context instead of replacing an activation parent.
+		const current = activeTracing
+			? clearIncomingContext(startActivation)
+			: startActivation();
 		activation = current;
 		const settled = () => {
 			if (activation === current) activation = null;
@@ -1049,6 +1054,7 @@ export function createPubSubBus(client, options = {}) {
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);
+			clearIncomingContext = activeTracing ? bindTraceContext(platform, null) : null;
 			wanted = true;
 			if (active) return;
 			// Connections that open together share one activation. A second
@@ -1077,6 +1083,8 @@ export function createPubSubBus(client, options = {}) {
 			if (pending) pending.cancel();
 			active = false;
 			activePlatform = null;
+			activeTracing = false;
+			clearIncomingContext = null;
 			const sub = subscriber;
 			subscriber = null;
 			// Closed at once rather than with UNSUBSCRIBE and QUIT: those wait in

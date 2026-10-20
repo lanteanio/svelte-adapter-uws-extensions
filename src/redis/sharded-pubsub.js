@@ -42,7 +42,7 @@ import {
 	carriedTraceContext,
 	liveTraceContext,
 	runTraceOperation,
-	withTraceContext,
+	bindTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
@@ -202,6 +202,7 @@ export function createShardedBus(client, options = {}) {
 	let activePlatform = null;
 	// Whether activePlatform has a tracing provider, read once at activate.
 	let activeTracing = false;
+	let clearIncomingContext = null;
 
 	/** @type {Map<string, number>} topic -> follow refcount */
 	const followCounts = new Map();
@@ -401,7 +402,7 @@ export function createShardedBus(client, options = {}) {
 		const parent = carriedTraceContext(parsed);
 		// Clear the subscriber's inherited context, including async descendants
 		// of delivery, when no remote parent was carried.
-		if (parent === null) return withTraceContext(activePlatform, null, () => deliverEnvelope(parsed, receivedShard));
+		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed, receivedShard));
 		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
 			() => deliverEnvelope(parsed, receivedShard));
 	}
@@ -978,11 +979,16 @@ export function createShardedBus(client, options = {}) {
 		startDashboard();
 		activePlatform = platform;
 		activeTracing = traceEnabled(platform);
+		clearIncomingContext = activeTracing ? bindTraceContext(platform, null) : null;
 		if (active) return;
 		// Overlapping calls share one activation, so only one subscriber set is
 		// opened.
 		if (activation) return activation;
-		const current = startActivation();
+		// Socket callbacks inherit this boundary, so normal carrier-less delivery
+		// can reuse the cleared context instead of replacing an activation parent.
+		const current = activeTracing
+			? clearIncomingContext(startActivation)
+			: startActivation();
 		activation = current;
 		const settled = () => {
 			if (activation === current) activation = null;
@@ -1018,6 +1024,7 @@ export function createShardedBus(client, options = {}) {
 			attempt = null;
 			activePlatform = null;
 			activeTracing = false;
+			clearIncomingContext = null;
 			throw thrown;
 		};
 		let info;
@@ -1081,6 +1088,7 @@ export function createShardedBus(client, options = {}) {
 		active = false;
 		activePlatform = null;
 		activeTracing = false;
+		clearIncomingContext = null;
 		subscribedChannels.clear();
 		// All of it before anything is awaited: an activate() meanwhile starts
 		// from a clean slate.

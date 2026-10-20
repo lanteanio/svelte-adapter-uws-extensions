@@ -210,3 +210,16 @@ export function withTraceContext(platform, context, fn) {
 	if (typeof withContext === 'function') return withContext.call(trace, context, fn);
 	return fn();
 }
+
+/** Reuse a fixed context boundary while an adapter Platform is active. */
+export function bindTraceContext(platform, context) {
+	let trace;
+	let withContext;
+	try {
+		trace = platform?.trace;
+		withContext = trace?.withContext;
+	} catch {
+		// Trace integration is observational.
+	}
+	return typeof withContext === 'function' ? withContext.bind(trace, context) : (fn) => fn();
+}

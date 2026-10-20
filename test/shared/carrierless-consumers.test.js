@@ -49,9 +49,11 @@ function observeDelivery(platform) {
 	return { observed, descendants };
 }
 
-function captureSubscriberContext(client) {
+function captureSubscriberContext(client, platform) {
+	const opened = [];
 	const duplicate = client.redis.duplicate.bind(client.redis);
 	client.redis.duplicate = (...args) => {
+		opened.push([trace.current(), platform.traceContext]);
 		const sub = duplicate(...args);
 		const on = sub.on.bind(sub);
 		sub.on = (event, fn) => {
@@ -60,6 +62,7 @@ function captureSubscriberContext(client) {
 		};
 		return sub;
 	};
+	return opened;
 }
 
 for (const sharded of [false, true]) {
@@ -69,11 +72,12 @@ for (const sharded of [false, true]) {
 				const { platform, spans } = recordingPlatform();
 				const { observed, descendants } = observeDelivery(platform);
 				const client = mockRedisClient();
-				captureSubscriberContext(client);
+				const opened = captureSubscriberContext(client, platform);
 				const bus = (sharded ? createShardedBus : createPubSubBus)(client);
 				await trace.withContext(activation, () => bus.activate(platform));
 				if (sharded) await bus.follow('chat');
 				try {
+					expect(opened).toEqual([[null, null]]);
 					const body = { topic: 'chat', event: 'message', data: 1 };
 					const envelope = { instanceId: 'peer', traceparent, ...(batched ? { batch: [body] } : body) };
 					if (sharded) await client.redis.spublish('uws:sharded:chat', JSON.stringify(envelope));
@@ -90,6 +94,31 @@ for (const sharded of [false, true]) {
 			});
 		});
 	}
+}
+
+for (const sharded of [false, true]) {
+	it.each(['ambient', 'connection fallback'])(`clears a later %s outside ${sharded ? 'sharded' : 'pubsub'} socket startup`, async (origin) => {
+		const { platform, spans } = recordingPlatform();
+		const { observed, descendants } = observeDelivery(platform);
+		const client = mockRedisClient();
+		const bus = (sharded ? createShardedBus : createPubSubBus)(client);
+		await trace.withContext(activation, () => bus.activate(platform));
+		if (sharded) await bus.follow('chat');
+		try {
+			const message = JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'message', data: 1 });
+			const emit = () => sharded
+				? client.redis.spublish('uws:sharded:chat', message)
+				: client.redis.publish('uws:pubsub', message);
+			// This emitter deliberately does not preserve the socket's startup
+			// context: a later callback still has to clear its actual parent.
+			if (origin === 'ambient') await trace.withContext(producer, emit);
+			else await emit();
+			expect(platform.published).toHaveLength(1);
+			expect(observed).toEqual([[null, null]]);
+			expect(await Promise.all(descendants)).toEqual([[null, null]]);
+			expect(spans.filter((span) => span.name === 'nested.publish')).toEqual([{ name: 'nested.publish', parent: null }]);
+		} finally { await bus.deactivate(); }
+	});
 }
 
 function notificationClient() {
