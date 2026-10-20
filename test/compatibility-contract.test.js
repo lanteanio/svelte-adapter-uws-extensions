@@ -1,16 +1,18 @@
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { installedCompatibility, parseCompatibility, renderBlocks, renderMigrationBlocks, replaceBlocks, validateCompatibility } from '../scripts/check-compatibility.js';
+import { NODE_FLOOR_STATEMENTS, installedCompatibility, nodeFloor, parseCompatibility, renderBlocks, renderMigrationBlocks, replaceBlocks, replaceNodeFloor, validateCompatibility } from '../scripts/check-compatibility.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 const migration = readFileSync(new URL('../MIGRATION.md', import.meta.url), 'utf8');
 const { adapter, rows } = installedCompatibility();
 const currentIndex = rows.findIndex(row => row.current === 'true');
+const floorFiles = [...new Set(NODE_FLOOR_STATEMENTS.map(statement => statement.file))];
+const readRepo = name => readFileSync(new URL('../' + name, import.meta.url), 'utf8');
 const change = edit => { const next = structuredClone(rows); edit(next[currentIndex], next); return next; };
 
 describe('installed adapter compatibility declaration', () => {
@@ -58,6 +60,32 @@ describe('installed adapter compatibility declaration', () => {
 		for (const release of [false, true]) expect(() => validateCompatibility(rows, wrongNode, adapter, { release })).toThrow('Node engine');
 	});
 
+	it('states the manifest Node floor in every prose and workflow line that names it', () => {
+		const floor = nodeFloor(rows[currentIndex].node);
+		expect(floor).toEqual({ major: '22', minimum: '22.0.0' });
+		for (const name of floorFiles) expect(replaceNodeFloor(name, readRepo(name), floor)).toBe(readRepo(name));
+		// A manifest floor bump rewrites every statement, including the
+		// minimum-profile CI job and the scheduled crawler's runtime.
+		const bumped = nodeFloor('>=24.0.0');
+		const statements = [];
+		for (const name of floorFiles) {
+			const next = replaceNodeFloor(name, readRepo(name), bumped);
+			for (const statement of NODE_FLOOR_STATEMENTS.filter(entry => entry.file === name)) {
+				statements.push([...next.matchAll(statement.pattern)].map(match => match[1]));
+			}
+		}
+		expect(statements).toEqual(NODE_FLOOR_STATEMENTS.map(statement => [statement.value === 'major' ? '24' : '24.0.0']));
+		expect(replaceNodeFloor('.github/workflows/verify.yml', readRepo('.github/workflows/verify.yml'), bumped)).toContain("node-version: '24.0.0'");
+	});
+
+	it('refuses a missing or duplicated Node floor statement', () => {
+		const floor = nodeFloor(rows[currentIndex].node);
+		const contributing = readRepo('CONTRIBUTING.md');
+		expect(() => replaceNodeFloor('CONTRIBUTING.md', contributing.replace('Install Node 22 or newer', 'Install a recent Node'), floor)).toThrow('found 0');
+		expect(() => replaceNodeFloor('CONTRIBUTING.md', contributing + '\nInstall Node 22 or newer\n', floor)).toThrow('found 2');
+		expect(() => nodeFloor('not a range')).toThrow('Invalid Node prerequisite');
+	});
+
 	it('rejects a mismatched publication version through the actual release CLI', () => {
 		const fixture = mkdtempSync(join(tmpdir(), 'extensions-compatibility-'));
 		try {
@@ -65,6 +93,10 @@ describe('installed adapter compatibility declaration', () => {
 			copyFileSync(new URL('../scripts/check-compatibility.js', import.meta.url), join(fixture, 'scripts/check-compatibility.js'));
 			writeFileSync(join(fixture, 'README.md'), readme);
 			writeFileSync(join(fixture, 'MIGRATION.md'), migration);
+			for (const name of floorFiles) {
+				mkdirSync(join(fixture, dirname(name)), { recursive: true });
+				writeFileSync(join(fixture, name), readRepo(name));
+			}
 			writeFileSync(join(fixture, 'package.json'), JSON.stringify({ ...pkg, version: '0.0.0' }));
 			symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(fixture, 'node_modules'), 'junction');
 			const run = args => spawnSync(process.execPath, [join(fixture, 'scripts/check-compatibility.js'), ...args], { encoding: 'utf8', timeout: 15000, windowsHide: true });
@@ -78,9 +110,24 @@ describe('installed adapter compatibility declaration', () => {
 			writeFileSync(join(fixture, 'MIGRATION.md'), migration.replace(renderMigrationBlocks(rows)['migration-action'], 'Incorrect minimum version'));
 			const drift = run([]);
 			expect(drift.status).toBe(1);
-			expect(drift.stderr).toContain('MIGRATION.md compatibility blocks are stale');
+			expect(drift.stderr).toContain('MIGRATION.md compatibility blocks or Node floor statements are stale');
 			expect(run(['--write']).status).toBe(0);
 			expect(readFileSync(join(fixture, 'MIGRATION.md'), 'utf8')).toBe(migration);
+			const contributing = readRepo('CONTRIBUTING.md');
+			writeFileSync(join(fixture, 'CONTRIBUTING.md'), contributing.replace('Install Node 22 or newer', 'Install Node 20 or newer'));
+			const nodeDrift = run([]);
+			expect(nodeDrift.status).toBe(1);
+			expect(nodeDrift.stderr).toContain('CONTRIBUTING.md compatibility blocks or Node floor statements are stale');
+			// A missing marker anywhere refuses the whole write: the stale
+			// statement in another file stays as it was.
+			writeFileSync(join(fixture, 'README.md'), readme.replace('<!-- compatibility-floor:start -->', ''));
+			const partial = run(['--write']);
+			expect(partial.status).toBe(1);
+			expect(partial.stderr).toContain('one ordered compatibility floor block');
+			expect(readFileSync(join(fixture, 'CONTRIBUTING.md'), 'utf8')).toContain('Install Node 20 or newer');
+			writeFileSync(join(fixture, 'README.md'), readme);
+			expect(run(['--write']).status).toBe(0);
+			expect(readFileSync(join(fixture, 'CONTRIBUTING.md'), 'utf8')).toBe(contributing);
 		} finally { rmSync(fixture, { recursive: true, force: true }); }
 	}, 30000);
 

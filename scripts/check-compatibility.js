@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { valid, validRange } from 'semver';
+import { minVersion, valid, validRange } from 'semver';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const requiredHeaders = ['schema_version', 'owner', 'current', 'channel', 'provenance', 'adapter_version', 'adapter', 'realtime', 'extensions', 'node', 'uwebsockets', 'realtime_version', 'extensions_version'];
@@ -72,6 +72,42 @@ export function renderMigrationBlocks(rows) {
 	};
 }
 
+/**
+ * Prose and workflow lines that state the supported Node floor. Each pattern
+ * must match exactly once in its file, with the stated version in group 1, so
+ * a reworded or deleted statement fails the gate instead of silently escaping
+ * it. `major` is the floor's major (`22`), `minimum` the exact lowest
+ * version the manifest range admits (`22.0.0`).
+ */
+export const NODE_FLOOR_STATEMENTS = [
+	{ file: 'MIGRATION.md', pattern: /Use Node\.js (\d+) or later/g, value: 'major' },
+	{ file: 'docs/getting-started.md', pattern: /Use Node (\d+) or newer/g, value: 'major' },
+	{ file: 'docs/getting-started.md', pattern: /minimum CI route uses Node (\d+\.\d+\.\d+) /g, value: 'minimum' },
+	{ file: 'CONTRIBUTING.md', pattern: /Install Node (\d+) or newer/g, value: 'major' },
+	{ file: 'CONTRIBUTING.md', pattern: /smoke gate on Linux with Node (\d+);/g, value: 'major' },
+	{ file: 'CONTRIBUTING.md', pattern: /supported runtime minimum\s+remains Node (\d+)\./g, value: 'major' },
+	{ file: '.github/workflows/verify.yml', pattern: /node-version: '(\d+)'/g, value: 'major' },
+	{ file: '.github/workflows/verify.yml', pattern: /node-version: '(\d+\.\d+\.\d+)'/g, value: 'minimum' },
+	{ file: '.github/workflows/docs-links.yml', pattern: /node-version: '(\d+)'/g, value: 'major' }
+];
+
+export function nodeFloor(range) {
+	const minimum = validRange(range) ? minVersion(range) : null;
+	if (!minimum) throw new Error('Invalid Node prerequisite');
+	return { major: String(minimum.major), minimum: minimum.version };
+}
+
+/** Rewrite every Node floor statement in one file to the manifest floor. */
+export function replaceNodeFloor(file, source, floor) {
+	for (const statement of NODE_FLOOR_STATEMENTS) {
+		if (statement.file !== file) continue;
+		const count = [...source.matchAll(statement.pattern)].length;
+		if (count !== 1) throw new Error('Expected one Node floor statement matching ' + statement.pattern + ' in ' + file + ', found ' + count);
+		source = source.replace(statement.pattern, (match, stated) => match.replace(stated, floor[statement.value]));
+	}
+	return source;
+}
+
 export function installedCompatibility() {
 	let directory = dirname(fileURLToPath(import.meta.resolve('svelte-adapter-uws/testing')));
 	for (let depth = 0; depth < 12; depth++) {
@@ -90,14 +126,22 @@ export function installedCompatibility() {
 function main() {
 	const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 	const { adapter, rows } = installedCompatibility();
-	validateCompatibility(rows, pkg, adapter, { release: process.argv.includes('--release') });
-	for (const [name, blocks] of [['README.md', renderBlocks(rows)], ['MIGRATION.md', renderMigrationBlocks(rows)]]) {
-		const path = join(root, name), source = readFileSync(path, 'utf8');
-		const expected = replaceBlocks(source, blocks);
-		if (process.argv.includes('--write')) writeFileSync(path, expected);
-		else if (source !== expected) throw new Error(name + ' compatibility blocks are stale; run node scripts/check-compatibility.js --write');
+	const current = validateCompatibility(rows, pkg, adapter, { release: process.argv.includes('--release') });
+	const floor = nodeFloor(current.node);
+	const blocks = new Map([['README.md', renderBlocks(rows)], ['MIGRATION.md', renderMigrationBlocks(rows)]]);
+	const files = new Set([...blocks.keys(), ...NODE_FLOOR_STATEMENTS.map(statement => statement.file)]);
+	// Render every file before writing any, so a missing or duplicated marker
+	// or statement leaves the tree untouched instead of half rewritten.
+	const stale = [];
+	for (const name of files) {
+		const path = join(root, ...name.split('/')), source = readFileSync(path, 'utf8');
+		let expected = blocks.has(name) ? replaceBlocks(source, blocks.get(name)) : source;
+		expected = replaceNodeFloor(name, expected, floor);
+		if (source !== expected) stale.push({ name, path, expected });
 	}
-	console.log('check-compatibility: declared tuple, Node engine, native pin and adapter peer floor match the installed manifest' + (process.argv.includes('--release') ? '; publication version matches' : ''));
+	if (process.argv.includes('--write')) for (const { path, expected } of stale) writeFileSync(path, expected);
+	else if (stale.length) throw new Error(stale.map(({ name }) => name).join(', ') + ' compatibility blocks or Node floor statements are stale; run node scripts/check-compatibility.js --write');
+	console.log('check-compatibility: declared tuple, Node engine and stated Node floor, native pin and adapter peer floor match the installed manifest' + (process.argv.includes('--release') ? '; publication version matches' : ''));
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; }

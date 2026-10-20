@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
+import { minVersion } from 'semver';
 
 const root = resolve(import.meta.dirname, '..');
 const read = (path) => readFileSync(resolve(root, path), 'utf8');
@@ -27,7 +28,8 @@ describe('first-success route', () => {
 		expect(commands).toEqual(publishedCommands(guide));
 		expect(commands).toEqual(['npm ci', 'npm run preflight', 'npm run smoke -- --mock-only', 'npm run smoke']);
 		expect(job).toContain('runs-on: ubuntu-24.04');
-		expect(job).toContain("node-version: '22.0.0'");
+		// The minimum-profile job runs the lowest Node the engine range admits.
+		expect(job).toContain("node-version: '" + minVersion(pkg.engines.node).version + "'");
 		expect(job).not.toContain('cache:');
 		expect(guide).toContain('continue only after `preflight OK`');
 	});
