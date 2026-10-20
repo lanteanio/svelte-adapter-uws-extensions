@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Redis pub/sub and sharded bus wrappers forward `platform.authorizeDelivery` when the adapter provides it, bound to the original platform, so handlers that receive the wrapped platform can install recipient delivery checks. On an adapter without it the member stays `undefined`, so capability checks keep working.
 
+### Changed
+
+- The LISTEN/NOTIFY bridge documentation states that delivery is at-most-once: notifications committed before `activate()` resolves, during a reconnect, or during an advisory leader handover are not delivered or replayed, and clients see no gap signal. Applications load authoritative state from the tables on subscribe or resume and use a row version to detect a missed change.
+
 ### Fixed
 
 - Redis client `quit()` ends connections still opening or waiting to reconnect and rejects their queued commands, so shutdown settles without requiring bus deactivation first and queued writes cannot replay later. Ready connections drain gracefully, with any intervening connection loss ending them instead of starting another attempt. A client that has begun shutdown no longer opens duplicate connections.

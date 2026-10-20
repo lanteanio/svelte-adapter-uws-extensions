@@ -1977,6 +1977,7 @@ export async function init({ platform }) {
 #### Limitations
 
 - **Payload is hard-limited to ~8000 bytes by Postgres.** Above it `pg_notify` raises `payload string too long`, which aborts the transaction that sent it: with the trigger above, the application's own INSERT or UPDATE fails. This is a Postgres constraint, not a library limitation. The bridge warns at 7500 bytes. For large rows, send the row ID in the notification and let the client fetch the full row via an API call.
+- **Delivery is at-most-once.** PostgreSQL delivers a notification only to sessions listening when its transaction commits. Changes committed before `activate()` resolves, while the bridge reconnects, or while an `'advisory'` leader hands over are not delivered and are never replayed, and WebSocket clients stay connected without any gap signal. Treat a notification as a hint that rows changed: load authoritative state from the tables when a client subscribes or resumes, and carry a row version in the payload so a client that sees a version jump refetches.
 - Only fires from triggers. Changes made outside your app (manual SQL, migrations) are invisible unless you add triggers for those tables too.
 - This is not logical replication. It is simpler, works on every Postgres provider, and needs no extensions or superuser access.
 
