@@ -11,6 +11,7 @@
  * @module svelte-adapter-uws-extensions/redis/ratelimit
  */
 
+import { attribution } from 'svelte-adapter-uws/connection';
 import { scanUnlinkExcept } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -354,9 +355,14 @@ return 1
  *   tenant resolver. When set, the bucket key is scoped by the returned tenant id, so two
  *   tenants sharing an IP / connection / custom key get independent buckets and a tenant's
  *   admin ops (`reset` / `ban` / `unban` / `clear`) touch only that tenant. Return
- *   null/undefined for an unscoped connection. Omit for a single-tenant deploy (byte-identical
- *   to before). The id should be a delimiter-safe slug - it is joined to the key with a NUL,
+ *   null/undefined for an unscoped connection. When omitted, reads the adapter's frozen
+ *   connection attribution. With neither, the principal key space stays byte-identical.
+ *   The id is joined to a principal key with a NUL,
  *   so it stays unambiguous even when the key is an IPv6 address.
+ * @property {'principal' | 'tenant'} [budget='principal'] - Per-principal allowance by
+ *   default; 'tenant' shares one allowance across every principal of that tenant and
+ *   requires a non-empty tenant id. reset/ban/unban use their tenant argument and ignore
+ *   the key argument in that mode. Separate key spaces keep the budget modes isolated.
  * @property {boolean | { points?: number, interval?: number }} [localFloorOnStorageFailure=false] -
  *   Opt-in degraded mode for `consume()`: when Redis is unreachable (or the breaker is open),
  *   decide on an in-process token bucket with the same semantics instead of rejecting the
@@ -364,8 +370,8 @@ return 1
  *   per-instance budget (e.g. `points / instanceCount` keeps the fleet-wide allowance
  *   roughly constant while degraded). Floor state is per process and per instance, so N
  *   instances allow up to N times the floor budget in the worst case; it never leaks back
- *   into Redis. Admin ops (`reset` / `ban` / `unban` / `clear` / `purgeUser`) are operator
- *   actions and still reject while the store is down - only the request-path verdict
+ *   into Redis. Admin ops that access storage still reject while the store is down
+ *   - only the request-path verdict
  *   degrades. Off (today's reject-to-caller behavior) unless set.
  * @property {'window' | 'sliding' | 'gcra'} [refill='window'] - Refill algorithm.
  *   'window' (default) is the fixed-window counter, byte-identical to prior releases;
@@ -406,7 +412,7 @@ export function createRateLimit(client, options) {
 		throw new Error('redis ratelimit: options object is required');
 	}
 
-	const { points, interval, blockDuration = 0, keyBy = 'ip', tenant } = options;
+	const { points, interval, blockDuration = 0, keyBy = 'ip', tenant, budget = 'principal' } = options;
 
 	if (!Number.isInteger(points) || points <= 0) {
 		throw new Error('redis ratelimit: points must be a positive integer');
@@ -422,6 +428,9 @@ export function createRateLimit(client, options) {
 	}
 	if (tenant !== undefined && typeof tenant !== 'function') {
 		throw new Error('redis ratelimit: tenant must be a function (ws) => id | null');
+	}
+	if (budget !== 'principal' && budget !== 'tenant') {
+		throw new Error("redis ratelimit: budget must be 'principal' or 'tenant'");
 	}
 
 	const refill = options.refill ?? 'window';
@@ -463,12 +472,23 @@ export function createRateLimit(client, options) {
 	// key spaces so rolling deployments with algorithm changes don't produce
 	// inconsistent rate limiting. Old-version keys expire naturally via TTL.
 	const SCRIPT_VERSION = 'v1';
+	// A shared tenant allowance must not collide with an unscoped principal
+	// whose key happens to equal the tenant id. Keep both budget layouts apart.
+	const bucketPrefix = SCRIPT_VERSION + ':' + (budget === 'tenant'
+		? mode.infix.slice(0, -1) + '-tenant:' : mode.infix);
+
+	function resolveTenant(ws) {
+		if (tenant) return tenant(ws);
+		const id = attribution(ws)?.tenantId;
+		return typeof id === 'string' ? id : null;
+	}
 
 	const b = options.breaker;
 	const m = options.metrics;
 	// Tenant isolation must not implicitly export the tenant's identifier.
-	// Reuse the registry's bounded identifier mapper; no resolver adds no label.
-	const labelTenants = typeof tenant === 'function';
+	// Explicit tenant budgets and resolvers use the bounded identifier mapper.
+	// Default principal metrics retain their unlabeled series.
+	const labelTenants = typeof tenant === 'function' || budget === 'tenant';
 	const mapTenant = m?.mapTopic || (() => 'all');
 	const tlabels = labelTenants ? ['tenant_id'] : undefined;
 	const mAllowed = m?.counter('ratelimit_allowed_total', 'Requests allowed', tlabels);
@@ -489,7 +509,7 @@ export function createRateLimit(client, options) {
 	// time we deny on a loopback/private key with no proxy header set (the
 	// signature of that collapse) we warn once. Read the env once here - it is
 	// fixed before the server starts. Purely diagnostic; never changes a verdict.
-	const ipMode = keyBy === 'ip';
+	const ipMode = budget === 'principal' && keyBy === 'ip';
 	const addressHeaderSet = isAddressHeaderConfigured();
 	let warnedProxyCollapse = false;
 
@@ -534,7 +554,7 @@ export function createRateLimit(client, options) {
 		return 'unknown';
 	}
 
-	// The tenant segment (when a `tenant` resolver is set) is FIRST and NUL-delimited,
+	// The principal bucket tenant segment is FIRST and NUL-delimited,
 	// so a validated id stays unambiguous even when the key is an IPv6 address (colons).
 	// Null tenant -> no segment, byte-identical to the single-tenant key space. The id is
 	// rejected if it contains the NUL delimiter (the one char that would let two distinct
@@ -542,6 +562,13 @@ export function createRateLimit(client, options) {
 	// validates at its own boundary, enforced here too so the property does not silently
 	// depend on the caller's resolver. The check short-circuits on the null (default) path.
 	function bucketKey(key, tenantId) {
+		if (budget === 'tenant') {
+			if (typeof tenantId !== 'string' || tenantId.length === 0) {
+				throw new Error("redis ratelimit: budget 'tenant' requires a non-empty tenant id from attribution or the tenant resolver; admin operations require their tenant id argument");
+			}
+			if (tenantId.includes('\0')) throw new Error('redis ratelimit: tenant id must not contain a NUL byte');
+			return client.key(bucketPrefix + tenantId);
+		}
 		key = String(key);
 		if (!tenantId && mode.infix === 'ratelimit:' && key === 'emergency') {
 			throw new TypeError('redis ratelimit: emergency is reserved for the fleet-wide scale');
@@ -549,7 +576,7 @@ export function createRateLimit(client, options) {
 		if (tenantId && tenantId.indexOf('\0') !== -1) {
 			throw new Error('redis ratelimit: tenant id must not contain a NUL byte (it is the bucket-key delimiter)');
 		}
-		return client.key(SCRIPT_VERSION + ':' + mode.infix + (tenantId ? tenantId + '\0' : '') + key);
+		return client.key(bucketPrefix + (tenantId ? tenantId + '\0' : '') + key);
 	}
 
 	return {
@@ -557,8 +584,8 @@ export function createRateLimit(client, options) {
 			if (typeof cost !== 'number' || !Number.isInteger(cost) || cost < 1) {
 				throw new Error('redis ratelimit: cost must be a positive integer');
 			}
-			const key = resolveKey(ws);
-			const tenantId = tenant ? tenant(ws) : null;
+			const key = budget === 'tenant' ? '' : resolveKey(ws);
+			const tenantId = resolveTenant(ws);
 			// Resolved before the try so a tenant-id validation throw surfaces
 			// to the caller and can never be mistaken for a storage failure.
 			const bk = bucketKey(key, tenantId);
@@ -607,8 +634,8 @@ export function createRateLimit(client, options) {
 			if (typeof cost !== 'number' || !Number.isInteger(cost) || cost < 1) {
 				throw new Error('redis ratelimit: cost must be a positive integer');
 			}
-			const key = resolveKey(ws);
-			const tenantId = tenant ? tenant(ws) : null;
+			const key = budget === 'tenant' ? '' : resolveKey(ws);
+			const tenantId = resolveTenant(ws);
 			const bk = bucketKey(key, tenantId);
 			try {
 				const result = await withBreaker(b, () =>
@@ -622,7 +649,8 @@ export function createRateLimit(client, options) {
 		},
 
 		async reset(key, tenantId) {
-			await withBreaker(b, () => redis.del(bucketKey(key, tenantId)));
+			const bk = bucketKey(key, tenantId);
+			await withBreaker(b, () => redis.del(bk));
 		},
 
 		/**
@@ -637,6 +665,9 @@ export function createRateLimit(client, options) {
 		 * @returns {Promise<number>} buckets removed (0 or 1)
 		 */
 		async purgeUser(tenantId, userId) {
+			// A tenant aggregate contains no user-owned state; erasing a user
+			// must not restore the allowance for every other principal.
+			if (budget === 'tenant') return 0;
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
 			const removed = await withBreaker(b, () => redis.del(bucketKey(userId, tenantId)));
 			return typeof removed === 'number' && removed > 0 ? removed : 0;
@@ -651,13 +682,20 @@ export function createRateLimit(client, options) {
 		},
 
 		async unban(key, tenantId) {
-			await withBreaker(b, () => redis.hset(bucketKey(key, tenantId), 'bannedUntil', 0));
+			const bk = bucketKey(key, tenantId);
+			await withBreaker(b, () => redis.hset(bk, 'bannedUntil', 0));
 		},
 
 		// No tenant -> clears the whole key space (every tenant's buckets too, since the
 		// glob `*` spans the NUL-delimited tenant segments). Pass a tenant id to clear
 		// only that tenant's buckets. Scoped to this limiter's refill-mode key space.
 		async clear(tenantId) {
+			if (budget === 'tenant' && tenantId != null) {
+				// Exact deletion: glob characters in an id cannot widen the scope.
+				const bk = bucketKey('', tenantId);
+				await withBreaker(b, () => redis.del(bk));
+				return;
+			}
 			// The tenant id is interpolated into a SCAN MATCH glob, so it needs
 			// the same delimiter guard as bucketKey PLUS a glob-metachar guard:
 			// clear('*') would otherwise wipe every tenant's buckets through a
@@ -692,7 +730,7 @@ export function createRateLimit(client, options) {
 			const suffix = tenantId ? tenantId + '\0*' : '*';
 			const emergencyKey = client.key('v1:ratelimit:emergency');
 			await withBreaker(b, () => scanUnlinkExcept(redis,
-				client.key(SCRIPT_VERSION + ':' + mode.infix + suffix),
+				client.key(bucketPrefix + suffix),
 				key => key === emergencyKey, () => {}));
 		},
 

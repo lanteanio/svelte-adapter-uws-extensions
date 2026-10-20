@@ -1295,7 +1295,7 @@ The session map is **independent of userId**: a connection may carry a userId, a
 
 ## Rate limiting
 
-Redis-backed counterpart to the core `createRateLimit` plugin, using an atomic Lua script. Await `consume` instead of reading the synchronous core result; the shared limiter also exposes `peek`. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call.
+Redis-backed counterpart to the core `createRateLimit` plugin, using an atomic Lua script. Await `consume` instead of reading the synchronous core result; the shared limiter also exposes `peek`. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call. `budget: 'tenant'` shares the allowance across a tenant's principals; the default is `'principal'`. See [tenant namespaces, weighted costs and configured caps](docs/tenancy.md).
 
 > **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -1333,7 +1333,7 @@ export async function message(ws, { data, platform }) {
 | `points` | *required* | Tokens available per interval |
 | `interval` | *required* | Refill interval in ms |
 | `blockDuration` | `0` | Auto-ban duration in ms (0 = no ban) |
-| `keyBy` | `'ip'` | `'ip'`, `'connection'`, or a function |
+| `keyBy` / `tenant` / `budget` | `'ip'` / adapter attribution / `'principal'` | Principal key, optional tenant resolver, and allowance scope (`'principal'` or `'tenant'`). Tenant mode requires an id and ignores `keyBy`; [scope and administration](docs/tenancy.md#one-allowance-per-tenant). |
 | `refill` | `'window'` | Refill algorithm: `'window'` (fixed-window counter), `'sliding'` (sliding-window-counter), or `'gcra'` (leaky-bucket / GCRA). See [Refill modes](#refill-modes). |
 | `localFloorOnStorageFailure` | `false` | Degraded mode for `consume()`: decide on an in-process token bucket while Redis is unreachable (or the breaker is open) instead of rejecting the promise. `true` reuses `points`/`interval`; `{ points?, interval? }` sets a tighter per-instance budget. The floor mirrors the selected `refill` mode. |
 
@@ -1349,10 +1349,10 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 |---|---|
 | `consume(ws, cost?)` | Attempt to consume tokens. `cost` must be a positive integer. |
 | `peek(ws, cost?)` | Read-only: the verdict a `consume(ws, cost)` **would** return - `{ allowed, remaining, resetMs }` - without spending, initializing the bucket, or moving the allowed/denied counters. |
-| `reset(key)` | Clear the bucket for a key |
-| `ban(key, duration?)` | Manually ban a key |
-| `unban(key)` | Remove a ban |
-| `clear()` | Reset all state |
+| `reset(key, tenant?)` | Clear a principal bucket, or the tenant aggregate selected by `tenant` |
+| `ban(key, duration?, tenant?)` | Manually ban a principal bucket or tenant aggregate |
+| `unban(key, tenant?)` | Remove the corresponding ban |
+| `clear(tenant?)` | Reset this budget/refill mode, optionally just one tenant |
 
 #### Refill modes
 

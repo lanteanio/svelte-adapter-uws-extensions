@@ -57,6 +57,7 @@ process.stdout.write(version);
 import { createDistributedSession, type DistributedSessionOptions } from 'svelte-adapter-uws-extensions/redis/session';
 import type { RedisClient } from 'svelte-adapter-uws-extensions/redis';
 import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
+import { createRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
 import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
@@ -74,6 +75,10 @@ platform.publishBatched([], { compress: 'true' });
 // @ts-expect-error Coalescing keys must be strings.
 platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 1 }]);
 declare const redis: RedisClient;
+createRateLimit(redis, { points: 3, interval: 1000, budget: 'tenant' });
+createRateLimit(redis, { points: 3, interval: 1000, budget: 'principal' });
+// @ts-expect-error A global budget is not a declared scope.
+createRateLimit(redis, { points: 3, interval: 1000, budget: 'global' });
 const cursor = createCursor(redis, { viewport: { enabled: true, padding: 64, cell: 128 }, backpressure: { enabled: true, maxBufferedBytes: 4096 } });
 createCursor(redis, { viewport: true, backpressure: true });
 createCursor(redis, { binary: false });

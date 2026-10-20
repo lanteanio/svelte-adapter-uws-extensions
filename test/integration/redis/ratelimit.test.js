@@ -66,6 +66,25 @@ describe('redis ratelimit (integration)', () => {
 		});
 	});
 
+	describe('tenant-total budgets', () => {
+		for (const refill of ['window', 'sliding', 'gcra']) {
+			it(`${refill} admits one shared allowance across distinct principals and limiter instances`, async () => {
+				const options = {
+					points: 3, interval: 60000, refill, budget: 'tenant',
+					tenant: (ws) => ws.getUserData().tenantId
+				};
+				const limiters = [createRateLimit(client, options), createRateLimit(client, options)];
+				const results = await Promise.all(Array.from({ length: 20 }, (_, i) =>
+					limiters[i % 2].consume(fakeWs({ tenantId: 'alpha', ip: `192.0.2.${i}` }))));
+				expect(results.filter((result) => result.allowed)).toHaveLength(3);
+				expect((await limiters[0].consume(fakeWs({ tenantId: 'beta', ip: '192.0.2.1' }), 3)).allowed).toBe(true);
+				await limiters[0].clear('alpha');
+				expect((await limiters[1].consume(fakeWs({ tenantId: 'alpha', ip: '192.0.2.99' }), 3)).allowed).toBe(true);
+				expect((await limiters[1].peek(fakeWs({ tenantId: 'beta' }))).allowed).toBe(false);
+			});
+		}
+	});
+
 	describe('atomic concurrent consumption', () => {
 		it('20 parallel consumes against points:5 produce exactly 5 allowed and 15 denied', async () => {
 			const limiter = createRateLimit(client, { points: 5, interval: 60_000 });

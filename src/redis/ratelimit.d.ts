@@ -44,10 +44,20 @@ export interface RedisRateLimitOptions {
 	 * Optional per-connection tenant resolver. When set, the bucket key is scoped by
 	 * the returned tenant id (joined to the key with a NUL, so it stays unambiguous even
 	 * for IPv6 keys), so two tenants sharing an IP / connection / custom key get
-	 * independent buckets. Return null/undefined for an unscoped connection; omit for a
-	 * single-tenant deploy (byte-identical).
+	 * independent buckets. Return null/undefined for an unscoped connection. When omitted,
+	 * reads the adapter's frozen connection attribution; an unattributed connection stays
+	 * in the unscoped principal key space.
 	 */
 	tenant?: (ws: any) => string | null | undefined;
+	/**
+	 * Per-principal allowance by default, matching the adapter's limiter. 'tenant'
+	 * shares one allowance across all principals of a tenant; consume/peek require
+	 * a non-empty tenant id from the resolver or adapter attribution. reset/ban/unban
+	 * select the tenant's aggregate by their tenant argument and ignore their key.
+	 * Budget modes use separate Redis key spaces; clear only affects this mode.
+	 * @default 'principal'
+	 */
+	budget?: 'principal' | 'tenant';
 	/**
 	 * Opt-in degraded mode for `consume()`: when Redis is unreachable (or the
 	 * breaker is open), decide on an in-process token bucket with the same
@@ -55,9 +65,9 @@ export interface RedisRateLimitOptions {
 	 * points/interval; the object form sets a tighter per-instance budget
 	 * (e.g. `points / instanceCount` keeps the fleet-wide allowance roughly
 	 * constant while degraded). Floor state is per process, so N instances
-	 * allow up to N times the floor budget in the worst case. Admin ops
-	 * (`reset` / `ban` / `unban` / `clear` / `purgeUser`) still reject while
-	 * the store is down - only the request-path verdict degrades. When a
+	 * allow up to N times the floor budget in the worst case. Admin ops that
+	 * access storage still reject while the store is down - only the
+	 * request-path verdict degrades. When a
 	 * metrics registry is configured, floor-decided verdicts count in
 	 * `ratelimit_storage_fallbacks_total`. @default false
 	 */
@@ -130,7 +140,8 @@ export interface RedisRateLimiter {
 	/**
 	 * Right-to-erasure: clear a user's bucket. Meaningful only when `keyBy`
 	 * resolves to the userId; a no-op for ip/connection buckets. Counters-only,
-	 * so no PII is involved.
+	 * so no PII is involved. In tenant-budget mode there is no user-owned bucket;
+	 * returns 0 without resetting the shared allowance.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	/** Manually ban a key (optionally scoped to a tenant). */
