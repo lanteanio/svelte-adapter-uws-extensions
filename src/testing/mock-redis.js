@@ -852,8 +852,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 			// Pub/sub
 			async publish(channel, message) {
+				// Like Redis, report how many subscribers received the message.
+				let receivers = 0;
 				for (const handler of pubsubHandlers) {
 					if (!handler.channels.has(channel)) continue;
+					receivers++;
 					const msgListener = handler.listeners.get('message');
 					if (!msgListener) continue;
 					if (relayFaultEngine) {
@@ -873,7 +876,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 						msgListener(channel, message);
 					}
 				}
-				return 1;
+				return receivers;
 			},
 			async subscribe(...channels) {
 				// Real ioredis SUBSCRIBE accepts variadic channels and reports

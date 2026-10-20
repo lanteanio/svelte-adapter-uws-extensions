@@ -7,14 +7,18 @@ export interface CrdtClusterOptions {
 	 * writer for a topic; set it above the document's `debounceWait` so the
 	 * holder keeps renewing across scheduled stores and the lease only rotates
 	 * when the holder goes quiet or dies. Default 6000 (suits the 2s document
-	 * debounce default).
+	 * debounce default). A newly acquired lease waits up to a third of it for
+	 * a sync round with the peers before the write is allowed.
 	 */
 	persistLeaseMs?: number;
 	/** Reject inbound relay envelopes larger than this BEFORE JSON.parse. Default 1048576. */
 	maxEnvelopeBytes?: number;
-	/** Optional circuit breaker; when open, outbound relays are skipped. */
+	/**
+	 * Optional circuit breaker. While it is open no relay is published; every
+	 * topic whose traffic it refused is resynced with the peers once it closes.
+	 */
 	breaker?: CircuitBreaker;
-	/** Observe a relay-subscriber failure (the subscriber tears down so a later relay re-subscribes). */
+	/** Observe a relay-subscriber failure (the subscriber tears down, is opened again, and resyncs). */
 	onError?: (err: unknown) => void;
 }
 
@@ -22,17 +26,22 @@ export interface CrdtClusterOptions {
 export interface CrdtClusterHandlers {
 	/** A peer applied an update: apply it to the local replica and fan it out. */
 	onUpdate?: (declKey: string, topic: string, bytes: number[]) => void;
-	/** A peer cold-joined: if this instance holds the topic, reply with the updates it lacks. */
+	/**
+	 * A peer cold-joined or is resyncing: if this instance holds the topic,
+	 * reply with the updates it lacks. The coordinator also calls it to read
+	 * the local replica's full state (an empty state vector, a local
+	 * `fromInstance`), so the reply must be sent synchronously.
+	 */
 	onSyncRequest?: (declKey: string, topic: string, stateVector: number[], fromInstance: string) => void;
-	/** A peer answered this instance's cold-join request: apply the catch-up diff and fan it out. */
+	/** A peer answered this instance's sync request: apply the catch-up diff and fan it out. */
 	onSyncReply?: (declKey: string, topic: string, bytes: number[]) => void;
 }
 
 /**
  * The cluster coordinator for conflict-free documents. Pure transport: it
  * relays applied updates so every instance's replica converges, answers
- * cold-join sync requests, and gates snapshot persistence to one writer per
- * topic. The replica itself lives in the adapter and is owned by the realtime
+ * cold-join sync requests, resyncs the replicas after the relay lost traffic,
+ * and gates snapshot persistence to one writer per topic. The replica itself lives in the adapter and is owned by the realtime
  * layer.
  */
 export interface CrdtCluster {
@@ -49,8 +58,12 @@ export interface CrdtCluster {
 	/**
 	 * Try to become (or stay) the sole snapshot writer for a topic. Resolves
 	 * true when this instance holds the per-topic persist lease and may write;
-	 * false when another instance holds it (skip). Rejects on a Redis error so
-	 * the caller's persistence schedule retries.
+	 * false when another instance holds it (skip). A newly acquired lease, and
+	 * one renewed while a resync of the topic runs, first waits for a sync
+	 * round with the peers (at most a third of `persistLeaseMs`). Rejects on a
+	 * Redis error, and while local edits to the topic have not reached the
+	 * peers, so the caller's persistence schedule retries and keeps the
+	 * replica loaded.
 	 */
 	acquirePersist(topic: string): Promise<boolean>;
 	/** Tear down the relay subscriber. Idempotent. */

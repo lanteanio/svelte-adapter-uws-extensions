@@ -7,8 +7,9 @@
  * realtime layer. This module is pure transport: it carries applied updates
  * between instances so every instance's replica converges, answers a
  * cold-joining instance's sync request with whatever a live peer holds beyond
- * the persisted snapshot, and gates snapshot persistence to one writer per
- * topic so concurrent instances never clobber each other's stores.
+ * the persisted snapshot, repairs the replicas after the relay lost traffic,
+ * and gates snapshot persistence to one writer per topic so concurrent
+ * instances never clobber each other's stores.
  *
  * The model, and why it is correct:
  *
@@ -21,12 +22,29 @@
  *     other instance applies them to its own replica and fans them out to its
  *     own subscribers. Because the merge is commutative and idempotent, order
  *     and overlap do not matter, so every replica converges to the same value.
+ *   - **Repair after a lost relay.** Pub/sub is fire-and-forget: a relay the
+ *     breaker refused or Redis failed, and a message published while this
+ *     instance's subscriber was reconnecting, never arrive. Each of those marks
+ *     the topic, and once the relay works again the coordinator runs a two-way
+ *     resync for it: it broadcasts the replica's full state when peers may
+ *     lack local edits (peers merge it) and asks every peer for its full state
+ *     (this instance merges the replies). Merging is idempotent, so a resync
+ *     never harms a replica that lost nothing. Triggers: the breaker closing
+ *     or probing, the subscriber restoring its channel, a failed or refused
+ *     publish (retried with a backoff when nothing else signals recovery), and
+ *     a freshly acquired persist lease.
  *   - **One writer per topic.** Snapshot persistence is gated by a per-topic
  *     lease (`acquirePersist`): the lease holder is the sole persister for that
  *     topic, so two instances can never write divergent snapshots to the same
- *     key. The holder's replica is the most converged (it receives every
- *     relayed update), so its snapshot is the freshest; the lease rotates
- *     naturally when the holder's last local subscriber leaves or it dies.
+ *     key. The lease rotates when the holder's last local subscriber leaves or
+ *     it dies.
+ *   - **Sync before the first write.** A replica only holds what reached it,
+ *     so a freshly acquired lease (or one renewed while a resync for the topic
+ *     is running) waits for a sync round - bounded to a third of the lease TTL
+ *     - before the write is allowed; whatever the round merged also schedules
+ *     a store of the converged state. A topic whose own edits have not reached
+ *     the peers refuses persistence (rejects, so the schedule retries and the
+ *     replica stays loaded) until the resync delivered them.
  *   - **Cold-join freshness.** A persisted snapshot is only as fresh as the
  *     last debounced store. When an instance cold-loads a topic it loads the
  *     snapshot AND broadcasts a sync request carrying its state vector; any
@@ -34,6 +52,16 @@
  *     lacks. The joiner applies the reply on top of the snapshot - idempotent,
  *     so applying both is always safe - closing the staleness gap whenever a
  *     live peer exists.
+ *
+ * The coordinator reads a replica's state through the realtime layer's own
+ * `onSyncRequest` handler: asked for the diff against an empty state vector on
+ * a local reply address, the handler answers synchronously through
+ * `sendSyncReply` with the full state, and no answer means the instance no
+ * longer holds the topic. A resync request carries a round id (`c`) and asks
+ * every peer to answer (`a: 1`); a peer holding nothing answers with an empty
+ * reply, so on a standalone server, where PUBLISH reports how many subscribers
+ * received the request, a round ends as soon as every peer answered. Peers
+ * that predate these fields ignore them and answer as for a cold join.
  *
  * The relay channel carries opaque CRDT bytes between TRUSTED instances: a
  * peer has already authorized its client's write before relaying (the realtime
@@ -47,18 +75,32 @@
  * @module svelte-adapter-uws-extensions/redis/crdt
  */
 
-import { randomBytes } from '../shared/runtime.js';
+import { randomBytes, setTimer, clearTimer, setImmediateTimer } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT } from '../shared/lease-scripts.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { openSubscriber } from '../shared/redis-subscriber.js';
+import { openSubscriber, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
+import { isCluster } from '../shared/cluster.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_UPDATE = 'u';
 const KIND_SYNC_REQUEST = 'sreq';
 const KIND_SYNC_REPLY = 'srep';
+
+// Retry cadence for a resync the relay could not carry, when no breaker
+// transition or subscriber restore signals recovery first.
+const RESYNC_RETRY_FIRST_MS = 1000;
+const RESYNC_RETRY_MAX_MS = 30000;
+
+// Resync rounds whose publishes may be in flight at once, so a recovery over
+// many held documents does not encode and publish them all in one task.
+const RESYNC_CONCURRENCY = 8;
+
+// The topics remembered for a resync are swept for ones no longer held once
+// the set grows past this, then past twice its size after the last sweep.
+const KNOWN_SWEEP_MIN = 1024;
 
 /** Coerce a positive-number option, else the default. */
 function positive(v, fallback) {
@@ -71,15 +113,17 @@ function positive(v, fallback) {
  *   lease holder is the sole snapshot writer for a topic; the TTL should
  *   exceed the document's `debounceWait` so the holder keeps renewing across
  *   scheduled stores and the lease only rotates when the holder goes quiet or
- *   dies. Default 6s suits the 2s document debounce default.
+ *   dies. Default 6s suits the 2s document debounce default. A freshly
+ *   acquired lease waits up to a third of it for the sync round.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound relay
  *   envelopes larger than this BEFORE JSON.parse. Defends against a bus-side
  *   DoS on shared-Redis deployments.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional
- *   circuit breaker; when open, outbound relays are skipped (the local replica
- *   and persistence are unaffected - convergence resumes when it closes).
+ *   circuit breaker; while it is open no relay is published, and every topic
+ *   whose traffic it refused is resynced with the peers once it lets traffic
+ *   through again.
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber
- *   failure (the subscriber tears down so a later relay re-subscribes).
+ *   failure (the subscriber tears down, is opened again, and resyncs).
  */
 
 /**
@@ -96,7 +140,13 @@ export function createCrdtCluster(client, options = {}) {
 	const redis = client.redis;
 	const channel = client.key('crdt:events');
 	const instanceId = randomBytes(8).toString('hex');
+	// Where a local state read is answered; never a peer's (hex) identity.
+	const localReplyTo = 'local:' + instanceId;
 	const persistLeaseMs = positive(options.persistLeaseMs, 6000);
+	const syncWindowMs = Math.max(1, Math.floor(persistLeaseMs / 3));
+	// PUBLISH counts every receiver only on a standalone server; a Cluster
+	// reports the receiving node's subscribers alone.
+	const countsReceivers = !isCluster(redis);
 	const validator = createBusValidator({
 		label: 'crdt cluster',
 		maxBytes: options.maxEnvelopeBytes,
@@ -107,21 +157,120 @@ export function createCrdtCluster(client, options = {}) {
 
 	/** @type {{ onUpdate: Function | null, onSyncRequest: Function | null, onSyncReply: Function | null }} */
 	let handlers = { onUpdate: null, onSyncRequest: null, onSyncReply: null };
+	let wired = false;
 	/** @type {any} */
 	let subscriber = null;
 	/** @type {Promise<any> | null} */
 	let subscriberReady = null;
+	// Whether this instance's subscriber currently receives the channel.
+	let subscribed = false;
+	// Set when the subscriber missed traffic it will not get back by itself.
+	let inboundLost = false;
 	// One report per failure streak: every relay retries a failed subscribe.
 	let subscribeFailing = false;
 	let destroyed = false;
 
-	/** Publish one envelope, after the subscriber is up so we never miss a reply we caused. */
-	function publish(obj) {
+	/** @type {Map<string, string>} topic -> declKey, for every topic seen held */
+	const known = new Map();
+	let sweepAt = KNOWN_SWEEP_MIN;
+	let sweepScheduled = false;
+	/** @type {Set<string>} topics holding local edits the peers may lack */
+	const unrelayed = new Set();
+	/** @type {Set<string>} topics whose replica may lack edits the peers sent */
+	const stale = new Set();
+	/** @type {Set<string>} topics waiting for a resync round */
+	const queue = new Set();
+	let activeRounds = 0;
+	/** @type {Map<string, any>} topic -> the resync round in flight */
+	const rounds = new Map();
+	/** @type {any} */
+	let retryTimer = null;
+	let retryMs = 0;
+	/** @type {unknown} */
+	let lastRelayError = null;
+	/** @type {{ declKey: string, topic: string, bytes: any } | null} */
+	let capture = null;
+	/** @type {{ declKey: string, topic: string, to: string, c: string | undefined, replied: boolean } | null} */
+	let answering = null;
+
+	/** Remember a topic this instance holds, so a recovery can resync it. */
+	function remember(declKey, topic) {
+		if (typeof declKey !== 'string' || typeof topic !== 'string') return;
+		known.set(topic, declKey);
+		if (known.size > sweepAt && !sweepScheduled) {
+			sweepScheduled = true;
+			setImmediateTimer(sweep);
+		}
+	}
+
+	/** Forget the remembered topics this instance no longer holds. */
+	function sweep() {
+		sweepScheduled = false;
 		if (destroyed) return;
-		if (b) { try { b.guard(); } catch { return; } }
+		for (const [topic, declKey] of known) {
+			if (rounds.has(topic) || unrelayed.has(topic) || stale.has(topic) || queue.has(topic)) continue;
+			if (readState(declKey, topic) === null) known.delete(topic);
+		}
+		sweepAt = Math.max(KNOWN_SWEEP_MIN, known.size * 2);
+	}
+
+	/**
+	 * Read the local replica's full state through the realtime handler (see the
+	 * module comment), or null when this instance does not hold the topic.
+	 * @returns {any[] | null}
+	 */
+	function readState(declKey, topic) {
+		const h = handlers.onSyncRequest;
+		if (!h) return null;
+		const prev = capture;
+		const slot = { declKey, topic, bytes: null };
+		capture = slot;
+		try {
+			h(declKey, topic, [], localReplyTo);
+		} catch {
+			/* a handler that throws holds nothing readable */
+		} finally {
+			capture = prev;
+		}
+		return Array.isArray(slot.bytes) ? slot.bytes : null;
+	}
+
+	/**
+	 * A relay was refused or failed: resync its topic once Redis takes traffic
+	 * again. A lost request leaves this replica behind; lost content leaves the
+	 * peers behind.
+	 */
+	function relayLost(obj, err) {
+		lastRelayError = err;
+		const topic = obj.t;
+		if (typeof topic === 'string' && known.has(topic)) {
+			if (obj.k === KIND_SYNC_REQUEST) stale.add(topic);
+			else if (Array.isArray(obj.b) && obj.b.length > 0) unrelayed.add(topic);
+		}
+		scheduleRetry();
+	}
+
+	/**
+	 * Publish one envelope, after the subscriber is up so we never miss a reply
+	 * we caused. Resolves to the receiver count Redis reports, or null when the
+	 * breaker refused the publish or Redis failed it; never rejects.
+	 * @returns {Promise<number | null>}
+	 */
+	function publish(obj) {
+		if (destroyed) return Promise.resolve(null);
+		if (b) {
+			try { b.guard(); } catch (err) { relayLost(obj, err); return Promise.resolve(null); }
+		}
 		const msg = JSON.stringify(obj);
-		if (subscriberReady) subscriberReady.then(() => redis.publish(channel, msg).catch(() => {}));
-		else redis.publish(channel, msg).catch(() => {});
+		const send = () => redis.publish(channel, msg).then((n) => {
+			b?.success();
+			return Number(n);
+		}, (err) => {
+			b?.failure(err);
+			relayLost(obj, err);
+			return null;
+		});
+		return subscriberReady ? subscriberReady.then(send) : send();
 	}
 
 	/** Bring up the relay subscriber once; idempotent. */
@@ -130,6 +279,15 @@ export function createCrdtCluster(client, options = {}) {
 		const sub = openSubscriber(client, 'crdt');
 		subscriber = sub;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CRDT_SUBSCRIBER, { error: err }));
+		sub.on(SUBSCRIBER_RESTORING, () => {
+			if (subscriber === sub) subscribed = false;
+		});
+		sub.on(SUBSCRIBER_RESTORED, () => {
+			if (subscriber !== sub || destroyed) return;
+			// Whatever peers published while the channel was down is gone.
+			subscribed = true;
+			resyncAll();
+		});
 		sub.on('message', (ch, message) => {
 			if (ch !== channel) return;
 			if (!validator.acceptRaw(message)) return; // size cap before parse
@@ -147,17 +305,29 @@ export function createCrdtCluster(client, options = {}) {
 			if (kind === KIND_UPDATE) {
 				if (handlers.onUpdate && Array.isArray(parsed.b)) handlers.onUpdate(declKey, topic, parsed.b);
 			} else if (kind === KIND_SYNC_REQUEST) {
-				if (handlers.onSyncRequest) handlers.onSyncRequest(declKey, topic, Array.isArray(parsed.v) ? parsed.v : [], parsed.i);
+				answerSyncRequest(parsed, declKey, topic);
 			} else if (kind === KIND_SYNC_REPLY) {
 				// Targeted: only the requester applies a reply addressed to it.
-				if (parsed.to !== instanceId) return;
-				if (handlers.onSyncReply && Array.isArray(parsed.b)) handlers.onSyncReply(declKey, topic, parsed.b);
+				if (parsed.to !== instanceId || !Array.isArray(parsed.b)) return;
+				if (parsed.b.length > 0 && handlers.onSyncReply) handlers.onSyncReply(declKey, topic, parsed.b);
+				noteReply(topic, parsed.i, parsed.c);
 			}
 		});
-		subscriberReady = sub.subscribe(channel).then(() => { subscribeFailing = false; }, (err) => {
-			// Failed subscribe: tear down so the next relay re-subscribes fresh.
+		subscriberReady = sub.subscribe(channel).then(() => {
+			if (subscriber !== sub) return;
+			subscribeFailing = false;
+			subscribed = true;
+			if (inboundLost) {
+				inboundLost = false;
+				resyncAll();
+			}
+		}, (err) => {
+			// Failed subscribe: tear down so the retry below re-subscribes
+			// fresh, then resyncs what peers published meanwhile.
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
-			if (subscriber === sub) { subscriber = null; subscriberReady = null; }
+			if (subscriber === sub) { subscriber = null; subscriberReady = null; subscribed = false; }
+			inboundLost = true;
+			scheduleRetry();
 			if (typeof options.onError === 'function') { try { options.onError(err); } catch { /* host handler */ } }
 			if (!subscribeFailing) {
 				subscribeFailing = true;
@@ -165,6 +335,144 @@ export function createCrdtCluster(client, options = {}) {
 			}
 		});
 	}
+
+	/** Answer a peer's sync request through the realtime handler. */
+	function answerSyncRequest(parsed, declKey, topic) {
+		const from = parsed.i;
+		const ctx = { declKey, topic, to: from, c: typeof parsed.c === 'string' ? parsed.c : undefined, replied: false };
+		if (handlers.onSyncRequest) {
+			const prev = answering;
+			answering = ctx;
+			try {
+				handlers.onSyncRequest(declKey, topic, Array.isArray(parsed.v) ? parsed.v : [], from);
+			} finally {
+				answering = prev;
+			}
+		}
+		// A resync round counts its answers, so a peer holding nothing says so.
+		if (parsed.a === 1 && !ctx.replied && typeof from === 'string') {
+			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: [], to: from, c: ctx.c });
+		}
+	}
+
+	/** Count a peer's answer toward the topic's resync round. */
+	function noteReply(topic, from, c) {
+		const round = rounds.get(topic);
+		if (!round || typeof from !== 'string') return;
+		if (c !== undefined && c !== round.id) return;
+		round.replied.add(from);
+		if (round.expected !== null && round.replied.size >= round.expected) finishRound(round);
+	}
+
+	function finishRound(round) {
+		if (round.done) return;
+		round.done = true;
+		if (round.timer !== null) { clearTimer(round.timer); round.timer = null; }
+		if (rounds.get(round.topic) === round) rounds.delete(round.topic);
+		round.resolve();
+	}
+
+	/**
+	 * Start a two-way resync of one topic: broadcast the replica's full state
+	 * when peers may lack local edits, and ask every peer for its full state.
+	 * Returns the round, or null when this instance no longer holds the topic.
+	 * The round settles when every peer answered or the sync window closed.
+	 * @param {string} topic
+	 */
+	function startRound(topic) {
+		const existing = rounds.get(topic);
+		if (existing) return existing;
+		queue.delete(topic);
+		const declKey = known.get(topic);
+		const full = declKey === undefined ? null : readState(declKey, topic);
+		stale.delete(topic);
+		if (declKey === undefined || full === null) {
+			known.delete(topic);
+			unrelayed.delete(topic);
+			return null;
+		}
+		const push = unrelayed.delete(topic);
+		/** @type {any} */
+		const round = { id: randomBytes(6).toString('hex'), topic, expected: null, replied: new Set(), done: false, timer: null, resolve: null, promise: null, sent: null };
+		round.promise = new Promise((resolve) => { round.resolve = resolve; });
+		rounds.set(topic, round);
+		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
+		if (round.timer && round.timer.unref) round.timer.unref();
+		const pushed = push ? publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }) : Promise.resolve(0);
+		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1 });
+		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
+			if (p === null || n === null) {
+				// relayLost marked the topic again; nothing will answer.
+				finishRound(round);
+				return;
+			}
+			if (unrelayed.size === 0 && stale.size === 0 && !inboundLost) retryMs = 0;
+			// Every receiver but this instance's own subscriber is a peer.
+			round.expected = countsReceivers ? Math.max(0, n - (subscribed ? 1 : 0)) : null;
+			if (round.expected !== null && round.replied.size >= round.expected) finishRound(round);
+		});
+		return round;
+	}
+
+	/** Run the queued resync rounds, a bounded number at a time. */
+	function pump() {
+		if (destroyed) return;
+		while (activeRounds < RESYNC_CONCURRENCY && queue.size > 0) {
+			if (b && b.state === 'broken') {
+				// Refused anyway; the breaker transition or the retry resumes.
+				for (const topic of queue) stale.add(topic);
+				queue.clear();
+				scheduleRetry();
+				return;
+			}
+			const topic = /** @type {string} */ (queue.values().next().value);
+			queue.delete(topic);
+			const round = startRound(topic);
+			if (!round) continue;
+			activeRounds++;
+			Promise.race([round.sent, round.promise]).then(() => {
+				activeRounds--;
+				pump();
+			});
+		}
+	}
+
+	/** Resync every remembered topic: this instance may have missed peer traffic. */
+	function resyncAll() {
+		for (const topic of known.keys()) queue.add(topic);
+		pump();
+	}
+
+	/** The relay may carry traffic again: resync what it lost and reopen the subscriber. */
+	function recover() {
+		if (destroyed) return;
+		if (wired && !subscriber) ensureSubscriber();
+		for (const topic of unrelayed) queue.add(topic);
+		for (const topic of stale) queue.add(topic);
+		pump();
+	}
+
+	function scheduleRetry() {
+		if (retryTimer !== null || destroyed) return;
+		retryMs = retryMs === 0 ? RESYNC_RETRY_FIRST_MS : Math.min(retryMs * 2, RESYNC_RETRY_MAX_MS);
+		retryTimer = setTimer(() => {
+			retryTimer = null;
+			recover();
+		}, retryMs);
+		if (retryTimer && retryTimer.unref) retryTimer.unref();
+	}
+
+	/** Join the topic's resync round, starting one when none runs. */
+	function syncRound(topic) {
+		const round = rounds.get(topic) ?? startRound(topic);
+		return round ? round.promise : Promise.resolve();
+	}
+
+	const unsubscribeBreaker = b && typeof b.subscribe === 'function'
+		? b.subscribe((from, to) => {
+			if (from !== to && (to === 'healthy' || to === 'probing')) recover();
+		})
+		: null;
 
 	return {
 		/** This instance's relay identity (stable for the coordinator's life). */
@@ -174,7 +482,9 @@ export function createCrdtCluster(client, options = {}) {
 		 * Register the inbound handlers and start the relay subscriber. The
 		 * realtime layer calls this once per coordinator with:
 		 *   - onUpdate(declKey, topic, bytes): apply a peer's update locally + fan out.
-		 *   - onSyncRequest(declKey, topic, sv, fromInstance): if held, reply via sendSyncReply.
+		 *   - onSyncRequest(declKey, topic, sv, fromInstance): if held, reply via
+		 *     sendSyncReply. The coordinator also asks it locally to read the
+		 *     replica's state, so it must reply synchronously.
 		 *   - onSyncReply(declKey, topic, bytes): apply a peer's catch-up diff locally + fan out.
 		 * @param {{ onUpdate?: Function, onSyncRequest?: Function, onSyncReply?: Function }} h
 		 */
@@ -184,42 +494,74 @@ export function createCrdtCluster(client, options = {}) {
 				onSyncRequest: typeof h.onSyncRequest === 'function' ? h.onSyncRequest : null,
 				onSyncReply: typeof h.onSyncReply === 'function' ? h.onSyncReply : null
 			};
+			wired = true;
 			ensureSubscriber();
 		},
 
 		/** Relay one applied update to peers so their replicas converge. */
 		relayUpdate(declKey, topic, bytes) {
+			remember(declKey, topic);
 			publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: bytes });
 		},
 
 		/** Broadcast a cold-join sync request carrying this replica's state vector. */
 		requestSync(declKey, topic, sv) {
+			remember(declKey, topic);
 			ensureSubscriber(); // so the targeted reply finds a live subscriber
 			publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: sv });
 		},
 
 		/** Answer a peer's sync request with the updates it lacks (targeted). */
 		sendSyncReply(declKey, topic, bytes, toInstance) {
-			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: bytes, to: toInstance });
+			if (toInstance === localReplyTo) {
+				// A local state read (see readState), never published.
+				if (capture && capture.declKey === declKey && capture.topic === topic) capture.bytes = bytes;
+				return;
+			}
+			remember(declKey, topic);
+			/** @type {any} */
+			const env = { i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: bytes, to: toInstance };
+			if (answering && answering.to === toInstance && answering.topic === topic && answering.declKey === declKey) {
+				answering.replied = true;
+				if (answering.c !== undefined) env.c = answering.c;
+			}
+			publish(env);
 		},
 
 		/**
 		 * Try to become (or stay) the sole snapshot writer for a topic. Returns
 		 * true when this instance holds the per-topic persist lease and may
 		 * write; false when another instance holds it (skip - that instance
-		 * persists). Throws on a Redis error so the caller's persistence
-		 * schedule retries rather than silently dropping the write.
+		 * persists). A newly acquired lease, and one renewed while a resync of
+		 * the topic runs, first waits for a sync round with the peers (bounded
+		 * to a third of the lease TTL). Throws on a Redis error, and while
+		 * local edits to the topic have not reached the peers, so the caller's
+		 * persistence schedule retries rather than dropping the write or
+		 * unloading the only replica holding those edits.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
 		async acquirePersist(topic) {
 			if (destroyed) return false;
+			let synced = false;
+			if (known.has(topic) && (unrelayed.has(topic) || stale.has(topic) || queue.has(topic) || rounds.has(topic))) {
+				await syncRound(topic);
+				synced = true;
+				if (destroyed) return false;
+				if (unrelayed.has(topic)) throw lastRelayError ?? new Error('crdt relay unavailable');
+			}
 			const key = client.key('crdt:persist:' + topic);
 			const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
-			if (r === 'OK') return true; // newly acquired
-			// Held by someone: renew only if it is ours (compare-and-pexpire).
-			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
-			return Number(renew) === 1;
+			if (r !== 'OK') {
+				// Held by someone: renew only if it is ours (compare-and-pexpire).
+				const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
+				if (Number(renew) !== 1) return false;
+			} else if (!synced && known.has(topic)) {
+				// Newly acquired: the previous writer may have held edits this
+				// replica never received.
+				await syncRound(topic);
+			}
+			return !destroyed;
 		},
 
 		/** Tear down the subscriber. Idempotent. */
@@ -227,10 +569,18 @@ export function createCrdtCluster(client, options = {}) {
 			if (destroyed) return;
 			destroyed = true;
 			handlers = { onUpdate: null, onSyncRequest: null, onSyncReply: null };
+			if (unsubscribeBreaker) unsubscribeBreaker();
+			if (retryTimer !== null) { clearTimer(retryTimer); retryTimer = null; }
+			for (const round of [...rounds.values()]) finishRound(round);
+			queue.clear();
+			unrelayed.clear();
+			stale.clear();
+			known.clear();
 			if (subscriber) {
 				const s = subscriber;
 				subscriber = null;
 				subscriberReady = null;
+				subscribed = false;
 				try { s.quit().catch(() => s.disconnect()); } catch { /* already gone */ }
 			}
 		}

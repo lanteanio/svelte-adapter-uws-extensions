@@ -10,6 +10,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCrdtCluster } from '../../src/redis/crdt.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { SUBSCRIBER_RESTORED } from '../../src/shared/redis-subscriber.js';
+import { createDocInstance, createBackend, itemsOf } from '../helpers/crdt-replica-harness.js';
 
 /** Let the deferred subscribe + publish + synchronous delivery settle. */
 const settle = async () => {
@@ -125,5 +128,252 @@ describe('createCrdtCluster per-topic persist lease', () => {
 	it('a destroyed coordinator declines to write', async () => {
 		a.destroy();
 		expect(await a.acquirePersist('board:1')).toBe(false);
+	});
+});
+
+describe('createCrdtCluster repair after a lost relay', () => {
+	const TOPIC = 'doc:1';
+	/** @type {any[]} */
+	let instances;
+	let client;
+	let backend;
+
+	const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+	async function until(fn, timeoutMs = 3000) {
+		const start = Date.now();
+		while (!(await fn())) {
+			if (Date.now() - start > timeoutMs) throw new Error('condition not met within ' + timeoutMs + 'ms');
+			await wait(5);
+		}
+	}
+	function instance(options, schedule) {
+		const inst = createDocInstance(client, backend, { persistLeaseMs: 600, ...options }, schedule);
+		instances.push(inst);
+		return inst;
+	}
+	/** Cut an instance's relay subscriber off the channel while `fn` runs. */
+	async function deaf(inst, fn) {
+		const channels = inst.subscribers[0]._subscribedChannels;
+		const held = [...channels];
+		channels.clear();
+		try { await fn(); } finally { for (const ch of held) channels.add(ch); }
+	}
+
+	beforeEach(() => {
+		client = mockRedisClient('crdtrepair:');
+		backend = createBackend();
+		instances = [];
+	});
+	afterEach(() => {
+		for (const inst of instances) inst.destroy();
+	});
+
+	it('delivers an edit the open breaker refused once the breaker closes, so the persister stores both edits', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		// a stores nothing during the test, so b is the sole persister.
+		const a = instance({ breaker }, { debounceWait: 60000, debounceMaxWait: 60000 });
+		const b = instance();
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true);
+
+		breaker.failure(new Error('redis down'));
+		a.edit(TOPIC, 'u1', 1); // relay refused by the open breaker
+		b.edit(TOPIC, 'u2', 2);
+		await settle();
+		expect(b.items(TOPIC)).toEqual({ u2: 2 });
+
+		breaker.reset();
+		await until(() => 'u1' in b.items(TOPIC));
+		await b.authority.persistNow(TOPIC);
+		expect(itemsOf(backend.blob)).toEqual({ u1: 1, u2: 2 });
+	});
+
+	it('retries a relay Redis failed without any breaker until the peers have it', async () => {
+		const a = instance();
+		const b = instance();
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		const publish = client.redis.publish;
+		let failures = 0;
+		client.redis.publish = function (channel, message) {
+			if (failures === 0 && message.includes(a.crdt.instanceId) && message.includes('"k":"u"')) {
+				failures++;
+				return Promise.reject(new Error('connection lost'));
+			}
+			return publish.call(this, channel, message);
+		};
+		a.edit(TOPIC, 'u1', 1);
+		await settle();
+		expect(failures).toBe(1);
+		expect(b.items(TOPIC)).toEqual({});
+		await until(() => 'u1' in b.items(TOPIC));
+		await b.authority.persistNow(TOPIC);
+		expect(itemsOf(backend.blob)).toEqual({ u1: 1 });
+	});
+
+	it('syncs a freshly acquired persist lease with the peers before the write is allowed', async () => {
+		// Neither instance stores during the test, so only the lease decides.
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({}, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		await deaf(b, async () => {
+			a.edit(TOPIC, 'u1', 1);
+			await settle();
+		});
+		expect(b.items(TOPIC)).toEqual({}); // b never received u1
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true); // fresh lease
+		expect(b.items(TOPIC)).toEqual({ u1: 1 }); // merged before the write
+		// A renewal with nothing to repair does not wait for a round.
+		const started = Date.now();
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true);
+		expect(Date.now() - started).toBeLessThan(100);
+	});
+
+	it('resyncs every held topic when the subscriber restores its channel', async () => {
+		const a = instance();
+		const b = instance();
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		await deaf(b, async () => {
+			a.edit(TOPIC, 'u1', 1);
+			await settle();
+		});
+		expect(b.items(TOPIC)).toEqual({});
+		b.subscribers[0]._listeners.get(SUBSCRIBER_RESTORED)();
+		await until(() => 'u1' in b.items(TOPIC));
+	});
+
+	it('keeps a replica holding edits the peers lack loaded until the relay delivered them', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const a = instance({ breaker });
+		const b = instance();
+		// b is the persister before a holds anything it could store.
+		await b.join(TOPIC);
+		expect(await b.crdt.acquirePersist(TOPIC)).toBe(true);
+		await a.join(TOPIC);
+		await settle();
+
+		breaker.failure(new Error('redis down'));
+		a.edit(TOPIC, 'u1', 1);
+		a.authority.release(TOPIC); // last local subscriber leaves: final store
+		await wait(100);
+		expect(a.authority.has(TOPIC)).toBe(true); // not unloaded with u1 unrelayed
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toThrow();
+
+		breaker.reset();
+		await until(() => 'u1' in b.items(TOPIC));
+		await until(() => !a.authority.has(TOPIC));
+	});
+
+	it('ends a lease sync round as soon as every peer answered, including peers that hold nothing', async () => {
+		const a = instance({ persistLeaseMs: 30000 });
+		const b = instance({ persistLeaseMs: 30000 });
+		await a.join(TOPIC);
+		// b holds nothing; it only answers with an empty reply.
+		await settle();
+		const started = Date.now();
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+		expect(Date.now() - started).toBeLessThan(2000); // the window is 10s
+	});
+
+	it('waits at most a third of the lease for a peer that never answers', async () => {
+		const a = instance({ persistLeaseMs: 600 });
+		await a.join(TOPIC);
+		await settle();
+		// A subscriber on the channel that never answers, like a peer that died.
+		const silent = client.duplicate();
+		await silent.subscribe(client.key('crdt:events'));
+		const started = Date.now();
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+		const took = Date.now() - started;
+		expect(took).toBeGreaterThanOrEqual(150);
+		expect(took).toBeLessThan(1000);
+	});
+});
+
+describe('createCrdtCluster relay retry', () => {
+	it('re-sends the full state of a topic whose relay failed, on a backoff with no other signal', async () => {
+		const client = mockRedisClient('crdtretry:');
+		const a = createCrdtCluster(client);
+		const b = createCrdtCluster(client);
+		const received = [];
+		// a's replica holds [7, 7]; b records what reaches it.
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, [7, 7], from) });
+		b.onMessage({ onUpdate: (declKey, topic, bytes) => received.push(bytes) });
+		await settle();
+		const publish = client.redis.publish;
+		let failed = false;
+		client.redis.publish = function (channel, message) {
+			if (!failed) {
+				failed = true;
+				return Promise.reject(new Error('connection lost'));
+			}
+			return publish.call(this, channel, message);
+		};
+		try {
+			a.relayUpdate('dk1', 'board:1', [7]);
+			await settle();
+			expect(received).toEqual([]);
+			await new Promise((r) => setTimeout(r, 1300));
+			expect(received).toEqual([[7, 7]]);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster breaker reporting', () => {
+	it('reports a relay admitted as the breaker probe, so a working relay closes the breaker', async () => {
+		const client = mockRedisClient('crdtprobe:');
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 10 });
+		const a = createCrdtCluster(client, { breaker });
+		try {
+			breaker.failure(new Error('redis down'));
+			await new Promise((r) => setTimeout(r, 40));
+			expect(breaker.state).toBe('probing');
+			a.relayUpdate('dk1', 'board:1', [1]);
+			await settle();
+			expect(breaker.state).toBe('healthy');
+		} finally {
+			a.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster subscriber recovery', () => {
+	it('re-subscribes after a refused subscribe without waiting for traffic, then resyncs the held topics', async () => {
+		const client = mockRedisClient('crdtresub:');
+		const b = createCrdtCluster(client);
+		const requests = [];
+		b.onMessage({ onSyncRequest: (declKey, topic, sv, from) => requests.push({ topic, from }) });
+		const recording = Object.create(client);
+		let opened = 0;
+		recording.duplicate = (...args) => {
+			const conn = client.duplicate(...args);
+			if (opened++ === 0) conn.subscribe = () => Promise.reject(new Error('NOPERM'));
+			return conn;
+		};
+		const a = createCrdtCluster(recording, { onError: () => {} });
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, [3], from) });
+		try {
+			a.requestSync('dk1', 'board:1', []); // cold join while the subscribe is refused
+			await settle();
+			expect(requests.filter((r) => r.from === a.instanceId)).toHaveLength(1);
+			await new Promise((r) => setTimeout(r, 1300));
+			expect(opened).toBe(2);
+			// The fresh subscriber missed the cold-join reply, so a resync asks again.
+			expect(requests.filter((r) => r.from === a.instanceId)).toHaveLength(2);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
 	});
 });
