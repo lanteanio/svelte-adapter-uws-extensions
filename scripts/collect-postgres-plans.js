@@ -15,7 +15,7 @@ import { createDeadLetter } from '../src/postgres/dead-letter.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../src/shared/runtime.js';
 import { verifyPostgresVersion } from './check-postgres-support.js';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_alarms_generations', 'plan_dead_letter'];
+const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_alarms_generations', 'plan_alarms_executions', 'plan_dead_letter'];
 const digest = value => createHash('sha256').update(value).digest('hex');
 const sqlText = value => String(value).trim().replace(/\s+/g, ' ');
 const numeric = value => value === undefined ? undefined : Number(value);
@@ -48,6 +48,9 @@ async function seed(client, rows) {
 	await client.query(`INSERT INTO plan_alarms(topic,fire_at,meta,generation)
 		SELECT 'alarm-'||i,(extract(epoch from now())*1000)::bigint+CASE WHEN i%20=0 THEN -1000 ELSE 3600000 END,jsonb_build_object('value',i),1 FROM generate_series(1,$1::int) i`, [rows]);
 	await client.query('INSERT INTO plan_alarms_generations(topic,reserved,committed) SELECT topic,1,1 FROM plan_alarms');
+	await client.query(`INSERT INTO plan_alarms_generations(topic,reserved,committed) SELECT 'retained-'||i,1,1 FROM generate_series(1,($1::int/20)) i`, [rows]);
+	await client.query(`INSERT INTO plan_alarms_executions(topic,generation,fire_at,meta,attempt,status,claimed_at,failed_at,error_class)
+		SELECT 'retained-'||i,1,1,jsonb_build_object('value',i),1,CASE WHEN i%2=0 THEN 'failed' ELSE 'claimed' END,1,CASE WHEN i%2=0 THEN 2 END,CASE WHEN i%2=0 THEN 'handler' END FROM generate_series(1,($1::int/20)) i`, [rows]);
 	await client.query(`INSERT INTO plan_dead_letter(topic,event,data,failed_at)
 		SELECT CASE WHEN i%20=0 THEN 'cold' ELSE 'hot' END,'event',jsonb_build_object('value',i),(extract(epoch from now())*1000)::bigint-i*1000 FROM generate_series(1,$1::int) i`, [rows]);
 	// Deterministic update churn leaves dead tuples for the before-vacuum sample.
@@ -88,7 +91,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		throw new Error('PostgreSQL plan collection exceeded its 60-second budget'); };
 	const record = (input, values) => {
 		const text = typeof input === 'string' ? input : input.text;
-		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms(?:_generations)?|dead_letter)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !text.includes('pg_try_advisory_xact_lock')) {
+		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms(?:_generations|_executions)?|dead_letter)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !text.includes('pg_try_advisory_xact_lock')) {
 			const fingerprint = digest(sqlText(text)), key = label + ':' + fingerprint;
 			if (!queries.has(key)) {
 				if (queries.size >= 128)
@@ -173,6 +176,15 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		await capture('alarms.set', () => alarms.set('new-alarm', Date.now() + 1000, { value: 1 }, generation));
 		await capture('alarms.due', () => alarms.due(Date.now()));
 		await capture('alarms.delete', () => alarms.delete('alarm-20', '1'));
+		const retained = await alarms.nextGeneration('new-retained');
+		await alarms.set('new-retained', Date.now(), { value: 1 }, retained);
+		await capture('alarms.claim', () => alarms.claim('new-retained', retained));
+		await capture('alarms.fail', () => alarms.fail('new-retained', retained, 1, { errorClass: 'handler', failedAt: Date.now() }));
+		await capture('alarms.getExecution', () => alarms.getExecution('new-retained', retained));
+		await capture('alarms.executions', () => alarms.executions({ limit: 100, after: { topic: 'retained-1', generation: '1' } }));
+		await capture('alarms.requeue', () => alarms.requeue('new-retained', retained, 1, { at: Date.now() }));
+		await alarms.claim('new-retained', retained);
+		await capture('alarms.complete', () => alarms.complete('new-retained', retained, 2));
 		const id = await capture('deadLetter.add', () => dlq.add({ webhookId: 'hook', topic: 'hot', event: 'event', data: { value: 1 }, attempts: 1, error: 'timeout' }));
 		await capture('deadLetter.get', () => dlq.get(id));
 		await capture('deadLetter.list', () => dlq.list({ topic: 'cold', limit: 25 }));

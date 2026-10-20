@@ -16,6 +16,13 @@ describe('PostgreSQL migration contracts', () => {
 		};
 		for (const [store, checksums] of Object.entries(expected)) expect(postgresMigrations({ store }).slice(0, 2).map(entry => entry.checksum)).toEqual(checksums);
 	});
+	it('adds retained alarm executions as version 4 without changing the generation migration', () => {
+		const versions = postgresMigrations({ store: 'alarm-store' });
+		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3, 4]);
+		expect(versions[2].checksum).toBe('861868ed365e9b05d3bb5afd851994312b576d7a130bd4a53de7e30dbc496570');
+		expect(versions[3].statements[0]).toBe('ALTER TABLE svti_alarms ADD COLUMN IF NOT EXISTS attempt BIGINT NOT NULL DEFAULT 1');
+		expect(versions[3].statements[1]).toMatch(/^CREATE TABLE IF NOT EXISTS svti_alarms_executions \(.*PRIMARY KEY \(topic, generation\)\)$/);
+	});
 	it.each(['replay', 'jobs', 'tasks', 'idempotency', 'dead-letter', 'alarm-store'])('migrates and validates %s repeatedly', async store => {
 		const client = mockPgClient();
 		await migrate(client, { store });

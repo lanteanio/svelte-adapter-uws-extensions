@@ -19,6 +19,24 @@ export interface AlarmRow {
 	generation: string;
 }
 
+/** Exact retained execution identity, also the exclusive `executions()` cursor. */
+export interface AlarmExecutionRef {
+	topic: string;
+	generation: string;
+}
+
+/** A claimed alarm, retained until completion or explicit disposition. */
+export interface AlarmExecution extends AlarmRow {
+	/** Starts at 1; each explicit requeue's next claim increments it. */
+	attempt: number;
+	status: 'claimed' | 'failed';
+	claimedAt: number;
+	/** Null until `fail` records the outcome. */
+	failedAt: number | null;
+	/** Stable failure classification; never the handler's raw error or payload. */
+	errorClass: 'handler' | null;
+}
+
 export interface RedisAlarmStoreOptions {
 	/**
 	 * Prefix prepended (after the client `keyPrefix`) to the alarm keys. Lets
@@ -55,9 +73,38 @@ export interface RedisAlarmStore {
 	 * watermarks survive deletion so delayed writes cannot resurrect it.
 	 */
 	delete(topic: string, generation: string): Promise<boolean>;
+	/**
+	 * Atomically move the matching scheduled generation into retained execution
+	 * storage and return its attempt, or null when it is absent, replaced or
+	 * already claimed. At execution capacity it rejects with code
+	 * `ALARM_CAPACITY` and leaves the schedule intact; retained work is never
+	 * evicted.
+	 */
+	claim(topic: string, generation: string): Promise<{ attempt: number } | null>;
+	/** Remove only this exact retained attempt (success, a misfire skip, or operator disposal). */
+	complete(topic: string, generation: string, attempt: number): Promise<boolean>;
+	/** Mark this exact attempt failed, keeping its metadata and deadline; false for an obsolete attempt. */
+	fail(topic: string, generation: string, attempt: number, failure: { errorClass: 'handler'; failedAt: number }): Promise<boolean>;
+	/** Read one retained execution, or null. Scheduled rows stay available through `get`. */
+	getExecution(topic: string, generation: string): Promise<AlarmExecution | null>;
+	/**
+	 * Page retained executions ordered by topic then generation (byte order),
+	 * after the exclusive cursor. Default limit 100, capped at 1000. Restrict to
+	 * trusted operators: topics and metadata carry tenant scope.
+	 */
+	executions(options?: { limit?: number; after?: AlarmExecutionRef | null }): Promise<{ items: AlarmExecution[]; next: AlarmExecutionRef | null }>;
+	/**
+	 * Explicit retry: move a failed attempt back to the schedule at `at`, keeping
+	 * its generation; the next claim gets `attempt + 1`. Returns false without
+	 * changes when the attempt does not match, a schedule exists or a newer
+	 * generation was reserved. A `claimed` record needs `allowAbandoned: true`,
+	 * after confirming its worker stopped. Writes the schedule only; the
+	 * realtime recovery poll dispatches it.
+	 */
+	requeue(topic: string, generation: string, attempt: number, options: { at: number; allowAbandoned?: boolean }): Promise<boolean>;
 	/** Return the alarms whose `at <= nowMs` (capped at `dueBatch`) for the poll. */
 	due(nowMs: number): Promise<AlarmRow[]>;
-	/** Maintenance operation: remove schedules and invalidate reservations, traversing retained topic history atomically. */
+	/** Maintenance operation: remove schedules and invalidate reservations, traversing retained topic history atomically. Retained executions are kept. */
 	clear(): Promise<void>;
 	/** No-op (no background loop); present for parity with the other factories. */
 	destroy(): Promise<void>;

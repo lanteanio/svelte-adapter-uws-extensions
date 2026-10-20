@@ -15,6 +15,7 @@ const escapeGlob = text => text.replace(/[\\*?\[\]]/g, '\\$&');
 const integer = text => typeof text === 'string' && /^\d+$/.test(text);
 const generation = (text, zero = false) => typeof text === 'string' && text.length <= 19
 	&& ((zero && text === '0') || /^[1-9][0-9]*$/.test(text)) && BigInt(text) <= 9223372036854775807n;
+const attempt = text => typeof text === 'string' && /^[1-9][0-9]*$/.test(text) && Number.isSafeInteger(Number(text));
 function fail(code) { throw Object.assign(new Error(code), { recoveryCode: code }); }
 function bound(value, fallback, max) {
 	if (value === undefined) return fallback;
@@ -38,7 +39,7 @@ export function validateConfig(config) {
 			return { ...spec, table };
 		});
 		if (Boolean(stores.replay) !== Boolean(stores['replay-sequence'])) fail('incomplete_restore_group');
-		if (Boolean(stores.alarms) !== Boolean(stores['alarm-generations'])) fail('incomplete_restore_group');
+		if (new Set(['alarms', 'alarm-generations', 'alarm-executions'].map(id => Boolean(stores[id]))).size !== 1) fail('incomplete_restore_group');
 		if (new Set(Object.values(stores)).size !== Object.keys(stores).length) fail('overlapping_tables');
 	}
 	if (config.redis) {
@@ -114,6 +115,16 @@ export async function verifyPostgres(client, specs, remaining = () => {}) {
 			const authority = sqlName(specs.find(item => item.id === 'alarm-generations').table);
 			const broken = (await query('SELECT EXISTS(SELECT 1 FROM ' + authority + ' WHERE reserved IS NULL OR committed IS NULL OR reserved<0 OR committed<0 OR reserved<committed) OR EXISTS(SELECT 1 FROM ' + rows + ' a LEFT JOIN ' + authority + ' g USING(topic) WHERE g.topic IS NULL OR a.generation IS NULL OR a.generation<=0 OR a.generation<>g.committed) AS broken')).rows[0].broken;
 			check(result, 'alarms', 'generation_authority', !broken);
+		}
+		if (valid.has('alarms') && valid.has('alarm-generations') && valid.has('alarm-executions')) {
+			remaining();
+			const rows = sqlName(specs.find(item => item.id === 'alarms').table);
+			const retained = sqlName(specs.find(item => item.id === 'alarm-executions').table);
+			const authority = sqlName(specs.find(item => item.id === 'alarm-generations').table);
+			// Each execution was claimed from a committed generation, and a
+			// generation is either scheduled or retained, never both.
+			const broken = (await query('SELECT EXISTS(SELECT 1 FROM ' + retained + ' e LEFT JOIN ' + authority + " g USING(topic) WHERE g.topic IS NULL OR e.generation IS NULL OR e.generation<=0 OR e.generation>g.committed OR e.attempt IS NULL OR e.attempt<1 OR e.attempt>9007199254740991 OR e.claimed_at IS NULL OR e.status IS NULL OR NOT ((e.status='claimed' AND e.failed_at IS NULL AND e.error_class IS NULL) OR (e.status='failed' AND e.failed_at IS NOT NULL AND e.error_class='handler'))) OR EXISTS(SELECT 1 FROM " + rows + ' a JOIN ' + retained + ' e USING(topic,generation)) OR EXISTS(SELECT 1 FROM ' + rows + ' WHERE attempt IS NULL OR attempt<1 OR attempt>9007199254740991) AS broken')).rows[0].broken;
+			check(result, 'alarms', 'execution_authority', !broken);
 		}
 		await query('ROLLBACK');
 	} catch (error) {
@@ -218,7 +229,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 			check(result, spec.id, 'key_types', stats.wrongTypes === 0);
 			check(result, spec.id, 'minimum_keys', stats.keys >= (config.minimumKeys[spec.id] ?? 0));
 		}
-		let replayOk = true, pairOk = true, alarmOk = true;
+		let replayOk = true, pairOk = true, alarmOk = true, executionOk = true;
 		for (const { family, roles } of groups.values()) {
 			remaining();
 			if (family === 'replay') {
@@ -274,6 +285,7 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 						const value = current.get(topic);
 						alarmOk &&= generation(value) && value === committed.get(topic) && reserved.has(topic);
 					}
+					executionOk &&= await verifyAlarmExecutions(roles, { committed, current }, config, read);
 				}
 				if (family === 'dead-letter' && (roles.sequence || hashCount)) {
 					const seq = roles.sequence ? await read('get', roles.sequence) : null;
@@ -281,7 +293,10 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 				}
 			}
 		}
-		if (config.specs.some(spec => spec.id === 'alarms')) check(result, 'alarms', 'generation_authority', alarmOk);
+		if (config.specs.some(spec => spec.id === 'alarms')) {
+			check(result, 'alarms', 'generation_authority', alarmOk);
+			check(result, 'alarms', 'execution_authority', executionOk);
+		}
 		if (config.specs.some(spec => spec.id === 'replay')) check(result, 'replay', 'sequence_authority', replayOk);
 		if (config.specs.some(spec => spec.id === 'lock-fences')) check(result, 'lock-fences', 'counter_authority', fenceOk);
 		if (config.specs.some(spec => ['alarms','dead-letter'].includes(spec.id))) check(result, 'redis', 'paired_membership', pairOk);
@@ -290,6 +305,48 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 	} catch (error) { result.complete = false; result.reason = error.recoveryCode || 'backend_read_failed'; }
 	result.scannedKeys = seen.size; result.matchedKeys = matched; result.scanCalls = calls;
 	return result;
+}
+/**
+ * Retained alarm executions: the record hash and its order index hold the same
+ * ids, each record matches its id and was claimed from a committed generation,
+ * and every requeued attempt counter names its current scheduled generation.
+ */
+async function verifyAlarmExecutions(roles, { committed, current }, config, read) {
+	let ok = true;
+	const records = roles.executions, order = roles['execution-order'], attempts = roles.attempt;
+	for (const key of [records, order, attempts]) if (key) ok &&= await read('pttl', key) === -1;
+	const recordCount = records ? Number(await read('hlen', records)) : 0;
+	const orderCount = order ? Number(await read('zcard', order)) : 0;
+	if (Math.max(recordCount, orderCount) > config.maxMembers) fail('member_limit_reached');
+	ok &&= recordCount === orderCount;
+	const ids = order ? await read('zrange', order, 0, -1) : [];
+	for (let offset = 0; offset < ids.length; offset += 256) {
+		const batch = ids.slice(offset, offset + 256);
+		const values = records ? await read('hmget', records, ...batch) : batch.map(() => null);
+		batch.forEach((id, index) => {
+			let record = null;
+			try { record = JSON.parse(values[index]); } catch { /* reported below */ }
+			const failed = record?.status === 'failed';
+			ok &&= Boolean(record) && typeof record.topic === 'string' && generation(record.generation)
+				&& id === record.topic.replaceAll('\0', '\0\x01') + '\0\0' + record.generation
+				&& attempt(record.attempt) && typeof record.claimedAt === 'string' && Number.isFinite(Number(record.claimedAt))
+				&& (failed ? record.errorClass === 'handler' && Number.isFinite(Number(record.failedAt)) : record.status === 'claimed' && record.failedAt === undefined && record.errorClass === undefined)
+				&& generation(committed.get(record.topic), true) && BigInt(record.generation) <= BigInt(committed.get(record.topic));
+		});
+	}
+	if (attempts) {
+		if (Number(await read('hlen', attempts)) > config.maxMembers) fail('member_limit_reached');
+		const topics = await read('hkeys', attempts);
+		for (let offset = 0; offset < topics.length; offset += 256) {
+			const batch = topics.slice(offset, offset + 256);
+			const values = await read('hmget', attempts, ...batch);
+			batch.forEach((topic, index) => {
+				const [owner, count, extra] = String(values[index]).split(':');
+				ok &&= extra === undefined && generation(owner) && owner === current.get(topic) && attempt(count) && count !== '1';
+			});
+		}
+	}
+	return ok;
 }
 export async function runVerification(config, clients) {
 	const selected = validateConfig(config), deadline = performance.now() + selected.timeoutMs;

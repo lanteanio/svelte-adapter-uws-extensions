@@ -149,7 +149,7 @@ describe('PostgreSQL ordered alarm generations', () => {
 			expect(await second.nextGeneration(`legacy${index}`)).toBe('2');
 		}
 		expect(await first.nextGeneration('new')).toBe('1');
-		expect((await a.query("SELECT version FROM svti_schema_migrations WHERE table_name = 'svti_alarms' ORDER BY version")).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+		expect((await a.query("SELECT version FROM svti_schema_migrations WHERE table_name = 'svti_alarms' ORDER BY version")).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
 	});
 	it('adopts an already provisioned generation schema without a migration ledger', async () => {
 		for (const version of postgresMigrations({ store: 'alarm-store' })) for (const statement of version.statements) await a.query(statement);
@@ -159,7 +159,7 @@ describe('PostgreSQL ordered alarm generations', () => {
 		expect(await first.get('retained')).toMatchObject({ generation: '2' });
 		expect(await second.set('retained', 2, null, '3')).toBe(true);
 		expect(await first.nextGeneration('retained')).toBe('4');
-		expect((await a.query("SELECT version FROM svti_schema_migrations WHERE table_name = 'svti_alarms' ORDER BY version")).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+		expect((await a.query("SELECT version FROM svti_schema_migrations WHERE table_name = 'svti_alarms' ORDER BY version")).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
 	});
 	it('refuses incompatible legacy authority without changing original rows', async () => {
 		const versions = postgresMigrations({ store: 'alarm-store' });

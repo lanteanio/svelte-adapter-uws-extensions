@@ -84,7 +84,7 @@ implementation.
 Save a private JSON scope file describing the stores actually deployed. Omit a
 backend that is not used. PostgreSQL names may be schema-qualified; all components
 must be lowercase SQL identifiers. Replay requires both event and sequence tables;
-alarms require both `alarms` and `alarm-generations` tables.
+alarms require the `alarms`, `alarm-generations` and `alarm-executions` tables together.
 Redis keyPrefix is the client prefix. The optional prefixes map replaces each
 family's store-level prefix, including empty strings.
 
@@ -130,15 +130,17 @@ Redis Cluster mode starts from the configured seed and scans every discovered
 primary; advertised endpoints must be reachable.
 
 PostgreSQL checks table presence, column types, valid index leading columns,
-serial counters, replay sequence authority and alarm generation authority using
-bigint-safe comparisons.
+serial counters, replay sequence authority, alarm generation authority and retained
+alarm execution authority using bigint-safe comparisons.
 It takes one repeatable-read snapshot. It does not certify every constraint,
 partial-index predicate, row payload or external side effect.
 
 Redis checks selected family key types, optional minimum key counts, replay
 sequence authority, exact membership pairing for alarms and dead letters, and
-canonical alarm generation watermarks and current membership. Retained generation
-hashes must not expire, even after all schedules are deleted. Legacy alarms without
+canonical alarm generation watermarks and current membership, and retained alarm
+executions against their order index, committed generation and retry attempt
+counters. Retained generation hashes and executions must not expire, even after
+all schedules are deleted. Legacy alarms without
 generation authority fail this package version's verification; use the matching
 pre-upgrade manifest when restoring an older artifact.
 It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS, HMGET and

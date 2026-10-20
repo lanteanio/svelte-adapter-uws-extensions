@@ -27,8 +27,64 @@ newer pending reservation to commit; it cannot resurrect an old committed alarm.
 `clear` removes current alarms and invalidates all reservations observed before
 its commit, retaining allocation history. Neither operation resets counters.
 
-These are durable storage claims. A process crash after claiming can still lose
-handler delivery; execution receipts and retries are a separate runtime concern.
+`delete` is cancellation. Timers and the recovery poll claim through `claim`
+(below), so a cancellation never consumes a running or failed execution.
+
+## Retained executions and explicit retry
+
+```js
+const claimed = await store.claim(topic, generation); // { attempt } or null
+if (claimed) {
+  try { await run(); await store.complete(topic, generation, claimed.attempt); }
+  catch { await store.fail(topic, generation, claimed.attempt, { errorClass: 'handler', failedAt: Date.now() }); }
+}
+```
+
+A scheduled row and a retained execution are separate records. `claim` atomically
+moves the matching schedule into execution storage and returns `{ attempt }`,
+starting at 1, or null when the generation is absent, replaced or already
+claimed. A lost claim reply therefore leaves a `claimed` record and a retrying
+caller gets null; the handler is not run twice. A newer generation scheduled
+afterwards coexists with the older execution.
+
+Each execution keeps the original `topic`, `at`, `meta` and `generation`, plus
+`attempt`, `status` (`claimed` or `failed`), `claimedAt`, `failedAt` (null
+until failure) and `errorClass` (null or `handler`). No error text or callback
+payload is stored. `complete` removes only the exact attempt and `fail` marks
+only the exact attempt failed; both return false for an obsolete attempt. A
+repeated `fail` for the same attempt returns true and keeps the first
+`failedAt`. `complete` on a failed record is the operator's way to discard it
+after inspection.
+
+Both stores refuse a claim once 100000 unresolved executions are retained in
+their namespace: `claim` rejects with code `ALARM_CAPACITY`, the schedule stays
+in place, and the claim can be retried after executions are resolved. Retained
+records are never evicted to make room. Concurrent PostgreSQL claims read the
+bound from their statement snapshot, so they can pass it by at most the number
+of claims in flight at that moment. The PostgreSQL check counts retained rows up to the bound, so a claim's cost
+grows with the number of unresolved executions; resolve or discard failed
+executions rather than letting them accumulate.
+
+`getExecution(topic, generation)` reads one record; `executions({ limit, after })`
+pages them by topic, then generation, in byte order of their text (so generation
+`10` sorts before `9`). `limit` defaults to 100 and is capped at 1000; `after`
+and the returned `next` are exclusive `{ topic, generation }` cursors, and `next`
+is null on the last page.
+
+Retry is explicit. `requeue(topic, generation, attempt, { at })` moves a failed
+execution back to the schedule at `at`, keeping its generation; the next claim
+receives `attempt + 1`. It returns false and changes nothing when the attempt
+does not match, a schedule already exists or a newer generation has been
+reserved. A `claimed` record (a crash or an unconfirmed outcome) needs
+`{ at, allowAbandoned: true }`; confirm its worker stopped and inspect the
+application's effects first. There is no lease expiry and no automatic replay.
+`requeue` writes a schedule only; the realtime recovery poll (`due`) dispatches
+it. Cancelling a requeued schedule with `delete` discards that retry, and a newer
+schedule replacing it starts again at attempt 1.
+
+Callback side effects are not transactional with `complete`. Deduplicate them
+with the realtime idempotency key, `JSON.stringify([topic, generation])`, scoped
+to this store's namespace.
 
 ## PostgreSQL rollout and recovery
 
@@ -45,10 +101,14 @@ alarms receive generation 1, with both watermarks set to 1. Empty topics first
 reserve 1. Backfill takes bounded locks and refuses incompatible existing
 authority instead of resetting it. Rehearse the migration on a restored copy.
 
-Grant runtime SELECT, INSERT, UPDATE and DELETE on the alarm table and SELECT,
-INSERT and UPDATE on its authority table, plus schema USAGE and ledger SELECT
+Migration version 4 adds `attempt BIGINT NOT NULL DEFAULT 1` to the alarm table
+and the `${table}_executions` table keyed by `(topic, generation)`. Existing
+schedules keep their rows and next claim at attempt 1.
+
+Grant runtime SELECT, INSERT, UPDATE and DELETE on the alarm and executions
+tables and SELECT, INSERT and UPDATE on its authority table, plus schema USAGE and ledger SELECT
 as described in [PostgreSQL readiness](./postgres-support.md). With
-`autoMigrate: false`, deployment must apply version 3 before runtime readiness.
+`autoMigrate: false`, deployment must apply versions 3 and 4 before runtime readiness.
 Administrative `clear()` uses a dedicated `READ COMMITTED` transaction, including
 writes that commit while it waits even if the connection defaults to stronger
 isolation. Authority is locked before the alarm table, checkout is bounded to ten seconds, lock waits to five seconds,
@@ -58,8 +118,8 @@ Clear scans retained authority but updates only outstanding reservations, avoidi
 row rewrites and WAL for settled history. Its scan cost still grows with lifetime
 topic cardinality; run it during planned maintenance rather than request handling.
 
-Restore the alarm table, authority table and migration ledger from the same
-recovery point. Retained authority includes deleted topics and reservations that
+Restore the alarm table, authority table, executions table and migration ledger
+from the same recovery point. Retained authority includes deleted topics and reservations that
 have not yet committed, so an empty alarm table does not mean its authority can
 be discarded. Do not truncate or expire generation records during cleanup.
 Restoring alarms without their authority can otherwise reuse old tokens. Rehearse
@@ -73,4 +133,4 @@ alarms and external handler effects before reverting a scheduler.
 
 ## Redis rollout and recovery
 
-For Redis upgrades, stop older writers that call topic-only `set` or `delete` before starting the generation-aware store. Existing scheduled rows acquire generation `1` atomically on first use, including `get()` and `due()`; these reads can write authority fields during adoption, while preserving metadata bytes. Keep all five keys together in backups and restores. `clear()` removes schedules and invalidates outstanding reservations, but retains generation authority. Deleted topics keep their counters so delayed calls and restarted processes cannot reuse a generation; this history has no automatic expiry. `clear()` traverses that full history synchronously in Redis, so its cost grows with lifetime topic cardinality. Use it for planned maintenance, away from request handling. Do not erase the authority hashes while any old calls can still arrive. Rolling back to a topic-only writer requires quiescing writers and coordinating the matching realtime version.
+For Redis upgrades, stop older writers that call topic-only `set` or `delete` before starting the generation-aware store. Existing scheduled rows acquire generation `1` atomically on first use, including `get()` and `due()`; these reads can write authority fields during adoption, while preserving metadata bytes. Keep all eight keys together in backups and restores, and use a `noeviction` memory policy: an evicted execution record is lost work. `clear()` removes schedules and pending retry attempts and invalidates outstanding reservations, but retains generation authority and retained executions. Deleted topics keep their counters so delayed calls and restarted processes cannot reuse a generation; this history has no automatic expiry. `clear()` traverses that full history synchronously in Redis, so its cost grows with lifetime topic cardinality. Use it for planned maintenance, away from request handling. Do not erase the authority hashes while any old calls can still arrive. Rolling back to a topic-only writer requires quiescing writers and coordinating the matching realtime version.

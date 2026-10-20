@@ -38,6 +38,15 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 		await alarms.set('private-deleted', 1, null, deletedGeneration);
 		await alarms.delete('private-deleted', deletedGeneration);
 		const pendingGeneration = await alarms.nextGeneration('private-deleted');
+		const failedGeneration = await alarms.nextGeneration('private-failed');
+		await alarms.set('private-failed', 1, { alarmId: 'notify' }, failedGeneration);
+		await alarms.claim('private-failed', failedGeneration);
+		await alarms.fail('private-failed', failedGeneration, 1, { errorClass: 'handler', failedAt: 2 });
+		const retryGeneration = await alarms.nextGeneration('private-retry');
+		await alarms.set('private-retry', 1, null, retryGeneration);
+		await alarms.claim('private-retry', retryGeneration);
+		await alarms.fail('private-retry', retryGeneration, 1, { errorClass: 'handler', failedAt: 2 });
+		await alarms.requeue('private-retry', retryGeneration, 1, { at: Date.now() + 60000 });
 		const dump = execFileSync('docker', ['exec', container, 'pg_dump', '-U', 'test', '-d', 'recovery_source', '-Fc'], { windowsHide: true, timeout: 30000 });
 		execFileSync('docker', ['exec', '-i', container, 'pg_restore', '-U', 'test', '-d', 'recovery_restored', '--exit-on-error', '--no-owner', '--no-acl'], { input: dump, windowsHide: true, timeout: 30000 });
 		const readerUrl = new URL(connection('recovery_restored'));
@@ -55,8 +64,9 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			env: { ...process.env, RECOVERY_POSTGRES_URL: readerUrl.href }
 		}));
 		expect(report.ok, JSON.stringify(report)).toBe(true);
-		expect(Object.keys(report.postgres.observations)).toHaveLength(9);
-		expect(report.postgres.observations['schema-migrations'].rows).toBe('13');
+		expect(Object.keys(report.postgres.observations)).toHaveLength(10);
+		expect(report.postgres.observations['schema-migrations'].rows).toBe('15');
+		expect(report.postgres.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: true });
 		expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|private-key/);
 		await expect(reader.query('DELETE FROM svti_tasks')).rejects.toMatchObject({ code: '25006' });
 		const restored = createPgClient({ connectionString: connection('recovery_restored'), autoShutdown: false });
@@ -65,6 +75,12 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			expect(await restoredAlarms.get('private-deleted')).toBeNull();
 			expect(await restoredAlarms.nextGeneration('private-deleted')).toBe((BigInt(pendingGeneration) + 1n).toString());
 			expect(await restoredAlarms.set('private-deleted', 1, null, pendingGeneration)).toBe(false);
+			expect(await restoredAlarms.getExecution('private-failed', failedGeneration)).toMatchObject({ status: 'failed', attempt: 1, meta: { alarmId: 'notify' } });
+			expect(await restoredAlarms.claim('private-retry', retryGeneration)).toEqual({ attempt: 2 });
+			await restored.query("UPDATE svti_alarms_generations SET committed = 0, reserved = 0 WHERE topic = 'private-failed'");
+			const orphaned = await runVerification(config, { postgres: reader });
+			expect(orphaned.postgres.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: false });
+			await restored.query("UPDATE svti_alarms_generations SET committed = $1, reserved = $1 WHERE topic = 'private-failed'", [failedGeneration]);
 			await restored.query("UPDATE svti_alarms_generations SET committed = 0 WHERE topic = 'private-room'");
 			const corruptAlarm = await runVerification(config, { postgres: reader });
 			expect(corruptAlarm.ok).toBe(false);

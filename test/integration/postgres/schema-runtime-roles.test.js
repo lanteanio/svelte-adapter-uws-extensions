@@ -29,6 +29,7 @@ beforeEach(async () => {
 	await deployment.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
 	await deployment.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${tables.join(', ')} TO ${role}`);
 	await deployment.query(`GRANT SELECT, INSERT, UPDATE ON svti_alarms_generations TO ${role}`);
+	await deployment.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON svti_alarms_executions TO ${role}`);
 	await deployment.query(`GRANT SELECT ON svti_schema_migrations TO ${role}`);
 	await deployment.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA ${schema} TO ${role}`);
 	runtime = connect(role, { options: `-c search_path=${schema}` });
@@ -119,6 +120,15 @@ it('runs all six stores and maintenance using a real non-owner login with only d
 	expect(await alarms.get('room')).toMatchObject({ generation });
 	expect(await alarms.due(2)).toHaveLength(1);
 	expect(await alarms.delete('room', generation)).toBe(true);
+	const retained = await alarms.nextGeneration('retained');
+	await alarms.set('retained', 1, null, retained);
+	expect(await alarms.claim('retained', retained)).toEqual({ attempt: 1 });
+	expect(await alarms.fail('retained', retained, 1, { errorClass: 'handler', failedAt: 2 })).toBe(true);
+	expect((await alarms.executions()).items).toHaveLength(1);
+	expect(await alarms.requeue('retained', retained, 1, { at: 3 })).toBe(true);
+	expect(await alarms.claim('retained', retained)).toEqual({ attempt: 2 });
+	expect(await alarms.complete('retained', retained, 2)).toBe(true);
+	expect(await alarms.getExecution('retained', retained)).toBeNull();
 	const next = await alarms.nextGeneration('room');
 	await alarms.set('room', 1, null, next); await alarms.clear();
 	expect(await alarms.get('room')).toBeNull();

@@ -163,22 +163,47 @@ it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();
 });
 
-it('requires PostgreSQL alarm rows and retained generation authority together', () => {
-	for (const stores of [{ alarms: 'svti_alarms' }, { 'alarm-generations': 'svti_alarms_generations' }]) {
+it('requires PostgreSQL alarm rows, retained generation authority and executions together', () => {
+	const all = { alarms: 'svti_alarms', 'alarm-generations': 'svti_alarms_generations', 'alarm-executions': 'svti_alarms_executions' };
+	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: all } })).not.toThrow();
+	for (const stores of [{ alarms: 'svti_alarms' }, { 'alarm-generations': 'svti_alarms_generations' }, { alarms: all.alarms, 'alarm-generations': all['alarm-generations'] }, { 'alarm-executions': all['alarm-executions'] }]) {
 		expect(() => validateConfig({ schemaVersion: 1, postgres: { stores } })).toThrow('incomplete_restore_group');
 	}
 });
 
-function alarmFixture({ due = [], metadata = [], reserved = [], committed = [], current = [] } = {}) {
-	const hashes = new Map([['meta', metadata.map(topic => [topic, '{}'])], ['reserved', reserved], ['committed', committed], ['current', current]].map(([role, entries]) => ['alarm:{alarms}:' + role, new Map(entries)]).filter(([, entries]) => entries.size));
+function alarmFixture({ due = [], metadata = [], reserved = [], committed = [], current = [], attempt = [], executions = [], order = executions.map(([id]) => id) } = {}) {
+	const hashes = new Map([['meta', metadata.map(topic => [topic, '{}'])], ['reserved', reserved], ['committed', committed], ['current', current], ['attempt', attempt], ['executions', executions]].map(([role, entries]) => ['alarm:{alarms}:' + role, new Map(entries)]).filter(([, entries]) => entries.size));
+	const sorted = new Map([['due', due], ['execution-order', order]].map(([role, members]) => ['alarm:{alarms}:' + role, members]).filter(([, members]) => members.length));
 	return {
-		scan: async () => ['0', [...hashes.keys(), ...(due.length ? ['alarm:{alarms}:due'] : [])]],
+		scan: async () => ['0', [...hashes.keys(), ...sorted.keys()]],
 		type: async key => hashes.has(key) ? 'hash' : 'zset', pttl: async () => -1,
 		hlen: async key => hashes.get(key).size, hkeys: async key => [...hashes.get(key).keys()],
 		hmget: async (key, ...fields) => fields.map(field => hashes.get(key)?.get(field) ?? null),
-		zcard: async () => due.length, zrange: async () => due
+		zcard: async key => sorted.get(key)?.length ?? 0, zrange: async key => sorted.get(key) ?? []
 	};
 }
+
+const retained = (topic, generation, fields = {}) => [topic.replaceAll('\0', '\0\x01') + '\0\0' + generation, JSON.stringify({ topic, generation, score: '1', payload: '', attempt: '1', status: 'claimed', claimedAt: '5', ...fields })];
+it.each([
+	[{ reserved: [['room', '2']], committed: [['room', '2']], executions: [retained('room', '1'), retained('room', '2', { status: 'failed', failedAt: '6', errorClass: 'handler', attempt: '3' })] }, true],
+	[{ reserved: [['a\0b', '1']], committed: [['a\0b', '1']], executions: [retained('a\0b', '1')] }, true],
+	[{ due: ['room'], metadata: ['room'], reserved: [['room', '1']], committed: [['room', '1']], current: [['room', '1']], attempt: [['room', '1:2']] }, true],
+	[{ reserved: [['room', '2']], committed: [['room', '1']], executions: [retained('room', '2')] }, false],
+	[{ executions: [retained('room', '1')] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1')], order: [] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [[retained('other', '1')[0], retained('room', '1')[1]]] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1', { status: 'failed' })] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1', { errorClass: 'handler' })] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1', { attempt: '0' })] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [['bogus-id', 'not json']] }, false],
+	[{ due: ['room'], metadata: ['room'], reserved: [['room', '2']], committed: [['room', '2']], current: [['room', '2']], attempt: [['room', '1:2']] }, false],
+	[{ due: ['room'], metadata: ['room'], reserved: [['room', '1']], committed: [['room', '1']], current: [['room', '1']], attempt: [['room', '1:1']] }, false]
+])('verifies retained Redis alarm executions %#', async (state, ok) => {
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'] } }, { redis: alarmFixture(state) });
+	expect(report.complete).toBe(true);
+	expect(report.redis.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok });
+	expect(report.redis.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: true });
+});
 
 it.each([
 	[{ reserved: [['deleted', '9007199254740993']], committed: [['deleted', '9007199254740992']] }, true],

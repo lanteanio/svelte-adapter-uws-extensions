@@ -996,7 +996,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			// command can observe a half-applied script. Keep every evaluator
 			// synchronous; introducing an `await` inside one would break this.
 			async eval(script, numKeys, ...args) {
-				if (script.includes('ORDERED_ALARM_GENERATIONS_V1')) {
+				if (script.includes('ORDERED_ALARM_GENERATIONS_V2')) {
 					return evaluateAlarmGeneration(args, { sortedSets, hashes });
 				}
 

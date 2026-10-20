@@ -34,6 +34,15 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	await alarms.set('private-deleted', 1, null, deletedGeneration);
 	await alarms.delete('private-deleted', deletedGeneration);
 	const pendingGeneration = await alarms.nextGeneration('private-deleted');
+	const failedGeneration = await alarms.nextGeneration('private-failed');
+	await alarms.set('private-failed', 1, { alarmId: 'notify' }, failedGeneration);
+	await alarms.claim('private-failed', failedGeneration);
+	await alarms.fail('private-failed', failedGeneration, 1, { errorClass: 'handler', failedAt: 2 });
+	const retryGeneration = await alarms.nextGeneration('private-retry');
+	await alarms.set('private-retry', 1, null, retryGeneration);
+	await alarms.claim('private-retry', retryGeneration);
+	await alarms.fail('private-retry', retryGeneration, 1, { errorClass: 'handler', failedAt: 2 });
+	await alarms.requeue('private-retry', retryGeneration, 1, { at: Date.now() + 60000 });
 	await createDeadLetter(source).add({ webhookId: 'delivery', topic: 'private-room', event: 'message', data: { value: 4 }, attempts: 1, error: 'failure' });
 	const records = [];
 	for (const key of await scanKeys(source.redis, source.key('*'))) {
@@ -42,7 +51,7 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	for (const record of records) {
 		await restored.redis.restore(restored.key(record.key), record.expiresAt < 0 ? 0 : record.expiresAt, Buffer.from(record.dump, 'base64'), ...(record.expiresAt < 0 ? [] : ['ABSTTL']));
 	}
-	const config = { schemaVersion: 1, redis: { keyPrefix: restored.key(''), families: ['replay','alarms','dead-letter'], minimumKeys: { replay: 4, alarms: 5, 'dead-letter': 3 } } };
+	const config = { schemaVersion: 1, redis: { keyPrefix: restored.key(''), families: ['replay','alarms','dead-letter'], minimumKeys: { replay: 4, alarms: 8, 'dead-letter': 3 } } };
 	let report;
 	if (typeof restored.redis.nodes === 'function') report = await runVerification(config, { redis: restored.redis });
 	else {
@@ -60,6 +69,14 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	expect(await restoredAlarms.get('private-deleted')).toBeNull();
 	expect(await restoredAlarms.nextGeneration('private-deleted')).toBe((BigInt(pendingGeneration) + 1n).toString());
 	expect(await restoredAlarms.set('private-deleted', 1, null, pendingGeneration)).toBe(false);
+	expect(await restoredAlarms.getExecution('private-failed', failedGeneration)).toMatchObject({ status: 'failed', attempt: 1, meta: { alarmId: 'notify' } });
+	const orderKey = restored.key('alarm:{alarms}:execution-order'), executionId = 'private-failed\0\0' + failedGeneration;
+	await restored.redis.zrem(orderKey, executionId);
+	const unindexed = await runVerification(config, { redis: restored.redis });
+	expect(unindexed.redis.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: false });
+	await restored.redis.zadd(orderKey, 0, executionId);
+	expect(await restoredAlarms.claim('private-retry', retryGeneration)).toEqual({ attempt: 2 });
+	expect(await restoredAlarms.complete('private-retry', retryGeneration, 2)).toBe(true);
 	await restored.redis.hset(restored.key('alarm:{alarms}:committed'), 'private-room', '0');
 	const corruptAlarm = await runVerification(config, { redis: restored.redis });
 	expect(corruptAlarm.ok).toBe(false);

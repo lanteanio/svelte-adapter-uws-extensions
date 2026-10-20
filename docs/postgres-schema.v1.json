@@ -94,7 +94,8 @@
 			"subpath": "postgres/alarm-store",
 			"tables": [
 				"svti_alarms",
-				"svti_alarms_generations"
+				"svti_alarms_generations",
+				"svti_alarms_executions"
 			],
 			"restoreTogether": true,
 			"initialization": "construction",
@@ -102,9 +103,10 @@
 			"changeClass": "new store since source release",
 			"additions": [
 				"store table and fire_at index",
-				"version 3: generation BIGINT NOT NULL; retained topic/reserved/committed authority; legacy rows start at generation 1"
+				"version 3: generation BIGINT NOT NULL; retained topic/reserved/committed authority; legacy rows start at generation 1",
+				"version 4: attempt BIGINT NOT NULL DEFAULT 1 on schedules; svti_alarms_executions retains claimed and failed attempts keyed by (topic, generation), with a byte-order (COLLATE \"C\") topic index for paging"
 			],
-			"rollbackLimit": "Stop topic-only writers before generation migration. Retain alarm rows, generation authority and ledger together; reconcile pending alarms and effects before changing schedulers."
+			"rollbackLimit": "Stop topic-only writers before generation migration. Retain alarm rows, generation authority, retained executions and ledger together; reconcile pending alarms, retained executions and effects before changing schedulers."
 		}
 	],
 	"ledger": {
@@ -123,9 +125,11 @@
 		"versions": [
 			1,
 			2,
-			3
+			3,
+			4
 		],
 		"version3Stores": ["postgres/alarm-store"],
+		"version4Stores": ["postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true
 	}

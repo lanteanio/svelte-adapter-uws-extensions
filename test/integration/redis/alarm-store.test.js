@@ -2,11 +2,13 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createAlarmStore } from '../../../src/redis/alarm-store.js';
 import { alarmGenerationContract } from '../../helpers/alarm-generation-contract.js';
+import { alarmExecutionContract } from '../../helpers/alarm-execution-contract.js';
 
 // The mirror config runs these same connection races against a real Cluster.
 // Lua must bind the observed generation, metadata and due index atomically.
 describe('redis ordered alarm generations (integration)', { retry: 0 }, () => {
 	let clientA, clientB, storeA, storeB;
+	const restarted = [];
 	beforeAll(() => {
 		clientA = createBackendClient({ keyPrefix: 'inttest-alarm:' });
 		clientB = createBackendClient({ keyPrefix: 'inttest-alarm:' });
@@ -17,8 +19,55 @@ describe('redis ordered alarm generations (integration)', { retry: 0 }, () => {
 	afterAll(async () => {
 		await clientA?.quit?.();
 		await clientB?.quit?.();
+		for (const client of restarted) await client.quit?.();
 	});
 	alarmGenerationContract(() => [storeA, storeB], () => clientA);
+	alarmExecutionContract({
+		stores: () => [storeA, storeB],
+		restart: () => {
+			const client = createBackendClient({ keyPrefix: 'inttest-alarm:' });
+			restarted.push(client);
+			return createAlarmStore(client);
+		},
+		fill: count => clientA.redis.eval(`local missing = tonumber(ARGV[1]) - redis.call('ZCARD', KEYS[2])
+			for index = 1, missing do
+				local topic = 'fill:' .. string.format('%06d', index)
+				local id = topic .. '\\0\\0' .. '1'
+				redis.call('HSET', KEYS[1], id, cjson.encode({topic=topic, generation='1', score='1', payload='', attempt='1', status='claimed', claimedAt='1'}))
+				redis.call('ZADD', KEYS[2], 0, id)
+			end
+			return missing`, 2, clientA.key('alarm:{alarms}:executions'), clientA.key('alarm:{alarms}:execution-order'), count)
+	});
+	it('orders execution ids by topic bytes even when topics contain NUL', async () => {
+		const accented = 'a' + String.fromCharCode(0xe9);
+		for (const topic of ['ab', 'a\0b', 'a', 'a\0', accented]) {
+			const generation = await storeA.nextGeneration(topic);
+			await storeA.set(topic, 1, null, generation);
+			await storeA.claim(topic, generation);
+		}
+		const page = await storeB.executions({ limit: 2 });
+		expect(page.items.map(item => item.topic)).toEqual(['a', 'a\0']);
+		expect((await storeB.executions({ after: page.next })).items.map(item => item.topic)).toEqual(['a\0b', 'ab', accented]);
+	});
+	it('a requeued schedule keeps fractional deadlines and unusual metadata exactly', async () => {
+		const meta = { alarmId: 'a/"b"\\c', path: 'x/y', tenantId: null };
+		const generation = await storeA.nextGeneration('exact');
+		await storeA.set('exact', 1.25, meta, generation);
+		await storeA.claim('exact', generation);
+		await storeA.fail('exact', generation, 1, { errorClass: 'handler', failedAt: 2 });
+		expect(await storeB.getExecution('exact', generation)).toMatchObject({ at: 1.25, meta });
+		expect(await storeB.requeue('exact', generation, 1, { at: 1760000000000.5 })).toBe(true);
+		expect(await storeA.get('exact')).toEqual({ topic: 'exact', at: 1760000000000.5, meta, generation });
+	});
+	it('racing claims on independent connections retain exactly one attempt', async () => {
+		for (let round = 0; round < 25; round++) {
+			const topic = 'race:' + round;
+			const generation = await storeA.nextGeneration(topic);
+			await storeA.set(topic, 1, null, generation);
+			const results = await Promise.all([storeA.claim(topic, generation), storeB.claim(topic, generation), storeA.claim(topic, generation)]);
+			expect(results.filter(Boolean)).toEqual([{ attempt: 1 }]);
+		}
+	});
 	it('bulk due reads retain order across chunks and validate every row before adoption', async () => {
 		const bulk = createAlarmStore(clientA, { dueBatch: 600 });
 		const dueKey = clientA.key('alarm:{alarms}:due');

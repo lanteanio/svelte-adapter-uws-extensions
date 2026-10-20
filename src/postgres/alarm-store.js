@@ -14,7 +14,8 @@
  *     fire_at BIGINT NOT NULL,      -- epoch-ms deadline
  *     meta    JSONB,                -- resolver metadata ({ alarmId, path, tenantId })
  *     tenant  TEXT,                 -- tenantId mirrored out for ops queries / cleanup
- *     generation BIGINT NOT NULL   -- exact reserved generation, returned as a string
+ *     generation BIGINT NOT NULL,  -- exact reserved generation, returned as a string
+ *     attempt BIGINT NOT NULL DEFAULT 1 -- attempt the next claim receives
  *   )
  *   + index on (fire_at) so the due() sweep is a range scan
  *
@@ -22,13 +23,26 @@
  * `delete(topic, generation)` claims only the observed generation; delayed old
  * writers cannot resurrect a cancelled alarm. Handler delivery belongs to realtime.
  *
+ * A companion `_executions` table, keyed by (topic, generation), retains claimed
+ * work. `claim` moves the observed schedule row there in one statement before
+ * the handler runs; `complete` and `fail` act only on the exact attempt, and
+ * `requeue` moves a failed (or confirmed abandoned) attempt back to the
+ * schedule. Every mutation of a topic's schedule serializes on its authority row.
+ *
  * @module svelte-adapter-uws-extensions/postgres/alarm-store
  */
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
 import { withBreaker } from './_breaker.js';
-import { assertAlarmGeneration } from '../shared/alarm-generation.js';
+import { wallEpoch } from '../shared/runtime.js';
+import {
+	MAX_ALARM_EXECUTIONS, alarmCapacityError, alarmExecutionsPage, assertAlarmAttempt,
+	assertAlarmFailure, assertAlarmGeneration, assertAlarmRequeue
+} from '../shared/alarm-generation.js';
+
+const LABEL = 'postgres alarm store';
+const EXECUTION_FIELDS = 'topic, fire_at, meta, generation::text AS generation, attempt::text AS attempt, status, claimed_at::text AS claimed_at, failed_at::text AS failed_at';
 
 /** Default cap on the rows returned by one `due(now)` sweep. */
 const DEFAULT_DUE_BATCH = 100;
@@ -64,13 +78,14 @@ export function createAlarmStore(client, options = {}) {
 	}
 	const table = options.table || 'svti_alarms';
 	const authority = table + '_generations';
+	const executions = table + '_executions';
 	const autoMigrate = options.autoMigrate !== false;
 	assertSafeTableName(table, 'postgres alarm store');
 
 	const b = options.breaker;
 	const m = options.metrics;
 	const mSet = m?.counter('alarm_store_set_total', 'Alarms persisted to the durable store');
-	const mClaimed = m?.counter('alarm_store_claimed_total', 'Alarms claimed (delete removed a present row)');
+	const mClaimed = m?.counter('alarm_store_claimed_total', 'Alarms claimed into retained execution storage');
 	const mDue = m?.counter('alarm_store_due_total', 'Due alarms returned to the recovery poll');
 
 	const schema = createStoreSchema(client, 'alarm-store', table, autoMigrate);
@@ -83,6 +98,17 @@ export function createAlarmStore(client, options = {}) {
 		}
 	}
 	const row = value => value ? ({ topic: value.topic, at: Number(value.fire_at), meta: value.meta ?? null, generation: value.generation }) : null;
+	const execution = value => {
+		if (!value) return null;
+		const failed = value.status === 'failed';
+		return { ...row(value), attempt: Number(value.attempt), status: failed ? 'failed' : 'claimed', claimedAt: Number(value.claimed_at), failedAt: failed ? Number(value.failed_at) : null, errorClass: failed ? 'handler' : null };
+	};
+	function assertExecution(topic, generation, attempt) {
+		assertTopic(topic);
+		assertAlarmGeneration(generation, LABEL);
+		if (attempt !== undefined) assertAlarmAttempt(attempt, LABEL);
+	}
+	const run = work => withBreaker(b, async () => { await ensureTable(); return work(); });
 
 	return {
 		ready: schema.ready,
@@ -132,7 +158,7 @@ export function createAlarmStore(client, options = {}) {
 					       INSERT INTO ${table} (topic, fire_at, meta, tenant, generation)
 					       SELECT topic, $2, $3::jsonb, $4, $5::bigint FROM accepted
 					       ON CONFLICT (topic) DO UPDATE
-					         SET fire_at = EXCLUDED.fire_at, meta = EXCLUDED.meta, tenant = EXCLUDED.tenant, generation = EXCLUDED.generation RETURNING topic`,
+					         SET fire_at = EXCLUDED.fire_at, meta = EXCLUDED.meta, tenant = EXCLUDED.tenant, generation = EXCLUDED.generation, attempt = 1 RETURNING topic`,
 					values: [topic, Math.trunc(at), JSON.stringify(meta ?? null), (meta && meta.tenantId != null) ? meta.tenantId : null, generation]
 				});
 				const accepted = result.rowCount === 1;
@@ -153,10 +179,109 @@ export function createAlarmStore(client, options = {}) {
 					       DELETE FROM ${table} a USING authority g WHERE a.topic = g.topic AND a.generation = $2::bigint RETURNING a.topic`,
 					values: [topic, generation]
 				});
-				const claimed = res.rowCount === 1;
-				if (claimed) mClaimed?.inc();
-				return claimed;
+				return res.rowCount === 1;
 			});
+		},
+
+		async claim(topic, generation) {
+			assertExecution(topic, generation);
+			const result = await run(() => client.query({
+				name: 'alarm_claim_' + table,
+				// One statement: lock the authority row like set/delete, then move the
+				// observed row only while retained storage is below its bound. The
+				// bound is read from the statement snapshot, so concurrent claims can
+				// overshoot it by at most their own number; nothing is ever evicted.
+				text: `WITH authority AS (SELECT topic FROM ${authority} WHERE topic = $1 AND committed = $2::bigint FOR UPDATE),
+				       capacity AS MATERIALIZED (SELECT count(*) < $3::bigint AS available FROM (SELECT 1 FROM ${executions} LIMIT $3::bigint) retained),
+				       claimed AS (DELETE FROM ${table} a USING authority g, capacity c WHERE a.topic = g.topic AND a.generation = $2::bigint AND c.available
+				         RETURNING a.topic, a.generation, a.fire_at, a.meta, a.tenant, a.attempt),
+				       moved AS (INSERT INTO ${executions} (topic, generation, fire_at, meta, tenant, attempt, status, claimed_at)
+				         SELECT topic, generation, fire_at, meta, tenant, attempt, 'claimed', $4::bigint FROM claimed RETURNING attempt)
+				       SELECT (SELECT attempt::text FROM moved) AS attempt, (SELECT available FROM capacity) AS available,
+				         EXISTS (SELECT 1 FROM ${table} WHERE topic = $1 AND generation = $2::bigint) AS present`,
+				values: [topic, generation, MAX_ALARM_EXECUTIONS, Math.trunc(wallEpoch())]
+			}));
+			const outcome = result.rows[0];
+			if (outcome?.attempt != null) {
+				mClaimed?.inc();
+				return { attempt: Number(outcome.attempt) };
+			}
+			// Refused outside the breaker: a full namespace is not a backend failure.
+			if (outcome?.present && !outcome.available) throw alarmCapacityError(LABEL);
+			return null;
+		},
+
+		async complete(topic, generation, attempt) {
+			assertExecution(topic, generation, attempt);
+			const result = await run(() => client.query({
+				name: 'alarm_complete_' + table,
+				text: `DELETE FROM ${executions} WHERE topic = $1 AND generation = $2::bigint AND attempt = $3::bigint`,
+				values: [topic, generation, attempt]
+			}));
+			return result.rowCount === 1;
+		},
+
+		async fail(topic, generation, attempt, failure) {
+			assertExecution(topic, generation, attempt);
+			const failedAt = assertAlarmFailure(failure, LABEL);
+			// A repeated outcome for the same attempt keeps the first failure time.
+			const result = await run(() => client.query({
+				name: 'alarm_fail_' + table,
+				text: `UPDATE ${executions} SET status = 'failed', failed_at = COALESCE(failed_at, $4::bigint), error_class = 'handler'
+				       WHERE topic = $1 AND generation = $2::bigint AND attempt = $3::bigint`,
+				values: [topic, generation, attempt, failedAt]
+			}));
+			return result.rowCount === 1;
+		},
+
+		async getExecution(topic, generation) {
+			assertExecution(topic, generation);
+			const result = await run(() => client.query({
+				name: 'alarm_execution_' + table,
+				text: `SELECT ${EXECUTION_FIELDS} FROM ${executions} WHERE topic = $1 AND generation = $2::bigint`,
+				values: [topic, generation]
+			}));
+			return execution(result.rows[0]);
+		},
+
+		async executions(options) {
+			const { limit, after } = alarmExecutionsPage(options, LABEL);
+			// Byte order of topic, then of the decimal generation text. The topic
+			// range walks the byte-order index; generations sort per topic.
+			const order = `ORDER BY topic COLLATE "C", generation::text COLLATE "C"`;
+			const result = await run(() => client.query(after ? {
+				name: 'alarm_executions_after_' + table,
+				text: `SELECT ${EXECUTION_FIELDS} FROM ${executions}
+				       WHERE topic COLLATE "C" >= $1::text AND (topic COLLATE "C" > $1::text OR generation::text COLLATE "C" > $2::text)
+				       ${order} LIMIT $3`,
+				values: [after.topic, after.generation, limit + 1]
+			} : {
+				name: 'alarm_executions_' + table,
+				text: `SELECT ${EXECUTION_FIELDS} FROM ${executions} ${order} LIMIT $1`,
+				values: [limit + 1]
+			}));
+			const items = result.rows.slice(0, limit).map(execution);
+			const last = items.at(-1);
+			return { items, next: result.rows.length > limit ? { topic: last.topic, generation: last.generation } : null };
+		},
+
+		async requeue(topic, generation, attempt, options) {
+			assertExecution(topic, generation, attempt);
+			const { at, allowAbandoned, next } = assertAlarmRequeue(attempt, options, LABEL);
+			const result = await run(() => client.query({
+				name: 'alarm_requeue_' + table,
+				// A newer reservation (reserved past this generation) or any existing
+				// schedule refuses the retry and leaves both records unchanged.
+				text: `WITH authority AS (SELECT topic FROM ${authority} WHERE topic = $1 AND reserved = $2::bigint AND committed = $2::bigint FOR UPDATE),
+				       moved AS (DELETE FROM ${executions} e USING authority g
+				         WHERE e.topic = g.topic AND e.generation = $2::bigint AND e.attempt = $3::bigint AND (e.status = 'failed' OR $6::boolean)
+				           AND NOT EXISTS (SELECT 1 FROM ${table} a WHERE a.topic = $1)
+				         RETURNING e.topic, e.generation, e.meta, e.tenant)
+				       INSERT INTO ${table} (topic, fire_at, meta, tenant, generation, attempt)
+				       SELECT topic, $4, meta, tenant, generation, $5::bigint FROM moved RETURNING topic`,
+				values: [topic, generation, attempt, Math.trunc(at), next, allowAbandoned]
+			}));
+			return result.rowCount === 1;
 		},
 
 		async due(nowMs) {

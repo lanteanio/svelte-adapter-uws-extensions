@@ -152,7 +152,8 @@ function validateLedger(rows, schema) {
 
 async function readIndexes(client, table) {
 	const { rows } = await client.query(`SELECT c.relname AS name, i.indisvalid AS valid, i.indisunique AS unique, i.indisprimary AS primary, am.amname AS method,
-		ARRAY(SELECT pg_get_indexdef(i.indexrelid, n, true) FROM generate_series(1, i.indnkeyatts) n) AS columns,
+		ARRAY(SELECT pg_get_indexdef(i.indexrelid, n, true) || COALESCE((SELECT ' COLLATE ' || quote_ident(co.collname) FROM pg_collation co JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[n - 1]
+			WHERE co.oid = i.indcollation[n - 1] AND co.oid <> a.attcollation), '') FROM generate_series(1, i.indnkeyatts) n) AS columns,
 		pg_get_expr(i.indpred, i.indrelid) AS predicate
 		FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam WHERE i.indrelid = to_regclass($1)`, [table]);
 	return rows;

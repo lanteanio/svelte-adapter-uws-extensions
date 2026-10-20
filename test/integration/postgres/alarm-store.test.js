@@ -31,7 +31,7 @@ describe('postgres alarm store single-fire claim (integration)', { retry: 0 }, (
 		// Two real pools standing in for two cluster instances.
 		clientA = createPgClient({ connectionString: url, autoShutdown: false });
 		clientB = createPgClient({ connectionString: url, autoShutdown: false });
-		await clientA.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_generations`);
+		await clientA.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_generations, ${TABLE}_executions`);
 		storeA = createAlarmStore(clientA, { table: TABLE });
 		storeB = createAlarmStore(clientB, { table: TABLE });
 		await storeA.ready();
@@ -44,7 +44,7 @@ describe('postgres alarm store single-fire claim (integration)', { retry: 0 }, (
 
 	afterAll(async () => {
 		if (clientA) {
-			await clientA.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_generations`);
+			await clientA.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_generations, ${TABLE}_executions`);
 			await clientA.end();
 		}
 		if (clientB) await clientB.end();

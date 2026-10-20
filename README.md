@@ -242,7 +242,7 @@ export const wrapped = createPgClient({ pool });
 
 Primary keys follow the `<tablename>_id` surrogate-key convention for the
 row-per-event tables: `svti_replay_id`, `svti_jobs_id`, `svti_tasks_id`,
-`svti_dead_letter_id`. Three aggregates deliberately use a **natural** primary
+`svti_dead_letter_id`. Four aggregates deliberately use a **natural** primary
 key instead, because each holds exactly one row per key and a surrogate would
 add identity nothing references plus a redundant index:
 
@@ -250,12 +250,12 @@ add identity nothing references plus a redundant index:
 |---|---|---|
 | `svti_idempotency` | `svti_idempotency_key` | one cached result per idempotency key |
 | `svti_alarms` | `topic` | one pending alarm per topic |
+| `svti_alarms_executions` | `(topic, generation)` | one retained execution per claimed generation |
 | `svti_replay_seq` | `topic` | one seq/epoch counter row per topic |
 
-This is a recorded exception to the surrogate-key rule, not an oversight; schema
-review should treat these three as intentional. Physical table names are
-configurable per factory (`table` option), but the logical column names above
-are stable regardless of the physical name.
+This is a recorded exception to the surrogate-key rule, not an oversight; schema review
+should treat these four as intentional. Physical table names are configurable per factory
+(`table` option), but the logical column names above are stable regardless of the physical name.
 
 ---
 
@@ -1594,12 +1594,12 @@ configureAlarm({
 });
 ```
 
-The realtime layer owns timers and recovery; the store runs no background loop. Reserve with `nextGeneration(topic)`, then await `set(topic, at, meta, generation)`; it returns false for stale reservations. `get(topic)` and `due(now)` include exact decimal-string generations. `delete(topic, generation)` claims only that current generation, fencing stale timers and preventing old writes from resurrecting cancelled alarms. `clear()` invalidates reservations while retaining generation history. These storage claims do not guarantee handler delivery after a crash. See [generation contracts, rollout and recovery](docs/alarm-generations.md).
+The realtime layer owns timers and recovery; the store runs no background loop. Reserve with `nextGeneration(topic)`, then await `set(topic, at, meta, generation)`; it returns false for stale reservations. `get(topic)` and `due(now)` include exact decimal-string generations. `delete(topic, generation)` cancels only that current generation, preventing old writes from resurrecting cancelled alarms. `clear()` removes schedules and invalidates reservations while retaining generation history and retained executions. Before a handler runs, `claim(topic, generation)` atomically moves the schedule into retained execution storage and returns `{ attempt }` (null when already claimed or replaced); `complete` and `fail` settle only that exact attempt, and failures keep the original row with `errorClass: 'handler'` but no error text. At 100000 unresolved executions `claim` rejects with code `ALARM_CAPACITY` and keeps the schedule; retained work is never evicted. Operators page `executions({ limit, after })`, read `getExecution(topic, generation)` and retry explicitly with `requeue(topic, generation, attempt, { at })`, which keeps the generation and increments the next attempt; a `claimed` record left by a crash needs `allowAbandoned: true`. Nothing expires or replays on its own; restrict these operator calls to trusted administrators, since topics and metadata carry tenant scope. See [generation contracts, executions, rollout and recovery](docs/alarm-generations.md).
 
-- **Redis.** The due-index ZSET (`{alarms}:due`) and metadata hash (`{alarms}:meta`) share a slot with three generation hashes: `{alarms}:reserved`, `{alarms}:committed` and `{alarms}:current`. Atomic scripts reserve generations, conditionally commit or delete a schedule, and read its metadata with its generation. All five keys are checked for the same slot at construction.
-- **Postgres.** Version 3 adds `generation` to `svti_alarms(topic, fire_at, meta, tenant, generation)` and retains allocation/commit watermarks in `svti_alarms_generations`. Writes and conditional claims serialize through authority rows; `due(now)` uses the `fire_at` range index. Restore both tables with the migration ledger.
+- **Redis.** The due-index ZSET (`{alarms}:due`) and metadata hash (`{alarms}:meta`) share a slot with three generation hashes (`{alarms}:reserved`, `{alarms}:committed`, `{alarms}:current`), the retry attempt hash `{alarms}:attempt`, the retained execution hash `{alarms}:executions` and its lexical index ZSET `{alarms}:execution-order`. Atomic scripts reserve generations, conditionally commit, cancel or claim a schedule, and fence execution outcomes by attempt. All eight keys are checked for the same slot at construction. Run the alarm namespace under a `noeviction` memory policy so Redis never evicts retained work.
+- **Postgres.** Version 3 adds `generation` to `svti_alarms` and retains allocation/commit watermarks in `svti_alarms_generations`. Version 4 adds `attempt` to `svti_alarms(topic, fire_at, meta, tenant, generation, attempt)` and the `svti_alarms_executions` table keyed by `(topic, generation)`. Every operation is a single statement; schedule writes, claims and retries serialize through the topic's authority row, and outcomes lock only their exact execution row; `due(now)` uses the `fire_at` range index. Restore all three tables with the migration ledger.
 
-Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres; default `svti_alarms`), `dueBatch` (max alarms swept per poll, default 100), `autoMigrate` (Postgres, default true), `breaker`, `metrics`. Requires a realtime build implementing `nextGeneration`, `get` and generation-qualified mutations; stop old topic-only writers before adoption.
+Options: `keyPrefix` (Redis; stacks with the client prefix) / `table` (Postgres; default `svti_alarms`), `dueBatch` (max alarms swept per poll, default 100), `autoMigrate` (Postgres, default true), `breaker`, `metrics`. Requires a realtime build that claims through `claim` and settles with `complete`/`fail`; stop old topic-only writers before adoption.
 
 ## Cursor
 

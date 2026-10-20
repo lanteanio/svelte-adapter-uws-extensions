@@ -90,7 +90,37 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 			generations.push(`ALTER TABLE ${relation.name} VALIDATE CONSTRAINT ${entry.name}`);
 		}
 		versions.push(generations);
-		schema.checkpoints[3] = schema.tables;
+		schema.checkpoints[3] = schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] }));
+		// Retained executions: a claim moves the schedule row here before the
+		// handler runs. The schedule carries the attempt its next claim receives.
+		const attempt = check('attempt', "attempt >= 1 AND attempt <= '9007199254740991'::bigint");
+		const executions = {
+			name: `${table}_executions`,
+			columns: [text('topic', true), ['generation', 'bigint', true], ['fire_at', 'bigint', true], json('meta'), text('tenant'), ['attempt', 'bigint', true], text('status', true), ['claimed_at', 'bigint', true], ['failed_at', 'bigint', false], text('error_class')],
+			// Byte-order topic index: executions() pages by topic, then sorts the
+			// few generations of each topic incrementally.
+			primary: ['topic', 'generation'], indexes: [index('execution_order', ['topic COLLATE "C"'])],
+			checks: [
+				check('execution_generation', 'generation > 0'),
+				check('execution_attempt', "attempt >= 1 AND attempt <= '9007199254740991'::bigint"),
+				check('execution_status', "(status = 'claimed' AND failed_at IS NULL AND error_class IS NULL) OR (status = 'failed' AND failed_at IS NOT NULL AND error_class = 'handler')")
+			],
+			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+		};
+		main.columns = [...main.columns, ['attempt', 'bigint', true, '1']];
+		main.checks = [...main.checks, attempt];
+		schema.tables.push(executions);
+		const retained = [
+			`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS attempt BIGINT NOT NULL DEFAULT 1`,
+			`CREATE TABLE IF NOT EXISTS ${executions.name} (${executions.columns.map(columnSql).join(', ')}, PRIMARY KEY (topic, generation))`
+		];
+		for (const [relation, entries] of [[main, [attempt]], [executions, executions.checks]]) for (const entry of entries) {
+			retained.push(`DO $migration$ BEGIN ALTER TABLE ${relation.name} ADD CONSTRAINT ${entry.name} CHECK (${entry.expression}) NOT VALID; EXCEPTION WHEN duplicate_object THEN NULL; END $migration$`);
+			retained.push(`ALTER TABLE ${relation.name} VALIDATE CONSTRAINT ${entry.name}`);
+		}
+		for (const entry of executions.indexes) retained.push(indexSql(executions.name, entry));
+		versions.push(retained);
+		schema.checkpoints[4] = schema.tables;
 	}
 	for (const [offset, statements] of versions.entries()) {
 		const version = offset + 1;
