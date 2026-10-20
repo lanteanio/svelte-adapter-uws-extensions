@@ -1607,7 +1607,9 @@ Redis-backed counterpart to the core `createCursor` plugin. Await `attach(ws, to
 
 Out of the box the broadcast path is a 60Hz world-state tick: each topic emits at most one frame per `topicThrottle` window, carrying the latest position for every cursor that moved. Bandwidth per peer scales with active-mover count, not with mover-count times per-mover rate - 100 cursors moving at 60Hz cost the same per peer as 100 cursors moving at 1Hz, because every peer receives one bulk frame per tick regardless. For high-density rooms (>200 active movers) where the bulk-frame size becomes the bottleneck, lower the tick by raising `topicThrottle` to 33 (30Hz).
 
-Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically.
+Hash entries have a TTL so stale cursors from crashed instances get cleaned up automatically. A mover idle for that TTL announces its identity again before its next position update.
+
+After the relay reconnects, each instance restores its local mover snapshots and reads each watched topic once to send a catalog and positions without resetting the client clock. This includes connections with an existing server-granted cursor subscription that request a snapshot. A live peer missing from the hash stays provisional for two snapshot intervals (100 ms with immediate snapshot writes); a confirming read removes it only if the hash still lacks it and no newer relay event arrived. Redis read failures retry without removing the peer. Failed local snapshot writes retry without waiting for more movement.
 
 > **Authorization:** cursors broadcast whatever the caller publishes to whoever is subscribed. Gate topic-subscribe and topic-publish in your handler. See [Authorize every extension call](#authorize-every-extension-call).
 

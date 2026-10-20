@@ -38,7 +38,7 @@ const SUBSCRIBE_RETRY_MAX_MS = 30000;
  * @param {{
  *   client: import('../index.js').RedisClient, redis: import('ioredis').Redis,
  *   channel: string, instanceId: string, b: any, validator: any,
- *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, watchedTopics: Function, recoverTopic: Function,
+ *   cursorTtl: number, snapshotIntervalMs: number, activeTopics: Set<string>, mergeRoster: Function, restoreLocal: Function, watchedTopics: Function, recoverTopic: Function,
  *   onMessage: (parsed: any, platform: any) => void, queueRemove: Function,
  *   inUse: () => boolean, inputDropped?: (reason: string, stage: string) => void
  * }} deps
@@ -55,6 +55,7 @@ export function createRedisIo({
 	snapshotIntervalMs,
 	activeTopics,
 	mergeRoster,
+	restoreLocal,
 	watchedTopics,
 	recoverTopic,
 	onMessage,
@@ -81,6 +82,7 @@ export function createRedisIo({
 	let subscriberReady = null;
 	// One report per failure streak: every cursor update retries a failed subscribe.
 	let subscribeFailing = false;
+	let localRefreshNeeded = false;
 	// An instance whose connections only watch never calls update(), so a
 	// subscription that could not open (the breaker open, SUBSCRIBE refused) is
 	// retried on a timer, backing off to SUBSCRIBE_RETRY_MAX_MS, while a
@@ -100,13 +102,20 @@ export function createRedisIo({
 	let relayOnline = false;
 
 	function retryRecoveryLater() {
-		if (disposed || recoveryTimer !== null || !recoveryNeeded || !inUse()) return;
+		if (disposed || !activePlatform || recoveryTimer !== null || !recoveryNeeded || !inUse()) return;
 		recoveryTimer = setTimer(() => {
 			recoveryTimer = null;
 			catchUp();
 		}, recoveryRetryMs);
 		recoveryTimer?.unref?.();
 		recoveryRetryMs = Math.min(recoveryRetryMs * 2, SUBSCRIBE_RETRY_MAX_MS);
+	}
+
+	function retryLocalRestore() {
+		if (disposed) return;
+		localRefreshNeeded = true;
+		recoveryNeeded = true;
+		retryRecoveryLater();
 	}
 
 	function catchUp() {
@@ -125,12 +134,16 @@ export function createRedisIo({
 				b?.success();
 			} catch (error) { inputDropped('redis_failure', 'catch_up'); b?.failure(error); return; }
 			if (disposed || !activePlatform || generation !== recoveryGeneration || !relayOnline) return;
+			if (localRefreshNeeded) {
+				localRefreshNeeded = false;
+				restoreLocal(activePlatform);
+			}
 			for (let i = 0; i < topicList.length; i++) {
 				const topic = topicList[i];
-				const cursors = mergeRoster(topic, results[i][1]);
+				const cursors = mergeRoster(topic, results[i][1], activePlatform);
 				recoverTopic(topic, cursors, activePlatform);
 			}
-			recoveryNeeded = false;
+			recoveryNeeded = localRefreshNeeded;
 			recoveryRetryMs = SUBSCRIBE_RETRY_MIN_MS;
 		})().catch(() => { inputDropped('delivery_failed', 'catch_up'); }).finally(() => {
 			if (recoveryRunning === run) recoveryRunning = null;
@@ -138,6 +151,23 @@ export function createRedisIo({
 		});
 		recoveryRunning = run;
 		return run;
+	}
+
+	async function validateRoster(topicList) {
+		if (topicList.length === 0) return true;
+		if (disposed || !relayOnline || !activePlatform) return false;
+		const generation = recoveryGeneration;
+		try { b?.guard(); } catch { inputDropped('breaker_open', 'catch_up'); return false; }
+		let results;
+		try {
+			results = await execMultiSlot(redis, topicList.map(topic => ['hgetall', hashKey(topic)]));
+			const error = firstCommandError(results);
+			if (error) throw error;
+			b?.success();
+		} catch (error) { inputDropped('redis_failure', 'catch_up'); b?.failure(error); return false; }
+		if (disposed || generation !== recoveryGeneration || !relayOnline) return false;
+		for (let i = 0; i < topicList.length; i++) mergeRoster(topicList[i], results[i][1], activePlatform);
+		return true;
 	}
 
 	function retrySubscribeLater() {
@@ -170,6 +200,7 @@ export function createRedisIo({
 		activePlatform = platform;
 		if (subscriber) return subscriberReady ?? undefined;
 		if (b && b.state === 'broken') {
+			localRefreshNeeded = true;
 			inputDropped('breaker_open', 'subscribe');
 			retrySubscribeLater();
 			return undefined;
@@ -185,6 +216,7 @@ export function createRedisIo({
 		});
 		sub.on(SUBSCRIBER_RESTORED, () => {
 			relayOnline = true;
+			localRefreshNeeded = true;
 			catchUp();
 		});
 		sub.on('error', (err) => {
@@ -211,6 +243,7 @@ export function createRedisIo({
 			relayOnline = true;
 			return catchUp();
 		}, (err) => {
+			localRefreshNeeded = true;
 			sub.quit().catch(() => sub.disconnect());
 			if (subscriber === sub) {
 				subscriber = null;
@@ -312,7 +345,7 @@ export function createRedisIo({
 		// A write that waited for its owner skips while the breaker is not
 		// healthy; the next flush decides on the values it left pending.
 		admit: b ? () => b.isHealthy : null,
-		onError(err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); },
+		onError(err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); retryLocalRestore(); },
 		onSettled(commands) {
 			for (const command of commands) if (command[0] === 'hset') writing.delete(command[1]);
 		},
@@ -327,19 +360,19 @@ export function createRedisIo({
 		if (disposed) return;
 		if (redisPending.size === 0) return;
 		let releaseAdmission;
-		try { releaseAdmission = guardBreaker(b); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); return; }
+		try { releaseAdmission = guardBreaker(b); } catch { inputDropped('breaker_open', 'snapshot_write'); redisPending = new Map(); retryLocalRestore(); return; }
 		writeSnapshots(Array.from(redisPending.keys()), releaseAdmission);
 	}
 
 	function queueSnapshot(topic, key, user, data) {
 		if (snapshotIntervalMs === 0) {
-			if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); return; } }
+			if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); retryLocalRestore(); return; } }
 			let value;
 			try { value = JSON.stringify({ user, data, ts: now() }); } catch { inputDropped('serialization_failed', 'snapshot_write'); return; }
 			const pipe = redis.pipeline();
 			pipe.hset(hashKey(topic), key, value);
 			pipe.expire(hashKey(topic), cursorTtl);
-			pipe.exec().then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); });
+			pipe.exec().then(settleSnapshot).catch((err) => { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); retryLocalRestore(); });
 			return;
 		}
 		let topicPending = redisPending.get(topic);
@@ -354,7 +387,7 @@ export function createRedisIo({
 	// when the batch is rejected.
 	function settleSnapshot(results) {
 		const err = firstCommandError(results);
-		if (err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); }
+		if (err) { inputDropped('redis_failure', 'snapshot_write'); b?.failure(err); retryLocalRestore(); }
 		else b?.success();
 	}
 
@@ -478,6 +511,7 @@ export function createRedisIo({
 	}
 
 	return {
+		validateRoster,
 		ensureSubscriber,
 		startCleanupTimer,
 		startSnapshotTimer,

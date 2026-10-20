@@ -1,9 +1,31 @@
-import { now, setTimer, clearTimer } from '../../shared/runtime.js';
+import { now, monotonicNow, setTimer, clearTimer } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 
 /** Merge persisted cursors with live relay changes and this worker's movers. */
-export function createRoster({ topics, instanceId, cursorTtl, inputDropped = () => {} }) {
+export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs, revalidate, removeMissing, inputDropped = () => {} }) {
 	const live = new Map();
+	const provisional = new Map();
+	const confirmationMs = Math.max(1, snapshotIntervalMs * 2 || 100);
+	let confirmationTimer = null;
+	let confirming = false;
+	let disposed = false;
+	let version = 0;
+
+	function confirmLater(minDelay = 1) {
+		if (disposed || confirming || confirmationTimer !== null || provisional.size === 0) return;
+		let deadline = Infinity;
+		for (const entries of provisional.values()) for (const entry of entries.values()) deadline = Math.min(deadline, entry.deadline);
+		confirmationTimer = setTimer(async () => {
+			confirmationTimer = null;
+			confirming = true;
+			let succeeded = false;
+			try { succeeded = await revalidate([...provisional.keys()]); }
+			catch { inputDropped('delivery_failed', 'catch_up'); }
+			finally { confirming = false; confirmLater(succeeded ? 1 : 1000); }
+		}, Math.max(minDelay, deadline - monotonicNow()));
+		confirmationTimer?.unref?.();
+	}
+
 	const ttlMs = cursorTtl * 1000;
 	let timer = null;
 	function prune() {
@@ -20,23 +42,29 @@ export function createRoster({ topics, instanceId, cursorTtl, inputDropped = () 
 		timer = setTimer(prune, ttlMs);
 		timer?.unref?.();
 	}
+	function recordOne(item, event, entries, ts) {
+		if (!item || typeof item.key !== 'string') return;
+		let entry = entries.get(item.key);
+		if (!entry) entries.set(item.key, entry = {});
+		entry.removed = event === EVENTS.REMOVE;
+		if (entry.removed) { delete entry.user; delete entry.data; }
+		if (event === EVENTS.JOIN) entry.user = item.user;
+		if (event === EVENTS.UPDATE || event === EVENTS.BULK) entry.data = item.data;
+		entry.ts = ts;
+		entry.version = ++version;
+	}
 	function record(topic, event, payload) {
-		const incoming = event === EVENTS.BULK ? payload : [payload];
-		if (![EVENTS.JOIN, EVENTS.UPDATE, EVENTS.BULK, EVENTS.REMOVE].includes(event) || !Array.isArray(incoming)) return;
+		if (event !== EVENTS.JOIN && event !== EVENTS.UPDATE && event !== EVENTS.BULK && event !== EVENTS.REMOVE) return;
+		if (event === EVENTS.BULK && !Array.isArray(payload)) return;
 		let entries = live.get(topic);
 		if (!entries) live.set(topic, entries = new Map());
-		for (const item of incoming) {
-			if (!item || typeof item.key !== 'string') continue;
-			const entry = event === EVENTS.REMOVE ? { removed: true } : (entries.get(item.key) || {});
-			if (event !== EVENTS.REMOVE) entry.removed = false;
-			if (event === EVENTS.JOIN) entry.user = item.user;
-			if (event === EVENTS.UPDATE || event === EVENTS.BULK) entry.data = item.data;
-			entry.ts = now();
-			entries.set(item.key, entry);
-		}
+		const ts = now();
+
+		if (event === EVENTS.BULK) for (const item of payload) recordOne(item, event, entries, ts);
+		else recordOne(payload, event, entries, ts);
 		arm();
 	}
-	function merge(topic, all) {
+	function merge(topic, all, platform) {
 		const result = new Map();
 		const cutoff = now() - ttlMs;
 		for (const [key, value] of Object.entries(all)) {
@@ -47,14 +75,43 @@ export function createRoster({ topics, instanceId, cursorTtl, inputDropped = () 
 				if (entry.ts >= cutoff) result.set(key, { key, user: entry.user, data: entry.data });
 			} catch { inputDropped('corrupt_entry', 'snapshot_read'); }
 		}
+		let candidates = provisional.get(topic);
+		const current = monotonicNow();
 		for (const [key, entry] of live.get(topic) || []) {
 			if (entry.ts < cutoff) continue;
-			if (entry.removed) { result.delete(key); continue; }
+			if (entry.removed) { result.delete(key); candidates?.delete(key); continue; }
+			if (result.has(key)) candidates?.delete(key);
+			else if ('user' in entry) {
+				if (!candidates) provisional.set(topic, candidates = new Map());
+				const candidate = candidates.get(key);
+				if (candidate?.version === entry.version && candidate.deadline <= current) {
+					entry.removed = true;
+					entry.ts = now();
+					delete entry.user;
+					delete entry.data;
+					candidates.delete(key);
+					removeMissing(topic, key, platform);
+					continue;
+				}
+				if (!candidate || candidate.version !== entry.version) candidates.set(key, { version: entry.version, deadline: current + confirmationMs });
+			}
 			const merged = { ...result.get(key), key };
 			if ('user' in entry) merged.user = entry.user;
 			if ('data' in entry) merged.data = entry.data;
 			if ('user' in merged) result.set(key, merged);
 		}
+		// An overlay may expire while its confirming read is in flight.
+		// Its absence still needs to reach clients that saw the earlier join.
+		if (candidates) {
+			for (const [key, candidate] of candidates) {
+				const entry = live.get(topic)?.get(key);
+				if (entry && entry.ts >= cutoff) continue;
+				if (!result.has(key) && candidate.deadline <= current) removeMissing(topic, key, platform);
+				candidates.delete(key);
+			}
+			if (candidates.size === 0) provisional.delete(topic);
+		}
+		confirmLater();
 		for (const [key, entry] of topics.get(topic) || []) {
 			result.set(key, { key, user: entry.user, data: entry.data });
 		}
@@ -62,8 +119,11 @@ export function createRoster({ topics, instanceId, cursorTtl, inputDropped = () 
 	}
 	function clear() {
 		live.clear();
+		provisional.clear();
+		if (confirmationTimer !== null) clearTimer(confirmationTimer);
+		confirmationTimer = null;
 		if (timer !== null) clearTimer(timer);
 		timer = null;
 	}
-	return { record, merge, drop: (topic) => live.delete(topic), clear };
+	return { record, merge, drop(topic) { live.delete(topic); provisional.delete(topic); }, clear, dispose() { disposed = true; clear(); } };
 }

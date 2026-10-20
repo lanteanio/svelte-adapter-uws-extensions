@@ -381,7 +381,11 @@ export function createCursor(client, options = {}) {
 	// ./cursor/remove-buffer.js for the setTimeout(0) cross-socket coalescing).
 	const { queueRemove, clear: clearRemoveBuffer } = createRemoveBuffer();
 
-	const roster = createRoster({ topics, instanceId, cursorTtl, inputDropped });
+	const roster = createRoster({
+		topics, instanceId, cursorTtl, snapshotIntervalMs, inputDropped,
+		revalidate: (topicList) => redisIo.validateRoster(topicList),
+		removeMissing: (topic, key, platform) => queueRemove(topic, key, platform)
+	});
 
 	function onPeerMessage(parsed, platform) {
 		if (!hasLocalInterest(parsed.topic, platform)) return;
@@ -430,6 +434,13 @@ export function createCursor(client, options = {}) {
 		snapshotIntervalMs,
 		activeTopics,
 		mergeRoster: roster.merge,
+		restoreLocal(platform) {
+			for (const [topic, entries] of topics) for (const [key, entry] of entries) {
+				queueSnapshot(topic, key, entry.user, entry.data);
+				emitJoin(topic, key, entry.user, platform);
+			}
+			redisIo.flushSnapshot();
+		},
 		watchedTopics: () => topicMembers.keys(),
 		recoverTopic(topic, cursors, platform) {
 			const catalog = cursors.map(({ key, user }) => ({ key, user }));
@@ -437,6 +448,10 @@ export function createCursor(client, options = {}) {
 			const members = topicMembers.get(topic);
 			if (members) {
 				for (const ws of members) {
+					if (!wsState.get(ws)?.member.has(topic) && !hasWsSubscription(ws, '__cursor:' + topic)) {
+						unwatchTopic(ws, topic);
+						continue;
+					}
 					const pending = snapshotWaiters.get(ws)?.get(topic);
 					// An attach waiting for this recovery will read afterwards. A read
 					// already in flight may be stale and must not skip recovery.
@@ -583,7 +598,9 @@ export function createCursor(client, options = {}) {
 		// wire-level gate refuses client-initiated subscribes to `__` topics,
 		// so a `__cursor:` entry can only have been put there by the server.
 		// Checked second, so an attached socket still costs one Map lookup.
-		return hasWsSubscription(ws, '__cursor:' + topic);
+		if (!hasWsSubscription(ws, '__cursor:' + topic)) return false;
+		watchTopic(ws, topic);
+		return true;
 	}
 
 	/**
@@ -677,7 +694,7 @@ export function createCursor(client, options = {}) {
 		try {
 			cursors = await tracker.list(topic);
 			if (request.superseded) return;
-			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: now() })])));
+			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: now() })])), platform);
 		} catch {
 			return;
 		}
@@ -805,6 +822,8 @@ export function createCursor(client, options = {}) {
 
 			let entry = topicMap.get(state.key);
 			const nowTs = monotonicNow();
+			const rejoining = entry && nowTs - entry.lastBroadcast >= cursorTtl * 1000;
+			if (rejoining) emitJoin(topic, state.key, state.user, platform);
 
 			if (!entry) {
 				entry = { user: state.user, data, lastBroadcast: 0, timer: null };
@@ -827,7 +846,7 @@ export function createCursor(client, options = {}) {
 				if (entry.settleTimer) { clearTimer(entry.settleTimer); entry.settleTimer = null; }
 				pos = finitePosition(data);
 				if (
-					pos && entry.lastSentPos &&
+					!rejoining && pos && entry.lastSentPos &&
 					Math.max(Math.abs(pos.x - entry.lastSentPos.x), Math.abs(pos.y - entry.lastSentPos.y)) < minMove
 				) {
 					entry.data = data; // keep latest for a real move later + snapshot
@@ -1053,7 +1072,10 @@ export function createCursor(client, options = {}) {
 			// The authorized subscribe path (attach -> emitSnapshot) has already
 			// checked and calls the emit half directly.
 			if (await authorizeTopic(ws, topic, platform, OBSERVER_LANE)) return;
-			await emitSnapshot(ws, topic, platform);
+			try { ws.getBufferedAmount(); } catch { return; }
+			const subscribed = hasWsSubscription(ws, '__cursor:' + topic);
+			if (subscribed) watchTopic(ws, topic);
+			await emitSnapshot(ws, topic, platform, subscribed ? ensureSubscriber(platform) : undefined);
 		},
 		/**
 		 * Record this subscriber's viewport rect for a topic, from the inbound
@@ -1230,7 +1252,7 @@ export function createCursor(client, options = {}) {
 					if (entry.settleTimer) clearTimer(entry.settleTimer);
 				}
 			}
-			roster.clear();
+			roster.dispose();
 			resetScheduler();
 			clearRemoveBuffer();
 			dirtyTopics.clear();
