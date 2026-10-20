@@ -268,11 +268,47 @@ function dropSocket(conn) {
  * Close a connection that is not to reconnect, at once, whatever state its
  * peer is in.
  *
+ * Between two reconnect attempts the socket is already closed, so ioredis's
+ * disconnect() only cancels the next attempt: no 'close' or 'end' follows,
+ * the commands waiting for the next connection never settle, and a later
+ * quit() queues behind them forever. Such a connection is ended here the way
+ * ioredis ends one that closes while it is not to reconnect: its status moves
+ * to 'end', which emits 'end', and every waiting command rejects.
+ *
  * @param {any} conn
  */
 export function closeConnection(conn) {
+	const betweenAttempts = conn.status === 'reconnecting';
 	conn.disconnect();
 	dropSocket(conn);
+	if (betweenAttempts && conn.status === 'reconnecting') endBetweenAttempts(conn);
+}
+
+/**
+ * End a connection whose next reconnect attempt disconnect() just cancelled,
+ * with the two methods ioredis's own close path runs. Its typings mark them
+ * private, so test/shared/redis-subscriber-close.test.js drives this against
+ * a real ioredis, where a change to them fails.
+ *
+ * @param {any} conn
+ */
+function endBetweenAttempts(conn) {
+	if (typeof conn.setStatus !== 'function' || typeof conn.flushQueue !== 'function') return;
+	// disconnect() set it for a 'close' that is not coming.
+	conn.manuallyClosing = false;
+	conn.setStatus('end');
+	const error = new Error(CLOSED);
+	conn.flushQueue(error);
+	// Commands written to a connection that then closed, kept to be sent again
+	// on the next one. A connection that closed while it was ready shares this
+	// with its command queue, flushed above; a later attempt that also failed
+	// replaced the command queue.
+	const prev = conn.prevCommandQueue;
+	if (prev && prev !== conn.commandQueue) {
+		let item;
+		while ((item = prev.shift())) item.command.reject(error);
+	}
+	conn.prevCommandQueue = null;
 }
 
 /**

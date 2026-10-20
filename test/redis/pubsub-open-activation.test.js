@@ -12,6 +12,7 @@ import { mockPlatform } from '../helpers/mock-platform.js';
 import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 
 let uWS;
@@ -36,6 +37,18 @@ afterEach(async () => {
 
 const settle = (ms = 40) => new Promise((r) => setTimeout(r, ms));
 
+/** Wait for `check` to hold, polling, and fail after `ms`. */
+async function until(check, ms = 3000) {
+	const deadline = Date.now() + ms;
+	while (!check()) {
+		if (Date.now() > deadline) throw new Error('condition not reached');
+		await new Promise((r) => setTimeout(r, 5));
+	}
+}
+
+/** The remote frames a connection received. */
+const remoteFrames = (c) => c.messages.filter((m) => m.topic === '__realtime' && m.event === 'remote');
+
 /** The failure lines printed so far. */
 function reports() {
 	const lines = [];
@@ -55,7 +68,13 @@ function refusingClient(refuse) {
 	client.duplicate = (overrides) => {
 		const sub = duplicate(overrides);
 		const subscribe = sub.subscribe.bind(sub);
-		sub.subscribe = (...channels) => (refuse.on ? Promise.reject(new Error('subscribe refused')) : subscribe(...channels));
+		sub.subscribe = (...channels) => {
+			if (refuse.on) return Promise.reject(new Error('subscribe refused'));
+			return subscribe(...channels).then((reply) => {
+				refuse.subscribed = (refuse.subscribed || 0) + 1;
+				return reply;
+			});
+		};
 		sub.disconnect = vi.fn();
 		subscribers.push(sub);
 		return sub;
@@ -160,6 +179,9 @@ describe('pub/sub bus open hook when activation fails', () => {
 });
 
 describeUWS('pub/sub bus open hook through the real adapter when activation fails', () => {
+	// A 1011 close is written before any later frame on the same socket, so a
+	// connection that receives the later remote message was not closed by the
+	// failed open before it.
 	it('keeps the connection open, reports once, and activates on a later open', async () => {
 		const lines = reports();
 		const refuse = { on: true };
@@ -169,25 +191,41 @@ describeUWS('pub/sub bus open hook through the real adapter when activation fail
 
 		const first = await connect(server.wsUrl);
 		const second = await connect(server.wsUrl);
-		await settle();
-		expect(first.closed).toBe(null);
-		expect(second.closed).toBe(null);
-		expect(lines).toHaveLength(1);
+		await until(() => lines.length === 1);
 
 		refuse.on = false;
 		const third = await connect(server.wsUrl);
-		await settle();
+		await until(() => refuse.subscribed === 1);
 		await client.redis.publish('uws:pubsub', REMOTE);
-		await settle();
+		await until(() => [first, second, third].every((c) => remoteFrames(c).length === 1));
 		for (const c of [first, second, third]) {
 			expect(c.closed).toBe(null);
-			expect(c.messages.filter((m) => m.topic === '__realtime' && m.event === 'remote')).toHaveLength(1);
+			expect(remoteFrames(c)).toHaveLength(1);
 		}
+		expect(lines).toHaveLength(1);
 	});
 
 	it('keeps the connection open while the breaker is open and activates when it lets a probe through', async () => {
-		reports();
-		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });
+		const lines = reports();
+		// The breaker's reset timer is held here and fired by hand.
+		const RESET_MS = 60000;
+		const held = [];
+		setRuntimeEnv({
+			timers: {
+				set: (cb, ms, ...args) => {
+					if (ms !== RESET_MS) return setTimeout(cb, ms, ...args);
+					const handle = { cb, cleared: false, unref() { return handle; } };
+					held.push(handle);
+					return handle;
+				},
+				clear: (handle) => {
+					if (handle && held.includes(handle)) handle.cleared = true;
+					else clearTimeout(handle);
+				}
+			}
+		});
+		cleanups.push(() => resetRuntimeEnv());
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: RESET_MS });
 		cleanups.push(() => breaker.destroy());
 		const client = mockRedisClient('open-activation:');
 		const bus = createPubSubBus(client, { breaker });
@@ -195,16 +233,18 @@ describeUWS('pub/sub bus open hook through the real adapter when activation fail
 		breaker.failure(new Error('down'));
 
 		const conn = await connect(server.wsUrl);
-		await settle(10);
-		expect(conn.closed).toBe(null);
+		await until(() => lines.length === 1);
 		expect(breaker.state).toBe('broken');
 
-		await settle(150);
-		expect(breaker.state).toBe('healthy');
+		const reset = held.filter((handle) => !handle.cleared);
+		expect(reset).toHaveLength(1);
+		reset[0].cleared = true;
+		reset[0].cb();
+		await until(() => breaker.state === 'healthy');
+		await until(() => conn.messages.some((m) => m.topic === '__realtime' && m.event === 'recovered'));
 		await client.redis.publish('uws:pubsub', REMOTE);
-		await settle();
+		await until(() => remoteFrames(conn).length === 1);
 		expect(conn.closed).toBe(null);
-		expect(conn.messages.filter((m) => m.topic === '__realtime' && m.event === 'remote')).toHaveLength(1);
 		expect(conn.messages.filter((m) => m.topic === '__realtime' && m.event === 'recovered')).toHaveLength(1);
 	});
 });
