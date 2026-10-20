@@ -7,10 +7,10 @@ const composePath = path.join(__dirname, 'docker-compose.yml');
 
 // Host ports default to non-standard values that won't clash with a locally
 // running Postgres (5432) or Redis (6379). Override via env vars when running
-// multiple integration stacks side-by-side (e.g. parallel agents in worktrees):
+// multiple integration stacks side-by-side (e.g. parallel worktrees):
 //   INTEGRATION_REDIS_HOST_PORT=56380 \
 //   INTEGRATION_POSTGRES_HOST_PORT=55433 \
-//   INTEGRATION_COMPOSE_PROJECT=my-slice \
+//   INTEGRATION_COMPOSE_PROJECT=my-stack \
 //   npm run test:integration
 const REDIS_HOST_PORT = Number(process.env.INTEGRATION_REDIS_HOST_PORT) || 56379;
 const POSTGRES_HOST_PORT = Number(process.env.INTEGRATION_POSTGRES_HOST_PORT) || 55432;

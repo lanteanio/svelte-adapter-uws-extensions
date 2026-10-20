@@ -3215,7 +3215,7 @@ The host ports and compose project name are env-var overridable for running mult
 ```bash
 INTEGRATION_REDIS_HOST_PORT=56380 \
 INTEGRATION_POSTGRES_HOST_PORT=55433 \
-INTEGRATION_COMPOSE_PROJECT=my-slice \
+INTEGRATION_COMPOSE_PROJECT=my-stack \
 npm run test:integration
 ```
 
@@ -3249,7 +3249,7 @@ The integration layer is additive: the mock-based test for a module stays in pla
 
 The consumer installs adapter 0.5.11 from the registry. Set `KIT3_ADAPTER_TARBALL` to an absolute path to test a locally packed adapter instead. Run `npm run test:integration:kit3 -- --mutations` to verify that disabling the bus, registry, or either replay store, loading a second module instance in the WebSocket hooks, dropping the `shutdown` export, skipping the client release in it, or releasing the clients in production fails the corresponding consumer check.
 
-The Redis Cluster suite accepts `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, `INTEGRATION_REDIS_CLUSTER_SUBNET` (a three-octet prefix such as `10.250.1`), and `INTEGRATION_COMPOSE_PROJECT` for isolated concurrent runs. Its default subnet is `10.249.0.0/24`.
+The Redis Cluster suite accepts `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, `INTEGRATION_REDIS_CLUSTER_SUBNET` (a three-octet prefix such as `10.250.1`), and `INTEGRATION_COMPOSE_PROJECT` for isolated concurrent runs. It appends `-cluster` to that project name, and the Kit 3 consumer appends `-kit3`, so one exported value keeps the compose projects of the standalone, cluster and consumer stacks apart. Concurrent runs still need different host ports, or leave the port variables unset for the Kit 3 consumer to pick free ones. The cluster suite's default subnet is `10.249.0.0/24`.
 
 ### Testing your own code
 
