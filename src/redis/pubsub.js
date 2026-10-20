@@ -163,6 +163,10 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {boolean} */
 	let active = false;
 
+	// The activation in flight, which overlapping activate() calls share.
+	/** @type {Promise<void> | null} */
+	let activation = null;
+
 	/** @type {import('svelte-adapter-uws').Platform | null} */
 	let activePlatform = null;
 	// Whether activePlatform has a tracing provider, read once at activate.
@@ -490,6 +494,85 @@ export function createPubSubBus(client, options = {}) {
 			}).catch(failed);
 		} catch (err) { failed(err); }
 	}
+
+	// Emits degraded / recovered while the bus is active or activating.
+	function breakerChanged(from, to) {
+		if (from === 'healthy' && to !== 'healthy') {
+			if (onDegraded) {
+				try { onDegraded(); } catch { /* don't propagate user errors */ }
+			}
+			if (systemChannel && activePlatform) {
+				// A degradation policy ships the precomputed client mitigation
+				// alongside the event + de-herds the push (jitterMs), so the
+				// resulting client retries/fallbacks spread across the cooldown.
+				let out = null;
+				if (degradationPolicy) { try { out = degradationPolicy.onDegraded({ from, to }); } catch { /* a policy must never break the emit */ } }
+				const data = out && out.mitigation ? { at: now(), mitigation: out.mitigation } : { at: now() };
+				activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
+				mDegraded?.inc();
+			}
+		} else if (from !== 'healthy' && to === 'healthy') {
+			if (onRecovered) {
+				try { onRecovered(); } catch { /* don't propagate user errors */ }
+			}
+			if (systemChannel && activePlatform) {
+				let out = null;
+				if (degradationPolicy) { try { out = degradationPolicy.onRecovered({ from, to }); } catch { /* a policy must never break the emit */ } }
+				const data = out && out.recovery ? { at: now(), recovery: out.recovery } : { at: now() };
+				activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
+				mRecovered?.inc();
+			}
+		}
+	}
+
+	// One message on the subscriber `sub`.
+	function receive(sub, ch, message) {
+		// A replaced subscriber can still receive until it closes.
+		if (subscriber !== sub || ch !== channel) return;
+		// Pre-parse size guard. A bus subscriber that JSON.parses an
+		// arbitrarily large attacker payload pays parsing CPU + V8
+		// heap before any further validation can fire.
+		if (!validator.acceptRaw(message)) {
+			mParseErrors?.inc();
+			return;
+		}
+		try {
+			const parsed = JSON.parse(message);
+			// An envelope without a string instanceId cannot be echo-checked
+			// or delivered. It is input from a shared transport, not a broken
+			// invariant of this package, so it is counted and dropped like any
+			// other malformed envelope: a line per message would let anyone who
+			// can publish on the channel flood the log.
+			if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
+				mParseErrors?.inc();
+				return;
+			}
+			// Skip messages from this instance (echo suppression).
+			// One check per envelope; batched envelopes carry one
+			// instanceId for the whole batch.
+			if (parsed.instanceId === instanceId) {
+				mEchoSuppressed?.inc();
+				return;
+			}
+			// A message can still arrive on the subscriber socket during the
+			// deactivate window (activePlatform is nulled before the UNSUBSCRIBE
+			// round-trip resolves). Drop it cleanly rather than dereferencing a
+			// null platform in a branch below (which the outer catch would
+			// swallow as a spurious parse error). Mirrors the sharded handler.
+			if (!activePlatform) return;
+			// Local delivery runs no application code, so a carried trace
+			// context only matters to a tracing provider: with one, delivery is
+			// a consumer operation parented on the producer's context; without
+			// one the trace fields are ignored and nothing is allocated for them.
+			if (activeTracing) deliverTraced(parsed);
+			else deliverEnvelope(parsed);
+		} catch {
+			// Malformed envelope; counted so a stream of bad messages
+			// is observable instead of silently swallowed.
+			mParseErrors?.inc();
+		}
+	}
+
 	const bus = {
 		wrap(platform) {
 			// The relaying methods below are the untraced relay: they read no
@@ -810,106 +893,49 @@ export function createPubSubBus(client, options = {}) {
 			activePlatform = platform;
 			activeTracing = traceEnabled(platform);
 			if (active) return;
-			b?.guard();
+			// Connections that open together share one activation. A second
+			// subscriber would deliver every remote message again.
+			if (activation) return activation;
+			const current = (async () => {
+				b?.guard();
 
-			if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
-				unsubscribeBreaker = b.subscribe((from, to) => {
-					if (from === 'healthy' && to !== 'healthy') {
-						if (onDegraded) {
-							try { onDegraded(); } catch { /* don't propagate user errors */ }
-						}
-						if (systemChannel && activePlatform) {
-							// A degradation policy ships the precomputed client mitigation
-							// alongside the event + de-herds the push (jitterMs), so the
-							// resulting client retries/fallbacks spread across the cooldown.
-							let out = null;
-							if (degradationPolicy) { try { out = degradationPolicy.onDegraded({ from, to }); } catch { /* a policy must never break the emit */ } }
-							const data = out && out.mitigation ? { at: now(), mitigation: out.mitigation } : { at: now() };
-							activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
-							mDegraded?.inc();
-						}
-					} else if (from !== 'healthy' && to === 'healthy') {
-						if (onRecovered) {
-							try { onRecovered(); } catch { /* don't propagate user errors */ }
-						}
-						if (systemChannel && activePlatform) {
-							let out = null;
-							if (degradationPolicy) { try { out = degradationPolicy.onRecovered({ from, to }); } catch { /* a policy must never break the emit */ } }
-							const data = out && out.recovery ? { at: now(), recovery: out.recovery } : { at: now() };
-							activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
-							mRecovered?.inc();
-						}
-					}
-				});
-			}
-
-			const sub = openSubscriber(client, 'pubsub');
-			subscriber = sub;
-			sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
-
-			sub.on('message', (ch, message) => {
-				if (ch !== channel) return;
-				// Pre-parse size guard. A bus subscriber that JSON.parses an
-				// arbitrarily large attacker payload pays parsing CPU + V8
-				// heap before any further validation can fire.
-				if (!validator.acceptRaw(message)) {
-					mParseErrors?.inc();
-					return;
+				if (b && typeof b.subscribe === 'function' && !unsubscribeBreaker) {
+					unsubscribeBreaker = b.subscribe(breakerChanged);
 				}
+
+				const sub = openSubscriber(client, 'pubsub');
+				subscriber = sub;
+				sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
+				sub.on('message', (ch, message) => receive(sub, ch, message));
+
 				try {
-					const parsed = JSON.parse(message);
-					// An envelope without a string instanceId cannot be echo-checked
-					// or delivered. It is input from a shared transport, not a broken
-					// invariant of this package, so it is counted and dropped like any
-					// other malformed envelope: a line per message would let anyone who
-					// can publish on the channel flood the log.
-					if (!(typeof parsed === 'object' && parsed !== null && typeof parsed.instanceId === 'string')) {
-						mParseErrors?.inc();
-						return;
+					await sub.subscribe(channel);
+				} catch (err) {
+					b?.failure(err);
+					activePlatform = null;
+					// quit() is the likely one to reject here, since Redis is what just
+					// failed, and its handler runs after the slot is cleared, so it uses
+					// this connection rather than reading the slot.
+					if (subscriber === sub) subscriber = null;
+					sub.quit().catch(() => sub.disconnect());
+					if (unsubscribeBreaker) {
+						unsubscribeBreaker();
+						unsubscribeBreaker = null;
 					}
-					// Skip messages from this instance (echo suppression).
-					// One check per envelope; batched envelopes carry one
-					// instanceId for the whole batch.
-					if (parsed.instanceId === instanceId) {
-						mEchoSuppressed?.inc();
-						return;
-					}
-					// A message can still arrive on the subscriber socket during the
-					// deactivate window (activePlatform is nulled before the UNSUBSCRIBE
-					// round-trip resolves). Drop it cleanly rather than dereferencing a
-					// null platform in a branch below (which the outer catch would
-					// swallow as a spurious parse error). Mirrors the sharded handler.
-					if (!activePlatform) return;
-					// Local delivery runs no application code, so a carried trace
-					// context only matters to a tracing provider: with one, delivery is
-					// a consumer operation parented on the producer's context; without
-					// one the trace fields are ignored and nothing is allocated for them.
-					if (activeTracing) deliverTraced(parsed);
-					else deliverEnvelope(parsed);
-				} catch {
-					// Malformed envelope; counted so a stream of bad messages
-					// is observable instead of silently swallowed.
-					mParseErrors?.inc();
+					activation = null;
+					throw err;
 				}
-			});
-
-			try {
-				await sub.subscribe(channel);
-				b?.success();
+				// Settle the shared state before the breaker runs its listeners,
+				// which may call activate() or deactivate() synchronously.
 				active = true;
-			} catch (err) {
-				b?.failure(err);
-				activePlatform = null;
-				// quit() is the likely one to reject here, since Redis is what just
-				// failed, and its handler runs after the slot is cleared, so it uses
-				// this connection rather than reading the slot.
-				if (subscriber === sub) subscriber = null;
-				sub.quit().catch(() => sub.disconnect());
-				if (unsubscribeBreaker) {
-					unsubscribeBreaker();
-					unsubscribeBreaker = null;
-				}
-				throw err;
+				activation = null;
+				b?.success();
+			})();
+			activation = current;
+			try {
+				await current;
+			} finally {
+				if (activation === current) activation = null;
 			}
 		},
 
