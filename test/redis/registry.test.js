@@ -1997,6 +1997,51 @@ describe('redis connection registry', () => {
 			});
 		}
 	});
+	describe('attributes / sendTo: event routing on a cluster', () => {
+		it('announces every event for a user through the node that owns the user row', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const b = createConnectionRegistry(client, opts);
+			const peer = createConnectionRegistry(client, opts);
+			try {
+				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+				// A keyless PUBLISH may leave from any cluster node. Model a slow
+				// one by holding the first such publish until released; publishes
+				// a script makes leave from the row's node with the row writes.
+				const evalScript = client.redis.eval.bind(client.redis);
+				let inScript = 0;
+				vi.spyOn(client.redis, 'eval').mockImplementation((script, ...args) => {
+					inScript++;
+					try { return evalScript(script, ...args); } finally { inScript--; }
+				});
+				const publish = client.redis.publish.bind(client.redis);
+				/** @type {Array<() => void>} */
+				const held = [];
+				vi.spyOn(client.redis, 'publish').mockImplementation((channel, message) => {
+					if (inScript === 0 && held.length === 0) {
+						return new Promise((resolve) => { held.push(() => resolve(publish(channel, message))); });
+					}
+					return publish(channel, message);
+				});
+
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				const opening = b.hooks.open(onB, { platform: mockPlatform() });
+				await expect.poll(() => client.redis.exists(client.key('conns:u'))).toBe(1);
+				await b.hooks.close(onB);
+				for (const release of held) release();
+				await opening;
+				vi.restoreAllMocks();
+
+				await expect.poll(() => peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+			} finally {
+				vi.restoreAllMocks();
+				await b.destroy();
+				await peer.destroy();
+			}
+		});
+	});
 	describe('subscriber: a refused SUBSCRIBE', () => {
 		const NOPERM = 'NOPERM this user has no permissions to access one of the channels';
 		let clock;

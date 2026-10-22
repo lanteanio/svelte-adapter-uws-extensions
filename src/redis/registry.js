@@ -101,6 +101,18 @@ end
 return redis.call('expire', KEYS[1], ARGV[5])
 `;
 
+// Publish a registry event through the node that owns the user's row. A
+// keyless PUBLISH on Redis Cluster goes to any node, and messages from two
+// nodes reach a subscriber in no fixed order, so an open and the close
+// after it could arrive reversed. Keyed on the row, every event for a user
+// leaves from one node, in the order of the row writes before it on the
+// same connection, including the restore script's own announcement.
+const ANNOUNCE_EVENT = `
+-- REGISTRY_ANNOUNCE
+redis.call('publish', ARGV[1], ARGV[2])
+return 1
+`;
+
 /**
  * @typedef {Object} RegistryOptions
  * @property {(ws: any) => string | null | undefined} identify - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them.
@@ -650,7 +662,7 @@ export function createConnectionRegistry(client, options) {
 			return;
 		}
 		try {
-			await redis.publish(eventsChannel, raw);
+			await evalCached(redis, ANNOUNCE_EVENT, 1, userKey(envelope.userId), eventsChannel, raw);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -1939,7 +1951,8 @@ export function createConnectionRegistry(client, options) {
 				// entry, and the recipients of the close event guard with
 				// `applyCloseEvent`'s owner check before unindexing. The
 				// PUBLISH follows the compare-and-delete on the same
-				// connection, so Redis runs them in that order.
+				// connection (the row's node on a cluster), so Redis runs
+				// them in that order.
 				if (attributes) {
 					applyCloseEvent(userId, instanceId);
 					writes.push(publishEvent({ type: 'close', userId, instanceId }));

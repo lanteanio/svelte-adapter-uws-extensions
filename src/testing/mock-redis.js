@@ -1005,6 +1005,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			// command can observe a half-applied script. Keep every evaluator
 			// synchronous; introducing an `await` inside one would break this.
 			async eval(script, numKeys, ...args) {
+				// Registry event routed by the user's row key; the key only
+				// picks the node, the script publishes.
+				if (script.includes('REGISTRY_ANNOUNCE')) {
+					return r.publish(String(args[numKeys]), args[numKeys + 1]).then(() => 1);
+				}
 				if (script.includes('ORDERED_ALARM_GENERATIONS_V2')) {
 					return evaluateAlarmGeneration(args, { sortedSets, hashes });
 				}

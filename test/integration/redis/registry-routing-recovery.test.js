@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
 import { WS_SESSION_ID } from 'svelte-adapter-uws/testing';
 import { createConnectionRegistry } from '../../../src/redis/registry.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
-import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
+import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
 import { mockWs } from '../../helpers/mock-ws.js';
@@ -140,4 +140,38 @@ it('announces a row restored after a peer close from the script, so peers route 
 	} finally {
 		await sub.quit();
 	}
+});
+
+it.skipIf(!isClusterBackend())('announces every event for a user through the node that owns the user row', async () => {
+	const attributes = () => ({ role: 'reader' });
+	const peer = registry({ attributes });
+	await peer.hooks.open(mockWs({}), { platform: mockPlatform() });
+	// Users sharing one hash slot, so one node owns every row.
+	const users = [1, 2, 3, 4, 5].map(n => ({ r: registry({ attributes }), ws: mockWs({ userId: '{route}' + n, [WS_SESSION_ID]: 's' + n }) }));
+	await users[0].r.hooks.open(users[0].ws, { platform: mockPlatform() });
+	await users[0].r.hooks.close(users[0].ws);
+	const rowKey = client.key('conns:{route}1');
+	let owner = null;
+	for (const node of client.redis.nodes('master')) {
+		try { await node.exists(rowKey); owner = node; } catch { /* MOVED: not the owner */ }
+	}
+	expect(owner).not.toBeNull();
+	// Every other node refuses writes, PUBLISH included, for a while.
+	const others = client.redis.nodes('all').filter(node => node !== owner);
+	await Promise.all(others.map(node => node.call('client', 'pause', 4000, 'WRITE')));
+	try {
+		const run = (async () => {
+			for (const { r, ws } of users) {
+				await r.hooks.open(ws, { platform: mockPlatform() });
+				await r.hooks.close(ws);
+			}
+		})();
+		let timer;
+		const bound = new Promise(resolve => { timer = setTimeout(() => resolve(false), 2000); });
+		expect(await Promise.race([run.then(() => true), bound])).toBe(true);
+		clearTimeout(timer);
+	} finally {
+		await Promise.all(others.map(node => node.call('client', 'unpause')));
+	}
+	await expect.poll(() => peer.sendTo({ role: 'reader' }, 'room', 'ping', 1)).toBe(0);
 });
