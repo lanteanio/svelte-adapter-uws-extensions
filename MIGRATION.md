@@ -493,8 +493,8 @@ publisher (`code` is `RELAY_ENVELOPE_TOO_LARGE`). A `RangeError` with `code`
 the bus's relay queue cannot admit the call because earlier relays still
 occupy it; that refusal is transient, so retry or shed the call once the queue
 drains (`*_batch_rejected_total{reason="queue_full"}` counts it). On the sharded
-bus a call whose shard envelopes together exceed `max(8 MiB, maxEnvelopeBytes)`
-is always refused; split it. Ordinary non-batched oversize relay handling is a separate contract;
+bus a call whose shard envelopes together exceed `max(8 MiB, maxEnvelopeBytes)`,
+or that needs more than 8,192 shard envelopes, is always refused; split it. Ordinary non-batched oversize relay handling is a separate contract;
 do not rely on it to accept a batched call. Small batches need no change.
 Keep the same application limits during rollback to avoid restoring divergent
 local/remote behavior.

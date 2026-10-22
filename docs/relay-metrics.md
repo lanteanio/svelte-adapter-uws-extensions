@@ -51,15 +51,19 @@ The retained byte ceiling is therefore `max(8 MiB, maxEnvelopeBytes)`.
 This bounds payload retention; it is not an exact JavaScript heap budget. A new
 `publish`, `batch`, coalesced or wire envelope that would exceed either limit is
 withheld from Redis after its local delivery; its logical messages count as
-`queue_full`, and the burst diagnostic reports the loss once per refusal streak,
-even without metrics. The next admitted envelope ends the streak and re-arms it.
+`queue_full`, and the burst diagnostic reports the loss once per overload
+episode, even without metrics. The episode ends, and the report re-arms, when
+every retained envelope has settled and the queue is empty; envelopes admitted
+while chunks keep it occupied do not re-arm it.
 
 `publishBatched` reserves room for every envelope of the call (one per shard
 channel on the sharded bus) before any local delivery. A call that does not fit
-behind the retained work, or whose envelopes together exceed
-`max(8 MiB, maxEnvelopeBytes)` on an idle queue, throws `RangeError` without
-delivering anything and counts `*_batch_rejected_total{reason="queue_full"}`;
-it can be retried once the queue drains. If local delivery itself throws, the
+behind the retained work throws `RangeError` without delivering anything and
+counts `*_batch_rejected_total{reason="queue_full"}`; it can be retried once the
+queue drains. A sharded-bus call whose envelopes together exceed
+`max(8 MiB, maxEnvelopeBytes)`, or that needs more than 8,192 envelopes, is
+refused the same way on every attempt, even on an idle queue: split it. If
+local delivery itself throws, the
 reserved relays are withdrawn, so no peer receives a call this instance did not
 deliver. Queue pressure does not fail the backend
 breaker. There is no retry or replay of refused envelopes: reconcile from durable

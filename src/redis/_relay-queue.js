@@ -56,6 +56,8 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 		retained -= flight.batch.length;
 		retainedBytes -= flight.bytes;
 		flight = null;
+		// One burst report per overload episode: only an empty queue re-arms it.
+		if (retained === 0) warned = false;
 		schedule();
 	}
 	function drain() {
@@ -101,12 +103,10 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 			// queue alone. Its capacity stays charged until submission settles.
 			if (retained === MAX_ENTRIES || (bytes > MAX_BYTES - retainedBytes && retained > 0)) {
 				dropped('queue_full', 1, count);
-				// One report per refusal streak: the next admitted envelope re-arms it.
 				if (!warned) { warned = true; normalizeBytes(); overflow({ entries: retained, bytes: retainedBytes, maxEntries: MAX_ENTRIES, maxBytes: MAX_BYTES }); }
 				return false;
 			}
 			enqueue(msg, count, channel, topics, bytes, exact);
-			warned = false;
 			schedule();
 			return true;
 		},
@@ -133,7 +133,6 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 				const entry = enqueue(msg, list[i + 1], list[i + 2], list[i + 3], exact ? Buffer.byteLength(msg) : msg.length * 3, exact);
 				if (first === null) first = entry;
 			}
-			warned = false;
 			schedule();
 			return first;
 		},
@@ -146,7 +145,6 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 				if (bytes > MAX_BYTES - retainedBytes) return null;
 			}
 			const entry = enqueue(msg, count, channel, topics, bytes, exact);
-			warned = false;
 			schedule();
 			return entry;
 		},
@@ -165,6 +163,7 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 				entries.length = 0; head = 0; normalizationHead = 0;
 				if (timer !== null) { clearTimer(timer); timer = null; }
 			}
+			if (retained === 0) warned = false;
 		},
 		clear() {
 			if (timer !== null) { clearTimer(timer); timer = null; }
@@ -174,6 +173,7 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 			if (count) dropped('deactivated', count, messages);
 			retained -= count; retainedBytes = flight?.bytes ?? 0;
 			entries.length = 0; head = 0; normalizationHead = 0;
+			if (retained === 0) warned = false;
 		}
 	};
 }

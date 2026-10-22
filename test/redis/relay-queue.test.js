@@ -113,7 +113,29 @@ describe('bounded relay admission and scheduling', () => {
 		expect(submit.mock.calls[1][0].map(e => e.msg)).toEqual(['new generation']);
 		q.clear(); resolve();
 	});
-	it('reports overflow once per refusal streak and re-arms after an admission', async () => {
+	it('reports overflow once per overload episode while settling chunks keep the queue saturated', async () => {
+		let resolve = () => {};
+		const { queue: q, submit, dropped, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
+		for (let i = 0; i < 8192; i++) expect(q.push(entry('m' + i))).toBe(true);
+		expect(q.push(entry('refused'))).toBe(false);
+		for (let round = 0; round < 50; round++) {
+			// One chunk settles and releases its room, the publisher refills it
+			// and is refused again: the queue never empties in between.
+			await vi.advanceTimersByTimeAsync(0);
+			resolve(); await Promise.resolve(); await Promise.resolve();
+			for (let i = 0; i < 256; i++) expect(q.push(entry('r' + i))).toBe(true);
+			expect(q.push(entry('refused'))).toBe(false);
+		}
+		expect(submit).toHaveBeenCalledTimes(50);
+		expect(dropped).toHaveBeenCalledTimes(51);
+		expect(overflow).toHaveBeenCalledTimes(1);
+		while (q.state.snapshot().retained > 0) { await vi.advanceTimersByTimeAsync(0); resolve(); await Promise.resolve(); await Promise.resolve(); }
+		for (let i = 0; i < 8192; i++) q.push(entry('n' + i));
+		expect(q.push(entry('refused'))).toBe(false);
+		expect(overflow).toHaveBeenCalledTimes(2);
+		q.clear();
+	});
+	it('re-arms the overflow report once the queue is empty again', async () => {
 		let resolve;
 		const { queue: q, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
 		const large = 'x'.repeat(5 * 1024 * 1024);
