@@ -36,7 +36,9 @@
  *     or probing, the subscriber restoring its channel, a failed or refused
  *     publish (retried with a backoff when nothing else signals recovery), and
  *     a freshly acquired persist lease. A lost sync reply is not a resync:
- *     the coordinator answers that requester again on recovery.
+ *     the coordinator answers that requester again on recovery. A receiver
+ *     that has to drop an envelope arriving in parts (its reassembly buffer is
+ *     full, or the parts stopped arriving) resyncs that topic too.
  *   - **One writer per topic.** Snapshot persistence is gated by a per-topic
  *     lease (`acquirePersist`): the lease holder is the sole persister for that
  *     topic, so two instances can never write divergent snapshots to the same
@@ -47,8 +49,9 @@
  *     is running) waits for a sync round - bounded to a third of the lease TTL
  *     - before the write is allowed; whatever the round merged also schedules
  *     a store of the converged state. A topic whose own edits have not reached
- *     the peers refuses persistence (rejects, so the schedule retries and the
- *     replica stays loaded) until the resync delivered them.
+ *     the peers, or whose round could not reach them, refuses persistence
+ *     (rejects, so the schedule retries and the replica stays loaded) until a
+ *     resync delivered them.
  *   - **Cold-join freshness.** A persisted snapshot is only as fresh as the
  *     last debounced store. When an instance cold-loads a topic it loads the
  *     snapshot AND broadcasts a sync request carrying its state vector; any
@@ -81,7 +84,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { randomBytes, setTimer, clearTimer, setImmediateTimer } from '../shared/runtime.js';
+import { randomBytes, setTimer, clearTimer, setImmediateTimer, monotonicNow } from '../shared/runtime.js';
+import { guardBreaker } from '../shared/breaker-admission.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT } from '../shared/lease-scripts.js';
@@ -100,9 +104,17 @@ const KIND_PART = 'part';
 
 // Bounds on the envelopes being reassembled from parts: base64 characters
 // held across all of them, how many at once, and how long one may take.
+// When a bound is hit the sender holding the most gives way, so one peer's
+// large resync cannot starve the others.
 const PART_BUFFER_MAX_CHARS = 64 * 1024 * 1024;
 const PART_ASSEMBLIES_MAX = 256;
 const PART_TIMEOUT_MS = 30000;
+// Envelopes dropped while their parts were arriving, remembered so their
+// remaining parts do not start a new assembly that can never complete.
+const PART_DROPPED_MAX = 1024;
+
+/** startRound's answer when the breaker refused the round. */
+const REFUSED = Symbol('refused');
 
 // Retry cadence for a resync the relay could not carry, when no breaker
 // transition or subscriber restore signals recovery first.
@@ -148,7 +160,10 @@ function positive(v, fallback) {
  *   whose traffic it refused is resynced with the peers once it lets traffic
  *   through again.
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber
- *   failure (the subscriber tears down, is opened again, and resyncs).
+ *   failure (the subscriber tears down, is opened again, and resyncs), and a
+ *   relay envelope too large to send even in parts (code
+ *   `RELAY_ENVELOPE_TOO_LARGE`; its topic keeps retrying, the other topics
+ *   are unaffected).
  */
 
 /**
@@ -221,8 +236,10 @@ export function createCrdtCluster(client, options = {}) {
 	let retryMs = 0;
 	/** @type {unknown} */
 	let lastRelayError = null;
-	// Counts lost relays, so a loop can tell that the relay just refused one.
-	let refusals = 0;
+	// Counts the relays the breaker refused, so a loop can tell that the
+	// breaker just refused one; a relay lost for any other reason concerns
+	// its own topic only.
+	let breakerRefusals = 0;
 	/** @type {{ declKey: string, topic: string, bytes: any } | null} */
 	let capture = null;
 	/** @type {{ declKey: string, topic: string, to: string, c: string | undefined, v: any[], replied: boolean } | null} */
@@ -286,14 +303,13 @@ export function createCrdtCluster(client, options = {}) {
 	 * again. A lost request leaves this replica behind; lost content leaves the
 	 * peers behind.
 	 */
-	function relayLost(obj, err) {
+	function relayLost(obj, err, permanent = false) {
 		lastRelayError = err;
-		refusals++;
 		const topic = obj.t;
 		if (typeof topic === 'string' && known.has(topic)) {
 			if (obj.k === KIND_SYNC_REQUEST) stale.add(topic);
 			else if (obj.k === KIND_UPDATE && Array.isArray(obj.b) && obj.b.length > 0) unrelayed.set(topic, ++marks);
-			else if (obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
+			else if (!permanent && obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
 				// The requester lacks this instance's state, but no local
 				// edit is at risk: answer it again once the relay recovers.
 				let peers = owed.get(topic);
@@ -304,28 +320,41 @@ export function createCrdtCluster(client, options = {}) {
 		scheduleRetry();
 	}
 
+	/** Hand a failure to the host's onError, which must not break the relay. */
+	function report(err) {
+		if (typeof options.onError === 'function') { try { options.onError(err); } catch { /* host handler */ } }
+	}
+
 	/**
 	 * Publish one envelope, after the subscriber is up so we never miss a reply
 	 * we caused. Resolves to the receiver count Redis reports, or null when the
-	 * breaker refused the publish or Redis failed it; never rejects. An
-	 * `admitted` publish already holds the breaker's admission.
+	 * breaker refused the publish, Redis failed it, or it is too large for the
+	 * relay; never rejects. A publish given a `verdict` runs under an admission
+	 * its caller took and reports to: it records whether Redis took it, or the
+	 * first error, there instead of on the breaker.
+	 * @param {any} obj
+	 * @param {{ reached: boolean, err: unknown } | null} [verdict]
 	 * @returns {Promise<number | null>}
 	 */
-	function publish(obj, admitted = false) {
+	function publish(obj, verdict = null) {
 		if (destroyed) return Promise.resolve(null);
 		const msgs = encode(obj);
 		if (msgs === null) {
-			relayLost(obj, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: the envelope exceeds the relay size limit even when sent in parts'));
+			const err = operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: the envelope exceeds the relay size limit even when sent in parts');
+			relayLost(obj, err, true);
+			report(err);
 			return Promise.resolve(null);
 		}
-		if (b && !admitted) {
-			try { b.guard(); } catch (err) { relayLost(obj, err); return Promise.resolve(null); }
+		if (b && verdict === null) {
+			try { b.guard(); } catch (err) { breakerRefusals++; relayLost(obj, err); return Promise.resolve(null); }
 		}
 		const send = () => Promise.all(msgs.map((msg) => redis.publish(channel, msg))).then((counts) => {
-			b?.success();
+			if (verdict) verdict.reached = true;
+			else b?.success();
 			return Number(counts[0]);
 		}, (err) => {
-			b?.failure(err);
+			if (verdict) { if (verdict.err === null) verdict.err = err; }
+			else b?.failure(err);
 			relayLost(obj, err);
 			return null;
 		});
@@ -376,16 +405,70 @@ export function createCrdtCluster(client, options = {}) {
 		return out;
 	}
 
-	/** @type {Map<string, { of: number, d: string, t: string, e: any, parts: Map<number, string>, chars: number, timer: any }>} */
+	/** @type {Map<string, { from: string, of: number, d: string, t: string, e: any, parts: Map<number, string>, chars: number, timer: any }>} */
 	const assemblies = new Map();
 	let partChars = 0;
+	/** @type {Map<string, { chars: number, count: number }>} sender -> what its assemblies hold */
+	const senders = new Map();
+	/** @type {Map<string, number>} dropped assembly -> until when its parts are ignored */
+	const dropped = new Map();
 
-	function dropAssembly(key) {
+	/**
+	 * Remove an assembly. A `lost` one carried traffic this instance will not
+	 * get otherwise: its topic is resynced, and its remaining parts are ignored.
+	 */
+	function dropAssembly(key, lost = false) {
 		const a = assemblies.get(key);
 		if (!a) return;
 		assemblies.delete(key);
 		partChars -= a.chars;
+		const sender = /** @type {{ chars: number, count: number }} */ (senders.get(a.from));
+		sender.chars -= a.chars;
+		if (--sender.count === 0) senders.delete(a.from);
 		if (a.timer !== null) clearTimer(a.timer);
+		if (lost) partsLost(key, a.t);
+	}
+
+	/** Envelope parts were lost: ignore the rest of them and resync their topic. */
+	function partsLost(key, topic) {
+		const at = monotonicNow();
+		for (const [k, until] of dropped) {
+			if (until > at && dropped.size < PART_DROPPED_MAX) break;
+			dropped.delete(k);
+		}
+		dropped.set(key, at + PART_TIMEOUT_MS);
+		if (typeof topic === 'string' && known.has(topic)) {
+			stale.add(topic);
+			scheduleRetry();
+		}
+	}
+
+	function isDropped(key) {
+		const until = dropped.get(key);
+		if (until === undefined) return false;
+		if (until > monotonicNow()) return true;
+		dropped.delete(key);
+		return false;
+	}
+
+	/** The sender holding the most by `by`, other than `except`, or null. */
+	function heaviestSender(by, except) {
+		let best = null;
+		let most = -1;
+		for (const [from, held] of senders) {
+			if (from !== except && held[by] > most) { best = from; most = held[by]; }
+		}
+		return best === null ? null : { from: best, most };
+	}
+
+	/** Drop the assembly of `from` holding the most characters. */
+	function evictFrom(from) {
+		let victim = null;
+		let most = -1;
+		for (const [key, a] of assemblies) {
+			if (a.from === from && a.chars > most) { victim = key; most = a.chars; }
+		}
+		if (victim !== null) dropAssembly(victim, true);
 	}
 
 	/**
@@ -399,14 +482,32 @@ export function createCrdtCluster(client, options = {}) {
 		const key = from + ' ' + id;
 		let a = assemblies.get(key);
 		if (!a) {
-			if (assemblies.size >= PART_ASSEMBLIES_MAX) return null;
-			a = { of, d, t, e: null, parts: new Map(), chars: 0, timer: null };
+			if (isDropped(key)) return null;
+			if (assemblies.size >= PART_ASSEMBLIES_MAX) {
+				// Room comes from the sender with the most assemblies, unless
+				// that is this one.
+				const own = senders.get(from)?.count ?? 0;
+				const other = heaviestSender('count', from);
+				if (other === null || other.most <= own) { partsLost(key, t); return null; }
+				evictFrom(other.from);
+			}
+			a = { from, of, d, t, e: null, parts: new Map(), chars: 0, timer: null };
 			assemblies.set(key, a);
-			a.timer = setTimer(() => { a.timer = null; dropAssembly(key); }, PART_TIMEOUT_MS);
+			let sender = senders.get(from);
+			if (!sender) senders.set(from, sender = { chars: 0, count: 0 });
+			sender.count++;
+			a.timer = setTimer(() => { a.timer = null; dropAssembly(key, true); }, PART_TIMEOUT_MS);
 			if (a.timer && a.timer.unref) a.timer.unref();
 		}
 		if (a.of !== of || a.d !== d || a.t !== t || a.parts.has(n)) return null;
-		if (partChars + x.length > PART_BUFFER_MAX_CHARS) { dropAssembly(key); return null; }
+		while (partChars + x.length > PART_BUFFER_MAX_CHARS) {
+			// The sender holding the most characters gives way; this part's
+			// own envelope when that is its sender.
+			const own = /** @type {{ chars: number, count: number }} */ (senders.get(from)).chars + x.length;
+			const other = heaviestSender('chars', from);
+			if (other === null || other.most <= own) { dropAssembly(key, true); return null; }
+			evictFrom(other.from);
+		}
 		if (n === 0) {
 			const e = parsed.e;
 			if (!e || typeof e !== 'object' || Array.isArray(e) || e.k === KIND_PART) { dropAssembly(key); return null; }
@@ -414,6 +515,7 @@ export function createCrdtCluster(client, options = {}) {
 		}
 		a.parts.set(n, x);
 		a.chars += x.length;
+		/** @type {{ chars: number, count: number }} */ (senders.get(from)).chars += x.length;
 		partChars += x.length;
 		if (a.parts.size < a.of) return null;
 		dropAssembly(key);
@@ -422,9 +524,9 @@ export function createCrdtCluster(client, options = {}) {
 		return { ...a.e, i: from, d: a.d, t: a.t, b: Array.from(Buffer.from(data, 'base64')) };
 	}
 
-	/** The rejection while a topic's local edits have not reached the peers. */
-	function relayPending() {
-		const err = operationError('CRDT_RELAY_PENDING', 'crdt: local edits to the document have not reached the other instances');
+	/** The rejection while a topic's local edits have not reached the peers, or its replica has not synced with them. */
+	function relayPending(message = 'crdt: local edits to the document have not reached the other instances') {
+		const err = operationError('CRDT_RELAY_PENDING', message);
 		if (lastRelayError !== null) err.cause = lastRelayError;
 		return err;
 	}
@@ -514,7 +616,7 @@ export function createCrdtCluster(client, options = {}) {
 			if (subscriber === sub) { subscriber = null; subscriberReady = null; subscribed = false; }
 			inboundLost = true;
 			scheduleRetry();
-			if (typeof options.onError === 'function') { try { options.onError(err); } catch { /* host handler */ } }
+			report(err);
 			if (!subscribeFailing) {
 				subscribeFailing = true;
 				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CRDT_SUBSCRIBE, { error: err });
@@ -568,19 +670,28 @@ export function createCrdtCluster(client, options = {}) {
 		if (round.expected !== null && round.replied.size >= round.expected) finishRound(round);
 	}
 
+	/**
+	 * End a round. It resolves true when Redis confirmed its sync request, so
+	 * every peer received it; false when the request was lost or still
+	 * unconfirmed when the window closed.
+	 */
 	function finishRound(round) {
 		if (round.done) return;
 		round.done = true;
 		if (round.timer !== null) { clearTimer(round.timer); round.timer = null; }
 		if (rounds.get(round.topic) === round) rounds.delete(round.topic);
-		round.resolve();
+		// A request not known to have reached the peers leaves the replica
+		// unsynced: the next write runs another round.
+		if (!round.asked && !destroyed && known.has(round.topic)) stale.add(round.topic);
+		round.resolve(round.asked);
 	}
 
 	/**
 	 * Start a two-way resync of one topic: broadcast the replica's full state
 	 * when peers may lack local edits, and ask every peer for its full state.
-	 * Returns the round, or null when this instance no longer holds the topic.
-	 * The round settles when every peer answered or the sync window closed.
+	 * Returns the round, null when this instance no longer holds the topic, or
+	 * REFUSED when the breaker refused it. The round settles when every peer
+	 * answered or the sync window closed.
 	 * @param {string} topic
 	 */
 	function startRound(topic) {
@@ -588,16 +699,29 @@ export function createCrdtCluster(client, options = {}) {
 		if (existing) return existing;
 		queue.delete(topic);
 		const declKey = known.get(topic);
-		if (declKey !== undefined && !admit()) {
-			// Refused before reading the replica: the breaker transition or
-			// the retry resyncs it.
-			stale.add(topic);
-			scheduleRetry();
+		if (declKey === undefined) {
+			stale.delete(topic);
+			unrelayed.delete(topic);
 			return null;
 		}
-		const full = declKey === undefined ? null : readState(declKey, topic);
+		// One admission covers both publishes of the round; a round that
+		// publishes nothing hands it back unused.
+		let release;
+		try {
+			release = guardBreaker(b);
+		} catch (err) {
+			// Refused before reading the replica: the breaker transition or
+			// the retry resyncs it.
+			lastRelayError = err;
+			breakerRefusals++;
+			stale.add(topic);
+			scheduleRetry();
+			return REFUSED;
+		}
+		const full = readState(declKey, topic);
 		stale.delete(topic);
-		if (declKey === undefined || full === null) {
+		if (full === null) {
+			release();
 			known.delete(topic);
 			unrelayed.delete(topic);
 			return null;
@@ -606,19 +730,25 @@ export function createCrdtCluster(client, options = {}) {
 		// meanwhile keeps it.
 		const mark = unrelayed.get(topic);
 		/** @type {any} */
-		const round = { id: randomBytes(6).toString('hex'), topic, expected: null, replied: new Set(), done: false, timer: null, resolve: null, promise: null, sent: null };
+		const round = { id: randomBytes(6).toString('hex'), topic, expected: null, replied: new Set(), asked: false, done: false, timer: null, resolve: null, promise: null, sent: null };
 		round.promise = new Promise((resolve) => { round.resolve = resolve; });
 		rounds.set(topic, round);
 		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
 		if (round.timer && round.timer.unref) round.timer.unref();
+		const verdict = { reached: false, err: /** @type {unknown} */ (null) };
 		const pushed = mark === undefined
 			? Promise.resolve(0)
-			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }, true).then((p) => {
+			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }, verdict).then((p) => {
 				if (p !== null && unrelayed.get(topic) === mark) unrelayed.delete(topic);
 				return p;
 			});
-		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) }, true);
+		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) }, verdict);
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
+			// The round's one admission gets one outcome.
+			if (verdict.err !== null) b?.failure(verdict.err);
+			else if (verdict.reached) b?.success();
+			else release();
+			if (n !== null) round.asked = true;
 			if (p === null || n === null) {
 				// relayLost marked the topic again; nothing will answer.
 				finishRound(round);
@@ -632,34 +762,19 @@ export function createCrdtCluster(client, options = {}) {
 		return round;
 	}
 
-	/**
-	 * Take the breaker's admission for one resync round (both of its
-	 * publishes); false when the breaker refuses it.
-	 */
-	function admit() {
-		if (!b) return true;
-		try {
-			b.guard();
-			return true;
-		} catch (err) {
-			lastRelayError = err;
-			refusals++;
-			return false;
-		}
-	}
-
 	/** Run the queued resync rounds, a bounded number at a time. */
 	function pump() {
 		if (destroyed) return;
 		while (activeRounds < RESYNC_CONCURRENCY && queue.size > 0) {
 			const topic = /** @type {string} */ (queue.values().next().value);
 			queue.delete(topic);
-			const before = refusals;
 			const round = startRound(topic);
-			if (refusals !== before) {
+			if (round === REFUSED) {
 				// The breaker refuses rounds (open, or probing with its probe
 				// taken): every further one would be refused after reading its
-				// replica. The breaker transition or the retry resumes.
+				// replica. The breaker transition or the retry resumes. A
+				// relay lost for another reason, such as an envelope too
+				// large to carry, concerns its own topic only.
 				for (const rest of queue) stale.add(rest);
 				queue.clear();
 				return;
@@ -668,6 +783,8 @@ export function createCrdtCluster(client, options = {}) {
 			activeRounds++;
 			Promise.race([round.sent, round.promise]).then(() => {
 				activeRounds--;
+				// Traffic for the topic lost while its round ran needs another.
+				if (stale.has(topic) && !rounds.has(topic)) scheduleRetry();
 				pump();
 			});
 		}
@@ -696,9 +813,9 @@ export function createCrdtCluster(client, options = {}) {
 				if (b && b.state === 'broken') { scheduleRetry(); return; }
 				peers.delete(to);
 				if (peers.size === 0) owed.delete(topic);
-				const before = refusals;
+				const before = breakerRefusals;
 				answerSyncRequest({ i: to, v: req.v, c: req.c }, req.declKey, topic);
-				if (refusals !== before) return; // refused again: re-owed, retried later
+				if (breakerRefusals !== before) return; // refused again: re-owed, retried later
 			}
 		}
 	}
@@ -713,10 +830,26 @@ export function createCrdtCluster(client, options = {}) {
 		if (retryTimer && retryTimer.unref) retryTimer.unref();
 	}
 
-	/** Join the topic's resync round, starting one when none runs. */
+	/**
+	 * Join the topic's resync round, starting one when none runs. Resolves
+	 * false when the round could not reach the peers.
+	 * @returns {Promise<boolean>}
+	 */
 	function syncRound(topic) {
 		const round = rounds.get(topic) ?? startRound(topic);
-		return round ? round.promise : Promise.resolve();
+		if (round === REFUSED) return Promise.resolve(false);
+		return round ? round.promise : Promise.resolve(true);
+	}
+
+	/**
+	 * Reject while the topic's local edits have not reached the peers, or its
+	 * replica may lack edits the peers sent.
+	 */
+	function assertSynced(topic, reached) {
+		if (unrelayed.has(topic)) throw relayPending();
+		if (!reached || stale.has(topic)) {
+			throw relayPending('crdt: the document has not synced with the other instances since the relay lost traffic');
+		}
 	}
 
 	const unsubscribeBreaker = b && typeof b.subscribe === 'function'
@@ -787,23 +920,27 @@ export function createCrdtCluster(client, options = {}) {
 		 * to a third of the lease TTL). Throws on a Redis error, and with
 		 * code `CRDT_RELAY_PENDING` while local edits to the topic have not
 		 * reached the peers (a relay that failed, or one Redis has not
-		 * confirmed within that window), so the caller's persistence schedule
-		 * retries rather than dropping the write or unloading the only
-		 * replica holding those edits.
+		 * confirmed within that window) or the replica has not synced with
+		 * them after the relay lost traffic (a sync round the breaker refused,
+		 * or whose request failed or was not confirmed within that window), so
+		 * the caller's persistence schedule retries rather than dropping the
+		 * write, storing a snapshot without the peers' edits, or unloading the
+		 * only replica holding local edits.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
 		async acquirePersist(topic) {
 			if (destroyed) return false;
 			let synced = false;
+			let reached = true;
 			if (known.has(topic) && (unrelayed.has(topic) || stale.has(topic) || queue.has(topic) || rounds.has(topic))) {
-				await syncRound(topic);
+				reached = await syncRound(topic);
 				synced = true;
 				if (destroyed) return false;
 			}
 			await awaitRelayed(topic);
 			if (destroyed) return false;
-			if (unrelayed.has(topic)) throw relayPending();
+			assertSynced(topic, reached);
 			const key = client.key('crdt:persist:' + topic);
 			const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
 			if (r !== 'OK') {
@@ -813,9 +950,15 @@ export function createCrdtCluster(client, options = {}) {
 			} else if (!synced && known.has(topic)) {
 				// Newly acquired: the previous writer may have held edits this
 				// replica never received.
-				await syncRound(topic);
+				reached = await syncRound(topic);
+				if (destroyed) return false;
+				await awaitRelayed(topic);
 			}
-			return !destroyed;
+			if (destroyed) return false;
+			// Edits marked or relays started while the lease was being taken
+			// count as well.
+			assertSynced(topic, reached);
+			return true;
 		},
 
 		/** Tear down the subscriber. Idempotent. */
@@ -833,6 +976,7 @@ export function createCrdtCluster(client, options = {}) {
 			owed.clear();
 			known.clear();
 			for (const key of [...assemblies.keys()]) dropAssembly(key);
+			dropped.clear();
 			if (subscriber) {
 				const s = subscriber;
 				subscriber = null;

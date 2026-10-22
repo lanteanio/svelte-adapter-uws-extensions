@@ -23,7 +23,12 @@ export interface CrdtClusterOptions {
 	 * topic whose traffic it refused is resynced with the peers once it closes.
 	 */
 	breaker?: CircuitBreaker;
-	/** Observe a relay-subscriber failure (the subscriber tears down, is opened again, and resyncs). */
+	/**
+	 * Observe a relay-subscriber failure (the subscriber tears down, is opened
+	 * again, and resyncs), and a relay envelope too large to send even in
+	 * parts (code `RELAY_ENVELOPE_TOO_LARGE`; its topic keeps retrying, the
+	 * other topics are unaffected).
+	 */
 	onError?: (err: unknown) => void;
 }
 
@@ -68,8 +73,10 @@ export interface CrdtCluster {
 	 * round with the peers (at most a third of `persistLeaseMs`). Rejects on a
 	 * Redis error, and with code `CRDT_RELAY_PENDING` while local edits to the
 	 * topic have not reached the peers (a relay that failed, or one Redis has
-	 * not confirmed within that window), so the caller's persistence schedule
-	 * retries and keeps the replica loaded.
+	 * not confirmed within that window) or while the replica has not synced
+	 * with them after the relay lost traffic (a sync round the breaker refused,
+	 * or whose request failed or was not confirmed within that window), so the
+	 * caller's persistence schedule retries and keeps the replica loaded.
 	 */
 	acquirePersist(topic: string): Promise<boolean>;
 	/** Tear down the relay subscriber. Idempotent. */

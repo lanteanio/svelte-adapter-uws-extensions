@@ -422,6 +422,116 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		breaker.reset();
 		await until(() => 'k' in a.items(TOPIC));
 	});
+
+	it('hands the breaker probe back when a resync finds a topic no longer held', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 50 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({ breaker }, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		breaker.failure(new Error('redis down'));
+		await a.join('doc:gone'); // its cold-join request is refused
+		await settle();
+		a.authority.release('doc:gone');
+		await wait(300); // the probing breaker resyncs doc:gone, which a no longer holds
+		expect(breaker.state).toBe('probing');
+		a.edit(TOPIC, 'after', 1);
+		await until(() => 'after' in b.items(TOPIC));
+		expect(breaker.state).toBe('healthy');
+	});
+
+	it('reports one failure to the breaker for a resync round whose publishes both fail', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 2, resetTimeout: 60000 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({ breaker }, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		breaker.failure(new Error('redis down'));
+		breaker.failure(new Error('redis down'));
+		a.edit(TOPIC, 'u1', 1); // refused: the round pushes the state and asks the peers
+		await settle();
+		const publish = client.redis.publish;
+		let failed = 0;
+		client.redis.publish = function (channel, message) {
+			if (message.includes(a.crdt.instanceId)) {
+				failed++;
+				return Promise.reject(new Error('connection lost'));
+			}
+			return publish.call(this, channel, message);
+		};
+		breaker.reset();
+		await settle();
+		client.redis.publish = publish;
+		expect(failed).toBe(2);
+		expect(breaker.failures).toBe(1);
+		expect(breaker.state).toBe('healthy');
+	});
+
+	it('refuses the first write of a lease whose sync round the breaker refused, until a round reaches the peers', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const b = instance({}, quiet);
+		await b.join(TOPIC);
+		await settle();
+		b.edit(TOPIC, 'onlyb', 1);
+		await settle();
+		const a = instance({ breaker }, quiet);
+		breaker.failure(new Error('redis down'));
+		await a.join(TOPIC); // the cold-join request is refused
+		await settle();
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(a.items(TOPIC)).toEqual({});
+		breaker.reset();
+		await until(() => 'onlyb' in a.items(TOPIC));
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+	});
+
+	it('refuses the first write of a fresh lease while a local edit made during its sync round is unconfirmed', async () => {
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({}, quiet);
+		await a.join(TOPIC);
+		await settle();
+		// A peer that never answers keeps the round open for the whole window.
+		const silent = client.duplicate();
+		await silent.subscribe(client.key('crdt:events'));
+		const pending = a.crdt.acquirePersist(TOPIC);
+		await wait(50);
+		const hold = holdUpdates(a);
+		a.edit(TOPIC, 'u1', 1);
+		await expect(pending).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(hold.held).toHaveLength(1);
+		hold.release();
+	});
+
+	it('refuses the first write of a fresh lease whose sync request Redis has not confirmed', async () => {
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({}, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		const publish = client.redis.publish;
+		const held = [];
+		client.redis.publish = function (channel, message) {
+			if (message.includes(a.crdt.instanceId) && message.includes('"k":"sreq"')) {
+				return new Promise((resolve, reject) => held.push(() => publish.call(this, channel, message).then(resolve, reject)));
+			}
+			return publish.call(this, channel, message);
+		};
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(held).toHaveLength(1);
+		// Renewing the lease it now holds does not skip the sync either.
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(held).toHaveLength(2);
+		client.redis.publish = publish;
+		for (const send of held.splice(0)) send();
+		await settle();
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+	});
 });
 
 describe('createCrdtCluster relay retry', () => {
@@ -626,17 +736,122 @@ describe('createCrdtCluster envelopes over maxEnvelopeBytes', () => {
 		await settle();
 		const channel = client.key('crdt:events');
 		const data = Buffer.from([1, 2, 3, 4, 5, 6]).toString('base64');
-		const part = (n, extra) => JSON.stringify({ i: 'peer', k: 'part', d: 'dk1', t: 'board:1', p: 'p1', n, of: 2, x: n === 0 ? data.slice(0, 4) : data.slice(4), ...extra });
+		const part = (n, extra, p = 'p1') => JSON.stringify({ i: 'peer', k: 'part', d: 'dk1', t: 'board:1', p, n, of: 2, x: n === 0 ? data.slice(0, 4) : data.slice(4), ...extra });
 		vi.useFakeTimers();
 		try {
 			await client.redis.publish(channel, part(0, { e: { k: 'u' } }));
 			vi.advanceTimersByTime(30001);
 			await client.redis.publish(channel, part(1));
 			expect(rb.updates).toEqual([]); // the first part expired
+			// The late part does not start an assembly of its own.
 			await client.redis.publish(channel, part(0, { e: { k: 'u' } }));
+			expect(rb.updates).toEqual([]);
+			await client.redis.publish(channel, part(0, { e: { k: 'u' } }, 'p2'));
+			await client.redis.publish(channel, part(1, {}, 'p2'));
 			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'board:1', bytes: [1, 2, 3, 4, 5, 6] }]);
 		} finally {
 			vi.useRealTimers();
+			b.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster topics the relay cannot carry', () => {
+	it('resyncs the other topics when one topic cannot be relayed at any size, and reports that one', async () => {
+		const client = mockRedisClient('crdtoversize:');
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const errors = [];
+		const a = createCrdtCluster(client, { breaker, maxEnvelopeBytes: 400, onError: (err) => errors.push(err) });
+		const b = createCrdtCluster(client, { maxEnvelopeBytes: 400 });
+		const rb = recorder();
+		b.onMessage(rb.handlers);
+		// Too long a name leaves no room for any part of its envelope.
+		const huge = 'doc:' + 'h'.repeat(300);
+		const state = { [huge]: Array.from({ length: 50 }, (_, i) => i), 'doc:small': [9, 9] };
+		a.onMessage({
+			onSyncRequest: (declKey, topic, sv, from) => {
+				if (from.startsWith('local:') && state[topic]) a.sendSyncReply(declKey, topic, state[topic], from);
+			}
+		});
+		try {
+			await settle();
+			breaker.failure(new Error('redis down'));
+			a.relayUpdate('dk1', huge, state[huge]); // cannot be carried: marked first
+			a.relayUpdate('dk1', 'doc:small', [9]); // refused: marked
+			await settle();
+			breaker.reset();
+			await settle();
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'doc:small', bytes: [9, 9] }]);
+			expect(errors.length).toBeGreaterThan(0);
+			expect(errors.every((err) => err.code === 'RELAY_ENVELOPE_TOO_LARGE')).toBe(true);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster reassembly capacity', () => {
+	const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+	/** A receiver holding `topics`, recording updates and the sync requests it sends. */
+	async function receiver(prefix, topics) {
+		const client = mockRedisClient(prefix);
+		const b = createCrdtCluster(client);
+		const rb = recorder();
+		b.onMessage({
+			...rb.handlers,
+			onSyncRequest: (declKey, topic, sv, from) => {
+				if (from.startsWith('local:')) b.sendSyncReply(declKey, topic, [1], from);
+			}
+		});
+		for (const topic of topics) b.requestSync('dk1', topic, []);
+		await settle();
+		const requests = [];
+		const publish = client.redis.publish;
+		client.redis.publish = function (channel, message) {
+			const env = JSON.parse(message);
+			if (env.i === b.instanceId && env.k === 'sreq') requests.push(env);
+			return publish.call(this, channel, message);
+		};
+		return { client, b, rb, requests, channel: client.key('crdt:events') };
+	}
+
+	const part = (from, id, topic, n, of, x, extra = {}) =>
+		JSON.stringify({ i: from, k: 'part', d: 'dk1', t: topic, p: id, n, of, x, ...(n === 0 ? { e: { k: 'u' } } : {}), ...extra });
+	const small = Buffer.from([4, 5, 6]).toString('base64');
+
+	it('makes room for another peer when one peer fills the buffer, and resyncs the topic it drops', async () => {
+		const { client, b, rb, requests, channel } = await receiver('crdtpartfair:', ['doc:big', 'doc:small']);
+		try {
+			// One peer's unfinished envelope fills the whole buffer.
+			const total = 64 * 1024 * 1024;
+			const slice = 1000000;
+			let held = 0;
+			for (let n = 0; held < total; n++) {
+				const size = Math.min(slice, total - held);
+				await client.redis.publish(channel, part('peerA', 'big', 'doc:big', n, 100, 'A'.repeat(size)));
+				held += size;
+			}
+			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 0, 2, small.slice(0, 2)));
+			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 1, 2, small.slice(2)));
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'doc:small', bytes: [4, 5, 6] }]);
+			// peerA's envelope is gone, so b asks the peers for the topic again.
+			for (let i = 0; i < 60 && !requests.some((r) => r.t === 'doc:big' && r.a === 1); i++) await wait(50);
+			expect(requests.some((r) => r.t === 'doc:big' && r.a === 1)).toBe(true);
+		} finally {
+			b.destroy();
+		}
+	});
+
+	it('makes room for another peer when one peer holds every assembly slot', async () => {
+		const { client, b, rb, channel } = await receiver('crdtpartslots:', ['doc:small']);
+		try {
+			for (let k = 0; k < 256; k++) await client.redis.publish(channel, part('peerA', 'a' + k, 'doc:other', 0, 2, 'AAAA'));
+			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 0, 2, small.slice(0, 2)));
+			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 1, 2, small.slice(2)));
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'doc:small', bytes: [4, 5, 6] }]);
+		} finally {
 			b.destroy();
 		}
 	});
