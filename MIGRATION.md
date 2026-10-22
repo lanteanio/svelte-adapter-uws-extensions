@@ -344,9 +344,9 @@ the auditor.
 aggregator, an admission class using `clusterTopPublisher` rejects every topic
 that 0.5 instance's sample does not list, cold ones included.
 
-**Why.** A 0.6 instance bounds a topic missing from a peer's sample by that
-peer's total `publishRate`. A 0.5 peer sends no total, so the bound is unknown
-and the rule fails closed.
+**Why.** A 0.6 instance bounds a topic missing from a peer's sample by the
+smaller of that peer's total `publishRate` and its slowest listed topic's rate.
+A 0.5 peer sends no total, so the bound is unknown and the rule fails closed.
 
 **Action.** Enable `clusterTopPublisher` only after the whole fleet runs 0.6,
 or accept the shedding for the length of the rollout. A stopped 0.5 instance's
