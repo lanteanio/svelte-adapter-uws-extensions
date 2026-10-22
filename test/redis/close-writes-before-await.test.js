@@ -51,6 +51,66 @@ describe('close hooks put their Redis writes on the wire before awaiting', () =>
 		void closing;
 	});
 
+	it('presence: every connection closed in the same tick leaves, past the shared pipeline budget', async () => {
+		const client = mockRedisClient('shut-pn:');
+		const presence = createPresence(client, { key: 'id', consistencyAuditIntervalMs: 0 });
+		cleanups.push(() => presence.destroy());
+		const platform = mockPlatform();
+		const sockets = [];
+		for (let i = 0; i < 20; i++) {
+			const ws = mockWs({ id: 'user' + i });
+			await presence.join(ws, 'room' + i, platform);
+			sockets.push(ws);
+		}
+
+		const wire = cutAfterSync(client.redis);
+		for (const ws of sockets) presence.hooks.close(ws, { platform });
+		await Promise.resolve();
+		wire.cut();
+		await settle();
+		wire.restore();
+
+		for (let i = 0; i < 20; i++) expect(await presence.list('room' + i)).toEqual([]);
+	});
+
+	it('presence: peers receive the leave event even when the hook is cut short', async () => {
+		const client = mockRedisClient('shut-pe:');
+		const presence = createPresence(client, { key: 'id', consistencyAuditIntervalMs: 0 });
+		cleanups.push(() => presence.destroy());
+		const platform = mockPlatform();
+		const sockets = [mockWs({ id: 'alice' }), mockWs({ id: 'bob' })];
+		for (const ws of sockets) await presence.join(ws, 'room', platform);
+
+		const leaves = [];
+		const probe = client.duplicate();
+		probe.on('message', (_ch, raw) => {
+			const event = JSON.parse(raw);
+			if (event.event === 'leave') leaves.push(event.payload.key);
+		});
+		await probe.subscribe(client.key('presence:events:room'));
+		cleanups.push(() => probe.quit());
+
+		const wire = cutAfterSync(client.redis);
+		for (const ws of sockets) presence.hooks.close(ws, { platform });
+		await Promise.resolve();
+		wire.cut();
+		await settle();
+		wire.restore();
+
+		expect(leaves.sort()).toEqual(['alice', 'bob']);
+
+		// A single-topic leave publishes from its script the same way.
+		const carol = mockWs({ id: 'carol' });
+		await presence.join(carol, 'room', platform);
+		const leaving = presence.leave(carol, platform, 'room');
+		await Promise.resolve();
+		wire.cut();
+		await settle();
+		wire.restore();
+		expect(leaves.sort()).toEqual(['alice', 'bob', 'carol']);
+		void leaving;
+	});
+
 	it('presence: a single-topic leave of the last connection does the same', async () => {
 		const client = mockRedisClient('shut-pt:');
 		const presence = createPresence(client, { key: 'id', consistencyAuditIntervalMs: 0 });

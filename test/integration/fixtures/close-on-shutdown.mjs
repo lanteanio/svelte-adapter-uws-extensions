@@ -1,5 +1,6 @@
-// Child process for close-on-shutdown.test.js. Registers one connection with
-// presence and the connection registry, then runs both close hooks the way a
+// Child process for close-on-shutdown.test.js. Registers twenty presence
+// members, more than the Redis client's in-flight pipeline budget, and one
+// connection with the connection registry, then runs both close hooks the way a
 // graceful shutdown does: started, not awaited, and the process exits on the
 // next turn of the event loop, before any Redis reply can arrive.
 import { createBackendClient } from '../helpers/backend.js';
@@ -18,14 +19,18 @@ const registry = createConnectionRegistry(client, {
 	sessionIdentify: (ws) => ws.getUserData().sid
 });
 
-const member = mockWs({ id: 'alice' });
-await presence.join(member, 'room', platform);
+const members = [];
+for (let i = 0; i < 20; i++) {
+	const member = mockWs({ id: 'member' + i });
+	await presence.join(member, 'room', platform);
+	members.push(member);
+}
 const conn = mockWs({ userId: 'u1', tenantId: 't', sid: 'app-1' });
 conn.getUserData()[WS_SESSION_ID] = 's1';
 await registry.hooks.open(conn, { platform });
 await new Promise((resolve) => process.stdout.write('ready\n', resolve));
 await new Promise((resolve) => process.stdin.once('data', resolve));
 
-presence.hooks.close(member, { platform });
+for (const member of members) presence.hooks.close(member, { platform });
 registry.hooks.close(conn, { platform });
 setImmediate(() => process.exit(0));

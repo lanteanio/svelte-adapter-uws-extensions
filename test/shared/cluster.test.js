@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { keySlot, isCluster, execMultiSlot, coalescedByOwner } from '../../src/shared/cluster.js';
+import { keySlot, isCluster, execMultiSlot, execMultiSlotNow, coalescedByOwner } from '../../src/shared/cluster.js';
 import { MAX_REDIS_PIPELINE_COMMANDS, MAX_REDIS_INFLIGHT_BATCHES } from '../../src/shared/caps.js';
 
 describe('keySlot', () => {
@@ -304,4 +304,30 @@ it('does not replay a refused command after its ownership changes before a topol
 	expect(writes).toEqual([]);
 	expect(completed).toMatchObject([{ total: 0, failed: 0, error: null }]);
 	refresh.stop();
+});
+
+it.each([false, true])('execMultiSlotNow writes every pipeline before returning, past a full budget (cluster: %s)', async clustered => {
+	const slots = [];
+	for (const key of ['a', 'b']) slots[keySlot(key)] = [key === 'a' ? 'nodeA' : 'nodeB'];
+	const waiting = [], written = [];
+	const redis = {
+		...(clustered ? { nodes: () => [], slots } : {}),
+		pipeline() {
+			const keys = [];
+			return { get(key) { keys.push(key); return this; }, exec() {
+				written.push(keys);
+				return new Promise(resolve => waiting.push(() => resolve(keys.map(key => [null, key]))));
+			} };
+		}
+	};
+	const busy = Array.from({ length: MAX_REDIS_INFLIGHT_BATCHES }, (_, i) => execMultiSlot(redis, [['get', i % 2 ? 'a' : 'b']]));
+	await flush();
+	expect(written).toHaveLength(MAX_REDIS_INFLIGHT_BATCHES);
+	written.length = 0;
+	const many = Array.from({ length: MAX_REDIS_PIPELINE_COMMANDS + 1 }, () => ['get', 'a']);
+	const now = execMultiSlotNow(redis, [...many, ['get', 'b']]);
+	expect(written.map(keys => keys.length)).toEqual(clustered ? [MAX_REDIS_PIPELINE_COMMANDS, 1, 1] : [MAX_REDIS_PIPELINE_COMMANDS, 2]);
+	for (const release of waiting.splice(0)) release();
+	expect(await now).toEqual([...many.map(() => [null, 'a']), [null, 'b']]);
+	await Promise.all(busy);
 });

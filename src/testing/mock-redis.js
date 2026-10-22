@@ -1809,6 +1809,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					clearFieldExpiry(topicHashKey, [userKeyStr]);
 					if (topicHash.size === 0) hashes.delete(topicHashKey);
 				}
+				// The leave broadcast rides the script, as on a real server.
+				const channel = args[numKeys + 2];
+				const message = args[numKeys + 3];
+				if (visible && message) r.publish(channel, message);
 				return visible ? 1 : 0;
 			}
 			return 0;

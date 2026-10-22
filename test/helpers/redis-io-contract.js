@@ -133,7 +133,8 @@ export function redisIOContract(makeClient) {
 					expect(meter.read()).toBe(0);
 					meter.reset();
 					await presence.leave(sockets[0], platform, 'room');
-					expect(meter.read()).toBe(2);
+					// The leave script publishes the leave event itself.
+					expect(meter.read()).toBe(1);
 				} finally { await presence.clear('room'); presence.destroy(); await raw.quit(); }
 			}
 		});

@@ -59,7 +59,7 @@ import {
 import { evalCached } from '../shared/eval-cached.js';
 import { scanAndUnlink, scanKeys } from '../shared/redis-scan.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
-import { execMultiSlot, firstCommandError, coalescedByOwner } from '../shared/cluster.js';
+import { execMultiSlot, execMultiSlotNow, firstCommandError, coalescedByOwner } from '../shared/cluster.js';
 import { coalescedWork } from '../shared/coalesced-work.js';
 import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -455,19 +455,35 @@ export function createPresence(client, options = {}) {
 			: '{"data":' + serializedData + ',"ts":' + JSON.stringify(ts) + '}';
 	}
 
-	async function publishEvent(topic, event, payload) {
-		const ch = eventChannel(topic);
+	/**
+	 * The event envelope peers receive on the topic's event channel, or ''
+	 * when it exceeds the bound every peer enforces inbound. Publishing past
+	 * it fans out locally and to no remote instance, which reads as a
+	 * partial roster rather than as an error, so it is reported instead.
+	 */
+	function encodeEvent(topic, event, payload) {
 		const msg = JSON.stringify({ instanceId, topic, event, payload });
-		// Hold outbound events to the bound every peer enforces inbound.
-		// Publishing past it fans out locally and to no remote instance,
-		// which reads as a partial roster rather than as an error.
 		if (msg.length > safeEnvelopeChars && Buffer.byteLength(msg) > maxEnvelopeBytes) {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PRESENCE_ENVELOPE_OVERSIZED, {
 				attributes: { event, bytes: Buffer.byteLength(msg), maxEnvelopeBytes }
 			});
-			return;
+			return '';
 		}
-		await redis.publish(ch, msg).catch(() => {});
+		return msg;
+	}
+
+	async function publishEvent(topic, event, payload) {
+		const msg = encodeEvent(topic, event, payload);
+		if (msg) await redis.publish(eventChannel(topic), msg).catch(() => {});
+	}
+
+	/**
+	 * LEAVE_SCRIPT arguments after its keys. The script publishes the leave
+	 * event itself when it removes the user's public row, so peers hear it
+	 * even if this instance stops before the reply arrives.
+	 */
+	function leaveArgs(topic, key, data) {
+		return [instanceId, key, eventChannel(topic), encodeEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data })];
 	}
 
 	/** Remove this reservation and clean up only membership still owned by it. */
@@ -617,7 +633,7 @@ export function createPresence(client, options = {}) {
 							leaving = evalCached(redis,
 								LEAVE_SCRIPT, 3,
 								userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
-								instanceId, key
+								...leaveArgs(topic, key, data)
 							);
 						} catch (err) {
 							b?.failure(err);
@@ -637,7 +653,6 @@ export function createPresence(client, options = {}) {
 					if (userGone === 1) {
 						mLeaves?.inc({ topic: mt(topic) });
 						bufferDiff(topic, 'leave', key, data, platform);
-						await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data });
 					}
 				} else {
 					counts.set(key, current - 1);
@@ -782,20 +797,24 @@ export function createPresence(client, options = {}) {
 		// close hook during a graceful shutdown runs only up to its first
 		// await before the process exits, and the removal is what must reach
 		// Redis. Waiting on the unsubscribes first left every last-connection
-		// entry behind until its field TTL.
+		// entry behind until its field TTL. A shutdown closes every socket in
+		// the same tick, so the pipeline also bypasses the client's shared
+		// in-flight budget: queued behind the earlier closes, it would not be
+		// written before the process exits. Each script publishes its own
+		// leave event, so peers hear it without this instance reading replies.
 		const commands = [];
-		for (const { topic, key } of pendingLeaves) {
+		for (const { topic, key, data } of pendingLeaves) {
 			commands.push([
 				'eval', LEAVE_SCRIPT, 3,
 				userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
-				instanceId, key
+				...leaveArgs(topic, key, data)
 			]);
 		}
 
 		let leaving = null;
 		let skipPipeline = false;
 		if (b) { try { b.guard(); } catch { skipPipeline = true; } }
-		if (!skipPipeline) leaving = execMultiSlot(redis, commands);
+		if (!skipPipeline) leaving = execMultiSlotNow(redis, commands);
 
 		const unsubPromises = [];
 		for (const { needsUnsub, topic } of pendingLeaves) {
@@ -817,21 +836,18 @@ export function createPresence(client, options = {}) {
 		}
 		if (unsubPromises.length > 0) await Promise.all(unsubPromises);
 
-		// Broadcast leave events only when Redis confirmed the user is
-		// completely gone. If results is null (Redis unavailable or
-		// pipeline failed), suppress all leave broadcasts so we don't
-		// lie to other instances about a user that may still be present
-		// elsewhere.
-		const publishPromises = [];
+		// Local leave diffs only where Redis confirmed the user is completely
+		// gone, the same condition under which the script told the peers. If
+		// results is null (Redis unavailable or pipeline failed), nothing is
+		// broadcast, so no instance hears of a leave for a user who may still
+		// be present elsewhere.
 		for (let i = 0; i < pendingLeaves.length; i++) {
 			const userGone = results ? (!results[i][0] && results[i][1] === 1) : false;
 			if (!userGone) continue;
 			const { topic, key, data } = pendingLeaves[i];
 			mLeaves?.inc({ topic: mt(topic) });
 			bufferDiff(topic, 'leave', key, data, platform);
-			publishPromises.push(publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key, data }));
 		}
-		if (publishPromises.length > 0) await Promise.all(publishPromises);
 		if (pendingUpdatedRelays.length > 0) await Promise.all(pendingUpdatedRelays);
 
 		if (syncTopics) {

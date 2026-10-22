@@ -310,6 +310,73 @@ function indexRange(start, end) {
 	return range;
 }
 
+/**
+ * Write one pipeline of commands assigned to a single allocation and store
+ * their replies in `results`. The pipeline is written before the first await.
+ */
+async function pipelineBatch(redis, commands, batch, clustered, results, individual) {
+	let replies;
+	try {
+		const pipe = redis.pipeline();
+		for (const index of batch) {
+			const [method, ...args] = commands[index];
+			pipe[method](...args);
+		}
+		replies = await pipe.exec();
+	} catch (error) {
+		// ioredis rejects this topology mismatch before writing the pipeline.
+		if (clustered && error.message === 'All keys in the pipeline should belong to the same slots allocation group') {
+			for (const index of batch) await individual(index);
+			return;
+		}
+		for (const index of batch) results[index] = [error, undefined];
+		return;
+	}
+	for (let i = 0; i < batch.length; i++) {
+		const reply = replies[i];
+		if (clustered && /^(MOVED|ASK) \d+ /.test(reply?.[0]?.message || '')) await individual(batch[i]);
+		else results[batch[i]] = reply;
+	}
+}
+
+/**
+ * `execMultiSlot` outside the shared in-flight budget: every pipeline and
+ * individually routed command is written before this returns, however many
+ * other calls hold the budget. Only for writes that must reach Redis from a
+ * caller that may not run past its first await, such as a close hook during a
+ * graceful shutdown; everything else queues through `execMultiSlot`.
+ *
+ * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
+ * @param {Array<[string, ...any]>} commands
+ * @returns {Promise<Array<[Error | null, any]>>}
+ */
+export function execMultiSlotNow(redis, commands) {
+	if (commands.length === 0) return Promise.resolve([]);
+	const clustered = isCluster(redis);
+	const results = new Array(commands.length);
+	const groups = new Map();
+	for (let i = 0; i < commands.length; i++) {
+		const group = clustered ? allocationGroup(redis, commands[i]) : UNKEYED_GROUP;
+		const id = group === null ? ROUTED_COMMANDS : group;
+		let indexes = groups.get(id);
+		if (!indexes) { indexes = []; groups.set(id, indexes); }
+		indexes.push(i);
+	}
+	async function individual(index) {
+		const [method, ...args] = commands[index];
+		try { results[index] = [null, await redis[method](...args)]; }
+		catch (error) { results[index] = [error, undefined]; }
+	}
+	const writes = [];
+	for (const [group, indexes] of groups) {
+		if (group === ROUTED_COMMANDS) { for (const index of indexes) writes.push(individual(index)); continue; }
+		for (let offset = 0; offset < indexes.length; offset += MAX_REDIS_PIPELINE_COMMANDS) {
+			writes.push(pipelineBatch(redis, commands, indexes.slice(offset, offset + MAX_REDIS_PIPELINE_COMMANDS), clustered, results, individual));
+		}
+	}
+	return Promise.all(writes).then(() => results);
+}
+
 // Entries without `indexes` cover every command in order.
 async function execGroups(redis, commands, entries, clustered, currentCommand = null) {
 	let cursor = 0;
@@ -352,28 +419,7 @@ async function execGroups(redis, commands, entries, clustered, currentCommand = 
 					if (batch.length === 0) return;
 				}
 				if (group === ROUTED_COMMANDS) { await individual(batch[0]); return; }
-				let replies;
-				try {
-					const pipe = redis.pipeline();
-					for (const index of batch) {
-						const [method, ...args] = commands[index];
-						pipe[method](...args);
-					}
-					replies = await pipe.exec();
-				} catch (error) {
-					// ioredis rejects this topology mismatch before writing the pipeline.
-					if (clustered && error.message === 'All keys in the pipeline should belong to the same slots allocation group') {
-						for (const index of batch) await individual(index);
-						return;
-					}
-					for (const index of batch) results[index] = [error, undefined];
-					return;
-				}
-				for (let i = 0; i < batch.length; i++) {
-					const reply = replies[i];
-					if (clustered && /^(MOVED|ASK) \d+ /.test(reply?.[0]?.message || '')) await individual(batch[i]);
-					else results[batch[i]] = reply;
-				}
+				await pipelineBatch(redis, commands, batch, clustered, results, individual);
 			}, clustered && group !== ROUTED_COMMANDS ? group : null).finally(() => {
 				scheduled.set(group, scheduled.get(group) - 1);
 			});

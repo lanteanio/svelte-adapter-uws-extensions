@@ -187,11 +187,18 @@ return {raw, ARGV[8]}
  * KEYS[3] = pendingHashKey (presence:pending:{topic})
  * ARGV[1] = instanceId
  * ARGV[2] = userKey
+ * ARGV[3] = optional event channel for the leave broadcast
+ * ARGV[4] = optional leave event envelope, published on ARGV[3] when the
+ *           committed public row is removed
  *
  * Returns 1 if this instance was the last one presenting this user on the
- * topic -> caller broadcasts a leave AND the per-topic hash entry is
- * removed. Returns 0 if another instance still has the user (no broadcast,
- * per-topic hash unchanged), or if no committed public row existed.
+ * topic -> the per-topic hash entry is removed and the leave event, when
+ * given, is published to peers in the same atomic step. Returns 0 if another
+ * instance still has the user (no broadcast, per-topic hash unchanged), or if
+ * no committed public row existed.
+ *
+ * Publishing from the script means peers learn of the leave as soon as Redis
+ * runs it, even when the leaving instance stops before reading the reply.
  *
  * The O(1) HLEN check replaces the previous O(M_topic) suffix-scan loop.
  * Mass-disconnect of N users is now O(N) Redis-blocked Lua time rather
@@ -207,6 +214,7 @@ redis.call('HDEL', userKey, instanceId)
 if redis.call('HLEN', userKey) == 0 then
   local removed = redis.call('HDEL', topicKey, userKeyStr)
   if KEYS[3] then redis.call('HDEL', KEYS[3], userKeyStr) end
+  if removed == 1 and ARGV[4] and ARGV[4] ~= '' then redis.call('PUBLISH', ARGV[3], ARGV[4]) end
   return removed
 end
 return 0
