@@ -1,0 +1,268 @@
+// Scenario half of scripts/real-cluster-oracle.js. It runs inside a throwaway
+// consumer that installed the packed packages, against a real Redis or Valkey
+// Cluster named by ORACLE_CLUSTER_NODES, and prints one JSON report on stdout.
+// It provisions nothing and never falls back to an in-memory store.
+//
+// Run it in a dedicated process: realtime's setBus() is process-global.
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const DEADLINE_MS = 60000;
+const SINGLES = 6;
+const BATCH = 6;
+
+const hash = (value) => createHash('sha256').update(value).digest('hex');
+const cases = ['setup', 'cluster-topology', 'single-fanout', 'batch-fanout', 'cleanup'].map((name) => ({ name, status: 'not_run' }));
+const report = {
+	schemaVersion: 1,
+	oracle: 'real-cluster-fanout',
+	startedAt: new Date().toISOString(),
+	seed: null,
+	faultMode: 'none',
+	provenance: { node: process.version, platform: process.platform + '-' + process.arch, scenarioSha256: hash(readFileSync(fileURLToPath(import.meta.url))), packages: {} },
+	backend: null,
+	cases
+};
+
+let emitted = false;
+function emit() {
+	if (emitted) return;
+	emitted = true;
+	report.finishedAt = new Date().toISOString();
+	const count = (status) => cases.filter((c) => c.status === status).length;
+	report.counts = {
+		planned: cases.length,
+		executed: count('passed') + count('failed'),
+		passed: count('passed'),
+		failed: count('failed'),
+		notRun: cases.length - count('passed') - count('failed')
+	};
+	report.status = report.counts.passed === cases.length ? 'passed' : 'failed';
+	process.stdout.write(JSON.stringify(report) + '\n');
+	process.exitCode = report.status === 'passed' ? 0 : 1;
+}
+
+function fail(record, error) {
+	record.status = 'failed';
+	record.error = { name: error?.name || 'Error', message: String(error?.message || error).slice(0, 2000) };
+}
+
+async function runCase(name, run) {
+	const record = cases.find((c) => c.name === name);
+	record.status = 'running';
+	const started = Date.now();
+	try {
+		await run(record);
+		record.status = 'passed';
+	} catch (error) {
+		fail(record, error);
+		throw error;
+	} finally {
+		record.durationMs = Date.now() - started;
+	}
+}
+
+const watchdog = setTimeout(() => {
+	const active = cases.find((record) => record.status === 'running');
+	if (active) fail(active, new Error('Scenario exceeded its ' + DEADLINE_MS / 1000 + '-second deadline'));
+	emit();
+	process.exit(1);
+}, DEADLINE_MS);
+
+// Walk up from the resolved entry file to the package root that owns it.
+function identity(specifier, expectedName) {
+	const entry = fileURLToPath(import.meta.resolve(specifier));
+	let root = dirname(entry);
+	while (true) {
+		try {
+			const bytes = readFileSync(join(root, 'package.json'));
+			const pkg = JSON.parse(bytes);
+			if (pkg.name === expectedName) return { version: pkg.version, entrySha256: hash(readFileSync(entry)), packageJsonSha256: hash(bytes) };
+		} catch { /* the entry may sit below its package root */ }
+		const parent = dirname(root);
+		if (parent === root) throw new Error('Cannot locate the package root of ' + expectedName);
+		root = parent;
+	}
+}
+
+async function waitFor(read, description) {
+	const deadline = Date.now() + 5000;
+	while (!read()) {
+		if (Date.now() >= deadline) throw new Error('Timed out waiting for ' + description);
+		await delay(5);
+	}
+}
+
+const sockets = [], servers = [], buses = [], connections = [];
+const topic = 'cluster-oracle';
+const namespace = 'oracle:' + randomUUID() + ':';
+const expected = [];
+let setBus, sourceClient, local, remote;
+
+try {
+	await runCase('setup', async () => {
+		const nodes = JSON.parse(process.env.ORACLE_CLUSTER_NODES || 'null');
+		assert.ok(Array.isArray(nodes) && nodes.length > 0, 'ORACLE_CLUSTER_NODES must be a JSON array of cluster seed nodes');
+		for (const node of nodes) {
+			assert.ok(node && typeof node.host === 'string' && Number.isInteger(node.port) && node.port > 0 && node.port <= 65535, 'Every seed node needs a host and an integer port');
+		}
+		const natMap = JSON.parse(process.env.ORACLE_CLUSTER_NAT_MAP || 'null');
+		const [{ default: Redis }, { WebSocket }, { createTestServer }, { createPubSubBus }, realtime] = await Promise.all([
+			import('ioredis'),
+			import('ws'),
+			import('svelte-adapter-uws/testing'),
+			import('svelte-adapter-uws-extensions/redis/pubsub'),
+			import('svelte-realtime/server')
+		]);
+		for (const [specifier, name] of [
+			['svelte-adapter-uws/testing', 'svelte-adapter-uws'],
+			['svelte-adapter-uws-extensions/redis/pubsub', 'svelte-adapter-uws-extensions'],
+			['svelte-realtime/server', 'svelte-realtime'],
+			['ioredis', 'ioredis'],
+			['ws', 'ws'],
+			['uWebSockets.js', 'uWebSockets.js']
+		]) report.provenance.packages[name] = identity(specifier, name);
+
+		const auth = {
+			...(process.env.ORACLE_REDIS_USERNAME ? { username: process.env.ORACLE_REDIS_USERNAME } : {}),
+			...(process.env.ORACLE_REDIS_PASSWORD ? { password: process.env.ORACLE_REDIS_PASSWORD } : {})
+		};
+		const clusterOptions = {
+			...(natMap ? { natMap } : {}),
+			enableReadyCheck: true,
+			maxRedirections: 16,
+			slotsRefreshTimeout: 5000,
+			clusterRetryStrategy: (times) => (times < 3 ? 100 : null),
+			redisOptions: { commandTimeout: 5000, connectTimeout: 5000, maxRetriesPerRequest: 1, ...auth }
+		};
+		const open = (overrides = {}) => {
+			const connection = new Redis.Cluster(nodes, { ...clusterOptions, ...overrides });
+			connection.on('error', () => {});
+			connections.push(connection);
+			return connection;
+		};
+		// The RedisClient shape the extensions accept, backed by a Cluster.
+		const client = () => {
+			const redis = open({ lazyConnect: true });
+			return { redis, keyPrefix: namespace, key: (key) => namespace + key, duplicate: (overrides) => open(overrides), async quit() { redis.disconnect(); } };
+		};
+		sourceClient = client();
+		const targetClient = client();
+		await Promise.all([sourceClient.redis.connect(), targetClient.redis.connect()]);
+
+		const sender = createPubSubBus(sourceClient, { channel: namespace + 'events', systemChannel: false });
+		const receiver = createPubSubBus(targetClient, { channel: namespace + 'events', systemChannel: false });
+		buses.push(sender, receiver);
+		setBus = realtime.setBus;
+		setBus(sender);
+
+		const subscribe = (_ws, name) => (name === topic ? null : 'FORBIDDEN');
+		const source = await createTestServer({ handler: {
+			subscribe,
+			message: realtime.createMessage({ onJsonMessage(_ws, message, platform) {
+				if (message.type === 'oracle-single') platform.publish(topic, 'changed', message.data);
+				else if (message.type === 'oracle-batch') platform.publishBatched(message.data.map((data) => ({ topic, event: 'changed', data })));
+			} })
+		} });
+		servers.push(source);
+		const target = await createTestServer({ handler: { subscribe } });
+		servers.push(target);
+		await sender.activate(source.platform);
+		await receiver.activate(target.platform);
+
+		async function connect(server) {
+			const socket = new WebSocket(server.wsUrl);
+			sockets.push(socket);
+			const messages = [];
+			let failure = null;
+			socket.on('error', (error) => { failure = error; });
+			socket.on('message', (bytes, binary) => {
+				try {
+					assert.equal(binary, false, 'The scenario expects JSON frames');
+					const frame = JSON.parse(bytes.toString());
+					if (frame.type === 'batch') {
+						assert.ok(Array.isArray(frame.events), 'A batch frame carries an events array');
+						messages.push(...frame.events);
+					} else messages.push(frame);
+				} catch (error) { failure = error; }
+			});
+			const check = () => { if (failure) throw failure; };
+			await waitFor(() => { check(); return socket.readyState === WebSocket.OPEN; }, 'the WebSocket to open');
+			socket.send(JSON.stringify({ type: 'subscribe', topic, ref: 'ready' }));
+			await waitFor(() => { check(); return messages.some((m) => m.type === 'subscribed' && m.ref === 'ready'); }, 'the subscription acknowledgement');
+			return {
+				send(message) { check(); socket.send(JSON.stringify(message)); },
+				values() { check(); return messages.filter((m) => m.topic === topic && m.event === 'changed').map((m) => m.data); }
+			};
+		}
+		local = await connect(source);
+		remote = await connect(target);
+	});
+
+	await runCase('cluster-topology', async () => {
+		const masters = sourceClient.redis.nodes('master');
+		assert.ok(masters.length >= 3, 'A real cluster with at least three masters is required, found ' + masters.length);
+		const info = await sourceClient.redis.cluster('INFO');
+		assert.match(info, /cluster_state:ok/, 'cluster_state must be ok');
+		assert.match(info, /cluster_slots_ok:16384/, 'every slot must be served');
+		const servers = await Promise.all(masters.map(async (node) => {
+			const text = await node.info('server');
+			return {
+				engine: /valkey_version:/.test(text) ? 'valkey' : 'redis',
+				version: /(?:valkey_version|redis_version):([^\r\n]+)/.exec(text)?.[1] || null
+			};
+		}));
+		report.backend = { kind: 'real-cluster', masters: masters.length, replicas: sourceClient.redis.nodes('slave').length, slots: 16384, servers };
+	});
+
+	async function assertDelivered() {
+		await waitFor(() => local.values().length >= expected.length && remote.values().length >= expected.length, 'ordered local and remote delivery');
+		assert.deepEqual(local.values(), expected, 'Local values, order or count differ');
+		assert.deepEqual(remote.values(), expected, 'Remote values, order or count differ');
+	}
+
+	await runCase('single-fanout', async () => {
+		for (let index = 0; index < SINGLES; index++) {
+			const data = { index, nested: { text: 'single-' + index } };
+			expected.push(data);
+			local.send({ type: 'oracle-single', data });
+		}
+		await assertDelivered();
+	});
+
+	await runCase('batch-fanout', async () => {
+		const data = Array.from({ length: BATCH }, (_, offset) => ({ index: expected.length + offset, nested: { text: 'batch-' + offset } }));
+		expected.push(...data);
+		local.send({ type: 'oracle-batch', data });
+		await assertDelivered();
+		// One more ordered message is the receive barrier: a duplicate of any
+		// batch member reaches each client before it, so no sleep is needed to
+		// prove nothing extra is still in flight.
+		const barrier = { index: expected.length, barrier: true };
+		expected.push(barrier);
+		local.send({ type: 'oracle-single', data: barrier });
+		await assertDelivered();
+		report.deliveries = { expectedPerSocket: expected.length, local: local.values().length, remote: remote.values().length };
+	});
+} catch {
+	// The failing case holds the verdict; the cases after it stay not_run.
+} finally {
+	try {
+		await runCase('cleanup', async () => {
+			setBus?.(null);
+			for (const socket of sockets) socket.terminate();
+			const results = await Promise.allSettled([...buses.map((bus) => bus.deactivate()), ...servers.map((server) => server.close())]);
+			for (const connection of connections) connection.disconnect();
+			const rejected = results.find((result) => result.status === 'rejected');
+			if (rejected) throw rejected.reason;
+		});
+	} catch {
+		// A cleanup failure fails the report too.
+	}
+	clearTimeout(watchdog);
+	emit();
+}

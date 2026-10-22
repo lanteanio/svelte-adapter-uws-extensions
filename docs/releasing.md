@@ -17,6 +17,8 @@ The ecosystem's current promotion requirements live in the adapter's [stable-pro
 - Maintainers can account for failures and changes: operational error references and diagnostics match the shipped code; README, MIGRATION and changelog describe the exact artifact; documented migration/rollback procedures cover its storage and wire changes. No known reachable defect is left without a documented workaround and an explicit acceptance decision.
 - Publication and routing identities are reconciled: all published versions have their immutable registry row and changelog heading, the candidate has retained-artifact/provenance evidence, and the required consumer checks pass before `next` or `latest` moves. A missing evidence item blocks promotion; do not weaken a gate in the change claiming readiness.
 
+The [real-cluster oracle](./real-cluster-oracle.md) records cross-instance delivery evidence for exact packed extensions, adapter and realtime artifacts on a real Redis Cluster, with tarball integrities and topology in one JSON result.
+
 These are release acceptance conditions, not claims that the current development checkout is ready for stable publication.
 
 ## Identity and branch roles

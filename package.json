@@ -221,6 +221,7 @@
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"gate:cross-repo": "node scripts/cross-repo-gate.js",
+		"oracle:real-cluster": "node scripts/real-cluster-oracle.js",
 		"test:integration": "npm run test:integration:redis && npm run test:integration:postgres && npm run test:integration:pgbouncer && npm run test:integration:valkey && npm run test:integration:cluster && npm run test:integration:cluster-mirror && npm run test:integration:valkey-cluster && npm run test:integration:valkey-cluster-mirror",
 		"test:integration:redis": "vitest run --config vitest.config.integration.redis.js",
 		"test:integration:postgres": "vitest run --config vitest.config.integration.postgres.js",

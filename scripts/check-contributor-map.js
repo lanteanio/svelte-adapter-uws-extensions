@@ -45,7 +45,7 @@ export function inventory(scripts, workflow) {
 	const hosted = new Set(hostedRoots.flatMap((name) => expandLanes(name, scripts)));
 	const jobs = workflows(workflow).flatMap(document => Object.keys(document.jobs || {}));
 	if (jobs.length === 0) throw new Error('No hosted jobs found');
-	const names = Object.keys(scripts).filter((name) => name.startsWith('verify:') || ['smoke', 'gate:cross-repo', 'check:format', 'check:contributor-map'].includes(name)).sort();
+	const names = Object.keys(scripts).filter((name) => name.startsWith('verify:') || ['smoke', 'gate:cross-repo', 'oracle:real-cluster', 'check:format', 'check:contributor-map'].includes(name)).sort();
 	const rows = names.map((name) => {
 		const expanded = [...new Set(expandLanes(name, scripts).slice(1))];
 		return `| \`npm run ${name}\` | ${expanded.length ? expanded.map((part) => '\`' + part + '\`').join(', ') : '\`' + scripts[name].replaceAll('|', '\\|') + '\`'} | ${hosted.has(name) ? 'Hosted' : 'Local'} |`;

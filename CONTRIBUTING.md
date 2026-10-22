@@ -77,6 +77,7 @@ Hosted jobs: `dependencies`, `external-links`, `backend`, `verify`, `publish`, `
 | `npm run check:contributor-map` | `node scripts/check-contributor-map.js` | Hosted |
 | `npm run check:format` | `node scripts/check-formatting.js` | Hosted |
 | `npm run gate:cross-repo` | `node scripts/cross-repo-gate.js` | Local |
+| `npm run oracle:real-cluster` | `node scripts/real-cluster-oracle.js` | Local |
 | `npm run smoke` | `node scripts/smoke.js` | Hosted |
 | `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Hosted |
 | `npm run verify:dependencies` | `check:lockfile` | Hosted |
@@ -198,6 +199,13 @@ remain separate. Use `--rungs contracts` to run only this contract and its packi
 and installation prerequisites.
 Use `--require-clean --strict` when recording exact committed source identities;
 the default also permits uncommitted working-tree changes.
+
+`oracle:real-cluster` is the same delivery contract on a real Redis Cluster: it
+packs this checkout, installs it with the adapter and a named realtime tarball or
+version, starts the cluster lane's Compose stack (same isolation variables), and
+writes a JSON verdict with package integrities and topology. Pass
+`--realtime <tarball>` when checking a realtime candidate. Inputs, cases and the
+result format are in the [real-cluster oracle guide](./docs/real-cluster-oracle.md).
 Never edit a sibling repository as part of this checkout's change; route the
 required change to its owner with the expected contract and verification evidence.
 
