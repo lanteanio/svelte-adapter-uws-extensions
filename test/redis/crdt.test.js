@@ -235,6 +235,30 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		expect(Date.now() - started).toBeLessThan(100);
 	});
 
+	it('moves no document bytes when a fresh lease finds the replicas converged', async () => {
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const all = [instance({}, quiet), instance({}, quiet), instance({}, quiet)];
+		for (const inst of all) await inst.join(TOPIC);
+		await settle();
+		all[0].edit(TOPIC, 'big', 'x'.repeat(50000));
+		await settle();
+		const sent = [];
+		const publish = client.redis.publish;
+		client.redis.publish = function (channel, message) {
+			sent.push(JSON.parse(message));
+			return publish.call(this, channel, message);
+		};
+		let applied = 0;
+		for (const inst of all) {
+			const apply = inst.authority.applyUpdate.bind(inst.authority);
+			inst.authority.applyUpdate = (topic, bytes) => { applied++; return apply(topic, bytes); };
+		}
+		expect(await all[1].crdt.acquirePersist(TOPIC)).toBe(true); // fresh lease
+		expect(sent.map((env) => env.k).sort()).toEqual(['srep', 'srep', 'sreq']);
+		expect(sent.filter((env) => Array.isArray(env.b) && env.b.length > 0)).toEqual([]);
+		expect(applied).toBe(0);
+	});
+
 	it('resyncs every held topic when the subscriber restores its channel', async () => {
 		const a = instance();
 		const b = instance();
@@ -374,8 +398,14 @@ describe('createCrdtCluster subscriber recovery', () => {
 	it('re-subscribes after a refused subscribe without waiting for traffic, then resyncs the held topics', async () => {
 		const client = mockRedisClient('crdtresub:');
 		const b = createCrdtCluster(client);
+		b.onMessage({ onSyncRequest: () => {} });
 		const requests = [];
-		b.onMessage({ onSyncRequest: (declKey, topic, sv, from) => requests.push({ topic, from }) });
+		const publish = client.redis.publish;
+		client.redis.publish = function (channel, message) {
+			const env = JSON.parse(message);
+			if (env.k === 'sreq') requests.push({ topic: env.t, from: env.i });
+			return publish.call(this, channel, message);
+		};
 		const recording = Object.create(client);
 		let opened = 0;
 		recording.duplicate = (...args) => {

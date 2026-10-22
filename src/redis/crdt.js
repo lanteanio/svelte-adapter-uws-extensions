@@ -28,8 +28,11 @@
  *     the topic, and once the relay works again the coordinator runs a two-way
  *     resync for it: it broadcasts the replica's full state when peers may
  *     lack local edits (peers merge it) and asks every peer for its full state
- *     (this instance merges the replies). Merging is idempotent, so a resync
- *     never harms a replica that lost nothing. Triggers: the breaker closing
+ *     (this instance merges the replies). The request carries a digest of
+ *     this replica's full state, and a peer whose state encodes to the same
+ *     digest answers empty, so a round over converged replicas moves no
+ *     document bytes. Merging is idempotent, so a resync never harms a
+ *     replica that lost nothing. Triggers: the breaker closing
  *     or probing, the subscriber restoring its channel, a failed or refused
  *     publish (retried with a backoff when nothing else signals recovery), and
  *     a freshly acquired persist lease. A lost sync reply is not a resync:
@@ -58,8 +61,9 @@
  * `onSyncRequest` handler: asked for the diff against an empty state vector on
  * a local reply address, the handler answers synchronously through
  * `sendSyncReply` with the full state, and no answer means the instance no
- * longer holds the topic. A resync request carries a round id (`c`) and asks
- * every peer to answer (`a: 1`); a peer holding nothing answers with an empty
+ * longer holds the topic. A resync request carries a round id (`c`), the
+ * sha256 digest of the requester's full state (`h`) and asks every peer to
+ * answer (`a: 1`); a peer holding nothing or the same state answers with an empty
  * reply, so on a standalone server, where PUBLISH reports how many subscribers
  * received the request, a round ends as soon as every peer answered. Peers
  * that predate these fields ignore them and answer as for a cold join.
@@ -76,6 +80,7 @@
  * @module svelte-adapter-uws-extensions/redis/crdt
  */
 
+import { createHash } from 'node:crypto';
 import { randomBytes, setTimer, clearTimer, setImmediateTimer } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { createBusValidator } from '../shared/bus-validate.js';
@@ -102,6 +107,11 @@ const RESYNC_CONCURRENCY = 8;
 // The topics remembered for a resync are swept for ones no longer held once
 // the set grows past this, then past twice its size after the last sweep.
 const KNOWN_SWEEP_MIN = 1024;
+
+/** Digest of a replica's full state, so a peer holding the same state can say so without sending it. */
+function digestOf(bytes) {
+	return createHash('sha256').update(Uint8Array.from(bytes)).digest('base64');
+}
 
 /** Coerce a positive-number option, else the default. */
 function positive(v, fallback) {
@@ -356,7 +366,15 @@ export function createCrdtCluster(client, options = {}) {
 		const from = parsed.i;
 		const v = Array.isArray(parsed.v) ? parsed.v : [];
 		const ctx = { declKey, topic, to: from, c: typeof parsed.c === 'string' ? parsed.c : undefined, v, replied: false };
-		if (handlers.onSyncRequest) {
+		if (typeof parsed.h === 'string' && typeof from === 'string') {
+			// A resync request carries the digest of the requester's full
+			// state: a replica holding exactly that state answers empty.
+			const full = readState(declKey, topic);
+			if (full !== null && full.length > 0 && digestOf(full) !== parsed.h) {
+				ctx.replied = true;
+				sendReply(declKey, topic, full, from, ctx.c, v);
+			}
+		} else if (handlers.onSyncRequest) {
 			const prev = answering;
 			answering = ctx;
 			try {
@@ -369,6 +387,15 @@ export function createCrdtCluster(client, options = {}) {
 		if (parsed.a === 1 && !ctx.replied && typeof from === 'string') {
 			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: [], to: from, c: ctx.c });
 		}
+	}
+
+	/** Publish a sync reply targeted at one requester. */
+	function sendReply(declKey, topic, bytes, to, c, v) {
+		/** @type {any} */
+		const env = { i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: bytes, to };
+		if (c !== undefined) env.c = c;
+		if (v !== undefined) replyVectors.set(env, v);
+		publish(env);
 	}
 
 	/** Count a peer's answer toward the topic's resync round. */
@@ -415,7 +442,7 @@ export function createCrdtCluster(client, options = {}) {
 		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
 		if (round.timer && round.timer.unref) round.timer.unref();
 		const pushed = push ? publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }) : Promise.resolve(0);
-		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1 });
+		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) });
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
 			if (p === null || n === null) {
 				// relayLost marked the topic again; nothing will answer.
@@ -550,14 +577,12 @@ export function createCrdtCluster(client, options = {}) {
 				return;
 			}
 			remember(declKey, topic);
-			/** @type {any} */
-			const env = { i: instanceId, k: KIND_SYNC_REPLY, d: declKey, t: topic, b: bytes, to: toInstance };
 			if (answering && answering.to === toInstance && answering.topic === topic && answering.declKey === declKey) {
 				answering.replied = true;
-				if (answering.c !== undefined) env.c = answering.c;
-				replyVectors.set(env, answering.v);
+				sendReply(declKey, topic, bytes, toInstance, answering.c, answering.v);
+			} else {
+				sendReply(declKey, topic, bytes, toInstance, undefined, undefined);
 			}
-			publish(env);
 		},
 
 		/**
