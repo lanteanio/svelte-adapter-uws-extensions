@@ -138,7 +138,7 @@ it('leaves a silent subscriber to the liveness watchdog instead of the command d
 		clear: (t) => { if (t && typeof t === 'object' && 'cleared' in t) t.cleared = true; else clearTimeout(t); }
 	} });
 	const sink = captureRegistered();
-	const client = createRedisClient({ url: 'redis://127.0.0.1:' + server.address().port, autoShutdown: false, options: { commandTimeout: 30, socketTimeout: undefined } });
+	const client = createRedisClient({ url: 'redis://127.0.0.1:' + server.address().port, autoShutdown: false, options: { commandTimeout: 250, socketTimeout: undefined } });
 	try {
 		const subscriber = openSubscriber(client, 'pubsub');
 		await subscriber.subscribe('chan');
@@ -146,7 +146,7 @@ it('leaves a silent subscriber to the liveness watchdog instead of the command d
 		for (const t of intervals) if (!t.cleared) t.cb();
 		await vi.waitFor(() => expect(pings).toBe(1));
 		// Well past the command deadline, the connection is still the one probed.
-		await new Promise((resolve) => setTimeout(resolve, 200));
+		await new Promise((resolve) => setTimeout(resolve, 750));
 		expect(subscriber.status).toBe('ready');
 		expect(subscriber.stream).toBe(stream);
 		expect(stream.destroyed).toBe(false);
