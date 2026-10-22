@@ -924,8 +924,10 @@ export function createCrdtCluster(client, options = {}) {
 		 * them after the relay lost traffic (a sync round the breaker refused,
 		 * or whose request failed or was not confirmed within that window), so
 		 * the caller's persistence schedule retries rather than dropping the
-		 * write, storing a snapshot without the peers' edits, or unloading the
-		 * only replica holding local edits.
+		 * write, storing a snapshot from a replica that could not ask its
+		 * peers, or unloading the only replica holding local edits. Replies
+		 * lost or late do not hold up the write; they are merged when they
+		 * arrive or by the next resync.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
