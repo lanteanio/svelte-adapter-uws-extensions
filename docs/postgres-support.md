@@ -174,11 +174,35 @@ Streaming replication senders are limited by `max_wal_senders` instead.
 
 Leave headroom for a replica that reconnects before the server has noticed the
 old session's loss. Advisory election does not reduce the budget: every follower
-keeps its session to retry the lock. Behind PgBouncer apply the left side to
-`max_client_conn`; session-mode routes then pin one server connection per client
-connection, while a transaction-mode route needs only its `default_pool_size`
-server connections per database and user. Notification bridges and migrations
-always need the session route; see [notification sessions](#notification-sessions-and-shutdown).
+keeps its session to retry the lock.
+
+Behind PgBouncer the budget splits in two. Every application connection is a
+PgBouncer client connection, so `max_client_conn` must cover `application` plus
+any other clients of the same PgBouncer. The server's `max_connections` then
+covers PgBouncer's server pools instead of the application: for each database
+and user pair its `default_pool_size` (or the database's `pool_size`) plus
+`reserve_pool_size`, capped by `max_db_connections` where that is set, plus
+every login that bypasses PgBouncer, such as direct migration and
+administrative connections:
+
+```text
+max_client_conn >= application + other PgBouncer clients
+max_connections >= sum over database/user pairs of
+                     (pool_size + reserve_pool_size), or max_db_connections
+                   + direct migrations + administration
+                   + superuser_reserved_connections + reserved_connections
+```
+
+A session-mode pool pins one server connection to each client connection for
+as long as the client stays connected, so its pool size must reach the number of
+clients routed to it: every notification bridge, every `createClient()` session
+and every migration that runs through it, and, when the query route is in
+session mode too, every pooled connection, including the one that sends the
+notification startup probe. Clients beyond the pool size wait in PgBouncer's
+queue up to `query_wait_timeout`. A transaction-mode route shares its
+`default_pool_size` server connections per database and user among all of its
+clients. Notification bridges and migrations always need the session route; see
+[notification sessions](#notification-sessions-and-shutdown).
 
 ### Backup, WAL archiving and point-in-time recovery
 
