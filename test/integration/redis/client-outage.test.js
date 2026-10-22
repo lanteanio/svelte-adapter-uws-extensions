@@ -5,9 +5,22 @@ import { createRedisClient } from '../../../src/redis/index.js';
 import { MAX_REDIS_QUEUED_COMMANDS } from '../../../src/shared/caps.js';
 import { createRateLimit } from '../../../src/redis/ratelimit.js';
 import { createCircuitBreaker } from '../../../src/shared/breaker.js';
+import { keySlot } from '../../../src/shared/cluster.js';
 import { captureRegistered } from '../../helpers/diagnostic-line.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * The server `admin` reaches that holds `key`: on a Cluster the master of the
+ * key's slot, so a proxied write lands where it is applied instead of being
+ * answered with MOVED; without a key, any master.
+ */
+function serverOf(admin, key) {
+	if (typeof admin.redis.nodes !== 'function') return { host: admin.redis.options.host, port: admin.redis.options.port };
+	if (key === undefined) return admin.redis.nodes('master')[0].options;
+	const owner = admin.redis.slots[keySlot(key)][0];
+	const at = owner.lastIndexOf(':');
+	return { host: owner.slice(0, at), port: Number(owner.slice(at + 1)) };
+}
 async function ready(redis) {
 	for (let i = 0; i < 100; i++) { if (redis.status === 'ready') return; await wait(20); }
 	throw new Error('Redis did not become ready');
@@ -16,12 +29,13 @@ async function ready(redis) {
 it('expires a startup write without sending it after recovery, then fails fast during an outage', async () => {
 	const admin = createBackendClient();
 	await admin.redis.ping();
-	const source = typeof admin.redis.nodes === 'function' ? admin.redis.nodes('master')[0] : admin.redis;
+	const key = 'inttest-outage:expired-startup-write';
+	const source = serverOf(admin, key);
 	const sockets = new Set();
 	let blocked = true;
 	const buffered = [];
 	const server = createServer((socket) => {
-		const upstream = connect({ host: source.options.host, port: source.options.port });
+		const upstream = connect({ host: source.host, port: source.port });
 		sockets.add(socket); sockets.add(upstream);
 		upstream.on('error', () => socket.destroy());
 		socket.on('error', () => upstream.destroy());
@@ -33,7 +47,6 @@ it('expires a startup write without sending it after recovery, then fails fast d
 	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 	const sink = captureRegistered();
 	const client = createRedisClient({ url: 'redis://127.0.0.1:' + server.address().port, autoShutdown: false });
-	const key = 'inttest-outage:expired-startup-write';
 	try {
 		await admin.redis.del(key);
 		const start = Date.now();
@@ -132,14 +145,14 @@ it('preserves explicit buffering and dedicated subscriber overrides', async () =
 });
 
 
-async function proxyClient(options = {}) {
+async function proxyClient(options = {}, key) {
 	const admin = createBackendClient();
 	await admin.redis.ping();
-	const source = typeof admin.redis.nodes === 'function' ? admin.redis.nodes('master')[0] : admin.redis;
+	const source = serverOf(admin, key);
 	const sockets = new Set(), buffered = [];
 	const gate = { outbound: false, inbound: false };
 	const server = createServer(socket => {
-		const upstream = connect({ host: source.options.host, port: source.options.port });
+		const upstream = connect({ host: source.host, port: source.port });
 		sockets.add(socket); sockets.add(upstream);
 		upstream.on('error', () => socket.destroy()); socket.on('error', () => upstream.destroy());
 		socket.on('close', () => { sockets.delete(socket); upstream.destroy(); });
@@ -156,10 +169,10 @@ async function proxyClient(options = {}) {
 }
 
 it('refuses an entire offline pipeline that straddles capacity, preserving later reply alignment', async () => {
-	const fixture = await proxyClient({ lazyConnect: true });
+	const keys = ['inttest-pipeline:{capacity}:a', 'inttest-pipeline:{capacity}:b', 'inttest-pipeline:{capacity}:c'];
+	const fixture = await proxyClient({ lazyConnect: true }, keys[0]);
 	const { client, admin, gate } = fixture;
 	gate.outbound = true;
-	const keys = ['inttest-pipeline:{capacity}:a', 'inttest-pipeline:{capacity}:b', 'inttest-pipeline:{capacity}:c'];
 	const callbacks = keys.map(() => vi.fn());
 	try {
 		for (const key of keys) await admin.redis.del(key);
@@ -178,10 +191,10 @@ it('refuses an entire offline pipeline that straddles capacity, preserving later
 });
 
 it('cancels all unsent pipeline members when one native deadline expires', async () => {
-	const fixture = await proxyClient({ lazyConnect: true });
+	const keys = ['inttest-pipeline:{expiry}:a', 'inttest-pipeline:{expiry}:b'];
+	const fixture = await proxyClient({ lazyConnect: true }, keys[0]);
 	const { client, admin, gate } = fixture;
 	gate.outbound = true;
-	const keys = ['inttest-pipeline:{expiry}:a', 'inttest-pipeline:{expiry}:b'];
 	const callbacks = keys.map(() => vi.fn());
 	try {
 		for (const key of keys) await admin.redis.del(key);
@@ -215,9 +228,9 @@ it('retires a timed-out WAIT without replaying it on reconnect', async () => {
 });
 
 it.each([false, true])('does not resend a timed-out applied write (already reconnecting: %s)', async reconnecting => {
-	const fixture = await proxyClient({ commandTimeout: 150, socketTimeout: undefined, retryStrategy: () => 300 });
-	const { client, admin, gate } = fixture;
 	const key = 'inttest-outage:ambiguous-write';
+	const fixture = await proxyClient({ commandTimeout: 150, socketTimeout: undefined, retryStrategy: () => 300 }, key);
+	const { client, admin, gate } = fixture;
 	try {
 		await admin.redis.del(key); await client.redis.ping();
 		gate.inbound = true;
@@ -236,9 +249,9 @@ it.each([false, true])('does not resend a timed-out applied write (already recon
 });
 
 it.each(['reset', 'socket deadline'])('does not resend an applied write after %s', async cause => {
-	const fixture = await proxyClient(cause === 'reset' ? {} : { commandTimeout: 1000, socketTimeout: 100 });
-	const { client, admin, gate } = fixture;
 	const key = 'inttest-outage:reset-applied-write';
+	const fixture = await proxyClient(cause === 'reset' ? {} : { commandTimeout: 1000, socketTimeout: 100 }, key);
+	const { client, admin, gate } = fixture;
 	try {
 		await admin.redis.del(key);
 		await client.redis.ping();

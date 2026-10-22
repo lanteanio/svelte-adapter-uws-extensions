@@ -122,6 +122,9 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		nativeClear.call(this);
 	}
 	function sendTimed(command, stream) {
+		// A command that brings its own setTimeout keeps it, as the subscriber
+		// liveness PING does to opt out of the connection's deadline.
+		if (Object.hasOwn(command, 'setTimeout') && command.setTimeout !== setDeadline) return send.call(this, command, stream);
 		if (sharedDeadlines && (command._clearTimers === nativeClear || command._clearTimers === clearDeadline)) {
 			command.setTimeout = setDeadline;
 			command._clearTimers = clearDeadline;

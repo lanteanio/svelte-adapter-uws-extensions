@@ -211,9 +211,10 @@ export function isReplyError(err) {
  * when anything came in over its socket meanwhile (the reply, an error reply,
  * or a message ahead of the reply on a busy connection); SILENT when nothing
  * did within LIVENESS_TIMEOUT_MS; MOOT when the connection closed or
- * reconnected meanwhile, which is handled where it ends or reconnects. ioredis
- * giving up on the PING itself (its commandTimeout option) decides nothing:
- * the reply can still be on its way behind a burst of messages.
+ * reconnected meanwhile, which is handled where it ends or reconnects. The
+ * PING carries no command deadline of its own (see untimedPing), and a
+ * connection that rejects it for one anyway decides nothing: the reply can
+ * still be on its way behind a burst of messages.
  *
  * @param {any} conn
  * @returns {Promise<string>}
@@ -238,7 +239,8 @@ function answersPing(conn) {
 		const listening = !!stream && typeof stream.once === 'function' && typeof stream.removeListener === 'function';
 		if (listening) stream.once('data', heard);
 		try {
-			Promise.resolve(conn.ping()).then(heard, (/** @type {any} */ err) => {
+			const reply = typeof conn.sendCommand === 'function' ? conn.sendCommand(untimedPing()) : conn.ping();
+			Promise.resolve(reply).then(heard, (/** @type {any} */ err) => {
 				if (isReplyError(err)) settle(ANSWERED);
 				else if (err?.message !== 'Command timed out' && !(err?.name === 'TimeoutError' && err?.service === 'redis')) settle(MOOT);
 			});
@@ -246,6 +248,21 @@ function answersPing(conn) {
 			settle(MOOT);
 		}
 	});
+}
+
+/**
+ * A PING command without a deadline. ioredis arms the connection's
+ * commandTimeout through the command's setTimeout, and a client from
+ * createRedisClient closes a connection whose sent command outlives it; on a
+ * subscriber that would close a silent connection before the watchdog decides
+ * and reports it. The watchdog's own LIVENESS_TIMEOUT_MS bounds the probe.
+ *
+ * @returns {any}
+ */
+function untimedPing() {
+	const command = new Redis.Command('ping');
+	command.setTimeout = () => {};
+	return command;
 }
 
 /**

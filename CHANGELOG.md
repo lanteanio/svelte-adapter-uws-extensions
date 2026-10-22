@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A subscriber whose Redis server stops answering is reported as `redis.subscriber.silent` and closed by the liveness check again when the client's `commandTimeout` is shorter than the 10 second PING timeout. The liveness PING carries no command deadline, so the deadline no longer closes the connection first without a report.
 - Redis client `quit()` ends connections still opening or waiting to reconnect and rejects their queued commands, so shutdown settles without requiring bus deactivation first and queued writes cannot replay later. Ready connections drain gracefully, with any intervening connection loss ending them instead of starting another attempt. A client that has begun shutdown no longer opens duplicate connections.
 
 - Registry heartbeats restore missing routing rows for still-connected users, including registries without attributes, while preserving newer owners and their TTLs. Queued recovery writes are discarded when the local connection closes, is replaced, or is erased before Redis dispatch.
