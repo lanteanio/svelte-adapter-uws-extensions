@@ -83,6 +83,11 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	REDIS_REPLAY_STORAGE_FALLBACK: 'EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK',
 	REDIS_REPLAY_STREAM_STORAGE_FALLBACK: 'EXTENSIONS-ERR-REDIS-REPLAY-STREAM-STORAGE-FALLBACK',
 	POSTGRES_REPLAY_STORAGE_FALLBACK: 'EXTENSIONS-ERR-POSTGRES-REPLAY-STORAGE-FALLBACK',
+	REDIS_REPLAY_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED',
+	REDIS_REPLAY_STREAM_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED',
+	POSTGRES_REPLAY_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED',
+	REDIS_DEAD_LETTER_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED',
+	POSTGRES_DEAD_LETTER_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED',
 	RATELIMIT_STORE_FLOOR: 'EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR',
 	COMPOSITE_RATELIMIT_STORE_FLOOR: 'EXTENSIONS-ERR-COMPOSITE-RATELIMIT-STORE-FLOOR',
 	PRESENCE_ENVELOPE_OVERSIZED: 'EXTENSIONS-ERR-PRESENCE-ENVELOPE-OVERSIZED',
@@ -702,6 +707,56 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Yes for later publishes: each one tries the store first and is stored again once Postgres answers. Messages that fell back are not backfilled.',
 		nextAction: 'Check Postgres connectivity and the breaker, then read replay_storage_fallbacks_total for how many publishes went unstored. The requestId attribute correlates the first one with its request.',
 		sources: ['src/postgres/replay.js'], anchor: 'extensions-err-postgres-replay-storage-fallback'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_RETENTION_UNBOUNDED,
+		event: 'redis.replay.retention-unbounded', component: 'runtime.redis.replay', severity: 'warn',
+		problemPrefix: 'A Redis replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.',
+		cause: 'The Redis replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.',
+		consequence: 'Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
+		sources: ['src/redis/replay.js'], anchor: 'extensions-err-redis-replay-retention-unbounded'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_RETENTION_UNBOUNDED,
+		event: 'redis.replay-stream.retention-unbounded', component: 'runtime.redis.replay-stream', severity: 'warn',
+		problemPrefix: 'A Redis stream replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.',
+		cause: 'The Redis stream replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.',
+		consequence: 'Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
+		sources: ['src/redis/replay-stream.js'], anchor: 'extensions-err-redis-replay-stream-retention-unbounded'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_RETENTION_UNBOUNDED,
+		event: 'postgres.replay.retention-unbounded', component: 'runtime.postgres.replay', severity: 'warn',
+		problemPrefix: 'A Postgres replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.',
+		cause: 'The Postgres replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.',
+		consequence: 'Records stay in Postgres until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
+		sources: ['src/postgres/replay.js'], anchor: 'extensions-err-postgres-replay-retention-unbounded'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_DEAD_LETTER_RETENTION_UNBOUNDED,
+		event: 'redis.dead-letter.retention-unbounded', component: 'runtime.redis.dead-letter', severity: 'warn',
+		problemPrefix: 'A Redis dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.',
+		cause: 'The Redis dead-letter store options leave ttlMs at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.',
+		consequence: 'Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set ttlMs to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
+		sources: ['src/redis/dead-letter.js'], anchor: 'extensions-err-redis-dead-letter-retention-unbounded'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.POSTGRES_DEAD_LETTER_RETENTION_UNBOUNDED,
+		event: 'postgres.dead-letter.retention-unbounded', component: 'runtime.postgres.dead-letter', severity: 'warn',
+		problemPrefix: 'A Postgres dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.',
+		cause: 'The Postgres dead-letter store options leave ttlMs at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.',
+		consequence: 'Records stay in Postgres until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set ttlMs to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
+		sources: ['src/postgres/dead-letter.js'], anchor: 'extensions-err-postgres-dead-letter-retention-unbounded'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.RATELIMIT_STORE_FLOOR,

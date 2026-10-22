@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Redis replay buffers (sorted set and stream), the Postgres replay buffer and both dead-letter stores report a warning once per process per store kind when they are created with neither a `ttl` (`ttlMs` for dead letters) nor a `forgetUserId` extractor: their payloads then never expire and `live.forget` cannot erase them. Each kind has its own entry in the error reference (`EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED` and its siblings).
+
 - Redis rate limiting mirrors the adapter's `budget: 'tenant'` option: all principals of a tenant share one atomic allowance across instances, with matching peek, admin and local-floor behavior. Budget modes have separate key spaces. Both modes read and cache frozen adapter attribution once per connection when an explicit tenant resolver is absent; unattributed principal keys retain their layout. Tenant aggregate erasure does not reset other principals' allowance. The tenancy guide explains weighted costs, composite principal/tenant checks and the distinction between declared config and enforced caps.
 
 - Registry `sendTo()` resolves to the dispatched recipient count and records `push_sendto_recipients_total`, including local recipients served before a remote-envelope refusal. Remote counts use the sender index and successful Redis publishes, without delivery acknowledgement.

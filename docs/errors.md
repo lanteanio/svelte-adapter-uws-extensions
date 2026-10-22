@@ -8,7 +8,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 72 diagnostic events. Each is one canonical line
+- 77 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -83,6 +83,11 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK](#extensions-err-redis-replay-storage-fallback) | `redis.replay.storage-fallback` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.storage-fallback severity=warn] Replay storage failed; the publish went to live subscribers without a replay sequence, so durability is degraded.` |
 | [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-STORAGE-FALLBACK](#extensions-err-redis-replay-stream-storage-fallback) | `redis.replay-stream.storage-fallback` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.storage-fallback severity=warn] Stream replay storage failed; the publish went to live subscribers without a replay sequence, so durability is degraded.` |
 | [EXTENSIONS-ERR-POSTGRES-REPLAY-STORAGE-FALLBACK](#extensions-err-postgres-replay-storage-fallback) | `postgres.replay.storage-fallback` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.storage-fallback severity=warn] Replay storage failed; the publish went to live subscribers without a replay sequence, so durability is degraded.` |
+| [EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED](#extensions-err-redis-replay-retention-unbounded) | `redis.replay.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.retention-unbounded severity=warn] A Redis replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
+| [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED](#extensions-err-redis-replay-stream-retention-unbounded) | `redis.replay-stream.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.retention-unbounded severity=warn] A Redis stream replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
+| [EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED](#extensions-err-postgres-replay-retention-unbounded) | `postgres.replay.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.retention-unbounded severity=warn] A Postgres replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
+| [EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-redis-dead-letter-retention-unbounded) | `redis.dead-letter.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.dead-letter event=redis.dead-letter.retention-unbounded severity=warn] A Redis dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
+| [EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-postgres-dead-letter-retention-unbounded) | `postgres.dead-letter.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.dead-letter event=postgres.dead-letter.retention-unbounded severity=warn] A Postgres dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
 | [EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR](#extensions-err-ratelimit-store-floor) | `redis.ratelimit.store-unreachable` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.ratelimit event=redis.ratelimit.store-unreachable severity=warn] The rate-limit store is unreachable; verdicts are decided on the in-process floor.` |
 | [EXTENSIONS-ERR-COMPOSITE-RATELIMIT-STORE-FLOOR](#extensions-err-composite-ratelimit-store-floor) | `redis.composite-ratelimit.store-unreachable` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.composite-ratelimit event=redis.composite-ratelimit.store-unreachable severity=warn] The composite rate-limit store is unreachable; verdicts are decided on the in-process floor.` |
 | [EXTENSIONS-ERR-PRESENCE-ENVELOPE-OVERSIZED](#extensions-err-presence-envelope-oversized) | `redis.presence.envelope-oversized` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.presence event=redis.presence.envelope-oversized severity=warn] A presence event envelope exceeds maxEnvelopeBytes and was not relayed to other instances.` |
@@ -120,7 +125,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 72 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 77 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -169,6 +174,11 @@ Indexed events:
 - `redis.replay.storage-fallback` - [EXTENSIONS-ERR-REDIS-REPLAY-STORAGE-FALLBACK](#extensions-err-redis-replay-storage-fallback)
 - `redis.replay-stream.storage-fallback` - [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-STORAGE-FALLBACK](#extensions-err-redis-replay-stream-storage-fallback)
 - `postgres.replay.storage-fallback` - [EXTENSIONS-ERR-POSTGRES-REPLAY-STORAGE-FALLBACK](#extensions-err-postgres-replay-storage-fallback)
+- `redis.replay.retention-unbounded` - [EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED](#extensions-err-redis-replay-retention-unbounded)
+- `redis.replay-stream.retention-unbounded` - [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED](#extensions-err-redis-replay-stream-retention-unbounded)
+- `postgres.replay.retention-unbounded` - [EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED](#extensions-err-postgres-replay-retention-unbounded)
+- `redis.dead-letter.retention-unbounded` - [EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-redis-dead-letter-retention-unbounded)
+- `postgres.dead-letter.retention-unbounded` - [EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-postgres-dead-letter-retention-unbounded)
 - `redis.ratelimit.store-unreachable` - [EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR](#extensions-err-ratelimit-store-floor)
 - `redis.composite-ratelimit.store-unreachable` - [EXTENSIONS-ERR-COMPOSITE-RATELIMIT-STORE-FLOOR](#extensions-err-composite-ratelimit-store-floor)
 - `redis.presence.envelope-oversized` - [EXTENSIONS-ERR-PRESENCE-ENVELOPE-OVERSIZED](#extensions-err-presence-envelope-oversized)
@@ -870,6 +880,66 @@ the stable ID tag on the line):
 - **Next action:** Check Postgres connectivity and the breaker, then read replay_storage_fallbacks_total for how many publishes went unstored. The requestId attribute correlates the first one with its request.
 - **Runtime help:** `docs/errors.md#extensions-err-postgres-replay-storage-fallback`
 - **Runtime sources:** [src/postgres/replay.js](../src/postgres/replay.js)
+
+<a id="extensions-err-redis-replay-retention-unbounded"></a>
+## `EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED`
+
+- **Code/event:** `redis.replay.retention-unbounded`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.retention-unbounded severity=warn] A Redis replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.`
+- **Cause:** The Redis replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.
+- **Consequence:** Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-replay-retention-unbounded`
+- **Runtime sources:** [src/redis/replay.js](../src/redis/replay.js)
+
+<a id="extensions-err-redis-replay-stream-retention-unbounded"></a>
+## `EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED`
+
+- **Code/event:** `redis.replay-stream.retention-unbounded`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.retention-unbounded severity=warn] A Redis stream replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.`
+- **Cause:** The Redis stream replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.
+- **Consequence:** Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-replay-stream-retention-unbounded`
+- **Runtime sources:** [src/redis/replay-stream.js](../src/redis/replay-stream.js)
+
+<a id="extensions-err-postgres-replay-retention-unbounded"></a>
+## `EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED`
+
+- **Code/event:** `postgres.replay.retention-unbounded`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.retention-unbounded severity=warn] A Postgres replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.`
+- **Cause:** The Postgres replay buffer options leave ttl at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.
+- **Consequence:** Records stay in Postgres until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
+- **Runtime help:** `docs/errors.md#extensions-err-postgres-replay-retention-unbounded`
+- **Runtime sources:** [src/postgres/replay.js](../src/postgres/replay.js)
+
+<a id="extensions-err-redis-dead-letter-retention-unbounded"></a>
+## `EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED`
+
+- **Code/event:** `redis.dead-letter.retention-unbounded`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.dead-letter event=redis.dead-letter.retention-unbounded severity=warn] A Redis dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.`
+- **Cause:** The Redis dead-letter store options leave ttlMs at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.
+- **Consequence:** Records stay in Redis until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set ttlMs to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-dead-letter-retention-unbounded`
+- **Runtime sources:** [src/redis/dead-letter.js](../src/redis/dead-letter.js)
+
+<a id="extensions-err-postgres-dead-letter-retention-unbounded"></a>
+## `EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED`
+
+- **Code/event:** `postgres.dead-letter.retention-unbounded`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.dead-letter event=postgres.dead-letter.retention-unbounded severity=warn] A Postgres dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.`
+- **Cause:** The Postgres dead-letter store options leave ttlMs at 0 (no expiry) and set no forgetUserId extractor. Both are opt-in because the store cannot know how long the application must keep its payloads or whose payload a record is.
+- **Consequence:** Records stay in Postgres until the size bound evicts them, and purgeUser removes none of them, so a user erasure leaves the payloads of that user in place. Reported once per process for this store kind.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set ttlMs to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
+- **Runtime help:** `docs/errors.md#extensions-err-postgres-dead-letter-retention-unbounded`
+- **Runtime sources:** [src/postgres/dead-letter.js](../src/postgres/dead-letter.js)
 
 <a id="extensions-err-ratelimit-store-floor"></a>
 ## `EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR`

@@ -39,6 +39,8 @@ import { withBreaker, pgFailure } from './_breaker.js';
 import { createStoreSchema } from './migrations.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 
 /**
  * @typedef {Object} PgDeadLetterOptions
@@ -78,6 +80,9 @@ export function createDeadLetter(client, options = {}) {
 	const pkCol = table + '_id';
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
+	if (ttlMs === 0 && !forgetUserId && firstReportInProcess(EXTENSIONS_ERROR_IDS.POSTGRES_DEAD_LETTER_RETENTION_UNBOUNDED)) {
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_DEAD_LETTER_RETENTION_UNBOUNDED);
+	}
 	const autoMigrate = options.autoMigrate !== false;
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 60000;
 

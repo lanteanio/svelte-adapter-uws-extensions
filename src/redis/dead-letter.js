@@ -50,6 +50,8 @@
 import { withBreaker } from '../shared/breaker.js';
 import { monotonicNow } from '../shared/runtime.js';
 import { TENANT_TOPIC_NS, topicInTenant } from '../shared/tenant-topic.js';
+import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 
 // A forget tombstone lives long enough to catch a webhook delivery that was
 // already in flight when `live.forget` ran and only fails (and would be
@@ -99,6 +101,9 @@ export function createDeadLetter(client, options = {}) {
 	const forgetUserId = options.forgetUserId;
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
+	if (ttlMs === 0 && !forgetUserId && firstReportInProcess(EXTENSIONS_ERROR_IDS.REDIS_DEAD_LETTER_RETENTION_UNBOUNDED)) {
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_DEAD_LETTER_RETENTION_UNBOUNDED);
+	}
 	// The forget tombstone window: how long `{prefix}dlq:purged:<user>` lives
 	// (its PX). A single delivery whose total retry duration outlives this
 	// resurrects the erased payload once the tombstone expires - the documented

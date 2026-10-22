@@ -43,7 +43,7 @@ import { ReplayStorageError, ReplaySerializationError, createResumeHook } from '
 import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.js';
 import { tenantTopicSql } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
-import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 export { ReplayStorageError, ReplaySerializationError };
 
@@ -153,6 +153,9 @@ export function createReplay(client, options = {}) {
 	const pkCol = table + '_id';
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
+	if (ttl === 0 && !forgetUserId && firstReportInProcess(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_RETENTION_UNBOUNDED)) {
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_RETENTION_UNBOUNDED);
+	}
 	const autoMigrate = options.autoMigrate !== false;
 	const cleanupInterval = options.cleanupInterval !== undefined ? options.cleanupInterval : 60000;
 

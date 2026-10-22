@@ -33,7 +33,7 @@ import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.j
 import { decodeSortedSetMember } from '../shared/replay-envelope.js';
 import { topicInTenant } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
-import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
@@ -145,6 +145,9 @@ export function createReplay(client, options = {}) {
 
 	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, maxDataBytes, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis replay', options);
+	if (ttl === 0 && !forgetUserId && firstReportInProcess(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_RETENTION_UNBOUNDED)) {
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_RETENTION_UNBOUNDED);
+	}
 
 	const redis = client.redis;
 

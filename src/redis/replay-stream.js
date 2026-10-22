@@ -31,7 +31,7 @@ import { checkReplayAccess, RESUME_PREAUTHORIZED } from '../shared/replay-gate.j
 import { decodeStreamFields } from '../shared/replay-envelope.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
-import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 
@@ -225,6 +225,9 @@ export function createStreamReplay(client, options = {}) {
 	// `live.forget` can XDEL the user's stream entries. Unset => not purgeable.
 	const forgetUserId = options.forgetUserId;
 	const redis = client.redis;
+	if (ttl === 0 && !forgetUserId && firstReportInProcess(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_RETENTION_UNBOUNDED)) {
+		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_STREAM_RETENTION_UNBOUNDED);
+	}
 
 	// Soft per-field-hash-TTL gate for the dedup cache: HPEXPIRE each
 	// requestId field on servers that support it (Redis 7.4+/Valkey 9.0+) so an

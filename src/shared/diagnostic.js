@@ -387,6 +387,22 @@ function redactedError(error, redact) {
 	return { ...projected, message: message.slice(0, MAX_TEXT) };
 }
 
+const FIRST_REPORTS = Symbol.for('svelte-adapter-uws-extensions.first-reports.v1');
+
+/**
+ * True the first time a key is seen in this process, false after. The set
+ * lives on globalThis so a bundler that loads this module twice still reports
+ * a configuration notice once.
+ * @param {string} key
+ * @returns {boolean}
+ */
+export function firstReportInProcess(key) {
+	const seen = globalThis[FIRST_REPORTS] ??= new Set();
+	if (seen.has(key)) return false;
+	seen.add(key);
+	return true;
+}
+
 /**
  * Emit a registry-indexed failure. The registry entry is the one place the
  * component, event, severity, and message are stated, so the emitted line and
