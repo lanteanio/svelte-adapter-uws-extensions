@@ -26,8 +26,9 @@ export interface CrdtClusterOptions {
 	/**
 	 * Observe a relay-subscriber failure (the subscriber tears down, is opened
 	 * again, and resyncs), and a relay envelope too large to send even in
-	 * parts (code `RELAY_ENVELOPE_TOO_LARGE`; its topic keeps retrying, the
-	 * other topics are unaffected).
+	 * parts (code `RELAY_ENVELOPE_TOO_LARGE`, once per held document; a
+	 * document past the relay limit is not replicated across instances and
+	 * persists from the local replica).
 	 */
 	onError?: (err: unknown) => void;
 }

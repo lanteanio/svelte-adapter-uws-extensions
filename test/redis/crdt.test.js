@@ -791,6 +791,54 @@ describe('createCrdtCluster topics the relay cannot carry', () => {
 	});
 });
 
+describe('createCrdtCluster documents past the relay limit', () => {
+	it('persists a topic the relay can never carry, reports it once and stops retrying it', async () => {
+		const client = mockRedisClient('crdtnever:');
+		const errors = [];
+		const a = createCrdtCluster(client, { maxEnvelopeBytes: 400, persistLeaseMs: 600, onError: (err) => errors.push(err) });
+		const huge = 'doc:' + 'h'.repeat(300);
+		let reads = 0;
+		a.onMessage({
+			onSyncRequest: (declKey, topic, sv, from) => {
+				if (!from.startsWith('local:')) return;
+				reads++;
+				a.sendSyncReply(declKey, topic, [1, 2, 3], from);
+			}
+		});
+		try {
+			await settle();
+			a.relayUpdate('dk1', huge, [1, 2, 3]);
+			await settle();
+			expect(await a.acquirePersist(huge)).toBe(true);
+			for (let k = 0; k < 3; k++) expect(await a.acquirePersist(huge)).toBe(true);
+			await new Promise((r) => setTimeout(r, 1300)); // past the first retry
+			expect(errors).toHaveLength(1);
+			expect(errors[0].code).toBe('RELAY_ENVELOPE_TOO_LARGE');
+			expect(reads).toBeLessThanOrEqual(1);
+		} finally {
+			a.destroy();
+		}
+	});
+
+	it('never serializes a whole state whose size alone rules out a single envelope', async () => {
+		const client = mockRedisClient('crdtnojson:');
+		const a = createCrdtCluster(client, { maxEnvelopeBytes: 400, onError: () => {} });
+		a.onMessage({});
+		const stringify = vi.spyOn(JSON, 'stringify');
+		try {
+			await settle();
+			const bytes = Array.from({ length: 300 }, (_, i) => i % 256);
+			a.relayUpdate('dk1', 'doc:' + 'h'.repeat(300), bytes);
+			a.relayUpdate('dk1', 'doc:ok', bytes);
+			await settle();
+			expect(stringify.mock.calls.filter(([value]) => value && value.b === bytes)).toEqual([]);
+		} finally {
+			stringify.mockRestore();
+			a.destroy();
+		}
+	});
+});
+
 describe('createCrdtCluster reassembly capacity', () => {
 	const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -821,24 +869,67 @@ describe('createCrdtCluster reassembly capacity', () => {
 		JSON.stringify({ i: from, k: 'part', d: 'dk1', t: topic, p: id, n, of, x, ...(n === 0 ? { e: { k: 'u' } } : {}), ...extra });
 	const small = Buffer.from([4, 5, 6]).toString('base64');
 
-	it('makes room for another peer when one peer fills the buffer, and resyncs the topic it drops', async () => {
-		const { client, b, rb, requests, channel } = await receiver('crdtpartfair:', ['doc:big', 'doc:small']);
+	const MB = 1000000;
+	/** Publish parts `from`..`to` (exclusive) of an envelope, each `size` characters. */
+	async function parts(client, channel, from, id, topic, of, first, last, size = MB) {
+		for (let n = first; n < last; n++) await client.redis.publish(channel, part(from, id, topic, n, of, 'A'.repeat(size)));
+	}
+	/** Wait out the resync retry, then the topics b asked the peers about. */
+	async function resynced(requests) {
+		await wait(1300);
+		return new Set(requests.filter((r) => r.a === 1).map((r) => r.t));
+	}
+
+	it('makes room for another peer when one peer holds more than its share of a full buffer, and resyncs the topic it drops', async () => {
+		const { client, b, rb, requests, channel } = await receiver('crdtpartfair:', ['doc:big', 'doc:mid', 'doc:small']);
 		try {
-			// One peer's unfinished envelope fills the whole buffer.
-			const total = 64 * 1024 * 1024;
-			const slice = 1000000;
-			let held = 0;
-			for (let n = 0; held < total; n++) {
-				const size = Math.min(slice, total - held);
-				await client.redis.publish(channel, part('peerA', 'big', 'doc:big', n, 100, 'A'.repeat(size)));
-				held += size;
-			}
-			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 0, 2, small.slice(0, 2)));
-			await client.redis.publish(channel, part('peerB', 's1', 'doc:small', 1, 2, small.slice(2)));
+			await parts(client, channel, 'peerA', 'big', 'doc:big', 50, 0, 49);
+			await parts(client, channel, 'peerB', 'mid', 'doc:mid', 20, 0, 18);
+			// Fill the buffer to the last character.
+			await client.redis.publish(channel, part('peerB', 'mid', 'doc:mid', 18, 20, 'A'.repeat(64 * 1024 * 1024 - 67 * MB)));
+			await client.redis.publish(channel, part('peerC', 's1', 'doc:small', 0, 2, small.slice(0, 2)));
+			await client.redis.publish(channel, part('peerC', 's1', 'doc:small', 1, 2, small.slice(2)));
 			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'doc:small', bytes: [4, 5, 6] }]);
-			// peerA's envelope is gone, so b asks the peers for the topic again.
-			for (let i = 0; i < 60 && !requests.some((r) => r.t === 'doc:big' && r.a === 1); i++) await wait(50);
-			expect(requests.some((r) => r.t === 'doc:big' && r.a === 1)).toBe(true);
+			// peerA held the most over its share; its envelope is gone, so b asks again.
+			expect([...(await resynced(requests))]).toEqual(['doc:big']);
+		} finally {
+			b.destroy();
+		}
+	});
+
+	it('gives way with the least complete envelope of a peer over its share, keeping its nearly complete one', async () => {
+		const { client, b, requests, channel } = await receiver('crdtpartprogress:', ['doc:x', 'doc:y', 'doc:z']);
+		try {
+			await parts(client, channel, 'peerA', 'x', 'doc:x', 36, 0, 35); // one part short
+			await parts(client, channel, 'peerA', 'y', 'doc:y', 30, 0, 10); // a third
+			await parts(client, channel, 'peerB', 'z', 'doc:z', 30, 0, 23); // overflows the buffer
+			expect([...(await resynced(requests))]).toEqual(['doc:y']);
+		} finally {
+			b.destroy();
+		}
+	});
+
+	it('drops an envelope too large for a sender at its first part instead of displacing others for it', async () => {
+		const { client, b, requests, channel } = await receiver('crdtparttoobig:', ['doc:x', 'doc:huge']);
+		try {
+			await parts(client, channel, 'peerA', 'x', 'doc:x', 41, 0, 40);
+			await parts(client, channel, 'peerB', 'huge', 'doc:huge', 60, 0, 27);
+			expect([...(await resynced(requests))]).toEqual(['doc:huge']);
+		} finally {
+			b.destroy();
+		}
+	});
+
+	it('keeps a large envelope while another peer sends small envelopes steadily', async () => {
+		const { client, b, rb, requests, channel } = await receiver('crdtpartsteady:', ['doc:big', 'doc:small']);
+		try {
+			for (let n = 0; n < 49; n++) {
+				await parts(client, channel, 'peerA', 'big', 'doc:big', 50, n, n + 1);
+				await client.redis.publish(channel, part('peerB', 's' + n, 'doc:small', 0, 2, small.slice(0, 2)));
+				await client.redis.publish(channel, part('peerB', 's' + n, 'doc:small', 1, 2, small.slice(2)));
+			}
+			expect(rb.updates).toHaveLength(49);
+			expect((await resynced(requests)).size).toBe(0);
 		} finally {
 			b.destroy();
 		}

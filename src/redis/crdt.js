@@ -104,9 +104,13 @@ const KIND_PART = 'part';
 
 // Bounds on the envelopes being reassembled from parts: base64 characters
 // held across all of them, how many at once, and how long one may take.
-// When a bound is hit the sender holding the most gives way, so one peer's
-// large resync cannot starve the others.
+// When a bound is hit, the senders holding more than their fair share give
+// way, so one peer's large resync cannot starve the others.
 const PART_BUFFER_MAX_CHARS = 64 * 1024 * 1024;
+// What one sender's envelopes may hold at once, which also caps the largest
+// envelope. The rest of the buffer stays free for the other senders, so
+// their small envelopes never displace a large one that fits.
+const PART_SENDER_MAX_CHARS = 48 * 1024 * 1024;
 const PART_ASSEMBLIES_MAX = 256;
 const PART_TIMEOUT_MS = 30000;
 // Envelopes dropped while their parts were arriving, remembered so their
@@ -162,8 +166,9 @@ function positive(v, fallback) {
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber
  *   failure (the subscriber tears down, is opened again, and resyncs), and a
  *   relay envelope too large to send even in parts (code
- *   `RELAY_ENVELOPE_TOO_LARGE`; its topic keeps retrying, the other topics
- *   are unaffected).
+ *   `RELAY_ENVELOPE_TOO_LARGE`, once per held document; a document past
+ *   the relay limit is not replicated across instances and persists from
+ *   the local replica).
  */
 
 /**
@@ -222,6 +227,10 @@ export function createCrdtCluster(client, options = {}) {
 	const inflight = new Map();
 	/** @type {Set<string>} topics whose replica may lack edits the peers sent */
 	const stale = new Set();
+	/** @type {Set<string>} topics whose name leaves no room for a sync request: never resynced */
+	const unaskable = new Set();
+	/** @type {Set<string>} topics already reported as too large for the relay */
+	const oversize = new Set();
 	/** @type {Map<string, Map<string, { declKey: string, v: any[], c: string | undefined }>>} topic -> requester -> a sync reply the relay lost */
 	const owed = new Map();
 	/** @type {WeakMap<object, any[]>} sync reply envelope -> the state vector it answered */
@@ -272,7 +281,7 @@ export function createCrdtCluster(client, options = {}) {
 			const [topic, declKey] = next.value;
 			if (rounds.has(topic) || unrelayed.has(topic) || stale.has(topic) || queue.has(topic)) continue;
 			reads++;
-			if (readState(declKey, topic) === null) { known.delete(topic); owed.delete(topic); }
+			if (readState(declKey, topic) === null) forget(topic);
 		}
 		setImmediateTimer(sweep);
 	}
@@ -298,18 +307,44 @@ export function createCrdtCluster(client, options = {}) {
 		return Array.isArray(slot.bytes) ? slot.bytes : null;
 	}
 
+	/** Drop everything remembered about a topic this instance no longer holds. */
+	function forget(topic) {
+		known.delete(topic);
+		owed.delete(topic);
+		stale.delete(topic);
+		unrelayed.delete(topic);
+		unaskable.delete(topic);
+		oversize.delete(topic);
+	}
+
+	/**
+	 * A relay too large to carry even in parts can never be sent, so retrying
+	 * it only repeats its cost. A document past the relay limit is not
+	 * replicated across instances: the topic is reported once to onError, its
+	 * local edits no longer hold up persistence (the local state holds them),
+	 * and a topic whose name leaves no room for a sync request is not resynced.
+	 */
+	function relayImpossible(obj, err) {
+		lastRelayError = err;
+		const topic = obj.t;
+		if (typeof topic !== 'string' || !known.has(topic)) { report(err); return; }
+		if (obj.k === KIND_SYNC_REQUEST) { unaskable.add(topic); stale.delete(topic); }
+		else if (obj.k === KIND_UPDATE) unrelayed.delete(topic);
+		if (!oversize.has(topic)) { oversize.add(topic); report(err); }
+	}
+
 	/**
 	 * A relay was refused or failed: resync its topic once Redis takes traffic
 	 * again. A lost request leaves this replica behind; lost content leaves the
 	 * peers behind.
 	 */
-	function relayLost(obj, err, permanent = false) {
+	function relayLost(obj, err) {
 		lastRelayError = err;
 		const topic = obj.t;
 		if (typeof topic === 'string' && known.has(topic)) {
 			if (obj.k === KIND_SYNC_REQUEST) stale.add(topic);
 			else if (obj.k === KIND_UPDATE && Array.isArray(obj.b) && obj.b.length > 0) unrelayed.set(topic, ++marks);
-			else if (!permanent && obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
+			else if (obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
 				// The requester lacks this instance's state, but no local
 				// edit is at risk: answer it again once the relay recovers.
 				let peers = owed.get(topic);
@@ -340,9 +375,7 @@ export function createCrdtCluster(client, options = {}) {
 		if (destroyed) return Promise.resolve(null);
 		const msgs = encode(obj);
 		if (msgs === null) {
-			const err = operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: the envelope exceeds the relay size limit even when sent in parts');
-			relayLost(obj, err, true);
-			report(err);
+			relayImpossible(obj, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: the envelope exceeds the relay size limit even when sent in parts'));
 			return Promise.resolve(null);
 		}
 		if (b && verdict === null) {
@@ -382,10 +415,15 @@ export function createCrdtCluster(client, options = {}) {
 	 * @returns {string[] | null}
 	 */
 	function encode(obj) {
-		const msg = JSON.stringify(obj);
-		if (Buffer.byteLength(msg) <= validator.maxBytes) return [msg];
-		if (!Array.isArray(obj.b)) return null;
-		const data = Buffer.from(Uint8Array.from(obj.b)).toString('base64');
+		const bytes = Array.isArray(obj.b) ? obj.b.length : -1;
+		// Each byte takes at least two characters of a JSON array, so a
+		// large state is never serialized whole only to be found too big.
+		if (bytes < 0 || bytes * 2 < validator.maxBytes) {
+			const msg = JSON.stringify(obj);
+			if (Buffer.byteLength(msg) <= validator.maxBytes) return [msg];
+			if (bytes < 0) return null;
+		}
+		if (Math.ceil(bytes / 3) * 4 > PART_SENDER_MAX_CHARS) return null;
 		const { i, d, t, b: _bytes, ...rest } = obj;
 		/** @type {any} */
 		const head = { i, k: KIND_PART, d, t, p: randomBytes(6).toString('hex') };
@@ -393,7 +431,8 @@ export function createCrdtCluster(client, options = {}) {
 		if (typeof obj.to === 'string') head.to = obj.to;
 		const overhead = Buffer.byteLength(JSON.stringify({ ...head, n: 1e9, of: 1e9, e: rest, x: '' }));
 		const room = validator.maxBytes - overhead;
-		if (room < 1 || data.length > PART_BUFFER_MAX_CHARS) return null;
+		if (room < 1) return null;
+		const data = Buffer.from(Uint8Array.from(obj.b)).toString('base64');
 		const of = Math.ceil(data.length / room);
 		const out = [];
 		for (let n = 0; n < of; n++) {
@@ -405,7 +444,7 @@ export function createCrdtCluster(client, options = {}) {
 		return out;
 	}
 
-	/** @type {Map<string, { from: string, of: number, d: string, t: string, e: any, parts: Map<number, string>, chars: number, timer: any }>} */
+	/** @type {Map<string, { from: string, of: number, d: string, t: string, e: any, parts: Map<number, string>, chars: number, partMax: number, timer: any }>} */
 	const assemblies = new Map();
 	let partChars = 0;
 	/** @type {Map<string, { chars: number, count: number }>} sender -> what its assemblies hold */
@@ -451,24 +490,43 @@ export function createCrdtCluster(client, options = {}) {
 		return false;
 	}
 
-	/** The sender holding the most by `by`, other than `except`, or null. */
-	function heaviestSender(by, except) {
-		let best = null;
-		let most = -1;
-		for (const [from, held] of senders) {
-			if (from !== except && held[by] > most) { best = from; most = held[by]; }
-		}
-		return best === null ? null : { from: best, most };
-	}
-
-	/** Drop the assembly of `from` holding the most characters. */
-	function evictFrom(from) {
-		let victim = null;
-		let most = -1;
+	/**
+	 * Free `need` of a bound (`chars` or `count`) for an envelope from `from`
+	 * by dropping assemblies of the other senders holding more than their
+	 * fair share of it: the sender most over its share first, and of its
+	 * assemblies the least complete, the newest on a tie. Drops nothing and
+	 * returns false when that cannot free enough.
+	 */
+	function makeRoom(by, from, need) {
+		const bound = by === 'chars' ? PART_BUFFER_MAX_CHARS : PART_ASSEMBLIES_MAX;
+		const share = bound / (senders.has(from) ? senders.size : senders.size + 1);
+		/** @type {Map<string, { held: number, queue: { key: string, size: number, done: number, at: number }[] }>} */
+		const others = new Map();
+		let at = 0;
 		for (const [key, a] of assemblies) {
-			if (a.from === from && a.chars > most) { victim = key; most = a.chars; }
+			at++;
+			if (a.from === from) continue;
+			let o = others.get(a.from);
+			if (!o) others.set(a.from, o = { held: /** @type {any} */ (senders.get(a.from))[by], queue: [] });
+			o.queue.push({ key, size: by === 'chars' ? a.chars : 1, done: a.parts.size / a.of, at });
 		}
-		if (victim !== null) dropAssembly(victim, true);
+		for (const o of others.values()) o.queue.sort((p, q) => p.done - q.done || q.at - p.at);
+		const plan = [];
+		let freed = 0;
+		while (freed < need) {
+			let pick = null;
+			let over = 0;
+			for (const o of others.values()) {
+				if (o.queue.length > 0 && o.held - share > over) { pick = o; over = o.held - share; }
+			}
+			if (pick === null) return false;
+			const victim = /** @type {{ key: string, size: number }} */ (pick.queue.shift());
+			plan.push(victim.key);
+			freed += victim.size;
+			pick.held -= victim.size;
+		}
+		for (const key of plan) dropAssembly(key, true);
+		return true;
 	}
 
 	/**
@@ -483,15 +541,11 @@ export function createCrdtCluster(client, options = {}) {
 		let a = assemblies.get(key);
 		if (!a) {
 			if (isDropped(key)) return null;
-			if (assemblies.size >= PART_ASSEMBLIES_MAX) {
-				// Room comes from the sender with the most assemblies, unless
-				// that is this one.
-				const own = senders.get(from)?.count ?? 0;
-				const other = heaviestSender('count', from);
-				if (other === null || other.most <= own) { partsLost(key, t); return null; }
-				evictFrom(other.from);
-			}
-			a = { from, of, d, t, e: null, parts: new Map(), chars: 0, timer: null };
+			// An envelope that cannot fit a sender's share never completes:
+			// no other one gives way for it.
+			if (x.length * of > PART_SENDER_MAX_CHARS) { partsLost(key, t); return null; }
+			if (assemblies.size >= PART_ASSEMBLIES_MAX && !makeRoom('count', from, 1)) { partsLost(key, t); return null; }
+			a = { from, of, d, t, e: null, parts: new Map(), chars: 0, partMax: 0, timer: null };
 			assemblies.set(key, a);
 			let sender = senders.get(from);
 			if (!sender) senders.set(from, sender = { chars: 0, count: 0 });
@@ -500,14 +554,14 @@ export function createCrdtCluster(client, options = {}) {
 			if (a.timer && a.timer.unref) a.timer.unref();
 		}
 		if (a.of !== of || a.d !== d || a.t !== t || a.parts.has(n)) return null;
-		while (partChars + x.length > PART_BUFFER_MAX_CHARS) {
-			// The sender holding the most characters gives way; this part's
-			// own envelope when that is its sender.
-			const own = /** @type {{ chars: number, count: number }} */ (senders.get(from)).chars + x.length;
-			const other = heaviestSender('chars', from);
-			if (other === null || other.most <= own) { dropAssembly(key, true); return null; }
-			evictFrom(other.from);
+		const sender = /** @type {{ chars: number, count: number }} */ (senders.get(from));
+		a.partMax = Math.max(a.partMax, x.length);
+		if (a.partMax * a.of > PART_SENDER_MAX_CHARS || sender.chars + x.length > PART_SENDER_MAX_CHARS) {
+			dropAssembly(key, true);
+			return null;
 		}
+		const over = partChars + x.length - PART_BUFFER_MAX_CHARS;
+		if (over > 0 && !makeRoom('chars', from, over)) { dropAssembly(key, true); return null; }
 		if (n === 0) {
 			const e = parsed.e;
 			if (!e || typeof e !== 'object' || Array.isArray(e) || e.k === KIND_PART) { dropAssembly(key); return null; }
@@ -515,7 +569,7 @@ export function createCrdtCluster(client, options = {}) {
 		}
 		a.parts.set(n, x);
 		a.chars += x.length;
-		/** @type {{ chars: number, count: number }} */ (senders.get(from)).chars += x.length;
+		sender.chars += x.length;
 		partChars += x.length;
 		if (a.parts.size < a.of) return null;
 		dropAssembly(key);
@@ -700,10 +754,10 @@ export function createCrdtCluster(client, options = {}) {
 		queue.delete(topic);
 		const declKey = known.get(topic);
 		if (declKey === undefined) {
-			stale.delete(topic);
-			unrelayed.delete(topic);
+			forget(topic);
 			return null;
 		}
+		if (unaskable.has(topic)) return null;
 		// One admission covers both publishes of the round; a round that
 		// publishes nothing hands it back unused.
 		let release;
@@ -722,8 +776,7 @@ export function createCrdtCluster(client, options = {}) {
 		stale.delete(topic);
 		if (full === null) {
 			release();
-			known.delete(topic);
-			unrelayed.delete(topic);
+			forget(topic);
 			return null;
 		}
 		// The mark stays until Redis confirmed the push, and a loss recorded
@@ -748,8 +801,9 @@ export function createCrdtCluster(client, options = {}) {
 			if (verdict.err !== null) b?.failure(verdict.err);
 			else if (verdict.reached) b?.success();
 			else release();
-			if (n !== null) round.asked = true;
-			if (p === null || n === null) {
+			// A topic that cannot be asked about has nothing to wait for.
+			if (n !== null || unaskable.has(topic)) round.asked = true;
+			if (n === null || (p === null && unrelayed.has(topic))) {
 				// relayLost marked the topic again; nothing will answer.
 				finishRound(round);
 				return;
@@ -975,6 +1029,8 @@ export function createCrdtCluster(client, options = {}) {
 			unrelayed.clear();
 			inflight.clear();
 			stale.clear();
+			unaskable.clear();
+			oversize.clear();
 			owed.clear();
 			known.clear();
 			for (const key of [...assemblies.keys()]) dropAssembly(key);
