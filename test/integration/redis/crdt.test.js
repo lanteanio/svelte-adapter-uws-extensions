@@ -200,5 +200,50 @@ describe('redis crdt cluster coordinator (integration)', () => {
 			a.edit(TOPIC, 'u1', 1); // published while both subscribers reconnect
 			await waitFor(() => 'u1' in b.items(TOPIC), 10000);
 		});
+
+		it('moves no document bytes when a fresh lease finds the replicas converged', async () => {
+			const backend = createBackend();
+			const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+			const a = doc(backend, {}, quiet);
+			const b = doc(backend, {}, quiet);
+			await a.join(TOPIC);
+			await b.join(TOPIC);
+			await wait(150);
+			a.edit(TOPIC, 'big', 'x'.repeat(50000));
+			await waitFor(() => 'big' in b.items(TOPIC));
+			const publish = client.redis.publish;
+			const sent = [];
+			client.redis.publish = function (channel, message) {
+				sent.push(JSON.parse(message));
+				return publish.call(this, channel, message);
+			};
+			try {
+				expect(await b.crdt.acquirePersist(TOPIC)).toBe(true); // fresh lease
+				await wait(100);
+			} finally {
+				client.redis.publish = publish;
+			}
+			expect(sent.some((env) => env.k === 'sreq')).toBe(true);
+			expect(sent.filter((env) => Array.isArray(env.b) && env.b.length > 0)).toEqual([]);
+		});
+
+		it('repairs a document whose full state exceeds maxEnvelopeBytes', async () => {
+			const backend = createBackend();
+			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+			const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+			const a = doc(backend, { breaker, maxEnvelopeBytes: 20000 }, quiet);
+			const b = doc(backend, { maxEnvelopeBytes: 20000 }, quiet);
+			await a.join(TOPIC);
+			await b.join(TOPIC);
+			await wait(150);
+			a.edit(TOPIC, 'big', 'y'.repeat(4000));
+			b.edit(TOPIC, 'big2', 'z'.repeat(4000));
+			await waitFor(() => 'big' in b.items(TOPIC) && 'big2' in a.items(TOPIC));
+			breaker.failure(new Error('redis down'));
+			a.edit(TOPIC, 'u1', 1);
+			breaker.reset(); // the resync pushes a full state larger than the cap
+			await waitFor(() => 'u1' in b.items(TOPIC), 5000);
+			expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+		});
 	});
 });
