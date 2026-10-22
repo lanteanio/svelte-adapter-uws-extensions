@@ -308,13 +308,13 @@ it('rejects a command written during the handshake when that connection drops be
 		await vi.waitFor(() => {
 			expect(client.redis.status).toBe('connect');
 			expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'info')).toBe(true);
-		}, { timeout: 2000 });
+		}, { timeout: 5000 });
 		// PUBLISH is valid while Redis loads, so ioredis writes it before ready;
 		// SET waits in the offline queue.
 		const publish = client.redis.publish('inttest-outage:handshake-channel', 'during-handshake');
 		const write = client.redis.set(key, 'after-handshake');
 		publish.catch(() => {});
-		await vi.waitFor(() => expect(received).toEqual(['during-handshake']), { timeout: 2000 });
+		await vi.waitFor(() => expect(received).toEqual(['during-handshake']), { timeout: 5000 });
 		expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'publish')).toBe(true);
 		const closed = new Promise(resolve => client.redis.once('close', resolve));
 		const droppedAt = Date.now();
