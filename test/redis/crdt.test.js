@@ -490,3 +490,56 @@ describe('createCrdtCluster subscriber recovery', () => {
 		}
 	});
 });
+
+describe('createCrdtCluster recovery cost', () => {
+	const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+	it('stops a recovery at the first round the probing breaker refuses, before reading another replica', async () => {
+		const client = mockRedisClient('crdtburst:');
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30 });
+		const a = createCrdtCluster(client, { breaker });
+		let reads = 0;
+		a.onMessage({
+			onSyncRequest: (declKey, topic, sv, from) => {
+				if (from.startsWith('local:')) reads++;
+				a.sendSyncReply(declKey, topic, [1], from);
+			}
+		});
+		try {
+			await settle();
+			breaker.failure(new Error('redis down'));
+			for (let i = 0; i < 20; i++) a.relayUpdate('dk1', 'doc:' + i, [i + 1]); // refused: 20 topics marked
+			client.redis.publish = () => new Promise(() => {}); // the probe never answers
+			await wait(100);
+			expect(breaker.state).toBe('probing');
+			// One round took the probe; the rest wait instead of each encoding
+			// its replica only to be refused.
+			expect(reads).toBe(1);
+		} finally {
+			a.destroy();
+		}
+	});
+
+	it('sweeps the remembered topics a bounded slice per event-loop turn', async () => {
+		const client = mockRedisClient('crdtsweep:');
+		const a = createCrdtCluster(client);
+		let reads = 0;
+		a.onMessage({
+			onSyncRequest: (declKey, topic, sv, from) => {
+				if (!from.startsWith('local:')) return;
+				reads++;
+				a.sendSyncReply(declKey, topic, [1], from);
+			}
+		});
+		try {
+			for (let i = 0; i <= 1024; i++) a.requestSync('dk1', 'doc:' + i, []); // one past the sweep threshold
+			await new Promise((r) => setImmediate(r));
+			expect(reads).toBeGreaterThan(0);
+			expect(reads).toBeLessThanOrEqual(64);
+			for (let turn = 0; turn < 40 && reads < 1025; turn++) await new Promise((r) => setImmediate(r));
+			expect(reads).toBe(1025);
+		} finally {
+			a.destroy();
+		}
+	});
+});

@@ -108,6 +108,9 @@ const RESYNC_CONCURRENCY = 8;
 // The topics remembered for a resync are swept for ones no longer held once
 // the set grows past this, then past twice its size after the last sweep.
 const KNOWN_SWEEP_MIN = 1024;
+// Replica reads one sweep step makes before yielding the event loop; each
+// read encodes a document's full state.
+const SWEEP_SLICE = 64;
 
 /** Digest of a replica's full state, so a peer holding the same state can say so without sending it. */
 function digestOf(bytes) {
@@ -185,7 +188,8 @@ export function createCrdtCluster(client, options = {}) {
 	/** @type {Map<string, string>} topic -> declKey, for every topic seen held */
 	const known = new Map();
 	let sweepAt = KNOWN_SWEEP_MIN;
-	let sweepScheduled = false;
+	/** @type {Iterator<[string, string]> | null} the sweep in progress */
+	let sweeping = null;
 	/** @type {Map<string, number>} topics holding local edits the peers may lack -> when last marked */
 	const unrelayed = new Map();
 	let marks = 0;
@@ -218,21 +222,32 @@ export function createCrdtCluster(client, options = {}) {
 	function remember(declKey, topic) {
 		if (typeof declKey !== 'string' || typeof topic !== 'string') return;
 		known.set(topic, declKey);
-		if (known.size > sweepAt && !sweepScheduled) {
-			sweepScheduled = true;
+		if (known.size > sweepAt && sweeping === null) {
+			sweeping = known.entries();
 			setImmediateTimer(sweep);
 		}
 	}
 
-	/** Forget the remembered topics this instance no longer holds. */
+	/**
+	 * Forget the remembered topics this instance no longer holds, a slice per
+	 * event-loop turn so a large set never stalls the loop.
+	 */
 	function sweep() {
-		sweepScheduled = false;
-		if (destroyed) return;
-		for (const [topic, declKey] of known) {
+		if (destroyed || sweeping === null) { sweeping = null; return; }
+		let reads = 0;
+		while (reads < SWEEP_SLICE) {
+			const next = sweeping.next();
+			if (next.done) {
+				sweeping = null;
+				sweepAt = Math.max(KNOWN_SWEEP_MIN, known.size * 2);
+				return;
+			}
+			const [topic, declKey] = next.value;
 			if (rounds.has(topic) || unrelayed.has(topic) || stale.has(topic) || queue.has(topic)) continue;
+			reads++;
 			if (readState(declKey, topic) === null) { known.delete(topic); owed.delete(topic); }
 		}
-		sweepAt = Math.max(KNOWN_SWEEP_MIN, known.size * 2);
+		setImmediateTimer(sweep);
 	}
 
 	/**
@@ -282,12 +297,13 @@ export function createCrdtCluster(client, options = {}) {
 	/**
 	 * Publish one envelope, after the subscriber is up so we never miss a reply
 	 * we caused. Resolves to the receiver count Redis reports, or null when the
-	 * breaker refused the publish or Redis failed it; never rejects.
+	 * breaker refused the publish or Redis failed it; never rejects. An
+	 * `admitted` publish already holds the breaker's admission.
 	 * @returns {Promise<number | null>}
 	 */
-	function publish(obj) {
+	function publish(obj, admitted = false) {
 		if (destroyed) return Promise.resolve(null);
-		if (b) {
+		if (b && !admitted) {
 			try { b.guard(); } catch (err) { relayLost(obj, err); return Promise.resolve(null); }
 		}
 		const msg = JSON.stringify(obj);
@@ -471,6 +487,13 @@ export function createCrdtCluster(client, options = {}) {
 		if (existing) return existing;
 		queue.delete(topic);
 		const declKey = known.get(topic);
+		if (declKey !== undefined && !admit()) {
+			// Refused before reading the replica: the breaker transition or
+			// the retry resyncs it.
+			stale.add(topic);
+			scheduleRetry();
+			return null;
+		}
 		const full = declKey === undefined ? null : readState(declKey, topic);
 		stale.delete(topic);
 		if (declKey === undefined || full === null) {
@@ -489,11 +512,11 @@ export function createCrdtCluster(client, options = {}) {
 		if (round.timer && round.timer.unref) round.timer.unref();
 		const pushed = mark === undefined
 			? Promise.resolve(0)
-			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }).then((p) => {
+			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }, true).then((p) => {
 				if (p !== null && unrelayed.get(topic) === mark) unrelayed.delete(topic);
 				return p;
 			});
-		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) });
+		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) }, true);
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
 			if (p === null || n === null) {
 				// relayLost marked the topic again; nothing will answer.
@@ -508,20 +531,38 @@ export function createCrdtCluster(client, options = {}) {
 		return round;
 	}
 
+	/**
+	 * Take the breaker's admission for one resync round (both of its
+	 * publishes); false when the breaker refuses it.
+	 */
+	function admit() {
+		if (!b) return true;
+		try {
+			b.guard();
+			return true;
+		} catch (err) {
+			lastRelayError = err;
+			refusals++;
+			return false;
+		}
+	}
+
 	/** Run the queued resync rounds, a bounded number at a time. */
 	function pump() {
 		if (destroyed) return;
 		while (activeRounds < RESYNC_CONCURRENCY && queue.size > 0) {
-			if (b && b.state === 'broken') {
-				// Refused anyway; the breaker transition or the retry resumes.
-				for (const topic of queue) stale.add(topic);
-				queue.clear();
-				scheduleRetry();
-				return;
-			}
 			const topic = /** @type {string} */ (queue.values().next().value);
 			queue.delete(topic);
+			const before = refusals;
 			const round = startRound(topic);
+			if (refusals !== before) {
+				// The breaker refuses rounds (open, or probing with its probe
+				// taken): every further one would be refused after reading its
+				// replica. The breaker transition or the retry resumes.
+				for (const rest of queue) stale.add(rest);
+				queue.clear();
+				return;
+			}
 			if (!round) continue;
 			activeRounds++;
 			Promise.race([round.sent, round.promise]).then(() => {
