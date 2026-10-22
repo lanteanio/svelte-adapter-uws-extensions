@@ -35,6 +35,48 @@ function supportsSharedDeadlines() {
 	} catch { return false; }
 }
 
+// Before ready ioredis writes its own handshake commands and any user command
+// of the same name (INFO, SELECT, CLIENT, AUTH). Only the handshake's own
+// commands may stay unsettled when that connection drops, so they are told
+// apart when sent: the connect handler issues AUTH, SELECT, CLIENT SETNAME and
+// CLIENT SETINFO right after it resets the command queue, each once per
+// connection, and the ready check issues INFO from `_readyCheck`. Returns null
+// when those private seams are missing, so callers fall back to the command
+// name alone.
+function trackHandshake(redis) {
+	const reset = redis.resetCommandQueue;
+	const readyCheck = redis._readyCheck;
+	if (typeof reset !== 'function' || typeof readyCheck !== 'function') return null;
+	const own = new WeakSet();
+	let expected = new Set();
+	let inReadyCheck = false;
+	redis.resetCommandQueue = function () {
+		const result = reset.apply(this, arguments);
+		const { condition, options } = this;
+		expected = new Set();
+		if (condition?.auth) expected.add('auth');
+		if (condition?.select) expected.add('select');
+		if (options.connectionName) expected.add('client setname');
+		if (!options.disableClientInfo) { expected.add('client setinfo lib-ver'); expected.add('client setinfo lib-name'); }
+		return result;
+	};
+	redis._readyCheck = function () {
+		inReadyCheck = true;
+		try { return readyCheck.apply(this, arguments); } finally { inReadyCheck = false; }
+	};
+	function kind(command) {
+		if (command.name !== 'client') return command.name;
+		const sub = String(command.args[0]).toLowerCase();
+		return sub === 'setinfo' ? 'client setinfo ' + String(command.args[1]).toLowerCase() : 'client ' + sub;
+	}
+	return {
+		note(command) {
+			if (inReadyCheck ? command.name === 'info' : expected.delete(kind(command))) own.add(command);
+		},
+		has(command) { return own.has(command); }
+	};
+}
+
 // ioredis rejects timed-out commands without removing them from its offline
 // queue. Unsent pipelines must be cancelled as a whole: ioredis only writes
 // their buffered bytes after every member has passed through sendCommand.
@@ -85,11 +127,12 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 	// command flagged `loading` (PUBLISH, SUBSCRIBE, MULTI, ...); everything
 	// else waits unsent in the offline queue. Rejecting a handshake command
 	// makes ioredis treat the handshake as fatal and flush that offline queue,
-	// so handshake commands stay with ioredis's own retry. The other sent
-	// commands are uncertain, and ioredis neither resends them nor keeps them
+	// so ioredis's own handshake commands stay with its retry. The other sent
+	// commands, user commands named like handshake ones included, are uncertain, and ioredis neither resends them nor keeps them
 	// once the next connection starts, so they are rejected here even when
 	// unanswered-command resend is enabled; otherwise they never settle.
 	const Command = Redis.Command;
+	const handshake = trackHandshake(redis);
 	let connectionReady = false;
 	redis.on('ready', () => { connectionReady = true; });
 	redis.on('close', () => {
@@ -100,7 +143,7 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 			const queue = redis.commandQueue;
 			for (let i = queue.length - 1; i >= 0; i--) {
 				const entry = queue.peekAt(i);
-				if (Command.checkFlag('HANDSHAKE_COMMANDS', entry.command.name)) continue;
+				if (handshake ? handshake.has(entry.command) : Command?.checkFlag('HANDSHAKE_COMMANDS', entry.command.name)) continue;
 				queue.remove(i, 1);
 				entry.command.reject(error);
 			}
@@ -147,6 +190,7 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
 		nativeClear.call(this);
 	}
 	function sendTimed(command, stream) {
+		if (handshake && redis.status === 'connect') handshake.note(command);
 		// A command that brings its own setTimeout keeps it, as the subscriber
 		// liveness PING does to opt out of the connection's deadline.
 		if (Object.hasOwn(command, 'setTimeout') && command.setTimeout !== setDeadline) return send.call(this, command, stream);

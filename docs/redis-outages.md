@@ -31,10 +31,12 @@ use idempotency or fencing for effects whose repetition would be unsafe.
 A connection reset, including a socket deadline, rejects unanswered sent commands
 with `ConnectionError` before reconnect. A drop during the startup handshake
 rejects only the sent commands that are not part of the handshake: ioredis
-writes commands valid while Redis loads, such as `PUBLISH` or `SUBSCRIBE`,
-before ready, so they may have run. Other commands issued during startup were
-never sent and stay in the offline queue until the next connection is ready,
-and the handshake commands themselves are retried by ioredis. This rejection
+writes commands valid while Redis loads, such as `PUBLISH` or `SUBSCRIBE`, and
+application commands named like handshake commands (`INFO`, `SELECT`, `CLIENT`,
+`AUTH`) before ready, so they may have run. Other commands issued during
+startup were never sent and stay in the offline queue until the next
+connection is ready, and the handshake commands ioredis issues itself are
+retried by ioredis. This rejection
 applies even with `autoResendUnfulfilledCommands: true`, because ioredis does
 not resend commands from a connection that never reached ready. The reset rule
 also applies when `commandTimeout`

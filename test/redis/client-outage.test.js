@@ -166,3 +166,81 @@ it('leaves a silent subscriber to the liveness watchdog instead of the command d
 		await new Promise((resolve) => server.close(resolve));
 	}
 });
+
+// Answers every command until it reads the first INFO, then stays silent, so
+// the ready check and everything after it remain unanswered.
+function quietAfterReadyCheck(sockets) {
+	return createServer((socket) => {
+		sockets.add(socket);
+		socket.on('close', () => sockets.delete(socket));
+		socket.on('error', () => {});
+		let buffer = Buffer.alloc(0);
+		let silent = false;
+		socket.on('data', (chunk) => {
+			buffer = Buffer.concat([buffer, chunk]);
+			for (;;) {
+				const parts = [];
+				let at = buffer.indexOf('\r\n');
+				if (buffer[0] !== 0x2a || at < 0) return;
+				const count = Number(buffer.subarray(1, at));
+				let offset = at + 2;
+				for (let i = 0; i < count; i++) {
+					at = buffer.indexOf('\r\n', offset);
+					if (at < 0) return;
+					const length = Number(buffer.subarray(offset + 1, at));
+					if (buffer.length < at + 2 + length + 2) return;
+					parts.push(buffer.subarray(at + 2, at + 2 + length).toString());
+					offset = at + 2 + length + 2;
+				}
+				buffer = buffer.subarray(offset);
+				if (parts[0].toLowerCase() === 'info') silent = true;
+				if (!silent) socket.write('+OK\r\n');
+			}
+		});
+	});
+}
+
+it('rejects user commands named like handshake commands when the connection drops before ready', async () => {
+	const sockets = new Set();
+	const server = quietAfterReadyCheck(sockets);
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const client = createRedisClient({
+		url: 'redis://127.0.0.1:' + server.address().port,
+		autoShutdown: false,
+		options: { lazyConnect: true, password: 'secret', db: 2, connectionName: 'handshake', retryStrategy: () => 60000 }
+	});
+	const outcome = (promise) => promise.then(() => 'resolved', error => error);
+	try {
+		client.redis.connect().catch(() => {});
+		await vi.waitFor(() => {
+			expect(client.redis.status).toBe('connect');
+			expect(client.redis.commandQueue.toArray().some(entry => entry.command.name === 'info')).toBe(true);
+		}, { timeout: 2000 });
+		const user = [
+			client.redis.info(),
+			client.redis.select(2),
+			client.redis.client('setname', 'handshake'),
+			client.redis.auth('secret')
+		].map(outcome);
+		outcome(client.redis.set('handshake:key', 'unsent'));
+		expect(client.redis.commandQueue.toArray().filter(entry => entry.command.name === 'info')).toHaveLength(2);
+		const closed = new Promise(resolve => client.redis.once('close', resolve));
+		client.redis.stream.destroy();
+		await closed;
+		const settled = await Promise.race([Promise.all(user), new Promise(resolve => setTimeout(resolve, 1000, 'pending'))]);
+		expect(settled).not.toBe('pending');
+		for (const error of settled) {
+			expect(error).toBeInstanceOf(ConnectionError);
+			expect(error.message).toMatch(/uncertain/);
+		}
+		// The ready check stays with ioredis, so the unsent write is kept for
+		// the next connection instead of being flushed as a handshake failure.
+		expect(client.redis.commandQueue.toArray().map(entry => entry.command.name)).toEqual(['info']);
+		expect(client.redis.offlineQueue.toArray().map(entry => entry.command.name)).toEqual(['set']);
+		expect(client.redis.status).toBe('reconnecting');
+	} finally {
+		client.redis.disconnect();
+		for (const socket of sockets) socket.destroy();
+		await new Promise(resolve => server.close(resolve));
+	}
+});
