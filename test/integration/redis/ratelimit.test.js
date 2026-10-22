@@ -425,5 +425,16 @@ return {1, 0, 0}
 			expect(await client.redis.exists(client.key('v1:ratelimit:emergency'))).toBe(0);
 			expect(await lim.emergency.get()).toBe(1);
 		});
+
+		it('keeps a factor stored at the earlier key through clear()', async () => {
+			const lim = createRateLimit(client, { points: 5, interval: 60000 });
+			const legacy = client.key('v1:ratelimit:emergency');
+			await client.redis.set(legacy, '0.2', 'PX', 3600000);
+			await lim.consume(fakeWs());
+			await lim.clear();
+			expect(await client.redis.get(legacy)).toBe('0.2');
+			expect(await lim.emergency.get()).toBe(0.2);
+			expect(await client.redis.pttl(legacy)).toBeGreaterThan(0);
+		});
 	});
 });

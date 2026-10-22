@@ -28,6 +28,7 @@
  */
 
 import { wallEpoch } from '../shared/runtime.js';
+import { evalCached } from '../shared/eval-cached.js';
 
 // A namespace no limiter bucket key can produce: bucket keys live under
 // `v1:ratelimit:`, `v1:ratelimits:`, `v1:ratelimitg:` and `v1:ratelimitc:`, so
@@ -37,7 +38,19 @@ const EMERGENCY_KEY = 'v1:ratelimit-control:emergency';
 // A string there is a factor written by such a version and is still honored
 // while the current key is absent; a hash there is an ordinary bucket named
 // `emergency` (GET on it fails with WRONGTYPE) and is ignored.
-const LEGACY_EMERGENCY_KEY = 'v1:ratelimit:emergency';
+export const LEGACY_EMERGENCY_KEY = 'v1:ratelimit:emergency';
+
+// Removes the key at the old location only when its type matches the caller's
+// intent: 'factor' removes a string (a factor), 'bucket' removes anything else
+// (a bucket named `emergency`). TYPE and UNLINK run in one script, so a factor
+// written by an earlier version between the check and the removal survives.
+const LEGACY_UNLINK_SCRIPT = `-- RATELIMIT_LEGACY_UNLINK
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind == 'none' then return 0 end
+if (kind == 'string') == (ARGV[1] == 'factor') then
+	return redis.call('UNLINK', KEYS[1])
+end
+return 0`;
 
 // The factor is clamped into a sane band on read AND write so a corrupt or
 // hostile value can neither zero out all traffic (0) nor disable limiting
@@ -83,7 +96,16 @@ async function readLegacy(redis, legacyKey) {
  * @param {string} legacyKey
  */
 async function clearLegacy(redis, legacyKey) {
-	if (await readLegacy(redis, legacyKey) !== null) await redis.del(legacyKey);
+	await evalCached(redis, LEGACY_UNLINK_SCRIPT, 1, legacyKey, 'factor');
+}
+
+/**
+ * Remove a bucket stored at the old factor key, leaving a factor there alone.
+ * @param {import('ioredis').Redis} redis the node that holds the key
+ * @param {string} legacyKey
+ */
+export async function unlinkLegacyBucket(redis, legacyKey) {
+	await evalCached(redis, LEGACY_UNLINK_SCRIPT, 1, legacyKey, 'bucket');
 }
 
 /**

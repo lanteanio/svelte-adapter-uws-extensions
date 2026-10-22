@@ -1000,6 +1000,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					return evaluateAlarmGeneration(args, { sortedSets, hashes });
 				}
 
+				if (script.includes('RATELIMIT_LEGACY_UNLINK')) {
+					const [key, intent] = args;
+					pruneExpiredString(key);
+					const isString = store.has(key);
+					if (!isString && !hashes.has(key) && !sortedSets.has(key) && !streams.has(key)) return 0;
+					return isString === (intent === 'factor') ? r.del(key) : 0;
+				}
 				if (script.includes('IDEM_OWNERSHIP')) return evalIdempotencyOwnership(args);
 				if (script.includes('IDEM_ERASE_OWNER')) return evalIdempotencyErase(args, false);
 				if (script.includes('IDEM_ERASE_LEGACY')) return evalIdempotencyErase(args, true);

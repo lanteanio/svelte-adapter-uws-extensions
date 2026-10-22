@@ -12,7 +12,7 @@
  */
 
 import { attribution } from 'svelte-adapter-uws/connection';
-import { scanAndUnlink } from '../shared/redis-scan.js';
+import { scanUnlinkExcept } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
@@ -25,7 +25,7 @@ import {
 	GCRA_SCRIPT,
 	GCRA_PEEK_SCRIPT
 } from './token-bucket-script.js';
-import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
+import { createEmergencyScaleReader, createEmergencyScaleOps, LEGACY_EMERGENCY_KEY, unlinkLegacyBucket } from './emergency-scale.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 
@@ -733,7 +733,12 @@ export function createRateLimit(client, options) {
 				throw new Error('redis ratelimit: clear tenant id must not be empty - call clear() with no argument to clear every tenant');
 			}
 			const suffix = tenantId ? tenantId + '\0*' : '*';
-			await withBreaker(b, () => scanAndUnlink(redis, client.key(bucketPrefix + suffix)));
+			// The unscoped fixed-window keyspace also holds a factor stored by an
+			// earlier version, which the emergency reader still honors. A bucket
+			// named `emergency` at that key is cleared; a factor there is not.
+			const legacyKey = client.key(LEGACY_EMERGENCY_KEY);
+			await withBreaker(b, () => scanUnlinkExcept(redis, client.key(bucketPrefix + suffix),
+				(key) => key === legacyKey, unlinkLegacyBucket));
 		},
 
 		// Operator surface for the fleet-wide emergency factor. `set(0.2)`
