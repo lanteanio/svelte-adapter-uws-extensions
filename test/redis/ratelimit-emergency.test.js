@@ -94,6 +94,24 @@ describe('ratelimit emergency scale', () => {
 			expect(await client.redis.exists(legacy)).toBe(0);
 		});
 
+		it('scans once when the cleared keyspace cannot hold the earlier key', async () => {
+			const scan = vi.spyOn(client.redis, 'scan');
+			const passes = () => scan.mock.calls.filter(([cursor]) => String(cursor) === '0').length;
+			const tenanted = createRateLimit(client, { points: 10, interval: 60000, tenant: () => 'tenant' });
+			await tenanted.consume(mockWs());
+			await tenanted.clear('tenant');
+			expect(passes()).toBe(1);
+			scan.mockClear();
+			const sliding = createRateLimit(client, { points: 10, interval: 60000, refill: 'sliding' });
+			await sliding.consume(mockWs());
+			await sliding.clear();
+			expect(passes()).toBe(1);
+			scan.mockClear();
+			const window = createRateLimit(client, { points: 10, interval: 60000 });
+			await window.clear();
+			expect(passes()).toBe(2);
+		});
+
 		it('set/get/clear round-trips the shared key', async () => {
 			const emergency = createRateLimitEmergency(client);
 			expect(await emergency.get()).toBe(1);
