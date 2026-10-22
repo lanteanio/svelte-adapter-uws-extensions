@@ -296,6 +296,67 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		await until(() => !a.authority.has(TOPIC));
 	});
 
+	/** Hold every update `inst` publishes until the returned release() runs. */
+	function holdUpdates(inst) {
+		const publish = client.redis.publish;
+		const held = [];
+		client.redis.publish = function (channel, message) {
+			if (message.includes(inst.crdt.instanceId) && message.includes('"k":"u"')) {
+				return new Promise((resolve, reject) => held.push(() => publish.call(this, channel, message).then(resolve, reject)));
+			}
+			return publish.call(this, channel, message);
+		};
+		return {
+			held,
+			release() {
+				client.redis.publish = publish;
+				for (const send of held.splice(0)) send();
+			}
+		};
+	}
+
+	it('refuses persistence while Redis has not confirmed the relay of a local edit', async () => {
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({}, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+		const hold = holdUpdates(a);
+		a.edit(TOPIC, 'u1', 1); // the publish hangs, like a command queued while offline
+		await settle();
+		expect(hold.held).toHaveLength(1);
+		const started = Date.now();
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(Date.now() - started).toBeLessThan(1000); // bounded by the sync window
+		hold.release();
+		await until(() => 'u1' in b.items(TOPIC));
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+	});
+
+	it('keeps a topic marked until Redis confirmed the resync that carries its lost edit', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({ breaker }, quiet);
+		const b = instance({}, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		breaker.failure(new Error('redis down'));
+		a.edit(TOPIC, 'u1', 1); // refused: the topic is marked
+		await settle();
+		const hold = holdUpdates(a);
+		breaker.reset(); // the resync pushes the full state, which hangs
+		await settle();
+		expect(hold.held).toHaveLength(1);
+		await expect(a.crdt.acquirePersist(TOPIC)).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+		expect(b.items(TOPIC)).toEqual({});
+		hold.release();
+		await until(() => 'u1' in b.items(TOPIC));
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+	});
+
 	it('ends a lease sync round as soon as every peer answered, including peers that hold nothing', async () => {
 		const a = instance({ persistLeaseMs: 30000 });
 		const b = instance({ persistLeaseMs: 30000 });

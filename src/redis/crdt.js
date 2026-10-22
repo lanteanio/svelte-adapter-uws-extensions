@@ -89,6 +89,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
 import { isCluster } from '../shared/cluster.js';
+import { operationError } from '../shared/errors.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_UPDATE = 'u';
@@ -185,8 +186,11 @@ export function createCrdtCluster(client, options = {}) {
 	const known = new Map();
 	let sweepAt = KNOWN_SWEEP_MIN;
 	let sweepScheduled = false;
-	/** @type {Set<string>} topics holding local edits the peers may lack */
-	const unrelayed = new Set();
+	/** @type {Map<string, number>} topics holding local edits the peers may lack -> when last marked */
+	const unrelayed = new Map();
+	let marks = 0;
+	/** @type {Map<string, Set<Promise<number | null>>>} topic -> update publishes Redis has not confirmed */
+	const inflight = new Map();
 	/** @type {Set<string>} topics whose replica may lack edits the peers sent */
 	const stale = new Set();
 	/** @type {Map<string, Map<string, { declKey: string, v: any[], c: string | undefined }>>} topic -> requester -> a sync reply the relay lost */
@@ -263,7 +267,7 @@ export function createCrdtCluster(client, options = {}) {
 		const topic = obj.t;
 		if (typeof topic === 'string' && known.has(topic)) {
 			if (obj.k === KIND_SYNC_REQUEST) stale.add(topic);
-			else if (obj.k === KIND_UPDATE && Array.isArray(obj.b) && obj.b.length > 0) unrelayed.add(topic);
+			else if (obj.k === KIND_UPDATE && Array.isArray(obj.b) && obj.b.length > 0) unrelayed.set(topic, ++marks);
 			else if (obj.k === KIND_SYNC_REPLY && Array.isArray(obj.b) && obj.b.length > 0 && typeof obj.to === 'string') {
 				// The requester lacks this instance's state, but no local
 				// edit is at risk: answer it again once the relay recovers.
@@ -295,7 +299,47 @@ export function createCrdtCluster(client, options = {}) {
 			relayLost(obj, err);
 			return null;
 		});
-		return subscriberReady ? subscriberReady.then(send) : send();
+		const sent = subscriberReady ? subscriberReady.then(send) : send();
+		if (obj.k === KIND_UPDATE && typeof obj.t === 'string') {
+			// Persistence waits for these: an edit is not safe to unload
+			// until Redis confirmed its relay.
+			const topic = obj.t;
+			let pending = inflight.get(topic);
+			if (!pending) inflight.set(topic, pending = new Set());
+			pending.add(sent);
+			sent.then(() => {
+				pending.delete(sent);
+				if (pending.size === 0 && inflight.get(topic) === pending) inflight.delete(topic);
+			});
+		}
+		return sent;
+	}
+
+	/** The rejection while a topic's local edits have not reached the peers. */
+	function relayPending() {
+		const err = operationError('CRDT_RELAY_PENDING', 'crdt: local edits to the document have not reached the other instances');
+		if (lastRelayError !== null) err.cause = lastRelayError;
+		return err;
+	}
+
+	/**
+	 * Wait, at most the sync window, for the topic's update publishes started
+	 * before this call; rejects while one of them is still unconfirmed.
+	 */
+	async function awaitRelayed(topic) {
+		const pending = inflight.get(topic);
+		if (!pending) return;
+		const started = [...pending];
+		let timer = null;
+		await Promise.race([
+			Promise.all(started),
+			new Promise((resolve) => {
+				timer = setTimer(resolve, syncWindowMs);
+				if (timer && timer.unref) timer.unref();
+			})
+		]);
+		if (timer !== null) clearTimer(timer);
+		if (started.some((p) => pending.has(p))) throw relayPending();
 	}
 
 	/** Bring up the relay subscriber once; idempotent. */
@@ -434,14 +478,21 @@ export function createCrdtCluster(client, options = {}) {
 			unrelayed.delete(topic);
 			return null;
 		}
-		const push = unrelayed.delete(topic);
+		// The mark stays until Redis confirmed the push, and a loss recorded
+		// meanwhile keeps it.
+		const mark = unrelayed.get(topic);
 		/** @type {any} */
 		const round = { id: randomBytes(6).toString('hex'), topic, expected: null, replied: new Set(), done: false, timer: null, resolve: null, promise: null, sent: null };
 		round.promise = new Promise((resolve) => { round.resolve = resolve; });
 		rounds.set(topic, round);
 		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
 		if (round.timer && round.timer.unref) round.timer.unref();
-		const pushed = push ? publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }) : Promise.resolve(0);
+		const pushed = mark === undefined
+			? Promise.resolve(0)
+			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }).then((p) => {
+				if (p !== null && unrelayed.get(topic) === mark) unrelayed.delete(topic);
+				return p;
+			});
 		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) });
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
 			if (p === null || n === null) {
@@ -490,7 +541,7 @@ export function createCrdtCluster(client, options = {}) {
 	function recover() {
 		if (destroyed) return;
 		if (wired && !subscriber) ensureSubscriber();
-		for (const topic of unrelayed) queue.add(topic);
+		for (const topic of unrelayed.keys()) queue.add(topic);
 		for (const topic of stale) queue.add(topic);
 		pump();
 		answerOwed();
@@ -591,10 +642,12 @@ export function createCrdtCluster(client, options = {}) {
 		 * write; false when another instance holds it (skip - that instance
 		 * persists). A newly acquired lease, and one renewed while a resync of
 		 * the topic runs, first waits for a sync round with the peers (bounded
-		 * to a third of the lease TTL). Throws on a Redis error, and while
-		 * local edits to the topic have not reached the peers, so the caller's
-		 * persistence schedule retries rather than dropping the write or
-		 * unloading the only replica holding those edits.
+		 * to a third of the lease TTL). Throws on a Redis error, and with
+		 * code `CRDT_RELAY_PENDING` while local edits to the topic have not
+		 * reached the peers (a relay that failed, or one Redis has not
+		 * confirmed within that window), so the caller's persistence schedule
+		 * retries rather than dropping the write or unloading the only
+		 * replica holding those edits.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
@@ -605,8 +658,10 @@ export function createCrdtCluster(client, options = {}) {
 				await syncRound(topic);
 				synced = true;
 				if (destroyed) return false;
-				if (unrelayed.has(topic)) throw lastRelayError ?? new Error('crdt relay unavailable');
 			}
+			await awaitRelayed(topic);
+			if (destroyed) return false;
+			if (unrelayed.has(topic)) throw relayPending();
 			const key = client.key('crdt:persist:' + topic);
 			const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
 			if (r !== 'OK') {
@@ -631,6 +686,7 @@ export function createCrdtCluster(client, options = {}) {
 			for (const round of [...rounds.values()]) finishRound(round);
 			queue.clear();
 			unrelayed.clear();
+			inflight.clear();
 			stale.clear();
 			owed.clear();
 			known.clear();

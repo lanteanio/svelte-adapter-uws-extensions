@@ -53,6 +53,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `CURSOR_TOPIC_CAPACITY_EXCEEDED` | Redis cursor update | The instance local-topic allowance is full. |
 | `CURSOR_CONNECTION_CAPACITY_EXCEEDED` | Redis cursor connection state | The instance local-connection allowance is full. |
 | `RELAY_ENVELOPE_TOO_LARGE` | Registry and Redis bus relay admission | The complete encoded envelope exceeds the configured peer limit. Bus batch failures remain RangeError; registry failures remain Error. |
+| `CRDT_RELAY_PENDING` | Redis CRDT coordinator `acquirePersist` | Local edits to the document have not reached the other instances, because a relay failed or Redis has not confirmed it. The persistence schedule retries; the replica stays loaded. |
 
 Task handler errors retain their code through worker-thread transport, state-change events, persisted JSON and `runner.await(taskId)`. Reconstructed errors preserve `name`, `message` and `code`, but are generic `Error` objects: do not rely on `instanceof LockLostError`, for example, after a worker or database boundary. Handler-supplied string codes are preserved.
 

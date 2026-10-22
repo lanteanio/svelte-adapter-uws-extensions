@@ -61,9 +61,10 @@ export interface CrdtCluster {
 	 * false when another instance holds it (skip). A newly acquired lease, and
 	 * one renewed while a resync of the topic runs, first waits for a sync
 	 * round with the peers (at most a third of `persistLeaseMs`). Rejects on a
-	 * Redis error, and while local edits to the topic have not reached the
-	 * peers, so the caller's persistence schedule retries and keeps the
-	 * replica loaded.
+	 * Redis error, and with code `CRDT_RELAY_PENDING` while local edits to the
+	 * topic have not reached the peers (a relay that failed, or one Redis has
+	 * not confirmed within that window), so the caller's persistence schedule
+	 * retries and keeps the replica loaded.
 	 */
 	acquirePersist(topic: string): Promise<boolean>;
 	/** Tear down the relay subscriber. Idempotent. */

@@ -19,6 +19,7 @@ const invalidInputs = {
 		'createForgetStore: pass a map or array of stores',
 		'createForgetStore: options.redis must be an ioredis instance (or a client wrapping one on .redis)'
 	],
+	'redis/crdt.js': [],
 	'redis/cursor.js': [
 		'redis cursor: select() must return JSON-serializable data',
 		'Topic must not contain quotes, backslashes, or control characters',
