@@ -303,6 +303,25 @@ export function closeConnection(conn) {
 }
 
 /**
+ * Make `conn.disconnect()` end a connection that waits between two reconnect
+ * attempts, as {@link closeConnection} does, so an application calling it
+ * directly gets 'end' and rejected commands instead of a connection stuck in
+ * 'reconnecting'. `disconnect(true)` keeps ioredis's behaviour.
+ *
+ * @param {any} conn
+ */
+export function endOnDisconnectBetweenAttempts(conn) {
+	const disconnect = conn.disconnect;
+	if (typeof disconnect !== 'function') return;
+	conn.disconnect = function (reconnect = false) {
+		const betweenAttempts = !reconnect && this.status === 'reconnecting';
+		const result = disconnect.call(this, reconnect);
+		if (betweenAttempts && this.status === 'reconnecting') endBetweenAttempts(this);
+		return result;
+	};
+}
+
+/**
  * End a connection whose next reconnect attempt disconnect() just cancelled,
  * with the two methods ioredis's own close path runs. Its typings mark them
  * private, so test/shared/redis-subscriber-close.test.js drives this against

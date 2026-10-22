@@ -8,7 +8,7 @@
  */
 
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
-import { closeConnection } from '../shared/redis-subscriber.js';
+import { closeConnection, endOnDisconnectBetweenAttempts } from '../shared/redis-subscriber.js';
 import Redis from 'ioredis';
 import { ConnectionError, TimeoutError } from '../shared/errors.js';
 import { MAX_REDIS_DUPLICATES_PER_CLIENT, MAX_REDIS_QUEUED_COMMANDS } from '../shared/caps.js';
@@ -307,6 +307,7 @@ export function createRedisClient(options = {}) {
 	}
 
 	boundOfflineQueue(redis, options.options?.enableOfflineQueue === true);
+	endOnDisconnectBetweenAttempts(redis);
 
 	// Without a listener ioredis prints its own unindexed "Unhandled error
 	// event" line, with the connection error unredacted.
@@ -365,6 +366,7 @@ export function createRedisClient(options = {}) {
 			// Subscriber connections must buffer their initial/reconnect admission.
 			const dup = redis.duplicate({ enableOfflineQueue: true, ...overrides });
 			boundOfflineQueue(dup, true);
+			endOnDisconnectBetweenAttempts(dup);
 			duplicates.add(dup);
 			if (duplicates.size >= MAX_REDIS_DUPLICATES_PER_CLIENT && !duplicatesWarnFired) {
 				duplicatesWarnFired = true;

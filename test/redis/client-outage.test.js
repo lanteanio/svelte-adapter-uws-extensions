@@ -244,3 +244,32 @@ it('rejects user commands named like handshake commands when the connection drop
 		await new Promise(resolve => server.close(resolve));
 	}
 });
+
+it.each(['client', 'duplicate'])('disconnect() between reconnect attempts ends the %s connection and rejects its queue', async (kind) => {
+	const server = createServer(socket => { socket.destroy(); });
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const client = createRedisClient({
+		url: 'redis://127.0.0.1:' + server.address().port,
+		autoShutdown: false,
+		options: { lazyConnect: true, retryStrategy: () => 60000, commandTimeout: 60000 }
+	});
+	const connection = kind === 'client' ? client.redis : client.duplicate({ lazyConnect: true });
+	try {
+		connection.connect().catch(() => {});
+		const queued = connection.get('between-attempts').then(() => 'resolved', error => error);
+		await vi.waitFor(() => expect(connection.status).toBe('reconnecting'), { timeout: 2000 });
+		const ended = new Promise(resolve => connection.once('end', () => resolve('end')));
+		connection.disconnect();
+		const pending = new Promise(resolve => setTimeout(resolve, 500, 'pending'));
+		expect(await Promise.race([ended, pending])).toBe('end');
+		expect(connection.status).toBe('end');
+		const error = await Promise.race([queued, pending]);
+		expect(error).toBeInstanceOf(Error);
+		expect(error.message).toMatch(/closed/i);
+		await client.quit();
+	} finally {
+		connection.disconnect();
+		client.redis.disconnect();
+		await new Promise(resolve => server.close(resolve));
+	}
+});
