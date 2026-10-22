@@ -237,8 +237,10 @@ families: `replay:epoch:{<topic>}`; `presence:pending:{<topic>}`, the private
 identity generations and committed-identity fence that every join writes
 (excluded from roster reads); the idempotency and session erasure indexes under
 `<keyPrefix>byuser:` (`idem:byuser:v2...` and `sess:byuser:...` with the default
-prefixes) when erasure is wired; `lock-fences:<key>` for fenced locks; and
-`v1:ratelimit-control:emergency` for the emergency scale.
+prefixes) when erasure is wired; `lock-fences:<key>` for fenced locks;
+`v1:ratelimit-tenant:`, `v1:ratelimits-tenant:` and `v1:ratelimitg-tenant:` for
+`budget: 'tenant'` rate limits; and `v1:ratelimit-control:emergency` for the
+emergency scale.
 
 **Action.** Grant the families your deployment uses. Key patterns sit under the
 client `keyPrefix`; where a factory has its own `keyPrefix` option, its default
@@ -256,7 +258,7 @@ is shown and a custom value replaces it:
 | Connection registry | `conns:*`, `sess:*` (factory `keyPrefix` defaults to empty) |
 | Locks, leader, task fences | `lock:*`, `lock-fences:*`, `leader`, `fence:*` |
 | Cluster clock, topic broadcast | `clock:leader-offset`, `{topic-broadcast}:instances` |
-| Rate limits | `v1:ratelimit:*`, `v1:ratelimit-control:*`, `v1:ratelimits:*`, `v1:ratelimitg:*`, `v1:ratelimitc:*`, `v1:upgrade-bucket:*` |
+| Rate limits | `v1:ratelimit:*`, `v1:ratelimits:*`, `v1:ratelimitg:*` (per principal), `v1:ratelimit-tenant:*`, `v1:ratelimits-tenant:*`, `v1:ratelimitg-tenant:*` (`budget: 'tenant'`), `v1:ratelimitc:*` (composite), `v1:ratelimit-control:*`, `v1:upgrade-bucket:*` |
 | Webhook controls | `whbudget:*`, `whbreaker:*` |
 
 Channels need their own `&` patterns. The bus `channel` (`uws:pubsub`), the
@@ -327,21 +329,31 @@ and the rule fails closed.
 **Action.** Enable `clusterTopPublisher` only after the whole fleet runs 0.6,
 or accept the shedding for the length of the rollout. A stopped 0.5 instance's
 slice stops counting after `staleAfter`.
+
 ### The rate-limit emergency factor moved to its own key
 
 **Symptom.** A Redis ACL that permits only `v1:ratelimit:*` refuses
-`emergency.set()`, and a backup that lists only the old key misses the factor.
+`emergency.set()` and `emergency.clear()`, and a backup that lists only the old
+key misses the factor. During a rolling upgrade, instances still on the earlier
+version ignore a factor set from an upgraded instance, and one they were already
+applying drops back to `1` (the full budget) as soon as an upgraded instance
+calls `emergency.set()` or `emergency.clear()`.
 
 **Why.** The fleet-wide factor moved from `v1:ratelimit:emergency`, inside the
 fixed-window bucket keyspace, to `v1:ratelimit-control:emergency`, so a bucket
-named `emergency` and a limiter `clear()` can no longer reach it. A factor
-stored at the old key keeps applying while no new factor is set. Until the whole
-fleet is upgraded, an instance on an earlier version reads only the old key and
-does not see a factor set by an upgraded instance.
+named `emergency` and a limiter `clear()` can no longer reach it. Upgraded
+instances read the new key first and fall back to a factor stored at the old
+key while no new factor is set. Instances on the earlier version read only the
+old key, and an upgraded `set()` or `clear()` deletes a factor stored there, so
+mid-incident a factor set from an upgraded instance lifts the clamp on every
+instance not yet upgraded.
 
 **Action.** Permit `v1:ratelimit-control:*` under the client prefix in Redis ACL
-key patterns and backup scope before upgrading, and set incident factors from an
-upgraded instance once the rollout completes.
+key patterns and backup scope before upgrading. Finish the rollout before
+changing the factor. If a factor has to change while both versions run, set it
+from an upgraded instance first and then from an instance on the earlier
+version, which writes the old key again. A `clear()` from an upgraded instance
+removes the factor at both keys.
 
 ### Ordered alarm generations
 

@@ -167,6 +167,15 @@ it('classifies the emergency policy keys by name and type', async () => {
 	expect(report.redis.observations['rate-window']).toMatchObject({ keys: 1, wrongTypes: 0 });
 	expect(report.redis.observations['emergency-scale']).toMatchObject({ keys: 1, wrongTypes: 0 });
 });
+it('classifies tenant-budget rate-limit buckets apart from principal buckets', async () => {
+	const keys = { 'v1:ratelimit-tenant:acme': 'hash', 'v1:ratelimits-tenant:acme': 'hash', 'v1:ratelimitg-tenant:acme': 'hash', 'v1:ratelimit:acme': 'hash' };
+	const families = ['rate-window', 'rate-window-tenant', 'rate-sliding-tenant', 'rate-gcra-tenant'];
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families } }, {
+		redis: { scan: async () => ['0', Object.keys(keys)], type: async key => keys[key], pttl: async () => -1 }
+	});
+	expect(report.redis.matchedKeys).toBe(4);
+	for (const id of families) expect(report.redis.observations[id]).toMatchObject({ keys: 1, wrongTypes: 0 });
+});
 it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], cluster: 'true' } })).toThrow();
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();

@@ -599,6 +599,42 @@
 			"notes": "Restore rate-control state with original expiry."
 		},
 		{
+			"id": "rate-window-tenant",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimit-tenant:<key>"
+				}
+			],
+			"notes": "Shared fixed-window tenant allowance for budget 'tenant'; restore with original expiry."
+		},
+		{
+			"id": "rate-sliding-tenant",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimits-tenant:<key>"
+				}
+			],
+			"notes": "Shared sliding tenant allowance for budget 'tenant'; restore with original expiry."
+		},
+		{
+			"id": "rate-gcra-tenant",
+			"restore": "reconcile",
+			"roles": [
+				{
+					"id": "bucket",
+					"type": "hash",
+					"template": "v1:ratelimitg-tenant:<key>"
+				}
+			],
+			"notes": "Shared GCRA tenant allowance for budget 'tenant'; restore with original expiry."
+		},
+		{
 			"id": "rate-composite",
 			"restore": "reconcile",
 			"roles": [
