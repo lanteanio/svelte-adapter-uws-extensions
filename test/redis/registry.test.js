@@ -1842,7 +1842,7 @@ describe('redis connection registry', () => {
 			}
 		});
 
-		it('leaves a row a newer owner wrote before the close arrived', async () => {
+		it('leaves a row a newer owner wrote before the close arrived and stops claiming the user', async () => {
 			const opts = {
 				identify: (ws) => ws.getUserData()?.userId,
 				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
@@ -1865,19 +1865,137 @@ describe('redis connection registry', () => {
 					return publish(channel, message);
 				});
 				await b.hooks.close(onB);
-				await new Promise((r) => setImmediate(r));
 
+				// The refused restore withdraws A's interim claim on the user.
+				await expect.poll(() => a.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
 				expect(await client.redis.hgetall(rowKey)).toMatchObject({ instanceId: 'newer-instance', sessionId: 'sn' });
 				expect(spy.mock.calls.filter(([, m]) => String(m).includes('"open"'))).toHaveLength(0);
 				spy.mockRestore();
-
-				await a.sendTo({ tenantId: 't' }, 'room', 'ping', 1);
-				expect(pa.sent.filter((f) => f.ws === onA && f.event === 'ping')).toHaveLength(1);
 			} finally {
 				await a.destroy();
 				await b.destroy();
 			}
 		});
+
+		it('announces a restore before a reopen that lands after it, so peers route to the newest socket', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const a = createConnectionRegistry(client, opts);
+			const b = createConnectionRegistry(client, opts);
+			const peer = createConnectionRegistry(client, opts);
+			const pa = mockPlatform();
+			const pb = mockPlatform();
+			try {
+				const onA = wsWithSession({ userId: 'u', tenantId: 't' }, 'sa');
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				const onB2 = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb2');
+				await a.hooks.open(onA, { platform: pa });
+				await b.hooks.open(onB, { platform: pb });
+				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+
+				// B reopens the user after A's restore ran in Redis but before
+				// A reads the reply.
+				const evalScript = client.redis.eval.bind(client.redis);
+				let reopened = false;
+				const evalSpy = vi.spyOn(client.redis, 'eval').mockImplementation(async (script, ...args) => {
+					const result = await evalScript(script, ...args);
+					if (!reopened && String(script).includes('REGISTRY_REFRESH')) {
+						reopened = true;
+						await b.hooks.open(onB2, { platform: pb });
+					}
+					return result;
+				});
+				const publishSpy = vi.spyOn(client.redis, 'publish');
+				await b.hooks.close(onB);
+
+				const opens = () => publishSpy.mock.calls
+					.map(([, m]) => JSON.parse(String(m)))
+					.filter((e) => e.type === 'open' && e.userId === 'u')
+					.map((e) => e.instanceId);
+				await expect.poll(() => reopened).toBe(true);
+				await expect.poll(() => opens().includes(a.instanceId) && opens().includes(b.instanceId)).toBe(true);
+				const announced = opens();
+				evalSpy.mockRestore();
+				publishSpy.mockRestore();
+
+				expect(announced).toEqual([a.instanceId, b.instanceId]);
+				expect((await client.redis.hgetall(client.key('conns:u'))).instanceId).toBe(b.instanceId);
+				await peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1);
+				await expect.poll(() => pb.sent.some((f) => f.ws === onB2 && f.event === 'ping')).toBe(true);
+				expect(pa.sent.some((f) => f.event === 'ping')).toBe(false);
+			} finally {
+				await a.destroy();
+				await b.destroy();
+				await peer.destroy();
+			}
+		});
+
+		for (const [label, forgetFirst] of [
+			['an erasure that lands between the close and the restore', false],
+			['an erasure announced before the restore reply', true]
+		]) {
+			it(`does not resurrect a user after ${label}`, async () => {
+				const opts = {
+					identify: (ws) => ws.getUserData()?.userId,
+					attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+				};
+				const a = createConnectionRegistry(client, opts);
+				const b = createConnectionRegistry(client, opts);
+				const peer = createConnectionRegistry(client, opts);
+				const pa = mockPlatform();
+				const rowKey = client.key('conns:u');
+				try {
+					const onA = wsWithSession({ userId: 'u', tenantId: 't' }, 'sa');
+					const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+					await a.hooks.open(onA, { platform: pa });
+					await b.hooks.open(onB, { platform: mockPlatform() });
+					await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+
+					// The eraser's DEL reaches Redis before A's restore. A learns of
+					// the forget either after handling the restore reply or before.
+					const evalScript = client.redis.eval.bind(client.redis);
+					const publish = client.redis.publish.bind(client.redis);
+					/** @type {Promise<number> | null} */
+					let purge = null;
+					/** @type {Promise<unknown> | null} */
+					let restore = null;
+					const publishSpy = vi.spyOn(client.redis, 'publish').mockImplementation(async (channel, message) => {
+						if (!forgetFirst && restore && String(message).includes('"forget"')) {
+							// Deliver once A's reply handler has run.
+							await restore;
+							await new Promise((r) => setImmediate(r));
+						}
+						return publish(channel, message);
+					});
+					const evalSpy = vi.spyOn(client.redis, 'eval').mockImplementation(async (script, ...args) => {
+						if (purge === null && String(script).includes('REGISTRY_REFRESH')) {
+							let done;
+							restore = new Promise((r) => { done = r; });
+							purge = peer.purgeUser(null, 'u');
+							if (forgetFirst) await purge;
+							try { return await evalScript(script, ...args); } finally { done(); }
+						}
+						return evalScript(script, ...args);
+					});
+					await b.hooks.close(onB);
+					await expect.poll(() => purge !== null).toBe(true);
+					await purge;
+
+					await expect.poll(() => client.redis.exists(rowKey)).toBe(0);
+					evalSpy.mockRestore();
+					publishSpy.mockRestore();
+					await expect.poll(() => peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+					expect(await a.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+					expect(pa.sent.some((f) => f.event === 'ping')).toBe(false);
+				} finally {
+					await a.destroy();
+					await b.destroy();
+					await peer.destroy();
+				}
+			});
+		}
 	});
 	describe('subscriber: a refused SUBSCRIBE', () => {
 		const NOPERM = 'NOPERM this user has no permissions to access one of the channels';

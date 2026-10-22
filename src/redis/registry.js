@@ -75,7 +75,11 @@ return 0
 // Restore only an absent registration. A surviving older socket must never
 // replace a newer owner or keep that owner's abandoned row alive forever.
 // Replies 2 when it restored the row, 1 when it renewed this instance's row,
-// 0 when another owner or transport holds it.
+// 0 when another owner or transport holds it. A restore announces the open
+// on ARGV[6] (empty when the registry keeps no attribute index) from inside
+// the script, so the announcement takes the row's place in Redis order: a
+// newer owner's open, written after the restore, is also announced after it.
+// ARGV[7] is the JSON-encoded userId; the envelope matches the open hook's.
 const REGISTRATION_RESTORED = 2;
 const REFRESH_REGISTRATION = `
 -- REGISTRY_REFRESH
@@ -85,6 +89,11 @@ if not current then
   if ARGV[4] ~= '' then redis.call('hset', KEYS[1], 'attrs', ARGV[4])
   else redis.call('hdel', KEYS[1], 'attrs') end
   redis.call('expire', KEYS[1], ARGV[5])
+  if ARGV[6] ~= '' then
+    local attrs = ARGV[4]
+    if attrs == '' then attrs = '{}' end
+    redis.call('publish', ARGV[6], '{"type":"open","userId":' .. ARGV[7] .. ',"instanceId":"' .. ARGV[1] .. '","attrs":' .. attrs .. '}')
+  end
   return 2
 elseif current ~= ARGV[1] or redis.call('hget', KEYS[1], 'sessionId') ~= ARGV[2] then
   return 0
@@ -437,36 +446,49 @@ export function createConnectionRegistry(client, options) {
 	/**
 	 * A peer that was the user's most recent owner closed them, which deleted
 	 * the Redis row and unindexed the user everywhere, though the user still
-	 * has a socket here. Index the user locally at once and run the heartbeat's
-	 * restore for this one registration now instead of on the next tick. The
-	 * restore writes the row only while it is absent, so a newer owner that
-	 * registered meanwhile keeps it; a restore that lands announces an open.
+	 * has a socket here. Run the heartbeat's restore for this one registration
+	 * now instead of on the next tick. The restore writes the row only while it
+	 * is absent, so a newer owner that registered meanwhile keeps it, and a
+	 * restore that lands announces the open from inside the script.
+	 *
+	 * Until the reply, the user is indexed here under a pending lease so local
+	 * `sendTo` keeps reaching the socket. Any open or close for the user
+	 * replaces the lease; one still in place when the restore did not land is
+	 * withdrawn, because the row then names another owner (or none) and this
+	 * instance must not keep claiming the user. A restore that lands after the
+	 * user left this instance, for example by a forget, is dropped again.
 	 * @param {string} userId
 	 */
 	function restoreLocalUser(userId) {
 		const command = localRefresh.get(userId);
 		if (destroyed || command === undefined) return;
-		applyOpenEvent(userId, instanceId, parseAttrsField(command[6]));
-		// A refused or failed restore is retried by the next heartbeat.
+		// A refused restore is retried by the next heartbeat.
 		if (!withBreakerGuard()) return;
+		applyOpenEvent(userId, instanceId, parseAttrsField(command[6]));
+		const lease = { owner: instanceId, expiresAt: Infinity };
+		remoteIndex.set(userId, lease);
+		const withdraw = () => {
+			if (remoteIndex.get(userId) === lease) removeIndex(userId);
+		};
 		/** @type {Promise<any>} */ (redis[command[0]](...command.slice(1))).then(
-			(result) => { breaker?.success(); if (result === REGISTRATION_RESTORED) registrationRestored(command); },
-			(err) => breaker?.failure(err)
+			(result) => {
+				breaker?.success();
+				if (result !== REGISTRATION_RESTORED) withdraw();
+				else if (!localUsers.has(userId)) dropOwnRow(userId);
+			},
+			(err) => { breaker?.failure(err); withdraw(); }
 		);
 	}
 
 	/**
-	 * Peers dropped the user on the close that removed the row, so a restored
-	 * row is announced like an open. Without `attributes` there is no index
-	 * and no events channel; the row alone restores routing.
-	 * @param {any[]} command the user's registration snapshot
+	 * Delete this instance's row for a user it no longer holds and announce
+	 * the close, so peers that indexed an open for it drop the user again.
+	 * @param {string} userId
 	 */
-	function registrationRestored(command) {
-		if (!attributes || !currentRefresh(command)) return;
-		const userId = command[2].slice(userKeyPrefix.length);
-		const attrs = parseAttrsField(command[6]);
-		applyOpenEvent(userId, instanceId, attrs);
-		publishEvent({ type: 'open', userId, instanceId, attrs });
+	function dropOwnRow(userId) {
+		if (destroyed) return;
+		deleteIfOurs(userId);
+		if (attributes) publishEvent({ type: 'close', userId, instanceId });
 	}
 
 	// Right-to-erasure (`live.forget`): clear EVERY in-memory trace of a user on
@@ -477,15 +499,29 @@ export function createConnectionRegistry(client, options) {
 	// owner shadow (localUsers + its paired sessionToWs entry). App-session maps
 	// are keyed by app-session id (no userId link) and are ws-bound, so they
 	// clear on the user's own disconnect.
+	//
+	// Returns whether this instance held a registration for the user.
 	function applyForgetEvent(userId) {
 		indexChecks.delete(userId);
 		removeIndex(userId);
 		const sessionId = localUsers.get(userId);
-		if (sessionId !== undefined) {
-			localUsers.delete(userId);
-			localRefresh.delete(userId);
-			sessionToWs.delete(sessionId);
-		}
+		if (sessionId === undefined) return false;
+		localUsers.delete(userId);
+		localRefresh.delete(userId);
+		sessionToWs.delete(sessionId);
+		return true;
+	}
+
+	/**
+	 * A forget from another instance. A restore or heartbeat refresh this
+	 * instance already sent can land after the eraser's DEL and write the row
+	 * back, so drop any row this instance holds with a compare-and-delete on
+	 * the same connection, which Redis runs after anything sent before it, and
+	 * announce the close so peers that indexed a restored open drop it again.
+	 * @param {string} userId
+	 */
+	function applyRemoteForget(userId) {
+		if (applyForgetEvent(userId)) dropOwnRow(userId);
 	}
 
 	/**
@@ -546,7 +582,19 @@ export function createConnectionRegistry(client, options) {
 		const key = userKey(userId);
 		const now = cachedNow();
 		const rawAttrs = attrs && Object.keys(attrs).length > 0 ? JSON.stringify(attrs) : '';
-		localRefresh.set(userId, [evalCachedName(redis, REFRESH_REGISTRATION), 1, key, instanceId, sessionId, now, rawAttrs, ttl]);
+		// A restore announces the open from the script. An envelope every peer
+		// would drop as oversized is not announced, as publishEvent drops it.
+		let announceChannel = '';
+		if (attributes) {
+			try {
+				encodeEnvelope({ type: 'open', userId, instanceId, attrs: attrs || {} });
+				announceChannel = eventsChannel;
+			} catch { /* over maxEnvelopeBytes */ }
+		}
+		localRefresh.set(userId, [
+			evalCachedName(redis, REFRESH_REGISTRATION), 1, key,
+			instanceId, sessionId, now, rawAttrs, ttl, announceChannel, announceChannel ? JSON.stringify(userId) : ''
+		]);
 		// Pipeline HSET (+ optional HDEL when attrs are absent) and EXPIRE
 		// into a single MULTI/EXEC round-trip. Pre-fix this was 2-3 awaited
 		// round-trips, which left a half-applied state observable to other
@@ -1008,7 +1056,8 @@ export function createConnectionRegistry(client, options) {
 		} else if (type === 'close') {
 			applyCloseEvent(userId, ownerInstanceId);
 		} else if (type === 'forget') {
-			applyForgetEvent(userId);
+			if (ownerInstanceId === instanceId) applyForgetEvent(userId);
+			else applyRemoteForget(userId);
 		}
 	}
 
@@ -1031,12 +1080,6 @@ export function createConnectionRegistry(client, options) {
 		// healthy; a tick probes through its own admission.
 		admit: breaker ? () => breaker.isHealthy : null,
 		onError: (err) => breaker?.failure(err),
-		onSettled(commands, results) {
-			for (let i = 0; results && i < results.length; i++) {
-				const result = results[i];
-				if (result && !result[0] && result[1] === REGISTRATION_RESTORED) registrationRestored(commands[i]);
-			}
-		},
 		onComplete(cycle) {
 			if (cycle.total > 0 && cycle.error === null) breaker?.success();
 			// A tick that reached no owner returns the probe it was admitted with.

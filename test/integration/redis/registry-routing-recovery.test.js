@@ -114,3 +114,30 @@ it('reports a refused repair command and retries after the backend row becomes u
 	await restored(peer, 'a');
 	await reached(peer, pa, wa);
 });
+
+it('announces a row restored after a peer close from the script, so peers route sendTo to the surviving socket', async () => {
+	const attributes = () => ({ role: 'reader' });
+	const a = registry({ attributes }), b = registry({ attributes }), peer = registry({ attributes });
+	const wa = socket('a'), wb = socket('b'), pa = mockPlatform();
+	await a.hooks.open(wa, { platform: pa });
+	await b.hooks.open(wb, { platform: mockPlatform() });
+	await peer.hooks.open(mockWs({}), { platform: mockPlatform() });
+	const sub = client.duplicate();
+	const messages = [];
+	try {
+		await sub.subscribe(client.key('__registry-events'));
+		sub.on('message', (_channel, message) => messages.push(message));
+		await b.hooks.close(wb);
+		await restored(peer, 'a');
+		await expect.poll(() => messages.some(m => JSON.parse(m).type === 'open')).toBe(true);
+		expect(messages.filter(m => JSON.parse(m).type === 'open')).toEqual([
+			JSON.stringify({ type: 'open', userId: 'user', instanceId: a.instanceId, attrs: { role: 'reader' } })
+		]);
+		await expect.poll(async () => {
+			await peer.sendTo({ role: 'reader' }, 'room', 'ping', 1);
+			return pa.sent.some(f => f.ws === wa && f.event === 'ping');
+		}).toBe(true);
+	} finally {
+		await sub.quit();
+	}
+});

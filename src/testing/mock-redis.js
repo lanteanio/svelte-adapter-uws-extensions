@@ -2298,7 +2298,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		function evalRegistryRefresh(args) {
-			const [key, owner, sessionId, ts, attrs] = args;
+			const [key, owner, sessionId, ts, attrs, , channel, userIdJson] = args;
 			let h = hashes.get(key);
 			const current = h?.get('instanceId');
 			if (current === undefined) {
@@ -2307,6 +2307,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				h.set('sessionId', sessionId);
 				h.set('ts', String(ts));
 				if (attrs) h.set('attrs', attrs); else h.delete('attrs');
+				// The script announces the restored open itself.
+				if (channel) {
+					r.publish(String(channel), '{"type":"open","userId":' + userIdJson + ',"instanceId":"' + owner +
+						'","attrs":' + (attrs || '{}') + '}');
+				}
 				return 2;
 			} else if (current !== owner || h.get('sessionId') !== sessionId) return 0;
 			return 1;

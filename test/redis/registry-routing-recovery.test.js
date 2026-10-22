@@ -61,9 +61,10 @@ it('announces a heartbeat-restored row so peers route sendTo to the surviving ow
 		return evalScript(script, ...args);
 	});
 	await b.hooks.close(wb);
-	await flush();
+	await expect.poll(() => failed).toBe(1);
+	// The failed restore withdraws A's interim claim until a restore lands.
+	await expect.poll(() => a.sendTo({ tenantId: 't' }, 'room', 'interim', 0)).toBe(0);
 	spy.mockRestore();
-	expect(failed).toBe(1);
 	await peer.sendTo({ tenantId: 't' }, 'room', 'before', 1);
 	expect(pa.sent.some(f => f.event === 'before')).toBe(false);
 	await tick();
