@@ -5,6 +5,7 @@ import { mockWs } from './mock-ws.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createPresence } from '../../src/redis/presence.js';
 import { createReplay } from '../../src/redis/replay.js';
+import { openSubscriber } from '../../src/shared/redis-subscriber.js';
 
 // A real server delivers within milliseconds, but a loaded host can stall the
 // subscriber past the 1 s poll default. The count is read once delivery is
@@ -27,6 +28,19 @@ export function redisIOContract(makeClient) {
 			} finally { await raw.quit(); }
 		});
 
+		it('counts commands on subscriber connections duplicated from the client', async () => {
+			const raw = makeClient();
+			const meter = countRedisIO(raw);
+			const subscriber = openSubscriber(meter.client, 'io-self-check');
+			try {
+				meter.reset();
+				await subscriber.subscribe('io-self-check:a');
+				await subscriber.subscribe('io-self-check:b');
+				await subscriber.unsubscribe('io-self-check:a');
+				expect(meter.commands()).toEqual(['subscribe', 'subscribe', 'unsubscribe']);
+			} finally { await subscriber.quit(); await raw.quit(); }
+		});
+
 		it('coalesces publishes independently of message count', async () => {
 			const counts = [];
 			for (const size of [2, 12]) {
@@ -34,7 +48,9 @@ export function redisIOContract(makeClient) {
 				const meter = countRedisIO(raw);
 				const platform = mockPlatform();
 				const bus = createPubSubBus(meter.client);
-				const observer = raw.duplicate();
+				// No ready check: its INFO would follow a SUBSCRIBE sent while connecting
+				// and fail in subscriber mode, dropping the subscription on reconnect.
+				const observer = raw.duplicate({ enableReadyCheck: false });
 				const received = [];
 				observer.on('message', (_channel, value) => received.push(JSON.parse(value)));
 				try {
@@ -60,7 +76,7 @@ export function redisIOContract(makeClient) {
 				const raw = makeClient();
 				const meter = countRedisIO(raw);
 				const bus = createPubSubBus(meter.client);
-				const observers = Array.from({ length: size }, () => raw.duplicate());
+				const observers = Array.from({ length: size }, () => raw.duplicate({ enableReadyCheck: false }));
 				const received = observers.map(() => []);
 				try {
 					await Promise.all(observers.map(async (observer, index) => {
@@ -105,6 +121,13 @@ export function redisIOContract(makeClient) {
 			assertConstantIO(...counts, 1);
 		});
 
+		// Presence slot fan-out: every key of a topic (its roster hash, pending hash
+		// and per-user hashes) carries the `{topic}` hash tag, so a single-topic
+		// join, update or leave script and its execMultiSlot leave pipeline land on
+		// one slot and one owning master even in Cluster. A leave spanning topics
+		// on k distinct owners submits k pipelines; these budgets use one topic.
+		// The event PUBLISH is keyless and propagates cluster-wide from one node.
+		// SUBSCRIBE / UNSUBSCRIBE go out on the presence subscriber connection.
 		it('pins presence writes, unchanged updates and roster reads', async () => {
 			for (const size of [2, 12]) {
 				const raw = makeClient();
@@ -137,6 +160,42 @@ export function redisIOContract(makeClient) {
 					expect(meter.read()).toBe(1);
 				} finally { await presence.clear('room'); presence.destroy(); await raw.quit(); }
 			}
+		});
+
+		// One SUBSCRIBE when a topic gains its first local member and one
+		// UNSUBSCRIBE when it loses its last, however many members come between.
+		// The warm-up join on another topic opens the subscriber connection and
+		// runs the version probe, which these budgets exclude.
+		it('subscribes on the first join and unsubscribes on the last leave only', async () => {
+			const subscribes = [];
+			const unsubscribes = [];
+			for (const size of [2, 12]) {
+				const raw = makeClient();
+				const meter = countRedisIO(raw);
+				const platform = mockPlatform();
+				const presence = createPresence(meter.client, { key: 'id', heartbeat: 60000, consistencyAuditIntervalMs: 0, selfPreservation: false });
+				const tally = name => meter.commands().filter(command => command === name).length;
+				try {
+					await presence.join(mockWs({ id: 'warm' }), 'warm', platform);
+					const sockets = Array.from({ length: size }, (_, i) => mockWs({ id: String(i) }));
+					meter.reset();
+					await presence.join(sockets[0], 'room', platform);
+					expect(meter.read()).toBe(5);
+					expect(tally('subscribe')).toBe(1);
+					for (const ws of sockets.slice(1)) await presence.join(ws, 'room', platform);
+					expect(meter.read()).toBe(5 + 4 * (size - 1));
+					subscribes.push(tally('subscribe'));
+					meter.reset();
+					for (const ws of sockets.slice(0, -1)) await presence.leave(ws, platform, 'room');
+					expect(meter.read()).toBe(2 * (size - 1));
+					expect(tally('unsubscribe')).toBe(0);
+					await presence.leave(sockets[size - 1], platform, 'room');
+					expect(meter.read()).toBe(2 * (size - 1) + 3);
+					unsubscribes.push(tally('unsubscribe'));
+				} finally { await presence.clear('room'); await presence.clear('warm'); presence.destroy(); await raw.quit(); }
+			}
+			assertConstantIO(...subscribes, 1);
+			assertConstantIO(...unsubscribes, 1);
 		});
 	});
 }
