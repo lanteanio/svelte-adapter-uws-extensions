@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The documentation link check resolves a link that starts with `/` from the repository root, as GitHub does, in both the per-link check and the package navigation map; such a link from a nested document was previously joined to that document's directory. A link to the repository root (`/`, `./`) is accepted, `http://` and `www.` spellings of this repository's GitHub URL are rejected as non-canonical, links in table cells report their row's line, and only Markdown files are read as documents.
 - A subscriber whose Redis server stops answering is reported as `redis.subscriber.silent` and closed by the liveness check again when the client's `commandTimeout` is shorter than the 10 second PING timeout. The liveness PING carries no command deadline, so the deadline no longer closes the connection first without a report.
 - Redis client `quit()` ends connections still opening or waiting to reconnect and rejects their queued commands, so shutdown settles without requiring bus deactivation first and queued writes cannot replay later. Ready connections drain gracefully, with any intervening connection loss ending them instead of starting another attempt. A client that has begun shutdown no longer opens duplicate connections.
 

@@ -181,7 +181,11 @@ function trackedMarkdown() {
  */
 export function documentationFiles() {
 	const files = new Set(trackedMarkdown());
-	for (const relative of REPOSITORY_DOCS) addFilesBeneath(relative, files);
+	const beneath = new Set();
+	for (const relative of REPOSITORY_DOCS) addFilesBeneath(relative, beneath);
+	for (const relative of beneath) {
+		if (relative.toLowerCase().endsWith('.md')) files.add(relative);
+	}
 	for (const relative of packageFiles()) {
 		if (relative.toLowerCase().endsWith('.md')) files.add(relative);
 	}
@@ -216,11 +220,29 @@ function ownedPathStatus(relativePath) {
 
 function packageContains(relativePath, packagedFiles) {
 	const target = relativePath.replace(/\/$/, '');
-	if (packagedFiles.has(target)) return true;
+	if (target === '' || packagedFiles.has(target)) return true;
 	for (const file of packagedFiles) {
 		if (file.startsWith(target + '/')) return true;
 	}
 	return false;
+}
+
+/**
+ * The repository path a relative documentation link names. GitHub resolves a
+ * leading slash from the repository root and every other path from the
+ * linking document's directory. The empty string is the repository root, and
+ * a trailing slash is kept so a directory link stays distinguishable from a
+ * file link. A path that climbs above the root keeps its leading '../'.
+ *
+ * @param {string} source the linking document, repository-relative
+ * @param {string} decodedPath the percent-decoded path part of the link
+ * @returns {string}
+ */
+export function resolveDocumentPath(source, decodedPath) {
+	const fromRoot = decodedPath.startsWith('/');
+	const base = fromRoot ? '' : posix.dirname(source.split('\\').join('/'));
+	const resolved = posix.normalize(posix.join(base, fromRoot ? decodedPath.replace(/^\/+/, '') : decodedPath));
+	return resolved === '.' || resolved === './' ? '' : resolved;
 }
 
 /**
@@ -342,8 +364,11 @@ export function linksOf(text) {
 		return targets;
 	}
 
+	// Table cells carry no source map of their own; the row that opened them does.
+	let blockLine = 1;
 	for (const token of markdown.parse(text, {})) {
-		const line = (token.map?.[0] ?? 0) + 1;
+		if (token.map) blockLine = token.map[0] + 1;
+		const line = blockLine;
 		const targets = token.type === 'inline'
 			? inlineTargets(token.children, line)
 			: token.type === 'html_block' ? htmlTargets(token.content, line) : [];
@@ -407,6 +432,11 @@ export function checkLink(rel, target, docs, options = {}) {
 	// snapshot, so the answer is about what is public NOW, not what a future
 	// promotion will make public); `dev` is this line's branch, validated
 	// against the staged git index the doc itself rides.
+	// GitHub answers the http:// and www. spellings of this repository with a
+	// redirect, so they are never canonical and their path goes unchecked.
+	if (/^(?:http:\/\/(?:www\.)?|https:\/\/www\.)github\.com\/lanteanio\/svelte-adapter-uws-extensions(?:[/?#]|$)/i.test(target)) {
+		return `same-repo link must use the canonical https://github.com/ form: ${target}`;
+	}
 	const sameRepo = /^https:\/\/github\.com\/lanteanio\/svelte-adapter-uws-extensions\/(blob|tree|raw)\/([^/#?]+)(?:\/([^#?]*))?/i.exec(target);
 	if (sameRepo) {
 		const [, , ref, blobPath = ''] = sameRepo;
@@ -450,10 +480,11 @@ export function checkLink(rel, target, docs, options = {}) {
 	let decodedPath;
 	try { decodedPath = decodeURIComponent(encodedPath); }
 	catch { return `malformed percent escape in path: ${encodedPath}`; }
-	const resolved = posix.normalize(posix.join(posix.dirname(rel.split('\\').join('/')), decodedPath));
+	const resolved = resolveDocumentPath(rel, decodedPath);
+	const shown = resolved === '' ? '/' : resolved;
 	const status = ownedPathStatus(resolved);
-	if (status === 'outside') return `path leaves repository: ${resolved}`;
-	if (status === 'missing') return `no such file with exact case: ${resolved}`;
+	if (status === 'outside') return `path leaves repository: ${shown}`;
+	if (status === 'missing') return `no such file with exact case: ${shown}`;
 	// A trailing slash names a directory (docs/, src/shared/). The index lists
 	// files only, so a directory is present when a tracked file lives under it,
 	// and a tracked FILE named with a trailing slash is not a directory.
@@ -463,10 +494,10 @@ export function checkLink(rel, target, docs, options = {}) {
 		const present = treePath !== resolved
 			? !tracked.has(treePath) && treeContains(tracked, treePath)
 			: treeContains(tracked, treePath);
-		if (!present) return `relative target absent from the staged tree (the git index): ${resolved}`;
+		if (!present) return `relative target absent from the staged tree (the git index): ${shown}`;
 	}
 	if (options.packagedDocs?.has(rel) && options.packagedFiles && !packageContains(resolved, options.packagedFiles)) {
-		return `target omitted from package: ${resolved}`;
+		return `target omitted from package: ${shown}`;
 	}
 	if (anchor === undefined) return null;
 
@@ -490,7 +521,7 @@ export function validateDocumentationMap(docs, packagedFiles) {
 			if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(target)) continue;
 			try {
 				const route = decodeURIComponent(target.split(/[?#]/)[0]);
-				const path = posix.normalize(posix.join(posix.dirname(file), route));
+				const path = resolveDocumentPath(file, route);
 				if (docs.has(path)) targets.add(path);
 			} catch { /* The ordinary link checker reports malformed escapes. */ }
 		}

@@ -26,7 +26,8 @@ import {
 	onMainLine,
 	documentationFiles,
 	packageFiles,
-	validateDocumentationMap
+	validateDocumentationMap,
+	resolveDocumentPath
 } from '../scripts/check-links.js';
 
 describe('heading slugs follow GitHub exactly', () => {
@@ -86,6 +87,11 @@ describe('collecting the links a document makes', () => {
 		expect(linksOf('write `[label](#anchor)` to link\n')).toEqual([]);
 	});
 
+	it('reports a link inside a table cell on its own row', () => {
+		expect(linksOf('intro\n\n| a | b |\n|---|---|\n| one | two |\n| [x](#here) | three |\n'))
+			.toEqual([{ line: 6, target: '#here' }]);
+	});
+
 	it('ignores a link title', () => {
 		expect(linksOf('[x](#here "the title")\n')).toEqual([{ line: 1, target: '#here' }]);
 	});
@@ -103,6 +109,23 @@ describe('collecting the links a document makes', () => {
 			{ line: 4, target: './NOT%20HERE.md' },
 			{ line: 5, target: './ALSO-NOT-HERE.md' }
 		]);
+	});
+});
+
+describe('resolving a documentation path', () => {
+	it('resolves a leading slash from the repository root', () => {
+		expect(resolveDocumentPath('docs/guide.md', '/README.md')).toBe('README.md');
+		expect(resolveDocumentPath('docs/guide.md', '/docs/getting-started.md')).toBe('docs/getting-started.md');
+		expect(resolveDocumentPath('docs/guide.md', '/docs/')).toBe('docs/');
+		expect(resolveDocumentPath('docs/guide.md', '/')).toBe('');
+		expect(resolveDocumentPath('docs/guide.md', '/../x.md')).toBe('../x.md');
+	});
+
+	it('resolves every other path from the linking document', () => {
+		expect(resolveDocumentPath('docs/guide.md', 'getting-started.md')).toBe('docs/getting-started.md');
+		expect(resolveDocumentPath('docs/guide.md', '../README.md')).toBe('README.md');
+		expect(resolveDocumentPath('README.md', './')).toBe('');
+		expect(resolveDocumentPath('README.md', '../x.md')).toBe('../x.md');
 	});
 });
 
@@ -166,6 +189,13 @@ describe('resolving one link', () => {
 		expect(checkLink('README.md', '//example.com/x', docs)).toBe(null);
 	});
 
+	it('rejects non-canonical spellings of this repository on GitHub', () => {
+		const path = '/lanteanio/svelte-adapter-uws-extensions/blob/dev/README.md';
+		expect(checkLink('README.md', 'http://github.com' + path, docs)).toContain('canonical https://github.com/ form');
+		expect(checkLink('README.md', 'https://www.github.com' + path, docs)).toContain('canonical https://github.com/ form');
+		expect(checkLink('README.md', 'https://github.com/lanteanio/svelte-adapter-uws-extensions-fork', docs)).toBe(null);
+	});
+
 	it('decodes a percent-escaped anchor before looking it up', () => {
 		const encoded = new Map([['README.md', { anchors: new Set(['größe']) }]]);
 		expect(checkLink('README.md', '#gr%C3%B6%C3%9Fe', encoded)).toBe(null);
@@ -181,7 +211,11 @@ it('validates GitHub Markdown fragments against the named tree', () => {
 
 
 
-it('runs the CLI against tracked and packaged documentation inventories', () => {
+/**
+ * A throwaway git checkout holding a copy of the checker, so the CLI runs
+ * against a real index, package allowlist and directory layout.
+ */
+function linkFixture() {
 	const root = fileURLToPath(new URL('..', import.meta.url));
 	const workRoot = join(root, '.cross-repo-gate');
 	mkdirSync(workRoot, { recursive: true });
@@ -193,18 +227,24 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 	};
 	const git = (...args) => execFileSync('git', ['-C', work, ...args], { stdio: 'pipe', windowsHide: true });
 	const run = () => spawnSync(process.execPath, ['scripts/check-links.js'], { cwd: work, encoding: 'utf8', windowsHide: true });
+	put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs'] }));
+	put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[History](CHANGELOG.md)\n[Entries](docs/public-entries.md)\n[Guide](docs/guide.md)\n');
+	put('MIGRATION.md', '# Migration\n[Overview](README.md)\n[History](CHANGELOG.md)\n');
+	put('CHANGELOG.md', '# History\n[Overview](README.md)\n');
+	put('docs/public-entries.md', '# Entries\n[Overview](../README.md)\n');
+	put('docs/guide.md', '# Guide\n[Overview](../README.md)\n');
+	put('docs/main-source-tree.v1.json', JSON.stringify({ commit: '0'.repeat(40), paths: [], anchors: {} }));
+	put('scripts/check-links.js', readFileSync(join(root, 'scripts/check-links.js'), 'utf8'));
+	return { put, git, run, cleanup: () => rmSync(work, { recursive: true, force: true }) };
+}
+
+it('runs the CLI against tracked and packaged documentation inventories', () => {
+	const { put, git, run, cleanup } = linkFixture();
 	try {
-		put('package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', type: 'module', files: ['README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs'] }));
-		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[History](CHANGELOG.md)\n[Entries](docs/public-entries.md)\n[Guide](docs/guide.md)\n');
-		put('MIGRATION.md', '# Migration\n[Overview](README.md)\n[History](CHANGELOG.md)\n');
-		put('CHANGELOG.md', '# History\n[Overview](README.md)\n');
-		put('docs/public-entries.md', '# Entries\n[Overview](../README.md)\n');
 		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Local](../private.md)\n');
-		put('docs/main-source-tree.v1.json', JSON.stringify({ commit: '0'.repeat(40), paths: [], anchors: {} }));
 		put('.gitignore', 'ignored.md\n');
 		put('private.md', '# Local scratch\n');
 		put('ignored.md', '# Ignored scratch\n');
-		put('scripts/check-links.js', readFileSync(join(root, 'scripts/check-links.js'), 'utf8'));
 		git('init', '--initial-branch=docs-fixture');
 		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', '.gitignore', 'scripts');
 		let result = run();
@@ -229,7 +269,63 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 		result = run();
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain('target omitted from package: MIGRATION.md');
-	} finally { rmSync(work, { recursive: true, force: true }); }
+	} finally { cleanup(); }
+}, 30_000);
+
+// GitHub resolves a link that starts with a slash from the repository root,
+// not from the directory of the document holding it.
+it('resolves a leading slash from the repository root in a nested document', () => {
+	const { put, git, run, cleanup } = linkFixture();
+	try {
+		put('docs/getting-started.md', '# Start here\n## First steps\n[Overview](../README.md)\n');
+		git('init', '--initial-branch=docs-fixture');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts');
+		put('docs/guide.md', [
+			'# Guide',
+			'[Overview](/README.md)',
+			'[Overview heading](/README.md#fixture)',
+			'[Start](/docs/getting-started.md)',
+			'[Start steps](/docs/getting-started.md#first-steps)',
+			'[Docs folder](/docs/)',
+			'[Docs folder without slash](/docs)',
+			'[Repository root](/)',
+			''
+		].join('\n'));
+		let result = run();
+		expect(result.stderr).toBe('');
+		expect(result.status).toBe(0);
+		for (const [target, failure] of [
+			['/getting-started.md', 'no such file with exact case: getting-started.md'],
+			['/docs/getting-started.md#missing-steps', 'no heading in docs/getting-started.md produces #missing-steps'],
+			['/README.md#missing', 'no heading in README.md produces #missing'],
+			['/missing/', 'no such file with exact case: missing/'],
+			['/README.md/', 'relative target absent from the staged tree (the git index): README.md/'],
+			['/../outside.md', 'path leaves repository: ../outside.md'],
+			['/scripts/', 'target omitted from package: scripts/']
+		]) {
+			put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Probe](' + target + ')\n');
+			result = run();
+			expect(result.status, target).toBe(1);
+			expect(result.stderr, target).toContain('docs/guide.md:3');
+			expect(result.stderr, target).toContain(failure);
+		}
+	} finally { cleanup(); }
+}, 30_000);
+
+// Only Markdown is a document; scripts beneath a documentation directory are
+// not parsed as Markdown, so text in them cannot pass or fail as a link.
+it('reads only Markdown beneath the repository documentation directories', () => {
+	const { put, git, run, cleanup } = linkFixture();
+	try {
+		put('bench/run.mjs', '// [not a link](./missing.md)\n');
+		put('bench/README.md', '# Bench\n[Gone](./missing.md)\n');
+		git('init', '--initial-branch=docs-fixture');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts', 'bench');
+		const result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('bench/README.md:2');
+		expect(result.stderr).not.toContain('bench/run.mjs');
+	} finally { cleanup(); }
 }, 30_000);
 
 
@@ -255,6 +351,10 @@ it('protects package navigation, reciprocal parent links and reachable companion
 	const selfLinkedCatalog = new Map(source);
 	selfLinkedCatalog.set('docs/public-entries.md', { text: '[Self](public-entries.md) [Guide](guide.md)' });
 	expect(validateDocumentationMap(selfLinkedCatalog, packaged)).toContain('docs/public-entries.md needs a package overview or public-entry parent link');
+	const rooted = new Map(source);
+	rooted.set('docs/public-entries.md', { text: '[Overview](/README.md) [Guide](/docs/guide.md)' });
+	rooted.set('docs/guide.md', { text: '[Overview](/README.md)' });
+	expect(validateDocumentationMap(rooted, packaged)).toEqual([]);
 	const orphan = new Map(source); orphan.set('docs/orphan.md', { text: '[Overview](../README.md)' });
 	expect(validateDocumentationMap(orphan, packaged)).toContain('docs/orphan.md is unreachable from README.md');
 	packaged.delete('CHANGELOG.md');
