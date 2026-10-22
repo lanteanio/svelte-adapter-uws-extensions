@@ -129,6 +129,12 @@ function notificationClient() {
 	connection.end = async () => {};
 	return {
 		createClient: () => connection,
+		// The session probe goes out through the query route and comes back on
+		// the pinned session, outside any traced context.
+		query: async (text, values) => {
+			if (/pg_notify/.test(text)) queueMicrotask(() => connection.emit('notification', { channel: values[0], payload: values[1] }));
+			return { rows: [], rowCount: 0 };
+		},
 		emit: (payload) => resume(() => connection.emit('notification', { channel: 'changes', payload }))
 	};
 }
