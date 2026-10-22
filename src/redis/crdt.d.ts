@@ -11,7 +11,12 @@ export interface CrdtClusterOptions {
 	 * a sync round with the peers before the write is allowed.
 	 */
 	persistLeaseMs?: number;
-	/** Reject inbound relay envelopes larger than this BEFORE JSON.parse. Default 1048576. */
+	/**
+	 * Reject inbound relay messages larger than this BEFORE JSON.parse.
+	 * Default 1048576. A larger envelope (a big update or full document
+	 * state) is sent as parts that each fit, so every instance must use the
+	 * same value.
+	 */
 	maxEnvelopeBytes?: number;
 	/**
 	 * Optional circuit breaker. While it is open no relay is published; every

@@ -95,6 +95,14 @@ import { operationError } from '../shared/errors.js';
 const KIND_UPDATE = 'u';
 const KIND_SYNC_REQUEST = 'sreq';
 const KIND_SYNC_REPLY = 'srep';
+/** One slice of an envelope larger than `maxEnvelopeBytes`. */
+const KIND_PART = 'part';
+
+// Bounds on the envelopes being reassembled from parts: base64 characters
+// held across all of them, how many at once, and how long one may take.
+const PART_BUFFER_MAX_CHARS = 64 * 1024 * 1024;
+const PART_ASSEMBLIES_MAX = 256;
+const PART_TIMEOUT_MS = 30000;
 
 // Retry cadence for a resync the relay could not carry, when no breaker
 // transition or subscriber restore signals recovery first.
@@ -131,8 +139,10 @@ function positive(v, fallback) {
  *   dies. Default 6s suits the 2s document debounce default. A freshly
  *   acquired lease waits up to a third of it for the sync round.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound relay
- *   envelopes larger than this BEFORE JSON.parse. Defends against a bus-side
- *   DoS on shared-Redis deployments.
+ *   messages larger than this BEFORE JSON.parse. Defends against a bus-side
+ *   DoS on shared-Redis deployments. A larger envelope (a big update or full
+ *   document state) is sent as parts that each fit, so every instance must
+ *   use the same value.
  * @property {import('../shared/breaker.js').CircuitBreaker} [breaker] - Optional
  *   circuit breaker; while it is open no relay is published, and every topic
  *   whose traffic it refused is resynced with the peers once it lets traffic
@@ -303,13 +313,17 @@ export function createCrdtCluster(client, options = {}) {
 	 */
 	function publish(obj, admitted = false) {
 		if (destroyed) return Promise.resolve(null);
+		const msgs = encode(obj);
+		if (msgs === null) {
+			relayLost(obj, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: the envelope exceeds the relay size limit even when sent in parts'));
+			return Promise.resolve(null);
+		}
 		if (b && !admitted) {
 			try { b.guard(); } catch (err) { relayLost(obj, err); return Promise.resolve(null); }
 		}
-		const msg = JSON.stringify(obj);
-		const send = () => redis.publish(channel, msg).then((n) => {
+		const send = () => Promise.all(msgs.map((msg) => redis.publish(channel, msg))).then((counts) => {
 			b?.success();
-			return Number(n);
+			return Number(counts[0]);
 		}, (err) => {
 			b?.failure(err);
 			relayLost(obj, err);
@@ -329,6 +343,83 @@ export function createCrdtCluster(client, options = {}) {
 			});
 		}
 		return sent;
+	}
+
+	/**
+	 * Serialize an envelope into the messages that carry it: itself when it
+	 * fits `maxEnvelopeBytes`, else parts whose base64 slices of its bytes
+	 * rebuild it on the receiver (coordinators without parts ignore them).
+	 * Null when even parts cannot carry it.
+	 * @returns {string[] | null}
+	 */
+	function encode(obj) {
+		const msg = JSON.stringify(obj);
+		if (Buffer.byteLength(msg) <= validator.maxBytes) return [msg];
+		if (!Array.isArray(obj.b)) return null;
+		const data = Buffer.from(Uint8Array.from(obj.b)).toString('base64');
+		const { i, d, t, b: _bytes, ...rest } = obj;
+		/** @type {any} */
+		const head = { i, k: KIND_PART, d, t, p: randomBytes(6).toString('hex') };
+		// A receiver drops the parts of a reply addressed to someone else.
+		if (typeof obj.to === 'string') head.to = obj.to;
+		const overhead = Buffer.byteLength(JSON.stringify({ ...head, n: 1e9, of: 1e9, e: rest, x: '' }));
+		const room = validator.maxBytes - overhead;
+		if (room < 1 || data.length > PART_BUFFER_MAX_CHARS) return null;
+		const of = Math.ceil(data.length / room);
+		const out = [];
+		for (let n = 0; n < of; n++) {
+			/** @type {any} */
+			const part = { ...head, n, of, x: data.slice(n * room, (n + 1) * room) };
+			if (n === 0) part.e = rest;
+			out.push(JSON.stringify(part));
+		}
+		return out;
+	}
+
+	/** @type {Map<string, { of: number, d: string, t: string, e: any, parts: Map<number, string>, chars: number, timer: any }>} */
+	const assemblies = new Map();
+	let partChars = 0;
+
+	function dropAssembly(key) {
+		const a = assemblies.get(key);
+		if (!a) return;
+		assemblies.delete(key);
+		partChars -= a.chars;
+		if (a.timer !== null) clearTimer(a.timer);
+	}
+
+	/**
+	 * Add one part; returns the rebuilt envelope once every part arrived. Parts
+	 * may arrive in any order (a Redis Cluster routes each PUBLISH on its own).
+	 */
+	function assemble(parsed) {
+		const { i: from, p: id, n, of, x, d, t } = parsed;
+		if (typeof from !== 'string' || typeof id !== 'string' || typeof x !== 'string') return null;
+		if (!Number.isInteger(of) || of < 1 || !Number.isInteger(n) || n < 0 || n >= of) return null;
+		const key = from + ' ' + id;
+		let a = assemblies.get(key);
+		if (!a) {
+			if (assemblies.size >= PART_ASSEMBLIES_MAX) return null;
+			a = { of, d, t, e: null, parts: new Map(), chars: 0, timer: null };
+			assemblies.set(key, a);
+			a.timer = setTimer(() => { a.timer = null; dropAssembly(key); }, PART_TIMEOUT_MS);
+			if (a.timer && a.timer.unref) a.timer.unref();
+		}
+		if (a.of !== of || a.d !== d || a.t !== t || a.parts.has(n)) return null;
+		if (partChars + x.length > PART_BUFFER_MAX_CHARS) { dropAssembly(key); return null; }
+		if (n === 0) {
+			const e = parsed.e;
+			if (!e || typeof e !== 'object' || Array.isArray(e) || e.k === KIND_PART) { dropAssembly(key); return null; }
+			a.e = e;
+		}
+		a.parts.set(n, x);
+		a.chars += x.length;
+		partChars += x.length;
+		if (a.parts.size < a.of) return null;
+		dropAssembly(key);
+		let data = '';
+		for (let k = 0; k < a.of; k++) data += a.parts.get(k);
+		return { ...a.e, i: from, d: a.d, t: a.t, b: Array.from(Buffer.from(data, 'base64')) };
 	}
 
 	/** The rejection while a topic's local edits have not reached the peers. */
@@ -358,6 +449,34 @@ export function createCrdtCluster(client, options = {}) {
 		if (started.some((p) => pending.has(p))) throw relayPending();
 	}
 
+	/** Apply one relay envelope from a peer. */
+	function receive(parsed) {
+		if (!parsed || typeof parsed !== 'object') return;
+		if (parsed.i === instanceId) return; // echo suppression
+		const kind = parsed.k;
+		const declKey = parsed.d;
+		const topic = parsed.t;
+		// `topic` rides the bus validator's topic-shape check (it is the
+		// bare document name, never `__`-prefixed); `kind` doubles as the
+		// event-shape argument.
+		if (typeof declKey !== 'string' || typeof kind !== 'string' || !validator.acceptEnvelope(topic, kind)) return;
+		if (kind === KIND_PART) {
+			// Only the addressee of a reply rebuilds it.
+			if (typeof parsed.to === 'string' && parsed.to !== instanceId) return;
+			const whole = assemble(parsed);
+			if (whole) receive(whole);
+		} else if (kind === KIND_UPDATE) {
+			if (handlers.onUpdate && Array.isArray(parsed.b)) handlers.onUpdate(declKey, topic, parsed.b);
+		} else if (kind === KIND_SYNC_REQUEST) {
+			answerSyncRequest(parsed, declKey, topic);
+		} else if (kind === KIND_SYNC_REPLY) {
+			// Targeted: only the requester applies a reply addressed to it.
+			if (parsed.to !== instanceId || !Array.isArray(parsed.b)) return;
+			if (parsed.b.length > 0 && handlers.onSyncReply) handlers.onSyncReply(declKey, topic, parsed.b);
+			noteReply(topic, parsed.i, parsed.c);
+		}
+	}
+
 	/** Bring up the relay subscriber once; idempotent. */
 	function ensureSubscriber() {
 		if (subscriber || destroyed) return;
@@ -378,25 +497,7 @@ export function createCrdtCluster(client, options = {}) {
 			if (!validator.acceptRaw(message)) return; // size cap before parse
 			let parsed;
 			try { parsed = JSON.parse(message); } catch { return; }
-			if (!parsed || typeof parsed !== 'object') return;
-			if (parsed.i === instanceId) return; // echo suppression
-			const kind = parsed.k;
-			const declKey = parsed.d;
-			const topic = parsed.t;
-			// `topic` rides the bus validator's topic-shape check (it is the
-			// bare document name, never `__`-prefixed); `kind` doubles as the
-			// event-shape argument.
-			if (typeof declKey !== 'string' || typeof kind !== 'string' || !validator.acceptEnvelope(topic, kind)) return;
-			if (kind === KIND_UPDATE) {
-				if (handlers.onUpdate && Array.isArray(parsed.b)) handlers.onUpdate(declKey, topic, parsed.b);
-			} else if (kind === KIND_SYNC_REQUEST) {
-				answerSyncRequest(parsed, declKey, topic);
-			} else if (kind === KIND_SYNC_REPLY) {
-				// Targeted: only the requester applies a reply addressed to it.
-				if (parsed.to !== instanceId || !Array.isArray(parsed.b)) return;
-				if (parsed.b.length > 0 && handlers.onSyncReply) handlers.onSyncReply(declKey, topic, parsed.b);
-				noteReply(topic, parsed.i, parsed.c);
-			}
+			receive(parsed);
 		});
 		subscriberReady = sub.subscribe(channel).then(() => {
 			if (subscriber !== sub) return;
@@ -731,6 +832,7 @@ export function createCrdtCluster(client, options = {}) {
 			stale.clear();
 			owed.clear();
 			known.clear();
+			for (const key of [...assemblies.keys()]) dropAssembly(key);
 			if (subscriber) {
 				const s = subscriber;
 				subscriber = null;

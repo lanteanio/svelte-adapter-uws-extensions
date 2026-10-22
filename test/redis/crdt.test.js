@@ -7,7 +7,7 @@
 // true multi-instance convergence is covered on real Redis in
 // test/integration/redis/crdt.test.js.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCrdtCluster } from '../../src/redis/crdt.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
@@ -357,6 +357,25 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
 	});
 
+	it('repairs a replica whose full state exceeds maxEnvelopeBytes', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 60000 });
+		const quiet = { debounceWait: 60000, debounceMaxWait: 60000 };
+		const a = instance({ breaker, maxEnvelopeBytes: 20000 }, quiet);
+		const b = instance({ maxEnvelopeBytes: 20000 }, quiet);
+		await a.join(TOPIC);
+		await b.join(TOPIC);
+		await settle();
+		a.edit(TOPIC, 'big', 'y'.repeat(4000)); // each edit fits one envelope
+		b.edit(TOPIC, 'big2', 'z'.repeat(4000));
+		await settle();
+		breaker.failure(new Error('redis down'));
+		a.edit(TOPIC, 'u1', 1);
+		await settle();
+		breaker.reset(); // the resync pushes a full state larger than the cap
+		await until(() => 'u1' in b.items(TOPIC));
+		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+	});
+
 	it('ends a lease sync round as soon as every peer answered, including peers that hold nothing', async () => {
 		const a = instance({ persistLeaseMs: 30000 });
 		const b = instance({ persistLeaseMs: 30000 });
@@ -540,6 +559,85 @@ describe('createCrdtCluster recovery cost', () => {
 			expect(reads).toBe(1025);
 		} finally {
 			a.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster envelopes over maxEnvelopeBytes', () => {
+	const bytesOf = (n) => Array.from({ length: n }, (_, i) => (i * 7) % 256);
+
+	it('carries an update larger than maxEnvelopeBytes to the peers in parts that each fit', async () => {
+		const client = mockRedisClient('crdtparts:');
+		const a = createCrdtCluster(client, { maxEnvelopeBytes: 2000 });
+		const b = createCrdtCluster(client, { maxEnvelopeBytes: 2000 });
+		const rb = recorder();
+		b.onMessage(rb.handlers);
+		a.onMessage({});
+		await settle();
+		const sizes = [];
+		const publish = client.redis.publish;
+		client.redis.publish = function (channel, message) {
+			sizes.push(Buffer.byteLength(message));
+			return publish.call(this, channel, message);
+		};
+		try {
+			const bytes = bytesOf(3000);
+			a.relayUpdate('dk1', 'board:1', bytes);
+			await settle();
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'board:1', bytes }]);
+			expect(sizes.length).toBeGreaterThan(1);
+			for (const size of sizes) expect(size).toBeLessThanOrEqual(2000);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('rebuilds an envelope whose parts arrive out of order', async () => {
+		const client = mockRedisClient('crdtpartorder:');
+		const a = createCrdtCluster(client, { maxEnvelopeBytes: 1000 });
+		const b = createCrdtCluster(client, { maxEnvelopeBytes: 1000 });
+		const rb = recorder();
+		b.onMessage(rb.handlers);
+		a.onMessage({});
+		await settle();
+		const publish = client.redis.publish;
+		const captured = [];
+		client.redis.publish = async (channel, message) => { captured.push([channel, message]); return 1; };
+		try {
+			const bytes = bytesOf(2000);
+			a.relayUpdate('dk1', 'board:1', bytes);
+			await settle();
+			client.redis.publish = publish;
+			expect(captured.length).toBeGreaterThan(2);
+			for (const [channel, message] of captured.reverse()) await client.redis.publish(channel, message);
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'board:1', bytes }]);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('drops a partly received envelope once its parts stop arriving', async () => {
+		const client = mockRedisClient('crdtpartexpiry:');
+		const b = createCrdtCluster(client);
+		const rb = recorder();
+		b.onMessage(rb.handlers);
+		await settle();
+		const channel = client.key('crdt:events');
+		const data = Buffer.from([1, 2, 3, 4, 5, 6]).toString('base64');
+		const part = (n, extra) => JSON.stringify({ i: 'peer', k: 'part', d: 'dk1', t: 'board:1', p: 'p1', n, of: 2, x: n === 0 ? data.slice(0, 4) : data.slice(4), ...extra });
+		vi.useFakeTimers();
+		try {
+			await client.redis.publish(channel, part(0, { e: { k: 'u' } }));
+			vi.advanceTimersByTime(30001);
+			await client.redis.publish(channel, part(1));
+			expect(rb.updates).toEqual([]); // the first part expired
+			await client.redis.publish(channel, part(0, { e: { k: 'u' } }));
+			expect(rb.updates).toEqual([{ declKey: 'dk1', topic: 'board:1', bytes: [1, 2, 3, 4, 5, 6] }]);
+		} finally {
+			vi.useRealTimers();
+			b.destroy();
 		}
 	});
 });
