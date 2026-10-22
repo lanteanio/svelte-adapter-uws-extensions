@@ -218,6 +218,21 @@ describe('redis dead-letter forget tombstone (right-to-erasure completeness)', (
 		expect(await s.count()).toBe(0);
 	});
 
+	it('purgeUser refuses a tenant id its tombstone key cannot carry', async () => {
+		const s = createDeadLetter(client, { forgetUserId: byAuthor });
+		await s.add(drec({ topic: '@t/a/b/orders' }));
+		for (const tenantId of ['a/b', '~', 'a~b', 7]) {
+			await expect(s.purgeUser(tenantId, 'u1')).rejects.toThrow(TypeError);
+		}
+		// Nothing was written or removed by the refused calls.
+		expect(await s.count()).toBe(1);
+		for (const scope of ['a/b', '~', 'a~b', '7']) {
+			expect(await client.redis.exists(client.key('dlq:purged:' + scope + '/u1'))).toBe(0);
+		}
+		expect(await s.purgeUser('a', 'u1')).toBe(1);
+		expect(await createDeadLetter(client).purgeUser('a/b', 'u1').catch((e) => e)).toBeInstanceOf(TypeError);
+	});
+
 	it('drops a record whose delivery raced a purge, and keeps a genuinely new one', async () => {
 		const s = createDeadLetter(client, { forgetUserId: byAuthor });
 

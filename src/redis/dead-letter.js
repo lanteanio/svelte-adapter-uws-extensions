@@ -122,8 +122,8 @@ export function createDeadLetter(client, options = {}) {
 	// records whose topic is inside its tenant scope, so the tombstone carries
 	// the same scope and `add` looks it up with the scope of the record's own
 	// topic: purging a user in one tenant never drops another tenant's capture
-	// for the same userId. `~` names the untenanted scope; neither `~` nor `/`
-	// can appear in a tenant id, so `<scope>/<user>` is unambiguous. Not
+	// for the same userId. `~` names the untenanted scope; purgeUser refuses a
+	// tenant id holding `~` or `/`, so `<scope>/<user>` is unambiguous. Not
 	// hash-tagged into the {dlq} slot: it is only ever read or written on its own.
 	function purgedKey(scope, userId) {
 		return client.key('dlq:purged:' + scope + '/' + userId);
@@ -314,9 +314,9 @@ export function createDeadLetter(client, options = {}) {
 				if (cutoff === -Infinity) return await withBreaker(b, () => redis.zcard(orderKey));
 				const [card, expired] = await withBreaker(b, () => Promise.all([
 					redis.zcard(orderKey),
-					redis.zrangebyscore(orderKey, '-inf', cutoff)
+					redis.zcount(orderKey, '-inf', cutoff)
 				]));
-				return Math.max(0, Number(card) - expired.length);
+				return Math.max(0, Number(card) - Number(expired));
 			}
 			const vals = await withBreaker(b, () => redis.hvals(recsKey));
 			let n = 0;
@@ -375,6 +375,12 @@ export function createDeadLetter(client, options = {}) {
 		 * @returns {Promise<number>} records removed
 		 */
 		async purgeUser(tenantId, userId) {
+			// The tombstone key joins scope and user with `/` and names the
+			// untenanted scope `~`, so a tenant id holding either character would
+			// write a tombstone that `add` never looks up.
+			if (tenantId != null && tenantId !== '' && (typeof tenantId !== 'string' || /[/~]/.test(tenantId))) {
+				throw new TypeError('redis dead-letter: purgeUser tenant id must be null or a string without "/" or "~"');
+			}
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
 			return withBreaker(b, async () => {
 				// Tombstone FIRST (server clock): a delivery already in flight when

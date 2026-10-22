@@ -533,6 +533,15 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const set = sortedSets.get(key);
 				return set ? set.length : 0;
 			},
+			async zcount(key, min, max) {
+				const set = sortedSets.get(key);
+				if (!set) return 0;
+				const lo = min === '-inf' ? -Infinity : Number(min);
+				const hi = max === '+inf' ? Infinity : Number(max);
+				let n = 0;
+				for (const e of set) if (e.score >= lo && e.score <= hi) n++;
+				return n;
+			},
 			async zrange(key, start, stop) {
 				const set = sortedSets.get(key);
 				if (!set) return [];
