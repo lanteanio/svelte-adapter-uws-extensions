@@ -9,8 +9,6 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `CONNECTION_FAILED` | Redis and PostgreSQL client connection wrappers | The connection could not be established. |
 | `OPERATION_TIMEOUT` | Redis and PostgreSQL client timeout wrappers | The operation did not complete before its deadline. |
 | `CIRCUIT_BROKEN` | Circuit breaker | The breaker refused the operation while open. |
-| `PG_CAPACITY_EXCEEDED` | PostgreSQL client wrapper `query()` and `connect()` | The client's `maxInFlight` admission bound was full, so the call never reached PostgreSQL. Store breakers and the notification bridge do not count it as a dependency failure. Retry later or raise the bound. |
-| `PG_NOTIFY_SESSION_UNSTABLE` | PostgreSQL notification bridge `activate()` | The new notification session could not be confirmed: its probe notification, sent through the client's query route, never arrived (a transaction- or statement-pooling proxy in the session route, or a query route reaching a different database or server), or the query route is read-only. Fix the routing; the bridge's breaker does not count it as a dependency failure, and with `autoReconnect` the bridge keeps retrying. |
 | `REPLICATION_TIMEOUT` | Redis replay | Fewer replicas acknowledged than required. The primary may already hold the write. |
 | `REPLAY_STORAGE_FAILED` | Redis and PostgreSQL replay | Replay storage failed; inspect the cause when diagnosing the backend. |
 | `REPLAY_SERIALIZATION_FAILED` | Redis and PostgreSQL replay | The supplied data could not be serialized. Correct the input before retrying. |
@@ -27,8 +25,9 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `WS_CLOSED` | Presence and cursor operations | The socket closed during the operation; the operation rolled back. |
 | `SUBSCRIBE_DENIED` | Presence and cursor operations | The platform refused access to the underlying topic. |
 | `WEBHOOK_CIRCUIT_OPEN` | Redis webhook controls | Delivery was refused while the target's breaker was open. |
-| `PG_CAPACITY_EXCEEDED` | PostgreSQL pool admission | The configured outstanding-operation limit is full; apply backpressure. This is a ConnectionError with a capacity-specific code. |
+| `PG_CAPACITY_EXCEEDED` | PostgreSQL client wrapper `query()` and `connect()` admission | The client's `maxInFlight` limit on outstanding operations is full, so the call never reached PostgreSQL; apply backpressure. This is a ConnectionError with a capacity-specific code. Store breakers and the notification bridge do not count it as a dependency failure. |
 | `PG_CLIENT_CLOSING` | PostgreSQL lifecycle registration | The client is closing and cannot own another long-lived consumer. |
+| `PG_NOTIFY_SESSION_UNSTABLE` | PostgreSQL notification bridge `activate()` | The new notification session could not be confirmed: its probe notification, sent through the client's query route, never arrived (a transaction- or statement-pooling proxy in the session route, or a query route reaching a different database or server), or the query route is read-only. Fix the routing; the bridge's breaker does not count it as a dependency failure, and with `autoReconnect` the bridge keeps retrying. |
 | `REGISTRY_TARGET_OFFLINE` | Registry request and requestSession | No live owner or local socket exists. The message excludes the target identifier. |
 | `REGISTRY_PENDING_LIMIT` | Registry request and requestSession | The instance pending-request limit is full; wait for existing requests to settle. |
 | `REGISTRY_REQUEST_TIMEOUT` | Registry request and requestSession | No reply arrived before the deadline; the remote outcome is unknown. |

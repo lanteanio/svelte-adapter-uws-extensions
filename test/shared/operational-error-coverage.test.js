@@ -99,4 +99,11 @@ describe('operational error coverage', () => {
 		}
 		for (const code of codes) expect(reference, code).toContain('`' + code + '`');
 	});
+	it('documents each code in exactly one reference row', () => {
+		const reference = readFileSync(new URL('../../docs/public-error-codes.md', import.meta.url), 'utf8');
+		const rows = reference.split('\n').map(line => /^\| `([A-Z0-9_]+)` \|/.exec(line)?.[1]).filter(Boolean);
+		expect(rows.length).toBeGreaterThan(0);
+		expect(rows.filter((code, index) => rows.indexOf(code) !== index)).toEqual([]);
+		expect(rows).toEqual(expect.arrayContaining(['PG_CAPACITY_EXCEEDED', 'PG_NOTIFY_SESSION_UNSTABLE']));
+	});
 });
