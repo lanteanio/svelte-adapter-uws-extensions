@@ -114,14 +114,25 @@ describe('cluster subscribers on nodes that stop answering or leave (cluster)', 
 		});
 	}
 
-	/** Every node reports a healthy cluster of all six nodes. */
+	/**
+	 * Every node reports a healthy cluster of all six nodes and lists a replica
+	 * beside each slot range's master. A replica that has not finished its
+	 * first sync is left out of CLUSTER SLOTS, so a client that maps the
+	 * cluster before then never connects to it.
+	 */
 	async function healthy() {
 		for (const node of nodes()) {
 			const info = String(await node.cluster('INFO'));
 			if (!/cluster_state:ok/.test(info) || !/cluster_known_nodes:6\b/.test(info)) return false;
+			const slots = await node.cluster('SLOTS');
+			if (!slots.every((range) => range.length >= 4)) return false;
 		}
 		return true;
 	}
+	/** Rebuilds the control client's node list from the cluster's current slot map. */
+	const remap = () => new Promise((resolve, reject) => {
+		ctrl.refreshSlotsCache((error) => (error ? reject(error) : resolve()));
+	});
 
 	beforeAll(async () => {
 		ctrl = clusterClient();
@@ -155,10 +166,13 @@ describe('cluster subscribers on nodes that stop answering or leave (cluster)', 
 	});
 
 	it('pub/sub bus: a subscriber on a node removed from the cluster moves to a member within two PING rounds', async () => {
+		await waitFor(healthy, 30000);
+		await remap();
 		const all = await topology();
 		const replica = all.find((n) => n.replica);
 		const master = all.find((n) => n.id === replica.master);
 		const replicaNode = nodes().find((n) => n.options.port === replica.port);
+		expect(replicaNode, 'replica on port ' + replica.port + ' in the slot map').toBeDefined();
 		const client = wrapper('inttest-live-removed:');
 		// The subscriber samples the replica.
 		steer = () => {

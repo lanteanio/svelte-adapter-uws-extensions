@@ -86,9 +86,15 @@ async function waitForClusterReady() {
 			const state = /cluster_state:(\w+)/.exec(info)?.[1];
 			const slotsOk = /cluster_slots_ok:(\d+)/.exec(info)?.[1];
 			if (state === 'ok' && Number(slotsOk) === 16384) {
-				return;
+				// Valkey leaves a replica out of CLUSTER SLOTS until its first
+				// sync completes, so a client started before then never learns
+				// of it.
+				const slots = await r.cluster('slots');
+				if (slots.length && slots.every(range => range.length >= 4)) return;
+				lastErr = new Error('cluster_state=ok, but a replica has not finished its first sync');
+			} else {
+				lastErr = new Error(`cluster_state=${state}, cluster_slots_ok=${slotsOk}`);
 			}
-			lastErr = new Error(`cluster_state=${state}, cluster_slots_ok=${slotsOk}`);
 		} catch (err) {
 			lastErr = err;
 		} finally {
@@ -96,7 +102,7 @@ async function waitForClusterReady() {
 		}
 		await new Promise((res) => setTimeout(res, 500));
 	}
-	throw new Error('Valkey cluster never reached cluster_state=ok within 60s. Last: ' + (lastErr?.message || 'unknown'));
+	throw new Error('Valkey cluster was not ready within 60s. Last: ' + (lastErr?.message || 'unknown'));
 }
 
 export default async function setup() {
