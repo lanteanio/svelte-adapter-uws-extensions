@@ -24,7 +24,7 @@
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { randomBytes, now } from './shared/runtime.js';
+import { randomBytes, wallEpoch } from './shared/runtime.js';
 import { emitRegisteredFailure } from './shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from './error-registry.js';
 
@@ -376,7 +376,7 @@ export function capabilityCookie(options) {
 			authentic = safeEqual(expectPrev, presentedSig);
 		}
 		if (!authentic) return null;
-		if (now() - issuedAt > ttlMs) return null;
+		if (wallEpoch() - issuedAt > ttlMs) return null;
 		return { nonce, issuedAt };
 	}
 
@@ -395,7 +395,7 @@ export function capabilityCookie(options) {
 	// Refresh never copies a legacy cookie's decoded session identifier.
 	function issue(_event, response) {
 		const nonce = randomBytes(16).toString('base64url');
-		appendSetCookie(response, serializeCookie(encode(nonce, now())));
+		appendSetCookie(response, serializeCookie(encode(nonce, wallEpoch())));
 	}
 
 	return {

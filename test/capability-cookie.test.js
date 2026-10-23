@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { capabilityCookie } from '../src/capability-cookie.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from './helpers/runtime-clock.js';
+import { installSteppedClock } from './helpers/stepped-clock.js';
 import { EXTENSIONS_ERROR_IDS } from '../src/error-registry.js';
 import { registeredRecord } from './helpers/diagnostic-line.js';
 
@@ -257,6 +258,26 @@ describe('capabilityCookie', () => {
 
 			// Expired after TTL.
 			Date.now.mockReturnValue(t0 + 61000);
+			expect(cap.verify(header, { required: true })).toBe(false);
+		});
+	});
+
+	describe('expiry at a one-second ttl', () => {
+		// Exact time and a cached now() that lags it, refreshing every 1010 ms.
+		let clock;
+		beforeEach(() => { clock = installSteppedClock({ captureIntervals: false }); });
+
+		it('measures the cookie age on the exact wall clock', () => {
+			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', ttlSeconds: 1 });
+			// Issued 20 ms before the cached clock refreshes.
+			clock.advance(990);
+			const res = mockResponse();
+			cap.issue(mockEvent(), res);
+			const header = cookieValueFrom(res.setCookies[0]);
+
+			clock.advance(1000);
+			expect(cap.verify(header, { required: true })).toBe(true);
+			clock.advance(1);
 			expect(cap.verify(header, { required: true })).toBe(false);
 		});
 	});
