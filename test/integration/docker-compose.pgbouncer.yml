@@ -18,7 +18,7 @@ services:
       retries: 30
   session:
     # PgBouncer 1.24.1, pinned so startup-parameter behavior is reproducible.
-    image: edoburu/pgbouncer@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
+    image: edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
     entrypoint: ["/usr/bin/pgbouncer"]
     command: ["/etc/pgbouncer/pgbouncer.ini"]
     ports:
@@ -30,7 +30,7 @@ services:
       postgres:
         condition: service_healthy
   transaction:
-    image: edoburu/pgbouncer@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
+    image: edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
     entrypoint: ["/usr/bin/pgbouncer"]
     command: ["/etc/pgbouncer/pgbouncer.ini"]
     ports:

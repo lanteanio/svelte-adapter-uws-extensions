@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `npm run test:integration` runs every backend tier: standalone Redis, Postgres, Postgres behind PgBouncer, standalone Valkey, and Redis and Valkey Cluster both natively and with the standalone suite mirrored onto them. `verify:full` and the release workflow's `verify:release` run that whole matrix, `verify:pgbouncer` names the PgBouncer lane, and a hosted `Integration` workflow runs each tier in its own job on Node 22 and Node 24, recording the server image digests. Every integration and smoke image is pinned by digest (Redis 7.4.11, PostgreSQL 16.15, Valkey 9.1.2).
+- `npm run test:integration` runs every backend tier: standalone Redis, Postgres, Postgres behind PgBouncer, standalone Valkey, and Redis and Valkey Cluster both natively and with the standalone suite mirrored onto them. `verify:full` and the release workflow's `verify:release` run that whole matrix, `verify:pgbouncer` names the PgBouncer lane, and a hosted `Integration` workflow runs each tier in its own job on Node 22 and Node 24, recording the server image digests. Every integration and smoke image is pinned by digest (Redis 7.4.11, PostgreSQL 16.15, PgBouncer 1.24.1, Valkey 9.1.2).
 - The LISTEN/NOTIFY bridge documentation states that delivery is at-most-once: notifications committed before `activate()` resolves, during a reconnect, or during an advisory leader handover are not delivered or replayed, and clients see no gap signal. Applications load authoritative state from the tables on subscribe or resume and use a row version to detect a missed change.
 
 ### Fixed

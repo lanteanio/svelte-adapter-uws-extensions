@@ -243,9 +243,13 @@ describe('postgres tasks async path (integration)', () => {
 			makeDispatcher('c');
 			expect(Object.keys(sweeps).sort()).toEqual(['a', 'b', 'c']);
 
-			await Promise.all(Object.values(sweeps).map((sweep) => sweep()));
-			await waitFor(() => allCalls.length === ids.length, 12000);
-			release();
+			try {
+				await Promise.all(Object.values(sweeps).map((sweep) => sweep()));
+				await waitFor(() => allCalls.length === ids.length, 12000);
+			} finally {
+				// A short claim must not leave handlers parked for the rest of the file.
+				release();
+			}
 
 			await waitFor(async () => {
 				const r = await client.query(
@@ -260,8 +264,8 @@ describe('postgres tasks async path (integration)', () => {
 			expect(allCalls).toHaveLength(ids.length);
 			expect(new Set(allCalls.map((c) => c.idx)).size).toBe(ids.length);
 
-			// Every concurrent claim skipped the rows the others had locked and
-			// took a full batch of its own.
+			// The three sweeps ran at once and each claimed a full batch of
+			// rows no other sweep claimed.
 			expect(calls).toEqual({ a: 4, b: 4, c: 4 });
 		});
 
