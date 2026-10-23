@@ -145,10 +145,12 @@ generation authority fail this package version's verification; use the matching
 pre-upgrade manifest when restoring an older artifact.
 It also scrubs each retained replay buffer and reports, without topics or payloads,
 `observations.replayEntries`: buffers and entries read, `corruptEntries` (entries
-the replay readers cannot decode; any fails the `decodable_entries` check) and
+the replay readers cannot decode, sorted-set members whose seq differs from their
+score, and stream entries whose id is not `<seq>-0`; any fails the
+`decodable_entries` check) and
 `missingEntries` (seqs between the oldest retained entry and the sequence counter
 with no entry, which `purgeUser` erasure also leaves). Resuming clients receive a
-`truncated` frame for either. Repair a topic with `replay.clearTopic(topic)`, which
+`truncated` frame for an entry the readers cannot decode and for a missing seq. Repair a topic with `replay.clearTopic(topic)`, which
 drops its buffer and rotates its epoch so clients reload.
 It reads SCAN, TYPE, PTTL, GET, ZREVRANGE, XREVRANGE, HLEN, ZCARD, HKEYS, HMGET,
 ZRANGE, XLEN and XRANGE; Cluster mode also reads CLUSTER SLOTS. Driver handshake commands are

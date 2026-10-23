@@ -233,8 +233,11 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 					}
 					// Read-only scrub of the retained entries: the replay readers drop
 					// an entry they cannot decode and resuming clients get a truncated
-					// frame for it, so count those and the seqs between the oldest
-					// retained entry and the counter that have no entry at all.
+					// frame for it. Count those as corrupt, together with entries that
+					// decode but do not carry their own seq (a sorted-set member whose
+					// seq differs from its score, a stream id that is not <seq>-0),
+					// and count the seqs between the oldest retained entry and the
+					// counter that have no entry at all.
 					const scrub = result.observations.replayEntries ??= { buffers: 0, entries: 0, corruptEntries: 0, missingEntries: 0 };
 					const seqs = [];
 					scrub.buffers++;
