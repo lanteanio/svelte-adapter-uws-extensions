@@ -114,12 +114,12 @@ const KIND_PART = 'part';
 
 // Bounds on the envelopes being reassembled from parts: base64 characters
 // held across all of them, how many at once, and how long one may take.
-// When a bound is hit, the senders holding more than their fair share give
-// way, so one peer's large resync cannot starve the others.
+// When a bound is hit, the sender most over its fair share gives way, the
+// sender of the arriving part included, so only a sender holding more than
+// its share of a full buffer ever loses an envelope to make room.
 const PART_BUFFER_MAX_CHARS = 64 * 1024 * 1024;
 // What one sender's envelopes may hold at once, which also caps the largest
-// envelope (see partsFit). The rest of the buffer stays free for the other
-// senders, so their small envelopes never displace a large one that fits.
+// envelope (see partsFit).
 const PART_SENDER_MAX_CHARS = 48 * 1024 * 1024;
 const PART_ASSEMBLIES_MAX = 256;
 const PART_TIMEOUT_MS = 30000;
@@ -527,15 +527,18 @@ export function createCrdtCluster(client, options = {}) {
 	}
 
 	/**
-	 * Free `need` of a bound (`chars` or `count`) for an envelope from `from`
-	 * by dropping assemblies of the other senders holding more than their
-	 * fair share of it: the sender most over its share first, and of its
-	 * assemblies the least complete, the newest on a tie. Drops nothing and
-	 * returns false when that cannot free enough.
+	 * Free `need` of a bound (`chars` or `count`) for `adding` more of it
+	 * from `from` by dropping assemblies of the senders holding more than
+	 * their fair share of it, the most over its share first, and of its
+	 * assemblies the least complete, the newest on a tie. When `from`, with
+	 * what it adds, is the most over (ties included), the arriving envelope
+	 * gives way instead. Drops nothing and returns false when the arriving
+	 * envelope gives way or no other sender over its share is left.
 	 */
-	function makeRoom(by, from, need) {
+	function makeRoom(by, from, need, adding) {
 		const bound = by === 'chars' ? PART_BUFFER_MAX_CHARS : PART_ASSEMBLIES_MAX;
 		const share = bound / (senders.has(from) ? senders.size : senders.size + 1);
+		const own = (senders.get(from)?.[by] ?? 0) + adding - share;
 		/** @type {Map<string, { held: number, queue: { key: string, size: number, done: number, at: number }[] }>} */
 		const others = new Map();
 		let at = 0;
@@ -555,7 +558,7 @@ export function createCrdtCluster(client, options = {}) {
 			for (const o of others.values()) {
 				if (o.queue.length > 0 && o.held - share > over) { pick = o; over = o.held - share; }
 			}
-			if (pick === null) return false;
+			if (pick === null || (own > 0 && own >= over)) return false;
 			const victim = /** @type {{ key: string, size: number }} */ (pick.queue.shift());
 			plan.push(victim.key);
 			freed += victim.size;
@@ -580,7 +583,7 @@ export function createCrdtCluster(client, options = {}) {
 			// An envelope that cannot fit a sender's share never completes:
 			// no other one gives way for it.
 			if (!partsFit(x.length, of)) { partsLost(key, t); return null; }
-			if (assemblies.size >= PART_ASSEMBLIES_MAX && !makeRoom('count', from, 1)) { partsLost(key, t); return null; }
+			if (assemblies.size >= PART_ASSEMBLIES_MAX && !makeRoom('count', from, 1, 1)) { partsLost(key, t); return null; }
 			a = { from, of, d, t, e: null, parts: new Map(), chars: 0, partMax: 0, timer: null };
 			assemblies.set(key, a);
 			let sender = senders.get(from);
@@ -597,7 +600,7 @@ export function createCrdtCluster(client, options = {}) {
 			return null;
 		}
 		const over = partChars + x.length - PART_BUFFER_MAX_CHARS;
-		if (over > 0 && !makeRoom('chars', from, over)) { dropAssembly(key, true); return null; }
+		if (over > 0 && !makeRoom('chars', from, over, x.length)) { dropAssembly(key, true); return null; }
 		if (n === 0) {
 			const e = parsed.e;
 			if (!e || typeof e !== 'object' || Array.isArray(e) || e.k === KIND_PART) { dropAssembly(key); return null; }

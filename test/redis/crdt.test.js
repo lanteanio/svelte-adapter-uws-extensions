@@ -1045,6 +1045,22 @@ describe('createCrdtCluster reassembly capacity', () => {
 		}
 	});
 
+	it('drops the arriving envelope when its own sender is the one most over its share', async () => {
+		const { client, b, rb, requests, channel } = await receiver('crdtpartarriving:', ['doc:a', 'doc:x', 'doc:y']);
+		try {
+			await parts(client, channel, 'peerA', 'a', 'doc:a', 45, 0, 40);
+			await parts(client, channel, 'peerX', 'x', 'doc:x', 24, 0, 23);
+			await parts(client, channel, 'peerY', 'y', 'doc:y', 2, 0, 1);
+			// peerA overflows the buffer while it holds far more than a third of it.
+			await parts(client, channel, 'peerA', 'a', 'doc:a', 45, 40, 45);
+			await parts(client, channel, 'peerX', 'x', 'doc:x', 24, 23, 24);
+			expect(rb.updates.map((u) => u.topic)).toEqual(['doc:x']);
+			expect([...(await resynced(requests))]).toEqual(['doc:a']);
+		} finally {
+			b.destroy();
+		}
+	});
+
 	it('drops an envelope too large for a sender at its first part instead of displacing others for it', async () => {
 		const { client, b, requests, channel } = await receiver('crdtparttoobig:', ['doc:x', 'doc:huge']);
 		try {
