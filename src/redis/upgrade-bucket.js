@@ -28,7 +28,7 @@
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
-import { now } from '../shared/runtime.js';
+import { now, monotonicNow } from '../shared/runtime.js';
 import { createEmergencyScaleReader } from './emergency-scale.js';
 
 /** Refill interval for a per-minute budget, in milliseconds. */
@@ -298,19 +298,25 @@ export function createLocalUpgradeBucket(options) {
 		async admit(ip, posture) {
 			const key = String(ip == null ? 'unknown' : ip);
 			const budget = resolve(posture);
-			const nowTs = now();
 			const e = touch(key);
 
+			// A ban is timed on the monotonic clock so a sub-second
+			// blockDuration holds for its full length, and it outlasts a
+			// refill, as in the Redis bucket. The minute window tolerates the
+			// cached clock, so an unbanned admit reads only that.
+			if (e.bannedUntil !== 0) {
+				if (e.bannedUntil > monotonicNow()) {
+					mRejected?.inc();
+					return false;
+				}
+				e.bannedUntil = 0;
+			}
+
+			const nowTs = now();
 			// Lazily initialize / refill on a fresh interval.
 			if (e.resetAt === 0 || e.resetAt <= nowTs) {
 				e.tokens = budget.perMinute;
 				e.resetAt = nowTs + MINUTE_MS;
-				e.bannedUntil = 0;
-			}
-
-			if (e.bannedUntil > nowTs) {
-				mRejected?.inc();
-				return false;
 			}
 
 			if (e.tokens >= 1) {
@@ -320,7 +326,7 @@ export function createLocalUpgradeBucket(options) {
 			}
 
 			if (budget.blockDuration > 0) {
-				e.bannedUntil = nowTs + budget.blockDuration;
+				e.bannedUntil = monotonicNow() + budget.blockDuration;
 			}
 			mRejected?.inc();
 			return false;

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
+import { installSteppedClock } from '../helpers/stepped-clock.js';
 import {
 	createUpgradeBucket,
 	createLocalUpgradeBucket
@@ -310,6 +311,23 @@ describe('createLocalUpgradeBucket', () => {
 		// After the minute interval the bucket refills.
 		Date.now.mockReturnValue(now + 60001);
 		expect(await bucket.admit('1.2.3.4')).toBe(true);
+	});
+
+	it('holds a sub-second ban for its full length, across a refill', async () => {
+		// Exact time and a cached now() that lags it, refreshing every 1010 ms.
+		// The minute window runs on the cached clock: it refills once that
+		// reaches 60000 ms, at the refresh at 60600 ms.
+		const clock = installSteppedClock({ captureIntervals: false });
+		const bucket = createLocalUpgradeBucket({ perMinute: 1, blockDuration: 500 });
+		expect(await bucket.admit('ip')).toBe(true);
+		clock.advance(60200);
+		expect(await bucket.admit('ip')).toBe(false); // banned until 60700
+		clock.advance(400);
+		expect(await bucket.admit('ip')).toBe(false); // refilled, still banned
+		clock.advance(99);
+		expect(await bucket.admit('ip')).toBe(false);
+		clock.advance(1);
+		expect(await bucket.admit('ip')).toBe(true);
 	});
 
 	it('caps the map size and evicts the least-recently-used IP', async () => {
