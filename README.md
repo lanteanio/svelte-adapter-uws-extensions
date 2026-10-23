@@ -256,8 +256,10 @@ add identity nothing references plus a redundant index:
 | `svti_schema_migrations` | `(table_name, version)` | one ledger entry per applied migration version of a table |
 
 This is a recorded exception to the surrogate-key rule, not an oversight; schema review
-should treat these six as intentional. Physical table names are configurable per factory
-(`table` option), but the logical column names above are stable regardless of the physical name.
+should treat these six as intentional. Store table names are configurable per factory
+(`table` option; companion tables such as `_seq`, `_generations` and `_executions` follow it),
+and the logical column names above are stable regardless of the physical name. The migration
+ledger is always `svti_schema_migrations`, and no store table may use that name.
 
 ---
 

@@ -190,7 +190,7 @@ export function createAlarmStore(client, options = {}) {
 				// One statement: lock the authority row like set/delete, then move the
 				// observed row only while retained storage is below its bound. The
 				// bound is read from the statement snapshot, so concurrent claims can
-				// overshoot it by at most their own number; nothing is ever evicted.
+				// pass it by fewer than the claims in flight; nothing is ever evicted.
 				// The count stops at the bound, so it reads at most that many rows.
 				// It deliberately updates no shared counter: a counter row is locked
 				// from the update until commit, which would serialize every claim and

@@ -59,10 +59,11 @@ describe('PostgreSQL retained alarm executions', () => {
 		const holder = await admin.connect();
 		let results;
 		try {
+			const holderPid = (await holder.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
 			await holder.query('BEGIN');
 			await holder.query('SELECT topic FROM svti_alarms_generations WHERE topic = ANY($1::text[]) FOR UPDATE', [topics]);
 			const pending = Promise.allSettled(topics.map((topic, index) => (index % 2 ? second : first).claim(topic, generations[index])));
-			await expect.poll(async () => (await admin.query("SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%svti_alarms_executions%'")).rows[0].count, { timeout: 10_000 }).toBe(inFlight);
+			await expect.poll(async () => (await admin.query("SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = current_database() AND $1::int = ANY(pg_blocking_pids(pid))", [holderPid])).rows[0].count, { timeout: 10_000 }).toBe(inFlight);
 			await holder.query('COMMIT');
 			results = await pending;
 		} finally {
