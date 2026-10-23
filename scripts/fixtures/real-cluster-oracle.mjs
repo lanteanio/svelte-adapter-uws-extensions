@@ -46,6 +46,12 @@ function forbid(moduleName, names) {
 }
 forbid('node:child_process', ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 forbid('node:worker_threads', ['Worker']);
+// A ChildProcess constructed directly starts through its prototype.
+const { ChildProcess } = requireBuiltin('node:child_process');
+ChildProcess.prototype.spawn = function blockedStart() {
+	blocked.push('node:child_process.ChildProcess.spawn');
+	throw new Error('The scenario refuses node:child_process.ChildProcess.spawn: module resolution cannot be confined outside its own thread');
+};
 Module.syncBuiltinESMExports();
 if (confined) {
 	Module.registerHooks({

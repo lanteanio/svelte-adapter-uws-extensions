@@ -24,7 +24,9 @@ The script:
 4. runs the scenario `scripts/fixtures/real-cluster-oracle.mjs` from the
    consumer; every module any package imports or requires must resolve inside
    the consumer, and starting a worker thread or a child process, which that
-   check cannot follow, fails the run;
+   check cannot follow, fails the run. This catches accidental resolution and
+   process starts by the loaded packages; it is not a security sandbox
+   against code that deliberately reaches Node's internal bindings;
 5. removes the Compose stack, checks that no container or network of the
    project is left, and writes the result.
 

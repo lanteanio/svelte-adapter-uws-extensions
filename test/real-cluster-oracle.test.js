@@ -140,15 +140,16 @@ describe('real-cluster oracle scenario', () => {
 		for (const name of Object.keys(STUBS)) stub(join(consumer, 'node_modules'), name);
 		writeFileSync(join(consumer, 'node_modules', 'svelte-realtime', 'server.js'), [
 			"import { Worker } from 'node:worker_threads';",
-			"import { spawnSync } from 'node:child_process';",
+			"import { ChildProcess, spawnSync } from 'node:child_process';",
 			"try { new Worker('setTimeout(() => {}, 1)', { eval: true }); } catch {}",
 			"try { spawnSync(process.execPath, ['-e', '0']); } catch {}",
+			"try { new ChildProcess().spawn({ file: process.execPath, args: [process.execPath, '-e', '0'], stdio: 'ignore' }); } catch {}",
 			'export function createMessage() {}',
 			'export function setBus() {}'
 		].join('\n'));
 		const { code, report } = scenarioIn(consumer);
 		expect(code).toBe(1);
-		expect(report.provenance.resolution.blocked).toEqual(['node:worker_threads.Worker', 'node:child_process.spawnSync']);
+		expect(report.provenance.resolution.blocked).toEqual(['node:worker_threads.Worker', 'node:child_process.spawnSync', 'node:child_process.ChildProcess.spawn']);
 		expect(report.cases.find((c) => c.name === 'cleanup')).toMatchObject({ status: 'failed', error: { message: expect.stringContaining('worker thread or child process') } });
 	});
 });
