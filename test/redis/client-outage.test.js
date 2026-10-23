@@ -273,3 +273,52 @@ it.each(['client', 'duplicate'])('disconnect() between reconnect attempts ends t
 		await new Promise(resolve => server.close(resolve));
 	}
 });
+
+
+it('rejects a user CLIENT SETINFO sent before the handshake one when the connection drops before ready', async () => {
+	// The server never replies, so every command written before ready stays
+	// unanswered. ioredis sends its LIB-VER only after reading its package
+	// version, later than the 'connect' event, so the application's identical
+	// command goes out first.
+	const sockets = new Set();
+	const server = createServer(socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {}); });
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const client = createRedisClient({
+		url: 'redis://127.0.0.1:' + server.address().port,
+		autoShutdown: false,
+		options: { lazyConnect: true, password: 'secret', db: 2, connectionName: 'handshake', retryStrategy: () => 60000, commandTimeout: 60000 }
+	});
+	const outcome = (promise) => promise.then(() => 'resolved', error => error);
+	const sent = () => client.redis.commandQueue.toArray().map(entry => [entry.command.name, ...entry.command.args.map(String)].join(' ').toLowerCase());
+	const user = [];
+	client.redis.once('connect', () => {
+		user.push(outcome(client.redis.client('SETINFO', 'LIB-VER', 'app')));
+		user.push(outcome(client.redis.auth('secret')));
+		user.push(outcome(client.redis.select(2)));
+		user.push(outcome(client.redis.client('SETNAME', 'handshake')));
+	});
+	try {
+		client.redis.connect().catch(() => {});
+		await vi.waitFor(() => {
+			expect(sent().filter(line => line.startsWith('client setinfo lib-ver'))).toHaveLength(2);
+		}, { timeout: 2000 });
+		expect(sent()[0]).toBe('auth secret');
+		expect(sent().indexOf('client setinfo lib-ver app')).toBeLessThan(sent().findIndex(line => line.startsWith('client setinfo lib-ver') && !line.endsWith(' app')));
+		const closed = new Promise(resolve => client.redis.once('close', resolve));
+		client.redis.stream.destroy();
+		await closed;
+		const settled = await Promise.race([Promise.all(user), new Promise(resolve => setTimeout(resolve, 1000, 'pending'))]);
+		expect(settled).not.toBe('pending');
+		for (const error of settled) {
+			expect(error).toBeInstanceOf(ConnectionError);
+			expect(error.message).toMatch(/uncertain/);
+		}
+		// ioredis ignores the outcome of its own LIB-VER, so it is rejected with
+		// the application commands; the rest of its handshake stays with it.
+		expect(sent()).toEqual(['auth secret', 'select 2', 'client setname handshake', 'client setinfo lib-name ioredis']);
+	} finally {
+		client.redis.disconnect();
+		for (const socket of sockets) socket.destroy();
+		await new Promise(resolve => server.close(resolve));
+	}
+});

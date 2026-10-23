@@ -38,39 +38,32 @@ function supportsSharedDeadlines() {
 // Before ready ioredis writes its own handshake commands and any user command
 // of the same name (INFO, SELECT, CLIENT, AUTH). Only the handshake's own
 // commands may stay unsettled when that connection drops, so they are told
-// apart when sent: the connect handler issues AUTH, SELECT, CLIENT SETNAME and
-// CLIENT SETINFO right after it resets the command queue, each once per
-// connection, and the ready check issues INFO from `_readyCheck`. The sending
-// hook is installed when a connection starts its handshake and removed at
-// ready, so commands on a ready connection pay nothing for it. Call this
-// before installing a ready listener that replaces `sendCommand`. Returns null
-// when those private seams are missing, so callers fall back to the command
-// name alone.
+// apart by when they are sent, never by name. The connect handler resets the
+// command queue and then writes AUTH, SELECT, CLIENT SETNAME and CLIENT
+// SETINFO LIB-NAME synchronously, before the 'connect' event that ioredis
+// emits on the next tick, so no application code runs in that window. The
+// ready check writes INFO synchronously from `_readyCheck`. Its CLIENT SETINFO
+// LIB-VER waits for a file read and can follow application commands, so it is
+// not tracked; ioredis ignores its outcome. The sending hook is installed
+// when a connection starts its handshake and removed at ready, so commands on
+// a ready connection pay nothing for it. Call this before installing a ready
+// listener that replaces `sendCommand`. Returns null when those private seams
+// are missing, so callers fall back to the command name alone.
 function trackHandshake(redis) {
 	const reset = redis.resetCommandQueue;
 	const readyCheck = redis._readyCheck;
 	if (typeof reset !== 'function' || typeof readyCheck !== 'function') return null;
 	const own = new WeakSet();
-	let expected = new Set();
+	let inConnect = false;
 	let inReadyCheck = false;
 	let base = null;
-	function kind(command) {
-		if (command.name !== 'client') return command.name;
-		const sub = String(command.args[0]).toLowerCase();
-		return sub === 'setinfo' ? 'client setinfo ' + String(command.args[1]).toLowerCase() : 'client ' + sub;
-	}
 	function sendNoting(command, stream) {
-		if (redis.status === 'connect' && (inReadyCheck ? command.name === 'info' : expected.delete(kind(command)))) own.add(command);
+		if (redis.status === 'connect' && (inConnect || (inReadyCheck && command.name === 'info'))) own.add(command);
 		return base.call(this, command, stream);
 	}
 	redis.resetCommandQueue = function () {
 		const result = reset.apply(this, arguments);
-		const { condition, options } = this;
-		expected = new Set();
-		if (condition?.auth) expected.add('auth');
-		if (condition?.select) expected.add('select');
-		if (options.connectionName) expected.add('client setname');
-		if (!options.disableClientInfo) { expected.add('client setinfo lib-ver'); expected.add('client setinfo lib-name'); }
+		inConnect = this.status === 'connect';
 		if (this.sendCommand !== sendNoting) {
 			base = this.sendCommand;
 			this.sendCommand = sendNoting;
@@ -81,6 +74,8 @@ function trackHandshake(redis) {
 		inReadyCheck = true;
 		try { return readyCheck.apply(this, arguments); } finally { inReadyCheck = false; }
 	};
+	// Runs before any other listener, at the first point application code can.
+	redis.prependListener('connect', () => { inConnect = false; });
 	redis.on('ready', () => {
 		if (redis.sendCommand === sendNoting) redis.sendCommand = base;
 	});
