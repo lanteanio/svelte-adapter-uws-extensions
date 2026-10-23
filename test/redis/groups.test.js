@@ -5,6 +5,7 @@ import { mockWs } from '../helpers/mock-ws.js';
 import { createGroup } from '../../src/redis/groups.js';
 import { createGroup as createLocalGroup } from 'svelte-adapter-uws/plugins/groups';
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 function interceptNextGroupLeave(redis, handler) {
 	const originalDefine = redis.defineCommand.bind(redis);
@@ -1549,19 +1550,81 @@ describe('redis groups', () => {
 	});
 
 	describe('small memberTtl heartbeat interval', () => {
+		// A virtual clock and captured heartbeat intervals, installed through the
+		// runtime seam, so real event-loop delays cannot move a member past its
+		// TTL. `cached` stands in for the ~1s-cached now() and moves only when a
+		// test steps it.
+		let clock;
+		beforeEach(() => {
+			clock = { t: 1_000_000, cached: 1_000_000, intervals: [] };
+			setRuntimeEnv({
+				clock: { now: () => clock.cached, monotonic: () => clock.t, wallEpoch: () => clock.t },
+				timers: {
+					setInterval: (cb, ms) => { const h = { cb, ms, cleared: false, unref() {} }; clock.intervals.push(h); return h; },
+					clearInterval: (h) => { if (h) h.cleared = true; }
+				}
+			});
+		});
+		afterEach(() => resetRuntimeEnv());
+
+		const flush = async () => {
+			for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+		};
+		const beat = async () => {
+			for (const h of clock.intervals) if (!h.cleared) h.cb();
+			await flush();
+		};
+
 		it('memberTtl: 1 does not expire live members before first heartbeat', async () => {
 			const g = createGroup(client, 'short-ttl', { memberTtl: 1 });
-			const ws = mockWs();
-			await g.join(ws, platform);
+			try {
+				expect(clock.intervals.map((h) => h.ms)).toEqual([333]);
+				const ws = mockWs();
+				await g.join(ws, platform);
+				expect(await g.count()).toBe(1);
 
-			expect(g.has(ws)).toBe(true);
+				// The first beat is due one interval after the group was created.
+				clock.t += 333;
+				expect(await g.count()).toBe(1);
+				await beat();
 
-			await new Promise((r) => setTimeout(r, 500));
+				// 1332 ms after join: only the beat's refresh keeps it live.
+				clock.t += 999;
+				expect(await g.count()).toBe(1);
 
-			expect(g.has(ws)).toBe(true);
-			expect(await g.count()).toBe(1);
+				for (let i = 0; i < 6; i++) {
+					await beat();
+					clock.t += 333;
+					expect(g.has(ws)).toBe(true);
+					expect(await g.count()).toBe(1);
+				}
+			} finally {
+				g.destroy();
+			}
+		});
 
-			g.destroy();
+		it('memberTtl: 1 measures liveness on the exact wall clock, not the cached one', async () => {
+			const g = createGroup(client, 'short-ttl-cached', { memberTtl: 1 });
+			try {
+				const ws = mockWs();
+				await g.join(ws, platform);
+				clock.t += 333;
+				await beat();
+
+				// The cached clock steps a little over a second, as it does under a
+				// real interval; the beat landed 67 ms before the step.
+				clock.t += 67;
+				clock.cached += 1010;
+				expect(await g.count()).toBe(1);
+
+				// With no further beat the member expires one TTL after its stamp.
+				clock.t += 933;
+				expect(await g.count()).toBe(1);
+				clock.t += 1;
+				expect(await g.count()).toBe(0);
+			} finally {
+				g.destroy();
+			}
 		});
 	});
 
