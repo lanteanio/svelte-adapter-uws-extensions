@@ -228,51 +228,56 @@ function packageContains(relativePath, packagedFiles) {
 }
 
 /**
- * The path a browser requests for a decoded link, resolved against the
- * linking document with dot-segment removal (RFC 3986 section 5.2.4). Unlike
- * posix.normalize it keeps empty segments, so a result starting with '//'
- * shows that a spelling such as '/a/..//x' or '/./%2fx' leaves the
- * repository tree. Climbing above the root stops at '/', as in a browser.
+ * The repository path a relative documentation link names, worked out the
+ * way a browser requests it. The link is split on its literal slashes before
+ * any segment is decoded, so an encoded '%2f' never acts as a separator and a
+ * leading slash counts only when it is written as one. GitHub resolves that
+ * leading slash from the repository root and every other path from the
+ * linking document's directory, then removes dot segments (RFC 3986 section
+ * 5.2.4) without collapsing empty ones.
+ *
+ * The result path is repository-relative: the empty string is the root, a
+ * trailing slash is kept so a directory link stays distinguishable from a
+ * file link, and a path that climbs above the root keeps one leading '../'
+ * per level. `problem` names a link that can resolve to no repository file:
+ * 'malformed' (a bad percent escape), 'encoded-separator' (a segment that
+ * decodes to '/' or '\') or 'empty-segment' (a doubled slash anywhere before
+ * the last segment, however it was spelled).
  *
  * @param {string} source the linking document, repository-relative
- * @param {string} decodedPath the percent-decoded path part of the link
- * @returns {string} an absolute path starting with '/'
+ * @param {string} encodedPath the path part of the link, still percent-encoded
+ * @returns {{ path: string, rootRelative: boolean, problem?: 'malformed' | 'encoded-separator' | 'empty-segment' }}
  */
-export function requestedPath(source, decodedPath) {
+export function resolveDocumentPath(source, encodedPath) {
+	const rootRelative = encodedPath.startsWith('/');
+	const linkSegments = [];
+	for (const encoded of (rootRelative ? encodedPath.slice(1) : encodedPath).split('/')) {
+		let decoded;
+		try { decoded = decodeURIComponent(encoded); }
+		catch { return { path: '', rootRelative, problem: 'malformed' }; }
+		if (decoded.includes('/') || decoded.includes('\\')) {
+			return { path: '', rootRelative, problem: 'encoded-separator' };
+		}
+		linkSegments.push(decoded);
+	}
 	const dir = posix.dirname(source.split('\\').join('/'));
-	const merged = decodedPath.startsWith('/') ? decodedPath : '/' + (dir === '.' ? '' : dir + '/') + decodedPath;
-	const segments = merged.split('/').slice(1);
+	const segments = [...(rootRelative || dir === '.' ? [] : dir.split('/')), ...linkSegments];
 	const output = [];
+	let above = 0;
 	segments.forEach((segment, index) => {
 		const last = index === segments.length - 1;
 		if (segment === '.' || segment === '..') {
-			if (segment === '..') output.pop();
+			if (segment === '..') {
+				if (output.length === 0) above++;
+				else output.pop();
+			}
 			if (last) output.push('');
 			return;
 		}
 		output.push(segment);
 	});
-	return '/' + output.join('/');
-}
-
-/**
- * The repository path a relative documentation link names. GitHub resolves a
- * leading slash from the repository root and every other path from the
- * linking document's directory. The empty string is the repository root, and
- * a trailing slash is kept so a directory link stays distinguishable from a
- * file link. A path that climbs above the root keeps its leading '../', and
- * only one leading slash is removed, so a doubled one stays absolute and is
- * never mistaken for a repository path.
- *
- * @param {string} source the linking document, repository-relative
- * @param {string} decodedPath the percent-decoded path part of the link
- * @returns {string}
- */
-export function resolveDocumentPath(source, decodedPath) {
-	const fromRoot = decodedPath.startsWith('/');
-	const base = fromRoot ? '' : posix.dirname(source.split('\\').join('/'));
-	const resolved = posix.normalize(posix.join(base, fromRoot ? decodedPath.slice(1) : decodedPath));
-	return resolved === '.' || resolved === './' ? '' : resolved;
+	if (output.slice(0, -1).includes('')) return { path: '', rootRelative, problem: 'empty-segment' };
+	return { path: '../'.repeat(above) + output.join('/'), rootRelative };
 }
 
 /**
@@ -507,18 +512,20 @@ export function checkLink(rel, target, docs, options = {}) {
 	const queryAt = route.indexOf('?');
 	const encodedPath = queryAt === -1 ? route : route.slice(0, queryAt);
 	if (encodedPath === '') return null;
-	let decodedPath;
-	try { decodedPath = decodeURIComponent(encodedPath); }
-	catch { return `malformed percent escape in path: ${encodedPath}`; }
-	if (requestedPath(rel, decodedPath).startsWith('//')) {
-		return `path resolves to a doubled leading slash and names no repository file: ${target}`;
+	const parsed = resolveDocumentPath(rel, encodedPath);
+	if (parsed.problem === 'malformed') return `malformed percent escape in path: ${encodedPath}`;
+	if (parsed.problem === 'encoded-separator') {
+		return `path segment decodes to a slash or backslash and names no repository file: ${target}`;
+	}
+	if (parsed.problem === 'empty-segment') {
+		return `path has an empty segment (a doubled slash) and names no repository file: ${target}`;
 	}
 	// A packaged document is also read from node_modules and the registry
 	// page, where a leading slash names no repository root at all.
-	if (decodedPath.startsWith('/') && options.packagedDocs?.has(rel)) {
+	if (parsed.rootRelative && options.packagedDocs?.has(rel)) {
 		return `root-relative link in a packaged document (write it relative to ${rel}): ${target}`;
 	}
-	const resolved = resolveDocumentPath(rel, decodedPath);
+	const resolved = parsed.path;
 	const shown = resolved === '' ? '/' : resolved;
 	const status = ownedPathStatus(resolved);
 	if (status === 'outside') return `path leaves repository: ${shown}`;
@@ -577,10 +584,20 @@ function directoryReadmes(directory) {
 	const names = tracked
 		? [...tracked].filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes('/')).map((path) => path.slice(prefix.length))
 		: readdirSync(join(root, directory)).filter((name) => statSync(join(root, directory, name)).isFile());
+	return readmeNames(names).map((name) => prefix + name);
+}
+
+/**
+ * The README names among one directory's file names, README.md first and
+ * the rest in code-unit order.
+ *
+ * @param {string[]} names
+ * @returns {string[]}
+ */
+export function readmeNames(names) {
 	return names
 		.filter((name) => /^readme(\.[^.]+)?$/i.test(name))
-		.sort((a, b) => (a === 'README.md' ? -1 : b === 'README.md' ? 1 : a < b ? -1 : a > b ? 1 : 0))
-		.map((name) => prefix + name);
+		.sort((a, b) => (a === b ? 0 : a === 'README.md' ? -1 : b === 'README.md' ? 1 : a < b ? -1 : 1));
 }
 
 /** Reader routes must work from the package overview and back again. */
@@ -590,11 +607,9 @@ export function validateDocumentationMap(docs, packagedFiles) {
 		const targets = new Set();
 		for (const { target } of linksOf(doc.text)) {
 			if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(target)) continue;
-			try {
-				const route = decodeURIComponent(target.split(/[?#]/)[0]);
-				const path = resolveDocumentPath(file, route);
-				if (docs.has(path)) targets.add(path);
-			} catch { /* The ordinary link checker reports malformed escapes. */ }
+			// The ordinary link checker reports a path this cannot resolve.
+			const { path, problem } = resolveDocumentPath(file, target.split(/[?#]/)[0]);
+			if (!problem && docs.has(path)) targets.add(path);
 		}
 		edges.set(file, targets);
 	}

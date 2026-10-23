@@ -27,7 +27,8 @@ import {
 	documentationFiles,
 	packageFiles,
 	validateDocumentationMap,
-	resolveDocumentPath
+	resolveDocumentPath,
+	readmeNames
 } from '../scripts/check-links.js';
 
 describe('heading slugs follow GitHub exactly', () => {
@@ -114,18 +115,25 @@ describe('collecting the links a document makes', () => {
 
 describe('resolving a documentation path', () => {
 	it('resolves a leading slash from the repository root', () => {
-		expect(resolveDocumentPath('docs/guide.md', '/README.md')).toBe('README.md');
-		expect(resolveDocumentPath('docs/guide.md', '/docs/getting-started.md')).toBe('docs/getting-started.md');
-		expect(resolveDocumentPath('docs/guide.md', '/docs/')).toBe('docs/');
-		expect(resolveDocumentPath('docs/guide.md', '/')).toBe('');
-		expect(resolveDocumentPath('docs/guide.md', '/../x.md')).toBe('../x.md');
+		expect(resolveDocumentPath('docs/guide.md', '/README.md').path).toBe('README.md');
+		expect(resolveDocumentPath('docs/guide.md', '/docs/getting-started.md').path).toBe('docs/getting-started.md');
+		expect(resolveDocumentPath('docs/guide.md', '/docs/').path).toBe('docs/');
+		expect(resolveDocumentPath('docs/guide.md', '/').path).toBe('');
+		expect(resolveDocumentPath('docs/guide.md', '/../x.md').path).toBe('../x.md');
 	});
 
 	it('resolves every other path from the linking document', () => {
-		expect(resolveDocumentPath('docs/guide.md', 'getting-started.md')).toBe('docs/getting-started.md');
-		expect(resolveDocumentPath('docs/guide.md', '../README.md')).toBe('README.md');
-		expect(resolveDocumentPath('README.md', './')).toBe('');
-		expect(resolveDocumentPath('README.md', '../x.md')).toBe('../x.md');
+		expect(resolveDocumentPath('docs/guide.md', 'getting-started.md').path).toBe('docs/getting-started.md');
+		expect(resolveDocumentPath('docs/guide.md', '../README.md').path).toBe('README.md');
+		expect(resolveDocumentPath('README.md', './').path).toBe('');
+		expect(resolveDocumentPath('README.md', '../x.md').path).toBe('../x.md');
+	});
+});
+
+describe('choosing a directory README', () => {
+	it('prefers README.md and otherwise keeps code-unit order', () => {
+		expect(readmeNames(['index.md', 'readme.md', 'README.MD', 'README.markdown', 'README.md', 'Readme.rst', 'readme-old.md']))
+			.toEqual(['README.md', 'README.MD', 'README.markdown', 'Readme.rst', 'readme.md']);
 	});
 });
 
@@ -308,10 +316,17 @@ it('resolves a leading slash from the repository root in a nested document', () 
 			['/missing/', 'no such file with exact case: missing/'],
 			['/README.md/', 'relative target absent from the staged tree (the git index): README.md/'],
 			['/../outside.md', 'path leaves repository: ../outside.md'],
-			['/%2fREADME.md', 'path resolves to a doubled leading slash'],
-			['/./%2fREADME.md', 'path resolves to a doubled leading slash'],
-			['/a/..//README.md', 'path resolves to a doubled leading slash'],
-			['..//README.md', 'path resolves to a doubled leading slash']
+			['/%2fREADME.md', 'path segment decodes to a slash or backslash'],
+			['/./%2fREADME.md', 'path segment decodes to a slash or backslash'],
+			['%2fREADME.md', 'path segment decodes to a slash or backslash'],
+			['..%2fREADME.md', 'path segment decodes to a slash or backslash'],
+			['../docs%2fgetting-started.md', 'path segment decodes to a slash or backslash'],
+			['/docs/%2fgetting-started.md', 'path segment decodes to a slash or backslash'],
+			['/docs/%5cgetting-started.md', 'path segment decodes to a slash or backslash'],
+			['/a/..//README.md', 'path has an empty segment (a doubled slash)'],
+			['..//README.md', 'path has an empty segment (a doubled slash)'],
+			['../docs/a/..//getting-started.md', 'path has an empty segment (a doubled slash)'],
+			['/docs//getting-started.md', 'path has an empty segment (a doubled slash)']
 		]) {
 			put('notes/guide.md', '# Notes\n[Overview](../README.md)\n[Probe](' + target + ')\n');
 			result = run();
@@ -334,6 +349,8 @@ it('checks a directory anchor against the README of that directory', () => {
 		put('notes/guide.md', '# Notes\n');
 		git('init', '--initial-branch=docs-fixture');
 		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts', 'notes', 'examples', 'other');
+		// Present on disk but not in the index, so GitHub never renders it.
+		put('notes/README.md', '# Notes home\n## Setup\n');
 		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Usage](../docs/#usage)\n[Here](./#usage)\n');
 		put('notes/guide.md', [
 			'# Notes',
