@@ -182,6 +182,8 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 	let activePlatform = null;
 	/** @type {Set<string>} - channels we have subscribed to */
 	const subscribedChannels = new Set();
+	/** @type {Map<string, { overtaken: boolean, done: Promise<void> }>} - SUBSCRIBEs awaiting their reply */
+	const subscribing = new Map();
 	let idleTimer = null;
 	let keyspaceSubscribed = false;
 
@@ -753,35 +755,58 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 		}
 	}
 
+	/**
+	 * Resolves once `ch` is subscribed on the current connection. A channel
+	 * enters `subscribedChannels` only when its SUBSCRIBE reply arrives and no
+	 * UNSUBSCRIBE or teardown was sent after it, since Redis runs those after
+	 * the SUBSCRIBE. A caller whose SUBSCRIBE was overtaken that way sends a
+	 * new one, so the set always matches what Redis holds.
+	 * @param {string} topic
+	 * @param {any} platform
+	 */
 	async function subscribeToTopic(topic, platform) {
 		if (idleTimer) {
 			clearTimer(idleTimer);
 			idleTimer = null;
 		}
-		await ensureSubscriber(platform);
-		if (!subscriber) return;
 		const ch = eventChannel(topic);
-		if (!subscribedChannels.has(ch)) {
-			await subscriber.subscribe(ch);
-			subscribedChannels.add(ch);
+		for (;;) {
+			await ensureSubscriber(platform);
+			if (!subscriber || subscribedChannels.has(ch)) return;
+			let attempt = subscribing.get(ch);
+			if (!attempt) {
+				const sub = subscriber;
+				/** @type {{ overtaken: boolean, done: Promise<void> }} */
+				const record = { overtaken: false, done: /** @type {any} */ (null) };
+				record.done = Promise.resolve(sub.subscribe(ch)).then(() => {
+					if (!record.overtaken && subscriber === sub) subscribedChannels.add(ch);
+				}).finally(() => {
+					if (subscribing.get(ch) === record) subscribing.delete(ch);
+				});
+				subscribing.set(ch, record);
+				attempt = record;
+			}
+			await attempt.done;
 		}
 	}
 
 	async function unsubscribeFromTopic(topic) {
 		if (!subscriber) return;
 		const ch = eventChannel(topic);
-		if (subscribedChannels.has(ch)) {
+		const attempt = subscribing.get(ch);
+		if (subscribedChannels.has(ch) || attempt) {
 			subscribedChannels.delete(ch);
+			if (attempt) attempt.overtaken = true;
 			await subscriber.unsubscribe(ch).catch(() => {});
 		}
 		// Don't idle-shutdown when keyspace notifications are on - the
 		// pattern subscription is the whole point of keeping the
 		// subscriber alive.
-		if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
+		if (subscribedChannels.size === 0 && subscribing.size === 0 && !keyspaceSubscribed && subscriber) {
 			if (!idleTimer) {
 				idleTimer = setTimer(() => {
 					idleTimer = null;
-					if (subscribedChannels.size === 0 && !keyspaceSubscribed && subscriber) {
+					if (subscribedChannels.size === 0 && subscribing.size === 0 && !keyspaceSubscribed && subscriber) {
 						const sub = subscriber;
 						subscriber = null;
 						sub.quit().catch(() => sub.disconnect());
@@ -794,10 +819,15 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 
 	async function unsubscribeAllChannels() {
 		if (subscriber) {
-			for (const ch of subscribedChannels) {
-				await subscriber.unsubscribe(ch).catch(() => {});
+			const channels = new Set(subscribedChannels);
+			for (const [ch, attempt] of subscribing) {
+				attempt.overtaken = true;
+				channels.add(ch);
 			}
 			subscribedChannels.clear();
+			for (const ch of channels) {
+				await subscriber.unsubscribe(ch).catch(() => {});
+			}
 		}
 	}
 
@@ -841,6 +871,7 @@ export function createSubscriber({ client, instanceId, maxEnvelopeBytes, keyspac
 			closeConnection(s);
 		}
 		keyspaceSubs.clear();
+		for (const attempt of subscribing.values()) attempt.overtaken = true;
 		subscribedChannels.clear();
 		keyspaceSubscribed = false;
 		activePlatform = null;

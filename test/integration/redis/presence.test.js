@@ -1240,4 +1240,63 @@ describeIntegration('redis presence (integration)', () => {
 			expect(attacker.isSubscribed('__presence:lobby')).toBe(true);
 		});
 	});
+
+	describe('topic channel ownership across a closed join and a syncing observer', () => {
+		it('keeps an observer subscribed when a join whose socket closed finishes subscribing after it', async () => {
+			const local = makeTracker();
+			const remote = makeTracker();
+			// Hold the replies to the room channel's SUBSCRIBEs until released, in
+			// the order they were sent; the commands reach Redis at once.
+			const held = [];
+			const duplicate = client.duplicate.bind(client);
+			let hold = true;
+			client.duplicate = (...args) => {
+				const dup = duplicate(...args);
+				// An accessor, so the hold also wraps the subscribe the subscriber
+				// guard installs over the client's own. A call the guard makes
+				// into the wrapped original while it runs is not held again.
+				let subscribe = dup.subscribe;
+				let depth = 0;
+				Object.defineProperty(dup, 'subscribe', {
+					configurable: true,
+					get() {
+						const fn = subscribe;
+						return (...channels) => {
+							let reply;
+							depth++;
+							try { reply = Promise.resolve(fn.apply(dup, channels)); } finally { depth--; }
+							if (depth > 0 || !hold || !channels.some((c) => String(c).includes('room'))) return reply;
+							return new Promise((resolve, reject) => held.push(() => reply.then(resolve, reject)));
+						};
+					},
+					set(fn) { subscribe = fn; }
+				});
+				return dup;
+			};
+			try {
+				const A = mockWs({ id: 'a', name: 'A' });
+				const joinA = local.join(A, 'room', platform).catch((e) => e.code);
+				await vi.waitFor(() => expect(held.length).toBeGreaterThan(0));
+				await local.leave(A, platform);
+				const syncO = local.sync(mockWs({ id: 'obs', name: 'Obs' }), 'room', platform);
+				await wait(50);
+				hold = false;
+				// The closed join's reply first, then any later one.
+				while (held.length > 0) {
+					held.shift()();
+					await wait(50);
+				}
+				expect(await joinA).toBe('WS_CLOSED');
+				await syncO;
+			} finally {
+				client.duplicate = duplicate;
+			}
+			platform.reset();
+			await remote.join(mockWs({ id: 'remote', name: 'Remote' }), 'room', mockPlatform());
+			await vi.waitFor(() => {
+				local.flushDiffs();
+				expect(joinDiffsFor(platform, 'remote').length).toBeGreaterThan(0);
+			}, { timeout: 3000 });
+		});
+	});
 });

@@ -429,6 +429,19 @@ export function createPresence(client, options = {}) {
 	});
 	const { subscribeToTopic, unsubscribeFromTopic } = subscriberCtx;
 
+	// Observers whose sync() is subscribing a topic's event channel and has
+	// not counted itself in syncCounts yet. A join counts itself in
+	// localCounts before its first await; an observer only after its reads,
+	// so without this a leave in that window would drop the channel the
+	// observer is about to rely on.
+	/** @type {Map<string, number>} */
+	const pendingObservers = new Map();
+
+	/** Whether anything on this instance still needs the topic's event channel. */
+	function channelHeld(topic) {
+		return localCounts.has(topic) || syncCounts.has(topic) || pendingObservers.has(topic);
+	}
+
 	// UTF-8 needs at most three bytes per UTF-16 code unit.
 	const safeEnvelopeChars = Math.floor(maxEnvelopeBytes / 3);
 	const safeFieldsChars = Math.floor(maxFieldsBytes / 3);
@@ -543,7 +556,7 @@ export function createPresence(client, options = {}) {
 				}
 			}
 		}
-		if (!localCounts.has(topic) && !syncCounts.has(topic)) await unsubscribeFromTopic(topic);
+		if (!channelHeld(topic)) await unsubscribeFromTopic(topic);
 	}
 
 	async function restoreIdentity(topic, key, newest, cached, platform) {
@@ -618,7 +631,7 @@ export function createPresence(client, options = {}) {
 					if (counts.size === 0) {
 						localCounts.delete(topic);
 						activeTopics.delete(topic);
-						releaseChannel = !syncCounts.has(topic);
+						releaseChannel = !channelHeld(topic);
 					}
 
 					// The removal is issued before the first await, so a close
@@ -686,7 +699,7 @@ export function createPresence(client, options = {}) {
 				const count = (syncCounts.get(topic) || 1) - 1;
 				if (count <= 0) {
 					syncCounts.delete(topic);
-					if (!localCounts.has(topic)) {
+					if (!channelHeld(topic)) {
 						await unsubscribeFromTopic(topic);
 					}
 				} else {
@@ -748,7 +761,7 @@ export function createPresence(client, options = {}) {
 					if (counts.size === 0) {
 						localCounts.delete(topic);
 						activeTopics.delete(topic);
-						if (!syncCounts.has(topic)) {
+						if (!channelHeld(topic)) {
 							needsUnsub = true;
 						}
 					}
@@ -853,7 +866,7 @@ export function createPresence(client, options = {}) {
 		if (syncTopics) {
 			const syncUnsubPromises = [];
 			for (const topic of syncTopics) {
-				if (!syncCounts.has(topic) && !localCounts.has(topic)) {
+				if (!channelHeld(topic)) {
 					syncUnsubPromises.push(unsubscribeFromTopic(topic));
 				}
 			}
@@ -948,18 +961,25 @@ export function createPresence(client, options = {}) {
 			if (denial) return denial;
 		}
 		b?.guard();
-		try {
-			await subscribeToTopic(topic, platform);
-		} catch (err) {
-			b?.failure(err);
-			throw err;
-		}
+		pendingObservers.set(topic, (pendingObservers.get(topic) || 0) + 1);
+		let pending = true;
+		const settlePending = () => {
+			if (!pending) return;
+			pending = false;
+			const left = (pendingObservers.get(topic) || 1) - 1;
+			if (left > 0) pendingObservers.set(topic, left);
+			else pendingObservers.delete(topic);
+		};
 		let all;
 		try {
+			await subscribeToTopic(topic, platform);
 			all = await coalesceHgetall(topic);
 			b?.success();
 		} catch (err) {
 			b?.failure(err);
+			// Nothing else may hold the channel this sync opened.
+			settlePending();
+			if (!channelHeld(topic)) await unsubscribeFromTopic(topic);
 			throw err;
 		}
 		const presenceTopic = '__presence:' + topic;
@@ -979,6 +999,7 @@ export function createPresence(client, options = {}) {
 			topics.add(topic);
 			syncCounts.set(topic, (syncCounts.get(topic) || 0) + 1);
 		}
+		settlePending();
 
 		try {
 			ws.subscribe(presenceTopic);
@@ -992,7 +1013,7 @@ export function createPresence(client, options = {}) {
 				const count = (syncCounts.get(topic) || 1) - 1;
 				if (count <= 0) {
 					syncCounts.delete(topic);
-					if (!localCounts.has(topic)) {
+					if (!channelHeld(topic)) {
 						await unsubscribeFromTopic(topic);
 					}
 				} else {
@@ -1104,7 +1125,7 @@ export function createPresence(client, options = {}) {
 			// subscribed. Throw so the caller sees the abort instead of a silent
 			// success.
 			if (!wsTopics.has(ws)) {
-				if (!localCounts.has(topic) && !syncCounts.has(topic)) await unsubscribeFromTopic(topic);
+				if (!channelHeld(topic)) await unsubscribeFromTopic(topic);
 				throwWsClosed(topic, cancelAdmission);
 			}
 
@@ -1707,7 +1728,7 @@ export function createPresence(client, options = {}) {
 						const count = (syncCounts.get(realTopic) || 1) - 1;
 						if (count <= 0) {
 							syncCounts.delete(realTopic);
-							if (!localCounts.has(realTopic)) {
+							if (!channelHeld(realTopic)) {
 								await unsubscribeFromTopic(realTopic);
 							}
 						} else {

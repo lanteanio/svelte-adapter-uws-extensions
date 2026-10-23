@@ -1490,6 +1490,123 @@ describe('redis presence', () => {
 		});
 	});
 
+	describe('event channel held by an observer that is still syncing', () => {
+		// Each case holds the first SUBSCRIBE reply for the room channel. The
+		// command itself reaches Redis at once; only its reply is delayed. All
+		// local calls share one platform, which receives the relayed diffs.
+		let local, remote, dups, held, realDuplicate;
+		const until = async (fn) => {
+			for (let i = 0; i < 200 && !fn(); i++) await new Promise((r) => setImmediate(r));
+		};
+		const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
+
+		beforeEach(() => {
+			local = createPresence(client, { key: 'id', heartbeat: 100000 });
+			remote = createPresence(client, { key: 'id', heartbeat: 100000 });
+			dups = [];
+			held = [];
+			let holdNext = true;
+			realDuplicate = client.redis.duplicate.bind(client.redis);
+			client.redis.duplicate = (...args) => {
+				const dup = realDuplicate(...args);
+				dups.push(dup);
+				const subscribe = dup.subscribe.bind(dup);
+				dup.subscribe = (...channels) => {
+					const reply = subscribe(...channels);
+					if (!holdNext || !channels.some((c) => String(c).includes('room'))) return reply;
+					holdNext = false;
+					return new Promise((resolve) => held.push(() => resolve(reply)));
+				};
+				return dup;
+			};
+		});
+
+		afterEach(() => {
+			client.redis.duplicate = realDuplicate;
+			local.destroy();
+			remote.destroy();
+		});
+
+		async function expectObserverHearsRemoteJoins(pO) {
+			await settle();
+			const subscribed = dups.flatMap((d) => [...d._subscribedChannels]).filter((c) => String(c).includes('room'));
+			expect(subscribed).toEqual(['test:presence:events:room']);
+			const before = pO.published.length + pO.publishedBatches.length;
+			await remote.join(mockWs({ id: 'remote' }), 'room', mockPlatform());
+			await settle();
+			local.flushDiffs?.(pO);
+			await settle();
+			expect(pO.published.length + pO.publishedBatches.length).toBeGreaterThan(before);
+		}
+
+		it('keeps the channel for an observer that subscribes while a closed join is subscribing it', async () => {
+			const pA = platform;
+			const pO = platform;
+			const A = mockWs({ id: '1' });
+			const joinA = local.join(A, 'room', pA).catch((e) => e.code);
+			await until(() => held.length === 1);
+			await local.leave(A, pA);
+			const syncO = local.sync(mockWs({ id: 'obs' }), 'room', pO);
+			held.shift()();
+			expect(await joinA).toBe('WS_CLOSED');
+			await syncO;
+			await expectObserverHearsRemoteJoins(pO);
+		});
+
+		it('keeps the channel when a failed join rolls back while an observer is syncing', async () => {
+			const pO = platform;
+			const syncO = local.sync(mockWs({ id: 'obs' }), 'room', pO);
+			await until(() => held.length === 1);
+			const evalScript = client.redis.eval.bind(client.redis);
+			let failed = false;
+			client.redis.eval = async (...args) => {
+				if (!failed) { failed = true; throw new Error('join refused'); }
+				return evalScript(...args);
+			};
+			try {
+				const joinA = local.join(mockWs({ id: '1' }), 'room', platform).catch((e) => e.message);
+				await settle();
+				held.shift()();
+				expect(await joinA).toBe('join refused');
+				await syncO;
+			} finally {
+				client.redis.eval = evalScript;
+			}
+			await expectObserverHearsRemoteJoins(pO);
+		});
+
+		it('keeps the channel when another observer of the topic fails while one is syncing', async () => {
+			const pO = platform;
+			const syncO = local.sync(mockWs({ id: 'obs' }), 'room', pO);
+			await until(() => held.length === 1);
+			const gone = mockWs({ id: 'gone' });
+			gone.subscribe = () => { throw new Error('closed'); };
+			const syncGone = local.sync(gone, 'room', platform);
+			await settle();
+			held.shift()();
+			await syncGone;
+			await syncO;
+			await expectObserverHearsRemoteJoins(pO);
+		});
+
+		it('releases the channel a sync opened when its roster read fails', async () => {
+			held.length = 0;
+			const original = client.redis.hgetall;
+			client.redis.hgetall = async () => { throw new Error('read failed'); };
+			const pending = local.sync(mockWs({ id: 'obs' }), 'room', platform);
+			await until(() => held.length === 1);
+			held.shift()();
+			try {
+				await expect(pending).rejects.toThrow('read failed');
+			} finally {
+				client.redis.hgetall = original;
+			}
+			await settle();
+			const subscribed = dups.flatMap((d) => [...d._subscribedChannels]).filter((c) => String(c).includes('room'));
+			expect(subscribed).toEqual([]);
+		});
+	});
+
 	describe('WsClosedError on ws-closed during async gap', () => {
 		// Pins the contract that `join()` throws `WsClosedError` (`code:
 		// 'WS_CLOSED'`) instead of silently returning when the websocket
