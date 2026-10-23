@@ -7,7 +7,7 @@
 // true multi-instance convergence is covered on real Redis in
 // test/integration/redis/crdt.test.js.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createCrdtCluster } from '../../src/redis/crdt.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
@@ -787,6 +787,124 @@ describe('createCrdtCluster topics the relay cannot carry', () => {
 		} finally {
 			a.destroy();
 			b.destroy();
+		}
+	});
+});
+
+describe('createCrdtCluster states past the part limit', () => {
+	// More bytes than parts can carry: 48 MiB of base64 holds 37748736.
+	const SIZE = 38000000;
+	let bigA;
+	let bigB;
+	beforeEach(() => {
+		bigA ??= new Array(SIZE).fill(7);
+		if (!bigB) { bigB = bigA.slice(); bigB[0] = 8; }
+	});
+	afterAll(() => { bigA = null; bigB = null; });
+
+	/** A coordinator whose replica of every topic is `state`. */
+	function holder(client, state, errors) {
+		const c = createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err) });
+		c.onMessage({ onSyncRequest: (declKey, topic, sv, from) => c.sendSyncReply(declKey, topic, state, from) });
+		return c;
+	}
+	const rejection = (p) => p.then(() => null, (err) => [err.code, err.cause?.code]);
+
+	it('persists a state the relay cannot carry when no other instance holds the document', async () => {
+		const client = mockRedisClient('crdtlone:');
+		const errors = [];
+		const a = holder(client, bigA, errors);
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', bigA);
+			await settle();
+			expect(await a.acquirePersist('doc:big')).toBe(true);
+			expect(await a.acquirePersist('doc:big')).toBe(true);
+			expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+		} finally {
+			a.destroy();
+		}
+	}, 60000);
+
+	it('lets neither of two instances persist when both hold different states the relay cannot carry', async () => {
+		const client = mockRedisClient('crdtbothbig:');
+		const aErrors = [];
+		const bErrors = [];
+		const a = holder(client, bigA, aErrors);
+		const b = holder(client, bigB, bErrors);
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', bigA);
+			b.relayUpdate('dk1', 'doc:big', bigB);
+			await settle();
+			// Both rounds start at once.
+			const results = await Promise.all([rejection(a.acquirePersist('doc:big')), rejection(b.acquirePersist('doc:big'))]);
+			expect(results).toEqual([['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE'], ['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']]);
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			expect(await rejection(b.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			expect(aErrors).toHaveLength(1);
+			expect(bErrors).toHaveLength(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	}, 60000);
+
+	it('stops persisting a state the relay cannot carry once a peer answers with a different one', async () => {
+		const client = mockRedisClient('crdtbigvsmall:');
+		const errors = [];
+		const a = holder(client, bigA, errors);
+		const b = holder(client, [1, 2, 3], []);
+		try {
+			await settle();
+			b.relayUpdate('dk1', 'doc:big', [1, 2, 3]);
+			a.relayUpdate('dk1', 'doc:big', bigA);
+			await settle();
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			expect(errors).toHaveLength(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	}, 60000);
+});
+
+describe('createCrdtCluster peer reports of a state too large to send', () => {
+	const forged = (client, to, fields) => client.redis.publish(client.key('crdt:events'),
+		JSON.stringify({ i: 'ffffffffffffffff', k: 'srep', d: 'dk1', t: 'doc:1', b: [], to, o: 1, ...fields }));
+
+	function single(client) {
+		const a = createCrdtCluster(client, { persistLeaseMs: 600 });
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => { if (from.startsWith('local:')) a.sendSyncReply(declKey, topic, [1], from); } });
+		return a;
+	}
+
+	it('ignores one for another declaration of the topic', async () => {
+		const client = mockRedisClient('crdtflagdecl:');
+		const a = single(client);
+		try {
+			await settle();
+			a.requestSync('dk1', 'doc:1', []); // a cold join awaiting replies
+			await settle();
+			await forged(client, a.instanceId, { d: 'x' });
+			expect(await a.acquirePersist('doc:1')).toBe(true);
+		} finally {
+			a.destroy();
+		}
+	});
+
+	it('ignores one that answers no request this instance has outstanding', async () => {
+		const client = mockRedisClient('crdtflagunsolicited:');
+		const a = single(client);
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:1', [1]); // held, never asked about
+			await settle();
+			await forged(client, a.instanceId, {});
+			await forged(client, a.instanceId, { c: 'abcdefabcdef' });
+			expect(await a.acquirePersist('doc:1')).toBe(true);
+		} finally {
+			a.destroy();
 		}
 	});
 });

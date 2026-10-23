@@ -52,14 +52,15 @@
  *     the peers, or whose round could not reach them, refuses persistence
  *     (rejects, so the schedule retries and the replica stays loaded) until a
  *     resync delivered them.
- *   - **Documents past the relay limit stay loaded.** A stored snapshot is
- *     replaced, not merged, so two instances writing replicas that differ
- *     would erase each other's edits in turn. When the relay cannot carry a
- *     topic's update, sync request or sync reply even in parts, its replicas
- *     can no longer be kept in sync: the instance that could not send, and a
- *     peer it could not answer, report the topic once and reject its
- *     persistence from then on, so each keeps its replica and edits loaded
- *     and none of them overwrites the snapshot with a partial state.
+ *   - **Documents past the relay limit.** A stored snapshot is replaced,
+ *     not merged, so two instances writing replicas that differ would erase
+ *     each other's edits in turn. A replica whose state the relay cannot
+ *     push is written only after a round in which every peer answered that
+ *     it holds the same state or nothing. Once a peer holds a different
+ *     state, or a sync request or reply cannot be sent at all, the sender
+ *     and the requester it was answering reject the topic's persistence
+ *     until they restart, keeping the replica and its edits loaded. Each
+ *     such topic is reported to onError once.
  *   - **Cold-join freshness.** A persisted snapshot is only as fresh as the
  *     last debounced store. When an instance cold-loads a topic it loads the
  *     snapshot AND broadcasts a sync request carrying its state vector; any
@@ -185,9 +186,8 @@ function positive(v, fallback) {
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber
  *   failure (the subscriber tears down, is opened again, and resyncs), and a
  *   relay envelope too large to send even in parts (code
- *   `RELAY_ENVELOPE_TOO_LARGE`, once per held document; the relay cannot
- *   keep such a document in sync, so `acquirePersist` rejects for it from
- *   then on and the replica stays loaded with its edits).
+ *   `RELAY_ENVELOPE_TOO_LARGE`, once per held document; see the module
+ *   comment for when such a document is persisted).
  */
 
 /**
@@ -248,6 +248,12 @@ export function createCrdtCluster(client, options = {}) {
 	const stale = new Set();
 	/** @type {Map<string, Error>} topics the relay cannot keep in sync -> the error reported for them */
 	const oversize = new Map();
+	/** @type {Map<string, Error>} topics whose local state the relay cannot carry to the peers -> why */
+	const unpushable = new Map();
+	/** @type {Set<string>} topics already reported as too large for the relay */
+	const reported = new Set();
+	/** @type {Map<string, number>} topics with a cold-join request awaiting replies -> until when */
+	const joining = new Map();
 	/** @type {Map<string, Map<string, { declKey: string, v: any[], c: string | undefined }>>} topic -> requester -> a sync reply the relay lost */
 	const owed = new Map();
 	/** @type {WeakMap<object, any[]>} sync reply envelope -> the state vector it answered */
@@ -331,16 +337,23 @@ export function createCrdtCluster(client, options = {}) {
 		stale.delete(topic);
 		unrelayed.delete(topic);
 		oversize.delete(topic);
+		unpushable.delete(topic);
+		reported.delete(topic);
+		joining.delete(topic);
 	}
 
 	/**
 	 * A relay too large to carry even in parts can never be sent, so retrying
-	 * it only repeats its cost. The topic's replicas can no longer be kept in
-	 * sync, and a stored snapshot is replaced, not merged, so a replica
-	 * written now could erase edits only another replica holds: the topic is
-	 * reported once to onError and its persistence rejects from then on,
-	 * which keeps the replica and its edits loaded. A peer whose sync request
-	 * got no state is told so, and its persistence rejects as well.
+	 * it only repeats its cost; the topic is reported once to onError. A
+	 * stored snapshot is replaced, not merged, so a replica written while
+	 * another replica holds edits it lacks could erase them. Local edits that
+	 * cannot be pushed leave the topic marked: its next resync round asks the
+	 * peers, and persistence goes on only when every peer answered that it
+	 * holds the same state or nothing (see finishRound). A sync request or
+	 * reply that cannot be sent means the replicas can no longer be kept in
+	 * sync: persistence rejects from then on, which keeps the replica and its
+	 * edits loaded, and the requester of a reply is told so, since its state
+	 * may differ from this one.
 	 */
 	function relayImpossible(obj, err) {
 		const topic = obj.t;
@@ -357,14 +370,35 @@ export function createCrdtCluster(client, options = {}) {
 			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: obj.d, t: topic, b: [], to: obj.to, c: obj.c, o: 1 });
 		}
 		if (typeof topic !== 'string' || !known.has(topic)) { report(err); return; }
+		if (obj.k === KIND_UPDATE) {
+			if (Array.isArray(obj.b) && obj.b.length > 0) unrelayed.set(topic, ++marks);
+			unpushable.set(topic, err);
+			reportOnce(topic, err);
+			return;
+		}
 		cannotSync(topic, err);
 	}
 
-	/** Stop persisting a topic the relay cannot keep in sync; report it once. */
+	/** Stop persisting a topic the relay cannot keep in sync. */
 	function cannotSync(topic, err) {
 		if (oversize.has(topic)) return;
 		oversize.set(topic, err);
+		reportOnce(topic, err);
+	}
+
+	function reportOnce(topic, err) {
+		if (reported.has(topic)) return;
+		reported.add(topic);
 		report(err);
+	}
+
+	/** Whether a cold-join request for the topic may still be answered. */
+	function joinPending(topic) {
+		const until = joining.get(topic);
+		if (until === undefined) return false;
+		if (until > monotonicNow()) return true;
+		joining.delete(topic);
+		return false;
 	}
 
 	/**
@@ -676,9 +710,17 @@ export function createCrdtCluster(client, options = {}) {
 			// Targeted: only the requester applies a reply addressed to it.
 			if (parsed.to !== instanceId || !Array.isArray(parsed.b)) return;
 			if (parsed.b.length > 0 && handlers.onSyncReply) handlers.onSyncReply(declKey, topic, parsed.b);
-			// The peer holds state the relay cannot carry to this replica.
-			if (parsed.o === 1 && known.has(topic)) {
-				cannotSync(topic, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: a peer holds document state too large for the relay even in parts'));
+			if (declKey === known.get(topic)) {
+				const round = rounds.get(topic);
+				const running = round !== undefined && !round.done;
+				const answersRound = running && parsed.c === round.id;
+				if (parsed.o === 1 && (answersRound || (parsed.c === undefined && joinPending(topic)))) {
+					// A peer whose state differs could not send it.
+					cannotSync(topic, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: a peer holding a different state of the document could not send it, as it is too large for the relay even in parts'));
+				} else if (parsed.b.length > 0 && running && round.unpushable !== null && (answersRound || parsed.c === undefined)) {
+					// A peer holding a different state cannot be given this one.
+					cannotSync(topic, round.unpushable);
+				}
 			}
 			noteReply(topic, parsed.i, parsed.c);
 		}
@@ -778,7 +820,11 @@ export function createCrdtCluster(client, options = {}) {
 	/**
 	 * End a round. It resolves true when Redis confirmed its sync request, so
 	 * every peer received it; false when the request was lost or still
-	 * unconfirmed when the window closed.
+	 * unconfirmed when the window closed. A round whose push the relay
+	 * cannot carry resolves true only when every peer answered, on a server
+	 * that counts them, and none of them holds a different state: then no
+	 * other replica holds edits a write could erase, and no peer lacks the
+	 * local edits.
 	 */
 	function finishRound(round) {
 		if (round.done) return;
@@ -788,7 +834,12 @@ export function createCrdtCluster(client, options = {}) {
 		// A request not known to have reached the peers leaves the replica
 		// unsynced: the next write runs another round.
 		if (!round.asked && !destroyed && known.has(round.topic)) stale.add(round.topic);
-		round.resolve(round.asked);
+		let ok = round.asked;
+		if (round.unpushable !== null) {
+			ok = ok && round.expected !== null && round.replied.size >= round.expected && !oversize.has(round.topic);
+			if (ok && unrelayed.get(round.topic) === round.mark) unrelayed.delete(round.topic);
+		}
+		round.resolve(ok);
 	}
 
 	/**
@@ -835,18 +886,24 @@ export function createCrdtCluster(client, options = {}) {
 		// meanwhile keeps it.
 		const mark = unrelayed.get(topic);
 		/** @type {any} */
-		const round = { id: randomBytes(6).toString('hex'), topic, expected: null, replied: new Set(), asked: false, done: false, timer: null, resolve: null, promise: null, sent: null };
+		const round = { id: randomBytes(6).toString('hex'), topic, mark, unpushable: null, expected: null, replied: new Set(), asked: false, done: false, timer: null, resolve: null, promise: null, sent: null };
 		round.promise = new Promise((resolve) => { round.resolve = resolve; });
 		rounds.set(topic, round);
 		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
 		if (round.timer && round.timer.unref) round.timer.unref();
 		const verdict = { reached: false, err: /** @type {unknown} */ (null) };
+		unpushable.delete(topic);
 		const pushed = mark === undefined
 			? Promise.resolve(0)
 			: publish({ i: instanceId, k: KIND_UPDATE, d: declKey, t: topic, b: full }, verdict).then((p) => {
 				if (p !== null && unrelayed.get(topic) === mark) unrelayed.delete(topic);
 				return p;
 			});
+		// The push is encoded before publish returns, so a state the relay
+		// cannot carry is known here. It carries no edit the mark does not
+		// cover, so the round keeps the mark it settles.
+		round.unpushable = unpushable.get(topic) ?? null;
+		if (round.unpushable !== null) unrelayed.set(topic, /** @type {number} */ (mark));
 		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) }, verdict);
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
 			// The round's one admission gets one outcome.
@@ -855,7 +912,7 @@ export function createCrdtCluster(client, options = {}) {
 			else release();
 			// A topic that cannot be asked about has nothing to wait for.
 			if (n !== null || oversize.has(topic)) round.asked = true;
-			if (n === null || (p === null && unrelayed.has(topic))) {
+			if (n === null || (p === null && unrelayed.has(topic) && round.unpushable === null)) {
 				// relayLost marked the topic again; nothing will answer.
 				finishRound(round);
 				return;
@@ -999,6 +1056,7 @@ export function createCrdtCluster(client, options = {}) {
 		requestSync(declKey, topic, sv) {
 			remember(declKey, topic);
 			ensureSubscriber(); // so the targeted reply finds a live subscriber
+			joining.set(topic, monotonicNow() + persistLeaseMs);
 			publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: sv });
 		},
 
@@ -1034,9 +1092,9 @@ export function createCrdtCluster(client, options = {}) {
 		 * write, storing a snapshot from a replica that could not ask its
 		 * peers, or unloading the only replica holding local edits. Replies
 		 * lost or late do not hold up the write; they are merged when they
-		 * arrive or by the next resync. A topic the relay cannot keep in sync
-		 * (see the module comment) rejects with the same code from then on,
-		 * its `cause` the `RELAY_ENVELOPE_TOO_LARGE` error reported for it.
+		 * arrive or by the next resync. A topic past the relay limit rejects
+		 * with the same code as the module comment describes, its `cause`
+		 * the `RELAY_ENVELOPE_TOO_LARGE` error reported for it.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
@@ -1086,6 +1144,9 @@ export function createCrdtCluster(client, options = {}) {
 			inflight.clear();
 			stale.clear();
 			oversize.clear();
+			unpushable.clear();
+			reported.clear();
+			joining.clear();
 			owed.clear();
 			known.clear();
 			for (const key of [...assemblies.keys()]) dropAssembly(key);
