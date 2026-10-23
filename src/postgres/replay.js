@@ -675,13 +675,15 @@ export function createReplay(client, options = {}) {
 			// Captured on the missed-empty path so the return below can confirm
 			// the client's sinceSeq against the counter before trusting it as
 			// the covered watermark.
+			// Position 0 has seen nothing, so it is owed seq 1: a trimmed head or
+			// an emptied buffer truncates it like any other position.
 			let truncated = false;
 			let currentSeq = null;
-			if (sinceSeq > 0 && missed.length > 0 && missed[0].seq > sinceSeq + 1) {
+			if (missed.length > 0 && missed[0].seq > sinceSeq + 1) {
 				mTruncations?.inc({ topic: mt(topic) });
 				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
-			} else if (sinceSeq > 0 && missed.length === 0) {
+			} else if (missed.length === 0) {
 				try {
 					const seqRes = await client.query({
 						name: 'replay_seq_' + table,

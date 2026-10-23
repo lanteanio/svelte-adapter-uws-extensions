@@ -450,6 +450,22 @@ describe('redis replay', () => {
 			expect(watermark).toBe(4);
 		});
 
+
+		it('reports a trimmed head as truncated from position 0', async () => {
+			for (let i = 1; i <= 7; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			expect(frames()).toEqual(['truncated', 3, 4, 5, 6, 7, 'end']);
+			expect(platform.sent.at(-1).data).toEqual({ truncated: true });
+		});
+
+		it('does not report a buffer holding seq 1 as truncated from position 0', async () => {
+			for (let i = 1; i <= 5; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			expect(frames()).toEqual([1, 2, 3, 4, 5, 'end']);
+		});
+
 		it('does not report a contiguous fill as truncated', async () => {
 			await publishFive();
 			for (const sinceSeq of [0, 2, 5]) {
@@ -496,7 +512,7 @@ describe('redis replay', () => {
 			expect(platform.sent[0].event).toBe('end');
 		});
 
-		it('does not send truncated when sinceSeq is 0 even with empty buffer', async () => {
+		it('sends truncated at sinceSeq 0 when the buffer is empty but seq has advanced', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
 			const bufKey = client.key('replay:buf:{chat}');
@@ -504,11 +520,11 @@ describe('redis replay', () => {
 
 			const fakeWs = {};
 			platform.reset();
-			// sinceSeq 0 means fresh client, never truncate
+			// Position 0 has seen nothing, so seq 1 is owed and it is gone.
 			await replay.replay(fakeWs, 'chat', 0, platform);
 
-			const truncated = platform.sent.filter((s) => s.event === 'truncated');
-			expect(truncated).toHaveLength(0);
+			expect(platform.sent.map((s) => s.event)).toEqual(['truncated', 'end']);
+			expect(platform.sent[1].data).toEqual({ truncated: true });
 		});
 	});
 

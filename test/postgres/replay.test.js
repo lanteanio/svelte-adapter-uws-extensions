@@ -282,17 +282,33 @@ describe('postgres replay', () => {
 			expect(end).toHaveLength(1);
 		});
 
-		it('does not send truncated when sinceSeq is 0 even with empty buffer', async () => {
+		it('sends truncated at sinceSeq 0 when the buffer is empty but seq has advanced', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 
 			await client.query('DELETE FROM svti_replay WHERE topic = $1', ['chat']);
 
 			const fakeWs = {};
 			platform.reset();
+			// Position 0 has seen nothing, so seq 1 is owed and it is gone.
 			await replay.replay(fakeWs, 'chat', 0, platform);
 
-			const truncated = platform.sent.filter((s) => s.event === 'truncated');
-			expect(truncated).toHaveLength(0);
+			expect(platform.sent.map((s) => s.event)).toEqual(['truncated', 'end']);
+			expect(platform.sent[1].data).toEqual({ truncated: true });
+		});
+
+		it('sends truncated at sinceSeq 0 when the head was trimmed', async () => {
+			for (let i = 1; i <= 7; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+
+			expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual(['truncated', 3, 4, 5, 6, 7, 'end']);
+		});
+
+		it('does not send truncated at sinceSeq 0 for an empty topic', async () => {
+			platform.reset();
+			await replay.replay({}, 'quiet', 0, platform);
+			expect(platform.sent.map((s) => s.event)).toEqual(['end']);
 		});
 	});
 

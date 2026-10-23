@@ -72,11 +72,12 @@ export function decodeStreamFields(fields, seq, topic) {
  * Whether a replay read missed any seq it should have delivered. `entries` are
  * the decoded entries above `sinceSeq` in ascending seq order (corrupt ones
  * already dropped) and `currentSeq` is the topic's seq counter, read before
- * the entries. Every seq from `sinceSeq + 1` (from the first entry for a
- * client with no position) through the counter was issued with its entry, so
- * a seq absent from that run was trimmed away, expired or stored corrupt: a
- * hole before the first entry, between two entries, or after the last one.
- * A client with no position and no entries has nothing to miss.
+ * the entries. A client at `sinceSeq` expects `sinceSeq + 1` next; position 0
+ * has seen nothing, so it expects seq 1, the same rule the in-memory replay
+ * plugin applies (truncated when the oldest retained seq is above
+ * `sinceSeq + 1`). Every seq through the counter was issued with its entry,
+ * so a seq absent from that run was trimmed away, expired or stored corrupt:
+ * a hole before the first entry, between two entries, or after the last one.
  *
  * @param {ReadonlyArray<{ seq: number }>} entries
  * @param {number} sinceSeq
@@ -84,8 +85,7 @@ export function decodeStreamFields(fields, seq, topic) {
  * @returns {boolean}
  */
 export function replayHasHole(entries, sinceSeq, currentSeq) {
-	if (entries.length === 0) return sinceSeq > 0 && currentSeq > sinceSeq;
-	let expected = sinceSeq > 0 ? sinceSeq + 1 : entries[0].seq;
+	let expected = sinceSeq + 1;
 	for (let i = 0; i < entries.length; i++) {
 		const seq = entries[i].seq;
 		if (seq > expected) return true;

@@ -166,6 +166,24 @@ describe('redis replay (stream backend)', () => {
 			expect(truncated).toHaveLength(1);
 		});
 
+		it('truncated event from position 0 when the head was trimmed', async () => {
+			for (let i = 1; i <= 7; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual(['truncated', 3, 4, 5, 6, 7, 'end']);
+			expect(platform.sent.at(-1).data).toEqual({ truncated: true });
+		});
+
+		it('truncated event from position 0 when the buffer is empty but seq has advanced', async () => {
+			await replay.publish(platform, 'chat', 'created', { id: 1 });
+			client._streams.delete(client.key('replay:streambuf:{chat}'));
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			expect(platform.sent.map((s) => s.event)).toEqual(['truncated', 'end']);
+		});
+
 		describe('a hole inside the replayed range', () => {
 			async function publishFive() {
 				for (let i = 1; i <= 5; i++) await replay.publish(platform, 'chat', 'created', { id: i });
@@ -181,6 +199,7 @@ describe('redis replay (stream backend)', () => {
 				expect(frames()).toEqual(['truncated', ...[1, 2, 4, 5].filter((seq) => seq > sinceSeq), 'end']);
 				expect(platform.sent.at(-1).data).toEqual({ truncated: true });
 			});
+
 
 			it('reports a deleted middle entry as truncated', async () => {
 				await publishFive();

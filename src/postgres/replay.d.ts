@@ -159,12 +159,15 @@ export interface PgReplayBuffer extends PostgresStoreReadiness {
 	 * Inspect whether the buffer still holds the next sequence after
 	 * `lastSeenSeq`. Returns `{ truncated: true, missingFrom: lastSeenSeq + 1 }`
 	 * when the next row is not in the buffer but the seq counter has advanced
-	 * past it; otherwise `{ truncated: false, missingFrom: null }`.
+	 * past it; otherwise `{ truncated: false, missingFrom: null }`. Only that
+	 * one seq is checked.
 	 *
 	 * Useful for clients that want to decide between an incremental replay
 	 * and a full reload before opening a WebSocket. `lastSeenSeq` of 0
-	 * always returns `{ truncated: false, missingFrom: null }` (a fresh
-	 * client has no history to lose).
+	 * always returns `{ truncated: false, missingFrom: null }`: a client
+	 * with no position loads in full anyway, so there is no incremental fetch
+	 * to decide on. `replay()` from position 0 still reports a buffer that no
+	 * longer holds seq 1.
 	 */
 	gap(topic: string, lastSeenSeq: number): Promise<ReplayGap>;
 
@@ -175,8 +178,11 @@ export interface PgReplayBuffer extends PostgresStoreReadiness {
 	 * Send buffered messages to a single connection. Sends each missed
 	 * message on `__replay:{topic}`, then an end marker.
 	 *
-	 * If the buffer has been trimmed past `sinceSeq`, a `truncated` event
-	 * is sent before the messages and the end marker includes `truncated: true`.
+	 * If the buffer has been trimmed past `sinceSeq`, or is empty while the
+	 * seq counter has advanced past it, a `truncated` event is sent before the
+	 * messages and the end marker includes `truncated: true`. Position 0 has
+	 * seen nothing, so it is owed seq 1: a buffer trimmed past seq 1
+	 * truncates a replay from 0, as in the core replay plugin.
 	 * Every message and the end marker echo a supplied `reqId`, so concurrent
 	 * requests can filter both history and truncation by their correlation ID.
 	 *

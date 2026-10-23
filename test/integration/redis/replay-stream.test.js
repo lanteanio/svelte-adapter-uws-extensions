@@ -195,9 +195,24 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			expect(result.missingFrom).toBe(2);
 		});
 
-		it('fresh client (lastSeenSeq=0) is never truncated', async () => {
+		it('gap() at lastSeenSeq 0 stays clean, replay() from 0 reports a trimmed head', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 			expect(await replay.gap('chat', 0)).toEqual({ truncated: false, missingFrom: null });
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			expect(platform.sent.some((s) => s.event === 'truncated')).toBe(false);
+
+			for (let i = 2; i <= 500; i++) {
+				await replay.publish(platform, 'chat', 'created', { id: i });
+			}
+			// MAXLEN ~ trims whole listpack nodes, so publish well past one.
+			expect((await replay.since('chat', 0))[0].seq).toBeGreaterThan(1);
+			expect(await replay.gap('chat', 0)).toEqual({ truncated: false, missingFrom: null });
+			platform.reset();
+			await replay.replay({}, 'chat', 0, platform);
+			const events = platform.sent.map((s) => s.event);
+			expect(events[0]).toBe('truncated');
+			expect(platform.sent.at(-1)).toMatchObject({ event: 'end', data: { truncated: true } });
 		});
 
 		it('returns clean for an unknown topic', async () => {
