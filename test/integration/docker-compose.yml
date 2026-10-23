@@ -1,10 +1,12 @@
 services:
   redis:
     # Redis 7.4+ required for the per-field hash TTL primitive (HEXPIRE family)
-    # used by createPresence. Pinning to the 7.4 minor avoids drift if the
-    # 7-alpine tag floats to a future major. Bump to redis:8-alpine when we
-    # adopt Redis 8 features (e.g. JSON, vector search).
-    image: redis:7.4-alpine
+    # used by createPresence. Every backend image in test/integration/ is
+    # pinned by its multi-platform index digest, so a run is reproducible and
+    # an upstream tag push cannot change the server under test; the tag beside
+    # the digest names the exact release. Move a pin deliberately, in every
+    # compose file at once, and rerun all tiers.
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "${INTEGRATION_REDIS_HOST_PORT:-56379}:6379"
@@ -18,7 +20,7 @@ services:
       start_period: 2s
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
     command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: test

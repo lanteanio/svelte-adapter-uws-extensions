@@ -100,7 +100,7 @@ async function main() {
 	try {
 		docker(['info', '--format', '{{.ServerVersion}}']);
 		container = 'extensions-smoke-' + randomUUID();
-		docker(['run', '--detach', '--rm', '--name', container, '--publish', '127.0.0.1::6379', 'redis:7.4-alpine', 'redis-server', '--save', '', '--appendonly', 'no']);
+		docker(['run', '--detach', '--rm', '--name', container, '--publish', '127.0.0.1::6379', 'redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541', 'redis-server', '--save', '', '--appendonly', 'no']);
 		const port = docker(['port', container, '6379/tcp']).split(':').at(-1);
 		const url = 'redis://127.0.0.1:' + port;
 		const options = { url, keyPrefix: 'smoke:', autoShutdown: false, options: { connectTimeout: 3000, maxRetriesPerRequest: 1, retryStrategy: (attempt) => attempt < 4 ? 50 : null } };

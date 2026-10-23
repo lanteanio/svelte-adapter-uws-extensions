@@ -3,9 +3,9 @@ services:
     # Valkey is the ecosystem's chosen cache backend; this tier re-runs the
     # Redis-backed integration suite against it. Valkey 9.0+ is required to
     # survive the WHOLE suite: createPresence's per-field hash TTL activation
-    # probe (the HEXPIRE family) gates on Valkey >= 9.0. Override the image via
-    # INTEGRATION_VALKEY_IMAGE (e.g. to pin an exact patch).
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    # probe (the HEXPIRE family) gates on Valkey >= 9.0. The default image is
+    # digest-pinned; INTEGRATION_VALKEY_IMAGE qualifies another Valkey release.
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--save", "", "--appendonly", "no"]
     ports:
       - "${INTEGRATION_VALKEY_HOST_PORT:-56381}:6379"

@@ -88,7 +88,8 @@ export const NODE_FLOOR_STATEMENTS = [
 	{ file: 'CONTRIBUTING.md', pattern: /supported runtime minimum\s+remains Node (\d+)\./g, value: 'major' },
 	{ file: '.github/workflows/verify.yml', pattern: /node-version: '(\d+)'/g, value: 'major' },
 	{ file: '.github/workflows/verify.yml', pattern: /node-version: '(\d+\.\d+\.\d+)'/g, value: 'minimum' },
-	{ file: '.github/workflows/docs-links.yml', pattern: /node-version: '(\d+)'/g, value: 'major' }
+	{ file: '.github/workflows/docs-links.yml', pattern: /node-version: '(\d+)'/g, value: 'major' },
+	{ file: '.github/workflows/integration.yml', pattern: /node: \['(\d+)'/g, value: 'major' }
 ];
 
 export function nodeFloor(range) {

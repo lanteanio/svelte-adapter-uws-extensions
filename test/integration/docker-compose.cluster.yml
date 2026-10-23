@@ -14,7 +14,7 @@
 
 services:
   redis-node-0:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -31,7 +31,7 @@ services:
       start_period: 2s
 
   redis-node-1:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -48,7 +48,7 @@ services:
       start_period: 2s
 
   redis-node-2:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -65,7 +65,7 @@ services:
       start_period: 2s
 
   redis-node-3:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -82,7 +82,7 @@ services:
       start_period: 2s
 
   redis-node-4:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -99,7 +99,7 @@ services:
       start_period: 2s
 
   redis-node-5:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     command: ["redis-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -119,7 +119,7 @@ services:
   # `redis-cli --cluster create` with --cluster-replicas 1 (3 masters + 3
   # replicas). --cluster-yes skips the interactive confirm.
   cluster-init:
-    image: redis:7.4-alpine
+    image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     depends_on:
       redis-node-0:
         condition: service_healthy

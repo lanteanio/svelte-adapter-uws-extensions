@@ -7,11 +7,12 @@
 # its host port (clients can't follow MOVED to internal bridge IPs otherwise).
 #
 # Valkey 9.0+ is required to survive the whole mirror suite (the presence
-# HEXPIRE activation gate). Override the image via INTEGRATION_VALKEY_IMAGE.
+# HEXPIRE activation gate). The default image is digest-pinned;
+# INTEGRATION_VALKEY_IMAGE qualifies another Valkey release.
 
 services:
   valkey-node-0:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -28,7 +29,7 @@ services:
       start_period: 2s
 
   valkey-node-1:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -45,7 +46,7 @@ services:
       start_period: 2s
 
   valkey-node-2:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -62,7 +63,7 @@ services:
       start_period: 2s
 
   valkey-node-3:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -79,7 +80,7 @@ services:
       start_period: 2s
 
   valkey-node-4:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -96,7 +97,7 @@ services:
       start_period: 2s
 
   valkey-node-5:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     command: ["valkey-server", "--port", "6379", "--cluster-enabled", "yes",
               "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000",
               "--appendonly", "no", "--save", ""]
@@ -116,7 +117,7 @@ services:
   # `valkey-cli --cluster create` with --cluster-replicas 1 (3 masters + 3
   # replicas). --cluster-yes skips the interactive confirm.
   cluster-init:
-    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9-alpine}
+    image: ${INTEGRATION_VALKEY_IMAGE:-valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11}
     depends_on:
       valkey-node-0:
         condition: service_healthy

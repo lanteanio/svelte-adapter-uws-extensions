@@ -46,17 +46,20 @@ its corresponding real-backend lane before review.
 | Pure utilities, Prometheus, breaker or admission policy | `npm run verify:unit`; focused tests for every affected caller. |
 | Redis commands, scripts, expiry, pub/sub or reconnect | `npm run verify:unit`, `npm run verify:redis`, `npm run verify:valkey`, `npm run verify:cluster`, `npm run verify:valkey-cluster`. |
 | Redis keys, hash tags, routing or a shared multi-slot helper | Both cluster lanes above plus the standalone Redis and Valkey lanes. Each cluster lane includes its dedicated tests and the standalone suite mirrored onto a cluster. |
-| Postgres SQL, transactions, notifications, tasks or jobs | `npm run verify:unit` and `npm run verify:postgres`. |
+| Postgres SQL, transactions, notifications, tasks or jobs | `npm run verify:unit`, `npm run verify:postgres` and `npm run verify:pgbouncer`. |
 | Dependency or lockfile changes | `npm run verify:dependencies`, a clean `npm ci`, full unit tests, and a full SBOM using the command below. |
 | Public exports, declarations or package metadata | `npm run verify:unit` (includes a packed strict TypeScript consumer), the affected backend lanes, and `npm run gate:cross-repo -- --quick` when sibling contracts change. |
 | Cursor/presence wire behavior or platform wrappers | Unit tests, smoke, Redis/Valkey/cluster lanes and matching lead-package wire fixtures. Coordinate sibling changes through their owning repository. |
 | Hot-path changes | Relevant correctness lanes plus a repeatable before/after benchmark from `bench/` under the same load and environment. |
 | CI or verification tooling | `npm run verify:docs`, run the changed lane, and check failure as well as success behavior. |
 
-`npm run verify:pr` combines the fast, unit and smoke lanes. It does not cover all
-backend tiers. `npm run verify:full` adds every backend tier. `npm run test:integration`
-by itself runs only standalone Redis and Postgres; it excludes Valkey and all
-cluster tiers. A reviewer may accept a named exception when a lane is unrelated
+`npm run verify:pr` combines the fast, unit and smoke lanes. It does not cover the
+backend tiers. `npm run test:integration` runs every backend tier in sequence:
+standalone Redis, Postgres, Postgres behind PgBouncer, standalone Valkey, Redis
+Cluster and Valkey Cluster, each cluster both natively and with the standalone
+suite mirrored onto it. `npm run verify:full` is `verify:pr` plus that whole
+matrix, and the release workflow runs the same matrix through `verify:release`.
+A reviewer may accept a named exception when a lane is unrelated
 or unavailable; record the missing claim and who accepted it in the PR. A skipped
 lane is not a passing lane.
 
@@ -67,7 +70,7 @@ The table below is generated from `package.json` and `.github/workflows/`.
 the workflow, run `node scripts/check-contributor-map.js --write` and inspect the diff.
 
 <!-- verification-inventory:start -->
-Hosted jobs: `dependencies`, `external-links`, `verify`, `publish`, `suite`, `onboarding`.
+Hosted jobs: `dependencies`, `external-links`, `backend`, `verify`, `publish`, `suite`, `onboarding`.
 
 | Command | Script expansion | Coverage |
 |---|---|---|
@@ -75,25 +78,29 @@ Hosted jobs: `dependencies`, `external-links`, `verify`, `publish`, `suite`, `on
 | `npm run check:format` | `node scripts/check-formatting.js` | Hosted |
 | `npm run gate:cross-repo` | `node scripts/cross-repo-gate.js` | Local |
 | `npm run smoke` | `node scripts/smoke.js` | Hosted |
-| `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Local |
+| `npm run verify:cluster` | `test:integration:cluster`, `test:integration:cluster-mirror` | Hosted |
 | `npm run verify:dependencies` | `check:lockfile` | Hosted |
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
 | `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish` | Hosted |
-| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `verify:redis`, `test:integration:redis`, `verify:postgres`, `test:integration:postgres`, `verify:valkey`, `test:integration:valkey`, `verify:cluster`, `test:integration:cluster`, `test:integration:cluster-mirror`, `verify:valkey-cluster`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
-| `npm run verify:postgres` | `test:integration:postgres` | Local |
+| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:pgbouncer` | `test:integration:pgbouncer` | Hosted |
+| `npm run verify:postgres` | `test:integration:postgres` | Hosted |
 | `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke` | Hosted |
-| `npm run verify:redis` | `test:integration:redis` | Local |
-| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres` | Hosted |
+| `npm run verify:redis` | `test:integration:redis` | Hosted |
+| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Hosted |
 | `npm run verify:unit` | `test` | Hosted |
-| `npm run verify:valkey` | `test:integration:valkey` | Local |
-| `npm run verify:valkey-cluster` | `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:valkey` | `test:integration:valkey` | Hosted |
+| `npm run verify:valkey-cluster` | `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Hosted |
 <!-- verification-inventory:end -->
 
 Hosted coverage means the checked-in workflow invokes that command, directly or
 through an aggregate. It does not assert branch protection or that an unpushed
-commit has run on GitHub. Lanes marked local are not hosted. The workflow runs the
-static/unit/smoke gate on Linux with Node 22; backend and cross-repository lanes
-remain contributor-run requirements for changes selected by the map.
+commit has run on GitHub. Lanes marked local are not hosted. The `Verify` workflow
+runs the static/unit/smoke gate on Linux with Node 22; the `Integration` workflow
+runs each backend tier in its own job on the Node floor and on Node 24, and records
+the Node version and server image digests in the job summary. Cross-repository
+lanes remain contributor-run requirements for changes selected by the map, and a
+backend change still runs its lanes locally before review.
 
 Plan for seconds for static checks, roughly 1-3 minutes for the unit suite, and
 10-60 seconds for smoke after the image is cached. Standalone backend suites
@@ -149,9 +156,11 @@ client integration seam and retain hot-path benchmark evidence before release.
 Integration commands create and tear down their own Compose stacks. Run tiers
 sequentially on one machine. The Redis and Postgres defaults use ports 56379 and
 55432; Valkey uses 56381. Redis Cluster uses 57000-57005 and subnet 10.249.0.0/24;
-Valkey Cluster uses 57100-57105 and subnet 10.249.1.0/24. Both subnets sit outside
-Docker's default address pools. Check for conflicts with other stacks before
-starting cluster tests. Do not stop another project's stack.
+Valkey Cluster uses 57100-57105 and subnet 10.249.1.0/24. Both subnets sit
+outside Docker's default address pools. The PgBouncer session and transaction
+pools use 55433 and 55434 in front of their own Postgres on the Postgres port.
+Check for conflicts with other stacks before starting cluster tests. Do not stop
+another project's stack.
 
 For an isolated standalone run, choose both a free port and a unique project:
 
@@ -164,13 +173,17 @@ npm run verify:redis
 The Valkey, Redis Cluster, Valkey Cluster and PgBouncer stacks append `-valkey`,
 `-cluster`, `-valkey-cluster` and `-pgbouncer` to that project name. The matching
 variables are `INTEGRATION_POSTGRES_HOST_PORT`,
+`INTEGRATION_PGBOUNCER_SESSION_PORT`, `INTEGRATION_PGBOUNCER_TRANSACTION_PORT`,
 `INTEGRATION_VALKEY_HOST_PORT`, `INTEGRATION_REDIS_CLUSTER_HOST_PORT_BASE`, and
 `INTEGRATION_VALKEY_CLUSTER_HOST_PORT_BASE`. Changing cluster host ports does not
 change their bridge subnets; when a subnet overlaps another network, set
 `INTEGRATION_REDIS_CLUSTER_SUBNET` or `INTEGRATION_VALKEY_CLUSTER_SUBNET` to a free
 /24 prefix such as `10.250.0`. The setup files under `test/integration/`
-and their Compose files are the source of truth. If a run is interrupted, remove
-only its named Compose project, using that setup's exact Compose file.
+and their Compose files are the source of truth. Every image there is pinned by
+digest, with the exact release in the tag beside it; move a pin in every Compose
+file and in `scripts/smoke.js` together, then run the whole matrix. If a run is
+interrupted, remove only its named Compose project, using that setup's exact
+Compose file.
 
 `gate:cross-repo` requires local adapter and realtime checkouts and package-manager
 network access. It reports which checks used installed tarballs and which ran in

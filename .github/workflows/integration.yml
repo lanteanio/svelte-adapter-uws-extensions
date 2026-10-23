@@ -1,0 +1,58 @@
+name: Integration
+
+# Every backend tier against real servers, on the supported Node floor and on
+# the current release line. Each tier runs in its own job, so one backend's
+# failure cannot hide another's, and every job starts its own Compose stack on
+# a fresh runner. The images are pinned by digest in test/integration/.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: ${{ matrix.tier }} on Node ${{ matrix.node }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+        tier: [redis, postgres, pgbouncer, valkey, cluster, valkey-cluster]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - if: matrix.tier == 'redis'
+        run: npm run verify:redis
+      - if: matrix.tier == 'postgres'
+        run: npm run verify:postgres
+      - if: matrix.tier == 'pgbouncer'
+        run: npm run verify:pgbouncer
+      - if: matrix.tier == 'valkey'
+        run: npm run verify:valkey
+      - if: matrix.tier == 'cluster'
+        run: npm run verify:cluster
+      - if: matrix.tier == 'valkey-cluster'
+        run: npm run verify:valkey-cluster
+      - name: Record the runtime and server images
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.tier }} on Node $(node --version)"
+            echo
+            echo '```'
+            docker image ls --digests --format '{{.Repository}}@{{.Digest}}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
