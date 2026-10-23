@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import { createPgClient } from '../../../src/postgres/index.js';
 import { createTaskRunner } from '../../../src/postgres/tasks.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
 import { waitPgMs } from '../helpers/backend-clock.js';
 
 const echoUrl = new URL('../../helpers/workers/echo.js', import.meta.url);
@@ -71,6 +72,7 @@ describe('postgres tasks async path (integration)', () => {
 	afterEach(() => {
 		for (const r of runners) r.destroy();
 		runners = [];
+		resetRuntimeEnv();
 	});
 
 	afterAll(async () => {
@@ -197,16 +199,40 @@ describe('postgres tasks async path (integration)', () => {
 
 			const allCalls = [];
 			const calls = { a: 0, b: 0, c: 0 };
+			// No handler finishes until all twelve rows are running, so every
+			// dispatcher's claim lands while the others still hold theirs.
+			let release;
+			const released = new Promise((resolve) => { release = resolve; });
+
+			// Each dispatcher's sweep is captured through the runtime seam
+			// instead of firing on a real interval, and the test runs one
+			// sweep per dispatcher, all at once. A sweep claims at most four
+			// rows, so the twelve rows need all three; however a loaded host
+			// schedules timers, it cannot hand them all to one runner.
+			const DISPATCH_MS = 3_600_000;
+			const sweeps = {};
+			let capturing = null;
+			setRuntimeEnv({
+				timers: {
+					setInterval: (cb, ms, ...args) => {
+						if (ms !== DISPATCH_MS) return setInterval(cb, ms, ...args);
+						sweeps[capturing] = cb;
+						return { unref() {} };
+					},
+					clearInterval: (handle) => clearInterval(handle)
+				}
+			});
 
 			function makeDispatcher(label) {
+				capturing = label;
 				const r = makeRunner({
-					dispatchInterval: 25,
+					dispatchInterval: DISPATCH_MS,
 					dispatchBatchSize: 4
 				});
 				r.register('worker', async ({ input }) => {
 					calls[label] += 1;
 					allCalls.push({ label, idx: input.idx });
-					await wait(5);
+					await released;
 					return { idx: input.idx, by: label };
 				});
 				return r;
@@ -215,6 +241,11 @@ describe('postgres tasks async path (integration)', () => {
 			makeDispatcher('a');
 			makeDispatcher('b');
 			makeDispatcher('c');
+			expect(Object.keys(sweeps).sort()).toEqual(['a', 'b', 'c']);
+
+			await Promise.all(Object.values(sweeps).map((sweep) => sweep()));
+			await waitFor(() => allCalls.length === ids.length, 12000);
+			release();
 
 			await waitFor(async () => {
 				const r = await client.query(
@@ -229,11 +260,9 @@ describe('postgres tasks async path (integration)', () => {
 			expect(allCalls).toHaveLength(ids.length);
 			expect(new Set(allCalls.map((c) => c.idx)).size).toBe(ids.length);
 
-			// Sanity: at least two of the three dispatchers contributed work
-			// (proves the SKIP LOCKED behaviour was actually exercised, not
-			// that one runner happened to do everything).
-			const contributors = ['a', 'b', 'c'].filter((k) => calls[k] > 0);
-			expect(contributors.length).toBeGreaterThanOrEqual(2);
+			// Every concurrent claim skipped the rows the others had locked and
+			// took a full batch of its own.
+			expect(calls).toEqual({ a: 4, b: 4, c: 4 });
 		});
 
 		it('respects dispatchBatchSize per sweep across many enqueued rows', async () => {
