@@ -205,7 +205,9 @@ export function createGroup(client, name, options = {}) {
 	const internalTopic = '__group:' + name;
 
 	// Local member tracking (ws objects on this instance)
-	/** @type {Map<any, { role: GroupRole, memberId: string }>} */
+	// `leaving` marks a member whose removal is in flight: the heartbeat skips
+	// it, so a beat between the removal and its reply cannot write it back.
+	/** @type {Map<any, { role: GroupRole, memberId: string, leaving?: boolean }>} */
 	const localMembers = new Map();
 	let memberCounter = 0;
 	let isClosed = false;
@@ -250,6 +252,7 @@ export function createGroup(client, name, options = {}) {
 		const nowTs = now();
 		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
+			if (entry.leaving) continue;
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: nowTs });
 			pipe.hset(membersKey, entry.memberId, memberData);
 		}
@@ -666,10 +669,13 @@ export function createGroup(client, name, options = {}) {
 				return;
 			}
 
+			entry.leaving = true;
 			try {
 				await redis.hdel(membersKey, entry.memberId);
 				b?.success();
 			} catch (err) {
+				// Still a member in Redis, so the heartbeat keeps it fresh again.
+				entry.leaving = false;
 				b?.failure(err);
 				return;
 			}

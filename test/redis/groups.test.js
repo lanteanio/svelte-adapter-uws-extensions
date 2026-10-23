@@ -1250,6 +1250,33 @@ describe('redis groups', () => {
 		});
 	});
 
+	describe('leave racing a heartbeat', () => {
+		it('a heartbeat during the leave does not write the departing member back', async () => {
+			// memberTtl 1 beats every 333ms. The removal reaches Redis at once but
+			// its reply is held past a beat, so a beat that still counted the
+			// member would re-add it after the removal and leave a member nobody
+			// holds until memberTtl reaps it.
+			const g = createGroup(client, 'leave-race', { memberTtl: 1 });
+			const membersKey = client.key('group:{leave-race}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
+			const hdel = client.redis.hdel;
+			client.redis.hdel = async (...args) => {
+				const result = await hdel.apply(client.redis, args);
+				await new Promise((r) => setTimeout(r, 500));
+				return result;
+			};
+			try {
+				await g.leave(ws, platform);
+			} finally {
+				client.redis.hdel = hdel;
+			}
+			expect(g.has(ws)).toBe(false);
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
+			g.destroy();
+		});
+	});
+
 	describe('small memberTtl heartbeat interval', () => {
 		it('memberTtl: 1 does not expire live members before first heartbeat', async () => {
 			const g = createGroup(client, 'short-ttl', { memberTtl: 1 });
