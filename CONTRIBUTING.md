@@ -50,6 +50,7 @@ its corresponding real-backend lane before review.
 | Dependency or lockfile changes | `npm run verify:dependencies`, a clean `npm ci`, full unit tests, and a full SBOM using the command below. |
 | Public exports, declarations or package metadata | `npm run verify:unit` (includes a packed strict TypeScript consumer), the affected backend lanes, and `npm run gate:cross-repo -- --quick` when sibling contracts change. |
 | Cursor/presence wire behavior or platform wrappers | Unit tests, smoke, Redis/Valkey/cluster lanes and matching lead-package wire fixtures. Coordinate sibling changes through their owning repository. |
+| What a closed connection or a removed subscription must release: relay, presence, groups, replay | The affected correctness lanes plus `npm run verify:leak` (see the leak lane below). |
 | Hot-path changes | Relevant correctness lanes plus a repeatable before/after benchmark from `bench/` under the same load and environment. |
 | CI or verification tooling | `npm run verify:docs`, run the changed lane, and check failure as well as success behavior. |
 
@@ -84,6 +85,7 @@ Hosted jobs: `dependencies`, `external-links`, `backend`, `verify`, `publish`, `
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
 | `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish` | Hosted |
 | `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:leak` | `test:leak`, `test:leak:cluster` | Local |
 | `npm run verify:pgbouncer` | `test:integration:pgbouncer` | Hosted |
 | `npm run verify:postgres` | `test:integration:postgres` | Hosted |
 | `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke` | Hosted |
@@ -108,6 +110,37 @@ Plan for seconds for static checks, roughly 1-3 minutes for the unit suite, and
 usually take 1-5 minutes each, and each cluster lane 3-10 minutes. These are planning
 ranges, not deadlines or pass criteria; record actual elapsed time with results.
 A cold image pull, slow Docker storage or a large stress case can take longer.
+
+## Leak lane
+
+`npm run test:leak` asks whether a Redis-backed deployment grows under a
+workload it should sustain indefinitely. It brings up the standalone Redis stack
+(`test:leak:cluster` the Redis Cluster stack, `verify:leak` both), forks three
+server instances that reach each other only through Redis, and churns real
+WebSocket clients against every instance at a fixed rate: each one connects as a
+new user, subscribes, publishes through the replay buffer, waits for its own
+event and closes. Held clients on every instance must receive the publishes made
+on the others, so the cross-instance relay is under load the whole time.
+
+After a one-minute warmup, a forced collection, an unsampled resettle and a wait
+until every instance holds still, a window (`--minutes N`, default 3) samples
+each instance's resident set, active handles and Redis connection listeners and
+the deployment's Redis key count every two seconds. The verdict uses the trend
+kernel from `svelte-adapter-uws/sim` with the adapter lane's rules: a slope
+counts only when the fit explains the samples (r-squared at least 0.5), more than
+0.5% failed churns or a p95 over 50% above the warmed baseline fail the run, and
+settled heap plus external is compared at both ends. After a cooldown in which
+every client has closed, no connection may still be registered, no presence or
+group member entry may remain in Redis, and the keys without an expiry may not
+exceed what the window opened with.
+
+One instance is a self-check: once the window opens it leaks a buffer, a Redis
+listener and a key without an expiry per closed connection, and the run fails
+unless the growth, listener and key gates each catch their own. Exit code 1 is a
+failed verdict and 2 a run that could not reach one it trusts. Each run writes a
+JSON record with every sample (`--out <dir>`). The isolation variables above
+apply; a run takes about 6-10 minutes per backend, so it is its own command rather
+than part of `verify:full`.
 
 ## Dependency graph
 
