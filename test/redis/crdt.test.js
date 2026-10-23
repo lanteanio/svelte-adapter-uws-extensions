@@ -867,6 +867,98 @@ describe('createCrdtCluster states past the part limit', () => {
 			b.destroy();
 		}
 	}, 60000);
+
+	it('waits for a counted receiver when its own subscriber no longer receives the channel', async () => {
+		const client = mockRedisClient('crdtselfcount:');
+		const subs = [];
+		const recording = Object.create(client);
+		recording.duplicate = (...args) => {
+			const sub = client.duplicate(...args);
+			subs.push(sub);
+			return sub;
+		};
+		const a = createCrdtCluster(recording, { persistLeaseMs: 900, onError: () => {} });
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, bigA, from) });
+		// A receiver that never answers, so the round cannot know it holds nothing.
+		const silent = client.duplicate();
+		try {
+			await settle();
+			await silent.subscribe(client.key('crdt:events'));
+			a.relayUpdate('dk1', 'doc:big', bigA);
+			await settle();
+			// The subscriber dropped off the channel before reporting it.
+			subs[0]._subscribedChannels.clear();
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+		} finally {
+			a.destroy();
+			silent.disconnect?.();
+		}
+	}, 60000);
+});
+
+describe('createCrdtCluster states past the part limit on a Redis Cluster', () => {
+	let big;
+	beforeEach(() => { big ??= new Array(38000000).fill(7); });
+	afterAll(() => { big = null; });
+
+	/** A lone holder on a client whose nodes answer PUBSUB NUMSUB through `numsub`. */
+	function clusterHolder(prefix, numsub) {
+		const client = mockRedisClient(prefix);
+		const asked = [];
+		client.redis.nodes = (role) => {
+			asked.push(role);
+			return numsub.map((answer) => ({
+				call: async (...args) => {
+					expect(args).toEqual(['PUBSUB', 'NUMSUB', client.key('crdt:events')]);
+					return answer();
+				}
+			}));
+		};
+		const errors = [];
+		const a = createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err) });
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, big, from) });
+		return { a, asked, errors, channel: client.key('crdt:events') };
+	}
+	const rejection = (p) => p.then(() => null, (err) => [err.code, err.cause?.code]);
+
+	it('persists a lone holder\'s state the relay cannot carry when the nodes count only its own subscriber', async () => {
+		let ch;
+		const { a, asked, errors, channel } = clusterHolder('crdtclusterlone:', [() => [ch, 1], () => [ch, 0], () => [ch, 0]]);
+		ch = channel;
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', big);
+			await settle();
+			expect(await a.acquirePersist('doc:big')).toBe(true);
+			expect(asked.every((role) => role === 'all')).toBe(true);
+			expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+		} finally {
+			a.destroy();
+		}
+	}, 60000);
+
+	it('keeps rejecting, retryably, while a node cannot be counted or counts a subscriber that does not answer', async () => {
+		let ch;
+		let mode = 'fail';
+		const second = () => {
+			if (mode === 'fail') throw new Error('node down');
+			return [ch, mode === 'extra' ? 1 : 0];
+		};
+		const { a, channel } = clusterHolder('crdtclusterunknown:', [() => [ch, 1], second]);
+		ch = channel;
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', big);
+			await settle();
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			mode = 'extra';
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			mode = 'none';
+			expect(await a.acquirePersist('doc:big')).toBe(true);
+		} finally {
+			a.destroy();
+		}
+	}, 60000);
 });
 
 describe('createCrdtCluster peer reports of a state too large to send', () => {

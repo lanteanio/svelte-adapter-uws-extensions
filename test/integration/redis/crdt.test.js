@@ -133,6 +133,25 @@ describe('redis crdt cluster coordinator (integration)', () => {
 		expect(await b.acquirePersist('board:ttl')).toBe(true);
 	});
 
+	it('persists a lone holder\'s state too large for the relay once it counted every subscriber', async () => {
+		// Just over what parts can carry: 48 MiB of base64 holds 37748736 bytes.
+		const big = new Array(38000000).fill(7);
+		const errors = [];
+		const a = track(createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err) }));
+		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, big, from) });
+		await wait(150);
+		a.relayUpdate('dk1', 'doc:lonebig', big);
+		// Subscribers of earlier tests may still be closing; until they are
+		// gone the round waits for them and the write is refused.
+		let persisted = false;
+		await waitFor(async () => {
+			persisted = await a.acquirePersist('doc:lonebig').catch(() => false);
+			return persisted;
+		}, 20000);
+		expect(persisted).toBe(true);
+		expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+	}, 60000);
+
 	describe('repair after a lost relay', () => {
 		const TOPIC = 'doc:repair';
 		const docs = [];

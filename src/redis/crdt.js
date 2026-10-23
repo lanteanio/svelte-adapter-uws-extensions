@@ -102,7 +102,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { LEASE_RENEW_SCRIPT } from '../shared/lease-scripts.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { openSubscriber, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
+import { openSubscriber, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
 import { isCluster } from '../shared/cluster.js';
 import { operationError } from '../shared/errors.js';
 
@@ -226,8 +226,6 @@ export function createCrdtCluster(client, options = {}) {
 	let subscriber = null;
 	/** @type {Promise<any> | null} */
 	let subscriberReady = null;
-	// Whether this instance's subscriber currently receives the channel.
-	let subscribed = false;
 	// Set when the subscriber missed traffic it will not get back by itself.
 	let inboundLost = false;
 	// One report per failure streak: every relay retries a failed subscribe.
@@ -689,7 +687,18 @@ export function createCrdtCluster(client, options = {}) {
 	/** Apply one relay envelope from a peer. */
 	function receive(parsed) {
 		if (!parsed || typeof parsed !== 'object') return;
-		if (parsed.i === instanceId) return; // echo suppression
+		if (parsed.i === instanceId) {
+			// This instance's subscriber received its own round request, so
+			// the receivers counted for the round include it.
+			if (parsed.k === KIND_SYNC_REQUEST && typeof parsed.t === 'string') {
+				const round = rounds.get(parsed.t);
+				if (round !== undefined && !round.done && parsed.c === round.id) {
+					round.echo = true;
+					settleIfAnswered(round);
+				}
+			}
+			return; // echo suppression
+		}
 		const kind = parsed.k;
 		const declKey = parsed.d;
 		const topic = parsed.t;
@@ -732,13 +741,9 @@ export function createCrdtCluster(client, options = {}) {
 		const sub = openSubscriber(client, 'crdt');
 		subscriber = sub;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.CRDT_SUBSCRIBER, { error: err }));
-		sub.on(SUBSCRIBER_RESTORING, () => {
-			if (subscriber === sub) subscribed = false;
-		});
 		sub.on(SUBSCRIBER_RESTORED, () => {
 			if (subscriber !== sub || destroyed) return;
 			// Whatever peers published while the channel was down is gone.
-			subscribed = true;
 			resyncAll();
 		});
 		sub.on('message', (ch, message) => {
@@ -751,7 +756,6 @@ export function createCrdtCluster(client, options = {}) {
 		subscriberReady = sub.subscribe(channel).then(() => {
 			if (subscriber !== sub) return;
 			subscribeFailing = false;
-			subscribed = true;
 			if (inboundLost) {
 				inboundLost = false;
 				resyncAll();
@@ -760,7 +764,7 @@ export function createCrdtCluster(client, options = {}) {
 			// Failed subscribe: tear down so the retry below re-subscribes
 			// fresh, then resyncs what peers published meanwhile.
 			try { sub.quit().catch(() => sub.disconnect()); } catch { /* already gone */ }
-			if (subscriber === sub) { subscriber = null; subscriberReady = null; subscribed = false; }
+			if (subscriber === sub) { subscriber = null; subscriberReady = null; }
 			inboundLost = true;
 			scheduleRetry();
 			report(err);
@@ -814,15 +818,56 @@ export function createCrdtCluster(client, options = {}) {
 		if (!round || typeof from !== 'string') return;
 		if (c !== undefined && c !== round.id) return;
 		round.replied.add(from);
-		if (round.expected !== null && round.replied.size >= round.expected) finishRound(round);
+		settleIfAnswered(round);
+	}
+
+	/**
+	 * The peers a round waits for: every receiver of its request but this
+	 * instance's own subscriber, counted only once that subscriber received
+	 * the request. Null when the receivers are unknown.
+	 */
+	function peersExpected(round) {
+		return round.receivers === null ? null : Math.max(0, round.receivers - (round.echo ? 1 : 0));
+	}
+
+	/** End a round every counted peer answered. */
+	function settleIfAnswered(round) {
+		const expected = peersExpected(round);
+		if (expected !== null && round.replied.size >= expected) finishRound(round);
+	}
+
+	/**
+	 * Count the subscribers of the relay channel across every node of a Redis
+	 * Cluster, where PUBLISH reports only the receiving node's. A subscriber
+	 * holds one connection to one node, a replica included, so the sum counts
+	 * it once; one that moves meanwhile can only be counted twice. Null when
+	 * a node does not answer.
+	 * @returns {Promise<number | null>}
+	 */
+	async function countSubscribers() {
+		let nodes;
+		try { nodes = redis.nodes('all'); } catch { return null; }
+		if (!Array.isArray(nodes) || nodes.length === 0) return null;
+		try {
+			const replies = await Promise.all(nodes.map((node) => node.call('PUBSUB', 'NUMSUB', channel)));
+			let total = 0;
+			for (const reply of replies) {
+				const count = Array.isArray(reply) ? Number(reply[1]) : NaN;
+				if (!Number.isInteger(count) || count < 0) return null;
+				total += count;
+			}
+			return total;
+		} catch {
+			return null;
+		}
 	}
 
 	/**
 	 * End a round. It resolves true when Redis confirmed its sync request, so
 	 * every peer received it; false when the request was lost or still
 	 * unconfirmed when the window closed. A round whose push the relay
-	 * cannot carry resolves true only when every peer answered, on a server
-	 * that counts them, and none of them holds a different state: then no
+	 * cannot carry resolves true only when every counted peer answered and
+	 * none of them holds a different state: then no
 	 * other replica holds edits a write could erase, and no peer lacks the
 	 * local edits.
 	 */
@@ -836,7 +881,8 @@ export function createCrdtCluster(client, options = {}) {
 		if (!round.asked && !destroyed && known.has(round.topic)) stale.add(round.topic);
 		let ok = round.asked;
 		if (round.unpushable !== null) {
-			ok = ok && round.expected !== null && round.replied.size >= round.expected && !oversize.has(round.topic);
+			const expected = peersExpected(round);
+			ok = ok && expected !== null && round.replied.size >= expected && !oversize.has(round.topic);
 			if (ok && unrelayed.get(round.topic) === round.mark) unrelayed.delete(round.topic);
 		}
 		round.resolve(ok);
@@ -886,7 +932,7 @@ export function createCrdtCluster(client, options = {}) {
 		// meanwhile keeps it.
 		const mark = unrelayed.get(topic);
 		/** @type {any} */
-		const round = { id: randomBytes(6).toString('hex'), topic, mark, unpushable: null, expected: null, replied: new Set(), asked: false, done: false, timer: null, resolve: null, promise: null, sent: null };
+		const round = { id: randomBytes(6).toString('hex'), topic, mark, unpushable: null, receivers: null, echo: false, replied: new Set(), asked: false, done: false, timer: null, resolve: null, promise: null, sent: null };
 		round.promise = new Promise((resolve) => { round.resolve = resolve; });
 		rounds.set(topic, round);
 		round.timer = setTimer(() => { round.timer = null; finishRound(round); }, syncWindowMs);
@@ -904,7 +950,20 @@ export function createCrdtCluster(client, options = {}) {
 		// cover, so the round keeps the mark it settles.
 		round.unpushable = unpushable.get(topic) ?? null;
 		if (round.unpushable !== null) unrelayed.set(topic, /** @type {number} */ (mark));
-		const asked = publish({ i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) }, verdict);
+		const request = { i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) };
+		// A round whose state cannot be pushed needs every peer's answer. On
+		// a Redis Cluster the subscribers are counted before the request and
+		// after it, and the larger count is waited for.
+		const counting = !countsReceivers && round.unpushable !== null;
+		const before = counting ? countSubscribers() : null;
+		const asked = before === null
+			? publish(request, verdict)
+			: before.then((count) => (round.done ? null : publish(request, verdict).then(async (n) => {
+				if (n === null) return null;
+				const after = await countSubscribers();
+				round.receivers = count === null || after === null ? null : Math.max(count, after);
+				return n;
+			})));
 		round.sent = Promise.all([pushed, asked]).then(([p, n]) => {
 			// The round's one admission gets one outcome.
 			if (verdict.err !== null) b?.failure(verdict.err);
@@ -918,9 +977,8 @@ export function createCrdtCluster(client, options = {}) {
 				return;
 			}
 			if (unrelayed.size === 0 && stale.size === 0 && !inboundLost) retryMs = 0;
-			// Every receiver but this instance's own subscriber is a peer.
-			round.expected = countsReceivers ? Math.max(0, n - (subscribed ? 1 : 0)) : null;
-			if (round.expected !== null && round.replied.size >= round.expected) finishRound(round);
+			if (countsReceivers) round.receivers = n;
+			settleIfAnswered(round);
 		});
 		return round;
 	}
@@ -1155,7 +1213,6 @@ export function createCrdtCluster(client, options = {}) {
 				const s = subscriber;
 				subscriber = null;
 				subscriberReady = null;
-				subscribed = false;
 				try { s.quit().catch(() => s.disconnect()); } catch { /* already gone */ }
 			}
 		}
