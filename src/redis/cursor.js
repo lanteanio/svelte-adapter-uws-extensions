@@ -43,7 +43,6 @@
 
 import {
 	randomBytes,
-	now,
 	monotonicNow,
 	wallEpoch,
 	setTimer,
@@ -714,7 +713,7 @@ export function createCursor(client, options = {}) {
 		try {
 			cursors = await tracker.list(topic);
 			if (request.superseded) return;
-			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: now() })])), platform);
+			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: wallEpoch() })])), platform);
 		} catch {
 			return;
 		}
@@ -1146,7 +1145,7 @@ export function createCursor(client, options = {}) {
 				throw err;
 			}
 			const result = [];
-			const nowTs = now();
+			const nowTs = wallEpoch();
 			const ttlMs = cursorTtl * 1000;
 			for (const key of Object.keys(all)) {
 				try {
@@ -1162,9 +1161,10 @@ export function createCursor(client, options = {}) {
 			const topicPending = getTopicPending(topic);
 			if (topicPending) {
 				const seen = new Set(result.map((r) => r.key));
+				// A pending value is this instance's newest one and is current
+				// until its write; a removal deletes it.
 				for (const [key, entry] of topicPending) {
 					if (seen.has(key)) continue;
-					if (!entry.ts || (nowTs - entry.ts) > ttlMs) continue;
 					result.push({ key, user: entry.user, data: entry.data });
 				}
 			}

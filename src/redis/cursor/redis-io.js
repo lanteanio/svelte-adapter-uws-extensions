@@ -14,7 +14,7 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/redis-io
  */
 
-import { now, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from '../../shared/runtime.js';
+import { wallEpoch, setIntervalTimer, clearIntervalTimer, setTimer, clearTimer } from '../../shared/runtime.js';
 import { evalCachedName } from '../../shared/eval-cached.js';
 import { CLEANUP_SCRIPT } from '../../shared/scripts.js';
 import { execMultiSlot, firstCommandError, coalescedByOwner } from '../../shared/cluster.js';
@@ -71,7 +71,7 @@ export function createRedisIo({
 	 * `snapshotIntervalMs` timer into a single `pipe.hset(topic, f1, v1, ...)`
 	 * per topic per tick. The broadcast/relay path queues entries here but
 	 * does not await the write.
-	 * @type {Map<string, Map<string, { user: any, data: any, ts: number }>>}
+	 * @type {Map<string, Map<string, { user: any, data: any }>>}
 	 */
 	let redisPending = new Map();
 
@@ -274,7 +274,7 @@ export function createRedisIo({
 	const sweepTopics = coalescedByOwner(redis, {
 		key: hashKey,
 		commands(topic, out) {
-			if (activeTopics.has(topic)) out.push([evalCachedName(redis, CLEANUP_SCRIPT), 1, hashKey(topic), now(), cursorTtlMs]);
+			if (activeTopics.has(topic)) out.push([evalCachedName(redis, CLEANUP_SCRIPT), 1, hashKey(topic), wallEpoch(), cursorTtlMs]);
 		},
 		onComplete(sweep) {
 			// A sweep that skipped a busy owner does not end a failure streak.
@@ -333,9 +333,13 @@ export function createRedisIo({
 			const key = hashKey(topic);
 			if (writing.has(key)) return;
 			redisPending.delete(topic);
+			// One exact wall-clock stamp per write: the readers on every instance
+			// judge liveness against it, and a pending value is current until
+			// it is written.
+			const ts = wallEpoch();
 			const args = [];
 			for (const [field, entry] of entries) {
-				try { args.push(field, JSON.stringify({ user: entry.user, data: entry.data, ts: entry.ts })); }
+				try { args.push(field, JSON.stringify({ user: entry.user, data: entry.data, ts })); }
 				catch { inputDropped('serialization_failed', 'snapshot_write'); }
 			}
 			if (args.length === 0) return;
@@ -368,7 +372,7 @@ export function createRedisIo({
 		if (snapshotIntervalMs === 0) {
 			if (b) { try { b.guard(); } catch { inputDropped('breaker_open', 'snapshot_write'); retryLocalRestore(); return; } }
 			let value;
-			try { value = JSON.stringify({ user, data, ts: now() }); } catch { inputDropped('serialization_failed', 'snapshot_write'); return; }
+			try { value = JSON.stringify({ user, data, ts: wallEpoch() }); } catch { inputDropped('serialization_failed', 'snapshot_write'); return; }
 			const pipe = redis.pipeline();
 			pipe.hset(hashKey(topic), key, value);
 			pipe.expire(hashKey(topic), cursorTtl);
@@ -380,7 +384,7 @@ export function createRedisIo({
 			topicPending = new Map();
 			redisPending.set(topic, topicPending);
 		}
-		topicPending.set(key, { user, data, ts: now() });
+		topicPending.set(key, { user, data });
 	}
 
 	// A snapshot write fails when Redis refuses any of its commands, not only

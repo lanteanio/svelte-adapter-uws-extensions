@@ -1,8 +1,10 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createCursor } from '../../src/redis/cursor.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
+import { resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { installSteppedClock } from '../helpers/stepped-clock.js';
 
 const trackers = [];
 afterEach(() => { for (const cursor of trackers.splice(0)) cursor.destroy(); });
@@ -62,5 +64,66 @@ describe('cursor snapshot roster', () => {
 		expect(platform.sent).toHaveLength(0);
 		cursor.hooks.message(ws, { data: { type: 'cursor', topic: 'board', data: { x: 7 } }, platform });
 		expect(cursor.stats().activeTopicsTotal).toBe(0);
+	});
+});
+
+describe('cursor roster at ttl 1 across a cached-clock step', () => {
+	// Exact time and a cached now() that lags it, refreshing every 1010 ms.
+	// Snapshot and cleanup intervals are captured and run on demand.
+	let clock;
+	beforeEach(() => { clock = installSteppedClock(); });
+	afterEach(() => resetRuntimeEnv());
+	const flush = async () => {
+		for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+	};
+	const run = async (ms) => {
+		for (const h of clock.intervals) if (!h.cleared && h.ms === ms) h.cb();
+		await flush();
+	};
+	const catalogOf = async (cursor, ws, platform) => {
+		platform.reset();
+		await cursor.snapshot(ws, 'board', platform);
+		return (platform.sent.find((frame) => frame.event === 'catalog')?.data ?? []).map((entry) => entry.user);
+	};
+
+	it('keeps a peer cursor that moved moments ago, in snapshots and through cleanup', async () => {
+		const client = mockRedisClient();
+		const a = createCursor(client, { ttl: 1, throttle: 0, topicThrottle: 0 });
+		const b = createCursor(client, { ttl: 1, throttle: 0, topicThrottle: 0 });
+		trackers.push(a, b);
+		const platformA = mockPlatform();
+		const platformB = mockPlatform();
+		const watcher = mockWs({ id: 'watcher' });
+		await b.attach(watcher, 'board', platformB);
+		const mover = mockWs({ id: 'mover' });
+
+		// The mover's last move and snapshot write land 20 ms before the
+		// cached clock refreshes at 1010 ms.
+		clock.advance(990);
+		a.update(mover, 'board', { x: 1 }, platformA);
+		await flush();
+		await run(100);
+		clock.advance(30);
+
+		expect(await catalogOf(b, watcher, platformB)).toEqual([{ id: 'mover' }]);
+		await run(10000);
+		const hash = await client.redis.hgetall(client.key('cursor:{board}'));
+		expect(Object.keys(hash)).toHaveLength(1);
+
+		// With no further move it expires one TTL after its write.
+		clock.advance(970);
+		expect(await catalogOf(b, watcher, platformB)).toEqual([{ id: 'mover' }]);
+		clock.advance(1);
+		expect(await catalogOf(b, watcher, platformB)).toEqual([]);
+	});
+	it('keeps a relayed peer join that has no persisted entry yet', async () => {
+		const { cursor, platform, ws, relay } = setup({ ttl: 1 });
+		await cursor.attach(ws, 'board', platform);
+		clock.advance(990);
+		await relay('join', { key: 'peer:1', user: { id: 'peer' } });
+		await relay('update', { key: 'peer:1', data: { x: 7 } });
+		// The cached clock refreshes 20 ms after the relay arrived.
+		clock.advance(30);
+		expect(await catalogOf(cursor, ws, platform)).toEqual([{ id: 'peer' }]);
 	});
 });

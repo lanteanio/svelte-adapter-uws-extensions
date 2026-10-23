@@ -1,4 +1,4 @@
-import { now, monotonicNow, setTimer, clearTimer } from '../../shared/runtime.js';
+import { wallEpoch, monotonicNow, setTimer, clearTimer, microtask } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 
 /** Merge persisted cursors with live relay changes and this worker's movers. */
@@ -26,11 +26,27 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		confirmationTimer?.unref?.();
 	}
 
+	// Relay overlay entries are stamped and aged on the monotonic clock: only
+	// this instance reads them. Persisted entries carry the writer's exact
+	// wall-clock stamp and are judged on this instance's exact wall clock.
+	// The cached now() steps about once a second, which at a one-second TTL
+	// would drop a cursor that moved a few ms earlier.
 	const ttlMs = cursorTtl * 1000;
+	// One monotonic read per synchronous run: a subscriber delivers a burst of
+	// relay messages in one run, and they share its stamp.
+	let stamp = -1;
+	const clearStamp = () => { stamp = -1; };
+	function stampNow() {
+		if (stamp < 0) {
+			stamp = monotonicNow();
+			microtask(clearStamp);
+		}
+		return stamp;
+	}
 	let timer = null;
 	function prune() {
 		timer = null;
-		const cutoff = now() - ttlMs;
+		const cutoff = monotonicNow() - ttlMs;
 		for (const [topic, entries] of live) {
 			for (const [key, entry] of entries) if (entry.ts < cutoff) entries.delete(key);
 			if (entries.size === 0) live.delete(topic);
@@ -58,7 +74,7 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		if (event === EVENTS.BULK && !Array.isArray(payload)) return;
 		let entries = live.get(topic);
 		if (!entries) live.set(topic, entries = new Map());
-		const ts = now();
+		const ts = stampNow();
 
 		if (event === EVENTS.BULK) for (const item of payload) recordOne(item, event, entries, ts);
 		else recordOne(payload, event, entries, ts);
@@ -66,7 +82,7 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 	}
 	function merge(topic, all, platform) {
 		const result = new Map();
-		const cutoff = now() - ttlMs;
+		const cutoff = wallEpoch() - ttlMs;
 		for (const [key, value] of Object.entries(all)) {
 			if (key.startsWith(instanceId + ':')) continue;
 			try {
@@ -77,8 +93,9 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		}
 		let candidates = provisional.get(topic);
 		const current = monotonicNow();
+		const liveCutoff = current - ttlMs;
 		for (const [key, entry] of live.get(topic) || []) {
-			if (entry.ts < cutoff) continue;
+			if (entry.ts < liveCutoff) continue;
 			if (entry.removed) { result.delete(key); candidates?.delete(key); continue; }
 			if (result.has(key)) candidates?.delete(key);
 			else if ('user' in entry) {
@@ -86,7 +103,7 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 				const candidate = candidates.get(key);
 				if (candidate?.version === entry.version && candidate.deadline <= current) {
 					entry.removed = true;
-					entry.ts = now();
+					entry.ts = current;
 					delete entry.user;
 					delete entry.data;
 					candidates.delete(key);
@@ -105,7 +122,7 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		if (candidates) {
 			for (const [key, candidate] of candidates) {
 				const entry = live.get(topic)?.get(key);
-				if (entry && entry.ts >= cutoff) continue;
+				if (entry && entry.ts >= liveCutoff) continue;
 				if (!result.has(key) && candidate.deadline <= current) removeMissing(topic, key, platform);
 				candidates.delete(key);
 			}
