@@ -455,6 +455,7 @@ describe('redis replay', () => {
 		// it runs a publish after the first queued read and before the second.
 		function interleavePublishInNextPipeline() {
 			const redis = client.redis;
+			const state = { published: false };
 			const original = redis.pipeline;
 			redis.pipeline = () => {
 				redis.pipeline = original;
@@ -465,7 +466,7 @@ describe('redis replay', () => {
 							return async () => {
 								const results = [];
 								for (let i = 0; i < commands.length; i++) {
-									if (i === 1) await replay.publish(platform, 'chat', 'created', { id: 'between' });
+									if (i === 1) { await replay.publish(platform, 'chat', 'created', { id: 'between' }); state.published = true; }
 									try { results.push([null, await redis[commands[i].method](...commands[i].args)]); }
 									catch (err) { results.push([err, null]); }
 								}
@@ -477,14 +478,18 @@ describe('redis replay', () => {
 				});
 				return p;
 			};
+			return state;
 		}
 
 		it('does not report truncated when a publish lands between the counter and range reads', async () => {
 			for (let i = 1; i <= 3; i++) await replay.publish(platform, 'chat', 'created', { id: i });
 			for (const sinceSeq of [0, 3]) {
-				interleavePublishInNextPipeline();
+				const interleaved = interleavePublishInNextPipeline();
+				const before = await replay.seq('chat');
 				platform.reset();
 				await replay.replay({}, 'chat', sinceSeq, platform);
+				expect(interleaved.published, `sinceSeq ${sinceSeq}`).toBe(true);
+				expect(await replay.seq('chat')).toBe(before + 1);
 				const replayed = platform.sent.filter((s) => s.topic === '__replay:chat');
 				expect(replayed.some((s) => s.event === 'truncated'), `sinceSeq ${sinceSeq}`).toBe(false);
 				expect(replayed.at(-1).data).toEqual({});
