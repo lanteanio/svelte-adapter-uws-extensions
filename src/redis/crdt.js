@@ -841,15 +841,22 @@ export function createCrdtCluster(client, options = {}) {
 	 * Cluster, where PUBLISH reports only the receiving node's. A subscriber
 	 * holds one connection to one node, a replica included, so the sum counts
 	 * it once; one that moves meanwhile can only be counted twice. Null when
-	 * a node does not answer.
+	 * a node does not answer within the sync window, as a command queued
+	 * while a node is offline may never be.
 	 * @returns {Promise<number | null>}
 	 */
 	async function countSubscribers() {
 		let nodes;
 		try { nodes = redis.nodes('all'); } catch { return null; }
 		if (!Array.isArray(nodes) || nodes.length === 0) return null;
+		let timer = null;
+		const late = new Promise((resolve) => {
+			timer = setTimer(() => resolve(null), syncWindowMs);
+			if (timer && timer.unref) timer.unref();
+		});
 		try {
-			const replies = await Promise.all(nodes.map((node) => node.call('PUBSUB', 'NUMSUB', channel)));
+			const replies = await Promise.race([Promise.all(nodes.map((node) => node.call('PUBSUB', 'NUMSUB', channel))), late]);
+			if (replies === null) return null;
 			let total = 0;
 			for (const reply of replies) {
 				const count = Array.isArray(reply) ? Number(reply[1]) : NaN;
@@ -859,6 +866,8 @@ export function createCrdtCluster(client, options = {}) {
 			return total;
 		} catch {
 			return null;
+		} finally {
+			clearTimer(timer);
 		}
 	}
 
@@ -953,12 +962,13 @@ export function createCrdtCluster(client, options = {}) {
 		const request = { i: instanceId, k: KIND_SYNC_REQUEST, d: declKey, t: topic, v: [], c: round.id, a: 1, h: digestOf(full) };
 		// A round whose state cannot be pushed needs every peer's answer. On
 		// a Redis Cluster the subscribers are counted before the request and
-		// after it, and the larger count is waited for.
+		// after it, and the larger count is waited for; with no first count the
+		// round cannot succeed, so it sends no request.
 		const counting = !countsReceivers && round.unpushable !== null;
 		const before = counting ? countSubscribers() : null;
 		const asked = before === null
 			? publish(request, verdict)
-			: before.then((count) => (round.done ? null : publish(request, verdict).then(async (n) => {
+			: before.then((count) => (count === null || round.done ? null : publish(request, verdict).then(async (n) => {
 				if (n === null) return null;
 				const after = await countSubscribers();
 				round.receivers = count === null || after === null ? null : Math.max(count, after);

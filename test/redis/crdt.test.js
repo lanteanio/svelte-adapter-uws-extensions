@@ -902,7 +902,7 @@ describe('createCrdtCluster states past the part limit on a Redis Cluster', () =
 	afterAll(() => { big = null; });
 
 	/** A lone holder on a client whose nodes answer PUBSUB NUMSUB through `numsub`. */
-	function clusterHolder(prefix, numsub) {
+	function clusterHolder(prefix, numsub, options = {}) {
 		const client = mockRedisClient(prefix);
 		const asked = [];
 		client.redis.nodes = (role) => {
@@ -915,7 +915,7 @@ describe('createCrdtCluster states past the part limit on a Redis Cluster', () =
 			}));
 		};
 		const errors = [];
-		const a = createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err) });
+		const a = createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err), ...options });
 		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, big, from) });
 		return { a, asked, errors, channel: client.key('crdt:events') };
 	}
@@ -932,6 +932,28 @@ describe('createCrdtCluster states past the part limit on a Redis Cluster', () =
 			expect(await a.acquirePersist('doc:big')).toBe(true);
 			expect(asked.every((role) => role === 'all')).toBe(true);
 			expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+		} finally {
+			a.destroy();
+		}
+	}, 60000);
+
+	it('ends a round whose count never answers by the sync window, with one breaker outcome', async () => {
+		const outcomes = [];
+		const breaker = { state: 'healthy', guard() {}, success() { outcomes.push('success'); }, failure() { outcomes.push('failure'); } };
+		let ch;
+		let calls = 0;
+		// The count before the request answers; the one after it never does.
+		const { a, channel } = clusterHolder('crdtclusterhang:', [() => (++calls === 1 ? [ch, 1] : new Promise(() => {}))], { breaker });
+		ch = channel;
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', big);
+			await settle();
+			const started = Date.now();
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			expect(Date.now() - started).toBeLessThan(2000);
+			await new Promise((r) => setTimeout(r, 400)); // past the count's own deadline
+			expect(outcomes).toEqual(['success']);
 		} finally {
 			a.destroy();
 		}
