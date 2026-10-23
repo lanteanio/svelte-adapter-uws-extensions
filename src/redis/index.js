@@ -42,9 +42,14 @@ function supportsSharedDeadlines() {
 // command queue and then writes AUTH, SELECT, CLIENT SETNAME and CLIENT
 // SETINFO LIB-NAME synchronously, before the 'connect' event that ioredis
 // emits on the next tick, so no application code runs in that window. The
-// ready check writes INFO synchronously from `_readyCheck`. Its CLIENT SETINFO
-// LIB-VER waits for a file read and can follow application commands, so it is
-// not tracked; ioredis ignores its outcome. The sending hook is installed
+// window closes when that event is emitted, ahead of every listener,
+// including ones an application prepends later. The ready check writes INFO
+// synchronously from `_readyCheck`. Its CLIENT SETINFO LIB-VER waits for a file read and can
+// follow application commands, so it is not tracked; ioredis ignores its
+// outcome. Rejecting it on a pre-ready drop can complete the handshake's
+// CLIENT commands and start that connection's ready check after it closed,
+// and that check would refuse INFO and fail the client, so a ready check only
+// runs while a connection is in its handshake. The sending hook is installed
 // when a connection starts its handshake and removed at ready, so commands on
 // a ready connection pay nothing for it. Call this before installing a ready
 // listener that replaces `sendCommand`. Returns null when those private seams
@@ -52,7 +57,8 @@ function supportsSharedDeadlines() {
 function trackHandshake(redis) {
 	const reset = redis.resetCommandQueue;
 	const readyCheck = redis._readyCheck;
-	if (typeof reset !== 'function' || typeof readyCheck !== 'function') return null;
+	const setStatus = redis.setStatus;
+	if (typeof reset !== 'function' || typeof readyCheck !== 'function' || typeof setStatus !== 'function') return null;
 	const own = new WeakSet();
 	let inConnect = false;
 	let inReadyCheck = false;
@@ -70,12 +76,28 @@ function trackHandshake(redis) {
 		}
 		return result;
 	};
+	// setStatus binds `this.emit` when it queues the status event, so the
+	// 'connect' event emitted through this wrapper closes the window before
+	// any listener runs. Other events and later emits use `emit` unchanged.
+	redis.setStatus = function (status) {
+		if (status !== 'connect') return setStatus.apply(this, arguments);
+		const hadOwn = Object.hasOwn(this, 'emit');
+		const emit = this.emit;
+		this.emit = function () {
+			inConnect = false;
+			return emit.apply(this, arguments);
+		};
+		try { return setStatus.apply(this, arguments); } finally {
+			if (hadOwn) this.emit = emit;
+			else delete this.emit;
+		}
+	};
 	redis._readyCheck = function () {
+		// Covers the loading retry too, which calls back in here on a timer.
+		if (this.status !== 'connect') return;
 		inReadyCheck = true;
 		try { return readyCheck.apply(this, arguments); } finally { inReadyCheck = false; }
 	};
-	// Runs before any other listener, at the first point application code can.
-	redis.prependListener('connect', () => { inConnect = false; });
 	redis.on('ready', () => {
 		if (redis.sendCommand === sendNoting) redis.sendCommand = base;
 	});

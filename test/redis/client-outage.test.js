@@ -291,6 +291,8 @@ it('rejects a user CLIENT SETINFO sent before the handshake one when the connect
 	const outcome = (promise) => promise.then(() => 'resolved', error => error);
 	const sent = () => client.redis.commandQueue.toArray().map(entry => [entry.command.name, ...entry.command.args.map(String)].join(' ').toLowerCase());
 	const user = [];
+	// A listener prepended after creation runs first on the 'connect' event.
+	client.redis.prependOnceListener('connect', () => { user.push(outcome(client.redis.info())); });
 	client.redis.once('connect', () => {
 		user.push(outcome(client.redis.client('SETINFO', 'LIB-VER', 'app')));
 		user.push(outcome(client.redis.auth('secret')));
@@ -303,6 +305,7 @@ it('rejects a user CLIENT SETINFO sent before the handshake one when the connect
 			expect(sent().filter(line => line.startsWith('client setinfo lib-ver'))).toHaveLength(2);
 		}, { timeout: 2000 });
 		expect(sent()[0]).toBe('auth secret');
+		expect(sent()).toContain('info');
 		expect(sent().indexOf('client setinfo lib-ver app')).toBeLessThan(sent().findIndex(line => line.startsWith('client setinfo lib-ver') && !line.endsWith(' app')));
 		const closed = new Promise(resolve => client.redis.once('close', resolve));
 		client.redis.stream.destroy();
@@ -316,6 +319,70 @@ it('rejects a user CLIENT SETINFO sent before the handshake one when the connect
 		// ioredis ignores the outcome of its own LIB-VER, so it is rejected with
 		// the application commands; the rest of its handshake stays with it.
 		expect(sent()).toEqual(['auth secret', 'select 2', 'client setname handshake', 'client setinfo lib-name ioredis']);
+	} finally {
+		client.redis.disconnect();
+		for (const socket of sockets) socket.destroy();
+		await new Promise(resolve => server.close(resolve));
+	}
+});
+
+
+it('does not run a ready check for a connection that closed during its handshake', async () => {
+	// Connection 1 reaches ready and is dropped. Connection 2 answers the
+	// handshake up to CLIENT SETINFO LIB-NAME and ends on LIB-VER, so the
+	// rejected LIB-VER completes ioredis's CLIENT commands after the close.
+	const info = 'redis_version:7.4.0\r\nloading:0\r\nrole:master\r\n';
+	const sockets = new Set();
+	let connections = 0;
+	const server = createServer(socket => {
+		const id = ++connections;
+		sockets.add(socket);
+		socket.on('close', () => sockets.delete(socket));
+		socket.on('error', () => {});
+		let buffer = Buffer.alloc(0);
+		socket.on('data', chunk => {
+			buffer = Buffer.concat([buffer, chunk]);
+			let reply = '';
+			for (;;) {
+				const parts = [];
+				let at = buffer.indexOf('\r\n');
+				if (buffer[0] !== 0x2a || at < 0) break;
+				const count = Number(buffer.subarray(1, at));
+				let offset = at + 2;
+				let complete = true;
+				for (let i = 0; i < count; i++) {
+					at = buffer.indexOf('\r\n', offset);
+					const length = at < 0 ? 0 : Number(buffer.subarray(offset + 1, at));
+					if (at < 0 || buffer.length < at + 2 + length + 2) { complete = false; break; }
+					parts.push(buffer.subarray(at + 2, at + 2 + length).toString());
+					offset = at + 2 + length + 2;
+				}
+				if (!complete) break;
+				buffer = buffer.subarray(offset);
+				const line = parts.join(' ').toLowerCase();
+				if (id === 2 && line.startsWith('client setinfo lib-ver')) { socket.end(reply); return; }
+				reply += line === 'info' ? '$' + info.length + '\r\n' + info + '\r\n' : '+OK\r\n';
+			}
+			if (reply) socket.write(reply);
+		});
+	});
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const client = createRedisClient({
+		url: 'redis://127.0.0.1:' + server.address().port,
+		autoShutdown: false,
+		options: { lazyConnect: true, maxRetriesPerRequest: 5, retryStrategy: attempt => (attempt > 3 ? null : 50) }
+	});
+	const errors = [];
+	client.redis.on('error', error => errors.push(error.message));
+	try {
+		await client.redis.connect();
+		for (const socket of sockets) socket.destroy();
+		await vi.waitFor(() => {
+			expect(connections).toBeGreaterThanOrEqual(3);
+			expect(client.redis.status).toBe('ready');
+		}, { timeout: 2000 });
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(errors).toEqual([]);
 	} finally {
 		client.redis.disconnect();
 		for (const socket of sockets) socket.destroy();
