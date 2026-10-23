@@ -43,8 +43,13 @@ export function countRedisIO(client) {
 					} });
 					return wrapped;
 				};
-				if (local.has(name) || typeof name !== 'string' || name.startsWith('_')) return value.bind(target);
-				return (...args) => { count(name); return value.apply(target, args); };
+				// A method that returns its own connection (on, once, and the other
+				// chainable EventEmitter calls) hands back the meter, so a chained
+				// command still counts.
+				if (local.has(name) || typeof name !== 'string' || name.startsWith('_')) {
+					return (...args) => { const result = value.apply(target, args); return result === target ? proxy : result; };
+				}
+				return (...args) => { count(name); const result = value.apply(target, args); return result === target ? proxy : result; };
 			}
 		});
 		wrappers.set(redis, proxy);

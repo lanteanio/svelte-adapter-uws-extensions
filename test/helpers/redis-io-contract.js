@@ -28,6 +28,18 @@ export function redisIOContract(makeClient) {
 			} finally { await raw.quit(); }
 		});
 
+		it('counts a command chained on the connection an event registration returns', async () => {
+			const raw = makeClient();
+			const meter = countRedisIO(raw);
+			try {
+				const noop = () => {};
+				const chained = meter.client.redis.on('io-self-check', noop).on('io-self-check', noop);
+				expect(chained).toBe(meter.client.redis);
+				await chained.get('io-self-check');
+				expect(meter.commands()).toEqual(['get']);
+			} finally { await raw.quit(); }
+		});
+
 		it('counts commands on subscriber connections duplicated from the client', async () => {
 			const raw = makeClient();
 			const meter = countRedisIO(raw);
