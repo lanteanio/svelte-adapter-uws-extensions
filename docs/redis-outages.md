@@ -35,8 +35,11 @@ writes commands valid while Redis loads, such as `PUBLISH` or `SUBSCRIBE`, and
 application commands named like handshake commands (`INFO`, `SELECT`, `CLIENT`,
 `AUTH`) before ready, so they may have run. Other commands issued during
 startup were never sent and stay in the offline queue until the next
-connection is ready, and the handshake commands ioredis issues itself are
-retried by ioredis. This rejection
+connection is ready. The handshake commands ioredis issues itself (`AUTH`,
+`SELECT`, `CLIENT SETNAME`, `CLIENT SETINFO LIB-NAME` and the `INFO` ready
+check) are retried by ioredis. Its `CLIENT SETINFO LIB-VER` is sent only once
+ioredis has read its package version, possibly after application commands,
+so it is rejected with them; ioredis ignores that outcome. This rejection
 applies even with `autoResendUnfulfilledCommands: true`, because ioredis does
 not resend commands from a connection that never reached ready. The reset rule
 also applies when `commandTimeout`
