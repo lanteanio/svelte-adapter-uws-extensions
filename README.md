@@ -1502,7 +1502,7 @@ export async function close(ws, { platform }) {
 | Method | Description |
 |---|---|
 | `join(ws, platform, role?)` | Add a member (returns false if full/closed) |
-| `leave(ws, platform)` | Remove a member |
+| `leave(ws, platform)` | Remove a member. The local membership ends at once even when Redis cannot be reached; a roster entry that could not be removed is retried by the heartbeat and otherwise expires after `memberTtl`. A `join()` or second `leave()` for the same ws waits for a leave in progress |
 | `publish(platform, event, data, role?)` | Broadcast to all or filter by role |
 | `send(platform, ws, event, data)` | Send to a single member |
 | `localMembers()` | Members on this instance |
@@ -3792,7 +3792,7 @@ Every Redis and Postgres extension accepts an optional `breaker` option - a shar
 | **Presence** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh and stale cleanup are skipped |
 | **Replay buffer** | `publish()` / `replay()` / `seq()` throw `CircuitBrokenError` | - |
 | **Rate limiting** | `consume()` throws `CircuitBrokenError` (fail-closed - requests are blocked, not allowed through) | - |
-| **Broadcast groups** | `join()` / `leave()` throw `CircuitBrokenError` | Heartbeat refresh is skipped |
+| **Broadcast groups** | `join()` throws `CircuitBrokenError`; `leave()` ends the local membership and leaves the roster removal to the heartbeat after recovery | Heartbeat refresh is skipped |
 | **Cursor** | - | Hash writes and cross-instance relay are skipped; local throttle continues |
 | **LISTEN/NOTIFY** | `activate()` throws; auto-reconnect retries on its own interval | - |
 

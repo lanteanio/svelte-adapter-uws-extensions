@@ -738,63 +738,80 @@ describe('redis groups', () => {
 		});
 	});
 
-	describe('leave hdel failure suppresses broadcast', () => {
-		it('does not publish leave when Redis hdel fails', async () => {
-			const ws = mockWs();
-			await group.join(ws, platform);
-			platform.reset();
-
-			const origHdel = client.redis.hdel;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
-
-			await group.leave(ws, platform);
-
-			const leaves = platform.published.filter((p) => p.event === 'leave');
-			expect(leaves).toHaveLength(0);
-
-			client.redis.hdel = origHdel;
-		});
-
-		it('does not fire onLeave when hdel fails', async () => {
+	describe('leave when the roster removal fails', () => {
+		it('still ends the local membership, publishes leave and fires onLeave', async () => {
 			const leaveCalls = [];
 			const g = createGroup(client, 'hdel-fail', {
 				onLeave: (ws, role) => leaveCalls.push(role)
 			});
 			const ws = mockWs();
 			await g.join(ws, platform);
+			platform.reset();
 
 			const origHdel = client.redis.hdel;
 			client.redis.hdel = async () => { throw new Error('hdel failed'); };
+			try {
+				await g.leave(ws, platform);
+			} finally {
+				client.redis.hdel = origHdel;
+			}
 
-			await g.leave(ws, platform);
-			expect(leaveCalls).toEqual([]);
-
-			client.redis.hdel = origHdel;
+			expect(g.has(ws)).toBe(false);
+			expect(platform.published.filter((p) => p.event === 'leave')).toHaveLength(1);
+			expect(leaveCalls).toEqual(['member']);
 			g.destroy();
 		});
 
-		it('keeps local member when breaker is broken so has() stays consistent', async () => {
-			const breaker = createCircuitBreaker({ failureThreshold: 1 });
-			const g = createGroup(client, 'leave-breaker', { breaker, memberTtl: 120 });
+		it('the next heartbeat removes a roster field whose HDEL failed', async () => {
+			const g = createGroup(client, 'hdel-retry', { memberTtl: 1 });
+			const membersKey = client.key('group:{hdel-retry}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
 
+			const origHdel = client.redis.hdel;
+			let calls = 0;
+			client.redis.hdel = async (...args) => {
+				if (calls++ === 0) throw new Error('hdel failed');
+				return origHdel.apply(client.redis, args);
+			};
+			try {
+				await g.leave(ws, platform);
+				expect(Object.keys(await client.redis.hgetall(membersKey))).toHaveLength(1);
+				await new Promise((r) => setTimeout(r, 800));
+			} finally {
+				client.redis.hdel = origHdel;
+			}
+			expect(g.has(ws)).toBe(false);
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
+			g.destroy();
+		});
+
+		it('a leave under a broken breaker is removed from the roster once it recovers', async () => {
+			const breaker = createCircuitBreaker({ failureThreshold: 1 });
+			const leaveCalls = [];
+			const g = createGroup(client, 'leave-breaker', { breaker, memberTtl: 1, onLeave: (ws, role) => leaveCalls.push(role) });
+			const membersKey = client.key('group:{leave-breaker}:members');
 			const ws = mockWs();
 			await g.join(ws, platform);
 			platform.reset();
 
 			breaker.failure();
-
 			await g.leave(ws, platform);
+			expect(g.has(ws)).toBe(false);
+			expect(platform.published.filter((p) => p.event === 'leave')).toHaveLength(1);
+			expect(leaveCalls).toEqual(['member']);
 
-			const leaves = platform.published.filter((p) => p.event === 'leave');
-			expect(leaves).toHaveLength(0);
-			expect(g.has(ws)).toBe(true);
-
+			breaker.reset();
+			await new Promise((r) => setTimeout(r, 800));
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
+			expect(g.has(ws)).toBe(false);
 			g.destroy();
+			breaker.destroy();
 		});
 	});
 
-	describe('leave keeps local member on hdel failure', () => {
-		it('has() stays true when Redis hdel fails', async () => {
+	describe('leave keeps the roster consistent on hdel failure', () => {
+		it('count() counts the member until its removal is retried', async () => {
 			const ws = mockWs();
 			await group.join(ws, platform);
 
@@ -802,19 +819,7 @@ describe('redis groups', () => {
 			client.redis.hdel = async () => { throw new Error('hdel failed'); };
 
 			await group.leave(ws, platform);
-			expect(group.has(ws)).toBe(true);
-
-			client.redis.hdel = origHdel;
-		});
-
-		it('count() stays consistent after failed leave hdel', async () => {
-			const ws = mockWs();
-			await group.join(ws, platform);
-
-			const origHdel = client.redis.hdel;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
-
-			await group.leave(ws, platform);
+			expect(group.has(ws)).toBe(false);
 			expect(await group.count()).toBe(1);
 
 			client.redis.hdel = origHdel;
@@ -1277,6 +1282,110 @@ describe('redis groups', () => {
 		});
 	});
 
+	describe('concurrent leave and join', () => {
+		it('a second leave waits for the first, so a failed first removal leaves no phantom', async () => {
+			const leaveCalls = [];
+			const g = createGroup(client, 'double-leave', { memberTtl: 3, onLeave: (ws, role) => leaveCalls.push(role) });
+			const membersKey = client.key('group:{double-leave}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
+			platform.reset();
+
+			const hdel = client.redis.hdel;
+			let calls = 0;
+			client.redis.hdel = async (...args) => {
+				const n = calls++;
+				if (n === 0) {
+					await new Promise((r) => setTimeout(r, 100));
+					throw new Error('hdel failed');
+				}
+				const result = await hdel.apply(client.redis, args);
+				if (n === 1) await new Promise((r) => setTimeout(r, 1500));
+				return result;
+			};
+			try {
+				await Promise.all([g.leave(ws, platform), g.leave(ws, platform)]);
+				// Past the next beat (memberTtl 3 beats every second), well short of
+				// the 3 s a rewritten member would take to be reaped.
+				await new Promise((r) => setTimeout(r, 1300));
+			} finally {
+				client.redis.hdel = hdel;
+			}
+			expect(g.has(ws)).toBe(false);
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
+			expect(leaveCalls).toEqual(['member']);
+			expect(platform.published.filter((p) => p.event === 'leave')).toHaveLength(1);
+			g.destroy();
+		});
+
+		it('a join during an in-flight leave waits for it and joins again', async () => {
+			const g = createGroup(client, 'rejoin', { memberTtl: 120 });
+			const membersKey = client.key('group:{rejoin}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
+			const firstId = Object.keys(await client.redis.hgetall(membersKey))[0];
+
+			const hdel = client.redis.hdel;
+			client.redis.hdel = async (...args) => {
+				const result = await hdel.apply(client.redis, args);
+				await new Promise((r) => setTimeout(r, 500));
+				return result;
+			};
+			let rejoined;
+			try {
+				const leaving = g.leave(ws, platform);
+				await new Promise((r) => setTimeout(r, 50));
+				rejoined = await g.join(ws, platform);
+				await leaving;
+			} finally {
+				client.redis.hdel = hdel;
+			}
+			expect(rejoined).toBe(true);
+			expect(g.has(ws)).toBe(true);
+			const fields = Object.keys(await client.redis.hgetall(membersKey));
+			expect(fields).toHaveLength(1);
+			expect(fields[0]).not.toBe(firstId);
+			g.destroy();
+		});
+
+		it('a leave waits for a heartbeat already sent, so its HDEL lands after the beat', async () => {
+			// A connection that queues commands while it is not ready can
+			// deliver a pipeline built before the leave after the leave's own
+			// HDEL. The mock models that with a beat whose exec is delayed.
+			const g = createGroup(client, 'late-beat', { memberTtl: 1 });
+			const membersKey = client.key('group:{late-beat}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
+
+			const pipeline = client.redis.pipeline;
+			let beatSent;
+			const beatSeen = new Promise((r) => { beatSent = r; });
+			client.redis.pipeline = () => {
+				const batch = pipeline.call(client.redis);
+				return new Proxy(batch, {
+					get(target, prop) {
+						if (prop !== 'exec') return target[prop];
+						return async () => {
+							beatSent();
+							await new Promise((r) => setTimeout(r, 200));
+							return target.exec();
+						};
+					}
+				});
+			};
+			try {
+				await beatSeen;
+				await g.leave(ws, platform);
+				// Long enough for the delayed beat to land in either order.
+				await new Promise((r) => setTimeout(r, 300));
+			} finally {
+				client.redis.pipeline = pipeline;
+			}
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
+			g.destroy();
+		});
+	});
+
 	describe('small memberTtl heartbeat interval', () => {
 		it('memberTtl: 1 does not expire live members before first heartbeat', async () => {
 			const g = createGroup(client, 'short-ttl', { memberTtl: 1 });
@@ -1426,7 +1535,7 @@ describe('redis groups', () => {
 	});
 
 	describe('leave does not fire onLeave on failed leave', () => {
-		it('does not call onLeave when breaker is broken', async () => {
+		it('calls onLeave once when breaker is broken', async () => {
 			const leaveCalls = [];
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			const g = createGroup(client, 'leave-no-cb', {
@@ -1441,8 +1550,8 @@ describe('redis groups', () => {
 			breaker.failure();
 			await g.leave(ws, platform);
 
-			expect(leaveCalls).toEqual([]);
-			expect(g.has(ws)).toBe(true);
+			expect(leaveCalls).toEqual(['member']);
+			expect(g.has(ws)).toBe(false);
 
 			g.destroy();
 			breaker.destroy();

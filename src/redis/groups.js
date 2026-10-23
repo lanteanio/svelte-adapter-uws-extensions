@@ -204,11 +204,27 @@ export function createGroup(client, name, options = {}) {
 	const eventChannel = client.key('group:{' + name + '}:events');
 	const internalTopic = '__group:' + name;
 
-	// Local member tracking (ws objects on this instance)
-	// `leaving` marks a member whose removal is in flight: the heartbeat skips
-	// it, so a beat between the removal and its reply cannot write it back.
-	/** @type {Map<any, { role: GroupRole, memberId: string, leaving?: boolean }>} */
+	// Local member tracking (ws objects on this instance). The heartbeat
+	// writes every entry here back into the roster, so leave() removes the
+	// entry before anything else and no later beat can name the member.
+	/** @type {Map<any, { role: GroupRole, memberId: string }>} */
 	const localMembers = new Map();
+	// leave() calls still running, by ws. A second leave() or a join() for the
+	// same ws waits for it instead of racing it.
+	/** @type {Map<any, Promise<void>>} */
+	const leavesInFlight = new Map();
+	// Roster fields whose leave-time HDEL could not be sent or failed, with the
+	// time each was queued. The heartbeat retries them. One older than
+	// memberTtl is dropped: nothing refreshes it, so the cleanup pass has
+	// already reaped it.
+	/** @type {Map<string, number>} */
+	const pendingRemovals = new Map();
+	// Heartbeat pipelines sent and not yet answered. A leave sends its HDEL
+	// only after these settle, so a beat built while the member was still
+	// local cannot reach Redis after the removal, whatever the topology
+	// does with queued commands.
+	/** @type {Set<Promise<void>>} */
+	const beatsInFlight = new Set();
 	let memberCounter = 0;
 	let isClosed = false;
 
@@ -252,10 +268,16 @@ export function createGroup(client, name, options = {}) {
 		const nowTs = now();
 		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
-			if (entry.leaving) continue;
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: nowTs });
 			pipe.hset(membersKey, entry.memberId, memberData);
 		}
+		/** @type {string[]} */
+		const removals = [];
+		for (const [memberId, queuedAt] of pendingRemovals) {
+			if (nowTs - queuedAt > memberTtlMs) pendingRemovals.delete(memberId);
+			else removals.push(memberId);
+		}
+		if (removals.length > 0) pipe.hdel(membersKey, ...removals);
 		pipe[cleanupCmd](1, membersKey, nowTs, memberTtlMs);
 		// Refresh the key-level TTL so the roster and meta persist while this
 		// instance holds the group open, and expire once every instance stops.
@@ -269,11 +291,17 @@ export function createGroup(client, name, options = {}) {
 			heartbeatFailing = true;
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_HEARTBEAT, { error: err, attributes: { group: name } });
 		};
-		pipe.exec().then((results) => {
+		const sent = pipe.exec().then((results) => {
 			const err = firstCommandError(results);
 			if (err) beatFailed(err);
-			else heartbeatFailing = false;
+			else {
+				heartbeatFailing = false;
+				for (const memberId of removals) pendingRemovals.delete(memberId);
+			}
 		}, beatFailed);
+		beatsInFlight.add(sent);
+		const settled = () => { beatsInFlight.delete(sent); };
+		sent.then(settled, settled);
 	}, memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
@@ -334,6 +362,7 @@ export function createGroup(client, name, options = {}) {
 			removeWsSubscription(ws, internalTopic);
 		}
 		localMembers.clear();
+		pendingRemovals.clear();
 		if (onClose) onClose();
 	}
 
@@ -504,6 +533,66 @@ export function createGroup(client, name, options = {}) {
 		await publishRaw(encodeEvent(event, data));
 	}
 
+	/**
+	 * Queue a roster field for the heartbeat to remove. Bounded like the local
+	 * roster; past the bound the oldest is dropped and left to the cleanup pass.
+	 * @param {string} memberId
+	 */
+	function queueRemoval(memberId) {
+		pendingRemovals.delete(memberId);
+		pendingRemovals.set(memberId, now());
+		while (pendingRemovals.size > MAX_GROUPS_LOCAL_MEMBERS) {
+			pendingRemovals.delete(pendingRemovals.keys().next().value);
+		}
+	}
+
+	/**
+	 * Remove a member's roster field. Never throws: a removal that cannot be
+	 * sent or fails is queued for the heartbeat. A failure is ambiguous (the
+	 * HDEL may have applied and only its reply been lost), and retrying an
+	 * HDEL is harmless either way.
+	 * @param {string} memberId
+	 */
+	async function removeMember(memberId) {
+		if (b) {
+			try { b.guard(); } catch {
+				queueRemoval(memberId);
+				return;
+			}
+		}
+		if (beatsInFlight.size > 0) await Promise.allSettled([...beatsInFlight]);
+		try {
+			await redis.hdel(membersKey, memberId);
+			b?.success();
+		} catch (err) {
+			b?.failure(err);
+			queueRemoval(memberId);
+		}
+	}
+
+	/**
+	 * End a local membership. The local teardown runs first and always: the
+	 * ws stops being a member here whether or not Redis answers, so no beat
+	 * writes it back and no reference to it is kept.
+	 * @param {any} ws
+	 * @param {{ role: GroupRole, memberId: string }} entry
+	 * @param {import('svelte-adapter-uws').Platform} platform
+	 */
+	async function runLeave(ws, entry, platform) {
+		localMembers.delete(ws);
+		try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
+		removeWsSubscription(ws, internalTopic);
+
+		await removeMember(entry.memberId);
+
+		mGroupLeaves?.inc({ group: metricGroup });
+		const leavePayload = { role: entry.role };
+		platform.publish(internalTopic, EVENTS.LEAVE, leavePayload, FRAME_OPTIONS);
+		await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
+
+		if (onLeave) onLeave(ws, entry.role);
+	}
+
 	/** @type {RedisGroup} */
 	const group = {
 		get name() { return name; },
@@ -538,6 +627,10 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async join(ws, platform, role = 'member') {
+			// A leave still running for this ws ends its membership; joining
+			// after it is a new membership, not the old one.
+			const leaving = leavesInFlight.get(ws);
+			if (leaving) await leaving.catch(() => {});
 			if (isClosed) return false;
 
 			// Idempotent
@@ -659,37 +752,17 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async leave(ws, platform) {
+			const inFlight = leavesInFlight.get(ws);
+			if (inFlight) return inFlight;
 			const entry = localMembers.get(ws);
 			if (!entry) return;
-
-			let skipHdel = false;
-			if (b) { try { b.guard(); } catch { skipHdel = true; } }
-
-			if (skipHdel) {
-				return;
-			}
-
-			entry.leaving = true;
+			const done = runLeave(ws, entry, platform);
+			leavesInFlight.set(ws, done);
 			try {
-				await redis.hdel(membersKey, entry.memberId);
-				b?.success();
-			} catch (err) {
-				// Still a member in Redis, so the heartbeat keeps it fresh again.
-				entry.leaving = false;
-				b?.failure(err);
-				return;
+				await done;
+			} finally {
+				if (leavesInFlight.get(ws) === done) leavesInFlight.delete(ws);
 			}
-
-			localMembers.delete(ws);
-			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
-			removeWsSubscription(ws, internalTopic);
-
-			mGroupLeaves?.inc({ group: metricGroup });
-			const leavePayload = { role: entry.role };
-			platform.publish(internalTopic, EVENTS.LEAVE, leavePayload, FRAME_OPTIONS);
-			await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
-
-			if (onLeave) onLeave(ws, entry.role);
 		},
 
 		async publish(platform, event, data, role) {
@@ -760,6 +833,7 @@ export function createGroup(client, name, options = {}) {
 					}
 					localMembers.clear();
 					await redis.del(membersKey);
+					pendingRemovals.clear();
 					b?.success();
 					if (onClose) onClose();
 					return;
@@ -778,6 +852,7 @@ export function createGroup(client, name, options = {}) {
 				localMembers.clear();
 
 				await redis.del(membersKey);
+				pendingRemovals.clear();
 				b?.success();
 			} catch (err) {
 				b?.failure(err);
