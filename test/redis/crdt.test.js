@@ -917,7 +917,7 @@ describe('createCrdtCluster states past the part limit on a Redis Cluster', () =
 		const errors = [];
 		const a = createCrdtCluster(client, { persistLeaseMs: 900, onError: (err) => errors.push(err), ...options });
 		a.onMessage({ onSyncRequest: (declKey, topic, sv, from) => a.sendSyncReply(declKey, topic, big, from) });
-		return { a, asked, errors, channel: client.key('crdt:events') };
+		return { a, client, asked, errors, channel: client.key('crdt:events') };
 	}
 	const rejection = (p) => p.then(() => null, (err) => [err.code, err.cause?.code]);
 
@@ -933,6 +933,43 @@ describe('createCrdtCluster states past the part limit on a Redis Cluster', () =
 			expect(asked.every((role) => role === 'all')).toBe(true);
 			expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
 		} finally {
+			a.destroy();
+		}
+	}, 60000);
+
+	it('sends no request while the count before it is unknown, and asks again once the nodes answer', async () => {
+		const outcomes = [];
+		const breaker = { state: 'healthy', guard() {}, success() { outcomes.push('success'); }, failure() { outcomes.push('failure'); } };
+		let ch;
+		let down = true;
+		const count = () => {
+			if (down) throw new Error('node down');
+			return [ch, 1];
+		};
+		const { a, client, channel } = clusterHolder('crdtclusterfirst:', [count], { breaker });
+		ch = channel;
+		const requests = [];
+		const publish = client.redis.publish;
+		client.redis.publish = function (target, message) {
+			const env = JSON.parse(message);
+			if (env.i === a.instanceId && env.k === 'sreq') requests.push(env);
+			return publish.call(this, target, message);
+		};
+		try {
+			await settle();
+			a.relayUpdate('dk1', 'doc:big', big);
+			await settle();
+			expect(await rejection(a.acquirePersist('doc:big'))).toEqual(['CRDT_RELAY_PENDING', 'RELAY_ENVELOPE_TOO_LARGE']);
+			await settle();
+			expect(requests).toEqual([]);
+			// The admission went back unused: the breaker saw no outcome.
+			expect(outcomes).toEqual([]);
+			down = false;
+			expect(await a.acquirePersist('doc:big')).toBe(true);
+			expect(requests.map((r) => r.a)).toEqual([1]);
+			expect(outcomes).toEqual(['success']);
+		} finally {
+			client.redis.publish = publish;
 			a.destroy();
 		}
 	}, 60000);
