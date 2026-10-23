@@ -232,7 +232,9 @@ function packageContains(relativePath, packagedFiles) {
  * leading slash from the repository root and every other path from the
  * linking document's directory. The empty string is the repository root, and
  * a trailing slash is kept so a directory link stays distinguishable from a
- * file link. A path that climbs above the root keeps its leading '../'.
+ * file link. A path that climbs above the root keeps its leading '../', and
+ * only one leading slash is removed, so a doubled one stays absolute and is
+ * never mistaken for a repository path.
  *
  * @param {string} source the linking document, repository-relative
  * @param {string} decodedPath the percent-decoded path part of the link
@@ -241,7 +243,7 @@ function packageContains(relativePath, packagedFiles) {
 export function resolveDocumentPath(source, decodedPath) {
 	const fromRoot = decodedPath.startsWith('/');
 	const base = fromRoot ? '' : posix.dirname(source.split('\\').join('/'));
-	const resolved = posix.normalize(posix.join(base, fromRoot ? decodedPath.replace(/^\/+/, '') : decodedPath));
+	const resolved = posix.normalize(posix.join(base, fromRoot ? decodedPath.slice(1) : decodedPath));
 	return resolved === '.' || resolved === './' ? '' : resolved;
 }
 
@@ -480,6 +482,14 @@ export function checkLink(rel, target, docs, options = {}) {
 	let decodedPath;
 	try { decodedPath = decodeURIComponent(encodedPath); }
 	catch { return `malformed percent escape in path: ${encodedPath}`; }
+	if (decodedPath.startsWith('//')) {
+		return `root-relative path starts with a doubled slash and resolves to no repository file: ${target}`;
+	}
+	// A packaged document is also read from node_modules and the registry
+	// page, where a leading slash names no repository root at all.
+	if (decodedPath.startsWith('/') && options.packagedDocs?.has(rel)) {
+		return `root-relative link in a packaged document (write it relative to ${rel}): ${target}`;
+	}
 	const resolved = resolveDocumentPath(rel, decodedPath);
 	const shown = resolved === '' ? '/' : resolved;
 	const status = ownedPathStatus(resolved);
@@ -501,14 +511,23 @@ export function checkLink(rel, target, docs, options = {}) {
 	}
 	if (anchor === undefined) return null;
 
+	// GitHub shows a directory with its README rendered below the listing, so
+	// an anchor on a directory link (the repository root included) is one of
+	// that README's headings, and a directory without one holds no anchors.
+	let anchored = resolved;
+	if (statSync(join(root, treePath)).isDirectory()) {
+		anchored = treePath === '' ? 'README.md' : treePath + '/README.md';
+		if (!docs.has(anchored)) return `directory ${shown} has no README.md to hold #${anchor}`;
+	}
+
 	// A cross-document anchor is only checkable when the target is one of the
 	// documents this gate reads; anything else resolves as a plain file link.
-	const doc = docs.get(resolved);
+	const doc = docs.get(anchored);
 	if (!doc) return null;
 	let decodedAnchor;
 	try { decodedAnchor = decodeURIComponent(anchor); }
 	catch { return `malformed percent escape in anchor: ${anchor}`; }
-	return doc.anchors.has(decodedAnchor) ? null : `no heading in ${resolved} produces #${anchor}`;
+	return doc.anchors.has(decodedAnchor) ? null : `no heading in ${anchored} produces #${anchor}`;
 }
 
 

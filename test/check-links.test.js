@@ -273,15 +273,18 @@ it('runs the CLI against tracked and packaged documentation inventories', () => 
 }, 30_000);
 
 // GitHub resolves a link that starts with a slash from the repository root,
-// not from the directory of the document holding it.
+// not from the directory of the document holding it. The probe document is
+// tracked but not packaged, the only place such a link is allowed.
 it('resolves a leading slash from the repository root in a nested document', () => {
 	const { put, git, run, cleanup } = linkFixture();
 	try {
+		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[History](CHANGELOG.md)\n[Entries](docs/public-entries.md)\n[Guide](docs/guide.md)\n[Start](docs/getting-started.md)\n');
 		put('docs/getting-started.md', '# Start here\n## First steps\n[Overview](../README.md)\n');
+		put('notes/guide.md', '# Notes\n');
 		git('init', '--initial-branch=docs-fixture');
-		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts');
-		put('docs/guide.md', [
-			'# Guide',
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts', 'notes');
+		put('notes/guide.md', [
+			'# Notes',
 			'[Overview](/README.md)',
 			'[Overview heading](/README.md#fixture)',
 			'[Start](/docs/getting-started.md)',
@@ -289,6 +292,8 @@ it('resolves a leading slash from the repository root in a nested document', () 
 			'[Docs folder](/docs/)',
 			'[Docs folder without slash](/docs)',
 			'[Repository root](/)',
+			'[Repository home heading](/#fixture)',
+			'[Scripts folder](/scripts/)',
 			''
 		].join('\n'));
 		let result = run();
@@ -298,17 +303,34 @@ it('resolves a leading slash from the repository root in a nested document', () 
 			['/getting-started.md', 'no such file with exact case: getting-started.md'],
 			['/docs/getting-started.md#missing-steps', 'no heading in docs/getting-started.md produces #missing-steps'],
 			['/README.md#missing', 'no heading in README.md produces #missing'],
+			['/#missing', 'no heading in README.md produces #missing'],
+			['/docs/#first-steps', 'directory docs/ has no README.md to hold #first-steps'],
 			['/missing/', 'no such file with exact case: missing/'],
 			['/README.md/', 'relative target absent from the staged tree (the git index): README.md/'],
 			['/../outside.md', 'path leaves repository: ../outside.md'],
-			['/scripts/', 'target omitted from package: scripts/']
+			['/%2fREADME.md', 'root-relative path starts with a doubled slash']
 		]) {
-			put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Probe](' + target + ')\n');
+			put('notes/guide.md', '# Notes\n[Overview](../README.md)\n[Probe](' + target + ')\n');
 			result = run();
 			expect(result.status, target).toBe(1);
-			expect(result.stderr, target).toContain('docs/guide.md:3');
+			expect(result.stderr, target).toContain('notes/guide.md:3');
 			expect(result.stderr, target).toContain(failure);
 		}
+	} finally { cleanup(); }
+}, 30_000);
+
+// A packaged document is also read from node_modules and the registry page,
+// where a leading slash does not name the repository root.
+it('rejects a root-relative link in a packaged document', () => {
+	const { put, git, run, cleanup } = linkFixture();
+	try {
+		git('init', '--initial-branch=docs-fixture');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Rooted](/README.md)\n');
+		const result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('docs/guide.md:3');
+		expect(result.stderr).toContain('root-relative link in a packaged document (write it relative to docs/guide.md)');
 	} finally { cleanup(); }
 }, 30_000);
 
