@@ -70,6 +70,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import Module from 'node:module';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -139,9 +140,13 @@ function quoteArg(arg) {
 }
 
 const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+// Exit statuses that mean a Ctrl-C: 130 from a POSIX shell, and
+// STATUS_CONTROL_C_EXIT (0xC000013A) from a Windows process, unsigned or as
+// the signed value some runtimes report.
+const CTRL_C_STATUSES = new Set([130, 0xc000013a, 0xc000013a - 0x100000000]);
 
-// The first signal a child died from, with exit status 130 standing in for
-// SIGINT. A Ctrl-C reaches the whole process group, and the child usually dies
+// The first signal a child died from, with a Ctrl-C exit status standing in
+// for SIGINT. A Ctrl-C reaches the whole process group, and the child usually dies
 // of it before this process's own handler gets to run.
 let childInterrupt = null;
 
@@ -158,7 +163,7 @@ function run(cmd, args, cwd, { env, shell = false, timeout } = {}) {
 	const timedOut = r.error?.code === 'ETIMEDOUT';
 	if (!timedOut && !childInterrupt) {
 		if (INTERRUPT_SIGNALS.includes(r.signal)) childInterrupt = r.signal;
-		else if (r.status === 130) childInterrupt = 'SIGINT';
+		else if (CTRL_C_STATUSES.has(r.status)) childInterrupt = 'SIGINT';
 	}
 	if (r.error) return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: `${cmd}: ${r.error.message}\n${r.stderr ?? ''}`, timedOut };
 	return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
@@ -222,16 +227,24 @@ const UNSCRUBBED_KEYS = new Set(['sha256', 'integrity', 'expectedIntegrity', 're
 const SEGMENT_CHAR = /[A-Za-z0-9_~$@%+=-]/;
 
 /**
- * The spellings one directory takes in captured output: a Windows path also
- * with forward slashes, with JSON-escaped backslashes and in the MSYS form
- * /c/...; a POSIX path as itself. A filesystem root has no spelling, so it is
- * never scrubbed.
+ * The spellings one directory takes in captured output. A Windows drive path
+ * also appears with forward slashes, with JSON-escaped backslashes and in the
+ * MSYS form /c/...; a UNC path (\\server\share\...) with forward slashes and
+ * JSON-escaped; both case-insensitively. A POSIX path is itself. A filesystem
+ * or share root has no spelling, so it is never scrubbed.
  */
 export function pathSpellings(path) {
-	const trimmed = String(path || '').replace(/[\\/]+$/, '');
-	const windows = /^[A-Za-z]:[\\/]/.test(trimmed);
-	if (!trimmed || /^[A-Za-z]:$/.test(trimmed)) return { spellings: [], caseInsensitive: windows };
-	if (!windows) return { spellings: [trimmed], caseInsensitive: false };
+	const text = String(path || '');
+	const unc = /^\\\\[^\\/]/.test(text);
+	const trimmed = text.replace(/[\\/]+$/, '');
+	const drive = /^[A-Za-z]:[\\/]/.test(trimmed);
+	if (unc) {
+		const parts = trimmed.slice(2).split(/[\\/]+/);
+		if (parts.length <= 2) return { spellings: [], caseInsensitive: true };
+		return { caseInsensitive: true, spellings: ['\\\\' + parts.join('\\'), '//' + parts.join('/'), '\\\\\\\\' + parts.join('\\\\')] };
+	}
+	if (!trimmed || /^[A-Za-z]:$/.test(trimmed)) return { spellings: [], caseInsensitive: drive };
+	if (!drive) return { spellings: [trimmed], caseInsensitive: false };
 	const parts = trimmed.split(/[\\/]+/);
 	return {
 		caseInsensitive: true,
@@ -240,14 +253,28 @@ export function pathSpellings(path) {
 }
 
 /**
+ * The 8.3 short spelling of an existing Windows directory, which tools such as
+ * cmd.exe print for TEMP, or null when it is the same as the long one or the
+ * platform has none.
+ */
+export function shortPathName(path) {
+	if (process.platform !== 'win32' || !path || /["%]/.test(path)) return null;
+	const r = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"for %I in ("${path}") do @echo %~sI"`], { encoding: 'utf8', windowsVerbatimArguments: true, timeout: 10000 });
+	const short = r.status === 0 ? String(r.stdout).trim() : '';
+	return short && !/[\r\n]/.test(short) && short.toLowerCase() !== path.toLowerCase() ? short : null;
+}
+
+/**
  * Replace the work dir, this checkout and the home directory in every string
  * of `value` with `<work-dir>`, `<repo>` and `~`, in each spelling from
- * pathSpellings(). Only whole path prefixes are replaced: a match must start
- * and end at a path boundary, and never follows a URL's `scheme://` other than
- * file://. Digest, integrity and `resolved` fields are left as they are.
+ * pathSpellings(). `aliases` adds other spellings of them, such as short
+ * names, as [path, label] pairs. Only whole path prefixes are replaced: a
+ * match must start and end at a path boundary, and never follows a URL's
+ * `scheme://` other than file://. Digest, integrity and `resolved` fields are
+ * left as they are.
  */
-export function scrubPaths(value, { workDir, repo = HERE, home = homedir() }) {
-	const rules = [[workDir, '<work-dir>'], [repo, '<repo>'], [home, '~']]
+export function scrubPaths(value, { workDir, repo = HERE, home = homedir(), aliases = [] }) {
+	const rules = [[workDir, '<work-dir>'], [repo, '<repo>'], [home, '~'], ...aliases]
 		.flatMap(([path, label]) => {
 			const { spellings, caseInsensitive } = pathSpellings(path);
 			return spellings.map((spelling) => ({ spelling, label, caseInsensitive }));
@@ -261,10 +288,10 @@ export function scrubPaths(value, { workDir, repo = HERE, home = homedir() }) {
 		if (SEGMENT_CHAR.test(before.slice(-1)) || before.endsWith('.')) return false;
 		if (/[A-Za-z][A-Za-z0-9+.-]*:\/\/$/.test(before) && !/(?:^|[^A-Za-z0-9+.-])file:\/\/$/i.test(before)) return false;
 		// The directory must end here: a separator, the end of the text, or a
-		// character no name continues with. A dot ends it only before the end
-		// or whitespace, as at the end of a sentence.
+		// character no name continues with. A dot ends it only when no name
+		// character follows, as at the end of a sentence or before a quote.
 		if (!after) return true;
-		if (after[0] === '.') return after.length === 1 || /\s/.test(after[1]);
+		if (after[0] === '.') return after.length === 1 || !(SEGMENT_CHAR.test(after[1]) || after[1] === '.');
 		return !SEGMENT_CHAR.test(after[0]);
 	};
 	const replaceIn = (text) => rules.reduce(
@@ -331,6 +358,16 @@ function defaultAdapter() {
 	if (!installed || !locked) throw new StepError('inputs', 'svelte-adapter-uws is not installed in this checkout; run npm ci or pass --adapter');
 	if (installed.version !== locked.version) throw new StepError('inputs', `installed svelte-adapter-uws ${installed.version} differs from the locked ${locked.version}; run npm ci or pass --adapter`);
 	return { name: 'svelte-adapter-uws', kind: 'registry', spec: locked.version, expectedIntegrity: locked.integrity };
+}
+
+/**
+ * Refuse a Node without module.registerHooks before anything is packed: the
+ * scenario confines module resolution to the consumer with it.
+ */
+export function assertResolveHooks(moduleApi = Module, version = process.version) {
+	if (typeof moduleApi.registerHooks !== 'function') {
+		throw new StepError('inputs', `the scenario needs Node 22.15 or later (module.registerHooks); this is Node ${version}`);
+	}
 }
 
 // - steps -----------------------------------------------------------
@@ -614,7 +651,15 @@ async function main() {
 		scenario: null,
 		error: null
 	};
-	const scrub = (value) => scrubPaths(value, { workDir });
+	// Only an existing directory has a short name, so they are asked for on
+	// first use, once the work dir exists.
+	let aliases = null;
+	const scrub = (value) => {
+		aliases ??= [[workDir, '<work-dir>'], [HERE, '<repo>'], [homedir(), '~']]
+			.map(([path, label]) => [shortPathName(path), label])
+			.filter(([path]) => path);
+		return scrubPaths(value, { workDir, aliases });
+	};
 	const write = () => {
 		result.finishedAt = new Date().toISOString();
 		mkdirSync(dirname(out), { recursive: true });
@@ -645,6 +690,8 @@ async function main() {
 		const adapter = opts.adapter ? describeSource('svelte-adapter-uws', opts.adapter, workDir) : defaultAdapter();
 		let extensions = opts.extensions ? describeSource('svelte-adapter-uws-extensions', opts.extensions, workDir) : null;
 		if (process.env.ORACLE_CLUSTER_NODES) externalCluster(result.services);
+		// Last of the input checks and before anything is packed or installed.
+		assertResolveHooks();
 
 		if (!extensions) {
 			lifecycle.step = 'pack';

@@ -29,6 +29,24 @@ const CONSUMER = dirname(fileURLToPath(import.meta.url));
 // optional require() treats the module as absent.
 const refused = [];
 const confined = typeof Module.registerHooks === 'function';
+// The hooks reach neither worker threads nor child processes, so the packages
+// may start neither: every way to start one throws, is recorded, and fails the
+// run in cleanup even when a package catches the error.
+const blocked = [];
+const requireBuiltin = Module.createRequire(import.meta.url);
+function forbid(moduleName, names) {
+	const api = requireBuiltin(moduleName);
+	for (const name of names) {
+		if (typeof api[name] !== 'function') continue;
+		api[name] = function blockedStart() {
+			blocked.push(moduleName + '.' + name);
+			throw new Error('The scenario refuses ' + moduleName + '.' + name + ': module resolution cannot be confined outside its own thread');
+		};
+	}
+}
+forbid('node:child_process', ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
+forbid('node:worker_threads', ['Worker']);
+Module.syncBuiltinESMExports();
 if (confined) {
 	Module.registerHooks({
 		resolve(specifier, context, nextResolve) {
@@ -66,7 +84,7 @@ const report = {
 	startedAt: new Date().toISOString(),
 	seed: null,
 	faultMode: 'none',
-	provenance: { node: process.version, platform: process.platform + '-' + process.arch, scenarioSha256: hash(readFileSync(fileURLToPath(import.meta.url))), packages: {}, resolution: { confined, refused } },
+	provenance: { node: process.version, platform: process.platform + '-' + process.arch, scenarioSha256: hash(readFileSync(fileURLToPath(import.meta.url))), packages: {}, resolution: { confined, refused, blocked } },
 	backend: null,
 	cases
 };
@@ -360,6 +378,7 @@ try {
 			for (const connection of connections) connection.disconnect();
 			const rejected = results.find((result) => result.status === 'rejected');
 			if (rejected) throw rejected.reason;
+			assert.deepEqual(blocked, [], 'A loaded package tried to start a worker thread or child process');
 		});
 	} catch {
 		// A cleanup failure fails the report too.

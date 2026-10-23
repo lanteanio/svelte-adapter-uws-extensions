@@ -23,7 +23,8 @@ The script:
    replicas, Redis 7.4) unless an external cluster is named;
 4. runs the scenario `scripts/fixtures/real-cluster-oracle.mjs` from the
    consumer; every module any package imports or requires must resolve inside
-   the consumer, which needs Node 22.15 or later (`module.registerHooks`);
+   the consumer, and starting a worker thread or a child process, which that
+   check cannot follow, fails the run;
 5. removes the Compose stack, checks that no container or network of the
    project is left, and writes the result.
 
@@ -36,6 +37,10 @@ The script:
 | `--adapter <tgz or spec>` | the installed version | `svelte-adapter-uws` to install. The default installs the exact version in `package-lock.json` and fails unless the consumer receives the same integrity. |
 | `--work-dir <path>` | `.real-cluster-oracle/` | Tarballs, consumer, result and scenario log. |
 | `--out <file>` | `<work-dir>/result.json` | Result path. |
+
+The oracle needs Node 22.15 or later (`module.registerHooks`), above the
+package's own engine floor of 22.0. On an older Node it stops at the `inputs`
+step with exit 2, before anything is packed or installed.
 
 A path input must be a gzip tarball. A spec must be a version, dist-tag or
 range of the named package; `file:`, `link:`, git, URL and `npm:` alias specs,
@@ -129,10 +134,13 @@ to the work directory or bare file names. In every other string of it, also in
 captured npm, Docker and scenario output, and in `scenario-stderr.log`, the
 work directory, the checkout and the home directory are replaced by
 `<work-dir>`, `<repo>` and `~`. A Windows directory is matched in any letter
-case and in its native, forward-slash, JSON-escaped (`C:\\Users\\...`) and
-MSYS (`/c/Users/...`) spellings. Only whole path prefixes are replaced: never a
-filesystem root such as `HOME=/`, never part of a longer name, and never a
-path inside a URL other than `file://`. Digest, `integrity` and `resolved`
+case and in its native, forward-slash and JSON-escaped (`C:\\Users\\...`)
+spellings, a drive path also in its MSYS (`/c/Users/...`) spelling, a UNC path
+(`\\server\share\...`) also as `//server/share/...`, and each of them also by
+its 8.3 short name (`C:\Users\LONGNA~1`) where that differs. Only whole path
+prefixes are replaced: never a filesystem or share root such as `HOME=/`,
+never part of a longer name, and never a path inside a URL other than
+`file://`. Digest, `integrity` and `resolved`
 fields are written as they are.
 
 | Field | Content |
@@ -142,7 +150,7 @@ fields are written as they are.
 | `source` | This repository's commit and whether the working tree had uncommitted changes. |
 | `packages` | Per package: `kind` (`tarball` or `registry`), installed `version`, and the tarball name, `sha256` and `integrity`, or the registry `spec`, `resolved` URL and `integrity`; the native binding's pin and version. |
 | `services` | `docker-compose` with project, Compose file, host ports, subnet, seeds and `teardown` (`removed`, `leaked` or `unverified`, with any teardown or fallback error), or `external` with seeds. |
-| `scenario` | The scenario report: `cases` with status, duration and error, `counts` (planned, executed, passed, failed, notRun), `deliveries` per client pair (values and batch frames per socket), `backend` (masters, replicas, engine and version per master) and `provenance` (Node version, platform, scenario SHA-256, and version, consumer-relative root, entry-file SHA-256 and `package.json` SHA-256 of every loaded package, and `resolution`: whether module resolution was confined to the consumer and which specifiers were refused). |
+| `scenario` | The scenario report: `cases` with status, duration and error, `counts` (planned, executed, passed, failed, notRun), `deliveries` per client pair (values and batch frames per socket), `backend` (masters, replicas, engine and version per master) and `provenance` (Node version, platform, scenario SHA-256, and version, consumer-relative root, entry-file SHA-256 and `package.json` SHA-256 of every loaded package, and `resolution`: whether module resolution was confined to the consumer, which specifiers were refused, and which worker or child-process starts were blocked). |
 | `error` | For `error`: the step (`inputs`, `pack`, `install`, `cluster`, `scenario`, `teardown`, `interrupted`) and its output. |
 
 Exit codes: `0` every case passed and the stack is gone, `1` the scenario ran

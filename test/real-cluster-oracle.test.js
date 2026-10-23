@@ -1,10 +1,12 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import Module from 'node:module';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+	assertResolveHooks,
 	describeSource,
 	installedProblems,
 	interrupt,
@@ -12,12 +14,16 @@ import {
 	portablePath,
 	scrubPaths,
 	settleTeardown,
+	shortPathName,
 	stopCluster
 } from '../scripts/real-cluster-oracle.js';
 
 const SCENARIO = 'scripts/fixtures/real-cluster-oracle.mjs';
 const ORACLE = 'scripts/real-cluster-oracle.js';
 const dirs = [];
+// The scenario confines module resolution with module.registerHooks, which
+// Node has from 22.15; the runner refuses an older Node up front.
+const hasHooks = typeof Module.registerHooks === 'function';
 
 function run(script, args = [], env = {}, cwd = undefined) {
 	const r = spawnSync(process.execPath, [script, ...args], {
@@ -89,7 +95,7 @@ describe('real-cluster oracle scenario', () => {
 		}
 	);
 
-	it('records each package root inside the consumer node_modules', () => {
+	it.skipIf(!hasHooks)('records each package root inside the consumer node_modules', () => {
 		const consumer = join(workDir(), 'consumer');
 		for (const name of Object.keys(STUBS)) stub(join(consumer, 'node_modules'), name);
 		const { code, report } = scenarioIn(consumer);
@@ -100,7 +106,7 @@ describe('real-cluster oracle scenario', () => {
 		}
 	});
 
-	it('fails setup when a package resolves from a directory above the consumer', () => {
+	it.skipIf(!hasHooks)('fails setup when a package resolves from a directory above the consumer', () => {
 		const outer = workDir();
 		const consumer = join(outer, 'consumer');
 		for (const name of Object.keys(STUBS)) {
@@ -113,7 +119,7 @@ describe('real-cluster oracle scenario', () => {
 		expect(report.counts.notRun).toBe(3);
 	});
 
-	it('refuses a transitive import that would climb out of the consumer', () => {
+	it.skipIf(!hasHooks)('refuses a transitive import that would climb out of the consumer', () => {
 		const outer = workDir();
 		const consumer = join(outer, 'consumer');
 		for (const name of Object.keys(STUBS)) stub(join(consumer, 'node_modules'), name);
@@ -127,6 +133,23 @@ describe('real-cluster oracle scenario', () => {
 		expect(report.cases[0].status).toBe('failed');
 		expect(report.cases[0].error.message).toContain('only-above resolved outside the consumer node_modules');
 		expect(report.provenance.resolution).toMatchObject({ confined: true, refused: [{ specifier: 'only-above' }] });
+	});
+
+	it.skipIf(!hasHooks)('refuses a worker thread or child process a package starts, and fails the run even when it catches that', () => {
+		const consumer = join(workDir(), 'consumer');
+		for (const name of Object.keys(STUBS)) stub(join(consumer, 'node_modules'), name);
+		writeFileSync(join(consumer, 'node_modules', 'svelte-realtime', 'server.js'), [
+			"import { Worker } from 'node:worker_threads';",
+			"import { spawnSync } from 'node:child_process';",
+			"try { new Worker('setTimeout(() => {}, 1)', { eval: true }); } catch {}",
+			"try { spawnSync(process.execPath, ['-e', '0']); } catch {}",
+			'export function createMessage() {}',
+			'export function setBus() {}'
+		].join('\n'));
+		const { code, report } = scenarioIn(consumer);
+		expect(code).toBe(1);
+		expect(report.provenance.resolution.blocked).toEqual(['node:worker_threads.Worker', 'node:child_process.spawnSync']);
+		expect(report.cases.find((c) => c.name === 'cleanup')).toMatchObject({ status: 'failed', error: { message: expect.stringContaining('worker thread or child process') } });
 	});
 });
 
@@ -168,6 +191,21 @@ describe('real-cluster oracle inputs', () => {
 
 	it.each(['--adapter', 'latest;rm', 'next&calc', 'other@1.0.0'])('refuses %s as not a version, tag or range', (value) => {
 		expect(() => describeSource('svelte-realtime', value, workDir())).toThrow(expect.objectContaining({ step: 'inputs', message: expect.stringContaining('is not a version, tag or range') }));
+	});
+});
+
+describe('real-cluster oracle Node floor', () => {
+	it('refuses a Node without module.registerHooks at the inputs step', () => {
+		expect(() => assertResolveHooks({}, 'v22.14.0')).toThrow(expect.objectContaining({ step: 'inputs', message: expect.stringContaining('Node 22.15 or later') }));
+		expect(() => assertResolveHooks({ registerHooks() {} })).not.toThrow();
+	});
+
+	it.runIf(!hasHooks)('exits 2 on this Node before packing anything', () => {
+		const dir = workDir();
+		const r = run(ORACLE, ['--realtime', 'next', '--work-dir', dir]);
+		expect(r.code).toBe(2);
+		const result = JSON.parse(readFileSync(join(dir, 'result.json'), 'utf8'));
+		expect(result).toMatchObject({ status: 'error', packages: {}, error: { step: 'inputs', message: expect.stringContaining('Node 22.15 or later') } });
 	});
 });
 
@@ -255,6 +293,52 @@ describe('real-cluster oracle result paths', () => {
 			msys: 'error at ~/notes',
 			lower: '<repo>' + B + 'y'
 		});
+	});
+
+	it('scrubs a UNC directory in every spelling and letter case, but never a share root', () => {
+		const unc = B + B + win('srv', 'share', 'w');
+		expect(pathSpellings(unc).spellings).toEqual([unc, '//srv/share/w', B + B + B + B + ['srv', 'share', 'w'].join(B + B)]);
+		expect(pathSpellings(B + B + win('srv', 'share')).spellings).toEqual([]);
+		const roots = { workDir: unc, repo: '/r', home: '/h' };
+		expect(scrubPaths({
+			native: unc + B + 'consumer',
+			upper: B + B + win('SRV', 'share', 'w', 'consumer'),
+			forward: '//srv/share/w/consumer',
+			escaped: JSON.stringify(unc + B + 'consumer')
+		}, roots)).toEqual({
+			native: '<work-dir>' + B + 'consumer',
+			upper: '<work-dir>' + B + 'consumer',
+			forward: '<work-dir>/consumer',
+			escaped: JSON.stringify('<work-dir>' + B + 'consumer')
+		});
+	});
+
+	it('labels a JSON-escaped directory followed by a full stop and a quote correctly', () => {
+		const text = JSON.stringify('at ' + win('C:', 'Users', 'me', 'repo') + '.');
+		expect(scrubPaths(text, windowsRoots)).toBe(JSON.stringify('at <repo>.'));
+	});
+
+	it('scrubs short-name aliases in every spelling', () => {
+		const short = win('C:', 'Users', 'LONGNA~1');
+		const roots = { workDir: win('C:', 'w'), repo: win('C:', 'r'), home: win('C:', 'Users', 'longname'), aliases: [[short, '~']] };
+		expect(scrubPaths({ a: short + B + 'AppData', b: JSON.stringify(short + B + 'x'), c: 'C:/Users/longna~1/y' }, roots)).toEqual({
+			a: '~' + B + 'AppData',
+			b: JSON.stringify('~' + B + 'x'),
+			c: '~/y'
+		});
+	});
+
+	it('derives a short name only on Windows and only when it differs', () => {
+		const dir = workDir();
+		const long = join(dir, 'a directory name longer than eight');
+		mkdirSync(long);
+		const short = shortPathName(long);
+		if (process.platform !== 'win32') expect(short).toBeNull();
+		else if (short !== null) {
+			expect(short.toLowerCase()).not.toBe(long.toLowerCase());
+			expect(existsSync(short)).toBe(true);
+		}
+		expect(shortPathName(dir.replace(/[\\/]+$/, '') + '"x')).toBeNull();
 	});
 
 	it('replaces whole path prefixes only and never a filesystem root', () => {
@@ -366,13 +450,16 @@ describe('real-cluster oracle runner', () => {
 		expect(r.stderr).toContain('--realtime needs a value');
 	});
 
-	it('records a child that died of an interrupt as interrupted and exits 130', () => {
+	it.skipIf(!hasHooks).each([
+		['130', 130],
+		['STATUS_CONTROL_C_EXIT', -1073741510]
+	])('records a child that died of an interrupt (%s) as interrupted and exits 130', (_label, windowsStatus) => {
 		const dir = workDir();
 		const bin = join(dir, 'bin');
 		mkdirSync(bin);
 		// A stand-in npm that dies the way a Ctrl-C ends it: by SIGINT on POSIX,
-		// with exit status 130 on Windows, which has no signals.
-		if (process.platform === 'win32') writeFileSync(join(bin, 'npm.cmd'), '@exit /b 130\r\n');
+		// with a Ctrl-C exit status on Windows, which has no signals.
+		if (process.platform === 'win32') writeFileSync(join(bin, 'npm.cmd'), `@exit /b ${windowsStatus}\r\n`);
 		else {
 			writeFileSync(join(bin, 'npm'), '#!/bin/sh\nkill -INT $$\n');
 			chmodSync(join(bin, 'npm'), 0o755);
