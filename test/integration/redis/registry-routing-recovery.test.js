@@ -234,3 +234,31 @@ it('announces the open in the row transaction, ahead of a close sent while its r
 	expect(await client.redis.exists(rowKey)).toBe(0);
 	expect(await peer.sendTo({ uid: userId }, 'room', 'ping', 1)).toBe(0);
 });
+
+for (const [label, warm] of [['while it waits for the subscriber', false], ['while it waits for the app-session write', true]]) {
+	it(`registers nothing for a socket that closes ${label}`, async () => {
+		const options = { attributes: () => ({ role: 'reader' }), sessionIdentify: ws => ws.getUserData().appSession };
+		const a = registry(options), peer = registry(options);
+		await peer.hooks.open(mockWs({}), { platform: mockPlatform() });
+		if (warm) await a.hooks.open(mockWs({}), { platform: mockPlatform() });
+		// A closed uWS socket still answers getUserData(), so identify succeeds.
+		const ws = mockWs({ userId: 'user', appSession: 'app-1', [WS_SESSION_ID]: 's1' });
+		const pa = mockPlatform();
+		const opening = a.hooks.open(ws, { platform: pa });
+		ws.close();
+		await a.hooks.close(ws, { platform: pa });
+		await opening;
+		// Several heartbeats renew and restore nothing for it.
+		for (let i = 0; i < 3; i++) {
+			for (const handle of intervals) handle.cb();
+			await waitRedisMs(client, 20);
+		}
+		expect(a.size()).toBe(0);
+		expect(await client.redis.exists(client.key('conns:user'))).toBe(0);
+		expect(await client.redis.exists(client.key('regsess:app-1'))).toBe(0);
+		expect(await peer.lookup('user')).toBeNull();
+		expect(await peer.lookupSession('app-1')).toBeNull();
+		expect(await peer.sendTo({ role: 'reader' }, 'room', 'ping', 1)).toBe(0);
+		expect(pa.sent).toEqual([]);
+	});
+}

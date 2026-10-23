@@ -352,6 +352,16 @@ export function createConnectionRegistry(client, options) {
 	const appSessionToWs = new Map();
 
 	/**
+	 * Sockets whose close hook has run. The adapter does not await the open
+	 * hook, so a close can run while open waits; open checks this after every
+	 * await and does not register, or releases, a socket that closed meanwhile.
+	 * A closed socket still answers `getUserData()`, so `identify` alone does
+	 * not reveal it.
+	 * @type {WeakSet<object>}
+	 */
+	const closedSockets = new WeakSet();
+
+	/**
 	 * In-flight outbound requests: ref -> { resolve, reject, timer, startTime }.
 	 * Keyed by per-request UUID. Cleared on reply, timeout, or destroy.
 	 * @type {Map<string, { resolve: (value: any) => void, reject: (err: Error) => void, timer: any, startTime: number }>}
@@ -761,6 +771,74 @@ export function createConnectionRegistry(client, options) {
 			// Best-effort: the local map is populated so the session is reachable
 			// from this instance until the heartbeat retries the TTL write.
 		}
+	}
+
+	/**
+	 * Drop an app session that `ws` holds and delete its routing row. The
+	 * ws-identity guard means a session that already resumed on a newer socket
+	 * is not deregistered by the older socket's late close - last-write-wins.
+	 * @param {string} sessionId
+	 * @param {any} ws
+	 * @param {Promise<void>[]} writes collects the Redis write, issued at once
+	 * @returns {Promise<void>[]}
+	 */
+	function releaseAppSession(sessionId, ws, writes) {
+		if (appSessionToWs.get(sessionId) === ws) {
+			appSessionToWs.delete(sessionId);
+			writes.push(deleteSessionIfOurs(sessionId));
+		}
+		return writes;
+	}
+
+	/**
+	 * Drop the user `ws` holds, delete this instance's row and announce the
+	 * close. Every Redis write is issued before the caller's first await.
+	 * @param {string} userId
+	 * @param {any} ws
+	 * @param {Promise<void>[]} writes
+	 * @returns {Promise<void>[]}
+	 */
+	function releaseUser(userId, ws, writes) {
+		const sessionId = localUsers.get(userId);
+		// Same-instance reconnect guard: if the user's current local binding
+		// points at a DIFFERENT (newer) socket, this is a stale close after a
+		// resume - the new socket's open already flipped both local maps AND the
+		// Redis row to itself, so the old socket's close must NOT run, or it
+		// would unbind the live socket and delete its registry row (a fresh
+		// laptop-then-phone reconnect would go dark). A user with no local entry
+		// at all is not a resume; fall through to the best-effort Redis cleanup
+		// as before. Mirrors the app-session guard and the realtime push
+		// registry's `entry.ws === ws` check; cross-instance migration is
+		// unaffected (this instance still owns its local ws, so it drains and
+		// publishes a close that the new owner's applyCloseEvent owner-check
+		// correctly ignores).
+		if (sessionId && sessionToWs.get(sessionId) !== ws) return writes;
+		if (sessionId) {
+			localUsers.delete(userId);
+			localRefresh.delete(userId);
+			sessionToWs.delete(sessionId);
+			// Pairs with the open hook's two writes; either both maps
+			// reflect the user or neither does.
+			assert(
+				localUsers.size === sessionToWs.size,
+				'registry.session-shadow.consistency',
+				{ localUsers: localUsers.size, sessionToWs: sessionToWs.size }
+			);
+		}
+		writes.push(deleteIfOurs(userId));
+		// Local index update and broadcast happen unconditionally
+		// once the local maps clear: the compare-and-delete above
+		// already protects the Redis row from clobbering a migrated
+		// entry, and the recipients of the close event guard with
+		// `applyCloseEvent`'s owner check before unindexing. The
+		// PUBLISH follows the compare-and-delete on the same
+		// connection (the row's node on a cluster), so Redis runs
+		// them in that order.
+		if (attributes) {
+			applyCloseEvent(userId, instanceId);
+			writes.push(publishEvent({ type: 'close', userId, instanceId }));
+		}
+		return writes;
 	}
 
 	async function refreshTtl(userId) {
@@ -1838,7 +1916,13 @@ export function createConnectionRegistry(client, options) {
 		},
 		hooks: {
 			async open(ws, ctx) {
+				// A close that ran while this hook waited found nothing to drain,
+				// so after every await the hook stops for a closed socket and
+				// releases whatever it already bound; nothing else would, and the
+				// heartbeat would keep renewing it.
+				if (closedSockets.has(ws)) return;
 				await settleSubscriber(ctx?.platform);
+				if (closedSockets.has(ws)) return;
 
 				// App-session registration (opt-in via `sessionIdentify`, independent
 				// of userId so an anonymous-but-sessioned connection still gets
@@ -1851,14 +1935,14 @@ export function createConnectionRegistry(client, options) {
 					try { sessionId = sessionIdentify(ws); } catch { sessionId = null; }
 					if (sessionId != null && sessionId !== '') {
 						await registerAppSession(sessionId, ws);
+						if (closedSockets.has(ws)) {
+							await Promise.all(releaseAppSession(sessionId, ws, []));
+							return;
+						}
 					}
 				}
 
-				// Closed-WS race: the ws may have closed during the
-				// `await settleSubscriber` above. `identify(ws)` and the
-				// subsequent `ws.getUserData()` both throw on a freed
-				// native handle; bail silently rather than crashing the
-				// worker. No state to roll back yet.
+				// A throwing identify or getUserData registers nothing.
 				let userId, ud;
 				try {
 					userId = identify(ws);
@@ -1905,6 +1989,11 @@ export function createConnectionRegistry(client, options) {
 					// so the user is still reachable from this instance until the
 					// heartbeat's restore writes and announces the row.
 				}
+				// A close during the write normally drained the user already;
+				// this covers one whose identify did not resolve the user.
+				if (closedSockets.has(ws) && sessionToWs.get(sessionId) === ws) {
+					await Promise.all(releaseUser(userId, ws, []));
+				}
 			},
 			async close(ws, _ctx) {
 				// Every Redis write this hook makes is issued before its first
@@ -1915,60 +2004,17 @@ export function createConnectionRegistry(client, options) {
 				// user to this instance until it reconnects.
 				/** @type {Promise<void>[]} */
 				const writes = [];
+				closedSockets.add(ws);
 
-				// App-session drain (opt-in; independent of userId). The ws-identity
-				// guard means a session that already resumed on a newer socket is not
-				// deregistered by the older socket's late close - last-write-wins.
+				// App-session drain (opt-in; independent of userId).
 				if (sessionIdentify) {
 					let sessionId;
 					try { sessionId = sessionIdentify(ws); } catch { sessionId = null; }
-					if (sessionId != null && sessionId !== '' && appSessionToWs.get(sessionId) === ws) {
-						appSessionToWs.delete(sessionId);
-						writes.push(deleteSessionIfOurs(sessionId));
-					}
+					if (sessionId != null && sessionId !== '') releaseAppSession(sessionId, ws, writes);
 				}
 
 				const userId = identify(ws);
-				if (!userId) { await Promise.all(writes); return; }
-				const sessionId = localUsers.get(userId);
-				// Same-instance reconnect guard: if the user's current local binding
-				// points at a DIFFERENT (newer) socket, this is a stale close after a
-				// resume - the new socket's open already flipped both local maps AND the
-				// Redis row to itself, so the old socket's close must NOT run, or it
-				// would unbind the live socket and delete its registry row (a fresh
-				// laptop-then-phone reconnect would go dark). A user with no local entry
-				// at all is not a resume; fall through to the best-effort Redis cleanup
-				// as before. Mirrors the app-session guard above and the realtime push
-				// registry's `entry.ws === ws` check; cross-instance migration is
-				// unaffected (this instance still owns its local ws, so it drains and
-				// publishes a close that the new owner's applyCloseEvent owner-check
-				// correctly ignores).
-				if (sessionId && sessionToWs.get(sessionId) !== ws) { await Promise.all(writes); return; }
-				if (sessionId) {
-					localUsers.delete(userId);
-					localRefresh.delete(userId);
-					sessionToWs.delete(sessionId);
-					// Pairs with the open hook's two writes; either both maps
-					// reflect the user or neither does.
-					assert(
-						localUsers.size === sessionToWs.size,
-						'registry.session-shadow.consistency',
-						{ localUsers: localUsers.size, sessionToWs: sessionToWs.size }
-					);
-				}
-				writes.push(deleteIfOurs(userId));
-				// Local index update and broadcast happen unconditionally
-				// once the local maps clear: the compare-and-delete above
-				// already protects the Redis row from clobbering a migrated
-				// entry, and the recipients of the close event guard with
-				// `applyCloseEvent`'s owner check before unindexing. The
-				// PUBLISH follows the compare-and-delete on the same
-				// connection (the row's node on a cluster), so Redis runs
-				// them in that order.
-				if (attributes) {
-					applyCloseEvent(userId, instanceId);
-					writes.push(publishEvent({ type: 'close', userId, instanceId }));
-				}
+				if (userId) releaseUser(userId, ws, writes);
 				await Promise.all(writes);
 			}
 		},

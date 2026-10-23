@@ -2030,6 +2030,111 @@ describe('redis connection registry', () => {
 			});
 		}
 	});
+	describe('a socket that closes while the open hook waits', () => {
+		const opts = {
+			identify: (ws) => ws.getUserData()?.userId,
+			sessionIdentify: (ws) => ws.getUserData()?.sid,
+			attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+		};
+		let intervals;
+		beforeEach(() => {
+			intervals = [];
+			setRuntimeEnv({ timers: {
+				setInterval(cb) { const handle = { cb, unref() {} }; intervals.push(handle); return handle; },
+				clearInterval(handle) { handle.cb = () => {}; }
+			} });
+		});
+		afterEach(() => resetRuntimeEnv());
+
+		async function expectNothingRegistered(a, peer) {
+			const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+			await settle();
+			// Heartbeats renew and restore nothing for the closed socket.
+			for (const handle of intervals) handle.cb();
+			await settle();
+			expect(a.size()).toBe(0);
+			expect(await client.redis.exists(client.key('conns:u'))).toBe(0);
+			expect(await client.redis.exists(client.key('regsess:app-1'))).toBe(0);
+			expect(await peer.lookup('u')).toBeNull();
+			expect(await peer.lookupSession('app-1')).toBeNull();
+			expect(await peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+			expect(await a.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+		}
+
+		for (const [label, warm] of [
+			['the first open, which waits for the subscriber', false],
+			['an open that waits for the app-session write', true]
+		]) {
+			it(`registers nothing for ${label}`, async () => {
+				const a = createConnectionRegistry(client, opts);
+				const peer = createConnectionRegistry(client, opts);
+				const pa = mockPlatform();
+				const other = wsWithSession({ userId: 'q', tenantId: 'other' }, 'sq');
+				try {
+					await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+					if (warm) await a.hooks.open(other, { platform: mockPlatform() });
+
+					// A closed socket still answers getUserData(), as on uWS.
+					const ws = wsWithSession({ userId: 'u', sid: 'app-1', tenantId: 't' }, 's1');
+					const opening = a.hooks.open(ws, { platform: pa });
+					ws.close();
+					await a.hooks.close(ws, { platform: pa });
+					await opening;
+
+					if (warm) await a.hooks.close(other);
+					await expectNothingRegistered(a, peer);
+				} finally {
+					await a.destroy();
+					await peer.destroy();
+				}
+			});
+		}
+
+		it('releases the user when the close hook could not identify it during the row write', async () => {
+			let closing = false;
+			const a = createConnectionRegistry(client, {
+				...opts,
+				identify: (ws) => { if (closing) throw new Error('gone'); return ws.getUserData()?.userId; }
+			});
+			const peer = createConnectionRegistry(client, opts);
+			const other = wsWithSession({ userId: 'q', tenantId: 'other' }, 'sq');
+			try {
+				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+				await a.hooks.open(other, { platform: mockPlatform() });
+				// The row write ran; its reply is in flight when the socket closes.
+				/** @type {Array<() => void>} */
+				const held = [];
+				const multi = client.redis.multi.bind(client.redis);
+				vi.spyOn(client.redis, 'multi').mockImplementation(() => {
+					const tx = multi();
+					return new Proxy(tx, {
+						get(target, prop) {
+							if (prop !== 'exec') return target[prop];
+							return () => {
+								const reply = target.exec();
+								return new Promise((resolve) => { held.push(() => resolve(reply)); });
+							};
+						}
+					});
+				});
+				const ws = wsWithSession({ userId: 'u', tenantId: 't' }, 's1');
+				const opening = a.hooks.open(ws, { platform: mockPlatform() });
+				await expect.poll(() => held.length).toBe(1);
+				vi.restoreAllMocks();
+				closing = true;
+				await expect(a.hooks.close(ws)).rejects.toThrow('gone');
+				closing = false;
+				held.shift()();
+				await opening;
+				await a.hooks.close(other);
+				await expectNothingRegistered(a, peer);
+			} finally {
+				vi.restoreAllMocks();
+				await a.destroy();
+				await peer.destroy();
+			}
+		});
+	});
 	describe('attributes / sendTo: a socket that closes right after opening', () => {
 		it('announces the open before the close, so peers do not index the gone user', async () => {
 			const opts = {
