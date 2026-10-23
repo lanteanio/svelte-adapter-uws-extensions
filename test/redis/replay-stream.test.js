@@ -200,6 +200,46 @@ describe('redis replay (stream backend)', () => {
 				expect(platform.sent.at(-1).data).toEqual({ truncated: true });
 			});
 
+			// Real Redis runs a pipeline's commands in order but lets another
+			// client's command land between them. This pipeline does exactly that:
+			// it runs a publish after the first queued read and before the second.
+			function interleavePublishInNextPipeline() {
+				const redis = client.redis;
+				const original = redis.pipeline;
+				redis.pipeline = () => {
+					redis.pipeline = original;
+					const commands = [];
+					const p = new Proxy({}, {
+						get(_, method) {
+							if (method === 'exec') {
+								return async () => {
+									const results = [];
+									for (let i = 0; i < commands.length; i++) {
+										if (i === 1) await replay.publish(platform, 'chat', 'created', { id: 'between' });
+										try { results.push([null, await redis[commands[i].method](...commands[i].args)]); }
+										catch (err) { results.push([err, null]); }
+									}
+									return results;
+								};
+							}
+							return (...args) => { commands.push({ method, args }); return p; };
+						}
+					});
+					return p;
+				};
+			}
+
+			it('does not report truncated when a publish lands between the counter and range reads', async () => {
+				for (let i = 1; i <= 3; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+				for (const sinceSeq of [0, 3]) {
+					interleavePublishInNextPipeline();
+					platform.reset();
+					await replay.replay({}, 'chat', sinceSeq, platform);
+					const replayed = platform.sent.filter((s) => s.topic === '__replay:chat');
+					expect(replayed.some((s) => s.event === 'truncated'), `sinceSeq ${sinceSeq}`).toBe(false);
+					expect(replayed.at(-1).data).toEqual({});
+				}
+			});
 
 			it('reports a deleted middle entry as truncated', async () => {
 				await publishFive();
