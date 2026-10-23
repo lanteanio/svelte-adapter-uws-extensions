@@ -792,7 +792,7 @@ describe('createCrdtCluster topics the relay cannot carry', () => {
 });
 
 describe('createCrdtCluster documents past the relay limit', () => {
-	it('persists a topic the relay can never carry, reports it once and stops retrying it', async () => {
+	it('refuses to persist a topic the relay can never carry, reports it once and stops retrying it', async () => {
 		const client = mockRedisClient('crdtnever:');
 		const errors = [];
 		const a = createCrdtCluster(client, { maxEnvelopeBytes: 400, persistLeaseMs: 600, onError: (err) => errors.push(err) });
@@ -809,14 +809,72 @@ describe('createCrdtCluster documents past the relay limit', () => {
 			await settle();
 			a.relayUpdate('dk1', huge, [1, 2, 3]);
 			await settle();
-			expect(await a.acquirePersist(huge)).toBe(true);
-			for (let k = 0; k < 3; k++) expect(await a.acquirePersist(huge)).toBe(true);
+			for (let k = 0; k < 4; k++) {
+				const err = await a.acquirePersist(huge).then(() => null, (e) => e);
+				expect(err?.code).toBe('CRDT_RELAY_PENDING');
+				expect(err.cause.code).toBe('RELAY_ENVELOPE_TOO_LARGE');
+			}
 			await new Promise((r) => setTimeout(r, 1300)); // past the first retry
 			expect(errors).toHaveLength(1);
 			expect(errors[0].code).toBe('RELAY_ENVELOPE_TOO_LARGE');
 			expect(reads).toBeLessThanOrEqual(1);
 		} finally {
 			a.destroy();
+		}
+	});
+
+	it('keeps each replica and its edits when the relay can carry nothing for the topic, and stores neither', async () => {
+		const client = mockRedisClient('crdtnolost:');
+		const backend = createBackend();
+		const T = 'doc:' + 'h'.repeat(420);
+		const opts = { maxEnvelopeBytes: 400, persistLeaseMs: 200, onError: () => {} };
+		const a = createDocInstance(client, backend, opts);
+		const b = createDocInstance(client, backend, opts);
+		const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+		try {
+			await a.join(T);
+			await b.join(T);
+			await settle();
+			a.edit(T, 'fromA', 1);
+			await wait(400);
+			b.edit(T, 'fromB', 2);
+			await wait(400);
+			// Each snapshot would hold one instance's edit and erase the other's.
+			expect(backend.writes).toEqual([]);
+			expect(a.items(T)).toEqual({ fromA: 1 });
+			expect(b.items(T)).toEqual({ fromB: 2 });
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('stops persisting on both sides when a sync reply is too large for the relay', async () => {
+		const client = mockRedisClient('crdtbigreply:');
+		const aErrors = [];
+		const bErrors = [];
+		const a = createCrdtCluster(client, { maxEnvelopeBytes: 400, persistLeaseMs: 600, onError: (err) => aErrors.push(err) });
+		const b = createCrdtCluster(client, { maxEnvelopeBytes: 400, persistLeaseMs: 600, onError: (err) => bErrors.push(err) });
+		// Room for a request and an empty reply, none for a part header.
+		const topic = 'doc:' + 'r'.repeat(250);
+		const stateA = Array.from({ length: 300 }, (_, i) => i % 256);
+		a.onMessage({ onSyncRequest: (declKey, t, sv, from) => a.sendSyncReply(declKey, t, stateA, from) });
+		b.onMessage({ onSyncRequest: (declKey, t, sv, from) => { if (from.startsWith('local:')) b.sendSyncReply(declKey, t, [1], from); } });
+		try {
+			await settle();
+			a.relayUpdate('dk1', topic, [1, 2, 3]); // fits: a holds the topic
+			await settle();
+			b.requestSync('dk1', topic, []);
+			await settle();
+			for (const [side, errors] of [[a, aErrors], [b, bErrors]]) {
+				const err = await side.acquirePersist(topic).then(() => null, (e) => e);
+				expect(err?.code).toBe('CRDT_RELAY_PENDING');
+				expect(err.cause.code).toBe('RELAY_ENVELOPE_TOO_LARGE');
+				expect(errors.map((e) => e.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+			}
+		} finally {
+			a.destroy();
+			b.destroy();
 		}
 	});
 

@@ -52,6 +52,14 @@
  *     the peers, or whose round could not reach them, refuses persistence
  *     (rejects, so the schedule retries and the replica stays loaded) until a
  *     resync delivered them.
+ *   - **Documents past the relay limit stay loaded.** A stored snapshot is
+ *     replaced, not merged, so two instances writing replicas that differ
+ *     would erase each other's edits in turn. When the relay cannot carry a
+ *     topic's update, sync request or sync reply even in parts, its replicas
+ *     can no longer be kept in sync: the instance that could not send, and a
+ *     peer it could not answer, report the topic once and reject its
+ *     persistence from then on, so each keeps its replica and edits loaded
+ *     and none of them overwrites the snapshot with a partial state.
  *   - **Cold-join freshness.** A persisted snapshot is only as fresh as the
  *     last debounced store. When an instance cold-loads a topic it loads the
  *     snapshot AND broadcasts a sync request carrying its state vector; any
@@ -177,9 +185,9 @@ function positive(v, fallback) {
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber
  *   failure (the subscriber tears down, is opened again, and resyncs), and a
  *   relay envelope too large to send even in parts (code
- *   `RELAY_ENVELOPE_TOO_LARGE`, once per held document; a document past
- *   the relay limit is not replicated across instances and persists from
- *   the local replica).
+ *   `RELAY_ENVELOPE_TOO_LARGE`, once per held document; the relay cannot
+ *   keep such a document in sync, so `acquirePersist` rejects for it from
+ *   then on and the replica stays loaded with its edits).
  */
 
 /**
@@ -238,10 +246,8 @@ export function createCrdtCluster(client, options = {}) {
 	const inflight = new Map();
 	/** @type {Set<string>} topics whose replica may lack edits the peers sent */
 	const stale = new Set();
-	/** @type {Set<string>} topics whose name leaves no room for a sync request: never resynced */
-	const unaskable = new Set();
-	/** @type {Set<string>} topics already reported as too large for the relay */
-	const oversize = new Set();
+	/** @type {Map<string, Error>} topics the relay cannot keep in sync -> the error reported for them */
+	const oversize = new Map();
 	/** @type {Map<string, Map<string, { declKey: string, v: any[], c: string | undefined }>>} topic -> requester -> a sync reply the relay lost */
 	const owed = new Map();
 	/** @type {WeakMap<object, any[]>} sync reply envelope -> the state vector it answered */
@@ -324,16 +330,17 @@ export function createCrdtCluster(client, options = {}) {
 		owed.delete(topic);
 		stale.delete(topic);
 		unrelayed.delete(topic);
-		unaskable.delete(topic);
 		oversize.delete(topic);
 	}
 
 	/**
 	 * A relay too large to carry even in parts can never be sent, so retrying
-	 * it only repeats its cost. A document past the relay limit is not
-	 * replicated across instances: the topic is reported once to onError, its
-	 * local edits no longer hold up persistence (the local state holds them),
-	 * and a topic whose name leaves no room for a sync request is not resynced.
+	 * it only repeats its cost. The topic's replicas can no longer be kept in
+	 * sync, and a stored snapshot is replaced, not merged, so a replica
+	 * written now could erase edits only another replica holds: the topic is
+	 * reported once to onError and its persistence rejects from then on,
+	 * which keeps the replica and its edits loaded. A peer whose sync request
+	 * got no state is told so, and its persistence rejects as well.
 	 */
 	function relayImpossible(obj, err) {
 		const topic = obj.t;
@@ -346,10 +353,18 @@ export function createCrdtCluster(client, options = {}) {
 			return;
 		}
 		lastRelayError = err;
+		if (obj.k === KIND_SYNC_REPLY && typeof obj.to === 'string' && Array.isArray(obj.b) && obj.b.length > 0) {
+			publish({ i: instanceId, k: KIND_SYNC_REPLY, d: obj.d, t: topic, b: [], to: obj.to, c: obj.c, o: 1 });
+		}
 		if (typeof topic !== 'string' || !known.has(topic)) { report(err); return; }
-		if (obj.k === KIND_SYNC_REQUEST) { unaskable.add(topic); stale.delete(topic); }
-		else if (obj.k === KIND_UPDATE) unrelayed.delete(topic);
-		if (!oversize.has(topic)) { oversize.add(topic); report(err); }
+		cannotSync(topic, err);
+	}
+
+	/** Stop persisting a topic the relay cannot keep in sync; report it once. */
+	function cannotSync(topic, err) {
+		if (oversize.has(topic)) return;
+		oversize.set(topic, err);
+		report(err);
 	}
 
 	/**
@@ -600,10 +615,18 @@ export function createCrdtCluster(client, options = {}) {
 	}
 
 	/** The rejection while a topic's local edits have not reached the peers, or its replica has not synced with them. */
-	function relayPending(message = 'crdt: local edits to the document have not reached the other instances') {
+	function relayPending(message = 'crdt: local edits to the document have not reached the other instances', cause = lastRelayError) {
 		const err = operationError('CRDT_RELAY_PENDING', message);
-		if (lastRelayError !== null) err.cause = lastRelayError;
+		if (cause !== null) err.cause = cause;
 		return err;
+	}
+
+	/** Reject while the relay cannot keep the topic's replicas in sync. */
+	function assertRelayable(topic) {
+		const cause = oversize.get(topic);
+		if (cause !== undefined) {
+			throw relayPending('crdt: the relay cannot keep the document in sync between the instances, so it is not persisted', cause);
+		}
 	}
 
 	/**
@@ -650,6 +673,10 @@ export function createCrdtCluster(client, options = {}) {
 			// Targeted: only the requester applies a reply addressed to it.
 			if (parsed.to !== instanceId || !Array.isArray(parsed.b)) return;
 			if (parsed.b.length > 0 && handlers.onSyncReply) handlers.onSyncReply(declKey, topic, parsed.b);
+			// The peer holds state the relay cannot carry to this replica.
+			if (parsed.o === 1 && known.has(topic)) {
+				cannotSync(topic, operationError('RELAY_ENVELOPE_TOO_LARGE', 'crdt: a peer holds document state too large for the relay even in parts'));
+			}
 			noteReply(topic, parsed.i, parsed.c);
 		}
 	}
@@ -778,7 +805,8 @@ export function createCrdtCluster(client, options = {}) {
 			forget(topic);
 			return null;
 		}
-		if (unaskable.has(topic)) return null;
+		// Nothing a round sends for such a topic can reach the peers.
+		if (oversize.has(topic)) return null;
 		// One admission covers both publishes of the round; a round that
 		// publishes nothing hands it back unused.
 		let release;
@@ -823,7 +851,7 @@ export function createCrdtCluster(client, options = {}) {
 			else if (verdict.reached) b?.success();
 			else release();
 			// A topic that cannot be asked about has nothing to wait for.
-			if (n !== null || unaskable.has(topic)) round.asked = true;
+			if (n !== null || oversize.has(topic)) round.asked = true;
 			if (n === null || (p === null && unrelayed.has(topic))) {
 				// relayLost marked the topic again; nothing will answer.
 				finishRound(round);
@@ -921,6 +949,7 @@ export function createCrdtCluster(client, options = {}) {
 	 * replica may lack edits the peers sent.
 	 */
 	function assertSynced(topic, reached) {
+		assertRelayable(topic);
 		if (unrelayed.has(topic)) throw relayPending();
 		if (!reached || stale.has(topic)) {
 			throw relayPending('crdt: the document has not synced with the other instances since the relay lost traffic');
@@ -1002,12 +1031,15 @@ export function createCrdtCluster(client, options = {}) {
 		 * write, storing a snapshot from a replica that could not ask its
 		 * peers, or unloading the only replica holding local edits. Replies
 		 * lost or late do not hold up the write; they are merged when they
-		 * arrive or by the next resync.
+		 * arrive or by the next resync. A topic the relay cannot keep in sync
+		 * (see the module comment) rejects with the same code from then on,
+		 * its `cause` the `RELAY_ENVELOPE_TOO_LARGE` error reported for it.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
 		async acquirePersist(topic) {
 			if (destroyed) return false;
+			assertRelayable(topic);
 			let synced = false;
 			let reached = true;
 			if (known.has(topic) && (unrelayed.has(topic) || stale.has(topic) || queue.has(topic) || rounds.has(topic))) {
@@ -1050,7 +1082,6 @@ export function createCrdtCluster(client, options = {}) {
 			unrelayed.clear();
 			inflight.clear();
 			stale.clear();
-			unaskable.clear();
 			oversize.clear();
 			owed.clear();
 			known.clear();

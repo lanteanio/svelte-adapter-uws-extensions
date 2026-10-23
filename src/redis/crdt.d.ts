@@ -26,9 +26,9 @@ export interface CrdtClusterOptions {
 	/**
 	 * Observe a relay-subscriber failure (the subscriber tears down, is opened
 	 * again, and resyncs), and a relay envelope too large to send even in
-	 * parts (code `RELAY_ENVELOPE_TOO_LARGE`, once per held document; a
-	 * document past the relay limit is not replicated across instances and
-	 * persists from the local replica).
+	 * parts (code `RELAY_ENVELOPE_TOO_LARGE`, once per held document; the
+	 * relay cannot keep such a document in sync, so `acquirePersist` rejects
+	 * for it from then on and the replica stays loaded with its edits).
 	 */
 	onError?: (err: unknown) => void;
 }
@@ -77,7 +77,12 @@ export interface CrdtCluster {
 	 * not confirmed within that window) or while the replica has not synced
 	 * with them after the relay lost traffic (a sync round the breaker refused,
 	 * or whose request failed or was not confirmed within that window), so the
-	 * caller's persistence schedule retries and keeps the replica loaded.
+	 * caller's persistence schedule retries and keeps the replica loaded. A
+	 * topic the relay cannot keep in sync (an update, sync request or sync
+	 * reply too large even in parts, here or at a peer it asked) rejects with
+	 * the same code from then on, its `cause` the `RELAY_ENVELOPE_TOO_LARGE`
+	 * error: a stored snapshot is replaced, not merged, so writing a replica
+	 * that differs from the others would erase their edits.
 	 */
 	acquirePersist(topic: string): Promise<boolean>;
 	/** Tear down the relay subscriber. Idempotent. */
