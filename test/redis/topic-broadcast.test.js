@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createTopicBroadcast } from '../../src/redis/topic-broadcast.js';
+import { resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { installSteppedClock } from '../helpers/stepped-clock.js';
 
 /** Flush pending microtasks + immediates so sync mock-redis pub/sub + async handlers settle. */
 const flush = () => new Promise((r) => setImmediate(r));
@@ -171,5 +173,40 @@ describe('redis topic-broadcast coordinator', () => {
 		const b = make();
 		expect(typeof a.instanceId).toBe('string');
 		expect(a.instanceId).not.toBe(b.instanceId);
+	});
+	describe('with a short heartbeat across a cached-clock step', () => {
+		// Exact time and a cached now() that lags it, refreshing every 1010 ms;
+		// heartbeats are captured and run on demand.
+		let clock;
+		beforeEach(() => { clock = installSteppedClock(); });
+		afterEach(() => resetRuntimeEnv());
+		const beat = async (h) => { h.cb(); await flush(); await flush(); };
+
+		it('keeps a live peer in the presence set and expires it one TTL after its last stamp', async () => {
+			const origin = make({ heartbeat: 300 });
+			const peer = make({ heartbeat: 300 });
+			origin.onRequest(serve([]));
+			peer.onRequest(serve([]));
+			await flush();
+			const [originBeat, peerBeat] = clock.intervals;
+			const presenceKey = client.key('{topic-broadcast}:instances');
+
+			// The peer stamps 30 ms before the origin's beat, with the cached
+			// clock refreshing at 1010 ms in between.
+			clock.advance(990);
+			await beat(peerBeat);
+			clock.advance(30);
+			await beat(originBeat);
+			expect(await client.redis.zrange(presenceKey, 0, -1)).toContain(peer.instanceId);
+
+			// presenceTtlMs defaults to 900 ms and the eviction cutoff is
+			// inclusive; the peer stops beating.
+			clock.advance(869);
+			await beat(originBeat);
+			expect(await client.redis.zrange(presenceKey, 0, -1)).toContain(peer.instanceId);
+			clock.advance(1);
+			await beat(originBeat);
+			expect(await client.redis.zrange(presenceKey, 0, -1)).not.toContain(peer.instanceId);
+		});
 	});
 });

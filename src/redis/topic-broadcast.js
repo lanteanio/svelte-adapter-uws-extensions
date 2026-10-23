@@ -50,7 +50,7 @@
  * @module svelte-adapter-uws-extensions/redis/topic-broadcast
  */
 
-import { randomBytes, now as cachedNow, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { randomBytes, wallEpoch, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { createBusValidator } from '../shared/bus-validate.js';
 import { MAX_REGISTRY_PENDING_REQUESTS } from '../shared/caps.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
@@ -185,13 +185,16 @@ export function createTopicBroadcast(client, options = {}) {
 	}
 
 	/** Stamp this instance's presence and evict instances stale beyond the TTL. */
+	// Scores are exact wall-clock stamps compared across instances. The cached
+	// now() lags by up to about a second, which a short heartbeat or TTL cannot
+	// absorb.
 	async function refreshPresence() {
 		if (destroyed) return;
 		if (b) { try { b.guard(); } catch { return; } }
 		try {
-			await redis.zadd(presenceKey, cachedNow(), instanceId);
+			await redis.zadd(presenceKey, wallEpoch(), instanceId);
 			// Inclusive cutoff (1ms of TTL slack is immaterial against a multi-second window).
-			await redis.zremrangebyscore(presenceKey, '-inf', cachedNow() - presenceTtlMs);
+			await redis.zremrangebyscore(presenceKey, '-inf', wallEpoch() - presenceTtlMs);
 			b?.success();
 		} catch (err) {
 			b?.failure(err);
@@ -207,7 +210,7 @@ export function createTopicBroadcast(client, options = {}) {
 	 * @returns {Promise<string[]>}
 	 */
 	async function liveInstances() {
-		const cutoff = cachedNow() - presenceTtlMs;
+		const cutoff = wallEpoch() - presenceTtlMs;
 		try {
 			const members = await redis.zrangebyscore(presenceKey, cutoff, '+inf');
 			b?.success();
