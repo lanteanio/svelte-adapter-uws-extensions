@@ -6,6 +6,11 @@ import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createPresence } from '../../src/redis/presence.js';
 import { createReplay } from '../../src/redis/replay.js';
 
+// A real server delivers within milliseconds, but a loaded host can stall the
+// subscriber past the 1 s poll default. The count is read once delivery is
+// seen, so a longer deadline adds no I/O to it.
+const DELIVERY = { timeout: 10_000 };
+
 // Lower budgets whenever possible. Raising one requires a recorded design reason.
 // Measurements exclude connection setup, script-cache warmup, and teardown.
 export function redisIOContract(makeClient) {
@@ -39,7 +44,7 @@ export function redisIOContract(makeClient) {
 					const wrapped = bus.wrap(platform);
 					meter.reset();
 					for (let i = 0; i < size; i++) wrapped.publish('room', 'value', i);
-					await expect.poll(() => received.length).toBe(size);
+					await expect.poll(() => received.length, DELIVERY).toBe(size);
 					counts.push(meter.read());
 					expect(platform.published).toHaveLength(size);
 					expect(received.map(frame => frame.data)).toEqual(Array.from({ length: size }, (_, i) => i));
@@ -67,7 +72,7 @@ export function redisIOContract(makeClient) {
 					const messages = Array.from({ length: size }, (_, i) => ({ topic: 'room', event: 'value', data: i }));
 					meter.reset();
 					wrapped.publishBatched(messages);
-					await expect.poll(() => received.every(frames => frames.length === 1)).toBe(true);
+					await expect.poll(() => received.every(frames => frames.length === 1), DELIVERY).toBe(true);
 					counts.push(meter.read());
 					for (const frames of received) expect(frames[0].batch.map(frame => frame.data)).toEqual(messages.map(frame => frame.data));
 					meter.reset();
