@@ -26,6 +26,20 @@ function gitLines(args) {
 }
 
 /**
+ * Repository paths a git listing prints, NUL-separated so a non-ASCII or
+ * whitespace-bearing name arrives verbatim instead of C-quoted.
+ */
+function gitPaths(args) {
+	const [command, ...rest] = args;
+	return execFileSync('git', ['-C', root, command, '-z', ...rest], {
+		encoding: 'utf8',
+		windowsHide: true,
+		stdio: ['ignore', 'pipe', 'ignore'],
+		maxBuffer: 64 * 1024 * 1024
+	}).split('\0').filter(Boolean);
+}
+
+/**
  * Whether this checkout has a usable git context: the binary exists AND the
  * repository it answers for is THIS one - the same guard trackedMarkdown
  * applies, because a ZIP-extracted copy nested inside some other repository
@@ -57,7 +71,7 @@ export function gitUsable() {
 let stagedTreeCache;
 export function stagedTree() {
 	if (stagedTreeCache === undefined) {
-		stagedTreeCache = gitUsable() ? new Set(gitLines(['ls-files', '--cached'])) : null;
+		stagedTreeCache = gitUsable() ? new Set(gitPaths(['ls-files', '--cached'])) : null;
 	}
 	return stagedTreeCache;
 }
@@ -643,7 +657,7 @@ function writeMainTree() {
 		console.error('check-links --write-main-tree FAILED: origin/main is not resolvable here; fetch it first (git fetch origin main).');
 		process.exit(1);
 	}
-	const paths = gitLines(['ls-tree', '-r', '--name-only', commit]);
+	const paths = gitPaths(['ls-tree', '-r', '--name-only', commit]);
 	const body = {
 		comment: 'File list of the published stable tree (origin/main), consumed by scripts/check-links.js to validate same-repo blob/main source links without network or a full clone. Regenerate after a stable promotion: node scripts/check-links.js --write-main-tree',
 		commit,

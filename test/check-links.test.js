@@ -377,6 +377,35 @@ it('checks a directory anchor against the README of that directory', () => {
 	} finally { cleanup(); }
 }, 30_000);
 
+// Git C-quotes a non-ASCII path unless it lists NUL-separated, and a quoted
+// name matches no link to the real file.
+it('finds tracked files and READMEs whose names are not ASCII', () => {
+	const { put, git, run, cleanup } = linkFixture();
+	try {
+		put('notes/guide.md', '# Notes\n');
+		put('notes/ä/README.md', '# Umlaut home\n## Setup\n');
+		put('notes/ä/über.md', '# Über\n## Größe\n');
+		git('init', '--initial-branch=docs-fixture');
+		git('config', 'core.quotePath', 'true');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts', 'notes');
+		put('notes/guide.md', [
+			'# Notes',
+			'[Encoded](%C3%A4/%C3%BCber.md)',
+			'[Encoded heading](%C3%A4/%C3%BCber.md#größe)',
+			'[Literal](ä/über.md)',
+			'[Folder heading](%C3%A4/#setup)',
+			''
+		].join('\n'));
+		let result = run();
+		expect(result.stderr).toBe('');
+		expect(result.status).toBe(0);
+		put('notes/guide.md', '# Notes\n[Probe](%C3%A4/#missing)\n');
+		result = run();
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('no heading in notes/ä/README.md produces #missing');
+	} finally { cleanup(); }
+}, 30_000);
+
 // A packaged document is also read from node_modules and the registry page,
 // where a leading slash does not name the repository root.
 it('rejects a root-relative link in a packaged document', () => {
