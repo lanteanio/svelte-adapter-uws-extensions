@@ -3,6 +3,7 @@ import { createPresence } from '../../src/redis/presence.js';
 import { mockRedisClient } from '../../src/testing/mock-redis.js';
 import { mockWs } from '../../src/testing/mock-ws.js';
 import { mockPlatform } from '../../src/testing/mock-platform.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 describe('presence relayed joins', () => {
 	it.each([false, true])('restores a surviving tab identity after its original TTL (closeAll=%s)', async closeAll => {
@@ -75,6 +76,27 @@ describe('presence relayed joins', () => {
 			}
 			expect(await b.list('room')).toEqual([expected]);
 		} finally { a.destroy(); b.destroy(); vi.useRealTimers(); }
+	});
+
+	it('a later join wins the identity when the cached clocks of two instances are out of phase', async () => {
+		// Each instance's cached now() lags the exact clock by its own amount,
+		// up to about a second; this one by 0 ms on A and 900 ms on B.
+		const clock = { t: 1_000_000, lag: 0 };
+		setRuntimeEnv({ clock: { now: () => clock.t - clock.lag, wallEpoch: () => clock.t, monotonic: () => clock.t } });
+		const client = mockRedisClient();
+		const options = { binary: false, select: (u) => ({ id: u.id, name: u.name }) };
+		const a = createPresence(client, options);
+		const b = createPresence(client, options);
+		try {
+			const pa = mockPlatform();
+			const pb = mockPlatform();
+			clock.lag = 0;
+			await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', pa);
+			clock.t += 500;
+			clock.lag = 900;
+			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
+			for (const tracker of [a, b]) expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'New' }]);
+		} finally { a.destroy(); b.destroy(); resetRuntimeEnv(); }
 	});
 
 	for (const closeAll of [false, true]) it('keeps the peer identity when an older local tab leaves, closeAll=' + closeAll, async () => {

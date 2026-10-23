@@ -48,7 +48,6 @@
 import { registerClusterHealth } from '../shared/cluster-dashboard.js';
 import {
 	randomBytes,
-	now,
 	monotonicNow,
 	wallEpoch,
 	setTimer,
@@ -567,7 +566,7 @@ export function createPresence(client, options = {}) {
 		try {
 			const result = await evalCached(redis, RESTORE_IDENTITY_SCRIPT, 3,
 				userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic),
-				instanceId, key, JSON.stringify(expected), JSON.stringify(newest), now(), presenceTtlMs, authority || '', instanceId + ':' + (++joinSequence)
+				instanceId, key, JSON.stringify(expected), JSON.stringify(newest), wallEpoch(), presenceTtlMs, authority || '', instanceId + ':' + (++joinSequence)
 			);
 			const topicData = localData.get(topic);
 			const current = topicData?.get(key);
@@ -1134,8 +1133,11 @@ export function createPresence(client, options = {}) {
 			let reservedIdentity = false;
 			const currentEntry = localData.get(topic)?.get(key);
 
+			// Identity writes are ordered across instances by their stamps, so
+			// they read the exact wall clock: cached clocks on two instances can
+			// be about a second apart, and a later join would lose to an earlier one.
 			if (prevCount === 0) {
-				const ts = now();
+				const ts = wallEpoch();
 				joinWrite = { token: instanceId + ':' + (++joinSequence) };
 				const value = storedValue(serializedData, ts);
 				try {
@@ -1171,7 +1173,7 @@ export function createPresence(client, options = {}) {
 				// Defer cache changes and notifications until the authoritative
 				// read-back commits, just as on a first local join.
 				try {
-					const ts = now();
+					const ts = wallEpoch();
 					joinWrite = { token: instanceId + ':' + (++joinSequence) };
 					const joinResult = await evalCached(redis,
 						JOIN_SCRIPT, 3,
@@ -1223,7 +1225,7 @@ export function createPresence(client, options = {}) {
 				try {
 					const finalize = () => evalCached(redis, FINALIZE_JOIN_SCRIPT, 3,
 						userHashKey(topic, key), topicHashKey(topic), pendingHashKey(topic), instanceId, key,
-						joinWrite.token, joinWrite.epoch, joinWrite.version, serializedData, now(), presenceTtlMs);
+						joinWrite.token, joinWrite.epoch, joinWrite.version, serializedData, wallEpoch(), presenceTtlMs);
 					// Finalization is idempotent. A lost reply must be reconciled
 					// before compensating; rollback never undoes a committed value.
 					let current;
@@ -1426,7 +1428,7 @@ export function createPresence(client, options = {}) {
 				if (b) { try { b.guard(); } catch { skip = true; } }
 				if (!skip) {
 					try {
-						const ts = now();
+						const ts = wallEpoch();
 						await evalCached(redis,
 							UPDATE_SCRIPT, 1, topicHashKey(topic),
 							key, JSON.stringify(changedDurable), ts, presenceTtlMs
