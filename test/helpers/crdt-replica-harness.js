@@ -5,7 +5,7 @@
 // cold join, and a persist hook gated by acquirePersist). Instances share one
 // `backend` object standing in for the app's persistence store.
 
-import * as Y from 'yjs'; // vocabulary-allow: the document library the adapter's replica runs on
+import * as Y from 'yjs';
 import { createCrdtAuthority } from 'svelte-adapter-uws/plugins/crdt/replica';
 import { createCrdtCluster } from '../../src/redis/crdt.js';
 
