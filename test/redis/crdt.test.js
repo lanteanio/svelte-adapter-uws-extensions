@@ -820,6 +820,53 @@ describe('createCrdtCluster documents past the relay limit', () => {
 		}
 	});
 
+	it('sends the largest envelope a receiver accepts and refuses the next larger one, by the receiver\'s own limit', async () => {
+		const client = mockRedisClient('crdtpartedge:');
+		const errors = [];
+		const a = createCrdtCluster(client, { onError: (err) => errors.push(err) });
+		const b = createCrdtCluster(client);
+		const received = [];
+		b.onMessage({ onUpdate: (declKey, topic, bytes) => received.push(bytes) });
+		a.onMessage({});
+		const parts = [];
+		const publish = client.redis.publish;
+		client.redis.publish = function (channel, message) {
+			const env = JSON.parse(message);
+			if (env.i === a.instanceId && env.k === 'part') parts.push(env.n === 0 ? env.x.length : 0);
+			return publish.call(this, channel, message);
+		};
+		try {
+			await settle();
+			// The room one part leaves for data, read off a small split envelope.
+			a.relayUpdate('dk1', 'doc:edge', new Array(900000).fill(7));
+			await settle();
+			const room = parts[0];
+			received.length = 0;
+			parts.length = 0;
+			// The most whole base64 quanta that whole parts of that room carry
+			// within what a receiver holds for one sender.
+			const of = Math.floor((48 * 1024 * 1024) / room);
+			const bytes = new Array(3 * Math.floor((of * room) / 4)).fill(7);
+			a.relayUpdate('dk1', 'doc:edge', bytes);
+			await settle();
+			expect(parts).toHaveLength(of);
+			expect(received).toHaveLength(1);
+			expect(received[0].length).toBe(bytes.length);
+			received.length = 0;
+			parts.length = 0;
+			// Three bytes more need one more part, which no receiver accepts.
+			bytes.push(7, 7, 7);
+			a.relayUpdate('dk1', 'doc:edge', bytes);
+			await settle();
+			expect(parts).toHaveLength(0);
+			expect(errors.map((err) => err.code)).toEqual(['RELAY_ENVELOPE_TOO_LARGE']);
+		} finally {
+			client.redis.publish = publish;
+			a.destroy();
+			b.destroy();
+		}
+	}, 60000);
+
 	it('never serializes a whole state whose size alone rules out a single envelope', async () => {
 		const client = mockRedisClient('crdtnojson:');
 		const a = createCrdtCluster(client, { maxEnvelopeBytes: 400, onError: () => {} });

@@ -108,8 +108,8 @@ const KIND_PART = 'part';
 // way, so one peer's large resync cannot starve the others.
 const PART_BUFFER_MAX_CHARS = 64 * 1024 * 1024;
 // What one sender's envelopes may hold at once, which also caps the largest
-// envelope. The rest of the buffer stays free for the other senders, so
-// their small envelopes never displace a large one that fits.
+// envelope (see partsFit). The rest of the buffer stays free for the other
+// senders, so their small envelopes never displace a large one that fits.
 const PART_SENDER_MAX_CHARS = 48 * 1024 * 1024;
 const PART_ASSEMBLIES_MAX = 256;
 const PART_TIMEOUT_MS = 30000;
@@ -139,6 +139,15 @@ const SWEEP_SLICE = 64;
 /** Digest of a replica's full state, so a peer holding the same state can say so without sending it. */
 function digestOf(bytes) {
 	return createHash('sha256').update(Uint8Array.from(bytes)).digest('base64');
+}
+
+/**
+ * Whether an envelope sent as `of` parts, the longest `partChars` characters
+ * long, fits what a receiver holds for one sender. The sender refuses an
+ * envelope by the same rule the receiver drops it by.
+ */
+function partsFit(partChars, of) {
+	return partChars * of <= PART_SENDER_MAX_CHARS;
 }
 
 /** Coerce a positive-number option, else the default. */
@@ -423,7 +432,8 @@ export function createCrdtCluster(client, options = {}) {
 			if (Buffer.byteLength(msg) <= validator.maxBytes) return [msg];
 			if (bytes < 0) return null;
 		}
-		if (Math.ceil(bytes / 3) * 4 > PART_SENDER_MAX_CHARS) return null;
+		const chars = Math.ceil(bytes / 3) * 4;
+		if (chars > PART_SENDER_MAX_CHARS) return null;
 		const { i, d, t, b: _bytes, ...rest } = obj;
 		/** @type {any} */
 		const head = { i, k: KIND_PART, d, t, p: randomBytes(6).toString('hex') };
@@ -432,8 +442,9 @@ export function createCrdtCluster(client, options = {}) {
 		const overhead = Buffer.byteLength(JSON.stringify({ ...head, n: 1e9, of: 1e9, e: rest, x: '' }));
 		const room = validator.maxBytes - overhead;
 		if (room < 1) return null;
+		const of = Math.ceil(chars / room);
+		if (!partsFit(Math.min(room, chars), of)) return null;
 		const data = Buffer.from(Uint8Array.from(obj.b)).toString('base64');
-		const of = Math.ceil(data.length / room);
 		const out = [];
 		for (let n = 0; n < of; n++) {
 			/** @type {any} */
@@ -543,7 +554,7 @@ export function createCrdtCluster(client, options = {}) {
 			if (isDropped(key)) return null;
 			// An envelope that cannot fit a sender's share never completes:
 			// no other one gives way for it.
-			if (x.length * of > PART_SENDER_MAX_CHARS) { partsLost(key, t); return null; }
+			if (!partsFit(x.length, of)) { partsLost(key, t); return null; }
 			if (assemblies.size >= PART_ASSEMBLIES_MAX && !makeRoom('count', from, 1)) { partsLost(key, t); return null; }
 			a = { from, of, d, t, e: null, parts: new Map(), chars: 0, partMax: 0, timer: null };
 			assemblies.set(key, a);
@@ -556,7 +567,7 @@ export function createCrdtCluster(client, options = {}) {
 		if (a.of !== of || a.d !== d || a.t !== t || a.parts.has(n)) return null;
 		const sender = /** @type {{ chars: number, count: number }} */ (senders.get(from));
 		a.partMax = Math.max(a.partMax, x.length);
-		if (a.partMax * a.of > PART_SENDER_MAX_CHARS || sender.chars + x.length > PART_SENDER_MAX_CHARS) {
+		if (!partsFit(a.partMax, a.of) || sender.chars + x.length > PART_SENDER_MAX_CHARS) {
 			dropAssembly(key, true);
 			return null;
 		}
