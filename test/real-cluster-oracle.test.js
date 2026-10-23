@@ -1,12 +1,14 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	describeSource,
+	installedProblems,
 	interrupt,
+	pathSpellings,
 	portablePath,
 	scrubPaths,
 	settleTeardown,
@@ -110,6 +112,22 @@ describe('real-cluster oracle scenario', () => {
 		expect(report.cases[0].error.message).toContain('ws resolved outside the consumer node_modules');
 		expect(report.counts.notRun).toBe(3);
 	});
+
+	it('refuses a transitive import that would climb out of the consumer', () => {
+		const outer = workDir();
+		const consumer = join(outer, 'consumer');
+		for (const name of Object.keys(STUBS)) stub(join(consumer, 'node_modules'), name);
+		writeFileSync(join(consumer, 'node_modules', 'svelte-realtime', 'server.js'), "import 'only-above';\nexport function createMessage() {}\nexport function setBus() {}");
+		const above = join(outer, 'node_modules', 'only-above');
+		mkdirSync(above, { recursive: true });
+		writeFileSync(join(above, 'package.json'), JSON.stringify({ name: 'only-above', version: '1.0.0', type: 'module', main: 'index.js' }));
+		writeFileSync(join(above, 'index.js'), 'export {};');
+		const { code, report } = scenarioIn(consumer);
+		expect(code).toBe(1);
+		expect(report.cases[0].status).toBe('failed');
+		expect(report.cases[0].error.message).toContain('only-above resolved outside the consumer node_modules');
+		expect(report.provenance.resolution).toMatchObject({ confined: true, refused: [{ specifier: 'only-above' }] });
+	});
 });
 
 describe('real-cluster oracle inputs', () => {
@@ -138,6 +156,56 @@ describe('real-cluster oracle inputs', () => {
 		expect(describeSource('svelte-adapter-uws-extensions', 'svelte-adapter-uws-extensions@0.6.0-next.63', workDir())).toEqual({ name: 'svelte-adapter-uws-extensions', kind: 'registry', spec: '0.6.0-next.63' });
 		expect(describeSource('svelte-realtime', 'next', workDir())).toEqual({ name: 'svelte-realtime', kind: 'registry', spec: 'next' });
 		expect(() => describeSource('svelte-realtime', 'svelte-realtime@', workDir())).toThrow(expect.objectContaining({ step: 'inputs' }));
+		expect(describeSource('svelte-realtime', '>=0.6.0-next.90', workDir()).spec).toBe('>=0.6.0-next.90');
+	});
+
+	it.each(['file:../dir', 'link:../dir', 'github:a/b', 'git+https://example.com/x.git', 'https://example.com/x.tgz', 'npm:other@1.0.0', '../no-such-dir', 'a/b'])(
+		'refuses the spec %s before anything is packed or installed',
+		(value) => {
+			expect(() => describeSource('svelte-realtime', value, workDir())).toThrow(expect.objectContaining({ step: 'inputs', message: expect.stringContaining('is not supported') }));
+		}
+	);
+
+	it.each(['--adapter', 'latest;rm', 'next&calc', 'other@1.0.0'])('refuses %s as not a version, tag or range', (value) => {
+		expect(() => describeSource('svelte-realtime', value, workDir())).toThrow(expect.objectContaining({ step: 'inputs', message: expect.stringContaining('is not a version, tag or range') }));
+	});
+});
+
+describe('real-cluster oracle installed tree', () => {
+	const manifests = { 'svelte-realtime': { version: '1.0.0' }, 'svelte-adapter-uws': { version: '2.0.0' } };
+	const manifest = (...parts) => (parts.length === 1 ? manifests[parts[0]] : null);
+
+	it('matches a tarball input against the integrity the consumer lock records', () => {
+		const sources = { 'svelte-realtime': { name: 'svelte-realtime', kind: 'tarball', tarball: 'rt.tgz', integrity: 'sha512-a' } };
+		const lock = (integrity) => ({ packages: { 'node_modules/svelte-realtime': integrity ? { integrity } : {} } });
+		expect(installedProblems(sources, { lock: lock('sha512-a'), manifest })).toEqual([]);
+		expect(sources['svelte-realtime'].version).toBe('1.0.0');
+		expect(installedProblems(sources, { lock: lock('sha512-b'), manifest })).toEqual([expect.stringContaining('but the tarball digests to sha512-a')]);
+		expect(installedProblems(sources, { lock: lock(null), manifest })).toEqual([expect.stringContaining('has no integrity in the consumer lock')]);
+	});
+
+	it('records a registry input from the lock and refuses one without integrity or with another', () => {
+		const sources = { 'svelte-adapter-uws': { name: 'svelte-adapter-uws', kind: 'registry', spec: '2.0.0', expectedIntegrity: 'sha512-x' } };
+		const entry = { resolved: 'https://registry.npmjs.org/a.tgz', integrity: 'sha512-x' };
+		expect(installedProblems(sources, { lock: { packages: { 'node_modules/svelte-adapter-uws': entry } }, manifest })).toEqual([]);
+		expect(sources['svelte-adapter-uws']).toMatchObject({ resolved: entry.resolved, integrity: 'sha512-x', version: '2.0.0' });
+		expect(installedProblems(sources, { lock: { packages: {} }, manifest })).toEqual([
+			'svelte-adapter-uws has no registry integrity in the consumer lock',
+			'svelte-adapter-uws installed with integrity null, expected sha512-x'
+		]);
+	});
+
+	it('refuses a missing package and a nested copy of another named package', () => {
+		const sources = {
+			'svelte-realtime': { name: 'svelte-realtime', kind: 'tarball', tarball: 'rt.tgz', integrity: 'sha512-a' },
+			'svelte-adapter-uws-extensions': { name: 'svelte-adapter-uws-extensions', kind: 'tarball', tarball: 'ext.tgz', integrity: 'sha512-e' }
+		};
+		const nested = (...parts) => (parts.join('/') === 'svelte-realtime/node_modules/svelte-adapter-uws-extensions' ? { version: '9.9.9' } : manifest(...parts));
+		const lock = { packages: { 'node_modules/svelte-realtime': { integrity: 'sha512-a' } } };
+		expect(installedProblems(sources, { lock, manifest: nested })).toEqual([
+			'svelte-realtime carries a nested svelte-adapter-uws-extensions@9.9.9, so the named svelte-adapter-uws-extensions is not the one in use',
+			'svelte-adapter-uws-extensions is not installed'
+		]);
 	});
 });
 
@@ -155,6 +223,61 @@ describe('real-cluster oracle result paths', () => {
 			{ workDir: '/home/me/repo/work', repo: '/home/me/repo', home: '/home/me' }
 		);
 		expect(result).toEqual({ a: ['<repo>/x', '<work-dir>/y'], b: { c: 'see ~/notes' }, n: 3 });
+	});
+
+	// Windows paths are built from parts so the test reads the same on every
+	// platform: B is one backslash.
+	const B = String.fromCharCode(92);
+	const win = (...parts) => parts.join(B);
+	const windowsRoots = { workDir: win('C:', 'Users', 'me', 'repo', 'work'), repo: win('C:', 'Users', 'me', 'repo'), home: win('C:', 'Users', 'me') };
+
+	it('lists the native, forward-slash, JSON-escaped and MSYS spellings of a Windows path', () => {
+		expect(pathSpellings(win('C:', 'Users', 'me') + B)).toEqual({
+			caseInsensitive: true,
+			spellings: [win('C:', 'Users', 'me'), 'C:/Users/me', ['C:', 'Users', 'me'].join(B + B), '/c/Users/me']
+		});
+		expect(pathSpellings('/home/me/')).toEqual({ caseInsensitive: false, spellings: ['/home/me'] });
+		for (const root of ['/', '', null, 'C:' + B, 'C:/', 'c:']) expect(pathSpellings(root).spellings).toEqual([]);
+	});
+
+	it('scrubs every spelling of a Windows path, in any letter case', () => {
+		const text = {
+			native: 'ENOENT ' + win('C:', 'Users', 'me', 'repo', 'work', 'consumer'),
+			escaped: JSON.stringify({ path: win('C:', 'Users', 'me', 'repo', 'x') }),
+			forward: 'at file:///C:/Users/me/repo/scripts/a.js:1:2',
+			msys: 'error at /c/Users/me/notes',
+			lower: win('c:', 'users', 'ME', 'repo', 'y')
+		};
+		expect(scrubPaths(text, windowsRoots)).toEqual({
+			native: 'ENOENT <work-dir>' + B + 'consumer',
+			escaped: JSON.stringify({ path: '<repo>' + B + 'x' }),
+			forward: 'at file:///<repo>/scripts/a.js:1:2',
+			msys: 'error at ~/notes',
+			lower: '<repo>' + B + 'y'
+		});
+	});
+
+	it('replaces whole path prefixes only and never a filesystem root', () => {
+		const roots = { workDir: '/w', repo: '/app', home: '/' };
+		expect(scrubPaths({
+			url: 'https://example.com/app/x',
+			sibling: '/apple/x and /app-old/y and /x/app/z',
+			own: '/app/x, then (/app) and /app.',
+			dotted: '/app.txt',
+			slashes: 'a/b/c'
+		}, roots)).toEqual({
+			url: 'https://example.com/app/x',
+			sibling: '/apple/x and /app-old/y and /x/app/z',
+			own: '<repo>/x, then (<repo>) and <repo>.',
+			dotted: '/app.txt',
+			slashes: 'a/b/c'
+		});
+	});
+
+	it('leaves digests, integrities and registry URLs untouched', () => {
+		const value = { integrity: 'sha512-ab/cd+ef==', sha256: 'abc', resolved: 'https://registry.npmjs.org/app/-/app-1.0.0.tgz', note: '/app/x' };
+		expect(scrubPaths(value, { workDir: '/w', repo: '/app', home: '/' })).toEqual({ ...value, note: '<repo>/x' });
+		expect(scrubPaths({ integrity: 'sha512-ab/cd+ef==' }, { workDir: '/w', repo: '/r', home: '/' })).toEqual({ integrity: 'sha512-ab/cd+ef==' });
 	});
 });
 
@@ -235,6 +358,32 @@ describe('real-cluster oracle runner', () => {
 		const r = run(ORACLE, ['--no-such-flag']);
 		expect(r.code).toBe(2);
 		expect(r.stderr).toContain('unknown argument: --no-such-flag');
+	});
+
+	it('refuses a flag where a value belongs', () => {
+		const r = run(ORACLE, ['--realtime', '--adapter', '0.6.0']);
+		expect(r.code).toBe(2);
+		expect(r.stderr).toContain('--realtime needs a value');
+	});
+
+	it('records a child that died of an interrupt as interrupted and exits 130', () => {
+		const dir = workDir();
+		const bin = join(dir, 'bin');
+		mkdirSync(bin);
+		// A stand-in npm that dies the way a Ctrl-C ends it: by SIGINT on POSIX,
+		// with exit status 130 on Windows, which has no signals.
+		if (process.platform === 'win32') writeFileSync(join(bin, 'npm.cmd'), '@exit /b 130\r\n');
+		else {
+			writeFileSync(join(bin, 'npm'), '#!/bin/sh\nkill -INT $$\n');
+			chmodSync(join(bin, 'npm'), 0o755);
+		}
+		const tarball = join(dir, 'ext.tgz');
+		writeFileSync(tarball, gzipSync(Buffer.from('package')));
+		const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH') || 'PATH';
+		const r = run(ORACLE, ['--extensions', tarball, '--realtime', 'next', '--work-dir', join(dir, 'work')], { [pathKey]: bin + delimiter + process.env[pathKey] });
+		expect(r.code).toBe(130);
+		const result = JSON.parse(readFileSync(join(dir, 'work', 'result.json'), 'utf8'));
+		expect(result).toMatchObject({ status: 'error', scenario: null, error: { step: 'interrupted', message: 'received SIGINT during install' } });
 	});
 
 	it('prints its usage with --help', () => {

@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import Module from 'node:module';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -16,7 +17,36 @@ import { setTimeout as delay } from 'node:timers/promises';
 const DEADLINE_MS = 60000;
 const SINGLES = 6;
 const BATCH = 6;
+// How long every socket stays watched after the last barrier arrived, so a
+// late duplicate still counts against the exact totals.
+const DRAIN_MS = 500;
 const CONSUMER = dirname(fileURLToPath(import.meta.url));
+
+// Every import and require of every loaded package must resolve inside the
+// consumer. Node would otherwise climb into any node_modules above it (a
+// checkout's own, for instance), and a missing transitive dependency would be
+// served from there unnoticed. A refusal carries MODULE_NOT_FOUND, so an
+// optional require() treats the module as absent.
+const refused = [];
+const confined = typeof Module.registerHooks === 'function';
+if (confined) {
+	Module.registerHooks({
+		resolve(specifier, context, nextResolve) {
+			const resolved = nextResolve(specifier, context);
+			if (resolved.url?.startsWith('file:')) {
+				const path = fileURLToPath(resolved.url);
+				const where = relative(CONSUMER, path);
+				if (where === '..' || where.startsWith('..' + sep) || isAbsolute(where)) {
+					refused.push({ specifier, url: resolved.url });
+					const error = new Error(specifier + ' resolved outside the consumer node_modules: ' + path);
+					error.code = 'MODULE_NOT_FOUND';
+					throw error;
+				}
+			}
+			return resolved;
+		}
+	});
+}
 
 // Two client pairs, each on its own topic. Plain clients send no hello, so
 // publishBatched reaches them through the adapter's per-member fallback.
@@ -36,7 +66,7 @@ const report = {
 	startedAt: new Date().toISOString(),
 	seed: null,
 	faultMode: 'none',
-	provenance: { node: process.version, platform: process.platform + '-' + process.arch, scenarioSha256: hash(readFileSync(fileURLToPath(import.meta.url))), packages: {} },
+	provenance: { node: process.version, platform: process.platform + '-' + process.arch, scenarioSha256: hash(readFileSync(fileURLToPath(import.meta.url))), packages: {}, resolution: { confined, refused } },
 	backend: null,
 	cases
 };
@@ -125,6 +155,7 @@ let setBus, sourceClient;
 
 try {
 	await runCase('setup', async () => {
+		assert.ok(confined, 'The scenario needs module.registerHooks (Node 22.15 or later) to keep module resolution inside the consumer');
 		const nodes = JSON.parse(process.env.ORACLE_CLUSTER_NODES || 'null');
 		assert.ok(Array.isArray(nodes) && nodes.length > 0, 'ORACLE_CLUSTER_NODES must be a JSON array of cluster seed nodes');
 		for (const node of nodes) {
@@ -196,9 +227,11 @@ try {
 		await sender.activate(source.platform);
 		await receiver.activate(target.platform);
 
-		async function connect(server, pair) {
+		async function connect(server, pair, side) {
 			const socket = new WebSocket(server.wsUrl);
 			sockets.push(socket);
+			// Control frames (acknowledgements and the like) and deliveries, which
+			// are the frames that carry an event.
 			const messages = [];
 			let batchFrames = 0;
 			let failure = null;
@@ -221,14 +254,22 @@ try {
 			await waitFor(() => { check(); return messages.some((m) => m.type === 'subscribed' && m.ref === 'ready'); }, 'the subscription acknowledgement');
 			return {
 				send(message) { check(); socket.send(JSON.stringify(message)); },
-				values() { check(); return messages.filter((m) => m.topic === pair.topic && m.event === 'changed').map((m) => m.data); },
+				// Every delivery counts: one for another topic or event fails the
+				// case instead of being filtered out.
+				values() {
+					check();
+					const deliveries = messages.filter((m) => m && typeof m === 'object' && 'event' in m);
+					const stray = deliveries.filter((m) => m.topic !== pair.topic || m.event !== 'changed');
+					if (stray.length) throw new Error('The ' + side + ' ' + pair.name + ' socket received ' + stray.length + ' frame(s) for another topic or event, first: ' + JSON.stringify(stray[0]).slice(0, 200));
+					return deliveries.map((m) => m.data);
+				},
 				batchFrames: () => batchFrames
 			};
 		}
 		for (const pair of PAIRS) {
 			pair.expected = [];
-			pair.local = await connect(source, pair);
-			pair.remote = await connect(target, pair);
+			pair.local = await connect(source, pair, 'local');
+			pair.remote = await connect(target, pair, 'remote');
 		}
 	});
 
@@ -275,17 +316,31 @@ try {
 			pair.local.send({ type: 'oracle-batch', topic: pair.topic, data });
 		}
 		await assertDelivered();
-		// One more ordered message per topic is the receive barrier: a duplicate
-		// of any batch member reaches each client before it, so no sleep is
-		// needed to prove nothing extra is still in flight.
+		// One more ordered message per topic is the barrier, followed by a drain
+		// window. On the remote socket the barrier travels the same Redis relay
+		// path as every earlier message, so a remote duplicate arrives before
+		// it. On the local socket the barrier is delivered directly, so an echo
+		// of an earlier member through the bus could still arrive after it:
+		// the window starts once the barrier has crossed the relay to the
+		// remote server and keeps every socket watched for DRAIN_MS more, and
+		// the totals are compared again after it.
 		for (const pair of PAIRS) {
 			const barrier = { index: pair.expected.length, barrier: true };
 			pair.expected.push(barrier);
 			pair.local.send({ type: 'oracle-single', topic: pair.topic, data: barrier });
 		}
 		await assertDelivered();
-		const capable = PAIRS.find((pair) => pair.caps);
-		assert.ok(capable.local.batchFrames() > 0, 'The batch-capable local client received no batch frame, so the shared-frame path was not exercised');
+		await delay(DRAIN_MS);
+		await assertDelivered();
+		// Shared batch frames go only to clients that announced the capability,
+		// on both sides of the relay.
+		for (const pair of PAIRS) {
+			for (const side of ['local', 'remote']) {
+				const frames = pair[side].batchFrames();
+				if (pair.caps) assert.ok(frames > 0, 'The ' + side + ' batch-capable client received no batch frame, so the shared-frame path was not exercised');
+				else assert.equal(frames, 0, 'The ' + side + ' plain client received ' + frames + ' batch frame(s) without announcing the capability');
+			}
+		}
 		report.deliveries = Object.fromEntries(PAIRS.map((pair) => [pair.name, {
 			expectedPerSocket: pair.expected.length,
 			local: pair.local.values().length,

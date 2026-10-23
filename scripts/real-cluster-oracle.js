@@ -105,7 +105,8 @@ function parseArgs(argv) {
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		const value = () => {
-			if (i + 1 >= argv.length) usage(`${arg} needs a value`);
+			// A flag right after a flag is a missing value, never the value.
+			if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) usage(`${arg} needs a value`);
 			return argv[++i];
 		};
 		if (arg === '--extensions') opts.extensions = value();
@@ -137,6 +138,13 @@ function quoteArg(arg) {
 	return /[\s"^&|<>()]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s;
 }
 
+const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+// The first signal a child died from, with exit status 130 standing in for
+// SIGINT. A Ctrl-C reaches the whole process group, and the child usually dies
+// of it before this process's own handler gets to run.
+let childInterrupt = null;
+
 function run(cmd, args, cwd, { env, shell = false, timeout } = {}) {
 	// Through a shell the command goes as one quoted line.
 	const r = spawnSync(shell ? [cmd, ...args].map(quoteArg).join(' ') : cmd, shell ? [] : args, {
@@ -147,8 +155,19 @@ function run(cmd, args, cwd, { env, shell = false, timeout } = {}) {
 		maxBuffer: 64 * 1024 * 1024,
 		env: env ? { ...process.env, ...env } : process.env
 	});
-	if (r.error) return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: `${cmd}: ${r.error.message}\n${r.stderr ?? ''}`, timedOut: r.error.code === 'ETIMEDOUT' };
+	const timedOut = r.error?.code === 'ETIMEDOUT';
+	if (!timedOut && !childInterrupt) {
+		if (INTERRUPT_SIGNALS.includes(r.signal)) childInterrupt = r.signal;
+		else if (r.status === 130) childInterrupt = 'SIGINT';
+	}
+	if (r.error) return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: `${cmd}: ${r.error.message}\n${r.stderr ?? ''}`, timedOut };
 	return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+// Let a signal that arrived while a synchronous child ran reach its listener:
+// the poll phase dispatches it before the check phase runs this callback.
+function settleSignals() {
+	return new Promise((done) => setImmediate(done));
 }
 
 // npm is a .cmd shim on Windows, which node only spawns through a shell.
@@ -196,22 +215,66 @@ export function portablePath(path, workDir) {
 	return basename(path);
 }
 
+// Fields that hold digests or registry URLs: never rewritten.
+const UNSCRUBBED_KEYS = new Set(['sha256', 'integrity', 'expectedIntegrity', 'resolved', 'entrySha256', 'packageJsonSha256', 'scenarioSha256']);
+// Characters that continue a path segment. A match must not touch one on
+// either side, so /app never matches inside /apple or /x-app.
+const SEGMENT_CHAR = /[A-Za-z0-9_~$@%+=-]/;
+
 /**
- * Replace the machine's directories in every string of the result: the work
- * dir, this checkout and the home directory. The file then names no user path,
- * also inside captured npm or Docker output.
+ * The spellings one directory takes in captured output: a Windows path also
+ * with forward slashes, with JSON-escaped backslashes and in the MSYS form
+ * /c/...; a POSIX path as itself. A filesystem root has no spelling, so it is
+ * never scrubbed.
+ */
+export function pathSpellings(path) {
+	const trimmed = String(path || '').replace(/[\\/]+$/, '');
+	const windows = /^[A-Za-z]:[\\/]/.test(trimmed);
+	if (!trimmed || /^[A-Za-z]:$/.test(trimmed)) return { spellings: [], caseInsensitive: windows };
+	if (!windows) return { spellings: [trimmed], caseInsensitive: false };
+	const parts = trimmed.split(/[\\/]+/);
+	return {
+		caseInsensitive: true,
+		spellings: [parts.join('\\'), parts.join('/'), parts.join('\\\\'), `/${parts[0][0].toLowerCase()}/${parts.slice(1).join('/')}`]
+	};
+}
+
+/**
+ * Replace the work dir, this checkout and the home directory in every string
+ * of `value` with `<work-dir>`, `<repo>` and `~`, in each spelling from
+ * pathSpellings(). Only whole path prefixes are replaced: a match must start
+ * and end at a path boundary, and never follows a URL's `scheme://` other than
+ * file://. Digest, integrity and `resolved` fields are left as they are.
  */
 export function scrubPaths(value, { workDir, repo = HERE, home = homedir() }) {
-	const roots = [[workDir, '<work-dir>'], [repo, '<repo>'], [home, '~']]
-		.filter(([path]) => path)
-		.flatMap(([path, label]) => [[path, label], [path.split(sep).join('/'), label]])
-		.sort((a, b) => b[0].length - a[0].length);
-	const flags = process.platform === 'win32' ? 'gi' : 'g';
-	const patterns = roots.map(([path, label]) => [new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags), label]);
+	const rules = [[workDir, '<work-dir>'], [repo, '<repo>'], [home, '~']]
+		.flatMap(([path, label]) => {
+			const { spellings, caseInsensitive } = pathSpellings(path);
+			return spellings.map((spelling) => ({ spelling, label, caseInsensitive }));
+		})
+		.sort((a, b) => b.spelling.length - a.spelling.length)
+		.map(({ spelling, label, caseInsensitive }) => ({
+			label,
+			pattern: new RegExp(spelling.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseInsensitive ? 'gi' : 'g')
+		}));
+	const boundary = (before, after) => {
+		if (SEGMENT_CHAR.test(before.slice(-1)) || before.endsWith('.')) return false;
+		if (/[A-Za-z][A-Za-z0-9+.-]*:\/\/$/.test(before) && !/(?:^|[^A-Za-z0-9+.-])file:\/\/$/i.test(before)) return false;
+		// The directory must end here: a separator, the end of the text, or a
+		// character no name continues with. A dot ends it only before the end
+		// or whitespace, as at the end of a sentence.
+		if (!after) return true;
+		if (after[0] === '.') return after.length === 1 || /\s/.test(after[1]);
+		return !SEGMENT_CHAR.test(after[0]);
+	};
+	const replaceIn = (text) => rules.reduce(
+		(current, { pattern, label }) => current.replace(pattern, (match, offset, whole) => (boundary(whole.slice(0, offset), whole.slice(offset + match.length)) ? label : match)),
+		text
+	);
 	const walk = (item) => {
-		if (typeof item === 'string') return patterns.reduce((text, [pattern, label]) => text.replace(pattern, label), item);
+		if (typeof item === 'string') return replaceIn(item);
 		if (Array.isArray(item)) return item.map(walk);
-		if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, walk(entry)]));
+		if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, UNSCRUBBED_KEYS.has(key) ? entry : walk(entry)]));
 		return item;
 	};
 	return walk(value);
@@ -232,10 +295,17 @@ function isGzip(path) {
 /**
  * Describe one package input. A value naming an existing path, or ending in
  * .tgz / .tar.gz, must be a gzip tarball and is installed by file: spec and
- * identified by its digest. Anything else is an npm version, tag or range,
- * identified by the registry integrity the consumer lock records.
+ * identified by its digest. Anything else must be an npm version, tag or
+ * range of this package, identified by the registry integrity the consumer
+ * lock records. file:, link:, git, URL and npm: alias specs are refused: they
+ * would install something the result cannot attest, and a directory would
+ * link outside the consumer.
  */
 export function describeSource(name, value, workDir) {
+	const spec = value.startsWith(`${name}@`) ? value.slice(name.length + 1) : value;
+	const unsupported = () => new StepError('inputs', `${name} spec ${JSON.stringify(value)} is not supported; pass a packed .tgz or a version, tag or range`);
+	// A scheme has two letters or more, so a drive letter still reads as a path.
+	if (/^[A-Za-z][A-Za-z0-9+.-]+:/.test(spec)) throw unsupported();
 	const pathLike = /\.(tgz|tar\.gz)$/i.test(value) || existsSync(value);
 	if (pathLike) {
 		const path = resolve(value);
@@ -250,8 +320,8 @@ export function describeSource(name, value, workDir) {
 		if (!isGzip(path)) throw new StepError('inputs', `${name} input ${label} is not a gzip tarball; pass a packed .tgz or a version`);
 		return { name, kind: 'tarball', path, tarball: label, spec: `file:${path.replace(/\\/g, '/')}`, ...digest(path) };
 	}
-	const spec = value.startsWith(`${name}@`) ? value.slice(name.length + 1) : value;
-	if (!spec || /[\s]/.test(spec)) throw new StepError('inputs', `${name} spec ${JSON.stringify(value)} is not a version, tag or range`);
+	if (/[\\/]/.test(spec)) throw unsupported();
+	if (!/^[A-Za-z0-9^~<>=*][A-Za-z0-9._+^~<>=*|-]*$/.test(spec)) throw new StepError('inputs', `${name} spec ${JSON.stringify(value)} is not a version, tag or range`);
 	return { name, kind: 'registry', spec };
 }
 
@@ -280,6 +350,45 @@ function packThis(tarballs) {
 	return path;
 }
 
+/**
+ * Compare the installed consumer with the named packages and fill in each
+ * source's installed version, and for a registry input its `resolved` URL and
+ * integrity. `manifest(...parts)` reads node_modules/<parts>/package.json.
+ * Returns the mismatches; an input the lock records no integrity for is one.
+ */
+export function installedProblems(sources, { lock, manifest }) {
+	const names = Object.keys(sources);
+	const problems = [];
+	for (const name of names) {
+		const source = sources[name];
+		const pkg = manifest(name);
+		if (!pkg) {
+			problems.push(`${name} is not installed`);
+			continue;
+		}
+		source.version = pkg.version;
+		const entry = lock?.packages?.[`node_modules/${name}`];
+		if (source.kind === 'registry') {
+			source.resolved = entry?.resolved || null;
+			source.integrity = entry?.integrity || null;
+			if (!source.integrity) problems.push(`${name} has no registry integrity in the consumer lock`);
+			if (source.expectedIntegrity && source.integrity !== source.expectedIntegrity) {
+				problems.push(`${name} installed with integrity ${source.integrity}, expected ${source.expectedIntegrity}`);
+			}
+		} else if (!entry?.integrity) {
+			problems.push(`${name} has no integrity in the consumer lock, so the installed tarball cannot be matched to ${source.tarball}`);
+		} else if (entry.integrity !== source.integrity) {
+			problems.push(`${name} installed with integrity ${entry.integrity}, but the tarball digests to ${source.integrity}`);
+		}
+		for (const other of names) {
+			if (other === name) continue;
+			const nested = manifest(name, 'node_modules', other);
+			if (nested) problems.push(`${name} carries a nested ${other}@${nested.version}, so the named ${other} is not the one in use`);
+		}
+	}
+	return problems;
+}
+
 function installConsumer(consumer, sources) {
 	mkdirSync(consumer, { recursive: true });
 	const deps = { ...CONSUMER_PEERS };
@@ -304,34 +413,10 @@ function installConsumer(consumer, sources) {
 		}
 	}
 
-	const lock = readJson(join(consumer, 'package-lock.json'));
-	const names = Object.keys(sources);
-	const problems = [];
-	for (const name of names) {
-		const source = sources[name];
-		const pkg = readJson(join(consumer, 'node_modules', name, 'package.json'));
-		if (!pkg) {
-			problems.push(`${name} is not installed`);
-			continue;
-		}
-		source.version = pkg.version;
-		const entry = lock?.packages?.[`node_modules/${name}`];
-		if (source.kind === 'registry') {
-			source.resolved = entry?.resolved || null;
-			source.integrity = entry?.integrity || null;
-			if (!source.integrity) problems.push(`${name} has no registry integrity in the consumer lock`);
-			if (source.expectedIntegrity && source.integrity !== source.expectedIntegrity) {
-				problems.push(`${name} installed with integrity ${source.integrity}, expected ${source.expectedIntegrity}`);
-			}
-		} else if (entry?.integrity && entry.integrity !== source.integrity) {
-			problems.push(`${name} installed with integrity ${entry.integrity}, but the tarball digests to ${source.integrity}`);
-		}
-		for (const other of names) {
-			if (other === name) continue;
-			const nested = readJson(join(consumer, 'node_modules', name, 'node_modules', other, 'package.json'));
-			if (nested) problems.push(`${name} carries a nested ${other}@${nested.version}, so the named ${other} is not the one in use`);
-		}
-	}
+	const problems = installedProblems(sources, {
+		lock: readJson(join(consumer, 'package-lock.json')),
+		manifest: (...parts) => readJson(join(consumer, 'node_modules', ...parts, 'package.json'))
+	});
 	if (problems.length) throw new StepError('install', 'the installed tree does not match the named packages', problems.join('\n'));
 	const nativePkg = readJson(join(consumer, 'node_modules', 'uWebSockets.js', 'package.json'));
 	return { native: { spec: native || null, version: nativePkg?.version || null } };
@@ -465,13 +550,15 @@ function externalCluster(services) {
 	Object.assign(services, { mode: 'external', nodes, natMap });
 }
 
-function runScenario(consumer, services, logPath) {
+function runScenario(consumer, services, logPath, scrub) {
 	const entry = join(consumer, 'real-cluster-oracle.mjs');
 	copyFileSync(SCENARIO, entry);
-	const env = { ORACLE_CLUSTER_NODES: JSON.stringify(services.nodes) };
+	// NODE_PATH would let a require() resolve outside the consumer; the
+	// scenario's resolve hook refuses anything else that tries.
+	const env = { ORACLE_CLUSTER_NODES: JSON.stringify(services.nodes), NODE_PATH: undefined };
 	if (services.natMap) env.ORACLE_CLUSTER_NAT_MAP = JSON.stringify(services.natMap);
 	const r = run(process.execPath, [entry], consumer, { env, timeout: SCENARIO_TIMEOUT_MS });
-	writeFileSync(logPath, r.stderr);
+	writeFileSync(logPath, scrub(r.stderr));
 	const line = r.stdout.trim().split(/\r?\n/).pop();
 	let report = null;
 	try {
@@ -486,15 +573,16 @@ function runScenario(consumer, services, logPath) {
 // - interrupt -------------------------------------------------------
 
 /**
- * Handle SIGINT/SIGTERM: remove whatever stack is up, record the interrupt in
- * the result, write it, and exit. Repeated signals while this runs are
- * ignored, so a second Ctrl-C cannot cut the teardown short.
+ * Handle SIGINT, SIGTERM and SIGHUP: remove whatever stack is up, record the
+ * interrupt and the step it hit in the result, write it, and exit 130.
+ * Repeated signals while this runs are ignored, so a second Ctrl-C cannot cut
+ * the teardown short.
  */
 export async function interrupt(signal, { result, lifecycle, write, exit }) {
 	if (lifecycle.interrupted) return;
 	lifecycle.interrupted = true;
 	result.status = 'error';
-	result.error = { step: 'interrupted', message: `received ${signal}` };
+	result.error = { step: 'interrupted', message: `received ${signal}${lifecycle.step ? ` during ${lifecycle.step}` : ''}` };
 	// A teardown already under way is awaited, not repeated or cut short.
 	const stop = lifecycle.stop;
 	lifecycle.stop = null;
@@ -526,19 +614,28 @@ async function main() {
 		scenario: null,
 		error: null
 	};
+	const scrub = (value) => scrubPaths(value, { workDir });
 	const write = () => {
 		result.finishedAt = new Date().toISOString();
 		mkdirSync(dirname(out), { recursive: true });
 		// Seeds and the natMap name the service; credentials never reach the file.
-		writeFileSync(out, JSON.stringify(scrubPaths(result, { workDir }), null, 2) + '\n');
+		writeFileSync(out, JSON.stringify(scrub(result), null, 2) + '\n');
 	};
-	const lifecycle = { stop: null, stopping: null, interrupted: false };
+	const lifecycle = { stop: null, stopping: null, interrupted: false, step: null };
 	const onSignal = (signal) => { interrupt(signal, { result, lifecycle, write, exit: (code) => process.exit(code) }); };
-	process.on('SIGINT', onSignal);
-	process.on('SIGTERM', onSignal);
+	for (const signal of INTERRUPT_SIGNALS) process.on(signal, onSignal);
+	// Every child runs synchronously, so a Ctrl-C shows up either as a child
+	// that died of it or as a signal still queued for this process. Ask before
+	// taking any failure at face value.
+	const interrupted = async () => {
+		await settleSignals();
+		if (!lifecycle.interrupted && childInterrupt) onSignal(childInterrupt);
+		return lifecycle.interrupted;
+	};
 
 	let exitCode = 2;
 	try {
+		lifecycle.step = 'inputs';
 		mkdirSync(workDir, { recursive: true });
 		const tarballs = join(workDir, 'tarballs');
 		rmSync(tarballs, { recursive: true, force: true });
@@ -550,10 +647,12 @@ async function main() {
 		if (process.env.ORACLE_CLUSTER_NODES) externalCluster(result.services);
 
 		if (!extensions) {
+			lifecycle.step = 'pack';
 			console.log('real-cluster-oracle: packing this repository');
 			extensions = describeSource('svelte-adapter-uws-extensions', packThis(tarballs), workDir);
 		}
 		const sources = { 'svelte-adapter-uws': adapter, 'svelte-adapter-uws-extensions': extensions, 'svelte-realtime': realtime };
+		lifecycle.step = 'install';
 		console.log('real-cluster-oracle: installing the consumer');
 		const consumer = join(workDir, 'consumer');
 		const { native } = installConsumer(consumer, sources);
@@ -564,32 +663,36 @@ async function main() {
 		result.packages['uWebSockets.js'] = native;
 
 		if (result.services.mode !== 'external') {
+			lifecycle.step = 'cluster';
 			console.log('real-cluster-oracle: starting the Redis Cluster');
 			await startCluster(result.services, lifecycle);
 		}
-		if (lifecycle.interrupted) return 130;
+		if (await interrupted()) return 130;
+		lifecycle.step = 'scenario';
 		console.log('real-cluster-oracle: running the scenario');
-		const report = runScenario(consumer, result.services, join(workDir, 'scenario-stderr.log'));
+		const report = runScenario(consumer, result.services, join(workDir, 'scenario-stderr.log'), scrub);
 		result.scenario = report;
 		result.status = report.status;
 		exitCode = report.status === 'passed' ? 0 : 1;
 	} catch (error) {
-		if (lifecycle.interrupted) return 130;
 		result.error = { step: error.step || 'oracle', message: error.message, ...(error.output ? { output: tail(error.output) } : {}) };
 	}
-	if (lifecycle.interrupted) return 130;
+	if (await interrupted()) return 130;
 	if (lifecycle.stop) {
 		const stop = lifecycle.stop;
 		lifecycle.stop = null;
+		lifecycle.step = 'teardown';
 		console.log('real-cluster-oracle: tearing the Redis Cluster down');
 		lifecycle.stopping = stop();
 		const outcome = await lifecycle.stopping;
-		if (lifecycle.interrupted) return 130;
+		if (await interrupted()) return 130;
 		exitCode = settleTeardown(result, outcome) ?? exitCode;
 	}
-	process.off('SIGINT', onSignal);
-	process.off('SIGTERM', onSignal);
+	// The result is on disk before the listeners go, so a late signal can only
+	// end a process whose verdict is already written.
+	if (await interrupted()) return 130;
 	write();
+	for (const signal of INTERRUPT_SIGNALS) process.off(signal, onSignal);
 
 	const counts = result.scenario?.counts;
 	console.log(`real-cluster-oracle: ${result.status}${counts ? ` (${counts.passed}/${counts.planned} cases passed, ${counts.failed} failed, ${counts.notRun} not run)` : ''}`);
