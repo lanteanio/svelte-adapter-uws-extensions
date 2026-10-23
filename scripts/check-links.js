@@ -228,6 +228,34 @@ function packageContains(relativePath, packagedFiles) {
 }
 
 /**
+ * The path a browser requests for a decoded link, resolved against the
+ * linking document with dot-segment removal (RFC 3986 section 5.2.4). Unlike
+ * posix.normalize it keeps empty segments, so a result starting with '//'
+ * shows that a spelling such as '/a/..//x' or '/./%2fx' leaves the
+ * repository tree. Climbing above the root stops at '/', as in a browser.
+ *
+ * @param {string} source the linking document, repository-relative
+ * @param {string} decodedPath the percent-decoded path part of the link
+ * @returns {string} an absolute path starting with '/'
+ */
+export function requestedPath(source, decodedPath) {
+	const dir = posix.dirname(source.split('\\').join('/'));
+	const merged = decodedPath.startsWith('/') ? decodedPath : '/' + (dir === '.' ? '' : dir + '/') + decodedPath;
+	const segments = merged.split('/').slice(1);
+	const output = [];
+	segments.forEach((segment, index) => {
+		const last = index === segments.length - 1;
+		if (segment === '.' || segment === '..') {
+			if (segment === '..') output.pop();
+			if (last) output.push('');
+			return;
+		}
+		output.push(segment);
+	});
+	return '/' + output.join('/');
+}
+
+/**
  * The repository path a relative documentation link names. GitHub resolves a
  * leading slash from the repository root and every other path from the
  * linking document's directory. The empty string is the repository root, and
@@ -482,8 +510,8 @@ export function checkLink(rel, target, docs, options = {}) {
 	let decodedPath;
 	try { decodedPath = decodeURIComponent(encodedPath); }
 	catch { return `malformed percent escape in path: ${encodedPath}`; }
-	if (decodedPath.startsWith('//')) {
-		return `root-relative path starts with a doubled slash and resolves to no repository file: ${target}`;
+	if (requestedPath(rel, decodedPath).startsWith('//')) {
+		return `path resolves to a doubled leading slash and names no repository file: ${target}`;
 	}
 	// A packaged document is also read from node_modules and the registry
 	// page, where a leading slash names no repository root at all.
@@ -514,10 +542,14 @@ export function checkLink(rel, target, docs, options = {}) {
 	// GitHub shows a directory with its README rendered below the listing, so
 	// an anchor on a directory link (the repository root included) is one of
 	// that README's headings, and a directory without one holds no anchors.
+	// GitHub matches the README name case-insensitively and renders other
+	// formats too; one this gate does not parse cannot be checked.
 	let anchored = resolved;
 	if (statSync(join(root, treePath)).isDirectory()) {
-		anchored = treePath === '' ? 'README.md' : treePath + '/README.md';
-		if (!docs.has(anchored)) return `directory ${shown} has no README.md to hold #${anchor}`;
+		const readmes = directoryReadmes(treePath);
+		if (readmes.length === 0) return `directory ${shown} has no README to hold #${anchor}`;
+		anchored = readmes.find((candidate) => docs.has(candidate));
+		if (anchored === undefined) return null;
 	}
 
 	// A cross-document anchor is only checkable when the target is one of the
@@ -530,6 +562,26 @@ export function checkLink(rel, target, docs, options = {}) {
 	return doc.anchors.has(decodedAnchor) ? null : `no heading in ${anchored} produces #${anchor}`;
 }
 
+
+/**
+ * The README files GitHub may render for a repository directory, with the
+ * conventional README.md first. Tracked files are used when an index exists,
+ * so an untracked scratch README never stands in for a missing one.
+ *
+ * @param {string} directory repository-relative, '' for the root
+ * @returns {string[]}
+ */
+function directoryReadmes(directory) {
+	const prefix = directory === '' ? '' : directory + '/';
+	const tracked = stagedTree();
+	const names = tracked
+		? [...tracked].filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes('/')).map((path) => path.slice(prefix.length))
+		: readdirSync(join(root, directory)).filter((name) => statSync(join(root, directory, name)).isFile());
+	return names
+		.filter((name) => /^readme(\.[^.]+)?$/i.test(name))
+		.sort((a, b) => (a === 'README.md' ? -1 : b === 'README.md' ? 1 : a < b ? -1 : a > b ? 1 : 0))
+		.map((name) => prefix + name);
+}
 
 /** Reader routes must work from the package overview and back again. */
 export function validateDocumentationMap(docs, packagedFiles) {

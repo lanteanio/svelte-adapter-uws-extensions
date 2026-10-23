@@ -304,11 +304,52 @@ it('resolves a leading slash from the repository root in a nested document', () 
 			['/docs/getting-started.md#missing-steps', 'no heading in docs/getting-started.md produces #missing-steps'],
 			['/README.md#missing', 'no heading in README.md produces #missing'],
 			['/#missing', 'no heading in README.md produces #missing'],
-			['/docs/#first-steps', 'directory docs/ has no README.md to hold #first-steps'],
+			['/docs/#first-steps', 'directory docs/ has no README to hold #first-steps'],
 			['/missing/', 'no such file with exact case: missing/'],
 			['/README.md/', 'relative target absent from the staged tree (the git index): README.md/'],
 			['/../outside.md', 'path leaves repository: ../outside.md'],
-			['/%2fREADME.md', 'root-relative path starts with a doubled slash']
+			['/%2fREADME.md', 'path resolves to a doubled leading slash'],
+			['/./%2fREADME.md', 'path resolves to a doubled leading slash'],
+			['/a/..//README.md', 'path resolves to a doubled leading slash'],
+			['..//README.md', 'path resolves to a doubled leading slash']
+		]) {
+			put('notes/guide.md', '# Notes\n[Overview](../README.md)\n[Probe](' + target + ')\n');
+			result = run();
+			expect(result.status, target).toBe(1);
+			expect(result.stderr, target).toContain('notes/guide.md:3');
+			expect(result.stderr, target).toContain(failure);
+		}
+	} finally { cleanup(); }
+}, 30_000);
+
+// An anchor on a directory link is a heading of the README GitHub renders
+// below that directory's listing, whatever the README name's case.
+it('checks a directory anchor against the README of that directory', () => {
+	const { put, git, run, cleanup } = linkFixture();
+	try {
+		put('README.md', '# Fixture\n[Migration](MIGRATION.md)\n[History](CHANGELOG.md)\n[Entries](docs/public-entries.md)\n[Guide](docs/guide.md)\n[Docs home](docs/README.md)\n');
+		put('docs/README.md', '# Docs home\n## Usage\n[Overview](../README.md)\n');
+		put('examples/readme.md', '# Examples\n## Setup\n');
+		put('other/README.markdown', '# Other\n');
+		put('notes/guide.md', '# Notes\n');
+		git('init', '--initial-branch=docs-fixture');
+		git('add', '--', 'package.json', 'README.md', 'MIGRATION.md', 'CHANGELOG.md', 'docs', 'scripts', 'notes', 'examples', 'other');
+		put('docs/guide.md', '# Guide\n[Overview](../README.md)\n[Usage](../docs/#usage)\n[Here](./#usage)\n');
+		put('notes/guide.md', [
+			'# Notes',
+			'[Usage](/docs/#usage)',
+			'[Usage without slash](../docs#usage)',
+			'[Setup](../examples/#setup)',
+			'[Unparsed README](../other/#anything)',
+			''
+		].join('\n'));
+		let result = run();
+		expect(result.stderr).toBe('');
+		expect(result.status).toBe(0);
+		for (const [target, failure] of [
+			['/docs/#missing', 'no heading in docs/README.md produces #missing'],
+			['../examples/#missing', 'no heading in examples/readme.md produces #missing'],
+			['../notes/#setup', 'directory notes/ has no README to hold #setup']
 		]) {
 			put('notes/guide.md', '# Notes\n[Overview](../README.md)\n[Probe](' + target + ')\n');
 			result = run();
