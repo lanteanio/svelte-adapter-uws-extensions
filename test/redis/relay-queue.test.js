@@ -114,6 +114,7 @@ describe('bounded relay admission and scheduling', () => {
 		q.clear(); resolve();
 	});
 	it('reports overflow once per overload episode while settling chunks keep the queue saturated', async () => {
+		let clock = 0; setRuntimeEnv({ clock: { monotonic: () => clock } });
 		let resolve = () => {};
 		const { queue: q, submit, dropped, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
 		for (let i = 0; i < 8192; i++) expect(q.push(entry('m' + i))).toBe(true);
@@ -130,12 +131,14 @@ describe('bounded relay admission and scheduling', () => {
 		expect(dropped).toHaveBeenCalledTimes(51);
 		expect(overflow).toHaveBeenCalledTimes(1);
 		while (q.state.snapshot().retained > 0) { await vi.advanceTimersByTimeAsync(0); resolve(); await Promise.resolve(); await Promise.resolve(); }
+		clock += 60_000;
 		for (let i = 0; i < 8192; i++) q.push(entry('n' + i));
 		expect(q.push(entry('refused'))).toBe(false);
 		expect(overflow).toHaveBeenCalledTimes(2);
 		q.clear();
 	});
-	it('re-arms the overflow report once the queue is empty again', async () => {
+	it('re-arms the overflow report once the queue is empty again and a minute has passed', async () => {
+		let clock = 0; setRuntimeEnv({ clock: { monotonic: () => clock } });
 		let resolve;
 		const { queue: q, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
 		const large = 'x'.repeat(5 * 1024 * 1024);
@@ -145,10 +148,42 @@ describe('bounded relay admission and scheduling', () => {
 		expect(overflow).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(0);
 		resolve(); await Promise.resolve();
+		clock += 60_000;
 		expect(q.push(entry(large))).toBe(true);
 		expect(q.push(entry(large))).toBe(false);
 		expect(overflow).toHaveBeenCalledTimes(2);
+		expect(overflow.mock.calls[1][0]).toMatchObject({ entries: 1, maxEntries: 8192, maxBytes: 8 * 1024 * 1024, suppressedEpisodes: 0 });
 		q.clear(); resolve();
+	});
+	it('reports bursts that end and restart within a minute once, with the episodes it suppressed', async () => {
+		let clock = 0; setRuntimeEnv({ clock: { monotonic: () => clock } });
+		let resolve;
+		const { queue: q, dropped, overflow } = queue(vi.fn(() => new Promise(r => { resolve = r; })));
+		const large = 'x'.repeat(5 * 1024 * 1024);
+		async function burst() {
+			expect(q.push(entry(large))).toBe(true);
+			expect(q.push(entry(large))).toBe(false);
+			await vi.advanceTimersByTimeAsync(0);
+			resolve(); await Promise.resolve();
+			expect(q.state.snapshot().retained).toBe(0);
+		}
+		for (let i = 0; i < 100; i++) { await burst(); clock += 1; }
+		expect(dropped).toHaveBeenCalledTimes(100);
+		expect(overflow).toHaveBeenCalledTimes(1);
+		expect(overflow.mock.calls[0][0].suppressedEpisodes).toBe(0);
+		clock = 59_999;
+		await burst();
+		expect(overflow).toHaveBeenCalledTimes(1);
+		clock = 60_000;
+		await burst();
+		expect(overflow).toHaveBeenCalledTimes(2);
+		expect(overflow.mock.calls[1][0].suppressedEpisodes).toBe(100);
+		clock += 1;
+		await burst();
+		expect(overflow).toHaveBeenCalledTimes(2);
+		clock += 60_000;
+		await burst();
+		expect(overflow.mock.calls[2][0].suppressedEpisodes).toBe(1);
 	});
 	it('admits a whole call or none of it, and withdraws an admitted call before it drains', async () => {
 		const submit = vi.fn(() => Promise.resolve()), dropped = vi.fn(), overflow = vi.fn();

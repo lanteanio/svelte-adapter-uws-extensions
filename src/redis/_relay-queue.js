@@ -4,6 +4,14 @@ const MAX_ENTRIES = 8192;
 const MAX_BYTES = 8 * 1024 * 1024;
 const CHUNK_ENTRIES = 256;
 const CHUNK_BYTES = 1024 * 1024;
+// Minimum time between two overload reports from one queue. An episode ends
+// when the queue empties, and a bursty publisher can start a new one every few
+// milliseconds, so re-arming on the empty queue alone still logs a warning per
+// burst. A minute keeps a recurring overload visible in the logs while it
+// lasts and bounds it to one line per minute per bus; the episodes folded in
+// between are carried as `suppressedEpisodes` on the next report, and every
+// refused relay is still counted in the queue_full drop metric.
+const OVERLOAD_REPORT_INTERVAL_MS = 60_000;
 const registries = new WeakMap();
 const collectedQueues = new FinalizationRegistry(({ refs, ref }) => refs.delete(ref));
 
@@ -17,6 +25,7 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 	let entries = [];
 	let head = 0, normalizationHead = 0, retainedBytes = 0, retained = 0;
 	let timer = null, flight = null, warned = false;
+	let reportedAt = null, suppressedEpisodes = 0;
 	const state = {
 		snapshot() {
 			normalizeBytes();
@@ -86,6 +95,17 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 		try { Promise.resolve(submit(batch)).then(settled, settled); }
 		catch { settled(); }
 	}
+	// The first refusal of an episode reports it, unless the previous report
+	// is younger than the interval; then the episode is only counted.
+	function report() {
+		warned = true;
+		const at = monotonicNow();
+		if (reportedAt !== null && at - reportedAt < OVERLOAD_REPORT_INTERVAL_MS) { suppressedEpisodes++; return; }
+		reportedAt = at;
+		normalizeBytes();
+		overflow({ entries: retained, bytes: retainedBytes, maxEntries: MAX_ENTRIES, maxBytes: MAX_BYTES, suppressedEpisodes });
+		suppressedEpisodes = 0;
+	}
 	function enqueue(msg, count, channel, topics, bytes, exact) {
 		const entry = { msg, count, channel, topics, bytes, exact, enqueued: metrics ? monotonicNow() : 0 };
 		entries.push(entry);
@@ -103,7 +123,7 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 			// queue alone. Its capacity stays charged until submission settles.
 			if (retained === MAX_ENTRIES || (bytes > MAX_BYTES - retainedBytes && retained > 0)) {
 				dropped('queue_full', 1, count);
-				if (!warned) { warned = true; normalizeBytes(); overflow({ entries: retained, bytes: retainedBytes, maxEntries: MAX_ENTRIES, maxBytes: MAX_BYTES }); }
+				if (!warned) report();
 				return false;
 			}
 			enqueue(msg, count, channel, topics, bytes, exact);
