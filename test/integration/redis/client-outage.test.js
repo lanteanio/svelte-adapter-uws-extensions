@@ -268,9 +268,9 @@ it.each(['reset', 'socket deadline'])('does not resend an applied write after %s
 });
 
 it('keeps an unsent startup write when the connection drops during the handshake', async () => {
-	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 });
-	const { client, admin, gate } = fixture;
 	const key = 'inttest-outage:handshake-drop';
+	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 }, key);
+	const { client, admin, gate } = fixture;
 	const sink = captureRegistered();
 	try {
 		await admin.redis.del(key);
@@ -294,9 +294,9 @@ it('keeps an unsent startup write when the connection drops during the handshake
 });
 
 it('rejects a command written during the handshake when that connection drops before ready', async () => {
-	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 });
-	const { client, admin, gate } = fixture;
 	const key = 'inttest-outage:handshake-written';
+	const fixture = await proxyClient({ lazyConnect: true, disableClientInfo: true, retryStrategy: () => 50 }, key);
+	const { client, admin, gate } = fixture;
 	const subscriber = admin.duplicate();
 	const received = [];
 	try {
