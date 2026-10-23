@@ -58,7 +58,9 @@
  *     instance holding the topic replies with exactly the updates the joiner
  *     lacks. The joiner applies the reply on top of the snapshot - idempotent,
  *     so applying both is always safe - closing the staleness gap whenever a
- *     live peer exists.
+ *     live peer exists. A state vector grows with the document's history,
+ *     so a request too large for the relay is replaced by a resync round,
+ *     whose request carries none.
  *
  * The coordinator reads a replica's state through the realtime layer's own
  * `onSyncRequest` handler: asked for the diff against an empty state vector on
@@ -334,8 +336,16 @@ export function createCrdtCluster(client, options = {}) {
 	 * and a topic whose name leaves no room for a sync request is not resynced.
 	 */
 	function relayImpossible(obj, err) {
-		lastRelayError = err;
 		const topic = obj.t;
+		if (obj.k === KIND_SYNC_REQUEST && obj.c === undefined && typeof topic === 'string' && known.has(topic)) {
+			// A cold-join request carries the replica's state vector, which
+			// grows with the document's history. A resync round asks without
+			// one, so the topic is repaired that way.
+			stale.add(topic);
+			scheduleRetry();
+			return;
+		}
+		lastRelayError = err;
 		if (typeof topic !== 'string' || !known.has(topic)) { report(err); return; }
 		if (obj.k === KIND_SYNC_REQUEST) { unaskable.add(topic); stale.delete(topic); }
 		else if (obj.k === KIND_UPDATE) unrelayed.delete(topic);

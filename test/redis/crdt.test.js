@@ -820,6 +820,37 @@ describe('createCrdtCluster documents past the relay limit', () => {
 		}
 	});
 
+	it('repairs a cold join whose state vector is too large for a request through a resync round', async () => {
+		const TOPIC = 'doc:1';
+		const client = mockRedisClient('crdtbigsv:');
+		const backend = createBackend();
+		const quiet = { debounceWait: 600000, debounceMaxWait: 600000 };
+		const opts = { maxEnvelopeBytes: 2000, persistLeaseMs: 600 };
+		const errors = [];
+		const a = createDocInstance(client, backend, opts, quiet);
+		const c = createDocInstance(client, backend, { ...opts, onError: (err) => errors.push(err) }, quiet);
+		try {
+			await a.join(TOPIC);
+			await settle();
+			// Every edit comes from its own client, so a state vector of the
+			// document holds 200 entries.
+			for (let k = 0; k < 200; k++) a.edit(TOPIC, 'k' + k, k);
+			await settle();
+			backend.blob = Uint8Array.from(a.authority.diff(TOPIC, null));
+			a.edit(TOPIC, 'fresh', 1); // newer than the snapshot
+			await settle();
+			await c.join(TOPIC); // its request cannot be sent
+			await settle();
+			await new Promise((r) => setTimeout(r, 700)); // past a's lease
+			expect(await c.crdt.acquirePersist(TOPIC)).toBe(true);
+			expect(c.items(TOPIC).fresh).toBe(1);
+			expect(errors).toEqual([]);
+		} finally {
+			a.destroy();
+			c.destroy();
+		}
+	});
+
 	it('sends the largest envelope a receiver accepts and refuses the next larger one, by the receiver\'s own limit', async () => {
 		const client = mockRedisClient('crdtpartedge:');
 		const errors = [];
