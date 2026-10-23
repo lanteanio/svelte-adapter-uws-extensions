@@ -305,6 +305,49 @@ describe('postgres replay', () => {
 			expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual(['truncated', 3, 4, 5, 6, 7, 'end']);
 		});
 
+		// A publish raises the counter and inserts its row in one statement.
+		// Commit one right after replay() reads the rows: if replay() then
+		// read the counter in a second round trip, it would see a seq with no
+		// row and report a false truncation.
+		it.each([0, 3])('does not send truncated when a publish commits right after the row read (sinceSeq %i)', async (sinceSeq) => {
+			for (let i = 1; i <= sinceSeq; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			const query = client.query;
+			let published = false;
+			client.query = async (...args) => {
+				const result = await query.apply(client, args);
+				const text = typeof args[0] === 'string' ? args[0] : args[0].text;
+				if (!published && text.includes('seq > $2')) {
+					published = true;
+					client.query = query;
+					await replay.publish(platform, 'chat', 'created', { id: 'between' });
+				}
+				return result;
+			};
+			platform.reset();
+			await replay.replay({}, 'chat', sinceSeq, platform);
+			client.query = query;
+			expect(published).toBe(true);
+			expect(await replay.seq('chat')).toBe(sinceSeq + 1);
+			const replayed = platform.sent.filter((s) => s.topic === '__replay:chat');
+			expect(replayed.map((s) => s.event)).toEqual(['end']);
+			expect(replayed[0].data).toEqual({});
+		});
+
+		it('delivers the gap-fill in seq order even when the rows arrive out of order', async () => {
+			for (let i = 1; i <= 3; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			const query = client.query;
+			client.query = async (...args) => {
+				const result = await query.apply(client, args);
+				const text = typeof args[0] === 'string' ? args[0] : args[0].text;
+				return text.includes('LEFT JOIN LATERAL') ? { ...result, rows: [...result.rows].reverse() } : result;
+			};
+			platform.reset();
+			const watermark = await replay.replay({}, 'chat', 0, platform);
+			client.query = query;
+			expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual([1, 2, 3, 'end']);
+			expect(watermark).toBe(3);
+		});
+
 		it('does not send truncated at sinceSeq 0 for an empty topic', async () => {
 			platform.reset();
 			await replay.replay({}, 'quiet', 0, platform);

@@ -650,58 +650,56 @@ export function createReplay(client, options = {}) {
 				throw err;
 			}
 
-			let missedRes;
+			// The rows and the seq counter come from one statement, so they share
+			// one snapshot: a publish raises the counter and inserts its row in a
+			// single statement, so every seq the counter reports has its row in
+			// the same read. Reading them in two round trips let a publish land
+			// in between and pass for a missing entry. The counter subquery is a
+			// primary-key lookup and the rows keep the (topic, seq) index scan;
+			// the LEFT JOIN returns one row with null columns when nothing is
+			// newer than sinceSeq, which still carries the counter.
+			let fillRes;
 			try {
-				missedRes = await client.query({
-					name: 'replay_since_' + table,
-					text: `SELECT seq, topic, event, data
-					   FROM ${table}
-					  WHERE topic = $1
-					    AND seq > $2
-					  ORDER BY seq ASC`,
+				fillRes = await client.query({
+					name: 'replay_fill_' + table,
+					text: `SELECT c.current_seq, r.seq, r.topic, r.event, r.data
+					   FROM (SELECT COALESCE((SELECT seq FROM ${seqTable} WHERE topic = $1), 0)::bigint AS current_seq) c
+					   LEFT JOIN LATERAL (
+					         SELECT seq, topic, event, data
+					           FROM ${table}
+					          WHERE topic = $1
+					            AND seq > $2
+					          ORDER BY seq ASC
+					   ) r ON true`,
 					values: [topic, sinceSeq]
 				});
 			} catch (err) {
 				pgFailure(b, err, cancelProbe);
 				throw err;
 			}
-			const missed = missedRes.rows.map((row) => ({
-				seq: parseInt(row.seq, 10),
-				topic: row.topic,
-				event: row.event,
-				data: row.data
-			}));
+			const fillRows = fillRes.rows;
+			const currentSeq = fillRows.length > 0 ? parseInt(fillRows[0].current_seq, 10) : 0;
+			const missed = [];
+			let ordered = true;
+			for (let i = 0; i < fillRows.length; i++) {
+				const row = fillRows[i];
+				if (row.seq === null || row.seq === undefined) continue;
+				const seq = parseInt(row.seq, 10);
+				if (missed.length > 0 && seq < missed[missed.length - 1].seq) ordered = false;
+				missed.push({ seq, topic: row.topic, event: row.event, data: row.data });
+			}
+			// The join keeps the inner index order in practice; SQL does not
+			// promise it without an outer ORDER BY, which would add a sort over
+			// every payload, so restore the order here if it ever differs.
+			if (!ordered) missed.sort((x, y) => x.seq - y.seq);
 
-			// Captured on the missed-empty path so the return below can confirm
-			// the client's sinceSeq against the counter before trusting it as
-			// the covered watermark.
 			// Position 0 has seen nothing, so it is owed seq 1: a trimmed head or
 			// an emptied buffer truncates it like any other position.
 			let truncated = false;
-			let currentSeq = null;
-			if (missed.length > 0 && missed[0].seq > sinceSeq + 1) {
+			if ((missed.length > 0 && missed[0].seq > sinceSeq + 1) || (missed.length === 0 && currentSeq > sinceSeq)) {
 				mTruncations?.inc({ topic: mt(topic) });
 				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
-			} else if (missed.length === 0) {
-				try {
-					const seqRes = await client.query({
-						name: 'replay_seq_' + table,
-						text: `SELECT COALESCE(seq, 0)::bigint AS current_seq
-						         FROM ${seqTable}
-						        WHERE topic = $1`,
-						values: [topic]
-					});
-					currentSeq = seqRes.rows.length > 0 ? parseInt(seqRes.rows[0].current_seq, 10) : 0;
-					if (currentSeq > sinceSeq) {
-						mTruncations?.inc({ topic: mt(topic) });
-						truncated = true;
-						platform.send(ws, replayTopic, 'truncated', null);
-					}
-				} catch (err) {
-					pgFailure(b, err, cancelProbe);
-					throw err;
-				}
 			}
 			b?.success();
 

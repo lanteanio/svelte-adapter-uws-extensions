@@ -16,12 +16,12 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 		expect(report.plans.some(p => p.operation.startsWith(store + '.'))).toBe(true);
 	for (const operation of ['replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup'])
 		expect(report.plans.some(p => p.operation === operation)).toBe(true);
-	for (const operation of ['replay.since.cold', 'idempotency.hit', 'alarms.due']) {
+	for (const operation of ['replay.since.cold', 'replay.replay.cold', 'idempotency.hit', 'alarms.due']) {
 		const statements = report.plans.filter(p => p.operation === operation);
 		expect(statements.length).toBeGreaterThan(0);
 		expect(statements.some(p => nodes(p.plan).some(n => n.index)), operation).toBe(true);
 	}
-	for (const operation of ['jobs.claim.hot', 'jobs.claim.cold', 'tasks.claim', 'tasks.reclaim', 'replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup', 'alarms.fail', 'alarms.getExecution', 'alarms.executions', 'alarms.requeue', 'alarms.complete']) {
+	for (const operation of ['replay.replay.hot', 'replay.replay.cold', 'jobs.claim.hot', 'jobs.claim.cold', 'tasks.claim', 'tasks.reclaim', 'replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup', 'alarms.fail', 'alarms.getExecution', 'alarms.executions', 'alarms.requeue', 'alarms.complete']) {
 		const statements = report.plans.filter(p => p.operation === operation);
 		expect(statements.length, operation).toBeGreaterThan(0);
 		for (const statement of statements) {

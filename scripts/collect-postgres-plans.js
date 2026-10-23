@@ -134,11 +134,13 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		stores.push(dlq);
 		await Promise.all([tasks.ready(), idem.ready(), alarms.ready(), replay.seq('initial'), jobs.pending(), dlq.count()]);
 		await seed(client, rows);
-		const platform = { publish: () => true, publishBatch: () => true };
+		const platform = { publish: () => true, publishBatch: () => true, checkSubscribe: () => null, send: () => {} };
 		await capture('replay.publish', () => replay.publish(platform, 'hot', 'event', { value: 1 }));
 		await capture('replay.publishBatch', () => replay.publishBatch(platform, [{ topic: 'hot', event: 'event', data: { value: 2 } }, { topic: 'cold-0', event: 'event', data: { value: 3 } }]));
 		await capture('replay.since.hot', () => replay.since('hot', rows - 100));
 		await capture('replay.since.cold', () => replay.since('cold-0', rows - 100));
+		await capture('replay.replay.hot', () => replay.replay({}, 'hot', rows - 100, platform));
+		await capture('replay.replay.cold', () => replay.replay({}, 'cold-0', rows - 100, platform));
 		await capture('replay.seq', () => replay.seq('hot'));
 		await capture('replay.gap', () => replay.gap('hot', rows - 50));
 		await capture('jobs.enqueue', () => jobs.enqueue('hot', { value: 1 }));

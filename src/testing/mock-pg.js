@@ -1147,6 +1147,21 @@ export function mockPgClient(options = {}) {
 			return { rows: [row], rowCount: 1 };
 		}
 
+		// Replay gap-fill: the seq counter and the rows above $2 in one
+		// statement (one snapshot). A LEFT JOIN row with null columns carries
+		// the counter when no row is newer than $2.
+		if (sql.includes('LEFT JOIN LATERAL') && sql.includes('current_seq')) {
+			const topic = values[0];
+			const since = parseInt(values[1], 10);
+			const current_seq = String(seqCounters.get(topic) ?? 0);
+			const result = rows
+				.filter((r) => r.topic === topic && r.seq > since)
+				.sort((a, b) => a.seq - b.seq)
+				.map((r) => ({ current_seq, seq: String(r.seq), topic: r.topic, event: r.event, data: r.data }));
+			if (result.length === 0) result.push({ current_seq, seq: null, topic: null, event: null, data: null });
+			return { rows: result, rowCount: result.length };
+		}
+
 		// SELECT COALESCE(seq, 0) FROM _seq table
 		if (sql.includes('current_seq') && sql.includes('_seq')) {
 			const topic = values[0];
