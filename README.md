@@ -515,9 +515,9 @@ const subscribeIndividually = async (ws, topics) => {
 export const { subscribeBatch } = bus.hooks;
 ```
 
-Single `follow` / `unfollow` keep their existing semantics; `followBatch` is purely additive. Refcount semantics for individual topics match `follow`: each call to `followBatch` bumps every input topic's refcount by 1, and only channel transitions trigger Redis traffic. Empty arrays no-op; duplicate topics in the input collapse to one refcount bump.
+Single `follow` / `unfollow` keep their existing semantics; `followBatch` is purely additive. Refcount semantics for individual topics match `follow`: each call to `followBatch` bumps every input topic's refcount by 1, and only channel transitions trigger Redis traffic. Empty arrays no-op; duplicate topics in the input collapse to one refcount bump. A batch that would take the instance past `MAX_SHARDED_BUS_TOPICS` distinct topics is refused whole with `SHARDED_TOPIC_CAPACITY_EXCEEDED` and counts none of its topics; topics the instance already follows never count against the cap.
 
-`bus.hooks.subscribeBatch` skips `__`-prefixed topics like the per-topic `subscribe` hook does, and skips topics this `ws` is already following so a duplicate batch from a flaky reconnect doesn't leak refcount.
+`bus.hooks.subscribeBatch` skips `__`-prefixed topics like the per-topic `subscribe` hook does, and skips topics this `ws` is already following so a duplicate batch from a flaky reconnect doesn't leak refcount. A refused batch rejects the hook and records nothing on the socket, so the adapter denies the batch the way it denies a single subscribe whose hook throws. Both hooks do nothing for a socket whose `close` hook already ran.
 
 #### Wire-batched publish (`publishBatched`)
 
@@ -3665,7 +3665,7 @@ General caps live in `shared/caps.js`; relay queue limits are internal to the qu
 | `MAX_REGISTRY_PENDING_REQUESTS` | 10_000_000 | reject new | `request(...)` rejects with "pending requests exceeded" |
 | `MAX_REGISTRY_USER_INDEX` | 100_000_000 | warn-only | cluster-wide; eviction would mis-route `sendTo` |
 | `MAX_REGISTRY_INDEX_VALUES_PER_KEY` | 10_000_000 | warn-only | per-attribute-key bucket in the secondary index |
-| `MAX_SHARDED_BUS_TOPICS` | 10_000_000 | reject new | `follow` / `followBatch` reject distinct-new past the cap |
+| `MAX_SHARDED_BUS_TOPICS` | 10_000_000 | reject new | `follow` / `followBatch` reject distinct-new past the cap; a batch is refused whole |
 | Redis relay envelopes per bus | 8_192 | withhold new relay | queued plus unsettled submissions; local delivery remains intact |
 | Redis relay encoded bytes per bus | 8 MiB, or one larger allowed envelope | withhold new relay | exact UTF-8 bytes; chunks yield between submissions |
 | `MAX_PRESENCE_WS` | 10_000_000 | reject new | per-instance ws joins |

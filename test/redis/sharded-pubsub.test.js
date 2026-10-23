@@ -1172,11 +1172,13 @@ describe.each(['subscribe', 'subscribeBatch'])('failed sharded %s ownership', (h
 			subscriber.ssubscribe = async () => { throw new Error('offline'); };
 			await expect(follow(a)).rejects.toThrow('offline');
 			subscriber.ssubscribe = subscribe;
+			await follow(a);
 			await follow(b);
 			await bus.hooks.close(a);
 			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
 			expect(platform.published).toHaveLength(1);
-			await follow(a);
+			// A closed socket never follows again; its reconnect is a new socket.
+			await follow({});
 			await bus.hooks.close(b);
 			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
 			expect(platform.published).toHaveLength(2);
@@ -1274,7 +1276,7 @@ describe.each([['subscribe', 'subscribe'], ['subscribe', 'subscribeBatch'], ['su
 				await bus.hooks.close(b);
 				await client.redis.spublish('uws:sharded:shared', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
 				expect(platform.published).toHaveLength(1);
-				await follow(firstHook, a, 'chat');
+				await follow(firstHook, {}, 'chat');
 				await bus.hooks.close(c);
 				await client.redis.spublish('uws:sharded:shared', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
 				expect(platform.published).toHaveLength(2);

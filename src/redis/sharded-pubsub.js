@@ -241,6 +241,11 @@ export function createShardedBus(client, options = {}) {
 	let topologyRefresh = null;
 	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
 	let wsFollows = new WeakMap();
+	// Sockets whose close hook ran. An app hook that awaits before delegating
+	// can reach subscribe after close, and nothing would release that follow.
+	// Not reset by deactivate: a closed socket stays closed.
+	/** @type {WeakSet<object>} */
+	const closedSockets = new WeakSet();
 
 
 	// Bounded FIFO tick batches: coalesce SPUBLISHes across channels
@@ -1239,7 +1244,9 @@ export function createShardedBus(client, options = {}) {
 	 * reconnect resubscribes.
 	 *
 	 * Empty arrays no-op. Duplicate topics in the input collapse to one
-	 * refcount bump.
+	 * refcount bump. A batch that would take the distinct-topic count past
+	 * the cap is refused whole with `SHARDED_TOPIC_CAPACITY_EXCEEDED`, as
+	 * `follow` refuses a single topic, and none of its topics is counted.
 	 *
 	 * @param {string[]} topics
 	 */
@@ -1251,15 +1258,35 @@ export function createShardedBus(client, options = {}) {
 			throw new TypeError('sharded bus: followBatch requires an array of topics');
 		}
 		if (topics.length === 0) return;
+		await admitBatch(reserveBatch(topics));
+	}
 
+	/**
+	 * Count a batch of topics without yielding, so a caller can record
+	 * exactly the topics counted before anything else interleaves. Throws
+	 * before counting any of them when the bus is inactive or the batch
+	 * would take the distinct-topic count past the cap.
+	 *
+	 * @param {Iterable<unknown>} topics
+	 */
+	function reserveBatch(topics) {
+		if (!subReady) {
+			throw operationError('BUS_NOT_ACTIVE', 'sharded bus: activate() must be called before followBatch()');
+		}
 		const touchedTopics = new Set();
-		const waitingTopics = [];
-		const channels = new Set();
+		let added = 0;
 		for (const topic of topics) {
 			if (typeof topic !== 'string' || topic.length === 0 || touchedTopics.has(topic)) continue;
-			const count = followCounts.get(topic) || 0;
-			if (count === 0 && followCounts.size >= MAX_SHARDED_BUS_TOPICS) continue;
 			touchedTopics.add(topic);
+			if (!followCounts.has(topic)) added++;
+		}
+		if (added > 0 && followCounts.size + added > MAX_SHARDED_BUS_TOPICS) {
+			throw operationError('SHARDED_TOPIC_CAPACITY_EXCEEDED', 'sharded bus: distinct topic count exceeded ' + MAX_SHARDED_BUS_TOPICS + ' on this instance');
+		}
+		const waitingTopics = [];
+		const channels = new Set();
+		for (const topic of touchedTopics) {
+			const count = followCounts.get(topic) || 0;
 			followCounts.set(topic, count + 1);
 			if (count > 0 && (pendingTopics.size === 0 || !pendingTopics.has(topic))) continue;
 			waitingTopics.push(topic);
@@ -1268,6 +1295,11 @@ export function createShardedBus(client, options = {}) {
 			channels.add(channel);
 			if (count === 0) channelRefcounts.set(channel, (channelRefcounts.get(channel) || 0) + 1);
 		}
+		return { touchedTopics, waitingTopics, channels };
+	}
+
+	/** @param {ReturnType<typeof reserveBatch>} reservation */
+	async function admitBatch({ touchedTopics, waitingTopics, channels }) {
 		if (channels.size === 0) return;
 		const generation = subGeneration;
 		try {
@@ -1673,7 +1705,7 @@ export function createShardedBus(client, options = {}) {
 		},
 		hooks: {
 			async subscribe(ws, topic) {
-				if (topic.startsWith('__')) return;
+				if (topic.startsWith('__') || closedSockets.has(ws)) return;
 				let topics = wsFollows.get(ws);
 				if (!topics) {
 					topics = new Set();
@@ -1690,24 +1722,30 @@ export function createShardedBus(client, options = {}) {
 				}
 			},
 			async subscribeBatch(ws, topics) {
-				if (!Array.isArray(topics) || topics.length === 0) return;
-				let wsTopics = wsFollows.get(ws);
+				if (!Array.isArray(topics) || topics.length === 0 || closedSockets.has(ws)) return;
+				const held = wsFollows.get(ws);
+				const fresh = new Set();
+				for (const topic of topics) {
+					if (typeof topic !== 'string' || topic.startsWith('__')) continue;
+					if (held?.has(topic)) continue;
+					fresh.add(topic);
+				}
+				if (fresh.size === 0) return;
+				// Counting does not yield, so the socket records exactly the topics
+				// counted before a close or another batch can run. A refused batch
+				// throws here with nothing counted and nothing recorded.
+				const reservation = reserveBatch(fresh);
+				if (reservation.touchedTopics.size === 0) return;
+				let wsTopics = held;
 				if (!wsTopics) {
 					wsTopics = new Set();
 					wsFollows.set(ws, wsTopics);
 				}
-				const fresh = [];
-				for (const topic of topics) {
-					if (typeof topic !== 'string' || topic.startsWith('__')) continue;
-					if (wsTopics.has(topic)) continue;
-					wsTopics.add(topic);
-					fresh.push(topic);
-				}
-				if (fresh.length === 0) return;
+				for (const topic of reservation.touchedTopics) wsTopics.add(topic);
 				try {
-					await followBatch(fresh);
+					await admitBatch(reservation);
 				} catch (err) {
-					for (const topic of fresh) wsTopics.delete(topic);
+					for (const topic of reservation.touchedTopics) wsTopics.delete(topic);
 					if (wsTopics.size === 0 && wsFollows.get(ws) === wsTopics) wsFollows.delete(ws);
 					throw err;
 				}
@@ -1720,6 +1758,7 @@ export function createShardedBus(client, options = {}) {
 				await unfollow(topic);
 			},
 			async close(ws) {
+				closedSockets.add(ws);
 				const topics = wsFollows.get(ws);
 				if (!topics) return;
 				wsFollows.delete(ws);
