@@ -15,9 +15,11 @@
 //
 // The self-check instance (LEAK_LANE_ROLE=selfcheck) is an ordinary member of
 // the deployment until it is armed. From then on every connection it closes
-// leaves three things behind: a 64 KiB buffer, a listener on its Redis
-// connection and a Redis key with no expiry. Each is what one of the lane's
-// gates exists to catch, and the lane requires each gate to catch it.
+// leaves behind a 64 KiB buffer, a timer, a listener on its Redis connection,
+// a Redis key with no expiry and a roster field, the keys under a prefix of
+// their own so the deployment's keyspace verdict stays its own. Each is what
+// one of the lane's gates exists to catch, and the lane requires each gate to
+// catch it.
 
 import { createTestServer } from 'svelte-adapter-uws/testing';
 import { createBackendClient } from '../../test/integration/helpers/backend.js';
@@ -51,6 +53,8 @@ const group = createGroup(client, 'room');
 let armed = false;
 /** @type {Buffer[]} */
 const retained = [];
+/** @type {ReturnType<typeof setInterval>[]} */
+const timers = [];
 let planted = 0;
 const noop = () => {};
 
@@ -94,9 +98,11 @@ server = await createTestServer({
 			await group.leave(ws, ctx.platform);
 			if (armed) {
 				retained.push(Buffer.alloc(64 * 1024, 1));
+				timers.push(setInterval(noop, 3600000));
 				client.redis.on('ready', noop);
-				const key = plantedPrefix + process.pid + ':' + planted++;
-				client.redis.set(key, '1').catch(noop);
+				const id = process.pid + ':' + planted++;
+				client.redis.set(plantedPrefix + 'key:' + id, '1').catch(noop);
+				client.redis.hset(plantedPrefix + 'group:{room}:members', id, '1').catch(noop);
 			}
 		}
 	}
@@ -127,6 +133,8 @@ function mem() {
 }
 
 async function stop() {
+	for (const timer of timers) clearInterval(timer);
+	timers.length = 0;
 	await bus.deactivate().catch(noop);
 	presence.destroy();
 	group.destroy();
@@ -157,5 +165,10 @@ process.on('message', async (msg) => {
 		reply({ error: err && err.message ? err.message : String(err) });
 	}
 });
+
+// A parent that dies without stopping this instance (killed, or interrupted
+// before its own cleanup ran) closes the IPC channel; exit with it rather
+// than keep a server and its Redis connections running unowned.
+process.on('disconnect', () => process.exit(0));
 
 process.send({ ready: true, port: server.port, role, pid: process.pid });

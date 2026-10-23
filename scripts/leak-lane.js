@@ -22,19 +22,23 @@
 //   window, and the window opens only once every instance has stopped moving.
 //
 //   A GATE THAT CANNOT FAIL IS NOT A GATE. One instance of the deployment is a
-//   self-check: once the window opens it leaks a buffer, a Redis listener and
-//   a Redis key with no expiry per closed connection, and the lane requires
-//   the growth gate, the listener gate and the key gate to each catch their
-//   own planted leak. A lane that has gone blind says so instead of passing.
+//   self-check: once the window opens it leaks, per closed connection, a
+//   buffer, a timer, a Redis listener, a Redis key with no expiry and a
+//   roster field, all under a prefix of their own. The lane requires every
+//   gate to catch the leak planted for it: the resident-set and retained
+//   gates the buffers, the handle gate the timers, the listener gate the
+//   listeners, the key-count and expiry gates the keys, and the membership
+//   gate the roster fields. A lane that has gone blind says so instead of
+//   passing.
 //
 // What this lane adds over the single-process one, and why:
 //
 //   THE KEYSPACE IS NOT IN ANY PROCESS. Replay, presence and group keys that
 //   never expire under churn are invisible to a resident-set probe, so the
 //   lane samples the deployment's key count across the window and, after the
-//   cooldown, requires the keys without an expiry to be no more than the
-//   window opened with and the membership left behind by closed clients to
-//   be zero.
+//   cooldown, requires the keys without an expiry to be no more than at a
+//   quiet point before the window (no client connected, after the same
+//   cooldown) and every roster entry presence and the group keep to be gone.
 //
 //   HANDLES AND LISTENERS. A Redis subscriber that adds a listener per
 //   connection, or a timer per topic that is never cleared, costs almost no
@@ -66,6 +70,9 @@ import { isCluster } from '../src/shared/cluster.js';
 
 const require = createRequire(import.meta.url);
 const instanceEntry = fileURLToPath(new URL('./fixtures/leak-lane-instance.mjs', import.meta.url));
+
+/** Forked instances still running, so an interrupted run can stop them. */
+const liveChildren = new Set();
 
 /** Where a run leaves its record unless --out says otherwise: .leak-lane/ in this repo, gitignored. */
 const DEFAULT_OUT = fileURLToPath(new URL('../.leak-lane/', import.meta.url));
@@ -285,12 +292,14 @@ export function judge(m) {
 export function judgeKeyspace(m) {
 	const growth = countGrowth(m.keys, KEY_TOLERANCE);
 	const persistentKept = m.persistentAfter - m.persistentBefore;
+	const persistentLeaking = persistentKept > PERSISTENT_KEY_TOLERANCE;
+	const membersLeaking = m.membersAfter > 0;
 	/** @type {string[]} */
 	const failures = [];
 	/** @type {string[]} */
 	const health = [];
 	if (m.keys.length < 8) health.push(`only ${m.keys.length} key-count sample(s): the growth fit needs 8, so it could not judge`);
-	if (m.relayShare === null || m.relayShare < MIN_RELAY_SHARE) {
+	if ('relayShare' in m && (m.relayShare === null || m.relayShare < MIN_RELAY_SHARE)) {
 		health.push('the held clients saw ' + (m.relayShare === null ? 'no' : `${(m.relayShare * 100).toFixed(0)}% of the`) +
 			' publishes made on other instances, so the cross-instance relay was not exercised');
 	}
@@ -298,13 +307,13 @@ export function judgeKeyspace(m) {
 		failures.push(`the deployment's Redis keys grew from ${growth.first} to ${growth.last} over ${growth.n} samples ` +
 			`(slope ${growth.slope.toFixed(1)} keys/sample, r-squared ${growth.rSquared.toFixed(2)})`);
 	}
-	if (persistentKept > PERSISTENT_KEY_TOLERANCE) {
-		failures.push(`${m.persistentAfter} Redis keys without an expiry after cooldown, ${persistentKept} more than when the window opened`);
+	if (persistentLeaking) {
+		failures.push(`${m.persistentAfter} Redis keys without an expiry after cooldown, ${persistentKept} more than at the quiet point before the window`);
 	}
-	if (m.membersAfter > 0) {
-		failures.push(`${m.membersAfter} presence or group member entries left in Redis after every client had closed`);
+	if (membersLeaking) {
+		failures.push(`${m.membersAfter} presence or group roster entries left in Redis after every client had closed`);
 	}
-	return { growth, persistentKept, failures, health, failing: failures.length > 0 };
+	return { growth, persistentKept, persistentLeaking, membersLeaking, failures, health, failing: failures.length > 0 };
 }
 
 /**
@@ -313,17 +322,69 @@ export function judgeKeyspace(m) {
  * some other gate is not detection, and accepting it would let the lane pass
  * its self-check while the gate it plants for has gone blind.
  *
- * @param {{ growth?: { leaking?: boolean }, listeners?: { leaking?: boolean } }} instance
- * @param {{ leaking?: boolean }} plantedKeys the key gate's report on the planted keys
+ * @param {{
+ *   growth?: { leaking?: boolean },
+ *   retained?: { leaking?: boolean },
+ *   handles?: { leaking?: boolean },
+ *   listeners?: { leaking?: boolean }
+ * }} instance the self-check instance's verdict
+ * @param {{ growth?: { leaking?: boolean }, persistentLeaking?: boolean, membersLeaking?: boolean } | null | undefined} planted
+ *   the keyspace verdict on the self-check's own prefix
  * @returns {{ pass: boolean, reasons: string[] }}
  */
-export function selfCheckVerdict(instance, plantedKeys) {
-	/** @type {string[]} */
-	const reasons = [];
-	if (!(instance.growth && instance.growth.leaking === true)) reasons.push('the planted memory growth went undetected by the growth gate');
-	if (!(instance.listeners && instance.listeners.leaking === true)) reasons.push('the planted Redis listeners went undetected by the listener gate');
-	if (!(plantedKeys && plantedKeys.leaking === true)) reasons.push('the planted Redis keys went undetected by the key gate');
+export function selfCheckVerdict(instance, planted) {
+	/** @type {[boolean, string][]} */
+	const gates = [
+		[instance.growth?.leaking === true, 'the planted memory growth went undetected by the resident-set gate'],
+		[instance.retained?.leaking === true, 'the planted retained memory went undetected by the retained gate'],
+		[instance.handles?.leaking === true, 'the planted timers went undetected by the handle gate'],
+		[instance.listeners?.leaking === true, 'the planted Redis listeners went undetected by the listener gate'],
+		[planted?.growth?.leaking === true, 'the planted Redis keys went undetected by the key-count gate'],
+		[planted?.persistentLeaking === true, 'the planted keys without an expiry went undetected by the expiry gate'],
+		[planted?.membersLeaking === true, 'the planted roster entries went undetected by the membership gate']
+	];
+	const reasons = gates.filter(([caught]) => !caught).map(([, reason]) => reason);
 	return { pass: reasons.length === 0, reasons };
+}
+
+/** Exit codes for the signals an interrupted run handles. */
+export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129 });
+
+/**
+ * Stop an interrupted run cleanly: kill every forked instance, tear the
+ * backend stack down and exit with the signal's code. The first signal wins;
+ * a second one while the teardown runs is ignored rather than cutting it short.
+ *
+ * @param {{
+ *   target?: { on: Function, off: Function },
+ *   children: Iterable<{ kill: (signal: string) => unknown }>,
+ *   teardown: () => unknown,
+ *   exit?: (code: number) => void,
+ *   log?: (line: string) => void
+ * }} spec
+ * @returns {() => void} removes the handlers
+ */
+export function installSignalCleanup({ target = process, children, teardown, exit = (code) => process.exit(code), log = (line) => console.error(line) }) {
+	let stopping = false;
+	/** @type {[string, () => void][]} */
+	const installed = [];
+	for (const [signal, code] of Object.entries(SIGNAL_EXIT_CODES)) {
+		const handler = () => {
+			if (stopping) return;
+			stopping = true;
+			log(`[leak-lane] ${signal}: stopping the instances and tearing the stack down`);
+			for (const child of children) {
+				try { child.kill('SIGKILL'); } catch { /* already gone */ }
+			}
+			Promise.resolve()
+				.then(() => teardown())
+				.catch((err) => log(`[leak-lane] teardown failed: ${err && err.message ? err.message : err}`))
+				.finally(() => exit(code));
+		};
+		target.on(signal, handler);
+		installed.push([signal, handler]);
+	}
+	return () => { for (const [signal, handler] of installed) target.off(signal, handler); };
 }
 
 /** Read either --name value or --name=value without silently dropping a value. */
@@ -386,6 +447,8 @@ async function startInstance(role, prefixes) {
 		});
 		child.on('exit', () => { clearTimeout(timer); resolve(null); });
 	});
+	liveChildren.add(child);
+	child.once('exit', () => liveChildren.delete(child));
 	if (!ready) {
 		child.kill('SIGKILL');
 		throw new Error(`a ${role} never became ready\n${output}`);
@@ -532,23 +595,45 @@ async function countPersistentKeys(client, pattern) {
 }
 
 /**
- * The membership closed clients left behind: presence entries per user and
- * topic, and group member fields. Named, so a failure says what was kept.
+ * Every roster entry closed clients can leave behind, named so a failure says
+ * what was kept. Presence keeps three structures per topic and the group one:
+ *
+ *   presence:user:{topic}:{userKey}   a hash per user; the key itself is the entry
+ *   presence:topic:{topic}            a field per user on the topic
+ *   presence:pending:{topic}          a field per user's private identity state
+ *   group:{name}:members              a field per member
  */
+export const ROSTER_KEYS = Object.freeze({
+	perKey: ['presence:user:*'],
+	perField: ['presence:topic:*', 'presence:pending:*', 'group:*:members']
+});
+
 async function listMembers(client, keyPrefix) {
 	const redis = client.redis;
 	const nodes = isCluster(redis) ? redis.nodes('master') : [redis];
+	/** @param {any} node @param {string} pattern */
+	const scanAll = async (node, pattern) => {
+		/** @type {string[]} */
+		const found = [];
+		let cursor = '0';
+		do {
+			const [next, keys] = await node.scan(cursor, 'MATCH', keyPrefix + pattern, 'COUNT', 200);
+			cursor = next;
+			found.push(...keys);
+		} while (cursor !== '0');
+		return found;
+	};
 	/** @type {string[]} */
 	const left = [];
 	for (const node of nodes) {
-		let cursor = '0';
-		do {
-			const [next, keys] = await node.scan(cursor, 'MATCH', keyPrefix + 'presence:user:*', 'COUNT', 200);
-			cursor = next;
-			left.push(...keys);
-		} while (cursor !== '0');
+		for (const pattern of ROSTER_KEYS.perKey) left.push(...await scanAll(node, pattern));
+		for (const pattern of ROSTER_KEYS.perField) {
+			// The node SCAN answered from owns the key, so HKEYS needs no redirect.
+			for (const key of await scanAll(node, pattern)) {
+				for (const field of await node.hkeys(key)) left.push(key + ' ' + field);
+			}
+		}
 	}
-	for (const field of await redis.hkeys(keyPrefix + 'group:{room}:members')) left.push('group member ' + field);
 	return left;
 }
 
@@ -563,16 +648,26 @@ async function runLane({ minutes, backend }) {
 	/** @type {Awaited<ReturnType<typeof startInstance>>[]} */
 	const instances = [];
 	/** @type {{ ws: import('ws').WebSocket, seen: Map<string, number> }[][]} */
-	const held = [];
+	let held = [];
+	let heldRound = 0;
+	const connectHeld = async () => {
+		const round = heldRound++;
+		const next = [];
+		for (let i = 0; i < INSTANCES; i++) {
+			const clients = [];
+			for (let h = 0; h < HELD_PER_INSTANCE; h++) clients.push(await holdClient(instances[i].port, `held-${i}-${h}-${round}-${run}`));
+			next.push(clients);
+		}
+		held = next;
+	};
+	const closeHeld = () => {
+		for (const clients of held) for (const c of clients) c.ws.close();
+	};
 	try {
 		for (let i = 0; i < INSTANCES; i++) {
 			instances.push(await startInstance(i === INSTANCES - 1 ? 'selfcheck' : 'instance', prefixes));
 		}
-		for (let i = 0; i < INSTANCES; i++) {
-			const clients = [];
-			for (let h = 0; h < HELD_PER_INSTANCE; h++) clients.push(await holdClient(instances[i].port, `held-${i}-${h}-${run}`));
-			held.push(clients);
-		}
+		await connectHeld();
 
 		/** Issued and completed publishes per instance, for the relay share. */
 		const published = new Array(INSTANCES).fill(0);
@@ -615,11 +710,22 @@ async function runLane({ minutes, backend }) {
 			settled = stableRounds.every((n) => n >= 8);
 		}
 
+		// QUIET POINT: every client closes and the cooldown passes, the state
+		// the final read is taken in, so keys that exist only while clients
+		// are connected count at neither end of the expiry gate. Then the held
+		// clients reconnect and the workload runs unsampled for a moment so
+		// the window does not open on the reconnect.
+		closeHeld();
+		await sleep(COOLDOWN_MS);
+		const persistentBefore = await countPersistentKeys(admin, prefixes.keyPrefix + '*');
+		const plantedPersistentBefore = await countPersistentKeys(admin, prefixes.plantedPrefix + '*');
+		await connectHeld();
+		nextIndex = (await driveAtRate({ ms: 4000, ratePerSecond, drive, startIndex: nextIndex })).nextIndex;
+
 		// WINDOW: the self-check starts leaking, every instance and the keyspace
 		// are sampled every 2s while the same workload continues.
 		const before = [];
 		for (const instance of instances) before.push(await instance.call('mem'));
-		const persistentBefore = await countPersistentKeys(admin, prefixes.keyPrefix + '*');
 		for (const instance of instances) await instance.call('arm');
 		const publishedBefore = published.slice();
 		const seenBefore = held.map((clients) => clients.map((c) => new Map(c.seen)));
@@ -663,13 +769,15 @@ async function runLane({ minutes, backend }) {
 
 		// FINAL: every client closes, the cooldown lets each close finish, then
 		// every instance and the keyspace are read again.
-		for (const clients of held) for (const c of clients) c.ws.close();
+		closeHeld();
 		await sleep(COOLDOWN_MS);
 		const finals = [];
 		for (const instance of instances) finals.push(await settledProbe(instance));
 		const persistentAfter = await countPersistentKeys(admin, prefixes.keyPrefix + '*');
 		const membersLeft = await listMembers(admin, prefixes.keyPrefix);
 		const membersAfter = membersLeft.length;
+		const plantedPersistentAfter = await countPersistentKeys(admin, prefixes.plantedPrefix + '*');
+		const plantedMembersAfter = (await listMembers(admin, prefixes.plantedPrefix)).length;
 
 		const windowByInstance = perInstance(windowResults);
 		const records = instances.map((instance, k) => {
@@ -704,13 +812,18 @@ async function runLane({ minutes, backend }) {
 			};
 		});
 		const keyspace = judgeKeyspace({ keys, persistentBefore, persistentAfter, membersAfter, relayShare });
-		const planted = countGrowth(plantedKeys, KEY_TOLERANCE);
+		const planted = judgeKeyspace({
+			keys: plantedKeys,
+			persistentBefore: plantedPersistentBefore,
+			persistentAfter: plantedPersistentAfter,
+			membersAfter: plantedMembersAfter
+		});
 		return {
 			backend, minutes, ratePerSecond, settled,
 			achievedRatePerSecond: achieved.length > 0 ? achieved.reduce((a, b) => a + b, 0) / achieved.length : 0,
 			instances: records,
 			keyspace: { keys, persistentBefore, persistentAfter, membersAfter, membersLeft: membersLeft.slice(0, 20), relayShare, ...keyspace },
-			plantedKeys: { keys: plantedKeys, ...planted }
+			planted: { keys: plantedKeys, persistentBefore: plantedPersistentBefore, persistentAfter: plantedPersistentAfter, membersAfter: plantedMembersAfter, ...planted }
 		};
 	} finally {
 		for (const clients of held) for (const c of clients) { try { c.ws.terminate(); } catch { /* gone */ } }
@@ -746,7 +859,7 @@ function report(record) {
 			`listeners ${r.listeners.kept === null ? '?' : (r.listeners.kept >= 0 ? '+' : '') + r.listeners.kept}, ` +
 			`connections after cooldown ${r.connectionsAfter}`);
 		if (r.role === 'selfcheck') {
-			const check = selfCheckVerdict(r, record.plantedKeys);
+			const check = selfCheckVerdict(r, record.planted);
 			if (check.pass) console.log(`[leak-lane] ${name}: selfcheck PASS - every planted leak was caught by its own gate`);
 			else {
 				for (const reason of check.reasons) console.error(`[leak-lane] ${name}: selfcheck FAIL - ${reason}`);
@@ -793,7 +906,22 @@ async function main() {
 	console.log(`[leak-lane] ${backend}: warmup ${WARMUP_MS / 1000}s, collect, resettle ${RESETTLE_MS / 1000}s unsampled, ` +
 		`settle until steady, then a ${minutes} minute window`);
 	const started = Date.now();
-	const teardown = await provision(backend);
+	// One teardown however many paths reach it: the run's own finally and a
+	// signal arriving during the run (or while the stack is still coming up).
+	/** @type {Promise<() => Promise<void>> | null} */
+	let provisioning = null;
+	const stopStack = async () => {
+		if (!provisioning) return;
+		const stop = await provisioning.catch(() => null);
+		if (stop) await stop();
+	};
+	installSignalCleanup({ children: liveChildren, teardown: stopStack });
+	provisioning = provision(backend).then((raw) => {
+		/** @type {Promise<void> | null} */
+		let once = null;
+		return () => (once ??= Promise.resolve().then(raw));
+	});
+	const teardown = await provisioning;
 	let exit = 0;
 	let record;
 	try {

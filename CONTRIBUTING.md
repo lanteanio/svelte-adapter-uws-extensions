@@ -129,19 +129,27 @@ the deployment's Redis key count every two seconds. The verdict uses the trend
 kernel from `svelte-adapter-uws/sim` with the adapter lane's rules: a slope
 counts only when the fit explains the samples (r-squared at least 0.5), more than
 0.5% failed churns or a p95 over 50% above the warmed baseline fail the run, and
-settled heap plus external is compared at both ends. After a cooldown in which
-every client has closed, no connection may still be registered, no presence or
-group member entry may remain in Redis, and the keys without an expiry may not
-exceed what the window opened with.
+settled heap plus external is compared at both ends. Just before the window
+every client closes and a cooldown passes; the keys without an expiry are counted
+at that quiet point, and the held clients reconnect. After the window every
+client closes again and, after the same cooldown, no connection may still be
+registered, no presence or group roster entry may remain in Redis (the
+`presence:user` keys and the fields of the `presence:topic`, `presence:pending`
+and group `members` hashes), and the keys without an expiry may not exceed the
+quiet-point count by more than 8.
 
-One instance is a self-check: once the window opens it leaks a buffer, a Redis
-listener and a key without an expiry per closed connection, and the run fails
-unless the growth, listener and key gates each catch their own. Exit code 1 is a
-failed verdict and 2 a run that could not reach one it trusts. Each run writes a
-JSON record with every sample to the gitignored `.leak-lane/` directory
-(`--out <dir>` to write elsewhere). The isolation variables above
-apply; a run takes about 6-10 minutes per backend, so it is its own command rather
-than part of `verify:full`.
+One instance is a self-check: once the window opens it leaks, per closed
+connection, a 64 KiB buffer, a timer, a Redis listener, a key without an expiry
+and a roster field, the keys under a prefix of their own. The run fails unless
+each gate catches the leak planted for it: the resident-set and retained gates
+the buffers, the handle gate the timers, the listener gate the listeners, the
+key-count and expiry gates the keys, and the membership gate the roster fields.
+Exit code 1 is a failed verdict and 2 a run that could not reach one it trusts.
+An interrupt (SIGINT, SIGTERM or SIGHUP) stops the instances, tears the backend
+stack down and exits 130, 143 or 129. Each run writes a JSON record with every
+sample to the gitignored `.leak-lane/` directory (`--out <dir>` to write
+elsewhere). The isolation variables above apply; a run takes about 6-10 minutes
+per backend, so it is its own command rather than part of `verify:full`.
 
 ## Dependency graph
 
