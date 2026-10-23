@@ -114,6 +114,15 @@ async function waitForClusterReady() {
 	throw new Error('Cluster never reached cluster_state=ok within 60s. Last: ' + (lastErr?.message || 'unknown'));
 }
 
+/**
+ * Remove this tier's Compose project, whatever state it is in. Safe to call
+ * before `up` has run or after it failed part way, so a caller can register it
+ * before starting the stack.
+ */
+export function composeDown() {
+	compose(['down', '-v']);
+}
+
 export default async function setup() {
 	// Vitest globalSetup runs in a separate context; tests read these via
 	// process.env. Tests should use `clusterClient()` from helpers/ which
@@ -134,6 +143,6 @@ export default async function setup() {
 
 	return async () => {
 		console.log('[integration-cluster] tearing down docker compose stack...');
-		compose(['down', '-v']);
+		composeDown();
 	};
 }

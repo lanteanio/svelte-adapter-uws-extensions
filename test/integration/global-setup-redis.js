@@ -35,6 +35,15 @@ function compose(args) {
 	}
 }
 
+/**
+ * Remove this tier's Compose project, whatever state it is in. Safe to call
+ * before `up` has run or after it failed part way, so a caller can register it
+ * before starting the stack.
+ */
+export function composeDown() {
+	compose(['down', '-v']);
+}
+
 export default async function setup() {
 	process.env.INTEGRATION_REDIS_URL = REDIS_URL;
 
@@ -44,6 +53,6 @@ export default async function setup() {
 
 	return async () => {
 		console.log('[integration:redis] tearing down docker compose stack...');
-		compose(['down', '-v']);
+		composeDown();
 	};
 }

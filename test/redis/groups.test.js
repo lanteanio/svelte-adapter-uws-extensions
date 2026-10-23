@@ -1348,6 +1348,49 @@ describe('redis groups', () => {
 			g.destroy();
 		});
 
+		it('a heartbeat that never replies holds neither the leave nor a rejoin, and the removal lands after recovery', async () => {
+			const g = createGroup(client, 'silent-beat', { memberTtl: 1 });
+			const membersKey = client.key('group:{silent-beat}:members');
+			const ws = mockWs();
+			await g.join(ws, platform);
+			const firstId = Object.keys(await client.redis.hgetall(membersKey))[0];
+
+			const pipeline = client.redis.pipeline;
+			let silent = true;
+			let beatSent;
+			const beatSeen = new Promise((r) => { beatSent = r; });
+			client.redis.pipeline = () => {
+				const batch = pipeline.call(client.redis);
+				return new Proxy(batch, {
+					get(target, prop) {
+						if (prop !== 'exec') return target[prop];
+						if (!silent) return () => target.exec();
+						return () => {
+							beatSent();
+							return new Promise(() => {});
+						};
+					}
+				});
+			};
+			const timeout = (ms) => new Promise((r) => setTimeout(() => r('timed out'), ms));
+			try {
+				await beatSeen;
+				silent = false;
+				const leaving = g.leave(ws, platform);
+				expect(await Promise.race([g.join(ws, platform), timeout(2000)])).toBe(true);
+				expect(await Promise.race([leaving.then(() => 'left'), timeout(2000)])).toBe('left');
+				// memberTtl 1 beats every 333 ms: the queued removal rides the next one.
+				await new Promise((r) => setTimeout(r, 800));
+			} finally {
+				client.redis.pipeline = pipeline;
+			}
+			const fields = Object.keys(await client.redis.hgetall(membersKey));
+			expect(fields).not.toContain(firstId);
+			expect(fields).toHaveLength(1);
+			expect(g.has(ws)).toBe(true);
+			g.destroy();
+		});
+
 		it('a leave waits for a heartbeat already sent, so its HDEL lands after the beat', async () => {
 			// A connection that queues commands while it is not ready can
 			// deliver a pipeline built before the leave after the leave's own
@@ -1534,7 +1577,7 @@ describe('redis groups', () => {
 		});
 	});
 
-	describe('leave does not fire onLeave on failed leave', () => {
+	describe('onLeave on leave', () => {
 		it('calls onLeave once when breaker is broken', async () => {
 			const leaveCalls = [];
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });

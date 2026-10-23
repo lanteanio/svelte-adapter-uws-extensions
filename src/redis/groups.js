@@ -18,7 +18,7 @@
  * @module svelte-adapter-uws-extensions/redis/groups
  */
 
-import { randomBytes, now, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { randomBytes, now, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -209,8 +209,9 @@ export function createGroup(client, name, options = {}) {
 	// entry before anything else and no later beat can name the member.
 	/** @type {Map<any, { role: GroupRole, memberId: string }>} */
 	const localMembers = new Map();
-	// leave() calls still running, by ws. A second leave() or a join() for the
-	// same ws waits for it instead of racing it.
+	// leave() calls still running, by ws. A second leave() waits for it
+	// instead of racing it; a join() waits at most one beat interval (see
+	// join), so a removal that never answers cannot hold a rejoin.
 	/** @type {Map<any, Promise<void>>} */
 	const leavesInFlight = new Map();
 	// Roster fields whose leave-time HDEL could not be sent or failed, with the
@@ -222,11 +223,30 @@ export function createGroup(client, name, options = {}) {
 	// Heartbeat pipelines sent and not yet answered. A leave sends its HDEL
 	// only after these settle, so a beat built while the member was still
 	// local cannot reach Redis after the removal, whatever the topology
-	// does with queued commands.
-	/** @type {Set<Promise<void>>} */
-	const beatsInFlight = new Set();
+	// does with queued commands. The wait ends one beat interval after the
+	// oldest of them was sent; past that the removal goes to the retry queue,
+	// and a later beat sends it behind the unanswered one. Values are send
+	// times.
+	/** @type {Map<Promise<void>, number>} */
+	const beatsInFlight = new Map();
+	const beatIntervalMs = memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000;
 	let memberCounter = 0;
 	let isClosed = false;
+
+	/**
+	 * Resolve true once `promise` settles, or false after `ms`, whichever is
+	 * first. Never rejects.
+	 * @param {Promise<unknown>} promise
+	 * @param {number} ms
+	 * @returns {Promise<boolean>}
+	 */
+	function settlesWithin(promise, ms) {
+		/** @type {any} */
+		let timer;
+		const limit = new Promise((resolve) => { timer = setTimer(() => resolve(false), ms); });
+		const settled = promise.then(() => true, () => true);
+		return Promise.race([settled, limit]).finally(() => clearTimer(timer));
+	}
 
 	let pendingMeta = null;
 	let metaInitError = null;
@@ -299,10 +319,10 @@ export function createGroup(client, name, options = {}) {
 				for (const memberId of removals) pendingRemovals.delete(memberId);
 			}
 		}, beatFailed);
-		beatsInFlight.add(sent);
+		beatsInFlight.set(sent, nowTs);
 		const settled = () => { beatsInFlight.delete(sent); };
 		sent.then(settled, settled);
-	}, memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000);
+	}, beatIntervalMs);
 	if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 	// Subscriber for cross-instance events
@@ -560,7 +580,13 @@ export function createGroup(client, name, options = {}) {
 				return;
 			}
 		}
-		if (beatsInFlight.size > 0) await Promise.allSettled([...beatsInFlight]);
+		if (beatsInFlight.size > 0) {
+			const remaining = beatIntervalMs - (now() - Math.min(...beatsInFlight.values()));
+			if (remaining <= 0 || !(await settlesWithin(Promise.allSettled([...beatsInFlight.keys()]), remaining))) {
+				queueRemoval(memberId);
+				return;
+			}
+		}
 		try {
 			await redis.hdel(membersKey, memberId);
 			b?.success();
@@ -627,10 +653,13 @@ export function createGroup(client, name, options = {}) {
 		},
 
 		async join(ws, platform, role = 'member') {
-			// A leave still running for this ws ends its membership; joining
-			// after it is a new membership, not the old one.
+			// A leave still running for this ws has already ended the local
+			// membership (that part is synchronous), so joining now creates a
+			// new one. Waiting for the rest keeps its leave event ahead of this
+			// join; the wait is bounded so a removal Redis never answers cannot
+			// hold the join.
 			const leaving = leavesInFlight.get(ws);
-			if (leaving) await leaving.catch(() => {});
+			if (leaving) await settlesWithin(leaving, beatIntervalMs);
 			if (isClosed) return false;
 
 			// Idempotent

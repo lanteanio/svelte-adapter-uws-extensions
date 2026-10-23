@@ -225,14 +225,14 @@ describe('leak lane interrupt', () => {
 		let exited;
 		const exit = new Promise((r) => { exited = r; });
 		const lines = [];
-		const remove = installSignalCleanup({
+		const { remove, interrupted } = installSignalCleanup({
 			target,
 			children,
 			teardown: async () => { teardowns++; },
 			exit: (code) => exited(code),
 			log: (line) => lines.push(line)
 		});
-		return { target, killed, teardowns: () => teardowns, exit, lines, remove };
+		return { target, killed, teardowns: () => teardowns, exit, lines, remove, interrupted };
 	}
 
 	for (const [signal, code] of Object.entries(SIGNAL_EXIT_CODES)) {
@@ -245,6 +245,15 @@ describe('leak lane interrupt', () => {
 			h.remove();
 		});
 	}
+
+	it('names the signal once one has arrived, so the run defers its own exit code', async () => {
+		const h = harness();
+		expect(h.interrupted()).toBe(null);
+		h.target.emit('SIGHUP');
+		expect(h.interrupted()).toBe('SIGHUP');
+		expect(await h.exit).toBe(129);
+		h.remove();
+	});
 
 	it('ignores a second signal while the first teardown runs', async () => {
 		const h = harness();

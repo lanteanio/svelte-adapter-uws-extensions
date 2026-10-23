@@ -354,6 +354,8 @@ export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143, SIGH
  * Stop an interrupted run cleanly: kill every forked instance, tear the
  * backend stack down and exit with the signal's code. The first signal wins;
  * a second one while the teardown runs is ignored rather than cutting it short.
+ * Once a signal has arrived, `interrupted()` names it, and the run's own exit
+ * paths defer to it so the signal's code is the one the process exits with.
  *
  * @param {{
  *   target?: { on: Function, off: Function },
@@ -362,16 +364,17 @@ export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143, SIGH
  *   exit?: (code: number) => void,
  *   log?: (line: string) => void
  * }} spec
- * @returns {() => void} removes the handlers
+ * @returns {{ remove: () => void, interrupted: () => string | null }}
  */
 export function installSignalCleanup({ target = process, children, teardown, exit = (code) => process.exit(code), log = (line) => console.error(line) }) {
-	let stopping = false;
+	/** @type {string | null} */
+	let stopping = null;
 	/** @type {[string, () => void][]} */
 	const installed = [];
 	for (const [signal, code] of Object.entries(SIGNAL_EXIT_CODES)) {
 		const handler = () => {
 			if (stopping) return;
-			stopping = true;
+			stopping = signal;
 			log(`[leak-lane] ${signal}: stopping the instances and tearing the stack down`);
 			for (const child of children) {
 				try { child.kill('SIGKILL'); } catch { /* already gone */ }
@@ -384,7 +387,10 @@ export function installSignalCleanup({ target = process, children, teardown, exi
 		target.on(signal, handler);
 		installed.push([signal, handler]);
 	}
-	return () => { for (const [signal, handler] of installed) target.off(signal, handler); };
+	return {
+		remove: () => { for (const [signal, handler] of installed) target.off(signal, handler); },
+		interrupted: () => stopping
+	};
 }
 
 /** Read either --name value or --name=value without silently dropping a value. */
@@ -838,12 +844,25 @@ async function runLane({ minutes, backend }) {
 	}
 }
 
-/** Bring up the integration stack for a backend; returns its teardown. */
-async function provision(backend) {
-	const setup = backend === 'cluster'
-		? (await import('../test/integration/global-setup-cluster-mirror.js')).default
-		: (await import('../test/integration/global-setup-redis.js')).default;
-	return setup();
+/**
+ * The integration setup for a backend: `up` brings the stack up, `down`
+ * removes its Compose project in whatever state it is in, so it can be
+ * registered before `up` starts.
+ */
+async function backendStack(backend) {
+	const mod = backend === 'cluster'
+		? await import('../test/integration/global-setup-cluster-mirror.js')
+		: await import('../test/integration/global-setup-redis.js');
+	return { up: mod.default, down: mod.composeDown };
+}
+
+/** Set once the run's signal handlers are installed, for the exit paths. */
+let signalCleanup = null;
+
+/** Exit with `code` unless a signal is already stopping the run with its own. */
+function finish(code) {
+	if (signalCleanup && signalCleanup.interrupted()) return;
+	process.exit(code);
 }
 
 function report(record) {
@@ -907,24 +926,20 @@ async function main() {
 		`settle until steady, then a ${minutes} minute window`);
 	const started = Date.now();
 	// One teardown however many paths reach it: the run's own finally and a
-	// signal arriving during the run (or while the stack is still coming up).
-	/** @type {Promise<() => Promise<void>> | null} */
-	let provisioning = null;
-	const stopStack = async () => {
-		if (!provisioning) return;
-		const stop = await provisioning.catch(() => null);
-		if (stop) await stop();
-	};
-	installSignalCleanup({ children: liveChildren, teardown: stopStack });
-	provisioning = provision(backend).then((raw) => {
-		/** @type {Promise<void> | null} */
-		let once = null;
-		return () => (once ??= Promise.resolve().then(raw));
-	});
-	const teardown = await provisioning;
+	// signal. It is registered before `up` starts, so an interrupt that aborts
+	// `up` part way still removes what it had created.
+	const stack = await backendStack(backend);
+	/** @type {Promise<void> | null} */
+	let stopping = null;
+	const teardown = () => (stopping ??= Promise.resolve().then(() => {
+		console.log('[leak-lane] tearing down the backend stack...');
+		stack.down();
+	}));
+	signalCleanup = installSignalCleanup({ children: liveChildren, teardown });
 	let exit = 0;
 	let record;
 	try {
+		await stack.up();
 		record = await runLane({ minutes, backend });
 		exit = report(record);
 	} catch (err) {
@@ -932,8 +947,12 @@ async function main() {
 		record = { backend, minutes, health: [err.message] };
 		exit = 2;
 	} finally {
-		await teardown();
+		await teardown().catch((err) => {
+			console.error(`[leak-lane] teardown failed: ${err.message}`);
+			exit = Math.max(exit, 2);
+		});
 	}
+	if (signalCleanup.interrupted()) return;
 	console.log(`[leak-lane] finished in ${((Date.now() - started) / 1000).toFixed(0)}s`);
 
 	try {
@@ -944,13 +963,13 @@ async function main() {
 	} catch (err) {
 		console.error(`[leak-lane] could not write the record: ${err.message}`);
 	}
-	process.exit(exit);
+	finish(exit);
 }
 
 // Importing this module for its rules must not start anything.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	main().catch((err) => {
 		console.error(`[leak-lane] ${err.stack || err.message}`);
-		process.exit(2);
+		finish(2);
 	});
 }

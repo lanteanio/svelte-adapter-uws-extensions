@@ -9,6 +9,8 @@
 // list is - vitest propagates global-setup process.env mutations to workers.
 import clusterSetup from './global-setup-cluster.js';
 
+export { composeDown } from './global-setup-cluster.js';
+
 export default async function setup() {
 	process.env.INTEGRATION_BACKEND = 'cluster';
 	return clusterSetup();
