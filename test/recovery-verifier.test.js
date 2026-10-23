@@ -196,7 +196,12 @@ it.each([
 	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1', { errorClass: 'handler' })] }, false],
 	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [retained('room', '1', { attempt: '0' })] }, false],
 	[{ reserved: [['room', '1']], committed: [['room', '1']], executions: [['bogus-id', 'not json']] }, false],
-	[{ due: ['room'], metadata: ['room'], reserved: [['room', '2']], committed: [['room', '2']], current: [['room', '2']], attempt: [['room', '1:2']] }, false],
+	// A counter left by a cancelled or replaced requeued schedule is inert.
+	[{ due: ['room'], metadata: ['room'], reserved: [['room', '2']], committed: [['room', '2']], current: [['room', '2']], attempt: [['room', '1:2']] }, true],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], attempt: [['room', '1:2']] }, true],
+	[{ reserved: [['room', '3']], committed: [['room', '2']], attempt: [['room', '3:2']] }, false],
+	[{ attempt: [['room', '1:2']] }, false],
+	[{ reserved: [['room', '1']], committed: [['room', '1']], attempt: [['room', '1:2:3']] }, false],
 	[{ due: ['room'], metadata: ['room'], reserved: [['room', '1']], committed: [['room', '1']], current: [['room', '1']], attempt: [['room', '1:1']] }, false]
 ])('verifies retained Redis alarm executions %#', async (state, ok) => {
 	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['alarms'] } }, { redis: alarmFixture(state) });

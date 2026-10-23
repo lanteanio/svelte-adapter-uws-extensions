@@ -138,8 +138,8 @@ partial-index predicate, row payload or external side effect.
 Redis checks selected family key types, optional minimum key counts, replay
 sequence authority, exact membership pairing for alarms and dead letters, and
 canonical alarm generation watermarks and current membership, and retained alarm
-executions against their order index, committed generation and retry attempt
-counters. Retained generation hashes and executions must not expire, even after
+executions against their order index and committed generation, and retry attempt
+entries against a committed generation of their topic. Retained generation hashes and executions must not expire, even after
 all schedules are deleted. Legacy alarms without
 generation authority fail this package version's verification; use the matching
 pre-upgrade manifest when restoring an older artifact.

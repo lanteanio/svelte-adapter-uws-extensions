@@ -59,11 +59,16 @@ after inspection.
 Both stores refuse a claim once 100000 unresolved executions are retained in
 their namespace: `claim` rejects with code `ALARM_CAPACITY`, the schedule stays
 in place, and the claim can be retried after executions are resolved. Retained
-records are never evicted to make room. Concurrent PostgreSQL claims read the
-bound from their statement snapshot, so they can pass it by at most the number
-of claims in flight at that moment. The PostgreSQL check counts retained rows up to the bound, so a claim's cost
-grows with the number of unresolved executions; resolve or discard failed
-executions rather than letting them accumulate.
+records are never evicted to make room. Redis checks the size of its execution
+index inside the claim script, so its bound is exact. A PostgreSQL claim counts
+retained rows in the claim statement, stopping at the bound, so the check reads
+at most min(retained, 100000) rows. The count comes from the statement
+snapshot, which does not include executions that concurrent claims have not yet
+committed, so concurrent claims can pass the bound by fewer than the number of
+claims in flight at that moment. The check writes no shared row: claims and
+outcomes on different topics never wait for each other's commit. Failed
+executions still count until they are completed or requeued; resolve or
+discard them rather than letting them accumulate.
 
 `getExecution(topic, generation)` reads one record; `executions({ limit, after })`
 pages them by topic, then generation, in byte order of their text (so generation
@@ -103,7 +108,10 @@ authority instead of resetting it. Rehearse the migration on a restored copy.
 
 Migration version 4 adds `attempt BIGINT NOT NULL DEFAULT 1` to the alarm table
 and the `${table}_executions` table keyed by `(topic, generation)`. Existing
-schedules keep their rows and next claim at attempt 1.
+schedules keep their rows and next claim at attempt 1. Stop workers of the previous generation-aware release before
+applying version 4: they claim through `delete`, so their handlers run without a
+retained execution, and their `set` keeps the attempt of a requeued schedule it
+replaces.
 
 Grant runtime SELECT, INSERT, UPDATE and DELETE on the alarm and executions
 tables and SELECT, INSERT and UPDATE on its authority table, plus schema USAGE and ledger SELECT
@@ -133,4 +141,4 @@ alarms and external handler effects before reverting a scheduler.
 
 ## Redis rollout and recovery
 
-For Redis upgrades, stop older writers that call topic-only `set` or `delete` before starting the generation-aware store. Existing scheduled rows acquire generation `1` atomically on first use, including `get()` and `due()`; these reads can write authority fields during adoption, while preserving metadata bytes. Keep all eight keys together in backups and restores, and use a `noeviction` memory policy: an evicted execution record is lost work. `clear()` removes schedules and pending retry attempts and invalidates outstanding reservations, but retains generation authority and retained executions. Deleted topics keep their counters so delayed calls and restarted processes cannot reuse a generation; this history has no automatic expiry. `clear()` traverses that full history synchronously in Redis, so its cost grows with lifetime topic cardinality. Use it for planned maintenance, away from request handling. Do not erase the authority hashes while any old calls can still arrive. Rolling back to a topic-only writer requires quiescing writers and coordinating the matching realtime version.
+For Redis upgrades, stop older writers that call topic-only `set` or `delete` before starting the generation-aware store. Workers on the previous generation-aware release must also be stopped before workers with retained executions start: they claim through `delete`, so their handlers run without a retained execution and outside the attempt fence. A requeued schedule that such a worker cancels or replaces leaves its retry attempt entry in `{alarms}:attempt`. The store applies an entry only to a current schedule of exactly its generation, and that generation is never scheduled again by `set`, so the entry is inert: the recovery verifier accepts entries naming a committed generation of their topic. The entry stays until a later `set` commits a schedule for the topic, that schedule is claimed or deleted, or `clear()` runs. Existing scheduled rows acquire generation `1` atomically on first use, including `get()` and `due()`; these reads can write authority fields during adoption, while preserving metadata bytes. Keep all eight keys together in backups and restores, and use a `noeviction` memory policy: an evicted execution record is lost work. `clear()` removes schedules and pending retry attempts and invalidates outstanding reservations, but retains generation authority and retained executions. Deleted topics keep their counters so delayed calls and restarted processes cannot reuse a generation; this history has no automatic expiry. `clear()` traverses that full history synchronously in Redis, so its cost grows with lifetime topic cardinality. Use it for planned maintenance, away from request handling. Do not erase the authority hashes while any old calls can still arrive. Rolling back to a topic-only writer requires quiescing writers and coordinating the matching realtime version.

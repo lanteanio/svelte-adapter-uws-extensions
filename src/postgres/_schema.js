@@ -101,9 +101,9 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 			// few generations of each topic incrementally.
 			primary: ['topic', 'generation'], indexes: [index('execution_order', ['topic COLLATE "C"'])],
 			checks: [
-				check('execution_generation', 'generation > 0'),
-				check('execution_attempt', "attempt >= 1 AND attempt <= '9007199254740991'::bigint"),
-				check('execution_status', "(status = 'claimed' AND failed_at IS NULL AND error_class IS NULL) OR (status = 'failed' AND failed_at IS NOT NULL AND error_class = 'handler')")
+				check('exec_generation', 'generation > 0'),
+				check('exec_attempt', "attempt >= 1 AND attempt <= '9007199254740991'::bigint"),
+				check('exec_status', "(status = 'claimed' AND failed_at IS NULL AND error_class IS NULL) OR (status = 'failed' AND failed_at IS NOT NULL AND error_class = 'handler')")
 			],
 			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
 		};

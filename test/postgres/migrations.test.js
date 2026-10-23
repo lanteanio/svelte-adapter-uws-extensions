@@ -22,6 +22,16 @@ describe('PostgreSQL migration contracts', () => {
 		expect(versions[2].checksum).toBe('861868ed365e9b05d3bb5afd851994312b576d7a130bd4a53de7e30dbc496570');
 		expect(versions[3].statements[0]).toBe('ALTER TABLE svti_alarms ADD COLUMN IF NOT EXISTS attempt BIGINT NOT NULL DEFAULT 1');
 		expect(versions[3].statements[1]).toMatch(/^CREATE TABLE IF NOT EXISTS svti_alarms_executions \(.*PRIMARY KEY \(topic, generation\)\)$/);
+		// Version 4 creates the executions table and no other relation.
+		expect(versions[3].statements.filter(statement => /^CREATE TABLE/.test(statement))).toHaveLength(1);
+	});
+	it('keeps every generated alarm identifier within the PostgreSQL limit for the longest table name', () => {
+		const table = 'a'.repeat(42);
+		const names = postgresMigrations({ store: 'alarm-store', table }).flatMap(entry => entry.statements)
+			.flatMap(statement => [...statement.matchAll(/\b(?:chk|idx)_[a-z0-9_]+|\ba{42}_[a-z_]+/g)].map(match => match[0]));
+		expect(names.length).toBeGreaterThan(10);
+		for (const name of names) expect(name.length, name).toBeLessThanOrEqual(63);
+		expect(Math.max(...names.map(name => name.length))).toBeGreaterThan(55);
 	});
 	it.each(['replay', 'jobs', 'tasks', 'idempotency', 'dead-letter', 'alarm-store'])('migrates and validates %s repeatedly', async store => {
 		const client = mockPgClient();

@@ -309,7 +309,10 @@ export async function verifyRedis(redis, config, remaining = () => {}) {
 /**
  * Retained alarm executions: the record hash and its order index hold the same
  * ids, each record matches its id and was claimed from a committed generation,
- * and every requeued attempt counter names its current scheduled generation.
+ * and every requeued attempt counter names a committed generation of its topic.
+ * The store applies a counter only to the current schedule of exactly that
+ * generation, so one left behind by a cancelled or replaced schedule is inert:
+ * a committed generation is never scheduled again by `set`.
  */
 async function verifyAlarmExecutions(roles, { committed, current }, config, read) {
 	let ok = true;
@@ -342,7 +345,9 @@ async function verifyAlarmExecutions(roles, { committed, current }, config, read
 			const values = await read('hmget', attempts, ...batch);
 			batch.forEach((topic, index) => {
 				const [owner, count, extra] = String(values[index]).split(':');
-				ok &&= extra === undefined && generation(owner) && owner === current.get(topic) && attempt(count) && count !== '1';
+				const watermark = committed.get(topic);
+				ok &&= extra === undefined && generation(owner) && attempt(count) && count !== '1'
+					&& (owner === current.get(topic) || (generation(watermark, true) && BigInt(owner) <= BigInt(watermark)));
 			});
 		}
 	}

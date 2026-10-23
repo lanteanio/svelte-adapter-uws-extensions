@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createPgClient, migrate, postgresMigrations } from '../../../src/postgres/index.js';
 import { createAlarmStore } from '../../../src/postgres/alarm-store.js';
+import { MAX_ALARM_EXECUTIONS } from '../../../src/shared/alarm-generation.js';
 import { alarmExecutionContract } from '../../helpers/alarm-execution-contract.js';
+import { realtimeAlarmContract } from '../../helpers/realtime-alarm-contract.js';
 
 const schema = 'alarm_executions_it';
 let admin, a, b, first, second;
@@ -37,6 +39,57 @@ describe('PostgreSQL retained alarm executions', () => {
 			await admin.query(`INSERT INTO svti_alarms_executions (topic, generation, fire_at, meta, tenant, attempt, status, claimed_at)
 				SELECT 'fill:' || lpad(n::text, 6, '0'), 1, 1, NULL, NULL, 1, 'claimed', 1 FROM generate_series(1, $1::int - (SELECT count(*)::int FROM svti_alarms_executions)) n`, [count]);
 		}
+	});
+
+	realtimeAlarmContract('postgres', () => first);
+
+	async function fillRetained(count) {
+		await admin.query(`INSERT INTO svti_alarms_executions (topic, generation, fire_at, attempt, status, claimed_at)
+			SELECT 'fill:' || lpad(n::text, 6, '0'), 1, 1, 1, 'claimed', 1 FROM generate_series(1, $1::int) n`, [count]);
+	}
+	const retainedCount = async () => (await admin.query('SELECT count(*)::int AS count FROM svti_alarms_executions')).rows[0].count;
+
+	it('concurrent claims at the bound overshoot it by fewer than the claims in flight', async () => {
+		await fillRetained(MAX_ALARM_EXECUTIONS - 1);
+		const inFlight = 8;
+		const topics = Array.from({ length: inFlight }, (_, index) => 'edge:' + index);
+		const generations = await Promise.all(topics.map(topic => schedule(first, topic)));
+		// Hold every authority row so all claims take their snapshot before any
+		// of them retains an execution, then release them together.
+		const holder = await admin.connect();
+		let results;
+		try {
+			await holder.query('BEGIN');
+			await holder.query('SELECT topic FROM svti_alarms_generations WHERE topic = ANY($1::text[]) FOR UPDATE', [topics]);
+			const pending = Promise.allSettled(topics.map((topic, index) => (index % 2 ? second : first).claim(topic, generations[index])));
+			await expect.poll(async () => (await admin.query("SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%svti_alarms_executions%'")).rows[0].count, { timeout: 10_000 }).toBe(inFlight);
+			await holder.query('COMMIT');
+			results = await pending;
+		} finally {
+			holder.release();
+		}
+		const claimed = results.filter(result => result.status === 'fulfilled');
+		for (const result of claimed) expect(result.value).toEqual({ attempt: 1 });
+		for (const result of results.filter(entry => entry.status === 'rejected')) expect(result.reason).toMatchObject({ code: 'ALARM_CAPACITY' });
+		expect(claimed.length).toBeGreaterThan(1);
+		const overshoot = (await retainedCount()) - MAX_ALARM_EXECUTIONS;
+		expect(overshoot).toBe(claimed.length - 1);
+		expect(overshoot).toBeLessThan(inFlight);
+		// Over the bound, the next claim is refused and keeps its schedule.
+		const late = await schedule(first, 'edge:late');
+		await expect(second.claim('edge:late', late)).rejects.toMatchObject({ code: 'ALARM_CAPACITY' });
+		expect(await first.get('edge:late')).toMatchObject({ generation: late });
+	});
+
+	it('generated identifiers fit PostgreSQL limits for the longest table name', async () => {
+		const table = 'a'.repeat(42);
+		const store = createAlarmStore(a, { table });
+		await store.ready();
+		const generation = await store.nextGeneration('long');
+		expect(await store.set('long', 1, null, generation)).toBe(true);
+		expect(await store.claim('long', generation)).toEqual({ attempt: 1 });
+		const names = (await admin.query("SELECT conname AS name FROM pg_constraint WHERE connamespace = $1::regnamespace AND contype = 'c'", [schema])).rows.map(row => row.name);
+		expect(names).toEqual(expect.arrayContaining(['chk_' + table + '_exec_generation', 'chk_' + table + '_exec_attempt', 'chk_' + table + '_exec_status']));
 	});
 
 	it('racing claims on independent pools retain exactly one attempt', async () => {
@@ -107,6 +160,7 @@ describe('PostgreSQL retained alarm executions', () => {
 			await store.ready();
 			expect(await store.get('kept')).toEqual({ topic: 'kept', at: 77, meta: { alarmId: 'k' }, generation: '3' });
 			expect(await store.claim('kept', '3')).toEqual({ attempt: 1 });
+			expect((await owner.query('SELECT count(*)::int AS count FROM svti_alarms_executions')).rows[0].count).toBe(1);
 			expect((await owner.query("SELECT version FROM svti_schema_migrations WHERE table_name = 'svti_alarms' ORDER BY version")).rows.map(row => row.version)).toEqual([1, 2, 3, 4]);
 		} finally {
 			await owner.end();

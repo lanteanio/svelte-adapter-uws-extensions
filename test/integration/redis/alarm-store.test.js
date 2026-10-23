@@ -3,6 +3,7 @@ import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createAlarmStore } from '../../../src/redis/alarm-store.js';
 import { alarmGenerationContract } from '../../helpers/alarm-generation-contract.js';
 import { alarmExecutionContract } from '../../helpers/alarm-execution-contract.js';
+import { realtimeAlarmContract } from '../../helpers/realtime-alarm-contract.js';
 
 // The mirror config runs these same connection races against a real Cluster.
 // Lua must bind the observed generation, metadata and due index atomically.
@@ -38,6 +39,7 @@ describe('redis ordered alarm generations (integration)', { retry: 0 }, () => {
 			end
 			return missing`, 2, clientA.key('alarm:{alarms}:executions'), clientA.key('alarm:{alarms}:execution-order'), count)
 	});
+	realtimeAlarmContract('redis', () => storeA);
 	it('orders execution ids by topic bytes even when topics contain NUL', async () => {
 		const accented = 'a' + String.fromCharCode(0xe9);
 		for (const topic of ['ab', 'a\0b', 'a', 'a\0', accented]) {

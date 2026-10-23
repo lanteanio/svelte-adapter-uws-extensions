@@ -77,6 +77,23 @@ it('verifies actual Redis dump restoration and rejects an incomplete authority g
 	await restored.redis.zadd(orderKey, 0, executionId);
 	expect(await restoredAlarms.claim('private-retry', retryGeneration)).toEqual({ attempt: 2 });
 	expect(await restoredAlarms.complete('private-retry', retryGeneration, 2)).toBe(true);
+	// An older worker cancelling a requeued schedule removes it the topic-only
+	// way and leaves its retry counter behind; that counter is inert.
+	const staleGeneration = await restoredAlarms.nextGeneration('private-stale');
+	await restoredAlarms.set('private-stale', 1, null, staleGeneration);
+	await restoredAlarms.claim('private-stale', staleGeneration);
+	await restoredAlarms.fail('private-stale', staleGeneration, 1, { errorClass: 'handler', failedAt: 2 });
+	await restoredAlarms.requeue('private-stale', staleGeneration, 1, { at: 1 });
+	await restored.redis.zrem(restored.key('alarm:{alarms}:due'), 'private-stale');
+	await restored.redis.hdel(restored.key('alarm:{alarms}:meta'), 'private-stale');
+	await restored.redis.hdel(restored.key('alarm:{alarms}:current'), 'private-stale');
+	expect(await restored.redis.hget(restored.key('alarm:{alarms}:attempt'), 'private-stale')).toBe(staleGeneration + ':2');
+	const stale = await runVerification(config, { redis: restored.redis });
+	expect(stale.ok, JSON.stringify(stale)).toBe(true);
+	const replacement = await restoredAlarms.nextGeneration('private-stale');
+	await restoredAlarms.set('private-stale', 1, null, replacement);
+	expect(await restoredAlarms.claim('private-stale', replacement)).toEqual({ attempt: 1 });
+	expect(await restoredAlarms.complete('private-stale', replacement, 1)).toBe(true);
 	await restored.redis.hset(restored.key('alarm:{alarms}:committed'), 'private-room', '0');
 	const corruptAlarm = await runVerification(config, { redis: restored.redis });
 	expect(corruptAlarm.ok).toBe(false);

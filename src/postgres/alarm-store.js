@@ -191,6 +191,10 @@ export function createAlarmStore(client, options = {}) {
 				// observed row only while retained storage is below its bound. The
 				// bound is read from the statement snapshot, so concurrent claims can
 				// overshoot it by at most their own number; nothing is ever evicted.
+				// The count stops at the bound, so it reads at most that many rows.
+				// It deliberately updates no shared counter: a counter row is locked
+				// from the update until commit, which would serialize every claim and
+				// outcome in the namespace behind one another's commit flush.
 				text: `WITH authority AS (SELECT topic FROM ${authority} WHERE topic = $1 AND committed = $2::bigint FOR UPDATE),
 				       capacity AS MATERIALIZED (SELECT count(*) < $3::bigint AS available FROM (SELECT 1 FROM ${executions} LIMIT $3::bigint) retained),
 				       claimed AS (DELETE FROM ${table} a USING authority g, capacity c WHERE a.topic = g.topic AND a.generation = $2::bigint AND c.available
