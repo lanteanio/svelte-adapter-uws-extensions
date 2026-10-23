@@ -1539,6 +1539,37 @@ describe('redis presence', () => {
 			local.destroy();
 		});
 
+		it('drops the topic channel when ws closes while the join subscribes it', async () => {
+			const local = createPresence(client, { key: 'id' });
+			const ws = mockWs({ id: '1' });
+			const realDuplicate = client.redis.duplicate.bind(client.redis);
+			const dups = [];
+			client.redis.duplicate = (...args) => {
+				const dup = realDuplicate(...args);
+				dups.push(dup);
+				const subscribe = dup.subscribe.bind(dup);
+				dup.subscribe = async (...channels) => {
+					// The close hook runs while the SUBSCRIBE is in flight.
+					if (channels.some((c) => String(c).includes('room'))) await local.leave(ws, platform);
+					return subscribe(...channels);
+				};
+				return dup;
+			};
+			try {
+				await expect(local.join(ws, 'room', platform)).rejects.toMatchObject({
+					name: 'WsClosedError',
+					code: 'WS_CLOSED'
+				});
+				expect(dups.length).toBeGreaterThan(0);
+				const channels = dups.flatMap((d) => [...d._subscribedChannels]);
+				expect(channels.filter((c) => String(c).includes('room'))).toEqual([]);
+				expect(await local.count('room')).toBe(0);
+			} finally {
+				client.redis.duplicate = realDuplicate;
+				local.destroy();
+			}
+		});
+
 		it('throws when ws closes after Redis state landed but before ws.subscribe', async () => {
 			const local = createPresence(client, { key: 'id' });
 			const ws = mockWs({ id: '1' });

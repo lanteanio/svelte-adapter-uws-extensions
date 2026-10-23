@@ -1097,11 +1097,16 @@ export function createPresence(client, options = {}) {
 				throw err;
 			}
 
-			// ws closed during `await subscribeToTopic`. The close hook already
-			// ran leaveAll, which swept localCounts / wsTopics for this ws;
-			// no compensating undoJoin needed. Throw so the caller sees the
-			// abort instead of a silent success.
-			if (!wsTopics.has(ws)) throwWsClosed(topic, cancelAdmission);
+			// ws closed during `await ensureRedis74` or `await subscribeToTopic`.
+			// The close hook already ran leaveAll, which swept localCounts /
+			// wsTopics for this ws, but its unsubscribe found no channel yet when
+			// this join was the topic's only holder; drop the channel this join
+			// subscribed. Throw so the caller sees the abort instead of a silent
+			// success.
+			if (!wsTopics.has(ws)) {
+				if (!localCounts.has(topic) && !syncCounts.has(topic)) await unsubscribeFromTopic(topic);
+				throwWsClosed(topic, cancelAdmission);
+			}
 
 			try { ws.getBufferedAmount(); } catch {
 				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
