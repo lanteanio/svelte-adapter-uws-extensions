@@ -6,6 +6,7 @@ import { createGroup } from '../../src/redis/groups.js';
 import { createGroup as createLocalGroup } from 'svelte-adapter-uws/plugins/groups';
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { installSteppedClock } from '../helpers/stepped-clock.js';
 
 function interceptNextGroupLeave(redis, handler) {
 	const originalDefine = redis.defineCommand.bind(redis);
@@ -1552,26 +1553,17 @@ describe('redis groups', () => {
 	describe('small memberTtl heartbeat interval', () => {
 		// A virtual clock and captured heartbeat intervals, installed through the
 		// runtime seam, so real event-loop delays cannot move a member past its
-		// TTL. `cached` stands in for the ~1s-cached now() and moves only when a
-		// test steps it.
+		// TTL. The cached now() lags the exact clock and refreshes every 1010 ms,
+		// as it does in production.
 		let clock;
-		beforeEach(() => {
-			clock = { t: 1_000_000, cached: 1_000_000, intervals: [] };
-			setRuntimeEnv({
-				clock: { now: () => clock.cached, monotonic: () => clock.t, wallEpoch: () => clock.t },
-				timers: {
-					setInterval: (cb, ms) => { const h = { cb, ms, cleared: false, unref() {} }; clock.intervals.push(h); return h; },
-					clearInterval: (h) => { if (h) h.cleared = true; }
-				}
-			});
-		});
+		beforeEach(() => { clock = installSteppedClock(); });
 		afterEach(() => resetRuntimeEnv());
 
 		const flush = async () => {
 			for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
 		};
 		const beat = async () => {
-			for (const h of clock.intervals) if (!h.cleared) h.cb();
+			clock.tick();
 			await flush();
 		};
 
@@ -1584,17 +1576,19 @@ describe('redis groups', () => {
 				expect(await g.count()).toBe(1);
 
 				// The first beat is due one interval after the group was created.
-				clock.t += 333;
+				clock.advance(333);
 				expect(await g.count()).toBe(1);
 				await beat();
 
-				// 1332 ms after join: only the beat's refresh keeps it live.
-				clock.t += 999;
+				// 1332 ms after join: only the beat's refresh keeps it live. The
+				// cached clock refreshed at 1010 ms, so a stamp read from it at
+				// the beat would read as 1010 ms old here.
+				clock.advance(999);
 				expect(await g.count()).toBe(1);
 
 				for (let i = 0; i < 6; i++) {
 					await beat();
-					clock.t += 333;
+					clock.advance(333);
 					expect(g.has(ws)).toBe(true);
 					expect(await g.count()).toBe(1);
 				}
@@ -1603,28 +1597,147 @@ describe('redis groups', () => {
 			}
 		});
 
-		it('memberTtl: 1 measures liveness on the exact wall clock, not the cached one', async () => {
-			const g = createGroup(client, 'short-ttl-cached', { memberTtl: 1 });
+		it('memberTtl: 1 expires a member one TTL after its last beat on the exact clock', async () => {
+			const g = createGroup(client, 'short-ttl-expiry', { memberTtl: 1 });
 			try {
 				const ws = mockWs();
 				await g.join(ws, platform);
-				clock.t += 333;
+				clock.advance(333);
 				await beat();
 
-				// The cached clock steps a little over a second, as it does under a
-				// real interval; the beat landed 67 ms before the step.
-				clock.t += 67;
-				clock.cached += 1010;
+				// No further beat runs.
+				clock.advance(1000);
 				expect(await g.count()).toBe(1);
-
-				// With no further beat the member expires one TTL after its stamp.
-				clock.t += 933;
-				expect(await g.count()).toBe(1);
-				clock.t += 1;
+				clock.advance(1);
 				expect(await g.count()).toBe(0);
 			} finally {
 				g.destroy();
 			}
+		});
+
+		it('memberTtl: 1 keeps the live members of another instance through cleanup', async () => {
+			const a = createGroup(client, 'short-ttl-shared', { memberTtl: 1 });
+			const b = createGroup(client, 'short-ttl-shared', { memberTtl: 1 });
+			const [beatA, beatB] = clock.intervals;
+			const membersKey = client.key('group:{short-ttl-shared}:members');
+			try {
+				await a.join(mockWs(), platform);
+				await b.join(mockWs(), mockPlatform());
+				clock.advance(333);
+				await beat();
+
+				// B refreshes its member 20 ms before A's beat, with the cached
+				// clock refreshing in between, so the two beats would stamp and
+				// judge on cached readings 1010 ms apart.
+				clock.advance(660);
+				beatB.cb();
+				await flush();
+				clock.advance(20);
+				beatA.cb();
+				await flush();
+
+				expect(Object.keys(await client.redis.hgetall(membersKey))).toHaveLength(2);
+				expect(await a.count()).toBe(2);
+			} finally {
+				a.destroy();
+				b.destroy();
+			}
+		});
+	});
+
+	describe('local durations under a wall-clock step', () => {
+		// The exact wall clock jumps (an NTP step) while monotonic time runs on.
+		let clock;
+		beforeEach(() => {
+			clock = { t: 1_000_000, wallOffset: 0, intervals: [] };
+			setRuntimeEnv({
+				clock: { now: () => clock.t + clock.wallOffset, monotonic: () => clock.t, wallEpoch: () => clock.t + clock.wallOffset },
+				timers: {
+					setInterval: (cb, ms) => { const h = { cb, ms, cleared: false, unref() {} }; clock.intervals.push(h); return h; },
+					clearInterval: (h) => { if (h) h.cleared = true; }
+				}
+			});
+		});
+		afterEach(() => resetRuntimeEnv());
+		const flush = async () => {
+			for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+		};
+
+		it('a queued removal is retried for one memberTtl of monotonic time when the wall clock steps back', async () => {
+			const g = createGroup(client, 'step-back', { memberTtl: 1 });
+			const [heartbeat] = clock.intervals;
+			const ws = mockWs();
+			await g.join(ws, platform);
+
+			const hdel = client.redis.hdel;
+			const pipeline = client.redis.pipeline;
+			client.redis.hdel = async () => { throw new Error('hdel failed'); };
+			let retries = 0;
+			client.redis.pipeline = () => {
+				const batch = pipeline.call(client.redis);
+				return new Proxy(batch, {
+					get(target, prop) {
+						if (prop === 'hdel') return (...args) => { retries++; return target.hdel(...args); };
+						if (prop === 'exec') return async () => { throw new Error('beat failed'); };
+						return target[prop];
+					}
+				});
+			};
+			try {
+				await g.leave(ws, platform);
+				clock.wallOffset = -3_600_000;
+				for (let i = 0; i < 5; i++) {
+					clock.t += 333;
+					heartbeat.cb();
+					await flush();
+				}
+			} finally {
+				client.redis.hdel = hdel;
+				client.redis.pipeline = pipeline;
+				g.destroy();
+			}
+			// Beats at 333, 666 and 999 ms retry it; at 1332 ms it is past memberTtl.
+			expect(retries).toBe(3);
+		});
+
+		it('a leave still waits for a beat in flight when the wall clock steps forward', async () => {
+			const g = createGroup(client, 'step-forward', { memberTtl: 1 });
+			const membersKey = client.key('group:{step-forward}:members');
+			const [heartbeat] = clock.intervals;
+			const ws = mockWs();
+			await g.join(ws, platform);
+
+			const pipeline = client.redis.pipeline;
+			let release;
+			const held = new Promise((r) => { release = r; });
+			client.redis.pipeline = () => {
+				const batch = pipeline.call(client.redis);
+				return new Proxy(batch, {
+					get(target, prop) {
+						if (prop !== 'exec') return target[prop];
+						return async () => { await held; return target.exec(); };
+					}
+				});
+			};
+			const hdel = client.redis.hdel;
+			let direct = 0;
+			client.redis.hdel = async (...args) => { direct++; return hdel.apply(client.redis, args); };
+			try {
+				clock.t += 333;
+				heartbeat.cb();
+				clock.wallOffset = 3_600_000;
+				const leaving = g.leave(ws, platform);
+				await flush();
+				release();
+				await leaving;
+			} finally {
+				client.redis.pipeline = pipeline;
+				client.redis.hdel = hdel;
+				g.destroy();
+			}
+			// The HDEL went out once the beat settled instead of being queued.
+			expect(direct).toBe(1);
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
 		});
 	});
 

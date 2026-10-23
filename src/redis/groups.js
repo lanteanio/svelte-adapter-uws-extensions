@@ -18,7 +18,7 @@
  * @module svelte-adapter-uws-extensions/redis/groups
  */
 
-import { randomBytes, wallEpoch, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
+import { randomBytes, wallEpoch, monotonicNow, setTimer, clearTimer, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { CLEANUP_SCRIPT, COUNT_SCRIPT } from '../shared/scripts.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -255,10 +255,12 @@ export function createGroup(client, name, options = {}) {
 	// times.
 	/** @type {Map<Promise<void>, number>} */
 	const beatsInFlight = new Map();
-	// Roster timestamps, liveness checks and these beat timings read the exact
-	// wall clock. The cached now() steps about once a second, so with a
-	// one-second memberTtl a member refreshed a few ms earlier would read as
-	// more than a TTL old right after the next step.
+	// Roster timestamps and liveness checks read the exact wall clock, since
+	// every instance compares them. The cached now() steps about once a
+	// second, so with a one-second memberTtl a member refreshed a few ms
+	// earlier would read as more than a TTL old right after the next step.
+	// The local durations (beat send times, removal queue ages) read the
+	// monotonic clock.
 	const beatIntervalMs = memberTtlMs < 15000 ? Math.floor(memberTtlMs / 3) : 5000;
 	let memberCounter = 0;
 	let isClosed = false;
@@ -316,6 +318,7 @@ export function createGroup(client, name, options = {}) {
 				.catch(() => { /* retried on the next beat */ });
 		}
 		const nowTs = wallEpoch();
+		const beatAt = monotonicNow();
 		const pipe = redis.pipeline();
 		for (const [, entry] of localMembers) {
 			const memberData = JSON.stringify({ role: entry.role, instanceId, ts: nowTs });
@@ -324,7 +327,7 @@ export function createGroup(client, name, options = {}) {
 		/** @type {string[]} */
 		const removals = [];
 		for (const [memberId, queuedAt] of pendingRemovals) {
-			if (nowTs - queuedAt > memberTtlMs) pendingRemovals.delete(memberId);
+			if (beatAt - queuedAt > memberTtlMs) pendingRemovals.delete(memberId);
 			else removals.push(memberId);
 		}
 		if (removals.length > 0) pipe.hdel(membersKey, ...removals);
@@ -349,7 +352,7 @@ export function createGroup(client, name, options = {}) {
 				for (const memberId of removals) pendingRemovals.delete(memberId);
 			}
 		}, beatFailed);
-		beatsInFlight.set(sent, nowTs);
+		beatsInFlight.set(sent, beatAt);
 		const settled = () => { beatsInFlight.delete(sent); };
 		sent.then(settled, settled);
 	}, beatIntervalMs);
@@ -589,7 +592,7 @@ export function createGroup(client, name, options = {}) {
 	 */
 	function queueRemoval(memberId) {
 		pendingRemovals.delete(memberId);
-		pendingRemovals.set(memberId, wallEpoch());
+		pendingRemovals.set(memberId, monotonicNow());
 		while (pendingRemovals.size > MAX_GROUPS_LOCAL_MEMBERS) {
 			pendingRemovals.delete(pendingRemovals.keys().next().value);
 		}
@@ -610,7 +613,7 @@ export function createGroup(client, name, options = {}) {
 			}
 		}
 		if (beatsInFlight.size > 0) {
-			const remaining = beatIntervalMs - (wallEpoch() - Math.min(...beatsInFlight.values()));
+			const remaining = beatIntervalMs - (monotonicNow() - Math.min(...beatsInFlight.values()));
 			if (remaining <= 0 || !(await settlesWithin(Promise.allSettled([...beatsInFlight.keys()]), remaining))) {
 				queueRemoval(memberId);
 				return null;
