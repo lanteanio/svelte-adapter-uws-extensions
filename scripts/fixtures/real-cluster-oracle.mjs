@@ -3,17 +3,30 @@
 // Cluster named by ORACLE_CLUSTER_NODES, and prints one JSON report on stdout.
 // It provisions nothing and never falls back to an in-memory store.
 //
-// Run it in a dedicated process: realtime's setBus() is process-global.
+// Run it in a dedicated process: realtime's setBus() is process-global. The
+// file must sit in the consumer's root: every package has to load from the
+// node_modules next to it.
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const DEADLINE_MS = 60000;
 const SINGLES = 6;
 const BATCH = 6;
+const CONSUMER = dirname(fileURLToPath(import.meta.url));
+
+// Two client pairs, each on its own topic. Plain clients send no hello, so
+// publishBatched reaches them through the adapter's per-member fallback.
+// Batch-capable clients announce the 'batch' capability, so the adapter sends
+// them shared {type:'batch'} frames. Mixing both on one topic would push every
+// subscriber onto the fallback.
+const PAIRS = [
+	{ name: 'plain', topic: 'cluster-oracle', caps: null },
+	{ name: 'batch-capable', topic: 'cluster-oracle-batch-capable', caps: ['batch'] }
+];
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const cases = ['setup', 'cluster-topology', 'single-fanout', 'batch-fanout', 'cleanup'].map((name) => ({ name, status: 'not_run' }));
@@ -73,20 +86,29 @@ const watchdog = setTimeout(() => {
 	process.exit(1);
 }, DEADLINE_MS);
 
-// Walk up from the resolved entry file to the package root that owns it.
+// Walk up from the resolved entry file to the package root that owns it, and
+// refuse a package that resolved from outside the consumer's own node_modules
+// (a parent directory's install would otherwise stand in for it silently).
 function identity(specifier, expectedName) {
 	const entry = fileURLToPath(import.meta.resolve(specifier));
 	let root = dirname(entry);
-	while (true) {
+	let found = null;
+	while (!found) {
 		try {
 			const bytes = readFileSync(join(root, 'package.json'));
 			const pkg = JSON.parse(bytes);
-			if (pkg.name === expectedName) return { version: pkg.version, entrySha256: hash(readFileSync(entry)), packageJsonSha256: hash(bytes) };
+			if (pkg.name === expectedName) found = { pkg, bytes };
 		} catch { /* the entry may sit below its package root */ }
+		if (found) break;
 		const parent = dirname(root);
 		if (parent === root) throw new Error('Cannot locate the package root of ' + expectedName);
 		root = parent;
 	}
+	const where = relative(CONSUMER, root);
+	if (isAbsolute(where) || !where.startsWith('node_modules' + sep)) {
+		throw new Error(expectedName + ' resolved outside the consumer node_modules: ' + root);
+	}
+	return { version: found.pkg.version, root: where.split(sep).join('/'), entrySha256: hash(readFileSync(entry)), packageJsonSha256: hash(found.bytes) };
 }
 
 async function waitFor(read, description) {
@@ -98,10 +120,8 @@ async function waitFor(read, description) {
 }
 
 const sockets = [], servers = [], buses = [], connections = [];
-const topic = 'cluster-oracle';
 const namespace = 'oracle:' + randomUUID() + ':';
-const expected = [];
-let setBus, sourceClient, local, remote;
+let setBus, sourceClient;
 
 try {
 	await runCase('setup', async () => {
@@ -160,12 +180,14 @@ try {
 		setBus = realtime.setBus;
 		setBus(sender);
 
-		const subscribe = (_ws, name) => (name === topic ? null : 'FORBIDDEN');
+		const topics = new Set(PAIRS.map((pair) => pair.topic));
+		const subscribe = (_ws, name) => (topics.has(name) ? null : 'FORBIDDEN');
 		const source = await createTestServer({ handler: {
 			subscribe,
 			message: realtime.createMessage({ onJsonMessage(_ws, message, platform) {
-				if (message.type === 'oracle-single') platform.publish(topic, 'changed', message.data);
-				else if (message.type === 'oracle-batch') platform.publishBatched(message.data.map((data) => ({ topic, event: 'changed', data })));
+				if (!topics.has(message.topic)) return;
+				if (message.type === 'oracle-single') platform.publish(message.topic, 'changed', message.data);
+				else if (message.type === 'oracle-batch') platform.publishBatched(message.data.map((data) => ({ topic: message.topic, event: 'changed', data })));
 			} })
 		} });
 		servers.push(source);
@@ -174,10 +196,11 @@ try {
 		await sender.activate(source.platform);
 		await receiver.activate(target.platform);
 
-		async function connect(server) {
+		async function connect(server, pair) {
 			const socket = new WebSocket(server.wsUrl);
 			sockets.push(socket);
 			const messages = [];
+			let batchFrames = 0;
 			let failure = null;
 			socket.on('error', (error) => { failure = error; });
 			socket.on('message', (bytes, binary) => {
@@ -186,21 +209,27 @@ try {
 					const frame = JSON.parse(bytes.toString());
 					if (frame.type === 'batch') {
 						assert.ok(Array.isArray(frame.events), 'A batch frame carries an events array');
+						batchFrames++;
 						messages.push(...frame.events);
 					} else messages.push(frame);
 				} catch (error) { failure = error; }
 			});
 			const check = () => { if (failure) throw failure; };
 			await waitFor(() => { check(); return socket.readyState === WebSocket.OPEN; }, 'the WebSocket to open');
-			socket.send(JSON.stringify({ type: 'subscribe', topic, ref: 'ready' }));
+			if (pair.caps) socket.send(JSON.stringify({ type: 'hello', caps: pair.caps }));
+			socket.send(JSON.stringify({ type: 'subscribe', topic: pair.topic, ref: 'ready' }));
 			await waitFor(() => { check(); return messages.some((m) => m.type === 'subscribed' && m.ref === 'ready'); }, 'the subscription acknowledgement');
 			return {
 				send(message) { check(); socket.send(JSON.stringify(message)); },
-				values() { check(); return messages.filter((m) => m.topic === topic && m.event === 'changed').map((m) => m.data); }
+				values() { check(); return messages.filter((m) => m.topic === pair.topic && m.event === 'changed').map((m) => m.data); },
+				batchFrames: () => batchFrames
 			};
 		}
-		local = await connect(source);
-		remote = await connect(target);
+		for (const pair of PAIRS) {
+			pair.expected = [];
+			pair.local = await connect(source, pair);
+			pair.remote = await connect(target, pair);
+		}
 	});
 
 	await runCase('cluster-topology', async () => {
@@ -220,33 +249,50 @@ try {
 	});
 
 	async function assertDelivered() {
-		await waitFor(() => local.values().length >= expected.length && remote.values().length >= expected.length, 'ordered local and remote delivery');
-		assert.deepEqual(local.values(), expected, 'Local values, order or count differ');
-		assert.deepEqual(remote.values(), expected, 'Remote values, order or count differ');
+		for (const pair of PAIRS) {
+			const { local, remote, expected } = pair;
+			await waitFor(() => local.values().length >= expected.length && remote.values().length >= expected.length, 'ordered local and remote delivery to ' + pair.name + ' clients');
+			assert.deepEqual(local.values(), expected, 'Local ' + pair.name + ' values, order or count differ');
+			assert.deepEqual(remote.values(), expected, 'Remote ' + pair.name + ' values, order or count differ');
+		}
 	}
 
 	await runCase('single-fanout', async () => {
-		for (let index = 0; index < SINGLES; index++) {
-			const data = { index, nested: { text: 'single-' + index } };
-			expected.push(data);
-			local.send({ type: 'oracle-single', data });
+		for (const pair of PAIRS) {
+			for (let index = 0; index < SINGLES; index++) {
+				const data = { index, nested: { text: 'single-' + index } };
+				pair.expected.push(data);
+				pair.local.send({ type: 'oracle-single', topic: pair.topic, data });
+			}
 		}
 		await assertDelivered();
 	});
 
 	await runCase('batch-fanout', async () => {
-		const data = Array.from({ length: BATCH }, (_, offset) => ({ index: expected.length + offset, nested: { text: 'batch-' + offset } }));
-		expected.push(...data);
-		local.send({ type: 'oracle-batch', data });
+		for (const pair of PAIRS) {
+			const data = Array.from({ length: BATCH }, (_, offset) => ({ index: pair.expected.length + offset, nested: { text: 'batch-' + offset } }));
+			pair.expected.push(...data);
+			pair.local.send({ type: 'oracle-batch', topic: pair.topic, data });
+		}
 		await assertDelivered();
-		// One more ordered message is the receive barrier: a duplicate of any
-		// batch member reaches each client before it, so no sleep is needed to
-		// prove nothing extra is still in flight.
-		const barrier = { index: expected.length, barrier: true };
-		expected.push(barrier);
-		local.send({ type: 'oracle-single', data: barrier });
+		// One more ordered message per topic is the receive barrier: a duplicate
+		// of any batch member reaches each client before it, so no sleep is
+		// needed to prove nothing extra is still in flight.
+		for (const pair of PAIRS) {
+			const barrier = { index: pair.expected.length, barrier: true };
+			pair.expected.push(barrier);
+			pair.local.send({ type: 'oracle-single', topic: pair.topic, data: barrier });
+		}
 		await assertDelivered();
-		report.deliveries = { expectedPerSocket: expected.length, local: local.values().length, remote: remote.values().length };
+		const capable = PAIRS.find((pair) => pair.caps);
+		assert.ok(capable.local.batchFrames() > 0, 'The batch-capable local client received no batch frame, so the shared-frame path was not exercised');
+		report.deliveries = Object.fromEntries(PAIRS.map((pair) => [pair.name, {
+			expectedPerSocket: pair.expected.length,
+			local: pair.local.values().length,
+			remote: pair.remote.values().length,
+			localBatchFrames: pair.local.batchFrames(),
+			remoteBatchFrames: pair.remote.batchFrames()
+		}]));
 	});
 } catch {
 	// The failing case holds the verdict; the cases after it stay not_run.
