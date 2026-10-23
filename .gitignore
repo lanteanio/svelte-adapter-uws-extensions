@@ -2,6 +2,7 @@ node_modules
 build
 coverage
 .cross-repo-gate
+.leak-lane
 .env
 .env.*
 .DS_Store

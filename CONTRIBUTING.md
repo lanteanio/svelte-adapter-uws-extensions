@@ -138,7 +138,8 @@ One instance is a self-check: once the window opens it leaks a buffer, a Redis
 listener and a key without an expiry per closed connection, and the run fails
 unless the growth, listener and key gates each catch their own. Exit code 1 is a
 failed verdict and 2 a run that could not reach one it trusts. Each run writes a
-JSON record with every sample (`--out <dir>`). The isolation variables above
+JSON record with every sample to the gitignored `.leak-lane/` directory
+(`--out <dir>` to write elsewhere). The isolation variables above
 apply; a run takes about 6-10 minutes per backend, so it is its own command rather
 than part of `verify:full`.
 

@@ -51,7 +51,7 @@
 //   node scripts/leak-lane.js                      standalone Redis, default window
 //   node scripts/leak-lane.js --backend cluster    a Redis Cluster instead
 //   node scripts/leak-lane.js --minutes 2          shorter window (1 through 60 minutes)
-//   node scripts/leak-lane.js --out <dir>          where the record is written
+//   node scripts/leak-lane.js --out <dir>          where the record is written (default .leak-lane/)
 //
 // The Redis stack is brought up and torn down through the integration
 // setups, so the isolation variables in CONTRIBUTING.md apply unchanged.
@@ -67,8 +67,8 @@ import { isCluster } from '../src/shared/cluster.js';
 const require = createRequire(import.meta.url);
 const instanceEntry = fileURLToPath(new URL('./fixtures/leak-lane-instance.mjs', import.meta.url));
 
-/** Where a local run leaves its record. Never TEMP: these are worth keeping. */
-const DEFAULT_OUT = 'c:/Users/kevin/Git/__harness/leak-lane-extensions';
+/** Where a run leaves its record unless --out says otherwise: .leak-lane/ in this repo, gitignored. */
+const DEFAULT_OUT = fileURLToPath(new URL('../.leak-lane/', import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Verdict rules. Pure, exported, and unit-tested in test/leak-lane-rules.test.js
