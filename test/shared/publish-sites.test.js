@@ -35,7 +35,7 @@ const srcDir = fileURLToPath(new URL('../../src', import.meta.url));
 const EXCLUDED = [path.join(srcDir, 'testing'), path.join(srcDir, 'sim.js')];
 const MIN_ARGS = { publish: 4, publishWire: 5 };
 const BATCH_METHODS = new Set(['publishBatched', 'batch']);
-const REDIS_RECEIVERS = new Set(['redis', 'client.redis', 'pipe', 't']);
+const REDIS_RECEIVERS = new Set(['redis', 'client.redis', 'pipe', 't', 'tx']);
 
 function sourceFiles(dir) {
 	const out = [];

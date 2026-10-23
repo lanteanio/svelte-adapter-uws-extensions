@@ -175,3 +175,62 @@ it.skipIf(!isClusterBackend())('announces every event for a user through the nod
 	}
 	await expect.poll(() => peer.sendTo({ role: 'reader' }, 'room', 'ping', 1)).toBe(0);
 });
+
+it('announces the open in the row transaction, ahead of a close sent while its reply is in flight', async () => {
+	const attributes = (ws) => ({ uid: ws.getUserData().userId });
+	const peer = registry({ attributes }), b = registry({ attributes });
+	await peer.hooks.open(mockWs({}), { platform: mockPlatform() });
+	// B is subscribed before the socket under test opens.
+	await b.hooks.open(mockWs({ userId: 'other', [WS_SESSION_ID]: 'o' }), { platform: mockPlatform() });
+	const userId = '{fastclose}u';
+	const rowKey = client.key('conns:' + userId);
+	const ws = mockWs({ userId, [WS_SESSION_ID]: 'b' });
+	const sub = client.duplicate();
+	const messages = [];
+	/** @type {any[]} */
+	let others = [];
+	const multi = client.redis.multi.bind(client.redis);
+	try {
+		await sub.subscribe(client.key('__registry-events'));
+		sub.on('message', (_channel, message) => {
+			const event = JSON.parse(message);
+			if (event.userId === userId) messages.push(event.type);
+		});
+		if (isClusterBackend()) {
+			// Every node but the row's owner refuses writes, PUBLISH included.
+			let owner = null;
+			for (const node of client.redis.nodes('master')) {
+				try { await node.exists(rowKey); owner = node; } catch { /* MOVED: not the owner */ }
+			}
+			expect(owner).not.toBeNull();
+			others = client.redis.nodes('all').filter(node => node !== owner);
+			await Promise.all(others.map(node => node.call('client', 'pause', 4000, 'WRITE')));
+		}
+		/** @type {Array<() => void>} */
+		const held = [];
+		client.redis.multi = (...args) => {
+			const tx = multi(...args);
+			return new Proxy(tx, { get(target, key) {
+				if (key !== 'exec') return target[key];
+				return () => {
+					const reply = target.exec();
+					return new Promise(resolve => { held.push(() => resolve(reply)); });
+				};
+			} });
+		};
+		const opening = b.hooks.open(ws, { platform: mockPlatform() });
+		await expect.poll(() => held.length).toBe(1);
+		await expect.poll(() => client.redis.exists(rowKey)).toBe(1);
+		await b.hooks.close(ws);
+		held.shift()();
+		await opening;
+		await expect.poll(() => messages.length).toBe(2);
+		expect(messages).toEqual(['open', 'close']);
+	} finally {
+		client.redis.multi = multi;
+		if (others.length > 0) await Promise.all(others.map(node => node.call('client', 'unpause')));
+		await sub.quit();
+	}
+	expect(await client.redis.exists(rowKey)).toBe(0);
+	expect(await peer.sendTo({ uid: userId }, 'room', 'ping', 1)).toBe(0);
+});

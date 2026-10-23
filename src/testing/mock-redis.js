@@ -1240,9 +1240,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		// cross-slot batch that spans nodes leaves the off-node writes unapplied, so
 		// the regression is catchable here instead of only against a live cluster.
 		//
-		// Every command runs synchronously relative to the others (the `await`s here
-		// only resolve the already-synchronous in-memory ops), so a batch applies as
-		// an ordered unit with no foreign command interleaving mid-batch.
+		// Every command is issued before the first reply is awaited, and the
+		// in-memory ops are synchronous, so a batch applies as an ordered unit with
+		// no foreign command interleaving mid-batch.
 		async function execBatch(commands) {
 			let targetNode = null;
 			if (clusterMode) {
@@ -1251,7 +1251,9 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					if (node !== null) { targetNode = node; break; }
 				}
 			}
-			const results = [];
+			// Every command is started before any reply is awaited, so no foreign
+			// command can run between two commands of the batch.
+			const started = [];
 			for (const { method: m, args } of commands) {
 				if (clusterMode && targetNode !== null) {
 					const node = nodeForCommand(m, args);
@@ -1260,7 +1262,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 						// targetNode, which does not own this slot, so it is dropped
 						// with a MOVED reply rather than run.
 						const slot = keySlot(commandKeys(m, args)[0]);
-						results.push([
+						started.push([
 							new Error('MOVED ' + slot + ' mock-node-' + node),
 							undefined
 						]);
@@ -1268,13 +1270,12 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					}
 				}
 				try {
-					const result = await r[m](...args);
-					results.push([null, result]);
+					started.push(Promise.resolve(r[m](...args)).then((result) => [null, result], (err) => [err, null]));
 				} catch (err) {
-					results.push([err, null]);
+					started.push([err, null]);
 				}
 			}
-			return results;
+			return Promise.all(started);
 		}
 
 		// Build a pipeline/transaction collector. Chained command calls accumulate;
@@ -2303,7 +2304,12 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		function evalRegistryRefresh(args) {
-			const [key, owner, sessionId, ts, attrs, , channel, userIdJson] = args;
+			const [key, owner, sessionId, ts, attrs, , channel, userIdJson, announceRenewal] = args;
+			const announce = () => {
+				if (!channel) return;
+				r.publish(String(channel), '{"type":"open","userId":' + userIdJson + ',"instanceId":"' + owner +
+					'","attrs":' + (attrs || '{}') + '}');
+			};
 			let h = hashes.get(key);
 			const current = h?.get('instanceId');
 			if (current === undefined) {
@@ -2313,12 +2319,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				h.set('ts', String(ts));
 				if (attrs) h.set('attrs', attrs); else h.delete('attrs');
 				// The script announces the restored open itself.
-				if (channel) {
-					r.publish(String(channel), '{"type":"open","userId":' + userIdJson + ',"instanceId":"' + owner +
-						'","attrs":' + (attrs || '{}') + '}');
-				}
+				announce();
 				return 2;
 			} else if (current !== owner || h.get('sessionId') !== sessionId) return 0;
+			if (String(announceRenewal) === '1') announce();
 			return 1;
 		}
 

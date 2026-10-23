@@ -80,25 +80,32 @@ return 0
 // the script, so the announcement takes the row's place in Redis order: a
 // newer owner's open, written after the restore, is also announced after it.
 // ARGV[7] is the JSON-encoded userId; the envelope matches the open hook's.
+// ARGV[8] = '1' also announces a renewal: a restore that finds this
+// instance's own row still has to re-index the user on peers that applied
+// the close which triggered it. The heartbeat leaves it unset.
 const REGISTRATION_RESTORED = 2;
 const REFRESH_REGISTRATION = `
 -- REGISTRY_REFRESH
+local function announce()
+  if ARGV[6] == '' then return end
+  local attrs = ARGV[4]
+  if attrs == '' then attrs = '{}' end
+  redis.call('publish', ARGV[6], '{"type":"open","userId":' .. ARGV[7] .. ',"instanceId":"' .. ARGV[1] .. '","attrs":' .. attrs .. '}')
+end
 local current = redis.call('hget', KEYS[1], 'instanceId')
 if not current then
   redis.call('hset', KEYS[1], 'instanceId', ARGV[1], 'sessionId', ARGV[2], 'ts', ARGV[3])
   if ARGV[4] ~= '' then redis.call('hset', KEYS[1], 'attrs', ARGV[4])
   else redis.call('hdel', KEYS[1], 'attrs') end
   redis.call('expire', KEYS[1], ARGV[5])
-  if ARGV[6] ~= '' then
-    local attrs = ARGV[4]
-    if attrs == '' then attrs = '{}' end
-    redis.call('publish', ARGV[6], '{"type":"open","userId":' .. ARGV[7] .. ',"instanceId":"' .. ARGV[1] .. '","attrs":' .. attrs .. '}')
-  end
+  announce()
   return 2
 elseif current ~= ARGV[1] or redis.call('hget', KEYS[1], 'sessionId') ~= ARGV[2] then
   return 0
 end
-return redis.call('expire', KEYS[1], ARGV[5])
+local renewed = redis.call('expire', KEYS[1], ARGV[5])
+if ARGV[8] == '1' then announce() end
+return renewed
 `;
 
 // Publish a registry event through the node that owns the user's row. A
@@ -466,9 +473,11 @@ export function createConnectionRegistry(client, options) {
 	 * Until the reply, the user is indexed here under a pending lease so local
 	 * `sendTo` keeps reaching the socket. Any open or close for the user
 	 * replaces the lease; one still in place when the restore did not land is
-	 * withdrawn, because the row then names another owner (or none) and this
-	 * instance must not keep claiming the user. A restore that lands after the
-	 * user left this instance, for example by a forget, is dropped again.
+	 * withdrawn, because the row then names another owner and this instance
+	 * must not keep claiming the user. A restore that finds this instance's
+	 * own row renews it and announces the open the same way. A restore or
+	 * renewal that lands after the user left this instance, for example by a
+	 * forget, is dropped again.
 	 * @param {string} userId
 	 */
 	function restoreLocalUser(userId) {
@@ -482,10 +491,10 @@ export function createConnectionRegistry(client, options) {
 		const withdraw = () => {
 			if (remoteIndex.get(userId) === lease) removeIndex(userId);
 		};
-		/** @type {Promise<any>} */ (redis[command[0]](...command.slice(1))).then(
+		/** @type {Promise<any>} */ (redis[command[0]](...command.slice(1), '1')).then(
 			(result) => {
 				breaker?.success();
-				if (result !== REGISTRATION_RESTORED) withdraw();
+				if (result === 0) withdraw();
 				else if (!localUsers.has(userId)) dropOwnRow(userId);
 			},
 			(err) => { breaker?.failure(err); withdraw(); }
@@ -594,12 +603,14 @@ export function createConnectionRegistry(client, options) {
 		const key = userKey(userId);
 		const now = cachedNow();
 		const rawAttrs = attrs && Object.keys(attrs).length > 0 ? JSON.stringify(attrs) : '';
-		// A restore announces the open from the script. An envelope every peer
-		// would drop as oversized is not announced, as publishEvent drops it.
+		// The open is announced inside the row's MULTI, and a restore announces
+		// it from the script. An envelope every peer would drop as oversized is
+		// not announced, as publishEvent drops it.
 		let announceChannel = '';
+		let openEnvelope = '';
 		if (attributes) {
 			try {
-				encodeEnvelope({ type: 'open', userId, instanceId, attrs: attrs || {} });
+				openEnvelope = encodeEnvelope({ type: 'open', userId, instanceId, attrs: attrs || {} });
 				announceChannel = eventsChannel;
 			} catch { /* over maxEnvelopeBytes */ }
 		}
@@ -631,6 +642,10 @@ export function createConnectionRegistry(client, options) {
 				tx.hdel(key, 'attrs');
 			}
 			tx.expire(key, ttl);
+			// On the wire before the open hook's first await and atomic with
+			// the row, so a close of this socket is always announced after it.
+			// Keyless, it travels with the transaction to the row's node.
+			if (openEnvelope) tx.publish(eventsChannel, openEnvelope);
 			await tx.exec();
 			breaker?.success();
 		} catch (err) {
@@ -1888,10 +1903,7 @@ export function createConnectionRegistry(client, options) {
 				} catch {
 					// Best-effort: a write failure leaves the local maps populated
 					// so the user is still reachable from this instance until the
-					// heartbeat retries.
-				}
-				if (attributes) {
-					await publishEvent({ type: 'open', userId, instanceId, attrs });
+					// heartbeat's restore writes and announces the row.
 				}
 			},
 			async close(ws, _ctx) {

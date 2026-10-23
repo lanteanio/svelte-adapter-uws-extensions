@@ -1877,6 +1877,39 @@ describe('redis connection registry', () => {
 			}
 		});
 
+		it('re-announces a row this instance still owns when a stale owner closes', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const a = createConnectionRegistry(client, opts);
+			const b = createConnectionRegistry(client, opts);
+			const peer = createConnectionRegistry(client, opts);
+			const pa = mockPlatform();
+			const rowKey = client.key('conns:u');
+			try {
+				const onA = wsWithSession({ userId: 'u', tenantId: 't' }, 'sa');
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				await a.hooks.open(onA, { platform: pa });
+				await b.hooks.open(onB, { platform: mockPlatform() });
+				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+				// The cluster indexes B, but A's row is the one in Redis.
+				await client.redis.hset(rowKey, 'instanceId', a.instanceId, 'sessionId', 'sa');
+
+				await b.hooks.close(onB);
+
+				// A's restore finds its own row: it keeps the user and announces it.
+				await expect.poll(() => peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(1);
+				await expect.poll(() => pa.sent.some((f) => f.ws === onA && f.event === 'ping')).toBe(true);
+				expect(await a.sendTo({ tenantId: 't' }, 'room', 'pong', 2)).toBe(1);
+				expect((await client.redis.hgetall(rowKey)).instanceId).toBe(a.instanceId);
+			} finally {
+				await a.destroy();
+				await b.destroy();
+				await peer.destroy();
+			}
+		});
+
 		it('announces a restore before a reopen that lands after it, so peers route to the newest socket', async () => {
 			const opts = {
 				identify: (ws) => ws.getUserData()?.userId,
@@ -1997,6 +2030,58 @@ describe('redis connection registry', () => {
 			});
 		}
 	});
+	describe('attributes / sendTo: a socket that closes right after opening', () => {
+		it('announces the open before the close, so peers do not index the gone user', async () => {
+			const opts = {
+				identify: (ws) => ws.getUserData()?.userId,
+				attributes: (ws) => ({ tenantId: ws.getUserData()?.tenantId })
+			};
+			const b = createConnectionRegistry(client, opts);
+			const peer = createConnectionRegistry(client, opts);
+			try {
+				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
+				// The open's transaction ran in Redis; its reply is still in flight
+				// when the socket closes.
+				/** @type {Array<() => void>} */
+				const held = [];
+				const multi = client.redis.multi.bind(client.redis);
+				vi.spyOn(client.redis, 'multi').mockImplementation(() => {
+					const tx = multi();
+					return new Proxy(tx, {
+						get(target, prop) {
+							if (prop !== 'exec') return target[prop];
+							return () => {
+								const reply = target.exec();
+								return new Promise((resolve) => { held.push(() => resolve(reply)); });
+							};
+						}
+					});
+				});
+				const publishSpy = vi.spyOn(client.redis, 'publish');
+
+				const onB = wsWithSession({ userId: 'u', tenantId: 't' }, 'sb');
+				const opening = b.hooks.open(onB, { platform: mockPlatform() });
+				await expect.poll(() => held.length).toBe(1);
+				await b.hooks.close(onB);
+				held.shift()();
+				await opening;
+				for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+				const events = publishSpy.mock.calls
+					.map(([, m]) => JSON.parse(String(m)))
+					.filter((e) => e.userId === 'u')
+					.map((e) => e.type);
+				publishSpy.mockRestore();
+				expect(events).toEqual(['open', 'close']);
+				expect(await client.redis.exists(client.key('conns:u'))).toBe(0);
+				expect(await peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
+			} finally {
+				vi.restoreAllMocks();
+				await b.destroy();
+				await peer.destroy();
+			}
+		});
+	});
 	describe('attributes / sendTo: event routing on a cluster', () => {
 		it('announces every event for a user through the node that owns the user row', async () => {
 			const opts = {
@@ -2008,19 +2093,37 @@ describe('redis connection registry', () => {
 			try {
 				await peer.hooks.open(wsWithSession({ userId: 'p', tenantId: 'other' }, 'sp'), { platform: mockPlatform() });
 				// A keyless PUBLISH may leave from any cluster node. Model a slow
-				// one by holding the first such publish until released; publishes
-				// a script makes leave from the row's node with the row writes.
+				// one by holding every such publish until released. Publishes a
+				// script or a transaction makes leave from the row's node with the
+				// row writes; the reply to the open's transaction is held instead.
 				const evalScript = client.redis.eval.bind(client.redis);
-				let inScript = 0;
+				let onRowNode = 0;
 				vi.spyOn(client.redis, 'eval').mockImplementation((script, ...args) => {
-					inScript++;
-					try { return evalScript(script, ...args); } finally { inScript--; }
+					onRowNode++;
+					try { return evalScript(script, ...args); } finally { onRowNode--; }
 				});
-				const publish = client.redis.publish.bind(client.redis);
 				/** @type {Array<() => void>} */
 				const held = [];
+				const multi = client.redis.multi.bind(client.redis);
+				vi.spyOn(client.redis, 'multi').mockImplementation(() => {
+					const tx = multi();
+					return new Proxy(tx, {
+						get(target, prop) {
+							if (prop !== 'exec') return target[prop];
+							return () => {
+								onRowNode++;
+								let reply;
+								try { reply = target.exec(); } finally { onRowNode--; }
+								return new Promise((resolve) => { held.push(() => resolve(reply)); });
+							};
+						}
+					});
+				});
+				const publish = client.redis.publish.bind(client.redis);
+				const stray = [];
 				vi.spyOn(client.redis, 'publish').mockImplementation((channel, message) => {
-					if (inScript === 0 && held.length === 0) {
+					if (onRowNode === 0) {
+						stray.push(message);
 						return new Promise((resolve) => { held.push(() => resolve(publish(channel, message))); });
 					}
 					return publish(channel, message);
@@ -2030,10 +2133,15 @@ describe('redis connection registry', () => {
 				const opening = b.hooks.open(onB, { platform: mockPlatform() });
 				await expect.poll(() => client.redis.exists(client.key('conns:u'))).toBe(1);
 				await b.hooks.close(onB);
-				for (const release of held) release();
+				expect(held.length).toBeGreaterThan(0);
+				while (held.length > 0) {
+					held.shift()();
+					await new Promise((r) => setImmediate(r));
+				}
 				await opening;
 				vi.restoreAllMocks();
 
+				expect(stray).toEqual([]);
 				await expect.poll(() => peer.sendTo({ tenantId: 't' }, 'room', 'ping', 1)).toBe(0);
 			} finally {
 				vi.restoreAllMocks();
