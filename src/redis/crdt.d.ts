@@ -81,8 +81,10 @@ export interface CrdtCluster {
 	 * stored snapshot is replaced, not merged, so for a topic whose local
 	 * state is too large to push even in parts the write is allowed only
 	 * after a resync round in which every peer answered that it holds the
-	 * same state or nothing, which needs a standalone Redis to count the
-	 * peers. Once a peer holds a different state, or a sync request or reply
+	 * same state or nothing; every other subscriber of the relay channel
+	 * counts as a peer (on a Redis Cluster, `PUBSUB NUMSUB` summed over every
+	 * node), and one that does not answer holds the write back, retryably.
+	 * Once a peer holds a different state, or a sync request or reply
 	 * for the topic cannot be sent, the sender and the requester it answered
 	 * reject with the same code until they restart, its `cause` the
 	 * `RELAY_ENVELOPE_TOO_LARGE` error, and keep the replica loaded.
