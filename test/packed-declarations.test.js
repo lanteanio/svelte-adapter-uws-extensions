@@ -118,8 +118,18 @@ createPgClient({ connectionString: 'postgres://localhost/example' }).query('SELE
 		const deprecatedFile = join(work, 'deprecated-consumer.ts');
 		writeFileSync(deprecatedFile, "import { WS_REQUEST_ID_KEY } from 'svelte-adapter-uws-extensions/testing';\nexport const carrier = WS_REQUEST_ID_KEY;\n");
 		const compilerOptions = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler };
+		// ts.sys is not a LanguageServiceHost: its useCaseSensitiveFileNames is a
+		// boolean where the host contract wants a function, and on a
+		// case-sensitive file system the service calls it.
 		const service = ts.createLanguageService({
-			...ts.sys,
+			useCaseSensitiveFileNames: () => ts.sys.useCaseSensitiveFileNames,
+			fileExists: ts.sys.fileExists,
+			readFile: ts.sys.readFile,
+			readDirectory: ts.sys.readDirectory,
+			directoryExists: ts.sys.directoryExists,
+			getDirectories: ts.sys.getDirectories,
+			realpath: ts.sys.realpath,
+			getNewLine: () => ts.sys.newLine,
 			getScriptFileNames: () => [deprecatedFile],
 			getScriptVersion: () => '0',
 			getScriptSnapshot: file => {

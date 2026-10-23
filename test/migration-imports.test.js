@@ -84,7 +84,9 @@ beforeAll(() => {
 		join(extractDir, 'package'),
 		join(consumerDir, 'node_modules', pkg.name)
 	);
-});
+	// Two child processes with 60 s budgets each; the 10 s default hook
+	// deadline would cut a pack on a loaded host short of its own limit.
+}, 180_000);
 
 afterAll(() => {
 	if (workDir) rmSync(workDir, { recursive: true, force: true });
