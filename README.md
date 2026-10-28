@@ -485,7 +485,7 @@ import { bus } from '$lib/server/bus';
 
 let distributed;
 
-export async function open(ws, { platform }) {
+export async function init({ platform }) {
   await bus.activate(platform);
   distributed = bus.wrap(platform);
 }
@@ -499,7 +499,7 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 // await bus.unfollow('chat:room-7');
 ```
 
-`bus.hooks` is the recommended path - it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
+Activate in `init`, which the adapter awaits: an activation failure rejects startup instead of escaping an unawaited WebSocket `open` hook. `bus.hooks` is the recommended subscription path - it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
 
 #### Bulk follow (`followBatch`, `bus.hooks.subscribeBatch`)
 
