@@ -126,7 +126,8 @@ export function createRelayQueue({ submit, dropped, overflow, metrics, prefix, m
 				if (!warned) report();
 				return false;
 			}
-			enqueue(msg, count, channel, topics, bytes, exact);
+			entries.push({ msg, count, channel, topics, bytes, exact, enqueued: metrics ? monotonicNow() : 0 });
+			retained++; retainedBytes += bytes;
 			schedule();
 			return true;
 		},
