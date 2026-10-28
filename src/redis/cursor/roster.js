@@ -1,4 +1,4 @@
-import { wallEpoch, monotonicNow, setTimer, clearTimer, microtask } from '../../shared/runtime.js';
+import { wallEpoch, monotonicNow, setTimer, clearTimer } from '../../shared/runtime.js';
 import { EVENTS } from './events.js';
 
 /** Merge persisted cursors with live relay changes and this worker's movers. */
@@ -32,17 +32,6 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 	// The cached now() steps about once a second, which at a one-second TTL
 	// would drop a cursor that moved a few ms earlier.
 	const ttlMs = cursorTtl * 1000;
-	// One monotonic read per synchronous run: a subscriber delivers a burst of
-	// relay messages in one run, and they share its stamp.
-	let stamp = -1;
-	const clearStamp = () => { stamp = -1; };
-	function stampNow() {
-		if (stamp < 0) {
-			stamp = monotonicNow();
-			microtask(clearStamp);
-		}
-		return stamp;
-	}
 	let timer = null;
 	function prune() {
 		timer = null;
@@ -74,7 +63,7 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		if (event === EVENTS.BULK && !Array.isArray(payload)) return;
 		let entries = live.get(topic);
 		if (!entries) live.set(topic, entries = new Map());
-		const ts = stampNow();
+		const ts = monotonicNow();
 
 		if (event === EVENTS.BULK) for (const item of payload) recordOne(item, event, entries, ts);
 		else recordOne(payload, event, entries, ts);

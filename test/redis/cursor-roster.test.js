@@ -126,4 +126,14 @@ describe('cursor roster at ttl 1 across a cached-clock step', () => {
 		clock.advance(30);
 		expect(await catalogOf(cursor, ws, platform)).toEqual([{ id: 'peer' }]);
 	});
+	it('stamps each relay message separately within one synchronous run', async () => {
+		const { cursor, platform, ws, relay } = setup({ ttl: 1 });
+		await cursor.attach(ws, 'board', platform);
+		const joining = relay('join', { key: 'peer:1', user: { id: 'peer' } });
+		clock.advance(1000);
+		const updating = relay('update', { key: 'peer:1', data: { x: 7 } });
+		await Promise.all([joining, updating]);
+		clock.advance(1);
+		expect(await catalogOf(cursor, ws, platform)).toEqual([{ id: 'peer' }]);
+	});
 });
