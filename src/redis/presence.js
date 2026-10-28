@@ -997,7 +997,7 @@ export function createPresence(client, options = {}) {
 		settlePending();
 
 		try {
-			if (!addWsSubscription(ws, presenceTopic)) throw new Error('presence subscription refused');
+			if (!addWsSubscription(ws, presenceTopic)) throw operationError('SUBSCRIBE_DENIED', 'presence subscription refused');
 			emitTo(ws, presenceTopic, 'state', state, platform);
 		} catch {
 			const topics = syncObservers.get(ws);
@@ -1206,7 +1206,7 @@ export function createPresence(client, options = {}) {
 
 			// Subscribe ws to presence channel (may have closed during async gap)
 			try {
-				if (!addWsSubscription(ws, '__presence:' + topic)) throw new Error('presence subscription refused');
+				if (!addWsSubscription(ws, '__presence:' + topic)) throw operationError('SUBSCRIBE_DENIED', 'presence subscription refused');
 			} catch {
 				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throwWsClosed(topic, cancelAdmission);

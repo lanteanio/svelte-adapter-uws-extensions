@@ -29,6 +29,7 @@ import { firstCommandError } from '../shared/cluster.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { operationError } from '../shared/errors.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -766,7 +767,7 @@ export function createGroup(client, name, options = {}) {
 			localMembers.set(ws, { role, memberId });
 
 			try {
-				if (!addWsSubscription(ws, internalTopic)) throw new Error('group subscription refused');
+				if (!addWsSubscription(ws, internalTopic)) throw operationError('SUBSCRIBE_DENIED', 'group subscription refused');
 			} catch {
 				localMembers.delete(ws);
 				try {

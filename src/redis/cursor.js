@@ -749,7 +749,7 @@ export function createCursor(client, options = {}) {
 			// the throw-WsClosedError contract instead of platform.subscribe's
 			// ambiguous null result.
 			try {
-				if (!addWsSubscription(ws, '__cursor:' + topic)) throw new Error('cursor subscription refused');
+				if (!addWsSubscription(ws, '__cursor:' + topic)) throw operationError('SUBSCRIBE_DENIED', 'cursor subscription refused');
 			} catch {
 				// No state to roll back (the throw fires before snapshot()
 				// could allocate this connection's identity). Throw so the
