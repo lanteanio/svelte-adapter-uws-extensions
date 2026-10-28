@@ -1298,8 +1298,11 @@ export function createShardedBus(client, options = {}) {
 		return { touchedTopics, waitingTopics, channels };
 	}
 
-	/** @param {ReturnType<typeof reserveBatch>} reservation */
-	async function admitBatch({ touchedTopics, waitingTopics, channels }) {
+	/**
+	 * @param {ReturnType<typeof reserveBatch>} reservation
+	 * @param {boolean} [releaseOnFailure=true]
+	 */
+	async function admitBatch({ touchedTopics, waitingTopics, channels }, releaseOnFailure = true) {
 		if (channels.size === 0) return;
 		const generation = subGeneration;
 		try {
@@ -1308,7 +1311,7 @@ export function createShardedBus(client, options = {}) {
 		} catch (err) {
 			// Each caller releases exactly its own reservation. A channel remains
 			// owned until the final topic's final reservation is released.
-			if (generation === subGeneration) await Promise.all([...touchedTopics].map(unfollow));
+			if (releaseOnFailure && generation === subGeneration) await Promise.all([...touchedTopics].map(unfollow));
 			throw err;
 		} finally {
 			if (generation === subGeneration) for (const topic of waitingTopics) releasePendingTopic(topic);
@@ -1743,10 +1746,15 @@ export function createShardedBus(client, options = {}) {
 				}
 				for (const topic of reservation.touchedTopics) wsTopics.add(topic);
 				try {
-					await admitBatch(reservation);
+					await admitBatch(reservation, false);
 				} catch (err) {
-					for (const topic of reservation.touchedTopics) wsTopics.delete(topic);
+					const releases = [];
+					for (const topic of reservation.touchedTopics) {
+						if (wsFollows.get(ws) !== wsTopics || !wsTopics.delete(topic)) continue;
+						releases.push(unfollow(topic));
+					}
 					if (wsTopics.size === 0 && wsFollows.get(ws) === wsTopics) wsFollows.delete(ws);
+					await Promise.all(releases);
 					throw err;
 				}
 			},

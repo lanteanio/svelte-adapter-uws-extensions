@@ -1172,7 +1172,6 @@ describe.each(['subscribe', 'subscribeBatch'])('failed sharded %s ownership', (h
 			subscriber.ssubscribe = async () => { throw new Error('offline'); };
 			await expect(follow(a)).rejects.toThrow('offline');
 			subscriber.ssubscribe = subscribe;
-			await follow(a);
 			await follow(b);
 			await bus.hooks.close(a);
 			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));

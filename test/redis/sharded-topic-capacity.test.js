@@ -122,29 +122,33 @@ describe.each(['subscribe', 'subscribeBatch'])('sharded %s closed-socket handlin
 			expect(received('chat')).toEqual([]);
 		} finally { await bus.deactivate(); }
 	});
+});
 
-	it('a socket closed while its admission fails does not release another follower', async () => {
+describe.each(['close', 'unsubscribe'])('sharded subscribeBatch admission rollback after %s', (action) => {
+	it('keeps a topic another socket holds after a mixed admission fails', async () => {
 		const { bus, subscriber, peer, received } = await setup();
 		const sub = subscriber();
 		const realSubscribe = sub.ssubscribe.bind(sub);
-		let reject;
-		sub.ssubscribe = () => new Promise((_, no) => { reject = no; });
 		const a = {}, b = {};
 		try {
-			const pending = call(bus, a, 'chat');
+			await bus.hooks.subscribe(b, 'held');
+			let reject;
+			sub.ssubscribe = () => new Promise((_, no) => { reject = no; });
+			const pending = bus.hooks.subscribeBatch(a, ['held', 'new']);
 			const failed = expect(pending).rejects.toThrow('offline');
-			const bFollow = call(bus, b, 'chat');
 			await settle();
-			await bus.hooks.close(a);
+			if (action === 'close') await bus.hooks.close(a);
+			else await bus.hooks.unsubscribe(a, 'held');
 			reject(new Error('offline'));
 			await failed;
-			await expect(bFollow).rejects.toThrow('offline');
 			sub.ssubscribe = realSubscribe;
-			await call(bus, b, 'chat');
-			await peer('chat', 1);
-			expect(received('chat')).toEqual([1]);
-			await bus.hooks.close(b);
-			expect(sub._shardedChannels.size).toBe(0);
-		} finally { await bus.deactivate(); }
+			expect(sub._shardedChannels.has('uws:sharded:held')).toBe(true);
+			expect(sub._shardedChannels.has('uws:sharded:new')).toBe(false);
+			await peer('held', 1);
+			expect(received('held')).toEqual([1]);
+		} finally {
+			sub.ssubscribe = realSubscribe;
+			await bus.deactivate();
+		}
 	});
 });
