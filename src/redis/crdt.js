@@ -234,6 +234,8 @@ export function createCrdtCluster(client, options = {}) {
 
 	/** @type {Map<string, string>} topic -> declKey, for every topic seen held */
 	const known = new Map();
+	/** Newly acquired leases whose first successful result has not been returned. */
+	const freshLeases = new Set();
 	let sweepAt = KNOWN_SWEEP_MIN;
 	/** @type {Iterator<[string, string]> | null} the sweep in progress */
 	let sweeping = null;
@@ -1091,10 +1093,11 @@ export function createCrdtCluster(client, options = {}) {
 		: null;
 
 	/**
-	 * Try to become (or stay) the sole snapshot writer for a topic. `fresh` is
-	 * true only for the SET NX acquisition, never for a renewal or a contender
-	 * that failed to acquire. A newly acquired lease, and one renewed while a
-	 * resync of the topic runs, first waits for a sync round with the peers
+	 * Try to become (or stay) the sole snapshot writer for a topic. `fresh`
+	 * stays pending through a rejected first acquisition attempt until the first
+	 * successful result, then clears; an ordinary renewal or a contender that
+	 * failed to acquire is not fresh. A newly acquired lease, and one renewed
+	 * while a resync of the topic runs, first waits for a sync round with the peers
 	 * (bounded to a third of the lease TTL). Throws on a Redis error, and with
 	 * code `CRDT_RELAY_PENDING` while local edits to the topic have not reached
 	 * the peers or the replica has not synced with them after the relay lost
@@ -1118,12 +1121,17 @@ export function createCrdtCluster(client, options = {}) {
 		assertSynced(topic, reached);
 		const key = client.key('crdt:persist:' + topic);
 		const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
-		const fresh = r === 'OK';
-		if (!fresh) {
+		if (r !== 'OK') {
 			// Held by someone: renew only if it is ours (compare-and-pexpire).
 			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
-			if (Number(renew) !== 1) return { acquired: false, fresh: false };
-		} else if (!synced && known.has(topic)) {
+			if (Number(renew) !== 1) {
+				freshLeases.delete(topic);
+				return { acquired: false, fresh: false };
+			}
+		} else {
+			freshLeases.add(topic);
+		}
+		if (r === 'OK' && !synced && known.has(topic)) {
 			// Newly acquired: the previous writer may have held edits this
 			// replica never received.
 			reached = await syncRound(topic);
@@ -1134,7 +1142,7 @@ export function createCrdtCluster(client, options = {}) {
 		// Edits marked or relays started while the lease was being taken
 		// count as well.
 		assertSynced(topic, reached);
-		return { acquired: true, fresh };
+		return { acquired: true, fresh: freshLeases.delete(topic) };
 	}
 
 	return {
@@ -1205,9 +1213,10 @@ export function createCrdtCluster(client, options = {}) {
 		},
 
 		/**
-		 * The boolean lease result plus whether this call newly acquired the
-		 * lease with SET NX. A fresh result tells the document layer to merge
-		 * the persisted snapshot before replacing it; a renewal is not fresh.
+		 * The boolean lease result plus whether this instance has a newly acquired
+		 * lease whose first successful result has not been returned. A fresh
+		 * result tells the document layer to merge the persisted snapshot before
+		 * replacing it; a later renewal is not fresh.
 		 * @param {string} topic
 		 * @returns {Promise<{ acquired: boolean, fresh: boolean }>}
 		 */
@@ -1231,6 +1240,7 @@ export function createCrdtCluster(client, options = {}) {
 			joining.clear();
 			owed.clear();
 			known.clear();
+			freshLeases.clear();
 			for (const key of [...assemblies.keys()]) dropAssembly(key);
 			dropped.clear();
 			if (subscriber) {

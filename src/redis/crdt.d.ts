@@ -51,7 +51,7 @@ export interface CrdtClusterHandlers {
 export interface CrdtPersistLease {
 	/** Whether this instance holds the lease and may persist the topic. */
 	acquired: boolean;
-	/** True only for a new SET NX acquisition, never for a renewal or denial. */
+	/** True for a new lease until its first successful result, never for a later renewal or denial. */
 	fresh: boolean;
 }
 
@@ -99,9 +99,10 @@ export interface CrdtCluster {
 	acquirePersist(topic: string): Promise<boolean>;
 	/**
 	 * The same lease and convergence barrier as `acquirePersist`, plus a
-	 * `fresh` signal that is true only for a new SET NX acquisition. On a fresh
-	 * result the document layer must merge the persisted snapshot before its
-	 * first replacement write; renewals and denied acquisitions return false.
+	 * `fresh` signal held until the new lease's first successful result, even
+	 * when a renewal retries a rejected barrier. On a fresh result the document
+	 * layer must merge the persisted snapshot before its first replacement
+	 * write; later renewals and denied acquisitions return false.
 	 */
 	acquirePersistDetailed(topic: string): Promise<CrdtPersistLease>;
 	/** Tear down the relay subscriber. Idempotent. */

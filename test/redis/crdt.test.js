@@ -540,7 +540,11 @@ describe('createCrdtCluster repair after a lost relay', () => {
 		client.redis.publish = publish;
 		for (const send of held.splice(0)) send();
 		await settle();
-		expect(await a.crdt.acquirePersist(TOPIC)).toBe(true);
+		// The first two attempts acquired the lease but rejected their barrier,
+		// so this renewal is still the first successful result: the caller must
+		// merge the stored snapshot now, not skip that step as an ordinary renew.
+		expect(await a.crdt.acquirePersistDetailed(TOPIC)).toEqual({ acquired: true, fresh: true });
+		expect(await a.crdt.acquirePersistDetailed(TOPIC)).toEqual({ acquired: true, fresh: false });
 	});
 });
 
