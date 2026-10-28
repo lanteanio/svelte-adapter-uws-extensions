@@ -32,6 +32,12 @@ async function waitFor(fn, timeoutMs = 2000) {
 	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
+async function countChannelSubscribers(client, channel) {
+	const servers = isClusterBackend() ? client.redis.nodes('all') : [client.redis];
+	const replies = await Promise.all(servers.map((server) => server.call('PUBSUB', 'NUMSUB', channel)));
+	return replies.reduce((total, reply) => total + Number(reply[1]), 0);
+}
+
 describe('redis crdt cluster coordinator (integration)', () => {
 	let client;
 	const coordinators = [];
@@ -214,9 +220,13 @@ describe('redis crdt cluster coordinator (integration)', () => {
 			const b = doc(backend);
 			await a.join(TOPIC);
 			await b.join(TOPIC);
-			await wait(150);
+			const channel = client.key('crdt:events');
+			// A fixed warmup races a cold cluster's slot map and node handshakes.
+			// Wait until both actual relay subscriptions exist before dropping them.
+			await waitFor(async () => (await countChannelSubscribers(client, channel)) === 2, 10000);
 			const servers = isClusterBackend() ? client.redis.nodes('all') : [client.redis];
-			await Promise.all(servers.map((s) => s.call('CLIENT', 'KILL', 'TYPE', 'pubsub')));
+			const killed = await Promise.all(servers.map((s) => s.call('CLIENT', 'KILL', 'TYPE', 'pubsub')));
+			expect(killed.reduce((total, count) => total + Number(count), 0)).toBe(2);
 			a.edit(TOPIC, 'u1', 1); // published while both subscribers reconnect
 			await waitFor(() => 'u1' in b.items(TOPIC), 10000);
 		});
