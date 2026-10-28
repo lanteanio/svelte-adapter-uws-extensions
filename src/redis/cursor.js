@@ -744,16 +744,12 @@ export function createCursor(client, options = {}) {
 			// only the snapshot.
 			const denial = await authorizeTopic(ws, topic, platform);
 			if (denial) throw new SubscribeDeniedError('cursor.attach', topic, denial);
-			// Raw `ws.subscribe` (uWS-native) NOT `platform.subscribe`. As of
-			// adapter 0.5.5 `platform.subscribe` swallows uWS's "closed
-			// websocket" throw and returns the same `null` sentinel it returns
-			// on success, so a try/catch around `platform.subscribe` cannot
-			// distinguish closed-ws from success without racing on
-			// `platform.closedWsAborts`. uWS-native `ws.subscribe` still throws
-			// on closed-ws, so the throw-WsClosedError contract holds. Mirrors
-			// what `presence.join` already does with `ws.subscribe('__presence:...')`.
+			// The tracked helper subscribes natively and charges the adapter's
+			// registry, cap, codec cohort and counter. Its false result preserves
+			// the throw-WsClosedError contract instead of platform.subscribe's
+			// ambiguous null result.
 			try {
-				ws.subscribe('__cursor:' + topic);
+				if (!addWsSubscription(ws, '__cursor:' + topic)) throw new Error('cursor subscription refused');
 			} catch {
 				// No state to roll back (the throw fires before snapshot()
 				// could allocate this connection's identity). Throw so the
@@ -763,11 +759,6 @@ export function createCursor(client, options = {}) {
 				mAttachesAborted?.inc({ topic: mt(topic), reason: 'ws_closed' });
 				throw new WsClosedError('cursor.attach', topic);
 			}
-			// Mirror into the subscription registry so the adapter's binary
-			// publish walk delivers to this member (native membership alone is
-			// invisible to it). detach() routes through platform.unsubscribe,
-			// which is already registry-aware.
-			addWsSubscription(ws, '__cursor:' + topic);
 			grantMembership(ws, topic);
 			// A connection that only watches still needs the other instances'
 			// cursors, which arrive on the Redis relay: open it here, not only on

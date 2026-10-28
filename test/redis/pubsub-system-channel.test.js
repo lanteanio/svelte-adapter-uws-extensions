@@ -1,14 +1,11 @@
 // The pub/sub bus's open hook on the adapter's real test server: a real
 // uWebSockets.js server and WS client from svelte-adapter-uws/testing. The
-// bus subscribes each connection to its systemChannel with the platform's
-// subscribe, which runs the application's subscribe hook, so that hook decides
-// whether a connection receives the bus's degraded / recovered events.
+// bus subscribes each connection to its systemChannel with the adapter's
+// tracked server-side helper, independently of application subscribe hooks.
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
-import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
-import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 
 let uWS;
 try {
@@ -81,46 +78,41 @@ describeUWS('pub/sub bus systemChannel through the real adapter', () => {
 		expect(lines).toEqual([]);
 	});
 
-	it('a subscribe hook that refuses the channel is reported once, and that connection gets no degraded', async () => {
+	it('an application subscribe refusal does not block the bus-owned channel', async () => {
 		const lines = refusals();
-		// Refuse the first two connections' systemChannel subscribe and allow
-		// the third, which shows degraded is published on this server.
 		let asked = 0;
-		const { server, breaker } = await start((ws, topic) => (topic === '__realtime' && asked++ < 2 ? 'FORBIDDEN' : null));
-		const refused = await connect(server.wsUrl);
-		await settle();
-		await connect(server.wsUrl);
-		await settle();
-		const allowed = await connect(server.wsUrl);
+		const { server, breaker } = await start(() => { asked++; return 'FORBIDDEN'; });
+		const client = await connect(server.wsUrl);
 		await settle();
 
-		expect(asked).toBe(3);
-		expect(lines).toHaveLength(1);
-		expect(registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED).attributes).toEqual({ reason: 'FORBIDDEN' });
-
+		expect(asked).toBe(0);
+		expect(lines).toEqual([]);
 		breaker.failure();
 		await settle();
-		expect(allowed.messages.filter((m) => m.topic === '__realtime' && m.event === 'degraded')).toHaveLength(1);
-		expect(refused.messages.filter((m) => m.topic === '__realtime')).toEqual([]);
+		expect(client.messages.filter((m) => m.topic === '__realtime' && m.event === 'degraded')).toHaveLength(1);
 	});
 
-	it('a subscribeBatch hook decides the systemChannel subscribe when the app exports one', async () => {
+	it('an application subscribeBatch refusal does not block the bus-owned channel', async () => {
 		const lines = refusals();
 		const { createTestServer } = await import('svelte-adapter-uws/testing');
 		const breaker = createCircuitBreaker({ failureThreshold: 1 });
 		const bus = createPubSubBus(mockRedisClient('system-channel:'), { breaker });
+		let asked = 0;
 		const server = await createTestServer({
 			handler: {
 				open: (ws, ctx) => bus.hooks.open(ws, ctx),
 				subscribe: () => null,
-				subscribeBatch: (ws, topics) => Object.fromEntries(topics.map((t) => [t, t === '__realtime' ? false : true]))
+				subscribeBatch: () => { asked++; return {}; }
 			}
 		});
 		cleanups.push(() => server.close(), () => bus.deactivate());
-		await connect(server.wsUrl);
+		const client = await connect(server.wsUrl);
 		await settle();
 
-		expect(lines).toHaveLength(1);
-		expect(registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED).attributes).toEqual({ reason: 'FORBIDDEN' });
+		expect(asked).toBe(0);
+		expect(lines).toEqual([]);
+		breaker.failure();
+		await settle();
+		expect(client.messages.filter((m) => m.topic === '__realtime' && m.event === 'degraded')).toHaveLength(1);
 	});
 });

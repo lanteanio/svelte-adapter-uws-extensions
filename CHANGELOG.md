@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Presence, cursor, groups and the pub/sub system channel use the adapter's tracked subscription helpers instead of writing its registry directly. Native membership, the per-connection cap, shared-codec cohorts and subscription accounting now move together, preventing uncharged internal topics and negative close totals.
 - The PostgreSQL schema inventory and operations guide include tasks version 3 and every alarm companion relation. A documentation regression derives store versions and relation names from the migration declarations.
 - Redis group `onJoin` now decides admission before subscriber creation or any roster write, matching the adapter: `false` refuses, a valid returned role replaces the requested role, invalid role strings throw, and a Promise return throws the synchronous-hook error without installing membership.
 - Redis group join and leave events include the member `count`, matching the adapter group's event payload. Join and successful leave counts come from the same atomic Redis roster mutation; a leave whose removal is queued during an outage reports the remaining local count.

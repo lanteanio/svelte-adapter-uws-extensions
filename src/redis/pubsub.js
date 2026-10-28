@@ -32,6 +32,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
+import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 
 // The degraded / recovered frames report this worker's own breaker, so they go
@@ -45,11 +46,6 @@ const CANCELLED = Symbol('cancelled');
 // The retry of a failed activation backs off between these.
 const ACTIVATE_RETRY_MIN_MS = 1000;
 const ACTIVATE_RETRY_MAX_MS = 30000;
-
-// The subscribe denial reasons the adapter declares (its SubscribeDenialReason
-// type) and INTERNAL_ERROR, its answer when a subscribe hook throws. Any
-// other reason is text the application's hook wrote and is not logged.
-const ADAPTER_DENIAL_CODES = new Set(['UNAUTHENTICATED', 'FORBIDDEN', 'INVALID_TOPIC', 'RATE_LIMITED', 'INTERNAL_ERROR']);
 
 /**
  * @typedef {Object} PubSubBusOptions
@@ -284,20 +280,16 @@ export function createPubSubBus(client, options = {}) {
 		scheduleRelay(plain, count);
 	}
 
-	// A platform.subscribe(ws, systemChannel) result from the open hook: null
-	// when subscribed, a reason string when refused. Only a bus with a breaker
-	// publishes degraded / recovered, so only there does a refusal lose any.
+	// Only a bus with a breaker publishes degraded / recovered, so only there
+	// does a refused systemChannel subscription lose health events.
 	const announcesHealth = !!(b && typeof b.subscribe === 'function');
 	let systemChannelRefusalReported = false;
-	function reportSystemChannelRefusal(denial) {
-		if (typeof denial !== 'string' || !announcesHealth || systemChannelRefusalReported) return;
+	function reportSystemChannelFailure() {
+		if (!announcesHealth || systemChannelRefusalReported) return;
 		systemChannelRefusalReported = true;
 		emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED, {
-			attributes: { reason: ADAPTER_DENIAL_CODES.has(denial) ? denial : 'APP_DEFINED' }
+			attributes: { reason: 'INTERNAL_ERROR' }
 		});
-	}
-	function reportSystemChannelFailure() {
-		reportSystemChannelRefusal('INTERNAL_ERROR');
 	}
 
 	// Local delivery of one envelope relayed by another instance. The untraced
@@ -1097,24 +1089,12 @@ export function createPubSubBus(client, options = {}) {
 			async open(ws, ctx) {
 				const platform = ctx && ctx.platform;
 				if (!platform) return;
-				// systemChannel uses the platform-trust path (`platform.subscribe`),
-				// not the wire path, so it bypasses the adapter's `__`-prefix
-				// gate. Subscribing here is what restores `degraded` / `recovered`
-				// delivery after the wire path was closed in adapter 0.5.0-next.21.
-				// The platform still runs the application's subscribe /
-				// subscribeBatch hook, which can refuse the topic. A refusal is
-				// not awaited; on a bus with a breaker it is reported. A platform
-				// that throws or rejects (a socket closing mid-subscribe on older
-				// adapters) is reported the same way and never escapes as an
-				// unhandled rejection or stops the bus activating.
-				if (systemChannel) {
-					try {
-						const denial = platform.subscribe(ws, systemChannel);
-						if (denial && typeof denial.then === 'function') denial.then(reportSystemChannelRefusal, reportSystemChannelFailure);
-						else reportSystemChannelRefusal(denial);
-					} catch {
-						reportSystemChannelFailure();
-					}
+				// The bus owns systemChannel, so server-side tracked subscription
+				// bypasses application authorization while charging the adapter's
+				// registry, cap, codec cohort and subscription counter. A refusal
+				// is reported on a bus with a breaker and never stops activation.
+				if (systemChannel && !addWsSubscription(ws, systemChannel)) {
+					reportSystemChannelFailure();
 				}
 				// Local delivery does not need the bus, so a failed activation
 				// leaves the connection open: adapters do not await this hook, and

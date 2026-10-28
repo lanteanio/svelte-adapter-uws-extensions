@@ -464,10 +464,8 @@ describe('redis cursor', () => {
 	});
 
 	describe('attach / detach', () => {
-		it('attach subscribes the connection to __cursor:{topic} via uWS-native ws.subscribe', async () => {
-			// As of adapter 0.5.5 we use raw `ws.subscribe` (not
-			// `platform.subscribe`) so a closed-ws throw still propagates;
-			// the membership lands in `ws._topics`, not in `platform.subscribed`.
+		it('attach subscribes the connection to __cursor:{topic} through the tracked helper', async () => {
+			// Native membership lands in `ws._topics`, not in `platform.subscribed`.
 			const ws = mockWs({ id: '1' });
 			await cursors.attach(ws, 'canvas', platform);
 

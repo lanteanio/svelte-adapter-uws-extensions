@@ -403,7 +403,6 @@ export function createGroup(client, name, options = {}) {
 			platform?.publish(internalTopic, EVENTS.CLOSE, data, FRAME_OPTIONS);
 		} catch { /* platform torn down mid-close */ }
 		for (const [ws] of localMembers) {
-			try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 			removeWsSubscription(ws, internalTopic);
 		}
 		localMembers.clear();
@@ -633,7 +632,6 @@ export function createGroup(client, name, options = {}) {
 	 */
 	async function runLeave(ws, entry, platform) {
 		localMembers.delete(ws);
-		try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 		removeWsSubscription(ws, internalTopic);
 
 		const count = await removeMember(entry.memberId);
@@ -768,8 +766,7 @@ export function createGroup(client, name, options = {}) {
 			localMembers.set(ws, { role, memberId });
 
 			try {
-				ws.subscribe(internalTopic);
-				addWsSubscription(ws, internalTopic);
+				if (!addWsSubscription(ws, internalTopic)) throw new Error('group subscription refused');
 			} catch {
 				localMembers.delete(ws);
 				try {
@@ -785,8 +782,7 @@ export function createGroup(client, name, options = {}) {
 				freshAll = await redis.hgetall(membersKey);
 			} catch (err) {
 				localMembers.delete(ws);
-				try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
-				removeWsSubscription(ws, internalTopic);
+						removeWsSubscription(ws, internalTopic);
 				try {
 					await redis.hdel(membersKey, memberId);
 				} catch (rollbackErr) {
@@ -899,8 +895,7 @@ export function createGroup(client, name, options = {}) {
 					platform.publish(internalTopic, EVENTS.CLOSE, null, FRAME_OPTIONS);
 					await publishEvent(EVENTS.CLOSE, null);
 					for (const [ws] of localMembers) {
-						try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
-						removeWsSubscription(ws, internalTopic);
+										removeWsSubscription(ws, internalTopic);
 					}
 					localMembers.clear();
 					await redis.del(membersKey);
@@ -917,8 +912,7 @@ export function createGroup(client, name, options = {}) {
 				await publishEvent(EVENTS.CLOSE, null);
 
 				for (const [ws] of localMembers) {
-					try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
-					removeWsSubscription(ws, internalTopic);
+								removeWsSubscription(ws, internalTopic);
 				}
 				localMembers.clear();
 

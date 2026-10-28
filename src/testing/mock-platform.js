@@ -8,7 +8,7 @@
  *
  * Drift on any of those three sites fails the parity test at CI time.
  */
-import { WS_SUBSCRIPTIONS } from '../shared/ws-subscriptions.js';
+import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscriptions';
 
 export const PLATFORM_KEYS = Object.freeze([
 	'publish', 'publishBatched', 'batch',
@@ -208,18 +208,11 @@ export function mockPlatform() {
 		// correct here and fails open - or closed - in production.
 		subscribe(ws, topic) {
 			p.subscribed.push({ ws, topic });
-			try {
-				const subs = ws?.getUserData?.()[WS_SUBSCRIPTIONS];
-				if (subs) subs.add(topic);
-			} catch { /* closed socket */ }
-			return null;
+			return trackedSubscribe(ws, topic) ? null : 'INTERNAL_ERROR';
 		},
 		unsubscribe(ws, topic) {
 			p.unsubscribed.push({ ws, topic });
-			try {
-				const subs = ws?.getUserData?.()[WS_SUBSCRIPTIONS];
-				if (subs) subs.delete(topic);
-			} catch { /* closed socket */ }
+			trackedUnsubscribe(ws, topic);
 			return false;
 		},
 		/**

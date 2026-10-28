@@ -6,11 +6,8 @@ import { WS_SUBSCRIPTIONS } from '../shared/ws-subscriptions.js';
  * After close(), subscribe/unsubscribe/getBufferedAmount throw, matching uWS.
  *
  * The subscription-registry slot is stamped at construction, exactly as the
- * adapter's handler stamps it on connection-open. Without it every
- * `addWsSubscription` in the package is a silent no-op against this double,
- * so plugin code that mirrors native membership into the registry looks
- * correct under test while excluding the socket from the binary publish
- * walk in production.
+ * adapter's handler stamps it on connection-open. Tracked subscription helpers
+ * charge this registry while native membership stays in `_topics`.
  *
  * @param {Record<string, any>} [userData]
  */

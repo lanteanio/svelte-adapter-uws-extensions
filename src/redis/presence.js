@@ -507,7 +507,6 @@ export function createPresence(client, options = {}) {
 			if (connTopics.size === 0) wsTopics.delete(ws);
 			indexRemove(topic, key, ws);
 			if (!syncObservers.get(ws)?.has(topic)) {
-				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				removeWsSubscription(ws, '__presence:' + topic);
 			}
 			const counts = localCounts.get(topic);
@@ -611,7 +610,6 @@ export function createPresence(client, options = {}) {
 			// socket close. The Redis topic-level subscription is separately
 			// refcounted below via syncCounts.
 			if (!syncObservers.get(ws)?.has(topic)) {
-				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				removeWsSubscription(ws, '__presence:' + topic);
 			}
 
@@ -693,7 +691,6 @@ export function createPresence(client, options = {}) {
 				syncTopics.delete(topic);
 				if (syncTopics.size === 0) syncObservers.delete(ws);
 
-				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				removeWsSubscription(ws, '__presence:' + topic);
 
 				const count = (syncCounts.get(topic) || 1) - 1;
@@ -726,13 +723,11 @@ export function createPresence(client, options = {}) {
 
 		if (connTopics) {
 			for (const topic of connTopics.keys()) {
-				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				removeWsSubscription(ws, '__presence:' + topic);
 			}
 		}
 		if (syncTopics) {
 			for (const topic of syncTopics) {
-				try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 				removeWsSubscription(ws, '__presence:' + topic);
 			}
 		}
@@ -1002,8 +997,7 @@ export function createPresence(client, options = {}) {
 		settlePending();
 
 		try {
-			ws.subscribe(presenceTopic);
-			addWsSubscription(ws, presenceTopic);
+			if (!addWsSubscription(ws, presenceTopic)) throw new Error('presence subscription refused');
 			emitTo(ws, presenceTopic, 'state', state, platform);
 		} catch {
 			const topics = syncObservers.get(ws);
@@ -1212,15 +1206,11 @@ export function createPresence(client, options = {}) {
 
 			// Subscribe ws to presence channel (may have closed during async gap)
 			try {
-				ws.subscribe('__presence:' + topic);
+				if (!addWsSubscription(ws, '__presence:' + topic)) throw new Error('presence subscription refused');
 			} catch {
 				await undoJoin(ws, topic, key, reservation, joinWrite, platform);
 				throwWsClosed(topic, cancelAdmission);
 			}
-			// Mirror into the subscription registry so the adapter's binary
-			// publish walk delivers to this member (native membership alone is
-			// invisible to it).
-			addWsSubscription(ws, '__presence:' + topic);
 
 			// If ws closed after subscribe, leave() already handled
 			// local cleanup and leave events. Just clean the Redis state.
@@ -1607,13 +1597,11 @@ export function createPresence(client, options = {}) {
 
 			for (const [ws, connTopics] of wsTopics) {
 				for (const topic of connTopics.keys()) {
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 					removeWsSubscription(ws, '__presence:' + topic);
 				}
 			}
 			for (const [ws, topics] of syncObservers) {
 				for (const topic of topics) {
-					try { ws.unsubscribe('__presence:' + topic); } catch { /* closed */ }
 					removeWsSubscription(ws, '__presence:' + topic);
 				}
 			}
@@ -1721,7 +1709,6 @@ export function createPresence(client, options = {}) {
 						// participant guard), so an observer leaving does not evict a
 						// co-resident participant role.
 						if (!wsTopics.get(ws)?.has(realTopic)) {
-							try { ws.unsubscribe(topic); } catch { /* closed */ }
 							removeWsSubscription(ws, topic);
 						}
 

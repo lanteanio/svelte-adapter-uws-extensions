@@ -1,16 +1,10 @@
 /**
- * Subscription-registry bookkeeping for plugins that manage server-side
- * topic membership with raw uWS socket calls.
+ * Accounted subscription membership for plugins that manage server-side topics.
  *
- * The adapter's `platform.publishWire` per-subscriber walk delivers by the
- * connection's subscription registry (native uWS membership is not
- * enumerable from JS), so a plugin that calls `ws.subscribe()` without
- * mirroring the topic into the registry silently excludes that socket from
- * every stateful-codec binary publish. These helpers do ONLY the registry
- * half: call them right after the native subscribe/unsubscribe attempt, and
- * keep whatever closed-socket throw/catch contract the call site already
- * has - the registry ops never throw (a dead socket's registry dies with
- * the connection record anyway).
+ * The adapter's tracked helpers keep native membership, its publish registry,
+ * per-connection cap, shared-codec cohort and subscription counter together.
+ * Callers use the same closed-socket and refusal handling as other adapter
+ * subscription paths.
  *
  * The slot symbol is `Symbol.for` so this module resolves the SAME registry
  * the adapter's handler stamps, regardless of bundling or module-instance
@@ -19,19 +13,19 @@
  * @module svelte-adapter-uws-extensions/shared/ws-subscriptions
  */
 
+import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscriptions';
+
 export const WS_SUBSCRIPTIONS = Symbol.for('adapter-uws.ws.subscriptions');
 
 /**
- * Mirror a native `ws.subscribe(topic)` into the connection's subscription
- * registry. Never throws.
+ * Subscribe natively and charge the adapter's registry, cap, codec cohort and
+ * subscription counter together.
  * @param {any} ws
  * @param {string} topic
+ * @returns {boolean} false when the socket is closed or the cap is reached
  */
 export function addWsSubscription(ws, topic) {
-	try {
-		const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
-		if (subs) subs.add(topic);
-	} catch { /* socket already closed; the registry dies with the connection */ }
+	return trackedSubscribe(ws, topic);
 }
 
 /**
@@ -107,17 +101,14 @@ export function markSideEffectHooks(hooks, names) {
 }
 
 /**
- * Mirror a native `ws.unsubscribe(topic)` into the registry, so the binary
- * publish walk stops delivering the moment native membership ends. Never
- * throws.
+ * Unsubscribe natively and release the adapter's registry, codec cohort and
+ * subscription accounting together.
  * @param {any} ws
  * @param {string} topic
+ * @returns {boolean} false when the socket was already closed
  */
 export function removeWsSubscription(ws, topic) {
-	try {
-		const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
-		if (subs) subs.delete(topic);
-	} catch { /* socket already closed; nothing left to clean */ }
+	return trackedUnsubscribe(ws, topic);
 }
 
 /**

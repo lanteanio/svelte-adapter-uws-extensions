@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
+import { mockWs } from '../helpers/mock-ws.js';
+import { WS_SUBSCRIPTIONS } from '../../src/shared/ws-subscriptions.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
@@ -1237,21 +1239,23 @@ describe('redis pubsub bus', () => {
 		});
 
 		it('subscribes the connection to the default systemChannel', async () => {
-			const ws = { id: 'w1' };
+			const ws = mockWs();
 			await bus.hooks.open(ws, { platform });
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+			expect(ws.getUserData()[WS_SUBSCRIPTIONS].has('__realtime')).toBe(true);
+			expect(ws.isSubscribed('__realtime')).toBe(true);
 
 			await bus.deactivate();
 		});
 
 		it('subscribes the connection to a custom systemChannel', async () => {
 			const customBus = createPubSubBus(client, { systemChannel: '__status' });
-			const ws = { id: 'w1' };
+			const ws = mockWs();
 
 			await customBus.hooks.open(ws, { platform });
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__status' }]);
+			expect(ws.getUserData()[WS_SUBSCRIPTIONS].has('__status')).toBe(true);
+			expect(ws.isSubscribed('__status')).toBe(true);
 
 			await customBus.deactivate();
 		});
@@ -1293,32 +1297,30 @@ describe('redis pubsub bus', () => {
 			return createPubSubBus(client, { breaker });
 		}
 
-		it('reports a refused systemChannel subscribe once, with the adapter reason', async () => {
-			// The adapter's platform.subscribe resolves its denial asynchronously,
-			// after the application's subscribe hook has run.
-			platform.subscribe = async () => 'FORBIDDEN';
+		it('reports a refused systemChannel subscribe once', async () => {
 			const healthy = healthBus();
+			const first = mockWs(), second = mockWs();
+			first.close();
+			second.close();
 			const lines = await warnings(async () => {
-				await healthy.hooks.open({ id: 'w1' }, { platform });
-				await healthy.hooks.open({ id: 'w2' }, { platform });
+				await healthy.hooks.open(first, { platform });
+				await healthy.hooks.open(second, { platform });
 			});
 
 			expect(lines).toHaveLength(1);
 			const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED);
-			expect(record.attributes).toEqual({ reason: 'FORBIDDEN' });
+			expect(record.attributes).toEqual({ reason: 'INTERNAL_ERROR' });
 
 			await healthy.deactivate();
 		});
 
-		it('reports a reason the application wrote without logging its text', async () => {
-			platform.subscribe = () => 'user 42 is not in room 7';
+		it('does not consult the application subscribe hook for the bus-owned channel', async () => {
+			platform.subscribe = vi.fn(() => 'FORBIDDEN');
 			const healthy = healthBus();
-			const lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+			const lines = await warnings(() => healthy.hooks.open(mockWs(), { platform }));
 
-			expect(lines).toHaveLength(1);
-			const record = registeredRecord(lines[0], EXTENSIONS_ERROR_IDS.PUBSUB_SYSTEM_CHANNEL_REFUSED);
-			expect(record.attributes).toEqual({ reason: 'APP_DEFINED' });
-			expect(lines[0]).not.toContain('user 42');
+			expect(platform.subscribe).not.toHaveBeenCalled();
+			expect(lines).toEqual([]);
 
 			await healthy.deactivate();
 		});
@@ -1332,13 +1334,14 @@ describe('redis pubsub bus', () => {
 			return seen;
 		}
 
-		it('contains a rejected systemChannel subscribe and still activates', async () => {
-			platform.subscribe = async () => { throw new Error('Invalid access of closed uWS.WebSocket'); };
+		it('contains a refused systemChannel subscribe and still activates', async () => {
 			const healthy = healthBus();
 			const activate = vi.spyOn(healthy, 'activate');
+			const ws = mockWs();
+			ws.close();
 			let lines;
 			const escaped = await unhandledDuring(async () => {
-				lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+				lines = await warnings(() => healthy.hooks.open(ws, { platform }));
 			});
 
 			expect(escaped).toEqual([]);
@@ -1349,10 +1352,10 @@ describe('redis pubsub bus', () => {
 			await healthy.deactivate();
 		});
 
-		it('contains a systemChannel subscribe that throws synchronously', async () => {
+		it('does not invoke a throwing application subscribe hook', async () => {
 			platform.subscribe = () => { throw new Error('platform failure'); };
 			const activate = vi.spyOn(bus, 'activate');
-			const escaped = await unhandledDuring(() => bus.hooks.open({ id: 'w1' }, { platform }));
+			const escaped = await unhandledDuring(() => bus.hooks.open(mockWs(), { platform }));
 
 			expect(escaped).toEqual([]);
 			expect(activate).toHaveBeenCalledWith(platform);
@@ -1361,9 +1364,8 @@ describe('redis pubsub bus', () => {
 		});
 
 		it('reports nothing when the systemChannel subscribe succeeds', async () => {
-			platform.subscribe = async () => null;
 			const healthy = healthBus();
-			const lines = await warnings(() => healthy.hooks.open({ id: 'w1' }, { platform }));
+			const lines = await warnings(() => healthy.hooks.open(mockWs(), { platform }));
 
 			expect(lines).toEqual([]);
 
@@ -1371,23 +1373,25 @@ describe('redis pubsub bus', () => {
 		});
 
 		it('reports nothing on a bus without a breaker, which publishes no degraded or recovered', async () => {
-			platform.subscribe = async () => 'FORBIDDEN';
-			const lines = await warnings(() => bus.hooks.open({ id: 'w1' }, { platform }));
+			const ws = mockWs();
+			ws.close();
+			const lines = await warnings(() => bus.hooks.open(ws, { platform }));
 
 			expect(lines).toEqual([]);
 
 			await bus.deactivate();
 		});
 
-		it('does not wait for the systemChannel subscribe to settle', async () => {
-			platform.subscribe = () => new Promise(() => {});
+		it('does not wait for an application subscribe hook', async () => {
+			platform.subscribe = vi.fn(() => new Promise(() => {}));
 			const healthy = healthBus();
 			const opened = await Promise.race([
-				healthy.hooks.open({ id: 'w1' }, { platform }).then(() => 'opened'),
+				healthy.hooks.open(mockWs(), { platform }).then(() => 'opened'),
 				new Promise((resolve) => setTimeout(() => resolve('waiting'), 500))
 			]);
 
 			expect(opened).toBe('opened');
+			expect(platform.subscribe).not.toHaveBeenCalled();
 
 			await healthy.deactivate();
 		});
@@ -1415,12 +1419,11 @@ describe('redis pubsub bus', () => {
 				return origDuplicate(overrides);
 			};
 
-			await bus.hooks.open({ id: 'w1' }, { platform });
-			await bus.hooks.open({ id: 'w2' }, { platform });
-			await bus.hooks.open({ id: 'w3' }, { platform });
+			const sockets = [mockWs(), mockWs(), mockWs()];
+			for (const ws of sockets) await bus.hooks.open(ws, { platform });
 
 			expect(duplicates).toBe(1);
-			expect(platform.subscribed).toHaveLength(3);
+			for (const ws of sockets) expect(ws.getUserData()[WS_SUBSCRIPTIONS].has('__realtime')).toBe(true);
 
 			await bus.deactivate();
 		});
@@ -1440,11 +1443,11 @@ describe('redis pubsub bus', () => {
 			};
 
 			const { open } = bus.hooks;
-			const ws = { id: 'detached' };
+			const ws = mockWs();
 
 			await open(ws, { platform });
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+			expect(ws.getUserData()[WS_SUBSCRIPTIONS].has('__realtime')).toBe(true);
 			expect(duplicates).toBe(1);
 
 			await bus.deactivate();
@@ -1458,11 +1461,11 @@ describe('redis pubsub bus', () => {
 			// integration test.
 			const breaker = createCircuitBreaker({ failureThreshold: 1 });
 			const wiredBus = createPubSubBus(client, { breaker });
-			const ws = { id: 'w1' };
+			const ws = mockWs();
 
 			await wiredBus.hooks.open(ws, { platform });
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+			expect(ws.getUserData()[WS_SUBSCRIPTIONS].has('__realtime')).toBe(true);
 
 			platform.reset();
 			breaker.failure();
