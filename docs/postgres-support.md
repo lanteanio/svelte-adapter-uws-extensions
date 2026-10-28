@@ -212,7 +212,7 @@ time. For a recovery point between dumps, run continuous WAL archiving with a
 base backup, as described in
 [continuous archiving and PITR](https://www.postgresql.org/docs/16/continuous-archiving.html),
 or the managed provider's equivalent. Every store table, the replay sequence
-table, the alarm generation table and `svti_schema_migrations` live in one
+table, the alarm generation and retained-execution tables and `svti_schema_migrations` live in one
 database, so a single recovery target restores them consistently; keep them in
 one database and one backup set. A point-in-time restore is still a restore:
 stop writers, run the verifier, and reconcile effects outside the database as the
@@ -362,9 +362,10 @@ grants. Trigger behavior and row-level policies still need application tests.
 
 `postgresMigrations({ store, table })` returns the versioned SQL and SHA-256
 checksums. Version 1 establishes the existing baseline and additive columns;
-version 2 adds constraints and replay uniqueness. Alarm-store version 3 adds
+version 2 adds constraints and replay uniqueness. Tasks version 3 adds the
+pending-created index. Alarm-store version 3 adds
 [ordered generation authority](./alarm-generations.md) and version 4 adds retained
-executions; other stores remain at version 2. Idempotency states are
+executions; replay, idempotency, jobs and dead-letter remain at version 2. Idempotency states are
 `pending`/`committed`; task states are `pending`/`running`/`committed`/`failed`.
 Jobs and tasks require nonnegative attempts. Job claim timestamps must both be
 null or both present with expiry at or after claim time. Replay's unique

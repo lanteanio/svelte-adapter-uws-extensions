@@ -73,7 +73,8 @@
 				"user_id TEXT",
 				"idx_svti_tasks_user(user_id)",
 				"CHECK status IN ('pending','running','committed','failed')",
-				"CHECK attempts >= 0"
+				"CHECK attempts >= 0",
+				"version 3: idx_svti_tasks_pending_created(created_at) WHERE status = 'pending'"
 			],
 			"rollbackLimit": "Retain nullable columns; old terminal rows and column-only readers are rehearsed. Drain handlers and preserve fence/receipt data."
 		},
@@ -128,7 +129,7 @@
 			3,
 			4
 		],
-		"version3Stores": ["postgres/alarm-store"],
+		"version3Stores": ["postgres/tasks", "postgres/alarm-store"],
 		"version4Stores": ["postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true
