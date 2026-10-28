@@ -1123,6 +1123,23 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('seen[userKey]') && script.includes('best[userKey]')) {
 					return evalListScript(args);
 				}
+				if (script.includes('GROUP_LEAVE')) {
+					const h = hashes.get(args[0]);
+					h?.delete(args[1]);
+					const now = Number(args[2]);
+					const memberTtlMs = Number(args[3]);
+					let liveCount = 0;
+					for (const [field, value] of h ?? []) {
+						try {
+							const ts = JSON.parse(value)?.ts;
+							if (ts && (now - ts) <= memberTtlMs) liveCount++;
+							else h.delete(field);
+						} catch {
+							h.delete(field);
+						}
+					}
+					return liveCount;
+				}
 				// Group join script (atomic capacity check + insert)
 				if (script.includes('cjson.decode') && script.includes('liveCount')) {
 					return evalGroupJoin(numKeys, args);
@@ -1935,7 +1952,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			}
 			h.set(memberId, memberData);
 			live.push(memberData);
-			return [1, ...live];
+			return [1, liveCount + 1, ...live];
 		}
 
 		// Streams idempotent replay publish Lua script simulation

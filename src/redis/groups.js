@@ -71,7 +71,7 @@ const EVENTS = Object.freeze({
  * ARGV[4] = now (ms)
  * ARGV[5] = memberTtl (ms)
  *
- * Returns {-1} if closed, {0} if full, {1, ...live} on success.
+ * Returns {-1} if closed, {0} if full, {1, count, ...live} on success.
  */
 const JOIN_SCRIPT = `
 local key = KEYS[1]
@@ -112,7 +112,32 @@ if liveCount >= maxMembers then
 end
 redis.call('hset', key, memberId, memberData)
 live[#live + 1] = memberData
-return {1, unpack(live)}
+return {1, liveCount + 1, unpack(live)}
+`;
+
+const LEAVE_SCRIPT = `
+-- GROUP_LEAVE
+local key = KEYS[1]
+local memberId = ARGV[1]
+local now = tonumber(ARGV[2])
+local memberTtl = tonumber(ARGV[3])
+redis.call('hdel', key, memberId)
+local all = redis.call('hgetall', key)
+local liveCount = 0
+local stale = {}
+for i = 1, #all, 2 do
+  local ok, val = pcall(cjson.decode, all[i+1])
+  local ts = ok and val and tonumber(val.ts) or nil
+  if ts and (now - ts) <= memberTtl then
+    liveCount = liveCount + 1
+  else
+    stale[#stale + 1] = all[i]
+  end
+end
+if #stale > 0 then
+  redis.call('hdel', key, unpack(stale))
+end
+return liveCount
 `;
 
 /**
@@ -577,22 +602,24 @@ export function createGroup(client, name, options = {}) {
 		if (b) {
 			try { b.guard(); } catch {
 				queueRemoval(memberId);
-				return;
+				return null;
 			}
 		}
 		if (beatsInFlight.size > 0) {
 			const remaining = beatIntervalMs - (now() - Math.min(...beatsInFlight.values()));
 			if (remaining <= 0 || !(await settlesWithin(Promise.allSettled([...beatsInFlight.keys()]), remaining))) {
 				queueRemoval(memberId);
-				return;
+				return null;
 			}
 		}
 		try {
-			await redis.hdel(membersKey, memberId);
+			const count = await evalCached(redis, LEAVE_SCRIPT, 1, membersKey, memberId, now(), memberTtlMs);
 			b?.success();
+			return count;
 		} catch (err) {
 			b?.failure(err);
 			queueRemoval(memberId);
+			return null;
 		}
 	}
 
@@ -609,10 +636,10 @@ export function createGroup(client, name, options = {}) {
 		try { ws.unsubscribe(internalTopic); } catch { /* closed */ }
 		removeWsSubscription(ws, internalTopic);
 
-		await removeMember(entry.memberId);
+		const count = await removeMember(entry.memberId);
 
 		mGroupLeaves?.inc({ group: metricGroup });
-		const leavePayload = { role: entry.role };
+		const leavePayload = { role: entry.role, count: count ?? localMembers.size };
 		platform.publish(internalTopic, EVENTS.LEAVE, leavePayload, FRAME_OPTIONS);
 		await publishEvent(EVENTS.LEAVE, leavePayload).catch(() => {});
 
@@ -756,8 +783,9 @@ export function createGroup(client, name, options = {}) {
 			// Publish join event only after the snapshot succeeded.
 			// This prevents orphaned join events when the snapshot step
 			// fails, eliminating the need for compensating leave events.
-			platform.publish(internalTopic, EVENTS.JOIN, { role }, FRAME_OPTIONS);
-			await publishEvent(EVENTS.JOIN, { role }).catch(() => {});
+			const joinPayload = { role, count: result[1] };
+			platform.publish(internalTopic, EVENTS.JOIN, joinPayload, FRAME_OPTIONS);
+			await publishEvent(EVENTS.JOIN, joinPayload).catch(() => {});
 
 			const freshNow = now();
 			const membersList = [];

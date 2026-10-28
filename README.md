@@ -1501,8 +1501,8 @@ export async function close(ws, { platform }) {
 
 | Method | Description |
 |---|---|
-| `join(ws, platform, role?)` | Add a member (returns false if full/closed) |
-| `leave(ws, platform)` | Remove a member. The local membership ends at once even when Redis cannot be reached; a roster entry that could not be removed is retried by the heartbeat and otherwise expires after `memberTtl`. A second `leave()` for the same ws waits for a leave in progress; a `join()` waits for it for at most one heartbeat interval, so while Redis is slow enough that a leave outlasts that interval, `onLeave` for the old membership can fire after `onJoin` for the new one |
+| `join(ws, platform, role?)` | Add a member (returns false if full/closed). The join event is `{ role, count }`, where `count` is the cluster-wide live roster size returned by the atomic join script |
+| `leave(ws, platform)` | Remove a member. The leave event is `{ role, count }`; after a successful atomic removal, `count` is the cluster-wide roster size. The local membership ends at once even when Redis cannot be reached; in that case the event reports the remaining local count, and the roster entry is retried by the heartbeat and otherwise expires after `memberTtl`. A second `leave()` for the same ws waits for a leave in progress; a `join()` waits for it for at most one heartbeat interval, so while Redis is slow enough that a leave outlasts that interval, `onLeave` for the old membership can fire after `onJoin` for the new one |
 | `publish(platform, event, data, role?)` | Broadcast to all or filter by role |
 | `send(platform, ws, event, data)` | Send to a single member |
 | `localMembers()` | Members on this instance |

@@ -3,7 +3,33 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { createGroup } from '../../src/redis/groups.js';
+import { createGroup as createLocalGroup } from 'svelte-adapter-uws/plugins/groups';
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
+
+function interceptNextGroupLeave(redis, handler) {
+	const originalDefine = redis.defineCommand.bind(redis);
+	let commandName;
+	let originalCommand;
+	const defineSpy = vi.spyOn(redis, 'defineCommand').mockImplementation((name, options) => {
+		originalDefine(name, options);
+		if (!options.lua.includes('GROUP_LEAVE')) return;
+		commandName = name;
+		originalCommand = redis[name];
+		redis[name] = async (...args) => {
+			redis[name] = originalCommand;
+			defineSpy.mockRestore();
+			return handler(originalCommand.bind(redis), args);
+		};
+	});
+	return () => {
+		defineSpy.mockRestore();
+		if (commandName) redis[commandName] = originalCommand;
+	};
+}
+
+function failNextGroupLeave(redis) {
+	return interceptNextGroupLeave(redis, async () => { throw new Error('leave script failed'); });
+}
 
 describe('redis groups', () => {
 	let client;
@@ -100,7 +126,7 @@ describe('redis groups', () => {
 
 			const joins = platform.published.filter((p) => p.event === 'join');
 			expect(joins).toHaveLength(1);
-			expect(joins[0].data).toEqual({ role: 'member' });
+			expect(joins[0].data).toEqual({ role: 'member', count: 1 });
 			// The group's own channel reaches the other workers, so the adapter's
 			// in-process relay would deliver it to them twice.
 			expect(joins[0].options).toEqual({ relay: false, seq: false });
@@ -215,7 +241,21 @@ describe('redis groups', () => {
 
 			const leaves = platform.published.filter((p) => p.event === 'leave');
 			expect(leaves).toHaveLength(1);
-			expect(leaves[0].data).toEqual({ role: 'member' });
+			expect(leaves[0].data).toEqual({ role: 'member', count: 0 });
+		});
+
+		it('excludes stale and corrupt roster fields from the leave count', async () => {
+			const ws = mockWs();
+			await group.join(ws, platform);
+			const membersKey = client.key('group:{lobby}:members');
+			await client.redis.hset(membersKey, 'expired', JSON.stringify({ role: 'member', instanceId: 'old', ts: 0 }));
+			await client.redis.hset(membersKey, 'corrupt', 'not-json');
+			platform.reset();
+
+			await group.leave(ws, platform);
+
+			expect(platform.published.find((p) => p.event === 'leave').data).toEqual({ role: 'member', count: 0 });
+			expect(await client.redis.hgetall(membersKey)).toEqual({});
 		});
 
 		it('calls onLeave hook', async () => {
@@ -234,6 +274,37 @@ describe('redis groups', () => {
 			await group.leave(mockWs(), platform);
 			// Should not throw
 		});
+	});
+
+	it('matches the adapter join and leave event payload shape', async () => {
+		const local = createLocalGroup('parity');
+		const localPlatform = mockPlatform();
+		const localWs = mockWs();
+		local.join(localWs, localPlatform, 'admin');
+		local.join(mockWs(), localPlatform, 'member');
+
+		const distributed = createGroup(client, 'parity');
+		const peer = createGroup(client, 'parity');
+		const peerPlatform = mockPlatform();
+		const distributedWs = mockWs();
+		try {
+			await distributed.join(distributedWs, platform, 'admin');
+			await peer.join(mockWs(), peerPlatform, 'member');
+			const localJoin = localPlatform.published.filter((p) => p.event === 'join').at(-1);
+			const distributedJoin = peerPlatform.published.filter((p) => p.event === 'join').at(-1);
+			expect(distributedJoin.data).toEqual(localJoin.data);
+			expect(distributedJoin.data.count).toBe(2);
+
+			local.leave(localWs, localPlatform);
+			await distributed.leave(distributedWs, platform);
+			const localLeave = localPlatform.published.filter((p) => p.event === 'leave').at(-1);
+			const distributedLeave = platform.published.filter((p) => p.event === 'leave').at(-1);
+			expect(distributedLeave.data).toEqual(localLeave.data);
+			expect(distributedLeave.data.count).toBe(1);
+		} finally {
+			distributed.destroy();
+			peer.destroy();
+		}
 	});
 
 	describe('publish', () => {
@@ -748,12 +819,11 @@ describe('redis groups', () => {
 			await g.join(ws, platform);
 			platform.reset();
 
-			const origHdel = client.redis.hdel;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
+			const restoreLeave = failNextGroupLeave(client.redis);
 			try {
 				await g.leave(ws, platform);
 			} finally {
-				client.redis.hdel = origHdel;
+				restoreLeave();
 			}
 
 			expect(g.has(ws)).toBe(false);
@@ -768,18 +838,13 @@ describe('redis groups', () => {
 			const ws = mockWs();
 			await g.join(ws, platform);
 
-			const origHdel = client.redis.hdel;
-			let calls = 0;
-			client.redis.hdel = async (...args) => {
-				if (calls++ === 0) throw new Error('hdel failed');
-				return origHdel.apply(client.redis, args);
-			};
+			const restoreLeave = failNextGroupLeave(client.redis);
 			try {
 				await g.leave(ws, platform);
 				expect(Object.keys(await client.redis.hgetall(membersKey))).toHaveLength(1);
 				await new Promise((r) => setTimeout(r, 800));
 			} finally {
-				client.redis.hdel = origHdel;
+				restoreLeave();
 			}
 			expect(g.has(ws)).toBe(false);
 			expect(await client.redis.hgetall(membersKey)).toEqual({});
@@ -815,14 +880,14 @@ describe('redis groups', () => {
 			const ws = mockWs();
 			await group.join(ws, platform);
 
-			const origHdel = client.redis.hdel;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
-
-			await group.leave(ws, platform);
-			expect(group.has(ws)).toBe(false);
-			expect(await group.count()).toBe(1);
-
-			client.redis.hdel = origHdel;
+			const restoreLeave = failNextGroupLeave(client.redis);
+			try {
+				await group.leave(ws, platform);
+				expect(group.has(ws)).toBe(false);
+				expect(await group.count()).toBe(1);
+			} finally {
+				restoreLeave();
+			}
 		});
 	});
 
@@ -1098,13 +1163,13 @@ describe('redis groups', () => {
 			const ws = mockWs();
 			await g.join(ws, platform);
 
-			const origHdel = client.redis.hdel;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
-
-			await g.leave(ws, platform);
-			expect(breaker.failures).toBe(1);
-
-			client.redis.hdel = origHdel;
+			const restoreLeave = failNextGroupLeave(client.redis);
+			try {
+				await g.leave(ws, platform);
+				expect(breaker.failures).toBe(1);
+			} finally {
+				restoreLeave();
+			}
 			g.destroy();
 			breaker.destroy();
 		});
@@ -1265,16 +1330,15 @@ describe('redis groups', () => {
 			const membersKey = client.key('group:{leave-race}:members');
 			const ws = mockWs();
 			await g.join(ws, platform);
-			const hdel = client.redis.hdel;
-			client.redis.hdel = async (...args) => {
-				const result = await hdel.apply(client.redis, args);
+			const restoreLeave = interceptNextGroupLeave(client.redis, async (leave, args) => {
+				const result = await leave(...args);
 				await new Promise((r) => setTimeout(r, 500));
 				return result;
-			};
+			});
 			try {
 				await g.leave(ws, platform);
 			} finally {
-				client.redis.hdel = hdel;
+				restoreLeave();
 			}
 			expect(g.has(ws)).toBe(false);
 			expect(await client.redis.hgetall(membersKey)).toEqual({});
@@ -1292,23 +1356,22 @@ describe('redis groups', () => {
 			platform.reset();
 
 			const hdel = client.redis.hdel;
-			let calls = 0;
 			client.redis.hdel = async (...args) => {
-				const n = calls++;
-				if (n === 0) {
-					await new Promise((r) => setTimeout(r, 100));
-					throw new Error('hdel failed');
-				}
 				const result = await hdel.apply(client.redis, args);
-				if (n === 1) await new Promise((r) => setTimeout(r, 1500));
+				await new Promise((r) => setTimeout(r, 1500));
 				return result;
 			};
+			const restoreLeave = interceptNextGroupLeave(client.redis, async () => {
+				await new Promise((r) => setTimeout(r, 100));
+				throw new Error('leave script failed');
+			});
 			try {
 				await Promise.all([g.leave(ws, platform), g.leave(ws, platform)]);
 				// Past the next beat (memberTtl 3 beats every second), well short of
 				// the 3 s a rewritten member would take to be reaped.
 				await new Promise((r) => setTimeout(r, 1300));
 			} finally {
+				restoreLeave();
 				client.redis.hdel = hdel;
 			}
 			expect(g.has(ws)).toBe(false);
@@ -1325,12 +1388,11 @@ describe('redis groups', () => {
 			await g.join(ws, platform);
 			const firstId = Object.keys(await client.redis.hgetall(membersKey))[0];
 
-			const hdel = client.redis.hdel;
-			client.redis.hdel = async (...args) => {
-				const result = await hdel.apply(client.redis, args);
+			const restoreLeave = interceptNextGroupLeave(client.redis, async (leave, args) => {
+				const result = await leave(...args);
 				await new Promise((r) => setTimeout(r, 500));
 				return result;
-			};
+			});
 			let rejoined;
 			try {
 				const leaving = g.leave(ws, platform);
@@ -1338,7 +1400,7 @@ describe('redis groups', () => {
 				rejoined = await g.join(ws, platform);
 				await leaving;
 			} finally {
-				client.redis.hdel = hdel;
+				restoreLeave();
 			}
 			expect(rejoined).toBe(true);
 			expect(g.has(ws)).toBe(true);
