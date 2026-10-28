@@ -4342,7 +4342,7 @@ const cap = capabilityCookie({
 | Option | Default | Description |
 |---|---|---|
 | `secret` | *required* | HMAC secret. At least 16 characters with at least 8 distinct ones - length is not entropy, and a padded placeholder is the shape a weak secret takes. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. |
-| `ttlSeconds` | `300` | Cookie lifetime in seconds. An expired cookie is invalid even under the current secret. |
+| `ttlSeconds` | `300` | Cookie lifetime in seconds. Fractional values retain their precision for server-side expiry; the cookie's `Max-Age` is floored to an integer. An expired cookie is invalid even under the current secret. |
 | `previousSecret` | - | Immediately-previous secret, accepted during a rotation window. The same strength checks as `secret` apply. When replacing a weak old key, omit it: existing capability cookies are reissued on the next page response; application sessions are independent. |
 | `cookieName` | `'sauws_cap'` | Cookie name. Must be an RFC 6265 token (letters, digits and ``!#$%&'*+-.^_`|~``); anything else serializes into a header the browser silently drops, which degrades the capability check to permanently-absent with nothing logged. |
 | `secure` | `true` | Set the `Secure` attribute. |

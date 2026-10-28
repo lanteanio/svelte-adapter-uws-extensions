@@ -135,6 +135,18 @@ describe('capabilityCookie', () => {
 			expect(sc).toContain('Max-Age=300');
 		});
 
+		it.each([
+			{ ttlSeconds: 1.5, maxAge: '1' },
+			{ ttlSeconds: 1e21, maxAge: '1000000000000000000000' },
+			{ ttlSeconds: Number.MAX_VALUE, maxAge: BigInt(Number.MAX_VALUE).toString() }
+		])('writes an integer Max-Age for ttlSeconds $ttlSeconds', ({ ttlSeconds, maxAge }) => {
+			const cap = capabilityCookie({ secret: 'b7e2d4a90c8f16352affe9d0c47b1836', ttlSeconds });
+			const res = mockResponse();
+			cap.issue(mockEvent(), res);
+
+			expect(res.setCookies[0]).toContain(`; Max-Age=${maxAge};`);
+		});
+
 		it.each([{ sessionId: 'sess-abc' }, { session: { id: 'sess-abc' } }])('never copies an application session into a capability: %o', (locals) => {
 			const cap = capabilityCookie({ secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c' });
 			const res = mockResponse();

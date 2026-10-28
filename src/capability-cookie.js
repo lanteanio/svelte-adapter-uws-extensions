@@ -295,6 +295,7 @@ export function capabilityCookie(options) {
 		);
 	}
 	const ttlMs = ttlSeconds * 1000;
+	const maxAge = BigInt(Math.floor(ttlSeconds));
 
 	const m = options.metrics;
 	const rawMisses = m?.counter(
@@ -383,7 +384,7 @@ export function capabilityCookie(options) {
 		let out =
 			cookieName + '=' + value +
 			'; Path=' + path +
-			'; Max-Age=' + ttlSeconds +
+			'; Max-Age=' + maxAge +
 			'; HttpOnly' +
 			'; SameSite=' + sameSite;
 		if (secure) out += '; Secure';
