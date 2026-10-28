@@ -150,7 +150,7 @@ return liveCount
  * @property {Record<string, any>} [meta] - Initial group metadata
  * @property {number} [memberTtl=120] - Member entry TTL in seconds. Entries from crashed instances expire after this.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound bus envelopes larger than this many bytes BEFORE `JSON.parse` runs, and refuse to publish outbound events past the same bound (every peer would drop them on receipt). Defends against bus-side DoS in shared-Redis deployments.
- * @property {(ws: any, role: GroupRole) => void} [onJoin]
+ * @property {(ws: any, role: GroupRole) => GroupRole | false | void} [onJoin] - Synchronous admission decision before membership side effects.
  * @property {(ws: any, role: GroupRole) => void} [onLeave]
  * @property {(ws: any, role: GroupRole) => void} [onFull]
  * @property {() => void} [onClose]
@@ -696,6 +696,21 @@ export function createGroup(client, name, options = {}) {
 				throw new Error(`redis group "${name}": invalid role "${role}"`);
 			}
 
+			if (onJoin) {
+				const decision = onJoin(ws, role);
+				if (decision === false) return false;
+				if (VALID_ROLES.has(decision)) {
+					role = decision;
+				} else if (typeof decision === 'string') {
+					throw new Error(`group ${name}: onJoin returned invalid role ${decision}`);
+				} else if (decision && typeof decision.then === 'function') {
+					void Promise.resolve(decision).catch((err) => {
+						emitRegisteredFailure(EXTENSIONS_ERROR_IDS.GROUPS_JOIN_HOOK, { error: err, attributes: { group: name } });
+					});
+					throw new Error(`group ${name}: onJoin must be synchronous`);
+				}
+			}
+
 			const memberId = instanceId + ':' + (++memberCounter);
 			const nowTs = now();
 			const memberData = JSON.stringify({ role, instanceId, ts: nowTs });
@@ -804,7 +819,6 @@ export function createGroup(client, name, options = {}) {
 			}
 
 			mJoins?.inc({ group: metricGroup });
-			if (onJoin) onJoin(ws, role);
 			return true;
 		},
 

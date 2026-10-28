@@ -1453,7 +1453,7 @@ if (!allowed) {
 
 Redis-backed counterpart to the core `createGroup` plugin. Await membership changes; use `localMembers()` for sockets owned by this instance instead of the core group's `members()`. Shared membership makes groups work across multiple server instances. Local WebSocket tracking is maintained per-instance, and cross-instance events are relayed via Redis pub/sub.
 
-> **Authorization:** the `onJoin` hook is the join-decision site; the plugin itself does not authorize. Returning a role admits the socket; throwing rejects. See [Authorize every extension call](#authorize-every-extension-call).
+> **Authorization:** the synchronous `onJoin` hook decides admission before subscriber creation, roster writes or event publication; the plugin itself does not authorize. Return `false` to refuse, a valid role to admit with that role, or `undefined` to admit with the requested role. Throwing rejects. Returning a Promise also rejects with the synchronous-hook error, so perform asynchronous authorization before calling `join()`. See [Authorize every extension call](#authorize-every-extension-call).
 
 #### Setup
 

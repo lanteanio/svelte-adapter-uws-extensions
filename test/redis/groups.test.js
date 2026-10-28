@@ -188,13 +188,70 @@ describe('redis groups', () => {
 			g.destroy();
 		});
 
-		it('calls onJoin hook', async () => {
-			const joinCalls = [];
-			const g = createGroup(client, 'hooks', {
-				onJoin: (ws, role) => joinCalls.push(role)
-			});
-			await g.join(mockWs(), platform, 'admin');
-			expect(joinCalls).toEqual(['admin']);
+		it('matches the adapter onJoin admission contract', async () => {
+			const decisions = [false, 'viewer', 'superuser', Promise.resolve('admin')];
+			for (const [index, decision] of decisions.entries()) {
+				const local = createLocalGroup(`admission-${index}`, { onJoin: () => decision });
+				const localPlatform = mockPlatform();
+				let localResult;
+				let localError;
+				try { localResult = local.join(mockWs(), localPlatform, 'member'); }
+				catch (err) { localError = err; }
+
+				const g = createGroup(client, `admission-${index}`, { onJoin: () => decision });
+				const distributedPlatform = mockPlatform();
+				let result;
+				let error;
+				try { result = await g.join(mockWs(), distributedPlatform, 'member'); }
+				catch (err) { error = err; }
+
+				expect(result).toBe(localResult);
+				expect(error?.message).toBe(localError?.message);
+				expect(await g.count()).toBe(local.count());
+				expect(distributedPlatform.published.filter((p) => p.event === 'join')).toHaveLength(localPlatform.published.filter((p) => p.event === 'join').length);
+				if (result === true) expect(g.localMembers()[0].role).toBe(local.members()[0].role);
+				g.destroy();
+			}
+		});
+
+		it('refuses onJoin before subscriber, roster and publish side effects', async () => {
+			const duplicate = vi.spyOn(client, 'duplicate');
+			const g = createGroup(client, 'refused', { onJoin: () => false });
+
+			expect(await g.join(mockWs(), platform)).toBe(false);
+
+			expect(duplicate).not.toHaveBeenCalled();
+			expect(await client.redis.hgetall(client.key('group:{refused}:members'))).toEqual({});
+			expect(platform.published).toEqual([]);
+			expect(platform.sent).toEqual([]);
+			g.destroy();
+		});
+
+		it('does not write or publish a refused cross-instance join', async () => {
+			const allowed = createGroup(client, 'shared-admission');
+			const refused = createGroup(client, 'shared-admission', { onJoin: () => false });
+			const refusedPlatform = mockPlatform();
+			try {
+				await allowed.join(mockWs(), platform);
+				expect(await refused.join(mockWs(), refusedPlatform)).toBe(false);
+
+				expect(await allowed.count()).toBe(1);
+				expect(refused.localMembers()).toEqual([]);
+				expect(refusedPlatform.published).toEqual([]);
+				expect(platform.published.filter((p) => p.event === 'join')).toHaveLength(1);
+			} finally {
+				allowed.destroy();
+				refused.destroy();
+			}
+		});
+
+		it('does not install membership when onJoin returns a Promise', async () => {
+			const g = createGroup(client, 'async-admission', { onJoin: () => Promise.resolve('admin') });
+
+			await expect(g.join(mockWs(), platform)).rejects.toThrow('group async-admission: onJoin must be synchronous');
+			expect(await g.count()).toBe(0);
+			expect(g.localMembers()).toEqual([]);
+			expect(platform.published).toEqual([]);
 			g.destroy();
 		});
 

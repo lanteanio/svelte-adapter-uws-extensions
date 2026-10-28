@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis group `onJoin` now decides admission before subscriber creation or any roster write, matching the adapter: `false` refuses, a valid returned role replaces the requested role, invalid role strings throw, and a Promise return throws the synchronous-hook error without installing membership.
 - Redis group join and leave events include the member `count`, matching the adapter group's event payload. Join and successful leave counts come from the same atomic Redis roster mutation; a leave whose removal is queued during an outage reports the remaining local count.
 - Replay streams, sessions and idempotency stores created on the same Redis client share one hash-field TTL capability probe. Creating or tearing down owners no longer accumulates `ready` listeners or repeats the server capability check for every owner.
 - `capabilityCookie` floors fractional `ttlSeconds` values when serializing `Max-Age`, matching the adapter's cookie serialization and keeping the attribute a valid integer. Server-side expiry retains the configured precision.

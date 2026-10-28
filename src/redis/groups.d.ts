@@ -12,8 +12,12 @@ export interface RedisGroupOptions {
 	meta?: Record<string, any>;
 	/** Member entry TTL in seconds. Entries from crashed instances expire after this. @default 120 */
 	memberTtl?: number;
-	/** Called after a member joins. */
-	onJoin?: (ws: any, role: GroupRole) => void;
+	/**
+	 * Synchronous admission hook, called before membership is installed.
+	 * Return `false` to reject, a role to override the requested role, or
+	 * `undefined` to accept it unchanged. Throwing also fails closed.
+	 */
+	onJoin?: (ws: any, role: GroupRole) => GroupRole | false | void;
 	/** Called after a member leaves. */
 	onLeave?: (ws: any, role: GroupRole) => void;
 	/** Called when a join is rejected because the group is full. */

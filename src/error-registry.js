@@ -57,6 +57,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	REDIS_REPLAY_STREAM_INPUT_DROPPED: 'EXTENSIONS-ERR-REDIS-REPLAY-STREAM-INPUT-DROPPED',
 	CURSOR_CLEANUP: 'EXTENSIONS-ERR-CURSOR-CLEANUP',
 	CURSOR_FLUSH: 'EXTENSIONS-ERR-CURSOR-FLUSH',
+	GROUPS_JOIN_HOOK: 'EXTENSIONS-ERR-GROUPS-JOIN-HOOK',
 	GROUPS_META_INITIALIZE: 'EXTENSIONS-ERR-GROUPS-META-INITIALIZE',
 	GROUPS_HEARTBEAT: 'EXTENSIONS-ERR-GROUPS-HEARTBEAT',
 	GROUPS_SUBSCRIBER: 'EXTENSIONS-ERR-GROUPS-SUBSCRIBER',
@@ -445,6 +446,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Every later tick publishes again.',
 		nextAction: 'Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their cursor data. Topics are not logged, since they can carry user ids.',
 		sources: ['src/redis/cursor/scheduler.js'], anchor: 'extensions-err-cursor-flush'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.GROUPS_JOIN_HOOK,
+		event: 'redis.groups.join-hook.failed', component: 'runtime.redis.groups', severity: 'error',
+		problemPrefix: 'A Redis group onJoin hook returned a Promise that later rejected.',
+		cause: 'onJoin is a synchronous admission hook. Returning a Promise refuses the join immediately; this event reports a later rejection from that Promise.',
+		consequence: 'The join was refused before subscriber creation, roster writes or event publication.',
+		automaticRecovery: 'A later join calls the hook again; no membership from the refused call is retained.',
+		nextAction: 'Return false, a valid role or undefined synchronously. Perform asynchronous authorization before calling join().',
+		sources: ['src/redis/groups.js'], anchor: 'extensions-err-groups-join-hook'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.GROUPS_META_INITIALIZE,

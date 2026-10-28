@@ -8,7 +8,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 77 diagnostic events. Each is one canonical line
+- 78 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -57,6 +57,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber) | `redis.cursor.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.subscriber.failed severity=error] The Redis cursor subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup) | `redis.cursor.cleanup.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.cleanup.failed severity=warn] Cursor stale-entry cleanup failed; the next sweep retries.` |
 | [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush) | `redis.cursor.flush.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.cursor event=redis.cursor.flush.failed severity=warn] A cursor tick could not publish one or more topics; the other topics were flushed.` |
+| [EXTENSIONS-ERR-GROUPS-JOIN-HOOK](#extensions-err-groups-join-hook) | `redis.groups.join-hook.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.join-hook.failed severity=error] A Redis group onJoin hook returned a Promise that later rejected.` |
 | [EXTENSIONS-ERR-GROUPS-META-INITIALIZE](#extensions-err-groups-meta-initialize) | `redis.groups.meta-initialize.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.meta-initialize.failed severity=warn] The initial Redis group metadata write failed.` |
 | [EXTENSIONS-ERR-GROUPS-HEARTBEAT](#extensions-err-groups-heartbeat) | `redis.groups.heartbeat.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.heartbeat.failed severity=warn] A Redis group heartbeat pipeline failed.` |
 | [EXTENSIONS-ERR-GROUPS-SUBSCRIBER](#extensions-err-groups-subscriber) | `redis.groups.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.subscriber.failed severity=error] The Redis group subscriber connection reported an error.` |
@@ -125,7 +126,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 77 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 78 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -148,6 +149,7 @@ Indexed events:
 - `redis.cursor.subscriber.failed` - [EXTENSIONS-ERR-CURSOR-SUBSCRIBER](#extensions-err-cursor-subscriber)
 - `redis.cursor.cleanup.failed` - [EXTENSIONS-ERR-CURSOR-CLEANUP](#extensions-err-cursor-cleanup)
 - `redis.cursor.flush.failed` - [EXTENSIONS-ERR-CURSOR-FLUSH](#extensions-err-cursor-flush)
+- `redis.groups.join-hook.failed` - [EXTENSIONS-ERR-GROUPS-JOIN-HOOK](#extensions-err-groups-join-hook)
 - `redis.groups.meta-initialize.failed` - [EXTENSIONS-ERR-GROUPS-META-INITIALIZE](#extensions-err-groups-meta-initialize)
 - `redis.groups.heartbeat.failed` - [EXTENSIONS-ERR-GROUPS-HEARTBEAT](#extensions-err-groups-heartbeat)
 - `redis.groups.subscriber.failed` - [EXTENSIONS-ERR-GROUPS-SUBSCRIBER](#extensions-err-groups-subscriber)
@@ -566,6 +568,18 @@ the stable ID tag on the line):
 - **Next action:** Read the error. A platform that refuses the publish itself fails every topic; a failure on only some topics points at their cursor data. Topics are not logged, since they can carry user ids.
 - **Runtime help:** `docs/errors.md#extensions-err-cursor-flush`
 - **Runtime sources:** [src/redis/cursor/scheduler.js](../src/redis/cursor/scheduler.js)
+
+<a id="extensions-err-groups-join-hook"></a>
+## `EXTENSIONS-ERR-GROUPS-JOIN-HOOK`
+
+- **Code/event:** `redis.groups.join-hook.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.groups event=redis.groups.join-hook.failed severity=error] A Redis group onJoin hook returned a Promise that later rejected.`
+- **Cause:** onJoin is a synchronous admission hook. Returning a Promise refuses the join immediately; this event reports a later rejection from that Promise.
+- **Consequence:** The join was refused before subscriber creation, roster writes or event publication.
+- **Automatic recovery:** A later join calls the hook again; no membership from the refused call is retained.
+- **Next action:** Return false, a valid role or undefined synchronously. Perform asynchronous authorization before calling join().
+- **Runtime help:** `docs/errors.md#extensions-err-groups-join-hook`
+- **Runtime sources:** [src/redis/groups.js](../src/redis/groups.js)
 
 <a id="extensions-err-groups-meta-initialize"></a>
 ## `EXTENSIONS-ERR-GROUPS-META-INITIALIZE`
