@@ -651,7 +651,9 @@ export function createShardedBus(client, options = {}) {
 			if (!subByNodeId.has(id)) {
 				const s = node.duplicate({ enableReadyCheck: false });
 				s.on('error', subOnError);
-				s.on('smessage', handleSMessage);
+				s.on('smessage', (ch, message) => {
+					if (subByNodeId.get(id) === s) handleSMessage(ch, message);
+				});
 				// ioredis gives cluster node connections no retry strategy and a
 				// duplicate inherits it, so this connection never reconnects: one
 				// the master drops ends for good.
@@ -934,9 +936,12 @@ export function createShardedBus(client, options = {}) {
 			if (generation !== subGeneration) return;
 			watchShardState(generation);
 		} else {
-			subStandalone = openSubscriber(client, 'sharded-pubsub');
-			subStandalone.on('error', subOnError);
-			subStandalone.on('smessage', handleSMessage);
+			const sub = openSubscriber(client, 'sharded-pubsub');
+			subStandalone = sub;
+			sub.on('error', subOnError);
+			sub.on('smessage', (ch, message) => {
+				if (subStandalone === sub) handleSMessage(ch, message);
+			});
 		}
 		subReady = true;
 	}
