@@ -54,6 +54,8 @@ export function hashFieldTTLSupport(info) {
 // answers in well under this, so the bound never false-negatives a live server.
 const DEFAULT_HEXPIRE_PROBE_TIMEOUT_MS = 1000;
 
+const probeStates = new WeakMap();
+
 /**
  * A cached, SOFT per-field-hash-TTL (HEXPIRE / HPEXPIRE) capability probe. Unlike
  * the presence store's hard gate - which throws when the server is too old
@@ -100,56 +102,56 @@ const DEFAULT_HEXPIRE_PROBE_TIMEOUT_MS = 1000;
  */
 export function createHashFieldTTLProbe(redis, options = {}) {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_HEXPIRE_PROBE_TIMEOUT_MS;
-	/** @type {boolean | null} null = not yet probed */
-	let known = null;
-	/** @type {Promise<void> | null} the in-flight INFO (may stall on the offline queue during an outage) */
-	let inflight = null;
-	// Bumped by invalidate() (and thus by the reconnect handler) so a reply that
-	// races in after an invalidation cannot write a now-stale answer into `known`.
-	let generation = 0;
-
-	function trigger() {
-		if (inflight || known !== null) return;
-		const myGen = generation;
-		const p = Promise.resolve()
-			.then(() => redis.info('server'))
-			.then((info) => {
-				// Discard a reply that landed after an invalidate(): the server it
-				// describes is no longer the connection we probed.
-				if (myGen === generation) known = hashFieldTTLSupport(info).supported === true;
-			})
-			.catch(() => { /* transient: leave unknown so the next call re-probes */ })
-			// Only the probe that still owns the slot clears it; a stale probe that
-			// settles after invalidate() re-pointed inflight must not null a newer one.
-			.finally(() => { if (inflight === p) inflight = null; });
-		inflight = p;
+	let state = probeStates.get(redis);
+	if (!state) {
+		state = createProbeState(redis);
+		probeStates.set(redis, state);
 	}
-
-	function invalidate() {
-		known = null;
-		generation++;
-		// Drop the reference to any pending probe so the next call re-probes
-		// immediately instead of waiting behind an INFO stalled on the offline
-		// queue; that probe is now stale (generation moved) and cannot write back.
-		inflight = null;
-	}
-
-	// Re-detect after any (re)connect; guarded so a test double / non-emitter
-	// client (which never reconnects) is a no-op.
-	if (typeof redis.on === 'function') redis.on('ready', invalidate);
 	return {
-		supported() { trigger(); return known === true; },
+		supported() { state.trigger(); return state.known === true; },
 		async ready() {
-			trigger();
-			const p = inflight;
+			state.trigger();
+			const p = state.inflight;
 			if (p) {
 				let timer = null;
 				const timed = new Promise((resolve) => { timer = setTimer(resolve, timeoutMs); });
 				try { await Promise.race([p, timed]); }
 				finally { clearTimer(timer); }
 			}
-			return known === true;
+			return state.known === true;
 		},
+		invalidate: state.invalidate
+	};
+}
+
+function createProbeState(redis) {
+	const state = {
+		known: null,
+		inflight: null,
+		generation: 0,
+		trigger,
 		invalidate
 	};
+
+	function trigger() {
+		if (state.inflight || state.known !== null) return;
+		const myGen = state.generation;
+		const p = Promise.resolve()
+			.then(() => redis.info('server'))
+			.then((info) => {
+				if (myGen === state.generation) state.known = hashFieldTTLSupport(info).supported === true;
+			})
+			.catch(() => { /* transient: leave unknown so the next call re-probes */ })
+			.finally(() => { if (state.inflight === p) state.inflight = null; });
+		state.inflight = p;
+	}
+
+	function invalidate() {
+		state.known = null;
+		state.generation++;
+		state.inflight = null;
+	}
+
+	if (typeof redis.on === 'function') redis.on('ready', invalidate);
+	return state;
 }

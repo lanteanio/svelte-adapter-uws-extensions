@@ -87,6 +87,7 @@ describe('createHashFieldTTLProbe (soft gate)', () => {
 			// current payload, modeling ioredis flushing the queue on reconnect.
 			releaseHang() { hang = false; hung.splice(0).forEach((r) => r(info)); },
 			get calls() { return calls; },
+			listenerCount(ev) { return (listeners[ev] || []).length; },
 			on(ev, fn) { (listeners[ev] ||= []).push(fn); return this; },
 			emit(ev) { (listeners[ev] || []).forEach((fn) => fn()); },
 			info() {
@@ -224,5 +225,15 @@ describe('createHashFieldTTLProbe (soft gate)', () => {
 		await new Promise((r) => setTimeout(r, 5)); // let the deferred INFO dispatch
 		expect(probe.supported()).toBe(false); // still hung -> still the safe fallback
 		expect(redis.calls).toBe(1); // one INFO across all reads, then it stays parked
+	});
+
+	it('shares one listener and INFO probe across owners on the same client', async () => {
+		const redis = fakeRedis(redisInfo('7.4.0'));
+		const probes = Array.from({ length: 20 }, (_, i) => createHashFieldTTLProbe(redis, { timeoutMs: i }));
+
+		expect(redis.listenerCount('ready')).toBe(1);
+		expect(await Promise.all(probes.map((probe) => probe.ready()))).toEqual(Array(20).fill(true));
+		expect(redis.calls).toBe(1);
+		expect(redis.listenerCount('ready')).toBe(1);
 	});
 });
