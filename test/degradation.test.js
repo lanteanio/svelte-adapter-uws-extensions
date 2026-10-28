@@ -73,6 +73,57 @@ describe('createDegradationPolicy', () => {
 		});
 	}
 
+	for (const field of ['mitigation', 'recovery']) {
+		const resolve = (policy) => policy[field === 'mitigation' ? 'onDegraded' : 'onRecovered'](degrade);
+
+		it('preserves localizable notice metadata for ' + field, () => {
+			const messageKey = 'realtime.orders.unavailable';
+			const messageParams = Object.assign(Object.create(null), { service: 'Redis', retry: 30, transient: true, detail: null });
+			const bannerCopy = 'Saving orders is temporarily unavailable.';
+			for (const envelope of [{ messageKey, messageParams, bannerCopy }, () => ({ messageKey, messageParams, bannerCopy })]) {
+				const result = resolve(createDegradationPolicy({ [field]: envelope }));
+				expect(result[field]).toEqual({ messageKey, messageParams, bannerCopy });
+			}
+		});
+
+		it.each(['', 'not a key', 'orders/create', 'caf\u00e9', 'x'.repeat(129), 5])('rejects invalid ' + field + ' message key %j', (messageKey) => {
+			expect(() => createDegradationPolicy({ [field]: { messageKey } })).toThrow(/messageKey/);
+			expect(() => resolve(createDegradationPolicy({ [field]: () => ({ messageKey }) }))).toThrow(/messageKey/);
+		});
+
+		it.each([
+			null,
+			[],
+			'params',
+			new Date(),
+			Object.fromEntries(Array.from({ length: 65 }, (_, i) => ['key' + i, i])),
+			{ 'not a key': 'value' },
+			{ nested: {} },
+			{ missing: undefined },
+			{ count: Infinity },
+			{ count: NaN },
+			{ count: 1n },
+			{ reason: 'x'.repeat(1025) },
+			{ a: 'x'.repeat(1024), b: 'x'.repeat(1024), c: 'x'.repeat(1024), d: 'x'.repeat(996) }
+		])('rejects invalid ' + field + ' message parameters %#', (messageParams) => {
+			expect(() => createDegradationPolicy({ [field]: { messageParams } })).toThrow(/messageParams/);
+			expect(() => resolve(createDegradationPolicy({ [field]: () => ({ messageParams }) }))).toThrow(/messageParams/);
+		});
+
+		it('accepts parameter bounds and special keys without prototype mutation for ' + field, () => {
+			const entries = Object.fromEntries(Array.from({ length: 64 }, (_, i) => ['key' + i, i]));
+			const serializedLimit = { a: 'x'.repeat(1024), b: 'x'.repeat(1024), c: 'x'.repeat(1024), d: 'x'.repeat(995) };
+			const special = JSON.parse('{"__proto__":"safe","constructor":false,"toString":null}');
+			for (const messageParams of [entries, serializedLimit, special, Object.create(null)]) {
+				expect(Buffer.byteLength(JSON.stringify(messageParams), 'utf8')).toBeLessThanOrEqual(4096);
+				const result = resolve(createDegradationPolicy({ [field]: { messageKey: 'x'.repeat(128), messageParams } }));
+				expect(result[field].messageParams).toBe(messageParams);
+			}
+			expect(Object.hasOwn(special, '__proto__')).toBe(true);
+			expect({}.polluted).toBeUndefined();
+		});
+	}
+
 	it('validates envelope fields and jitter ranges', () => {
 		expect(() => createDegradationPolicy({ mitigation: { retryAfterMs: -1 } })).toThrow(/retryAfterMs/);
 		expect(() => createDegradationPolicy({ mitigation: { streams: 'x' } })).toThrow(/streams/);
@@ -94,12 +145,13 @@ describe('createPubSubBus degradationPolicy integration', () => {
 	const find = (platform, event) => platform.published.find((p) => p.topic === '__realtime' && p.event === event);
 
 	it('ships the mitigation + de-herd jitter on the degraded event', () => {
-		const policy = createDegradationPolicy({ mitigation: { retryAfterMs: 4000, bannerCopy: 'Read-only', rpcs: ['orders/create'] } });
+		const mitigation = { retryAfterMs: 4000, messageKey: 'orders.unavailable', messageParams: { service: 'Redis' }, bannerCopy: 'Read-only', rpcs: ['orders/create'] };
+		const policy = createDegradationPolicy({ mitigation });
 		const { platform, breaker } = wire({ degradationPolicy: policy });
 		breaker.failure(new Error('down')); // healthy -> broken
 		const deg = find(platform, 'degraded');
 		expect(deg).toBeDefined();
-		expect(deg.data.mitigation).toEqual({ retryAfterMs: 4000, bannerCopy: 'Read-only', rpcs: ['orders/create'] });
+		expect(deg.data.mitigation).toEqual(mitigation);
 		expect(deg.options).toEqual({ relay: false, seq: false, jitterMs: 1000 }); // min(4000/4, 5000)
 	});
 

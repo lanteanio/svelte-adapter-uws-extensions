@@ -63,6 +63,13 @@ import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
 import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
 import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
+import { createDegradationPolicy, type DegradationNotice } from 'svelte-adapter-uws-extensions/degradation';
+const notice: DegradationNotice = { messageKey: 'orders.unavailable', messageParams: { service: 'Redis', retry: 30, transient: true, detail: null }, bannerCopy: 'Saving orders is unavailable.' };
+createDegradationPolicy({ mitigation: { ...notice, rpcs: ['orders/create'] }, recovery: notice });
+// @ts-expect-error Notice parameters are scalar interpolation values.
+createDegradationPolicy({ mitigation: { messageParams: { nested: {} } } });
+// @ts-expect-error Notice keys are strings.
+createDegradationPolicy({ recovery: { messageKey: 5 } });
 const stopBreakerMetrics: () => void = wireBreakerMetrics(createCircuitBreaker(), createMetrics());
 stopBreakerMetrics();
 // @ts-expect-error A breaker cannot be replaced by an arbitrary object.

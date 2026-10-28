@@ -1,23 +1,29 @@
+/** Localizable notice metadata. Application catalogs own the translated text. */
+export interface DegradationNotice {
+	/** Application catalog key using only ASCII letters, digits, `.`, `_`, or `-`; at most 128 UTF-8 bytes. Unknown keys use `bannerCopy`, then the application's generic localized fallback. */
+	messageKey?: string;
+	/** Plain interpolation object: at most 64 entries, 1024 UTF-8 bytes per string, and 4096 bytes serialized. Numbers must be finite. */
+	messageParams?: Record<string, string | number | boolean | null>;
+	/** Optional source-English fallback notice. Well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ may accompany text. Render as text. */
+	bannerCopy?: string;
+}
+
 /** The precomputed client mitigation broadcast when a failure class degrades. */
-export interface Mitigation {
+export interface Mitigation extends DegradationNotice {
 	/** Stream topics to treat as unavailable while degraded. */
 	streams?: string[];
 	/** RPC paths to treat as unavailable while degraded. */
 	rpcs?: string[];
 	/** How long (ms) the client should hold off before retrying. */
 	retryAfterMs?: number;
-	/** Optional source-English fallback notice. Well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ may accompany text. Render as text. */
-	bannerCopy?: string;
 }
 
 /** The optional recovery hint broadcast when the failure class recovers. */
-export interface RecoveryHint {
+export interface RecoveryHint extends DegradationNotice {
 	/** The client should refetch affected streams. */
 	refetch?: boolean;
 	/** The client should clear any local cache for the affected data. */
 	clearCache?: boolean;
-	/** Optional source-English fallback notice. Well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ may accompany text. Render as text. */
-	bannerCopy?: string;
 }
 
 export interface DegradationTransition {

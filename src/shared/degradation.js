@@ -20,6 +20,29 @@ const DEFAULT_JITTER_CAP_MS = 5000;
 const MAX_JITTER_MS = 60000;
 /** Keep a status notice bounded independently of the enclosing bus frame. */
 const MAX_NOTICE_BYTES = 2048;
+const MAX_MESSAGE_KEY_BYTES = 128;
+const MAX_MESSAGE_PARAMS = 64;
+const MAX_MESSAGE_PARAM_STRING_BYTES = 1024;
+const MAX_MESSAGE_PARAMS_BYTES = 4096;
+
+function isMessageKey(value) {
+	return typeof value === 'string' && /^[A-Za-z0-9_.-]+$/.test(value) && Buffer.byteLength(value, 'utf8') <= MAX_MESSAGE_KEY_BYTES;
+}
+
+function validateMessageParams(params, label) {
+	const error = () => new Error('degradation policy: ' + label + '.messageParams must be a plain object with at most 64 entries, safe keys, scalar values, strings of at most 1024 UTF-8 bytes, and at most 4096 serialized UTF-8 bytes');
+	if (!params || typeof params !== 'object' || Array.isArray(params)) throw error();
+	const prototype = Object.getPrototypeOf(params);
+	if (prototype !== Object.prototype && prototype !== null) throw error();
+	const entries = Object.entries(params);
+	if (entries.length > MAX_MESSAGE_PARAMS) throw error();
+	for (const [key, value] of entries) {
+		if (!isMessageKey(key)) throw error();
+		if (value !== null && typeof value !== 'string' && typeof value !== 'boolean' && !(typeof value === 'number' && Number.isFinite(value))) throw error();
+		if (typeof value === 'string' && Buffer.byteLength(value, 'utf8') > MAX_MESSAGE_PARAM_STRING_BYTES) throw error();
+	}
+	if (Buffer.byteLength(JSON.stringify(params), 'utf8') > MAX_MESSAGE_PARAMS_BYTES) throw error();
+}
 
 /**
  * Validate a mitigation / recovery envelope. All fields optional; unknown fields are
@@ -42,6 +65,10 @@ function validateEnvelope(env, label) {
 	if (notice !== undefined && (typeof notice !== 'string' || Buffer.byteLength(notice, 'utf8') > MAX_NOTICE_BYTES || !notice.isWellFormed() || !/(?!\p{Default_Ignorable_Code_Point})[\p{L}\p{N}]/u.test(notice) || /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(notice))) {
 		throw new Error('degradation policy: ' + label + '.bannerCopy must be well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control characters or line breaks');
 	}
+	if (env.messageKey !== undefined && !isMessageKey(env.messageKey)) {
+		throw new Error('degradation policy: ' + label + '.messageKey must contain only ASCII letters, digits, dot, underscore, or hyphen and be at most 128 UTF-8 bytes');
+	}
+	if (env.messageParams !== undefined) validateMessageParams(env.messageParams, label);
 	if (env.refetch !== undefined && typeof env.refetch !== 'boolean') throw new Error('degradation policy: ' + label + '.refetch must be a boolean');
 	if (env.clearCache !== undefined && typeof env.clearCache !== 'boolean') throw new Error('degradation policy: ' + label + '.clearCache must be a boolean');
 	return env;
@@ -73,6 +100,8 @@ function resolveJitter(envelope, explicit) {
  * @property {string[]} [streams] - Stream topics to treat as unavailable while degraded.
  * @property {string[]} [rpcs] - RPC paths to treat as unavailable while degraded.
  * @property {number} [retryAfterMs] - How long the client should hold off before retrying.
+ * @property {string} [messageKey] - Application catalog key using ASCII letters, digits, dot, underscore, or hyphen; at most 128 UTF-8 bytes.
+ * @property {Object<string, string | number | boolean | null>} [messageParams] - Plain interpolation parameters; at most 64 entries and 4096 serialized UTF-8 bytes, with strings at most 1024 UTF-8 bytes.
  * @property {string} [bannerCopy] - Optional source-English fallback notice. Well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ may accompany text. Render as text.
  */
 

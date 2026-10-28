@@ -446,14 +446,14 @@ const bus = createPubSubBus(redis, {
     mitigation: {
       rpcs: ['orders/create'],     // treat these as unavailable while degraded
       retryAfterMs: 8000,          // how long the client should hold off
-      bannerCopy: 'Saving orders is temporarily unavailable.'
+      messageKey: 'orders.unavailable', messageParams: { service: 'Redis' }, bannerCopy: 'Saving orders is temporarily unavailable.'
     }
     // jitterMs defaults to min(retryAfterMs / 4, 5000); override to tune the spread
   })
 });
 ```
 
-The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. The application renders the affected capability and follows the supplied retry guidance. `bannerCopy`, when present, is a source-English fallback: well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks; ZWNJ/ZWJ joiners may accompany text. Render it as text, never as HTML. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope (`{ refetch, clearCache, bannerCopy }`) + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
+The mitigation rides the `degraded` event; svelte-realtime (`>= 0.6.0-next.47`) surfaces it on its `degradation` store. Mitigation and recovery notices accept bounded `messageKey` and `messageParams` for application-owned display-language catalogs; `bannerCopy` remains the source-English fallback. See [Localized and accessible degradation notices](docs/degradation-notices.md) for bounds, catalog fallback, live-region, control-mapping, focus and retry semantics. The application renders the affected capability and follows the supplied retry guidance. `mitigation` may be a function `(transition) => envelope` for dynamic policies, and an optional `recovery` envelope + `recoveryJitterMs` staggers the recovery wave. A throwing policy never breaks the degraded/recovered emit, and with no policy the event is unchanged.
 
 ---
 
