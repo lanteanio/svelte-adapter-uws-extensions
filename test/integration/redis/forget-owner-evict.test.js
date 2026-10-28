@@ -89,6 +89,8 @@ describe('createForgetStore cluster owner eviction (integration)', () => {
 
 		const res = await store.purgeUser(null, 'u1');
 		expect(res.rowsAffected.presenceRoster).toBe(2);
+		expect(res.presenceTopics).toEqual(['room1']);
+		expect(res.cursorTopics).toEqual([]);
 		const h = await redis.hgetall('__live-presence:room1');
 		expect(h['c:u1']).toBeUndefined();
 		expect(h['d:u1']).toBeUndefined();

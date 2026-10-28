@@ -11,12 +11,24 @@
  * @module svelte-adapter-uws-extensions/forget-store
  */
 
+export interface ForgetDetailedPurge {
+	count: number;
+	presenceTopics?: string[];
+	cursorTopics?: string[];
+}
+
 export interface ForgetableStore {
 	purgeUser(
 		tenantId: string | null,
 		userId: string,
 		cascade?: unknown
 	): Promise<number | Record<string, number>> | number | Record<string, number>;
+	/** Optional additive metadata used by the composer; numeric purgeUser remains unchanged. */
+	purgeUserDetailed?(
+		tenantId: string | null,
+		userId: string,
+		cascade?: unknown
+	): Promise<ForgetDetailedPurge>;
 }
 
 /**
@@ -31,13 +43,15 @@ export interface ForgetOwnerSuccession {
 }
 
 /**
- * The envelope resolved when the store was built with `options.redis`:
- * the per-store removal counts (the built-in legs report under `roomOwners`
- * and `presenceRoster`) plus the ownership changes the eviction produced.
+ * The envelope resolved when the store was built with `options.redis` or a
+ * detailed presence/cursor store: per-store removal counts, ownership changes,
+ * and the wire topics whose presence/cursor entries were actually erased.
  */
 export interface ForgetEnvelope {
 	rowsAffected: Record<string, number>;
 	ownerSuccessions: ForgetOwnerSuccession[];
+	presenceTopics: string[];
+	cursorTopics: string[];
 }
 
 export interface ForgetStoreOptions {
@@ -57,15 +71,14 @@ export interface ForgetStore {
 	 * Erase a user across every composed store. Attempts all stores even if one
 	 * fails, then rejects if any failed (so the realtime layer can surface the
 	 * incomplete erasure for retry). Resolves to a per-store removal-count
-	 * breakdown - or, when the store was built with `options.redis`, the
-	 * owner-succession envelope.
+	 * breakdown - or, with `options.redis` or detailed presence/cursor stores,
+	 * the envelope carrying owner successions and erased wire topics.
 	 *
-	 * On rejection the thrown error still carries `ownerSuccessions` (the
-	 * `ForgetOwnerSuccession[]` for rooms whose eviction ALREADY committed
-	 * before a sibling room failed) plus `failures` and `partialCounts`. The
-	 * realtime layer announces those committed successions even on the failure
-	 * path, because a retry re-drives only the failed rooms and would not
-	 * re-report an already-handed-off room.
+	 * On rejection the thrown error still carries `ownerSuccessions`,
+	 * `presenceTopics` and `cursorTopics` for work that ALREADY committed before
+	 * a sibling failed, plus `failures` and `partialCounts`. The realtime layer
+	 * announces those committed changes even on the failure path, because a
+	 * retry re-drives only the failed work and would not re-report them.
 	 *
 	 * `tenantId` is `null` for the untenanted scope, or a string of at most 64
 	 * characters from `[a-zA-Z0-9_.:-]` - domains and namespaced ids included.

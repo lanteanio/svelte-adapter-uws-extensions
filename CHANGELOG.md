@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Degradation mitigation and recovery notices accept bounded `messageKey` and typed `messageParams` fields for application-owned localization catalogs, preserving `bannerCopy` as the source-English fallback. The client reference resolves display-language catalogs with safe fallbacks and covers transition-only polite announcements, unavailable-control associations, focus-preserving recovery, and stable retry deadlines.
+- `createForgetStore` reports sorted, deduplicated `presenceTopics` and `cursorTopics` containing only wire topics whose entries it actually erased, alongside the existing removal counts and owner successions. The Redis presence and cursor trackers expose the metadata through additive `purgeUserDetailed()` methods while their numeric `purgeUser()` results remain unchanged. The composer uses the detailed methods when available and carries already-erased topics on partial-failure errors so the realtime layer can announce peer leaves without losing committed work on retry.
 
 - The Redis replay buffers (sorted set and stream), the Postgres replay buffer and both dead-letter stores report a warning once per process per store kind when they are created with neither a `ttl` (`ttlMs` for dead letters) nor a `forgetUserId` extractor: their payloads then never expire and `live.forget` cannot erase them. Each kind has its own entry in the error reference (`EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED` and its siblings).
 

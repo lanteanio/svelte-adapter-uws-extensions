@@ -13,8 +13,8 @@ import { operationError } from './errors.js';
  *
  * With `options.redis` (the same client the app stashes on `platform.redis`),
  * the purge additionally erases the user from the CLUSTER-WIDE room state the
- * realtime layer keeps in Redis, and the result becomes the owner-succession
- * envelope `{ rowsAffected, ownerSuccessions }`:
+ * realtime layer keeps in Redis, and the result becomes the envelope
+ * `{ rowsAffected, ownerSuccessions, presenceTopics, cursorTopics }`:
  *
  * - Room-owner hashes (`__live-room-owner:<topic>`): the user's membership
  *   fields are removed from every room in the tenant scope, and where the user
@@ -33,9 +33,10 @@ import { operationError } from './errors.js';
  *
  * The realtime layer publishes each returned succession on the room's `:owner`
  * stream (through the replay buffer), so live subscribers on every replica and
- * resumers see the successor rather than the erased owner. Without
- * `options.redis` the return shape is the plain per-store breakdown,
- * byte-identical to before.
+ * resumers see the successor rather than the erased owner. Presence and cursor
+ * topics name only entries actually erased, so their leave frames can reach
+ * peers too. Without `options.redis` or a detailed composed store the return
+ * shape is the plain per-store breakdown, byte-identical to before.
  *
  * The realtime layer never imports this; it only sees `{ purgeUser }`.
  *
@@ -273,30 +274,35 @@ async function evictOwnerUser(redis, tenantId, userId) {
  * @param {any} redis
  * @param {string | null} tenantId
  * @param {string} userId
- * @returns {Promise<{ removed: number, failures: any[] }>} roster fields removed + per-roster failures
+ * @returns {Promise<{ removed: number, topics: string[], failures: any[] }>} roster fields and wire topics erased + per-roster failures
  */
 async function purgePresenceRoster(redis, tenantId, userId) {
 	let rosters;
 	try {
 		rosters = await scanTenantTopics(redis, PRESENCE_KEY_PREFIX, tenantId);
 	} catch (err) {
-		return { removed: 0, failures: [err] };
+		return { removed: 0, topics: [], failures: [err] };
 	}
 	const failures = [];
+	const topics = [];
 	let removed = 0;
-	const settled = await mapBounded(rosters, PURGE_CONCURRENCY, ({ key }) =>
-		redis.hdel(key, 'c:' + userId, 'd:' + userId)
-	);
+	const settled = await mapBounded(rosters, PURGE_CONCURRENCY, async ({ key, topic }) => ({
+		topic,
+		removed: await redis.hdel(key, 'c:' + userId, 'd:' + userId)
+	}));
 	for (const s of settled) {
 		if (s.status === 'rejected') { failures.push(s.reason); continue; }
-		removed += Number(s.value) || 0;
+		const count = Number(s.value.removed) || 0;
+		removed += count;
+		if (count > 0) topics.push(s.value.topic);
 	}
-	return { removed, failures };
+	return { removed, topics, failures };
 }
 
 /**
  * @typedef {Object} ForgetableStore
  * @property {(tenantId: string | null, userId: string, cascade?: any) => Promise<number | Record<string, number>> | number | Record<string, number>} purgeUser
+ * @property {(tenantId: string | null, userId: string, cascade?: any) => Promise<{ count: number, presenceTopics?: string[], cursorTopics?: string[] }>} [purgeUserDetailed]
  */
 
 /**
@@ -314,15 +320,16 @@ async function purgePresenceRoster(redis, tenantId, userId) {
  *
  * `options.redis` opts the purge into the cluster-wide room-owner eviction and
  * presence-roster erasure (see the module doc) and switches the resolved shape
- * to the owner-succession envelope `{ rowsAffected, ownerSuccessions }`. The
- * eviction counts land in `rowsAffected` under `roomOwners` and
- * `presenceRoster` (summed into a composed store's count if one shares the
+ * to the envelope `{ rowsAffected, ownerSuccessions, presenceTopics,
+ * cursorTopics }`. The eviction counts land in `rowsAffected` under `roomOwners`
+ * and `presenceRoster` (summed into a composed store's count if one shares the
  * name). Accepts the raw ioredis instance or a client wrapper exposing one on
- * `.redis`.
+ * `.redis`. A composed store with `purgeUserDetailed` selects the same envelope
+ * without `options.redis`; numeric-only stores retain the legacy breakdown.
  *
  * @param {Record<string, ForgetableStore | null | undefined> | Array<ForgetableStore | null | undefined>} stores
  * @param {{ redis?: any }} [options]
- * @returns {{ purgeUser: (tenantId: string | null, userId: string, cascade?: any) => Promise<Record<string, number> | { rowsAffected: Record<string, number>, ownerSuccessions: ForgetOwnerSuccession[] }> }}
+ * @returns {{ purgeUser: (tenantId: string | null, userId: string, cascade?: any) => Promise<Record<string, number> | { rowsAffected: Record<string, number>, ownerSuccessions: ForgetOwnerSuccession[], presenceTopics: string[], cursorTopics: string[] }> }}
  */
 export function createForgetStore(stores, options) {
 	if (!stores || typeof stores !== 'object') {
@@ -332,6 +339,7 @@ export function createForgetStore(stores, options) {
 		? stores.map((s, i) => [`store${i}`, s])
 		: Object.entries(stores);
 	const entries = raw.filter(([, s]) => s && typeof (/** @type {any} */ (s).purgeUser) === 'function');
+	const detailed = entries.some(([, s]) => typeof (/** @type {any} */ (s).purgeUserDetailed) === 'function');
 	let redis = (options && options.redis) || null;
 	// Accept a client wrapper: unwrap to the raw ioredis it holds.
 	if (redis && typeof redis.scan !== 'function' && redis.redis && typeof redis.redis.scan === 'function') {
@@ -345,22 +353,27 @@ export function createForgetStore(stores, options) {
 		async purgeUser(tenantId, userId, cascade) {
 			if (typeof userId !== 'string' || userId.length === 0) return {};
 			tenantId = validateTenantId(tenantId);
-			const jobs = entries.map(([name, s]) =>
-				Promise.resolve(/** @type {any} */ (s).purgeUser(tenantId, userId, cascade)).then((n) => ({ name, n }))
-			);
+			const jobs = entries.map(([name, s]) => {
+				const purge = typeof (/** @type {any} */ (s).purgeUserDetailed) === 'function'
+					? /** @type {any} */ (s).purgeUserDetailed
+					: /** @type {any} */ (s).purgeUser;
+				return Promise.resolve(purge.call(s, tenantId, userId, cascade)).then((n) => ({ name, n }));
+			});
 			if (redis) {
 				const scope = tenantId == null ? null : tenantId;
 				// The two cluster legs never reject the whole job: each surfaces
 				// its per-room/-roster failures in `legFailures` so a room that
 				// already committed still contributes its succession.
 				jobs.push(evictOwnerUser(redis, scope, userId).then((r) => ({ name: 'roomOwners', n: r.touched, successions: r.successions, legFailures: r.failures })));
-				jobs.push(purgePresenceRoster(redis, scope, userId).then((r) => ({ name: 'presenceRoster', n: r.removed, legFailures: r.failures })));
+				jobs.push(purgePresenceRoster(redis, scope, userId).then((r) => ({ name: 'presenceRoster', n: r.removed, presenceTopics: r.topics, legFailures: r.failures })));
 			}
 			const settled = await Promise.allSettled(jobs);
 			/** @type {Record<string, number>} */
 			const counts = {};
 			/** @type {ForgetOwnerSuccession[]} */
 			const ownerSuccessions = [];
+			const presenceTopics = new Set();
+			const cursorTopics = new Set();
 			const failures = [];
 			// Failed PURGE UNITS (a store, or one cluster leg with any per-room
 			// failure), for the "N of M" message; distinct from `failures`, which
@@ -379,6 +392,12 @@ export function createForgetStore(stores, options) {
 					if (/** @type {any} */ (r.value).successions) {
 						ownerSuccessions.push(.../** @type {any} */ (r.value).successions);
 					}
+					for (const topic of /** @type {any} */ (r.value).presenceTopics || n?.presenceTopics || []) {
+						if (typeof topic === 'string' && topic.length > 0) presenceTopics.add(topic);
+					}
+					for (const topic of n?.cursorTopics || []) {
+						if (typeof topic === 'string' && topic.length > 0) cursorTopics.add(topic);
+					}
 					const legFailures = /** @type {any} */ (r.value).legFailures;
 					if (legFailures && legFailures.length) {
 						failures.push(...legFailures);
@@ -389,6 +408,8 @@ export function createForgetStore(stores, options) {
 					failedUnits++;
 				}
 			}
+			const erasedPresenceTopics = [...presenceTopics].sort();
+			const erasedCursorTopics = [...cursorTopics].sort();
 			if (failures.length) {
 				const err = operationError('ERASURE_INCOMPLETE',
 					'createForgetStore: ' + failedUnits + ' of ' + (entries.length + (redis ? 2 : 0)) +
@@ -401,11 +422,16 @@ export function createForgetStore(stores, options) {
 				// realtime layer announces them on the `:owner` stream even though
 				// the overall erasure is incomplete and will be retried. The retry
 				// re-drives only the failed rooms, so each commits its wire
-				// announcement exactly once.
+				// announcement exactly once. Erased topics ride along for the same
+				// reason: their leave frames still need to reach remote replicas.
 				/** @type {any} */ (err).ownerSuccessions = ownerSuccessions;
+				/** @type {any} */ (err).presenceTopics = erasedPresenceTopics;
+				/** @type {any} */ (err).cursorTopics = erasedCursorTopics;
 				throw err;
 			}
-			return redis ? { rowsAffected: counts, ownerSuccessions } : counts;
+			return redis || detailed
+				? { rowsAffected: counts, ownerSuccessions, presenceTopics: erasedPresenceTopics, cursorTopics: erasedCursorTopics }
+				: counts;
 		}
 	};
 }

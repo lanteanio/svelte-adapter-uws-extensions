@@ -163,6 +163,8 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 
 		const res = await store.purgeUser(null, 'u1');
 		expect(res.rowsAffected.presenceRoster).toBe(2); // c:u1 + d:u1, room1 only (tenant scope)
+		expect(res.presenceTopics).toEqual(['room1']);
+		expect(res.cursorTopics).toEqual([]);
 		const h = await redis.hgetall('__live-presence:room1');
 		expect(h['c:u1']).toBeUndefined();
 		expect(h['d:u1']).toBeUndefined();
@@ -194,6 +196,46 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('u1'); // untouched
 	});
 
+	it('reports only erased presence and cursor topics through the public store entry points', async () => {
+		const platform = mockPlatform();
+		const presence = createPresence(client, {
+			key: 'id', select: (u) => ({ id: u.id }), heartbeat: 60000, ttl: 180
+		});
+		const cursor = createCursor(client, {
+			throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (u) => ({ id: u.id })
+		});
+		try {
+			await presence.join(mockWs({ id: 'u1' }), 'roomB', platform);
+			await presence.join(mockWs({ id: 'u1' }), 'roomA', platform);
+			await presence.join(mockWs({ id: 'u2' }), 'roomC', platform);
+			cursor.update(mockWs({ id: 'u1' }), 'board', { x: 1 }, platform);
+			cursor.update(mockWs({ id: 'u1' }), 'board', { x: 2 }, platform);
+			cursor.update(mockWs({ id: 'u1' }), 'canvas', { x: 3 }, platform);
+			cursor.update(mockWs({ id: 'u2' }), 'other', { x: 4 }, platform);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			await redis.hset('__live-presence:live-room', 'c:u1', '1', 'd:u1', '{}');
+
+			const store = createForgetStore({ presence, cursor }, { redis });
+			const result = await store.purgeUser(null, 'u1');
+			expect(result.rowsAffected).toMatchObject({ presence: 2, cursor: 3, presenceRoster: 2 });
+			expect(result.presenceTopics).toEqual(['live-room', 'roomA', 'roomB']);
+			expect(result.cursorTopics).toEqual(['board', 'canvas']);
+			expect(result.presenceTopics).not.toContain('roomC');
+			expect(result.cursorTopics).not.toContain('other');
+			expect(await presence.purgeUser(null, 'missing')).toBe(0);
+			expect(await cursor.purgeUser(null, 'missing')).toBe(0);
+
+			const empty = await createForgetStore({ presence, cursor }).purgeUser(null, 'u1');
+			expect(empty).toEqual({
+				rowsAffected: { presence: 0, cursor: 0 },
+				ownerSuccessions: [], presenceTopics: [], cursorTopics: []
+			});
+		} finally {
+			presence.destroy();
+			cursor.destroy();
+		}
+	});
+
 	it('still runs the cluster legs when a composed store fails, then rejects', async () => {
 		await seedOwnerRoom('room1', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
 		const bad = { async purgeUser() { throw new Error('redis down'); } };
@@ -214,6 +256,8 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 		// carries it. The realtime layer announces `err.ownerSuccessions`.
 		await seedOwnerRoom('roomA', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
 		await seedOwnerRoom('roomB', { o: 'u1', q: 2, 'j:u1': 1, 'j:u3': 2, 'n:u1': 1, 'n:u3': 1 });
+		await redis.hset('__live-presence:roomA', 'c:u1', '1', 'd:u1', '{}');
+		await redis.hset('__live-presence:roomB', 'c:u1', '1', 'd:u1', '{}');
 		const raw = redis;
 		const failKey = '__live-room-owner:roomB';
 		// Pass every command through to the mock EXCEPT the owner-eviction script
@@ -240,6 +284,8 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 		expect(err.message).toMatch(/incomplete/);
 		// The committed room's succession rides on the error for announcement...
 		expect(err.ownerSuccessions).toEqual([{ topic: 'roomA', owner: 'u2', reason: 'succeeded' }]);
+		expect(err.presenceTopics).toEqual(['roomA', 'roomB']);
+		expect(err.cursorTopics).toEqual([]);
 		expect(err.failures).toHaveLength(1); // roomB's transient error surfaced
 		// ...roomA committed durably, roomB is untouched (a retry re-drives it).
 		expect((await raw.hgetall('__live-room-owner:roomA')).o).toBe('u2');

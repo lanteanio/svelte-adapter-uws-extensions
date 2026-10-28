@@ -1184,6 +1184,12 @@ export function createCursor(client, options = {}) {
 			return result;
 		},
 
+		/** @returns {Promise<number>} cursor entries removed */
+		async purgeUser(tenantId, userId) {
+			const result = await tracker.purgeUserDetailed(tenantId, userId);
+			return result.count;
+		},
+
 		/**
 		 * Right-to-erasure (`live.forget`): remove a user's cursors from every
 		 * topic across the cluster. The cursor hash FIELD is an ephemeral
@@ -1198,14 +1204,15 @@ export function createCursor(client, options = {}) {
 		 * topics outside the tenant namespace.
 		 * @param {string | null} tenantId
 		 * @param {string} userId
-		 * @returns {Promise<number>} cursor entries removed
+		 * @returns {Promise<{ count: number, cursorTopics: string[] }>} count and wire topics actually erased
 		 */
-		async purgeUser(tenantId, userId) {
-			if (typeof userId !== 'string' || userId.length === 0) return 0;
+		async purgeUserDetailed(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return { count: 0, cursorTopics: [] };
 			const prefix = client.key('cursor:{');
 			let keys;
-			try { keys = await scanKeys(redis, hashKey('*')); } catch { inputDropped('scan_failed', 'erase'); return 0; }
+			try { keys = await scanKeys(redis, hashKey('*')); } catch { inputDropped('scan_failed', 'erase'); return { count: 0, cursorTopics: [] }; }
 			let n = 0;
+			const cursorTopics = new Set();
 			for (const fullKey of keys) {
 				if (!fullKey.startsWith(prefix) || !fullKey.endsWith('}')) continue;
 				const topic = fullKey.slice(prefix.length, fullKey.length - 1);
@@ -1234,11 +1241,11 @@ export function createCursor(client, options = {}) {
 							tm.delete(field);
 						}
 					}
-					if (await removeKeysBatch([topic], field)) n++;
+					if (await removeKeysBatch([topic], field)) { n++; cursorTopics.add(topic); }
 					else inputDropped('delete_failed', 'erase');
 				}
 			}
-			return n;
+			return { count: n, cursorTopics: [...cursorTopics] };
 		},
 
 		async clear() {

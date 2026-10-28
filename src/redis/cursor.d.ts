@@ -260,6 +260,12 @@ export interface RedisCursorTracker {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
+	 * Detailed erasure for `createForgetStore`: the numeric count plus every
+	 * wire cursor topic from which at least one entry was actually erased.
+	 */
+	purgeUserDetailed(tenantId: string | null, userId: string): Promise<{ count: number; cursorTopics: string[] }>;
+
+	/**
 	 * Send the current state for a topic to a single connection as ordered
 	 * events on `__cursor:{topic}`: `time` (`{t}`, the server clock seed),
 	 * `you` (`{key}`, the connection's own roster key - allocated here
