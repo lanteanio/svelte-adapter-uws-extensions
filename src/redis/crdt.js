@@ -1090,6 +1090,53 @@ export function createCrdtCluster(client, options = {}) {
 		})
 		: null;
 
+	/**
+	 * Try to become (or stay) the sole snapshot writer for a topic. `fresh` is
+	 * true only for the SET NX acquisition, never for a renewal or a contender
+	 * that failed to acquire. A newly acquired lease, and one renewed while a
+	 * resync of the topic runs, first waits for a sync round with the peers
+	 * (bounded to a third of the lease TTL). Throws on a Redis error, and with
+	 * code `CRDT_RELAY_PENDING` while local edits to the topic have not reached
+	 * the peers or the replica has not synced with them after the relay lost
+	 * traffic, so the caller's persistence schedule retries rather than dropping
+	 * the write or unloading the only replica holding local edits.
+	 * @param {string} topic
+	 * @returns {Promise<{ acquired: boolean, fresh: boolean }>}
+	 */
+	async function acquirePersistDetailed(topic) {
+		if (destroyed) return { acquired: false, fresh: false };
+		assertRelayable(topic);
+		let synced = false;
+		let reached = true;
+		if (known.has(topic) && (unrelayed.has(topic) || stale.has(topic) || queue.has(topic) || rounds.has(topic))) {
+			reached = await syncRound(topic);
+			synced = true;
+			if (destroyed) return { acquired: false, fresh: false };
+		}
+		await awaitRelayed(topic);
+		if (destroyed) return { acquired: false, fresh: false };
+		assertSynced(topic, reached);
+		const key = client.key('crdt:persist:' + topic);
+		const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
+		const fresh = r === 'OK';
+		if (!fresh) {
+			// Held by someone: renew only if it is ours (compare-and-pexpire).
+			const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
+			if (Number(renew) !== 1) return { acquired: false, fresh: false };
+		} else if (!synced && known.has(topic)) {
+			// Newly acquired: the previous writer may have held edits this
+			// replica never received.
+			reached = await syncRound(topic);
+			if (destroyed) return { acquired: false, fresh: false };
+			await awaitRelayed(topic);
+		}
+		if (destroyed) return { acquired: false, fresh: false };
+		// Edits marked or relays started while the lease was being taken
+		// count as well.
+		assertSynced(topic, reached);
+		return { acquired: true, fresh };
+	}
+
 	return {
 		/** This instance's relay identity (stable for the coordinator's life). */
 		instanceId,
@@ -1148,56 +1195,23 @@ export function createCrdtCluster(client, options = {}) {
 		 * Try to become (or stay) the sole snapshot writer for a topic. Returns
 		 * true when this instance holds the per-topic persist lease and may
 		 * write; false when another instance holds it (skip - that instance
-		 * persists). A newly acquired lease, and one renewed while a resync of
-		 * the topic runs, first waits for a sync round with the peers (bounded
-		 * to a third of the lease TTL). Throws on a Redis error, and with
-		 * code `CRDT_RELAY_PENDING` while local edits to the topic have not
-		 * reached the peers (a relay that failed, or one Redis has not
-		 * confirmed within that window) or the replica has not synced with
-		 * them after the relay lost traffic (a sync round the breaker refused,
-		 * or whose request failed or was not confirmed within that window), so
-		 * the caller's persistence schedule retries rather than dropping the
-		 * write, storing a snapshot from a replica that could not ask its
-		 * peers, or unloading the only replica holding local edits. Replies
-		 * lost or late do not hold up the write; they are merged when they
-		 * arrive or by the next resync. A topic past the relay limit rejects
-		 * with the same code as the module comment describes, its `cause`
-		 * the `RELAY_ENVELOPE_TOO_LARGE` error reported for it.
+		 * persists). Uses the same convergence and error barrier as
+		 * `acquirePersistDetailed`.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
 		async acquirePersist(topic) {
-			if (destroyed) return false;
-			assertRelayable(topic);
-			let synced = false;
-			let reached = true;
-			if (known.has(topic) && (unrelayed.has(topic) || stale.has(topic) || queue.has(topic) || rounds.has(topic))) {
-				reached = await syncRound(topic);
-				synced = true;
-				if (destroyed) return false;
-			}
-			await awaitRelayed(topic);
-			if (destroyed) return false;
-			assertSynced(topic, reached);
-			const key = client.key('crdt:persist:' + topic);
-			const r = await redis.set(key, instanceId, 'NX', 'PX', persistLeaseMs);
-			if (r !== 'OK') {
-				// Held by someone: renew only if it is ours (compare-and-pexpire).
-				const renew = await evalCached(redis, LEASE_RENEW_SCRIPT, 1, key, instanceId, persistLeaseMs);
-				if (Number(renew) !== 1) return false;
-			} else if (!synced && known.has(topic)) {
-				// Newly acquired: the previous writer may have held edits this
-				// replica never received.
-				reached = await syncRound(topic);
-				if (destroyed) return false;
-				await awaitRelayed(topic);
-			}
-			if (destroyed) return false;
-			// Edits marked or relays started while the lease was being taken
-			// count as well.
-			assertSynced(topic, reached);
-			return true;
+			return (await acquirePersistDetailed(topic)).acquired;
 		},
+
+		/**
+		 * The boolean lease result plus whether this call newly acquired the
+		 * lease with SET NX. A fresh result tells the document layer to merge
+		 * the persisted snapshot before replacing it; a renewal is not fresh.
+		 * @param {string} topic
+		 * @returns {Promise<{ acquired: boolean, fresh: boolean }>}
+		 */
+		acquirePersistDetailed,
 
 		/** Tear down the subscriber. Idempotent. */
 		destroy() {

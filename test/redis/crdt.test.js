@@ -119,6 +119,16 @@ describe('createCrdtCluster per-topic persist lease', () => {
 		expect(await a.acquirePersist('board:1')).toBe(true); // holder renews
 	});
 
+	it('reports a fresh lease only for a new acquisition, never a renewal or denial', async () => {
+		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: true, fresh: true });
+		expect(await b.acquirePersistDetailed('board:1')).toEqual({ acquired: false, fresh: false });
+		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: true, fresh: false });
+		await client.redis.del(client.key('crdt:persist:board:1'));
+		expect(await b.acquirePersistDetailed('board:1')).toEqual({ acquired: true, fresh: true });
+		a.destroy();
+		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: false, fresh: false });
+	});
+
 	it('leases are per-topic (one instance can hold different topics independently)', async () => {
 		expect(await a.acquirePersist('board:1')).toBe(true);
 		expect(await b.acquirePersist('board:2')).toBe(true); // a different topic, free

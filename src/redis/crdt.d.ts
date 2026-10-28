@@ -48,6 +48,13 @@ export interface CrdtClusterHandlers {
 	onSyncReply?: (declKey: string, topic: string, bytes: number[]) => void;
 }
 
+export interface CrdtPersistLease {
+	/** Whether this instance holds the lease and may persist the topic. */
+	acquired: boolean;
+	/** True only for a new SET NX acquisition, never for a renewal or denial. */
+	fresh: boolean;
+}
+
 /**
  * The cluster coordinator for conflict-free documents. Pure transport: it
  * relays applied updates so every instance's replica converges, answers
@@ -90,6 +97,13 @@ export interface CrdtCluster {
 	 * `RELAY_ENVELOPE_TOO_LARGE` error, and keep the replica loaded.
 	 */
 	acquirePersist(topic: string): Promise<boolean>;
+	/**
+	 * The same lease and convergence barrier as `acquirePersist`, plus a
+	 * `fresh` signal that is true only for a new SET NX acquisition. On a fresh
+	 * result the document layer must merge the persisted snapshot before its
+	 * first replacement write; renewals and denied acquisitions return false.
+	 */
+	acquirePersistDetailed(topic: string): Promise<CrdtPersistLease>;
 	/** Tear down the relay subscriber. Idempotent. */
 	destroy(): void;
 }

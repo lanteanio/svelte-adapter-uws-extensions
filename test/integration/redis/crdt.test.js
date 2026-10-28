@@ -130,7 +130,8 @@ describe('redis crdt cluster coordinator (integration)', () => {
 		expect(await b.acquirePersist('board:ttl')).toBe(false);
 		// Let A's lease lapse without renewal; B can then take over.
 		await wait(450);
-		expect(await b.acquirePersist('board:ttl')).toBe(true);
+		expect(await b.acquirePersistDetailed('board:ttl')).toEqual({ acquired: true, fresh: true });
+		expect(await b.acquirePersistDetailed('board:ttl')).toEqual({ acquired: true, fresh: false });
 	});
 
 	it('persists a lone holder\'s state too large for the relay once it counted every subscriber', async () => {
