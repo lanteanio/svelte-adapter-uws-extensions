@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPresence } from '../../src/redis/presence.js';
 import { mockRedisClient } from '../../src/testing/mock-redis.js';
 import { mockWs } from '../../src/testing/mock-ws.js';
@@ -97,6 +97,64 @@ describe('presence relayed joins', () => {
 			await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', pb);
 			for (const tracker of [a, b]) expect(await tracker.list('room')).toEqual([{ id: 'alice', name: 'New' }]);
 		} finally { a.destroy(); b.destroy(); resetRuntimeEnv(); }
+	});
+
+	describe('identity write stamps while the cached clock lags', () => {
+		// The stored stamp is what later joins on every instance are fenced
+		// against, so each write carries the exact time it was made, never the
+		// older stamp a lagging cached clock would hand it.
+		let clock;
+		const stored = async (client) => JSON.parse(await client.redis.hget(client.key('presence:topic:{room}'), 'alice'));
+		const options = { binary: false, select: (u) => ({ id: u.id, name: u.name }) };
+		beforeEach(() => {
+			clock = { t: 1_000_000, lag: 0 };
+			setRuntimeEnv({ clock: { now: () => clock.t - clock.lag, wallEpoch: () => clock.t, monotonic: () => clock.t } });
+		});
+		afterEach(() => resetRuntimeEnv());
+
+		it('commits a peer join with the time it finalized', async () => {
+			const client = mockRedisClient();
+			const a = createPresence(client, options);
+			const b = createPresence(client, options);
+			try {
+				await a.join(mockWs({ id: 'alice', name: 'Old' }), 'room', mockPlatform());
+				expect((await stored(client)).ts).toBe(1_000_000);
+				clock.t += 500;
+				clock.lag = 900;
+				await b.join(mockWs({ id: 'alice', name: 'New' }), 'room', mockPlatform());
+				expect(await stored(client)).toMatchObject({ data: { name: 'New' }, ts: 1_000_500 });
+			} finally { a.destroy(); b.destroy(); }
+		});
+		it('stamps a durable update with the time it was made', async () => {
+			const client = mockRedisClient();
+			const a = createPresence(client, options);
+			try {
+				const pa = mockPlatform();
+				const ws = mockWs({ id: 'alice', name: 'Old' });
+				await a.join(ws, 'room', pa);
+				clock.t += 100;
+				clock.lag = 900;
+				await a.update(ws, 'room', { color: 'blue' }, pa);
+				expect(await stored(client)).toMatchObject({ fields: { color: 'blue' }, ts: 1_000_100 });
+			} finally { a.destroy(); }
+		});
+		it('stamps a restored tab identity with the time it was restored', async () => {
+			const client = mockRedisClient();
+			const a = createPresence(client, options);
+			try {
+				const pa = mockPlatform();
+				const older = mockWs({ id: 'alice', name: 'Old' });
+				const newer = mockWs({ id: 'alice', name: 'New' });
+				await a.join(older, 'room', pa);
+				clock.t += 100;
+				await a.join(newer, 'room', pa);
+				expect(await stored(client)).toMatchObject({ data: { name: 'New' }, ts: 1_000_100 });
+				clock.t += 400;
+				clock.lag = 900;
+				await a.leave(newer, pa, 'room');
+				expect(await stored(client)).toMatchObject({ data: { name: 'Old' }, ts: 1_000_500 });
+			} finally { a.destroy(); }
+		});
 	});
 
 	for (const closeAll of [false, true]) it('keeps the peer identity when an older local tab leaves, closeAll=' + closeAll, async () => {
