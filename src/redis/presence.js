@@ -1509,12 +1509,6 @@ export function createPresence(client, options = {}) {
 			flushPendingDiffs();
 		},
 
-		/** @returns {Promise<number>} topics the user was removed from */
-		async purgeUser(tenantId, userId) {
-			const result = await tracker.purgeUserDetailed(tenantId, userId);
-			return result.count;
-		},
-
 		/**
 		 * Right-to-erasure (`live.forget`): remove a user from every presence topic
 		 * across the cluster. Scans `presence:user:{*}:{userId}` (the per-user hash
@@ -1534,10 +1528,10 @@ export function createPresence(client, options = {}) {
 		 *
 		 * @param {string | null} tenantId
 		 * @param {string} userId
-		 * @returns {Promise<{ count: number, presenceTopics: string[] }>} count and wire topics actually erased
+		 * @returns {Promise<number>} topics the user was removed from
 		 */
-		async purgeUserDetailed(tenantId, userId) {
-			if (typeof userId !== 'string' || userId.length === 0) return { count: 0, presenceTopics: [] };
+		async purgeUser(tenantId, userId) {
+			if (typeof userId !== 'string' || userId.length === 0) return 0;
 			// The user id is interpolated into the SCAN MATCH glob below, so a
 			// metacharacter in it WIDENS the scan instead of narrowing it:
 			// userId '*' matches every user in every topic. The exact
@@ -1567,8 +1561,8 @@ export function createPresence(client, options = {}) {
 					const member = userHashKey(topic, userId);
 					if (!seen.has(member)) { seen.add(member); keys.push(member); }
 				}
-			} catch { return { count: 0, presenceTopics: [] }; }
-			const presenceTopics = [];
+			} catch { return 0; }
+			let n = 0;
 			for (const k of keys) {
 				if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
 				const topic = k.slice(prefix.length, k.length - suffix.length);
@@ -1595,9 +1589,9 @@ export function createPresence(client, options = {}) {
 				// syncCounts is a topic-level OBSERVER refcount (topic -> number),
 				// not per-user state - purging a user must leave it untouched.
 				try { await publishEvent(topic, INTERNAL_EVENTS.LEAVE, { key: userId, data: null }); } catch { /* leave broadcast best-effort */ }
-				presenceTopics.push(topic);
+				n++;
 			}
-			return { count: presenceTopics.length, presenceTopics };
+			return n;
 		},
 
 		async clear() {

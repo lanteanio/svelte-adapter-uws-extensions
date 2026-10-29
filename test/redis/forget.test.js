@@ -196,7 +196,7 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 		expect((await redis.hgetall('__live-room-owner:room1')).o).toBe('u1'); // untouched
 	});
 
-	it('reports only erased presence and cursor topics through the public store entry points', async () => {
+	it('derives erased topics from the roster sweep only, and keeps the numeric shape without options.redis', async () => {
 		const platform = mockPlatform();
 		const presence = createPresence(client, {
 			key: 'id', select: (u) => ({ id: u.id }), heartbeat: 60000, ttl: 180
@@ -205,35 +205,97 @@ describe('createForgetStore cluster owner eviction (owner-succession envelope)',
 			throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0, select: (u) => ({ id: u.id })
 		});
 		try {
-			await presence.join(mockWs({ id: 'u1' }), 'roomB', platform);
+			// The trackers' own keys hold u1 in roomA and on board; only the
+			// realtime roster keys below are what the envelope topics describe.
 			await presence.join(mockWs({ id: 'u1' }), 'roomA', platform);
-			await presence.join(mockWs({ id: 'u2' }), 'roomC', platform);
 			cursor.update(mockWs({ id: 'u1' }), 'board', { x: 1 }, platform);
-			cursor.update(mockWs({ id: 'u1' }), 'board', { x: 2 }, platform);
-			cursor.update(mockWs({ id: 'u1' }), 'canvas', { x: 3 }, platform);
-			cursor.update(mockWs({ id: 'u2' }), 'other', { x: 4 }, platform);
 			await new Promise((resolve) => setTimeout(resolve, 0));
 			await redis.hset('__live-presence:live-room', 'c:u1', '1', 'd:u1', '{}');
+			await redis.hset('__live-presence:\0cursors:canvas', 'c:u1', '1', 'd:u1', 'null');
 
-			const store = createForgetStore({ presence, cursor }, { redis });
-			const result = await store.purgeUser(null, 'u1');
-			expect(result.rowsAffected).toMatchObject({ presence: 2, cursor: 3, presenceRoster: 2 });
-			expect(result.presenceTopics).toEqual(['live-room', 'roomA', 'roomB']);
-			expect(result.cursorTopics).toEqual(['board', 'canvas']);
-			expect(result.presenceTopics).not.toContain('roomC');
-			expect(result.cursorTopics).not.toContain('other');
-			expect(await presence.purgeUser(null, 'missing')).toBe(0);
-			expect(await cursor.purgeUser(null, 'missing')).toBe(0);
+			const result = await createForgetStore({ presence, cursor }, { redis }).purgeUser(null, 'u1');
+			expect(result.rowsAffected).toMatchObject({ presence: 1, cursor: 1, presenceRoster: 4 });
+			expect(result.presenceTopics).toEqual(['live-room']);
+			expect(result.cursorTopics).toEqual(['canvas']);
 
-			const empty = await createForgetStore({ presence, cursor }).purgeUser(null, 'u1');
-			expect(empty).toEqual({
-				rowsAffected: { presence: 0, cursor: 0 },
-				ownerSuccessions: [], presenceTopics: [], cursorTopics: []
-			});
+			await presence.join(mockWs({ id: 'u2' }), 'roomB', platform);
+			expect(await createForgetStore({ presence }).purgeUser(null, 'u2')).toEqual({ presence: 1 });
+			expect(await createForgetStore({ presence, cursor }).purgeUser(null, 'u2')).toEqual({ presence: 0, cursor: 0 });
 		} finally {
 			presence.destroy();
 			cursor.destroy();
 		}
+	});
+
+	it('reports a cursor-publisher roster under cursorTopics with the control prefix stripped', async () => {
+		await redis.hset('__live-presence:\0cursors:board', 'c:u1', '1', 'd:u1', 'null');
+		await redis.hset('__live-presence:room', 'c:u1', '1', 'd:u1', '{}');
+		const res = await createForgetStore({}, { redis }).purgeUser(null, 'u1');
+		expect(res.presenceTopics).toEqual(['room']);
+		expect(res.cursorTopics).toEqual(['board']);
+		expect(await redis.hgetall('__live-presence:\0cursors:board')).toEqual({});
+	});
+
+	it('scopes a cursor-publisher roster by the wire topic behind the control prefix', async () => {
+		const key = '__live-presence:\0cursors:@t/acme/board';
+		await redis.hset(key, 'c:u1', '1', 'd:u1', 'null');
+		const store = createForgetStore({}, { redis });
+
+		const untenanted = await store.purgeUser(null, 'u1');
+		expect(untenanted.cursorTopics).toEqual([]);
+		expect(untenanted.presenceTopics).toEqual([]);
+		expect(untenanted.rowsAffected.presenceRoster).toBe(0);
+		expect((await redis.hgetall(key))['c:u1']).toBe('1');
+
+		const otherTenant = await store.purgeUser('other', 'u1');
+		expect(otherTenant.cursorTopics).toEqual([]);
+		expect((await redis.hgetall(key))['c:u1']).toBe('1');
+
+		const scoped = await store.purgeUser('acme', 'u1');
+		expect(scoped.cursorTopics).toEqual(['@t/acme/board']);
+		expect(scoped.presenceTopics).toEqual([]);
+		expect(scoped.rowsAffected.presenceRoster).toBe(2);
+		expect(await redis.hgetall(key)).toEqual({});
+	});
+
+	it('does not report a roster that held no fields for the user', async () => {
+		await redis.hset('__live-presence:room', 'c:u2', '1', 'd:u2', '{}');
+		await redis.hset('__live-presence:\0cursors:board', 'c:u2', '1', 'd:u2', 'null');
+		const res = await createForgetStore({}, { redis }).purgeUser(null, 'u1');
+		expect(res.rowsAffected.presenceRoster).toBe(0);
+		expect(res.presenceTopics).toEqual([]);
+		expect(res.cursorTopics).toEqual([]);
+	});
+
+	it('reports only the rosters whose HDEL succeeded when a sibling roster fails', async () => {
+		await redis.hset('__live-presence:okRoom', 'c:u1', '1', 'd:u1', '{}');
+		await redis.hset('__live-presence:badRoom', 'c:u1', '1', 'd:u1', '{}');
+		await redis.hset('__live-presence:\0cursors:okBoard', 'c:u1', '1', 'd:u1', 'null');
+		await redis.hset('__live-presence:\0cursors:badBoard', 'c:u1', '1', 'd:u1', 'null');
+		const raw = redis;
+		const failing = new Set(['__live-presence:badRoom', '__live-presence:\0cursors:badBoard']);
+		const wrap = {
+			options: raw.options,
+			scan: (...a) => raw.scan(...a),
+			hdel: (key, ...fields) => failing.has(key)
+				? Promise.reject(new Error('Connection is closed'))
+				: raw.hdel(key, ...fields),
+			hgetall: (...a) => raw.hgetall(...a),
+			defineCommand(name, def) {
+				raw.defineCommand(name, def);
+				wrap[name] = (...args) => raw[name](...args);
+			}
+		};
+		const err = await createForgetStore({}, { redis: wrap }).purgeUser(null, 'u1').then(
+			() => { throw new Error('expected rejection'); },
+			(e) => e
+		);
+		expect(err.message).toMatch(/incomplete/);
+		expect(err.failures).toHaveLength(2);
+		expect(err.presenceTopics).toEqual(['okRoom']);
+		expect(err.cursorTopics).toEqual(['okBoard']);
+		expect(err.partialCounts.presenceRoster).toBe(4);
+		expect((await raw.hgetall('__live-presence:badRoom'))['c:u1']).toBe('1');
 	});
 
 	it('still runs the cluster legs when a composed store fails, then rejects', async () => {

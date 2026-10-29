@@ -97,6 +97,20 @@ describe('createForgetStore cluster owner eviction (integration)', () => {
 		expect(h['c:u2']).toBe('1');
 	});
 
+	it('reports cursor-publisher rosters as cursor topics, scoped by the wire topic', async () => {
+		await redis.hset('__live-presence:\0cursors:@t/acme/board', 'c:u1', '1', 'd:u1', 'null');
+		await redis.hset('__live-presence:\0cursors:canvas', 'c:u1', '1', 'd:u1', 'null');
+
+		const untenanted = await store.purgeUser(null, 'u1');
+		expect(untenanted.cursorTopics).toEqual(['canvas']);
+		expect(untenanted.presenceTopics).toEqual([]);
+		expect((await redis.hgetall('__live-presence:\0cursors:@t/acme/board'))['c:u1']).toBe('1');
+
+		const scoped = await store.purgeUser('acme', 'u1');
+		expect(scoped.cursorTopics).toEqual(['@t/acme/board']);
+		expect(await redis.hgetall('__live-presence:\0cursors:@t/acme/board')).toEqual({});
+	});
+
 	it('is idempotent: a second purge finds nothing and reports no successions', async () => {
 		await seedOwnerRoom('room1', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
 

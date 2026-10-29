@@ -24,21 +24,14 @@ describe('topic-scoped presence and cursor erasure', () => {
 			}
 			await new Promise((resolve) => setTimeout(resolve, 0));
 			const expectedTopics = tenantId === null ? ['room'] : topics.filter((topic) => topic.startsWith('@t/' + tenantId + '/'));
-			const sortedTopics = [...expectedTopics].sort();
-			expect(await store.purgeUser(tenantId, 'shared-user')).toEqual({
-				rowsAffected: { presence: expectedTopics.length, cursor: expectedTopics.length },
-				ownerSuccessions: [], presenceTopics: sortedTopics, cursorTopics: sortedTopics
-			});
+			expect(await store.purgeUser(tenantId, 'shared-user')).toEqual({ presence: expectedTopics.length, cursor: expectedTopics.length });
 			for (const topic of topics) {
 				const expected = expectedTopics.includes(topic) ? ['survivor'] : ['shared-user', 'survivor'];
 				expect((await presence.list(topic)).map((entry) => entry.id).sort(), topic).toEqual(expected);
 				expect((await cursor.list(topic)).map((entry) => entry.user.id).sort(), topic).toEqual(expected);
 			}
 			// A second erasure neither widens the scope nor counts already-erased entries.
-			expect(await store.purgeUser(tenantId, 'shared-user')).toEqual({
-				rowsAffected: { presence: 0, cursor: 0 },
-				ownerSuccessions: [], presenceTopics: [], cursorTopics: []
-			});
+			expect(await store.purgeUser(tenantId, 'shared-user')).toEqual({ presence: 0, cursor: 0 });
 		} finally {
 			presence.destroy();
 			cursor.destroy();

@@ -261,12 +261,6 @@ export interface RedisPresenceTracker {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
-	 * Detailed erasure for `createForgetStore`: the numeric count plus every
-	 * wire presence topic whose durable roster entry was actually erased.
-	 */
-	purgeUserDetailed(tenantId: string | null, userId: string): Promise<{ count: number; presenceTopics: string[] }>;
-
-	/**
 	 * Snapshot of local presence health metrics. Synchronous; reads
 	 * in-memory state only. The same numbers are exposed as Prometheus
 	 * gauges (`presence_total_online`, `presence_heartbeat_latency_ms`)
