@@ -183,6 +183,14 @@ it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();
 });
 
+it('requires PostgreSQL dead letters and erasure tombstones together', () => {
+	const all = { 'dead-letter': 'svti_dead_letter', 'dead-letter-erasure': 'svti_dead_letter_purges' };
+	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: all } })).not.toThrow();
+	for (const stores of [{ 'dead-letter': all['dead-letter'] }, { 'dead-letter-erasure': all['dead-letter-erasure'] }]) {
+		expect(() => validateConfig({ schemaVersion: 1, postgres: { stores } })).toThrow('incomplete_restore_group');
+	}
+});
+
 it('requires PostgreSQL alarm rows, retained generation authority and executions together', () => {
 	const all = { alarms: 'svti_alarms', 'alarm-generations': 'svti_alarms_generations', 'alarm-executions': 'svti_alarms_executions' };
 	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: all } })).not.toThrow();

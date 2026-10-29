@@ -122,6 +122,22 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		versions.push(retained);
 		schema.checkpoints[4] = schema.tables;
 	}
+	if (store === 'dead-letter') {
+		const erasure = {
+			name: `${table}_purges`,
+			columns: [text('scope', true), text('user_id', true), ['purged_at', 'bigint', true]],
+			primary: ['scope', 'user_id'],
+			indexes: [index('purges_expiry', ['purged_at'])],
+			checks: [], additions: [],
+			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+		};
+		schema.tables.push(erasure);
+		versions.push([
+			`CREATE TABLE IF NOT EXISTS ${erasure.name} (${erasure.columns.map(columnSql).join(', ')}, PRIMARY KEY (scope, user_id))`,
+			indexSql(erasure.name, erasure.indexes[0])
+		]);
+		schema.checkpoints[3] = schema.tables;
+	}
 	for (const [offset, statements] of versions.entries()) {
 		const version = offset + 1;
 		const checksum = createHash('sha256').update(JSON.stringify({ store, version, statements })).digest('hex');

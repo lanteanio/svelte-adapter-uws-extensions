@@ -47,12 +47,15 @@ wait or adding recurring timers. `destroy()` cancels a queued trailing pass.
 TTL selection uses `failed_at`; size cleanup retains the newest `max`
 ids. The two policies alternate priority. `get`, `count`, `list` and `summary`
 exclude expired rows using database time, including when physical cleanup has
-not finished. The idle timer runs even when TTL is disabled so an oversized
-queue can drain after writes stop. An acknowledged INSERT keeps its returned
-id when cleanup fails, times out or loses ownership to another replica.
-With `cleanupInterval: 0`, residual backlog needs another write to trigger
-cleanup, including writes that arrive during the trailing pass. `max` is a
-retention target, not a strict post-write physical row count.
+not finished. Erasure fences in `<table>_purges` expire after 10 minutes and,
+when `forgetUserId` is set, are deleted in the same bounded passes; capture
+ignores an expired fence before it is deleted. The idle timer runs even when
+TTL is disabled so oversized queues and fence backlogs can drain after
+writes stop. An acknowledged INSERT keeps its returned id when cleanup fails,
+times out or loses ownership to another replica.
+With `cleanupInterval: 0`, residual record and fence backlog needs another
+write to trigger cleanup, including writes that arrive during the trailing pass.
+`max` is a retention target, not a strict post-write physical row count.
 
 Bounded transactions add round trips to isolated dead-letter captures. A local
 PostgreSQL 16 Docker benchmark on 2026-10-10 used a 100-record target, a one-hour

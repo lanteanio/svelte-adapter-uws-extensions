@@ -28,7 +28,8 @@ beforeAll(() => { client = createPgClient({ connectionString: process.env.INTEGR
 afterEach(async () => {
 	for (const item of stores.splice(0)) item.destroy();
 	resetRuntimeEnv();
-	await client.query(`DROP TABLE IF EXISTS ${table}`);
+	await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_purges`);
+	await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1', [table]);
 	await client.query('DROP FUNCTION IF EXISTS svti_dlq_slow_delete()');
 });
 afterAll(async () => { await client.end(); });
@@ -141,5 +142,14 @@ describe('bounded PostgreSQL dead-letter retention', () => {
 			await expect.poll(physicalCount).toBe(2);
 			expect((await dlq.list()).map(r => r.id).sort()).toEqual(ids.sort((a, b) => Number(b) - Number(a)).slice(0, 2).sort());
 		} finally { resume(); await leading; }
+	});
+	it('prunes expired erasure tombstones during bounded write cleanup', async () => {
+		const dlq = store(client, { cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await dlq.purgeUser(null, 'alice');
+		expect((await client.query(`SELECT count(*)::int AS n FROM ${table}_purges`)).rows[0].n).toBe(1);
+		// Age the fence past its ten-minute window.
+		await client.query(`UPDATE ${table}_purges SET purged_at = (extract(epoch from now()) * 1000)::bigint - 600100`);
+		expect(await dlq.add({ ...record(), data: { user: 'alice' }, startedAt: 0 })).not.toBeNull();
+		expect((await client.query(`SELECT count(*)::int AS n FROM ${table}_purges`)).rows[0].n).toBe(0);
 	});
 });

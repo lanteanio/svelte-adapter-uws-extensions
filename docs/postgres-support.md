@@ -344,7 +344,7 @@ start stores with `autoMigrate: false`. Readiness requires these privileges:
 | Jobs `svti_jobs` | SELECT, INSERT, UPDATE, DELETE |
 | Tasks `svti_tasks` | SELECT, INSERT, UPDATE, DELETE |
 | Idempotency `svti_idempotency` | SELECT, INSERT, UPDATE, DELETE |
-| Dead letters `svti_dead_letter` | SELECT, INSERT, UPDATE, DELETE |
+| Dead letters `svti_dead_letter` and erasure fences `svti_dead_letter_purges` | SELECT, INSERT, UPDATE, DELETE |
 | Alarm schedules `svti_alarms` | SELECT, INSERT, UPDATE, DELETE |
 | Alarm authority `svti_alarms_generations` | SELECT, INSERT, UPDATE |
 | Alarm executions `svti_alarms_executions` | SELECT, INSERT, UPDATE, DELETE |
@@ -363,9 +363,10 @@ grants. Trigger behavior and row-level policies still need application tests.
 `postgresMigrations({ store, table })` returns the versioned SQL and SHA-256
 checksums. Version 1 establishes the existing baseline and additive columns;
 version 2 adds constraints and replay uniqueness. Tasks version 3 adds the
-pending-created index. Alarm-store version 3 adds
+pending-created index. Dead-letter version 3 adds the tenant/user erasure-fence
+table and its expiry index. Alarm-store version 3 adds
 [ordered generation authority](./alarm-generations.md) and version 4 adds retained
-executions; replay, idempotency, jobs and dead-letter remain at version 2. Idempotency states are
+executions; replay, idempotency and jobs remain at version 2. Idempotency states are
 `pending`/`committed`; task states are `pending`/`running`/`committed`/`failed`.
 Jobs and tasks require nonnegative attempts. Job claim timestamps must both be
 null or both present with expiry at or after claim time. Replay's unique
@@ -439,7 +440,10 @@ stop new producers, drain active work, then revert dependants in the order in th
 [migration guide](../MIGRATION.md#rollback-and-fleet-compatibility).
 
 Restore replay events together with their sequence/epoch table. Restoring only
-one can reuse sequence numbers or claim history that is absent. Restore task
+one can reuse sequence numbers or claim history that is absent. Restore dead
+letters with their tenant/user erasure fences, and reapply erasures newer than
+the backup before retrying deliveries. Old dead-letter writers do not honor
+these fences: stop them and drain in-flight deliveries before downgrade. Restore task
 rows with their fence, attempt, status, input/result and idempotency mappings
 from a coordinated application recovery point. A database restore cannot undo
 external side effects: reconcile payment/email/job outcomes before retrying

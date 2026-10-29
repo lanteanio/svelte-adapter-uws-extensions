@@ -177,6 +177,25 @@
 			"restoreGroup": "postgres-dead-letter"
 		},
 		{
+			"id": "dead-letter-erasure",
+			"table": "svti_dead_letter_purges",
+			"columns": {
+				"scope": "text",
+				"user_id": "text",
+				"purged_at": "bigint"
+			},
+			"indexColumns": [
+				[
+					"scope",
+					"user_id"
+				],
+				[
+					"purged_at"
+				]
+			],
+			"restoreGroup": "postgres-dead-letter"
+		},
+		{
 			"id": "alarms",
 			"table": "svti_alarms",
 			"columns": {

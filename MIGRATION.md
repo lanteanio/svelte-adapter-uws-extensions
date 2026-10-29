@@ -1035,6 +1035,33 @@ rolling upgrade, an instance still on an earlier version reads only the
 earlier key, so a purge run by an upgraded instance does not drop that
 instance's late captures; finish the rollout before relying on it.
 
+### Postgres dead-letter schema version 3 and erasure fences
+
+Dead-letter migration version 3 creates `<table>_purges`
+(`svti_dead_letter_purges` by default), one erasure fence per tenant scope and
+user. With the default `autoMigrate: true` it is applied on first use. With
+`autoMigrate: false`, apply version 3
+(`postgresMigrations({ store: 'dead-letter' })`) before starting writers of
+this release and grant the runtime role SELECT, INSERT, UPDATE and DELETE on the new table; until then
+`ready()` fails validation, and `purgeUser` and every capture of a record with
+a user id reject.
+
+`purgeUser` writes the fence and deletes the records in one transaction, and
+`add()` now resolves `null` instead of an id for a record of the purged user,
+in the purged scope, whose delivery started before the purge, the same
+contract as the Redis and in-memory stores. Code that reads the result of
+`add()` handles `null`. The fence window is fixed at 10 minutes. A tenant id
+containing `/` or `~` makes `purgeUser` throw a `TypeError`, as on Redis.
+
+Writers of an earlier release do not take the erasure lock or read fences:
+stop them before writers of this release start, and stop writers of this
+release and drain in-flight deliveries before a downgrade, or an earlier
+writer can capture an erased payload after the purge. Back up and restore
+`<table>` and `<table>_purges` together. The recovery verifier treats them as
+one restore group: a PostgreSQL scope file that lists `dead-letter` must also
+list `dead-letter-erasure` (and the reverse), or validation fails with
+`incomplete_restore_group`; add the entry to existing scope files.
+
 ### `createClusterClock` prefixes `leaderKey`
 
 `leaderKey` is now relative to the client key prefix, so two apps sharing one

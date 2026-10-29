@@ -52,14 +52,24 @@ export interface DeadLetterRecord {
  * svelte-realtime >= 0.6.0-next.40.
  */
 export interface PgDeadLetterStore extends PostgresStoreReadiness {
-	/** Returns the committed row ID even if later retention cleanup fails. A rejected insert can still have an ambiguous transport outcome; add() has no caller deduplication key. */
-	add(rec: Omit<DeadLetterRecord, 'id'>): Promise<string>;
+	/**
+	 * Returns the committed row ID even if later retention cleanup fails, or
+	 * null when `purgeUser` erased the record's user after its delivery started
+	 * (within the 10-minute fence). `startedAt` is the monotonic delivery start
+	 * and is never stored. A rejected insert can have an ambiguous transport
+	 * outcome; add() has no caller deduplication key.
+	 */
+	add(rec: Omit<DeadLetterRecord, 'id'> & { startedAt?: number }): Promise<string | null>;
 	get(id: string): Promise<DeadLetterRecord | null>;
 	remove(id: string): Promise<boolean>;
 	count(filter?: { topic?: string }): Promise<number>;
 	list(filter?: { topic?: string; limit?: number }): Promise<DeadLetterRecord[]>;
 	summary(): Promise<{ total: number; byTopic: Record<string, number>; oldest: number | null; newest: number | null }>;
-	/** Right-to-erasure: delete every record stamped with a user's id (needs `forgetUserId`). */
+	/**
+	 * Right-to-erasure: delete every record stamped with a user's id in the
+	 * tenant scope (needs `forgetUserId`), and fence captures of deliveries
+	 * already in flight. Throws `TypeError` for a tenant id containing `/` or `~`.
+	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 	clear(): Promise<void>;
 	/** Stop retention maintenance. */

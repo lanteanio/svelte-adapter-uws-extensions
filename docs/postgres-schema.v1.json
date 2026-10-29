@@ -81,15 +81,18 @@
 		{
 			"subpath": "postgres/dead-letter",
 			"tables": [
-				"svti_dead_letter"
+				"svti_dead_letter",
+				"svti_dead_letter_purges"
 			],
+			"restoreTogether": true,
 			"initialization": "first store operation or ready()",
 			"ready": true,
 			"changeClass": "new store since source release",
 			"additions": [
-				"store table and topic, failed_at, user_id indexes"
+				"store table and topic, failed_at, user_id indexes",
+				"version 3: tenant/user erasure tombstones with bounded purged_at pruning"
 			],
-			"rollbackLimit": "The source release has no corresponding PostgreSQL store. Preserve captured evidence; do not drop it to downgrade."
+			"rollbackLimit": "Old writers do not fence racing captures. Stop old writers and drain deliveries before downgrade; preserve captures and tombstones together."
 		},
 		{
 			"subpath": "postgres/alarm-store",
@@ -129,7 +132,7 @@
 			3,
 			4
 		],
-		"version3Stores": ["postgres/tasks", "postgres/alarm-store"],
+		"version3Stores": ["postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
 		"version4Stores": ["postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true

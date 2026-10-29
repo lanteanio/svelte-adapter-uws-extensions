@@ -19,6 +19,7 @@ import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 import { createDeadLetter } from '../../../src/postgres/dead-letter.js';
 import { createReplay } from '../../../src/postgres/replay.js';
 import { createTaskRunner } from '../../../src/postgres/tasks.js';
+import { monotonicNow } from '../../../src/shared/runtime.js';
 
 // The replay/stream publish path only calls platform.publish on a storage
 // failure fallback; a no-op stub is enough for the happy path.
@@ -103,8 +104,8 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 
 	describe('dead-letter.purgeUser', () => {
 		const TABLE = 'svti_dlq_forget_it';
-		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}`); await forgetFixtureMigrations(client, [TABLE]); });
+		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges`); await forgetFixtureMigrations(client, [TABLE]); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		const rec = (u) => ({ webhookId: 'w', topic: 'hooks', event: 'e', data: { user: u }, attempts: 1, error: 'boom', failedAt: 1 });
 
@@ -117,6 +118,21 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 			expect(await store.count()).toBe(1);
 			const left = await store.list();
 			expect(left.every((r) => r.data.user === 'bob')).toBe(true);
+		});
+
+		it('fences old captures by tenant and preserves post-purge deliveries', async () => {
+			const store = createDeadLetter(client, { table: TABLE, forgetUserId: r => r.data?.user });
+			try {
+				const startedAt = monotonicNow();
+				await store.purgeUser('acme', 'alice');
+				expect(await store.add({ ...rec('alice'), topic: '@t/acme/hooks', startedAt })).toBeNull();
+				const other = await store.add({ ...rec('alice'), topic: '@t/globex/hooks', startedAt });
+				expect(other).not.toBeNull();
+				const newStart = monotonicNow();
+				const fresh = await store.add({ ...rec('alice'), topic: '@t/acme/hooks', startedAt: newStart });
+				expect(fresh).not.toBeNull();
+				expect((await store.list()).map(r => r.id).sort()).toEqual([other, fresh].sort());
+			} finally { store.destroy(); }
 		});
 
 		it('is a no-op without a forgetUserId extractor', async () => {

@@ -37,12 +37,12 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 	expect(report.statementStats.records.length).toBeGreaterThan(0);
 	expect(report.statementStats.records.some(r => r.calls > 0 && r.shared_blks_hit > 0)).toBe(true);
 	expect((await client.query('SELECT marker FROM public.plan_jobs')).rows).toEqual([{marker:'preserve-existing'}]);
-	expect(report.storage).toHaveLength(9);
+	expect(report.storage).toHaveLength(10);
 	expect(report.sourceSha256['replay.js']).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.collectorSha256).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.lockfileSha256).toMatch(/^[a-f0-9]{64}$/);
-	expect(report.vacuum).toHaveLength(9);
-	expect(report.afterVacuum).toHaveLength(9);
+	expect(report.vacuum).toHaveLength(10);
+	expect(report.afterVacuum).toHaveLength(10);
 	expect(report.afterVacuum.map(row => row.relname)).toEqual(report.tableHealth.map(row => row.relname));
 	for (const row of report.afterVacuum) {
 		expect(Number.isFinite(Number(row.n_dead_tup))).toBe(true);

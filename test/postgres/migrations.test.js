@@ -25,6 +25,14 @@ describe('PostgreSQL migration contracts', () => {
 		// Version 4 creates the executions table and no other relation.
 		expect(versions[3].statements.filter(statement => /^CREATE TABLE/.test(statement))).toHaveLength(1);
 	});
+	it('adds bounded dead-letter erasure fences as version 3', () => {
+		const versions = postgresMigrations({ store: 'dead-letter' });
+		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3]);
+		expect(versions[2].statements).toEqual([
+			'CREATE TABLE IF NOT EXISTS svti_dead_letter_purges (scope TEXT NOT NULL, user_id TEXT NOT NULL, purged_at BIGINT NOT NULL, PRIMARY KEY (scope, user_id))',
+			'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_svti_dead_letter_purges_expiry ON svti_dead_letter_purges (purged_at)'
+		]);
+	});
 	it('keeps every generated alarm identifier within the PostgreSQL limit for the longest table name', () => {
 		const table = 'a'.repeat(42);
 		const names = postgresMigrations({ store: 'alarm-store', table }).flatMap(entry => entry.statements)

@@ -40,6 +40,7 @@ export function validateConfig(config) {
 			return { ...spec, table };
 		});
 		if (Boolean(stores.replay) !== Boolean(stores['replay-sequence'])) fail('incomplete_restore_group');
+		if (Boolean(stores['dead-letter']) !== Boolean(stores['dead-letter-erasure'])) fail('incomplete_restore_group');
 		if (new Set(['alarms', 'alarm-generations', 'alarm-executions'].map(id => Boolean(stores[id]))).size !== 1) fail('incomplete_restore_group');
 		if (new Set(Object.values(stores)).size !== Object.keys(stores).length) fail('overlapping_tables');
 	}

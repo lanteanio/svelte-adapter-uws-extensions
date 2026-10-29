@@ -64,8 +64,8 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			env: { ...process.env, RECOVERY_POSTGRES_URL: readerUrl.href }
 		}));
 		expect(report.ok, JSON.stringify(report)).toBe(true);
-		expect(Object.keys(report.postgres.observations)).toHaveLength(10);
-		expect(report.postgres.observations['schema-migrations'].rows).toBe('15');
+		expect(Object.keys(report.postgres.observations)).toHaveLength(11);
+		expect(report.postgres.observations['schema-migrations'].rows).toBe('16');
 		expect(report.postgres.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: true });
 		expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|private-key/);
 		await expect(reader.query('DELETE FROM svti_tasks')).rejects.toMatchObject({ code: '25006' });

@@ -21,6 +21,20 @@
  *   )
  *   + index on (topic) and (failed_at)
  *
+ *   svti_dead_letter_purges (
+ *     scope     TEXT   NOT NULL,
+ *     user_id   TEXT   NOT NULL,
+ *     purged_at BIGINT NOT NULL,
+ *     PRIMARY KEY (scope, user_id)
+ *   )
+ *   + index on (purged_at)
+ *
+ * Captures and purges for one tenant/user serialize under a transaction-scoped
+ * advisory lock. Purge writes its fence and deletes records atomically, so a
+ * delivery that started before the purge cannot commit after it and resurrect
+ * its payload. A fence lives 10 minutes, as in the in-memory store, and expired
+ * fences are pruned by the same bounded cleanup passes.
+ *
  * Retention uses `max` (oldest captured id first) and optional `ttlMs`.
  * Writes and periodic maintenance share bounded cleanup transactions; large
  * backlogs drain over multiple passes. Reads exclude expired records even while
@@ -38,9 +52,16 @@ import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker, pgFailure } from './_breaker.js';
 import { createStoreSchema } from './migrations.js';
 import { scheduleCleanup } from './_cleanup.js';
-import { tenantTopicSql } from '../shared/tenant-topic.js';
+import { TENANT_TOPIC_NS, tenantTopicSql } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
+import { monotonicNow } from '../shared/runtime.js';
+import { withTransaction } from '../shared/pg-tx.js';
+
+// How long a purge fences captures of deliveries that started before it. The
+// in-memory store's window; a delivery whose retries outlast it is the
+// residual every backend shares.
+const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 
 /**
  * @typedef {Object} PgDeadLetterOptions
@@ -77,6 +98,7 @@ export function createDeadLetter(client, options = {}) {
 	// the user's undelivered payloads. Unset => not user-purgeable.
 	const forgetUserId = options.forgetUserId;
 	const table = options.table || 'svti_dead_letter';
+	const purgeTable = table + '_purges';
 	const pkCol = table + '_id';
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
@@ -95,6 +117,28 @@ export function createDeadLetter(client, options = {}) {
 
 	const schema = createStoreSchema(client, 'dead-letter', table, autoMigrate);
 	const ensureTable = schema.ensure;
+
+	function topicScope(topic) {
+		if (typeof topic !== 'string') return null;
+		if (!topic.startsWith(TENANT_TOPIC_NS)) return '~';
+		const end = topic.indexOf('/', TENANT_TOPIC_NS.length);
+		return end > TENANT_TOPIC_NS.length ? topic.slice(TENANT_TOPIC_NS.length, end) : null;
+	}
+
+	// Take the per-identity erasure lock and return the database clock read
+	// after it was granted. The lock key is the fence table's OID (the same
+	// search_path resolution as the statements that follow, so differently
+	// cased spellings of one table share it), tenant scope and user; unrelated
+	// identities never serialize. The clock comes from the outer query, which
+	// runs only once the locking subquery has produced its row.
+	async function lockErasure(tx, scope, userId) {
+		const res = await tx.query(
+			`SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS db_now
+			   FROM (SELECT pg_advisory_xact_lock(hashtextextended($1::regclass::oid::text || ':' || $2 || ':' || $3, 0))) AS locked`,
+			[purgeTable, scope, userId]
+		);
+		return Number(res.rows[0].db_now);
+	}
 
 	/** Map a DB row (snake_case, bigints-as-strings) to the camelCase record. */
 	function rowToRecord(row) {
@@ -134,6 +178,21 @@ export function createDeadLetter(client, options = {}) {
 			if (count < limit) break;
 		}
 	}
+	async function trimPurges(budget) {
+		// Without an extractor purgeUser writes no fences, so the pass would
+		// only cost each capture two more statements.
+		if (!forgetUserId) return;
+		while (budget.available) {
+			const limit = budget.limit;
+			const count = await budget.remove(`WITH expired AS (
+				SELECT scope, user_id FROM ${purgeTable}
+				WHERE purged_at < (extract(epoch from now()) * 1000)::bigint - $1
+				ORDER BY purged_at LIMIT $2 FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${purgeTable} p USING expired
+			 WHERE p.scope = expired.scope AND p.user_id = expired.user_id`, [FORGET_TOMBSTONE_MS, limit]);
+			if (count < limit) break;
+		}
+	}
 	let ttlFirst = true;
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
@@ -145,6 +204,7 @@ export function createDeadLetter(client, options = {}) {
 			ttlFirst = !ttlFirst;
 			await first(budget);
 			await second(budget);
+			await trimPurges(budget);
 		}
 	});
 	const liveRows = ttlMs > 0 ? `failed_at >= (extract(epoch from now()) * 1000)::bigint - ${ttlMs}` : 'TRUE';
@@ -152,7 +212,15 @@ export function createDeadLetter(client, options = {}) {
 	return {
 		ready: schema.ready,
 		status: schema.status,
-		/** @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number }} rec */
+		/**
+		 * Retain an undeliverable event. Resolves the new record id, or `null`
+		 * when purgeUser erased the record's user after its delivery started.
+		 * `startedAt` is the delivery start as a monotonic stamp (threaded by
+		 * svelte-realtime's `_fireWebhookOut`), used only for that check and
+		 * never stored.
+		 * @param {{ webhookId: string, topic: string, event: string, data: unknown, attempts: number, error: string, failedAt?: number, startedAt?: number }} rec
+		 * @returns {Promise<string | null>}
+		 */
 		async add(rec) {
 			await ensureTable();
 			// The caller's stamp is display data; the database clamps it to
@@ -166,17 +234,49 @@ export function createDeadLetter(client, options = {}) {
 			if (forgetUserId) {
 				try { const u = forgetUserId(rec); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
 			}
-			const res = await withBreaker(b, () => client.query(
-				`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
-				 VALUES ($1, $2, $3, $4, $5, $6,
-				         LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint),
-				         $8) RETURNING ${pkCol}`,
-				[rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId]
-			));
-			// The row is committed (autocommit). Retention trims are best-effort
-			// from here: a failed size/TTL delete - or an open breaker - must not
-			// reject an add whose record already persisted, or the caller retries
-			// and double-captures. Mirrors the Redis backend's evict().catch().
+			// A record with no user, or whose topic is a malformed tenant topic no
+			// purge scope contains, cannot be fenced: one autocommit INSERT.
+			const scope = userId === null ? null : topicScope(rec.topic);
+			const values = [rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId];
+			const res = await withBreaker(b, () => scope === null
+				? client.query(
+					`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
+					 VALUES ($1, $2, $3, $4, $5, $6,
+					         LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint),
+					         $8) RETURNING ${pkCol}`,
+					values
+				)
+				: withTransaction(client, async (tx) => {
+					// Under the lock purgeUser takes, this capture either commits first
+					// (and the purge deletes it) or sees the purge's committed fence.
+					const dbNow = await lockErasure(tx, scope, userId);
+					// The delivery start on the database clock: dbNow minus the
+					// delivery's monotonic duration, read after the lock reply. The
+					// reply's latency moves the start earlier, so a purge at or after
+					// the true start is always fenced. An untraced delivery starts
+					// now, so an earlier purge does not drop it.
+					const startedAt = typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
+						? dbNow - Math.max(0, monotonicNow() - rec.startedAt)
+						: dbNow;
+					values.push(scope, startedAt, dbNow);
+					return tx.query(
+						`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
+						 SELECT $1::text, $2::text, $3::text, $4::jsonb, $5::integer, $6::text,
+						        LEAST(NULLIF($7::bigint, 0), $11::bigint), $8::text
+						  WHERE NOT EXISTS (
+						        SELECT 1 FROM ${purgeTable} p
+						         WHERE p.scope = $9 AND p.user_id = $8
+						           AND p.purged_at >= $10::bigint
+						           AND p.purged_at >= $11::bigint - ${FORGET_TOMBSTONE_MS}
+						  ) RETURNING ${pkCol}`,
+						values
+					);
+				}));
+			// No row: a purge ran while this delivery was in flight.
+			if (res.rows.length === 0) return null;
+			// The row is committed. Retention trims are best-effort from here:
+			// cleanup failure must not reject an acknowledged capture and cause a
+			// duplicate retry. Mirrors the Redis backend's evict().catch().
 			await cleanup.run().catch(() => { /* capture already persisted */ });
 			mAdded?.inc({ topic: mt(rec.topic) });
 			return String(res.rows[0][pkCol]);
@@ -243,17 +343,31 @@ export function createDeadLetter(client, options = {}) {
 		 * @returns {Promise<number>} records removed
 		 */
 		async purgeUser(tenantId, userId) {
+			if (tenantId != null && tenantId !== '' && (typeof tenantId !== 'string' || /[/~]/.test(tenantId))) {
+				throw new TypeError('postgres dead-letter: purgeUser tenant id must be null or a string without "/" or "~"');
+			}
 			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
-			// Tenant-scoped by the topic namespace, matching the sibling legs of
-			// the same purge. See postgres/replay.js for why deleting on
-			// `user_id` alone made one tenant's erasure reach every other's.
 			const scope = tenantTopicSql(tenantId, 2);
 			await ensureTable();
-			const res = await withBreaker(b, () => client.query(
-				`DELETE FROM ${table} WHERE user_id = $1 AND ${scope.sql}`,
-				[userId, scope.value]
-			));
-			return res.rowCount || 0;
+			return withBreaker(b, () => withTransaction(client, async (tx) => {
+				const fenceScope = tenantId || '~';
+				// The fence and the delete commit atomically under the lock add()
+				// takes, stamped with the same post-lock clock add() reads. Keep the
+				// newest stamp if repeated purges straddle a backwards clock step.
+				const purgedAt = await lockErasure(tx, fenceScope, userId);
+				await tx.query(
+					`INSERT INTO ${purgeTable} (scope, user_id, purged_at)
+					 VALUES ($1, $2, $3::bigint)
+					 ON CONFLICT (scope, user_id) DO UPDATE
+					   SET purged_at = GREATEST(${purgeTable}.purged_at, EXCLUDED.purged_at)`,
+					[fenceScope, userId, purgedAt]
+				);
+				const res = await tx.query(
+					`DELETE FROM ${table} WHERE user_id = $1 AND ${scope.sql}`,
+					[userId, scope.value]
+				);
+				return res.rowCount || 0;
+			}));
 		},
 
 		async clear() {

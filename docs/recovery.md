@@ -19,7 +19,7 @@ describes upgrade and initialization behavior.
 | Jobs and tasks | Complete rows, serial sequences where used, ownership/fence state, and any application result cache | Stop old workers and reconcile effects that completed outside the database. |
 | Idempotency and sessions | Results/session records, expiry and erasure indexes | Reapply erasures and revocations newer than the backup; reconcile pending owners. |
 | Alarms | Schedule, metadata and all retained generation authority; PostgreSQL also needs its migration ledger | Preserve watermarks for deleted and pending topics; reconcile executed callbacks before enabling due work. |
-| Dead letters | Records, ordered index, ID authority and erasure tombstones | Reapply later erasures before redelivery. |
+| Dead letters | Records, ordered index, ID authority and erasure tombstones; PostgreSQL `svti_dead_letter` and `svti_dead_letter_purges` together | Reapply later erasures before redelivery; old writers must not resume without fence support. |
 | Lock fence counters | `lock-fences:` counters, together with each protected resource's accepted-fence history | Never restore a counter below a fence its resource accepted; set a lagging counter to at least that fence before fenced writers resume. See [monotonic fencing](./distributed-locks.md#monotonic-fencing). |
 | Presence, routing, cursors and leases | Rebuild from current authenticated connections and processes | Isolate old owners and reconnect clients. Restoring bytes does not restore a socket. |
 | Groups, smoothing and admission controls | Apply the manifest's family-specific reconciliation policy | Preserve closure decisions and expiry; establish current ownership and policy. |
@@ -84,7 +84,8 @@ implementation.
 Save a private JSON scope file describing the stores actually deployed. Omit a
 backend that is not used. PostgreSQL names may be schema-qualified; all components
 must be lowercase SQL identifiers. Replay requires both event and sequence tables;
-alarms require the `alarms`, `alarm-generations` and `alarm-executions` tables together.
+dead letters require `dead-letter` and `dead-letter-erasure` together; alarms
+require the `alarms`, `alarm-generations` and `alarm-executions` tables together.
 Redis keyPrefix is the client prefix. The optional prefixes map replaces each
 family's store-level prefix, including empty strings.
 

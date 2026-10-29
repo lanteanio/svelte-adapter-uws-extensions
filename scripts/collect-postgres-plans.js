@@ -15,7 +15,7 @@ import { createDeadLetter } from '../src/postgres/dead-letter.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../src/shared/runtime.js';
 import { verifyPostgresVersion } from './check-postgres-support.js';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_alarms_generations', 'plan_alarms_executions', 'plan_dead_letter'];
+const tables = ['plan_replay', 'plan_replay_seq', 'plan_jobs', 'plan_tasks', 'plan_idempotency', 'plan_alarms', 'plan_alarms_generations', 'plan_alarms_executions', 'plan_dead_letter', 'plan_dead_letter_purges'];
 const digest = value => createHash('sha256').update(value).digest('hex');
 const sqlText = value => String(value).trim().replace(/\s+/g, ' ');
 const numeric = value => value === undefined ? undefined : Number(value);
@@ -91,7 +91,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		throw new Error('PostgreSQL plan collection exceeded its 60-second budget'); };
 	const record = (input, values) => {
 		const text = typeof input === 'string' ? input : input.text;
-		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms(?:_generations|_executions)?|dead_letter)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !text.includes('pg_try_advisory_xact_lock')) {
+		if (label && /\bplan_(?:replay|replay_seq|jobs|tasks|idempotency|alarms(?:_generations|_executions)?|dead_letter(?:_purges)?)\b/.test(text) && /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(text.trim()) && !text.includes('set_config(') && !/pg_(?:try_)?advisory_xact_lock/.test(text)) {
 			const fingerprint = digest(sqlText(text)), key = label + ':' + fingerprint;
 			if (!queries.has(key)) {
 				if (queries.size >= 128)
@@ -130,7 +130,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		stores.push(idem);
 		const alarms = createAlarmStore(observed, { table: 'plan_alarms' });
 		stores.push(alarms);
-		const dlq = createDeadLetter(observed, { table: 'plan_dead_letter', max: rows + 100, ttlMs: 3600000, cleanupInterval: 0 });
+		const dlq = createDeadLetter(observed, { table: 'plan_dead_letter', max: rows + 100, ttlMs: 3600000, cleanupInterval: 0, forgetUserId: record => record.data?.user });
 		stores.push(dlq);
 		await Promise.all([tasks.ready(), idem.ready(), alarms.ready(), replay.seq('initial'), jobs.pending(), dlq.count()]);
 		await seed(client, rows);
@@ -192,6 +192,8 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		await capture('deadLetter.list', () => dlq.list({ topic: 'cold', limit: 25 }));
 		await capture('deadLetter.count', () => dlq.count({ topic: 'cold' }));
 		await capture('deadLetter.remove', () => dlq.remove(id));
+		await capture('deadLetter.purgeUser', () => dlq.purgeUser(null, 'erased'));
+		await capture('deadLetter.addFenced', () => dlq.add({ webhookId: 'hook', topic: 'hot', event: 'event', data: { user: 'erased' }, attempts: 1, error: 'timeout', startedAt: 0 }));
 		// Trigger the actual maintenance scheduler once, without waiting for its
 		// jitter timer or starting any automatic background loop in this process.
 		const ticks = [];
