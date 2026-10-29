@@ -3,7 +3,8 @@ import { createCursor } from '../../src/redis/cursor.js';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
-import { resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { createRoster } from '../../src/redis/cursor/roster.js';
+import { resetRuntimeEnv, setRuntimeEnv } from '../../src/shared/runtime.js';
 import { installSteppedClock } from '../helpers/stepped-clock.js';
 
 const trackers = [];
@@ -115,6 +116,54 @@ describe('cursor roster at ttl 1 across a cached-clock step', () => {
 		expect(await catalogOf(b, watcher, platformB)).toEqual([{ id: 'mover' }]);
 		clock.advance(1);
 		expect(await catalogOf(b, watcher, platformB)).toEqual([]);
+	});
+	it('stamps a direct write with the time it was made when snapshotIntervalMs is 0', async () => {
+		const client = mockRedisClient();
+		const a = createCursor(client, { ttl: 1, throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+		const b = createCursor(client, { ttl: 1, throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+		trackers.push(a, b);
+		clock.advance(990);
+		a.update(mockWs({ id: 'mover' }), 'board', { x: 1 }, mockPlatform());
+		await flush();
+		// The cached clock refreshes 20 ms after the write.
+		clock.advance(30);
+		expect((await b.list('board')).map((entry) => entry.user)).toEqual([{ id: 'mover' }]);
+	});
+	it('sweeps a persisted cursor one TTL after its write, before the cached clock steps', async () => {
+		const client = mockRedisClient();
+		const a = createCursor(client, { ttl: 1, throttle: 0, topicThrottle: 0 });
+		trackers.push(a);
+		const platform = mockPlatform();
+		clock.advance(5);
+		a.update(mockWs({ id: 'early' }), 'board', { x: 1 }, platform);
+		await flush();
+		await run(100);
+		// A later mover keeps the hash itself from expiring.
+		clock.advance(895);
+		a.update(mockWs({ id: 'late' }), 'board', { x: 2 }, platform);
+		await flush();
+		await run(100);
+		// The early write is 1004 ms old; the cached clock still reads the start.
+		clock.advance(109);
+		await run(10000);
+		const hash = await client.redis.hgetall(client.key('cursor:{board}'));
+		expect(Object.values(hash).map((value) => JSON.parse(value).user)).toEqual([{ id: 'late' }]);
+	});
+	it('releases relay entries one TTL after they arrived and stops pruning', () => {
+		const timers = [];
+		setRuntimeEnv({
+			clock: { now: () => 1_000_000, monotonic: () => clock.t, wallEpoch: () => clock.t },
+			timers: { set: (cb, ms) => { const h = { cb, ms, unref() {} }; timers.push(h); return h; }, clear() {} }
+		});
+		const roster = createRoster({ topics: new Map(), instanceId: 'self', cursorTtl: 1, snapshotIntervalMs: 50, revalidate: async () => true, removeMissing() {} });
+		try {
+			roster.record('board', 'update', { key: 'peer:1', data: { x: 1 } });
+			expect(timers).toHaveLength(1);
+			clock.advance(1001);
+			timers.shift().cb();
+			// Nothing is left to age out, so no prune is pending.
+			expect(timers).toHaveLength(0);
+		} finally { roster.dispose(); }
 	});
 	it('keeps a relayed peer join that has no persisted entry yet', async () => {
 		const { cursor, platform, ws, relay } = setup({ ttl: 1 });
