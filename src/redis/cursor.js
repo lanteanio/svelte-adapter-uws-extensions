@@ -640,6 +640,25 @@ export function createCursor(client, options = {}) {
 	}
 
 	/**
+	 * Read a topic's persisted cursor hash as stored, through the breaker.
+	 * Rethrows the breaker's open-circuit throw and any Redis rejection.
+	 * @param {string} topic
+	 * @returns {Promise<Record<string, string>>}
+	 */
+	async function readPersisted(topic) {
+		try { b?.guard(); } catch (err) { inputDropped('breaker_open', 'snapshot_read'); throw err; }
+		try {
+			const all = await redis.hgetall(hashKey(topic));
+			b?.success();
+			return all;
+		} catch (err) {
+			inputDropped('redis_failure', 'snapshot_read');
+			b?.failure(err);
+			throw err;
+		}
+	}
+
+	/**
 	 * Emit the current roster and positions for `topic` to one socket. Split
 	 * out of `snapshot` so the attach path, which has just authorized, does
 	 * not pay for a second `checkSubscribe` round trip. Every caller MUST
@@ -700,7 +719,7 @@ export function createCursor(client, options = {}) {
 		}
 		if (relayReady) await relayReady;
 		request.reading = true;
-		// `list()` rethrows both the breaker's open-circuit throw and any
+		// `readPersisted()` rethrows both the breaker's open-circuit throw and any
 		// Redis rejection, and every caller of emitSnapshot is reached from a
 		// fire-and-forget `hooks.message` branch. An unhandled rejection
 		// terminates the worker on Node, and the shipped cursor client sends
@@ -709,11 +728,14 @@ export function createCursor(client, options = {}) {
 		// on each replacement worker. A snapshot that cannot be read is a
 		// missing snapshot, not a fatal error; the client recovers on the next
 		// bulk frame.
+		// The roster merge judges each persisted entry on its writer's stamp,
+		// and this instance's movers come from its own topic map, so the hash
+		// goes to it as stored.
 		let cursors;
 		try {
-			cursors = await tracker.list(topic);
+			const all = await readPersisted(topic);
 			if (request.superseded) return;
-			cursors = roster.merge(topic, Object.fromEntries(cursors.map((entry) => [entry.key, JSON.stringify({ ...entry, ts: wallEpoch() })])), platform);
+			cursors = roster.merge(topic, all, platform);
 		} catch {
 			return;
 		}
@@ -1134,16 +1156,7 @@ export function createCursor(client, options = {}) {
 		},
 
 		async list(topic) {
-			try { b?.guard(); } catch (err) { inputDropped('breaker_open', 'snapshot_read'); throw err; }
-			let all;
-			try {
-				all = await redis.hgetall(hashKey(topic));
-				b?.success();
-			} catch (err) {
-				inputDropped('redis_failure', 'snapshot_read');
-				b?.failure(err);
-				throw err;
-			}
+			const all = await readPersisted(topic);
 			const result = [];
 			const nowTs = wallEpoch();
 			const ttlMs = cursorTtl * 1000;
