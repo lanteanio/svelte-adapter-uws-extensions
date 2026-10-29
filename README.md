@@ -517,7 +517,7 @@ export const { subscribeBatch } = bus.hooks;
 
 Single `follow` / `unfollow` keep their existing semantics; `followBatch` is purely additive. Refcount semantics for individual topics match `follow`: each call to `followBatch` bumps every input topic's refcount by 1, and only channel transitions trigger Redis traffic. Empty arrays no-op; duplicate topics in the input collapse to one refcount bump. A batch that would take the instance past `MAX_SHARDED_BUS_TOPICS` distinct topics is refused whole with `SHARDED_TOPIC_CAPACITY_EXCEEDED` and counts none of its topics; topics the instance already follows never count against the cap.
 
-`bus.hooks.subscribeBatch` skips `__`-prefixed topics like the per-topic `subscribe` hook does, and skips topics this `ws` is already following so a duplicate batch from a flaky reconnect doesn't leak refcount. A refused batch rejects the hook and records nothing on the socket, so the adapter denies the batch the way it denies a single subscribe whose hook throws. Both hooks do nothing for a socket whose `close` hook already ran.
+`bus.hooks.subscribeBatch` skips `__`-prefixed topics like the per-topic `subscribe` hook does, and skips topics this `ws` is already following so a duplicate batch from a flaky reconnect doesn't leak refcount. While the call that first counted such a topic is still waiting for Redis, a later `subscribe` or `subscribeBatch` on the same `ws` that skips it waits for that call and fails if it fails. A refused batch rejects the hook and records nothing on the socket, so the adapter denies the batch the way it denies a single subscribe whose hook throws. Both hooks do nothing for a socket whose `close` hook already ran.
 
 #### Wire-batched publish (`publishBatched`)
 

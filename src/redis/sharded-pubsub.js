@@ -239,7 +239,10 @@ export function createShardedBus(client, options = {}) {
 	let topologyDirty = false;
 	/** @type {Promise<void> | null} in-flight topology refresh, shared by concurrent callers */
 	let topologyRefresh = null;
-	/** @type {WeakMap<any, Set<string>>} ws -> set of followed topics */
+	// ws -> followed topic -> the hook call that counted it. A failed call
+	// releases only the topics still mapped to its own owner record, and a
+	// call that finds a topic still pending waits for that owner's outcome.
+	/** @type {WeakMap<any, Map<string, { pending: Promise<void> | null }>>} */
 	let wsFollows = new WeakMap();
 	// Sockets whose close hook ran. An app hook that awaits before delegating
 	// can reach subscribe after close, and nothing would release that follow.
@@ -1318,6 +1321,37 @@ export function createShardedBus(client, options = {}) {
 		}
 	}
 
+	/**
+	 * Admit one socket's batch together with the pending topics it skipped
+	 * because the socket had already counted them. On any failure, release
+	 * only the topics still mapped to this batch's owner record: one that was
+	 * unsubscribed, or re-counted by a later hook call, stays as it is.
+	 *
+	 * @param {object} ws
+	 * @param {Map<string, { pending: Promise<void> | null }>} wsTopics
+	 * @param {{ pending: Promise<void> | null }} owner
+	 * @param {ReturnType<typeof reserveBatch>} reservation
+	 * @param {Set<Promise<void>> | null} waits
+	 */
+	async function admitSocketBatch(ws, wsTopics, owner, reservation, waits) {
+		try {
+			await admitBatch(reservation, false);
+			if (waits) await Promise.all(waits);
+		} catch (err) {
+			const releases = [];
+			if (wsFollows.get(ws) === wsTopics) {
+				for (const topic of reservation.touchedTopics) {
+					if (wsTopics.get(topic) !== owner) continue;
+					wsTopics.delete(topic);
+					releases.push(unfollow(topic));
+				}
+				if (wsTopics.size === 0) wsFollows.delete(ws);
+			}
+			await Promise.all(releases);
+			throw err;
+		}
+	}
+
 	async function unfollow(topic) {
 		const count = followCounts.get(topic) || 0;
 		if (count === 0) return;
@@ -1711,15 +1745,25 @@ export function createShardedBus(client, options = {}) {
 				if (topic.startsWith('__') || closedSockets.has(ws)) return;
 				let topics = wsFollows.get(ws);
 				if (!topics) {
-					topics = new Set();
+					topics = new Map();
 					wsFollows.set(ws, topics);
 				}
-				if (topics.has(topic)) return;
-				topics.add(topic);
+				const held = topics.get(topic);
+				if (held) {
+					// The socket counts a topic once; until that count is admitted,
+					// this call succeeds or fails with it.
+					if (held.pending) await held.pending;
+					return;
+				}
+				/** @type {{ pending: Promise<void> | null }} */
+				const owner = { pending: null };
+				topics.set(topic, owner);
+				owner.pending = follow(topic);
 				try {
-					await follow(topic);
+					await owner.pending;
+					owner.pending = null;
 				} catch (err) {
-					topics.delete(topic);
+					if (topics.get(topic) === owner) topics.delete(topic);
 					if (topics.size === 0 && wsFollows.get(ws) === topics) wsFollows.delete(ws);
 					throw err;
 				}
@@ -1728,35 +1772,33 @@ export function createShardedBus(client, options = {}) {
 				if (!Array.isArray(topics) || topics.length === 0 || closedSockets.has(ws)) return;
 				const held = wsFollows.get(ws);
 				const fresh = new Set();
+				/** @type {Set<Promise<void>> | null} */
+				let waits = null;
 				for (const topic of topics) {
 					if (typeof topic !== 'string' || topic.startsWith('__')) continue;
-					if (held?.has(topic)) continue;
-					fresh.add(topic);
+					const prior = held?.get(topic);
+					if (!prior) fresh.add(topic);
+					else if (prior.pending) (waits ??= new Set()).add(prior.pending);
 				}
-				if (fresh.size === 0) return;
 				// Counting does not yield, so the socket records exactly the topics
 				// counted before a close or another batch can run. A refused batch
 				// throws here with nothing counted and nothing recorded.
-				const reservation = reserveBatch(fresh);
-				if (reservation.touchedTopics.size === 0) return;
+				const reservation = fresh.size ? reserveBatch(fresh) : null;
+				if (!reservation || reservation.touchedTopics.size === 0) {
+					if (waits) await Promise.all(waits);
+					return;
+				}
 				let wsTopics = held;
 				if (!wsTopics) {
-					wsTopics = new Set();
+					wsTopics = new Map();
 					wsFollows.set(ws, wsTopics);
 				}
-				for (const topic of reservation.touchedTopics) wsTopics.add(topic);
-				try {
-					await admitBatch(reservation, false);
-				} catch (err) {
-					const releases = [];
-					for (const topic of reservation.touchedTopics) {
-						if (wsFollows.get(ws) !== wsTopics || !wsTopics.delete(topic)) continue;
-						releases.push(unfollow(topic));
-					}
-					if (wsTopics.size === 0 && wsFollows.get(ws) === wsTopics) wsFollows.delete(ws);
-					await Promise.all(releases);
-					throw err;
-				}
+				/** @type {{ pending: Promise<void> | null }} */
+				const owner = { pending: null };
+				for (const topic of reservation.touchedTopics) wsTopics.set(topic, owner);
+				owner.pending = admitSocketBatch(ws, wsTopics, owner, reservation, waits);
+				await owner.pending;
+				owner.pending = null;
 			},
 			async unsubscribe(ws, topic) {
 				const topics = wsFollows.get(ws);
@@ -1771,7 +1813,7 @@ export function createShardedBus(client, options = {}) {
 				if (!topics) return;
 				wsFollows.delete(ws);
 				const pending = [];
-				for (const t of topics) pending.push(unfollow(t));
+				for (const t of topics.keys()) pending.push(unfollow(t));
 				await Promise.all(pending);
 			}
 		}

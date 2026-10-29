@@ -1415,3 +1415,113 @@ it.each(['subscribe', 'subscribeBatch'])('restores admission when a new %s arriv
 		expect(platform.published).toHaveLength(2);
 	} finally { await bus.deactivate(); }
 });
+
+describe('sharded per-socket topic ownership', () => {
+	async function setup() {
+		const client = mockRedisClient();
+		const platform = mockPlatform();
+		let subscriber;
+		const duplicate = client.redis.duplicate.bind(client.redis);
+		client.redis.duplicate = (...args) => (subscriber = duplicate(...args));
+		const bus = createShardedBus(client);
+		await bus.activate(platform);
+		const sub = subscriber;
+		const realSubscribe = sub.ssubscribe.bind(sub);
+		// Every SSUBSCRIBE waits until the test passes or fails it.
+		const calls = [];
+		const hold = () => {
+			sub.ssubscribe = (...channels) => new Promise((resolve, reject) => {
+				calls.push({ pass: () => resolve(realSubscribe(...channels)), fail: reject });
+			});
+		};
+		const restore = () => { sub.ssubscribe = realSubscribe; };
+		const peer = (topic, data) => client.redis.spublish('uws:sharded:' + topic, JSON.stringify({ instanceId: 'peer', topic, event: 'msg', data }));
+		const received = (topic) => platform.published.filter((p) => p.topic === topic).map((p) => p.data);
+		return { bus, sub, calls, hold, restore, peer, received };
+	}
+
+	it('a failed batch keeps a topic the socket unsubscribed and subscribed again meanwhile', async () => {
+		const { bus, sub, calls, hold, restore, peer, received } = await setup();
+		const a = {}, b = {};
+		try {
+			await bus.hooks.subscribe(b, 'held');
+			hold();
+			const batch = bus.hooks.subscribeBatch(a, ['held', 'new']);
+			const failed = expect(batch).rejects.toThrow('offline');
+			await settle();
+			await bus.hooks.unsubscribe(a, 'held');
+			await bus.hooks.subscribe(a, 'held');
+			calls[0].fail(new Error('offline'));
+			await failed;
+			restore();
+			// The later subscribe still counts 'held' for a, so b leaving keeps it.
+			await bus.hooks.close(b);
+			expect(sub._shardedChannels.has('uws:sharded:held')).toBe(true);
+			expect(sub._shardedChannels.has('uws:sharded:new')).toBe(false);
+			await peer('held', 1);
+			expect(received('held')).toEqual([1]);
+			await bus.hooks.close(a);
+			expect(sub._shardedChannels.size).toBe(0);
+		} finally {
+			restore();
+			await bus.deactivate();
+		}
+	});
+
+	describe.each(['subscribe', 'subscribeBatch'])('a %s that skips a topic pending in an earlier batch on the same socket', (hook) => {
+		const second = (bus, ws) => hook === 'subscribe' ? bus.hooks.subscribe(ws, 'x') : bus.hooks.subscribeBatch(ws, ['x', 'z']);
+
+		it('fails with that batch and releases what it counted itself', async () => {
+			const { bus, sub, calls, hold, restore, peer, received } = await setup();
+			const a = {};
+			try {
+				hold();
+				const first = bus.hooks.subscribeBatch(a, ['x', 'y']);
+				let secondSettled = false;
+				const later = second(bus, a).finally(() => { secondSettled = true; });
+				const outcomes = Promise.allSettled([first, later]);
+				await settle();
+				expect(secondSettled).toBe(false);
+				calls[0].fail(new Error('offline'));
+				for (const call of calls.slice(1)) call.pass();
+				expect((await outcomes).map((result) => result.status)).toEqual(['rejected', 'rejected']);
+				restore();
+				expect(sub._shardedChannels.size).toBe(0);
+				// Nothing is recorded for a, so a retry follows every topic again.
+				await second(bus, a);
+				await peer('x', 1);
+				expect(received('x')).toEqual([1]);
+				await bus.hooks.close(a);
+				expect(sub._shardedChannels.size).toBe(0);
+			} finally {
+				restore();
+				await bus.deactivate();
+			}
+		});
+
+		it('resolves once that batch is admitted and counts the topic once', async () => {
+			const { bus, sub, calls, hold, restore, peer, received } = await setup();
+			const a = {};
+			try {
+				hold();
+				const first = bus.hooks.subscribeBatch(a, ['x', 'y']);
+				let secondSettled = false;
+				const later = second(bus, a).finally(() => { secondSettled = true; });
+				await settle();
+				expect(secondSettled).toBe(false);
+				for (const call of calls) call.pass();
+				await Promise.all([first, later]);
+				restore();
+				await peer('x', 1);
+				expect(received('x')).toEqual([1]);
+				await bus.hooks.unsubscribe(a, 'x');
+				expect(sub._shardedChannels.has('uws:sharded:x')).toBe(false);
+				await bus.hooks.close(a);
+				expect(sub._shardedChannels.size).toBe(0);
+			} finally {
+				restore();
+				await bus.deactivate();
+			}
+		});
+	});
+});
