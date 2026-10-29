@@ -32,10 +32,34 @@ async function waitFor(fn, timeoutMs = 2000) {
 	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
-async function countChannelSubscribers(client, channel) {
+/**
+ * A client whose duplicates (the relay subscribers) carry `name`, so a test
+ * can find its own pubsub connections among every other suite's on a shared
+ * backend. A Cluster names its node connections through `redisOptions`.
+ */
+function namedDuplicates(client, name) {
+	const named = Object.create(client);
+	named.duplicate = (overrides = {}) => client.duplicate(isClusterBackend()
+		? { ...overrides, redisOptions: { ...overrides.redisOptions, connectionName: name } }
+		: { ...overrides, connectionName: name });
+	return named;
+}
+
+/** The pubsub connections called `name` on every node, as `{ server, id }`. */
+async function namedPubsubClients(client, name) {
 	const servers = isClusterBackend() ? client.redis.nodes('all') : [client.redis];
-	const replies = await Promise.all(servers.map((server) => server.call('PUBSUB', 'NUMSUB', channel)));
-	return replies.reduce((total, reply) => total + Number(reply[1]), 0);
+	const found = [];
+	await Promise.all(servers.map(async (server) => {
+		const list = String(await server.call('CLIENT', 'LIST', 'TYPE', 'pubsub'));
+		for (const line of list.split('\n')) {
+			const fields = new Map(line.trim().split(' ').filter(Boolean).map((kv) => {
+				const at = kv.indexOf('=');
+				return [kv.slice(0, at), kv.slice(at + 1)];
+			}));
+			if (fields.get('name') === name) found.push({ server, id: fields.get('id') });
+		}
+	}));
+	return found;
 }
 
 describe('redis crdt cluster coordinator (integration)', () => {
@@ -216,16 +240,20 @@ describe('redis crdt cluster coordinator (integration)', () => {
 
 		it('resyncs a held document after the subscriber connection drops and restores', async () => {
 			const backend = createBackend();
-			const a = doc(backend);
-			const b = doc(backend);
+			// Only this test's relay subscribers are found and dropped, so other
+			// pubsub connections on the nodes neither count nor get killed.
+			const name = 'inttest-crdt-restore-' + process.pid + '-' + Date.now();
+			const named = namedDuplicates(client, name);
+			const a = createDocInstance(named, backend, { persistLeaseMs: 900 });
+			const b = createDocInstance(named, backend, { persistLeaseMs: 900 });
+			docs.push(a, b);
 			await a.join(TOPIC);
 			await b.join(TOPIC);
-			const channel = client.key('crdt:events');
 			// A fixed warmup races a cold cluster's slot map and node handshakes.
-			// Wait until both actual relay subscriptions exist before dropping them.
-			await waitFor(async () => (await countChannelSubscribers(client, channel)) === 2, 10000);
-			const servers = isClusterBackend() ? client.redis.nodes('all') : [client.redis];
-			const killed = await Promise.all(servers.map((s) => s.call('CLIENT', 'KILL', 'TYPE', 'pubsub')));
+			// Wait until both relay subscriptions exist before dropping them.
+			let subs = [];
+			await waitFor(async () => (subs = await namedPubsubClients(client, name)).length === 2, 10000);
+			const killed = await Promise.all(subs.map(({ server, id }) => server.call('CLIENT', 'KILL', 'ID', id)));
 			expect(killed.reduce((total, count) => total + Number(count), 0)).toBe(2);
 			a.edit(TOPIC, 'u1', 1); // published while both subscribers reconnect
 			await waitFor(() => 'u1' in b.items(TOPIC), 10000);
