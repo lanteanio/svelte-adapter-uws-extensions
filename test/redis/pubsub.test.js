@@ -1840,3 +1840,92 @@ describe('redis pubsub lifecycle', () => {
 		expect(sub.disconnect).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe('redis pubsub delivery across a reactivation', () => {
+	// The first call to `method` on `from` deactivates the bus and activates it
+	// on `to` synchronously, as a local handler of the delivered message could.
+	function reactivateOnFirstCall(bus, from, to, method, pending) {
+		const original = from[method].bind(from);
+		let fired = false;
+		from[method] = (...args) => {
+			const result = original(...args);
+			if (!fired) {
+				fired = true;
+				pending.push(bus.deactivate(), bus.activate(to));
+			}
+			return result;
+		};
+	}
+
+	// Delivers one frame on the subscriber connection the bus opened last. Redis
+	// sends a message only to the connections subscribed when it was published,
+	// never to one a reactivation opens while it is being delivered.
+	function trackSubscribers(client) {
+		const subs = [];
+		const duplicate = client.duplicate.bind(client);
+		client.duplicate = (overrides) => {
+			const sub = duplicate(overrides);
+			subs.push(sub);
+			return sub;
+		};
+		return (envelope) => subs[subs.length - 1]._listeners.get('message')('uws:pubsub', JSON.stringify(envelope));
+	}
+
+	it('publishes the rest of a batch envelope to the platform it arrived on', async () => {
+		const client = mockRedisClient();
+		const deliver = trackSubscribers(client);
+		const bus = createPubSubBus(client);
+		const first = mockPlatform();
+		const next = mockPlatform();
+		delete first.publishBatched;
+		await bus.activate(first);
+		first.reset();
+		const pending = [];
+		reactivateOnFirstCall(bus, first, next, 'publish', pending);
+		try {
+			deliver({
+				instanceId: 'other-instance',
+				batch: [
+					{ topic: 'a', event: 'x', data: 1 },
+					{ topic: 'b', event: 'y', data: 2 }
+				]
+			});
+			expect(first.published.map((m) => m.data)).toEqual([1, 2]);
+			expect(next.published).toEqual([]);
+		} finally {
+			await Promise.all(pending);
+			await bus.deactivate();
+		}
+	});
+
+	it('sends the rest of a coalesced envelope to the platform it arrived on', async () => {
+		const client = mockRedisClient();
+		const deliver = trackSubscribers(client);
+		const bus = createPubSubBus(client);
+		const first = mockPlatform();
+		const next = mockPlatform();
+		const wsA = { id: 'a' };
+		const wsB = { id: 'b' };
+		first.forEachSubscriber = (topic, fn) => { fn(wsA); fn(wsB); };
+		next.forEachSubscriber = first.forEachSubscriber;
+		await bus.activate(first);
+		first.reset();
+		const pending = [];
+		reactivateOnFirstCall(bus, first, next, 'sendCoalesced', pending);
+		try {
+			deliver({
+				instanceId: 'other-instance',
+				coalesced: true,
+				topic: 'prices',
+				event: 'tick',
+				data: { p: 5 },
+				coalesceKey: 'btc'
+			});
+			expect(first.sentCoalesced.map((s) => s.ws)).toEqual([wsA, wsB]);
+			expect(next.sentCoalesced).toEqual([]);
+		} finally {
+			await Promise.all(pending);
+			await bus.deactivate();
+		}
+	});
+});

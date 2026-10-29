@@ -321,7 +321,7 @@ export function createShardedBus(client, options = {}) {
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
-	function deliverEnvelope(parsed, receivedShard) {
+	function deliverEnvelope(parsed, receivedShard, platform) {
 		// Coalesced relay: re-coalesce onto local subscribers (latest-value-
 		// wins per ws+key), mirroring the publishing instance's sendCoalesced.
 		// Precedes the batch/single branches so a coalesced frame is never
@@ -336,13 +336,13 @@ export function createShardedBus(client, options = {}) {
 			// the value goes out as a plain publish: every subscriber still gets
 			// it, as the wire branch below falls back to JSON. Unsequenced, like the
 			// coalesced send it stands in for.
-			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
+			if (typeof platform.sendCoalesced !== 'function' || typeof platform.forEachSubscriber !== 'function') {
+				platform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
 				return;
 			}
 			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
-			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
-				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+			platform.forEachSubscriber(parsed.topic, (ws) => {
+				platform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
 			});
 			return;
 		}
@@ -360,11 +360,11 @@ export function createShardedBus(client, options = {}) {
 			}
 			mReceived?.inc({ topic: mt(parsed.topic) });
 			const codec = wireCodecs.get(parsed.capability);
-			if (codec && typeof activePlatform.publishWire === 'function') {
-				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
+			if (codec && typeof platform.publishWire === 'function') {
+				platform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
 					receivedOptions(parsed.s, undefined, parsed.compress === true ? true : undefined));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
+				platform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
 			}
 			return;
 		}
@@ -387,11 +387,11 @@ export function createShardedBus(client, options = {}) {
 			if (local.length === 0) return;
 			// A peer's platform batched these; this one may not have the batched
 			// lane, and then each message goes out on its own.
-			if (typeof activePlatform.publishBatched === 'function') {
-				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
+			if (typeof platform.publishBatched === 'function') {
+				platform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
-					activePlatform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
+					platform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
 				}
 			}
 		} else {
@@ -402,17 +402,17 @@ export function createShardedBus(client, options = {}) {
 			mReceived?.inc({ topic: mt(parsed.topic) });
 			// Re-apply the de-herd window (`j`) and the origin's seq choice (`s`);
 			// `relay: false` stops the re-relay.
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
+			platform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
 		}
 	}
 
-	function deliverTraced(parsed, receivedShard) {
+	function deliverTraced(parsed, receivedShard, platform) {
 		const parent = carriedTraceContext(parsed);
 		// Clear the subscriber's inherited context, including async descendants
 		// of delivery, when no remote parent was carried.
-		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed, receivedShard));
-		runTraceOperation(activePlatform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
-			() => deliverEnvelope(parsed, receivedShard));
+		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed, receivedShard, platform));
+		runTraceOperation(platform, 'redis.sharded-pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
+			() => deliverEnvelope(parsed, receivedShard, platform));
 	}
 
 	// One publish as the bus relays it. The de-herd window (`j`) and the seq
@@ -583,8 +583,10 @@ export function createShardedBus(client, options = {}) {
 				// consumer operation parented on the producer's context; without one
 				// the trace fields are ignored and nothing is allocated for them.
 				const shard = ch.slice(channelPrefix.length);
-				if (activeTracing) deliverTraced(parsed, shard);
-				else deliverEnvelope(parsed, shard);
+				// The whole envelope goes to the platform active when it arrived: a
+				// local publish may deactivate and reactivate the bus mid-envelope.
+				if (activeTracing) deliverTraced(parsed, shard, activePlatform);
+				else deliverEnvelope(parsed, shard, activePlatform);
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
 				// is observable instead of silently swallowed.

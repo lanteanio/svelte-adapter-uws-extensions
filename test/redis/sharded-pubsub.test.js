@@ -1525,3 +1525,80 @@ describe('sharded per-socket topic ownership', () => {
 		});
 	});
 });
+
+describe('redis sharded bus delivery across a reactivation', () => {
+	const TOPIC = 'prices';
+
+	// The first call to `method` on `from` deactivates the bus and activates it
+	// on `to` synchronously, as a local handler of the delivered message could.
+	function reactivateOnFirstCall(bus, from, to, method, pending) {
+		const original = from[method].bind(from);
+		let fired = false;
+		from[method] = (...args) => {
+			const result = original(...args);
+			if (!fired) {
+				fired = true;
+				pending.push(bus.deactivate(), bus.activate(to));
+			}
+			return result;
+		};
+	}
+
+	it('publishes the rest of a batch envelope to the platform it arrived on', async () => {
+		const client = mockRedisClient();
+		const bus = createShardedBus(client);
+		const first = mockPlatform();
+		const next = mockPlatform();
+		delete first.publishBatched;
+		await bus.activate(first);
+		await bus.follow(TOPIC);
+		first.reset();
+		const pending = [];
+		reactivateOnFirstCall(bus, first, next, 'publish', pending);
+		try {
+			await client.redis.spublish('uws:sharded:' + TOPIC, JSON.stringify({
+				instanceId: 'other-instance',
+				batch: [
+					{ topic: TOPIC, event: 'x', data: 1 },
+					{ topic: TOPIC, event: 'y', data: 2 }
+				]
+			}));
+			expect(first.published.map((m) => m.data)).toEqual([1, 2]);
+			expect(next.published).toEqual([]);
+		} finally {
+			await Promise.all(pending);
+			await bus.deactivate();
+		}
+	});
+
+	it('sends the rest of a coalesced envelope to the platform it arrived on', async () => {
+		const client = mockRedisClient();
+		const bus = createShardedBus(client);
+		const first = mockPlatform();
+		const next = mockPlatform();
+		const wsA = { id: 'a' };
+		const wsB = { id: 'b' };
+		first.forEachSubscriber = (topic, fn) => { fn(wsA); fn(wsB); };
+		next.forEachSubscriber = first.forEachSubscriber;
+		await bus.activate(first);
+		await bus.follow(TOPIC);
+		first.reset();
+		const pending = [];
+		reactivateOnFirstCall(bus, first, next, 'sendCoalesced', pending);
+		try {
+			await client.redis.spublish('uws:sharded:' + TOPIC, JSON.stringify({
+				instanceId: 'other-instance',
+				coalesced: true,
+				topic: TOPIC,
+				event: 'tick',
+				data: { p: 5 },
+				coalesceKey: 'btc'
+			}));
+			expect(first.sentCoalesced.map((s) => s.ws)).toEqual([wsA, wsB]);
+			expect(next.sentCoalesced).toEqual([]);
+		} finally {
+			await Promise.all(pending);
+			await bus.deactivate();
+		}
+	});
+});

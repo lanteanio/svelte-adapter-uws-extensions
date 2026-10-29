@@ -295,7 +295,7 @@ export function createPubSubBus(client, options = {}) {
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
-	function deliverEnvelope(parsed) {
+	function deliverEnvelope(parsed, platform) {
 		// Coalesced relay: re-coalesce the latest value onto this
 		// instance's local subscribers (latest-value-wins per ws+key),
 		// mirroring the publishing instance's sendCoalesced fan-out. Must
@@ -311,13 +311,13 @@ export function createPubSubBus(client, options = {}) {
 			// the value goes out as a plain publish: every subscriber still gets
 			// it, as the wire branch below falls back to JSON. Unsequenced, like the
 			// coalesced send it stands in for.
-			if (typeof activePlatform.sendCoalesced !== 'function' || typeof activePlatform.forEachSubscriber !== 'function') {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
+			if (typeof platform.sendCoalesced !== 'function' || typeof platform.forEachSubscriber !== 'function') {
+				platform.publish(parsed.topic, parsed.event, parsed.data, UNSEQUENCED_DELIVERY);
 				return;
 			}
 			const fullKey = parsed.topic + '\0' + (parsed.coalesceKey == null ? '' : parsed.coalesceKey);
-			activePlatform.forEachSubscriber(parsed.topic, (ws) => {
-				activePlatform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
+			platform.forEachSubscriber(parsed.topic, (ws) => {
+				platform.sendCoalesced(ws, { key: fullKey, topic: parsed.topic, event: parsed.event, data: parsed.data });
 			});
 			return;
 		}
@@ -339,11 +339,11 @@ export function createPubSubBus(client, options = {}) {
 			}
 			mReceived?.inc();
 			const codec = wireCodecs.get(parsed.capability);
-			if (codec && typeof activePlatform.publishWire === 'function') {
-				activePlatform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
+			if (codec && typeof platform.publishWire === 'function') {
+				platform.publishWire(parsed.topic, parsed.event, parsed.data, codec,
 					receivedOptions(parsed.s, undefined, parsed.compress === true ? true : undefined));
 			} else {
-				activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
+				platform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, undefined, parsed.compress === true));
 			}
 			return;
 		}
@@ -366,11 +366,11 @@ export function createPubSubBus(client, options = {}) {
 			mReceived?.inc(local.length);
 			// A peer's platform batched these; this one may not have the batched
 			// lane, and then each message goes out on its own.
-			if (typeof activePlatform.publishBatched === 'function') {
-				activePlatform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
+			if (typeof platform.publishBatched === 'function') {
+				platform.publishBatched(local, parsed.compress === true ? { compress: true } : undefined);
 			} else {
 				for (let i = 0; i < local.length; i++) {
-					activePlatform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
+					platform.publish(local[i].topic, local[i].event, local[i].data, { ...local[i].options, compress: parsed.compress === true });
 				}
 			}
 		} else {
@@ -382,17 +382,17 @@ export function createPubSubBus(client, options = {}) {
 			// Re-apply the de-herd window (carried as `j`) and the origin's seq
 			// choice (carried as `s`) so this node's subscribers stagger AND dedup
 			// against the origin's seq space; `relay: false` stops the re-relay.
-			activePlatform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
+			platform.publish(parsed.topic, parsed.event, parsed.data, receivedOptions(parsed.s, parsed.j, parsed.compress));
 		}
 	}
 
-	function deliverTraced(parsed) {
+	function deliverTraced(parsed, platform) {
 		const parent = carriedTraceContext(parsed);
 		// Clear the subscriber's inherited context, including async descendants
 		// of delivery, when no remote parent was carried.
-		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed));
-		runTraceOperation(activePlatform, 'redis.pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
-			() => deliverEnvelope(parsed));
+		if (parent === null) return clearIncomingContext(() => deliverEnvelope(parsed, platform));
+		runTraceOperation(platform, 'redis.pubsub.receive', 'consumer', parent, REDIS_TRACE_ATTRIBUTES,
+			() => deliverEnvelope(parsed, platform));
 	}
 
 	// The traced publish's envelope; the untraced publish builds the same
@@ -605,8 +605,10 @@ export function createPubSubBus(client, options = {}) {
 			// context only matters to a tracing provider: with one, delivery is
 			// a consumer operation parented on the producer's context; without
 			// one the trace fields are ignored and nothing is allocated for them.
-			if (activeTracing) deliverTraced(parsed);
-			else deliverEnvelope(parsed);
+			// The whole envelope goes to the platform active when it arrived: a
+			// local publish may deactivate and reactivate the bus mid-envelope.
+			if (activeTracing) deliverTraced(parsed, activePlatform);
+			else deliverEnvelope(parsed, activePlatform);
 		} catch {
 			// Malformed envelope; counted so a stream of bad messages
 			// is observable instead of silently swallowed.
