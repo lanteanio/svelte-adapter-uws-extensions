@@ -1261,7 +1261,7 @@ export function createShardedBus(client, options = {}) {
 			throw new TypeError('sharded bus: followBatch requires an array of topics');
 		}
 		if (topics.length === 0) return;
-		await admitBatch(reserveBatch(topics));
+		await admitFollowBatch(reserveBatch(topics));
 	}
 
 	/**
@@ -1305,7 +1305,7 @@ export function createShardedBus(client, options = {}) {
 	 * @param {ReturnType<typeof reserveBatch>} reservation
 	 * @param {boolean} [releaseOnFailure=true]
 	 */
-	async function admitBatch({ touchedTopics, waitingTopics, channels }, releaseOnFailure = true) {
+	async function admitFollowBatch({ touchedTopics, waitingTopics, channels }, releaseOnFailure = true) {
 		if (channels.size === 0) return;
 		const generation = subGeneration;
 		try {
@@ -1335,7 +1335,7 @@ export function createShardedBus(client, options = {}) {
 	 */
 	async function admitSocketBatch(ws, wsTopics, owner, reservation, waits) {
 		try {
-			await admitBatch(reservation, false);
+			await admitFollowBatch(reservation, false);
 			if (waits) await Promise.all(waits);
 		} catch (err) {
 			const releases = [];
