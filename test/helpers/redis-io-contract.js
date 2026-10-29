@@ -199,10 +199,11 @@ export function redisIOContract(makeClient) {
 					subscribes.push(tally('subscribe'));
 					meter.reset();
 					for (const ws of sockets.slice(0, -1)) await presence.leave(ws, platform, 'room');
-					expect(meter.read()).toBe(2 * (size - 1));
+					// The leave script publishes the leave event itself.
+					expect(meter.read()).toBe(size - 1);
 					expect(tally('unsubscribe')).toBe(0);
 					await presence.leave(sockets[size - 1], platform, 'room');
-					expect(meter.read()).toBe(2 * (size - 1) + 3);
+					expect(meter.read()).toBe(size - 1 + 2);
 					unsubscribes.push(tally('unsubscribe'));
 				} finally { await presence.clear('room'); await presence.clear('warm'); presence.destroy(); await raw.quit(); }
 			}
