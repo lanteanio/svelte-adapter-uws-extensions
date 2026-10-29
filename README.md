@@ -499,7 +499,7 @@ export const { subscribe, unsubscribe, close } = bus.hooks;
 // await bus.unfollow('chat:room-7');
 ```
 
-Activate in `init`, which the adapter awaits: an activation failure rejects startup instead of escaping an unawaited WebSocket `open` hook. `bus.hooks` is the recommended subscription path - it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
+Activate in `init`, which the adapter runs once at startup, so an activation failure fails startup. In the WebSocket `open` hook, the adapter closes every connection with 1011 for as long as activation fails, and the sharded bus does not retry on its own. `bus.hooks` is the recommended subscription path - it tracks per-`ws` subscription state and refcounts so the bus only `SSUBSCRIBE`s on the first follower per channel and `SUNSUBSCRIBE`s on the last one out.
 
 #### Bulk follow (`followBatch`, `bus.hooks.subscribeBatch`)
 
@@ -3874,8 +3874,8 @@ export const aggregator = createPublishRateAggregator(redis, {
   topN: 20
 });
 
-// In your open hook (or any startup path with a platform reference):
-export async function open(ws, { platform }) {
+// In the `init` hook of src/hooks.ws.js, which runs once at startup (a failed activation in `open` closes that connection with 1011):
+export async function init({ platform }) {
   await aggregator.activate(platform);
 }
 ```
