@@ -234,7 +234,13 @@ export function createCrdtCluster(client, options = {}) {
 
 	/** @type {Map<string, string>} topic -> declKey, for every topic seen held */
 	const known = new Map();
-	/** Newly acquired leases whose first successful result has not been returned. */
+	/**
+	 * Topics whose newly acquired lease has not yet been returned as fresh by
+	 * `acquirePersistDetailed`. Dropped with the rest of a topic's state when
+	 * the topic is forgotten, so a lease abandoned after a rejected barrier
+	 * does not stay here.
+	 * @type {Set<string>}
+	 */
 	const freshLeases = new Set();
 	let sweepAt = KNOWN_SWEEP_MIN;
 	/** @type {Iterator<[string, string]> | null} the sweep in progress */
@@ -333,6 +339,7 @@ export function createCrdtCluster(client, options = {}) {
 	/** Drop everything remembered about a topic this instance no longer holds. */
 	function forget(topic) {
 		known.delete(topic);
+		freshLeases.delete(topic);
 		owed.delete(topic);
 		stale.delete(topic);
 		unrelayed.delete(topic);
@@ -1093,20 +1100,23 @@ export function createCrdtCluster(client, options = {}) {
 		: null;
 
 	/**
-	 * Try to become (or stay) the sole snapshot writer for a topic. `fresh`
-	 * stays pending through a rejected first acquisition attempt until the first
-	 * successful result, then clears; an ordinary renewal or a contender that
-	 * failed to acquire is not fresh. A newly acquired lease, and one renewed
-	 * while a resync of the topic runs, first waits for a sync round with the peers
-	 * (bounded to a third of the lease TTL). Throws on a Redis error, and with
-	 * code `CRDT_RELAY_PENDING` while local edits to the topic have not reached
-	 * the peers or the replica has not synced with them after the relay lost
-	 * traffic, so the caller's persistence schedule retries rather than dropping
-	 * the write or unloading the only replica holding local edits.
+	 * Try to become (or stay) the sole snapshot writer for a topic. A newly
+	 * acquired lease stays pending as fresh through rejected barriers and
+	 * boolean `acquirePersist` calls; the first successful result with
+	 * `consume` reports it and clears it. An ordinary renewal or a contender
+	 * that failed to acquire is not fresh. A newly acquired lease, and one
+	 * renewed while a resync of the topic runs, first waits for a sync round
+	 * with the peers (bounded to a third of the lease TTL). Throws on a Redis
+	 * error, and with code `CRDT_RELAY_PENDING` while local edits to the topic
+	 * have not reached the peers or the replica has not synced with them after
+	 * the relay lost traffic, so the caller's persistence schedule retries
+	 * rather than dropping the write or unloading the only replica holding
+	 * local edits.
 	 * @param {string} topic
+	 * @param {boolean} consume clear a pending fresh flag when reporting it
 	 * @returns {Promise<{ acquired: boolean, fresh: boolean }>}
 	 */
-	async function acquirePersistDetailed(topic) {
+	async function acquireLease(topic, consume) {
 		if (destroyed) return { acquired: false, fresh: false };
 		assertRelayable(topic);
 		let synced = false;
@@ -1142,7 +1152,7 @@ export function createCrdtCluster(client, options = {}) {
 		// Edits marked or relays started while the lease was being taken
 		// count as well.
 		assertSynced(topic, reached);
-		return { acquired: true, fresh: freshLeases.delete(topic) };
+		return { acquired: true, fresh: consume ? freshLeases.delete(topic) : freshLeases.has(topic) };
 	}
 
 	return {
@@ -1204,23 +1214,25 @@ export function createCrdtCluster(client, options = {}) {
 		 * true when this instance holds the per-topic persist lease and may
 		 * write; false when another instance holds it (skip - that instance
 		 * persists). Uses the same convergence and error barrier as
-		 * `acquirePersistDetailed`.
+		 * `acquirePersistDetailed` and leaves its fresh flag pending.
 		 * @param {string} topic
 		 * @returns {Promise<boolean>}
 		 */
 		async acquirePersist(topic) {
-			return (await acquirePersistDetailed(topic)).acquired;
+			return (await acquireLease(topic, false)).acquired;
 		},
 
 		/**
-		 * The boolean lease result plus whether this instance has a newly acquired
-		 * lease whose first successful result has not been returned. A fresh
-		 * result tells the document layer to merge the persisted snapshot before
-		 * replacing it; a later renewal is not fresh.
+		 * The boolean lease result plus whether this instance holds a newly
+		 * acquired lease not yet reported fresh. The flag clears when this call
+		 * returns it, not when the caller's write succeeds, so a caller keeps its
+		 * own merge-pending state until a store succeeds.
 		 * @param {string} topic
 		 * @returns {Promise<{ acquired: boolean, fresh: boolean }>}
 		 */
-		acquirePersistDetailed,
+		acquirePersistDetailed(topic) {
+			return acquireLease(topic, true);
+		},
 
 		/** Tear down the subscriber. Idempotent. */
 		destroy() {

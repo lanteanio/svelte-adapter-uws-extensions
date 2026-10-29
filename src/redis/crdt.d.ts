@@ -51,7 +51,12 @@ export interface CrdtClusterHandlers {
 export interface CrdtPersistLease {
 	/** Whether this instance holds the lease and may persist the topic. */
 	acquired: boolean;
-	/** True for a new lease until its first successful result, never for a later renewal or denial. */
+	/**
+	 * True when this instance newly acquired the lease and no earlier
+	 * `acquirePersistDetailed` call reported it fresh; false for a later
+	 * renewal or a denial. The flag clears when the call returns it, not when
+	 * the caller's write succeeds.
+	 */
 	fresh: boolean;
 }
 
@@ -99,10 +104,16 @@ export interface CrdtCluster {
 	acquirePersist(topic: string): Promise<boolean>;
 	/**
 	 * The same lease and convergence barrier as `acquirePersist`, plus a
-	 * `fresh` signal held until the new lease's first successful result, even
-	 * when a renewal retries a rejected barrier. On a fresh result the document
-	 * layer must merge the persisted snapshot before its first replacement
-	 * write; later renewals and denied acquisitions return false.
+	 * `fresh` signal. A new lease stays pending as fresh through rejected
+	 * barriers and boolean `acquirePersist` calls until this method first
+	 * resolves with it acquired; that result reports `fresh: true` and clears
+	 * the flag. On a fresh result the document layer must merge the persisted
+	 * snapshot before its first replacement write. Because the flag clears when
+	 * this call returns, not when the write succeeds, a caller that can still
+	 * abort or fail its store after a fresh result (a cancelled write, an empty
+	 * diff, a failed load or store) keeps its own merge-pending flag until a
+	 * store succeeds. A topic the coordinator stops holding drops its pending
+	 * flag.
 	 */
 	acquirePersistDetailed(topic: string): Promise<CrdtPersistLease>;
 	/** Tear down the relay subscriber. Idempotent. */

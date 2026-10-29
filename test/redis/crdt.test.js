@@ -129,6 +129,40 @@ describe('createCrdtCluster per-topic persist lease', () => {
 		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: false, fresh: false });
 	});
 
+	it('leaves the fresh flag pending through boolean acquisitions', async () => {
+		expect(await a.acquirePersist('board:1')).toBe(true);
+		expect(await a.acquirePersist('board:1')).toBe(true);
+		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: true, fresh: true });
+		expect(await a.acquirePersistDetailed('board:1')).toEqual({ acquired: true, fresh: false });
+	});
+
+	it('drops the pending fresh flag of a topic it stops holding after a rejected barrier', async () => {
+		const c = createCrdtCluster(client, { persistLeaseMs: 900 });
+		const held = new Set(['doc:f']);
+		c.onMessage({ onSyncRequest: (declKey, topic, sv, from) => { if (held.has(topic)) c.sendSyncReply(declKey, topic, [1], from); } });
+		const publish = client.redis.publish;
+		try {
+			await settle();
+			c.relayUpdate('dk1', 'doc:f', [1]);
+			await settle();
+			// The fresh lease's sync request never gets confirmed: the barrier
+			// rejects after the lease was taken, leaving the flag pending.
+			client.redis.publish = function (channel, message) {
+				if (message.includes('"k":"sreq"')) return new Promise(() => {});
+				return publish.call(this, channel, message);
+			};
+			await expect(c.acquirePersistDetailed('doc:f')).rejects.toMatchObject({ code: 'CRDT_RELAY_PENDING' });
+			client.redis.publish = publish;
+			// The replica is gone; the next round finds nothing held and forgets
+			// the topic, pending flag included. The lease itself is still ours.
+			held.delete('doc:f');
+			expect(await c.acquirePersistDetailed('doc:f')).toEqual({ acquired: true, fresh: false });
+		} finally {
+			client.redis.publish = publish;
+			c.destroy();
+		}
+	});
+
 	it('leases are per-topic (one instance can hold different topics independently)', async () => {
 		expect(await a.acquirePersist('board:1')).toBe(true);
 		expect(await b.acquirePersist('board:2')).toBe(true); // a different topic, free
