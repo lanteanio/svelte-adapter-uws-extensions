@@ -208,5 +208,28 @@ describe('redis topic-broadcast coordinator', () => {
 			await beat(originBeat);
 			expect(await client.redis.zrange(presenceKey, 0, -1)).not.toContain(peer.instanceId);
 		});
+		it('does not wait on a peer whose last stamp is older than the TTL', async () => {
+			const origin = make({ heartbeat: 300 });
+			const peer = make({ heartbeat: 300 });
+			origin.onRequest(serve([{ ok: true, reply: 'o' }]));
+			peer.onRequest(serve([{ ok: true, reply: 'p' }]));
+			await flush();
+			const peerBeat = clock.intervals[1];
+			const presenceKey = client.key('{topic-broadcast}:instances');
+			// The silent peer's last stamp is 905 ms old at the broadcast, past
+			// the default 900 ms TTL. The live peer's last beat came 10 ms
+			// earlier, too soon to evict it, and the cached clock has not
+			// stepped since before that stamp.
+			clock.advance(100);
+			await client.redis.zadd(presenceKey, clock.t, 'silent-peer');
+			clock.advance(895);
+			await beat(peerBeat);
+			clock.advance(10);
+			let settled = false;
+			const out = origin.broadcast('room', 'ping', null, { timeoutMs: 60000 }).then((replies) => { settled = true; return replies; });
+			for (let i = 0; i < 5; i++) await flush();
+			expect(settled).toBe(true);
+			expect(await out).toEqual([{ ok: true, reply: 'o' }, { ok: true, reply: 'p' }]);
+		});
 	});
 });
