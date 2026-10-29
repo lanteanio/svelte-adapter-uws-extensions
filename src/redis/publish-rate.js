@@ -32,7 +32,7 @@ import { MAX_AGGREGATOR_REMOTE_INSTANCES, MAX_REMOTE_SLICE_ENTRIES } from '../sh
 import { createBusValidator } from '../shared/bus-validate.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { openSubscriber } from '../shared/redis-subscriber.js';
+import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
 import { registerAdmissionRate } from '../shared/_publish-rate-admission.js';
 
 /**
@@ -132,6 +132,8 @@ export function createPublishRateAggregator(client, options = {}) {
 	const busValidator = createBusValidator({});
 	let publishTimer = null;
 	let activated = false;
+	// The activation in flight, shared by overlapping activate() calls.
+	let activation = null;
 	let remoteInstancesWarnFired = false;
 
 	// Merged-view memo. computeMerged runs on EVERY rateOf/topPublishers read
@@ -229,18 +231,19 @@ export function createPublishRateAggregator(client, options = {}) {
 	}
 
 	async function activate(platform) {
-		if (activated) {
+		if (activated || activation) {
 			activePlatform = platform || activePlatform;
+			if (activation) return activation;
 			return;
 		}
-		activated = true;
 		activePlatform = platform;
 
-		subscriber = openSubscriber(client, 'publish-rate');
-		subscriber.on('error', (err) => {
+		const sub = openSubscriber(client, 'publish-rate');
+		subscriber = sub;
+		sub.on('error', (err) => {
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBLISH_RATE_SUBSCRIBER, { error: err });
 		});
-		subscriber.on('message', (ch, raw) => {
+		sub.on('message', (ch, raw) => {
 			if (ch !== channel) return;
 			// Cap raw bytes before JSON.parse, like every sibling bus module.
 			if (!busValidator.acceptRaw(raw)) { mParseErrors?.inc(); return; }
@@ -329,17 +332,33 @@ export function createPublishRateAggregator(client, options = {}) {
 				remoteSubs.set(env.instanceId, { ts, subs: subsMap });
 			}
 		});
-		await subscriber.subscribe(channel);
-
-		// First broadcast on the next tick (so subscribers in this same
-		// process can't race against an in-flight subscribe). Each tick also
-		// evaluates threshold crossings over the freshly-merged view.
-		publishTimer = setIntervalTimer(tick, publishInterval);
-		if (publishTimer.unref) publishTimer.unref();
+		// A deactivate() meanwhile replaced or dropped `subscriber` and closed
+		// this one, so the attempt then ends without starting the timer.
+		const current = sub.subscribe(channel).then(() => {
+			if (subscriber !== sub) return;
+			activation = null;
+			activated = true;
+			// First broadcast on the next tick (so subscribers in this same
+			// process can't race against an in-flight subscribe). Each tick also
+			// evaluates threshold crossings over the freshly-merged view.
+			publishTimer = setIntervalTimer(tick, publishInterval);
+			if (publishTimer.unref) publishTimer.unref();
+		}, (err) => {
+			if (subscriber !== sub) return;
+			// Left inactive, so the next activate() tries again.
+			activation = null;
+			subscriber = null;
+			activePlatform = null;
+			closeConnection(sub);
+			throw err;
+		});
+		activation = current;
+		return current;
 	}
 
 	async function deactivate() {
 		activated = false;
+		activation = null;
 		if (publishTimer) {
 			clearIntervalTimer(publishTimer);
 			publishTimer = null;

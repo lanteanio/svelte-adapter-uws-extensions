@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { createPublishRateAggregator } from '../../src/redis/publish-rate.js';
@@ -302,6 +302,77 @@ describe('redis publish-rate aggregator', () => {
 			await agg.activate(platform);
 			await agg.deactivate();
 			await expect(agg.deactivate()).resolves.toBeUndefined();
+		});
+
+		// Subscriber connections whose SUBSCRIBE settles as `gate` decides, and
+		// the broadcasts that reach the aggregation channel.
+		function gatedClient(gate) {
+			const subscribers = [];
+			const duplicate = client.duplicate.bind(client);
+			client.duplicate = (overrides) => {
+				const sub = duplicate(overrides);
+				const subscribe = sub.subscribe.bind(sub);
+				sub.subscribe = (...channels) => gate(() => subscribe(...channels));
+				subscribers.push(sub);
+				return sub;
+			};
+			const broadcasts = [];
+			const publish = client.redis.publish.bind(client.redis);
+			client.redis.publish = (ch, message) => {
+				if (ch === 'uws:pressure:rates') broadcasts.push(JSON.parse(message));
+				return publish(ch, message);
+			};
+			return { subscribers, broadcasts };
+		}
+
+		it('activates again after a refused SUBSCRIBE', async () => {
+			let refuse = true;
+			const { subscribers, broadcasts } = gatedClient((go) => (refuse ? Promise.reject(new Error('NOPERM')) : go()));
+			const agg = createPublishRateAggregator(client, { publishInterval: 10 });
+			try {
+				await expect(agg.activate(platform)).rejects.toThrow('NOPERM');
+				refuse = false;
+				await agg.activate(platform);
+				expect(subscribers).toHaveLength(2);
+				await new Promise((r) => setTimeout(r, 40));
+				expect(broadcasts.length).toBeGreaterThan(0);
+
+				client.redis.publish('uws:pressure:rates', JSON.stringify({
+					instanceId: 'sib',
+					ts: Date.now(),
+					slice: [{ topic: 't', messagesPerSec: 50, bytesPerSec: 500 }]
+				}));
+				expect(agg.topPublishers.find((t) => t.topic === 't')).toBeDefined();
+			} finally {
+				await agg.deactivate();
+			}
+		});
+
+		it('shares one activation between overlapping calls', async () => {
+			const { subscribers } = gatedClient(() => Promise.reject(new Error('NOPERM')));
+			const agg = createPublishRateAggregator(client);
+			const first = agg.activate(platform);
+			const second = agg.activate(platform);
+			await expect(first).rejects.toThrow('NOPERM');
+			await expect(second).rejects.toThrow('NOPERM');
+			expect(subscribers).toHaveLength(1);
+			await agg.deactivate();
+		});
+
+		it('starts no broadcast timer when deactivated during activation', async () => {
+			vi.useFakeTimers();
+			try {
+				let release;
+				gatedClient((go) => new Promise((resolve) => { release = () => resolve(go()); }));
+				const agg = createPublishRateAggregator(client, { publishInterval: 10 });
+				const activating = agg.activate(platform);
+				await agg.deactivate();
+				release();
+				await activating;
+				expect(vi.getTimerCount()).toBe(0);
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 
