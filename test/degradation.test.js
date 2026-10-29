@@ -104,7 +104,12 @@ describe('createDegradationPolicy', () => {
 			{ count: NaN },
 			{ count: 1n },
 			{ reason: 'x'.repeat(1025) },
-			{ a: 'x'.repeat(1024), b: 'x'.repeat(1024), c: 'x'.repeat(1024), d: 'x'.repeat(996) }
+			// 513 two-byte characters: 1026 UTF-8 bytes, within a 1024 character count.
+			{ reason: '\u00e9'.repeat(513) },
+			{ a: 'x'.repeat(1024), b: 'x'.repeat(1024), c: 'x'.repeat(1024), d: 'x'.repeat(996) },
+			// Each string is exactly 1024 bytes; the object serializes to 5156 bytes but
+			// only 2596 characters.
+			Object.fromEntries(['a', 'b', 'c', 'd', 'e'].map((key) => [key, '\u00e9'.repeat(512)]))
 		])('rejects invalid ' + field + ' message parameters %#', (messageParams) => {
 			expect(() => createDegradationPolicy({ [field]: { messageParams } })).toThrow(/messageParams/);
 			expect(() => resolve(createDegradationPolicy({ [field]: () => ({ messageParams }) }))).toThrow(/messageParams/);
@@ -114,7 +119,8 @@ describe('createDegradationPolicy', () => {
 			const entries = Object.fromEntries(Array.from({ length: 64 }, (_, i) => ['key' + i, i]));
 			const serializedLimit = { a: 'x'.repeat(1024), b: 'x'.repeat(1024), c: 'x'.repeat(1024), d: 'x'.repeat(995) };
 			const special = JSON.parse('{"__proto__":"safe","constructor":false,"toString":null}');
-			for (const messageParams of [entries, serializedLimit, special, Object.create(null)]) {
+			const multiByteLimit = { reason: '\u00e9'.repeat(512) };
+			for (const messageParams of [entries, serializedLimit, multiByteLimit, special, Object.create(null)]) {
 				expect(Buffer.byteLength(JSON.stringify(messageParams), 'utf8')).toBeLessThanOrEqual(4096);
 				const result = resolve(createDegradationPolicy({ [field]: { messageKey: 'x'.repeat(128), messageParams } }));
 				expect(result[field].messageParams).toBe(messageParams);

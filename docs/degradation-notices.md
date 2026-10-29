@@ -14,29 +14,31 @@ Both `mitigation` and `recovery` accept these optional fields:
 | `messageParams` | A plain interpolation object with at most 64 entries. Keys follow `messageKey` syntax and bounds. Values are strings, finite numbers, booleans, or null; each string is at most 1024 UTF-8 bytes and the serialized object is at most 4096 UTF-8 bytes. |
 | `bannerCopy` | The source-English fallback: well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks. ZWNJ/ZWJ joiners may accompany text. |
 
-Invalid fields reject policy construction or the dynamic policy transition. Other valid mitigation or recovery fields remain independent. Render resolved notices as text, never as HTML.
+On the server, one invalid field rejects the whole envelope: a static envelope makes `createDegradationPolicy` throw, and an invalid envelope returned by a dynamic policy makes that transition throw, so the bus emits the bare `degraded` or `recovered` event without a `mitigation` or `recovery` envelope. The realtime client checks the same bounds on receipt and drops each invalid `bannerCopy`, `messageKey`, or `messageParams` field on its own, keeping the envelope's other fields. Render resolved notices as text, never as HTML.
 
 ## Resolve the display language
 
-Resolve a known key through the selected display-language catalog. For an unknown key, use `bannerCopy`, then the application's generic localized fallback. Applications own locale selection, fallback chains, interpolation, plural and number formatting, `lang`, `dir`, and bidirectional isolation. Keep machine identifiers outside translated prose and isolate untrusted identifiers at the rendering boundary.
+Resolve a known key through the selected display-language catalog. For an unknown key, use `bannerCopy`, then the application's generic localized fallback for that transition. A transition without an envelope, such as a recovery with no `recovery` field, resolves straight to that fallback. Applications own locale selection, fallback chains, interpolation, plural and number formatting, `lang`, `dir`, and bidirectional isolation. Keep machine identifiers outside translated prose and isolate untrusted identifiers at the rendering boundary.
 
 ```js
 const catalogs = {
   en: {
     generic: 'Real-time updates are temporarily unavailable.',
+    restored: 'Real-time updates are available again.',
     'orders.unavailable': 'Saving orders is unavailable while {service} recovers.',
     'orders.restored': 'Saving orders is available again.'
   },
   de: {
     generic: 'Echtzeit-Updates sind vorübergehend nicht verfügbar.',
+    restored: 'Echtzeit-Updates sind wieder verfügbar.',
     'orders.unavailable': 'Bestellungen können während der Wiederherstellung von {service} nicht gespeichert werden.',
     'orders.restored': 'Bestellungen können wieder gespeichert werden.'
   }
 };
 
-export function resolveNotice(notice, locale = 'en') {
-  if (!notice) return '';
+export function resolveNotice(notice, locale = 'en', fallbackKey = 'generic') {
   const catalog = Object.hasOwn(catalogs, locale) ? catalogs[locale] : catalogs.en;
+  if (!notice) return catalog[fallbackKey];
   const template = notice.messageKey && Object.hasOwn(catalog, notice.messageKey)
     ? catalog[notice.messageKey]
     : null;
@@ -45,7 +47,7 @@ export function resolveNotice(notice, locale = 'en') {
       Object.hasOwn(notice.messageParams || {}, key) ? String(notice.messageParams[key]) : match
     );
   }
-  return notice.bannerCopy || catalog.generic;
+  return notice.bannerCopy || catalog[fallbackKey];
 }
 ```
 
@@ -55,7 +57,7 @@ A locale switch updates visible copy through the same resolver. It does not emit
 
 Keep one persistent polite status region mounted before the first event with `role="status"`, `aria-live="polite"`, and `aria-atomic="true"`. Update its announcement only on a meaningful degradation or recovery transition, not on every render, locale switch, duplicate event, or timer tick. The visible reason and announcement use the same resolved copy.
 
-Map each unavailable control to its visible reason with `aria-describedby`. Use native `disabled` and expose `aria-disabled` on the unavailable control; if a design keeps an aria-disabled control focusable instead, its action handler must also refuse activation. Do not disable unaffected controls. Recovery restores availability and removes the stale reason association without moving focus. Announce recovery once through the same persistent region.
+Map each unavailable control to its visible reason with `aria-describedby`. Mark a control that may hold focus with `aria-disabled="true"` and make its action handler refuse activation, including form submission; the control stays focusable, so focus stays where the user left it when the transition arrives. Native `disabled` drops focus from a focused control, so reserve it for controls that cannot hold focus at that moment. Do not disable unaffected controls. Recovery restores availability and removes the stale reason association without moving focus. Announce recovery once through the same persistent region.
 
 Derive a retry deadline once from receipt of the degraded transition plus `retryAfterMs`. Keep it stable across rerenders and duplicate events. It is retry guidance, not a recovery promise. Without `retryAfterMs`, show no countdown or estimated recovery time. Put countdowns and elapsed-time updates outside the live region so timer ticks are not announced.
 
@@ -71,8 +73,9 @@ This Svelte reference uses the resolver above with realtime's `degradation` stor
   let wasActive = false;
   let retryAt = null;
 
-  $: notice = $degradation.active ? $degradation.mitigation : $degradation.recovery;
-  $: visibleCopy = resolveNotice(notice, locale);
+  $: visibleCopy = $degradation.active
+    ? resolveNotice($degradation.mitigation, locale)
+    : resolveNotice($degradation.recovery, locale, 'restored');
   $: savingUnavailable = $degradation.active &&
     Boolean($degradation.mitigation?.rpcs?.includes('orders/create'));
   $: if ($degradation.active !== wasActive) {
@@ -82,6 +85,11 @@ This Svelte reference uses the resolver above with realtime's `degradation` stor
       ? Date.now() + $degradation.mitigation.retryAfterMs
       : null;
   }
+
+  function saveOrder() {
+    if (savingUnavailable) return;
+    // Submit the order.
+  }
 </script>
 
 <div role="status" aria-live="polite" aria-atomic="true">{announced}</div>
@@ -89,9 +97,10 @@ This Svelte reference uses the resolver above with realtime's `degradation` stor
   <p id="degradation-reason">{visibleCopy}</p>
 {/if}
 <button
-  disabled={savingUnavailable}
+  type="button"
   aria-disabled={savingUnavailable}
   aria-describedby={savingUnavailable ? 'degradation-reason' : undefined}
+  on:click={saveOrder}
 >Save order</button>
 {#if retryAt !== null}
   <p>Retry at <time datetime={new Date(retryAt).toISOString()}>{new Date(retryAt).toISOString()}</time></p>
