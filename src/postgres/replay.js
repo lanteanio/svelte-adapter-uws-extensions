@@ -45,6 +45,7 @@ import { tenantTopicSql } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
+import { replayHasHole } from '../shared/replay-envelope.js';
 export { ReplayStorageError, ReplaySerializationError };
 
 /**
@@ -693,12 +694,12 @@ export function createReplay(client, options = {}) {
 			// every payload, so restore the order here if it ever differs.
 			if (!ordered) missed.sort((x, y) => x.seq - y.seq);
 
-			// Position 0 has seen nothing, so it is owed seq 1: a trimmed head or
-			// an emptied buffer truncates it like any other position.
-			let truncated = false;
-			if ((missed.length > 0 && missed[0].seq > sinceSeq + 1) || (missed.length === 0 && currentSeq > sinceSeq)) {
+			// Every seq from sinceSeq + 1 through the counter must be in the read:
+			// a trimmed head, a row removed in the middle (purgeUser, a manual
+			// delete) or a missing tail truncates. Position 0 is owed seq 1.
+			const truncated = replayHasHole(missed, sinceSeq, currentSeq);
+			if (truncated) {
 				mTruncations?.inc({ topic: mt(topic) });
-				truncated = true;
 				platform.send(ws, replayTopic, 'truncated', null);
 			}
 			b?.success();

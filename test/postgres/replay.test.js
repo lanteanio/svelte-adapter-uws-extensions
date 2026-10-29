@@ -296,6 +296,42 @@ describe('postgres replay', () => {
 			expect(platform.sent[1].data).toEqual({ truncated: true });
 		});
 
+		// An erased row leaves a hole the head and empty-buffer checks never
+		// see: rows on both sides of it are still delivered.
+		it.each([
+			{ hole: 'middle', sinceSeq: 1, erased: 3, delivered: [2, 4, 5] },
+			{ hole: 'tail', sinceSeq: 1, erased: 5, delivered: [2, 3, 4] },
+			{ hole: 'middle', sinceSeq: 0, erased: 3, delivered: [1, 2, 4, 5] }
+		])('sends truncated for a $hole hole (sinceSeq $sinceSeq)', async ({ sinceSeq, erased, delivered }) => {
+			const store = createReplay(client, { size: 5, cleanupInterval: 0, forgetUserId: ({ data }) => data.author });
+			try {
+				for (let i = 1; i <= 5; i++) await store.publish(platform, 'chat', 'created', { author: i === erased ? 'bob' : 'alice' });
+				expect(await store.purgeUser(null, 'bob')).toBe(1);
+				platform.reset();
+				const watermark = await store.replay({}, 'chat', sinceSeq, platform);
+				expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual(['truncated', ...delivered, 'end']);
+				expect(platform.sent.at(-1).data).toEqual({ truncated: true });
+				expect(watermark).toBe(delivered.at(-1));
+			} finally {
+				store.destroy();
+			}
+		});
+
+		it('does not send truncated for a contiguous range read out of order', async () => {
+			for (let i = 1; i <= 4; i++) await replay.publish(platform, 'chat', 'created', { id: i });
+			const query = client.query;
+			client.query = async (...args) => {
+				const result = await query.apply(client, args);
+				const text = typeof args[0] === 'string' ? args[0] : args[0].text;
+				return text.includes('LEFT JOIN LATERAL') ? { ...result, rows: [result.rows[1], result.rows[0], ...result.rows.slice(2)] } : result;
+			};
+			platform.reset();
+			await replay.replay({}, 'chat', 1, platform);
+			client.query = query;
+			expect(platform.sent.map((s) => s.event === 'msg' ? s.data.seq : s.event)).toEqual([2, 3, 4, 'end']);
+			expect(platform.sent.at(-1).data).toEqual({});
+		});
+
 		it('sends truncated at sinceSeq 0 when the head was trimmed', async () => {
 			for (let i = 1; i <= 7; i++) await replay.publish(platform, 'chat', 'created', { id: i });
 

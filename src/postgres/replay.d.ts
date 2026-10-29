@@ -178,9 +178,10 @@ export interface PgReplayBuffer extends PostgresStoreReadiness {
 	 * Send buffered messages to a single connection. Sends each missed
 	 * message on `__replay:{topic}`, then an end marker.
 	 *
-	 * If the buffer has been trimmed past `sinceSeq`, or is empty while the
-	 * seq counter has advanced past it, a `truncated` event is sent before the
-	 * messages and the end marker includes `truncated: true`. Position 0 has
+	 * If any seq between `sinceSeq` and the seq counter is missing (a trimmed
+	 * head, a row removed in the middle of the range or at its newest end, or
+	 * an empty buffer), a `truncated` event is sent before the messages and
+	 * the end marker includes `truncated: true`. Position 0 has
 	 * seen nothing, so it is owed seq 1: a buffer trimmed past seq 1
 	 * truncates a replay from 0, as in the core replay plugin.
 	 * Every message and the end marker echo a supplied `reqId`, so concurrent
