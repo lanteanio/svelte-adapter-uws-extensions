@@ -64,7 +64,7 @@ import { MAX_PROJECTION_DEPTH, exceedsDepth } from '../shared/sensitive-names.js
 import { withBreaker } from '../shared/breaker.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 import { MAX_PRESENCE_WS, MAX_PRESENCE_TOPICS } from '../shared/caps.js';
-import { WsClosedError } from '../shared/errors.js';
+import { WsClosedError, operationError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, OBSERVER_LANE, markSideEffectHooks } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
