@@ -30,7 +30,7 @@ import {
 } from '../shared/trace-context.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
+import { openSubscriber, closeConnection, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
@@ -39,6 +39,10 @@ import { defineOptions, option } from '../shared/options.js';
 // The degraded / recovered frames report this worker's own breaker, so they go
 // to this worker's subscribers only, and they make no monotonic promise.
 const SYSTEM_FRAME = Object.freeze({ relay: false, seq: false });
+
+// The recovery hint a `recovered` frame carries when messages may have been
+// lost: the client's view is short and must be reloaded.
+const REFETCH = Object.freeze({ refetch: true });
 
 // How an activation's SUBSCRIBE race ended.
 const SUBSCRIBED = Symbol('subscribed');
@@ -220,6 +224,22 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
 
+	// Delivery this instance may have lost since it last said so, kept as two
+	// flags so the bookkeeping stays bounded however long an outage lasts.
+	// Inbound: its subscriber missed messages (a reconnect, a failed
+	// activation, or a peer that lost relays), so its own clients may be stale;
+	// the next `recovered` frame it publishes asks them to refetch. Outbound:
+	// relays it accepted were dropped, before or after the breaker opened, so
+	// clients of other instances may be stale; when its breaker recovers it
+	// relays a refetch request that each peer turns into a frame of its own.
+	// Neither flag, nor anything else of this instance's outage, goes on the
+	// wire beyond that request.
+	let inboundLost = false;
+	let outboundLost = false;
+	// The subscriber is restoring its channel after a reconnect and may still
+	// miss messages, so the inbound hint waits for the restore.
+	let restoring = false;
+
 	// From activate() until deactivate(): a failed activation is retried, on a
 	// timer that backs off, and at once when the breaker lets a probe through or
 	// recovers. One report per failure streak.
@@ -247,7 +267,10 @@ export function createPubSubBus(client, options = {}) {
 	// rewrite locked in.
 	const relayQueue = createRelayQueue({
 		submit: flushRelay, metrics: m, prefix: 'pubsub', maxEnvelopeBytes: validator.maxBytes,
-		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
+		dropped: (reason, envelopes, messages) => {
+			if (reason === 'queue_full') outboundLost = true;
+			relayMetrics?.dropped(reason, envelopes, messages);
+		},
 		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_RELAY_BURST, { attributes })
 	});
 	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
@@ -303,6 +326,8 @@ export function createPubSubBus(client, options = {}) {
 	// Only a bus with a breaker publishes degraded / recovered, so only there
 	// does a refused systemChannel subscription lose health events.
 	const announcesHealth = !!(b && typeof b.subscribe === 'function');
+	// The topic of a peer's refetch request this bus answers itself, if any.
+	const hintChannel = announcesHealth && systemChannel ? systemChannel : null;
 	let systemChannelRefusalReported = false;
 	function reportSystemChannelFailure() {
 		if (!announcesHealth || systemChannelRefusalReported) return;
@@ -520,10 +545,15 @@ export function createPubSubBus(client, options = {}) {
 		let totalMessages = 0;
 		for (let i = 0; i < batch.length; i++) totalMessages += batch[i].count;
 		if (b) {
-			try { b.guard(); } catch { relayMetrics?.dropped('breaker_open', batch.length, totalMessages); return; }
+			try { b.guard(); } catch {
+				outboundLost = true;
+				relayMetrics?.dropped('breaker_open', batch.length, totalMessages);
+				return;
+			}
 		}
 		const started = relayMetrics?.start();
 		const failed = (err) => {
+			outboundLost = true;
 			relayMetrics?.settled(started, batch.length, batch.length, totalMessages);
 			b?.failure(err);
 		};
@@ -553,6 +583,7 @@ export function createPubSubBus(client, options = {}) {
 					if (!results[i][0]) relayed += batch[i].count;
 					else failedEnvelopes++;
 				}
+				outboundLost = true;
 				if (relayed > 0) mRelayed?.inc(relayed);
 				relayMetrics?.settled(started, batch.length, failedEnvelopes, totalMessages - relayed);
 				b?.failure(err);
@@ -585,11 +616,51 @@ export function createPubSubBus(client, options = {}) {
 			if (systemChannel && activePlatform) {
 				let out = null;
 				if (degradationPolicy) { try { out = degradationPolicy.onRecovered({ from, to }); } catch { /* a policy must never break the emit */ } }
-				const data = out && out.recovery ? { at: now(), recovery: out.recovery } : { at: now() };
+				let recovery = out && out.recovery ? out.recovery : null;
+				// A policy that sets refetch itself has decided; otherwise lost
+				// messages ask for one. A subscriber still restoring may lose
+				// more, so its hint waits for the restore.
+				if (inboundLost && !restoring) {
+					inboundLost = false;
+					if (recovery === null) recovery = REFETCH;
+					else if (recovery.refetch === undefined) recovery = { ...recovery, refetch: true };
+				}
+				const data = recovery ? { at: now(), recovery } : { at: now() };
 				activePlatform.publish(systemChannel, 'recovered', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
 				mRecovered?.inc();
 			}
+			if (outboundLost && systemChannel) relayLossHint();
 		}
+	}
+
+	// Ask the other instances to have their clients refetch, because relays
+	// from this one were lost. The request is a plain `recovered` envelope on
+	// systemChannel with nothing of this instance's outage in it; a receiver
+	// that knows it publishes its own frame instead (see peerLost), and one
+	// that does not delivers this one. Lost again, it is sent again at the
+	// next recovery.
+	function relayLossHint() {
+		outboundLost = false;
+		scheduleRelay(JSON.stringify({ instanceId, topic: systemChannel, event: 'recovered', data: { at: now(), recovery: REFETCH }, s: false }), 1);
+	}
+
+	// Whether this bus may announce lost inbound delivery now: it publishes
+	// health frames, and neither its breaker nor its subscriber is still
+	// failing. Otherwise the breaker's own `recovered` frame or the end of the
+	// restore carries the hint.
+	function announceInboundLoss() {
+		if (!inboundLost || restoring || !announcesHealth || !systemChannel || !activePlatform) return;
+		if (typeof b.state === 'string' && b.state !== 'healthy') return;
+		inboundLost = false;
+		activePlatform.publish(systemChannel, 'recovered', { at: now(), recovery: REFETCH }, SYSTEM_FRAME);
+		mRecovered?.inc();
+	}
+
+	// A peer lost relays during its own outage, so this instance's clients
+	// missed what it published.
+	function peerLost() {
+		inboundLost = true;
+		announceInboundLoss();
 	}
 
 	// One message on the subscriber `sub`.
@@ -619,6 +690,13 @@ export function createPubSubBus(client, options = {}) {
 			// instanceId for the whole batch.
 			if (parsed.instanceId === instanceId) {
 				mEchoSuppressed?.inc();
+				return;
+			}
+			// A peer's refetch request is not forwarded as it came on a bus with
+			// a breaker: that breaker decides whether its clients hear it now,
+			// and they must not read a peer's recovery as this instance's.
+			if (hintChannel !== null && parsed.topic === hintChannel && parsed.event === 'recovered') {
+				peerLost();
 				return;
 			}
 			// Local delivery runs no application code, so a carried trace
@@ -676,8 +754,21 @@ export function createPubSubBus(client, options = {}) {
 			throw err;
 		}
 		subscriber = sub;
+		restoring = false;
 		sub.on('error', (err) => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_SUBSCRIBER, { error: err }));
 		sub.on('message', (ch, message) => receive(sub, ch, message));
+		// A reconnect drops the subscription without an 'end': whatever peers
+		// published until the channel is restored never arrives.
+		sub.on(SUBSCRIBER_RESTORING, () => {
+			if (subscriber !== sub) return;
+			restoring = true;
+			inboundLost = true;
+		});
+		sub.on(SUBSCRIBER_RESTORED, () => {
+			if (subscriber !== sub) return;
+			restoring = false;
+			announceInboundLoss();
+		});
 
 		let outcome;
 		try {
@@ -702,10 +793,15 @@ export function createPubSubBus(client, options = {}) {
 		attempt = null;
 		active = true;
 		activation = null;
+		// Connections served while activation kept failing missed what peers
+		// published meanwhile.
+		if (activateFailing) inboundLost = true;
 		activateFailing = false;
 		stopRetry();
 		retryMs = 0;
 		b?.success();
+		// The breaker's `recovered` frame carried the hint if it recovered here.
+		announceInboundLoss();
 	}
 
 	function deactivatedError() {
@@ -1101,6 +1197,9 @@ export function createPubSubBus(client, options = {}) {
 			stopRetry();
 			retryMs = 0;
 			activateFailing = false;
+			inboundLost = false;
+			outboundLost = false;
+			restoring = false;
 			if (unsubscribeBreaker) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;

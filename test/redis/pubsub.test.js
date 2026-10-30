@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
@@ -8,6 +8,8 @@ import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
+import { createDegradationPolicy } from '../../src/shared/degradation.js';
+import { SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../src/shared/redis-subscriber.js';
 
 const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
@@ -1229,6 +1231,221 @@ describe('redis pubsub bus', () => {
 			expect(breaker.failures).toBe(1);
 
 			breaker.destroy();
+		});
+	});
+
+	describe('refetch hint after lost delivery', () => {
+		const cleanups = [];
+		afterEach(async () => {
+			while (cleanups.length) await cleanups.pop()();
+		});
+
+		// One instance: its own platform, breaker and bus on the shared client,
+		// and the subscriber connection the bus opened.
+		async function instance(options = {}) {
+			const p = mockPlatform();
+			const breaker = createCircuitBreaker({ failureThreshold: 1, ...options.breaker });
+			const subs = [];
+			const source = options.client || client;
+			const opened = { ...source, duplicate: (o) => { const dup = source.duplicate(o); subs.push(dup); return dup; } };
+			const b = createPubSubBus(opened, { breaker, ...options.bus });
+			await b.activate(p);
+			p.reset();
+			cleanups.push(async () => { await b.deactivate(); breaker.destroy(); });
+			return { platform: p, breaker, bus: b, wrapped: b.wrap(p), subscriber: () => subs[subs.length - 1] };
+		}
+		const frames = (p, event = 'recovered') => p.published.filter((f) => f.topic === '__realtime' && f.event === event);
+		const failPublishes = () => {
+			const original = client.redis.publish;
+			client.redis.publish = async () => { throw new Error('connection lost'); };
+			return () => { client.redis.publish = original; };
+		};
+		const emit = (sub, event) => sub._listeners.get(event)();
+
+		it('asks the other instances to refetch when relays failed before the breaker opened', async () => {
+			const a = await instance({ breaker: { failureThreshold: 2 } });
+			const b = await instance();
+			const restore = failPublishes();
+			a.wrapped.publish('chat', 'msg', { n: 1 });
+			await settle();
+			// One failure is under the threshold: still healthy, but the message is lost.
+			expect(a.breaker.state).toBe('healthy');
+			a.breaker.failure();
+			expect(a.breaker.state).toBe('broken');
+			restore();
+			const envelopes = await captureChannel(client);
+			a.breaker.reset();
+			await settle();
+
+			// The request carries nothing of the sender's outage.
+			const hints = envelopes.filter((e) => e.topic === '__realtime');
+			expect(hints).toHaveLength(1);
+			expect(Object.keys(hints[0]).sort()).toEqual(['data', 'event', 'instanceId', 's', 'topic']);
+			expect(hints[0]).toMatchObject({ event: 'recovered', s: false });
+			expect(Object.keys(hints[0].data).sort()).toEqual(['at', 'recovery']);
+			expect(hints[0].data.recovery).toEqual({ refetch: true });
+
+			// The peer publishes a frame of its own, local only.
+			expect(frames(b.platform)).toHaveLength(1);
+			expect(frames(b.platform)[0].data).toEqual({ at: expect.any(Number), recovery: { refetch: true } });
+			expect(frames(b.platform)[0].options).toEqual({ relay: false, seq: false });
+			// The sender's own clients missed nothing: its subscriber stayed up.
+			expect(frames(a.platform)).toHaveLength(1);
+			expect(frames(a.platform)[0].data.recovery).toBeUndefined();
+		});
+
+		it('counts relays refused while the breaker is open', async () => {
+			const a = await instance();
+			const b = await instance();
+			a.breaker.failure();
+			a.wrapped.publish('chat', 'msg', { n: 1 });
+			await settle();
+			a.breaker.reset();
+			await settle();
+			expect(frames(b.platform)).toHaveLength(1);
+			expect(frames(b.platform)[0].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('sends no request and no hint when nothing was lost', async () => {
+			const a = await instance();
+			const b = await instance();
+			const envelopes = await captureChannel(client);
+			a.breaker.failure();
+			a.breaker.reset();
+			await settle();
+			expect(envelopes.filter((e) => e.topic === '__realtime')).toHaveLength(0);
+			expect(frames(b.platform)).toHaveLength(0);
+			expect(frames(a.platform)).toHaveLength(1);
+			expect(frames(a.platform)[0].data).toEqual({ at: expect.any(Number) });
+		});
+
+		it('holds a peer request while this instance is degraded and puts it on its own recovered frame', async () => {
+			const a = await instance();
+			const b = await instance();
+			a.breaker.failure();
+			b.breaker.failure();
+			a.wrapped.publish('chat', 'msg', { n: 1 });
+			await settle();
+			a.breaker.reset();
+			await settle();
+			// A peer's recovery is not this instance's: its clients stay degraded.
+			expect(frames(b.platform)).toHaveLength(0);
+			b.breaker.reset();
+			expect(frames(b.platform)).toHaveLength(1);
+			expect(frames(b.platform)[0].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('asks its own clients to refetch once a reconnected subscriber restored the channel', async () => {
+			const a = await instance();
+			emit(a.subscriber(), SUBSCRIBER_RESTORING);
+			expect(frames(a.platform)).toHaveLength(0);
+			emit(a.subscriber(), SUBSCRIBER_RESTORED);
+			expect(frames(a.platform)).toHaveLength(1);
+			expect(frames(a.platform)[0].data).toEqual({ at: expect.any(Number), recovery: { refetch: true } });
+			expect(frames(a.platform)[0].options).toEqual({ relay: false, seq: false });
+			// Said once.
+			a.breaker.failure();
+			a.breaker.reset();
+			expect(frames(a.platform)[1].data.recovery).toBeUndefined();
+		});
+
+		it('puts a reconnect during the outage on the breaker recovered frame', async () => {
+			const a = await instance();
+			a.breaker.failure();
+			emit(a.subscriber(), SUBSCRIBER_RESTORING);
+			emit(a.subscriber(), SUBSCRIBER_RESTORED);
+			expect(frames(a.platform)).toHaveLength(0);
+			a.breaker.reset();
+			expect(frames(a.platform)).toHaveLength(1);
+			expect(frames(a.platform)[0].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('waits for a restore still running when the breaker recovers', async () => {
+			const a = await instance();
+			a.breaker.failure();
+			emit(a.subscriber(), SUBSCRIBER_RESTORING);
+			a.breaker.reset();
+			expect(frames(a.platform)).toHaveLength(1);
+			expect(frames(a.platform)[0].data.recovery).toBeUndefined();
+			emit(a.subscriber(), SUBSCRIBER_RESTORED);
+			expect(frames(a.platform)).toHaveLength(2);
+			expect(frames(a.platform)[1].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('asks its own clients to refetch after activation failed and then succeeded', async () => {
+			const failing = mockRedisClient();
+			const original = failing.duplicate.bind(failing);
+			let refusals = 1;
+			failing.duplicate = (o) => {
+				const dup = original(o);
+				const subscribe = dup.subscribe.bind(dup);
+				dup.subscribe = async (...ch) => {
+					if (refusals > 0) { refusals--; throw new Error('connection lost'); }
+					return subscribe(...ch);
+				};
+				return dup;
+			};
+			const p = mockPlatform();
+			const breaker = createCircuitBreaker({ failureThreshold: 5 });
+			const b = createPubSubBus(failing, { breaker });
+			cleanups.push(async () => { await b.deactivate(); breaker.destroy(); });
+			await expect(b.activate(p)).rejects.toThrow('connection lost');
+			expect(frames(p)).toHaveLength(0);
+			await b.activate(p);
+			expect(frames(p)).toHaveLength(1);
+			expect(frames(p)[0].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('leaves refetch to a policy that sets it and adds it to one that does not', async () => {
+			const decided = { refetch: false, bannerCopy: 'Live updates are back.' };
+			const a = await instance({ bus: { degradationPolicy: createDegradationPolicy({ recovery: decided }) } });
+			a.breaker.failure();
+			emit(a.subscriber(), SUBSCRIBER_RESTORING);
+			emit(a.subscriber(), SUBSCRIBER_RESTORED);
+			a.breaker.reset();
+			expect(frames(a.platform)[0].data.recovery).toEqual(decided);
+
+			const notice = { bannerCopy: 'Live updates are back.' };
+			const c = await instance({ bus: { degradationPolicy: createDegradationPolicy({ recovery: notice }) } });
+			c.breaker.failure();
+			emit(c.subscriber(), SUBSCRIBER_RESTORING);
+			emit(c.subscriber(), SUBSCRIBER_RESTORED);
+			c.breaker.reset();
+			expect(frames(c.platform)[0].data.recovery).toEqual({ bannerCopy: 'Live updates are back.', refetch: true });
+			expect(notice).toEqual({ bannerCopy: 'Live updates are back.' });
+		});
+
+		it('delivers a peer request unchanged on a bus without a breaker', async () => {
+			const a = await instance();
+			const p = mockPlatform();
+			const plain = createPubSubBus(client);
+			await plain.activate(p);
+			cleanups.push(() => plain.deactivate());
+			a.breaker.failure();
+			a.wrapped.publish('chat', 'msg', { n: 1 });
+			await settle();
+			a.breaker.reset();
+			await settle();
+			expect(frames(p)).toHaveLength(1);
+			expect(frames(p)[0].data.recovery).toEqual({ refetch: true });
+		});
+
+		it('sends the request again when it was itself lost', async () => {
+			const a = await instance();
+			const b = await instance();
+			a.breaker.failure();
+			a.wrapped.publish('chat', 'msg', { n: 1 });
+			await settle();
+			const restore = failPublishes();
+			a.breaker.reset();
+			await settle();
+			expect(frames(b.platform)).toHaveLength(0);
+			restore();
+			a.breaker.reset();
+			expect(a.breaker.state).toBe('healthy');
+			// The failed request tripped the breaker again; its recovery resends it.
+			await settle();
+			expect(frames(b.platform)).toHaveLength(1);
 		});
 	});
 

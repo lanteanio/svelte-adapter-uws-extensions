@@ -13,6 +13,12 @@ export interface PubSubBusOptions {
 	 * state. Set to `null` or `false` to disable auto-emission. Requires
 	 * a `breaker` to do anything.
 	 *
+	 * When messages may have been lost, a `recovered` event carries
+	 * `recovery: { refetch: true }`: on this instance after its subscriber
+	 * missed messages (also without a preceding `degraded`), and on the
+	 * other instances after this one's relays were dropped, through one
+	 * `recovered` envelope it relays on this topic when its breaker recovers.
+	 *
 	 * @default '__realtime'
 	 */
 	systemChannel?: string | null | false;
