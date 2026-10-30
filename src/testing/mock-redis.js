@@ -510,7 +510,21 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const expireAt = stringExpiry.get(key);
 				return expireAt === undefined ? -1 : Math.max(0, expireAt - serverNowMs());
 			},
-			async pexpire(key) {
+			async pexpire(key, ms, flag) {
+				// String keys keep a real expiry, with the NX / XX / GT / LT
+				// conditions; other types keep the existence-only stub.
+				pruneExpiredString(key);
+				if (store.has(key)) {
+					const next = serverNowMs() + Number(ms);
+					const current = stringExpiry.get(key);
+					const condition = flag === undefined ? '' : String(flag).toUpperCase();
+					if (condition === 'GT' && (current === undefined || next <= current)) return 0;
+					if (condition === 'LT' && current !== undefined && next >= current) return 0;
+					if (condition === 'NX' && current !== undefined) return 0;
+					if (condition === 'XX' && current === undefined) return 0;
+					stringExpiry.set(key, next);
+					return 1;
+				}
 				const exists = store.has(key) || sortedSets.has(key)
 					|| hashes.has(key) || streams.has(key);
 				return exists ? 1 : 0;

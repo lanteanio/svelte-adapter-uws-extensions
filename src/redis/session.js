@@ -615,13 +615,10 @@ export function createDistributedSession(client, options = {}) {
 	// exists. A session lives at most `ttlMs` after the command that wrote or
 	// slid it reached the server.
 	//
-	// A renewal is a plain `SET key value PX 1.5 * ttlMs`, so a client allowed
-	// SET but not EVAL keeps working. PX counts from when the server applies
-	// it, so a later renewal of any store with the same `ttlMs` only moves the
-	// expiry forward; two renewals in flight together land in either order,
-	// and the later one wins by at most their difference in arrival. A store
-	// with a shorter `ttlMs` on the same prefix can shorten the coverage a
-	// longer one set, so stores sharing a prefix use one `ttlMs`.
+	// A renewal is `SET key value NX PX 1.5 * ttlMs` plus `PEXPIRE key
+	// 1.5 * ttlMs GT` (see sendRenewal), plain commands a client allowed SET but
+	// not EVAL can send. A renewal only ever moves the expiry forward, whatever
+	// the renewing store's ttlMs.
 	//
 	// Before a write or slide the store awaits a renewal when its estimate of
 	// what is left falls under AWAIT_BELOW = 1.25 * ttlMs: the command is sent
@@ -654,29 +651,51 @@ export function createDistributedSession(client, options = {}) {
 	const RENEW_BELOW = 1.375 * ttlMs;
 	const COVERAGE_TTL = Math.ceil(1.5 * ttlMs);
 	const RETRY_AFTER_MS = Math.min(1_000, ttlMs / 4);
-	const CHECK_EVERY_MS = Math.min(1_000, ttlMs / 8);
+	const CHECK_EVERY_MS = Math.min(1_000, ttlMs / 16);
 	function coverageKey() {
 		return client.key(keyPrefix + COVERAGE_KEY);
 	}
 	function renewCoverage() {
-		coverage ??= (async () => {
-			const started = monotonicNow();
-			const wall = wallEpoch();
-			try {
+		if (coverage) return coverage;
+		// Assigned before it can settle, and cleared only while it is still the
+		// renewal in flight, so a SET that throws synchronously cannot leave a
+		// settled promise behind.
+		const renewal = sendRenewal().finally(() => { if (coverage === renewal) coverage = null; });
+		coverage = renewal;
+		return renewal;
+	}
+	// SET NX creates the key; PEXPIRE GT then only ever moves its expiry
+	// forward, so a store with a shorter ttlMs on the same prefix cannot
+	// shorten what a longer one set. Both are sent in the same tick, one round
+	// trip on the key's connection. A server older than Redis 7 rejects GT;
+	// the store then renews with a plain SET PX, which can shorten it.
+	let gtUnsupported = false;
+	async function sendRenewal() {
+		const started = monotonicNow();
+		const wall = wallEpoch();
+		try {
+			if (gtUnsupported) {
 				await redis.set(coverageKey(), COVERAGE_VALUE, 'PX', COVERAGE_TTL);
-				breaker?.success();
-				coveredUntil = started + COVERAGE_TTL;
-				renewedMono = started;
-				renewedWall = wall;
-			} catch (err) {
-				breaker?.failure(err);
-				failedAt = monotonicNow();
-				throw err;
-			} finally {
-				coverage = null;
+			} else {
+				const created = redis.set(coverageKey(), COVERAGE_VALUE, 'NX', 'PX', COVERAGE_TTL);
+				const extended = redis.pexpire(coverageKey(), COVERAGE_TTL, 'GT');
+				const [, outcome] = await Promise.allSettled([created, extended]);
+				await created;
+				if (outcome.status === 'rejected') {
+					if (!/syntax|wrong number|unsupported|unknown/i.test(String(outcome.reason?.message))) throw outcome.reason;
+					gtUnsupported = true;
+					await redis.set(coverageKey(), COVERAGE_VALUE, 'PX', COVERAGE_TTL);
+				}
 			}
-		})();
-		return coverage;
+			breaker?.success();
+			coveredUntil = started + COVERAGE_TTL;
+			renewedMono = started;
+			renewedWall = wall;
+		} catch (err) {
+			breaker?.failure(err);
+			failedAt = monotonicNow();
+			throw err;
+		}
 	}
 	function renewInBackground() {
 		if (coverage || monotonicNow() - failedAt < RETRY_AFTER_MS) return;

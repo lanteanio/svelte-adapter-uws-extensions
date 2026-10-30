@@ -513,8 +513,9 @@ export function sessionIdentityContract(getClient) {
 
 		it('renews the coverage when the key is lost under a running legacy writer', async () => {
 			const s = sessions();
-			// The key is checked at most once per ttlMs / 8 (50 ms here).
-			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
+			// The key is checked at most once per ttlMs / 16 (50 ms here), before
+			// the store's own background renewal is due (after 100 ms).
+			const legacy = createDistributedSession(getClient(), { ttlMs: 800 });
 			expect(await s.purgeUser('ta', 'x')).toBe(0);
 			await legacy.set('warm', owner('tb', '1'));
 			await legacy.delete('warm');
@@ -528,7 +529,7 @@ export function sessionIdentityContract(getClient) {
 
 		it('renews the coverage after a flush and a clean rescan', async () => {
 			const s = sessions();
-			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
+			const legacy = createDistributedSession(getClient(), { ttlMs: 800 });
 			await legacy.set('warm', owner('tb', '1'));
 			for (const key of await scanKeys(getClient().redis, getClient().key('*'))) await getClient().redis.del(key);
 			expect(await s.purgeUser('ta', 'x')).toBe(0);
@@ -548,7 +549,7 @@ export function sessionIdentityContract(getClient) {
 			const redis = getClient().redis;
 			const set = redis.set;
 			redis.set = async function (...args) {
-				await new Promise((resolve) => setTimeout(resolve, 150));
+				await new Promise((resolve) => setTimeout(resolve, 100));
 				return set.apply(this, args);
 			};
 			try {
@@ -605,13 +606,20 @@ export function sessionIdentityContract(getClient) {
 				left.push(await redis.pttl(coverageKey()));
 				return set(...args);
 			});
+			// The renewal takes 50 ms to reach the server.
 			const restore = patchSetOf(redis, coverageKey(), async (set, args) => {
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				await new Promise((resolve) => setTimeout(resolve, 50));
 				return set(...args);
 			});
+			const pexpire = redis.pexpire;
+			redis.pexpire = async function (key, ...args) {
+				if (key === coverageKey()) await new Promise((resolve) => setTimeout(resolve, 50));
+				return pexpire.call(this, key, ...args);
+			};
 			try {
 				await legacy.set('late', { v: 1 });
 			} finally {
+				redis.pexpire = pexpire;
 				restore();
 				restoreLate();
 			}
@@ -695,6 +703,18 @@ export function sessionIdentityContract(getClient) {
 			} finally {
 				restore();
 			}
+		});
+
+		it('never shortens the coverage another store with a longer ttlMs set', async () => {
+			const s = sessions({ ttlMs: 4_000 });
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			const long = createDistributedSession(getClient(), { ttlMs: 4_000 });
+			const short = createDistributedSession(getClient(), { ttlMs: 200 });
+			await long.set('old', owner('ta', '42'));
+			await short.set('other', { v: 1 });
+			await new Promise((resolve) => setTimeout(resolve, 400));
+			expect(await getClient().redis.pttl(coverageKey())).toBeGreaterThan(4_000);
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 		});
 
 		it('checks the coverage key at most one at a time and once per interval', async () => {

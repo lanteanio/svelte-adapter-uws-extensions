@@ -688,29 +688,31 @@ a slot was migrating while it ran; `residue` keeps purges incomplete for
 scan that fails gives it back. A scan that finds nothing records `clean`.
 
 `sess:identity:v1:legacy-active` covers sessions written later by a store
-without `forgetIdentity`. Such a store keeps the key alive with a plain
-`SET <key> <value> PX <1.5 * ttlMs>`, which needs no scripting permission.
-Before a write or TTL slide (`set`, `create`, the close-time persist, `touch`,
+without `forgetIdentity`. Such a store keeps the key alive with
+`SET <key> <value> NX PX <1.5 * ttlMs>` and `PEXPIRE <key> <1.5 * ttlMs> GT`,
+sent together in one round trip and needing no scripting permission, so a
+renewal only ever moves the expiry forward, whatever the renewing store's
+`ttlMs`. A server older than Redis 7 rejects `GT`; the store then renews with
+a plain `SET ... PX`, where a store with a shorter `ttlMs` on the same prefix
+can shorten what a longer one set, so on such a server stores sharing a prefix
+use one `ttlMs`. Before a write or TTL slide (`set`, `create`, the close-time persist, `touch`,
 a refreshing `get` or load) it waits for that SET when less than
 `1.25 * ttlMs` of the coverage it knows of is left, so a write delayed by up to
 `ttlMs / 4` still lands inside the coverage, and it sends the SET in the
-background, without waiting, when less than `1.375 * ttlMs` is left. One SET
+background, without waiting, when less than `1.375 * ttlMs` is left. One renewal
 is in flight at a time, shared by concurrent calls; a background SET that
 fails is not repeated in the background for a second (`ttlMs / 4` when
 shorter). A legacy write or slide also sends one `EXISTS` of the key, not
-awaited, at most one at a time and at most once per second (`ttlMs / 8` when
-shorter) per instance. Together that costs each store instance one SET per
+awaited, at most one at a time and at most once per second (`ttlMs / 16` when
+shorter) per instance. Together that costs each store instance one renewal per
 `ttlMs / 8`, awaited only when the background ones did not keep up (at start
 and after an outage), and at most one EXISTS per second, whatever its session
 traffic; every other operation is a plain command as before. A qualified purge
 reports `legacyResidue` while the key exists. The key appears in every
 deployment that uses the Redis session store, with or without
-`forgetIdentity`, and `clear()` keeps it. Stores sharing a prefix use one
-`ttlMs`: each SET sets the expiry from when it lands, so one with a shorter
-`ttlMs` can shorten what a longer one set, and two SETs in flight together
-land in either order, the later one winning by at most the time between them.
+`forgetIdentity`, and `clear()` keeps it.
 
-When the awaited SET fails, the session write or slide is not sent and
+When the awaited renewal fails, the session write or slide is not sent and
 rejects with that Redis error, so no legacy session lands before its coverage
 is in place; the next call tries again. This is the one new way a store
 without `forgetIdentity` can fail: a write or slide that is due for a renewal
@@ -719,7 +721,12 @@ without `forgetIdentity` can fail: a write or slide that is due for a renewal
 during a failover, out of memory under `noeviction`). On a Redis Cluster that
 node is the one master owning the key's slot, which may differ from the
 session's own. While the key cannot be read, qualified purges fail and report
-the erasure incomplete.
+the erasure incomplete. A refreshing `get` or lifecycle load does
+not reject: it returns the session without extending it. Each failed renewal
+counts once against the store's circuit breaker like any failed command, so
+renewals that keep failing open a breaker the store shares with others (five
+in a row at the default threshold) even while the sessions' own masters are
+healthy.
 
 Keep both keys under a memory policy that does not evict them: `noeviction`,
 or `volatile-ttl`, which evicts the soonest-expiring keys first, and the
@@ -727,8 +734,9 @@ coverage key outlives every session it covers. Reads do not refresh a key's
 access time, so an LRU or LFU policy evicts the coverage key early. Once the
 key is lost (evicted, flushed, or dropped by a failover that lost the last
 renewal), purges miss every live legacy session until an instance without
-`forgetIdentity` writes or slides a session again: that call's `EXISTS` notices
-the loss and renews the key. An instance that stays idle keeps the gap open
+`forgetIdentity` writes or slides a session again and its next `EXISTS`, at
+most a second (`ttlMs / 16`) after the previous one, notices the loss and
+renews the key. An instance that stays idle keeps the gap open
 until its sessions expire. Eviction is the only way to lose the key in normal
 operation, which the memory policy above rules out; after a flush or a
 failover that lost writes, delete `sess:identity:v1:legacy` as well so the

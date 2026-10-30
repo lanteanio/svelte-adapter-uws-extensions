@@ -70,3 +70,56 @@ it('reports one failed renewal to the breaker once and retries nothing while idl
 	expect(breaker.state).not.toBe('broken');
 	expect(await client.redis.get(client.key('sess:k'))).toBeNull();
 });
+
+it('recovers from a coverage renewal that throws synchronously', async () => {
+	const legacy = createDistributedSession(client, {});
+	const set = client.redis.set;
+	let fail = true;
+	client.redis.set = function (key, ...args) {
+		if (key === coverageKey() && fail) throw new Error('SYNC');
+		return set.call(this, key, ...args);
+	};
+	try {
+		await expect(legacy.set('a', { v: 1 })).rejects.toThrow('SYNC');
+		fail = false;
+		await legacy.set('b', { v: 1 });
+	} finally {
+		client.redis.set = set;
+	}
+	expect(await client.redis.get(client.key('sess:b'))).not.toBeNull();
+});
+
+it('counts a failed coverage renewal on the breaker', async () => {
+	const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30_000 });
+	const legacy = createDistributedSession(client, { breaker });
+	const watch = watchRenewals({ fail: true });
+	try {
+		await expect(legacy.set('k', { v: 1 })).rejects.toThrow('READONLY');
+	} finally {
+		watch.restore();
+	}
+	expect(breaker.state).toBe('broken');
+});
+
+it('renews with a plain SET on a server without PEXPIRE GT', async () => {
+	const legacy = createDistributedSession(client, { ttlMs: 400 });
+	const pexpire = client.redis.pexpire;
+	let calls = 0;
+	client.redis.pexpire = async function (key, ...args) {
+		if (key !== coverageKey()) return pexpire.call(this, key, ...args);
+		calls++;
+		throw new Error("ERR wrong number of arguments for 'pexpire' command");
+	};
+	try {
+		await legacy.set('a', { v: 1 });
+		expect(await client.redis.pttl(coverageKey())).toBeGreaterThan(500);
+		await client.redis.del(coverageKey());
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await legacy.set('b', { v: 1 });
+		await legacy.set('c', { v: 1 });
+	} finally {
+		client.redis.pexpire = pexpire;
+	}
+	expect(calls).toBe(1);
+	expect(await client.redis.exists(coverageKey())).toBe(1);
+});
