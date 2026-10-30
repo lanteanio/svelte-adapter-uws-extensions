@@ -68,6 +68,37 @@ for (const backend of BACKENDS) {
 			expect(await client.redis.zcard(registryKey())).toBe(2);
 		});
 
+		it('evicts when the created topic ties the oldest score and sorts first', async () => {
+			// Same clock second, and 'other' < 'room': a candidate list that
+			// counts the creating topic itself would evict nothing.
+			const replay = create({ maxTopics: 1 });
+			await publishAt(replay, 1000, 'room');
+			await publishAt(replay, 1000, 'other');
+			expect(await replay.seq('room')).toBe(0);
+			expect(await replay.seq('other')).toBe(1);
+			expect(await client.redis.zcard(registryKey())).toBe(1);
+		});
+
+		it('evicts when the created topic scores below the others (a clock behind)', async () => {
+			const replay = create({ maxTopics: 1 });
+			await publishAt(replay, 5000, 'room');
+			await publishAt(replay, 1000, 'late');
+			expect(await replay.seq('room')).toBe(0);
+			expect(await replay.seq('late')).toBe(1);
+		});
+
+		if (backend.name === 'stream') {
+			it('republishes an idempotent request into the generation that follows an eviction', async () => {
+				const replay = create({ maxTopics: 1 });
+				clock = 1000;
+				const opts = { producerId: 'p', requestId: 'r1' };
+				expect(await replay.publishIdempotent(platform, 'room', 'msg', { id: 1 }, opts)).toEqual({ seq: 1, isDuplicate: false });
+				expect(await replay.publishIdempotent(platform, 'room', 'msg', { id: 1 }, opts)).toEqual({ seq: 1, isDuplicate: true });
+				await replay.publish(platform, 'other', 'msg', { id: 1 });
+				expect(await replay.publishIdempotent(platform, 'room', 'msg', { id: 1 }, opts)).toEqual({ seq: 1, isDuplicate: false });
+			});
+		}
+
 		it('removes every per-topic key of an evicted topic', async () => {
 			const replay = create({ maxTopics: 1 });
 			await publishAt(replay, 1000, 'gone', 3);

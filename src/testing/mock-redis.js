@@ -2039,10 +2039,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		function zsetSort(set) {
 			set.sort((a, b) => a.score - b.score || (String(a.member) < String(b.member) ? -1 : String(a.member) > String(b.member) ? 1 : 0));
 		}
-		function zsetLowest(key, count) {
+		// The `count` lowest entries, leaving out `skip` (the topic being
+		// created is never its own eviction candidate).
+		function zsetLowest(key, count, skip) {
 			const set = sortedSets.get(key) || [];
 			const out = [];
-			for (let i = 0; i < Math.min(count, set.length); i++) out.push(String(set[i].member), String(set[i].score));
+			for (let i = 0; i < set.length && out.length < count * 2; i++) {
+				if (String(set[i].member) !== skip) out.push(String(set[i].member), String(set[i].score));
+			}
 			return out;
 		}
 
@@ -2062,14 +2066,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			else set.push({ score: usedAt, member: topic });
 			zsetSort(set);
 			const over = Math.min(set.length - maxTopics, batch);
-			return over > 0 ? [generation, ...zsetLowest(registryKey, over)] : [generation];
+			return over > 0 ? [generation, ...zsetLowest(registryKey, over, topic)] : [generation];
 		}
 
-		// args layout: [registryKey, maxTopics, batch]
+		// args layout: [registryKey, maxTopics, batch, topic]
 		function evalReplayTopicCandidates(args) {
 			const set = sortedSets.get(args[0]) || [];
 			const over = Math.min(set.length - Number(args[1]), Number(args[2]));
-			return over > 0 ? zsetLowest(args[0], over) : [];
+			return over > 0 ? zsetLowest(args[0], over, String(args[3])) : [];
 		}
 
 		// args layout: [seqKey, bufKey, streamKey, epochKey, usedKey, score]

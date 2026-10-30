@@ -45,7 +45,9 @@ const EVICTION_ROUNDS = 4;
  * Reserve a generation and record the topic as used now. Returns `{0}` when
  * the counter is missing (not seeded yet), else `{generation, topic1, score1,
  * ...}` with the lowest-scored registry entries when the registry holds more
- * than `maxTopics` topics.
+ * than `maxTopics` topics. The reserving topic is never a candidate: its score
+ * can tie the lowest one (same clock second) or sort below it (a clock behind
+ * the others), and skipping it then would leave the store over the cap.
  *
  * KEYS[1] = generation counter, KEYS[2] = registry
  * ARGV[1] = topic, ARGV[2] = now (ms), ARGV[3] = maxTopics, ARGV[4] = batch
@@ -72,25 +74,33 @@ if over > 0 then
   if over > batch then
     over = batch
   end
-  local candidates = redis.call('zrange', registryKey, 0, over - 1, 'WITHSCORES')
-  for i = 1, #candidates do
-    reply[i + 1] = candidates[i]
+  local candidates = redis.call('zrange', registryKey, 0, over, 'WITHSCORES')
+  for i = 1, #candidates, 2 do
+    if #reply > over * 2 then
+      break
+    end
+    if candidates[i] ~= topic then
+      reply[#reply + 1] = candidates[i]
+      reply[#reply + 1] = candidates[i + 1]
+    end
   end
 end
 return reply
 `;
 
 /**
- * The lowest-scored registry entries while the registry is over the cap.
+ * The lowest-scored registry entries while the registry is over the cap,
+ * leaving out the topic being created (see RESERVE_SCRIPT).
  *
  * KEYS[1] = registry
- * ARGV[1] = maxTopics, ARGV[2] = batch
+ * ARGV[1] = maxTopics, ARGV[2] = batch, ARGV[3] = topic being created
  */
 const CANDIDATES_SCRIPT = `
 -- REPLAY_TOPIC_CANDIDATES
 local registryKey = KEYS[1]
 local maxTopics = tonumber(ARGV[1])
 local batch = tonumber(ARGV[2])
+local topic = ARGV[3]
 if maxTopics == nil or batch == nil then
   return redis.error_reply('REPLAY_TOPIC_CANDIDATES: maxTopics/batch must be numeric')
 end
@@ -101,7 +111,18 @@ end
 if over > batch then
   over = batch
 end
-return redis.call('zrange', registryKey, 0, over - 1, 'WITHSCORES')
+local candidates = redis.call('zrange', registryKey, 0, over, 'WITHSCORES')
+local reply = {}
+for i = 1, #candidates, 2 do
+  if #reply >= over * 2 then
+    break
+  end
+  if candidates[i] ~= topic then
+    reply[#reply + 1] = candidates[i]
+    reply[#reply + 1] = candidates[i + 1]
+  end
+end
+return reply
 `;
 
 /**
@@ -318,7 +339,7 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted })
 			}
 			if (settle.length > 0) await evalCached(redis, SETTLE_SCRIPT, 1, registryKey, ...settle);
 			if (!moved) return;
-			flat = await evalCached(redis, CANDIDATES_SCRIPT, 1, registryKey, maxTopics, EVICTION_BATCH);
+			flat = await evalCached(redis, CANDIDATES_SCRIPT, 1, registryKey, maxTopics, EVICTION_BATCH, topic);
 		}
 	}
 
