@@ -138,17 +138,28 @@ async function validateColumns(client, schema, known = schema) {
 			if (actual.not_null && !columns.some(column => column[0] === actual.column_name)) throw new Error(`postgres schema: unexpected required column ${relation.name}.${actual.column_name}`);
 			if (!columns.some(column => column[0] === actual.column_name) && (actual.column_default != null || actual.generated || actual.identity)) throw new Error(`postgres schema: unexpected computed column ${relation.name}.${actual.column_name}`);
 		}
-		for (const [name, type, required, fallback] of columns) {
-			const actual = rows.find(column => column.column_name === name);
+		for (const column of columns) {
+			const [name] = column;
+			const actual = rows.find(entry => entry.column_name === name);
 			if (!actual) throw new Error(`postgres schema: ${relation.name} is missing expected column ${name}`);
 			if (actual.generated || actual.identity) throw new Error(`postgres schema: incompatible generated or identity column ${relation.name}.${name}`);
-			if (actual.data_type !== type || actual.not_null !== required) throw new Error(`postgres schema: incompatible type or nullability for ${relation.name}.${name}`);
-			// PostgreSQL renders these literal numeric/now() defaults canonically.
-			// Never lowercase SQL literals or discard grouping when comparing them.
-			const defaultMatches = fallback === 'serial' ? /^nextval\(/.test(actual.column_default ?? '') : (actual.column_default ?? null) === (fallback ?? null);
-			if (!defaultMatches) throw new Error(`postgres schema: incompatible default for ${relation.name}.${name}`);
+			// A checkpoint replayed over a schema that already holds a later
+			// version (a manually provisioned schema adopted without a ledger)
+			// may find the column in its later definition; either one is valid.
+			const later = permitted.columns.find(entry => entry[0] === name);
+			const problem = columnProblem(actual, column);
+			if (problem && (later === column || !later || columnProblem(actual, later))) throw new Error(`postgres schema: incompatible ${problem} for ${relation.name}.${name}`);
 		}
 	}
+}
+
+/** The first way an existing column differs from its declaration, or null. */
+function columnProblem(actual, [, type, required, fallback]) {
+	if (actual.data_type !== type || actual.not_null !== required) return 'type or nullability';
+	// PostgreSQL renders these literal numeric/now() defaults canonically.
+	// Never lowercase SQL literals or discard grouping when comparing them.
+	const defaultMatches = fallback === 'serial' ? /^nextval\(/.test(actual.column_default ?? '') : (actual.column_default ?? null) === (fallback ?? null);
+	return defaultMatches ? null : 'default';
 }
 
 /** Inspect only catalogs; safe for a runtime role with no schema-creation privileges. */

@@ -84,7 +84,9 @@ describe('PostgreSQL migration readiness', () => {
 		const oid = async () => (await client.query('SELECT to_regclass($1)::oid AS oid', [index])).rows[0].oid;
 		try {
 			await migrate(client, { store: 'replay', table });
-			await client.query("DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 2", [table]);
+			// Back to a schema whose version 2 never ran: the ledger cannot hold a
+			// later version without it.
+			await client.query("DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version >= 2", [table]);
 			await client.query(`DROP INDEX IF EXISTS ${index}`);
 			await client.query(`CREATE INDEX IF NOT EXISTS idx_${table}_topic_seq ON ${table} (topic, seq)`);
 			await client.query(`INSERT INTO ${table} (topic, seq, event, data) SELECT 't' || (g % 10), g, 'e', '{}'::jsonb FROM generate_series(1, 1000) g`);

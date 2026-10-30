@@ -89,6 +89,15 @@ describe('PostgreSQL migration contracts', () => {
 		await migrate(client, { store });
 		await validateSchema(client, { store });
 	});
+	it.each(['replay', 'jobs', 'tasks', 'idempotency', 'dead-letter', 'alarm-store'])('adopts a manually provisioned %s schema without a ledger', async store => {
+		// Every version's SQL applied by hand, as the docs describe; migrate()
+		// then replays the earlier versions over the later column definitions.
+		const client = mockPgClient();
+		for (const version of postgresMigrations({ store })) for (const statement of version.statements) await client.query(statement);
+		await validateSchema(client, { store });
+		await migrate(client, { store });
+		await validateSchema(client, { store });
+	});
 	it('does not change the migration corpus when a caller edits the returned manifest', () => {
 		const original = postgresMigrations({ store: 'jobs' });
 		const copy = postgresMigrations({ store: 'jobs' });
