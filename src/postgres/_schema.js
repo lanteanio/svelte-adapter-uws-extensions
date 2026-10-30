@@ -79,10 +79,11 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		// Tenant-qualified identity: identity_version 1 marks a row stamped by a
 		// forgetIdentity runner (tenant_id NULL is then the untenanted scope);
 		// NULL marks a row written without one, whose tenant is unknown. The
-		// pending-scope index serves per-tenant dispatch and replaces the
-		// creation-time index, which no claim reads any more.
+		// pending-scope index serves per-tenant dispatch with equality on the
+		// task name, and replaces the creation-time index, which no claim reads
+		// any more.
 		const identity = index('identity', ['identity_version', 'tenant_id', 'user_id']);
-		const scope = index('pending_scope', ['identity_version', 'tenant_id', 'created_at'], "status = 'pending'");
+		const scope = index('pending_scope', ['identity_version', 'name', 'tenant_id', 'created_at'], "status = 'pending'");
 		// IS NOT NULL keeps the expression false, not unknown, for an unstamped
 		// row with a tenant: a CHECK passes on unknown.
 		const stamp = check('identity', '(identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1)');

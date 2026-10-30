@@ -72,7 +72,7 @@ describe('postgres tasks tenant-qualified identity (integration)', () => {
 		try {
 			await connection.query('BEGIN');
 			// The shared lock a stamped insert holds until it commits.
-			await connection.query(`SELECT pg_advisory_xact_lock_shared(hashtext('${TABLE}'), hashtext($1::text))`, [tuple]);
+			await connection.query(`SELECT pg_advisory_xact_lock_shared(hashtextextended($1::regclass::oid::text || ':' || $2::text, 0))`, [TABLE, tuple]);
 			await connection.query(`INSERT INTO ${TABLE} (svti_tasks_id, name, status, fence, fence_expires_at, attempts, identity_version, tenant_id, user_id)
 				VALUES (gen_random_uuid(), 'job', 'pending', gen_random_uuid(), now(), 0, 1, 'ta', '42')`);
 			const r = runner();
@@ -94,7 +94,8 @@ describe('postgres tasks tenant-qualified identity (integration)', () => {
 		let enqueued;
 		try {
 			await connection.query('BEGIN');
-			await connection.query(`SELECT pg_advisory_xact_lock(hashtext('${TABLE}'), hashtext($1::text))`, [JSON.stringify(['ta', '42'])]);
+			// Another spelling of the same table takes the same lock.
+			await connection.query(`SELECT pg_advisory_xact_lock(hashtextextended($1::regclass::oid::text || ':' || $2::text, 0))`, ['public.' + TABLE.toUpperCase(), JSON.stringify(['ta', '42'])]);
 			let settled = false;
 			enqueued = r.enqueue('job', { input: owner('ta', '42') }).finally(() => { settled = true; });
 			// Another identity is not held up.
@@ -126,37 +127,68 @@ describe('postgres tasks per-tenant dispatch (integration)', () => {
 		expect(ids).toContain(old);
 	});
 
-	it('never claims a row twice under concurrent sweeps', async () => {
+	it('never claims a row twice and keeps claiming under concurrent sweeps', async () => {
 		const r = runner();
 		const total = 300;
 		for (let i = 0; i < total; i++) await r.enqueue('job', { input: owner('t' + (i % 7), 'u' + i) });
 		const sweepers = Array.from({ length: 6 }, () => sql());
 		const seen = [];
+		let starved = 0;
 		await Promise.all(sweepers.map(async (s) => {
-			for (;;) {
+			while (seen.length < total) {
+				const unclaimed = total - seen.length;
 				const rows = await s.claimPending(10, ['job']);
-				if (rows.length === 0) return;
+				// Overlapping claims lock at most 7 * 4 rows each, so with more
+				// than that many per sweeper left every claim finds rows.
+				if (rows.length === 0 && unclaimed > 6 * 28) starved++;
+				if (rows.length === 0) await wait(1);
 				seen.push(...rows.map((row) => row.id));
 			}
 		}));
+		expect(starved).toBe(0);
 		expect(seen).toHaveLength(total);
 		expect(new Set(seen).size).toBe(total);
 		const { rows } = await client.query(`SELECT max(attempts)::int AS max, count(*) FILTER (WHERE status = 'running')::int AS running FROM ${TABLE}`);
 		expect(rows[0]).toEqual({ max: 1, running: total });
 	});
 
-	it('reads the pending-scope index for each claim', async () => {
+	it.each(['legacy', 'tenant'])('takes the next rows while another claim holds the oldest (%s scope)', async (scope) => {
+		const r = scope === 'legacy' ? runner({ forgetIdentity: undefined }) : runner();
+		for (let i = 0; i < 25; i++) await r.enqueue('job', { input: owner('ta', 'u' + i) });
+		const connection = await client.connect();
+		try {
+			await connection.query('BEGIN');
+			const first = await createTaskSql({ client: connection, table: TABLE, fenceTtl: 30, rowTtl: 3600, autoMigrate: false }).claimPending(10, ['job']);
+			expect(first).toHaveLength(10);
+			const second = await sql().claimPending(10, ['job']);
+			expect(second).toHaveLength(10);
+			expect(second.filter((row) => first.some((held) => held.id === row.id))).toEqual([]);
+			await connection.query('COMMIT');
+		} finally {
+			connection.release();
+		}
+	});
+
+	it('reads the pending-scope index with the name and never rows of other names', async () => {
 		const r = runner();
+		for (let i = 0; i < 200; i++) await r.enqueue('other', { input: owner('t1', 'o' + i) });
 		for (let i = 0; i < 50; i++) await r.enqueue('job', { input: owner('t' + (i % 5), 'u' + i) });
 		await client.query(`ANALYZE ${TABLE}`);
-		await client.query('SET enable_seqscan = off');
+		const connection = await client.connect();
 		try {
-			const forced = await client.query(`EXPLAIN SELECT svti_tasks_id FROM ${TABLE}
-				WHERE status = 'pending' AND identity_version = 1 AND tenant_id = 't1' AND name = ANY(ARRAY['job'])
-				ORDER BY identity_version, tenant_id, created_at LIMIT 10`);
-			expect(forced.rows.map((row) => row['QUERY PLAN']).join('\n')).toContain(`idx_${TABLE}_pending_scope`);
+			await connection.query('SET enable_seqscan = off');
+			const plan = await connection.query(`EXPLAIN (ANALYZE, BUFFERS OFF, FORMAT JSON) SELECT svti_tasks_id FROM ${TABLE}
+				WHERE status = 'pending' AND identity_version = 1 AND name = 'job' AND tenant_id = 't1'
+				ORDER BY identity_version, name, tenant_id, created_at LIMIT 10`);
+			const text = JSON.stringify(plan.rows[0]['QUERY PLAN']);
+			expect(text).toContain(`idx_${TABLE}_pending_scope`);
+			expect(text).not.toContain('Rows Removed by Filter');
+			// The claim serves the registered name and leaves the others pending.
+			const claimed = await sql().claimPending(10, ['job']);
+			expect(claimed).toHaveLength(10);
+			expect(claimed.every((row) => row.name === 'job')).toBe(true);
 		} finally {
-			await client.query('RESET enable_seqscan');
+			connection.release(true);
 		}
 	});
 });

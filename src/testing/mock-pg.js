@@ -696,7 +696,8 @@ export function mockPgClient(options = {}) {
 		}
 
 		// Task claim-pending, second statement: up to $5 oldest rows of each
-		// chosen scope, ranked by their position inside the scope and then by the
+		// chosen scope and registered name, ranked by their position inside the
+		// scope and then by the
 		// scope's rotation order, claimed up to $1. Models FOR UPDATE SKIP LOCKED:
 		// rows another connection holds are skipped, so two concurrent claimers
 		// get disjoint sets. The final ORDER BY is read from the statement, so a
@@ -710,20 +711,22 @@ export function mockPgClient(options = {}) {
 			if (Number(values[6]) > 0) scopes.push({ ord: Number(values[6]), match: (row) => row.identity_version == null && row.tenant_id == null });
 			if (Number(values[7]) > 0) scopes.push({ ord: Number(values[7]), match: (row) => row.identity_version === 1 && row.tenant_id == null });
 			const ts = now();
+			// Each (scope, name) read skips rows another connection holds and
+			// takes the next ones, as its FOR UPDATE ... SKIP LOCKED does.
 			const candidates = [];
 			for (const scope of scopes) {
-				const scoped = [...taskRows.values()]
-					.filter((row) => row.status === 'pending' && names.has(row.name) && scope.match(row))
-					.sort(byCreatedThenIns)
-					.slice(0, perScope);
-				scoped.forEach((row, i) => candidates.push({ row, pos: i + 1, ord: scope.ord }));
+				const scoped = [];
+				for (const name of names) {
+					scoped.push(...[...taskRows.values()]
+						.filter((row) => row.status === 'pending' && row.name === name && scope.match(row) && !isRowLockedByOther('task', row.id, connId))
+						.sort(byCreatedThenIns)
+						.slice(0, perScope));
+				}
+				scoped.sort(byCreatedThenIns).forEach((row, i) => candidates.push({ row, pos: i + 1, ord: scope.ord }));
 			}
 			if (sql.includes('ORDER BY r.pos, r.ord')) candidates.sort((a, b) => a.pos - b.pos || a.ord - b.ord);
 			else candidates.sort((a, b) => byCreatedThenIns(a.row, b.row));
-			const claimed = candidates
-				.filter(({ row }) => !isRowLockedByOther('task', row.id, connId))
-				.slice(0, limit)
-				.map(({ row }) => row);
+			const claimed = candidates.slice(0, limit).map(({ row }) => row);
 			const out = [];
 			for (const row of claimed) {
 				lockRow('task', row.id, connId);

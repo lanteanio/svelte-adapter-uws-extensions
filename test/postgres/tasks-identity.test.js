@@ -172,11 +172,57 @@ describe('postgres tasks per-tenant dispatch', () => {
 		expect(new Set(first.map((row) => row.tenant_id)).size).toBe(10);
 	});
 
+	it('keeps one rotation per set of names when a sweep claims twice', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 20, 'heavy');
+		const [victim] = await enqueue('zzz', 1, 'heavy');
+		const served = [];
+		// A sweep with a pooled handler at capacity 1 and an inline handler.
+		for (let sweep = 0; sweep < 2; sweep++) {
+			served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.id));
+			await claim(9, ['light']);
+		}
+		expect(served).toContain(victim);
+	});
+
+	it('skips rows another claim holds and takes the next ones', async () => {
+		const { client, enqueue } = await setup();
+		const legacy = runner(client, { forgetIdentity: undefined });
+		for (let i = 0; i < 12; i++) await legacy.enqueue('job', { input: {} });
+		await enqueue('ta', 12);
+		const connection = await client.connect();
+		try {
+			await connection.query('BEGIN');
+			const held = createTaskSql({ client: connection, table: 'svti_tasks', fenceTtl: 30, rowTtl: 3600, autoMigrate: false });
+			const first = await held.claimPending(10, ['job']);
+			expect(first).toHaveLength(10);
+			const other = createTaskSql({ client, table: 'svti_tasks', fenceTtl: 30, rowTtl: 3600, autoMigrate: false });
+			const second = await other.claimPending(10, ['job']);
+			expect(second).toHaveLength(10);
+			expect(second.filter((row) => first.some((h) => h.id === row.id))).toEqual([]);
+			await connection.query('COMMIT');
+		} finally {
+			connection.release();
+		}
+	});
+
 	it('claims only registered names', async () => {
 		const { enqueue, claim } = await setup();
 		await enqueue('ta', 2, 'other');
 		const [mine] = await enqueue('tb', 1);
 		expect((await claim(10)).map((row) => row.id)).toEqual([mine]);
+	});
+
+	it('serves a later tenant while a worker pool handler and an inline handler share each sweep', async () => {
+		const client = mockPgClient();
+		const r = runner(client, { dispatchInterval: 20, dispatchBatchSize: 10 });
+		r.register('heavy', null, { worker: { path: new URL('../helpers/workers/echo.js', import.meta.url), pool: { size: 1, idleTimeout: 5000 } } });
+		r.register('light', async () => 'ok');
+		for (let i = 0; i < 20; i++) await r.enqueue('heavy', { input: owner('aaa', 'u' + i) });
+		const victim = await r.enqueue('heavy', { input: owner('zzz', 'v') });
+		await r.await(victim, { timeout: 10000, pollInterval: 5 });
+		const done = rowsOf(client).filter((row) => row.tenant_id === 'aaa' && row.status === 'committed').length;
+		expect(done).toBeLessThan(5);
 	});
 
 	it('runs a later tenant\'s task in the first dispatch sweep', async () => {

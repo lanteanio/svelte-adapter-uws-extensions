@@ -61,21 +61,27 @@ future ticks and late external replies cannot start another database renewal.
 A dispatch sweep claims pending rows by tenant scope, not by global creation
 order. A scope is one tenant of rows stamped by `forgetIdentity`, the untenanted
 scope of stamped rows with a `null` tenant, or all rows written without
-`forgetIdentity`. Each sweep takes the oldest row of every chosen scope before
+`forgetIdentity`. Each claim takes the oldest row of every chosen scope before
 a second row of any scope, and keeps creation order inside a scope. When more
-scopes have pending work than the sweep's limit, the next sweep continues after
-the last scope served, so every tenant with pending work is reached within
-`ceil(scopes / dispatchBatchSize)` sweeps however large another tenant's
-backlog is. Rotation state is per runner. Only `forgetIdentity` gives a row a
-tenant: without it every row is in one scope and dispatch is first in, first out.
+scopes have pending work than the claim's limit, the next claim for the same
+handler names continues after the last scope served, so every tenant with
+pending work is reached within `ceil(scopes / dispatchBatchSize)` sweeps however
+large another tenant's backlog is. A sweep that claims separately for worker
+pool and inline handlers keeps one rotation for each. Rotation state is per
+runner. Only `forgetIdentity` gives a row a tenant: without it every row is in
+one scope and dispatch is first in, first out.
 
 The claim reads the `idx_svti_tasks_pending_scope` partial index
-`(identity_version, tenant_id, created_at) WHERE status = 'pending'`. Finding
-the scopes costs at most `2 * dispatchBatchSize + 2` single-row index probes;
-claiming reads at most `k * (dispatchBatchSize - k + 1)` index entries for `k`
-chosen scopes, 30 at the default batch of 10. The previous first-in, first-out
-claim read up to `dispatchBatchSize` entries of a creation-time index in one
-statement; the fair claim uses two statements and does not sort the backlog, so
-its cost does not grow with any tenant's pending rows. The claimed rows are
-locked with `FOR UPDATE SKIP LOCKED` and re-checked as pending after the lock,
-so concurrent sweeps never claim one row twice.
+`(identity_version, name, tenant_id, created_at) WHERE status = 'pending'`
+with equality on each registered handler name, so rows of names this runner
+does not handle are never read. For `n` registered names, finding the scopes
+costs at most `n * (2 * dispatchBatchSize + 2)` single-entry index probes, and
+claiming reads at most `n * k * (dispatchBatchSize - k + 1)` index entries for
+`k` chosen scopes, 30 per name at the default batch of 10. Neither grows with
+any tenant's backlog of either registered or other names. The first-in,
+first-out claim it replaces read one creation-time index and filtered names as
+it went, so a backlog of other names lay in its path. The rows each read takes
+are locked with `FOR UPDATE SKIP LOCKED`: a claim that overlaps another passes
+over that claim's rows and takes the next ones, and a row another sweep claimed
+meanwhile is re-checked and left alone, so no row is claimed twice. Rows read
+but not claimed stay pending; their locks end with the claim's statement.

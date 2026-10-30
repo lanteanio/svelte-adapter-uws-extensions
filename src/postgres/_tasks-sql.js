@@ -165,13 +165,15 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * the same lock exclusively before its DELETE. An insert that is in flight
 	 * when an erasure starts therefore commits before the DELETE takes its
 	 * snapshot and is erased with the rest; one that starts after the erasure
-	 * committed is a later write. The two-key form keeps these locks apart
-	 * from the single-key locks the migration runner takes.
+	 * committed is a later write. The key hashes the table's OID with the
+	 * identity, so every spelling of one table that resolves to it on the
+	 * search path shares the lock.
 	 */
 	const COLUMN_TYPES = {
 		svti_tasks_id: 'uuid', name: 'text', svti_idempotency_key: 'text', request_id: 'text', fence: 'uuid',
 		user_id: 'text', traceparent: 'text', tracestate: 'text', identity_version: 'integer', tenant_id: 'text'
 	};
+	const FENCE_KEY = (first) => `hashtextextended($${first}::regclass::oid::text || ':' || $${first + 1}::text, 0)`;
 	function insertStatement(name, columns, expressions, values, stamp) {
 		const fenced = stamp.version === 1 && stamp.userId !== null;
 		if (!fenced) {
@@ -184,8 +186,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			name: name + 'fenced_' + table,
 			text: `INSERT INTO ${table} (${columns.join(', ')})
 			       SELECT ${typed.join(', ')}
-			         FROM (SELECT pg_advisory_xact_lock_shared(hashtext('${table}'), hashtext($${values.length + 1}::text))) AS fence`,
-			values: [...values, JSON.stringify([stamp.tenantId, stamp.userId])]
+			         FROM (SELECT pg_advisory_xact_lock_shared(${FENCE_KEY(values.length + 1)})) AS fence`,
+			values: [...values, table, JSON.stringify([stamp.tenantId, stamp.userId])]
 		};
 	}
 
@@ -404,48 +406,64 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * Pending dispatch is fair across tenant scopes. A scope is one tenant of
 	 * qualified rows, the untenanted qualified scope, or the rows written
 	 * without forgetIdentity. Scopes rotate in the order LEGACY, UNTENANTED,
-	 * then tenant ids in index order; each sweep starts after the scope the
-	 * previous sweep ended on and takes at most `limit` scopes. Rows are then
+	 * then tenant ids in index order; each claim starts after the scope the
+	 * previous claim for the same set of names ended on and takes at most
+	 * `limit` scopes that have pending rows of those names. Rows are then
 	 * claimed round by round (every chosen scope's oldest row before any
 	 * scope's second), FIFO inside a scope, up to `limit` rows in all.
 	 *
-	 * With k chosen scopes each may contribute up to limit - k + 1 rows: when
-	 * one scope has that many the others' first rows still fill the batch, and
-	 * when none has, every row of every scope fits. The claim therefore fills as
-	 * a FIFO claim would while reading at most k * (limit - k + 1) index entries
-	 * (30 at the default limit of 10). Finding the scopes costs up to
-	 * 2 * limit + 2 single-row probes of the pending-scope index.
+	 * Every read goes through the pending-scope index
+	 * (identity_version, name, tenant_id, created_at) with equality on the
+	 * name, so rows of names this runner does not handle are never read and
+	 * the cost is bounded by the number of names n, not by any backlog.
+	 * Finding the scopes takes at most n * (2 * limit + 2) single-entry
+	 * probes. With k chosen scopes each may contribute up to limit - k + 1
+	 * rows (when one scope has that many the others' first rows still fill
+	 * the claim, and when none has, every row fits), read as at most
+	 * n * k * (limit - k + 1) index entries. Those reads lock their rows with
+	 * SKIP LOCKED, so rows another claim holds are passed over for the next
+	 * ones instead of filling the scope's share; the rows read but not
+	 * claimed stay pending and are unlocked when the statement commits.
 	 */
 	const LEGACY = 1, UNTENANTED = 2;
-	/** @type {null | 1 | 2 | string} */
-	let cursor = null;
+	// One rotation position per set of names: a sweep that claims for its
+	// pooled and its inline handlers separately keeps both rotations moving.
+	/** @type {Map<string, null | 1 | 2 | string>} */
+	const cursors = new Map();
+	const MAX_CURSORS = 64;
 
-	const scopeProbe = (where) => `(SELECT TRUE FROM ${table}
-	          WHERE status = 'pending' AND ${where} AND name = ANY($1::text[])
-	          ORDER BY identity_version, tenant_id, created_at LIMIT 1)`;
+	const scopeProbe = (where) => `(SELECT TRUE FROM unnest($1::text[]) AS q(name)
+	          CROSS JOIN LATERAL (SELECT 1 FROM ${table} p
+	                               WHERE p.status = 'pending' AND p.name = q.name AND ${where}
+	                               ORDER BY p.identity_version, p.name, p.tenant_id LIMIT 1) x
+	          LIMIT 1)`;
+	const nextTenant = (after) => `(SELECT min(x.tenant_id) FROM unnest($1::text[]) AS q(name)
+	          CROSS JOIN LATERAL (SELECT p.tenant_id FROM ${table} p
+	                               WHERE p.status = 'pending' AND p.identity_version = 1 AND p.name = q.name AND ${after}
+	                               ORDER BY p.identity_version, p.name, p.tenant_id LIMIT 1) x)`;
 	const tenantWalk = (first) => `ARRAY(
 	         WITH RECURSIVE walk(tenant_id, n) AS (
-	           (SELECT p.tenant_id, 1 FROM ${table} p
-	             WHERE p.status = 'pending' AND p.identity_version = 1 AND ${first} AND p.name = ANY($1::text[])
-	             ORDER BY p.identity_version, p.tenant_id LIMIT 1)
+	           SELECT ${nextTenant(first)}, 1
 	           UNION ALL
-	           SELECT (SELECT p.tenant_id FROM ${table} p
-	                    WHERE p.status = 'pending' AND p.identity_version = 1 AND p.tenant_id > w.tenant_id AND p.name = ANY($1::text[])
-	                    ORDER BY p.identity_version, p.tenant_id LIMIT 1), w.n + 1
+	           SELECT ${nextTenant('p.tenant_id > w.tenant_id')}, w.n + 1
 	             FROM walk w WHERE w.tenant_id IS NOT NULL AND w.n < $2
 	         ) SELECT tenant_id FROM walk WHERE tenant_id IS NOT NULL ORDER BY n)`;
 	const scopeRows = (where) => `SELECT p.svti_tasks_id, p.created_at FROM ${table} p
-	           WHERE p.status = 'pending' AND ${where} AND p.name = ANY($3::text[])
-	           ORDER BY p.identity_version, p.tenant_id, p.created_at LIMIT $5`;
+	           WHERE p.status = 'pending' AND p.name = q.name AND ${where}
+	           ORDER BY p.identity_version, p.name, p.tenant_id, p.created_at LIMIT $5
+	           FOR UPDATE OF p SKIP LOCKED`;
 
 	async function claimPending(limit, registeredNames) {
+		const names = [...registeredNames].sort();
+		const cursorKey = names.join('\n');
+		const cursor = cursors.get(cursorKey) ?? null;
 		const found = (await client.query({
 			name: 'tasks_claim_scopes_' + table,
-			text: `SELECT ${scopeProbe('identity_version IS NULL AND tenant_id IS NULL')} AS legacy,
-			              ${scopeProbe('identity_version = 1 AND tenant_id IS NULL')} AS untenanted,
+			text: `SELECT ${scopeProbe('p.identity_version IS NULL AND p.tenant_id IS NULL')} AS legacy,
+			              ${scopeProbe('p.identity_version = 1 AND p.tenant_id IS NULL')} AS untenanted,
 			              ${tenantWalk('p.tenant_id > $3')} AS after,
 			              ${tenantWalk('p.tenant_id IS NOT NULL')} AS head`,
-			values: [registeredNames, limit, typeof cursor === 'string' ? cursor : null]
+			values: [names, limit, typeof cursor === 'string' ? cursor : null]
 		})).rows[0] ?? {};
 		const virtual = [];
 		if (found.legacy === true) virtual.push(LEGACY);
@@ -463,8 +481,12 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		else if (cursor === UNTENANTED) order = [...head, ...virtual];
 		else order = [...virtual, ...head];
 		const chosen = order.slice(0, limit);
-		// A sweep that reached every scope starts the next one at the beginning.
-		cursor = chosen.length === limit ? chosen[chosen.length - 1] : null;
+		// A claim that reached every scope starts the next one at the beginning.
+		cursors.delete(cursorKey);
+		if (chosen.length === limit) {
+			cursors.set(cursorKey, chosen[chosen.length - 1]);
+			if (cursors.size > MAX_CURSORS) cursors.delete(cursors.keys().next().value);
+		}
 		if (chosen.length === 0) return [];
 		const tenants = [], ords = [];
 		let legacyOrd = 0, untenantedOrd = 0;
@@ -478,13 +500,18 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			text: `WITH candidates AS (
 			         SELECT c.svti_tasks_id, c.created_at, s.ord
 			           FROM unnest($4::text[], $6::int[]) AS s(tenant_id, ord)
+			          CROSS JOIN unnest($3::text[]) AS q(name)
 			          CROSS JOIN LATERAL (${scopeRows('p.identity_version = 1 AND p.tenant_id = s.tenant_id')}) c
 			         UNION ALL
 			         SELECT c.svti_tasks_id, c.created_at, $7::int
-			           FROM (${scopeRows('p.identity_version IS NULL AND p.tenant_id IS NULL')}) c WHERE $7::int > 0
+			           FROM unnest($3::text[]) AS q(name)
+			          CROSS JOIN LATERAL (${scopeRows('p.identity_version IS NULL AND p.tenant_id IS NULL')}) c
+			          WHERE $7::int > 0
 			         UNION ALL
 			         SELECT c.svti_tasks_id, c.created_at, $8::int
-			           FROM (${scopeRows('p.identity_version = 1 AND p.tenant_id IS NULL')}) c WHERE $8::int > 0
+			           FROM unnest($3::text[]) AS q(name)
+			          CROSS JOIN LATERAL (${scopeRows('p.identity_version = 1 AND p.tenant_id IS NULL')}) c
+			          WHERE $8::int > 0
 			       ),
 			       ranked AS (
 			         SELECT svti_tasks_id, ord, row_number() OVER (PARTITION BY ord ORDER BY created_at, svti_tasks_id) AS pos
@@ -496,7 +523,6 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			          WHERE t.status = 'pending'
 			          ORDER BY r.pos, r.ord
 			          LIMIT $1
-			          FOR UPDATE OF t SKIP LOCKED
 			       )
 			       UPDATE ${table} t
 			          SET status = 'running',
@@ -508,7 +534,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			        WHERE t.svti_tasks_id = claimed.svti_tasks_id AND t.status = 'pending'
 			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
 			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
-			values: [limit, fenceTtl, registeredNames, tenants, limit - chosen.length + 1, ords, legacyOrd, untenantedOrd]
+			values: [limit, fenceTtl, names, tenants, limit - chosen.length + 1, ords, legacyOrd, untenantedOrd]
 		});
 		return res.rows;
 	}
@@ -570,8 +596,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		return withTransaction(client, async (tx) => {
 			await tx.query({
 				name: 'tasks_erase_fence_' + table,
-				text: `SELECT pg_advisory_xact_lock(hashtext('${table}'), hashtext($1::text))`,
-				values: [JSON.stringify([identity.tenantId, identity.userId])]
+				text: `SELECT pg_advisory_xact_lock(${FENCE_KEY(1)})`,
+				values: [table, JSON.stringify([identity.tenantId, identity.userId])]
 			});
 			return deleteIdentityRows(tx, identity, untenanted);
 		});
