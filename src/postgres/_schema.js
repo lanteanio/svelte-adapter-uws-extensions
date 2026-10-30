@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
+import { topicTenantScopeSql } from '../shared/tenant-topic.js';
 
 const defaults = { replay: 'svti_replay', idempotency: 'svti_idempotency', jobs: 'svti_jobs', tasks: 'svti_tasks', 'dead-letter': 'svti_dead_letter', 'alarm-store': 'svti_alarms' };
 const text = (name, required = false) => [name, 'text', required];
@@ -137,38 +138,48 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 			indexSql(erasure.name, erasure.indexes[0])
 		]);
 		schema.checkpoints[3] = schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] }));
-		// Fair-share eviction: each record carries its tenant scope ('' for rows
-		// written before the column existed), statement triggers keep the record
-		// count per scope in the companion table for every writer, and the
-		// (scope, id) index yields a scope's oldest records. The migration
-		// rebuilds the counts under a lock that holds writers off meanwhile.
+		// Fair-share eviction: each record carries its tenant scope, statement
+		// triggers keep the record count and oldest id per scope in the
+		// companion table for every writer, and the (scope, id) index yields a
+		// scope's oldest records. Under a lock that holds writers off, the
+		// migration derives the scope of the rows already present from their
+		// topics and counts them. The trigger function names its tables with the
+		// schema of the record table and runs with a fixed search_path, so it
+		// updates the same counts whatever the writer's search_path is.
 		const counts = {
 			name: `${table}_scopes`,
-			columns: [text('scope', true), ['records', 'bigint', true]],
+			columns: [text('scope', true), ['records', 'bigint', true], ['oldest', 'bigint', true]],
 			primary: ['scope'], indexes: [], checks: [], additions: [],
 			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
 		};
 		const scopeColumn = ['scope', 'text', true, "''::text"];
 		const byScope = index('scope', ['scope', primary]);
 		const sync = `${table}_scopes_sync`;
-		const source = scopeSyncSource(counts.name);
+		const source = scopeSyncSource(table, counts.name, primary);
+		const config = 'search_path=pg_catalog, pg_temp';
 		main.columns = [...main.columns, scopeColumn];
 		main.indexes = [...main.indexes, byScope];
 		main.triggers = [
-			{ name: `${table}_scopes_insert`, event: 'INSERT', type: 4, oldTable: null, newTable: 'added', function: sync, source },
-			{ name: `${table}_scopes_update`, event: 'UPDATE', type: 16, oldTable: 'removed', newTable: 'added', function: sync, source },
-			{ name: `${table}_scopes_delete`, event: 'DELETE', type: 8, oldTable: 'removed', newTable: null, function: sync, source },
-			{ name: `${table}_scopes_truncate`, event: 'TRUNCATE', type: 32, oldTable: null, newTable: null, function: sync, source }
+			{ name: `${table}_scopes_insert`, event: 'INSERT', type: 4, oldTable: null, newTable: 'added', function: sync, source, config },
+			{ name: `${table}_scopes_update`, event: 'UPDATE', type: 16, oldTable: 'removed', newTable: 'added', function: sync, source, config },
+			{ name: `${table}_scopes_delete`, event: 'DELETE', type: 8, oldTable: 'removed', newTable: null, function: sync, source, config },
+			{ name: `${table}_scopes_truncate`, event: 'TRUNCATE', type: 32, oldTable: null, newTable: null, function: sync, source, config }
 		];
 		schema.tables.push(counts);
 		const triggers = main.triggers.map(entry => {
 			const referencing = [entry.oldTable && `OLD TABLE AS ${entry.oldTable}`, entry.newTable && `NEW TABLE AS ${entry.newTable}`].filter(Boolean).join(' ');
-			return `CREATE OR REPLACE TRIGGER ${entry.name} AFTER ${entry.event} ON ${table} ${referencing ? `REFERENCING ${referencing} ` : ''}FOR EACH STATEMENT EXECUTE FUNCTION ${sync}();`;
+			return `EXECUTE format('CREATE OR REPLACE TRIGGER %I AFTER ${entry.event} ON %s.%I ${referencing ? `REFERENCING ${referencing} ` : ''}FOR EACH STATEMENT EXECUTE FUNCTION %s.%I()', '${entry.name}', target, '${table}', target, '${sync}');`;
 		});
+		const derived = topicTenantScopeSql('topic');
 		versions.push([
 			`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${columnSql(scopeColumn)}`,
 			`CREATE TABLE IF NOT EXISTS ${counts.name} (${counts.columns.map(columnSql).join(', ')}, PRIMARY KEY (scope))`,
-			`DO $migration$ BEGIN LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE; CREATE OR REPLACE FUNCTION ${sync}() RETURNS trigger LANGUAGE plpgsql AS $sync$${source}$sync$; ${triggers.join(' ')} DELETE FROM ${counts.name}; INSERT INTO ${counts.name} (scope, records) SELECT scope, count(*) FROM ${table} GROUP BY scope; END $migration$`,
+			`DO $migration$ DECLARE target text; BEGIN LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE;`
+				+ ` SELECT '"' || replace(n.nspname, '"', '""') || '"' INTO target FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = '${table}'::regclass;`
+				+ ` UPDATE ${table} SET scope = ${derived} WHERE scope = '' AND ${derived} <> '';`
+				+ ` EXECUTE format('CREATE OR REPLACE FUNCTION %s.%I() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS %L', target, '${sync}', replace($sync$${source}$sync$, '@S@', target));`
+				+ ` ${triggers.join(' ')}`
+				+ ` DELETE FROM ${counts.name}; INSERT INTO ${counts.name} (scope, records, oldest) SELECT scope, count(*), min(${primary}) FROM ${table} GROUP BY scope; END $migration$`,
 			indexSql(table, byScope)
 		]);
 		schema.checkpoints[4] = schema.tables;
@@ -182,23 +193,31 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 }
 
 // The dead-letter scope-count trigger body, kept on one line so the stored
-// source compares exactly. Each statement applies its change per scope in
-// scope order, so concurrent multi-scope statements take the count rows in
-// one order. A count that reaches zero is deleted.
-function scopeSyncSource(counts) {
+// source compares exactly. `@S@` stands for the quoted schema of the record
+// table; the migration substitutes it, and validation compares against the
+// same substitution. Each statement applies its change per scope in scope
+// order, so concurrent multi-scope statements take the count rows in one
+// order. A count that reaches zero is deleted; a scope whose oldest record was
+// deleted reads its next oldest id from the (scope, id) index.
+function scopeSyncSource(table, counts, primary) {
+	const rows = `@S@."${table}"`;
+	const scopes = `@S@."${counts}"`;
 	return [
 		' DECLARE delta record;',
 		'BEGIN',
-		`IF TG_OP = 'TRUNCATE' THEN DELETE FROM ${counts}; RETURN NULL; END IF;`,
+		`IF TG_OP = 'TRUNCATE' THEN DELETE FROM ${scopes}; RETURN NULL; END IF;`,
 		`IF TG_OP <> 'INSERT' THEN`,
-		'FOR delta IN SELECT scope, count(*) AS n FROM removed GROUP BY scope ORDER BY scope LOOP',
-		`DELETE FROM ${counts} WHERE scope = delta.scope AND records <= delta.n;`,
-		`IF NOT FOUND THEN UPDATE ${counts} SET records = records - delta.n WHERE scope = delta.scope; END IF;`,
+		`FOR delta IN SELECT scope, count(*) AS n, min(${primary}) AS lowest FROM removed GROUP BY scope ORDER BY scope LOOP`,
+		`DELETE FROM ${scopes} WHERE scope = delta.scope AND records <= delta.n;`,
+		`IF NOT FOUND THEN UPDATE ${scopes} AS c SET records = c.records - delta.n,`,
+		`oldest = CASE WHEN c.oldest >= delta.lowest THEN (SELECT min(r.${primary}) FROM ${rows} AS r WHERE r.scope = delta.scope) ELSE c.oldest END`,
+		'WHERE c.scope = delta.scope; END IF;',
 		'END LOOP;',
 		'END IF;',
 		`IF TG_OP <> 'DELETE' THEN`,
-		'FOR delta IN SELECT scope, count(*) AS n FROM added GROUP BY scope ORDER BY scope LOOP',
-		`INSERT INTO ${counts} AS c (scope, records) VALUES (delta.scope, delta.n) ON CONFLICT (scope) DO UPDATE SET records = c.records + EXCLUDED.records;`,
+		`FOR delta IN SELECT scope, count(*) AS n, min(${primary}) AS lowest FROM added GROUP BY scope ORDER BY scope LOOP`,
+		`INSERT INTO ${scopes} AS c (scope, records, oldest) VALUES (delta.scope, delta.n, delta.lowest)`,
+		'ON CONFLICT (scope) DO UPDATE SET records = c.records + EXCLUDED.records, oldest = LEAST(c.oldest, EXCLUDED.oldest);',
 		'END LOOP;',
 		'END IF;',
 		'RETURN NULL;',

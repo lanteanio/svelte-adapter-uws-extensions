@@ -224,13 +224,20 @@ async function validateCatalog(client, schema, known = schema) {
 		if (!relation.triggers?.length) continue;
 		// Statement triggers that maintain companion state: each must fire for
 		// its event (tgtype carries the event bit, no row/before bits), with its
-		// transition tables, in every session, calling the expected body.
-		const triggers = await client.query(`SELECT t.tgname AS name, t.tgenabled AS enabled, t.tgtype AS type, t.tgoldtable AS old_table, t.tgnewtable AS new_table, p.proname AS function, p.prosrc AS source
-			FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid WHERE t.tgrelid = to_regclass($1) AND NOT t.tgisinternal`, [relation.name]);
+		// transition tables, in every session, calling the expected body from
+		// the table's own schema with its pinned search_path. `@S@` in the body
+		// stands for that schema, quoted.
+		const triggers = await client.query(`SELECT t.tgname AS name, t.tgenabled AS enabled, t.tgtype AS type, t.tgoldtable AS old_table, t.tgnewtable AS new_table,
+				p.proname AS function, p.prosrc AS source, p.proconfig AS config, tn.nspname AS schema, pn.nspname AS function_schema
+			FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid JOIN pg_namespace pn ON pn.oid = p.pronamespace
+			JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace tn ON tn.oid = c.relnamespace
+			WHERE t.tgrelid = to_regclass($1) AND NOT t.tgisinternal`, [relation.name]);
 		for (const expected of relation.triggers) {
 			const actual = triggers.rows.find(entry => entry.name === expected.name);
+			const schemaName = actual ? '"' + String(actual.schema).replaceAll('"', '""') + '"' : null;
 			if (!actual || !['O', 'A'].includes(actual.enabled) || Number(actual.type) !== expected.type || (actual.old_table ?? null) !== expected.oldTable
-				|| (actual.new_table ?? null) !== expected.newTable || actual.function !== expected.function || actual.source !== expected.source) {
+				|| (actual.new_table ?? null) !== expected.newTable || actual.function !== expected.function || actual.function_schema !== actual.schema
+				|| !(actual.config ?? []).includes(expected.config) || actual.source !== expected.source.replaceAll('@S@', schemaName)) {
 				throw new Error(`postgres schema: missing or incompatible trigger ${expected.name}`);
 			}
 		}

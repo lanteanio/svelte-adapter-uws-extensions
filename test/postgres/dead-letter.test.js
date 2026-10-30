@@ -14,6 +14,7 @@ function fakePg(nowFn = () => Date.now()) {
 	let rows = [];
 	let purges = [];
 	let nextId = 1;
+	let drift = false;
 	const hydrate = (r) => ({ ...r, data: r.data == null ? null : JSON.parse(r.data) });
 	// node-postgres sends a number as String(n), and int8 input refuses a
 	// fraction (SQLSTATE 22P02), so a bigint parameter must be a whole number.
@@ -59,6 +60,7 @@ function fakePg(nowFn = () => Date.now()) {
 	return {
 		_rows: () => rows,
 		_purges: () => purges,
+		_drift: () => { drift = true; },
 		async connect() {
 			return {
 				query: (sql, values) => this.query(sql.text ?? sql, sql.values ?? values),
@@ -108,24 +110,51 @@ function fakePg(nowFn = () => Date.now()) {
 			if (s === 'INSERT INTO svti_dead_letter (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope) VALUES ($1, $2, $3, $4, $5, $6, LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint), $8, $9) RETURNING svti_dead_letter_id') {
 				return insert(values, nowFn());
 			}
-			// The fair-share size trim reads the largest scope from the counts
-			// the triggers keep, which equal the rows grouped by scope (ties to
-			// the lowest scope name), bigints as strings.
-			if (s === 'SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess, lead(records) OVER (ORDER BY records DESC, scope) AS runner_up FROM svti_dead_letter_scopes ORDER BY records DESC, scope LIMIT 1') {
-				int8(values[0]);
+			// The per-scope counts the triggers keep equal the rows grouped by
+			// scope, with the lowest id as `oldest`; ranked by count, then the
+			// oldest record, then the scope name.
+			const scopeCounts = () => {
 				const counts = new Map();
-				for (const r of rows) counts.set(r.scope, (counts.get(r.scope) ?? 0) + 1);
-				const ranked = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-				if (ranked.length === 0) return { rows: [], rowCount: 0 };
-				const [[scope, records], runnerUp] = ranked;
-				return { rows: [{ scope, records: String(records), excess: String(rows.length - Number(values[0])), runner_up: runnerUp ? String(runnerUp[1]) : null }], rowCount: 1 };
+				for (const r of rows) {
+					const entry = counts.get(r.scope) ?? { scope: r.scope, records: 0, oldest: Infinity };
+					entry.records++;
+					entry.oldest = Math.min(entry.oldest, r.svti_dead_letter_id);
+					counts.set(r.scope, entry);
+				}
+				return [...counts.values()].sort((a, b) => b.records - a.records || a.oldest - b.oldest || (a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0));
+			};
+			// The fair-share size trim reads the largest scope, bigints as strings.
+			if (s === 'SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess, lead(records) OVER (ORDER BY records DESC, oldest, scope) AS runner_up FROM svti_dead_letter_scopes ORDER BY records DESC, oldest, scope LIMIT 1') {
+				int8(values[0]);
+				const [heaviest, runnerUp] = scopeCounts();
+				if (!heaviest) return { rows: [], rowCount: 0 };
+				return { rows: [{ scope: heaviest.scope, records: String(heaviest.records), excess: String(rows.length - Number(values[0])), runner_up: runnerUp ? String(runnerUp.records) : null }], rowCount: 1 };
 			}
-			// ...then deletes that scope's oldest ids, the count bound as a value.
+			// ...then deletes one scope's oldest ids, the count bound as a value...
 			if (s === 'WITH victims AS ( SELECT svti_dead_letter_id FROM svti_dead_letter WHERE scope = $1 ORDER BY svti_dead_letter_id LIMIT $2 FOR UPDATE SKIP LOCKED ) DELETE FROM svti_dead_letter d USING victims WHERE d.svti_dead_letter_id = victims.svti_dead_letter_id') {
 				int8(values[1]);
 				const victims = new Set(rows.filter(r => r.scope === values[0]).sort((a, b) => a.svti_dead_letter_id - b.svti_dead_letter_id).slice(0, Number(values[1])));
 				rows = rows.filter(r => !victims.has(r));
 				return { rows: [], rowCount: victims.size };
+			}
+			// ...or the oldest record of each of the equally large scopes holding
+			// the oldest records.
+			if (s === 'WITH victims AS ( SELECT svti_dead_letter_id FROM svti_dead_letter WHERE svti_dead_letter_id IN ( SELECT (SELECT min(r.svti_dead_letter_id) FROM svti_dead_letter r WHERE r.scope = c.scope) FROM svti_dead_letter_scopes c WHERE c.records = $1 ORDER BY c.oldest, c.scope LIMIT $2 ) FOR UPDATE SKIP LOCKED ) DELETE FROM svti_dead_letter d USING victims WHERE d.svti_dead_letter_id = victims.svti_dead_letter_id') {
+				int8(values[0]); int8(values[1]);
+				const oldest = new Set(scopeCounts().filter(c => c.records === Number(values[0])).slice(0, Number(values[1])).map(c => c.oldest));
+				const before = rows.length;
+				rows = rows.filter(r => !oldest.has(r.svti_dead_letter_id));
+				return { rows: [], rowCount: before - rows.length };
+			}
+			// ready() compares the counts with the rows; `_drift` stands in for
+			// counts a write around the triggers left behind.
+			if (s.startsWith('SELECT EXISTS ( SELECT 1 FROM (SELECT scope, count(*) AS n FROM svti_dead_letter GROUP BY scope) r FULL JOIN svti_dead_letter_scopes c USING (scope)')) {
+				return { rows: [{ drifted: drift }], rowCount: 1 };
+			}
+			if (s === 'LOCK TABLE svti_dead_letter_scopes IN EXCLUSIVE MODE' || s === 'DELETE FROM svti_dead_letter_scopes') return { rows: [], rowCount: 0 };
+			if (s === 'INSERT INTO svti_dead_letter_scopes (scope, records, oldest) SELECT scope, count(*), min(svti_dead_letter_id) FROM svti_dead_letter GROUP BY scope') {
+				drift = false;
+				return { rows: [], rowCount: scopeCounts().length };
 			}
 			if (s.startsWith('WITH expired AS') && s.includes('FROM svti_dead_letter_purges')) {
 				const cutoff = nowFn() - values[0];
@@ -462,10 +491,48 @@ describe('postgres dead-letter fair-share eviction', () => {
 		expect(await store.count({ topic: '@t/victim/orders' })).toBe(5);
 		// The noisy tenant lost its own oldest records.
 		expect((await store.list({ topic: '@t/noisy/orders' })).map(r => r.data.n)).toEqual([9, 8, 7, 6, 5]);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 5');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 5');
 		for (let n = 10; n < 30; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
 		expect(await store.count({ topic: '@t/victim/orders' })).toBe(5);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 25');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 25');
+	});
+
+	it('breaks a tie between equally large scopes on the oldest record, whatever the tenant names', async () => {
+		for (const order of [['a', 'b', 'z'], ['z', 'b', 'a']]) {
+			client = fakePg();
+			store?.destroy();
+			store = createDeadLetter(client, { autoMigrate: false, max: 2, cleanupInterval: 0 });
+			const ids = [];
+			for (const tenant of order) ids.push(await store.add(rec({ topic: `@t/${tenant}/x` })));
+			// The capture just made survives; the oldest record's tenant pays.
+			expect(await store.get(ids[2])).not.toBeNull();
+			expect((await store.list()).map(r => r.topic).sort()).toEqual(order.slice(1).map(t => `@t/${t}/x`).sort());
+		}
+	});
+
+	it('stops a scope at the runner-up and lets the tie rule pick the next record', async () => {
+		store = createDeadLetter(client, { autoMigrate: false, max: 3, cleanupInterval: 0 });
+		for (const tenant of ['b', 'b', 'a', 'a']) await client.query('INSERT INTO svti_dead_letter', ['hook', `@t/${tenant}/x`, 'event', '{}', 1, 'failed', 100, null, tenant]);
+		const last = await store.add(rec({ topic: '@t/a/x' }));
+		// a (3) gives up one record to reach b (2); then b holds the oldest.
+		expect(client._rows().map(r => String(r.svti_dead_letter_id))).toEqual(['2', '4', last]);
+	});
+
+	it('drains equally large scopes in one statement per level, oldest records first', async () => {
+		store = createDeadLetter(client, { autoMigrate: false, max: 4, cleanupInterval: 0 });
+		for (const tenant of ['c', 'a', 'd', 'b']) for (let n = 0; n < 2; n++) await client.query('INSERT INTO svti_dead_letter', ['hook', `@t/${tenant}/x`, 'event', JSON.stringify({ n }), 1, 'failed', 100, null, tenant]);
+		const deletes = [];
+		const query = client.query.bind(client);
+		client.query = async (sql, values) => {
+			const text = String(sql.text ?? sql).trim();
+			if (text.startsWith('WITH victims AS')) deletes.push(values);
+			return query(sql, values);
+		};
+		await store.add(rec({ topic: '@t/e/x' }));
+		// Nine records over a cap of four: the four scopes at two each give up
+		// their oldest record in one statement, then the oldest single record goes.
+		expect(deletes).toEqual([[2, 5], [1, 1]]);
+		expect(client._rows().map(r => r.topic + ':' + r.data).sort()).toEqual(['@t/a/x:{"n":1}', '@t/b/x:{"n":1}', '@t/d/x:{"n":1}', '@t/e/x:{"n":1}']);
 	});
 
 	it('stores the tenant scope of each topic and evicts the largest scope down to the others', async () => {
@@ -514,9 +581,9 @@ describe('postgres dead-letter fair-share eviction', () => {
 			return query(sql, values);
 		};
 		expect(await store.add(rec({ topic: '@t/a/orders' }))).not.toBeNull();
-		expect(metrics.serialize()).not.toContain('dead_letter_evicted_total{store="postgres"}');
+		expect(metrics.serialize()).not.toMatch(/^dead_letter_evicted_total /m);
 		await store.add(rec({ topic: '@t/a/orders' }));
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 1');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 1');
 	});
 });
 

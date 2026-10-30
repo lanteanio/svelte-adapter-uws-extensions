@@ -74,14 +74,18 @@ export function mockPgSchema() {
 			}
 			const match = /ALTER TABLE (\w+) ADD CONSTRAINT (\w+) CHECK \((.*)\) NOT VALID;/.exec(sql);
 			if (match && !checks.has(match[2])) checks.set(match[2], { table: match[1], name: match[2], expression: match[3], valid: false });
-			for (const fn of sql.matchAll(/CREATE OR REPLACE FUNCTION (\w+)\(\) RETURNS trigger LANGUAGE plpgsql AS \$sync\$([\s\S]*?)\$sync\$;/g)) functions.set(fn[1], fn[2]);
-			for (const trigger of sql.matchAll(/CREATE OR REPLACE TRIGGER (\w+) AFTER (\w+) ON (\w+) (?:REFERENCING (?:OLD TABLE AS (\w+) ?)?(?:NEW TABLE AS (\w+) )?)?FOR EACH STATEMENT EXECUTE FUNCTION (\w+)\(\);/g)) {
-				triggers.set(trigger[1], { table: trigger[3], name: trigger[1], enabled: 'O', type: triggerTypes[trigger[2]], old_table: trigger[4] ?? null, new_table: trigger[5] ?? null, function: trigger[6] });
+			// Every relation of this double lives in "public"; the migration
+			// substitutes that schema for @S@ in the function body.
+			for (const fn of sql.matchAll(/EXECUTE format\('CREATE OR REPLACE FUNCTION %s\.%I\(\) RETURNS trigger LANGUAGE plpgsql SET (search_path = [^A]+?) AS %L', target, '(\w+)', replace\(\$sync\$([\s\S]*?)\$sync\$, '@S@', target\)\);/g)) {
+				functions.set(fn[2], { source: fn[3].replaceAll('@S@', '"public"'), config: [fn[1].replace(' = ', '=')] });
+			}
+			for (const trigger of sql.matchAll(/EXECUTE format\('CREATE OR REPLACE TRIGGER %I AFTER (\w+) ON %s\.%I (?:REFERENCING (?:OLD TABLE AS (\w+) ?)?(?:NEW TABLE AS (\w+) )?)?FOR EACH STATEMENT EXECUTE FUNCTION %s\.%I\(\)', '(\w+)', target, '(\w+)', target, '(\w+)'\);/g)) {
+				triggers.set(trigger[4], { table: trigger[5], name: trigger[4], enabled: 'O', type: triggerTypes[trigger[1]], old_table: trigger[2] ?? null, new_table: trigger[3] ?? null, function: trigger[6] });
 			}
 			return result([]);
 		}
 		if (sql.includes('FROM pg_trigger t')) {
-			return result([...triggers.values()].filter(entry => entry.table === values[0]).map(({ table, ...entry }) => ({ ...entry, source: functions.get(entry.function) ?? null })));
+			return result([...triggers.values()].filter(entry => entry.table === values[0]).map(({ table, ...entry }) => ({ ...entry, source: functions.get(entry.function)?.source ?? null, config: functions.get(entry.function)?.config ?? null, schema: 'public', function_schema: 'public' })));
 		}
 		if (sql.includes('FROM pg_attribute a')) return result(tables.get(values[0]) ?? []);
 		if (sql.startsWith('SELECT i.indisvalid')) { const entry = indexes.get(values[0]); return result(entry ? [{ indisvalid: entry.valid, owned: entry.table === values[1] }] : []); }

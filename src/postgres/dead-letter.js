@@ -25,10 +25,12 @@
  *
  *   svti_dead_letter_scopes (
  *     scope   TEXT   PRIMARY KEY,
- *     records BIGINT NOT NULL
+ *     records BIGINT NOT NULL,
+ *     oldest  BIGINT NOT NULL
  *   )
  *   + statement triggers on svti_dead_letter that keep `records` equal to the
- *     number of rows per scope for every INSERT, UPDATE, DELETE and TRUNCATE
+ *     number of rows per scope and `oldest` at its lowest id, for every INSERT,
+ *     UPDATE, DELETE and TRUNCATE
  *
  *   svti_dead_letter_purges (
  *     scope     TEXT   NOT NULL,
@@ -45,12 +47,16 @@
  * fences are pruned by the same bounded cleanup passes.
  *
  * Retention uses `max` and optional `ttlMs`. Above `max`, cleanup deletes the
- * oldest ids of the tenant scope holding the most records, so a scope at or
+ * oldest ids of the tenant scope holding the most records; between equally
+ * large scopes, the one holding the oldest record pays first. A scope at or
  * under `max / scopes present` never loses records to another scope's
  * overflow. `scope` is the tenant scope the erasure fences use (`~` for an
- * untenanted topic, `''` for a malformed tenant topic and for rows written
- * before the column existed). A size trim reads the per-scope counts and
- * deletes through the (scope, id) index, never walking the whole record table.
+ * untenanted topic, `''` for a malformed tenant topic); the migration derives
+ * it from the topic of rows already present. A size trim reads the per-scope
+ * counts and deletes through the (scope, id) index, never walking the whole
+ * record table. `ready()` also compares the counts with the rows and rebuilds
+ * them when they differ, which only writes that bypass the triggers cause (a
+ * data-only restore with triggers enabled, a session in replica mode).
  * Writes and periodic maintenance share bounded cleanup transactions; large
  * backlogs drain over multiple passes. Reads exclude expired records even while
  * physical deletion is pending. Replica maintenance uses a per-table lock.
@@ -159,7 +165,7 @@ export function createDeadLetter(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
-	const mEvicted = m?.counter('dead_letter_evicted_total', 'Dead-letter records evicted by the max cap from the tenant scope holding the most records', ['store']);
+	const mEvicted = m?.counter('dead_letter_evicted_total', 'Dead-letter records evicted by the max cap from the tenant scope holding the most records');
 
 	const schema = createStoreSchema(client, 'dead-letter', table, autoMigrate);
 	const ensureTable = schema.ensure;
@@ -207,25 +213,35 @@ export function createDeadLetter(client, options = {}) {
 		}
 	}
 	// Fair-share size trim. A read of the per-scope counts (one row per scope
-	// holding records) names the largest scope, the excess over `max` and the
-	// runner-up's count; the delete then takes that scope's oldest ids, at most
-	// down to the runner-up so the next round can pick the largest again. The
-	// delete binds the scope and the row count as values, so the planner walks
-	// the (scope, id) index for exactly those rows instead of estimating an
-	// unknown limit. Under the cap the delete is skipped. Returns the rows
-	// evicted.
+	// holding records) names the largest scope (ties to the one holding the
+	// oldest record), the excess over `max` and the runner-up's count. A scope
+	// larger than the runner-up gives up its oldest ids down to the runner-up's
+	// count. Equally large scopes each give up their oldest record, the scopes
+	// holding the oldest records first, so a tie drains a batch per statement.
+	// The deletes bind the scope or count and the row count as values, so the
+	// planner walks the (scope, id) index for exactly those rows instead of
+	// estimating an unknown limit. Under the cap nothing is deleted. Returns
+	// the rows evicted.
 	async function trimSize(budget) {
 		let evicted = 0;
 		while (budget.available) {
 			const { rows: [heaviest] } = await budget.query(`SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess,
-				       lead(records) OVER (ORDER BY records DESC, scope) AS runner_up
-				  FROM ${scopeTable} ORDER BY records DESC, scope LIMIT 1`, [max]);
+				       lead(records) OVER (ORDER BY records DESC, oldest, scope) AS runner_up
+				  FROM ${scopeTable} ORDER BY records DESC, oldest, scope LIMIT 1`, [max]);
 			const excess = heaviest ? Number(heaviest.excess) : 0;
 			if (excess <= 0) break;
-			const take = Math.min(excess, budget.limit, Math.max(1, Number(heaviest.records) - Number(heaviest.runner_up ?? 0)));
-			const count = await budget.remove(`WITH victims AS (
-				SELECT ${pkCol} FROM ${table} WHERE scope = $1 ORDER BY ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
-			) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}`, [heaviest.scope, take]);
+			const records = Number(heaviest.records);
+			const runnerUp = heaviest.runner_up == null ? 0 : Number(heaviest.runner_up);
+			const count = runnerUp < records
+				? await budget.remove(`WITH victims AS (
+					SELECT ${pkCol} FROM ${table} WHERE scope = $1 ORDER BY ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
+				) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}`, [heaviest.scope, Math.min(excess, budget.limit, records - runnerUp)])
+				: await budget.remove(`WITH victims AS (
+					SELECT ${pkCol} FROM ${table} WHERE ${pkCol} IN (
+						SELECT (SELECT min(r.${pkCol}) FROM ${table} r WHERE r.scope = c.scope)
+						  FROM ${scopeTable} c WHERE c.records = $1 ORDER BY c.oldest, c.scope LIMIT $2
+					) FOR UPDATE SKIP LOCKED
+				) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}`, [records, Math.min(excess, budget.limit)]);
 			evicted += count;
 			if (count === 0 || count >= excess) break;
 		}
@@ -250,8 +266,13 @@ export function createDeadLetter(client, options = {}) {
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
-		success: () => b?.success(), failure: error => pgFailure(b, error),
-		committed: evicted => { if (evicted > 0) mEvicted?.inc({ store: 'postgres' }, evicted); },
+		success: () => b?.success(),
+		// A pass deletes rows whose triggers update shared per-scope count rows,
+		// which captures update too. A pass that hits its lock timeout waiting
+		// for one met ordinary contention, not a failing database, so it stays
+		// out of the breaker; the next pass retries.
+		failure: error => { if (error?.code !== '55P03') pgFailure(b, error); },
+		committed: evicted => { if (evicted > 0) mEvicted?.inc(evicted); },
 		isolation: READ_COMMITTED_TX.isolation,
 		async work(budget) {
 			const expiredFirst = ttlFirst;
@@ -263,10 +284,33 @@ export function createDeadLetter(client, options = {}) {
 			return evicted;
 		}
 	});
+	// The triggers keep the counts for every writer, so they only drift
+	// through writes that bypass them (a data-only restore with triggers
+	// enabled, a session in replica mode). ready() compares them with the
+	// rows in one read and, on a difference, rebuilds them while holding
+	// count updates off; captures wait for the rebuild instead of racing it.
+	let reconciled = null;
+	function reconcileCounts() {
+		reconciled ??= (async () => {
+			const drift = await withBreaker(b, () => client.query(`SELECT EXISTS (
+				SELECT 1 FROM (SELECT scope, count(*) AS n FROM ${table} GROUP BY scope) r
+				FULL JOIN ${scopeTable} c USING (scope) WHERE r.n IS DISTINCT FROM c.records
+			) AS drifted`));
+			if (!drift.rows[0]?.drifted) return;
+			await withBreaker(b, () => withTransaction(client, async (tx) => {
+				await tx.query("SELECT set_config('lock_timeout', '1000', true)");
+				await tx.query(`LOCK TABLE ${scopeTable} IN EXCLUSIVE MODE`);
+				await tx.query(`DELETE FROM ${scopeTable}`);
+				await tx.query(`INSERT INTO ${scopeTable} (scope, records, oldest) SELECT scope, count(*), min(${pkCol}) FROM ${table} GROUP BY scope`);
+			}, READ_COMMITTED_TX));
+		})().catch((error) => { reconciled = null; throw error; });
+		return reconciled;
+	}
+
 	const liveRows = ttlMs > 0 ? `failed_at >= (extract(epoch from now()) * 1000)::bigint - ${ttlMs}` : 'TRUE';
 
 	return {
-		ready: schema.ready,
+		ready: () => schema.ready().then(reconcileCounts),
 		status: schema.status,
 		/**
 		 * Retain an undeliverable event. Resolves the new record id, or `null`

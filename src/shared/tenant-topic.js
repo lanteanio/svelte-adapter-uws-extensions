@@ -49,6 +49,21 @@ export function topicTenantScope(topic) {
 }
 
 /**
+ * SQL expression for {@link topicTenantScope} over a text column, with `''`
+ * where that function returns null (a NULL topic or a malformed tenant
+ * topic). `left`/`substr`/`strpos` have no pattern semantics, as in
+ * {@link tenantTopicSql}.
+ *
+ * @param {string} column - A trusted column reference.
+ * @returns {string}
+ */
+export function topicTenantScopeSql(column) {
+	const rest = `substr(${column}, ${TENANT_TOPIC_NS.length + 1})`;
+	return `CASE WHEN ${column} IS NULL THEN '' WHEN left(${column}, ${TENANT_TOPIC_NS.length}) <> '${TENANT_TOPIC_NS}' THEN '~'`
+		+ ` WHEN strpos(${rest}, '/') > 1 THEN left(${rest}, strpos(${rest}, '/') - 1) ELSE '' END`;
+}
+
+/**
  * SQL fragment applying the same rule to a `topic` column, plus the parameter
  * to bind. `$<n>` is the placeholder index the caller has available.
  *

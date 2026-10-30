@@ -3,6 +3,7 @@ import { createPgClient } from '../../../src/postgres/index.js';
 import { createDeadLetter } from '../../../src/postgres/dead-letter.js';
 import { postgresMigrations, validateSchema } from '../../../src/postgres/migrations.js';
 import { createMetrics } from '../../../src/prometheus/index.js';
+import { createCircuitBreaker } from '../../../src/shared/breaker.js';
 import { resetRuntimeEnv, setRuntimeEnv } from '../../../src/shared/runtime.js';
 
 const table = 'svti_dlq_retention';
@@ -173,7 +174,7 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 		for (let n = 0; n < 30; n++) await dlq.add(tenantRecord('@t/noisy/orders', n));
 		expect((await dlq.list({ topic: '@t/victim/orders' })).map(r => r.data.n)).toEqual([4, 3, 2, 1, 0]);
 		expect((await dlq.list({ topic: '@t/noisy/orders' })).map(r => r.data.n)).toEqual([29, 28, 27, 26, 25]);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 25');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 25');
 		expect(await scopeCounts()).toEqual([{ scope: 'noisy', records: 5 }, { scope: 'victim', records: 5 }]);
 	});
 
@@ -199,7 +200,7 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 		expect(await scopeCounts()).toEqual([]);
 	});
 
-	it('migrates rows written before the scope column into one scope that pays for overflow first', async () => {
+	it('migrates rows written before the scope column into the scope of their topic', async () => {
 		// The table as version 3 left it, holding six captures.
 		const versions = postgresMigrations({ store: 'dead-letter', table });
 		await client.query('CREATE TABLE IF NOT EXISTS svti_schema_migrations (table_name TEXT NOT NULL, store TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (table_name, version))');
@@ -207,14 +208,81 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 		for (const { version, checksum } of versions.slice(0, 3)) {
 			await client.query('INSERT INTO svti_schema_migrations (table_name, store, version, checksum) VALUES ($1, $2, $3, $4)', [table, 'dead-letter', version, checksum]);
 		}
-		await client.query(`INSERT INTO ${table} (topic, failed_at) SELECT '@t/earlier/orders', i FROM generate_series(1, 6) i`);
+		await client.query(`INSERT INTO ${table} (topic, failed_at) SELECT CASE WHEN i <= 4 THEN '@t/earlier/orders' WHEN i = 5 THEN 'orders' ELSE '@t/x' END, i FROM generate_series(1, 6) i`);
 		const dlq = store(client, { max: 8, cleanupInterval: 0 });
 		await dlq.ready();
-		expect(await scopeCounts()).toEqual([{ scope: '', records: 6 }]);
+		expect(await scopeCounts()).toEqual([{ scope: '', records: 1 }, { scope: 'earlier', records: 4 }, { scope: '~', records: 1 }]);
 		for (let n = 0; n < 4; n++) await dlq.add(tenantRecord('@t/fresh/orders', n));
-		expect(await dlq.count({ topic: '@t/fresh/orders' })).toBe(4);
-		expect((await dlq.list({ topic: '@t/earlier/orders' })).map(r => r.failedAt)).toEqual([6, 5, 4, 3]);
-		expect(await scopeCounts()).toEqual([{ scope: '', records: 4 }, { scope: 'fresh', records: 4 }]);
+		// earlier is largest at the first overflow, fresh at the second.
+		expect((await dlq.list({ topic: '@t/earlier/orders' })).map(r => r.failedAt)).toEqual([4, 3, 2]);
+		expect(await scopeCounts()).toEqual([{ scope: '', records: 1 }, { scope: 'earlier', records: 3 }, { scope: 'fresh', records: 3 }, { scope: '~', records: 1 }]);
+	});
+
+	it('breaks a tie between equally large scopes on the oldest record, whatever the tenant names', async () => {
+		for (const order of [['a', 'b', 'z'], ['z', 'b', 'a']]) {
+			const dlq = store(client, { max: 2, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+			await dlq.clear();
+			const ids = [];
+			for (const tenant of order) ids.push(await dlq.add(tenantRecord(`@t/${tenant}/x`, 0)));
+			// The capture just made survives; the oldest record's tenant pays.
+			expect(await dlq.get(ids[2])).not.toBeNull();
+			expect((await dlq.list()).map(r => r.topic).sort()).toEqual(order.slice(1).map(t => `@t/${t}/x`).sort());
+		}
+	});
+
+	it('drains equally large scopes a level per statement', async () => {
+		const dlq = store(client, { max: 4, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await dlq.ready();
+		await client.query(`INSERT INTO ${table} (topic, failed_at, scope) SELECT '@t/' || s || '/x', 1, s FROM unnest(ARRAY['c', 'c', 'a', 'a', 'd', 'd', 'b', 'b']) s`);
+		await dlq.add(tenantRecord('@t/e/x', 0));
+		expect(await scopeCounts()).toEqual([{ scope: 'a', records: 1 }, { scope: 'b', records: 1 }, { scope: 'd', records: 1 }, { scope: 'e', records: 1 }]);
+		expect(await scopeCounts()).toEqual(await actualCounts());
+	});
+
+	it('repairs counts that drifted outside the triggers on ready()', async () => {
+		const dlq = store(client, { max: 10, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await dlq.ready();
+		for (let n = 0; n < 3; n++) await dlq.add(tenantRecord('@t/a/x', n));
+		// A data-only restore with triggers enabled counts restored rows twice.
+		await client.query(`UPDATE ${table}_scopes SET records = records + 9`);
+		const restarted = store(client, { max: 10, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await restarted.ready();
+		expect(await scopeCounts()).toEqual([{ scope: 'a', records: 3 }]);
+		await restarted.add(tenantRecord('@t/a/x', 3));
+		expect(await dlq.count()).toBe(4);
+	});
+
+	it('updates the counts of the record table whatever the writer search_path', async () => {
+		const dlq = store(client, { cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await dlq.ready();
+		await client.query('DROP SCHEMA IF EXISTS svti_dlq_decoy CASCADE');
+		await client.query('CREATE SCHEMA svti_dlq_decoy');
+		try {
+			await client.query(`CREATE TABLE svti_dlq_decoy.${table}_scopes (scope TEXT PRIMARY KEY, records BIGINT NOT NULL, oldest BIGINT NOT NULL)`);
+			const writer = await client.connect();
+			try {
+				await writer.query('SET search_path = svti_dlq_decoy, public');
+				await writer.query(`INSERT INTO public.${table} (topic, failed_at, scope) VALUES ('@t/a/x', 1, 'a')`);
+			} finally { writer.release(true); }
+			expect(await scopeCounts()).toEqual([{ scope: 'a', records: 1 }]);
+			expect((await client.query(`SELECT count(*)::int AS n FROM svti_dlq_decoy.${table}_scopes`)).rows[0].n).toBe(0);
+		} finally {
+			await client.query('DROP SCHEMA svti_dlq_decoy CASCADE');
+		}
+	});
+
+	it('keeps the breaker closed while cleanup contends with concurrent captures on the count rows', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		try {
+			const dlq = store(client, { max: 20, cleanupInterval: 0, breaker, forgetUserId: r => r.data?.user });
+			await dlq.ready();
+			const ids = await Promise.all(Array.from({ length: 300 }, (_, n) => dlq.add(tenantRecord(`@t/t${n % 3}/x`, n))));
+			expect(ids.every(id => /^\d+$/.test(id))).toBe(true);
+			expect(breaker.state).toBe('healthy');
+			await dlq.add(tenantRecord('@t/t0/x', 300));
+			expect(await scopeCounts()).toEqual(await actualCounts());
+			expect(await dlq.count()).toBeLessThanOrEqual(20);
+		} finally { breaker.destroy(); }
 	});
 
 	it('captures concurrently for one tenant under a repeatable-read default', async () => {

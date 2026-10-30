@@ -92,9 +92,9 @@
 			"additions": [
 				"store table and topic, failed_at, user_id indexes",
 				"version 3: tenant/user erasure tombstones with bounded purged_at pruning",
-				"version 4: scope TEXT NOT NULL DEFAULT '' (existing rows share the '' scope); svti_dead_letter_scopes per-scope record counts kept by statement triggers for INSERT, UPDATE, DELETE and TRUNCATE; idx_svti_dead_letter_scope(scope,svti_dead_letter_id)"
+				"version 4: scope TEXT NOT NULL DEFAULT '' (derived from the topic of existing rows); svti_dead_letter_scopes per-scope record count and oldest id kept by statement triggers for INSERT, UPDATE, DELETE and TRUNCATE (function in the table's schema, search_path pinned); idx_svti_dead_letter_scope(scope,svti_dead_letter_id)"
 			],
-			"rollbackLimit": "Old writers do not fence racing captures and store their rows in the '' scope. Stop old writers and drain deliveries before downgrade; preserve captures, tombstones and scope counts together."
+			"rollbackLimit": "Old writers do not fence racing captures and store their rows in the '' scope. Grant the runtime role its privileges on svti_dead_letter_scopes in the same step as version 4, or every write fails. Stop old writers and drain deliveries before downgrade; preserve captures, tombstones and scope counts together."
 		},
 		{
 			"subpath": "postgres/alarm-store",

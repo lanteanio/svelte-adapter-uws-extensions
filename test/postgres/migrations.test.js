@@ -3,6 +3,7 @@ import { migrate, postgresMigrations, postgresReadiness, validateSchema } from '
 import { createReplay } from '../../src/postgres/replay.js';
 import { createJobQueue } from '../../src/postgres/jobs.js';
 import { mockPgClient } from '../../src/testing/mock-pg.js';
+import { topicTenantScopeSql } from '../../src/shared/tenant-topic.js';
 
 describe('PostgreSQL migration contracts', () => {
 	it('keeps published migration checksums immutable', () => {
@@ -38,16 +39,23 @@ describe('PostgreSQL migration contracts', () => {
 		const { statements } = postgresMigrations({ store: 'dead-letter' })[3];
 		expect(statements).toHaveLength(4);
 		expect(statements[0]).toBe("ALTER TABLE svti_dead_letter ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT ''::text");
-		expect(statements[1]).toBe('CREATE TABLE IF NOT EXISTS svti_dead_letter_scopes (scope TEXT NOT NULL, records BIGINT NOT NULL, PRIMARY KEY (scope))');
+		expect(statements[1]).toBe('CREATE TABLE IF NOT EXISTS svti_dead_letter_scopes (scope TEXT NOT NULL, records BIGINT NOT NULL, oldest BIGINT NOT NULL, PRIMARY KEY (scope))');
 		expect(statements[3]).toBe('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_svti_dead_letter_scope ON svti_dead_letter (scope, svti_dead_letter_id)');
-		// One locked block replaces the function, recreates the four statement
-		// triggers and rebuilds the counts from the rows already present.
-		expect(statements[2]).toMatch(/^DO \$migration\$ BEGIN LOCK TABLE svti_dead_letter IN SHARE ROW EXCLUSIVE MODE; CREATE OR REPLACE FUNCTION svti_dead_letter_scopes_sync\(\) RETURNS trigger LANGUAGE plpgsql AS \$sync\$/);
-		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_insert AFTER INSERT ON svti_dead_letter REFERENCING NEW TABLE AS added FOR EACH STATEMENT');
-		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_update AFTER UPDATE ON svti_dead_letter REFERENCING OLD TABLE AS removed NEW TABLE AS added FOR EACH STATEMENT');
-		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_delete AFTER DELETE ON svti_dead_letter REFERENCING OLD TABLE AS removed FOR EACH STATEMENT');
-		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_truncate AFTER TRUNCATE ON svti_dead_letter FOR EACH STATEMENT');
-		expect(statements[2]).toMatch(/DELETE FROM svti_dead_letter_scopes; INSERT INTO svti_dead_letter_scopes \(scope, records\) SELECT scope, count\(\*\) FROM svti_dead_letter GROUP BY scope; END \$migration\$$/);
+		// One locked block derives the scope of existing rows from their topics,
+		// replaces the function in the table's schema with a pinned search_path,
+		// recreates the four statement triggers and rebuilds the counts.
+		const block = statements[2];
+		expect(block).toMatch(/^DO \$migration\$ DECLARE target text; BEGIN LOCK TABLE svti_dead_letter IN SHARE ROW EXCLUSIVE MODE; SELECT '"' \|\| replace\(n\.nspname, '"', '""'\) \|\| '"' INTO target FROM pg_class c JOIN pg_namespace n ON n\.oid = c\.relnamespace WHERE c\.oid = 'svti_dead_letter'::regclass;/);
+		expect(block).toContain(`UPDATE svti_dead_letter SET scope = ${topicTenantScopeSql('topic')} WHERE scope = '' AND ${topicTenantScopeSql('topic')} <> '';`);
+		expect(block).toContain("EXECUTE format('CREATE OR REPLACE FUNCTION %s.%I() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS %L', target, 'svti_dead_letter_scopes_sync', replace($sync$");
+		// Every table the body names carries the schema placeholder.
+		const body = /\$sync\$([\s\S]*?)\$sync\$/.exec(block)[1];
+		expect(body.match(/"svti_dead_letter(?:_scopes)?"/g).length).toBe(body.match(/@S@\."svti_dead_letter(?:_scopes)?"/g).length);
+		expect(body).not.toMatch(/(?:FROM|INTO|UPDATE) (?!@S@)\w*svti/);
+		for (const [event, referencing] of [['INSERT', 'REFERENCING NEW TABLE AS added '], ['UPDATE', 'REFERENCING OLD TABLE AS removed NEW TABLE AS added '], ['DELETE', 'REFERENCING OLD TABLE AS removed '], ['TRUNCATE', '']]) {
+			expect(block).toContain(`EXECUTE format('CREATE OR REPLACE TRIGGER %I AFTER ${event} ON %s.%I ${referencing}FOR EACH STATEMENT EXECUTE FUNCTION %s.%I()', 'svti_dead_letter_scopes_${event.toLowerCase()}', target, 'svti_dead_letter', target, 'svti_dead_letter_scopes_sync');`);
+		}
+		expect(block).toMatch(/DELETE FROM svti_dead_letter_scopes; INSERT INTO svti_dead_letter_scopes \(scope, records, oldest\) SELECT scope, count\(\*\), min\(svti_dead_letter_id\) FROM svti_dead_letter GROUP BY scope; END \$migration\$$/);
 	});
 	it('keeps every generated dead-letter identifier within the PostgreSQL limit for the longest table name', () => {
 		const table = 'a'.repeat(42);

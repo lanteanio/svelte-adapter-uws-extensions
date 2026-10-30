@@ -205,7 +205,8 @@
 			"table": "svti_dead_letter_scopes",
 			"columns": {
 				"scope": "text",
-				"records": "bigint"
+				"records": "bigint",
+				"oldest": "bigint"
 			},
 			"indexColumns": [
 				[
@@ -337,6 +338,11 @@
 					"id": "tenant-size",
 					"type": "zset",
 					"template": "dlq:tenant-size:{dlq}"
+				},
+				{
+					"id": "tenant-rank",
+					"type": "zset",
+					"template": "dlq:tenant-rank:{dlq}"
 				},
 				{
 					"id": "erasure",
