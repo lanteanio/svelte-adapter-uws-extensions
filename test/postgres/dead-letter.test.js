@@ -108,22 +108,24 @@ function fakePg(nowFn = () => Date.now()) {
 			if (s === 'INSERT INTO svti_dead_letter (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope) VALUES ($1, $2, $3, $4, $5, $6, LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint), $8, $9) RETURNING svti_dead_letter_id') {
 				return insert(values, nowFn());
 			}
-			// The fair-share size trim. The per-scope counts the triggers keep
-			// equal the rows grouped by scope; the statement deletes the oldest
-			// ids of the largest scope (ties to the lowest scope name), at most
-			// down to the runner-up, and returns the starting excess per row.
-			if (s.startsWith('WITH heaviest AS ( SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess, lead(records) OVER (ORDER BY records DESC, scope) AS runner_up FROM svti_dead_letter_scopes ORDER BY records DESC, scope LIMIT 1 ), victims AS ( SELECT svti_dead_letter_id FROM svti_dead_letter WHERE scope = (SELECT scope FROM heaviest) ORDER BY svti_dead_letter_id LIMIT (SELECT GREATEST(0, LEAST(excess, $2::bigint, GREATEST(1, records - COALESCE(runner_up, 0)))) FROM heaviest) FOR UPDATE SKIP LOCKED ) DELETE FROM svti_dead_letter d USING victims WHERE d.svti_dead_letter_id = victims.svti_dead_letter_id RETURNING (SELECT excess FROM heaviest) AS excess')) {
-				int8(values[0]); int8(values[1]);
+			// The fair-share size trim reads the largest scope from the counts
+			// the triggers keep, which equal the rows grouped by scope (ties to
+			// the lowest scope name), bigints as strings.
+			if (s === 'SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess, lead(records) OVER (ORDER BY records DESC, scope) AS runner_up FROM svti_dead_letter_scopes ORDER BY records DESC, scope LIMIT 1') {
+				int8(values[0]);
 				const counts = new Map();
 				for (const r of rows) counts.set(r.scope, (counts.get(r.scope) ?? 0) + 1);
 				const ranked = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 				if (ranked.length === 0) return { rows: [], rowCount: 0 };
 				const [[scope, records], runnerUp] = ranked;
-				const excess = rows.length - Number(values[0]);
-				const take = Math.max(0, Math.min(excess, Number(values[1]), Math.max(1, records - (runnerUp?.[1] ?? 0))));
-				const victims = new Set(rows.filter(r => r.scope === scope).sort((a, b) => a.svti_dead_letter_id - b.svti_dead_letter_id).slice(0, take));
+				return { rows: [{ scope, records: String(records), excess: String(rows.length - Number(values[0])), runner_up: runnerUp ? String(runnerUp[1]) : null }], rowCount: 1 };
+			}
+			// ...then deletes that scope's oldest ids, the count bound as a value.
+			if (s === 'WITH victims AS ( SELECT svti_dead_letter_id FROM svti_dead_letter WHERE scope = $1 ORDER BY svti_dead_letter_id LIMIT $2 FOR UPDATE SKIP LOCKED ) DELETE FROM svti_dead_letter d USING victims WHERE d.svti_dead_letter_id = victims.svti_dead_letter_id') {
+				int8(values[1]);
+				const victims = new Set(rows.filter(r => r.scope === values[0]).sort((a, b) => a.svti_dead_letter_id - b.svti_dead_letter_id).slice(0, Number(values[1])));
 				rows = rows.filter(r => !victims.has(r));
-				return { rows: [...victims].map(() => ({ excess: String(excess) })), rowCount: victims.size };
+				return { rows: [], rowCount: victims.size };
 			}
 			if (s.startsWith('WITH expired AS') && s.includes('FROM svti_dead_letter_purges')) {
 				const cutoff = nowFn() - values[0];
@@ -349,7 +351,7 @@ describe('postgres dead-letter store', () => {
 		let held = false;
 		client.query = async (sql, values) => {
 			const result = await query(sql, values);
-			if (sql.trim().startsWith('WITH heaviest AS') && !held) {
+			if (sql.trim().startsWith('SELECT scope, records,') && !held) {
 				held = true; entered(); await blocked;
 			}
 			return result;
@@ -371,7 +373,7 @@ describe('postgres dead-letter store', () => {
 			...base,
 			async query(sql, values) {
 				const s = sql.replace(/\s+/g, ' ').trim();
-				if (s.startsWith('WITH heaviest AS')) {
+				if (s.startsWith('SELECT scope, records,')) {
 					throw new Error('deadlock detected');
 				}
 				return base.query(sql, values);
@@ -479,17 +481,22 @@ describe('postgres dead-letter fair-share eviction', () => {
 		]);
 	});
 
-	it('issues one trim statement per capture once the excess is gone', async () => {
+	it('reads the counts once and deletes once per capture over the cap, and never deletes under it', async () => {
 		store = createDeadLetter(client, { autoMigrate: false, max: 3, cleanupInterval: 0 });
-		for (let n = 0; n < 3; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
 		const query = client.query.bind(client);
-		let trims = 0;
+		const issued = [];
 		client.query = async (sql, values) => {
-			if (String(sql.text ?? sql).trim().startsWith('WITH heaviest AS')) trims++;
+			const text = String(sql.text ?? sql).trim();
+			if (text.startsWith('SELECT scope, records,')) issued.push('counts');
+			if (text.startsWith('WITH victims AS')) issued.push(['delete', ...values]);
 			return query(sql, values);
 		};
+		for (let n = 0; n < 3; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		expect(issued).toEqual(['counts', 'counts', 'counts']);
+		issued.length = 0;
 		await store.add(rec({ topic: '@t/noisy/orders', data: { n: 3 } }));
-		expect(trims).toBe(1);
+		// The scope and the row count are bound values, never subqueries.
+		expect(issued).toEqual(['counts', ['delete', 'noisy', 1]]);
 		expect(await store.count()).toBe(3);
 	});
 
@@ -498,9 +505,12 @@ describe('postgres dead-letter fair-share eviction', () => {
 		store = createDeadLetter(client, { autoMigrate: false, max: 1, cleanupInterval: 0, metrics });
 		await store.add(rec({ topic: '@t/a/orders' }));
 		const query = client.query.bind(client);
-		let failCommit = true;
+		// Fail the commit of the first cleanup pass that evicted.
+		let evicting = false, failed = false;
 		client.query = async (sql, values) => {
-			if (failCommit && String(sql.text ?? sql).trim() === 'COMMIT') { failCommit = false; throw new Error('connection lost'); }
+			const text = String(sql.text ?? sql).trim();
+			if (text.startsWith('WITH victims AS')) evicting = true;
+			if (evicting && !failed && text === 'COMMIT') { failed = true; throw new Error('connection lost'); }
 			return query(sql, values);
 		};
 		expect(await store.add(rec({ topic: '@t/a/orders' }))).not.toBeNull();
@@ -647,6 +657,31 @@ describe('postgres dead-letter erasure fences', () => {
 		expect(await store.add(fencedRecord({ topic: '@t/acme/orders', startedAt: monotonicNow() }))).not.toBeNull();
 		expect(await store.purgeUser('acme', 'u1')).toBe(1);
 		expect(begins).toEqual(['BEGIN ISOLATION LEVEL READ COMMITTED', 'BEGIN ISOLATION LEVEL READ COMMITTED']);
+	});
+
+	it('pins read committed for every statement that changes the scope counts', async () => {
+		// Unfenced captures, remove, clear and the retention pass all write
+		// rows whose triggers update shared per-scope count rows.
+		store.destroy();
+		store = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0, max: 1 });
+		const begins = [];
+		const writes = [];
+		let open = false;
+		const query = client.query.bind(client);
+		client.query = async (sql, values) => {
+			const text = (typeof sql === 'string' ? sql : sql.text).replace(/\s+/g, ' ').trim();
+			if (text.startsWith('BEGIN')) { begins.push(text); open = true; }
+			if (text === 'COMMIT' || text === 'ROLLBACK') open = false;
+			if (/^(INSERT INTO svti_dead_letter |DELETE FROM svti_dead_letter|WITH (victims|expired) AS)/.test(text)) writes.push(open);
+			return query(sql, values);
+		};
+		const first = await store.add(rec({ topic: '@t/acme/orders' }));
+		await store.add(rec({ topic: '@t/acme/orders' }));
+		await store.remove(first);
+		await store.clear();
+		// Two captures, one eviction, remove and clear, none in autocommit.
+		expect(writes).toEqual([true, true, true, true, true]);
+		expect(new Set(begins)).toEqual(new Set(['BEGIN ISOLATION LEVEL READ COMMITTED']));
 	});
 
 	it('binds an integer start for a delivery that claims an absurdly early start', async () => {

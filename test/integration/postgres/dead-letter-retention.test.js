@@ -130,7 +130,7 @@ describe('bounded PostgreSQL dead-letter retention', () => {
 				return {
 					async query(sql, values) {
 						const result = await tx.query(sql, values);
-						if (sql.text?.trim().startsWith('WITH heaviest AS') && hold) {
+						if (sql.text?.trim().startsWith('SELECT scope, records,') && hold) {
 							hold = false; entered(); await blocked;
 						}
 						return result;
@@ -215,6 +215,23 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 		expect(await dlq.count({ topic: '@t/fresh/orders' })).toBe(4);
 		expect((await dlq.list({ topic: '@t/earlier/orders' })).map(r => r.failedAt)).toEqual([6, 5, 4, 3]);
 		expect(await scopeCounts()).toEqual([{ scope: '', records: 4 }, { scope: 'fresh', records: 4 }]);
+	});
+
+	it('captures concurrently for one tenant under a repeatable-read default', async () => {
+		const strict = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, options: { max: 8, options: '-c default_transaction_isolation=repeatable\\ read' } });
+		try {
+			expect((await strict.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation).toBe('repeatable read');
+			const dlq = store(strict, { max: 5, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+			await dlq.ready();
+			// Every capture updates the same count row; half of them are fenced.
+			const ids = await Promise.all(Array.from({ length: 40 }, (_, n) => dlq.add({ ...record(), topic: '@t/noisy/orders', data: n % 2 ? { n, user: 'u' + n } : { n } })));
+			expect(ids.every(id => /^\d+$/.test(id))).toBe(true);
+			await dlq.clear();
+			expect(await scopeCounts()).toEqual([]);
+		} finally {
+			for (const item of stores.splice(0)) item.destroy();
+			await strict.end();
+		}
 	});
 
 	it('refuses readiness when a scope-count trigger is disabled', async () => {

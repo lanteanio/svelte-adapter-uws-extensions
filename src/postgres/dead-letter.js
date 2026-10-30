@@ -49,8 +49,8 @@
  * under `max / scopes present` never loses records to another scope's
  * overflow. `scope` is the tenant scope the erasure fences use (`~` for an
  * untenanted topic, `''` for a malformed tenant topic and for rows written
- * before the column existed). Each trim statement reads the per-scope counts
- * and walks the (scope, id) index, never the whole record table.
+ * before the column existed). A size trim reads the per-scope counts and
+ * deletes through the (scope, id) index, never walking the whole record table.
  * Writes and periodic maintenance share bounded cleanup transactions; large
  * backlogs drain over multiple passes. Reads exclude expired records even while
  * physical deletion is pending. Replica maintenance uses a per-table lock.
@@ -78,10 +78,15 @@ import { withTransaction } from '../shared/pg-tx.js';
 // residual every backend shares.
 const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 
-// Captures and purges read fences and records after waiting on the erasure
-// lock. Under a repeatable-read default the snapshot would predate the wait
-// and miss a fence or capture committed during it, so pin read committed.
-const FENCE_TX = { isolation: 'read committed' };
+// Every statement that adds or deletes records runs at read committed,
+// whatever the server or role default. Captures and purges read fences and
+// records after waiting on the erasure lock, and under a repeatable-read
+// snapshot they would miss a fence or capture committed during the wait.
+// The scope-count triggers update one row per tenant scope that concurrent
+// writers share; under repeatable read, a row another transaction changed
+// after the snapshot fails the statement with a serialization error, while
+// read committed waits for that writer and applies the change on top.
+const READ_COMMITTED_TX = { isolation: 'read committed' };
 import { defineOptions, option } from '../shared/options.js';
 
 /**
@@ -201,29 +206,28 @@ export function createDeadLetter(client, options = {}) {
 			if (count < limit) break;
 		}
 	}
-	// Fair-share size trim. Each statement reads the per-scope counts (one row
-	// per scope holding records) and deletes the oldest ids of the largest
-	// scope, at most down to the runner-up's count so the next statement can
-	// pick the largest again, through the (scope, id) index. Every deleted row
-	// returns the excess the statement started from, so the loop stops without
-	// a further statement once the excess is gone. Returns the rows evicted.
+	// Fair-share size trim. A read of the per-scope counts (one row per scope
+	// holding records) names the largest scope, the excess over `max` and the
+	// runner-up's count; the delete then takes that scope's oldest ids, at most
+	// down to the runner-up so the next round can pick the largest again. The
+	// delete binds the scope and the row count as values, so the planner walks
+	// the (scope, id) index for exactly those rows instead of estimating an
+	// unknown limit. Under the cap the delete is skipped. Returns the rows
+	// evicted.
 	async function trimSize(budget) {
 		let evicted = 0;
 		while (budget.available) {
-			const { rows } = await budget.removeReturning(`WITH heaviest AS (
-				SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess,
+			const { rows: [heaviest] } = await budget.query(`SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess,
 				       lead(records) OVER (ORDER BY records DESC, scope) AS runner_up
-				  FROM ${scopeTable} ORDER BY records DESC, scope LIMIT 1
-			), victims AS (
-				SELECT ${pkCol} FROM ${table}
-				 WHERE scope = (SELECT scope FROM heaviest)
-				 ORDER BY ${pkCol}
-				 LIMIT (SELECT GREATEST(0, LEAST(excess, $2::bigint, GREATEST(1, records - COALESCE(runner_up, 0)))) FROM heaviest)
-				   FOR UPDATE SKIP LOCKED
-			) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}
-			  RETURNING (SELECT excess FROM heaviest) AS excess`, [max, budget.limit]);
-			evicted += rows.length;
-			if (rows.length === 0 || rows.length >= Number(rows[0].excess)) break;
+				  FROM ${scopeTable} ORDER BY records DESC, scope LIMIT 1`, [max]);
+			const excess = heaviest ? Number(heaviest.excess) : 0;
+			if (excess <= 0) break;
+			const take = Math.min(excess, budget.limit, Math.max(1, Number(heaviest.records) - Number(heaviest.runner_up ?? 0)));
+			const count = await budget.remove(`WITH victims AS (
+				SELECT ${pkCol} FROM ${table} WHERE scope = $1 ORDER BY ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}`, [heaviest.scope, take]);
+			evicted += count;
+			if (count === 0 || count >= excess) break;
 		}
 		return evicted;
 	}
@@ -248,6 +252,7 @@ export function createDeadLetter(client, options = {}) {
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
 		success: () => b?.success(), failure: error => pgFailure(b, error),
 		committed: evicted => { if (evicted > 0) mEvicted?.inc({ store: 'postgres' }, evicted); },
+		isolation: READ_COMMITTED_TX.isolation,
 		async work(budget) {
 			const expiredFirst = ttlFirst;
 			ttlFirst = !ttlFirst;
@@ -286,20 +291,21 @@ export function createDeadLetter(client, options = {}) {
 				try { const u = forgetUserId(rec); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
 			}
 			// A record with no user, or whose topic is a malformed tenant topic no
-			// purge scope contains, cannot be fenced: one autocommit INSERT. The
-			// row's scope column is the same tenant scope ('' for a malformed
-			// topic) and drives fair-share eviction.
+			// purge scope contains, cannot be fenced: a transaction with one
+			// INSERT, at read committed for the scope-count trigger. The row's
+			// scope column is the same tenant scope ('' for a malformed topic)
+			// and drives fair-share eviction.
 			const tenantScope = topicTenantScope(rec.topic);
 			const scope = userId === null ? null : tenantScope;
 			const values = [rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId, tenantScope ?? ''];
 			const res = await withBreaker(b, () => scope === null
-				? client.query(
+				? withTransaction(client, (tx) => tx.query(
 					`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope)
 					 VALUES ($1, $2, $3, $4, $5, $6,
 					         LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint),
 					         $8, $9) RETURNING ${pkCol}`,
 					values
-				)
+				), READ_COMMITTED_TX)
 				: withTransaction(client, async (tx) => {
 					// Under the lock purgeUser takes, this capture either commits first
 					// (and the purge deletes it) or sees the purge's committed fence.
@@ -328,7 +334,7 @@ export function createDeadLetter(client, options = {}) {
 						  ) RETURNING ${pkCol}`,
 						values
 					);
-				}, FENCE_TX));
+				}, READ_COMMITTED_TX));
 			// No row: a purge ran while this delivery was in flight.
 			if (res.rows.length === 0) return null;
 			// The row is committed. Retention trims are best-effort from here:
@@ -349,7 +355,7 @@ export function createDeadLetter(client, options = {}) {
 		/** @param {string} id @returns {Promise<boolean>} */
 		async remove(id) {
 			await ensureTable();
-			const res = await withBreaker(b, () => client.query(`DELETE FROM ${table} WHERE ${pkCol} = $1`, [id]));
+			const res = await withBreaker(b, () => withTransaction(client, (tx) => tx.query(`DELETE FROM ${table} WHERE ${pkCol} = $1`, [id]), READ_COMMITTED_TX));
 			return res.rowCount > 0;
 		},
 
@@ -424,12 +430,12 @@ export function createDeadLetter(client, options = {}) {
 					[userId, scope.value]
 				);
 				return res.rowCount || 0;
-			}, FENCE_TX));
+			}, READ_COMMITTED_TX));
 		},
 
 		async clear() {
 			await ensureTable();
-			await withBreaker(b, () => client.query(`DELETE FROM ${table}`));
+			await withBreaker(b, () => withTransaction(client, (tx) => tx.query(`DELETE FROM ${table}`), READ_COMMITTED_TX));
 		},
 
 		/** Stop retention maintenance. */

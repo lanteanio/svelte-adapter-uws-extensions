@@ -25,7 +25,10 @@ describe('dead-letter capture survives database housekeeping errors', () => {
 		store = createDeadLetter(client, { table, max: 1, ttlMs: 60000, cleanupInterval: 0, breaker });
 		await store.add(record());
 		await client.query(`TRUNCATE ${table}`);
-		const fragment = phase === 'ttl' ? 'failed_at <' : 'runner_up';
+		// One stored record puts the capture over the cap, so the size trim deletes.
+		const seeded = (await client.query(`INSERT INTO ${table} (topic, failed_at, data, scope)
+			VALUES ('room', (extract(epoch from now()) * 1000)::bigint, '{"retained": true}', '~') RETURNING ${table}_id::text AS id`)).rows[0].id;
+		const fragment = phase === 'ttl' ? 'failed_at <' : 'WITH victims';
 		await client.query(`CREATE FUNCTION svti_dlq_trim_failure() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			IF strpos(current_query(), '${fragment}') > 0 THEN
@@ -36,8 +39,9 @@ describe('dead-letter capture survives database housekeeping errors', () => {
 		await client.query(`CREATE TRIGGER reject_retention BEFORE DELETE ON ${table} FOR EACH STATEMENT EXECUTE FUNCTION svti_dlq_trim_failure()`);
 		const id = await store.add(record());
 		expect(id).toMatch(/^\d+$/);
-		const rows = (await client.query(`SELECT ${table}_id::text AS id, data FROM ${table}`)).rows;
-		expect(rows).toEqual([{ id, data: { retained: true } }]);
+		// The failed pass rolled back, so neither record was evicted.
+		const rows = (await client.query(`SELECT ${table}_id::text AS id, data FROM ${table} ORDER BY ${table}_id`)).rows;
+		expect(rows).toEqual([{ id: seeded, data: { retained: true } }, { id, data: { retained: true } }]);
 		if (breaker) expect(breaker.state).toBe('broken');
 	});
 	it('rejects an insert that PostgreSQL refuses without returning a capture receipt', async () => {

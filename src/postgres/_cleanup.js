@@ -7,7 +7,8 @@ const pendingCheckouts = new WeakSet();
 
 // Only retention work uses this transaction namespace. The table OID resolves
 // through the same search_path as its DELETE, including custom table names.
-export async function runCleanupPass(client, table, work, stopped = () => false) {
+// isolation 'read committed' pins that level whatever the server default.
+export async function runCleanupPass(client, table, work, stopped = () => false, isolation) {
 	if (pendingCheckouts.has(client)) return { result: 'waiting', rows: 0 };
 	const controller = new AbortController();
 	const timeout = setTimer(() => controller.abort(), PASS_MS);
@@ -43,7 +44,7 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 		const deadline = monotonicNow() + PASS_MS;
 		const workDeadline = deadline - 100;
 		const query = (text, values) => tx.query({ text, values, query_timeout: Math.max(1, Math.ceil(deadline - monotonicNow())) });
-		await query('BEGIN');
+		await query(isolation === 'read committed' ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN');
 		await query("SELECT set_config('statement_timeout', '1000', true), set_config('lock_timeout', '100', true)");
 		const lock = await query('SELECT pg_try_advisory_xact_lock(1937134697, $1::regclass::oid::integer) AS acquired', [table]);
 		if (!lock.rows[0]?.acquired) {
@@ -62,13 +63,9 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 				return query(text, values);
 			},
 			async remove(text, values) {
-				return (await this.removeReturning(text, values)).rowCount || 0;
-			},
-			// A deleting statement whose RETURNING rows the caller reads.
-			async removeReturning(text, values) {
 				const result = await this.query(text, values);
 				rows += result.rowCount || 0;
-				return result;
+				return result.rowCount || 0;
 			}
 		};
 		const detail = await work(budget);
@@ -89,7 +86,7 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 }
 
 // `committed(detail)` receives what `work` returned, once its pass committed.
-export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work, committed, coalesce = false }) {
+export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work, committed, isolation, coalesce = false }) {
 	if (!Number.isInteger(interval) || interval < 0 || interval > 2147483647) {
 		throw new Error('postgres cleanup: cleanupInterval must be an integer between 0 and 2147483647');
 	}
@@ -120,7 +117,7 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 			if (healthy && !healthy()) return;
 			await ready();
 			if (stopped) return;
-			const result = await runCleanupPass(client, table, work, () => stopped);
+			const result = await runCleanupPass(client, table, work, () => stopped, isolation);
 			runs?.inc({ store: kind, result: result.result });
 			if (result.rows) removed?.inc({ store: kind }, result.rows);
 			if (result.detail !== undefined) committed?.(result.detail);
