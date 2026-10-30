@@ -20,6 +20,7 @@ import { breakerStates } from './breaker-observation.js';
 import { MAX_BREAKER_LISTENERS, MAX_BREAKER_KEYS } from './caps.js';
 import { setTimer, clearTimer } from './runtime.js';
 import { EXTENSIONS_ERROR_IDS, extensionsError } from '../error-registry.js';
+import { defineOptions, option, timerCeiling } from './options.js';
 
 export class CircuitBrokenError extends Error {
 	constructor() {
@@ -95,7 +96,20 @@ export async function withBreaker(b, fn, key) {
 	}
 }
 
+const validateOptions = defineOptions({
+	factory: 'createCircuitBreaker',
+	label: 'circuit breaker',
+	types: 'CircuitBreakerOptions in shared/breaker.d.ts'
+}, {
+	failureThreshold: option.known,
+	// Arms the probe timer.
+	resetTimeout: timerCeiling(),
+	probeConcurrency: option.known,
+	onStateChange: option.function
+});
+
 export function createCircuitBreaker(options = {}) {
+	validateOptions(options);
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetTimeout = options.resetTimeout ?? 30000;
 	const probeConcurrency = options.probeConcurrency ?? 1;

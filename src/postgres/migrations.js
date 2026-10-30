@@ -1,6 +1,7 @@
 import { schemaFor } from './_schema.js';
 import { schemaExpression } from './_schema-expression.js';
 import { monotonicNow, setTimer } from '../shared/runtime.js';
+import { defineOptions, option } from '../shared/options.js';
 
 const LEDGER = 'svti_schema_migrations';
 const LOCK = "hashtextextended(current_database() || ':' || current_schema() || ':svti_schema_migrations', 0)";
@@ -12,13 +13,33 @@ const LOCK = "hashtextextended(current_database() || ':' || current_schema() || 
 // or an explicit migrate() with raised bounds is the remedy.
 const boundedDdl = new WeakSet();
 
+const TYPES = 'PostgresSchemaOptions in postgres/index.d.ts';
+const schemaOptionsFor = (factory) => defineOptions({ factory, label: 'postgres migrations', types: TYPES }, {
+	store: option.known,
+	table: option.known
+});
+const validateInspectOptions = schemaOptionsFor('postgresMigrations');
+const validateCatalogOptions = schemaOptionsFor('validateSchema');
+const validateMigrateOptions = defineOptions({
+	factory: 'migrate',
+	label: 'postgres migrations',
+	types: 'PostgresMigrationOptions in postgres/index.d.ts'
+}, {
+	store: option.known,
+	table: option.known,
+	statementTimeoutMs: option.known,
+	lockTimeoutMs: option.known
+});
+
 /** Inspect the ordered SQL and checksums without connecting to a database. */
 export function postgresMigrations(options) {
+	validateInspectOptions(options);
 	return schemaFor(options).versions;
 }
 
 /** Apply resumable migrations using a schema-owner connection. Existing data is never repaired or discarded. */
 export async function migrate(client, options) {
+	validateMigrateOptions(options);
 	const schema = schemaFor(options);
 	const statementTimeoutMs = options.statementTimeoutMs ?? 30000;
 	const lockTimeoutMs = options.lockTimeoutMs ?? 5000;
@@ -132,6 +153,7 @@ async function validateColumns(client, schema, known = schema) {
 
 /** Inspect only catalogs; safe for a runtime role with no schema-creation privileges. */
 export async function validateSchema(client, options) {
+	validateCatalogOptions(options);
 	const schema = schemaFor(options);
 	const query = (text, values) => client.query({ text, values, query_timeout: 10000 }, undefined, { signal: AbortSignal.timeout(10000) });
 	const ledger = await query('SELECT to_regclass($1) IS NOT NULL AS present', [LEDGER]);

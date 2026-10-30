@@ -17,6 +17,7 @@
 
 import { PRESSURE_REASON_CODES } from 'svelte-adapter-uws/observability';
 import { admissionRateReader } from './_publish-rate-admission.js';
+import { defineOptions, option } from './options.js';
 
 /**
  * Every pressure reason the adapter can report, in the adapter's own order,
@@ -64,6 +65,17 @@ const REASONS_FOR_DOC = PRESSURE_REASONS.join(', ');
  * @property {(className: string, platform: { readonly pressure: PressureSnapshot }, opts?: { topic?: string }) => boolean} shouldAccept
  */
 
+const validateOptions = defineOptions({
+	factory: 'createAdmissionControl',
+	label: 'admission control',
+	types: 'AdmissionControlOptions in shared/admission.d.ts'
+}, {
+	classes: option.known,
+	aggregator: option.known,
+	clock: option.known,
+	metrics: option.collaborator
+});
+
 /**
  * Create an admission controller.
  *
@@ -90,6 +102,7 @@ export function createAdmissionControl(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('admission control: options object is required');
 	}
+	validateOptions(options);
 	const { classes, metrics, aggregator, clock } = options;
 	if (!classes || typeof classes !== 'object') {
 		throw new Error('admission control: classes is required and must be an object');

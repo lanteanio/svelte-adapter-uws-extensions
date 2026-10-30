@@ -28,6 +28,7 @@ import {
 	withTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /**
  * @typedef {Object} NotifyBridgeOptions
@@ -108,10 +109,29 @@ import {
 // sent through the client's query route while the session is idle.
 const SESSION_PROBE_TIMEOUT_MS = 5000;
 
+const validateOptions = defineOptions({
+	factory: 'createNotifyBridge',
+	label: 'notify bridge',
+	types: 'NotifyBridgeOptions in postgres/notify.d.ts'
+}, {
+	channel: option.known,
+	parse: option.known,
+	autoReconnect: option.boolean,
+	reconnectInterval: option.known,
+	multiListener: option.known,
+	lockId: option.known,
+	pollInterval: option.known,
+	maxEnvelopeBytes: option.known,
+	allowSystemTopics: option.boolean,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 export function createNotifyBridge(client, options) {
 	if (!options || typeof options.channel !== 'string' || options.channel.length === 0) {
 		throw new Error('notify bridge: channel must be a non-empty string');
 	}
+	validateOptions(options);
 
 	const channel = options.channel;
 	// Validate the channel name against the same `[a-zA-Z_][a-zA-Z0-9_]*`

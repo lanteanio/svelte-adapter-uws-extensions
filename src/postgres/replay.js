@@ -46,6 +46,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
 import { replayHasHole } from '../shared/replay-envelope.js';
+import { defineOptions, option } from '../shared/options.js';
 export { ReplayStorageError, ReplaySerializationError };
 
 /**
@@ -108,6 +109,23 @@ const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
  * @property {() => void} destroy - Stop cleanup timer
  */
 
+const validateOptions = defineOptions({
+	factory: 'createReplay',
+	label: 'postgres replay',
+	types: 'PgReplayOptions in postgres/replay.d.ts'
+}, {
+	table: option.known,
+	size: option.known,
+	ttl: option.known,
+	autoMigrate: option.boolean,
+	cleanupInterval: option.known,
+	localFanoutOnStorageFailure: option.known,
+	maxDataBytes: option.known,
+	forgetUserId: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed replay buffer.
  *
@@ -116,6 +134,7 @@ const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
  * @returns {PgReplayBuffer}
  */
 export function createReplay(client, options = {}) {
+	validateOptions(options);
 	if (options.size !== undefined) {
 		if (typeof options.size !== 'number' || options.size < 1 || !Number.isInteger(options.size)) {
 			throw new Error(`postgres replay: size must be a positive integer, got ${options.size}`);

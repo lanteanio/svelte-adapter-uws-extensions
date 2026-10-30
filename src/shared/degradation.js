@@ -14,6 +14,8 @@
 // breaker per bus, so the bus IS the failure class). A function form covers dynamic
 // policies that vary the mitigation by the transition.
 
+import { defineOptions, option } from './options.js';
+
 /** Default de-herd cap: spread retries across a quarter of the cooldown, capped here. */
 const DEFAULT_JITTER_CAP_MS = 5000;
 /** Hard ceiling on any de-herd window (matches the publish-side cap). */
@@ -116,6 +118,17 @@ function resolveJitter(envelope, explicit) {
  * @property {number} [recoveryJitterMs] - De-herd window for the recovered push.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createDegradationPolicy',
+	label: 'degradation policy',
+	types: 'DegradationSpec in shared/degradation.d.ts'
+}, {
+	mitigation: option.known,
+	jitterMs: option.known,
+	recovery: option.known,
+	recoveryJitterMs: option.known
+});
+
 /**
  * Create a degradation policy. Pass it to `createPubSubBus(client, { breaker,
  * degradationPolicy })`; on a breaker transition the bus calls the policy and ships the
@@ -125,6 +138,7 @@ function resolveJitter(envelope, explicit) {
  * @param {DegradationSpec} [spec]
  */
 export function createDegradationPolicy(spec = {}) {
+	validateOptions(spec);
 	if (typeof spec !== 'object' || spec === null) throw new Error('degradation policy: spec must be an object');
 	assertWindow(spec.jitterMs, 'jitterMs');
 	assertWindow(spec.recoveryJitterMs, 'recoveryJitterMs');

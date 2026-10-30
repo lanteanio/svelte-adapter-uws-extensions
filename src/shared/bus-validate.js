@@ -26,6 +26,7 @@
  */
 
 import { isFramableTopic } from './frame-topic.js';
+import { defineOptions, option } from './options.js';
 
 const DEFAULT_MAX_ENVELOPE_BYTES = 1024 * 1024; // 1 MB
 const MAX_TOPIC_LEN = 256;
@@ -74,6 +75,17 @@ export function isValidBusTopic(topic) {
  *   value rather than a bare sentence.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createBusValidator',
+	label: 'bus validator',
+	types: 'BusValidatorOptions in shared/bus-validate.d.ts'
+}, {
+	maxBytes: option.known,
+	allowSystemTopics: option.boolean,
+	allowedSystemTopics: option.stringArray,
+	label: option.string
+});
+
 /**
  * Build a per-bus validator. Each subscriber holds one instance and
  * calls its methods in the message handler before forwarding to the
@@ -82,6 +94,7 @@ export function isValidBusTopic(topic) {
  * @param {BusValidatorOptions} [options]
  */
 export function createBusValidator(options = {}) {
+	validateOptions(options);
 	// Number.isInteger, not `typeof === 'number' && > 0`: NaN IS a number and
 	// `NaN > 0` is false, so the typeof form quietly selected the 1 MB default
 	// for `0`, `-1`, `'65536'` and `NaN` alike. A deployment that believed it

@@ -27,6 +27,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { randomBytes, wallEpoch } from './shared/runtime.js';
 import { emitRegisteredFailure } from './shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from './error-registry.js';
+import { defineOptions, option } from './shared/options.js';
 
 /** Default cookie name. */
 const DEFAULT_COOKIE_NAME = 'sauws_cap';
@@ -222,10 +223,27 @@ function assertSecretStrength(value, label) {
 	}
 }
 
+const validateOptions = defineOptions({
+	factory: 'capabilityCookie',
+	label: 'capability-cookie',
+	types: 'CapabilityCookieOptions in capability-cookie.d.ts'
+}, {
+	secret: option.known,
+	previousSecret: option.known,
+	ttlSeconds: option.known,
+	cookieName: option.known,
+	// Read as a truthy flag: 0 or '' would drop the Secure attribute.
+	secure: option.boolean,
+	sameSite: option.known,
+	path: option.known,
+	metrics: option.collaborator
+});
+
 export function capabilityCookie(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('capability-cookie: options object is required');
 	}
+	validateOptions(options);
 	const { secret, previousSecret } = options;
 	assertSecretStrength(secret, 'secret');
 	// Either verification key can authorize a cookie; both need the same floor.

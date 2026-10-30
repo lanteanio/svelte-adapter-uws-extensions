@@ -15,6 +15,7 @@ import { ConnectionError } from '../shared/errors.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { defineOptions, option } from '../shared/options.js';
 export { migrate, validateSchema, postgresMigrations, postgresReadiness } from './migrations.js';
 
 const { Pool, Client } = pg;
@@ -35,6 +36,19 @@ const { Pool, Client } = pg;
  * @property {(text: string | import('pg').QueryConfig, values?: any[], options?: { signal?: AbortSignal }) => Promise<import('pg').QueryResult>} query - Run a query
  * @property {() => Promise<void>} end - Stop registered notification bridges, close owned standalone sessions, then close the pool, and remove the `sveltekit:shutdown` listener. When the pool was provided externally, the pool and its sessions stay open (the caller owns the lifecycle).
  */
+
+const validateOptions = defineOptions({
+	factory: 'createPgClient',
+	label: 'postgres',
+	types: 'PgClientOptions in postgres/index.d.ts'
+}, {
+	connectionString: option.string,
+	pool: option.known,
+	autoShutdown: option.boolean,
+	options: option.object,
+	maxInFlight: option.known,
+	metrics: option.collaborator
+});
 
 /**
  * Create a Postgres client.
@@ -64,6 +78,7 @@ export function createPgClient(opts) {
 	if (!opts) {
 		throw new ConnectionError('postgres', 'connectionString or pool is required');
 	}
+	validateOptions(opts);
 	const externalPool = opts.pool;
 	if (externalPool === undefined && !opts.connectionString) {
 		throw new ConnectionError('postgres', 'connectionString or pool is required');

@@ -72,6 +72,7 @@ import {
 	liveTraceContext,
 	runTraceOperation
 } from '../shared/trace-context.js';
+import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
 
@@ -164,6 +165,35 @@ function delay(ms) {
 	return new Promise((resolve) => setTimer(resolve, ms));
 }
 
+const validateOptions = defineOptions({
+	factory: 'createTaskRunner',
+	label: 'postgres tasks',
+	types: 'TaskRunnerOptions in postgres/tasks.d.ts'
+}, {
+	table: option.known,
+	idempotency: option.collaborator,
+	fence: option.known,
+	fenceTtl: option.known,
+	heartbeatInterval: option.known,
+	// These three feed setInterval / setTimeout directly.
+	recoveryInterval: timerCeiling(),
+	recoveryBatchSize: option.known,
+	dispatchInterval: timerCeiling(),
+	dispatchBatchSize: option.known,
+	awaitPollInterval: timerCeiling(),
+	awaitTimeout: option.known,
+	cleanupInterval: option.known,
+	rowTtl: option.known,
+	autoMigrate: option.boolean,
+	maxPayloadBytes: option.known,
+	serializeErrorCause: option.boolean,
+	forgetUserId: option.known,
+	onStateChange: option.known,
+	platform: option.collaborator,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed task runner.
  *
@@ -172,6 +202,7 @@ function delay(ms) {
  * @returns {TaskRunner}
  */
 export function createTaskRunner(client, options = {}) {
+	validateOptions(options);
 	if (options.fenceTtl !== undefined) {
 		if (typeof options.fenceTtl !== 'number' || options.fenceTtl < 1 || !Number.isInteger(options.fenceTtl)) {
 			throw new Error(`postgres tasks: fenceTtl must be a positive integer, got ${options.fenceTtl}`);

@@ -60,6 +60,7 @@ import { operationError } from './errors.js';
 import { scanKeys } from './redis-scan.js';
 import { evalCached } from './eval-cached.js';
 import { topicInTenant, TENANT_TOPIC_NS } from './tenant-topic.js';
+import { defineOptions, option } from './options.js';
 
 // The realtime layer's cluster key shapes (room-owner.js / presence.js /
 // tenant.js). These are wire-frozen: the hashes are written through the raw
@@ -327,6 +328,14 @@ async function purgePresenceRoster(redis, tenantId, userId) {
  * @property {string} reason 'succeeded' | 'vacated'
  */
 
+const validateOptions = defineOptions({
+	factory: 'createForgetStore',
+	label: 'createForgetStore',
+	types: 'ForgetStoreOptions in shared/forget-store.d.ts'
+}, {
+	redis: option.known
+});
+
 /**
  * Compose wired stores into one `{ purgeUser }`. Accepts a named map
  * (`{ registry, idempotency }`) for a labelled breakdown, or an array (labelled
@@ -346,6 +355,7 @@ async function purgePresenceRoster(redis, tenantId, userId) {
  * @returns {{ purgeUser: (tenantId: string | null, userId: string, cascade?: any) => Promise<Record<string, number> | { rowsAffected: Record<string, number>, ownerSuccessions: ForgetOwnerSuccession[], presenceTopics: string[], cursorTopics: string[] }> }}
  */
 export function createForgetStore(stores, options) {
+	validateOptions(options);
 	if (!stores || typeof stores !== 'object') {
 		throw new Error('createForgetStore: pass a map or array of stores');
 	}

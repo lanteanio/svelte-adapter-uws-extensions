@@ -35,6 +35,7 @@ import { randomUuid } from '../shared/runtime.js';
 import { scheduleCleanup } from './_cleanup.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../shared/errors.js';
+import { defineOptions, option } from '../shared/options.js';
 
 export { IdempotencyResultTooLargeError, IdempotencyLeaseLostError };
 
@@ -66,6 +67,21 @@ const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
  * @property {() => void} destroy - Stop the cleanup timer.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createIdempotencyStore',
+	label: 'postgres idempotency',
+	types: 'PgIdempotencyOptions in postgres/idempotency.d.ts'
+}, {
+	table: option.known,
+	ttl: option.known,
+	acquireTtl: option.known,
+	maxResultBytes: option.known,
+	autoMigrate: option.boolean,
+	cleanupInterval: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed idempotency store.
  *
@@ -74,6 +90,7 @@ const DEFAULT_MAX_RESULT_BYTES = 256 * 1024;
  * @returns {PgIdempotencyStore}
  */
 export function createIdempotencyStore(client, options = {}) {
+	validateOptions(options);
 	if (options.ttl !== undefined) {
 		if (typeof options.ttl !== 'number' || options.ttl < 1 || !Number.isInteger(options.ttl)) {
 			throw new Error(`postgres idempotency: ttl must be a positive integer, got ${options.ttl}`);

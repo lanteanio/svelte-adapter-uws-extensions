@@ -67,6 +67,7 @@ const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 // lock. Under a repeatable-read default the snapshot would predate the wait
 // and miss a fence or capture committed during it, so pin read committed.
 const FENCE_TX = { isolation: 'read committed' };
+import { defineOptions, option } from '../shared/options.js';
 
 /**
  * @typedef {Object} PgDeadLetterOptions
@@ -81,6 +82,21 @@ const FENCE_TX = { isolation: 'read committed' };
  * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createDeadLetter',
+	label: 'postgres dead-letter',
+	types: 'PgDeadLetterOptions in postgres/dead-letter.d.ts'
+}, {
+	table: option.known,
+	max: option.known,
+	ttlMs: option.known,
+	autoMigrate: option.boolean,
+	cleanupInterval: option.known,
+	forgetUserId: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed dead-letter store.
  *
@@ -88,6 +104,7 @@ const FENCE_TX = { isolation: 'read committed' };
  * @param {PgDeadLetterOptions} [options]
  */
 export function createDeadLetter(client, options = {}) {
+	validateOptions(options);
 	if (options.max !== undefined && (!Number.isInteger(options.max) || options.max <= 0)) {
 		throw new Error(`postgres dead-letter: max must be a positive integer, got ${options.max}`);
 	}

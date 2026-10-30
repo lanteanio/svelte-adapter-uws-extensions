@@ -40,6 +40,7 @@ import {
 	MAX_ALARM_EXECUTIONS, alarmCapacityError, alarmExecutionsPage, assertAlarmAttempt,
 	assertAlarmFailure, assertAlarmGeneration, assertAlarmRequeue
 } from '../shared/alarm-generation.js';
+import { defineOptions, option } from '../shared/options.js';
 
 const LABEL = 'postgres alarm store';
 const EXECUTION_FIELDS = 'topic, fire_at, meta, generation::text AS generation, attempt::text AS attempt, status, claimed_at::text AS claimed_at, failed_at::text AS failed_at';
@@ -64,6 +65,18 @@ const DEFAULT_DUE_BATCH = 100;
  * @property {{ alarmId?: string, path?: string, tenantId?: string | null } | null} meta
  */
 
+const validateOptions = defineOptions({
+	factory: 'createAlarmStore',
+	label: 'postgres alarm store',
+	types: 'PgAlarmStoreOptions in postgres/alarm-store.d.ts'
+}, {
+	table: option.known,
+	dueBatch: option.known,
+	autoMigrate: option.boolean,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed durable alarm store. Wire it into the realtime layer with
  * `configureAlarm({ store: createAlarmStore(client), leader: () => leader.isLeader() })`.
@@ -72,6 +85,7 @@ const DEFAULT_DUE_BATCH = 100;
  * @param {PgAlarmStoreOptions} [options]
  */
 export function createAlarmStore(client, options = {}) {
+	validateOptions(options);
 	const dueBatch = options.dueBatch ?? DEFAULT_DUE_BATCH;
 	if (!Number.isInteger(dueBatch) || dueBatch < 1) {
 		throw new Error(`postgres alarm store: dueBatch must be a positive integer, got ${dueBatch}`);

@@ -13,6 +13,7 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { defineOptions, option } from '../shared/options.js';
 
 const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const LABEL_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
@@ -511,7 +512,46 @@ export function tokenEquals(presented, expected) {
 	const b = createHash('sha256').update(expected, 'utf8').digest();
 	return timingSafeEqual(a, b);
 }
+
+const validateRegistryOptions = defineOptions({
+	factory: 'createMetrics',
+	label: 'createMetrics',
+	types: 'MetricsOptions in prometheus/index.d.ts'
+}, {
+	// A non-string prefix only failed at the first registration, far from the
+	// configuration that caused it.
+	prefix: option.string,
+	mapTopic: option.known,
+	defaultBuckets: option.numberArray,
+	maxSeries: option.known,
+	maxBuckets: option.known
+});
+
+// The options form of counter() / gauge() / histogram(). The values are judged
+// by the instrument constructors; this adds the unknown-key warning (a counter
+// silently ignored `buckets`) and the one flag read with `=== true`.
+const validateMetricOptions = defineOptions({
+	factory: 'counter() / gauge()',
+	label: 'metric',
+	types: 'MetricOptions in prometheus/index.d.ts'
+}, {
+	labelNames: option.known,
+	maxSeries: option.known
+});
+const validateHistogramOptions = defineOptions({
+	factory: 'histogram()',
+	label: 'metric',
+	types: 'HistogramOptions in prometheus/index.d.ts'
+}, {
+	labelNames: option.known,
+	maxSeries: option.known,
+	buckets: option.known,
+	allowNegative: option.boolean,
+	maxBuckets: option.known
+});
+
 export function createMetrics(options = {}) {
+	validateRegistryOptions(options);
 	const prefix = options.prefix || '';
 	if (options.mapTopic != null && typeof options.mapTopic !== 'function') {
 		throw new Error('createMetrics: mapTopic must be a function');
@@ -567,9 +607,10 @@ export function createMetrics(options = {}) {
 	// self-documenting. A `labelNames` array - or an omitted third arg - keeps
 	// the positional form, so every existing positional call is unchanged. The
 	// options form supersedes any trailing positional args.
-	function resolveMetricArgs(labelNames, positional) {
+	function resolveMetricArgs(labelNames, positional, validate = validateMetricOptions) {
 		if (labelNames != null && typeof labelNames === 'object' && !Array.isArray(labelNames)) {
 			const o = labelNames;
+			validate(o);
 			return {
 				labelNames: o.labelNames,
 				buckets: o.buckets,
@@ -649,7 +690,7 @@ export function createMetrics(options = {}) {
 	}
 
 	function histogram(name, help, labelNames, buckets, allowNegative, maxSeries, maxBuckets) {
-		const a = resolveMetricArgs(labelNames, { buckets, allowNegative, maxSeries, maxBuckets });
+		const a = resolveMetricArgs(labelNames, { buckets, allowNegative, maxSeries, maxBuckets }, validateHistogramOptions);
 		const fullName = prefix + name;
 		if (fullName === droppedCounterName) {
 			throw new Error('prometheus_series_dropped_total is reserved for registry drop accounting');
@@ -789,6 +830,18 @@ const DEFAULT_DURATION_BUCKETS = [1, 10, 60, 300, 1800, 3600, 14400, 86400];
 const DEFAULT_MESSAGE_BUCKETS = [1, 10, 100, 1000, 10000, 100000];
 const DEFAULT_BYTE_BUCKETS = [1024, 65536, 1048576, 16777216, 268435456];
 
+const wirerOptionsFor = (factory) => defineOptions({
+	factory,
+	label: factory,
+	types: 'PublishRateMetricsOptions in prometheus/index.d.ts'
+}, {
+	topN: option.known,
+	// Called at scrape time, where a non-function failed every scrape.
+	mapTopic: option.function
+});
+const validatePublishRateWirerOptions = wirerOptionsFor('wirePublishRateMetrics');
+const validateClusterPublishRateWirerOptions = wirerOptionsFor('wireClusterPublishRateMetrics');
+
 /**
  * Wire `platform.pressure.topPublishers` into per-topic publish-rate gauges.
  *
@@ -801,6 +854,7 @@ const DEFAULT_BYTE_BUCKETS = [1024, 65536, 1048576, 16777216, 268435456];
  * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
  */
 export function wirePublishRateMetrics(platform, metrics, options = {}) {
+	validatePublishRateWirerOptions(options);
 	if (!platform || typeof platform !== 'object') {
 		throw new TypeError('wirePublishRateMetrics: platform is required');
 	}
@@ -856,6 +910,7 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
  * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
  */
 export function wireClusterPublishRateMetrics(aggregator, metrics, options = {}) {
+	validateClusterPublishRateWirerOptions(options);
 	if (!aggregator || typeof aggregator !== 'object') {
 		throw new TypeError('wireClusterPublishRateMetrics: aggregator is required');
 	}

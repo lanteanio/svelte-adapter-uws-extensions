@@ -36,6 +36,7 @@ import {
 	liveTraceContext,
 	runTraceOperation
 } from '../shared/trace-context.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /**
  * @typedef {Object} JobQueueOptions
@@ -55,6 +56,18 @@ import {
  * @property {Date} created_at
  */
 
+const validateOptions = defineOptions({
+	factory: 'createJobQueue',
+	label: 'postgres jobs',
+	types: 'JobQueueOptions in postgres/jobs.d.ts'
+}, {
+	table: option.known,
+	autoMigrate: option.boolean,
+	visibilityTimeout: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Postgres-backed job queue.
  *
@@ -62,6 +75,7 @@ import {
  * @param {JobQueueOptions} [options]
  */
 export function createJobQueue(client, options = {}) {
+	validateOptions(options);
 	const table = options.table || 'svti_jobs';
 	assertSafeTableName(table, 'postgres jobs');
 	const autoMigrate = options.autoMigrate !== false;
