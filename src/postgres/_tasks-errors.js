@@ -93,6 +93,24 @@ export class TaskEnqueueOutcomeUnknownError extends Error {
 }
 
 /**
+ * Thrown by `enqueueOnce()` when every attempt found the receipt for its key
+ * live at insert time and gone or expired by the time it was read. Each
+ * attempt inserted nothing, so retrying the same submission is safe.
+ *
+ * Stable contract: `err.code === 'TASK_ENQUEUE_UNSETTLED'`.
+ */
+export class TaskEnqueueUnsettledError extends Error {
+	constructor(tenantId, taskName, idempotencyKey) {
+		super(`enqueueOnce for task "${taskName}" found its receipt replaced or expiring on every attempt and inserted nothing; retry the same submission`);
+		this.name = 'TaskEnqueueUnsettledError';
+		this.code = 'TASK_ENQUEUE_UNSETTLED';
+		this.tenantId = tenantId;
+		this.taskName = taskName;
+		this.idempotencyKey = idempotencyKey;
+	}
+}
+
+/**
  * Convert an Error (or anything else) into a JSON-safe shape for storage
  * in the tasks table or transport across a worker-thread boundary.
  *

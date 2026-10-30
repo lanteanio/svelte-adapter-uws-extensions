@@ -511,6 +511,19 @@ export class TaskEnqueueOutcomeUnknownError extends Error {
 }
 
 /**
+ * Thrown by `enqueueOnce()` when every attempt found the receipt for its key
+ * live at insert time and gone or expired when read back. Nothing was
+ * inserted; retry the same submission.
+ */
+export class TaskEnqueueUnsettledError extends Error {
+	name: 'TaskEnqueueUnsettledError';
+	code: 'TASK_ENQUEUE_UNSETTLED';
+	tenantId: string | null;
+	taskName: string;
+	idempotencyKey: string;
+}
+
+/**
  * Create a Postgres-backed durable task runner.
  */
 export function createTaskRunner(client: PgClient, options?: TaskRunnerOptions): TaskRunner;

@@ -20,6 +20,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `TASK_AWAIT_TIMEOUT` | PostgreSQL task `await()` | The row exists but did not become terminal within the wait deadline. |
 | `TASK_FENCE_LOST` | PostgreSQL task execution | Another worker owns the task and its canonical outcome was not available before the deadline. |
 | `TASK_ENQUEUE_CONFLICT` | PostgreSQL task `enqueueOnce()` | A live receipt for this tenant, task name and key holds different input or a different owner; nothing was inserted. |
+| `TASK_ENQUEUE_UNSETTLED` | PostgreSQL task `enqueueOnce()` | Every attempt found the key's receipt replaced or expiring before it could be read; nothing was inserted. Retry the same submission. |
 | `TASK_ENQUEUE_OUTCOME_UNKNOWN` | PostgreSQL task `enqueueOnce()` | The reply was lost and the primary could not establish whether the task committed. Retry the same submission with the same key. |
 | `IDEMPOTENCY_RESULT_TOO_LARGE` | Redis and PostgreSQL idempotency | The encoded result exceeds the configured byte cap. |
 | `IDEMPOTENCY_LEASE_LOST` | Redis and PostgreSQL idempotency | The pending slot is no longer owned by this call. |

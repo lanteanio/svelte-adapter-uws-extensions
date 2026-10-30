@@ -57,6 +57,7 @@ import {
 	TaskFenceLostError,
 	TaskEnqueueConflictError,
 	TaskEnqueueOutcomeUnknownError,
+	TaskEnqueueUnsettledError,
 	deserialiseError,
 	serialiseErrorSafe
 } from './_tasks-errors.js';
@@ -79,7 +80,7 @@ import {
 } from '../shared/trace-context.js';
 import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
-export { TaskInFlightError, UnknownTaskError, TaskFenceLostError, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError };
+export { TaskInFlightError, UnknownTaskError, TaskFenceLostError, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError, TaskEnqueueUnsettledError };
 
 // Private control flow: a lost lease is not a terminal handler outcome.
 class AbandonedTaskAttempt {
@@ -1116,7 +1117,7 @@ export function createTaskRunner(client, options = {}) {
 					throw new TaskEnqueueConflictError(tenantId, name, key);
 				}
 			}
-			throw new Error('postgres tasks: enqueueOnce found the receipt for this key replaced or expiring on every attempt and inserted nothing; retry the same submission');
+			throw new TaskEnqueueUnsettledError(tenantId, name, key);
 		},
 
 		async lookupEnqueueReceipt(name, query) {
