@@ -37,12 +37,18 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 	expect(report.statementStats.records.length).toBeGreaterThan(0);
 	expect(report.statementStats.records.some(r => r.calls > 0 && r.shared_blks_hit > 0)).toBe(true);
 	expect((await client.query('SELECT marker FROM public.plan_jobs')).rows).toEqual([{marker:'preserve-existing'}]);
-	expect(report.storage).toHaveLength(11);
+	const relations = ['plan_alarms', 'plan_alarms_executions', 'plan_alarms_generations', 'plan_dead_letter', 'plan_dead_letter_purges', 'plan_dead_letter_scopes', 'plan_idempotency', 'plan_jobs', 'plan_replay', 'plan_replay_seq', 'plan_tasks'];
+	const named = rows => rows.map(row => row.relname ?? row.table).sort();
+	expect(named(report.storage)).toEqual(relations);
 	expect(report.sourceSha256['replay.js']).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.collectorSha256).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.lockfileSha256).toMatch(/^[a-f0-9]{64}$/);
-	expect(report.vacuum).toHaveLength(10);
-	expect(report.afterVacuum).toHaveLength(10);
+	expect(named(report.vacuum)).toEqual(relations);
+	expect(named(report.tableHealth)).toEqual(relations);
+	expect(named(report.afterVacuum)).toEqual(relations);
+	// The dead-letter scope counts take an upsert per capture and a decrement
+	// per trim, but hold one row per scope: vacuum keeps the relation small.
+	expect(Number(report.storage.find(row => row.relname === 'plan_dead_letter_scopes').total_bytes)).toBeLessThan(1024 * 1024);
 	expect(report.afterVacuum.map(row => row.relname)).toEqual(report.tableHealth.map(row => row.relname));
 	for (const row of report.afterVacuum) {
 		expect(Number.isFinite(Number(row.n_dead_tup))).toBe(true);
