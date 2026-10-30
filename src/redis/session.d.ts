@@ -119,8 +119,7 @@ export interface DistributedSessionOptions<T = unknown> {
 	 * `refreshOnGet`): its identity is extracted, indexed, and the record is
 	 * rewritten in the qualified layout with a fresh TTL. One whose identity
 	 * cannot be extracted stays readable but is not extended, and `touch`
-	 * resolves `false` for it. The time the keyspace first saw qualified mode
-	 * is kept at `sess:identity:v1:since`.
+	 * resolves `false` for it.
 	 */
 	forgetIdentity?: (data: T) => ForgetIdentity | null | undefined;
 
@@ -207,9 +206,12 @@ export interface DistributedSession<T = unknown> {
 	 * identity. An invalid `tenantId` throws. Records written before
 	 * qualified mode name no tenant and have no qualified index entry, so
 	 * while one may still exist it rejects with `code: 'ERASURE_INCOMPLETE'`,
-	 * `legacyResidue: true` and the `removed` count: for `ttlMs` after the
-	 * keyspace first saw qualified mode, and while the `forgetUserId` index of
-	 * the same raw user id still lists one.
+	 * `legacyResidue: true` and the `removed` count. The first qualified purge
+	 * scans the keyspace once for such records and keeps the answer at
+	 * `sess:identity:v1:legacy`: none found opens no window, some found opens
+	 * one for `ttlMs`. A store without `forgetIdentity` deletes that answer
+	 * before its first write. Records still listed by the `forgetUserId` index
+	 * of the same raw user id are residue as well.
 	 * Every rejection carries `removed`, the sessions this call revoked.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;

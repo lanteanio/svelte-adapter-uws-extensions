@@ -63,11 +63,15 @@ unknown:
 
 - Postgres tasks: any row with no identity stamp whose `user_id` is this user id
   or is null.
-- Redis sessions: any session in the legacy layout during the first `ttlMs`
-  after the store's keyspace first ran in qualified mode (recorded at
-  `sess:identity:v1:since`), because such sessions carry no index the purge
-  could read; afterwards, a legacy session still listed in the `forgetUserId`
-  index of this user id.
+- Redis sessions: any session in the legacy layout, which carries no index
+  the purge could read. The first qualified purge scans the session keyspace
+  once and records the result at `sess:identity:v1:legacy`; when it found
+  legacy sessions, purges report residue for `ttlMs` after the scan, by which
+  time each has been adopted or has expired. A keyspace without one opens no
+  window. A store created without `forgetIdentity` deletes the record before
+  its first write, so a later qualified purge scans again. Afterwards, a
+  legacy session still listed in the `forgetUserId` index of this user id is
+  residue.
 - Redis registry: a `conns:<userId>` row written by `identify`.
 
 Every other failure rejects with `removed` as well, and `createForgetStore`
@@ -135,7 +139,8 @@ migration ledger.
    them finish and expire. Rows of unknown ownership stay unstamped and keep
    qualified erasures incomplete; do not relabel them as the `null` tenant.
    Legacy sessions are adopted on their next refresh or expire within `ttlMs`
-   (keep `ttlMs` at least as long as before the switch); session purges report
+   (keep `ttlMs` at least as long as before the switch); when the first
+   qualified purge finds legacy sessions, session purges report
    `legacyResidue` until that window has passed. Legacy registry rows expire
    within the registry `ttl`.
 

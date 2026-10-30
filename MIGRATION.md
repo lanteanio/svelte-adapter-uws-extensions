@@ -664,14 +664,19 @@ upgrading.
 ### Redis sessions switching to `forgetIdentity`
 
 **Symptom.** Session `purgeUser` rejects with `code: 'ERASURE_INCOMPLETE'` and
-`legacyResidue: true` for `ttlMs` after the first instance runs the store with
-`forgetIdentity`.
+`legacyResidue: true` for `ttlMs` after the first qualified purge, when the
+keyspace still held sessions written before the switch.
 
 **Why.** Sessions written before the switch carry no tenant and, without
 `forgetUserId`, no index, so the purge cannot show that none of them belongs to
-the user until every one of them has either been adopted or expired. The store
-records the switch time at `sess:identity:v1:since`; keep that key with the
-sessions (`clear()` removes it, which opens the window again).
+the user until every one of them has either been adopted or expired. The first
+qualified purge scans the session keyspace once (a SCAN of the store's prefix
+and one GET per session) and records the result at
+`sess:identity:v1:legacy`; a keyspace with no legacy session opens no window.
+A store without `forgetIdentity` deletes that record before its first write,
+and `clear()` deletes it with the sessions, so the next qualified purge scans
+again. Keep the store's prefix for sessions only: a JSON value of another kind
+under it counts as a legacy session.
 
 **Action.** Stop instances of the earlier release first, and keep `ttlMs` at
 least as long as before the switch. Active sessions are adopted on their next

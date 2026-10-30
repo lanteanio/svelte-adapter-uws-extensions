@@ -32,7 +32,7 @@
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
 import { evalCached, evalCachedName } from '../shared/eval-cached.js';
-import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { execMultiSlot, firstCommandError, isCluster } from '../shared/cluster.js';
 import { MAX_REDIS_PIPELINE_COMMANDS } from '../shared/caps.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { randomBytes, wallEpoch } from '../shared/runtime.js';
@@ -84,7 +84,17 @@ return 0
 // before that increment sees the change after storing its record and deletes
 // the record again. The counter lives long enough for any write in flight.
 const ERASURE_FIELD = 'identity:erasure';
-const SINCE_KEY = 'identity:v1:since';
+const MARKER_KEY = 'identity:v1:legacy';
+
+// Replace the legacy marker only while it holds the exact value written.
+const SETTLE_MARKER = `
+-- SESSION_SETTLE_MARKER
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+`;
 const ERASURE_FENCE_MS = INDEX_GRACE_MS;
 
 // Qualified mode wraps the record the legacy layout would store with the
@@ -468,29 +478,114 @@ export function createDistributedSession(client, options = {}) {
 		throw incompleteIndex(cause);
 	}
 
-	// The time this store's keyspace first saw qualified mode, recorded once
-	// under the reserved `identity:` prefix and kept. A session written in the
-	// legacy layout before then can exist, unindexed, until its TTL runs out,
-	// so a purge reports such residue for `ttlMs` after this time. Memoized
-	// per store; a failed read is retried on the next call.
-	let sinceRead = null;
-	function qualifiedSince() {
-		if (sinceRead) return sinceRead;
-		sinceRead = (async () => {
-			const sinceKey = client.key(keyPrefix + SINCE_KEY);
-			try {
-				await redis.set(sinceKey, String(wallEpoch()), 'NX');
-				const value = Number(await redis.get(sinceKey));
-				breaker?.success();
-				// An unreadable marker counts as just set: the window opens now.
-				return Number.isFinite(value) ? value : wallEpoch();
-			} catch (err) {
-				breaker?.failure(err);
-				throw err;
+	// Whether a session in the legacy layout may still exist in this keyspace.
+	// Such a session names no tenant and has no index a qualified purge can
+	// read. The answer is kept in a marker under the reserved `identity:`
+	// prefix: `clean` when a scan of the keyspace found none, `residue` when
+	// it found some (they are gone `ttlMs` after `since`, since nothing extends
+	// them without adopting them), `scanning` while a scan runs. A missing or
+	// unreadable marker is established by scanning. Every write of a store
+	// without forgetIdentity deletes the marker before its first write, so a
+	// keyspace that went back to legacy writes is scanned again.
+	function markerKey() {
+		return client.key(keyPrefix + MARKER_KEY);
+	}
+
+	function readMarker(raw) {
+		let marker;
+		try { marker = JSON.parse(raw); } catch { return null; }
+		if (!marker || typeof marker !== 'object' || !Number.isFinite(marker.since)) return null;
+		if (marker.state !== 'clean' && marker.state !== 'residue' && marker.state !== 'scanning') return null;
+		return marker;
+	}
+
+	async function legacyMayExist() {
+		let marker;
+		try {
+			marker = readMarker(await redis.get(markerKey()));
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		marker ??= await establishMarker();
+		if (marker.state === 'clean') return false;
+		return wallEpoch() < marker.since + ttlMs;
+	}
+
+	async function establishMarker() {
+		const since = wallEpoch();
+		const scanning = JSON.stringify({ since, state: 'scanning', id: randomBytes(8).toString('hex') });
+		let settled;
+		try {
+			if (await redis.set(markerKey(), scanning, 'NX') === null) {
+				const current = readMarker(await redis.get(markerKey()));
+				// Another purge is establishing it, or did: use its answer.
+				if (current) { breaker?.success(); return current; }
+				// An unreadable marker is replaced.
+				await redis.set(markerKey(), scanning);
 			}
-		})();
-		sinceRead.catch(() => { sinceRead = null; });
-		return sinceRead;
+			const found = await scanForLegacy();
+			const marker = { since, state: found ? 'residue' : 'clean' };
+			// Kept only while it is still this scan's marker: a legacy write
+			// that deleted it meanwhile may have added a session the scan missed.
+			settled = Number(await evalCached(redis, SETTLE_MARKER, 1, markerKey(), scanning, JSON.stringify(marker))) === 1;
+			breaker?.success();
+			return settled ? marker : { since, state: 'residue' };
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+	}
+
+	// One pass over the session keyspace; true at the first record in the
+	// legacy layout. Index hashes and the marker are skipped; corrupt and
+	// empty records read as misses and are skipped as get() skips them.
+	async function scanForLegacy() {
+		const base = client.key(keyPrefix);
+		let found = false;
+		for (const node of isCluster(redis) ? redis.nodes('master') : [redis]) {
+			let cursor = '0';
+			do {
+				const [next, keys] = await node.scan(cursor, 'MATCH', base + '*', 'COUNT', 100);
+				cursor = String(next);
+				const records = keys.filter((k) => {
+					const token = k.slice(base.length);
+					return !token.startsWith('byuser:') && !token.startsWith('identity:');
+				});
+				for (let i = 0; i < records.length && !found; i += PURGE_CHUNK) {
+					const reads = await batch(records.slice(i, i + PURGE_CHUNK).map((k) => ['get', k]));
+					for (const [err, raw] of reads) {
+						if (err) {
+							// A key of another type under the prefix is not a session.
+							if (/WRONGTYPE/.test(String(err.message))) continue;
+							throw err;
+						}
+						if (raw == null || raw === '') continue;
+						let value;
+						try { value = JSON.parse(raw); } catch { continue; }
+						if (unwrapQualified(value) === null) { found = true; break; }
+					}
+				}
+			} while (cursor !== '0' && !found);
+			if (found) break;
+		}
+		return found;
+	}
+
+	// A store without forgetIdentity deletes the marker once before its first
+	// write; a later qualified purge then scans the keyspace again.
+	let markerReleased = false;
+	async function releaseMarker() {
+		if (markerReleased) return;
+		try {
+			await redis.del(markerKey());
+			breaker?.success();
+			markerReleased = true;
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
 	}
 
 	// Adopt a record in the legacy layout where a legacy store would slide it:
@@ -501,7 +596,6 @@ export function createDistributedSession(client, options = {}) {
 	async function adoptLegacy(key, token, raw, value) {
 		let identity;
 		try { identity = readIdentity(forgetIdentity(unwrapData(value)), 'session: forgetIdentity'); } catch { return false; }
-		await qualifiedSince();
 		const epoch = identity !== null ? await indexOwner(identity, token) : null;
 		const wrapped = wrapQualified(identity, raw);
 		let swapped;
@@ -523,7 +617,6 @@ export function createDistributedSession(client, options = {}) {
 	// stores ('' for no data). Resolves whether the record was written.
 	async function writeQualified(key, token, record, onlyExisting) {
 		const identity = record === '' ? null : extractIdentity(unwrapData(JSON.parse(record)));
-		try { await qualifiedSince(); } catch (err) { throw incompleteIndex(err); }
 		const epoch = identity !== null ? await indexOwner(identity, token) : null;
 		const raw = record === '' ? '' : wrapQualified(identity, record);
 		let result;
@@ -658,6 +751,7 @@ export function createDistributedSession(client, options = {}) {
 			mSet?.inc();
 			return;
 		}
+		await releaseMarker();
 		// The index field is written first: a failed index write rejects before
 		// the record exists, so purgeUser can always find what set stored.
 		await indexStored(raw, token);
@@ -804,6 +898,7 @@ export function createDistributedSession(client, options = {}) {
 			await writeQualified(key, token, raw, false);
 			return;
 		}
+		await releaseMarker();
 		// Index first, as in set().
 		await indexStored(raw, token);
 		try {
@@ -838,6 +933,7 @@ export function createDistributedSession(client, options = {}) {
 			await writeQualified(key, token, raw, true);
 			return;
 		}
+		await releaseMarker();
 		if (forgetUserId) {
 			try {
 				const present = Number(await redis.exists(key)) === 1;
@@ -1157,11 +1253,10 @@ export function createDistributedSession(client, options = {}) {
 		}
 		if (qualified && !failure && !residue) {
 			try {
-				// Sessions written in the legacy layout before qualified mode
-				// carry no index this purge could read until their TTL has run
-				// out since the switch; those still listed by a forgetUserId
-				// index are checked one by one.
-				residue = wallEpoch() < (await qualifiedSince()) + ttlMs || await legacyResidue(userId);
+				// Sessions in the legacy layout carry no index this purge could
+				// read; those still listed by a forgetUserId index are checked
+				// one by one.
+				residue = await legacyMayExist() || await legacyResidue(userId);
 			} catch (err) { failure = err; }
 		}
 		if (failure) {

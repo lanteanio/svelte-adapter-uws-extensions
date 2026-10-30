@@ -1178,11 +1178,16 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// DEL iff the stored value matches). Their DEL would otherwise look
 				// like the fence-release script; the markers keep them distinct and
 				// are matched first.
-				if (script.includes('SESSION_ADOPT_RECORD')) {
+				// Session compare-and-set scripts, modelled from their text: an
+				// optional GET comparison guarding one SET, with or without PX.
+				if (script.includes('SESSION_ADOPT_RECORD') || script.includes('SESSION_SETTLE_MARKER')) {
 					const [key, expected, next, ttlMs] = args;
+					const withTtl = script.includes("redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])");
+					if (!withTtl && !script.includes("redis.call('SET', KEYS[1], ARGV[2])")) throw new Error('mock-redis: unmodelled session script');
 					pruneExpiredString(key);
-					if (store.get(key) !== expected) return 0;
-					await r.set(key, next, 'PX', ttlMs);
+					if (script.includes("if redis.call('GET', KEYS[1]) == ARGV[1] then") && store.get(key) !== expected) return 0;
+					if (withTtl) await r.set(key, next, 'PX', ttlMs);
+					else await r.set(key, next);
 					return 1;
 				}
 				if (script.includes('IDEM_ABORT') || script.includes('SESSION_ERASE_RECORD')) {

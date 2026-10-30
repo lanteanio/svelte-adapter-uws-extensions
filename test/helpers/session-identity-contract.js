@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { createDistributedSession } from '../../src/redis/session.js';
 import { createForgetStore } from '../../src/shared/forget-store.js';
 import { scanKeys } from '../../src/shared/redis-scan.js';
@@ -72,10 +72,10 @@ export function sessionIdentityContract(getClient) {
 	const sessions = (extra = {}) => createDistributedSession(getClient(), { ...options, ...extra });
 	const record = (token) => getClient().redis.get(getClient().key('sess:' + token));
 
-	const sinceKey = () => getClient().key('sess:identity:v1:since');
-	// Most cases start long after the store switched to qualified mode, so no
-	// unindexed legacy session can remain.
-	beforeEach(async () => { await getClient().redis.set(sinceKey(), '0'); });
+	const markerKey = () => getClient().key('sess:identity:v1:legacy');
+	// For cases about something else than the switch window: record that the
+	// keyspace's legacy sessions were found long enough ago to have expired.
+	const switchedLongAgo = () => getClient().redis.set(markerKey(), JSON.stringify({ since: 0, state: 'residue' }));
 
 	describe('session tenant-qualified erasure', () => {
 		it('refuses forgetUserId together with forgetIdentity and a non-function extractor', () => {
@@ -127,7 +127,7 @@ export function sessionIdentityContract(getClient) {
 				await expect(s.create({ v: 1 })).rejects.toMatchObject({ code: 'ERASURE_INDEX_INCOMPLETE' });
 				expect(await record('t')).toBeNull();
 			}
-			expect(await scanKeys(getClient().redis, getClient().key('sess:*'))).toEqual([sinceKey()]);
+			expect(await scanKeys(getClient().redis, getClient().key('sess:*'))).toEqual([]);
 		});
 
 		it('stores an explicitly unattributed session without an index entry', async () => {
@@ -214,6 +214,7 @@ export function sessionIdentityContract(getClient) {
 			await legacy.set('old', { legacyUser: '42' });
 			await s.set('new', owner('ta', '42'));
 			await s.set('other', owner('ta', '43'));
+			await switchedLongAgo();
 			// The composed store keeps the committed count.
 			await expect(createForgetStore({ sessions: s }).purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', partialCounts: { sessions: 1 } });
 			expect(await record('new')).toBeNull();
@@ -265,22 +266,109 @@ export function sessionIdentityContract(getClient) {
 			expect(expiries.keys).not.toContain(getClient().key('sess:old'));
 		});
 
-		it('reports residue for ttlMs after the store first ran in qualified mode', async () => {
-			await getClient().redis.del(sinceKey());
+		it('opens no residue window for a keyspace that never held a legacy session', async () => {
+			const s = sessions();
+			await s.set('a', owner('ta', '42'));
+			expect(await s.purgeUser('ta', '42')).toBe(1);
+			expect(await s.purgeUser('ta', 'nobody')).toBe(0);
+			expect(await createForgetStore({ sessions: s }).purgeUser('ta', 'nobody')).toEqual({ sessions: 0 });
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+		});
+
+		it('reports residue for ttlMs while a legacy session found at the switch may remain', async () => {
+			const legacy = createDistributedSession(getClient(), { refreshOnGet: false, ttlMs: 200 });
+			await legacy.set('old', owner('ta', '42'));
 			const s = sessions({ ttlMs: 400 });
 			await s.set('a', owner('ta', '42'));
-			await s.set('b', owner('ta', '43'));
-			// A legacy session written before the switch has no index the purge
-			// can read, so the purge cannot report the user absent yet.
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', legacyResidue: true, removed: 1 });
 			expect(await record('a')).toBeNull();
-			const since = Number(await getClient().redis.get(sinceKey()));
-			expect(since).toBeGreaterThan(0);
+			expect(await record('old')).not.toBeNull();
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'residue' });
 			await new Promise((resolve) => setTimeout(resolve, 450));
-			// The marker is kept; a later store instance reads the same time.
-			await sessions({ ttlMs: 400 }).set('c', owner('ta', '43'));
-			expect(Number(await getClient().redis.get(sinceKey()))).toBe(since);
+			await s.set('b', owner('ta', '43'));
 			expect(await s.purgeUser('ta', '43')).toBe(1);
+		});
+
+		it('scans again after a period of legacy writes', async () => {
+			const s = sessions();
+			expect(await s.purgeUser('ta', '42')).toBe(0);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+			// forgetIdentity switched off: writes without an extractor.
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('old', owner('ta', '42'));
+			// Switched on again, in a running and in a new instance.
+			for (const store of [s, sessions()]) {
+				await expect(store.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', legacyResidue: true });
+			}
+			expect(await record('old')).not.toBeNull();
+		});
+
+		it('keeps the window open when a legacy write lands during the scan', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			const s = sessions();
+			const redis = getClient().redis;
+			const nodes = typeof redis.nodes === 'function' ? redis.nodes('master') : [redis];
+			const scans = nodes.map((node) => node.scan);
+			let fired = false;
+			// The legacy write lands after the scan read its keys.
+			nodes.forEach((node, i) => {
+				node.scan = async function (...args) {
+					const result = await scans[i].apply(this, args);
+					if (!fired) { fired = true; await legacy.set('late', owner('ta', '42')); }
+					return result;
+				};
+			});
+			try {
+				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+			} finally {
+				nodes.forEach((node, i) => { node.scan = scans[i]; });
+			}
+			expect(await record('late')).not.toBeNull();
+		});
+
+		it('adopts a legacy session without bringing back one logged out meanwhile', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('tok', owner('ta', '42'));
+			const s = sessions();
+			const restore = afterNthMulti(getClient().redis, 1, () => legacy.delete('tok'));
+			try {
+				expect(await s.touch('tok')).toBe(false);
+			} finally {
+				restore();
+			}
+			expect(await record('tok')).toBeNull();
+		});
+
+		it('adopts a legacy session without overwriting a replacement written meanwhile', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('tok', owner('ta', '42'));
+			const s = sessions();
+			const restore = afterNthMulti(getClient().redis, 1, () => s.set('tok', owner('tb', '7')));
+			try {
+				expect(await s.touch('tok')).toBe(false);
+			} finally {
+				restore();
+			}
+			expect(await s.get('tok')).toEqual(owner('tb', '7'));
+			expect(await s.purgeUser('tb', '7')).toBe(1);
+		});
+
+		it('deletes a legacy session adopted while its identity was erased', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('tok', owner('ta', '42'));
+			const s = sessions();
+			const eraser = sessions();
+			// The erasure runs after adoption indexed the session and before it
+			// rewrote the record: it sees a legacy record and reports residue.
+			const restore = afterNthMulti(getClient().redis, 1, async () => {
+				await expect(eraser.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+			});
+			try {
+				await expect(s.touch('tok')).rejects.toMatchObject({ code: 'ERASURE_INDEX_INCOMPLETE' });
+			} finally {
+				restore();
+			}
+			expect(await record('tok')).toBeNull();
 		});
 
 		it('reserves the identity: token prefix with and without an extractor', async () => {
