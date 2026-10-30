@@ -989,11 +989,6 @@ export function mockPgClient(options = {}) {
 		}
 
 		// Task clear (default table name)
-		if (/^DELETE FROM \w+_receipts$/.test(sql)) {
-			const before = receiptRows.size;
-			receiptRows.clear();
-			return { rows: [], rowCount: before };
-		}
 		if (sql.startsWith('DELETE FROM svti_tasks') && !sql.includes('WHERE')) {
 			const before = taskRows.size;
 			taskRows.clear();

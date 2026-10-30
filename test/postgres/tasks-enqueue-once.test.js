@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mockPgClient } from '../helpers/mock-pg.js';
-import { createTaskRunner, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError } from '../../src/postgres/tasks.js';
+import { createTaskRunner, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError, TaskEnqueueUnsettledError } from '../../src/postgres/tasks.js';
 import { postgresMigrations } from '../../src/postgres/migrations.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -147,8 +147,8 @@ describe('enqueueOnce', () => {
 			return query(config, ...rest);
 		};
 		const error = await runner.enqueueOnce('send', { tenantId: null, idempotencyKey: 'k' }).catch((e) => e);
-		expect(error).not.toBeInstanceOf(TaskEnqueueOutcomeUnknownError);
-		expect(error.message).toContain('inserted nothing');
+		expect(error).toBeInstanceOf(TaskEnqueueUnsettledError);
+		expect(error).toMatchObject({ code: 'TASK_ENQUEUE_UNSETTLED', tenantId: null, taskName: 'send', idempotencyKey: 'k' });
 		expect(statements).toBe(3);
 	});
 
@@ -214,6 +214,17 @@ describe('enqueueOnce erasure owner', () => {
 		await Promise.all([stamping.ready(), plain.ready()]);
 		await stamping.enqueueOnce('send', { tenantId: 't1', idempotencyKey: 'k', input: 1 });
 		await expect(plain.enqueueOnce('send', { tenantId: 't1', idempotencyKey: 'k', input: 1 })).rejects.toBeInstanceOf(TaskEnqueueConflictError);
+		expect(client._getTaskRows().size).toBe(1);
+	});
+
+	it('rejects the same input bytes owned by another user of the same tenant', async () => {
+		const client = mockPgClient();
+		const first = create(client, { forgetIdentity: () => ({ tenantId: 't1', userId: 'u1' }) });
+		const second = create(client, { forgetIdentity: () => ({ tenantId: 't1', userId: 'u2' }) });
+		await Promise.all([first.ready(), second.ready()]);
+		await first.enqueueOnce('send', { tenantId: 't1', idempotencyKey: 'k', input: 1 });
+		await expect(second.enqueueOnce('send', { tenantId: 't1', idempotencyKey: 'k', input: 1 })).rejects.toBeInstanceOf(TaskEnqueueConflictError);
+		expect(await first.enqueueOnce('send', { tenantId: 't1', idempotencyKey: 'k', input: 1 })).toBeDefined();
 		expect(client._getTaskRows().size).toBe(1);
 	});
 
