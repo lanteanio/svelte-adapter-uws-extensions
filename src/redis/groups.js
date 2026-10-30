@@ -620,7 +620,7 @@ export function createGroup(client, name, options = {}) {
 			}
 		}
 		try {
-			const count = await evalCached(redis, LEAVE_SCRIPT, 1, membersKey, memberId, now(), memberTtlMs);
+			const count = await evalCached(redis, LEAVE_SCRIPT, 1, membersKey, memberId, wallEpoch(), memberTtlMs);
 			b?.success();
 			return count;
 		} catch (err) {

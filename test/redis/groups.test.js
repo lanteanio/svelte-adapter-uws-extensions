@@ -1669,9 +1669,8 @@ describe('redis groups', () => {
 			const ws = mockWs();
 			await g.join(ws, platform);
 
-			const hdel = client.redis.hdel;
 			const pipeline = client.redis.pipeline;
-			client.redis.hdel = async () => { throw new Error('hdel failed'); };
+			const restoreLeave = failNextGroupLeave(client.redis);
 			let retries = 0;
 			client.redis.pipeline = () => {
 				const batch = pipeline.call(client.redis);
@@ -1692,7 +1691,7 @@ describe('redis groups', () => {
 					await flush();
 				}
 			} finally {
-				client.redis.hdel = hdel;
+				restoreLeave();
 				client.redis.pipeline = pipeline;
 				g.destroy();
 			}
@@ -1719,9 +1718,8 @@ describe('redis groups', () => {
 					}
 				});
 			};
-			const hdel = client.redis.hdel;
 			let direct = 0;
-			client.redis.hdel = async (...args) => { direct++; return hdel.apply(client.redis, args); };
+			const restoreLeave = interceptNextGroupLeave(client.redis, (leave, args) => { direct++; return leave(...args); });
 			try {
 				clock.t += 333;
 				heartbeat.cb();
@@ -1732,10 +1730,10 @@ describe('redis groups', () => {
 				await leaving;
 			} finally {
 				client.redis.pipeline = pipeline;
-				client.redis.hdel = hdel;
+				restoreLeave();
 				g.destroy();
 			}
-			// The HDEL went out once the beat settled instead of being queued.
+			// The leave script ran once the beat settled instead of being queued.
 			expect(direct).toBe(1);
 			expect(await client.redis.hgetall(membersKey)).toEqual({});
 		});
