@@ -186,8 +186,9 @@ describeIntegration('redis replay (integration)', () => {
 			expect(platform.sent.at(-1)).toMatchObject({ event: 'end', data: { truncated: true } });
 		});
 
-		it('returns clean for an unknown topic', async () => {
-			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		it('returns clean for an unknown topic at position 0, truncated past it', async () => {
+			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: true, missingFrom: 6 });
 		});
 	});
 
@@ -355,18 +356,93 @@ describeIntegration('redis replay (integration)', () => {
 			const r = createReplay(client, { size: 5, ttl: 600 });
 			await r.publish(platform, 'chat', 'created', { id: 1 });
 
-			const seqTtl = await client.redis.ttl(client.key('replay:seq:{chat}'));
-			const bufTtl = await client.redis.ttl(client.key('replay:buf:{chat}'));
-			expect(seqTtl).toBeGreaterThan(0);
-			expect(bufTtl).toBeGreaterThan(0);
-			expect(seqTtl).toBeLessThanOrEqual(600);
-			expect(bufTtl).toBeLessThanOrEqual(600);
+			// Every key of the topic, the epoch and use stamp included, carries
+			// the same ttl, and a later publish or read never stretches it.
+			const kinds = ['seq', 'buf', 'epoch', 'used'];
+			for (const kind of kinds) {
+				const ttl = await client.redis.ttl(client.key('replay:' + kind + ':{chat}'));
+				expect(ttl, kind).toBeGreaterThan(0);
+				expect(ttl, kind).toBeLessThanOrEqual(600);
+			}
+			await r.publish(platform, 'chat', 'created', { id: 2 });
+			await r.since('chat', 0);
+			await r.seq('chat');
+			for (const kind of kinds) {
+				expect(await client.redis.ttl(client.key('replay:' + kind + ':{chat}')), kind).toBeLessThanOrEqual(600);
+			}
+		});
+
+		it('clearTopic keeps the counter and epoch under the same ttl', async () => {
+			const r = createReplay(client, { size: 5, ttl: 600 });
+			await r.publish(platform, 'chat', 'created', { id: 1 });
+			await r.clearTopic('chat');
+			for (const kind of ['seq', 'epoch', 'used']) {
+				const ttl = await client.redis.ttl(client.key('replay:' + kind + ':{chat}'));
+				expect(ttl, kind).toBeGreaterThan(0);
+				expect(ttl, kind).toBeLessThanOrEqual(600);
+			}
 		});
 
 		it('leaves keys with no TTL when ttl is unset', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 			expect(await client.redis.ttl(client.key('replay:seq:{chat}'))).toBe(-1);
 			expect(await client.redis.ttl(client.key('replay:buf:{chat}'))).toBe(-1);
+		});
+	});
+
+	describe('maxTopics and generations (real Lua)', () => {
+		for (const storage of ['sortedset', 'stream']) {
+			it(`${storage}: evicts the least recently published topic and never reuses its epoch`, async () => {
+				const r = createReplay(client, { storage, size: 5, maxTopics: 2 });
+				await r.publish(platform, 'a', 'created', { id: 1 });
+				await new Promise((resolve) => setTimeout(resolve, 1100));
+				await r.publish(platform, 'b', 'created', { id: 1 });
+				await new Promise((resolve) => setTimeout(resolve, 1100));
+				// A steady publish to a stamps its use in a's own slot.
+				await r.publish(platform, 'a', 'created', { id: 2 });
+				const bEpoch = await r.currentEpoch('b');
+				await new Promise((resolve) => setTimeout(resolve, 1100));
+				await r.publish(platform, 'c', 'created', { id: 1 });
+
+				expect(await r.seq('a')).toBe(2);
+				expect(await r.seq('b')).toBe(0);
+				expect(await r.currentEpoch('b')).toBe(0);
+				expect(await client.redis.zcard(client.key('replay:topics:{replay-topics}'))).toBe(2);
+
+				await r.publish(platform, 'b', 'created', { id: 2 });
+				expect(await r.currentEpoch('b')).toBeGreaterThan(bEpoch);
+				platform.reset();
+				await r.resumeHook()({}, { lastSeenSeqs: { b: 1 }, lastSeenEpochs: { b: bEpoch }, platform });
+				expect(platform.sent.some((s) => s.topic === '__replay:b' && s.event === 'rehydrate')).toBe(true);
+			});
+
+			it(`${storage}: raises the generation counter above epochs stored before it`, async () => {
+				await client.redis.set(client.key('replay:seq:{room}'), '50');
+				await client.redis.set(client.key('replay:epoch:{room}'), '2');
+				await client.redis.set(client.key('replay:epoch:{idle}'), '40');
+				const r = createReplay(client, { storage, size: 5, maxTopics: 1 });
+
+				await r.publish(platform, 'fresh', 'created', { id: 1 });
+				expect(Number(await client.redis.get(client.key('replay:generation:{replay-topics}')))).toBeGreaterThan(40);
+				expect(await r.currentEpoch('fresh')).toBeGreaterThan(40);
+				// Never published since the upgrade, so evicted first.
+				expect(await r.seq('room')).toBe(0);
+
+				await r.publish(platform, 'room', 'created', { id: 1 });
+				expect(await r.currentEpoch('room')).toBeGreaterThan(40);
+			});
+		}
+
+		it('stream: publishIdempotent creates a topic and dedups within its generation', async () => {
+			const r = createReplay(client, { storage: 'stream', size: 5, maxTopics: 1 });
+			const first = await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' });
+			expect(first).toEqual({ seq: 1, isDuplicate: false });
+			expect(await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' }))
+				.toEqual({ seq: 1, isDuplicate: true });
+			await r.publish(platform, 'other', 'created', { id: 1 });
+			// room was evicted: the retry is published into the new generation.
+			const retry = await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' });
+			expect(retry).toEqual({ seq: 1, isDuplicate: false });
 		});
 	});
 

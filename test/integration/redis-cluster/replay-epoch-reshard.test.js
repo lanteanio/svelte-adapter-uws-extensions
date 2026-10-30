@@ -3,10 +3,10 @@
  * the seq space actually resets.
  *
  * The epoch key shares the topic's `{hash-tag}` with seq:/buf:, so a CLUSTER
- * SETSLOT handover MIGRATEs all three together: the seq counter and its buffer
+ * SETSLOT handover MIGRATEs them together: the seq counter and its buffer
  * arrive contiguous on the new owner and the epoch is unchanged, so a resume
  * gap-fills as before. The dangerous case is a handover that drops the keys
- * (the new owner starts seq at 1): the publish Lua's reset edge bumps the epoch
+ * (the new owner starts seq at 1): the publish Lua sets a new generation
  * atomically with re-populating the space, so a client holding the pre-reset
  * epoch is cold-rehydrated instead of being served the new shard's seq numbering
  * (1, 2, ...) as if it continued the old one.
@@ -126,6 +126,7 @@ describe('replay epoch across a topic slot migration (cluster)', () => {
 		const epochKey = client.key('replay:epoch:{' + topic + '}');
 		const seqKey = client.key('replay:seq:{' + topic + '}');
 		const bufKey = client.key('replay:buf:{' + topic + '}');
+		const usedKey = client.key('replay:used:{' + topic + '}');
 		const slot = keySlot(epochKey);
 
 		await replay.publish(platform, topic, 'created', { id: 1 });
@@ -138,7 +139,7 @@ describe('replay epoch across a topic slot migration (cluster)', () => {
 		const toId = [...mastersById.keys()].find((id) => id !== fromId);
 		expect(fromId).toBeTruthy();
 		expect(toId).toBeTruthy();
-		await migrateSlotWithKeys(slot, fromId, toId, [seqKey, bufKey, epochKey]);
+		await migrateSlotWithKeys(slot, fromId, toId, [seqKey, bufKey, epochKey, usedKey]);
 
 		slots = await ctrl.cluster('SLOTS');
 		expect(ownerIdOf(slots, slot)).toBe(toId);
@@ -180,16 +181,16 @@ describe('replay epoch across a topic slot migration (cluster)', () => {
 
 		// Model a lossy handover: the seq + buffer keys are lost (an operator
 		// SETSLOT NODE without MIGRATE on populated keys, or a wipe). The epoch
-		// key has NO ttl and is NOT dropped here, mirroring a real reshard where
-		// only the data keys went missing - the point under test is that the
-		// next publish on the empty seq space restarts at 1 and the in-Lua reset
-		// edge bumps the epoch atomically.
+		// key is NOT dropped here, mirroring a real reshard where only the data
+		// keys went missing - the point under test is that the next publish on
+		// the empty seq space restarts at 1 under a new generation, set in the
+		// same script as the first write.
 		await client.redis.unlink(seqKey, bufKey);
 
 		// New owner issues seq 1, 2 for the same topic. Their seq numbers sit
 		// BELOW the client's lastSeenSeq of 3, so a naive gap-fill would skip
-		// them and the client would silently lose state. The epoch bump on the
-		// seq==1 edge is what forces a cold rehydrate instead.
+		// them and the client would silently lose state. The new generation on
+		// the fresh seq space is what forces a cold rehydrate instead.
 		await replay.publish(platform, topic, 'created', { id: 4 });
 		await replay.publish(platform, topic, 'created', { id: 5 });
 		await waitFor(async () => (await replay.currentEpoch(topic)) !== staleEpoch);

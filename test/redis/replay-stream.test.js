@@ -412,7 +412,7 @@ describe('redis replay (stream backend)', () => {
 			expect(await replay.seq('todos')).toBe(1);
 		});
 
-		it('clear rotates each topic epoch instead of reusing generation 1', async () => {
+		it('clear drops every epoch and never hands an earlier one out again', async () => {
 			await replay.publish(platform, 'chat', 'created', { id: 1 });
 			await replay.publish(platform, 'todos', 'created', { id: 1 });
 			const chatBefore = await replay.currentEpoch('chat');
@@ -420,11 +420,19 @@ describe('redis replay (stream backend)', () => {
 
 			await replay.clear();
 
+			// The seq space and its metadata are gone ...
 			expect(await replay.seq('chat')).toBe(0);
-			// Epoch ADVANCES rather than being deleted and recreated at 1, so a client
-			// that straddled the clear observes a new generation on resume.
-			expect(await replay.currentEpoch('chat')).toBeGreaterThan(chatBefore);
-			expect(await replay.currentEpoch('todos')).toBeGreaterThan(todosBefore);
+			expect(await replay.currentEpoch('chat')).toBe(0);
+			expect(await replay.currentEpoch('todos')).toBe(0);
+			// ... and a republished topic takes a generation above every epoch
+			// handed out before the clear, so no straddling client can match it.
+			await replay.publish(platform, 'chat', 'created', { id: 2 });
+			await replay.publish(platform, 'todos', 'created', { id: 2 });
+			const chatAfter = await replay.currentEpoch('chat');
+			const todosAfter = await replay.currentEpoch('todos');
+			expect(chatAfter).toBeGreaterThan(Math.max(chatBefore, todosBefore));
+			expect(todosAfter).toBeGreaterThan(Math.max(chatBefore, todosBefore));
+			expect(chatAfter).not.toBe(todosAfter);
 		});
 
 		it('a client straddling clear() rehydrates instead of silently seeing contiguity', async () => {
@@ -466,10 +474,13 @@ describe('redis replay (stream backend)', () => {
 			await replay.clearTopic('chat');
 			const after = await replay.currentEpoch('chat');
 			expect(after).toBeGreaterThan(before);
-			// Next publish restarts seq at 1 and bumps again (fresh seq space).
+			// Next publish restarts seq at 1 under the epoch clearTopic set: the
+			// counter is kept at 0, so the publish continues the cleared space
+			// instead of taking another generation, and a client that subscribed
+			// after the clear resumes by gap-fill.
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
 			expect(await replay.seq('chat')).toBe(1);
-			expect(await replay.currentEpoch('chat')).toBeGreaterThan(after);
+			expect(await replay.currentEpoch('chat')).toBe(after);
 		});
 
 		it('exposes the epoch synchronously via cachedEpoch after a read', async () => {
@@ -1168,8 +1179,18 @@ describe('redis replay (stream backend)', () => {
 		it('honors a legacy bare-seq dedup value for one window (backward compatible)', async () => {
 			const idmpKey = client.key('replay:idmp:p1:{chat}');
 			await client.redis.hset(idmpKey, 'r1', '7'); // pre-versioning value, no epoch
+			await client.redis.set(client.key('replay:seq:{chat}'), '7'); // the topic it was written for
 			const res = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
 			expect(res).toEqual({ seq: 7, isDuplicate: true });
+		});
+
+		it('does NOT honor a legacy bare-seq dedup value once the seq space is gone', async () => {
+			// The topic expired or was evicted: the bare seq names an entry of a
+			// numbering that no longer exists, so the request is published anew.
+			const idmpKey = client.key('replay:idmp:p1:{chat}');
+			await client.redis.hset(idmpKey, 'r1', '7');
+			const res = await r.publishIdempotent(platform, 'chat', 'e', { n: 1 }, { producerId: 'p1', requestId: 'r1' });
+			expect(res).toEqual({ seq: 1, isDuplicate: false });
 		});
 
 		it('does NOT honor a legacy bare-seq dedup value once a reset bumped the epoch', async () => {

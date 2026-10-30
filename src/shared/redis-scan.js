@@ -44,10 +44,24 @@ function scanTargets(redis) {
  */
 export async function scanKeys(redis, pattern) {
 	const found = [];
-	for (const node of scanTargets(redis)) {
-		await scanNodeBatches(node, pattern, (keys) => { found.push(...keys); });
-	}
+	await scanEach(redis, pattern, (keys) => { found.push(...keys); });
 	return found;
+}
+
+/**
+ * Visit every key matching `pattern` one SCAN batch at a time, across every
+ * master on a Cluster, without collecting the whole match set in memory.
+ * `onKeys` is awaited before the next batch is fetched.
+ *
+ * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
+ * @param {string} pattern
+ * @param {(keys: string[]) => Promise<void> | void} onKeys
+ * @returns {Promise<void>}
+ */
+export async function scanEach(redis, pattern, onKeys) {
+	for (const node of scanTargets(redis)) {
+		await scanNodeBatches(node, pattern, onKeys);
+	}
 }
 
 /**

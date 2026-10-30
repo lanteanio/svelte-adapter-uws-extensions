@@ -78,6 +78,10 @@ export function decodeStreamFields(fields, seq, topic) {
  * `sinceSeq + 1`). Every seq through the counter was issued with its entry,
  * so a seq absent from that run was trimmed away, expired or stored corrupt:
  * a hole before the first entry, between two entries, or after the last one.
+ * A counter of 0 means the topic has no seq space at all (never published,
+ * cleared, expired or evicted), so a nonzero position names a numbering the
+ * store no longer holds: that is a hole too, and the client must re-read
+ * rather than wait for seqs it will never be sent.
  *
  * @param {ReadonlyArray<{ seq: number }>} entries
  * @param {number} sinceSeq
@@ -85,6 +89,7 @@ export function decodeStreamFields(fields, seq, topic) {
  * @returns {boolean}
  */
 export function replayHasHole(entries, sinceSeq, currentSeq) {
+	if (currentSeq === 0 && sinceSeq > 0) return true;
 	let expected = sinceSeq + 1;
 	for (let i = 0; i < entries.length; i++) {
 		const seq = entries[i].seq;

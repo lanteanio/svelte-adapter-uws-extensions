@@ -26,8 +26,13 @@ describe('replay epoch cache is bounded in every store', () => {
 			try {
 				// clearTopic starts a new generation and caches it, in the order
 				// a, b, c. Reading 'a' makes 'b' the least recently used.
-				for (const topic of ['a', 'b', 'c']) await replay.clearTopic(topic);
-				expect(replay.cachedEpoch('a')).toBe(1);
+				const epochs = {};
+				for (const topic of ['a', 'b', 'c']) {
+					await replay.clearTopic(topic);
+					epochs[topic] = replay.cachedEpoch(topic);
+					expect(epochs[topic]).toBeGreaterThan(0);
+				}
+				expect(replay.cachedEpoch('a')).toBe(epochs.a);
 
 				// One more topic, as a resume presenting many does.
 				await replay.currentEpoch('spray');
@@ -36,8 +41,8 @@ describe('replay epoch cache is bounded in every store', () => {
 				// read falls back to the baseline while the store keeps its real
 				// generation.
 				expect(replay.cachedEpoch('b')).toBe(0);
-				expect(await replay.currentEpoch('b')).toBe(1);
-				expect(replay.cachedEpoch('a')).toBe(1);
+				expect(await replay.currentEpoch('b')).toBe(epochs.b);
+				expect(replay.cachedEpoch('a')).toBe(epochs.a);
 			} finally {
 				replay.destroy?.();
 			}

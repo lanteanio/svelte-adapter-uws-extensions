@@ -16,7 +16,7 @@ export interface RedisReplayOptions {
 	storage?: 'sortedset' | 'stream';
 	/** Max messages per topic. @default 1000 */
 	size?: number;
-	/** TTL in seconds for replay keys (0 = no expiry). @default 0 */
+	/** TTL in seconds for replay keys (0 = no expiry). Every key of a topic, its epoch included, expires after `ttl` seconds without a publish. @default 0 */
 	ttl?: number;
 	/**
 	 * Opt into per-publish replication signalling. After the write,
@@ -77,6 +77,15 @@ export interface RedisReplayOptions {
 	 * @default 262144
 	 */
 	maxDataBytes?: number;
+	/**
+	 * Max number of topics holding replay state, as in the core replay
+	 * plugin: creating a topic past the cap evicts the least recently used
+	 * topic's buffer, sequence counter and epoch. One cap for every instance
+	 * sharing the key prefix. A topic's use is its last publish or
+	 * `clearTopic`; reads do not refresh it.
+	 * @default 100
+	 */
+	maxTopics?: number;
 	/**
 	 * Right-to-erasure: map a buffered event to its authoring userId so
 	 * `live.forget` can drop the user's buffered events (scanned per topic at
@@ -287,12 +296,12 @@ export interface RedisReplayBuffer {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
-	 * Current stored generation of a topic's seq space. A topic whose seq
-	 * space has never reset reads as the baseline `0`. Bumped whenever the
-	 * authoritative seq numbering for the topic restarts (`clearTopic`, a
-	 * seq-key TTL reap, or a publish landing on a fresh/relocated empty seq
-	 * space). The resume hook compares this to the client's presented epoch
-	 * to choose gap-fill (match) or cold-rehydrate (mismatch).
+	 * Current stored generation of a topic's seq space; `0` for a topic with
+	 * no seq space. Replaced by a value never handed out before whenever the
+	 * authoritative seq numbering for the topic restarts (`clearTopic`, or a
+	 * publish creating the topic again after expiry, eviction, `clear()` or a
+	 * lossy reshard). The resume hook compares this to the client's presented
+	 * epoch to choose gap-fill (match) or cold-rehydrate (mismatch).
 	 */
 	currentEpoch(topic: string): Promise<number>;
 

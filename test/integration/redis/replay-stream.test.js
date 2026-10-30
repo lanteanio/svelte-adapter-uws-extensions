@@ -215,8 +215,9 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			expect(platform.sent.at(-1)).toMatchObject({ event: 'end', data: { truncated: true } });
 		});
 
-		it('returns clean for an unknown topic', async () => {
-			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		it('returns clean for an unknown topic at position 0, truncated past it', async () => {
+			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: true, missingFrom: 6 });
 		});
 
 		it('reports truncated when buffer was UNLINKed but seq counter still advanced', async () => {
@@ -268,12 +269,31 @@ describeIntegration('redis replay (stream backend, integration)', () => {
 			const r = createReplay(client, { storage: 'stream', size: 5, ttl: 600 });
 			await r.publish(platform, 'chat', 'created', { id: 1 });
 
-			const seqTtl = await client.redis.ttl(client.key('replay:seq:{chat}'));
-			const bufTtl = await client.redis.ttl(client.key('replay:streambuf:{chat}'));
-			expect(seqTtl).toBeGreaterThan(0);
-			expect(bufTtl).toBeGreaterThan(0);
-			expect(seqTtl).toBeLessThanOrEqual(600);
-			expect(bufTtl).toBeLessThanOrEqual(600);
+			// Every key of the topic, the epoch and use stamp included, carries
+			// the same ttl, and a later publish or read never stretches it.
+			const kinds = ['seq', 'streambuf', 'epoch', 'used'];
+			for (const kind of kinds) {
+				const ttl = await client.redis.ttl(client.key('replay:' + kind + ':{chat}'));
+				expect(ttl, kind).toBeGreaterThan(0);
+				expect(ttl, kind).toBeLessThanOrEqual(600);
+			}
+			await r.publish(platform, 'chat', 'created', { id: 2 });
+			await r.since('chat', 0);
+			await r.seq('chat');
+			for (const kind of kinds) {
+				expect(await client.redis.ttl(client.key('replay:' + kind + ':{chat}')), kind).toBeLessThanOrEqual(600);
+			}
+		});
+
+		it('clearTopic keeps the counter and epoch under the same ttl', async () => {
+			const r = createReplay(client, { storage: 'stream', size: 5, ttl: 600 });
+			await r.publish(platform, 'chat', 'created', { id: 1 });
+			await r.clearTopic('chat');
+			for (const kind of ['seq', 'epoch', 'used']) {
+				const ttl = await client.redis.ttl(client.key('replay:' + kind + ':{chat}'));
+				expect(ttl, kind).toBeGreaterThan(0);
+				expect(ttl, kind).toBeLessThanOrEqual(600);
+			}
 		});
 
 		it('leaves keys with no TTL when ttl is unset', async () => {
