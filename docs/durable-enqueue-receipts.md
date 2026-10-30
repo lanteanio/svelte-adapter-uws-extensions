@@ -78,7 +78,11 @@ establish the outcome, the call rejects with `TaskEnqueueOutcomeUnknownError`
 with the same key; do not generate a replacement key. The runner never falls
 back to `enqueue()` or runs the handler inline. A statement error PostgreSQL
 reports (which rolls the statement back), a validation failure and a local
-admission refusal are ordinary failures with no receipt.
+admission refusal are ordinary failures with no receipt. When the receipt that blocked
+an insert keeps expiring or disappearing before it can be read, the call gives
+up after three attempts with `TaskEnqueueUnsettledError`
+(`TASK_ENQUEUE_UNSETTLED`); nothing was inserted and the same submission can be
+retried.
 
 `lookupEnqueueReceipt()` reads the primary through the runner's client: it
 resolves the live receipt, `null` when none is visible, or rejects when the
@@ -108,8 +112,10 @@ erasure takes exclusively, so an insertion in flight when the erasure starts
 commits first and is erased with the rest. With `forgetIdentity`, unstamped
 receipts that may hold the user make the erasure report
 `ERASURE_INCOMPLETE` with `legacyResidue: true`, as unstamped task rows do.
-Revoke the identity's write authority before erasure and keep it revoked: a
-later authorized request creates a new task, because erasure removes its
+An insertion that arrives while the erasure holds the lock waits for it and
+inserts afterwards, so its task and receipt survive that erasure. Revoke the
+identity's write authority before erasure and keep it revoked: a later
+authorized request creates a new task, because erasure removes its
 deduplication memory. No tombstone is retained.
 
 The `run()` result cache neither supplies nor consumes receipts.
