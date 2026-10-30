@@ -211,8 +211,9 @@ export interface DistributedSession<T = unknown> {
 	 * `sess:identity:v1:legacy`: none found opens no window; some found, a
 	 * scan out of time, or Cluster slots moving during it opens one for
 	 * `ttlMs`. A store without `forgetIdentity` keeps the key
-	 * `sess:identity:v1:legacy-active` alive, on the server's clock, while
-	 * sessions it wrote may live; purges report residue while it exists.
+	 * `sess:identity:v1:legacy-active` alive, on the server's clock, for
+	 * `1.5 * ttlMs` after its last renewal; purges report residue while it
+	 * exists.
 	 * Records still listed by the `forgetUserId` index of the same raw user
 	 * id are residue as well. A write still in flight can land after a purge.
 	 * Every rejection carries `removed`, the sessions this call revoked.

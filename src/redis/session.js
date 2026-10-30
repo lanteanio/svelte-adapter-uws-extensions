@@ -619,31 +619,54 @@ export function createDistributedSession(client, options = {}) {
 	}
 
 	// Coverage of the sessions a store without forgetIdentity writes. Such a
-	// session has no index a qualified purge could read, so before its first
-	// write or slide, and again whenever the coverage it knows of has less
-	// than `ttlMs` left, the store awaits one script that keeps a coverage key
-	// alive for at least `1.5 * ttlMs` on the server's clock. Every session it
-	// writes or slides is then sent while the key outlives it, since a
-	// session lives at most `ttlMs` after its last write. A qualified purge
-	// reports residue while the key exists. The local estimate is measured on
-	// the monotonic clock from before the script was sent, so it never runs
-	// past the server's expiry. The write path costs one awaited round trip
-	// per store instance per `ttlMs / 2` and nothing else.
+	// session has no index a qualified purge could read, so the store keeps a
+	// coverage key alive, on the server's clock, for as long as a session it
+	// wrote or slid may live; a qualified purge reports residue while the key
+	// exists. A session lives at most `ttlMs` after the command that wrote or
+	// slid it reached the server.
+	//
+	// The store renews the key to COVERAGE_TTL = 1.5 * ttlMs. Before a write
+	// or slide it awaits a renewal when its estimate of what is left falls
+	// under AWAIT_BELOW = 1.25 * ttlMs: the command is sent with at least that
+	// much coverage left, so one delayed by up to `ttlMs / 4` (offline queue,
+	// MOVED or TRYAGAIN retries, a GC pause) still lands inside it. Under
+	// RENEW_BELOW = 1.375 * ttlMs it renews in the background without waiting,
+	// so the awaited renewal is the exception: at most one renewal per
+	// instance per `ttlMs / 8`, shared by concurrent callers.
+	//
+	// The estimate runs on the monotonic clock from before the script was
+	// sent, so it never outlasts the server's expiry. It is dropped when the
+	// wall clock moved on much more than the monotonic one (a suspended host),
+	// and when the EXISTS sent alongside each command finds the key gone
+	// (eviction, a flush, a failover that lost it): the next command then
+	// waits for a renewal, which that EXISTS has already started. A renewal
+	// that fails is not retried for RETRY_AFTER_MS; commands that need it
+	// reject meanwhile, without contacting Redis.
 	let coveredUntil = -Infinity;
 	let coverage = null;
+	let failedAt = -Infinity;
+	let failure = null;
+	let lastWall = wallEpoch();
+	let lastMono = monotonicNow();
+	const AWAIT_BELOW = 1.25 * ttlMs;
+	const RENEW_BELOW = 1.375 * ttlMs;
+	const COVERAGE_TTL = Math.ceil(1.5 * ttlMs);
+	const RETRY_AFTER_MS = Math.min(1_000, ttlMs / 4);
 	function coverageKey() {
 		return client.key(keyPrefix + COVERAGE_KEY);
 	}
-	function coverLegacyWrites() {
-		if (coveredUntil - monotonicNow() >= ttlMs) return null;
+	function renewCoverage() {
 		coverage ??= (async () => {
 			const started = monotonicNow();
 			try {
-				const left = Number(await evalCached(redis, LEGACY_COVERAGE, 1, coverageKey(), ttlMs, Math.ceil(1.5 * ttlMs), COVERAGE_VALUE));
+				const left = Number(await evalCached(redis, LEGACY_COVERAGE, 1, coverageKey(), Math.ceil(RENEW_BELOW), COVERAGE_TTL, COVERAGE_VALUE));
 				breaker?.success();
 				coveredUntil = started + left;
+				failure = null;
 			} catch (err) {
 				breaker?.failure(err);
+				failedAt = monotonicNow();
+				failure = err;
 				throw err;
 			} finally {
 				coverage = null;
@@ -651,12 +674,40 @@ export function createDistributedSession(client, options = {}) {
 		})();
 		return coverage;
 	}
+	function coverLegacyWrites() {
+		const mono = monotonicNow(), wall = wallEpoch();
+		if ((wall - lastWall) - (mono - lastMono) > ttlMs / 4) coveredUntil = -Infinity;
+		lastWall = wall;
+		lastMono = mono;
+		const left = coveredUntil - mono;
+		if (left >= RENEW_BELOW) return null;
+		if (left >= AWAIT_BELOW) {
+			renewCoverage().catch(() => { /* retried by a later command */ });
+			return null;
+		}
+		if (failure && !coverage && mono - failedAt < RETRY_AFTER_MS) {
+			breaker?.failure(failure);
+			return Promise.reject(failure);
+		}
+		return renewCoverage();
+	}
+	// Sent in the same tick as the command and not awaited: a missing key
+	// drops the estimate and starts a renewal. Its own failure is ignored.
+	function checkCoverage() {
+		redis.exists(coverageKey()).then((found) => {
+			if (Number(found) === 0) {
+				coveredUntil = -Infinity;
+				renewCoverage().catch(() => { /* retried by a later command */ });
+			}
+		}, () => { /* the command itself reports Redis failures */ });
+	}
 
 	// One write or slide of a store without forgetIdentity, sent once the
 	// coverage above holds.
 	async function legacyCommand([method, ...args]) {
 		const pending = coverLegacyWrites();
 		if (pending) await pending;
+		checkCoverage();
 		try {
 			const result = await redis[method](...args);
 			breaker?.success();

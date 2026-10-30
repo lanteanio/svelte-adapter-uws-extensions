@@ -68,6 +68,30 @@ function patchScan(redis, handler) {
 	return () => nodes.forEach((node, i) => { node.scan = originals[i]; });
 }
 
+// Make every Lua script fail, as when the coverage key's master is down. A
+// real client sends scripts through sendCommand; the mock runs them through
+// eval. The returned restore function also counts the attempts.
+function failScripts(redis) {
+	let attempts = 0;
+	const real = typeof redis.sendCommand === 'function';
+	const original = real ? redis.sendCommand : redis.eval;
+	if (real) {
+		redis.sendCommand = function (command, ...rest) {
+			if (/^eval/i.test(String(command?.name))) {
+				attempts++;
+				command.reject?.(new Error('coverage unavailable'));
+				return command.promise ?? Promise.reject(new Error('coverage unavailable'));
+			}
+			return original.call(this, command, ...rest);
+		};
+	} else {
+		redis.eval = async () => { attempts++; throw new Error('coverage unavailable'); };
+	}
+	const restore = () => { if (real) redis.sendCommand = original; else redis.eval = original; };
+	restore.attempts = () => attempts;
+	return restore;
+}
+
 // Every PEXPIRE key, the command that slides a session record.
 function recordExpiries(redis) {
 	const original = redis.pexpire;
@@ -506,6 +530,128 @@ export function sessionIdentityContract(getClient) {
 			expect(await getClient().redis.pttl(coverageKey())).toBeGreaterThan(0);
 			await legacy.set('new', owner('ta', '42'));
 			await expect(sessions().purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('renews the coverage when the key is lost under a running legacy writer', async () => {
+			const s = sessions();
+			const legacy = createDistributedSession(getClient(), {});
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			await legacy.set('warm', owner('tb', '1'));
+			await legacy.delete('warm');
+			// Evicted, or lost in a failover.
+			await getClient().redis.del(coverageKey());
+			await legacy.set('old', owner('ta', '42'));
+			expect(await record('old')).not.toBeNull();
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('renews the coverage after a flush and a clean rescan', async () => {
+			const s = sessions();
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('warm', owner('tb', '1'));
+			for (const key of await scanKeys(getClient().redis, getClient().key('*'))) await getClient().redis.del(key);
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			await legacy.set('old', owner('ta', '42'));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('keeps the coverage past a legacy write delayed near the renewal point', async () => {
+			const ttlMs = 600;
+			const s = sessions({ ttlMs });
+			const legacy = createDistributedSession(getClient(), { ttlMs });
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			await legacy.set('warm', owner('tb', '1'));
+			await legacy.delete('warm');
+			await new Promise((resolve) => setTimeout(resolve, 280));
+			const redis = getClient().redis;
+			const set = redis.set;
+			redis.set = async function (...args) {
+				await new Promise((resolve) => setTimeout(resolve, 150));
+				return set.apply(this, args);
+			};
+			try {
+				await legacy.set('old', owner('ta', '42'));
+			} finally {
+				redis.set = set;
+			}
+			expect(await redis.pttl(coverageKey())).toBeGreaterThan(await redis.pttl(getClient().key('sess:old')));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('drops the coverage estimate after a host suspend', async () => {
+			const ttlMs = 100;
+			let frozen = null;
+			setRuntimeEnv({ clock: { monotonic: () => frozen ?? performance.now() } });
+			try {
+				const s = sessions({ ttlMs });
+				const legacy = createDistributedSession(getClient(), { ttlMs });
+				expect(await s.purgeUser('ta', 'x')).toBe(0);
+				await legacy.set('warm', owner('tb', '1'));
+				await legacy.delete('warm');
+				// The monotonic clock stops while the host sleeps.
+				frozen = performance.now();
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				const redis = getClient().redis;
+				const set = redis.set;
+				const covered = [];
+				redis.set = async function (key, ...args) {
+					if (key === getClient().key('sess:old')) covered.push(await redis.exists(coverageKey()));
+					return set.call(this, key, ...args);
+				};
+				try {
+					await legacy.set('old', owner('ta', '42'));
+				} finally {
+					redis.set = set;
+				}
+				// The write was sent only once the coverage was renewed.
+				expect(covered).toEqual([1]);
+				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+			} finally {
+				resetRuntimeEnv();
+			}
+		});
+
+		it('does not send a legacy write with less than 1.25 ttlMs of coverage it cannot renew', async () => {
+			const ttlMs = 400;
+			const legacy = createDistributedSession(getClient(), { ttlMs });
+			await legacy.set('warm', { v: 1 });
+			// Less than 1.25 * ttlMs of the 1.5 * ttlMs is left.
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			const restore = failScripts(getClient().redis);
+			try {
+				await expect(legacy.set('late', { v: 1 })).rejects.toThrow('coverage unavailable');
+			} finally {
+				restore();
+			}
+			expect(await record('late')).toBeNull();
+		});
+
+		it('rejects legacy writes while the coverage cannot be renewed, retrying after a pause', async () => {
+			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
+			const restore = failScripts(getClient().redis);
+			try {
+				await expect(legacy.set('a', { v: 1 })).rejects.toThrow('coverage unavailable');
+				const attempts = restore.attempts();
+				await expect(legacy.set('b', { v: 1 })).rejects.toThrow('coverage unavailable');
+				// The second write did not try again at once.
+				expect(restore.attempts()).toBe(attempts);
+			} finally {
+				restore();
+			}
+			expect(await record('a')).toBeNull();
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			await legacy.set('c', { v: 1 });
+			expect(await record('c')).not.toBeNull();
+		});
+
+		it('does not read the coverage key of a nested legacy store as a legacy session', async () => {
+			const nested = createDistributedSession(getClient(), { keyPrefix: 'sess:admin:' });
+			await nested.set('x', { v: 1 });
+			await nested.delete('x');
+			const s = sessions();
+			await s.set('t', owner('ta', '42'));
+			expect(await s.purgeUser('ta', '42')).toBe(1);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
 		});
 
 		it('gives the marker back when the scan fails, and leases it while it runs', async () => {
