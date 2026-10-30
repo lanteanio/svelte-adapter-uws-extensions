@@ -688,30 +688,38 @@ a slot was migrating while it ran; `residue` keeps purges incomplete for
 scan that fails gives it back. A scan that finds nothing records `clean`.
 
 `sess:identity:v1:legacy-active` covers sessions written later by a store
-without `forgetIdentity`. Such a store keeps the key alive for `1.5 * ttlMs`
-on the server's clock: before a write or TTL slide (`set`, `create`, the
-close-time persist, `touch`, a refreshing `get` or load) it waits for a
-renewal when less than `1.25 * ttlMs` is left, so a write delayed by up to
-`ttlMs / 4` still lands inside the coverage, and it renews in the background,
-without waiting, when less than `1.375 * ttlMs` is left. A renewal succeeds at
-most once per store instance per `ttlMs / 8`; one at a time is in flight,
-shared by concurrent calls, and after a failure the next is not sent for a
-second (`ttlMs / 4` when shorter). Every other operation is a plain command as
-before. On top of that, a legacy write or slide sends one `EXISTS` of the key,
-not awaited, at most one at a time and at most once per second (`ttlMs / 8`
-when shorter) per instance: a bounded rate per instance, whatever its session
-traffic. A qualified purge reports `legacyResidue` while the key exists. The
-key appears in every deployment that uses the Redis session store, with or
-without `forgetIdentity`, and `clear()` keeps it.
+without `forgetIdentity`. Such a store keeps the key alive with a plain
+`SET <key> <value> PX <1.5 * ttlMs>`, which needs no scripting permission.
+Before a write or TTL slide (`set`, `create`, the close-time persist, `touch`,
+a refreshing `get` or load) it waits for that SET when less than
+`1.25 * ttlMs` of the coverage it knows of is left, so a write delayed by up to
+`ttlMs / 4` still lands inside the coverage, and it sends the SET in the
+background, without waiting, when less than `1.375 * ttlMs` is left. One SET
+is in flight at a time, shared by concurrent calls; a background SET that
+fails is not repeated in the background for a second (`ttlMs / 4` when
+shorter). A legacy write or slide also sends one `EXISTS` of the key, not
+awaited, at most one at a time and at most once per second (`ttlMs / 8` when
+shorter) per instance. Together that costs each store instance one SET per
+`ttlMs / 8`, awaited only when the background ones did not keep up (at start
+and after an outage), and at most one EXISTS per second, whatever its session
+traffic; every other operation is a plain command as before. A qualified purge
+reports `legacyResidue` while the key exists. The key appears in every
+deployment that uses the Redis session store, with or without
+`forgetIdentity`, and `clear()` keeps it. Stores sharing a prefix use one
+`ttlMs`: each SET sets the expiry from when it lands, so one with a shorter
+`ttlMs` can shorten what a longer one set, and two SETs in flight together
+land in either order, the later one winning by at most the time between them.
 
-A renewal that fails never fails the write: the session is written and a
-timer retries the renewal after the pause until one succeeds, which covers the
-sessions written meanwhile, since they expire within `ttlMs` of their write.
-While the key cannot be read, qualified purges fail and report the erasure
-incomplete. Only the failed renewal itself is reported to the circuit breaker.
-On a Redis Cluster the key lives on one slot: while its master is down,
-legacy writes go on and purges fail; once it is back, a purge in the pause
-before the next retry can miss the sessions written during the outage.
+When the awaited SET fails, the session write or slide is not sent and
+rejects with that Redis error, so no legacy session lands before its coverage
+is in place; the next call tries again. This is the one new way a store
+without `forgetIdentity` can fail: a write or slide that is due for a renewal
+(an instance's first, then any after the background SETs failed for
+`ttlMs / 8`) while the coverage key's node refuses writes (down, read-only
+during a failover, out of memory under `noeviction`). On a Redis Cluster that
+node is the one master owning the key's slot, which may differ from the
+session's own. While the key cannot be read, qualified purges fail and report
+the erasure incomplete.
 
 Keep both keys under a memory policy that does not evict them: `noeviction`,
 or `volatile-ttl`, which evicts the soonest-expiring keys first, and the

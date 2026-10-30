@@ -151,7 +151,10 @@ export interface DistributedSession<T = unknown> {
 	 *
 	 * With `forgetUserId`, the owner's erasure-index field is written first, and
 	 * an extractor or index failure rejects with `code: 'ERASURE_INDEX_INCOMPLETE'`
-	 * before the record is written.
+	 * before the record is written. Without `forgetIdentity`, a `set` (and a
+	 * `touch` or refreshing read) that is due to renew the
+	 * `identity:v1:legacy-active` coverage key waits for that SET, and rejects
+	 * with its Redis error, writing nothing, when it fails.
 	 */
 	set(token: string, data: T): Promise<void>;
 
@@ -212,7 +215,9 @@ export interface DistributedSession<T = unknown> {
 	 * scan out of time, or Cluster slots moving during it opens one for
 	 * `ttlMs`. A store without `forgetIdentity` keeps the key
 	 * `sess:identity:v1:legacy-active` alive, on the server's clock, for
-	 * `1.5 * ttlMs` after its last renewal; purges report residue while it
+	 * `1.5 * ttlMs` after its last renewal (a plain SET it waits for before a
+	 * write or slide that is due for one, and which fails that write when it
+	 * fails); purges report residue while it
 	 * exists.
 	 * Records still listed by the `forgetUserId` index of the same raw user
 	 * id are residue as well. A write still in flight can land after a purge.

@@ -1187,15 +1187,6 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// DEL iff the stored value matches). Their DEL would otherwise look
 				// like the fence-release script; the markers keep them distinct and
 				// are matched first.
-				// Session legacy coverage: extend to ARGV[2] ms when under ARGV[1].
-				if (script.includes('SESSION_LEGACY_COVERAGE')) {
-					if (!script.includes("if redis.call('PTTL', KEYS[1]) < tonumber(ARGV[1]) then") || !script.includes("redis.call('SET', KEYS[1], ARGV[3], 'PX', ARGV[2])")) {
-						throw new Error('mock-redis: unmodelled session script');
-					}
-					const [key, below, ttlMs, value] = args;
-					if (await r.pttl(key) < Number(below)) await r.set(key, value, 'PX', ttlMs);
-					return r.pttl(key);
-				}
 				// Session compare-and-set scripts, modelled from their text: an
 				// optional GET comparison guarding one SET, with or without PX.
 				if (script.includes('SESSION_ADOPT_RECORD') || script.includes('SESSION_SETTLE_MARKER')) {

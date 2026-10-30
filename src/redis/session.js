@@ -36,7 +36,7 @@ import { execMultiSlot, firstCommandError, isCluster, clusterTopology } from '..
 import { MAX_REDIS_PIPELINE_COMMANDS } from '../shared/caps.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { defineOptions, option, wholeExpiry } from '../shared/options.js';
-import { randomBytes, wallEpoch, monotonicNow, setTimer } from '../shared/runtime.js';
+import { randomBytes, wallEpoch, monotonicNow } from '../shared/runtime.js';
 import { readIdentity, purgeIdentity, sameIdentity, identityKey, identityTuple, tupleIdentity, legacyResidueError } from '../shared/forget-identity.js';
 
 // Delete only the exact record inspected; a concurrent replacement survives.
@@ -96,16 +96,6 @@ const SCAN_LEASE_MS = 3 * SCAN_BUDGET_MS;
 // Kept alive by stores without forgetIdentity while their sessions may live.
 const COVERAGE_KEY = 'identity:v1:legacy-active';
 const COVERAGE_VALUE = '{"legacyActive":true}';
-
-// Keep the coverage key alive for at least ARGV[2] ms when less than ARGV[1]
-// ms are left, never shortening it, and return what is left.
-const LEGACY_COVERAGE = `
--- SESSION_LEGACY_COVERAGE
-if redis.call('PTTL', KEYS[1]) < tonumber(ARGV[1]) then
-  redis.call('SET', KEYS[1], ARGV[3], 'PX', ARGV[2])
-end
-return redis.call('PTTL', KEYS[1])
-`;
 
 // The first bytes of every qualified record.
 const QUALIFIED_HEAD = '{"identity:v1":';
@@ -625,38 +615,39 @@ export function createDistributedSession(client, options = {}) {
 	// exists. A session lives at most `ttlMs` after the command that wrote or
 	// slid it reached the server.
 	//
-	// The store renews the key to COVERAGE_TTL = 1.5 * ttlMs. Before a write
-	// or slide it awaits a renewal when its estimate of what is left falls
-	// under AWAIT_BELOW = 1.25 * ttlMs: the command is sent with at least that
-	// much coverage left, so one delayed by up to `ttlMs / 4` (offline queue,
-	// MOVED or TRYAGAIN retries, a GC pause) still lands inside it. Under
+	// A renewal is a plain `SET key value PX 1.5 * ttlMs`, so a client allowed
+	// SET but not EVAL keeps working. PX counts from when the server applies
+	// it, so a later renewal of any store with the same `ttlMs` only moves the
+	// expiry forward; two renewals in flight together land in either order,
+	// and the later one wins by at most their difference in arrival. A store
+	// with a shorter `ttlMs` on the same prefix can shorten the coverage a
+	// longer one set, so stores sharing a prefix use one `ttlMs`.
+	//
+	// Before a write or slide the store awaits a renewal when its estimate of
+	// what is left falls under AWAIT_BELOW = 1.25 * ttlMs: the command is sent
+	// with at least that much coverage left, so one delayed by up to
+	// `ttlMs / 4` (offline queue, MOVED or TRYAGAIN retries, a GC pause) still
+	// lands inside it. If that renewal fails the command is not sent and
+	// rejects with the renewal's error, so no legacy session lands without
+	// coverage in place first; the next command tries again. Under
 	// RENEW_BELOW = 1.375 * ttlMs it renews in the background without waiting,
-	// so a renewal succeeds at most once per instance per `ttlMs / 8`. At most
-	// one renewal is in flight, shared by concurrent callers, and after a
-	// failed one the next is not sent for RETRY_AFTER_MS.
+	// so a renewal succeeds at most once per instance per `ttlMs / 8`; one is
+	// in flight at a time, shared by concurrent callers, and a failed
+	// background renewal is not retried in the background for RETRY_AFTER_MS.
 	//
-	// A failed renewal never fails the write: the session is written, its
-	// coverage is unknown, and a timer keeps retrying the renewal every
-	// RETRY_AFTER_MS until one succeeds. A qualified purge that cannot read the
-	// coverage key fails, so while the key's node is down erasure reports
-	// incomplete; once it is back, the next retry covers what was written
-	// meanwhile, since those sessions expire within `ttlMs` of their write.
-	// Only the failure of the renewal itself is reported to the breaker.
-	//
-	// The estimate runs on the monotonic clock from before the script was
-	// sent, so it never outlasts the server's expiry. It is dropped when the
-	// wall clock has moved on by more than `ttlMs / 4` more than the monotonic
-	// one since that renewal started (suspended hosts, summed over every
-	// suspend), and when an EXISTS of the key finds it gone (eviction, a
-	// flush, a failover that lost it). That EXISTS is sent alongside a legacy
-	// command, not awaited, at most one at a time and at most once per
-	// CHECK_EVERY_MS; when it finds the key gone it starts a renewal.
+	// The estimate runs on the monotonic clock from before the SET was sent,
+	// so it never outlasts the server's expiry. It is dropped when the wall
+	// clock has moved on by more than `ttlMs / 4` more than the monotonic one
+	// since that renewal started (suspended hosts, summed over every suspend),
+	// and when an EXISTS of the key finds it gone (eviction, a flush, a
+	// failover that lost it). That EXISTS is sent alongside a legacy command,
+	// not awaited, at most one at a time and at most once per CHECK_EVERY_MS;
+	// when it finds the key gone it starts a background renewal.
 	let coveredUntil = -Infinity;
 	let coverage = null;
 	let failedAt = -Infinity;
 	let renewedWall = 0;
 	let renewedMono = 0;
-	let retryTimer = null;
 	let checking = false;
 	let checkedAt = -Infinity;
 	const AWAIT_BELOW = 1.25 * ttlMs;
@@ -667,48 +658,40 @@ export function createDistributedSession(client, options = {}) {
 	function coverageKey() {
 		return client.key(keyPrefix + COVERAGE_KEY);
 	}
-	// Resolves whether the renewal succeeded; never rejects.
 	function renewCoverage() {
-		if (coverage) return coverage;
-		if (monotonicNow() - failedAt < RETRY_AFTER_MS) return null;
-		coverage = (async () => {
+		coverage ??= (async () => {
 			const started = monotonicNow();
 			const wall = wallEpoch();
 			try {
-				const left = Number(await evalCached(redis, LEGACY_COVERAGE, 1, coverageKey(), Math.ceil(RENEW_BELOW), COVERAGE_TTL, COVERAGE_VALUE));
+				await redis.set(coverageKey(), COVERAGE_VALUE, 'PX', COVERAGE_TTL);
 				breaker?.success();
-				coveredUntil = started + left;
+				coveredUntil = started + COVERAGE_TTL;
 				renewedMono = started;
 				renewedWall = wall;
-				return true;
 			} catch (err) {
 				breaker?.failure(err);
 				failedAt = monotonicNow();
-				scheduleRetry();
-				return false;
+				throw err;
 			} finally {
 				coverage = null;
 			}
 		})();
 		return coverage;
 	}
-	function scheduleRetry() {
-		if (retryTimer) return;
-		retryTimer = setTimer(() => {
-			retryTimer = null;
-			if (coveredUntil - monotonicNow() >= AWAIT_BELOW) return;
-			const pending = renewCoverage();
-			if (!pending) scheduleRetry();
-		}, RETRY_AFTER_MS);
-		retryTimer?.unref?.();
+	function renewInBackground() {
+		if (coverage || monotonicNow() - failedAt < RETRY_AFTER_MS) return;
+		renewCoverage().catch(() => { /* the next command that needs it retries */ });
 	}
 	function coverLegacyWrites() {
 		const mono = monotonicNow();
 		if (coveredUntil > -Infinity && (wallEpoch() - renewedWall) - (mono - renewedMono) > ttlMs / 4) coveredUntil = -Infinity;
 		const left = coveredUntil - mono;
 		if (left >= RENEW_BELOW) return null;
-		const pending = renewCoverage();
-		return left >= AWAIT_BELOW ? null : pending;
+		if (left >= AWAIT_BELOW) {
+			renewInBackground();
+			return null;
+		}
+		return renewCoverage();
 	}
 	function checkCoverage() {
 		const mono = monotonicNow();
@@ -719,13 +702,13 @@ export function createDistributedSession(client, options = {}) {
 			checking = false;
 			if (Number(found) === 0) {
 				coveredUntil = -Infinity;
-				renewCoverage();
+				renewInBackground();
 			}
 		}, () => { checking = false; });
 	}
 
 	// One write or slide of a store without forgetIdentity, sent once the
-	// coverage above holds or its renewal has failed.
+	// coverage above holds; rejects with the renewal's error otherwise.
 	async function legacyCommand([method, ...args]) {
 		const pending = coverLegacyWrites();
 		if (pending) await pending;

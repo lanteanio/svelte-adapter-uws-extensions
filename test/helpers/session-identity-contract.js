@@ -68,44 +68,20 @@ function patchScan(redis, handler) {
 	return () => nodes.forEach((node, i) => { node.scan = originals[i]; });
 }
 
-// Make every Lua script fail, as when the coverage key's master is down. A
-// real client sends scripts through sendCommand; the mock runs them through
-// eval. The returned restore function also counts the attempts.
-function failScripts(redis) {
-	let attempts = 0;
-	const real = typeof redis.sendCommand === 'function';
-	const original = real ? redis.sendCommand : redis.eval;
-	if (real) {
-		redis.sendCommand = function (command, ...rest) {
-			if (/^eval/i.test(String(command?.name))) {
-				attempts++;
-				command.reject?.(new Error('coverage unavailable'));
-				return command.promise ?? Promise.reject(new Error('coverage unavailable'));
-			}
-			return original.call(this, command, ...rest);
-		};
-	} else {
-		redis.eval = async () => { attempts++; throw new Error('coverage unavailable'); };
-	}
-	const restore = () => { if (real) redis.sendCommand = original; else redis.eval = original; };
-	restore.attempts = () => attempts;
+// Route every SET of `key` through `handler(set, args)`, where `set` sends
+// it; other SETs pass through. The returned restore function also counts the
+// SETs of `key`.
+function patchSetOf(redis, key, handler) {
+	const original = redis.set;
+	let calls = 0;
+	redis.set = function (target, ...args) {
+		if (target !== key) return original.call(this, target, ...args);
+		calls++;
+		return handler((...a) => original.call(this, target, ...a), args);
+	};
+	const restore = () => { redis.set = original; };
+	restore.calls = () => calls;
 	return restore;
-}
-
-// Delay every Lua script by `ms`, as on a slow link.
-function delayScripts(redis, ms) {
-	const real = typeof redis.sendCommand === 'function';
-	const original = real ? redis.sendCommand : redis.eval;
-	const wait = () => new Promise((resolve) => setTimeout(resolve, ms));
-	if (real) {
-		redis.sendCommand = function (command, ...rest) {
-			if (!/^eval/i.test(String(command?.name))) return original.call(this, command, ...rest);
-			return wait().then(() => original.call(this, command, ...rest));
-		};
-	} else {
-		redis.eval = async function (...args) { await wait(); return original.apply(this, args); };
-	}
-	return () => { if (real) redis.sendCommand = original; else redis.eval = original; };
 }
 
 // Every PEXPIRE key, the command that slides a session record.
@@ -504,39 +480,26 @@ export function sessionIdentityContract(getClient) {
 			for (let i = 0; i < 80; i++) await writer.set('k' + i, { v: i });
 			const legacy = createDistributedSession(getClient(), { refreshOnGet: true });
 			const redis = getClient().redis;
-			const counts = { eval: 0, batch: 0 };
+			let batches = 0;
 			const wrapped = {};
-			// A real client sends scripts, defined commands included, through
-			// sendCommand; the mock runs them through eval.
-			if (typeof redis.sendCommand === 'function') {
-				wrapped.sendCommand = redis.sendCommand;
-				redis.sendCommand = function (command, ...rest) {
-					if (/^eval/i.test(String(command?.name))) counts.eval++;
-					return wrapped.sendCommand.call(this, command, ...rest);
-				};
-			} else {
-				wrapped.eval = redis.eval;
-				redis.eval = function (...args) { counts.eval++; return wrapped.eval.apply(this, args); };
-			}
-			for (const method of ['pipeline', 'multi']) {
+			for (const method of ['pipeline', 'multi', 'eval', 'evalsha']) {
 				wrapped[method] = redis[method];
-				redis[method] = function (...args) { counts.batch++; return wrapped[method].apply(this, args); };
+				redis[method] = function (...args) { batches++; return wrapped[method].apply(this, args); };
 			}
+			const renewals = patchSetOf(redis, coverageKey(), (set, args) => set(...args));
 			try {
 				await Promise.all(Array.from({ length: 80 }, (_, i) => legacy.get('k' + i)));
-				const renewals = counts.eval;
-				// Within the coverage the store knows of, slides send no script.
+				expect(renewals.calls()).toBe(1);
+				// Within the coverage the store knows of, slides send no renewal.
 				for (let i = 0; i < 10; i++) await legacy.touch('k' + i);
 				await Promise.all(Array.from({ length: 80 }, (_, i) => legacy.touch('k' + i)));
-				expect(counts.eval).toBe(renewals);
+				expect(renewals.calls()).toBe(1);
 			} finally {
+				renewals();
 				for (const method of Object.keys(wrapped)) redis[method] = wrapped[method];
 			}
-			// One renewal; a real server may answer the first EVALSHA with
-			// NOSCRIPT, and the client then retries it as EVAL.
-			expect(counts.batch).toBe(0);
-			expect(counts.eval).toBeGreaterThanOrEqual(1);
-			expect(counts.eval).toBeLessThanOrEqual(2);
+			// Plain commands only: no pipeline, transaction or script.
+			expect(batches).toBe(0);
 		});
 
 		it('keeps the coverage through clear()', async () => {
@@ -636,42 +599,67 @@ export function sessionIdentityContract(getClient) {
 			await legacy.set('warm', { v: 1 });
 			// Less than 1.25 * ttlMs of the 1.5 * ttlMs is left.
 			await new Promise((resolve) => setTimeout(resolve, 150));
-			const restore = delayScripts(getClient().redis, 100);
 			const redis = getClient().redis;
-			const set = redis.set;
 			const left = [];
-			redis.set = async function (key, ...args) {
-				if (key === getClient().key('sess:late')) left.push(await redis.pttl(coverageKey()));
-				return set.call(this, key, ...args);
-			};
+			const restoreLate = patchSetOf(redis, getClient().key('sess:late'), async (set, args) => {
+				left.push(await redis.pttl(coverageKey()));
+				return set(...args);
+			});
+			const restore = patchSetOf(redis, coverageKey(), async (set, args) => {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				return set(...args);
+			});
 			try {
 				await legacy.set('late', { v: 1 });
 			} finally {
-				redis.set = set;
 				restore();
+				restoreLate();
 			}
 			expect(left[0]).toBeGreaterThan(1.25 * ttlMs);
 		});
 
-		it('writes while the coverage cannot be renewed and covers the writes once it can', async () => {
+		it('sends no legacy write whose coverage renewal fails', async () => {
 			const s = sessions();
 			expect(await s.purgeUser('ta', 'x')).toBe(0);
 			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
-			const restore = failScripts(getClient().redis);
+			const restore = patchSetOf(getClient().redis, coverageKey(), async () => { throw new Error('READONLY'); });
 			try {
-				await legacy.set('a', owner('ta', '42'));
-				const attempts = restore.attempts();
-				await legacy.set('b', owner('ta', '43'));
-				// The second write did not try again at once.
-				expect(restore.attempts()).toBe(attempts);
+				await expect(legacy.set('a', owner('ta', '42'))).rejects.toThrow('READONLY');
+				// The next write tries again.
+				await expect(legacy.set('b', owner('ta', '42'))).rejects.toThrow('READONLY');
+				expect(restore.calls()).toBe(2);
 			} finally {
 				restore();
 			}
-			expect(await record('a')).not.toBeNull();
-			expect(await record('b')).not.toBeNull();
-			// The retry runs on its own, without another write.
-			await new Promise((resolve) => setTimeout(resolve, 200));
-			expect(await getClient().redis.exists(coverageKey())).toBe(1);
+			expect(await record('a')).toBeNull();
+			expect(await record('b')).toBeNull();
+			await legacy.set('c', owner('ta', '42'));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('renews the coverage without scripts', async () => {
+			const s = sessions();
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			const legacy = createDistributedSession(getClient(), {});
+			const redis = getClient().redis;
+			const wrapped = {};
+			// Scripting refused, as for a user without EVAL.
+			for (const method of ['eval', 'evalsha', 'sendCommand']) {
+				if (typeof redis[method] !== 'function') continue;
+				wrapped[method] = redis[method];
+				redis[method] = method === 'sendCommand'
+					? function (command, ...rest) {
+						if (/^eval/i.test(String(command?.name))) return Promise.reject(new Error('NOPERM'));
+						return wrapped.sendCommand.call(this, command, ...rest);
+					}
+					: async () => { throw new Error('NOPERM'); };
+			}
+			try {
+				await legacy.set('old', owner('ta', '42'));
+			} finally {
+				for (const method of Object.keys(wrapped)) redis[method] = wrapped[method];
+			}
+			expect(await record('old')).not.toBeNull();
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 		});
 
@@ -681,10 +669,29 @@ export function sessionIdentityContract(getClient) {
 			await legacy.set('warm', { v: 1 });
 			// Between 1.25 and 1.375 * ttlMs of coverage is left.
 			await new Promise((resolve) => setTimeout(resolve, 70));
-			const restore = failScripts(getClient().redis);
+			const restore = patchSetOf(getClient().redis, coverageKey(), async () => { throw new Error('READONLY'); });
 			try {
 				for (let i = 0; i < 20; i++) await legacy.set('k' + i, { v: i });
-				expect(restore.attempts()).toBeLessThanOrEqual(2);
+				expect(restore.calls()).toBeLessThanOrEqual(2);
+			} finally {
+				restore();
+			}
+		});
+
+		it('does not wait for a background renewal', async () => {
+			const ttlMs = 400;
+			const legacy = createDistributedSession(getClient(), { ttlMs });
+			await legacy.set('warm', { v: 1 });
+			await new Promise((resolve) => setTimeout(resolve, 70));
+			const restore = patchSetOf(getClient().redis, coverageKey(), async (set, args) => {
+				await new Promise((resolve) => setTimeout(resolve, 300));
+				return set(...args);
+			});
+			try {
+				const started = performance.now();
+				await legacy.set('k', { v: 1 });
+				expect(performance.now() - started).toBeLessThan(200);
+				expect(restore.calls()).toBe(1);
 			} finally {
 				restore();
 			}
