@@ -2,6 +2,9 @@ import type { UpgradeContext, CloseContext } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+import type { ForgetIdentity } from '../shared/forget-identity.js';
+
+export type { ForgetIdentity };
 
 /**
  * The subset of the adapter `hooks.ws` handler that `withHooks` composes with.
@@ -92,6 +95,30 @@ export interface DistributedSessionOptions<T = unknown> {
 	 */
 	forgetUserId?: (data: T) => string | null | undefined;
 
+	/**
+	 * Tenant-qualified alternative to `forgetUserId`; configuring both throws.
+	 * Receives the same application data and returns the exact
+	 * `{ tenantId, userId }` owning it (`tenantId` is server-trusted: 1 to 64
+	 * characters of `[a-zA-Z0-9_-]`, or `null` for the untenanted scope), or
+	 * `null` / `undefined` for an unattributed session, which is stored
+	 * without an index entry and is not reachable by `purgeUser`.
+	 *
+	 * The identity is extracted once per write and stored beside the record
+	 * as `{"identity:v1":[tenantId,userId],"r":<record>}`; refreshes,
+	 * replacements and purges read it from there. The index is
+	 * `sess:identity:v1:byuser:<base64url(JSON [tenantId,userId])>`, written
+	 * before the record, as with `forgetUserId`. A replacement for another
+	 * identity drops the token from the previous identity's index. A throwing
+	 * or malformed extractor (a missing `tenantId`, an invalid tenant, an empty
+	 * `userId`) rejects `set` and `create` with
+	 * `code: 'ERASURE_INDEX_INCOMPLETE'` (the close-time persist skips its
+	 * write), and nothing is written. `touch` never calls the extractor.
+	 *
+	 * Records written before the option was enabled stay readable but are not
+	 * extended, so they expire within `ttlMs`.
+	 */
+	forgetIdentity?: (data: T) => ForgetIdentity | null | undefined;
+
 	breaker?: CircuitBreaker;
 	metrics?: MetricsRegistry;
 }
@@ -114,7 +141,8 @@ export interface DistributedSession<T = unknown> {
 
 	/**
 	 * Store or replace data for `token`. Resets the TTL via `SET PX`.
-	 * All token operations reject the reserved, case-sensitive `byuser:` prefix.
+	 * All token operations reject the reserved, case-sensitive `byuser:` and
+	 * `identity:` prefixes.
 	 * The data must be JSON-serializable.
 	 *
 	 * With `forgetUserId`, the owner's erasure-index field is written first, and
@@ -150,7 +178,8 @@ export interface DistributedSession<T = unknown> {
 	clear(): Promise<void>;
 
 	/**
-	 * Revoke every session a user holds (needs `forgetUserId`; a no-op
+	 * Revoke every session a user holds (needs `forgetUserId` or
+	 * `forgetIdentity`; a no-op
 	 * returning 0 without it). Reads only this user's erasure index, never the
 	 * rest of the keyspace, so the cost scales with the user's own sessions.
 	 * An indexed record is deleted only while its stored bytes still name this
@@ -163,8 +192,18 @@ export interface DistributedSession<T = unknown> {
 	 * changing during the purge. The user's other reachable sessions are still
 	 * revoked (none are when the index itself cannot be read), and the
 	 * unresolved index fields stay for a retry. Rejects before deleting
-	 * anything when the index holds a reserved `byuser:` token. User IDs are
-	 * globally unique; tenantId does not partition this legacy store.
+	 * anything when the index holds a reserved `byuser:` token. With
+	 * `forgetUserId`, user IDs are globally unique and tenantId does not
+	 * partition the store.
+	 *
+	 * With `forgetIdentity` (needed instead of `forgetUserId`), the purge
+	 * reads only the index of exactly `(tenantId, userId)`, `null` being only
+	 * the untenanted scope, and deletes only records stored with that
+	 * identity. An invalid `tenantId` throws. While the `forgetUserId` index of
+	 * the same raw user id still lists a record written before qualified mode,
+	 * which names no tenant, it rejects with `code: 'ERASURE_INCOMPLETE'`,
+	 * `legacyResidue: true` and the `removed` count, and leaves that record.
+	 * Every rejection carries `removed`, the sessions this call revoked.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 

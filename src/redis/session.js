@@ -23,17 +23,21 @@
  *     field per token the user holds. A field is written or refreshed before
  *     its record is written or slid, and outlives the record, so the index
  *     always covers every record and `purgeUser` reads nothing else.
+ *   - With `forgetIdentity` instead, the record is
+ *     `{"identity:v1":[tenantId,userId],"r":<record>}` and the index is
+ *     `{prefix}sess:identity:v1:byuser:{base64url(JSON [tenantId,userId])}`.
  *
  * @module svelte-adapter-uws-extensions/redis/session
  */
 
 import { scanAndUnlink } from '../shared/redis-scan.js';
-import { evalCachedName } from '../shared/eval-cached.js';
+import { evalCached, evalCachedName } from '../shared/eval-cached.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { MAX_REDIS_PIPELINE_COMMANDS } from '../shared/caps.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { randomBytes, wallEpoch } from '../shared/runtime.js';
 import { defineOptions, option, wholeExpiry } from '../shared/options.js';
+import { readIdentity, purgeIdentity, sameIdentity, identityKey, identityTuple, tupleIdentity, legacyResidueError } from '../shared/forget-identity.js';
 
 // Delete only the exact record inspected; a concurrent replacement survives.
 const ERASE_RECORD = `
@@ -61,6 +65,33 @@ function incompleteIndex(cause) {
 	error.code = 'ERASURE_INDEX_INCOMPLETE';
 	error.erasureIndexIncomplete = true;
 	return error;
+}
+
+// Qualified mode keeps an erasure counter in each identity's index hash. The
+// field name begins with the reserved token prefix, so no token collides with
+// it. purgeUser increments it before reading the index; a write that started
+// before that increment sees the change after storing its record and deletes
+// the record again. The counter lives long enough for any write in flight.
+const ERASURE_FIELD = 'identity:erasure';
+const ERASURE_FENCE_MS = INDEX_GRACE_MS;
+
+// Qualified mode wraps the record the legacy layout would store with the
+// identity extracted when it was written. Refreshes, replacements and purges
+// read the identity from here and never call the extractor again.
+const QUALIFIED_FIELD = 'identity:v1';
+function wrapQualified(identity, record) {
+	return '{"' + QUALIFIED_FIELD + '":' + (identity === null ? 'null' : identityTuple(identity)) + ',"r":' + record + '}';
+}
+
+// `{ identity, record }` for a qualified record, or null for one in the legacy
+// layout (written before `forgetIdentity` was enabled, so it has no tenant).
+function unwrapQualified(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	if (!Object.hasOwn(value, QUALIFIED_FIELD) || !Object.hasOwn(value, 'r') || Object.keys(value).length !== 2) return null;
+	const tuple = value[QUALIFIED_FIELD];
+	if (tuple === null) return { identity: null, record: value.r };
+	const identity = tupleIdentity(tuple);
+	return identity === null ? null : { identity, record: value.r };
 }
 
 // The exact shape the lifecycle layer stores: `{ d: data, c: createdAt }`.
@@ -170,6 +201,16 @@ export function createDistributedSession(client, options = {}) {
 	if (forgetUserId !== undefined && typeof forgetUserId !== 'function') {
 		throw new Error('session: forgetUserId must be a function (data) => userId');
 	}
+	// Tenant-qualified alternative: the identity is extracted once per write,
+	// stored with the record, and indexed by the exact (tenantId, userId).
+	const forgetIdentity = options.forgetIdentity;
+	if (forgetIdentity !== undefined && typeof forgetIdentity !== 'function') {
+		throw new Error('session: forgetIdentity must be a function (data) => { tenantId, userId }');
+	}
+	if (forgetUserId !== undefined && forgetIdentity !== undefined) {
+		throw new Error('session: forgetUserId and forgetIdentity are mutually exclusive');
+	}
+	const qualified = forgetIdentity !== undefined;
 	const maxAgeMs = options.maxAgeMs;
 	if (maxAgeMs !== undefined && (typeof maxAgeMs !== 'number' || !Number.isFinite(maxAgeMs) || maxAgeMs < 1)) {
 		throw new Error('session: maxAgeMs must be a positive number (ms)');
@@ -208,6 +249,9 @@ export function createDistributedSession(client, options = {}) {
 	function byUserKey(userId) {
 		return client.key(keyPrefix + 'byuser:' + userId);
 	}
+	function byIdentityKey(identity) {
+		return client.key(keyPrefix + 'identity:v1:byuser:' + identityKey(identity));
+	}
 
 	// The user owning `data`, or null when it names none. Extractor failures
 	// and non-string results are data errors: they reject without counting
@@ -222,9 +266,21 @@ export function createDistributedSession(client, options = {}) {
 		return owner;
 	}
 
+	// The application data of a stored value, unwrapping a lifecycle record.
+	function unwrapData(value) {
+		return isLifecycleRecord(value) ? value.d : value;
+	}
+
 	// The owner of a stored value, unwrapping a lifecycle record first.
 	function recordOwner(value) {
-		return extractOwner(isLifecycleRecord(value) ? value.d : value);
+		return extractOwner(unwrapData(value));
+	}
+
+	// The identity owning data about to be written, or null for an explicit
+	// absent identity. A throwing or malformed extractor rejects the write.
+	function extractIdentity(data) {
+		try { return readIdentity(forgetIdentity(data), 'session: forgetIdentity'); }
+		catch (err) { throw incompleteIndex(err); }
 	}
 
 	// Write or refresh `token` in its owner's index. Callers run this BEFORE
@@ -233,8 +289,10 @@ export function createDistributedSession(client, options = {}) {
 	// per-field mode the GT whole-key PEXPIRE can only extend a key TTL left by
 	// the fallback (an older server, or a probe that timed out), which would
 	// otherwise drop every field of the key at once.
+	// In qualified mode it resolves the identity's erasure counter, read in
+	// the same transaction.
 	async function indexOwner(owner, token) {
-		const idxKey = byUserKey(owner);
+		const idxKey = qualified ? byIdentityKey(owner) : byUserKey(owner);
 		let result;
 		try {
 			const perField = await hexpireProbe.ready();
@@ -246,6 +304,7 @@ export function createDistributedSession(client, options = {}) {
 			} else {
 				tx.pexpire(idxKey, indexTtlMs);
 			}
+			if (qualified) tx.hget(idxKey, ERASURE_FIELD);
 			result = await tx.exec();
 		} catch (err) {
 			breaker?.failure(err);
@@ -257,6 +316,7 @@ export function createDistributedSession(client, options = {}) {
 			throw incompleteIndex(err);
 		}
 		breaker?.success();
+		return qualified ? result[result.length - 1][1] ?? null : undefined;
 	}
 
 	// Index the owner of a value about to be written. A no-op without an
@@ -292,12 +352,188 @@ export function createDistributedSession(client, options = {}) {
 		}
 	}
 
+	// Slide a qualified record after extending the index field of the identity
+	// stored with it. The field is only extended, never created: a slide that
+	// races an erasure must not leave a field behind for the erased record. A
+	// record whose field is gone is not extended. A record with an explicit
+	// absent identity has no field.
+	async function slideQualified(key, token, identity) {
+		if (identity !== null && !(await extendIndexField(identity, token))) return false;
+		try {
+			const r = await redis.pexpire(key, ttlMs);
+			breaker?.success();
+			return Number(r) === 1;
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+	}
+
+	// Whether the index field of `token` exists, with its TTL extended.
+	async function extendIndexField(identity, token) {
+		const idxKey = byIdentityKey(identity);
+		let result;
+		try {
+			const perField = await hexpireProbe.ready();
+			const tx = redis.multi();
+			if (perField) {
+				tx.hpexpire(idxKey, indexTtlMs, 'FIELDS', 1, token);
+				tx.pexpire(idxKey, indexTtlMs, 'GT');
+			} else {
+				tx.hexists(idxKey, token);
+				tx.pexpire(idxKey, indexTtlMs);
+			}
+			result = await tx.exec();
+		} catch (err) {
+			breaker?.failure(err);
+			throw incompleteIndex(err);
+		}
+		const err = Array.isArray(result) ? firstCommandError(result) : new Error('session: index transaction discarded');
+		if (err) {
+			breaker?.failure(err);
+			throw incompleteIndex(err);
+		}
+		breaker?.success();
+		const first = result[0][1];
+		return Number(Array.isArray(first) ? first[0] : first) === 1;
+	}
+
+	// After a qualified record is stored: delete it again when an erasure of
+	// its identity started after the index field was written (the counter
+	// moved), and restore the field when a concurrent erasure or replacement
+	// removed it. Rejects with the record deleted when it cannot be confirmed.
+	async function confirmIndexed(key, token, identity, raw, epoch) {
+		const idxKey = byIdentityKey(identity);
+		let cause = null;
+		for (let attempt = 0; attempt < MAX_ERASE_ATTEMPTS; attempt++) {
+			let result;
+			try {
+				const tx = redis.multi();
+				tx.hget(idxKey, ERASURE_FIELD);
+				tx.hexists(idxKey, token);
+				result = await tx.exec();
+				const err = Array.isArray(result) ? firstCommandError(result) : new Error('session: index transaction discarded');
+				if (err) throw err;
+				breaker?.success();
+			} catch (err) {
+				breaker?.failure(err);
+				throw incompleteIndex(err);
+			}
+			if ((result[0][1] ?? null) !== epoch) {
+				cause = new Error('session: the identity was erased while this write was in flight');
+				break;
+			}
+			if (Number(result[1][1]) === 1) return;
+			// Restore the field and check again; the counter stays the one read
+			// before the record was stored.
+			try {
+				const perField = await hexpireProbe.ready();
+				const tx = redis.multi();
+				tx.hset(idxKey, token, '1');
+				if (perField) {
+					tx.hpexpire(idxKey, indexTtlMs, 'FIELDS', 1, token);
+					tx.pexpire(idxKey, indexTtlMs, 'GT');
+				} else {
+					tx.pexpire(idxKey, indexTtlMs);
+				}
+				const restored = await tx.exec();
+				const err = Array.isArray(restored) ? firstCommandError(restored) : new Error('session: index transaction discarded');
+				if (err) throw err;
+				breaker?.success();
+			} catch (err) {
+				breaker?.failure(err);
+				cause = err;
+				break;
+			}
+		}
+		cause ??= new Error('session: the index field kept disappearing');
+		try {
+			await evalCached(redis, ERASE_RECORD, 1, key, raw);
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+		}
+		throw incompleteIndex(cause);
+	}
+
+	// Write a qualified record: index the new identity, then replace the record
+	// and read the one it replaced in one transaction, so the previous
+	// identity's index field can be dropped. `record` is what the legacy layout
+	// stores ('' for no data). Resolves whether the record was written.
+	async function writeQualified(key, token, record, onlyExisting) {
+		const identity = record === '' ? null : extractIdentity(unwrapData(JSON.parse(record)));
+		const epoch = identity !== null ? await indexOwner(identity, token) : null;
+		const raw = record === '' ? '' : wrapQualified(identity, record);
+		let result;
+		try {
+			const tx = redis.multi();
+			tx.get(key);
+			if (onlyExisting) tx.set(key, raw, 'PX', ttlMs, 'XX');
+			else tx.set(key, raw, 'PX', ttlMs);
+			result = await tx.exec();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		const err = Array.isArray(result) ? firstCommandError(result) : new Error('session: write transaction discarded');
+		if (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		breaker?.success();
+		if (result[1][1] == null) {
+			// The record vanished before the conditional write: the field just
+			// written must not outlive it.
+			if (identity !== null) await dropIndexField(identity, token);
+			return false;
+		}
+		await releasePrevious(key, result[0][1], identity, token);
+		if (identity !== null) await confirmIndexed(key, token, identity, raw, epoch);
+		return true;
+	}
+
+	async function dropIndexField(identity, token) {
+		try {
+			await redis.hdel(byIdentityKey(identity), token);
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+	}
+
+	// A replacement for another identity, or for none, removes the token from
+	// the previous identity's index. When that fails the field stays behind,
+	// pointing at a record the previous identity no longer owns; purgeUser
+	// checks the stored identity before deleting, so it only drops the field.
+	// A write for the previous identity can land between the replacement and
+	// the drop, so the record is read again and the field restored for it.
+	async function releasePrevious(key, previous, identity, token) {
+		if (previous == null || previous === '') return;
+		let stored;
+		try { stored = unwrapQualified(JSON.parse(previous)); } catch { return; }
+		if (stored === null || stored.identity === null) return;
+		if (identity !== null && sameIdentity(stored.identity, identity)) return;
+		try {
+			await dropIndexField(stored.identity, token);
+			const raw = await redis.get(key);
+			let current = null;
+			try { current = raw ? unwrapQualified(JSON.parse(raw)) : null; } catch { /* not a qualified record */ }
+			if (current?.identity && sameIdentity(current.identity, stored.identity)) await indexOwner(stored.identity, token);
+		} catch { /* reported to the breaker */ }
+	}
+
 	function validateToken(token) {
 		if (typeof token !== 'string' || token.length === 0) {
 			throw new Error('session: token must be a non-empty string');
 		}
 		if (token.startsWith('byuser:')) {
 			throw new Error('session: token must not begin with reserved prefix byuser:');
+		}
+		// Reserved in both modes, so a store upgraded before qualified writers
+		// start already refuses a token that could name a qualified index.
+		if (token.startsWith('identity:')) {
+			throw new Error('session: token must not begin with reserved prefix identity:');
 		}
 	}
 
@@ -324,6 +560,19 @@ export function createDistributedSession(client, options = {}) {
 			mGet?.inc({ result: 'miss' });
 			return null;
 		}
+		if (qualified) {
+			// A record in the legacy layout stays readable but is never
+			// extended, so it expires within one TTL of its last legacy write.
+			const stored = unwrapQualified(data);
+			if (stored !== null) {
+				data = stored.record;
+				if (refreshOnGet) {
+					try { await slideQualified(key, token, stored.identity); } catch { /* not slid */ }
+				}
+			}
+			mGet?.inc({ result: 'hit' });
+			return data;
+		}
 		if (refreshOnGet) {
 			// The refresh is best-effort: a read never fails because of it. When
 			// the index field cannot be refreshed first, the record keeps its
@@ -341,6 +590,11 @@ export function createDistributedSession(client, options = {}) {
 		// A value with no JSON form (undefined) is stored as an empty record,
 		// which get reads as a miss, rather than as whatever the client makes of it.
 		const raw = JSON.stringify(data) ?? '';
+		if (qualified) {
+			await writeQualified(key, token, raw, false);
+			mSet?.inc();
+			return;
+		}
 		// The index field is written first: a failed index write rejects before
 		// the record exists, so purgeUser can always find what set stored.
 		await indexStored(raw, token);
@@ -358,7 +612,7 @@ export function createDistributedSession(client, options = {}) {
 		validateToken(token);
 		const key = fullKey(token);
 		let refreshed = false;
-		if (!forgetUserId) {
+		if (!forgetUserId && !qualified) {
 			try {
 				refreshed = Number(await redis.pexpire(key, ttlMs)) === 1;
 				breaker?.success();
@@ -383,7 +637,11 @@ export function createDistributedSession(client, options = {}) {
 				// A corrupt record reads as a miss, as in get(), and is not slid.
 				try { value = JSON.parse(raw); } catch { readable = false; }
 			}
-			if (readable) refreshed = await slide(key, token, value);
+			if (readable && qualified) {
+				// The legacy layout is not extended, as in get().
+				const stored = unwrapQualified(value);
+				if (stored !== null) refreshed = await slideQualified(key, token, stored.identity);
+			} else if (readable) refreshed = await slide(key, token, value);
 		}
 		mTouch?.inc({ result: refreshed ? 'present' : 'absent' });
 		return refreshed;
@@ -447,6 +705,10 @@ export function createDistributedSession(client, options = {}) {
 		if (raw == null) return null;
 		let rec;
 		try { rec = JSON.parse(raw); } catch { return null; }
+		// Qualified mode reads the record inside its identity wrapper; one in
+		// the legacy layout loads but is not extended.
+		const stored = qualified ? unwrapQualified(rec) : null;
+		if (stored !== null) rec = stored.record;
 		if (!rec || typeof rec !== 'object' || !('d' in rec)) return null;
 		const createdAt = Number(rec.c) || 0;
 		// Absolute timeout. With maxAgeMs set, a record we cannot prove is fresh -
@@ -457,9 +719,12 @@ export function createDistributedSession(client, options = {}) {
 			try { await redis.unlink(key); breaker?.success(); } catch (err) { breaker?.failure(err); }
 			return null;
 		}
-		if (refreshOnGet) {
+		if (refreshOnGet && (!qualified || stored !== null)) {
 			// Best-effort, as in get(): a load never fails because of it.
-			try { await slide(key, token, rec); } catch { /* not slid */ }
+			try {
+				if (stored !== null) await slideQualified(key, token, stored.identity);
+				else await slide(key, token, rec);
+			} catch { /* not slid */ }
 		}
 		return { data: rec.d, createdAt };
 	}
@@ -469,6 +734,10 @@ export function createDistributedSession(client, options = {}) {
 		const key = fullKey(token);
 		const record = { d: data, c: createdAt };
 		const raw = JSON.stringify(record);
+		if (qualified) {
+			await writeQualified(key, token, raw, false);
+			return;
+		}
 		// Index first, as in set().
 		await indexStored(raw, token);
 		try {
@@ -491,6 +760,18 @@ export function createDistributedSession(client, options = {}) {
 		const key = fullKey(token);
 		const raw = JSON.stringify({ d: data, c: createdAt });
 		let written;
+		if (qualified) {
+			try {
+				const present = Number(await redis.exists(key)) === 1;
+				breaker?.success();
+				if (!present) return;
+			} catch (err) {
+				breaker?.failure(err);
+				throw err;
+			}
+			await writeQualified(key, token, raw, true);
+			return;
+		}
 		if (forgetUserId) {
 			try {
 				const present = Number(await redis.exists(key)) === 1;
@@ -654,14 +935,28 @@ export function createDistributedSession(client, options = {}) {
 		return results;
 	}
 
+	// How a stored record relates to the identity being purged: 'owned' (delete
+	// it), 'other' (it belongs to another identity or to none, so only the
+	// index field goes) or 'residue' (qualified mode found a record in the
+	// legacy layout, which names no tenant and is neither deleted nor
+	// attributed). Throws when the record cannot be parsed or attributed.
+	function classify(raw, target) {
+		const value = JSON.parse(raw);
+		if (!qualified) return recordOwner(value) === target ? 'owned' : 'other';
+		const stored = unwrapQualified(value);
+		if (stored === null) return 'residue';
+		return stored.identity !== null && sameIdentity(stored.identity, target) ? 'owned' : 'other';
+	}
+
 	// Erase one bounded chunk of a user's indexed tokens. A record is deleted
 	// only while it still holds the exact bytes inspected and those bytes name
 	// this user. A missing record, or one that now belongs to someone else or
 	// to nobody, only loses its index field. A record that cannot be read or
 	// attributed keeps its field so a retry revisits it.
-	async function purgeTokens(idxKey, userId, tokens) {
+	async function purgeTokens(idxKey, target, tokens) {
 		let removed = 0;
 		let failure = null;
+		let residue = false;
 		const resolved = [];
 		let pending = tokens;
 		for (let attempt = 0; attempt < MAX_ERASE_ATTEMPTS && pending.length > 0; attempt++) {
@@ -672,9 +967,10 @@ export function createDistributedSession(client, options = {}) {
 				if (err) { failure ??= err; continue; }
 				// An empty record (a token set to undefined) holds no data and no owner.
 				if (raw == null || raw === '') { resolved.push(pending[i]); continue; }
-				let owner;
-				try { owner = recordOwner(JSON.parse(raw)); } catch (error) { failure ??= error; continue; }
-				if (owner === userId) owned.push({ token: pending[i], raw });
+				let relation;
+				try { relation = classify(raw, target); } catch (error) { failure ??= error; continue; }
+				if (relation === 'owned') owned.push({ token: pending[i], raw });
+				else if (relation === 'residue') residue = true;
 				else resolved.push(pending[i]);
 			}
 			pending = [];
@@ -698,7 +994,55 @@ export function createDistributedSession(client, options = {}) {
 				failure ??= err;
 			}
 		}
-		return { removed, failure };
+		return { removed, failure, residue };
+	}
+
+	// Whether a record in the legacy layout is still listed in the legacy index
+	// of this raw user id. Such a record was written before qualified mode, so
+	// it names no tenant: it may belong to any tenant's user of that id, and a
+	// qualified purge can neither delete nor rule it out.
+	async function legacyResidue(userId) {
+		let tokens;
+		try {
+			tokens = await redis.hkeys(byUserKey(userId));
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		for (let i = 0; i < tokens.length; i += PURGE_CHUNK) {
+			const chunk = tokens.slice(i, i + PURGE_CHUNK);
+			const reads = await batch(chunk.map((token) => ['get', fullKey(token)]));
+			for (const [err, raw] of reads) {
+				if (err) throw err;
+				if (raw == null || raw === '') continue;
+				let stored;
+				try { stored = unwrapQualified(JSON.parse(raw)); } catch { return true; }
+				if (stored === null) return true;
+			}
+		}
+		return false;
+	}
+
+	// Move the identity's erasure counter, then list its indexed tokens, in one
+	// transaction: every write whose index field this listing misses read the
+	// old counter and deletes its own record when it sees the new one. The
+	// counter field outlives the purge by ERASURE_FENCE_MS.
+	async function fenceAndList(idxKey) {
+		const perField = await hexpireProbe.ready();
+		const tx = redis.multi();
+		tx.hincrby(idxKey, ERASURE_FIELD, 1);
+		if (perField) {
+			tx.hpexpire(idxKey, ERASURE_FENCE_MS, 'FIELDS', 1, ERASURE_FIELD);
+		} else {
+			tx.pexpire(idxKey, ERASURE_FENCE_MS, 'NX');
+			tx.pexpire(idxKey, ERASURE_FENCE_MS, 'GT');
+		}
+		tx.hkeys(idxKey);
+		const result = await tx.exec();
+		const err = Array.isArray(result) ? firstCommandError(result) : new Error('session: erasure transaction discarded');
+		if (err) throw err;
+		return result[result.length - 1][1].filter((field) => field !== ERASURE_FIELD);
 	}
 
 	/**
@@ -708,36 +1052,53 @@ export function createDistributedSession(client, options = {}) {
 	 * deletes compare the inspected bytes, so a concurrent replacement survives.
 	 * Cost scales with the user's own sessions, never with the keyspace. A no-op
 	 * when no extractor is wired - session values are opaque to the store, so
-	 * without one a user's tokens are not addressable. `tenantId` is accepted
-	 * for the uniform store contract; the index is keyed by raw userId.
+	 * without one a user's tokens are not addressable.
+	 *
+	 * With `forgetUserId`, `tenantId` is accepted for the uniform store
+	 * contract and the index is keyed by raw userId. With `forgetIdentity` the
+	 * purge addresses exactly `(tenantId, userId)`, null being only the
+	 * untenanted scope, and rejects as incomplete while the legacy index of
+	 * that raw user id still lists a record written before qualified mode.
 	 * @param {string | null} tenantId
 	 * @param {string} userId
 	 * @returns {Promise<number>} sessions revoked
 	 */
 	async function purgeUser(tenantId, userId) {
-		if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
-		const idxKey = byUserKey(userId);
+		if ((!forgetUserId && !qualified) || typeof userId !== 'string' || userId.length === 0) return 0;
+		const target = qualified ? purgeIdentity(tenantId, userId, 'session: purgeUser') : userId;
+		const idxKey = qualified ? byIdentityKey(target) : byUserKey(userId);
 		let tokens;
 		try {
-			tokens = await redis.hkeys(idxKey);
+			tokens = qualified ? await fenceAndList(idxKey) : await redis.hkeys(idxKey);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
-			throw incompleteIndex(err);
+			throw Object.assign(incompleteIndex(err), { removed: 0 });
 		}
 		// Refuse legacy namespace collisions before deleting any indexed key.
 		// An old caller token may otherwise name another user's index.
 		for (const token of tokens) validateToken(token);
 		let removed = 0;
 		let failure = null;
+		let residue = false;
 		// Every chunk is attempted, so one unreadable record still lets the
 		// rest of the user's sessions go; the purge then reports incomplete.
 		for (let i = 0; i < tokens.length; i += PURGE_CHUNK) {
-			const outcome = await purgeTokens(idxKey, userId, tokens.slice(i, i + PURGE_CHUNK));
+			const outcome = await purgeTokens(idxKey, target, tokens.slice(i, i + PURGE_CHUNK));
 			removed += outcome.removed;
 			failure ??= outcome.failure;
+			residue ||= outcome.residue;
 		}
-		if (failure) throw failure.erasureIndexIncomplete ? failure : incompleteIndex(failure);
+		if (qualified && !failure && !residue) {
+			try { residue = await legacyResidue(userId); } catch (err) { failure = err; }
+		}
+		if (failure) {
+			const error = failure.erasureIndexIncomplete ? failure : incompleteIndex(failure);
+			throw Object.assign(error, { removed });
+		}
+		if (residue) {
+			throw legacyResidueError('ERASURE_INCOMPLETE', 'session: a session written before forgetIdentity was enabled names no tenant and may hold this user id', removed);
+		}
 		return removed;
 	}
 
