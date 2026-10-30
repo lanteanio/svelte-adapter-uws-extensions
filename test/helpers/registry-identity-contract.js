@@ -134,6 +134,9 @@ export function registryIdentityContract(getClient) {
 			const platform = mockPlatform();
 			const registry = make({ attributes: (ws) => ({ role: ws.getUserData().role }) });
 			const probe = getClient().redis.duplicate();
+			// A real connection refuses commands until it is ready.
+			if (probe.status === 'wait') await probe.connect();
+			else if (probe.status !== undefined && probe.status !== 'ready') await new Promise((resolve) => probe.once('ready', resolve));
 			const seen = [];
 			probe.on('message', (channel, raw) => seen.push({ channel, envelope: JSON.parse(raw) }));
 			const versioned = getClient().key('identity:v1:registry-events');
