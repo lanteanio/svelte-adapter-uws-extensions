@@ -246,6 +246,9 @@ export function mockPgClient(options = {}) {
 		}
 
 		if (sql.includes('set_config(')) return { rows: [], rowCount: 1 };
+		// The task erasure's identity lock. Blocking is not modelled: the mock
+		// runs one statement at a time, so no insert is ever in flight.
+		if (sql.startsWith('SELECT pg_advisory_xact_lock(')) return { rows: [{ pg_advisory_xact_lock: '' }], rowCount: 1 };
 		if (sql.includes('pg_try_advisory_xact_lock')) {
 			const key = values[0], owner = transactionLocks.get(key);
 			const acquired = owner === undefined || owner === connId;
@@ -501,14 +504,19 @@ export function mockPgClient(options = {}) {
 		) {
 			const fenceTtlSec = Number(values[6]);
 			const ts = now();
+			// The identity stamp follows user_id, or the trace columns when present.
+			const traced = sql.includes('traceparent');
 			taskRows.set(values[0], {
 				id: values[0],
 				name: values[1],
 				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 				idempotency_key: values[3],
 				request_id: values[4] ?? null,
-				traceparent: values[8] ?? null,
-				tracestate: values[9] ?? null,
+				traceparent: traced ? values[8] ?? null : null,
+				tracestate: traced ? values[9] ?? null : null,
+				user_id: values[7] ?? null,
+				identity_version: values[traced ? 10 : 8] ?? null,
+				tenant_id: values[traced ? 11 : 9] ?? null,
 				status: 'running',
 				result: null,
 				error: null,
@@ -532,14 +540,18 @@ export function mockPgClient(options = {}) {
 			sql.includes('gen_random_uuid()')
 		) {
 			const ts = now();
+			const traced = sql.includes('traceparent');
 			taskRows.set(values[0], {
 				id: values[0],
 				name: values[1],
 				input: typeof values[2] === 'string' ? JSON.parse(values[2]) : values[2],
 				idempotency_key: values[3],
 				request_id: values[4] ?? null,
-				traceparent: values[6] ?? null,
-				tracestate: values[7] ?? null,
+				traceparent: traced ? values[6] ?? null : null,
+				tracestate: traced ? values[7] ?? null : null,
+				user_id: values[5] ?? null,
+				identity_version: values[traced ? 8 : 6] ?? null,
+				tenant_id: values[traced ? 9 : 7] ?? null,
 				status: 'pending',
 				result: null,
 				error: null,
@@ -656,23 +668,62 @@ export function mockPgClient(options = {}) {
 			};
 		}
 
-		// Task claim-pending: dispatch sweep for enqueued rows. Models FOR
-		// UPDATE SKIP LOCKED: rows another connection currently holds are
-		// invisible, so two concurrent claimers get disjoint sets. Ordering is
-		// deterministic (FIFO by created_at, then row id as a stable tie-break).
-		if (sql.includes('WITH claimed') && sql.includes("WHERE status = 'pending'")) {
-			const names = sql.includes('name = ANY($3::text[])') ? new Set(values[2]) : null;
+		// Task claim-pending, first statement: which tenant scopes have pending
+		// rows of the registered names. Tenant ids are walked in code-unit order,
+		// the order of a C-collation index. Row locks do not hide a scope.
+		if (sql.includes('AS legacy') && sql.includes('AS untenanted') && sql.includes('AS head')) {
+			const names = new Set(values[0]);
+			const limit = Number(values[1]);
+			const cursor = values[2];
+			let legacy = null, untenanted = null;
+			const tenants = new Set();
+			for (const row of taskRows.values()) {
+				if (row.status !== 'pending' || !names.has(row.name)) continue;
+				if (row.identity_version == null) { if (row.tenant_id == null) legacy = true; }
+				else if (row.tenant_id == null) untenanted = true;
+				else tenants.add(row.tenant_id);
+			}
+			const sorted = [...tenants].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+			return {
+				rows: [{
+					legacy,
+					untenanted,
+					after: cursor == null ? [] : sorted.filter((tenant) => tenant > cursor).slice(0, limit),
+					head: sorted.slice(0, limit)
+				}],
+				rowCount: 1
+			};
+		}
+
+		// Task claim-pending, second statement: up to $5 oldest rows of each
+		// chosen scope, ranked by their position inside the scope and then by the
+		// scope's rotation order, claimed up to $1. Models FOR UPDATE SKIP LOCKED:
+		// rows another connection holds are skipped, so two concurrent claimers
+		// get disjoint sets. The final ORDER BY is read from the statement, so a
+		// statement that ranks rows differently is modelled as written.
+		if (sql.includes('WITH candidates AS (') && sql.includes("status = 'pending'")) {
 			const limit = Number(values[0]);
 			const ttlSec = Number(values[1]);
+			const names = new Set(values[2]);
+			const perScope = Number(values[4]);
+			const scopes = values[3].map((tenant, i) => ({ ord: values[5][i], match: (row) => row.identity_version === 1 && row.tenant_id === tenant }));
+			if (Number(values[6]) > 0) scopes.push({ ord: Number(values[6]), match: (row) => row.identity_version == null && row.tenant_id == null });
+			if (Number(values[7]) > 0) scopes.push({ ord: Number(values[7]), match: (row) => row.identity_version === 1 && row.tenant_id == null });
 			const ts = now();
-			const pending = [];
-			for (const row of taskRows.values()) {
-				if (row.status !== 'pending' || (names && !names.has(row.name))) continue;
-				if (isRowLockedByOther('task', row.id, connId)) continue;
-				pending.push(row);
+			const candidates = [];
+			for (const scope of scopes) {
+				const scoped = [...taskRows.values()]
+					.filter((row) => row.status === 'pending' && names.has(row.name) && scope.match(row))
+					.sort(byCreatedThenIns)
+					.slice(0, perScope);
+				scoped.forEach((row, i) => candidates.push({ row, pos: i + 1, ord: scope.ord }));
 			}
-			pending.sort(byCreatedThenIns);
-			const claimed = pending.slice(0, limit);
+			if (sql.includes('ORDER BY r.pos, r.ord')) candidates.sort((a, b) => a.pos - b.pos || a.ord - b.ord);
+			else candidates.sort((a, b) => byCreatedThenIns(a.row, b.row));
+			const claimed = candidates
+				.filter(({ row }) => !isRowLockedByOther('task', row.id, connId))
+				.slice(0, limit)
+				.map(({ row }) => row);
 			const out = [];
 			for (const row of claimed) {
 				lockRow('task', row.id, connId);
@@ -698,6 +749,32 @@ export function mockPgClient(options = {}) {
 			// connection holds them until its COMMIT / ROLLBACK.
 			if (!txState || !txState.inTx) releaseRowLocks(connId);
 			return { rows: out, rowCount: out.length };
+		}
+
+		// Task erasure. Unqualified: rows with this user id and no identity
+		// stamp. Qualified: rows stamped with exactly (tenant, user), plus
+		// whether unstamped rows that could be this user's remain.
+		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE user_id = $1 AND identity_version IS NULL')) {
+			let removed = 0;
+			for (const [id, row] of taskRows) {
+				if (row.user_id === values[0] && row.identity_version == null) { taskRows.delete(id); removed++; }
+			}
+			return { rows: [], rowCount: removed };
+		}
+		if (sql.includes('WITH removed AS (') && sql.includes('identity_version = 1')) {
+			const userId = values[0];
+			const untenanted = sql.includes('identity_version = 1 AND tenant_id IS NULL');
+			const tenant = untenanted ? null : values[1];
+			let removed = 0;
+			let residue = false;
+			for (const [id, row] of taskRows) {
+				if (row.identity_version == null && row.tenant_id == null && (row.user_id === userId || row.user_id == null)) residue = true;
+				if (row.identity_version === 1 && (row.tenant_id ?? null) === tenant && row.user_id === userId) {
+					taskRows.delete(id);
+					removed++;
+				}
+			}
+			return { rows: [{ removed, residue }], rowCount: 1 };
 		}
 
 		// Task reclaim: stuck-row sweep with CTE + gen_random_uuid(). Same

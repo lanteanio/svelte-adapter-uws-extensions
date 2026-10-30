@@ -64,6 +64,7 @@ import { withBreaker, pgFailure } from './_breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { readIdentity, purgeIdentity, legacyResidueError } from '../shared/forget-identity.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import {
 	POSTGRES_TRACE_ATTRIBUTES,
@@ -291,9 +292,27 @@ export function createTaskRunner(client, options = {}) {
 	// this extracts the owning userId at insert time into a user_id column so
 	// `live.forget` can drop the user's task rows. Unset => not user-purgeable.
 	const forgetUserId = options.forgetUserId;
-	const _taskUserId = (input, name) => {
-		if (!forgetUserId) return null;
-		try { const u = forgetUserId(input, name); return typeof u === 'string' && u.length > 0 ? u : null; } catch { return null; }
+	// Tenant-qualified alternative: the identity is extracted once per accepted
+	// insert and stamped as identity_version 1 with tenant_id and user_id. A
+	// throwing or malformed extractor rejects the run or enqueue.
+	const forgetIdentity = options.forgetIdentity;
+	if (forgetIdentity !== undefined && typeof forgetIdentity !== 'function') {
+		throw new Error('postgres tasks: forgetIdentity must be a function (input, name) => { tenantId, userId }');
+	}
+	if (forgetUserId !== undefined && forgetIdentity !== undefined) {
+		throw new Error('postgres tasks: forgetUserId and forgetIdentity are mutually exclusive');
+	}
+	const qualified = forgetIdentity !== undefined;
+	const UNSTAMPED = Object.freeze({ version: null, tenantId: null, userId: null });
+	const _taskStamp = (input, name) => {
+		if (qualified) {
+			const identity = readIdentity(forgetIdentity(input, name), 'postgres tasks: forgetIdentity');
+			return identity === null
+				? { version: 1, tenantId: null, userId: null }
+				: { version: 1, tenantId: identity.tenantId, userId: identity.userId };
+		}
+		if (!forgetUserId) return UNSTAMPED;
+		try { const u = forgetUserId(input, name); return typeof u === 'string' && u.length > 0 ? { version: null, tenantId: null, userId: u } : UNSTAMPED; } catch { return UNSTAMPED; }
 	};
 	const idempotency = options.idempotency || null;
 	const fenceProvider = options.fence || null;
@@ -468,7 +487,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	}
 
-	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput, workerPermit, initialLeaseStarted) {
+	async function runRegisteredTask(name, input, idempotencyKey, taskId, startingAttempt, startingFence, requestId, traceContext, tracePlatform, awaitCanonical = false, initialEncodedInput, workerPermit, initialLeaseStarted, stamp = UNSTAMPED) {
 		try {
 			const reg = handlers.get(name);
 			if (!reg) throw new UnknownTaskError(name);
@@ -496,7 +515,7 @@ export function createTaskRunner(client, options = {}) {
 								idempotencyKey,
 								fence,
 								requestId,
-								_taskUserId(input, name),
+								stamp,
 								traceContext
 							);
 						});
@@ -900,6 +919,7 @@ export function createTaskRunner(client, options = {}) {
 			}
 			const { tracePlatform, traceContext } = producerTrace(runOptions);
 			const requestId = resolveRequestId(runOptions, runOptions.platform ?? defaultTracePlatform);
+			const stamp = _taskStamp(input, name);
 
 			await sql.ensureTable();
 
@@ -911,7 +931,7 @@ export function createTaskRunner(client, options = {}) {
 				const slot = await idempotency.acquire(cacheKey);
 				if (slot.acquired) {
 					try {
-						const result = await runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform);
+						const result = await runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform, stamp);
 						await slot.commit(result);
 						return result;
 					} catch (err) {
@@ -926,7 +946,7 @@ export function createTaskRunner(client, options = {}) {
 				return slot.result;
 			}
 
-			return runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform);
+			return runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform, stamp);
 		},
 
 		async enqueue(name, runOptions = {}) {
@@ -955,6 +975,7 @@ export function createTaskRunner(client, options = {}) {
 			const tracePlatform = producer.tracePlatform;
 			let traceContext = producer.traceContext;
 			const requestId = resolveRequestId(runOptions, runOptions.platform ?? defaultTracePlatform);
+			const stamp = _taskStamp(input, name);
 
 			await sql.ensureTable();
 
@@ -967,7 +988,7 @@ export function createTaskRunner(client, options = {}) {
 					encodedInput,
 					idempotencyKey,
 					requestId,
-					_taskUserId(input, name),
+					stamp,
 					traceContext
 				));
 			});
@@ -1062,9 +1083,16 @@ export function createTaskRunner(client, options = {}) {
 
 		/**
 		 * Right-to-erasure (`live.forget`): delete every task row stamped with this
-		 * user's id (requires a `forgetUserId` extractor; a no-op otherwise).
+		 * user's id (requires a `forgetUserId` or `forgetIdentity` extractor; a
+		 * no-op otherwise).
 		 *
-		 * `tenantId` does NOT scope this store, and is accepted only so the
+		 * With `forgetIdentity` the purge deletes exactly the rows stamped with
+		 * `(tenantId, userId)`, null being only the untenanted scope, and rejects
+		 * with `code: 'ERASURE_INCOMPLETE'` and `legacyResidue: true` while rows
+		 * without a qualified stamp remain that carry this raw user id or no user
+		 * id at all: their tenant is unknown, so they are kept and reported.
+		 *
+		 * With `forgetUserId`, `tenantId` does NOT scope this store, and is accepted only so the
 		 * method matches the uniform purge contract. Tenancy is carried on wire
 		 * topics (`@t/<tenantId>/<topic>`) and a task is keyed by NAME, not by
 		 * topic, so a task row carries no tenant dimension to filter on. The
@@ -1074,12 +1102,19 @@ export function createTaskRunner(client, options = {}) {
 		 * silent difference between them is what made one tenant's erasure
 		 * reach another's data.
 		 *
-		 * @param {string | null} tenantId - Accepted for contract symmetry; ignored.
+		 * @param {string | null} tenantId - The exact scope with forgetIdentity; ignored with forgetUserId.
 		 * @param {string} userId
 		 * @returns {Promise<number>} task rows removed
 		 */
 		async purgeUser(tenantId, userId) {
-			if (!forgetUserId || typeof userId !== 'string' || userId.length === 0) return 0;
+			if ((!forgetUserId && !qualified) || typeof userId !== 'string' || userId.length === 0) return 0;
+			if (qualified) {
+				const identity = purgeIdentity(tenantId, userId, 'postgres tasks: purgeUser');
+				await sql.ensureTable();
+				const { removed, residue } = await withBreaker(b, () => sql.deleteByIdentity(identity));
+				if (residue) throw legacyResidueError('ERASURE_INCOMPLETE', 'postgres tasks: rows written without forgetIdentity name no tenant and may hold this user', removed);
+				return removed;
+			}
 			await sql.ensureTable();
 			return withBreaker(b, () => sql.deleteByUser(userId));
 		},
@@ -1120,7 +1155,7 @@ export function createTaskRunner(client, options = {}) {
 		}
 	};
 
-	function runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform) {
+	function runWithoutCache(name, input, encodedInput, idempotencyKey, requestId, traceContext, tracePlatform, stamp) {
 		const taskId = randomUuid();
 		// Foreground caller: must report the CANONICAL outcome (and the idempotency
 		// store caches whatever this returns), so poll the durable row on a lost
@@ -1131,7 +1166,7 @@ export function createTaskRunner(client, options = {}) {
 			// Worker queues retain the bounded JSON snapshot that was persisted,
 			// not a caller-owned object that may grow or change while waiting.
 			const workerInput = pool ? JSON.parse(encodedInput) : input;
-			return runRegisteredTask(name, workerInput, idempotencyKey, taskId, 1, null, requestId, traceContext, tracePlatform, true, encodedInput, permit);
+			return runRegisteredTask(name, workerInput, idempotencyKey, taskId, 1, null, requestId, traceContext, tracePlatform, true, encodedInput, permit, undefined, stamp);
 		} catch (error) { permit?.release(); throw error; }
 	}
 }

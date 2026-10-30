@@ -75,7 +75,31 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		const pending = index('pending_created', ['created_at'], "status = 'pending'");
 		main.indexes.push(pending);
 		versions.push([indexSql(table, pending)]);
-		schema.checkpoints[3] = schema.tables;
+		schema.checkpoints[3] = schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] }));
+		// Tenant-qualified identity: identity_version 1 marks a row stamped by a
+		// forgetIdentity runner (tenant_id NULL is then the untenanted scope);
+		// NULL marks a row written without one, whose tenant is unknown. The
+		// pending-scope index serves per-tenant dispatch and replaces the
+		// creation-time index, which no claim reads any more.
+		const identity = index('identity', ['identity_version', 'tenant_id', 'user_id']);
+		const scope = index('pending_scope', ['identity_version', 'tenant_id', 'created_at'], "status = 'pending'");
+		// IS NOT NULL keeps the expression false, not unknown, for an unstamped
+		// row with a tenant: a CHECK passes on unknown.
+		const stamp = check('identity', '(identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1)');
+		main.columns = [...main.columns, ['identity_version', 'integer', false], text('tenant_id')];
+		main.indexes = [...main.indexes.filter(entry => entry !== pending), identity, scope];
+		main.checks = [...main.checks, stamp];
+		schema.retiredIndexes.push({ ...pending, table });
+		versions.push([
+			`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS identity_version INTEGER`,
+			`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tenant_id TEXT`,
+			`DO $migration$ BEGIN ALTER TABLE ${table} ADD CONSTRAINT ${stamp.name} CHECK (${stamp.expression}) NOT VALID; EXCEPTION WHEN duplicate_object THEN NULL; END $migration$`,
+			`ALTER TABLE ${table} VALIDATE CONSTRAINT ${stamp.name}`,
+			indexSql(table, identity),
+			indexSql(table, scope),
+			`DROP INDEX CONCURRENTLY IF EXISTS ${pending.name}`
+		]);
+		schema.checkpoints[4] = schema.tables;
 	}
 	if (store === 'alarm-store') {
 		const authority = { name: `${table}_generations`, columns: [text('topic', true), ['reserved', 'bigint', true, '0'], ['committed', 'bigint', true, '0']], primary: ['topic'], indexes: [], checks: [check('authority', 'reserved >= 0 AND committed >= 0 AND reserved >= committed')], privileges: ['SELECT', 'INSERT', 'UPDATE'] };

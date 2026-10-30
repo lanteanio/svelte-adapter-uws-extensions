@@ -55,3 +55,27 @@ Handler exceptions retain their original errors. When an external fence renewal
 is already pending at handler completion, success waits for its result or the
 watchdog deadline; late ownership loss is not silently discarded. Shutdown stops
 future ticks and late external replies cannot start another database renewal.
+
+## Fair dispatch across tenants
+
+A dispatch sweep claims pending rows by tenant scope, not by global creation
+order. A scope is one tenant of rows stamped by `forgetIdentity`, the untenanted
+scope of stamped rows with a `null` tenant, or all rows written without
+`forgetIdentity`. Each sweep takes the oldest row of every chosen scope before
+a second row of any scope, and keeps creation order inside a scope. When more
+scopes have pending work than the sweep's limit, the next sweep continues after
+the last scope served, so every tenant with pending work is reached within
+`ceil(scopes / dispatchBatchSize)` sweeps however large another tenant's
+backlog is. Rotation state is per runner. Only `forgetIdentity` gives a row a
+tenant: without it every row is in one scope and dispatch is first in, first out.
+
+The claim reads the `idx_svti_tasks_pending_scope` partial index
+`(identity_version, tenant_id, created_at) WHERE status = 'pending'`. Finding
+the scopes costs at most `2 * dispatchBatchSize + 2` single-row index probes;
+claiming reads at most `k * (dispatchBatchSize - k + 1)` index entries for `k`
+chosen scopes, 30 at the default batch of 10. The previous first-in, first-out
+claim read up to `dispatchBatchSize` entries of a creation-time index in one
+statement; the fair claim uses two statements and does not sort the backlog, so
+its cost does not grow with any tenant's pending rows. The claimed rows are
+locked with `FOR UPDATE SKIP LOCKED` and re-checked as pending after the lock,
+so concurrent sweeps never claim one row twice.

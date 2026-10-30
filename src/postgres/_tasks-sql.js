@@ -15,6 +15,7 @@
 import { createStoreSchema } from './migrations.js';
 import { serialiseError, unserialisableErrorShape } from './_tasks-errors.js';
 import { MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
+import { withTransaction } from '../shared/pg-tx.js';
 
 /**
  * JSON-encode a task payload, refusing anything past the payload cap.
@@ -158,43 +159,55 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	const schema = createStoreSchema(client, 'tasks', table, autoMigrate);
 	const ensureTable = schema.ensure;
 
+	/*
+	 * A row stamped with an erasable identity is inserted under a shared
+	 * transaction-level advisory lock on that identity; deleteByIdentity takes
+	 * the same lock exclusively before its DELETE. An insert that is in flight
+	 * when an erasure starts therefore commits before the DELETE takes its
+	 * snapshot and is erased with the rest; one that starts after the erasure
+	 * committed is a later write. The two-key form keeps these locks apart
+	 * from the single-key locks the migration runner takes.
+	 */
+	const COLUMN_TYPES = {
+		svti_tasks_id: 'uuid', name: 'text', svti_idempotency_key: 'text', request_id: 'text', fence: 'uuid',
+		user_id: 'text', traceparent: 'text', tracestate: 'text', identity_version: 'integer', tenant_id: 'text'
+	};
+	function insertStatement(name, columns, expressions, values, stamp) {
+		const fenced = stamp.version === 1 && stamp.userId !== null;
+		if (!fenced) {
+			return { name: name + table, text: `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${expressions.join(', ')})`, values };
+		}
+		// INSERT ... SELECT infers no parameter types from the target columns,
+		// so every bare parameter is cast to its column's type.
+		const typed = expressions.map((expression, i) => (/^\$\d+$/.test(expression) ? `${expression}::${COLUMN_TYPES[columns[i]]}` : expression));
+		return {
+			name: name + 'fenced_' + table,
+			text: `INSERT INTO ${table} (${columns.join(', ')})
+			       SELECT ${typed.join(', ')}
+			         FROM (SELECT pg_advisory_xact_lock_shared(hashtext('${table}'), hashtext($${values.length + 1}::text))) AS fence`,
+			values: [...values, JSON.stringify([stamp.tenantId, stamp.userId])]
+		};
+	}
+
 	/**
 	 * Takes the already-encoded input that run() validated at its caller
 	 * boundary. Re-encoding here would invoke a user-defined toJSON twice:
 	 * the first value could pass the cap and the second could fail inside the
 	 * storage breaker, misclassifying caller input as a transient DB failure.
 	 */
-	async function insertAttempt(taskId, name, encodedInput, idempotencyKey, fence, requestId, userId, traceContext) {
+	async function insertAttempt(taskId, name, encodedInput, idempotencyKey, fence, requestId, stamp, traceContext) {
+		const columns = ['svti_tasks_id', 'name', 'input', 'svti_idempotency_key', 'request_id', 'status', 'fence', 'fence_expires_at', 'user_id'];
+		const expressions = ['$1', '$2', '$3::jsonb', '$4', '$5', "'running'", '$6', "now() + ($7 || ' seconds')::interval", '$8'];
+		const values = [taskId, name, encodedInput, idempotencyKey ?? null, requestId ?? null, fence, fenceTtl, stamp.userId];
 		if (traceContext != null) {
-			await client.query({
-				name: 'tasks_insert_trace_' + table,
-				text: `INSERT INTO ${table}
-				          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, user_id, traceparent, tracestate)
-				       VALUES
-				          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval, $8, $9, $10)`,
-				values: [
-					taskId,
-					name,
-					encodedInput,
-					idempotencyKey ?? null,
-					requestId ?? null,
-					fence,
-					fenceTtl,
-					userId ?? null,
-					traceContext.traceparent,
-					traceContext.tracestate ?? null
-				]
-			});
-			return;
+			columns.push('traceparent', 'tracestate');
+			expressions.push('$9', '$10');
+			values.push(traceContext.traceparent, traceContext.tracestate ?? null);
 		}
-		await client.query({
-			name: 'tasks_insert_' + table,
-			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, status, fence, fence_expires_at, user_id)
-			       VALUES
-			          ($1, $2, $3::jsonb, $4, $5, 'running', $6, now() + ($7 || ' seconds')::interval, $8)`,
-			values: [taskId, name, encodedInput, idempotencyKey ?? null, requestId ?? null, fence, fenceTtl, userId ?? null]
-		});
+		columns.push('identity_version', 'tenant_id');
+		expressions.push('$' + (values.length + 1), '$' + (values.length + 2));
+		values.push(stamp.version, stamp.tenantId);
+		await client.query(insertStatement(traceContext != null ? 'tasks_insert_trace_' : 'tasks_insert_', columns, expressions, values, stamp));
 	}
 
 	async function rearmAttempt(taskId, priorFence, nextFence, attempt) {
@@ -372,46 +385,118 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	}
 
 	/** Same already-encoded contract as insertAttempt(), for enqueue(). */
-	async function insertPending(taskId, name, encodedInput, idempotencyKey, requestId, userId, traceContext) {
+	async function insertPending(taskId, name, encodedInput, idempotencyKey, requestId, stamp, traceContext) {
+		const columns = ['svti_tasks_id', 'name', 'input', 'svti_idempotency_key', 'request_id', 'user_id'];
+		const expressions = ['$1', '$2', '$3::jsonb', '$4', '$5', '$6'];
+		const values = [taskId, name, encodedInput, idempotencyKey ?? null, requestId ?? null, stamp.userId];
 		if (traceContext != null) {
-			await client.query({
-				name: 'tasks_enqueue_trace_' + table,
-				text: `INSERT INTO ${table}
-				          (svti_tasks_id, name, input, svti_idempotency_key, request_id, user_id, traceparent, tracestate, status, fence, fence_expires_at, attempts)
-				       VALUES
-				          ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, 'pending', gen_random_uuid(), now(), 0)`,
-				values: [
-					taskId,
-					name,
-					encodedInput,
-					idempotencyKey ?? null,
-					requestId ?? null,
-					userId ?? null,
-					traceContext.traceparent,
-					traceContext.tracestate ?? null
-				]
-			});
-			return;
+			columns.push('traceparent', 'tracestate');
+			expressions.push('$7', '$8');
+			values.push(traceContext.traceparent, traceContext.tracestate ?? null);
 		}
-		await client.query({
-			name: 'tasks_enqueue_' + table,
-			text: `INSERT INTO ${table}
-			          (svti_tasks_id, name, input, svti_idempotency_key, request_id, user_id, status, fence, fence_expires_at, attempts)
-			       VALUES
-			          ($1, $2, $3::jsonb, $4, $5, $6, 'pending', gen_random_uuid(), now(), 0)`,
-			values: [taskId, name, encodedInput, idempotencyKey ?? null, requestId ?? null, userId ?? null]
-		});
+		columns.push('status', 'fence', 'fence_expires_at', 'attempts', 'identity_version', 'tenant_id');
+		expressions.push("'pending'", 'gen_random_uuid()', 'now()', '0', '$' + (values.length + 1), '$' + (values.length + 2));
+		values.push(stamp.version, stamp.tenantId);
+		await client.query(insertStatement(traceContext != null ? 'tasks_enqueue_trace_' : 'tasks_enqueue_', columns, expressions, values, stamp));
 	}
 
+	/*
+	 * Pending dispatch is fair across tenant scopes. A scope is one tenant of
+	 * qualified rows, the untenanted qualified scope, or the rows written
+	 * without forgetIdentity. Scopes rotate in the order LEGACY, UNTENANTED,
+	 * then tenant ids in index order; each sweep starts after the scope the
+	 * previous sweep ended on and takes at most `limit` scopes. Rows are then
+	 * claimed round by round (every chosen scope's oldest row before any
+	 * scope's second), FIFO inside a scope, up to `limit` rows in all.
+	 *
+	 * With k chosen scopes each may contribute up to limit - k + 1 rows: when
+	 * one scope has that many the others' first rows still fill the batch, and
+	 * when none has, every row of every scope fits. The claim therefore fills as
+	 * a FIFO claim would while reading at most k * (limit - k + 1) index entries
+	 * (30 at the default limit of 10). Finding the scopes costs up to
+	 * 2 * limit + 2 single-row probes of the pending-scope index.
+	 */
+	const LEGACY = 1, UNTENANTED = 2;
+	/** @type {null | 1 | 2 | string} */
+	let cursor = null;
+
+	const scopeProbe = (where) => `(SELECT TRUE FROM ${table}
+	          WHERE status = 'pending' AND ${where} AND name = ANY($1::text[])
+	          ORDER BY identity_version, tenant_id, created_at LIMIT 1)`;
+	const tenantWalk = (first) => `ARRAY(
+	         WITH RECURSIVE walk(tenant_id, n) AS (
+	           (SELECT p.tenant_id, 1 FROM ${table} p
+	             WHERE p.status = 'pending' AND p.identity_version = 1 AND ${first} AND p.name = ANY($1::text[])
+	             ORDER BY p.identity_version, p.tenant_id LIMIT 1)
+	           UNION ALL
+	           SELECT (SELECT p.tenant_id FROM ${table} p
+	                    WHERE p.status = 'pending' AND p.identity_version = 1 AND p.tenant_id > w.tenant_id AND p.name = ANY($1::text[])
+	                    ORDER BY p.identity_version, p.tenant_id LIMIT 1), w.n + 1
+	             FROM walk w WHERE w.tenant_id IS NOT NULL AND w.n < $2
+	         ) SELECT tenant_id FROM walk WHERE tenant_id IS NOT NULL ORDER BY n)`;
+	const scopeRows = (where) => `SELECT p.svti_tasks_id, p.created_at FROM ${table} p
+	           WHERE p.status = 'pending' AND ${where} AND p.name = ANY($3::text[])
+	           ORDER BY p.identity_version, p.tenant_id, p.created_at LIMIT $5`;
+
 	async function claimPending(limit, registeredNames) {
+		const found = (await client.query({
+			name: 'tasks_claim_scopes_' + table,
+			text: `SELECT ${scopeProbe('identity_version IS NULL AND tenant_id IS NULL')} AS legacy,
+			              ${scopeProbe('identity_version = 1 AND tenant_id IS NULL')} AS untenanted,
+			              ${tenantWalk('p.tenant_id > $3')} AS after,
+			              ${tenantWalk('p.tenant_id IS NOT NULL')} AS head`,
+			values: [registeredNames, limit, typeof cursor === 'string' ? cursor : null]
+		})).rows[0] ?? {};
+		const virtual = [];
+		if (found.legacy === true) virtual.push(LEGACY);
+		if (found.untenanted === true) virtual.push(UNTENANTED);
+		const after = Array.isArray(found.after) ? found.after : [];
+		const head = Array.isArray(found.head) ? found.head : [];
+		// The walk after the cursor holds every tenant past it whenever it is
+		// shorter than `limit`, so the head walk minus those is exactly the
+		// wrap-around part, in index order and without comparing ids here.
+		let order;
+		if (typeof cursor === 'string') {
+			const seen = new Set(after);
+			order = [...after, ...virtual, ...head.filter(tenant => !seen.has(tenant))];
+		} else if (cursor === LEGACY) order = [...virtual.filter(scope => scope !== LEGACY), ...head, ...virtual.filter(scope => scope === LEGACY)];
+		else if (cursor === UNTENANTED) order = [...head, ...virtual];
+		else order = [...virtual, ...head];
+		const chosen = order.slice(0, limit);
+		// A sweep that reached every scope starts the next one at the beginning.
+		cursor = chosen.length === limit ? chosen[chosen.length - 1] : null;
+		if (chosen.length === 0) return [];
+		const tenants = [], ords = [];
+		let legacyOrd = 0, untenantedOrd = 0;
+		chosen.forEach((scope, index) => {
+			if (scope === LEGACY) legacyOrd = index + 1;
+			else if (scope === UNTENANTED) untenantedOrd = index + 1;
+			else { tenants.push(scope); ords.push(index + 1); }
+		});
 		const res = await client.query({
 			name: 'tasks_claim_registered_' + table,
-			text: `WITH claimed AS (
-			         SELECT svti_tasks_id FROM ${table}
-			          WHERE status = 'pending' AND name = ANY($3::text[])
-			          ORDER BY created_at ASC
+			text: `WITH candidates AS (
+			         SELECT c.svti_tasks_id, c.created_at, s.ord
+			           FROM unnest($4::text[], $6::int[]) AS s(tenant_id, ord)
+			          CROSS JOIN LATERAL (${scopeRows('p.identity_version = 1 AND p.tenant_id = s.tenant_id')}) c
+			         UNION ALL
+			         SELECT c.svti_tasks_id, c.created_at, $7::int
+			           FROM (${scopeRows('p.identity_version IS NULL AND p.tenant_id IS NULL')}) c WHERE $7::int > 0
+			         UNION ALL
+			         SELECT c.svti_tasks_id, c.created_at, $8::int
+			           FROM (${scopeRows('p.identity_version = 1 AND p.tenant_id IS NULL')}) c WHERE $8::int > 0
+			       ),
+			       ranked AS (
+			         SELECT svti_tasks_id, ord, row_number() OVER (PARTITION BY ord ORDER BY created_at, svti_tasks_id) AS pos
+			           FROM candidates
+			       ),
+			       claimed AS (
+			         SELECT t.svti_tasks_id
+			           FROM ranked r JOIN ${table} t ON t.svti_tasks_id = r.svti_tasks_id
+			          WHERE t.status = 'pending'
+			          ORDER BY r.pos, r.ord
 			          LIMIT $1
-			          FOR UPDATE SKIP LOCKED
+			          FOR UPDATE OF t SKIP LOCKED
 			       )
 			       UPDATE ${table} t
 			          SET status = 'running',
@@ -420,10 +505,10 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			              attempts = t.attempts + 1,
 			              updated_at = now()
 			         FROM claimed
-			        WHERE t.svti_tasks_id = claimed.svti_tasks_id
+			        WHERE t.svti_tasks_id = claimed.svti_tasks_id AND t.status = 'pending'
 			    RETURNING t.svti_tasks_id AS id, t.name, t.input, t.svti_idempotency_key AS idempotency_key,
 			              t.request_id, t.traceparent, t.tracestate, t.fence, t.attempts`,
-			values: [limit, fenceTtl, registeredNames]
+			values: [limit, fenceTtl, registeredNames, tenants, limit - chosen.length + 1, ords, legacyOrd, untenantedOrd]
 		});
 		return res.rows;
 	}
@@ -462,14 +547,51 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		) DELETE FROM ${table} r USING expired WHERE r.svti_tasks_id = expired.svti_tasks_id`, [rowTtl, limit]);
 	}
 
-	// Right-to-erasure: delete every task row stamped with this user's id.
+	// Right-to-erasure: delete every unqualified task row stamped with this
+	// user's id. Rows a forgetIdentity runner stamped belong to one tenant's
+	// user and are erased only through their exact identity.
 	async function deleteByUser(userId) {
 		const res = await client.query({
 			name: 'tasks_delete_user_' + table,
-			text: `DELETE FROM ${table} WHERE user_id = $1`,
+			text: `DELETE FROM ${table} WHERE user_id = $1 AND identity_version IS NULL`,
 			values: [userId]
 		});
 		return res.rowCount || 0;
+	}
+
+	// Qualified erasure: delete the rows stamped with exactly (tenantId,
+	// userId), and in the same statement report whether unqualified rows remain
+	// that could still be this user's: rows with the same raw user id, or with
+	// none. Their tenant is unknown, so they are neither deleted nor ruled out.
+	// The exclusive identity lock first waits out inserts of this identity
+	// already in flight (see insertStatement).
+	async function deleteByIdentity(identity) {
+		const untenanted = identity.tenantId === null;
+		return withTransaction(client, async (tx) => {
+			await tx.query({
+				name: 'tasks_erase_fence_' + table,
+				text: `SELECT pg_advisory_xact_lock(hashtext('${table}'), hashtext($1::text))`,
+				values: [JSON.stringify([identity.tenantId, identity.userId])]
+			});
+			return deleteIdentityRows(tx, identity, untenanted);
+		});
+	}
+
+	async function deleteIdentityRows(tx, identity, untenanted) {
+		const res = await tx.query({
+			name: (untenanted ? 'tasks_delete_untenanted_' : 'tasks_delete_identity_') + table,
+			text: `WITH removed AS (
+			         DELETE FROM ${table}
+			          WHERE identity_version = 1 AND ${untenanted ? 'tenant_id IS NULL' : 'tenant_id = $2'} AND user_id = $1
+			      RETURNING 1
+			       )
+			       SELECT (SELECT count(*) FROM removed)::int AS removed,
+			              (EXISTS (SELECT 1 FROM ${table} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id = $1)
+			               OR EXISTS (SELECT 1 FROM ${table} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id IS NULL)) AS residue`,
+			values: untenanted ? [identity.userId] : [identity.userId, identity.tenantId]
+		});
+		const row = res.rows[0] ?? {};
+		return { removed: Number(row.removed) || 0, residue: row.residue === true };
 	}
 
 	return {
@@ -488,6 +610,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		claimPending,
 		reclaimStuck,
 		deleteOldTerminal,
-		deleteByUser
+		deleteByUser,
+		deleteByIdentity
 	};
 }

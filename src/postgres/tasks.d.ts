@@ -5,6 +5,9 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 import type { RedisIdempotencyStore } from '../redis/idempotency.js';
 import type { PgIdempotencyStore } from './idempotency.js';
 import type { TraceContext, TracePlatform } from '../shared/trace-context.js';
+import type { ForgetIdentity } from '../shared/forget-identity.js';
+
+export type { ForgetIdentity };
 
 export type TaskTracePlatform = TracePlatform;
 
@@ -167,6 +170,21 @@ export interface TaskRunnerOptions {
 	 * user_id`. Without it, task rows are not user-purgeable.
 	 */
 	forgetUserId?: (input: unknown, name: string) => string | null | undefined;
+	/**
+	 * Tenant-qualified alternative to `forgetUserId`; configuring both throws.
+	 * Returns the exact `{ tenantId, userId }` that owns a task (`tenantId` is
+	 * server-trusted: 1 to 64 characters of `[a-zA-Z0-9_-]`, or `null` for the
+	 * untenanted scope), or `null` / `undefined` for an unattributed task.
+	 * Extracted once before the row is inserted and stored as
+	 * `identity_version = 1` with `tenant_id` and `user_id`; retries, recovery
+	 * and cleanup keep the stamp. A throwing or malformed extractor rejects
+	 * `run` / `enqueue` before any row is written.
+	 *
+	 * Pending tasks are dispatched fairly across tenants: each sweep takes the
+	 * oldest row of every tenant with pending work before a second row of any
+	 * tenant. Rows written without this option form one further scope.
+	 */
+	forgetIdentity?: (input: unknown, name: string) => ForgetIdentity | null | undefined;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */
@@ -350,7 +368,19 @@ export interface TaskRunner extends PostgresStoreReadiness {
 	 */
 	counts(options?: { name?: string }): Promise<TaskCounts>;
 
-	/** Right-to-erasure: delete every task row stamped with a user's id (needs `forgetUserId`). */
+	/**
+	 * Right-to-erasure: delete every task row stamped with a user's id (needs
+	 * `forgetUserId` or `forgetIdentity`; resolves 0 without either).
+	 *
+	 * With `forgetIdentity`, deletes exactly the rows stamped
+	 * `(tenantId, userId)`, `null` being only the untenanted scope; an invalid
+	 * `tenantId` throws. While rows written without an identity stamp remain
+	 * that carry this raw user id or no user id, it rejects with
+	 * `code: 'ERASURE_INCOMPLETE'`, `legacyResidue: true` and the committed
+	 * `removed` count: their tenant is unknown, so they are kept.
+	 * With `forgetUserId`, `tenantId` does not scope the delete, and rows
+	 * stamped by `forgetIdentity` are left alone.
+	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
