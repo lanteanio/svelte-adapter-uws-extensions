@@ -14,6 +14,7 @@ const invalidInputs = {
 	],
 	'shared/redis-subscriber.js': [],
 	'shared/forget-store.js': [
+		'forget-store: tenant id is required - pass null for the untenanted scope',
 		'forget-store: tenant id must be null (untenanted scope) or a string - got ',
 		'forget-store: tenant id must be a non-empty string of [a-zA-Z0-9_.:-], at most ',
 		'createForgetStore: pass a map or array of stores',
@@ -37,6 +38,8 @@ const invalidInputs = {
 	],
 	'redis/registry.js': [
 		'registry: options object is required', 'registry: identify must be a function',
+		'registry: identify and identifyIdentity are mutually exclusive', 'registry: identifyIdentity must be a function',
+		'registry: a user target must be an identity { tenantId, userId }',
 		'registry: attributes must be a function returning a flat object of string|number|boolean',
 		'registry: sessionIdentify must be a function returning a string sessionId or null',
 		'registry: ttl must be a positive number (seconds)', 'registry: heartbeat must be a positive number (ms)',

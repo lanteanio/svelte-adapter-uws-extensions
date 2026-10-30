@@ -11,6 +11,8 @@
  * @module svelte-adapter-uws-extensions/forget-store
  */
 
+export type { ForgetIdentity } from './forget-identity.js';
+
 export interface ForgetableStore {
 	purgeUser(
 		tenantId: string | null,

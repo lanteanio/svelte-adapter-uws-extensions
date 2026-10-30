@@ -143,7 +143,13 @@ const OWNER_FORGET_EVICT_SCRIPT =
 const VALID_TENANT_ID = /^[a-zA-Z0-9_.:-]+$/;
 const MAX_TENANT_ID_LEN = 64;
 function validateTenantId(tenantId) {
-	if (tenantId == null) return null;
+	// A missing tenant is refused rather than read as the untenanted scope: a
+	// qualified store would otherwise erase only the null-tenant identity and
+	// report success, and a direct call to that store refuses it as well.
+	if (tenantId === undefined) {
+		throw new Error('forget-store: tenant id is required - pass null for the untenanted scope');
+	}
+	if (tenantId === null) return null;
 	// Non-strings are refused rather than coerced. On an erasure path a silent
 	// miss is worse than a loud refusal: the data was written under whatever
 	// representation the WRITER used, and coercing here would report a
@@ -427,6 +433,16 @@ export function createForgetStore(stores, options) {
 			}
 			const erasedPresenceTopics = [...presenceTopics].sort();
 			const erasedCursorTopics = [...cursorTopics].sort();
+			// A store that rejected after committing part of its erasure reports
+			// that count on the error as `removed`; keep it in the breakdown.
+			for (let i = 0; i < entries.length; i++) {
+				const r = settled[i];
+				const removed = r.status === 'rejected' ? /** @type {any} */ (r.reason)?.removed : undefined;
+				if (Number.isSafeInteger(removed) && removed > 0) {
+					const name = entries[i][0];
+					counts[name] = (counts[name] || 0) + removed;
+				}
+			}
 			if (failures.length) {
 				const err = operationError('ERASURE_INCOMPLETE',
 					'createForgetStore: ' + failedUnits + ' of ' + (entries.length + (redis ? 2 : 0)) +
