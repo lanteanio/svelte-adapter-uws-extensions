@@ -33,6 +33,22 @@ export function topicInTenant(tenantId, topic) {
 }
 
 /**
+ * The tenant scope a topic belongs to under the same rule: the tenant id of an
+ * `@t/<tenantId>/` topic, `~` for an untenanted topic, and null for a
+ * malformed tenant topic (`@t/` with no tenant segment), which no tenant
+ * scope contains.
+ *
+ * @param {unknown} topic
+ * @returns {string | null}
+ */
+export function topicTenantScope(topic) {
+	if (typeof topic !== 'string') return null;
+	if (!topic.startsWith(TENANT_TOPIC_NS)) return '~';
+	const end = topic.indexOf('/', TENANT_TOPIC_NS.length);
+	return end > TENANT_TOPIC_NS.length ? topic.slice(TENANT_TOPIC_NS.length, end) : null;
+}
+
+/**
  * SQL fragment applying the same rule to a `topic` column, plus the parameter
  * to bind. `$<n>` is the placeholder index the caller has available.
  *

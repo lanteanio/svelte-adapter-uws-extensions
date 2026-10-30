@@ -533,6 +533,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				const set = sortedSets.get(key);
 				return set ? set.length : 0;
 			},
+			async zscore(key, member) {
+				const entry = sortedSets.get(key)?.find((e) => String(e.member) === String(member));
+				return entry ? String(entry.score) : null;
+			},
 			async zcount(key, min, max) {
 				const set = sortedSets.get(key);
 				if (!set) return 0;
@@ -1016,6 +1020,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('ORDERED_ALARM_GENERATIONS_V2')) {
 					return evaluateAlarmGeneration(args, { sortedSets, hashes });
 				}
+				if (script.includes('-- DLQ_ADD')) return evalDeadLetter(numKeys, args, true);
+				if (script.includes('-- DLQ_DROP')) return evalDeadLetter(numKeys, args, false);
 
 				if (script.includes('RATELIMIT_LEGACY_UNLINK')) {
 					const [key, intent] = args;
@@ -2166,6 +2172,98 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				out.push(k, v.json);
 			}
 			return out;
+		}
+
+		// Dead-letter capture and removal (DLQ_ADD / DLQ_DROP): the same steps as
+		// the Lua over the record hash, the failedAt order set, the record ->
+		// tenant scope hash, the `<scope>/<padded id>` index and the per-scope
+		// counts. Key TTLs stay inert, like this double's PEXPIRE surface.
+		function evalDeadLetter(numKeys, args, add) {
+			const [seqKey, recsKey, orderKey, tenantKey, tenantOrderKey, sizeKey] = args.slice(0, numKeys).map(String);
+			const argv = args.slice(numKeys).map(String);
+			const entry = (scope, id) => scope + '/' + id.padStart(20, '0');
+			const hash = (key) => { if (!hashes.has(key)) hashes.set(key, new Map()); return hashes.get(key); };
+			const hdel = (key, field) => {
+				const h = hashes.get(key);
+				const removed = h?.delete(field) ? 1 : 0;
+				if (h && h.size === 0) hashes.delete(key);
+				return removed;
+			};
+			const zadd = (key, score, member) => {
+				if (!sortedSets.has(key)) sortedSets.set(key, []);
+				const set = sortedSets.get(key);
+				const existing = set.find((e) => String(e.member) === member);
+				if (existing) existing.score = score;
+				else set.push({ score, member });
+				set.sort((a, b) => a.score - b.score);
+				return existing ? existing.score : score;
+			};
+			const zrem = (key, member) => {
+				const set = sortedSets.get(key);
+				if (!set) return;
+				const index = set.findIndex((e) => String(e.member) === member);
+				if (index !== -1) set.splice(index, 1);
+				if (set.length === 0) sortedSets.delete(key);
+			};
+			const zincr = (key, member, delta) => {
+				const current = sortedSets.get(key)?.find((e) => String(e.member) === member);
+				return zadd(key, (current ? current.score : 0) + delta, member);
+			};
+			const drop = (id) => {
+				const removed = hdel(recsKey, id);
+				zrem(orderKey, id);
+				const scope = hashes.get(tenantKey)?.get(id);
+				if (scope !== undefined) {
+					hdel(tenantKey, id);
+					zrem(tenantOrderKey, entry(scope, id));
+					if (zincr(sizeKey, scope, -1) <= 0) zrem(sizeKey, scope);
+				}
+				return removed;
+			};
+			if (!add) return argv.reduce((removed, id) => removed + drop(id), 0);
+			const ordered = () => (sortedSets.get(orderKey) ?? []).map((e) => String(e.member));
+			if ((hashes.get(tenantKey)?.size ?? 0) !== ordered().length) {
+				sortedSets.delete(tenantOrderKey);
+				sortedSets.delete(sizeKey);
+				const live = new Set(ordered());
+				for (const id of [...(hashes.get(tenantKey)?.keys() ?? [])]) if (!live.has(id)) hdel(tenantKey, id);
+				for (const id of ordered()) {
+					let scope = hashes.get(tenantKey)?.get(id);
+					if (scope === undefined) { scope = ''; hash(tenantKey).set(id, scope); }
+					zadd(tenantOrderKey, 0, entry(scope, id));
+					zincr(sizeKey, scope, 1);
+				}
+			}
+			const [json, failedAt, scope, max, ttlMs, cutoff] = argv;
+			pruneExpiredString(seqKey);
+			const id = String(parseInt(store.get(seqKey) || '0', 10) + 1);
+			store.set(seqKey, id);
+			hash(recsKey).set(id, json);
+			zadd(orderKey, Number(failedAt), id);
+			hash(tenantKey).set(id, scope);
+			zadd(tenantOrderKey, 0, entry(scope, id));
+			zincr(sizeKey, scope, 1);
+			if (Number(ttlMs) > 0) {
+				for (const e of [...(sortedSets.get(orderKey) ?? [])]) if (e.score <= Number(cutoff)) drop(String(e.member));
+			}
+			let evicted = 0;
+			while ((sortedSets.get(orderKey)?.length ?? 0) > Number(max)) {
+				// ZREVRANGE 0 0: the highest count, ties to the greatest member.
+				let heaviest;
+				for (const e of sortedSets.get(sizeKey) ?? []) {
+					const member = String(e.member);
+					if (heaviest === undefined || e.score > heaviest.score || (e.score === heaviest.score && member > heaviest.member)) heaviest = { score: e.score, member };
+				}
+				if (heaviest === undefined) break;
+				const prefix = heaviest.member + '/';
+				// ZRANGEBYLEX [<scope>/ (<scope>0 LIMIT 0 1: the lowest member with the prefix.
+				const oldest = (sortedSets.get(tenantOrderKey) ?? []).map((e) => String(e.member)).filter((m) => m.startsWith(prefix)).sort()[0];
+				if (oldest === undefined) { zrem(sizeKey, heaviest.member); continue; }
+				const victim = /^0*(\d+)$/.exec(oldest.slice(prefix.length))?.[1];
+				if (victim !== undefined) evicted += drop(victim);
+				zrem(tenantOrderKey, oldest);
+			}
+			return [id, evicted];
 		}
 
 		// Ownership scripts model pending/result string expiry and per-field TTL.

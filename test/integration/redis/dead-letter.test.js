@@ -14,6 +14,7 @@ import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { redisNowMs, waitRedisMs } from '../helpers/backend-clock.js';
 import { monotonicNow } from '../../../src/shared/runtime.js';
 import { createDeadLetter } from '../../../src/redis/dead-letter.js';
+import { createMetrics } from '../../../src/prometheus/index.js';
 
 const byAuthor = (record) => (record && record.data && record.data.author) || null;
 
@@ -148,6 +149,57 @@ describe('redis dead-letter (integration)', () => {
 		expect(await dlq.add(rec({ topic: '@t/acme/orders', data: { author: 'u1', body: 'PII' }, failedAt, startedAt }))).toBeNull();
 		expect(await dlq.add(rec({ topic: '@t/globex/orders', data: { author: 'u1', body: 'kept' }, failedAt, startedAt }))).not.toBeNull();
 		expect((await dlq.list()).map(r => r.topic)).toEqual(['@t/globex/orders']);
+	});
+
+	it('evicts from the tenant holding the most records, never from one under its share', async () => {
+		const metrics = createMetrics();
+		const dlq = createDeadLetter(client, { max: 10, metrics });
+		const failedAt = await redisNowMs(client);
+		for (let n = 0; n < 5; n++) await dlq.add(rec({ topic: '@t/victim/orders', data: { n }, failedAt }));
+		for (let n = 0; n < 30; n++) await dlq.add(rec({ topic: '@t/noisy/orders', data: { n }, failedAt }));
+
+		expect((await dlq.list({ topic: '@t/victim/orders' })).map((r) => r.data.n)).toEqual([4, 3, 2, 1, 0]);
+		expect((await dlq.list({ topic: '@t/noisy/orders' })).map((r) => r.data.n)).toEqual([29, 28, 27, 26, 25]);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 25');
+		// Every structure agrees after the script's evictions.
+		expect(await client.redis.hlen(client.key('dlq:recs:{dlq}'))).toBe(10);
+		expect(await client.redis.zcard(client.key('dlq:order:{dlq}'))).toBe(10);
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(10);
+		expect(await client.redis.zcard(client.key('dlq:tenant-order:{dlq}'))).toBe(10);
+		expect(await client.redis.zrange(client.key('dlq:tenant-size:{dlq}'), 0, -1, 'WITHSCORES')).toEqual(['noisy', '5', 'victim', '5']);
+	});
+
+	it('keeps the tenant accounting in step with remove, purgeUser and clear', async () => {
+		const dlq = createDeadLetter(client, { max: 4, forgetUserId: byAuthor });
+		const failedAt = await redisNowMs(client);
+		const first = await dlq.add(rec({ topic: '@t/a/orders', data: { author: 'u1' }, failedAt }));
+		await dlq.add(rec({ topic: '@t/a/orders', data: { author: 'u2' }, failedAt }));
+		await dlq.add(rec({ topic: '@t/b/orders', data: { author: 'u2' }, failedAt }));
+		expect(await dlq.remove(first)).toBe(true);
+		expect(await dlq.purgeUser('b', 'u2')).toBe(1);
+		expect(await client.redis.zrange(client.key('dlq:tenant-size:{dlq}'), 0, -1, 'WITHSCORES')).toEqual(['a', '1']);
+		expect(await client.redis.zcard(client.key('dlq:tenant-order:{dlq}'))).toBe(1);
+		for (let n = 0; n < 4; n++) await dlq.add(rec({ topic: '@t/b/orders', data: { n }, failedAt }));
+		expect(await dlq.count({ topic: '@t/a/orders' })).toBe(1);
+		await dlq.clear();
+		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size']) {
+			expect(await client.redis.exists(client.key(`dlq:${key}:{dlq}`))).toBe(0);
+		}
+	});
+
+	it('counts records captured before tenant accounting in one scope of their own', async () => {
+		const now = await redisNowMs(client);
+		for (let id = 1; id <= 6; id++) {
+			await client.redis.hset(client.key('dlq:recs:{dlq}'), String(id), JSON.stringify({ ...rec({ topic: '@t/victim/orders', data: { n: id } }), failedAt: now - 1000 + id }));
+			await client.redis.zadd(client.key('dlq:order:{dlq}'), now - 1000 + id, String(id));
+		}
+		await client.redis.set(client.key('dlq:seq:{dlq}'), '6');
+		const dlq = createDeadLetter(client, { max: 8 });
+		for (let n = 0; n < 4; n++) await dlq.add(rec({ topic: '@t/fresh/orders', data: { n }, failedAt: now }));
+		expect(await dlq.count({ topic: '@t/fresh/orders' })).toBe(4);
+		expect((await dlq.list({ topic: '@t/victim/orders' })).map((r) => r.id)).toEqual(['6', '5', '4', '3']);
+		expect(await client.redis.zrange(client.key('dlq:tenant-size:{dlq}'), 0, -1, 'WITHSCORES')).toEqual(['', '4', 'fresh', '4']);
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(8);
 	});
 
 	it('hides records past ttlMs from reads before any later add evicts them', async () => {

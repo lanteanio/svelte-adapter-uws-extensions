@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { createDeadLetter } from '../../src/redis/dead-letter.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 import { setRuntimeEnv, resetRuntimeEnv, monotonicNow } from '../../src/shared/runtime.js';
 
 const rec = (over = {}) => ({
@@ -156,6 +157,90 @@ describe('redis dead-letter store', () => {
 		expect(await store.count()).toBe(0);
 		expect(await store.list()).toEqual([]);
 		expect(await store.summary()).toMatchObject({ total: 0, byTopic: {} });
+		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size']) {
+			expect(await client.redis.exists(client.key(`dlq:${key}:{dlq}`))).toBe(0);
+		}
+	});
+});
+
+describe('redis dead-letter fair-share eviction', () => {
+	let client;
+	beforeEach(() => { client = mockRedisClient('test:'); });
+
+	const topicsKept = async (s) => (await s.list({ limit: 1000 })).map((r) => r.topic + ':' + r.data.n).sort();
+	const size = (scope) => client.redis.zscore(client.key('dlq:tenant-size:{dlq}'), scope);
+
+	it('keeps every record of a tenant under its share while another tenant overflows', async () => {
+		const metrics = createMetrics();
+		const s = createDeadLetter(client, { max: 10, metrics });
+		for (let n = 0; n < 5; n++) await s.add(rec({ topic: '@t/victim/orders', data: { n } }));
+		for (let n = 0; n < 10; n++) await s.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		expect(await s.count()).toBe(10);
+		expect(await s.count({ topic: '@t/victim/orders' })).toBe(5);
+		// The noisy tenant lost its own oldest records.
+		expect((await s.list({ topic: '@t/noisy/orders' })).map((r) => r.data.n)).toEqual([9, 8, 7, 6, 5]);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 5');
+		for (let n = 10; n < 30; n++) await s.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		expect(await s.count({ topic: '@t/victim/orders' })).toBe(5);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 25');
+		expect(await size('victim')).toBe('5');
+		expect(await size('noisy')).toBe('5');
+	});
+
+	it('evicts the largest scope down to the others, then shares the cap', async () => {
+		const s = createDeadLetter(client, { max: 6 });
+		for (let n = 0; n < 2; n++) await s.add(rec({ topic: 'orders', data: { n } }));
+		for (let n = 0; n < 2; n++) await s.add(rec({ topic: '@t/a/orders', data: { n } }));
+		for (let n = 0; n < 6; n++) await s.add(rec({ topic: '@t/b/orders', data: { n } }));
+		// Untenanted topics are one scope; b had the most records and paid for all of it.
+		expect(await topicsKept(s)).toEqual(['@t/a/orders:0', '@t/a/orders:1', '@t/b/orders:4', '@t/b/orders:5', 'orders:0', 'orders:1']);
+		// Every scope sits at its share, so the next capture evicts the
+		// capturing tenant's own oldest record.
+		await s.add(rec({ topic: '@t/a/orders', data: { n: 2 } }));
+		expect(await s.count({ topic: '@t/a/orders' })).toBe(2);
+		expect(await s.count()).toBe(6);
+	});
+
+	it('keeps the tenant accounting in step with remove and purgeUser', async () => {
+		const s = createDeadLetter(client, { max: 4, forgetUserId: (r) => r.data.user });
+		const first = await s.add(rec({ topic: '@t/a/orders', data: { n: 0, user: 'u1' } }));
+		await s.add(rec({ topic: '@t/a/orders', data: { n: 1, user: 'u2' } }));
+		await s.add(rec({ topic: '@t/b/orders', data: { n: 0, user: 'u2' } }));
+		expect(await s.remove(first)).toBe(true);
+		expect(await s.remove(first)).toBe(false);
+		expect(await size('a')).toBe('1');
+		expect(await s.purgeUser('b', 'u2')).toBe(1);
+		expect(await size('b')).toBe(null);
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(1);
+		for (let n = 0; n < 4; n++) await s.add(rec({ topic: '@t/b/orders', data: { n: n + 1 } }));
+		expect(await s.count({ topic: '@t/a/orders' })).toBe(1);
+		expect(await s.count()).toBe(4);
+	});
+
+	it('counts records captured before tenant accounting in one scope of their own', async () => {
+		// Records an earlier version wrote: hash and order set, no tenant entries.
+		for (let id = 1; id <= 6; id++) {
+			await client.redis.hset(client.key('dlq:recs:{dlq}'), String(id), JSON.stringify({ ...rec({ topic: '@t/victim/orders', data: { n: id } }), failedAt: id }));
+			await client.redis.zadd(client.key('dlq:order:{dlq}'), id, String(id));
+		}
+		await client.redis.set(client.key('dlq:seq:{dlq}'), '6');
+		const s = createDeadLetter(client, { max: 8 });
+		for (let n = 0; n < 4; n++) await s.add(rec({ topic: '@t/fresh/orders', data: { n } }));
+		// The six earlier records form the largest scope, so they pay for the overflow.
+		expect(await s.count({ topic: '@t/fresh/orders' })).toBe(4);
+		expect((await s.list({ topic: '@t/victim/orders' })).map((r) => r.id)).toEqual(['6', '5', '4', '3']);
+		expect(await size('')).toBe('4');
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(8);
+	});
+
+	it('counts a malformed tenant topic in the unknown scope', async () => {
+		const s = createDeadLetter(client, { max: 3 });
+		await s.add(rec({ topic: '@t/victim/orders' }));
+		await s.add(rec({ topic: '@t/' }));
+		await s.add(rec({ topic: '@t/' }));
+		await s.add(rec({ topic: '@t/' }));
+		expect(await s.count({ topic: '@t/victim/orders' })).toBe(1);
+		expect(await size('')).toBe('2');
 	});
 });
 

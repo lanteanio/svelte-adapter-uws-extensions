@@ -305,6 +305,21 @@
 					"template": "dlq:order:{dlq}"
 				},
 				{
+					"id": "tenant",
+					"type": "hash",
+					"template": "dlq:tenant:{dlq}"
+				},
+				{
+					"id": "tenant-order",
+					"type": "zset",
+					"template": "dlq:tenant-order:{dlq}"
+				},
+				{
+					"id": "tenant-size",
+					"type": "zset",
+					"template": "dlq:tenant-size:{dlq}"
+				},
+				{
 					"id": "erasure",
 					"type": "string",
 					"template": "dlq:purged:<scope>/<user>"
