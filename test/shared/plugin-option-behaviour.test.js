@@ -57,7 +57,20 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
-/** A mock platform that also records the wire-codec paths and when each frame went out. */
+/** Cursor keys carry a random per-instance prefix on the Redis side. */
+const unkey = (v) => JSON.parse(JSON.stringify(v ?? null).replace(/"[0-9a-f]{16}:/g, '"'));
+
+/** A client that negotiated the cursor short-id dictionary. */
+const dictionaryClient = {
+	getUserData: () => ({ [Symbol.for('adapter-uws.ws.caps')]: new Set(['cursor.protocol:2', 'cursor.protocol:3', 'presence.protocol:1']) })
+};
+
+/**
+ * A mock platform that also records the wire-codec paths, when each frame
+ * went out, and the bytes a dictionary-capable client would receive for each
+ * wire frame (encoded through the codec's per-connection state, as the
+ * adapter does).
+ */
 function recordingPlatform() {
 	const platform = mockPlatform();
 	const start = Date.now();
@@ -66,9 +79,18 @@ function recordingPlatform() {
 		list.push = (...items) => push(...items.map((item) => ({ ...item, at: Date.now() - start })));
 	}
 	platform.codecs = [];
+	platform.encoded = [];
+	const states = new Map();
+	const encode = (codec, event, data) => {
+		if (!codec) return;
+		if (!states.has(codec)) states.set(codec, codec.state?.onAttach?.(dictionaryClient) ?? undefined);
+		const bytes = codec.encode(event, unkey(data), states.get(codec));
+		platform.encoded.push(bytes == null ? null : Buffer.from(bytes).toString('hex'));
+	};
 	platform.registerWireCodec = () => {};
 	platform.publishWire = (topic, event, data, codec, options) => {
 		platform.codecs.push(codec?.capability ?? null);
+		encode(codec, event, data);
 		return platform.publish(topic, event, data, options);
 	};
 	platform.sendWire = (ws, topic, event, data, codec, options) => {
@@ -253,13 +275,12 @@ async function cursorUpdates(side, options, { topic = 'room', moves = [{ x: 1, y
 		elapsed = at;
 		seen.push([platform.published.length, platform.sent.length, platform.sentCoalesced.length]);
 	}
-	const unkey = (v) => JSON.parse(JSON.stringify(v ?? null).replace(/"[0-9a-f]{16}:/g, '"'));
 	const frames = [
 		...platform.published.map((p) => ['publish', p.at, p.topic.length, p.event, sorted(unkey(p.data))]),
 		...platform.sent.map((p) => ['send', p.at, p.event, sorted(unkey(p.data))]),
 		...platform.sentCoalesced.map((p) => ['coalesced', p.at, p.event, sorted(unkey(p.data))])
 	];
-	return { outcome, seen, codecs: [...new Set(platform.codecs)].sort(), frames };
+	return { outcome, seen, codecs: [...new Set(platform.codecs)].sort(), encoded: platform.encoded, frames };
 }
 
 const cursorScenarios = {
@@ -276,8 +297,31 @@ const cursorScenarios = {
 		long: await cursorUpdates(side, o, { topic: 't'.repeat(257) })
 	}),
 	minMove: (side, o) => cursorUpdates(side, o, { moves: [{ x: 0, y: 0 }, { x: 0.5, y: 0 }, { x: 3, y: 0 }, { x: 20, y: 0 }], gap: 50, checkpoints: [0, 100] }),
-	position: (side, o) => cursorUpdates(side, o, { moves: [{ x: 1, y: 1 }, { x: 5, y: 5 }], gap: 50 }),
-	viewport: (side, o) => cursorUpdates(side, o, { sockets: 2 }),
+	// minMove is measured on what position() returns, so it decides which moves go out.
+	position: (side, o) => cursorUpdates(side, { minMove: 5, ...o }, { moves: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 10, y: 0 }, { x: 11, y: 0 }], gap: 50 }),
+	async viewport(side, o) {
+		const c = side.make(o);
+		created.push(c);
+		const platform = recordingPlatform();
+		const a = mockWs({ id: 'a' });
+		const b = mockWs({ id: 'b' });
+		await c.update(a, 'room', { x: 0, y: 0 }, platform);
+		await c.update(b, 'room', { x: 0, y: 0 }, platform);
+		await settle(50);
+		const reported = await attempt(() => c.viewport(a, 'room', { x: 5000, y: 5000, w: 100, h: 100, zoom: 1 }));
+		platform.reset();
+		for (let i = 1; i < 5; i++) {
+			await c.update(b, 'room', { x: i * 10, y: i * 10 }, platform);
+			await settle(40);
+		}
+		await settle(200);
+		return {
+			reported: typeof reported === 'string' ? reported : 'ok',
+			published: platform.published.map((p) => p.event),
+			sent: platform.sent.map((p) => [p.ws?.getUserData?.().id, p.event]),
+			coalesced: platform.sentCoalesced.map((p) => [p.ws?.getUserData?.().id, p.event])
+		};
+	},
 	backpressure: (side, o) => cursorUpdates(side, o, { sockets: 2 })
 };
 
@@ -310,25 +354,50 @@ const groupScenarios = {
 		const { g, joins } = await groupJoins(side, options);
 		return { maxMembers: g.maxMembers, joins };
 	},
-	async onJoin(side, options) {
-		const { joins } = await groupJoins(side, options, 2);
-		return { joins };
-	},
-	async onLeave(side, options) {
-		const { g, platform } = await groupJoins(side, options, 1);
-		const left = await attempt(() => g.leave(mockWs({ id: 'u0' }), platform));
-		return { left: typeof left === 'string' ? left : 'ok' };
-	},
-	async onFull(side, options) {
-		const { joins } = await groupJoins(side, { ...options, maxMembers: 1 }, 2);
-		return { joins };
-	},
-	async onClose(side, options) {
-		const { g, platform } = await groupJoins(side, options, 1);
-		const closed = await attempt(() => g.close(platform));
-		return { closed: typeof closed === 'string' ? closed : 'ok' };
-	}
+	onJoin: groupHooks,
+	onLeave: groupHooks,
+	onFull: groupHooks,
+	onClose: groupHooks
 };
+
+/**
+ * Wrap each hook in the options so every call is recorded with its
+ * arguments (a socket as its id) and what the hook returned, then run a
+ * fixed sequence on a group capped at two: a joins, b joins as admin, c is
+ * refused, a joins again, b leaves twice, the group closes.
+ */
+async function groupHooks(side, options) {
+	const calls = [];
+	const wrapped = { maxMembers: 2, ...options };
+	for (const name of ['onJoin', 'onLeave', 'onFull', 'onClose']) {
+		const hook = wrapped[name];
+		if (typeof hook !== 'function') continue;
+		wrapped[name] = (...args) => {
+			const result = hook(...args);
+			calls.push([name, ...args.map((a) => (a && typeof a.getUserData === 'function' ? 'ws:' + a.getUserData().id : a)), sorted(result ?? null)]);
+			return result;
+		};
+	}
+	const g = side.make(wrapped);
+	created.push(g);
+	const platform = recordingPlatform();
+	const a = mockWs({ id: 'a' });
+	const b = mockWs({ id: 'b' });
+	const c = mockWs({ id: 'c' });
+	const joins = [
+		await attempt(() => g.join(a, platform)),
+		await attempt(() => g.join(b, platform, 'admin')),
+		await attempt(() => g.join(c, platform)),
+		await attempt(() => g.join(a, platform))
+	];
+	await settle(50);
+	await attempt(() => g.leave(b, platform));
+	await attempt(() => g.leave(b, platform));
+	await settle(50);
+	await attempt(() => g.close(platform));
+	await settle(50);
+	return { joins, calls };
+}
 
 /** Rate limit: the verdict sequence over time, in the default window mode. */
 const rateSides = {
@@ -390,7 +459,20 @@ for (const [name, sides, scenarios] of plugins) {
 	}
 }
 
+const scenarioKeys = plugins.flatMap(([name, sides, scenarios]) => Object.entries(scenarios).map(([key, scenario]) => [`${name}.${key}`, sides, scenario, key]));
+
 describe('options shared with the in-memory plugins behave the same', () => {
+	// A scenario that records the same thing for every value cannot tell two
+	// readings of the option apart.
+	it.each(scenarioKeys)('%s: the scenario tells the in-memory plugin\'s values apart', async (_id, sides, scenario, key) => {
+		const records = new Set();
+		for (const value of ODD_VALUES) {
+			if (!constructs(sides.lead, key, value)) continue;
+			records.add(JSON.stringify(await scenario(sides.lead, { [key]: value })));
+		}
+		expect(records.size).toBeGreaterThanOrEqual(2);
+	});
+
 	it.each(rows)('%s', async (_id, sides, scenario, key, value) => {
 		if (!constructs(sides.lead, key, value) || !constructs(sides.redis, key, value)) return;
 		const lead = await scenario(sides.lead, { [key]: value });
