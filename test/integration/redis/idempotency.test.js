@@ -11,6 +11,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createIdempotencyStore } from '../../../src/redis/idempotency.js';
+import { createHashFieldTTLProbe } from '../../../src/shared/redis-version.js';
 
 describe('redis idempotency (integration)', () => {
 	let client;
@@ -41,7 +42,11 @@ describe('redis idempotency (integration)', () => {
 			await waitRedisMs(client.redis, 1100);
 			expect(await store.purgeUser(null, 'alice')).toBeGreaterThanOrEqual(1);
 			expect((await store.acquire('long')).acquired).toBe(true);
-		} finally { client.redis.info = info; }
+		} finally {
+			client.redis.info = info;
+			// Stores on one client share the capability probe; forget the faked answer.
+			createHashFieldTTLProbe(client.redis).invalidate();
+		}
 	});
 
 	it.each([undefined, 0, 5, 864000])('per-acquire retention %s replaces the pending lease', async (ttl) => {

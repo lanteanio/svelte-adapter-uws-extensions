@@ -16,6 +16,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { createBackendClient, resetBackendKeys } from '../helpers/backend.js';
 import { createPubSubBus } from '../../../src/redis/pubsub.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { mockWs } from '../../helpers/mock-ws.js';
 
 function wait(ms) {
 	return new Promise((r) => setTimeout(r, ms));
@@ -441,11 +442,11 @@ describe('redis pubsub bus (integration)', () => {
 			// trust path.
 			const channel = uniqueChannel('hooks-open');
 			const bus = track(createPubSubBus(client, { channel }));
-			const ws = { id: 'w1' };
+			const ws = mockWs();
 
 			await bus.hooks.open(ws, { platform });
 
-			expect(platform.subscribed).toEqual([{ ws, topic: '__realtime' }]);
+			expect(ws.isSubscribed('__realtime')).toBe(true);
 
 			// Confirm activate ran: a remote publish on `channel` is
 			// forwarded through the bus's subscriber duplicate to the
@@ -463,11 +464,10 @@ describe('redis pubsub bus (integration)', () => {
 			const channel = uniqueChannel('hooks-open-many');
 			const bus = track(createPubSubBus(client, { channel }));
 
-			await bus.hooks.open({ id: 'w1' }, { platform });
-			await bus.hooks.open({ id: 'w2' }, { platform });
-			await bus.hooks.open({ id: 'w3' }, { platform });
+			const sockets = [mockWs(), mockWs(), mockWs()];
+			for (const ws of sockets) await bus.hooks.open(ws, { platform });
 
-			expect(platform.subscribed.map((s) => s.topic)).toEqual(['__realtime', '__realtime', '__realtime']);
+			expect(sockets.map((ws) => ws.isSubscribed('__realtime'))).toEqual([true, true, true]);
 
 			// One remote publish should arrive exactly once - confirms a
 			// single subscriber duplicate handles all three open calls.
