@@ -344,7 +344,7 @@ start stores with `autoMigrate: false`. Readiness requires these privileges:
 | Jobs `svti_jobs` | SELECT, INSERT, UPDATE, DELETE |
 | Tasks `svti_tasks` | SELECT, INSERT, UPDATE, DELETE |
 | Idempotency `svti_idempotency` | SELECT, INSERT, UPDATE, DELETE |
-| Dead letters `svti_dead_letter` and erasure fences `svti_dead_letter_purges` | SELECT, INSERT, UPDATE, DELETE |
+| Dead letters `svti_dead_letter`, erasure fences `svti_dead_letter_purges` and scope counts `svti_dead_letter_scopes` | SELECT, INSERT, UPDATE, DELETE |
 | Alarm schedules `svti_alarms` | SELECT, INSERT, UPDATE, DELETE |
 | Alarm authority `svti_alarms_generations` | SELECT, INSERT, UPDATE |
 | Alarm executions `svti_alarms_executions` | SELECT, INSERT, UPDATE, DELETE |
@@ -354,7 +354,9 @@ Grant `USAGE` (or `UPDATE`) on the owned serial sequences for replay, jobs and
 dead letters. Substitute configured names and grant only the stores in use.
 Replay and dead-letter cleanup select rows with `FOR UPDATE SKIP LOCKED`, so
 `UPDATE` is required even though their public event operations insert and delete
-rather than updating stored payloads. Test readiness and maintenance through the
+rather than updating stored payloads. The dead-letter scope-count triggers run as the
+writing role, so a role that changes dead-letter rows also needs its grants on
+`svti_dead_letter_scopes`. Test readiness and maintenance through the
 actual runtime login: testing with the owner or superuser can conceal missing
 grants. Trigger behavior and row-level policies still need application tests.
 

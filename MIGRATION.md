@@ -1118,6 +1118,36 @@ one restore group: a PostgreSQL scope file that lists `dead-letter` must also
 list `dead-letter-erasure` (and the reverse), or validation fails with
 `incomplete_restore_group`; add the entry to existing scope files.
 
+### Dead-letter eviction is fair-share across tenants
+
+Above `max`, both dead-letter stores now evict the oldest record of the tenant
+scope holding the most records instead of the oldest record overall. The scope
+is the one erasure uses: the tenant of an `@t/<tenant>/` topic, `~` for
+untenanted topics. Records stored before this release, and a malformed tenant
+topic, count in the scope `''`, which pays first while it is the largest. A
+dashboard or test that expected the globally oldest record to go first sees a
+different record evicted; `dead_letter_evicted_total{store}` counts evictions.
+
+On Redis three keys join the `{dlq}` slot under `dlq:*`: `dlq:tenant:{dlq}`,
+`dlq:tenant-order:{dlq}` and `dlq:tenant-size:{dlq}`. Back them up and restore
+them with the records; the next capture rebuilds them when the record and
+tenant counts disagree, for example after records written by an earlier
+release.
+
+Postgres dead-letter migration version 4 adds `scope TEXT NOT NULL DEFAULT ''`
+to `<table>`, an index on `(scope, <table>_id)`, the `<table>_scopes` count
+table, and statement triggers on `<table>` that keep the counts for every
+INSERT, UPDATE, DELETE and TRUNCATE. The migration takes a SHARE ROW EXCLUSIVE
+lock on `<table>` while it counts the existing rows, so writers wait for one
+pass over the table. With `autoMigrate: false`, apply version 4
+(`postgresMigrations({ store: 'dead-letter' })`) and grant the runtime role
+SELECT, INSERT, UPDATE and DELETE on `<table>_scopes` before writers of this
+release start; `ready()` fails while a trigger is missing or disabled. Writers
+of an earlier release keep working and store their rows in the `''` scope. Back
+up and restore `<table>_scopes` with the other two tables: a PostgreSQL recovery
+scope file that lists `dead-letter` must also list `dead-letter-tenants`, and
+the verifier checks the counts against the rows (`scope_counts`).
+
 ### `createClusterClock` prefixes `leaderKey`
 
 `leaderKey` is now relative to the client key prefix, so two apps sharing one
