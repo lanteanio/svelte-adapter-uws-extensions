@@ -745,7 +745,7 @@ export function createGroup(client, name, options = {}) {
 				const stored = await withBreaker(b, () => redis.hlen(membersKey));
 				const live = Number(stored) < maxMembers
 					? Number(stored)
-					: await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, now(), memberTtlMs));
+					: await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, wallEpoch(), memberTtlMs));
 				if (isClosed) return false;
 				if (localMembers.has(ws)) return true;
 				if (Number(live) >= maxMembers) {
