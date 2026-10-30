@@ -261,8 +261,9 @@ export function createDeadLetter(client, options = {}) {
 					// the true start is always fenced. Monotonic time is fractional
 					// and the parameter is a bigint, so floor it, again earlier. An
 					// untraced delivery starts now, so an earlier purge does not drop it.
+					// Capping the duration at dbNow keeps the start a plain integer.
 					const startedAt = typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
-						? Math.floor(dbNow - Math.max(0, monotonicNow() - rec.startedAt))
+						? Math.floor(dbNow - Math.min(dbNow, Math.max(0, monotonicNow() - rec.startedAt)))
 						: dbNow;
 					values.push(scope, startedAt, dbNow);
 					return tx.query(

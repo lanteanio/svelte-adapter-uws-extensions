@@ -574,6 +574,10 @@ describe('postgres dead-letter erasure fences', () => {
 		expect(begins).toEqual(['BEGIN ISOLATION LEVEL READ COMMITTED', 'BEGIN ISOLATION LEVEL READ COMMITTED']);
 	});
 
+	it('binds an integer start for a delivery that claims an absurdly early start', async () => {
+		expect(await store.add(fencedRecord({ startedAt: -1e22 }))).not.toBeNull();
+	});
+
 	it('keeps an untraced post-purge capture and refuses an unscopable tenant', async () => {
 		await store.purgeUser(null, 'u1');
 		clockMs += 1;
