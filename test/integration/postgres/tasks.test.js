@@ -437,7 +437,10 @@ describe('postgres tasks core (integration)', () => {
 				idempotency: store,
 				recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0
 			});
+			let started;
+			const aStarted = new Promise((resolve) => { started = resolve; });
 			runnerA.register('slow', async () => {
+				started();
 				await wait(300);
 				return { ok: true };
 			});
@@ -448,8 +451,8 @@ describe('postgres tasks core (integration)', () => {
 			const aPromise = runnerA.run('slow', {
 				input: null, idempotencyKey: 'idem-inflight'
 			});
-			// Give A time to acquire the slot before B tries.
-			await wait(50);
+			// A's handler runs only after A holds the idempotency slot.
+			await aStarted;
 
 			await expect(
 				runnerB.run('slow', { input: null, idempotencyKey: 'idem-inflight' })
