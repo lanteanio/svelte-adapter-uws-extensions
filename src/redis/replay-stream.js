@@ -347,6 +347,7 @@ export function createStreamReplay(client, options = {}) {
 
 	const topics = createReplayTopics(client, {
 		maxTopics,
+		ttl,
 		breaker: b,
 		onEvicted: (topic) => {
 			epochCache.delete(topic);

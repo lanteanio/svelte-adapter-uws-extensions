@@ -447,6 +447,20 @@ describeIntegration('redis replay (integration)', () => {
 				expect(await r.seq('recent')).toBe(3);
 			});
 
+			it(`${storage}: the seed deletes leftovers of reaped topics and ranks the rest by remaining expiry`, async () => {
+				await client.redis.set(client.key('replay:epoch:{dead}'), '7');
+				await client.redis.set(client.key('replay:used:{dead}'), '5');
+				// ttl 600 s: 'aaa' published 10 s ago, 'zzz' 500 s ago.
+				await client.redis.set(client.key('replay:seq:{aaa}'), '3', 'PX', 590_000);
+				await client.redis.set(client.key('replay:seq:{zzz}'), '3', 'PX', 100_000);
+				const r = createReplay(client, { storage, size: 5, maxTopics: 2, ttl: 600 });
+				await r.publish(platform, 'fresh', 'created', { id: 1 });
+				expect(await client.redis.exists(client.key('replay:epoch:{dead}'), client.key('replay:used:{dead}'))).toBe(0);
+				expect(await client.redis.zrange(client.key('replay:topics:{replay-topics}'), 0, -1)).not.toContain('dead');
+				expect(await r.seq('zzz')).toBe(0);
+				expect(await r.seq('aaa')).toBe(3);
+			});
+
 			it(`${storage}: a recreated topic draws a new epoch`, async () => {
 				const r = createReplay(client, { storage, size: 5, maxTopics: 10 });
 				await r.publish(platform, 'a', 'created', { id: 1 });

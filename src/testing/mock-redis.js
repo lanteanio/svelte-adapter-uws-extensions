@@ -1115,6 +1115,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('REPLAY_TOPIC_SETTLE')) return evalReplayTopicSettle(args);
 				if (script.includes('REPLAY_TOPIC_TOUCH')) return evalReplayTopicTouch(args);
 				if (script.includes('REPLAY_SEED_LEASE')) return evalReplaySeedLease(args);
+				if (script.includes('REPLAY_SEED_PROBE')) return evalReplaySeedProbe(args);
 				if (script.includes('REPLAY_SEED_PROGRESS')) return evalReplaySeedProgress(args);
 				if (script.includes('REPLAY_SEED_FINISH')) return evalReplaySeedFinish(args);
 				if (script.includes('REPLAY_CLEAR_TOPIC')) return evalReplayClearTopic(args);
@@ -2115,15 +2116,28 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			if (!replaySeedLeaseHeld(gen, args[2])) return 0;
 			const nowMs = evalTimeNowMs();
 			const set = zsetEntries(args[1]);
-			for (let i = 6; i < args.length; i++) {
+			for (let i = 6; i + 1 < args.length; i += 2) {
 				const topic = String(args[i]);
-				if (!set.some((e) => String(e.member) === topic)) set.push({ score: 0, member: topic });
+				const age = Number(args[i + 1]);
+				const score = Number.isFinite(age) && age >= 0 ? Math.max(nowMs - age, 0) : 0;
+				if (!set.some((e) => String(e.member) === topic)) set.push({ score, member: topic });
 			}
 			zsetSort(set);
 			if (set.length === 0) sortedSets.delete(args[1]);
 			gen.set('cursor:' + args[4], String(args[5]));
 			gen.set('leaseUntil', String(nowMs + Number(args[3])));
 			return 1;
+		}
+
+		// args layout: [seqKey, bufKey, streamKey, epochKey, usedKey]
+		function evalReplaySeedProbe(args) {
+			pruneExpiredString(args[0]);
+			if (!store.has(args[0])) {
+				r.del(args[1], args[2], args[3], args[4]);
+				return -2;
+			}
+			const expireAt = stringExpiry.get(args[0]);
+			return expireAt === undefined ? -1 : Math.max(0, expireAt - serverNowMs());
 		}
 
 		// args layout: [seedKey, registryKey, token]
@@ -2147,9 +2161,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const seen = Number(args[5]);
 			pruneExpiredString(args[4]);
 			const used = Number(store.get(args[4]) || '0') || 0;
-			if (used > seen) return used;
+			if (used > seen) return [1, used];
+			let removed = 0;
+			for (const key of args.slice(0, 5)) {
+				pruneExpiredString(key);
+				if (store.has(key) || sortedSets.has(key) || hashes.has(key) || streams.has(key)) removed++;
+			}
 			r.del(args[0], args[1], args[2], args[3], args[4]);
-			return 0;
+			return [0, removed];
 		}
 
 		// args layout: [registryKey, (topic, scoreRead, newScore | '')...]

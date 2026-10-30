@@ -24,9 +24,12 @@
  * does not reorder topics.
  *
  * Seeding. Topics stored before the registry existed are enrolled once per
- * deployment by a scan of the replay keys, at score 0: neither buffer stores a
- * time per entry, so they rank as least recently used until a publish or read
- * after the upgrade stamps them. One instance holds a lease and scans; the
+ * deployment by a scan of the replay keys. Neither buffer stores a time per
+ * entry: with a `ttl` a topic's last publish is estimated from its seq key's
+ * remaining TTL, and without one it ranks as least recently used until a
+ * publish or read after the upgrade stamps it. A topic left with an epoch but
+ * no seq key has no seq space; the scan deletes those leftovers instead of
+ * enrolling them. One instance holds a lease and scans; the
  * cursor is kept in `replay:seed:{replay-topics}`, so a pass that fails resumes
  * where it stopped, and other instances do not scan. A topic created before
  * the deployment is seeded waits for the scan at most SEED_WAIT_MS.
@@ -169,8 +172,9 @@ return reply
 /**
  * Evict one topic unless it was used since its registry score. Runs in the
  * topic's own slot, so the check and the delete are atomic against a publish
- * or a read stamping the topic. Returns 0 when the keys were deleted, else the
- * newer use stamp.
+ * or a read stamping the topic. Returns {1, newer use stamp} when the topic
+ * was used since, else {0, keys removed} (0 for an entry whose keys had
+ * already expired).
  *
  * KEYS[1] = seq, KEYS[2] = sorted-set buffer, KEYS[3] = stream buffer,
  * KEYS[4] = epoch, KEYS[5] = use stamp
@@ -184,10 +188,28 @@ if seen == nil then
 end
 local used = tonumber(redis.call('get', KEYS[5]) or '0') or 0
 if used > seen then
-  return used
+  return {1, used}
 end
-redis.call('unlink', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
-return 0
+return {0, redis.call('unlink', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])}
+`;
+
+/**
+ * Seed probe for one topic found by the scan. A topic without a seq key has
+ * no seq space left (its counter expired or was deleted): its leftover epoch,
+ * use stamp and buffers are deleted here and it is not enrolled, returning -2.
+ * Otherwise returns the seq key's remaining TTL in ms (-1 for none), from which
+ * the scanning instance estimates the topic's last publish.
+ *
+ * KEYS[1] = seq, KEYS[2] = sorted-set buffer, KEYS[3] = stream buffer,
+ * KEYS[4] = epoch, KEYS[5] = use stamp
+ */
+const SEED_PROBE_SCRIPT = `
+-- REPLAY_SEED_PROBE
+local pttl = redis.call('pttl', KEYS[1])
+if pttl == -2 then
+  redis.call('unlink', KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+end
+return pttl
 `;
 
 /**
@@ -261,13 +283,15 @@ return 1
 `;
 
 /**
- * Record one scanned batch: enroll its topics at score 0 (an already
- * registered topic keeps its score), store the node's next cursor and extend
- * the lease. Returns 0 when the lease is no longer this token's.
+ * Record one scanned batch: enroll its topics (an already registered topic
+ * keeps its score), store the node's next cursor and extend the lease. A topic
+ * whose age is known is scored at now minus that age; one whose age is not
+ * (-1) at 0, the least recently used. Returns 0 when the lease is no longer
+ * this token's.
  *
  * KEYS[1] = seed state hash, KEYS[2] = registry
  * ARGV[1] = token, ARGV[2] = lease ms, ARGV[3] = node, ARGV[4] = next cursor
- * ('done' when the node is finished), then the topics
+ * ('done' when the node is finished), then pairs of topic and age in ms
  */
 const SEED_PROGRESS_SCRIPT = `
 -- REPLAY_SEED_PROGRESS
@@ -277,8 +301,13 @@ if redis.call('hget', seedKey, 'lease') ~= ARGV[1] then
   return 0
 end
 ${NOW_MS}
-for i = 5, #ARGV do
-  redis.call('zadd', registryKey, 'NX', 0, ARGV[i])
+for i = 5, #ARGV, 2 do
+  local age = tonumber(ARGV[i + 1])
+  local score = 0
+  if age ~= nil and age >= 0 then
+    score = math.max(nowMs - age, 0)
+  end
+  redis.call('zadd', registryKey, 'NX', score, ARGV[i])
 end
 redis.call('hset', seedKey, 'cursor:' .. ARGV[3], ARGV[4])
 redis.call('hset', seedKey, 'leaseUntil', nowMs + tonumber(ARGV[2]))
@@ -360,12 +389,13 @@ function nodeName(redis, node, index) {
  * @param {import('./index.js').RedisClient} client
  * @param {{
  *   maxTopics: number,
+ *   ttl?: number,
  *   breaker?: import('../shared/breaker.js').CircuitBreaker,
  *   onEvicted?: (topic: string) => void,
  *   onSeeded?: (topics: number) => void
  * }} options
  */
-export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, onSeeded }) {
+export function createReplayTopics(client, { maxTopics, ttl = 0, breaker: b, onEvicted, onSeeded }) {
 	const redis = client.redis;
 	const seedKey = client.key('replay:seed:{replay-topics}');
 	const registryKey = client.key('replay:topics:{replay-topics}');
@@ -416,9 +446,26 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 					if (key.startsWith(seqPrefix)) topics.add(key.slice(seqPrefix.length, -1));
 					else if (key.startsWith(epochPrefix)) topics.add(key.slice(epochPrefix.length, -1));
 				}
+				const list = [...topics];
+				const pairs = [];
+				if (list.length > 0) {
+					const probe = evalCachedName(redis, SEED_PROBE_SCRIPT);
+					const results = await execMultiSlot(redis, list.map((t) =>
+						[probe, 5, keys.seq(t), keys.buf(t), keys.streambuf(t), keys.epoch(t), keys.used(t)]));
+					for (let i = 0; i < list.length; i++) {
+						const [err, pttl] = results[i];
+						if (err) throw err;
+						const left = Number(pttl);
+						// No seq key: a dead leftover, removed by the probe.
+						if (left === -2) continue;
+						// With a ttl every publish resets the key's expiry, so its
+						// remaining TTL tells how long ago the topic was published.
+						pairs.push(list[i], ttl > 0 && left > 0 ? Math.max(0, ttl * 1000 - left) : -1);
+					}
+				}
 				const nextCursor = String(next) === '0' ? 'done' : String(next);
 				const kept = await evalCached(redis, SEED_PROGRESS_SCRIPT, 2, seedKey, registryKey,
-					token, SEED_LEASE_MS, name, nextCursor, ...topics);
+					token, SEED_LEASE_MS, name, nextCursor, ...pairs);
 				if (Number(kept) !== 1) return;
 				cursor = nextCursor;
 			}
@@ -443,11 +490,14 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 				const [err, value] = results[i];
 				if (err) continue;
 				const [t, score] = candidates[i];
-				if (Number(value) === 0) {
+				const [kind, amount] = value;
+				if (Number(kind) === 0) {
 					settle.push(t, score, '');
-					onEvicted?.(t);
+					// Counted only when keys were removed, not for a registry entry
+					// whose keys had already expired.
+					if (Number(amount) > 0) onEvicted?.(t);
 				} else {
-					settle.push(t, score, String(value));
+					settle.push(t, score, String(amount));
 					moved = true;
 				}
 			}

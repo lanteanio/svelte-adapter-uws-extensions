@@ -53,7 +53,7 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * @property {number} [minReplicas=1] - Minimum replicas that must ack before publish is considered durable. Required when `durability: 'replicated'`.
  * @property {number} [replicationTimeoutMs=1000] - Per-publish replication timeout in milliseconds. `0` disables the Redis WAIT timeout; client command and socket deadlines still apply (5000 ms by default).
  * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, shared by sorted-set and stream storage.
- * @property {number} [maxTopics=100] - Max topics holding replay state in this key prefix, across every instance sharing it. Creating a topic past the cap evicts the least recently published topic's buffer, counter and epoch.
+ * @property {number} [maxTopics=100] - Max topics holding replay state in this key prefix, across every instance sharing it. Creating a topic past the cap evicts the least recently used topic (publishes, clearTopic and reads count as use)'s buffer, counter and epoch.
  */
 
 /**
@@ -257,6 +257,7 @@ export function createReplay(client, options = {}) {
 
 	const topics = createReplayTopics(client, {
 		maxTopics,
+		ttl,
 		breaker: b,
 		onEvicted: (topic) => {
 			epochCache.delete(topic);

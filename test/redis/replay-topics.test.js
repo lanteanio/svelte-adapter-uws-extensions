@@ -182,6 +182,42 @@ for (const backend of BACKENDS) {
 			}
 		});
 
+		it('the seed deletes leftovers of topics without a seq key instead of enrolling them', async () => {
+			await client.redis.set(key('epoch', 'dead'), '7');
+			await client.redis.set(key('used', 'dead'), '5');
+			await client.redis.set(key('seq', 'live'), '3');
+			const replay = create({ maxTopics: 10 });
+			await publishAt(replay, 1000, 'fresh');
+			const registry = await client.redis.zrange(registryKey(), 0, -1);
+			expect(registry).toContain('live');
+			expect(registry).not.toContain('dead');
+			expect(await client.redis.exists(key('epoch', 'dead'))).toBe(0);
+			expect(await client.redis.exists(key('used', 'dead'))).toBe(0);
+		});
+
+		it('ranks existing topics with a ttl by their remaining expiry', async () => {
+			// ttl 600 s: 'aaa' was published 10 s ago, 'zzz' 500 s ago.
+			await client.redis.set(key('seq', 'aaa'), '3', 'PX', 590_000);
+			await client.redis.set(key('seq', 'zzz'), '3', 'PX', 100_000);
+			const replay = create({ maxTopics: 2, ttl: 600 });
+			await publishAt(replay, clock, 'fresh');
+			expect(await replay.seq('zzz')).toBe(0);
+			expect(await replay.seq('aaa')).toBe(3);
+		});
+
+		it('counts an eviction only when the topic still had keys to remove', async () => {
+			const metrics = createMetrics();
+			const replay = create({ maxTopics: 1, metrics });
+			await publishAt(replay, 1000, 'expired');
+			// Its keys expired; only the registry entry is left.
+			for (const kind of ['seq', backend.buf, 'epoch', 'used']) await client.redis.del(key(kind, 'expired'));
+			await publishAt(replay, 2000, 'next');
+			expect(await client.redis.zrange(registryKey(), 0, -1)).toEqual(['next']);
+			expect(await metrics.serialize()).not.toMatch(/replay_topic_evictions_total [1-9]/);
+			await publishAt(replay, 3000, 'third');
+			expect(await metrics.serialize()).toMatch(/replay_topic_evictions_total 1/);
+		});
+
 		it('removes every per-topic key of an evicted topic', async () => {
 			const replay = create({ maxTopics: 1 });
 			await publishAt(replay, 1000, 'gone', 3);
