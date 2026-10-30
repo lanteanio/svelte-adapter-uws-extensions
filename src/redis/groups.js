@@ -730,6 +730,23 @@ export function createGroup(client, name, options = {}) {
 				throw new Error(`redis group "${name}": invalid role "${role}"`);
 			}
 
+			// As in the in-memory groups plugin, a full group refuses before
+			// onJoin runs, and onFull receives the role the caller asked for.
+			// With a finite cap that costs one COUNT_SCRIPT round trip per join
+			// (an HGETALL of the members hash, stale entries excluded the way
+			// the JOIN script excludes them); joins only, never messages.
+			const requestedRole = role;
+			if (Number.isFinite(maxMembers)) {
+				const live = await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, now(), memberTtlMs));
+				if (isClosed) return false;
+				if (localMembers.has(ws)) return true;
+				if (Number(live) >= maxMembers) {
+					mRejected?.inc({ group: metricGroup });
+					if (onFull) onFull(ws, requestedRole);
+					return false;
+				}
+			}
+
 			if (onJoin) {
 				const decision = onJoin(ws, role);
 				if (decision === false) return false;
@@ -774,8 +791,12 @@ export function createGroup(client, name, options = {}) {
 				return false;
 			}
 			if (result[0] === 0) {
+				// The JOIN script's atomic check is the final word: a concurrent
+				// join can fill the group between the count above and this
+				// script. That race is the only case where onJoin ran for a join
+				// that ends full.
 				mRejected?.inc({ group: metricGroup });
-				if (onFull) onFull(ws, role);
+				if (onFull) onFull(ws, requestedRole);
 				return false;
 			}
 
@@ -794,7 +815,7 @@ export function createGroup(client, name, options = {}) {
 			// has graceful handling for that path.
 			if (!localMembers.has(ws) && localMembers.size >= MAX_GROUPS_LOCAL_MEMBERS) {
 				mRejected?.inc({ group: metricGroup });
-				if (onFull) onFull(ws, role);
+				if (onFull) onFull(ws, requestedRole);
 				try { await redis.hdel(membersKey, memberId); } catch { /* ignore */ }
 				return false;
 			}

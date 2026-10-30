@@ -7,6 +7,7 @@ import { createGroup as createLocalGroup } from 'svelte-adapter-uws/plugins/grou
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { installSteppedClock } from '../helpers/stepped-clock.js';
+import { COUNT_SCRIPT } from '../../src/shared/scripts.js';
 
 function interceptNextGroupLeave(redis, handler) {
 	const originalDefine = redis.defineCommand.bind(redis);
@@ -188,6 +189,61 @@ describe('redis groups', () => {
 
 			expect(fullCalls).toEqual(['member']);
 			g.destroy();
+		});
+
+		it('refuses a full group before onJoin and hands onFull the requested role, as the adapter does', async () => {
+			const run = async (make) => {
+				const calls = [];
+				const g = make({
+					maxMembers: 2,
+					onJoin: (ws, role) => { calls.push(['join', ws.getUserData().id, role]); return 'viewer'; },
+					onFull: (ws, role) => calls.push(['full', ws.getUserData().id, role])
+				});
+				const joins = [];
+				for (const id of ['a', 'b', 'c']) joins.push(await g.join(mockWs({ id }), platform, 'member'));
+				g.destroy?.();
+				return { joins, calls };
+			};
+			const local = await run((o) => createLocalGroup('order-local', o));
+			const redisSide = await run((o) => createGroup(client, 'order-redis', o));
+			expect(local).toEqual({
+				joins: [true, true, false],
+				calls: [['join', 'a', 'member'], ['join', 'b', 'member'], ['full', 'c', 'member']]
+			});
+			expect(redisSide).toEqual(local);
+		});
+
+		it('when a concurrent join fills the group after the count, the atomic join refuses and onFull gets the requested role', async () => {
+			// Both joins pass the count (the group is empty), so both run onJoin;
+			// the JOIN script admits one. This race is the only case where onJoin
+			// runs for a join that ends full.
+			const calls = [];
+			const g = createGroup(client, 'race', {
+				maxMembers: 1,
+				onJoin: (ws, role) => { calls.push(['join', ws.getUserData().id, role]); return 'viewer'; },
+				onFull: (ws, role) => calls.push(['full', ws.getUserData().id, role])
+			});
+			const joins = await Promise.all([g.join(mockWs({ id: 'a' }), platform), g.join(mockWs({ id: 'b' }), platform)]);
+			expect(joins.filter(Boolean)).toHaveLength(1);
+			expect(calls.filter(([kind]) => kind === 'join')).toHaveLength(2);
+			const loser = joins[0] ? 'b' : 'a';
+			expect(calls.filter(([kind]) => kind === 'full')).toEqual([['full', loser, 'member']]);
+			expect(await g.count()).toBe(1);
+			g.destroy();
+		});
+
+		it('a capped join costs one count script, an uncapped one none', async () => {
+			const counts = async (maxMembers) => {
+				const g = createGroup(client, 'cost-' + maxMembers, { maxMembers });
+				const evalSpy = vi.spyOn(client.redis, 'eval');
+				await g.join(mockWs({ id: 'a' }), platform);
+				const n = evalSpy.mock.calls.filter(([script]) => script === COUNT_SCRIPT).length;
+				evalSpy.mockRestore();
+				g.destroy();
+				return n;
+			};
+			expect(await counts(10)).toBe(1);
+			expect(await counts(Infinity)).toBe(0);
 		});
 
 		it('matches the adapter onJoin admission contract', async () => {
