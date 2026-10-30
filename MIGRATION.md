@@ -196,7 +196,11 @@ fractional Redis lifetime failed every write that set it. The
 "not set", and a falsy `breaker` or `metrics` is still none. Options the
 adapter's in-memory presence, cursor, groups and rate-limit plugins also read
 accept every value those plugins accept, so swapping one for its Redis
-counterpart never meets a new refusal.
+counterpart never meets a new refusal. The one exception is presence
+`heartbeat: 0`, which the in-memory plugin reads as "no heartbeat" and the Redis
+presence refuses: its heartbeat also renews every local entry's Redis TTL, so
+without it every present user would expire after `ttl` seconds. Keep a
+positive `heartbeat` (shorter than a third of `ttl`) when moving to Redis.
 
 **Action.** Pass the type the message names. Convert environment values
 explicitly (`process.env.AUTO_MIGRATE !== 'false'`, `Number(process.env.TTL_MS)`),
