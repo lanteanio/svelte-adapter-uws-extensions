@@ -850,9 +850,10 @@ asked for rather than the one `onJoin` would have returned.
 
 **Why.** `createGroup` takes the in-memory groups plugin's default cap and
 hook order, so a group behaves the same whichever implementation backs it.
-`group.maxMembers` reports the cap in effect. A capped join reads the live
-member count once before `onJoin`; the atomic join that follows still has
-the final word, so when a concurrent join fills the group in between,
+`group.maxMembers` reports the cap in effect. A capped join checks the
+members hash length before `onJoin` (one HLEN; the full live count runs only
+when the stored entries reach the cap); the atomic join that follows still
+has the final word, so when a concurrent join fills the group in between,
 `onJoin` has run for a join that then ends full (with `onFull` called).
 
 **Action.** Pass `maxMembers` explicitly for a group that should hold more,

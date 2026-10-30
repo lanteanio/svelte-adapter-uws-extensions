@@ -232,18 +232,47 @@ describe('redis groups', () => {
 			g.destroy();
 		});
 
-		it('a capped join costs one count script, an uncapped one none', async () => {
-			const counts = async (maxMembers) => {
+		it('a capped join below the cap costs one HLEN and no count script; an uncapped one neither', async () => {
+			const cost = async (maxMembers) => {
 				const g = createGroup(client, 'cost-' + maxMembers, { maxMembers });
 				const evalSpy = vi.spyOn(client.redis, 'eval');
+				const hlenSpy = vi.spyOn(client.redis, 'hlen');
 				await g.join(mockWs({ id: 'a' }), platform);
-				const n = evalSpy.mock.calls.filter(([script]) => script === COUNT_SCRIPT).length;
+				const counted = { hlen: hlenSpy.mock.calls.length, count: evalSpy.mock.calls.filter(([script]) => script === COUNT_SCRIPT).length };
 				evalSpy.mockRestore();
+				hlenSpy.mockRestore();
 				g.destroy();
-				return n;
+				return counted;
 			};
-			expect(await counts(10)).toBe(1);
-			expect(await counts(Infinity)).toBe(0);
+			expect(await cost(10)).toEqual({ hlen: 1, count: 0 });
+			expect(await cost(Infinity)).toEqual({ hlen: 0, count: 0 });
+		});
+
+		it('a group whose stored entries reach the cap but are partly stale still admits, through the full count', async () => {
+			const calls = [];
+			const g = createGroup(client, 'stale-full', {
+				maxMembers: 2,
+				memberTtl: 120,
+				onJoin: (ws) => { calls.push(['join', ws.getUserData().id]); },
+				onFull: (ws, role) => { calls.push(['full', ws.getUserData().id, role]); }
+			});
+			const members = client.key('group:{stale-full}:members');
+			// Two stored entries, one of them long expired: HLEN says full, the
+			// live count says one.
+			await client.redis.hset(members, 'old', JSON.stringify({ role: 'member', instanceId: 'gone', ts: Date.now() - 10 * 60 * 1000 }));
+			await client.redis.hset(members, 'live', JSON.stringify({ role: 'member', instanceId: 'other', ts: Date.now() }));
+			const evalSpy = vi.spyOn(client.redis, 'eval');
+			const joined = await g.join(mockWs({ id: 'a' }), platform);
+			const countRuns = evalSpy.mock.calls.filter(([script]) => script === COUNT_SCRIPT).length;
+			evalSpy.mockRestore();
+			expect(joined).toBe(true);
+			expect(countRuns).toBe(1);
+			expect(await g.count()).toBe(2);
+			const refused = await g.join(mockWs({ id: 'b' }), platform);
+			expect(refused).toBe(false);
+			// The second join meets two live members and is refused before onJoin.
+			expect(calls).toEqual([['join', 'a'], ['full', 'b', 'member']]);
+			g.destroy();
 		});
 
 		it('matches the adapter onJoin admission contract', async () => {

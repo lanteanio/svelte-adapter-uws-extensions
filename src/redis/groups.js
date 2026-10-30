@@ -732,12 +732,18 @@ export function createGroup(client, name, options = {}) {
 
 			// As in the in-memory groups plugin, a full group refuses before
 			// onJoin runs, and onFull receives the role the caller asked for.
-			// With a finite cap that costs one COUNT_SCRIPT round trip per join
-			// (an HGETALL of the members hash, stale entries excluded the way
-			// the JOIN script excludes them); joins only, never messages.
+			// With a finite cap that costs one HLEN per join. The hash also
+			// holds stale entries, so HLEN never undercounts the live members:
+			// below the cap it proves there is room. Only when the stored
+			// entries reach the cap does COUNT_SCRIPT (an HGETALL that skips
+			// stale entries the way the JOIN script does) decide. Joins only,
+			// never messages.
 			const requestedRole = role;
 			if (Number.isFinite(maxMembers)) {
-				const live = await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, now(), memberTtlMs));
+				const stored = await withBreaker(b, () => redis.hlen(membersKey));
+				const live = Number(stored) < maxMembers
+					? Number(stored)
+					: await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, membersKey, now(), memberTtlMs));
 				if (isClosed) return false;
 				if (localMembers.has(ws)) return true;
 				if (Number(live) >= maxMembers) {
