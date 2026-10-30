@@ -15,6 +15,14 @@ function fakePg(nowFn = () => Date.now()) {
 	let purges = [];
 	let nextId = 1;
 	const hydrate = (r) => ({ ...r, data: r.data == null ? null : JSON.parse(r.data) });
+	// node-postgres sends a number as String(n), and int8 input refuses a
+	// fraction (SQLSTATE 22P02), so a bigint parameter must be a whole number.
+	function int8(value) {
+		if (!/^-?\d+$/.test(String(value))) {
+			throw Object.assign(new Error(`invalid input syntax for type bigint: "${value}"`), { code: '22P02' });
+		}
+		return value;
+	}
 	// LEAST(NULLIF($7::bigint, 0), dbNow): Postgres LEAST ignores NULLs, so
 	// 0 -> now, a future stamp -> now, a past stamp -> kept.
 	function insert(values, dbNow) {
@@ -57,7 +65,7 @@ function fakePg(nowFn = () => Date.now()) {
 		},
 		async query(sql, values = []) {
 			let s = sql.replace(/\s+/g, ' ').trim();
-			if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK' || s.includes('set_config')) return { rows: [], rowCount: 0 };
+			if (s === 'BEGIN' || s === 'BEGIN ISOLATION LEVEL READ COMMITTED' || s === 'COMMIT' || s === 'ROLLBACK' || s.includes('set_config')) return { rows: [], rowCount: 0 };
 			if (s.includes('pg_try_advisory_xact_lock')) return { rows: [{ acquired: true }], rowCount: 1 };
 			// The erasure lock: the clock is read by the outer query, after the
 			// locking subquery, so it postdates the lock wait.
@@ -65,7 +73,8 @@ function fakePg(nowFn = () => Date.now()) {
 				if (s !== "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS db_now FROM (SELECT pg_advisory_xact_lock(hashtextextended($1::regclass::oid::text || ':' || $2 || ':' || $3, 0))) AS locked") {
 					throw new Error('fakePg: unmodelled erasure lock: ' + s);
 				}
-				return { rows: [{ db_now: String(nowFn()) }], rowCount: 1 };
+				// `::bigint` output: whole milliseconds.
+				return { rows: [{ db_now: String(Math.floor(nowFn())) }], rowCount: 1 };
 			}
 			let visible = rows;
 			if (s.startsWith('SELECT')) {
@@ -77,7 +86,7 @@ function fakePg(nowFn = () => Date.now()) {
 				if (!s.endsWith('SET purged_at = GREATEST(svti_dead_letter_purges.purged_at, EXCLUDED.purged_at)')) {
 					throw new Error('fakePg: unmodelled fence write: ' + s);
 				}
-				const at = Number(values[2]);
+				const at = Number(int8(values[2]));
 				const found = purges.find(p => p.scope === values[0] && p.user_id === values[1]);
 				if (found) found.purged_at = Math.max(found.purged_at, at);
 				else purges.push({ scope: values[0], user_id: values[1], purged_at: at });
@@ -88,6 +97,7 @@ function fakePg(nowFn = () => Date.now()) {
 			// a capture statement without a working fence keeps the payload.
 			const fenced = /^INSERT INTO svti_dead_letter \(webhook_id, topic, event, data, attempts, error, failed_at, user_id\) SELECT \$1::text, \$2::text, \$3::text, \$4::jsonb, \$5::integer, \$6::text, LEAST\(NULLIF\(\$7::bigint, 0\), \$(\d+)::bigint\), \$8::text WHERE (.+) RETURNING svti_dead_letter_id$/.exec(s);
 			if (fenced) {
+				int8(values[6]); int8(values[9]); int8(values[10]);
 				if (!capturePredicate(fenced[2], values)) return { rows: [], rowCount: 0 };
 				return insert(values, Number(values[Number(fenced[1]) - 1]));
 			}
@@ -431,7 +441,9 @@ describe('postgres dead-letter erasure fences', () => {
 	const fencedRecord = (over = {}) => rec({ data: { author: 'u1', private: true }, ...over });
 
 	beforeEach(() => {
-		clockMs = 1_000_000;
+		// Fractional like the real monotonic clock (epoch + performance.now());
+		// the database side reads whole milliseconds.
+		clockMs = 1_000_000.375;
 		setRuntimeEnv({ clock: { now: () => clockMs, monotonic: () => clockMs, wallEpoch: () => clockMs } });
 		client = fakePg(() => clockMs);
 		store = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0, forgetUserId: byAuthor });
@@ -440,9 +452,11 @@ describe('postgres dead-letter erasure fences', () => {
 
 	it('drops an old racing capture and preserves new deliveries and other tenants', async () => {
 		const startedAt = monotonicNow();
-		clockMs += 5_000;
+		// Fractional steps make the delivery duration fractional, as it is on
+		// the real clock; the start it yields is bound as a bigint.
+		clockMs += 5_000.25;
 		expect(await store.purgeUser('acme', 'u1')).toBe(0);
-		clockMs += 5_000;
+		clockMs += 5_000.25;
 
 		expect(await store.add(fencedRecord({ topic: '@t/acme/orders', startedAt }))).toBeNull();
 		const otherTenant = await store.add(fencedRecord({ topic: '@t/globex/orders', startedAt }));
@@ -465,7 +479,7 @@ describe('postgres dead-letter erasure fences', () => {
 
 		expect(await store.purgeUser('acme', 'u1')).toBe(1);
 		expect(await store.count()).toBe(0);
-		const begin = statements.indexOf('BEGIN');
+		const begin = statements.indexOf('BEGIN ISOLATION LEVEL READ COMMITTED');
 		const lock = statements.findIndex(s => s.includes('pg_advisory_xact_lock'));
 		const tombstone = statements.findIndex(s => s.startsWith('INSERT INTO svti_dead_letter_purges'));
 		const erase = statements.findIndex(s => s.startsWith('DELETE FROM svti_dead_letter WHERE user_id'));
@@ -476,7 +490,7 @@ describe('postgres dead-letter erasure fences', () => {
 		expect(erase).toBeGreaterThan(tombstone);
 		expect(commit).toBeGreaterThan(erase);
 		// Stamped with the clock the lock statement read after the lock.
-		expect(client._purges()).toEqual([{ scope: 'acme', user_id: 'u1', purged_at: clockMs }]);
+		expect(client._purges()).toEqual([{ scope: 'acme', user_id: 'u1', purged_at: Math.floor(clockMs) }]);
 	});
 
 	it('serializes mixed-case capture and purge on one physical lock identity', async () => {
@@ -539,6 +553,25 @@ describe('postgres dead-letter erasure fences', () => {
 		};
 		expect(await store.add(fencedRecord({ startedAt }))).toBeNull();
 		expect(client._rows()).toHaveLength(0);
+	});
+
+	// The fence and record reads follow the lock wait; a repeatable-read
+	// snapshot taken before the wait would miss rows committed during it.
+	it('pins read committed for fenced captures and purges', async () => {
+		// The BEGIN of each transaction that takes the erasure lock (the
+		// retention pass after a capture has its own plain BEGIN).
+		const begins = [];
+		let lastBegin;
+		const query = client.query.bind(client);
+		client.query = async (sql, values) => {
+			const text = typeof sql === 'string' ? sql : sql.text;
+			if (text.startsWith('BEGIN')) lastBegin = text;
+			if (text.includes('pg_advisory_xact_lock(hashtextextended')) begins.push(lastBegin);
+			return query(sql, values);
+		};
+		expect(await store.add(fencedRecord({ topic: '@t/acme/orders', startedAt: monotonicNow() }))).not.toBeNull();
+		expect(await store.purgeUser('acme', 'u1')).toBe(1);
+		expect(begins).toEqual(['BEGIN ISOLATION LEVEL READ COMMITTED', 'BEGIN ISOLATION LEVEL READ COMMITTED']);
 	});
 
 	it('keeps an untraced post-purge capture and refuses an unscopable tenant', async () => {

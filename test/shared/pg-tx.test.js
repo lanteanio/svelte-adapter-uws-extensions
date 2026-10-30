@@ -35,6 +35,14 @@ describe('shared/pg-tx', () => {
 		expect(isReleased()).toBe(true);
 	});
 
+	it('pins read committed in the BEGIN when asked, whatever the server default', async () => {
+		const { client, queries } = makeMockClient();
+		await withTransaction(client, async (tx) => {
+			await tx.query('DELETE FROM a');
+		}, { isolation: 'read committed' });
+		expect(queries).toEqual(['BEGIN ISOLATION LEVEL READ COMMITTED', 'DELETE FROM a', 'COMMIT']);
+	});
+
 	it('returns the value fn returns', async () => {
 		const { client } = makeMockClient();
 		const result = await withTransaction(client, async () => 42);

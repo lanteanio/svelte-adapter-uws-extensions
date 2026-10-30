@@ -38,12 +38,19 @@ import { emitRegisteredFailure } from './diagnostic.js';
  * connection. The transaction is committed when `fn` resolves and
  * rolled back if `fn` throws (the original error is re-thrown).
  *
+ * `options.isolation: 'read committed'` pins that level in the BEGIN itself,
+ * for work whose correctness needs each statement to see rows committed
+ * while an earlier statement waited on a lock, whatever the server or role
+ * default is.
+ *
  * @template T
  * @param {import('../postgres/index.js').PgClient} client
  * @param {(tx: PgTxClient) => Promise<T>} fn
+ * @param {{ isolation?: 'read committed' }} [options]
  * @returns {Promise<T>}
  */
-export async function withTransaction(client, fn) {
+export async function withTransaction(client, fn, options) {
+	const begin = options?.isolation === 'read committed' ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN';
 	// client.connect(), not client.pool.connect(): the wrapper redacts the
 	// connection DSN out of pg's error text, and connection acquisition is
 	// the failure mode that carries it. Falls back to the raw pool for a
@@ -68,7 +75,7 @@ export async function withTransaction(client, fn) {
 	try {
 		if (typeof pgClient.on === 'function') pgClient.on('error', onError);
 		try {
-			await pgClient.query('BEGIN');
+			await pgClient.query(begin);
 		} catch (err) {
 			unsafe = err;
 			throw err;

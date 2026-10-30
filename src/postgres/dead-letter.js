@@ -63,6 +63,11 @@ import { withTransaction } from '../shared/pg-tx.js';
 // residual every backend shares.
 const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 
+// Captures and purges read fences and records after waiting on the erasure
+// lock. Under a repeatable-read default the snapshot would predate the wait
+// and miss a fence or capture committed during it, so pin read committed.
+const FENCE_TX = { isolation: 'read committed' };
+
 /**
  * @typedef {Object} PgDeadLetterOptions
  * @property {string} [table='svti_dead_letter'] - Table name.
@@ -253,10 +258,11 @@ export function createDeadLetter(client, options = {}) {
 					// The delivery start on the database clock: dbNow minus the
 					// delivery's monotonic duration, read after the lock reply. The
 					// reply's latency moves the start earlier, so a purge at or after
-					// the true start is always fenced. An untraced delivery starts
-					// now, so an earlier purge does not drop it.
+					// the true start is always fenced. Monotonic time is fractional
+					// and the parameter is a bigint, so floor it, again earlier. An
+					// untraced delivery starts now, so an earlier purge does not drop it.
 					const startedAt = typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
-						? dbNow - Math.max(0, monotonicNow() - rec.startedAt)
+						? Math.floor(dbNow - Math.max(0, monotonicNow() - rec.startedAt))
 						: dbNow;
 					values.push(scope, startedAt, dbNow);
 					return tx.query(
@@ -271,7 +277,7 @@ export function createDeadLetter(client, options = {}) {
 						  ) RETURNING ${pkCol}`,
 						values
 					);
-				}));
+				}, FENCE_TX));
 			// No row: a purge ran while this delivery was in flight.
 			if (res.rows.length === 0) return null;
 			// The row is committed. Retention trims are best-effort from here:
@@ -367,7 +373,7 @@ export function createDeadLetter(client, options = {}) {
 					[userId, scope.value]
 				);
 				return res.rowCount || 0;
-			}));
+			}, FENCE_TX));
 		},
 
 		async clear() {
