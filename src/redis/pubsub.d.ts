@@ -51,8 +51,8 @@ export interface PubSubBusOptions {
 	 * the push, so connected clients act on the recommendation (go read-only, retry after
 	 * N ms, show a banner) spread across the cooldown instead of all retrying at t+0.
 	 * Requires a `breaker`. When several buses announce on one platform and
-	 * topic, the policy of the first one activated with a policy shapes every
-	 * event until that bus is deactivated.
+	 * topic, the policy of the most recently activated one with a policy shapes
+	 * every event until that bus is deactivated.
 	 */
 	degradationPolicy?: DegradationPolicy;
 

@@ -171,12 +171,25 @@ Every bus with a breaker on one platform and topic shares one announcer, so
 the pub/sub bus and the sharded bus, or two pub/sub buses, never publish
 competing events. It listens to all of their breakers: one `degraded` when the
 first leaves healthy, one `recovered` when the last is healthy again, and none
-while any is open. Their refetch reports merge into the same events. The
-degradation policy of the first bus attached with one (in activation order)
-shapes every event; a different policy passed to a bus attached later applies
-only once the earlier bus is deactivated. When the bus whose breaker kept the
-clients degraded is deactivated and the remaining breakers are healthy, the
-announcer publishes `recovered`.
+while any is open. Their refetch reports merge into the same events, and a
+shared metrics registry counts each event once. A bus activated with another
+bus's wrapped platform joins the announcer of the platform underneath. The
+degradation policy of the most recently activated bus that has one shapes
+every event, so a policy edited before a development reload applies to the bus
+the reload created; once that bus is deactivated the policy of the one before
+applies again. When the bus whose breaker kept the clients degraded is
+deactivated and the remaining breakers are healthy, the announcer publishes
+`recovered`.
+
+A breaker leaves `probing` only when a guarded operation reports an outcome,
+so a bus that carries no traffic, or one a development reload left behind,
+would otherwise keep its breaker, and with it every other bus's `recovered`,
+open. While a bus's breaker is probing, the announcer sends that bus's own
+Redis connection a `PING` through the breaker, which closes it on a reply and
+reopens it on a failure; the breaker's `resetTimeout` then spaces the next
+`PING`. When another caller holds the probe slot, the `PING` is tried again
+after one second, doubling up to 30 seconds. A bus whose connection ended for
+good (`quit()`) is detached from the announcer instead.
 
 Every `recovered` event goes through the degradation policy: its `recovery`
 fields and `recoveryJitterMs` apply, and an event outside a breaker transition

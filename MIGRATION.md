@@ -1183,7 +1183,10 @@ requests from several instances merge into it, and at most one such frame per
 ten seconds; a breaker `recovered` frame whose policy sets `refetch: true`
 waits the one second too. Buses with a breaker on one platform and topic
 announce together: one `degraded` / `recovered` per transition of all their
-breakers, shaped by the first attached bus's policy. A degradation policy whose `recovery`
+breakers, shaped by the most recently activated bus's policy. While a bus's
+breaker is probing, the bus sends its own connection a `PING` through the
+breaker, so the breaker recovers without application traffic; a test that
+holds a breaker in `probing` with such a bus active sees it close. A degradation policy whose `recovery`
 envelope sets `refetch` keeps its value, and its `recovery` fields and
 `recoveryJitterMs` apply to every `recovered` frame. `pubsub_recovered_total`
 counts the refetch-only frames too, so it no longer pairs with
