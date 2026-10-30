@@ -98,11 +98,14 @@ const EPOCH_QUERY_CHUNK_TOPICS = 1_000;
 /** Topics one creating publish evicts at most; cleanup drains any rest. */
 const CREATE_EVICTION_TOPICS = 4;
 
-/** Topics one cleanup statement removes. */
-const TOPIC_RETENTION_BATCH = 8;
+/**
+ * Event rows one cleanup statement aims to remove with its topics; the topics
+ * per statement are this divided by `size`, between 8 and 256.
+ */
+const TOPIC_RETENTION_ROWS = 2_000;
 
 /** Topic-removing statements one cleanup pass issues at most. */
-const TOPIC_RETENTION_STATEMENTS = 32;
+const TOPIC_RETENTION_STATEMENTS = 64;
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -112,7 +115,7 @@ const TOPIC_RETENTION_STATEMENTS = 32;
  * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded maintenance passes (ms). 0 disables.
  * @property {number} [maxDataBytes=262144] - Positive-integer byte cap on one JSON-encoded payload, including each publishBatch entry.
- * @property {number} [maxTopics=100] - Max topics holding replay state in this table, across every instance sharing it. Creating a topic past the cap evicts the least recently published topic's events and sequence row.
+ * @property {number} [maxTopics=100] - Max topics holding replay state in this table, across every instance sharing it. Creating a topic past the cap evicts the least recently used topic (publishes, clearTopic and reads count as use)'s events and sequence row.
  */
 
 /**
@@ -355,6 +358,7 @@ export function createReplay(client, options = {}) {
 	// Topic retention runs as short autocommit statements beside the pass, not
 	// inside its transaction: a removed topic's row lock is released when its
 	// statement ends instead of being held until the pass commits.
+	const topicBatch = Math.min(256, Math.max(8, Math.floor(TOPIC_RETENTION_ROWS / maxSize)));
 	async function trimTopics(budget) {
 		let statements = 0;
 		const removeTopics = async (text, values) => {
@@ -364,16 +368,20 @@ export function createReplay(client, options = {}) {
 			if (res.rows.length > 0) mEvictions?.inc(res.rows.length);
 			return res.rows.length;
 		};
-		while (ttl > 0 && budget.available && statements < TOPIC_RETENTION_STATEMENTS) {
-			if (await removeTopics(idleSql, [ttl, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
-		}
+		// A full batch means more may remain; when the pass stops there, it asks
+		// for the next pass soon instead of after the cleanup interval.
+		const remove = async (text, values) => {
+			while (budget.available && statements < TOPIC_RETENTION_STATEMENTS) {
+				if (await removeTopics(text, values) < topicBatch) return;
+			}
+			budget.more?.();
+		};
+		if (ttl > 0) await remove(idleSql, [ttl, topicBatch]);
 		if (!budget.available || statements >= TOPIC_RETENTION_STATEMENTS) return;
 		statements++;
 		const cutoff = (await client.query({ text: cutoffSql, values: [maxTopics] })).rows[0];
 		if (!cutoff) return;
-		while (budget.available && statements < TOPIC_RETENTION_STATEMENTS) {
-			if (await removeTopics(evictBelowSql, [cutoff.at, cutoff.topic, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
-		}
+		await remove(evictBelowSql, [cutoff.at, cutoff.topic, topicBatch]);
 	}
 	const policies = [trimExpired, trimSizes, trimTopics];
 	let turn = 0;

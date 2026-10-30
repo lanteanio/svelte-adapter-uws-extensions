@@ -57,7 +57,11 @@ export async function runCleanupPass(client, table, work, stopped = () => false,
 		}
 		let rows = 0;
 		let queries = 0;
+		let backlog = false;
 		const budget = {
+			// Work done outside this transaction left a backlog: report the pass
+			// as exhausted so the next one is scheduled soon.
+			more() { backlog = true; },
 			get available() { return !stopped() && rows < ROW_BUDGET && queries < 128 && monotonicNow() < workDeadline; },
 			get limit() { return Math.min(BATCH_SIZE, ROW_BUDGET - rows); },
 			async query(text, values) {
@@ -74,7 +78,7 @@ export async function runCleanupPass(client, table, work, stopped = () => false,
 		};
 		const detail = await work(budget);
 		if (failure) throw failure;
-		const exhausted = !budget.available;
+		const exhausted = !budget.available || backlog;
 		await query('COMMIT');
 		return { result: exhausted ? 'budget' : 'complete', rows, detail };
 	} catch (error) {

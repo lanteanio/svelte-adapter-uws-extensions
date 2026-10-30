@@ -234,6 +234,45 @@ describe('postgres replay maxTopics and generations', () => {
 		}
 	});
 
+	it('cleanup drains a large surplus in big batches and asks for the next pass soon', async () => {
+		const writer = create({ maxTopics: 1000, size: 1000 });
+		for (let i = 0; i < 600; i++) await publishAt(writer, 1000 + i, 'room-' + i);
+		const replay = createReplay(client, { maxTopics: 2, size: 1000, cleanupInterval: 60_000 });
+		const tick = ticks.at(-1);
+		try {
+			await tick.cb();
+			// One cutoff read and 63 statements of 8 topics (2,000 event rows /
+			// size 1000) per pass.
+			let left = 0;
+			for (let i = 0; i < 600; i++) if (await replay.seq('room-' + i) > 0) left++;
+			expect(left).toBe(600 - 63 * 8);
+			// A backlog remains, so the next pass comes after 100 ms, not 60 s.
+			expect(ticks.at(-1).ms).toBe(100);
+			await ticks.at(-1).cb();
+			left = 0;
+			for (let i = 0; i < 600; i++) if (await replay.seq('room-' + i) > 0) left++;
+			expect(left).toBe(2);
+		} finally {
+			replay.destroy();
+		}
+	});
+
+	it('cleanup removes more topics per statement when their buffers are small', async () => {
+		const writer = create({ maxTopics: 1000, size: 10 });
+		for (let i = 0; i < 600; i++) await publishAt(writer, 1000 + i, 'room-' + i);
+		const replay = createReplay(client, { maxTopics: 2, size: 10, cleanupInterval: 60_000 });
+		const tick = ticks.at(-1);
+		try {
+			await tick.cb();
+			// 200 topics per statement (2,000 event rows / size 10): one pass.
+			let left = 0;
+			for (let i = 0; i < 600; i++) if (await replay.seq('room-' + i) > 0) left++;
+			expect(left).toBe(2);
+		} finally {
+			replay.destroy();
+		}
+	});
+
 	it('cleanup drains topics over the cap without waiting for a creation', async () => {
 		const writer = create({ maxTopics: 100 });
 		for (let i = 1; i <= 5; i++) await publishAt(writer, i * 1000, 'room-' + i);
