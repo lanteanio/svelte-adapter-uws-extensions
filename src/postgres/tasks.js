@@ -699,7 +699,7 @@ export function createTaskRunner(client, options = {}) {
 				for (let i = 0; i < batchLimit; i++) permits.push(pool.reserveThread(maxPayloadBytes));
 			}
 			const leaseStarted = monotonicNow();
-			const rows = await sql[method](batchLimit, names);
+			const rows = await sql[method](batchLimit, names, 'sweep');
 			b?.success();
 			sweepFailing[method === 'claimPending' ? 'dispatch' : 'recovery'] = false;
 			for (const row of rows) {
@@ -712,7 +712,7 @@ export function createTaskRunner(client, options = {}) {
 		// Fill its remaining budget after the mixed FIFO claim has been started.
 		if (inlineNames.length && batchLimit < limit) {
 			const leaseStarted = monotonicNow();
-			for (const row of await sql[method](limit - batchLimit, inlineNames)) yield { row, leaseStarted };
+			for (const row of await sql[method](limit - batchLimit, inlineNames, 'inline')) yield { row, leaseStarted };
 		}
 	}
 	async function recoveryTick() {

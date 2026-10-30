@@ -407,7 +407,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * qualified rows, the untenanted qualified scope, or the rows written
 	 * without forgetIdentity. Scopes rotate in the order LEGACY, UNTENANTED,
 	 * then tenant ids in index order; each claim starts after the scope the
-	 * previous claim for the same set of names ended on and takes at most
+	 * previous claim from the same call site ended on and takes at most
 	 * `limit` scopes that have pending rows of those names. Rows are then
 	 * claimed round by round (every chosen scope's oldest row before any
 	 * scope's second), FIFO inside a scope, up to `limit` rows in all.
@@ -423,14 +423,15 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * n * k * (limit - k + 1) index entries. Those reads lock their rows with
 	 * SKIP LOCKED, so rows another claim holds are passed over for the next
 	 * ones instead of filling the scope's share; the rows read but not
-	 * claimed stay pending and are unlocked when the statement commits.
+	 * claimed stay pending and are unlocked when the claim's transaction
+	 * ends.
 	 */
 	const LEGACY = 1, UNTENANTED = 2;
-	// One rotation position per set of names: a sweep that claims for its
-	// pooled and its inline handlers separately keeps both rotations moving.
+	// One rotation position per call site: a sweep that claims for all
+	// handlers and then again for its inline handlers keeps both rotations
+	// moving, whichever worker pools have capacity in a given sweep.
 	/** @type {Map<string, null | 1 | 2 | string>} */
 	const cursors = new Map();
-	const MAX_CURSORS = 64;
 
 	const scopeProbe = (where) => `(SELECT TRUE FROM unnest($1::text[]) AS q(name)
 	          CROSS JOIN LATERAL (SELECT 1 FROM ${table} p
@@ -453,10 +454,14 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	           ORDER BY p.identity_version, p.name, p.tenant_id, p.created_at LIMIT $5
 	           FOR UPDATE OF p SKIP LOCKED`;
 
-	async function claimPending(limit, registeredNames) {
-		const names = [...registeredNames].sort();
-		const cursorKey = names.join('\n');
-		const cursor = cursors.get(cursorKey) ?? null;
+	/**
+	 * @param {number} limit
+	 * @param {string[]} registeredNames
+	 * @param {string} [site] - the caller's rotation, one per call site
+	 */
+	async function claimPending(limit, registeredNames, site = 'sweep') {
+		const names = [...registeredNames];
+		const cursor = cursors.get(site) ?? null;
 		const found = (await client.query({
 			name: 'tasks_claim_scopes_' + table,
 			text: `SELECT ${scopeProbe('p.identity_version IS NULL AND p.tenant_id IS NULL')} AS legacy,
@@ -482,11 +487,7 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		else order = [...virtual, ...head];
 		const chosen = order.slice(0, limit);
 		// A claim that reached every scope starts the next one at the beginning.
-		cursors.delete(cursorKey);
-		if (chosen.length === limit) {
-			cursors.set(cursorKey, chosen[chosen.length - 1]);
-			if (cursors.size > MAX_CURSORS) cursors.delete(cursors.keys().next().value);
-		}
+		cursors.set(site, chosen.length === limit ? chosen[chosen.length - 1] : null);
 		if (chosen.length === 0) return [];
 		const tenants = [], ords = [];
 		let legacyOrd = 0, untenantedOrd = 0;

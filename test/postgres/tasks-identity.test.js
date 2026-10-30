@@ -127,7 +127,7 @@ describe('postgres tasks per-tenant dispatch', () => {
 		const sql = createTaskSql({ client, table: 'svti_tasks', fenceTtl: 30, rowTtl: 3600, autoMigrate: true });
 		await sql.ensureTable();
 		const enqueue = (tenantId, n, name = 'job') => Promise.all(Array.from({ length: n }, (_, i) => r.enqueue(name, { input: owner(tenantId, 'u' + i) })));
-		const claim = async (limit = 10, names = ['job']) => (await sql.claimPending(limit, names)).map((row) => client._getTaskRows().get(row.id));
+		const claim = async (limit = 10, names = ['job'], site) => (await sql.claimPending(limit, names, site)).map((row) => client._getTaskRows().get(row.id));
 		return { client, r, sql, enqueue, claim };
 	}
 
@@ -172,15 +172,26 @@ describe('postgres tasks per-tenant dispatch', () => {
 		expect(new Set(first.map((row) => row.tenant_id)).size).toBe(10);
 	});
 
-	it('keeps one rotation per set of names when a sweep claims twice', async () => {
+	it('keeps one rotation per call site when a sweep claims twice', async () => {
 		const { enqueue, claim } = await setup();
 		await enqueue('aaa', 20, 'heavy');
 		const [victim] = await enqueue('zzz', 1, 'heavy');
 		const served = [];
 		// A sweep with a pooled handler at capacity 1 and an inline handler.
 		for (let sweep = 0; sweep < 2; sweep++) {
-			served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.id));
-			await claim(9, ['light']);
+			served.push(...(await claim(1, ['heavy', 'light'], 'sweep')).map((row) => row.id));
+			await claim(9, ['light'], 'inline');
+		}
+		expect(served).toContain(victim);
+	});
+
+	it('keeps the rotation when the set of names with capacity changes every sweep', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 40, 'heavy');
+		const [victim] = await enqueue('zzz', 1, 'heavy');
+		const served = [];
+		for (let sweep = 0; sweep < 3; sweep++) {
+			served.push(...(await claim(1, ['heavy', 'pool' + sweep], 'sweep')).map((row) => row.id));
 		}
 		expect(served).toContain(victim);
 	});

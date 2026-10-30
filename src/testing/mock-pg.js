@@ -703,6 +703,9 @@ export function mockPgClient(options = {}) {
 		// get disjoint sets. The final ORDER BY is read from the statement, so a
 		// statement that ranks rows differently is modelled as written.
 		if (sql.includes('WITH candidates AS (') && sql.includes("status = 'pending'")) {
+			// Only reads that lock with SKIP LOCKED are modelled: without it a
+			// real claim would wait on rows another claim holds.
+			if ((sql.match(/FOR UPDATE OF p SKIP LOCKED/g) || []).length !== 3) throw new Error('mock-pg: unmodelled task claim statement');
 			const limit = Number(values[0]);
 			const ttlSec = Number(values[1]);
 			const names = new Set(values[2]);

@@ -63,12 +63,15 @@ order. A scope is one tenant of rows stamped by `forgetIdentity`, the untenanted
 scope of stamped rows with a `null` tenant, or all rows written without
 `forgetIdentity`. Each claim takes the oldest row of every chosen scope before
 a second row of any scope, and keeps creation order inside a scope. When more
-scopes have pending work than the claim's limit, the next claim for the same
-handler names continues after the last scope served, so every tenant with
-pending work is reached within `ceil(scopes / dispatchBatchSize)` sweeps however
-large another tenant's backlog is. A sweep that claims separately for worker
-pool and inline handlers keeps one rotation for each. Rotation state is per
-runner. Only `forgetIdentity` gives a row a tenant: without it every row is in
+scopes have pending work than the claim's limit, the next claim from the same
+call site continues after the last scope served. A sweep's first claim covers
+every handler with capacity and takes up to `dispatchBatchSize` scopes, or
+fewer when a worker pool has fewer free threads than that; when it took fewer,
+a second claim covers the inline handlers with the rest of the budget. Each of
+the two keeps its own rotation, whichever pools have capacity, so a tenant with
+pending work is reached within `ceil(scopes / m)` sweeps, where `m` is the
+smallest limit that call site's claims had in those sweeps (at least 1), however
+large another tenant's backlog is. Rotation state is per runner. Only `forgetIdentity` gives a row a tenant: without it every row is in
 one scope and dispatch is first in, first out.
 
 The claim reads the `idx_svti_tasks_pending_scope` partial index
@@ -84,4 +87,5 @@ it went, so a backlog of other names lay in its path. The rows each read takes
 are locked with `FOR UPDATE SKIP LOCKED`: a claim that overlaps another passes
 over that claim's rows and takes the next ones, and a row another sweep claimed
 meanwhile is re-checked and left alone, so no row is claimed twice. Rows read
-but not claimed stay pending; their locks end with the claim's statement.
+but not claimed stay pending; their locks end with the claim's transaction,
+which is the statement itself on an autocommit connection.
