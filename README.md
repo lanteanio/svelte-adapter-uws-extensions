@@ -4,7 +4,8 @@ Redis and Postgres extensions for [svelte-adapter-uws](https://github.com/lantea
 
 **Official links:** [GitHub owner](https://github.com/lanteanio) | [Documentation](https://svelte-realtime.dev/) | [Live demo](https://svelte-realtime-demo.lantean.io/) | `svti.me` is the ecosystem-owned runtime-help redirect domain.
 
-The core adapter keeps everything in-process memory. That works great for single-server deployments, but the moment you scale to multiple instances you
+The core adapter keeps everything in-process memory. That works great for
+single-server deployments, but the moment you scale to multiple instances you
 need shared state. This package provides Redis and Postgres counterparts with
 backend-specific factories and client setup. Moving from memory to a shared
 backend also changes some calls: distributed session methods are asynchronous
@@ -40,7 +41,8 @@ before replacing an in-memory primitive.
 
 **Upgrading from 0.5.x?** Start with the [0.5-to-0.6 migration guide](./MIGRATION.md#05x-to-06x) for prerequisites, required changes and rollback.
 
-For translation, privacy, incidents, releases and capacity testing, use the [ecosystem integration resources](./docs/integration-resources.md).
+For translation, privacy, incidents, releases and capacity testing, use the
+[ecosystem integration resources](./docs/integration-resources.md).
 Search the [error reference](./docs/errors.md) for a stable diagnostic ID. Use [operational error codes](./docs/public-error-codes.md) to handle recoverable failures. Every factory [checks its options](./docs/factory-options.md) when it is called.
 
 ---
@@ -376,7 +378,6 @@ On an adapter that runs several worker threads, each worker loads its own copy o
 Such an adapter refuses any publish that would draw its per-worker sequence counter, and publishes through the bus follow the same rule: pass `{ seq: false }` for volatile events, or the seq an ordered source allocated, as the [replay buffer](#replay-buffer-redis) does. Through the bus, `relay: false` keeps a publish on this worker, so it is not the way to reach the other workers. The bus carries `seq: false` and `seq: null` as an unsequenced choice, and an authoritative number or bigint as a safe integer, so the frame is stamped the same everywhere. A counter-stamped frame arrives with no choice attached: a single worker stamps its own counter on it, a multi-worker one delivers it unsequenced. Scoped helpers take the options as their last argument, as on the adapter's platform.
 
 For ordinary `publish` and `batch` calls, Redis buses retain local delivery when a serialized publish envelope exceeds `maxEnvelopeBytes`, skip the Redis relay, and report `redis.pubsub.envelope.oversized` once per consecutive oversized streak. `publishBatched` instead preflights every relay envelope and rejects the entire call before delivery if any exceed the limit (per shard channel for the sharded bus). A valid envelope resumes relay and re-arms the report. Keep payloads within the configured cap or raise it consistently on every instance; skipped envelopes do not reach remote instances or sibling workers. Topic broadcasts reject oversized requests before serving local subscribers; oversized replies are skipped with `redis.topic-broadcast.envelope.oversized` and may leave the requester waiting for its timeout.
-
 
 ```js
 distributed.publish('cursor:42', 'move', pos, { seq: false });
@@ -2131,7 +2132,6 @@ If your handler needs durable result tracking and crash recovery, and its effect
 ## Idempotency store
 
 Both durable stores honor `acquire(key, ttlSec)`: omit `ttlSec` to use the store's default retention, or pass a non-negative integer number of seconds. Zero retains the pending lease while work runs, then `commit()` releases it without caching the result. A stale owner cannot release or overwrite its successor's lease.
-
 
 Caches the result of an effectful operation under a stable key so retries within `ttl` return the original outcome rather than re-executing. Use it for HTTP/RPC retries, webhook redeliveries, and any handler where the caller may legitimately repeat a request that must execute at most once - charge-customer, send-email, create-order.
 
