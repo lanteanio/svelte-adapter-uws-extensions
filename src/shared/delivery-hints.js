@@ -121,6 +121,7 @@ export function announcersOf(platform) {
  *   relay: (data: object) => void,
  *   probe?: () => unknown,
  *   gone?: () => boolean,
+ *   detached?: () => void,
  *   counters?: { degraded?: { inc(): void }, recovered?: { inc(): void } }
  * }} HealthSource
  */
@@ -259,6 +260,7 @@ function createAnnouncer(platform, topic, forget) {
 			if (h.source.breaker !== b || typeof h.source.probe !== 'function') continue;
 			if (h.source.gone?.()) {
 				h.detach();
+				h.source.detached?.();
 				if (!breakers.has(b)) return;
 				continue;
 			}
@@ -288,7 +290,16 @@ function createAnnouncer(platform, topic, forget) {
 	}
 
 	function transition(b, from, to) {
-		if (to === 'probing') probeSoon(b);
+		if (to === 'probing') {
+			// A new probing window: a retry backed off in the last one waits no more.
+			const entry = breakers.get(b);
+			if (entry) {
+				if (entry.probe !== null) clearTimer(entry.probe);
+				entry.probe = null;
+				entry.retryMs = 0;
+			}
+			probeSoon(b);
+		}
 		if (from === 'healthy' && to !== 'healthy') {
 			if (degraded) return;
 			degraded = true;
@@ -326,6 +337,8 @@ function createAnnouncer(platform, topic, forget) {
 			const handle = {
 				source,
 				outboundLost: false,
+				/** Still attached: false once detached, also for a connection that ended. */
+				get live() { return live; },
 				relayRequest() {
 					handle.outboundLost = false;
 					source.relay({ at: now(), recovery: REFETCH });

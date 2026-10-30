@@ -163,17 +163,38 @@ export function createShardedBus(client, options = {}) {
 		// An empty batch on the health topic's shard channel: peers parse it
 		// and deliver nothing.
 		probe: () => client.redis.spublish(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, batch: [] })),
-		gone: () => client.redis.status === 'end'
+		gone: () => client.redis.status === 'end',
+		detached: () => {
+			if (readyListener !== null || typeof client.redis.once !== 'function') return;
+			readyListener = reattach;
+			client.redis.once('ready', readyListener);
+		}
 	} : null;
 	/** @type {ReturnType<typeof attachHealth> | null} */
 	let hints = null;
 	/** @type {any} */
 	let healthPlatform = null;
 	function attachTo(platform) {
-		if (healthSource === null || healthPlatform === platform) return;
+		if (healthSource === null || (healthPlatform === platform && hints?.live)) return;
 		hints?.detach();
 		healthPlatform = platform;
 		hints = attachHealth(platform, HEALTH_TOPIC, healthSource);
+	}
+	// A bus detached because its connection ended attaches again once the
+	// connection is back: on its ready event, or a relay that succeeded.
+	/** @type {(() => void) | null} */
+	let readyListener = null;
+	function reattach() {
+		readyListener = null;
+		if (healthPlatform !== null && hints !== null && !hints.live) attachTo(healthPlatform);
+	}
+	function relayedOk() {
+		if (hints !== null && !hints.live) reattach();
+		hints?.relayed();
+	}
+	function stopReadyListener() {
+		if (readyListener !== null) client.redis.removeListener?.('ready', readyListener);
+		readyListener = null;
 	}
 	// An activation failed since the last one that succeeded: the connections
 	// served meanwhile missed what peers published.
@@ -617,7 +638,7 @@ export function createShardedBus(client, options = {}) {
 					b?.failure(err);
 				} else {
 					b?.success();
-					hints?.relayed();
+					relayedOk();
 				}
 			}).catch(failed);
 		} catch (err) { failed(err); }
@@ -657,7 +678,11 @@ export function createShardedBus(client, options = {}) {
 				const shard = ch.slice(channelPrefix.length);
 				// The whole envelope goes to the platform active when it arrived: a
 				// local publish may deactivate and reactivate the bus mid-envelope.
-				if (activeTracing) deliverTraced(parsed, shard, activePlatform);
+				// The empty batch a peer's breaker probe sends delivers nothing,
+				// so it opens no consumer operation.
+				if (activeTracing) {
+					if (!(Array.isArray(parsed.batch) && parsed.batch.length === 0)) deliverTraced(parsed, shard, activePlatform);
+				}
 				else deliverEnvelope(parsed, shard, activePlatform);
 			} catch {
 				// Malformed envelope; counted so a stream of bad messages
@@ -1244,6 +1269,7 @@ export function createShardedBus(client, options = {}) {
 		hints?.detach();
 		hints = null;
 		healthPlatform = null;
+		stopReadyListener();
 		activationFailed = false;
 		if (healthRetry !== null) {
 			clearTimer(healthRetry);

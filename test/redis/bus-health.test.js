@@ -12,6 +12,7 @@ import { SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../src/shared/redi
 import { HINT_HOLD_MS, HINT_MAX_HOLD_MS } from '../../src/shared/delivery-hints.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { guardBreaker } from '../../src/shared/breaker-admission.js';
 
 const request = (instanceId) => JSON.stringify({ instanceId, topic: '__realtime', event: 'recovered', data: { at: 1, recovery: { refetch: true } }, s: false });
 
@@ -360,5 +361,139 @@ describe('shared health announcer', () => {
 		await tick();
 		expect(frames(p, 'degraded')).toHaveLength(0);
 		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+	it('probes when a bus attaches to a breaker that is already probing', async () => {
+		// Two probe slots: the activation's SUBSCRIBE, which never answers
+		// here, holds one, so only the bus's own probe can close the breaker.
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100, probeConcurrency: 2 });
+		breaker.failure();
+		await vi.advanceTimersByTimeAsync(150);
+		expect(breaker.state).toBe('probing');
+		const source = mockRedisClient();
+		const duplicate = source.duplicate.bind(source);
+		source.duplicate = (o) => { const d = duplicate(o); d.subscribe = () => new Promise(() => {}); return d; };
+		const p = mockPlatform();
+		const bus = createPubSubBus(source, { breaker });
+		cleanups.push(async () => { await bus.deactivate(); breaker.destroy(); });
+		bus.activate(p).catch(() => {});
+		await tick();
+		expect(breaker.state).toBe('healthy');
+	});
+
+	it('asks for the probe slot again when another caller holds it', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const { p } = await both([breaker, breaker]);
+		let release = null;
+		const off = breaker.subscribe((from, to) => { if (to === 'probing' && release === null) release = guardBreaker(breaker); });
+		cleanups.push(off);
+		breaker.failure();
+		await vi.advanceTimersByTimeAsync(150);
+		expect(breaker.state).toBe('probing');
+		// The holder gives the slot back without a verdict.
+		release();
+		await vi.advanceTimersByTimeAsync(1100);
+		expect(breaker.state).toBe('healthy');
+		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+
+	it('probes at once in a new probing window, whatever the last one backed off to', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		await both([breaker, breaker]);
+		let holding = true;
+		const off = breaker.subscribe((from, to) => { if (to === 'probing' && holding) { holding = false; breaker.guard(); } });
+		cleanups.push(off);
+		breaker.failure();
+		// Another caller holds the slot for 20 s, so the bus backs off.
+		await vi.advanceTimersByTimeAsync(20000);
+		expect(breaker.state).toBe('probing');
+		breaker.failure(new Error('down'));
+		// The next window opens after resetTimeout; the bus probes it at once.
+		await vi.advanceTimersByTimeAsync(150);
+		expect(breaker.state).toBe('healthy');
+	});
+
+	it('does not probe a breaker that left probing before the probe ran', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		await both([breaker, breaker]);
+		const probes = [];
+		const { publish, spublish } = client.redis;
+		client.redis.publish = async function (channel, message) { if (JSON.parse(message).batch?.length === 0) probes.push(channel); return publish.call(this, channel, message); };
+		client.redis.spublish = async function (channel, message) { if (JSON.parse(message).batch?.length === 0) probes.push(channel); return spublish.call(this, channel, message); };
+		cleanups.push(() => { client.redis.publish = publish; client.redis.spublish = spublish; });
+		// Another caller's verdict closes the breaker as soon as it is probing.
+		const off = breaker.subscribe((from, to) => { if (to === 'probing') { breaker.guard(); breaker.success(); } });
+		cleanups.push(off);
+		breaker.failure();
+		await vi.advanceTimersByTimeAsync(500);
+		expect(breaker.state).toBe('healthy');
+		expect(probes).toEqual([]);
+	});
+
+	it('attaches a bus again once its ended connection is back', async () => {
+		const p = mockPlatform();
+		const own = mockRedisClient();
+		const first = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const second = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const live = createPubSubBus(client, { breaker: first, channel: 'one' });
+		const bus = createPubSubBus(own, { breaker: second, channel: 'two' });
+		await live.activate(p);
+		await bus.activate(p);
+		cleanups.push(async () => { await live.deactivate(); await bus.deactivate(); first.destroy(); second.destroy(); });
+		second.failure();
+		own.redis.status = 'end';
+		await vi.advanceTimersByTimeAsync(500);
+		// Detached: the other breaker alone decides.
+		p.reset();
+		first.failure();
+		first.reset();
+		expect(frames(p, 'degraded')).toHaveLength(1);
+		// Reconnected and activated again: announces with the others again.
+		second.reset();
+		own.redis.status = 'ready';
+		await bus.activate(p);
+		p.reset();
+		second.failure();
+		expect(frames(p, 'degraded')).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(second.state).toBe('healthy');
+		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+
+	it('attaches a bus again after a relay succeeds on its reconnected connection', async () => {
+		const p = mockPlatform();
+		const own = mockRedisClient();
+		const second = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const bus = createPubSubBus(own, { breaker: second });
+		await bus.activate(p);
+		cleanups.push(async () => { await bus.deactivate(); second.destroy(); });
+		second.failure();
+		own.redis.status = 'end';
+		await vi.advanceTimersByTimeAsync(500);
+		own.redis.status = 'ready';
+		second.reset();
+		p.reset();
+		bus.wrap(p).publish('chat', 'msg', 1);
+		await tick();
+		second.failure();
+		expect(frames(p, 'degraded')).toHaveLength(1);
+	});
+
+	it('opens no consumer operation for an empty batch on either bus', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const p = mockPlatform();
+		p.trace.enabled = true;
+		const ps = createPubSubBus(client, { breaker });
+		const sh = createShardedBus(client, { breaker });
+		await ps.activate(p);
+		await sh.activate(p);
+		await tick();
+		cleanups.push(async () => { await ps.deactivate(); await sh.deactivate(); breaker.destroy(); });
+		const traceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+		await client.redis.publish('uws:pubsub', JSON.stringify({ instanceId: 'peer', batch: [], traceparent }));
+		await client.redis.spublish('uws:sharded:__realtime', JSON.stringify({ instanceId: 'peer', batch: [], traceparent }));
+		expect(p.traceOperations).toEqual([]);
+		// A batch that delivers is still traced.
+		await client.redis.publish('uws:pubsub', JSON.stringify({ instanceId: 'peer', batch: [{ topic: 'chat', event: 'msg', data: 1 }], traceparent }));
+		expect(p.traceOperations.map((o) => o.name)).toEqual(['redis.pubsub.receive']);
 	});
 });

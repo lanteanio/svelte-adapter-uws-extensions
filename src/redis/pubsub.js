@@ -231,6 +231,11 @@ export function createPubSubBus(client, options = {}) {
 			return redis.publish(channel, JSON.stringify({ instanceId, batch: [] }));
 		},
 		gone: () => client.redis.status === 'end',
+		detached: () => {
+			if (readyListener !== null || typeof client.redis.once !== 'function') return;
+			readyListener = reattach;
+			client.redis.once('ready', readyListener);
+		},
 		counters: { degraded: mDegraded, recovered: mRecovered }
 	} : null;
 	/** @type {ReturnType<typeof attachHealth> | null} */
@@ -238,10 +243,26 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {any} */
 	let healthPlatform = null;
 	function attachTo(platform) {
-		if (healthSource === null || healthPlatform === platform) return;
+		if (healthSource === null || (healthPlatform === platform && hints?.live)) return;
 		hints?.detach();
 		healthPlatform = platform;
 		hints = attachHealth(platform, /** @type {string} */ (systemChannel), healthSource);
+	}
+	// A bus detached because its connection ended attaches again once the
+	// connection is back: on its ready event, or a relay that succeeded.
+	/** @type {(() => void) | null} */
+	let readyListener = null;
+	function reattach() {
+		readyListener = null;
+		if (healthPlatform !== null && hints !== null && !hints.live) attachTo(healthPlatform);
+	}
+	function relayedOk() {
+		if (hints !== null && !hints.live) reattach();
+		hints?.relayed();
+	}
+	function stopReadyListener() {
+		if (readyListener !== null) client.redis.removeListener?.('ready', readyListener);
+		readyListener = null;
 	}
 
 	// From activate() until deactivate(): a failed activation is retried, on a
@@ -569,7 +590,7 @@ export function createPubSubBus(client, options = {}) {
 					mRelayed?.inc(totalMessages);
 					relayMetrics?.settled(started, 1, 0, 0);
 					b?.success();
-					hints?.relayed();
+					relayedOk();
 				}).catch(failed);
 			}
 			const pipe = redis.pipeline();
@@ -581,7 +602,7 @@ export function createPubSubBus(client, options = {}) {
 					mRelayed?.inc(totalMessages);
 					relayMetrics?.settled(started, batch.length, 0, 0);
 					b?.success();
-					hints?.relayed();
+					relayedOk();
 					return;
 				}
 				let relayed = 0, failedEnvelopes = 0;
@@ -655,7 +676,11 @@ export function createPubSubBus(client, options = {}) {
 			// one the trace fields are ignored and nothing is allocated for them.
 			// The whole envelope goes to the platform active when it arrived: a
 			// local publish may deactivate and reactivate the bus mid-envelope.
-			if (activeTracing) deliverTraced(parsed, activePlatform);
+			// The empty batch a peer's breaker probe sends delivers nothing,
+			// so it opens no consumer operation.
+			if (activeTracing) {
+				if (!(Array.isArray(parsed.batch) && parsed.batch.length === 0)) deliverTraced(parsed, activePlatform);
+			}
 			else deliverEnvelope(parsed, activePlatform);
 		} catch {
 			// Malformed envelope; counted so a stream of bad messages
@@ -1148,6 +1173,7 @@ export function createPubSubBus(client, options = {}) {
 			hints?.detach();
 			hints = null;
 			healthPlatform = null;
+			stopReadyListener();
 			if (unsubscribeBreaker) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;

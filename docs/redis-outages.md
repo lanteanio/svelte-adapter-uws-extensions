@@ -193,7 +193,11 @@ keeps the breaker open. A reply closes the breaker, a failure reopens it, and
 the breaker's `resetTimeout` spaces the next probe. When another caller holds
 the probe slot, the probe is tried again after one second, doubling up to 30
 seconds. A bus whose connection ended for
-good (`quit()`) is detached from the announcer instead.
+good (`quit()`) is detached from the announcer instead, and attaches again when
+its connection is ready again, on its next successful relay, or when it is
+activated again. A new probing window probes at once, whatever an earlier
+window's retry had backed off to. A peer's probe envelope opens no consumer
+trace operation, since it delivers nothing.
 
 Every `recovered` event goes through the degradation policy: its `recovery`
 fields and `recoveryJitterMs` apply, and an event outside a breaker transition
