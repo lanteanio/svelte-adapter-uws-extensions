@@ -1,9 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createDegradationPolicy } from '../src/shared/degradation.js';
 import { createCircuitBreaker } from '../src/shared/breaker.js';
 import { createPubSubBus } from '../src/redis/pubsub.js';
 import { mockRedisClient } from './helpers/mock-redis.js';
 import { mockPlatform } from './helpers/mock-platform.js';
+import { HINT_HOLD_MS } from '../src/shared/delivery-hints.js';
 
 describe('createDegradationPolicy', () => {
 	const degrade = { from: 'healthy', to: 'broken' };
@@ -171,14 +172,34 @@ describe('createPubSubBus degradationPolicy integration', () => {
 		expect(deg.options).toEqual({ relay: false, seq: false });
 	});
 
-	it('ships recovery hints + jitter on the recovered event', () => {
-		const policy = createDegradationPolicy({ recovery: { refetch: true, bannerCopy: 'Back online' }, recoveryJitterMs: 3000 });
+	it('ships recovery hints + jitter on the recovered event', async () => {
+		vi.useFakeTimers();
+		try {
+			const policy = createDegradationPolicy({ recovery: { refetch: true, bannerCopy: 'Back online' }, recoveryJitterMs: 3000 });
+			const { platform, breaker } = wire({ degradationPolicy: policy });
+			await vi.advanceTimersByTimeAsync(0);
+			breaker.failure(new Error('down')); // -> broken
+			breaker.reset(); // -> healthy
+			// A frame that asks for a refetch waits for refetch requests from
+			// other instances to merge into it.
+			expect(find(platform, 'recovered')).toBeUndefined();
+			await vi.advanceTimersByTimeAsync(HINT_HOLD_MS);
+			const rec = find(platform, 'recovered');
+			expect(rec).toBeDefined();
+			expect(rec.data.recovery).toEqual({ refetch: true, bannerCopy: 'Back online' });
+			expect(rec.options).toEqual({ relay: false, seq: false, jitterMs: 3000 });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('ships a recovery envelope without refetch on the recovered event at once', () => {
+		const policy = createDegradationPolicy({ recovery: { bannerCopy: 'Back online' }, recoveryJitterMs: 3000 });
 		const { platform, breaker } = wire({ degradationPolicy: policy });
-		breaker.failure(new Error('down')); // -> broken
-		breaker.reset(); // -> healthy
+		breaker.failure(new Error('down'));
+		breaker.reset();
 		const rec = find(platform, 'recovered');
-		expect(rec).toBeDefined();
-		expect(rec.data.recovery).toEqual({ refetch: true, bannerCopy: 'Back online' });
+		expect(rec.data.recovery).toEqual({ bannerCopy: 'Back online' });
 		expect(rec.options).toEqual({ relay: false, seq: false, jitterMs: 3000 });
 	});
 
