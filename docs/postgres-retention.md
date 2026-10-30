@@ -44,8 +44,9 @@ Dead-letter writes use the same bounded maintenance as idle passes. Concurrent
 writes share local cleanup ownership. Writes arriving during a leading pass
 queue at most one trailing bounded pass, without extending the original write's
 wait or adding recurring timers. `destroy()` cancels a queued trailing pass.
-TTL selection uses `failed_at`; size cleanup retains the newest `max`
-ids. The two policies alternate priority. `get`, `count`, `list` and `summary`
+TTL selection uses `failed_at`; size cleanup deletes the oldest ids of the
+tenant scope holding the most records (ties to the scope holding the oldest
+record) until `max` remain. The two policies alternate priority. `get`, `count`, `list` and `summary`
 exclude expired rows using database time, including when physical cleanup has
 not finished. Erasure fences in `<table>_purges` expire after 10 minutes and,
 when `forgetUserId` is set, are deleted in the same bounded passes; capture

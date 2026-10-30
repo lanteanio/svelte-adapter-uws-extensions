@@ -1121,32 +1121,56 @@ list `dead-letter-erasure` (and the reverse), or validation fails with
 ### Dead-letter eviction is fair-share across tenants
 
 Above `max`, both dead-letter stores now evict the oldest record of the tenant
-scope holding the most records instead of the oldest record overall. The scope
+scope holding the most records instead of the oldest record overall. Between
+equally large scopes, the one holding the oldest record pays, so a capture is
+never evicted while an older record of an equally large scope exists. The scope
 is the one erasure uses: the tenant of an `@t/<tenant>/` topic, `~` for
-untenanted topics. Records stored before this release, and a malformed tenant
-topic, count in the scope `''`, which pays first while it is the largest. A
+untenanted topics, `''` for a malformed tenant topic. Records stored before
+this release get the scope of their stored topic during the upgrade. A
 dashboard or test that expected the globally oldest record to go first sees a
-different record evicted; `dead_letter_evicted_total{store}` counts evictions.
+different record evicted; `dead_letter_evicted_total` counts evictions.
 
-On Redis three keys join the `{dlq}` slot under `dlq:*`: `dlq:tenant:{dlq}`,
-`dlq:tenant-order:{dlq}` and `dlq:tenant-size:{dlq}`. Back them up and restore
-them with the records; the next capture rebuilds them when the record and
-tenant counts disagree, for example after records written by an earlier
-release.
+On Redis four keys join the `{dlq}` slot under `dlq:*`: `dlq:tenant:{dlq}`,
+`dlq:tenant-order:{dlq}`, `dlq:tenant-size:{dlq}` and `dlq:tenant-rank:{dlq}`.
+Back them up and restore them with the records. The next capture rebuilds them
+when they disagree with the records, reading the topic of each record stored
+without them, for example by an earlier release.
 
 Postgres dead-letter migration version 4 adds `scope TEXT NOT NULL DEFAULT ''`
-to `<table>`, an index on `(scope, <table>_id)`, the `<table>_scopes` count
-table, and statement triggers on `<table>` that keep the counts for every
-INSERT, UPDATE, DELETE and TRUNCATE. The migration takes a SHARE ROW EXCLUSIVE
-lock on `<table>` while it counts the existing rows, so writers wait for one
-pass over the table. With `autoMigrate: false`, apply version 4
-(`postgresMigrations({ store: 'dead-letter' })`) and grant the runtime role
-SELECT, INSERT, UPDATE and DELETE on `<table>_scopes` before writers of this
-release start; `ready()` fails while a trigger is missing or disabled. Writers
-of an earlier release keep working and store their rows in the `''` scope. Back
-up and restore `<table>_scopes` with the other two tables: a PostgreSQL recovery
-scope file that lists `dead-letter` must also list `dead-letter-tenants`, and
-the verifier checks the counts against the rows (`scope_counts`).
+to `<table>`, an index on `(scope, <table>_id)`, the `<table>_scopes` table
+(record count and oldest id per scope), and statement triggers on `<table>`
+that keep it for every INSERT, UPDATE, DELETE and TRUNCATE. Under a SHARE ROW
+EXCLUSIVE lock on `<table>`, so writers wait for one pass over the table, the
+migration derives the scope of existing rows from their topics and counts
+them. The trigger function lives in the schema of `<table>`, names its tables
+with that schema and pins `search_path`, so writers with any search path update
+the same counts.
+
+The triggers run as the writing role. When the role that runs the migration is
+not the runtime role (`autoMigrate: false`), grant the runtime role the count
+table in the same maintenance step that applies version 4
+(`postgresMigrations({ store: 'dead-letter' })`); between the two, every
+INSERT and DELETE on `<table>`, by writers of this release and of earlier ones,
+fails with `permission denied`:
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE ON svti_dead_letter_scopes TO runtime_role;
+```
+
+Substitute the configured table name and role, or grant it ahead of time with
+`ALTER DEFAULT PRIVILEGES ... GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES`.
+`ready()` fails while a trigger is missing or disabled. With the grant in place,
+writers of an earlier release keep working and store their rows in the `''`
+scope.
+
+Back up and restore `<table>_scopes` with the other two tables: a PostgreSQL
+recovery scope file that lists `dead-letter` must also list
+`dead-letter-tenants`, and the verifier checks the counts against the rows
+(`scope_counts`). A data-only restore into existing tables fires the triggers
+and counts the restored rows a second time; restore with
+`pg_restore --data-only --disable-triggers`. `ready()` compares the counts with
+the rows and rebuilds them when they differ, so a store that starts after such
+a restore repairs them before serving.
 
 ### `createClusterClock` prefixes `leaderKey`
 
