@@ -16,9 +16,11 @@
  * A breaker leaves `probing` only on an outcome, so a bus that carries no
  * traffic would hold its breaker, and with it every other bus's `recovered`,
  * open for good. While one of its buses' breakers is probing, the announcer
- * sends that bus's own connection a PING through the breaker, so the breaker
- * recovers without application traffic. A PING that fails opens the breaker
- * again, and the breaker's reset timeout spaces the next one; a probe slot
+ * runs that bus's probe through the breaker: a publish of an empty batch on
+ * the bus's own channel, which every peer drops unread. It is the operation
+ * the breaker guards, so a connection that answers but may not publish (a
+ * revoked channel grant) keeps the breaker open. A probe that fails opens the
+ * breaker again, and the breaker's reset timeout spaces the next one; a probe slot
  * another caller holds is asked again after one second, doubling up to 30 s.
  * A bus whose connection ended for good is detached.
  *
@@ -117,7 +119,7 @@ export function announcersOf(platform) {
  *   breaker: { state?: string, subscribe(listener: (from: string, to: string) => void): () => void },
  *   policy?: { onDegraded(transition: { from: string, to: string }): any, onRecovered(transition: { from: string, to: string }): any },
  *   relay: (data: object) => void,
- *   ping?: () => unknown,
+ *   probe?: () => unknown,
  *   gone?: () => boolean,
  *   counters?: { degraded?: { inc(): void }, recovered?: { inc(): void } }
  * }} HealthSource
@@ -125,8 +127,8 @@ export function announcersOf(platform) {
 
 /**
  * Attach a bus to the announcer of `platform` and `topic`, creating it on
- * first use. `relay` sends the bus's peer request; `ping` checks the bus's
- * own connection; `gone` says whether that connection ended for good;
+ * first use. `relay` sends the bus's peer request; `probe` runs the
+ * operation the bus's breaker guards, without effect on its peers; `gone` says whether that connection ended for good;
  * `counters` count each event the announcer publishes, a counter shared by
  * several buses once.
  *
@@ -254,7 +256,7 @@ function createAnnouncer(platform, topic, forget) {
 		}
 		let pinger = null;
 		for (const h of handles) {
-			if (h.source.breaker !== b || typeof h.source.ping !== 'function') continue;
+			if (h.source.breaker !== b || typeof h.source.probe !== 'function') continue;
 			if (h.source.gone?.()) {
 				h.detach();
 				if (!breakers.has(b)) return;
@@ -275,7 +277,7 @@ function createAnnouncer(platform, topic, forget) {
 		}
 		entry.retryMs = 0;
 		let reply;
-		try { reply = Promise.resolve(pinger.source.ping()); } catch (err) { reply = Promise.reject(err); }
+		try { reply = Promise.resolve(pinger.source.probe()); } catch (err) { reply = Promise.reject(err); }
 		reply.then(() => { /** @type {any} */ (b).success?.(); }, (err) => { /** @type {any} */ (b).failure?.(err); });
 	}
 	function probeSoon(b) {

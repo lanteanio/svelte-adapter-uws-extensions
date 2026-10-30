@@ -225,7 +225,11 @@ export function createPubSubBus(client, options = {}) {
 		breaker: b,
 		policy: degradationPolicy,
 		relay: (data) => scheduleRelay(JSON.stringify({ instanceId, topic: systemChannel, event: 'recovered', data, s: false }), 1),
-		ping: () => client.redis.ping(),
+		// An empty batch: peers parse it and deliver nothing.
+		probe: () => {
+			const redis = relayPublisher();
+			return redis.publish(channel, JSON.stringify({ instanceId, batch: [] }));
+		},
 		gone: () => client.redis.status === 'end',
 		counters: { degraded: mDegraded, recovered: mRecovered }
 	} : null;

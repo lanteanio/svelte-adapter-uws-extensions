@@ -482,8 +482,8 @@ describe('the bus system channel on a multi-worker runtime', () => {
 		await bus.activate(a);
 		try {
 			breaker.failure(new Error('down'));
-			await until(() => breaker.state === 'probing');
-			breaker.success();
+			// The bus's own probe publish closes the breaker once it is probing.
+			await until(() => breaker.state === 'healthy');
 		} finally {
 			await bus.deactivate();
 		}

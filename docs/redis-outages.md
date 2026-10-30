@@ -184,11 +184,15 @@ deactivated and the remaining breakers are healthy, the announcer publishes
 A breaker leaves `probing` only when a guarded operation reports an outcome,
 so a bus that carries no traffic, or one a development reload left behind,
 would otherwise keep its breaker, and with it every other bus's `recovered`,
-open. While a bus's breaker is probing, the announcer sends that bus's own
-Redis connection a `PING` through the breaker, which closes it on a reply and
-reopens it on a failure; the breaker's `resetTimeout` then spaces the next
-`PING`. When another caller holds the probe slot, the `PING` is tried again
-after one second, doubling up to 30 seconds. A bus whose connection ended for
+open. While a bus's breaker is probing, the announcer has that bus publish an
+empty batch envelope on its own channel (the pub/sub channel, or the sharded
+bus's `__realtime` shard channel) through the breaker; every peer parses it
+and delivers nothing. A publish is what the breaker guards, so a connection
+that answers but may not publish, such as one whose channel grant was revoked,
+keeps the breaker open. A reply closes the breaker, a failure reopens it, and
+the breaker's `resetTimeout` spaces the next probe. When another caller holds
+the probe slot, the probe is tried again after one second, doubling up to 30
+seconds. A bus whose connection ended for
 good (`quit()`) is detached from the announcer instead.
 
 Every `recovered` event goes through the degradation policy: its `recovery`

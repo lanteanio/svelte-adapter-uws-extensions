@@ -160,7 +160,9 @@ export function createShardedBus(client, options = {}) {
 	const healthSource = announcesHealth ? {
 		breaker: b,
 		relay: (data) => scheduleRelay(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, topic: HEALTH_TOPIC, event: 'recovered', data, s: false }), [HEALTH_TOPIC]),
-		ping: () => client.redis.ping(),
+		// An empty batch on the health topic's shard channel: peers parse it
+		// and deliver nothing.
+		probe: () => client.redis.spublish(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, batch: [] })),
 		gone: () => client.redis.status === 'end'
 	} : null;
 	/** @type {ReturnType<typeof attachHealth> | null} */

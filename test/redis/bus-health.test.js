@@ -224,24 +224,35 @@ describe('shared health announcer', () => {
 		expect(frames(p, 'recovered')).toHaveLength(1);
 	});
 
-	it('keeps probing a failing connection at the breaker reset timeout and stops once healthy', async () => {
+	it('keeps a breaker open while the connection answers but may not publish, and stops probing once healthy', async () => {
+		// A revoked channel grant: PING still answers, every publish is refused.
 		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
-		const pings = [];
-		let fail = true;
-		const ping = client.redis.ping;
-		client.redis.ping = async () => { pings.push(Date.now()); if (fail) throw new Error('down'); return 'PONG'; };
-		cleanups.push(() => { client.redis.ping = ping; });
+		const probes = [];
+		let refuse = true;
+		const { publish, spublish } = client.redis;
+		const guarded = (send) => async function (channel, message) {
+			if (JSON.parse(message).batch?.length === 0) probes.push(channel);
+			if (refuse) throw new Error('NOPERM this user has no permissions to access the channel');
+			return send.call(this, channel, message);
+		};
+		client.redis.publish = guarded(publish);
+		client.redis.spublish = guarded(spublish);
+		cleanups.push(() => { client.redis.publish = publish; client.redis.spublish = spublish; });
 		const { p } = await both([breaker, breaker]);
 		breaker.failure();
 		await vi.advanceTimersByTimeAsync(350);
-		expect(pings.length).toBe(3);
-		fail = false;
+		expect(probes.length).toBe(3);
+		expect(breaker.state).not.toBe('healthy');
+		expect(frames(p, 'recovered')).toEqual([]);
+		refuse = false;
 		await vi.advanceTimersByTimeAsync(150);
 		expect(breaker.state).toBe('healthy');
-		const settled = pings.length;
-		await vi.advanceTimersByTimeAsync(5000);
-		expect(pings.length).toBe(settled);
 		expect(frames(p, 'recovered')).toHaveLength(1);
+		const settled = probes.length;
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(probes.length).toBe(settled);
+		// Peers drop the empty batch: nothing reached the platform but the event.
+		expect(p.published.filter((f) => f.topic !== '__realtime')).toEqual([]);
 	});
 
 	it('takes over the outage of a bus left behind by a reload, with the new policy', async () => {

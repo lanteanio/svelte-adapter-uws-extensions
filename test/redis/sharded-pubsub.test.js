@@ -1217,10 +1217,10 @@ describe.each(['follow', 'followBatch'])('sharded %s breaker admission', (method
 
 	it('returns a cancelled probe when the bus closes during subscribe', async () => {
 		const client = mockRedisClient();
-		// Two probe slots: the bus's own PING of its connection, which never
-		// answers here, holds one, and the follow takes the other.
+		// Two probe slots: the bus's own probe publish, which never answers
+		// here, holds one, and the follow takes the other.
 		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0, probeConcurrency: 2 });
-		client.redis.ping = () => new Promise(() => {});
+		client.redis.spublish = () => new Promise(() => {});
 		let resolveSubscribe;
 		// Activation subscribes the health channel; only the follow hangs.
 		let hang = false;
