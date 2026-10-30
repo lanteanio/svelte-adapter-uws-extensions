@@ -82,7 +82,7 @@ import { createConsistencyAuditor } from '../shared/auditor.js';
 import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { defineOptions, interval, option, timerCeiling, wholeExpiry } from '../shared/options.js';
+import { defineOptions, interval, option, wholeExpiry } from '../shared/options.js';
 
 const onlineMetricCollectors = new WeakMap();
 function collectOnlineMetric(gauge, mapTopic, counts) {
@@ -155,23 +155,25 @@ const validateOptions = defineOptions({
 	label: 'redis presence',
 	types: 'RedisPresenceOptions in redis/presence.d.ts'
 }, {
-	key: option.string,
+	// The keys the adapter's in-memory presence plugin also reads are read
+	// exactly as it reads them, so an app moving between the two never meets
+	// a refusal only one of them makes.
+	key: option.known,
 	select: option.known,
-	clientUpdateFields: option.known,
 	maxFieldsBytes: option.known,
 	maxTotalFieldsBytes: option.known,
+	topicThrottle: option.known,
+	heartbeat: option.known,
+	transient: option.known,
+	binary: option.known,
+	clientUpdateFields: option.known,
 	maxTopicsPerConnection: option.known,
-	// Paces the diff flush timer.
-	topicThrottle: timerCeiling(),
-	heartbeat: timerCeiling(),
 	// Sent to Redis in milliseconds (HPEXPIRE / PX).
 	ttl: wholeExpiry({ scale: 1000, unit: 'seconds' }),
-	transient: option.stringArray,
-	binary: option.boolean,
 	selfPreservation: option.known,
 	keyspaceNotifications: option.boolean,
 	maxEnvelopeBytes: option.known,
-	// 0 disables the auditor, as in the adapter.
+	// 0 disables the auditor, as the adapter's own auditor interval does.
 	consistencyAuditIntervalMs: interval(),
 	breaker: option.collaborator,
 	metrics: option.collaborator

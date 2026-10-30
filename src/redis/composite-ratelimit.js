@@ -39,7 +39,7 @@ import { wallEpoch } from '../shared/runtime.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { assertWholeExpiry, defineOptions, option } from '../shared/options.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // Same version discipline as the single-dimension limiter: a layout change
 // moves to a fresh key space and old keys age out via TTL.
@@ -150,7 +150,7 @@ if tripped ~= 0 then
   -- configured and not already banned) is the one write.
   if blockOf[tripped] > 0 and banned[tripped] <= now then
     redis.call('hset', KEYS[tripped], 'points', pts[tripped], 'resetAt', resetAt[tripped], 'bannedUntil', now + blockOf[tripped])
-    redis.call('pexpire', KEYS[tripped], blockOf[tripped] + 60000)
+    redis.call('pexpire', KEYS[tripped], math.ceil(blockOf[tripped] + 60000))
   end
   local out = {0, tripped, retryMs}
   for i = 1, n do
@@ -163,7 +163,7 @@ local minReset = nil
 for i = 1, n do
   pts[i] = pts[i] - cost
   redis.call('hset', KEYS[i], 'points', pts[i], 'resetAt', resetAt[i], 'bannedUntil', banned[i])
-  redis.call('pexpire', KEYS[i], intervalOf[i] + blockOf[i] + 60000)
+  redis.call('pexpire', KEYS[i], math.ceil(intervalOf[i] + blockOf[i] + 60000))
   local untilReset = resetAt[i] - now
   if minReset == nil or untilReset < minReset then minReset = untilReset end
 end
@@ -348,10 +348,6 @@ export function createCompositeRateLimit(client, options) {
 		if (typeof blockDuration !== 'number' || !Number.isFinite(blockDuration) || blockDuration < 0) {
 			throw new Error(`redis composite ratelimit: dimension '${name}' blockDuration must be a non-negative number`);
 		}
-		// Both reach PEXPIRE inside the check script, after earlier dimensions
-		// were already written, so a fractional one half-applies every check.
-		assertWholeExpiry(`redis composite ratelimit: dimension '${name}' interval`, d.interval, { min: 0 });
-		assertWholeExpiry(`redis composite ratelimit: dimension '${name}' blockDuration`, blockDuration, { min: 0 });
 		if (d.keyBy !== 'ip' && d.keyBy !== 'connection' && typeof d.keyBy !== 'function') {
 			throw new Error(`redis composite ratelimit: dimension '${name}' keyBy is required ('ip', 'connection', or a function) - each dimension must count along its own axis`);
 		}
@@ -659,7 +655,7 @@ export function createCompositeRateLimit(client, options) {
 				const pts = vals && vals[0] != null ? vals[0] : String(d.points);
 				const rst = vals && vals[1] != null ? vals[1] : String(nowMs + d.interval);
 				await redis.hset(bk, 'points', pts, 'resetAt', rst, 'bannedUntil', String(nowMs + dur));
-				await redis.pexpire(bk, dur + 60000);
+				await redis.pexpire(bk, Math.ceil(dur + 60000));
 			});
 		},
 

@@ -180,8 +180,9 @@ const validateOptions = defineOptions({
 	types: 'RedisGroupOptions in redis/groups.d.ts'
 }, {
 	maxMembers: option.known,
-	// Written to Redis with HMSET.
-	meta: option.object,
+	// Read exactly as the adapter's in-memory groups plugin reads it, so an app
+	// moving between the two never meets a refusal only one of them makes.
+	meta: option.known,
 	// Sent to Redis in milliseconds (PEXPIRE), and bounds the settle timers.
 	memberTtl: wholeExpiry({ scale: 1000, unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
 	maxEnvelopeBytes: option.known,
@@ -303,8 +304,11 @@ export function createGroup(client, name, options = {}) {
 
 	let pendingMeta = null;
 	let metaInitError = null;
-	if (options.meta) {
-		const initialMeta = options.meta;
+	// A shallow copy, as the in-memory plugin takes it. An empty one writes
+	// nothing: HMSET without a field is a Redis error.
+	const initialMeta = options.meta ? { ...options.meta } : null;
+	const hasInitialMeta = initialMeta !== null && Object.keys(initialMeta).length > 0;
+	if (hasInitialMeta) {
 		pendingMeta = redis.hmset(metaKey, initialMeta)
 			.then(() => { pendingMeta = null; })
 			.catch((err) => {
@@ -680,9 +684,9 @@ export function createGroup(client, name, options = {}) {
 		async getMeta() {
 			if (b) b.guard();
 			if (pendingMeta) await pendingMeta;
-			if (metaInitError && options.meta) {
+			if (metaInitError && hasInitialMeta) {
 				try {
-					await redis.hmset(metaKey, options.meta);
+					await redis.hmset(metaKey, initialMeta);
 					metaInitError = null;
 				} catch (err) {
 					b?.failure(err);
@@ -778,7 +782,7 @@ export function createGroup(client, name, options = {}) {
 			try {
 				const ttlPipe = redis.pipeline();
 				ttlPipe.pexpire(membersKey, keyExpiryMs);
-				if (options.meta) ttlPipe.pexpire(metaKey, keyExpiryMs);
+				if (hasInitialMeta) ttlPipe.pexpire(metaKey, keyExpiryMs);
 				await ttlPipe.exec();
 			} catch { /* best-effort; the heartbeat re-applies the TTL */ }
 

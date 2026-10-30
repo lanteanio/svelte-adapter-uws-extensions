@@ -167,6 +167,24 @@ describe('redis ratelimit (integration)', () => {
 		});
 	});
 
+	describe('fractional interval and blockDuration', () => {
+		// PEXPIRE refuses a fractional argument, so every expiry the scripts set
+		// is rounded up; the in-memory limiter accepts these values, and so
+		// must this one.
+		for (const refill of ['window', 'sliding', 'gcra']) {
+			it(`${refill} consumes, bans and bans explicitly with fractional values`, async () => {
+				const limiter = createRateLimit(client, { points: 1, interval: 1000.5, blockDuration: 2500.25, refill });
+				const ws = fakeWs({ ip: '9.9.9.' + refill.length });
+				expect((await limiter.consume(ws)).allowed).toBe(true);
+				const denied = await limiter.consume(ws);
+				expect(denied.allowed).toBe(false);
+				expect(denied.resetMs).toBeGreaterThan(1000);
+				await limiter.ban('10.0.0.' + refill.length, 1500.5);
+				expect((await limiter.consume(fakeWs({ ip: '10.0.0.' + refill.length }))).allowed).toBe(false);
+			});
+		}
+	});
+
 	describe('keyBy modes', () => {
 		it('ip mode shares a bucket across two ws with the same IP', async () => {
 			const limiter = createRateLimit(client, { points: 5, interval: 60_000 });

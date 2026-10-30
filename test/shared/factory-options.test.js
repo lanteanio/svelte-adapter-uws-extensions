@@ -114,50 +114,48 @@ const cases = [
 		[{ breaker: null }, { metrics: null }, { storage: 'stream' }, { storage: 'sortedset' }]],
 	['createPresence', (o) => createPresence(redis, o), ['hearbeat', 'heartbeat'],
 		[
-			[{ heartbeat: MAX + 1 }, overflow('redis presence: heartbeat')],
-			[{ topicThrottle: MAX + 1 }, overflow('redis presence: topicThrottle')],
 			[{ ttl: 1.0001 }, whole('redis presence: ttl')],
-			[{ transient: 'typing' }, 'redis presence: transient must be an array of strings'],
-			[{ transient: ['typing', 5] }, 'redis presence: transient must be an array of strings'],
-			[{ binary: 'false' }, 'redis presence: binary must be true or false'],
 			[{ keyspaceNotifications: 'yes' }, 'redis presence: keyspaceNotifications must be true or false'],
 			[{ consistencyAuditIntervalMs: '1000' }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
-			[{ consistencyAuditIntervalMs: -1 }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
-			[{ key: 5 }, 'redis presence: key must be a string']
+			[{ consistencyAuditIntervalMs: -1 }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)']
 		],
-		[{ select: null }, { breaker: null }, { metrics: null }, { ttl: 1.5 }, { transient: [] }, { binary: false }, { consistencyAuditIntervalMs: 0 }, { heartbeat: MAX }]],
+		[
+			{ select: null }, { breaker: null }, { metrics: null }, { ttl: 1.5 }, { transient: [] }, { binary: false }, { consistencyAuditIntervalMs: 0 }, { heartbeat: MAX },
+			// Values the adapter's in-memory presence plugin accepts.
+			{ binary: 'false' }, { transient: 'typing' }, { transient: ['typing', 5] }, { key: 0 }, { heartbeat: MAX + 1 }, { topicThrottle: MAX + 1 }
+		]],
 	['createCursor', (o) => createCursor(redis, o), ['throtle', 'throttle'],
 		[
-			[{ throttle: MAX + 1 }, overflow('redis cursor: throttle')],
-			[{ topicThrottle: MAX + 1 }, overflow('redis cursor: topicThrottle')],
 			[{ snapshotIntervalMs: Math.floor(MAX / 2) + 1 }, overflow('redis cursor: snapshotIntervalMs')],
 			[{ ttl: 1.5 }, whole('redis cursor: ttl')],
-			[{ ttl: Math.floor(MAX / 1000) + 1 }, overflow('redis cursor: ttl')],
-			[{ binary: 0 }, 'redis cursor: binary must be true or false'],
-			[{ dictionary: 'no' }, 'redis cursor: dictionary must be true or false']
+			[{ ttl: Math.floor(MAX / 1000) + 1 }, overflow('redis cursor: ttl')]
 		],
-		[{ select: null }, { breaker: null }, { metrics: null }, { binary: false }, { dictionary: false }, { ttl: 30 }]],
+		[
+			{ select: null }, { breaker: null }, { metrics: null }, { binary: false }, { dictionary: false }, { ttl: 30 },
+			// Values the adapter's in-memory cursor plugin accepts.
+			{ binary: 0 }, { dictionary: 'no' }, { throttle: MAX + 1 }, { topicThrottle: MAX + 1 }
+		]],
+	// Fractional intervals and blocks are accepted, as the in-memory limiter
+	// accepts them; their Redis expiries are rounded up.
 	['createRateLimit', (o) => createRateLimit(redis, { points: 2, interval: 1000, ...o }), ['blockduration', 'blockDuration'],
+		[],
 		[
-			[{ interval: 1000.5 }, whole('redis ratelimit: interval')],
-			[{ interval: 1000.25, refill: 'sliding' }, "redis ratelimit: interval must be a whole number of milliseconds, or a half one with refill 'sliding'"],
-			[{ blockDuration: 0.5 }, whole('redis ratelimit: blockDuration')],
-			[{ blockDuration: 1.5, refill: 'gcra' }, whole('redis ratelimit: blockDuration')]
-		],
-		[{ breaker: null }, { metrics: null }, { interval: 1000.5, refill: 'sliding' }, { interval: 1000.7, refill: 'gcra' }, { blockDuration: 0 }, { refill: null }]],
+			{ breaker: null }, { metrics: null }, { blockDuration: 0 }, { refill: null },
+			{ interval: 1000.5 }, { interval: 1000.25, refill: 'sliding' }, { interval: 1000.7, refill: 'gcra' }, { blockDuration: 0.5 }, { blockDuration: 1.5, refill: 'gcra' }
+		]],
 	['createCompositeRateLimit', (o) => createCompositeRateLimit(redis, { dimensions, ...o }), ['tennant', 'tenant'],
+		[],
 		[
-			[{ dimensions: { ...dimensions, ip: { ...dimensions.ip, interval: 999.5 } } }, whole("redis composite ratelimit: dimension 'ip' interval")],
-			[{ dimensions: { ...dimensions, ip: { ...dimensions.ip, blockDuration: 0.5 } } }, whole("redis composite ratelimit: dimension 'ip' blockDuration")]
-		],
-		[{ breaker: null }, { metrics: null }]],
+			{ breaker: null }, { metrics: null },
+			{ dimensions: { ...dimensions, ip: { ...dimensions.ip, interval: 999.5, blockDuration: 0.5 } } }
+		]],
 	['createGroup', (o) => createGroup(redis, 'room', o), ['maxMember', 'maxMembers'],
 		[
-			[{ meta: 'vip' }, 'redis group: meta must be an object - got "vip" (string).'],
 			[{ memberTtl: 1.0001 }, whole('redis group: memberTtl')],
 			[{ memberTtl: Math.floor(MAX / 1000) + 1 }, overflow('redis group: memberTtl')]
 		],
-		[{ meta: null }, { onJoin: null }, { breaker: null }, { metrics: null }, { memberTtl: 1.5 }]],
+		// meta: 'vip' is shallow-copied, as the in-memory groups plugin copies it.
+		[{ meta: null }, { onJoin: null }, { breaker: null }, { metrics: null }, { memberTtl: 1.5 }, { meta: 'vip' }, { meta: {} }]],
 	['createDistributedSession', (o) => createDistributedSession(redis, o), ['ttlms', 'ttlMs'],
 		[[{ ttlMs: 1500.5 }, whole('session: ttlMs')], [{ refreshOnGet: 'no' }, 'session: refreshOnGet must be true or false']],
 		[{ breaker: null }, { metrics: null }, { refreshOnGet: false }, { onLoadError: null }]],
@@ -232,15 +230,12 @@ const cases = [
 		[[{ breaker: 'on' }, 'redis idempotency: breaker must be an object (or omitted)']],
 		[{ breaker: null }, { metrics: null }, { maxResultBytes: null }]],
 	['createUpgradeBucket', (o) => createUpgradeBucket(redis, { perMinute: 1, ...o }), ['perminute', 'perMinute'],
-		[
-			[{ blockDuration: 0.5 }, whole('redis upgrade-bucket: normal blockDuration')],
-			[{ siege: { perMinute: 1, blockDuration: 1.5 } }, whole('redis upgrade-bucket: siege blockDuration')]
-		],
-		[{ breaker: null }, { metrics: null }, { blockDuration: 1000 }]],
+		[],
+		// Fractional blocks are accepted, as the local bucket accepts them.
+		[{ breaker: null }, { metrics: null }, { blockDuration: 1000 }, { blockDuration: 0.5 }, { siege: { perMinute: 1, blockDuration: 1.5 } }]],
 	['createLocalUpgradeBucket', (o) => createLocalUpgradeBucket({ perMinute: 1, ...o }), ['maxEntrie', 'maxEntries'],
 		[[{ metrics: 'on' }, 'local upgrade-bucket: metrics must be an object (or omitted)']],
-		// Fractional blocks never reach Redis here, and the shared options type
-		// declares emergency and breaker.
+		// The shared options type declares emergency and breaker.
 		[{ blockDuration: 0.5 }, { emergency: {}, breaker: null }]],
 	['createRetryBudget', (o) => createRetryBudget(redis, o), ['capacty', 'capacity'],
 		[[{ breaker: 7 }, 'redis retry budget: breaker must be an object (or omitted)']],
@@ -324,6 +319,83 @@ describe.each(cases)('%s', (factory, build, [typo, suggestion], invalid, valid) 
 
 	it.each(valid.map((options) => [JSON.stringify(options), options]))('accepts %s', (_shown, options) => {
 		expect(() => keep(build(options))).not.toThrow();
+	});
+});
+
+/**
+ * Optional options whose own check is written `options.x !== undefined` (or
+ * a destructuring default), which a null used to reach and fail. Each must
+ * now take its default, as an omitted key does.
+ */
+const nullDefaults = [
+	['createPubSubBus', (o) => createPubSubBus(redis, o), ['onDegraded', 'onRecovered', 'degradationPolicy', 'maxEnvelopeBytes']],
+	['createShardedBus', (o) => createShardedBus(redis, o), ['shardKey', 'subscribersAggregator', 'maxEnvelopeBytes']],
+	['redis createReplay', (o) => createReplay(redis, o), ['storage', 'size', 'ttl', 'durability', 'localFanoutOnStorageFailure', 'maxDataBytes', 'forgetUserId']],
+	['redis createReplay (stream)', (o) => createReplay(redis, { storage: 'stream', ...o }), ['size', 'ttl', 'idempotencyTtl', 'maxDataBytes']],
+	['createPresence', (o) => createPresence(redis, o), ['clientUpdateFields', 'selfPreservation', 'maxEnvelopeBytes']],
+	['createCursor', (o) => createCursor(redis, o), ['position', 'maxEnvelopeBytes']],
+	['createRateLimit', (o) => createRateLimit(redis, { points: 2, interval: 1000, ...o }), ['blockDuration', 'keyBy', 'tenant', 'budget', 'localFloorOnStorageFailure']],
+	['createCompositeRateLimit', (o) => createCompositeRateLimit(redis, { dimensions, ...o }), ['tenant', 'localFloorOnStorageFailure', 'emergency']],
+	['createGroup', (o) => createGroup(redis, 'room', o), ['maxEnvelopeBytes']],
+	['createDistributedSession', (o) => createDistributedSession(redis, o), ['identify', 'maxAgeMs', 'forgetUserId']],
+	['createConnectionRegistry', (o) => createConnectionRegistry(redis, { identify: () => null, ...o }), ['attributes', 'sessionIdentify', 'maxEnvelopeBytes']],
+	['createLeader', (o) => createLeader(redis, o), ['key', 'instanceId', 'onError', 'mapKey']],
+	['createDistributedLock', (o) => createDistributedLock(redis, o), ['keyPrefix', 'fence', 'mapKey']],
+	['createClockSkewSampler', (o) => createClockSkewSampler(redis, { immediate: false, ...o }), ['onSkew', 'onWarn', 'onTrip', 'onError', 'fence', 'onFence']],
+	['createClusterClock', (o) => createClusterClock(redis, { immediate: false, ...o }), ['ntp', 'leader', 'leaderKey', 'legacyLeaderKeyFallback', 'onSample', 'onWarn', 'onTrip', 'onDrift', 'onError']],
+	['createPublishRateAggregator', (o) => createPublishRateAggregator(redis, o), ['subjects']],
+	['redis createAlarmStore', (o) => createRedisAlarmStore(redis, o), ['keyPrefix']],
+	['createCrdtCluster', (o) => createCrdtCluster(redis, o), ['maxEnvelopeBytes']],
+	['createSmoothCluster', (o) => createSmoothCluster(redis, o), ['maxEnvelopeBytes']],
+	['createTopicBroadcast', (o) => createTopicBroadcast(redis, o), ['maxEnvelopeBytes']],
+	['createRedisFence', (o) => createRedisFence(redis, o), ['keyPrefix']],
+	['redis createIdempotencyStore', (o) => createRedisIdempotency(redis, o), ['keyPrefix', 'ttl', 'acquireTtl']],
+	['createUpgradeBucket', (o) => createUpgradeBucket(redis, { perMinute: 1, ...o }), ['blockDuration', 'elevated', 'siege']],
+	['redis createDeadLetter', (o) => createRedisDeadLetter(redis, o), ['max', 'ttlMs', 'forgetUserId', 'forgetTombstoneMs']],
+	['postgres createIdempotencyStore', (o) => createPgIdempotency(pg, { autoMigrate: false, cleanupInterval: 0, ...o }), ['ttl', 'acquireTtl', 'cleanupInterval']],
+	['createTaskRunner', (o) => createTaskRunner(pg, { autoMigrate: false, recoveryInterval: 0, dispatchInterval: 0, cleanupInterval: 0, ...o }),
+		['fenceTtl', 'recoveryInterval', 'recoveryBatchSize', 'dispatchInterval', 'dispatchBatchSize', 'awaitPollInterval', 'awaitTimeout', 'cleanupInterval', 'rowTtl', 'maxPayloadBytes', 'forgetUserId', 'onStateChange']],
+	['createNotifyBridge', (o) => createNotifyBridge(pg, { channel: 'test', ...o }), ['maxEnvelopeBytes']],
+	['postgres createReplay', (o) => createPgReplay(pg, { autoMigrate: false, cleanupInterval: 0, ...o }), ['size', 'ttl', 'cleanupInterval', 'localFanoutOnStorageFailure', 'maxDataBytes', 'forgetUserId']],
+	['postgres createDeadLetter', (o) => createPgDeadLetter(pg, { autoMigrate: false, cleanupInterval: 0, ...o }), ['max', 'ttlMs', 'cleanupInterval', 'forgetUserId']],
+	['createDegradationPolicy', (o) => createDegradationPolicy(o), ['jitterMs', 'recoveryJitterMs']],
+	['createBusValidator', (o) => createBusValidator(o), ['maxBytes']],
+	['capabilityCookie', (o) => capabilityCookie({ secret: '0123456789abcdef', ...o }), ['previousSecret']]
+];
+
+describe.each(nullDefaults)('%s: null means not set', (_factory, build, keys) => {
+	it.each(keys)('%s: null takes the default', (key) => {
+		expect(() => keep(build({ [key]: null }))).not.toThrow();
+	});
+});
+
+describe('null takes the default, observed', () => {
+	it('a null fence keyPrefix writes the default fence: key', async () => {
+		const fence = createRedisFence(redis, { keyPrefix: null });
+		await fence.acquire('t1', 'f1', 30);
+		expect(await redis.redis.get(redis.key('fence:t1'))).toBe('f1');
+	});
+
+	it('the caller options object is not modified', () => {
+		const options = { size: null, ttl: null };
+		keep(createReplay(redis, options));
+		expect(options).toEqual({ size: null, ttl: null });
+	});
+
+	it('a null pub/sub systemChannel still turns the health events off', async () => {
+		const platform = mockPlatform();
+		const bus = keep(createPubSubBus(redis, { systemChannel: null }));
+		await bus.hooks.open({ id: 'w1' }, { platform });
+		expect(platform.subscribed).toEqual([]);
+	});
+});
+
+describe('values shared with the in-memory plugins read the same way', () => {
+	it('group meta is shallow-copied as the in-memory groups plugin copies it', async () => {
+		const vip = keep(createGroup(redis, 'vip-room', { meta: 'vip' }));
+		expect(await vip.getMeta()).toEqual({ 0: 'v', 1: 'i', 2: 'p' });
+		const empty = keep(createGroup(redis, 'empty-room', { meta: {} }));
+		expect(await empty.getMeta()).toEqual({});
 	});
 });
 

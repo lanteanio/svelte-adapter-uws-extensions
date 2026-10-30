@@ -155,23 +155,26 @@ const validateOptions = defineOptions({
 	label: 'redis cursor',
 	types: 'RedisCursorOptions in redis/cursor.d.ts'
 }, {
+	// The keys the adapter's in-memory cursor plugin also reads are read
+	// exactly as it reads them, so an app moving between the two never meets
+	// a refusal only one of them makes.
 	maxDataBytes: option.known,
 	maxTopicLength: option.known,
-	throttle: timerCeiling(),
-	topicThrottle: timerCeiling(),
-	// The roster confirmation timer waits twice this.
-	snapshotIntervalMs: timerCeiling({ scale: 2 }),
+	throttle: option.known,
+	topicThrottle: option.known,
 	select: option.known,
-	// Sent to Redis EXPIRE in seconds, and paces the cleanup and prune timers
-	// in milliseconds.
-	ttl: wholeExpiry({ unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
 	position: option.known,
 	minMove: option.known,
 	viewport: option.known,
 	backpressure: option.known,
+	binary: option.known,
+	dictionary: option.known,
+	// The roster confirmation timer waits twice this.
+	snapshotIntervalMs: timerCeiling({ scale: 2 }),
+	// Sent to Redis EXPIRE in seconds, and paces the cleanup and prune timers
+	// in milliseconds.
+	ttl: wholeExpiry({ unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
 	maxEnvelopeBytes: option.known,
-	binary: option.boolean,
-	dictionary: option.boolean,
 	breaker: option.collaborator,
 	metrics: option.collaborator
 });

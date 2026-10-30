@@ -30,7 +30,7 @@ import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { now, monotonicNow } from '../shared/runtime.js';
 import { createEmergencyScaleReader } from './emergency-scale.js';
-import { assertWholeExpiry, defineOptions, option } from '../shared/options.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /** Refill interval for a per-minute budget, in milliseconds. */
 const MINUTE_MS = 60000;
@@ -161,11 +161,6 @@ const validateOptions = defineOptions({
 export function createUpgradeBucket(client, options) {
 	options = validateOptions(options);
 	const resolve = buildBudgets(options, 'redis upgrade-bucket');
-	// Each budget's block reaches Redis inside a PEXPIRE argument. A fractional
-	// one fails every admit after its HSET, and a failed admit fails open.
-	for (const posture of ['normal', 'elevated', 'siege']) {
-		assertWholeExpiry(`redis upgrade-bucket: ${posture} blockDuration`, resolve(posture).blockDuration, { min: 0 });
-	}
 
 	const redis = client.redis;
 

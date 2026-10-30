@@ -28,7 +28,7 @@ import {
 import { createEmergencyScaleReader, createEmergencyScaleOps, LEGACY_EMERGENCY_KEY, unlinkLegacyBucket } from './emergency-scale.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
-import { assertWholeExpiry, defineOptions, option } from '../shared/options.js';
+import { defineOptions, option } from '../shared/options.js';
 
 export { createEmergencyScaleOps as createRateLimitEmergency } from './emergency-scale.js';
 export { createCompositeRateLimit } from './composite-ratelimit.js';
@@ -335,7 +335,7 @@ local pts = vals[1] or defaultPoints
 local rst = vals[2] or (now + defaultInterval)
 
 redis.call('hset', key, 'points', pts, 'resetAt', rst, 'bannedUntil', now + duration)
-redis.call('pexpire', key, duration + 60000)
+redis.call('pexpire', key, math.ceil(duration + 60000))
 return 1
 `;
 
@@ -458,18 +458,6 @@ export function createRateLimit(client, options) {
 		throw new Error("redis ratelimit: refill must be 'window', 'sliding', or 'gcra'");
 	}
 	const mode = REFILL_MODES[refill];
-	// The consume and ban scripts hand these to PEXPIRE after writing the
-	// bucket, so a fractional value spends the point and then fails the call.
-	// GCRA floors its interval term and sliding doubles it, so only the window
-	// mode needs a whole interval and sliding needs a whole double.
-	assertWholeExpiry('redis ratelimit: blockDuration', blockDuration, { min: 0 });
-	if (refill === 'window') assertWholeExpiry('redis ratelimit: interval', interval, { min: 0 });
-	if (refill === 'sliding' && !Number.isInteger(interval * 2)) {
-		throw new TypeError(
-			`redis ratelimit: interval must be a whole number of milliseconds, or a half one with refill 'sliding' - got ${interval}. ` +
-			'Redis refuses a fractional expiry, so every write that sets it would fail.'
-		);
-	}
 
 	const floorOpt = options.localFloorOnStorageFailure;
 	let floor = null;

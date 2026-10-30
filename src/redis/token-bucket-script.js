@@ -21,6 +21,10 @@
  *
  * Uses Redis TIME internally for clock-skew-safe timestamps.
  *
+ * interval and blockDuration may be fractional, as the in-memory limiter
+ * allows. PEXPIRE only takes whole milliseconds, so every expiry these
+ * scripts (and the composite and ban scripts) set is rounded up.
+ *
  * Returns: [allowed (0/1), remaining, resetMs]
  *
  * This module also exports the read-only and alternate-refill companions, all
@@ -91,7 +95,7 @@ if points >= cost then
   redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
   -- Set TTL to avoid stale keys: interval + blockDuration + buffer
   local ttlMs = interval + blockDuration + 60000
-  redis.call('pexpire', key, ttlMs)
+  redis.call('pexpire', key, math.ceil(ttlMs))
   return {1, points, resetAt - now}
 end
 
@@ -100,13 +104,13 @@ if blockDuration > 0 then
   bannedUntil = now + blockDuration
   redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
   local ttlMs = blockDuration + 60000
-  redis.call('pexpire', key, ttlMs)
+  redis.call('pexpire', key, math.ceil(ttlMs))
   return {0, 0, blockDuration}
 end
 
 redis.call('hset', key, 'points', points, 'resetAt', resetAt, 'bannedUntil', bannedUntil)
 local ttlMs = interval + 60000
-redis.call('pexpire', key, ttlMs)
+redis.call('pexpire', key, math.ceil(ttlMs))
 return {0, math.max(0, points), resetAt - now}
 `;
 
@@ -238,7 +242,7 @@ local resetMs = windowStart + interval - now
 if weighted + cost <= maxPoints then
   curr = curr + cost
   redis.call('hset', key, 'curr', curr, 'prev', prev, 'windowStart', windowStart, 'bannedUntil', bannedUntil)
-  redis.call('pexpire', key, interval * 2 + blockDuration + 60000)
+  redis.call('pexpire', key, math.ceil(interval * 2 + blockDuration + 60000))
   local remaining = maxPoints - weighted - cost
   if remaining < 0 then remaining = 0 end
   return {1, math.floor(remaining), resetMs}
@@ -247,12 +251,12 @@ end
 if blockDuration > 0 then
   bannedUntil = now + blockDuration
   redis.call('hset', key, 'curr', curr, 'prev', prev, 'windowStart', windowStart, 'bannedUntil', bannedUntil)
-  redis.call('pexpire', key, blockDuration + 60000)
+  redis.call('pexpire', key, math.ceil(blockDuration + 60000))
   return {0, 0, blockDuration}
 end
 
 redis.call('hset', key, 'curr', curr, 'prev', prev, 'windowStart', windowStart, 'bannedUntil', bannedUntil)
-redis.call('pexpire', key, interval * 2 + 60000)
+redis.call('pexpire', key, math.ceil(interval * 2 + 60000))
 local remaining = maxPoints - weighted
 if remaining < 0 then remaining = 0 end
 return {0, math.floor(remaining), resetMs}
@@ -384,14 +388,14 @@ if now >= allowAt then
   local remaining = math.floor((now - allowAt) / emission)
   if remaining < 0 then remaining = 0 end
   redis.call('hset', key, 'tat', newTat, 'bannedUntil', bannedUntil)
-  redis.call('pexpire', key, math.floor(burst) + blockDuration + 60000)
+  redis.call('pexpire', key, math.ceil(math.floor(burst) + blockDuration + 60000))
   return {1, remaining, math.floor(newTat - now)}
 end
 
 if blockDuration > 0 then
   bannedUntil = now + blockDuration
   redis.call('hset', key, 'tat', tatEff, 'bannedUntil', bannedUntil)
-  redis.call('pexpire', key, blockDuration + 60000)
+  redis.call('pexpire', key, math.ceil(blockDuration + 60000))
   return {0, 0, blockDuration}
 end
 
