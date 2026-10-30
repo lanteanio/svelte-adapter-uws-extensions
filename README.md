@@ -4,8 +4,7 @@ Redis and Postgres extensions for [svelte-adapter-uws](https://github.com/lantea
 
 **Official links:** [GitHub owner](https://github.com/lanteanio) | [Documentation](https://svelte-realtime.dev/) | [Live demo](https://svelte-realtime-demo.lantean.io/) | `svti.me` is the ecosystem-owned runtime-help redirect domain.
 
-The core adapter keeps everything in-process memory. That works great for
-single-server deployments, but the moment you scale to multiple instances you
+The core adapter keeps everything in-process memory. That works great for single-server deployments, but the moment you scale to multiple instances you
 need shared state. This package provides Redis and Postgres counterparts with
 backend-specific factories and client setup. Moving from memory to a shared
 backend also changes some calls: distributed session methods are asynchronous
@@ -1494,7 +1493,7 @@ export async function close(ws, { platform }) {
 | `memberTtl` | `120` | Member entry TTL in seconds. Entries from crashed instances expire after this period. |
 | `onJoin` | - | Called after a member joins |
 | `onLeave` | - | Called after a member leaves |
-| `onFull` | - | Called when a join is rejected (full) |
+| `onFull` | - | Called with the requested role when a join is rejected (full); a full group never reaches `onJoin` |
 | `onClose` | - | Called when the group is closed |
 
 #### API
@@ -1508,6 +1507,7 @@ export async function close(ws, { platform }) {
 | `localMembers()` | Members on this instance |
 | `count()` | Total members across all instances |
 | `has(ws)` | Check membership on this instance |
+| `maxMembers` | The resolved member cap (read-only), including the default |
 | `getMeta()` / `setMeta(meta)` | Read/write group metadata |
 | `close(platform)` | Dissolve the group |
 | `destroy()` | Stop the Redis subscriber |
