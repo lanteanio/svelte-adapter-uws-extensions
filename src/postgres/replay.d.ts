@@ -221,9 +221,9 @@ export interface PgReplayBuffer extends PostgresStoreReadiness {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
-	 * Current stored generation of a topic's seq space; `0` for a topic with
-	 * no sequence row. Replaced by the next value of the epoch sequence
-	 * whenever the authoritative seq numbering for the topic restarts
+	 * Current stored epoch of a topic's seq space, an opaque random 32-bit
+	 * integer; `0` for a topic with no sequence row. Drawn anew whenever the
+	 * authoritative seq numbering for the topic restarts
 	 * (`clearTopic`, or a publish creating the topic's row again after
 	 * eviction, idle expiry or `clear()`). The resume hook compares this to the
 	 * client's presented epoch to choose gap-fill (match) or cold-rehydrate

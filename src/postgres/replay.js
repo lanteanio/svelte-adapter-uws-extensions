@@ -18,20 +18,20 @@
  *   svti_replay_seq (
  *     topic        TEXT        PRIMARY KEY,
  *     seq          BIGINT      NOT NULL DEFAULT 0,
- *     epoch        BIGINT      NOT NULL DEFAULT nextval('svti_replay_seq_epoch_seq'),
+ *     epoch        BIGINT      NOT NULL DEFAULT 0,
  *     last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
  *   )
  *
  * Sequences are generated atomically via the _seq table (an UPDATE of the
  * topic row, or an INSERT ... ON CONFLICT DO UPDATE for a new topic), so they
  * are safe across multiple server instances without races. The same row
- * carries a per-topic epoch: the generation of the current seq space, taken
- * from one sequence whenever the seq space restarts (a new or recreated topic,
- * clearTopic), so a reconnecting client whose topic reset is cold-rehydrated
+ * carries a per-topic epoch: an opaque random 32-bit value drawn whenever the
+ * seq space restarts (a new or recreated topic, clearTopic), carrying no time
+ * and no count, so a reconnecting client whose topic reset is cold-rehydrated
  * instead of being served the restarted numbering as if it continued the old
- * one. Because no epoch is ever handed out twice, a topic row may be deleted:
- * `maxTopics` evicts the least recently published topics, and with a `ttl` a
- * topic idle for longer than it loses its row along with its expired events.
+ * one. A topic row may therefore be deleted - `maxTopics` evicts the least
+ * recently used topics, and with a `ttl` a topic idle for longer than it loses
+ * its row along with its expired events - and a recreated topic draws anew.
  *
  * @module svelte-adapter-uws-extensions/postgres/replay
  */
@@ -39,7 +39,12 @@
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES, REPLAY_READ_USE_INTERVAL_MS } from '../shared/caps.js';
-import { now } from '../shared/runtime.js';
+import { now, randomU32 } from '../shared/runtime.js';
+
+/** An epoch for a new seq space: random, 1 .. 2^32 - 1 (0 means none). */
+function drawEpoch() {
+	return (randomU32() % 4294967295) + 1;
+}
 import { createLruMap } from '../shared/lru-map.js';
 import { withBreaker, pgFailure, guardBreaker } from './_breaker.js';
 import { scheduleCleanup } from './_cleanup.js';
@@ -189,7 +194,6 @@ export function createReplay(client, options = {}) {
 
 	const table = options.table || 'svti_replay';
 	const seqTable = table + '_seq';
-	const epochSequence = seqTable + '_epoch_seq';
 	const pkCol = table + '_id';
 	const maxSize = options.size || 1000;
 	const ttl = options.ttl || 0;
@@ -522,7 +526,7 @@ export function createReplay(client, options = {}) {
 					await ensureTable();
 					// An existing topic takes the UPDATE branch, which also
 					// stamps its last use; only a new topic reaches the INSERT,
-					// so the epoch sequence is read only when a seq space starts.
+					// so the drawn epoch ($5) is stored only when a seq space starts.
 					// ON CONFLICT covers a concurrent first publish of the topic.
 					return client.query({
 						name: 'replay_publish_' + table,
@@ -531,8 +535,8 @@ export function createReplay(client, options = {}) {
 							 WHERE topic = $1
 							RETURNING seq, epoch, false AS created
 						), fresh AS (
-							INSERT INTO ${seqTable} (topic, seq)
-							SELECT $1, 1 WHERE NOT EXISTS (SELECT 1 FROM bumped)
+							INSERT INTO ${seqTable} (topic, seq, epoch)
+							SELECT $1, 1, $5 WHERE NOT EXISTS (SELECT 1 FROM bumped)
 							ON CONFLICT (topic)
 							  DO UPDATE SET seq = ${seqTable}.seq + 1, last_used_at = now()
 							  RETURNING seq, epoch, (xmax = 0) AS created
@@ -545,7 +549,7 @@ export function createReplay(client, options = {}) {
 						SELECT $1, new_seq.seq, $2, $3, $4
 						  FROM new_seq
 						RETURNING seq, (SELECT epoch FROM new_seq) AS epoch, (SELECT created FROM new_seq) AS created`,
-						values: [topic, event, payload, userId]
+						values: [topic, event, payload, userId, drawEpoch()]
 					});
 				});
 			} catch (err) {
@@ -595,6 +599,9 @@ export function createReplay(client, options = {}) {
 			const events = new Array(messages.length);
 			const payloads = new Array(messages.length);
 			const userIds = new Array(messages.length);
+			// One drawn epoch per topic, used only if the batch creates it.
+			const epochs = new Array(messages.length);
+			const drawn = new Map();
 			for (let i = 0; i < messages.length; i++) {
 				const msg = messages[i];
 				if (!msg || typeof msg.topic !== 'string' || msg.topic.length === 0 || typeof msg.event !== 'string') {
@@ -609,6 +616,8 @@ export function createReplay(client, options = {}) {
 					try { const u = forgetUserId({ topic: msg.topic, event: msg.event, data: msg.data }); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
 				}
 				userIds[i] = userId;
+				if (!drawn.has(msg.topic)) drawn.set(msg.topic, drawEpoch());
+				epochs[i] = drawn.get(msg.topic);
 			}
 
 			let res;
@@ -630,18 +639,18 @@ export function createReplay(client, options = {}) {
 					return client.query({
 						name: 'replay_publishbatch_' + table,
 						text: `WITH input AS (
-							SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[])
-							  WITH ORDINALITY AS t(topic, event, data, user_id, ord)
+							SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[])
+							  WITH ORDINALITY AS t(topic, event, data, user_id, epoch, ord)
 						), counts AS (
-							SELECT topic, COUNT(*)::bigint AS n FROM input GROUP BY topic
+							SELECT topic, COUNT(*)::bigint AS n, min(epoch) AS epoch FROM input GROUP BY topic
 						), updated AS (
 							UPDATE ${seqTable} s SET seq = s.seq + c.n, last_used_at = now()
 							  FROM counts c
 							 WHERE s.topic = c.topic
 							RETURNING s.topic, s.seq AS new_high, s.epoch, false AS created
 						), inserted AS (
-							INSERT INTO ${seqTable} (topic, seq)
-							SELECT c.topic, c.n FROM counts c
+							INSERT INTO ${seqTable} (topic, seq, epoch)
+							SELECT c.topic, c.n, c.epoch FROM counts c
 							 WHERE NOT EXISTS (SELECT 1 FROM updated u WHERE u.topic = c.topic)
 							ON CONFLICT (topic)
 							  DO UPDATE SET seq = ${seqTable}.seq + EXCLUDED.seq, last_used_at = now()
@@ -662,7 +671,7 @@ export function createReplay(client, options = {}) {
 							RETURNING topic, seq
 						)
 						SELECT topic, new_high, epoch, created FROM bumped`,
-						values: [topics, events, payloads, userIds]
+						values: [topics, events, payloads, userIds, epochs]
 					});
 				});
 			} catch (err) {
@@ -959,9 +968,8 @@ export function createReplay(client, options = {}) {
 			await withBreaker(b, async () => {
 				await ensureTable();
 				// Delete every seq-table row and every data row. A republished
-				// topic takes a new generation from the epoch sequence, above
-				// every epoch handed out before the clear, so a long-lived client
-				// holding a pre-clear epoch cannot match it. Run both in a
+				// topic draws a new random epoch, so a long-lived client holding
+				// a pre-clear epoch mismatches and rehydrates. Run both in a
 				// transaction so an interruption cannot leave data rows gone while
 				// the seq counters remain. A pooled-connection BEGIN/COMMIT is
 				// required because the default `client.query()` may check out a
@@ -989,7 +997,7 @@ export function createReplay(client, options = {}) {
 				const res = await withTransaction(client, async (tx) => {
 					// Lock/reset the seq-table row FIRST - the same row a publish to
 					// this topic contends on. Keep the row with seq reset to 0 and a
-					// new generation from the epoch sequence, so the next publish
+					// newly drawn epoch (never the one it replaces), so the next publish
 					// issues seq = 1 under it: a client that subscribed after the
 					// clear resumes by gap-fill. Holding this row lock for the rest of
 					// the transaction serializes any concurrent publish behind COMMIT;
@@ -998,10 +1006,13 @@ export function createReplay(client, options = {}) {
 					// reset numbering then re-issued - a duplicate (topic, seq).
 					const r = await tx.query(
 						`INSERT INTO ${seqTable} (topic, seq, epoch, last_used_at)
-						      VALUES ($1, 0, nextval('${epochSequence}'::regclass), now())
+						      VALUES ($1, 0, $2, now())
 						 ON CONFLICT (topic)
-						   DO UPDATE SET seq = 0, epoch = EXCLUDED.epoch, last_used_at = now()
-						   RETURNING epoch, (xmax = 0) AS created`, [topic]);
+						   DO UPDATE SET seq = 0, last_used_at = now(),
+						                 epoch = CASE WHEN ${seqTable}.epoch = EXCLUDED.epoch
+						                              THEN EXCLUDED.epoch % 4294967295 + 1
+						                              ELSE EXCLUDED.epoch END
+						   RETURNING epoch, (xmax = 0) AS created`, [topic, drawEpoch()]);
 					await tx.query(
 						`DELETE FROM ${table}
 						  WHERE topic = $1`, [topic]);

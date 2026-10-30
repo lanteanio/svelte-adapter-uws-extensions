@@ -4,6 +4,7 @@ import { mockPlatform } from '../helpers/mock-platform.js';
 import { createReplay, ReplayStorageError, ReplaySerializationError } from '../../src/postgres/replay.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 import { registeredRecord } from '../helpers/diagnostic-line.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 describe('postgres replay', () => {
 	let client;
@@ -555,10 +556,11 @@ describe('postgres replay', () => {
 
 		it('bumps the epoch on the first publish of a fresh topic', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			const epoch = await replay.currentEpoch('chat');
+			expect(epoch).toBeGreaterThan(0);
 			// Steady-state publishes do not move the epoch.
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			expect(await replay.currentEpoch('chat')).toBe(epoch);
 		});
 
 		it('bumps the epoch when clearTopic resets the seq space', async () => {
@@ -566,34 +568,35 @@ describe('postgres replay', () => {
 			const before = await replay.currentEpoch('chat');
 			await replay.clearTopic('chat');
 			const after = await replay.currentEpoch('chat');
-			expect(after).toBeGreaterThan(before);
-			// Next publish restarts seq at 1 but does NOT re-bump: clearTopic keeps
+			expect(after).not.toBe(before);
+			// Next publish restarts seq at 1 under the same epoch: clearTopic keeps
 			// the seq-table row (seq reset to 0), so the publish takes the UPDATE
-			// branch and carries the already-bumped epoch forward. The bump is done
-			// once, atomically, by clearTopic - this is the durable single-bump
-			// guarantee that keeps repeated clears monotonic.
+			// branch and carries the epoch clearTopic drew.
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
 			expect(await replay.seq('chat')).toBe(1);
 			expect(await replay.currentEpoch('chat')).toBe(after);
 		});
 
-		it('keeps the epoch monotonic across repeated clears', async () => {
-			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
-			await replay.clearTopic('chat');
-			expect(await replay.currentEpoch('chat')).toBe(2);
-			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			await replay.clearTopic('chat');
-			expect(await replay.currentEpoch('chat')).toBe(3);
-			await replay.publish(platform, 'chat', 'msg', { id: 3 });
-			await replay.clearTopic('chat');
-			expect(await replay.currentEpoch('chat')).toBe(4);
+		it('draws a random epoch and never keeps the stored one across a clear', async () => {
+			// Every draw returns 41, stored as 42 (epochs run 1 .. 2^32 - 1).
+			setRuntimeEnv({ rng: { u32: () => 41 } });
+			try {
+				await replay.publish(platform, 'chat', 'msg', { id: 1 });
+				expect(await replay.currentEpoch('chat')).toBe(42);
+				await replay.clearTopic('chat');
+				expect(await replay.currentEpoch('chat')).toBe(43);
+				await replay.publish(platform, 'chat', 'msg', { id: 2 });
+				await replay.clearTopic('chat');
+				expect(await replay.currentEpoch('chat')).toBe(42);
+			} finally {
+				resetRuntimeEnv();
+			}
 		});
 
 		it('exposes the epoch synchronously via cachedEpoch after a read', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			await replay.currentEpoch('chat');
-			expect(replay.cachedEpoch('chat')).toBe(1);
+			const epoch = await replay.currentEpoch('chat');
+			expect(replay.cachedEpoch('chat')).toBe(epoch);
 			// A topic this process has not observed reads the baseline.
 			expect(replay.cachedEpoch('never-touched')).toBe(0);
 		});
@@ -810,7 +813,7 @@ describe('postgres replay', () => {
 			expect(seen[0]).toBe('BEGIN');
 			expect(seen[seen.length - 1]).toBe('COMMIT');
 			// Both the data rows and the seq-table rows go. A republished topic
-			// takes its epoch from the epoch sequence, which a clear never resets.
+			// draws a new random epoch.
 			const deletes = seen.filter((s) => s.startsWith('DELETE'));
 			expect(deletes).toEqual(['DELETE FROM svti_replay_seq', 'DELETE FROM svti_replay']);
 			// Lock order: the seq-counter delete (which locks the rows a publish
@@ -843,11 +846,11 @@ describe('postgres replay', () => {
 			// The data row is deleted; the seq-table row is kept (seq reset to 0,
 			// new generation) via an upsert, so the next publish continues under it.
 			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
-			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('nextval('))).toBe(true);
+			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('EXCLUDED.epoch'))).toBe(true);
 			// Lock order: the seq-counter upsert (which locks the row a publish to
 			// this topic contends on) must run BEFORE the data delete, so a
 			// concurrent publish cannot interleave and duplicate a (topic, seq).
-			const topicReset = seen.findIndex((s) => s.startsWith('INSERT') && s.includes('nextval('));
+			const topicReset = seen.findIndex((s) => s.startsWith('INSERT') && s.includes('EXCLUDED.epoch'));
 			const topicDelete = seen.findIndex((s) => s.startsWith('DELETE'));
 			expect(topicReset).toBeLessThan(topicDelete);
 		});
@@ -1156,15 +1159,18 @@ describe('postgres replay', () => {
 			expect(stored.map((m) => m.data.id)).toEqual([1, 2, 3, 4]);
 		});
 
-		it('seeds epoch 1 on a fresh topic and carries the epoch across clearTopic', async () => {
+		it('draws an epoch for a fresh topic and carries the epoch across clearTopic', async () => {
 			await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 1 } }]);
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			const first = await replay.currentEpoch('chat');
+			expect(first).toBeGreaterThan(0);
 
 			await replay.clearTopic('chat');
+			const cleared = await replay.currentEpoch('chat');
+			expect(cleared).not.toBe(first);
 			await replay.publishBatch(platform, [{ topic: 'chat', event: 'created', data: { id: 2 } }]);
-			// clearTopic bumps the epoch and resets seq; the batch UPDATE branch
-			// must carry the bumped epoch forward, not re-seed 1.
-			expect(await replay.currentEpoch('chat')).toBe(2);
+			// clearTopic draws the epoch and resets seq; the batch UPDATE branch
+			// must carry that epoch forward, not draw again.
+			expect(await replay.currentEpoch('chat')).toBe(cleared);
 			expect(await replay.seq('chat')).toBe(1);
 		});
 

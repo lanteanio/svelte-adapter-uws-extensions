@@ -96,16 +96,13 @@ export function mockPgClient(options = {}) {
 	 * topic -> epoch. Lives on the same logical row as seqCounters (the
 	 * svti_replay_seq row), mirroring the durable `epoch` column. A
 	 * never-published topic has no entry and reads 0; a new topic row and
-	 * every clearTopic take the next value of the epoch sequence
-	 * (`replayGeneration`), which is never handed out twice, so a topic whose
-	 * row was evicted or expired comes back under a generation no client saw.
+	 * every clearTopic take the random epoch the statement carries (clearTopic
+	 * moves to the next value when the draw equals the stored epoch).
 	 * @type {Map<string, number>}
 	 */
 	const epochCounters = new Map();
 	/** topic -> last publish (ms), the `last_used_at` column. @type {Map<string, number>} */
 	const lastUsedAt = new Map();
-	/** The `<table>_seq_epoch_seq` sequence: the last value handed out. */
-	let replayGeneration = 0;
 	/** Topic rows newest first by last use, ties by topic descending. */
 	function replayTopicsByUse() {
 		return [...seqCounters.keys()].sort((a, b) =>
@@ -1133,8 +1130,7 @@ export function mockPgClient(options = {}) {
 		}
 
 		// clearTopic upsert: keep the seq-table row, reset seq to 0, take the
-		// next generation. INSERT ... VALUES ($1, 0, nextval(...), now())
-		// ON CONFLICT DO UPDATE SET seq = 0, epoch = EXCLUDED.epoch.
+		// drawn epoch ($2), or the next value when it equals the stored one.
 		if (
 			sql.includes('INSERT INTO') &&
 			sql.includes('_seq') &&
@@ -1144,7 +1140,8 @@ export function mockPgClient(options = {}) {
 		) {
 			const topic = values[0];
 			const created = !seqCounters.has(topic);
-			const next = ++replayGeneration;
+			const drawn = Number(values[1]);
+			const next = epochCounters.get(topic) === drawn ? (drawn % 4294967295) + 1 : drawn;
 			epochCounters.set(topic, next);
 			// Keep the row with seq reset to 0 so the next publish's UPDATE
 			// branch issues seq = 1 and carries this epoch forward.
@@ -1204,13 +1201,13 @@ export function mockPgClient(options = {}) {
 
 		// Batch CTE publish: UNNEST arrays -> per-topic seq bump + multi-row
 		// insert in one statement. Mirrors the single-publish branches exactly:
-		// a topic with no seq row seeds seq=n under the next generation (INSERT
+		// a topic with no seq row seeds seq=n under its drawn epoch (INSERT
 		// branch); an existing row takes seq+=n and carries its epoch forward
 		// (UPDATE branch). Both stamp the last use. Per-topic seqs are assigned
 		// contiguously in caller order. Returns one row per distinct topic:
 		// { topic, new_high, epoch, created }.
 		if (sql.includes('UNNEST') && sql.includes('ON CONFLICT') && sql.includes('new_high')) {
-			const [batchTopics, batchEvents, batchDatas, batchUserIds] = values;
+			const [batchTopics, batchEvents, batchDatas, batchUserIds, batchEpochs] = values;
 			const perTopic = new Map();
 			for (let i = 0; i < batchTopics.length; i++) {
 				const topic = batchTopics[i];
@@ -1226,7 +1223,7 @@ export function mockPgClient(options = {}) {
 				lastUsedAt.set(topic, now());
 				let epoch;
 				if (!hadRow) {
-					epoch = ++replayGeneration;
+					epoch = Math.min(...indexes.map((i) => Number(batchEpochs[i])));
 					epochCounters.set(topic, epoch);
 				} else {
 					epoch = epochCounters.get(topic) || 0;
@@ -1264,7 +1261,7 @@ export function mockPgClient(options = {}) {
 			lastUsedAt.set(topic, now());
 			let epoch;
 			if (!hadRow) {
-				epoch = ++replayGeneration;
+				epoch = Number(values[4]);
 				epochCounters.set(topic, epoch);
 			} else {
 				epoch = epochCounters.get(topic) || 0;
@@ -1479,7 +1476,7 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: before - rows.length };
 		}
 
-		// DELETE FROM *_seq (clear all sequences; the epoch sequence keeps going)
+		// DELETE FROM *_seq (clear all sequence rows)
 		if (sql.includes('DELETE FROM') && sql.includes('_seq')) {
 			const before = seqCounters.size;
 			seqCounters.clear();
@@ -1659,7 +1656,6 @@ export function mockPgClient(options = {}) {
 			seqCounters.clear();
 			epochCounters.clear();
 			lastUsedAt.clear();
-			replayGeneration = 0;
 			idemRows.clear();
 			taskRows.clear();
 			taskInsSeq = 1;

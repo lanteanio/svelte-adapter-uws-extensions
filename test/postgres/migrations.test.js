@@ -220,19 +220,15 @@ describe('PostgreSQL migration contracts', () => {
 		expect(release).toHaveBeenCalledExactlyOnceWith(true);
 	});
 
-	it('adds replay last use and a seeded epoch sequence as version 3', () => {
+	it('adds replay last use, seeded from the newest event of each topic, as version 3', () => {
 		const versions = postgresMigrations({ store: 'replay' });
 		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3]);
-		expect(versions[2].statements[0]).toBe('ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()');
-		const seed = versions[2].statements[1];
-		expect(seed).toContain('CREATE SEQUENCE IF NOT EXISTS svti_replay_seq_epoch_seq AS BIGINT OWNED BY svti_replay_seq.epoch;');
-		// Seeded from the highest stored epoch before any new topic can take one.
-		expect(seed.indexOf('MAX(epoch)')).toBeLessThan(seed.indexOf('SET DEFAULT nextval'));
-		expect(seed).toContain("ALTER TABLE svti_replay_seq ALTER COLUMN epoch SET DEFAULT nextval('svti_replay_seq_epoch_seq'::regclass)");
-		// Existing topics start from their newest event, not the migration time.
-		expect(seed).toContain('UPDATE svti_replay_seq s SET last_used_at = COALESCE((SELECT r.created_at FROM svti_replay r WHERE r.topic = s.topic ORDER BY r.seq DESC LIMIT 1), to_timestamp(0))');
-		const long = postgresMigrations({ store: 'replay', table: 'a'.repeat(42) })[2].statements.join(' ');
-		for (const [name] of long.matchAll(/\ba{42}_[a-z_]+/g)) expect(name.length, name).toBeLessThanOrEqual(63);
+		expect(versions[2].statements).toEqual([
+			'ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()',
+			'DO $migration$ BEGIN LOCK TABLE svti_replay_seq IN SHARE ROW EXCLUSIVE MODE; UPDATE svti_replay_seq s SET last_used_at = COALESCE((SELECT r.created_at FROM svti_replay r WHERE r.topic = s.topic ORDER BY r.seq DESC LIMIT 1), to_timestamp(0)); END $migration$'
+		]);
+		// The epoch keeps its version 1 column: random values are written by the store.
+		expect(versions.flatMap(entry => entry.statements).join(' ')).not.toMatch(/SEQUENCE|nextval/);
 	});
 
 	it('refuses a manually provisioned column no version defines before running any DDL', async () => {

@@ -103,7 +103,7 @@ describe('postgres replay maxTopics and generations', () => {
 
 		await publishAt(replay, 3000, 'room', 2);
 		const recreated = await replay.currentEpoch('room');
-		expect(recreated).toBeGreaterThan(evictedEpoch);
+		expect(recreated).not.toBe(evictedEpoch);
 
 		platform.reset();
 		await hook(mockWs({}), { lastSeenSeqs: { room: 1 }, lastSeenEpochs: { room: evictedEpoch }, platform });
@@ -228,7 +228,7 @@ describe('postgres replay maxTopics and generations', () => {
 			expect(await replay.seq('warm')).toBe(1);
 
 			await publishAt(replay, 71_000, 'idle');
-			expect(await replay.currentEpoch('idle')).toBeGreaterThan(idleEpoch);
+			expect(await replay.currentEpoch('idle')).not.toBe(idleEpoch);
 		} finally {
 			replay.destroy();
 		}

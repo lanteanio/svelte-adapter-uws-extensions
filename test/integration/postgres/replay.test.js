@@ -13,6 +13,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { createPgClient } from '../../../src/postgres/index.js';
 import { createReplay } from '../../../src/postgres/replay.js';
 import { mockPlatform } from '../../helpers/mock-platform.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../../src/shared/runtime.js';
 
 describe('postgres replay (integration)', () => {
 	let client;
@@ -480,36 +481,41 @@ describe('postgres replay (integration)', () => {
 	});
 
 	describe('per-topic epoch against real Postgres', () => {
-		it('starts at baseline 0 and bumps once on the first publish of a topic', async () => {
+		it('starts at baseline 0 and draws a random epoch on the first publish of a topic', async () => {
 			expect(await replay.currentEpoch('chat')).toBe(0);
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			const epoch = await replay.currentEpoch('chat');
+			expect(Number.isInteger(epoch) && epoch >= 1 && epoch <= 4294967295).toBe(true);
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			expect(await replay.currentEpoch('chat')).toBe(epoch);
 		});
 
-		it('bumps the epoch and restarts seq at 1 after clearTopic', async () => {
+		it('draws a new epoch and restarts seq at 1 after clearTopic', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
 			const before = await replay.currentEpoch('chat');
 			await replay.clearTopic('chat');
 			const after = await replay.currentEpoch('chat');
-			expect(after).toBeGreaterThan(before);
+			expect(after).not.toBe(before);
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
 			expect(await replay.seq('chat')).toBe(1);
-			// clearTopic keeps the seq-table row (seq reset to 0) and bumps the
-			// epoch once, so the republish takes the UPDATE branch and carries the
-			// already-bumped epoch forward rather than re-seeding it.
+			// clearTopic keeps the seq-table row (seq reset to 0) with its new
+			// epoch, so the republish takes the UPDATE branch and carries it.
 			expect(await replay.currentEpoch('chat')).toBe(after);
 		});
 
-		it('keeps the epoch monotonic across repeated clears', async () => {
-			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
-			await replay.clearTopic('chat');
-			expect(await replay.currentEpoch('chat')).toBe(2);
-			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			await replay.clearTopic('chat');
-			expect(await replay.currentEpoch('chat')).toBe(3);
+		it('a clear never keeps the stored epoch, even when the draw repeats it', async () => {
+			setRuntimeEnv({ rng: { u32: () => 41 } });
+			try {
+				await replay.publish(platform, 'chat', 'msg', { id: 1 });
+				expect(await replay.currentEpoch('chat')).toBe(42);
+				await replay.clearTopic('chat');
+				expect(await replay.currentEpoch('chat')).toBe(43);
+				await replay.publish(platform, 'chat', 'msg', { id: 2 });
+				await replay.clearTopic('chat');
+				expect(await replay.currentEpoch('chat')).toBe(42);
+			} finally {
+				resetRuntimeEnv();
+			}
 		});
 
 		it('gap-fills on a matching epoch and cold-rehydrates on a stale one', async () => {
@@ -608,7 +614,7 @@ describe('postgres replay (integration)', () => {
 				expect((await client.query(`SELECT count(*)::int AS n FROM ${TABLE}_seq`)).rows[0].n).toBe(2);
 
 				await r.publishBatch(platform, [{ topic: 'b', event: 'msg', data: 2 }]);
-				expect(await r.currentEpoch('b')).toBeGreaterThan(bEpoch);
+				expect(await r.currentEpoch('b')).not.toBe(bEpoch);
 				platform.reset();
 				await r.resumeHook()({}, { lastSeenSeqs: { b: 1 }, lastSeenEpochs: { b: bEpoch }, platform });
 				expect(platform.sent.some((s) => s.topic === '__replay:b' && s.event === 'rehydrate')).toBe(true);
@@ -617,11 +623,9 @@ describe('postgres replay (integration)', () => {
 			}
 		});
 
-		it('version 3 starts the epoch sequence above epochs stored under version 2', async () => {
+		it('version 3 applies over version 2 rows, which count toward the cap', async () => {
 			await replay.ready();
 			// Return the table to its version 2 shape with a legacy topic at epoch 41.
-			await client.query(`ALTER TABLE ${TABLE}_seq ALTER COLUMN epoch SET DEFAULT 0`);
-			await client.query(`DROP SEQUENCE ${TABLE}_seq_epoch_seq`);
 			await client.query(`ALTER TABLE ${TABLE}_seq DROP COLUMN last_used_at`);
 			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 3', [TABLE]);
 			await client.query(`INSERT INTO ${TABLE}_seq (topic, seq, epoch) VALUES ('room', 50, 41)`);
@@ -630,11 +634,10 @@ describe('postgres replay (integration)', () => {
 			try {
 				await r.ready();
 				await r.publish(platform, 'fresh', 'msg', { id: 1 });
-				expect(await r.currentEpoch('fresh')).toBe(42);
 				// The legacy row counted toward the cap and was the least recently used.
 				expect(await r.seq('room')).toBe(0);
 				await r.publish(platform, 'room', 'msg', { id: 1 });
-				expect(await r.currentEpoch('room')).toBeGreaterThan(42);
+				expect(await r.currentEpoch('room')).not.toBe(41);
 			} finally {
 				r.destroy();
 			}
@@ -698,8 +701,6 @@ describe('postgres replay (integration)', () => {
 
 		it('version 3 starts each existing topic at its newest event', async () => {
 			await replay.ready();
-			await client.query(`ALTER TABLE ${TABLE}_seq ALTER COLUMN epoch SET DEFAULT 0`);
-			await client.query(`DROP SEQUENCE ${TABLE}_seq_epoch_seq`);
 			await client.query(`ALTER TABLE ${TABLE}_seq DROP COLUMN last_used_at`);
 			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 3', [TABLE]);
 			for (const [topic, age] of [['alpha', '3 hours'], ['beta', '1 hour'], ['gamma', '2 hours']]) {
@@ -728,7 +729,7 @@ describe('postgres replay (integration)', () => {
 			expect((await client.query(`SELECT count(*)::int AS n FROM ${TABLE}_seq`)).rows[0].n).toBe(0);
 			expect(await replay.currentEpoch('chat')).toBe(0);
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			expect(await replay.currentEpoch('chat')).toBeGreaterThan(before);
+			expect(await replay.currentEpoch('chat')).not.toBe(before);
 		});
 	});
 
@@ -832,16 +833,19 @@ describe('postgres replay (integration)', () => {
 			expect(stored.map((m) => [m.seq, m.data.id])).toEqual([[1, 1], [2, 2], [3, 3], [4, 4]]);
 		});
 
-		it('epoch edges match the single path: fresh seeds 1, clearTopic bump is carried', async () => {
+		it('epoch edges match the single path: a fresh topic draws, the clearTopic epoch is carried', async () => {
 			await replay.publishBatch(platform, [{ topic: 'chat', event: 'e', data: { id: 1 } }]);
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			const first = await replay.currentEpoch('chat');
+			expect(first).toBeGreaterThan(0);
 
 			await replay.clearTopic('chat');
+			const cleared = await replay.currentEpoch('chat');
+			expect(cleared).not.toBe(first);
 			await replay.publishBatch(platform, [
 				{ topic: 'chat', event: 'e', data: { id: 2 } },
 				{ topic: 'chat', event: 'e', data: { id: 3 } }
 			]);
-			expect(await replay.currentEpoch('chat')).toBe(2);
+			expect(await replay.currentEpoch('chat')).toBe(cleared);
 			expect((await replay.since('chat', 0)).map((m) => m.seq)).toEqual([1, 2]);
 		});
 
