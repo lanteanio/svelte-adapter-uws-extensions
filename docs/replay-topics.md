@@ -18,7 +18,14 @@ A publish to an existing topic is unchanged in round trips: one `EVAL` on the to
 
 Creating a topic on Redis costs two more round trips: one to the `{replay-topics}` slot, which holds the topic registry, and the write retried with a drawn epoch. When the registry is over the cap an eviction pass follows: the least recently registered entries are checked against their own use stamps in one pipelined round trip, an entry used since it was registered is moved up instead of evicted, and the registry is updated once. The registry is never written by a steady publish or a read, so it does not concentrate their traffic on one slot.
 
-Creating a topic on Postgres costs one more statement, which deletes up to four topics past the cap with their events. It finds the cutoff, the newest row past the cap, without locks, and then locks only the rows at or below it, skipping rows another session holds and re-checking `last_used_at` under the lock, so a publish to a hot topic is never blocked by an eviction. The bounded cleanup reads the cutoff once per pass and then removes eight topics per statement in short autocommit statements, so draining a large surplus does not sort the table per batch and holds each row lock only for its statement. The sequence table carries no index on `last_used_at`, so a publish's row update stays a heap-only update.
+Creating a topic on Postgres costs one more statement, which deletes up to four topics past the cap with their events. It finds the cutoff, the newest row past the cap, without locks, and then locks only the rows at or below it, skipping rows another session holds and re-checking `last_used_at` under the lock, so a publish to a hot topic is never blocked by an eviction. The bounded cleanup reads the cutoff once per pass and then removes topics in short autocommit statements of about 2,000 event rows each (2,000 / `size` topics, between 8 and 256), up to 63 statements within the pass's one-second deadline; while a backlog remains the next pass follows after 100 ms. Draining a large surplus therefore does not sort the table per batch, holds each row lock only for its statement, and removes up to about 500 topics a second at the default `size` of 1000 (more for a smaller `size`), so 100,000 leaked topics drain in a few minutes, bounded by how fast the database deletes their events. The sequence table carries no index on `last_used_at`, so a publish's row update stays a heap-only update.
+
+## Waits
+
+Two operations can wait, and nothing else does:
+
+- **A Postgres read that carries the use stamp** (at most once a minute per topic per process) waits for the row lock of a publish to the same topic in flight, for as long as that publish's statement runs. A read that does not carry the stamp, and every Redis read, never waits for a lock.
+- **Creating a Redis topic before the deployment is seeded** waits up to two seconds for the seed scan, so the cap counts the existing topics, and then goes on without it. This applies only until the one-time scan completes; once the deployment is seeded no creation waits.
 
 ## Epochs
 
@@ -37,9 +44,9 @@ All times the Redis scripts record, the use stamps and registry scores included,
 Topics stored before the upgrade count toward the cap.
 
 - **Postgres.** Schema version 3 starts each existing topic's `last_used_at` at its newest event's `created_at` (1970 for a topic with no event left), so eviction keeps the most recently published topics. The bounded cleanup drains a surplus even when no topic is created.
-- **Redis.** Neither buffer stores a time per entry (sorted-set members carry the seq, stream ids are `<seq>-0`), so existing topics enroll as least recently used, all equal. The first creations past the cap evict them in topic-name order, except a topic published or read after the upgrade: its use stamp moves it up, so it is kept.
+- **Redis.** Neither buffer stores a time per entry (sorted-set members carry the seq, stream ids are `<seq>-0`). With a `ttl`, a publish resets the topic's expiry, so the scan ranks each existing topic by its seq key's remaining TTL: the most recently published are kept. Without a `ttl` existing topics enroll as least recently used, all equal, and the first creations past the cap evict them in topic-name order. Either way a topic published or read after the upgrade has its use stamped and is kept over one that was not. A topic left with an epoch or use stamp but no seq key has no seq space; the scan deletes those leftovers rather than enrolling them.
 
-The Redis scan of the replay keys runs once per deployment, in one instance: it holds a lease, keeps its cursor in `replay:seed:{replay-topics}` so a failed pass resumes where it stopped, and marks the deployment seeded when done. A topic created before that waits for the scan at most two seconds, so the cap counts the existing topics, and then goes on. The scan needs `SCAN`, and the scripts need `TIME`, in the Redis user's ACL.
+The Redis scan of the replay keys runs once per deployment, in one instance: it holds a lease, keeps its cursor in `replay:seed:{replay-topics}` so a failed pass resumes where it stopped, and marks the deployment seeded when done. The scan needs `SCAN`, and the scripts need `TIME`, in the Redis user's ACL.
 
 When the topics found exceed `maxTopics`, the store reports it once per process (`EXTENSIONS-ERR-REDIS-REPLAY-TOPICS-OVER-CAP`, `EXTENSIONS-ERR-POSTGRES-REPLAY-TOPICS-OVER-CAP`) with the count and the cap.
 

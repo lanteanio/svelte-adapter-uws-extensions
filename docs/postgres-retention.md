@@ -39,9 +39,11 @@ busy topic consumes the row budget, so other topics still progress. Replay topic
 cleanup removes sequence-table rows, with their events, for topics past
 `maxTopics` (least recently used first) and, with a `ttl`, for topics not used
 for longer than the `ttl`. It reads the eviction cutoff once per pass and then
-removes eight topics per statement, in autocommit statements beside the pass
+removes topics in autocommit statements of about 2,000 event rows each (2,000 /
+`size` topics, between 8 and 256, at most 63 per pass) beside the pass
 transaction, so each removed row stays locked only for its own statement and
-rows other sessions hold are skipped. TTL, size and topic cleanup take turns
+rows other sessions hold are skipped. While a topic backlog remains, the next
+pass follows after 100 ms. TTL, size and topic cleanup take turns
 going first. Larger backlogs drain over several passes; cleanup
 is not a hard physical-storage cap or an exact expiry alarm. Replay publish-time
 trimming and logical read-expiry checks keep their existing behavior, and a

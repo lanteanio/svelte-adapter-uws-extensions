@@ -44,8 +44,8 @@ export interface PgReplayOptions {
 	 * Max number of topics holding replay state in the table, as in the core
 	 * replay plugin: creating a topic past the cap evicts the least recently
 	 * used topic's events and sequence row. One cap for every instance sharing
-	 * the table. A topic's use is its last publish or `clearTopic`; reads do
-	 * not refresh it.
+	 * the table. Publishes, `clearTopic` and reads (`seq`, `since`, `gap`,
+	 * `replay`, at most once a minute per topic per process) count as use.
 	 * @default 100
 	 */
 	maxTopics?: number;

@@ -81,8 +81,9 @@ export interface RedisReplayOptions {
 	 * Max number of topics holding replay state, as in the core replay
 	 * plugin: creating a topic past the cap evicts the least recently used
 	 * topic's buffer, sequence counter and epoch. One cap for every instance
-	 * sharing the key prefix. A topic's use is its last publish or
-	 * `clearTopic`; reads do not refresh it.
+	 * sharing the key prefix. Publishes, `clearTopic` and reads (`seq`,
+	 * `since`, `gap`, `replay`, at most once a minute per topic per process)
+	 * count as use.
 	 * @default 100
 	 */
 	maxTopics?: number;

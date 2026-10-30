@@ -433,11 +433,12 @@ the core plugin refuses multi-worker runtimes, so it keeps exactly one buffer of
 `maxTopics` topics, and the shared store is the one buffer here. Topics stored
 before the upgrade count, ranked by their last use as far as it is known:
 Postgres takes each topic's newest event's `created_at`; Redis stores no time
-per entry, so it ranks every existing topic as least recently used until a
-publish or read after the upgrade stamps it, and evicts the unstamped ones in
-topic-name order. A deployment with more topics than the cap therefore loses
-the buffers of all but the topics it keeps (on Postgres its most recently
-published ones, on Redis the ones used after the upgrade).
+per entry, so with a `ttl` it ranks existing topics by their seq key's remaining
+expiry, and without one ranks them all as least recently used, evicted in
+topic-name order; a publish or read after the upgrade stamps a topic and keeps
+it. The Redis scan deletes leftover epoch and use keys of topics whose seq key
+is gone instead of enrolling them. A deployment with more topics than the cap
+therefore loses the buffers of all but the topics it keeps.
 
 **Action.** Before upgrading, count the topics the deployment keeps replay
 history for (Redis: `replay:seq:{*}` keys under the client prefix; Postgres:
