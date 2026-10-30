@@ -276,7 +276,14 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 		try {
 			const dlq = store(client, { max: 20, cleanupInterval: 0, breaker, forgetUserId: r => r.data?.user });
 			await dlq.ready();
-			const ids = await Promise.all(Array.from({ length: 300 }, (_, n) => dlq.add(tenantRecord(`@t/t${n % 3}/x`, n))));
+			// Each capture holds one admission slot of the client's default
+			// maxInFlight of 100 while it waits for a connection, as a single
+			// statement did, so the bursts stay under it.
+			const ids = [];
+			for (let wave = 0; wave < 5; wave++) {
+				ids.push(...await Promise.all(Array.from({ length: 60 }, (_, n) => dlq.add(tenantRecord(`@t/t${n % 3}/x`, wave * 60 + n)))));
+			}
+			expect(ids).toHaveLength(300);
 			expect(ids.every(id => /^\d+$/.test(id))).toBe(true);
 			expect(breaker.state).toBe('healthy');
 			await dlq.add(tenantRecord('@t/t0/x', 300));
