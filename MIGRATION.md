@@ -290,7 +290,9 @@ below does not exercise this Redis transition.
 rate limits for a Redis user whose key and channel patterns were written for 0.5.
 
 **Why.** Hash-tagged keys change the per-entity key strings, and 0.6 adds key
-families: `replay:epoch:{<topic>}`; `presence:pending:{<topic>}`, the private
+families: `replay:epoch:{<topic>}`, `replay:used:{<topic>}`,
+`replay:generation:{replay-topics}` and `replay:topics:{replay-topics}`;
+`presence:pending:{<topic>}`, the private
 identity generations and committed-identity fence that every join writes
 (excluded from roster reads); the idempotency and session erasure indexes under
 `<keyPrefix>byuser:` (`idem:byuser:v2...` and `sess:byuser:...` with the default
@@ -305,7 +307,7 @@ is shown and a custom value replaces it:
 
 | Module | Key patterns |
 |---|---|
-| Replay (sorted set and stream) | `replay:*` (sequence, buffer, stream buffer, epoch, producer cache) |
+| Replay (sorted set and stream) | `replay:*` (sequence, buffer, stream buffer, epoch, last use, producer cache, generation counter, topic registry) |
 | Presence | `presence:*` (roster, per-user connections, pending identity) |
 | Cursor, groups | `cursor:*`, `group:*` |
 | CRDT, smooth cluster | `crdt:*`, `smooth:*` |
@@ -411,6 +413,70 @@ changing the factor. If a factor has to change while both versions run, set it
 from an upgraded instance first and then from an instance on the earlier
 version, which writes the old key again. A `clear()` from an upgraded instance
 removes the factor at both keys.
+
+### Replay buffers keep at most `maxTopics` topics
+
+**Symptom.** After the upgrade, topics that have not been published to
+recently lose their replay history: `seq(topic)` reads 0, `since` returns
+nothing, and a resuming client gets `rehydrate` (or `truncated` when it never
+received an epoch) instead of a gap-fill.
+
+**Why.** The Redis (sorted-set and stream) and Postgres replay buffers enforce
+the core plugin's `maxTopics` option with its default, 100, and its eviction:
+creating a topic past the cap evicts the least recently used topic, deleting its
+buffer, sequence counter and epoch. The cap is per store - every instance
+sharing a Redis key prefix or a Postgres table - not per process: the store is
+one buffer, and a per-instance cap would let one instance evict a topic another
+is serving. A topic's use is its last publish or `clearTopic`; reads do not
+refresh it. Topics stored before the upgrade count: on Redis the first topic
+created after the upgrade registers every existing topic as the least recently
+used, and each later creation evicts the oldest past the cap; on Postgres the
+existing sequence rows count from the migration on, and the bounded cleanup
+drains a surplus even without new topics. A deployment with more than 100
+topics therefore loses the buffers of all but its 100 most recently published
+topics.
+
+**Action.** Before upgrading, count the topics the deployment keeps replay
+history for (Redis: `replay:seq:{*}` keys under the client prefix; Postgres:
+rows in `svti_replay_seq`) and pass `maxTopics` at least that large, with room
+for growth, to every `createReplay` call. A larger cap costs nothing per
+publish; on Postgres, creating a topic and each cleanup pass read the sequence
+table, which the cap bounds.
+
+### Replay epochs come from one generation counter
+
+**Symptom.** Epoch values are no longer consecutive per topic, a topic's epoch
+can read 0 again after `clear()`, expiry or eviction, and Postgres readiness
+with `autoMigrate: false` fails with an incomplete ledger until replay schema
+version 3 is applied.
+
+**Why.** A topic's epoch now comes from one counter per store - the Redis key
+`replay:generation:{replay-topics}`, the Postgres sequence
+`svti_replay_seq_epoch_seq` - and is never handed out twice. Per-topic metadata
+can then be deleted safely: with a `ttl`, the Redis epoch and last-use keys
+expire with the buffer, and Postgres cleanup deletes the sequence row of a
+topic not published for longer than the `ttl`; `clear()` deletes every epoch
+and the topic registry; `maxTopics` eviction deletes the evicted topic's epoch.
+A recreated topic takes a new generation, so a client holding the old epoch
+rehydrates. `clearTopic` sets a new epoch which the topic's next publish
+continues under, on every backend. A `replay()` or `gap()` from a nonzero
+position on a topic with no seq space now reports truncation. The Redis
+counter is raised above every stored epoch the first time a topic is created
+after the upgrade, which scans the `replay:*` keys once per deployment; Postgres
+version 3 does the same when it creates the sequence. Postgres version 3 also
+adds `last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()` to `svti_replay_seq`.
+
+**Action.** With the default `autoMigrate: true` version 3 is applied on first
+use. With `autoMigrate: false`, apply it (`postgresMigrations({ store: 'replay' })`)
+before writers of this release start, and grant the runtime role `USAGE` on
+`svti_replay_seq_epoch_seq` (substitute configured names). Stop replay writers
+of the previous release before writers of this release start: they give a new
+topic epoch 1 and bump epochs by one, outside the counter, so a topic they
+recreate can repeat an epoch a client holds. Back up and restore the Redis
+counter and registry with the replay keys, and the Postgres sequence with its
+table; never restore the counter below a stored epoch. Grant Redis ACLs the
+`replay:generation:{replay-topics}`, `replay:topics:{replay-topics}` and
+`replay:used:{*}` keys where replay keys are listed explicitly.
 
 ### Ordered alarm generations
 

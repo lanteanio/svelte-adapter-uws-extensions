@@ -55,13 +55,15 @@
 			"columns": {
 				"topic": "text",
 				"seq": "bigint",
-				"epoch": "bigint"
+				"epoch": "bigint",
+				"last_used_at": "timestamp with time zone"
 			},
 			"indexColumns": [
 				[
 					"topic"
 				]
 			],
+			"serialColumn": "epoch",
 			"restoreGroup": "postgres-replay"
 		},
 		{
@@ -298,12 +300,27 @@
 					"template": "replay:epoch:{<topic>}"
 				},
 				{
+					"id": "last-use",
+					"type": "string",
+					"template": "replay:used:{<topic>}"
+				},
+				{
 					"id": "producer-cache",
 					"type": "hash",
 					"template": "replay:idmp:<producer>:{<topic>}"
+				},
+				{
+					"id": "generation",
+					"type": "string",
+					"template": "replay:generation:{replay-topics}"
+				},
+				{
+					"id": "topic-registry",
+					"type": "zset",
+					"template": "replay:topics:{replay-topics}"
 				}
 			],
-			"notes": "Restore all selected buffer backends, sequence, epoch and producer-cache keys at one cut. Empty buffers and absent legacy epoch zero are valid; retained events require sequence authority."
+			"notes": "Restore all selected buffer backends, sequence, epoch, last-use, producer-cache, generation and topic-registry keys at one cut. Empty buffers and an absent epoch (zero) are valid; retained events require sequence authority. The generation counter must not be restored below any stored epoch: a lower counter hands an epoch out again."
 		},
 		{
 			"id": "dead-letter",

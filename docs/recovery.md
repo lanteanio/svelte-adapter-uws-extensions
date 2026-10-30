@@ -14,8 +14,8 @@ describes upgrade and initialization behavior.
 | State | Restore boundary | Before traffic resumes |
 | --- | --- | --- |
 | PostgreSQL migration ledger | svti_schema_migrations in each store schema, together with all covered tables | Check version/checksum compatibility through store readiness. |
-| PostgreSQL replay | Event rows, sequence/epoch rows, serial sequence and indexes | Confirm retained events never exceed their topic sequence. |
-| Redis replay | Sorted-set or stream buffer, sequence, epoch and producer idempotency hashes for each topic | Preserve epochs even when buffers have expired. An absent legacy epoch means zero. |
+| PostgreSQL replay | Event rows, sequence/epoch rows, the event id and epoch sequences, and indexes | Confirm retained events never exceed their topic sequence and the epoch sequence is above every stored epoch. |
+| Redis replay | Sorted-set or stream buffer, sequence, epoch, last-use and producer idempotency keys for each topic, plus the generation counter and topic registry | Never restore the generation counter below a stored epoch. An absent epoch means zero. |
 | Jobs and tasks | Complete rows, serial sequences where used, ownership/fence state, and any application result cache | Stop old workers and reconcile effects that completed outside the database. |
 | Idempotency and sessions | Results/session records, expiry and erasure indexes | Reapply erasures and revocations newer than the backup; reconcile pending owners. |
 | Alarms | Schedule, metadata and all retained generation authority; PostgreSQL also needs its migration ledger | Preserve watermarks for deleted and pending topics; reconcile executed callbacks before enabling due work. |
