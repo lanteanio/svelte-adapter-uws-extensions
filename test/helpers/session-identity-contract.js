@@ -91,7 +91,17 @@ export function sessionIdentityContract(getClient) {
 	const markerKey = () => getClient().key('sess:identity:v1:legacy');
 	// For cases about something else than the switch window: record that the
 	// keyspace's legacy sessions were found long enough ago to have expired.
-	const switchedLongAgo = () => getClient().redis.set(markerKey(), JSON.stringify({ since: 0, state: 'residue' }));
+	const coverageKey = () => getClient().key('sess:identity:v1:legacy-active');
+	// For cases about something else than the switch window: record that the
+	// keyspace's legacy sessions were found long enough ago to have expired,
+	// and that no store without forgetIdentity has written one since.
+	const switchedLongAgo = async () => {
+		await getClient().redis.set(markerKey(), JSON.stringify({ since: 0, state: 'residue' }));
+		await getClient().redis.del(coverageKey());
+	};
+	// Sessions a store without forgetIdentity wrote stay as if an earlier
+	// release, which keeps no coverage, had written them.
+	const writtenByEarlierRelease = () => getClient().redis.del(coverageKey());
 
 	describe('session tenant-qualified erasure', () => {
 		it('refuses forgetUserId together with forgetIdentity and a non-function extractor', () => {
@@ -262,6 +272,7 @@ export function sessionIdentityContract(getClient) {
 				expect(await getClient().redis.pttl(getClient().key('sess:' + token))).toBeGreaterThan(10_000);
 			}
 			expect(await s.get('read')).toEqual(data('2'));
+			await writtenByEarlierRelease();
 			for (const userId of ['1', '2', '3']) expect(await s.purgeUser('ta', userId)).toBe(1);
 			for (const token of ['touched', 'read', loaded]) expect(await record(token)).toBeNull();
 		});
@@ -294,6 +305,7 @@ export function sessionIdentityContract(getClient) {
 		it('reports residue for ttlMs while a legacy session found at the switch may remain', async () => {
 			const legacy = createDistributedSession(getClient(), { refreshOnGet: false, ttlMs: 200 });
 			await legacy.set('old', owner('ta', '42'));
+			await writtenByEarlierRelease();
 			const s = sessions({ ttlMs: 400 });
 			await s.set('a', owner('ta', '42'));
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', legacyResidue: true, removed: 1 });
@@ -319,26 +331,21 @@ export function sessionIdentityContract(getClient) {
 			expect(await record('old')).not.toBeNull();
 		});
 
-		it('keeps the window open when a legacy write lands during the scan', async () => {
+		it('reports residue after a legacy write that landed during the scan', async () => {
 			const legacy = createDistributedSession(getClient(), {});
 			const s = sessions();
-			const redis = getClient().redis;
-			const nodes = typeof redis.nodes === 'function' ? redis.nodes('master') : [redis];
-			const scans = nodes.map((node) => node.scan);
-			let fired = false;
-			// The legacy write lands after the scan read its keys.
-			nodes.forEach((node, i) => {
-				node.scan = async function (...args) {
-					const result = await scans[i].apply(this, args);
-					if (!fired) { fired = true; await legacy.set('late', owner('ta', '42')); }
-					return result;
-				};
+			const restore = patchScan(getClient().redis, async (scan, args, first) => {
+				const result = await scan(...args);
+				if (first) await legacy.set('late', owner('ta', '42'));
+				return result;
 			});
 			try {
-				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+				// The write was in flight while this purge ran: either answer.
+				await s.purgeUser('ta', '42').catch(() => {});
 			} finally {
-				nodes.forEach((node, i) => { node.scan = scans[i]; });
+				restore();
 			}
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 			expect(await record('late')).not.toBeNull();
 		});
 
@@ -366,6 +373,7 @@ export function sessionIdentityContract(getClient) {
 				restore();
 			}
 			expect(await s.get('tok')).toEqual(owner('tb', '7'));
+			await writtenByEarlierRelease();
 			expect(await s.purgeUser('tb', '7')).toBe(1);
 		});
 
@@ -387,36 +395,117 @@ export function sessionIdentityContract(getClient) {
 			expect(await record('tok')).toBeNull();
 		});
 
-		it('scans again when a store without forgetIdentity that already wrote writes again', async () => {
+		it('reports residue while a store without forgetIdentity that already wrote keeps writing', async () => {
 			const legacy = createDistributedSession(getClient(), {});
 			await legacy.set('warm', owner('tb', '1'));
 			await legacy.delete('warm');
 			const s = sessions();
-			expect(await s.purgeUser('ta', 'x')).toBe(0);
-			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+			await expect(s.purgeUser('ta', 'x')).rejects.toMatchObject({ legacyResidue: true });
 			await legacy.set('old', owner('ta', '42'));
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', legacyResidue: true });
 			expect(await record('old')).not.toBeNull();
 		});
 
-		it('scans again when a store without forgetIdentity writes after the window', async () => {
-			const legacy = createDistributedSession(getClient(), { ttlMs: 60 });
-			await legacy.set('a', owner('tb', '1'));
-			const s = sessions({ ttlMs: 60 });
-			await expect(s.purgeUser('ta', 'x')).rejects.toMatchObject({ legacyResidue: true });
-			await new Promise((resolve) => setTimeout(resolve, 100));
-			await legacy.set('old', owner('ta', '42'));
+		it('reports residue when a store without forgetIdentity starts writing after a clean scan', async () => {
+			const s = sessions();
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+			await createDistributedSession(getClient(), {}).set('old', owner('ta', '42'));
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 		});
 
-		it('drops the marker when a store without forgetIdentity slides a session', async () => {
-			const legacy = createDistributedSession(getClient(), { refreshOnGet: true });
-			await legacy.set('old', owner('ta', '42'));
-			for (const slideIt of [() => legacy.touch('old'), () => legacy.get('old')]) {
-				await getClient().redis.set(markerKey(), JSON.stringify({ since: 0, state: 'clean' }));
-				await slideIt();
-				expect(await getClient().redis.get(markerKey())).toBeNull();
+		it('ends the coverage after the sessions it covers', async () => {
+			const legacy = createDistributedSession(getClient(), { ttlMs: 60 });
+			await legacy.set('a', owner('ta', '42'));
+			const s = sessions({ ttlMs: 60 });
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+			const left = await getClient().redis.pttl(coverageKey());
+			expect(left).toBeGreaterThan(60);
+			expect(left).toBeLessThanOrEqual(90);
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			expect(await record('a')).toBeNull();
+			expect(await s.purgeUser('ta', '42')).toBe(0);
+			// A later write covers itself again.
+			await legacy.set('b', owner('ta', '42'));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('renews the coverage when a store without forgetIdentity slides a session', async () => {
+			for (const slideIt of [(legacy) => legacy.touch('old'), (legacy) => legacy.get('old')]) {
+				const legacy = createDistributedSession(getClient(), { refreshOnGet: true, ttlMs: 300 });
+				await legacy.set('old', owner('ta', '42'));
+				await getClient().redis.del(coverageKey());
+				// Less than ttlMs of the coverage this store knows of is left.
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				await slideIt(legacy);
+				expect(await getClient().redis.pttl(coverageKey())).toBeGreaterThan(300);
 			}
+		});
+
+		it('sends a legacy write only once its coverage holds', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			const redis = getClient().redis;
+			const set = redis.set;
+			const seen = [];
+			redis.set = async function (key, ...args) {
+				if (key === getClient().key('sess:old')) seen.push(await redis.exists(coverageKey()));
+				return set.call(this, key, ...args);
+			};
+			try {
+				await legacy.set('old', owner('ta', '42'));
+			} finally {
+				redis.set = set;
+			}
+			expect(seen).toEqual([1]);
+		});
+
+		it('renews the coverage once for many concurrent slides, with plain commands', async () => {
+			const writer = createDistributedSession(getClient(), {});
+			for (let i = 0; i < 80; i++) await writer.set('k' + i, { v: i });
+			const legacy = createDistributedSession(getClient(), { refreshOnGet: true });
+			const redis = getClient().redis;
+			const counts = { eval: 0, batch: 0 };
+			const wrapped = {};
+			// A real client sends scripts, defined commands included, through
+			// sendCommand; the mock runs them through eval.
+			if (typeof redis.sendCommand === 'function') {
+				wrapped.sendCommand = redis.sendCommand;
+				redis.sendCommand = function (command, ...rest) {
+					if (/^eval/i.test(String(command?.name))) counts.eval++;
+					return wrapped.sendCommand.call(this, command, ...rest);
+				};
+			} else {
+				wrapped.eval = redis.eval;
+				redis.eval = function (...args) { counts.eval++; return wrapped.eval.apply(this, args); };
+			}
+			for (const method of ['pipeline', 'multi']) {
+				wrapped[method] = redis[method];
+				redis[method] = function (...args) { counts.batch++; return wrapped[method].apply(this, args); };
+			}
+			try {
+				await Promise.all(Array.from({ length: 80 }, (_, i) => legacy.get('k' + i)));
+				const renewals = counts.eval;
+				// Within the coverage the store knows of, slides send no script.
+				for (let i = 0; i < 10; i++) await legacy.touch('k' + i);
+				await Promise.all(Array.from({ length: 80 }, (_, i) => legacy.touch('k' + i)));
+				expect(counts.eval).toBe(renewals);
+			} finally {
+				for (const method of Object.keys(wrapped)) redis[method] = wrapped[method];
+			}
+			// One renewal; a real server may answer the first EVALSHA with
+			// NOSCRIPT, and the client then retries it as EVAL.
+			expect(counts.batch).toBe(0);
+			expect(counts.eval).toBeGreaterThanOrEqual(1);
+			expect(counts.eval).toBeLessThanOrEqual(2);
+		});
+
+		it('keeps the coverage through clear()', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('old', owner('ta', '42'));
+			await sessions().clear();
+			expect(await getClient().redis.pttl(coverageKey())).toBeGreaterThan(0);
+			await legacy.set('new', owner('ta', '42'));
+			await expect(sessions().purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 		});
 
 		it('gives the marker back when the scan fails, and leases it while it runs', async () => {
@@ -467,16 +556,20 @@ export function sessionIdentityContract(getClient) {
 			if (typeof redis.nodes !== 'function') return;
 			const s = sessions();
 			await s.set('a', owner('ta', '42'));
-			const cluster = redis.cluster;
+			// The second reading of every master shows one more master.
+			const masters = redis.nodes('master');
+			const originals = masters.map((node) => node.cluster);
 			let calls = 0;
-			redis.cluster = async function (...args) {
-				const reply = await cluster.apply(this, args);
-				return ++calls === 1 ? reply : String(reply) + '\ndeadbeef 127.0.0.1:1@2 master - 0 0 99 connected 0-1\n';
-			};
+			masters.forEach((node, i) => {
+				node.cluster = async function (...args) {
+					const reply = await originals[i].apply(node, args);
+					return ++calls <= masters.length ? reply : String(reply) + 'deadbeef 127.0.0.1:1@2 master - 0 0 99 connected 0-1';
+				};
+			});
 			try {
 				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 			} finally {
-				redis.cluster = cluster;
+				masters.forEach((node, i) => { node.cluster = originals[i]; });
 			}
 		});
 

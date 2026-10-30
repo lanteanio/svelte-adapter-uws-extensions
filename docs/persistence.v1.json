@@ -433,6 +433,21 @@
 					"template": "<prefix>byuser:<user>"
 				},
 				{
+					"id": "identity-erasure-index",
+					"type": "hash",
+					"template": "<prefix>identity:v1:byuser:<identity>"
+				},
+				{
+					"id": "legacy-scan",
+					"type": "string",
+					"template": "<prefix>identity:v1:legacy"
+				},
+				{
+					"id": "legacy-coverage",
+					"type": "string",
+					"template": "<prefix>identity:v1:legacy-active"
+				},
+				{
 					"id": "session",
 					"type": "string",
 					"template": "<prefix><token>"

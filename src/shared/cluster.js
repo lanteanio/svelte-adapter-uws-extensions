@@ -20,22 +20,31 @@ export function isCluster(redis) {
 /**
  * A fingerprint of a Cluster's slot ownership, for telling whether it moved
  * between two reads: each master's id and slot ranges from CLUSTER NODES,
- * sorted. Null while any slot is migrating or importing, when a key may be
- * on either side. An empty string on a standalone server.
+ * sorted. Every master is asked, since a slot that is migrating shows as such
+ * only on the two masters involved; null while any of them reports a slot
+ * migrating or importing, or when the masters disagree. An empty string on a
+ * standalone server.
  *
  * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
  * @returns {Promise<string | null>}
  */
 export async function clusterTopology(redis) {
 	if (!isCluster(redis)) return '';
-	const text = String(await /** @type {any} */ (redis).cluster('NODES'));
-	if (/\[\d+-[<>]-/.test(text)) return null;
-	return text.split('\n')
-		.map((line) => line.trim().split(' '))
-		.filter((fields) => fields.length >= 8 && fields[2].split(',').includes('master'))
-		.map((fields) => fields[0] + ' ' + fields.slice(8).join(' '))
-		.sort()
-		.join('\n');
+	const views = await Promise.all(/** @type {any} */ (redis).nodes('master').map((node) => node.cluster('NODES')));
+	let fingerprint;
+	for (const view of views) {
+		const text = String(view);
+		if (/\[\d+-[<>]-/.test(text)) return null;
+		const own = text.split('\n')
+			.map((line) => line.trim().split(' '))
+			.filter((fields) => fields.length >= 8 && fields[2].split(',').includes('master'))
+			.map((fields) => fields[0] + ' ' + fields.slice(8).join(' '))
+			.sort()
+			.join('\n');
+		if (fingerprint !== undefined && own !== fingerprint) return null;
+		fingerprint = own;
+	}
+	return fingerprint ?? null;
 }
 
 const executionQueues = new WeakMap();

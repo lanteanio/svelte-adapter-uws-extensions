@@ -681,11 +681,23 @@ own legacy sessions count. The scan stops at the first legacy session, runs
 for at most 5 seconds, and settles `residue` when it runs out of time or, on a
 Redis Cluster, when slot ownership changed or a slot was migrating while it
 ran. While it runs the record says `scanning` under a 15-second lease, and a
-scan that fails gives it back, so the next purge scans again. Every write and
-every TTL slide of a store without `forgetIdentity` (`set`, `create`, the
-close-time persist, `touch`, a refreshing `get` or load) deletes the record in
-the same pipelined round trip, one extra `DEL` per call, and `clear()` deletes
-it with the sessions, so the next qualified purge scans again.
+scan that fails gives it back, so the next purge scans again; `clear()`
+deletes the record with the sessions.
+
+Sessions written later by a store without `forgetIdentity` are covered
+separately. Such a store keeps the key `sess:identity:v1:legacy-active` alive
+while sessions it wrote may live: before a write or TTL slide (`set`, `create`,
+the close-time persist, `touch`, a refreshing `get` or load), when the coverage
+it knows of has less than `ttlMs` left, it awaits one script that extends the
+key to at least `1.5 * ttlMs` on the server's clock. Each store instance spends
+one extra round trip per `ttlMs / 2` on this; every other operation is a plain
+command as before. A qualified purge reports `legacyResidue` while the key
+exists, and `clear()` keeps it. The key appears in every deployment that uses
+the Redis session store, with or without `forgetIdentity`.
+
+One case remains: a session write still in flight from a request when a purge
+runs can land after it, as with any store. Stop the writes for a user before
+erasing them.
 
 **Action.** Stop instances of the earlier release first, and keep `ttlMs` at
 least as long as before the switch. Active sessions are adopted on their next

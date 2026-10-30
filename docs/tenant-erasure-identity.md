@@ -69,10 +69,13 @@ unknown:
   `sess:identity:v1:legacy`. When it found legacy sessions, ran out of time,
   or saw the Cluster's slots move, purges report residue for `ttlMs` after the
   scan, by which time each has been adopted or has expired. A keyspace without
-  one opens no window. Every write and TTL slide of a store created without
-  `forgetIdentity` deletes the record in the same round trip, so a later
-  qualified purge scans again. A legacy session still listed in the
-  `forgetUserId` index of this user id is residue as well.
+  one opens no window. A store created without `forgetIdentity` keeps the key
+  `sess:identity:v1:legacy-active` alive while sessions it wrote may live
+  (before a write or TTL slide, when less than `ttlMs` of its coverage is
+  left, it awaits one script extending the key to at least `1.5 * ttlMs` on
+  the server's clock), and purges report residue while the key exists. A
+  legacy session still listed in the `forgetUserId` index of this user id is
+  residue as well.
 - Redis registry: a `conns:<userId>` row written by `identify`.
 
 Every other failure rejects with `removed` as well, and `createForgetStore`

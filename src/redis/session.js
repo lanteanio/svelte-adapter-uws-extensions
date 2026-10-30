@@ -93,6 +93,20 @@ const MARKER_KEY = 'identity:v1:legacy';
 const SCAN_BUDGET_MS = 5_000;
 const SCAN_LEASE_MS = 3 * SCAN_BUDGET_MS;
 
+// Kept alive by stores without forgetIdentity while their sessions may live.
+const COVERAGE_KEY = 'identity:v1:legacy-active';
+const COVERAGE_VALUE = '{"legacyActive":true}';
+
+// Keep the coverage key alive for at least ARGV[2] ms when less than ARGV[1]
+// ms are left, never shortening it, and return what is left.
+const LEGACY_COVERAGE = `
+-- SESSION_LEGACY_COVERAGE
+if redis.call('PTTL', KEYS[1]) < tonumber(ARGV[1]) then
+  redis.call('SET', KEYS[1], ARGV[3], 'PX', ARGV[2])
+end
+return redis.call('PTTL', KEYS[1])
+`;
+
 // The first bytes of every qualified record.
 const QUALIFIED_HEAD = '{"identity:v1":';
 
@@ -496,11 +510,10 @@ export function createDistributedSession(client, options = {}) {
 	// read. The answer is kept in a marker under the reserved `identity:`
 	// prefix: `clean` when a scan of the keyspace found none, `residue` when
 	// it found some or could not finish (each is adopted or expires within
-	// `ttlMs` of `since`, as long as no store without forgetIdentity writes or
-	// slides one), and `scanning`, with a lease, while a scan runs. A missing
-	// or unreadable marker is established by scanning. Every write and slide
-	// of a store without forgetIdentity deletes the marker in the same round
-	// trip, so the next qualified purge after it scans again.
+	// `ttlMs` of `since`), and `scanning`, with a lease, while a scan runs. A
+	// missing or unreadable marker is established by scanning. Sessions that
+	// a store without forgetIdentity writes or slides later are covered by
+	// its coverage key instead (see coverLegacyWrites).
 	function markerKey() {
 		return client.key(keyPrefix + MARKER_KEY);
 	}
@@ -508,8 +521,11 @@ export function createDistributedSession(client, options = {}) {
 	async function legacyMayExist() {
 		let marker;
 		try {
-			marker = readMarker(await redis.get(markerKey()));
+			const [stored, covered] = await Promise.all([redis.get(markerKey()), redis.exists(coverageKey())]);
 			breaker?.success();
+			// A store without forgetIdentity wrote or slid a session recently.
+			if (Number(covered) === 1) return true;
+			marker = readMarker(stored);
 		} catch (err) {
 			breaker?.failure(err);
 			throw err;
@@ -583,7 +599,7 @@ export function createDistributedSession(client, options = {}) {
 					if (raw == null || raw === '') continue;
 					let value;
 					try { value = JSON.parse(raw); } catch { continue; }
-					if (unwrapQualified(value) === null && readMarker(raw) === null) return 'residue';
+					if (unwrapQualified(value) === null && readMarker(raw) === null && raw !== COVERAGE_VALUE) return 'residue';
 				}
 				if (monotonicNow() - started > SCAN_BUDGET_MS) return 'residue';
 			} while (cursor !== '0');
@@ -602,23 +618,53 @@ export function createDistributedSession(client, options = {}) {
 		});
 	}
 
-	// Run one write or slide of a store without forgetIdentity together with
-	// the deletion of the legacy marker, in one pipelined round trip.
-	async function legacyCommand(command) {
-		let results;
+	// Coverage of the sessions a store without forgetIdentity writes. Such a
+	// session has no index a qualified purge could read, so before its first
+	// write or slide, and again whenever the coverage it knows of has less
+	// than `ttlMs` left, the store awaits one script that keeps a coverage key
+	// alive for at least `1.5 * ttlMs` on the server's clock. Every session it
+	// writes or slides is then sent while the key outlives it, since a
+	// session lives at most `ttlMs` after its last write. A qualified purge
+	// reports residue while the key exists. The local estimate is measured on
+	// the monotonic clock from before the script was sent, so it never runs
+	// past the server's expiry. The write path costs one awaited round trip
+	// per store instance per `ttlMs / 2` and nothing else.
+	let coveredUntil = -Infinity;
+	let coverage = null;
+	function coverageKey() {
+		return client.key(keyPrefix + COVERAGE_KEY);
+	}
+	function coverLegacyWrites() {
+		if (coveredUntil - monotonicNow() >= ttlMs) return null;
+		coverage ??= (async () => {
+			const started = monotonicNow();
+			try {
+				const left = Number(await evalCached(redis, LEGACY_COVERAGE, 1, coverageKey(), ttlMs, Math.ceil(1.5 * ttlMs), COVERAGE_VALUE));
+				breaker?.success();
+				coveredUntil = started + left;
+			} catch (err) {
+				breaker?.failure(err);
+				throw err;
+			} finally {
+				coverage = null;
+			}
+		})();
+		return coverage;
+	}
+
+	// One write or slide of a store without forgetIdentity, sent once the
+	// coverage above holds.
+	async function legacyCommand([method, ...args]) {
+		const pending = coverLegacyWrites();
+		if (pending) await pending;
 		try {
-			results = await execMultiSlot(redis, [command, ['del', markerKey()]]);
+			const result = await redis[method](...args);
+			breaker?.success();
+			return result;
 		} catch (err) {
 			breaker?.failure(err);
 			throw err;
 		}
-		const err = firstCommandError(results);
-		if (err) {
-			breaker?.failure(err);
-			throw err;
-		}
-		breaker?.success();
-		return results[0][1];
 	}
 
 	// Adopt a record in the legacy layout where a legacy store would slide it:
@@ -853,7 +899,11 @@ export function createDistributedSession(client, options = {}) {
 		// batched UNLINK, preserving the original throughput shape.
 		const pattern = client.key(keyPrefix + '*');
 		try {
+			// The coverage key is put back: stores without forgetIdentity that
+			// still run rely on it until it expires.
+			const left = Number(await redis.pttl(coverageKey()));
 			await scanAndUnlink(redis, pattern);
+			if (left > 0) await redis.set(coverageKey(), COVERAGE_VALUE, 'PX', left, 'NX');
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);

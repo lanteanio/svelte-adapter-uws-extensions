@@ -7,7 +7,8 @@ const lines = [
 	'c3 10.0.0.3:6379@16379 master - 0 1 3 connected 10923-16383',
 	'd4 10.0.0.4:6379@16379 slave a1 0 1 1 connected'
 ];
-const cluster = (text) => ({ nodes: () => [], cluster: async () => text });
+// A Cluster whose masters each answer CLUSTER NODES with their own view.
+const cluster = (...views) => ({ nodes: () => views.map((text) => ({ cluster: async () => text })) });
 
 describe('cluster topology fingerprint', () => {
 	it('is empty on a standalone server', async () => {
@@ -28,6 +29,18 @@ describe('cluster topology fingerprint', () => {
 		expect(await clusterTopology(cluster(moved))).not.toBe(first);
 		const failedOver = [lines[0].replace('myself,master', 'myself,slave'), lines[1], lines[2], lines[3].replace('slave a1', 'master -') + ' 0-5460'].join('\n');
 		expect(await clusterTopology(cluster(failedOver))).not.toBe(first);
+	});
+
+	it('asks every master: a migration shows only on the masters involved', async () => {
+		const plain = lines.join('\n');
+		const migrating = [lines[0], lines[1] + ' [6000->-c3]', ...lines.slice(2)].join('\n');
+		expect(await clusterTopology(cluster(plain, plain, plain))).toBe(await clusterTopology(cluster(plain)));
+		expect(await clusterTopology(cluster(plain, migrating, plain))).toBeNull();
+	});
+
+	it('is null when the masters disagree', async () => {
+		const moved = lines.map((line) => line.replace('5461-10922', '5462-10922').replace('0-5460', '0-5461')).join('\n');
+		expect(await clusterTopology(cluster(lines.join('\n'), moved))).toBeNull();
 	});
 
 	it('is null while a slot is migrating or importing', async () => {

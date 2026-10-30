@@ -299,6 +299,15 @@ for (const families of [['sessions'], ['registry'], ['sessions', 'registry']]) {
 	});
 }
 
+it('classifies tenant-qualified session indexes and markers', async () => {
+	const keys = new Map([['sess:token', 'string'], ['sess:identity:v1:byuser:WyJ0IiwidSJd', 'hash'], ['sess:identity:v1:legacy', 'string'], ['sess:identity:v1:legacy-active', 'string']]);
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'] } }, {
+		redis: { scan: async () => ['0', [...keys.keys()]], type: async (key) => keys.get(key), pttl: async () => 60000 }
+	});
+	expect(report.ok).toBe(true);
+	expect(report.redis.observations.sessions.keys).toBe(4);
+});
+
 it('flags a hash in the session namespace as a wrong type', async () => {
 	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'] } }, {
 		redis: { scan: async () => ['0', ['sess:route']], type: async () => 'hash', pttl: async () => 60000 }
