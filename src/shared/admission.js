@@ -102,7 +102,7 @@ export function createAdmissionControl(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('admission control: options object is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const { classes, metrics, aggregator, clock } = options;
 	if (!classes || typeof classes !== 'object') {
 		throw new Error('admission control: classes is required and must be an object');

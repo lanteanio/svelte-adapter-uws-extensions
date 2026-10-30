@@ -184,7 +184,7 @@ const validateOptions = defineOptions({
  * @returns {RedisCursorTracker}
  */
 export function createCursor(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const {
 		maxDataBytes,
 		maxTopicLength,

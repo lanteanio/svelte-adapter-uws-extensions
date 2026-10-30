@@ -78,7 +78,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createFunctionLibrary(client, code, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (typeof code !== 'string' || code.length === 0) {
 		throw new Error('redis functions: code must be a non-empty string');
 	}

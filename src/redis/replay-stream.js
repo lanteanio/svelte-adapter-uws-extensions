@@ -231,7 +231,7 @@ const validateOptions = defineOptions({
  * @returns {import('./replay.js').RedisReplayBuffer}
  */
 export function createStreamReplay(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, maxDataBytes, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis stream replay', options);
 

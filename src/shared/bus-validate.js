@@ -94,7 +94,7 @@ const validateOptions = defineOptions({
  * @param {BusValidatorOptions} [options]
  */
 export function createBusValidator(options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	// Number.isInteger, not `typeof === 'number' && > 0`: NaN IS a number and
 	// `NaN > 0` is false, so the typeof form quietly selected the 1 MB default
 	// for `0`, `-1`, `'65536'` and `NaN` alike. A deployment that believed it

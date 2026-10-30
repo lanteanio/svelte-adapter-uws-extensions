@@ -75,7 +75,7 @@ const validateOptions = defineOptions({
  * @param {JobQueueOptions} [options]
  */
 export function createJobQueue(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const table = options.table || 'svti_jobs';
 	assertSafeTableName(table, 'postgres jobs');
 	const autoMigrate = options.autoMigrate !== false;

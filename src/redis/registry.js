@@ -218,7 +218,7 @@ export function createConnectionRegistry(client, options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('registry: options object is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const identify = options.identify;
 	if (typeof identify !== 'function') {
 		throw new Error('registry: identify must be a function');

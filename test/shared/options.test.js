@@ -42,8 +42,35 @@ describe('defineOptions: absent values', () => {
 
 	it('ignores a missing or non-object bag', () => {
 		const { validate } = validator({ enabled: option.boolean });
-		for (const bag of [undefined, null, 'redis://x', 42]) expect(() => validate(bag)).not.toThrow();
+		for (const bag of [undefined, null, 'redis://x', 42]) expect(validate(bag)).toBe(bag);
 		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it('hands the factory its options without the null keys, so the factory default applies', () => {
+		const { validate } = validator({ size: option.known, ttl: option.known, keyPrefix: option.known });
+		const proto = { inherited: 1 };
+		const bag = Object.assign(Object.create(proto), { size: null, ttl: 5, keyPrefix: null, zz: null });
+		const seen = validate(bag);
+		expect(seen).not.toBe(bag);
+		expect(Object.keys(seen)).toEqual(['ttl']);
+		expect(seen.size).toBeUndefined();
+		expect(seen.inherited).toBe(1);
+		// The caller's object is left as it was.
+		expect(bag).toEqual(expect.objectContaining({ size: null, ttl: 5, keyPrefix: null, zz: null }));
+	});
+
+	it('returns the caller object itself when nothing is null', () => {
+		const { validate } = validator({ size: option.known });
+		const bag = { size: 3 };
+		expect(validate(bag)).toBe(bag);
+		expect(validate({})).toEqual({});
+	});
+
+	it('keeps null for a key declared nullable, where null is a setting of its own', () => {
+		const { validate } = validator({ systemChannel: option.nullable, size: option.known });
+		const seen = validate({ systemChannel: null, size: null });
+		expect(seen).toEqual({ systemChannel: null });
+		expect(Object.hasOwn(seen, 'systemChannel')).toBe(true);
 	});
 });
 
@@ -91,12 +118,20 @@ describe('defineOptions: unknown keys', () => {
 describe('defineOptions: value rules', () => {
 	it('names the option, the accepted values and the value received', () => {
 		const { validate } = validator({ enabled: option.boolean, onError: option.function, meta: option.object });
-		expect(() => validate({ enabled: 'false' })).toThrow(
-			new TypeError('thing: enabled must be true or false - got "false" (string).')
-		);
+		expect(() => validate({ enabled: 'false' })).toThrow('thing: enabled must be true or false - got "false" (string).');
 		expect(() => validate({ onError: 'log' })).toThrow('thing: onError must be a function - got "log" (string).');
 		expect(() => validate({ meta: [1] })).toThrow('thing: meta must be an object - got [1] (object).');
 		expect(() => validate({ enabled: 10n })).toThrow('thing: enabled must be true or false - got 10n (bigint).');
+	});
+
+	it('throws a plain Error, as the adapter configuration guards do', () => {
+		const { validate } = validator({ enabled: option.boolean, heartbeat: timerCeiling(), ttlMs: wholeExpiry() });
+		for (const bag of [{ enabled: 'false' }, { heartbeat: MAX_TIMER_INTERVAL_MS + 1 }, { ttlMs: 1.5 }]) {
+			let error;
+			try { validate(bag); } catch (e) { error = e; }
+			expect(error).toBeInstanceOf(Error);
+			expect(error.constructor).toBe(Error);
+		}
 	});
 
 	it('accepts the values it lists', () => {

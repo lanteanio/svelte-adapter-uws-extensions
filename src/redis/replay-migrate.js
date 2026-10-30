@@ -77,7 +77,7 @@ export async function migrateReplayToStream(client, options = {}) {
 	if (!client || typeof client !== 'object' || !client.redis || typeof client.key !== 'function') {
 		throw new Error('migrateReplayToStream: a redis client (from createRedisClient) is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const { topics, size = 1000, force = false, dryRun = false } = options;
 	if (topics !== undefined &&
 		(!Array.isArray(topics) || topics.some((t) => typeof t !== 'string' || t.length === 0))) {

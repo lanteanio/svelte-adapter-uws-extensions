@@ -86,7 +86,7 @@ describe('task payload cap', () => {
 		// Same NaN trap parseReplayOptions guards: NaN is a number and
 		// `NaN < 1` is false, so a typeof-only guard accepts it and then every
 		// `bytes > NaN` comparison is false - removing the bound entirely.
-		for (const bad of [NaN, 0, -1, 1.5, '65536', null, Infinity]) {
+		for (const bad of [NaN, 0, -1, 1.5, '65536', Infinity]) {
 			expect(() => createTaskRunner(client, { maxPayloadBytes: bad, recoveryInterval: 0, cleanupInterval: 0 }))
 				.toThrow('positive integer');
 		}

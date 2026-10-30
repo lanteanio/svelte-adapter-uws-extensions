@@ -109,7 +109,7 @@ const validateOptions = defineOptions({
 });
 
 export function createCircuitBreaker(options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetTimeout = options.resetTimeout ?? 30000;
 	const probeConcurrency = options.probeConcurrency ?? 1;

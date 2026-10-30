@@ -1147,7 +1147,7 @@ describe('redis sharded bus', () => {
 
 		it('rejects an aggregator without subscribersOf', () => {
 			expect(() => createShardedBus(client, { subscribersAggregator: {} })).toThrow(/subscribersOf/);
-			expect(() => createShardedBus(client, { subscribersAggregator: null })).toThrow(/subscribersOf/);
+			expect(() => createShardedBus(client, { subscribersAggregator: 'local' })).toThrow(/subscribersOf/);
 		});
 	});
 });

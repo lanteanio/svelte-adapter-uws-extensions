@@ -86,7 +86,7 @@ const validateOptions = defineOptions({
  * @returns {RedisFenceProvider}
  */
 export function createRedisFence(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.keyPrefix !== undefined && typeof options.keyPrefix !== 'string') {
 		throw new Error('redis fence: keyPrefix must be a string');
 	}

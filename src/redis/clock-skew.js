@@ -145,7 +145,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createClockSkewSampler(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('clock-skew: client (from createRedisClient) is required');
 	}

@@ -85,7 +85,7 @@ const validateOptions = defineOptions({
 });
 
 export function createPublishRateAggregator(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('publish-rate: client (from createRedisClient) is required');
 	}

@@ -101,7 +101,7 @@ describe('capabilityCookie', () => {
 		});
 
 		it('refuses a weak verification key even when the signing key is strong', () => {
-			for (const previousSecret of ['', 'q', 'dev', 'changeme', 'x'.repeat(64), 'ab'.repeat(32), 123, null]) {
+			for (const previousSecret of ['', 'q', 'dev', 'changeme', 'x'.repeat(64), 'ab'.repeat(32), 123]) {
 				expect(() => capabilityCookie({
 					secret: 'a3f9c1d7e5b2408695ecfa71d3b8402c', previousSecret
 				})).toThrow(/previousSecret/);

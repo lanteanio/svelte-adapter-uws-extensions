@@ -33,13 +33,13 @@ const validateMigrateOptions = defineOptions({
 
 /** Inspect the ordered SQL and checksums without connecting to a database. */
 export function postgresMigrations(options) {
-	validateInspectOptions(options);
+	options = validateInspectOptions(options);
 	return schemaFor(options).versions;
 }
 
 /** Apply resumable migrations using a schema-owner connection. Existing data is never repaired or discarded. */
 export async function migrate(client, options) {
-	validateMigrateOptions(options);
+	options = validateMigrateOptions(options);
 	const schema = schemaFor(options);
 	const statementTimeoutMs = options.statementTimeoutMs ?? 30000;
 	const lockTimeoutMs = options.lockTimeoutMs ?? 5000;
@@ -153,7 +153,7 @@ async function validateColumns(client, schema, known = schema) {
 
 /** Inspect only catalogs; safe for a runtime role with no schema-creation privileges. */
 export async function validateSchema(client, options) {
-	validateCatalogOptions(options);
+	options = validateCatalogOptions(options);
 	const schema = schemaFor(options);
 	const query = (text, values) => client.query({ text, values, query_timeout: 10000 }, undefined, { signal: AbortSignal.timeout(10000) });
 	const ledger = await query('SELECT to_regclass($1) IS NOT NULL AS present', [LEDGER]);

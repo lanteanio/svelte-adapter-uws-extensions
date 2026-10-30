@@ -132,7 +132,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createTopicBroadcast(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const redis = client.redis;
 	const instanceId = randomBytes(8).toString('hex');
 	// Stacks on the client's own keyPrefix (mirrors the connection registry) so

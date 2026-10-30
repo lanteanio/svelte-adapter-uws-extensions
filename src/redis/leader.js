@@ -104,7 +104,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createLeader(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('leader: client (from createRedisClient) is required');
 	}

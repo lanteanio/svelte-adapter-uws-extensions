@@ -78,7 +78,7 @@ export function createPgClient(opts) {
 	if (!opts) {
 		throw new ConnectionError('postgres', 'connectionString or pool is required');
 	}
-	validateOptions(opts);
+	opts = validateOptions(opts);
 	const externalPool = opts.pool;
 	if (externalPool === undefined && !opts.connectionString) {
 		throw new ConnectionError('postgres', 'connectionString or pool is required');

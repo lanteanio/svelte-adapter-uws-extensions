@@ -94,7 +94,8 @@ const validateOptions = defineOptions({
 }, {
 	// Compared with the string channel ioredis delivers.
 	channel: option.string,
-	systemChannel: option.known,
+	// null turns the health events off, so it is not "not set" here.
+	systemChannel: option.nullable,
 	onDegraded: option.known,
 	onRecovered: option.known,
 	degradationPolicy: option.known,
@@ -129,7 +130,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createPubSubBus(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const channel = options.channel || 'uws:pubsub';
 	const instanceId = randomBytes(8).toString('hex');
 

@@ -159,7 +159,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createUpgradeBucket(client, options) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const resolve = buildBudgets(options, 'redis upgrade-bucket');
 	// Each budget's block reaches Redis inside a PEXPIRE argument. A fractional
 	// one fails every admit after its HSET, and a failed admit fails open.
@@ -291,7 +291,7 @@ const validateLocalOptions = defineOptions({
  * @returns {UpgradeBucket}
  */
 export function createLocalUpgradeBucket(options) {
-	validateLocalOptions(options);
+	options = validateLocalOptions(options);
 	const resolve = buildBudgets(options, 'local upgrade-bucket');
 
 	const maxEntries = options.maxEntries ?? DEFAULT_MAX_LOCAL_ENTRIES;

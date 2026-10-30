@@ -316,7 +316,7 @@ export function createCompositeRateLimit(client, options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('redis composite ratelimit: options object is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const dims = options.dimensions;
 	if (!dims || typeof dims !== 'object' || Array.isArray(dims)) {
 		throw new Error('redis composite ratelimit: dimensions must be an object of name -> { points, interval, keyBy }');

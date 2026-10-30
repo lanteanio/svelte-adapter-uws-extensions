@@ -313,7 +313,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createRedisClient(options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const url = options.url || 'redis://localhost:6379';
 	const keyPrefix = options.keyPrefix || '';
 	const autoShutdown = options.autoShutdown !== false;

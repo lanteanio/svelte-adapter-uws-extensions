@@ -158,7 +158,7 @@ describe('tenant budget identity', () => {
 
 	it('refuses invalid budget values and missing or ambiguous tenant identifiers before Redis or fallback', async () => {
 		const client = mockRedisClient();
-		for (const budget of [null, 'global', '', false]) {
+		for (const budget of ['global', '', false]) {
 			expect(() => createRateLimit(client, { ...options, budget })).toThrow(/budget/);
 		}
 		const evalSpy = vi.spyOn(client.redis, 'eval');

@@ -131,7 +131,7 @@ export function createNotifyBridge(client, options) {
 	if (!options || typeof options.channel !== 'string' || options.channel.length === 0) {
 		throw new Error('notify bridge: channel must be a non-empty string');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 
 	const channel = options.channel;
 	// Validate the channel name against the same `[a-zA-Z_][a-zA-Z0-9_]*`

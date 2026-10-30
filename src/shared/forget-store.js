@@ -355,7 +355,7 @@ const validateOptions = defineOptions({
  * @returns {{ purgeUser: (tenantId: string | null, userId: string, cascade?: any) => Promise<Record<string, number> | { rowsAffected: Record<string, number>, ownerSuccessions: ForgetOwnerSuccession[], presenceTopics: string[], cursorTopics: string[] }> }}
  */
 export function createForgetStore(stores, options) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!stores || typeof stores !== 'object') {
 		throw new Error('createForgetStore: pass a map or array of stores');
 	}

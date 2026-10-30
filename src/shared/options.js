@@ -11,9 +11,11 @@
  *   it accepts. A misshaped value is not read as "use the default": most
  *   factories compare numbers with `>` or read flags with `=== true`, so a
  *   string or a negative number silently disables the bound it configures.
- * - `undefined` and `null` are both absent. Neither is judged here; the
- *   factory applies its default (or its own long-standing check) exactly as
- *   it did before this validation existed.
+ * - `undefined` and `null` are both absent. Neither is judged here, and the
+ *   options handed back to the factory leave a `null` out, so the factory
+ *   applies its default exactly as for an omitted key.
+ * - Errors are plain `Error`s, as the adapter's configuration guards and the
+ *   factories' own checks throw.
  *
  * Keys the factory already judges itself are declared with `option.known`
  * so their established messages stay the ones users see. Refinements such as
@@ -69,7 +71,7 @@ export function describeValue(value) {
  * @returns {never}
  */
 function refuse(surface, expected, value) {
-	throw new TypeError(`${surface} must be ${expected} - got ${describeValue(value)} (${typeof value}).`);
+	throw new Error(`${surface} must be ${expected} - got ${describeValue(value)} (${typeof value}).`);
 }
 
 /**
@@ -80,7 +82,7 @@ function refuse(surface, expected, value) {
  * @returns {never}
  */
 function throwTimerOverflow(surface, ceiling, unit, value) {
-	throw new TypeError(
+	throw new Error(
 		`${surface} must be no greater than ${ceiling} ${unit}, because Node ` +
 		`stores a timer delay in a signed 32-bit integer and a larger delay overflows to fire ` +
 		`every millisecond - the tight loop an interval this large was meant to avoid - got ` +
@@ -108,6 +110,12 @@ const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(v
 export const option = Object.freeze({
 	/** Accepted key whose value the factory judges itself. */
 	known: () => {},
+	/**
+	 * Accepted key the factory judges itself, where `null` is a documented
+	 * setting rather than "not set" (the pub/sub `systemChannel: null` turns
+	 * the health events off), so the validator hands it through.
+	 */
+	nullable: () => {},
 	boolean: rule('true or false', (value) => typeof value === 'boolean'),
 	function: rule('a function', (value) => typeof value === 'function'),
 	object: rule('an object', isObject),
@@ -174,7 +182,7 @@ export function assertWholeExpiry(surface, value, { scale = 1, unit = 'milliseco
 	if (!isFiniteNumber(value) || /** @type {number} */ (value) < min) return;
 	if (Number.isInteger(/** @type {number} */ (value) * scale)) return;
 	const whole = scale === 1 ? unit : `milliseconds (${unit} with at most three decimals)`;
-	throw new TypeError(
+	throw new Error(
 		`${surface} must be a whole number of ${whole} - got ${describeValue(value)}. ` +
 		'Redis refuses a fractional expiry, so every write that sets it would fail.'
 	);
@@ -266,18 +274,29 @@ function boundedEditDistance(a, b, bound) {
  * accepted top-level key to its value rule; it is read once here, so a factory
  * constructed per room pays one key walk per construction and nothing more.
  *
+ * The validator returns the options the factory reads from. A top-level
+ * `null` means "not set", as in the adapter, so it is left out of what the
+ * factory sees and every default and established check behaves as if the key
+ * were omitted - including checks written as `options.x !== undefined` and
+ * destructuring defaults, which `null` would otherwise pass straight through.
+ * Without a `null` the caller's object comes back unchanged; with one, a
+ * shallow copy (same prototype) without those keys. A key declared with
+ * `option.nullable` keeps its `null`, which is a setting of its own there.
+ *
+ * @template T
  * @param {{ factory: string, label: string, types: string }} names
  *   `factory` is the function users call (named in the unknown-key warning),
  *   `label` prefixes value errors the way the factory's own errors do, and
  *   `types` points at the documented options interface.
  * @param {Record<string, (surface: string, value: unknown) => void>} schema
- * @returns {(bag: unknown) => void}
+ * @returns {(bag: T) => T}
  */
 export function defineOptions({ factory, label, types }, schema) {
 	const known = new Set(Object.keys(schema));
+	const keepsNull = new Set(Object.keys(schema).filter((key) => schema[key] === option.nullable));
 	const entries = Object.entries(schema);
 	return function validateOptions(bag) {
-		if (bag === null || typeof bag !== 'object') return;
+		if (bag === null || typeof bag !== 'object') return bag;
 		const options = /** @type {Record<string, unknown>} */ (bag);
 		for (const [key, check] of entries) {
 			const value = options[key];
@@ -285,23 +304,38 @@ export function defineOptions({ factory, label, types }, schema) {
 			check(`${label}: ${key}`, value);
 		}
 		let unknown = null;
+		let absent = null;
 		for (const key of Object.keys(options)) {
+			if (options[key] === null && !keepsNull.has(key)) (absent ??= []).push(key);
 			if (known.has(key)) continue;
 			(unknown ??= []).push(key);
 		}
-		if (unknown === null) return;
-		const id = `${types}\0${factory}\0${unknown.slice().sort().join('\0')}`;
-		if (warnedUnknownKeySets.has(id)) return;
-		if (warnedUnknownKeySets.size >= MAX_WARNED_UNKNOWN_KEY_SETS) warnedUnknownKeySets.clear();
-		warnedUnknownKeySets.add(id);
-		const described = unknown.map((key) => {
-			const suggestion = suggestOptionKey(key, known);
-			return suggestion === null ? key : `${key} (did you mean '${suggestion}'?)`;
-		});
-		console.warn(
-			`[extensions] unknown ${factory} option(s): ${described.join(', ')} - ` +
-			`not recognized by ${factory} and ignored. Check the spelling against the ` +
-			`documented options (${types}).`
-		);
+		if (unknown !== null) warnUnknown(factory, types, known, unknown);
+		if (absent === null) return bag;
+		const copy = Object.assign(Object.create(Object.getPrototypeOf(options)), options);
+		for (const key of absent) delete copy[key];
+		return copy;
 	};
+}
+
+/**
+ * @param {string} factory
+ * @param {string} types
+ * @param {Set<string>} known
+ * @param {string[]} unknown
+ */
+function warnUnknown(factory, types, known, unknown) {
+	const id = `${types}\0${factory}\0${unknown.slice().sort().join('\0')}`;
+	if (warnedUnknownKeySets.has(id)) return;
+	if (warnedUnknownKeySets.size >= MAX_WARNED_UNKNOWN_KEY_SETS) warnedUnknownKeySets.clear();
+	warnedUnknownKeySets.add(id);
+	const described = unknown.map((key) => {
+		const suggestion = suggestOptionKey(key, known);
+		return suggestion === null ? key : `${key} (did you mean '${suggestion}'?)`;
+	});
+	console.warn(
+		`[extensions] unknown ${factory} option(s): ${described.join(', ')} - ` +
+		`not recognized by ${factory} and ignored. Check the spelling against the ` +
+		`documented options (${types}).`
+	);
 }

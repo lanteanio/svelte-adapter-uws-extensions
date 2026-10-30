@@ -105,7 +105,7 @@ const validateOptions = defineOptions({
  * @returns {RedisAlarmStore}
  */
 export function createAlarmStore(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.keyPrefix !== undefined && typeof options.keyPrefix !== 'string') {
 		throw new Error('redis alarm store: keyPrefix must be a string');
 	}

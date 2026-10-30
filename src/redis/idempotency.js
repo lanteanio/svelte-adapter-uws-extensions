@@ -99,7 +99,7 @@ const validateOptions = defineOptions({
  * @returns {RedisIdempotencyStore}
  */
 export function createIdempotencyStore(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.ttl !== undefined) {
 		if (typeof options.ttl !== 'number' || options.ttl < 1 || !Number.isInteger(options.ttl)) {
 			throw new Error(`redis idempotency: ttl must be a positive integer, got ${options.ttl}`);

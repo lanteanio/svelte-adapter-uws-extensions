@@ -185,7 +185,7 @@ const validateOptions = defineOptions({
  * @returns {RedisPresenceTracker}
  */
 export function createPresence(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const ctx = createPresenceState(client, options);
 	const {
 		maxFieldsBytes, maxTotalFieldsBytes, maxTopicsPerConnection, topicThrottle,

@@ -129,7 +129,7 @@ describe('presence-update frames from a client', () => {
 
 	it('refuses a clientUpdateFields that is not an array', () => {
 		const client = mockRedisClient('cf4:');
-		for (const value of ['typing', { typing: true }, 7, null]) {
+		for (const value of ['typing', { typing: true }, 7]) {
 			expect(() => createPresence(client, { select, clientUpdateFields: value }))
 				.toThrow('redis presence: clientUpdateFields must be an array of field names');
 		}

@@ -430,7 +430,7 @@ export function createRateLimit(client, options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('redis ratelimit: options object is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 
 	const { points, interval, blockDuration = 0, keyBy = 'ip', tenant, budget = 'principal' } = options;
 

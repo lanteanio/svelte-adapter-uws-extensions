@@ -45,8 +45,9 @@ describe('PostgreSQL pool admission and deadlines', () => {
 		expect(pool).not.toHaveProperty('options');
 	});
 
-	it('rejects null supplied pool clearly', () => {
-		expect(() => createPgClient({ pool: null })).toThrow('pool must be a pg.Pool instance');
+	it('reads a null pool as not set, so it still needs a connection string', () => {
+		expect(() => createPgClient({ pool: null })).toThrow('connectionString or pool is required');
+		expect(() => createPgClient({ pool: {} })).toThrow('pool must be a pg.Pool instance');
 	});
 
 	it('bounds a 20,000-call owned burst before entering the driver queue', async () => {

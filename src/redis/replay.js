@@ -149,7 +149,7 @@ const validateOptions = defineOptions({
  * @returns {RedisReplayBuffer}
  */
 export function createReplay(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.storage !== undefined && options.storage !== 'sortedset' && options.storage !== 'stream') {
 		throw new Error(`redis replay: storage must be 'sortedset' or 'stream', got ${options.storage}`);
 	}

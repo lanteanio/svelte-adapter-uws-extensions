@@ -202,7 +202,7 @@ const validateOptions = defineOptions({
  * @returns {RedisGroup}
  */
 export function createGroup(client, name, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!name || typeof name !== 'string') {
 		throw new Error('redis group: name must be a non-empty string');
 	}

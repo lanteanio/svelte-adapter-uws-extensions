@@ -110,7 +110,7 @@ const validateOptions = defineOptions({
  * @returns {ShardedBus}
  */
 export function createShardedBus(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const channelPrefix = options.channelPrefix ?? 'uws:sharded:';
 	if (typeof channelPrefix !== 'string') {
 		throw new Error('sharded bus: channelPrefix must be a string');

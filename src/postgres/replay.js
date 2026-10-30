@@ -134,7 +134,7 @@ const validateOptions = defineOptions({
  * @returns {PgReplayBuffer}
  */
 export function createReplay(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.size !== undefined) {
 		if (typeof options.size !== 'number' || options.size < 1 || !Number.isInteger(options.size)) {
 			throw new Error(`postgres replay: size must be a positive integer, got ${options.size}`);

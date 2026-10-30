@@ -104,7 +104,7 @@ const validateOptions = defineOptions({
  * @param {PgDeadLetterOptions} [options]
  */
 export function createDeadLetter(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.max !== undefined && (!Number.isInteger(options.max) || options.max <= 0)) {
 		throw new Error(`postgres dead-letter: max must be a positive integer, got ${options.max}`);
 	}

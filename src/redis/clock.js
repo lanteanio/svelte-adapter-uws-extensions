@@ -176,7 +176,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createClusterClock(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('cluster clock: client (from createRedisClient) is required');
 	}

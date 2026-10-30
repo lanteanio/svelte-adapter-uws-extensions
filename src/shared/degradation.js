@@ -138,7 +138,7 @@ const validateOptions = defineOptions({
  * @param {DegradationSpec} [spec]
  */
 export function createDegradationPolicy(spec = {}) {
-	validateOptions(spec);
+	spec = validateOptions(spec);
 	if (typeof spec !== 'object' || spec === null) throw new Error('degradation policy: spec must be an object');
 	assertWindow(spec.jitterMs, 'jitterMs');
 	assertWindow(spec.recoveryJitterMs, 'recoveryJitterMs');

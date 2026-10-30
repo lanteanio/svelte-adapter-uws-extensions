@@ -90,7 +90,7 @@ const validateOptions = defineOptions({
  * @returns {PgIdempotencyStore}
  */
 export function createIdempotencyStore(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.ttl !== undefined) {
 		if (typeof options.ttl !== 'number' || options.ttl < 1 || !Number.isInteger(options.ttl)) {
 			throw new Error(`postgres idempotency: ttl must be a positive integer, got ${options.ttl}`);

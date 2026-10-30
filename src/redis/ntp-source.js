@@ -132,7 +132,7 @@ export function createNtpSource(options = {}) {
 	if (!options || typeof options.host !== 'string' || options.host.length === 0) {
 		throw new Error('ntp: host is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const host = options.host;
 	const port = options.port ?? DEFAULT_PORT;
 	if (!Number.isInteger(port) || port < 1 || port > 65535) {

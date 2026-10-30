@@ -214,7 +214,7 @@ const validateOptions = defineOptions({
  * @param {CrdtClusterOptions} [options]
  */
 export function createCrdtCluster(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const redis = client.redis;
 	const channel = client.key('crdt:events');
 	const instanceId = randomBytes(8).toString('hex');

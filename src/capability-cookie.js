@@ -243,7 +243,7 @@ export function capabilityCookie(options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('capability-cookie: options object is required');
 	}
-	validateOptions(options);
+	options = validateOptions(options);
 	const { secret, previousSecret } = options;
 	assertSecretStrength(secret, 'secret');
 	// Either verification key can authorize a cookie; both need the same floor.

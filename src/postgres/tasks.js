@@ -202,7 +202,7 @@ const validateOptions = defineOptions({
  * @returns {TaskRunner}
  */
 export function createTaskRunner(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	if (options.fenceTtl !== undefined) {
 		if (typeof options.fenceTtl !== 'number' || options.fenceTtl < 1 || !Number.isInteger(options.fenceTtl)) {
 			throw new Error(`postgres tasks: fenceTtl must be a positive integer, got ${options.fenceTtl}`);

@@ -85,7 +85,7 @@ const validateOptions = defineOptions({
  * @param {PgAlarmStoreOptions} [options]
  */
 export function createAlarmStore(client, options = {}) {
-	validateOptions(options);
+	options = validateOptions(options);
 	const dueBatch = options.dueBatch ?? DEFAULT_DUE_BATCH;
 	if (!Number.isInteger(dueBatch) || dueBatch < 1) {
 		throw new Error(`postgres alarm store: dueBatch must be a positive integer, got ${dueBatch}`);

@@ -551,7 +551,7 @@ const validateHistogramOptions = defineOptions({
 });
 
 export function createMetrics(options = {}) {
-	validateRegistryOptions(options);
+	options = validateRegistryOptions(options);
 	const prefix = options.prefix || '';
 	if (options.mapTopic != null && typeof options.mapTopic !== 'function') {
 		throw new Error('createMetrics: mapTopic must be a function');
@@ -609,8 +609,7 @@ export function createMetrics(options = {}) {
 	// options form supersedes any trailing positional args.
 	function resolveMetricArgs(labelNames, positional, validate = validateMetricOptions) {
 		if (labelNames != null && typeof labelNames === 'object' && !Array.isArray(labelNames)) {
-			const o = labelNames;
-			validate(o);
+			const o = validate(labelNames);
 			return {
 				labelNames: o.labelNames,
 				buckets: o.buckets,
@@ -854,7 +853,7 @@ const validateClusterPublishRateWirerOptions = wirerOptionsFor('wireClusterPubli
  * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
  */
 export function wirePublishRateMetrics(platform, metrics, options = {}) {
-	validatePublishRateWirerOptions(options);
+	options = validatePublishRateWirerOptions(options);
 	if (!platform || typeof platform !== 'object') {
 		throw new TypeError('wirePublishRateMetrics: platform is required');
 	}
@@ -910,7 +909,7 @@ export function wirePublishRateMetrics(platform, metrics, options = {}) {
  * @param {{ topN?: number, mapTopic?: (topic: string) => string }} [options]
  */
 export function wireClusterPublishRateMetrics(aggregator, metrics, options = {}) {
-	validateClusterPublishRateWirerOptions(options);
+	options = validateClusterPublishRateWirerOptions(options);
 	if (!aggregator || typeof aggregator !== 'object') {
 		throw new TypeError('wireClusterPublishRateMetrics: aggregator is required');
 	}
