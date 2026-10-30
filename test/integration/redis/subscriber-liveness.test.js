@@ -117,6 +117,20 @@ describe('subscriber connections whose server stops answering (integration)', ()
 		const holder = await serverWith((server) => numsub(server, channel));
 		const [before] = await subscriberIds(holder);
 		expect(before).toBeDefined();
+		// A standalone server holds this publish until the pause ends, up to
+		// PAUSE_MS minus the PING timeout on the server's clock, which can run
+		// slow against the host's: the default 5 second command deadline is too
+		// close to that. Connected before the pause, which would hold its
+		// handshake too.
+		let publisher;
+		if (isClusterBackend()) {
+			publisher = admin.redis.nodes('master').find((n) => n !== holder);
+		} else {
+			const patient = createBackendClient({ keyPrefix: 'inttest-live:', options: { commandTimeout: PAUSE_MS + 10000, socketTimeout: undefined } });
+			cleanups.push(() => patient.quit());
+			await patient.redis.ping();
+			publisher = patient.redis;
+		}
 
 		const pausedUntil = await pause(holder);
 		pingRound();
@@ -125,7 +139,6 @@ describe('subscriber connections whose server stops answering (integration)', ()
 
 		// On a cluster another node takes the channel while the paused one still
 		// holds every command; a standalone server delivers again once it answers.
-		const publisher = isClusterBackend() ? admin.redis.nodes('master').find((n) => n !== holder) : admin.redis;
 		const envelope = JSON.stringify({ instanceId: 'remote', topic: 'chat', event: 'back', data: 1 });
 		await waitFor(async () => {
 			await publisher.publish(channel, envelope);
