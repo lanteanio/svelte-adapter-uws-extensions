@@ -797,7 +797,7 @@ describe('redis replay', () => {
 			const before = await replay.currentEpoch('chat');
 			await replay.clearTopic('chat');
 			const after = await replay.currentEpoch('chat');
-			expect(after).toBeGreaterThan(before);
+			expect(after).not.toBe(before);
 			// Next publish restarts seq at 1 under the epoch clearTopic set: the
 			// counter is kept at 0, so the publish continues the cleared space
 			// instead of taking another generation, and a client that subscribed
@@ -1048,15 +1048,15 @@ describe('redis replay', () => {
 			expect(await replay.seq('chat')).toBe(0);
 			expect(await replay.currentEpoch('chat')).toBe(0);
 			expect(await replay.currentEpoch('todos')).toBe(0);
-			// ... and a republished topic takes a generation above every epoch
-			// handed out before the clear, so no straddling client can match it.
+			// ... and a republished topic draws a new random epoch, so a
+			// straddling client mismatches and rehydrates.
 			await replay.publish(platform, 'chat', 'created', { id: 2 });
 			await replay.publish(platform, 'todos', 'created', { id: 2 });
 			const chatAfter = await replay.currentEpoch('chat');
 			const todosAfter = await replay.currentEpoch('todos');
-			expect(chatAfter).toBeGreaterThan(Math.max(chatBefore, todosBefore));
-			expect(todosAfter).toBeGreaterThan(Math.max(chatBefore, todosBefore));
-			expect(chatAfter).not.toBe(todosAfter);
+			expect(chatAfter).toBeGreaterThan(0);
+			expect(chatAfter).not.toBe(chatBefore);
+			expect(todosAfter).not.toBe(todosBefore);
 		});
 
 		it('a client straddling clear() rehydrates instead of silently seeing contiguity', async () => {

@@ -296,9 +296,10 @@ export interface RedisReplayBuffer {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
-	 * Current stored generation of a topic's seq space; `0` for a topic with
-	 * no seq space. Replaced by a value never handed out before whenever the
-	 * authoritative seq numbering for the topic restarts (`clearTopic`, or a
+	 * Current stored epoch of a topic's seq space, an opaque random 32-bit
+	 * integer; `0` for a topic with no seq space. Drawn anew (never equal to
+	 * the epoch it replaces) whenever the authoritative seq numbering for the
+	 * topic restarts (`clearTopic`, or a
 	 * publish creating the topic again after expiry, eviction, `clear()` or a
 	 * lossy reshard). The resume hook compares this to the client's presented
 	 * epoch to choose gap-fill (match) or cold-rehydrate (mismatch).

@@ -104,31 +104,33 @@ for (const backend of BACKENDS) {
 			});
 		}
 
-		it('a lost counter restarts above every epoch still stored', async () => {
+		it('draws an opaque epoch from the runtime RNG, not from time or a count', async () => {
+			setRuntimeEnv({ clock: { now: () => clock, wallEpoch: () => clock }, rng: { u32: () => 41 } });
 			const replay = create({ maxTopics: 10 });
-			clock = 1000;
-			for (const topic of ['a', 'b', 'c']) await replay.publish(platform, topic, 'msg', 1);
-			// Three generations in the same millisecond run ahead of the clock.
-			const top = Math.max(...await Promise.all(['a', 'b', 'c'].map((t) => replay.currentEpoch(t))));
-			expect(top).toBeGreaterThan(1000);
-			await client.redis.del(client.key('replay:generation:{replay-topics}'));
-			const other = create({ maxTopics: 10 });
-			await other.publish(platform, 'd', 'msg', 1);
-			expect(await other.currentEpoch('d')).toBeGreaterThan(top);
+			await publishAt(replay, 1000, 'a');
+			expect(await replay.currentEpoch('a')).toBe(42);
 		});
 
-		it('a counter lost with every key restarts at the server clock', async () => {
+		it('a recreated topic never takes the epoch still stored for it', async () => {
+			setRuntimeEnv({ clock: { now: () => clock, wallEpoch: () => clock }, rng: { u32: () => 41 } });
 			const replay = create({ maxTopics: 10 });
-			clock = 1000;
-			await replay.publish(platform, 'c', 'msg', 1);
-			const before = await replay.currentEpoch('c');
-			const [, all] = await client.redis.scan('0', 'MATCH', client.key('*'));
-			await client.redis.del(...all);
-			clock = 5000;
-			await create({ maxTopics: 10 }).publish(platform, 'c', 'msg', 1);
-			const after = await replay.currentEpoch('c');
-			expect(after).toBeGreaterThanOrEqual(5000);
-			expect(after).not.toBe(before);
+			await publishAt(replay, 1000, 'a');
+			expect(await replay.currentEpoch('a')).toBe(42);
+			// The counter is lost but the epoch survives; the same draw comes up.
+			await client.redis.del(key('seq', 'a'));
+			await publishAt(replay, 2000, 'a');
+			expect(await replay.currentEpoch('a')).toBe(43);
+			await replay.clearTopic('a');
+			expect(await replay.currentEpoch('a')).toBe(42);
+		});
+
+		it('wraps a drawn epoch within 1 .. 2^32 - 1', async () => {
+			setRuntimeEnv({ clock: { now: () => clock, wallEpoch: () => clock }, rng: { u32: () => 4294967295 } });
+			const replay = create({ maxTopics: 10 });
+			await publishAt(replay, 1000, 'a');
+			expect(await replay.currentEpoch('a')).toBe(1);
+			await replay.clearTopic('a');
+			expect(await replay.currentEpoch('a')).toBe(2);
 		});
 
 		it('scans for existing topics in one instance only', async () => {
@@ -148,14 +150,14 @@ for (const backend of BACKENDS) {
 
 		it('creates a topic within a bounded wait while another instance holds the seed lease', async () => {
 			clock = Date.now();
-			const generation = client.key('replay:generation:{replay-topics}');
-			await client.redis.hset(generation, 'lease', 'other', 'leaseUntil', String(clock + 600_000));
+			const seed = client.key('replay:seed:{replay-topics}');
+			await client.redis.hset(seed, 'lease', 'other', 'leaseUntil', String(clock + 600_000));
 			await client.redis.set(key('seq', 'legacy'), '4');
 			const started = Date.now();
 			const replay = create({ maxTopics: 10 });
 			await replay.publish(platform, 'fresh', 'msg', 1);
 			expect(Date.now() - started).toBeLessThan(5000);
-			expect(await replay.currentEpoch('fresh')).toBeGreaterThanOrEqual(clock);
+			expect(await replay.currentEpoch('fresh')).toBeGreaterThan(0);
 			// The scan belongs to the lease holder: nothing was enrolled here.
 			expect(await client.redis.zrange(registryKey(), 0, -1)).not.toContain('legacy');
 		}, 10_000);
@@ -172,7 +174,7 @@ for (const backend of BACKENDS) {
 				const { event } = extensionsErrorDefinition(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP);
 				const warnings = records.filter((r) => r.event === event);
 				expect(warnings).toHaveLength(1);
-				expect(warnings[0].attributes).toEqual({ topics: 3, maxTopics: 2 });
+				expect(warnings[0].attributes).toEqual({ topics: 4, maxTopics: 2 });
 				expect(await metrics.serialize()).toMatch(/replay_topic_evictions_total 2/);
 			} finally {
 				dispose();
@@ -205,7 +207,7 @@ for (const backend of BACKENDS) {
 			await publishAt(replay, 3000, 'room', 2);
 			const recreated = await replay.currentEpoch('room');
 			expect(recreated).not.toBe(evictedEpoch);
-			expect(recreated).toBeGreaterThan(evictedEpoch);
+			expect(recreated).toBeGreaterThan(0);
 
 			platform.reset();
 			await hook(mockWs({}), { lastSeenSeqs: { room: 1 }, lastSeenEpochs: { room: evictedEpoch }, platform });
@@ -213,8 +215,8 @@ for (const backend of BACKENDS) {
 			expect(platform.sent.some((s) => s.topic === '__replay:room' && s.event === 'msg')).toBe(false);
 		});
 
-		it('raises the generation counter above epochs stored before it existed', async () => {
-			// A deployment upgraded from a release without the counter: a room at
+		it('enrolls topics stored before the upgrade and recreates them under a new epoch', async () => {
+			// A deployment upgraded from a release without the registry: a room at
 			// seq 50 under epoch 2, and an idle topic whose epoch reached 40.
 			await client.redis.set(key('seq', 'room'), '50');
 			await client.redis.set(key('epoch', 'room'), '2');
@@ -225,10 +227,9 @@ for (const backend of BACKENDS) {
 			// Both legacy topics were enrolled and, never published since, are
 			// the least recently used: the room is evicted.
 			expect(await replay.seq('room')).toBe(0);
-			expect(await replay.currentEpoch('fresh')).toBeGreaterThan(40);
 
 			await publishAt(replay, 2000, 'room');
-			expect(await replay.currentEpoch('room')).toBeGreaterThan(40);
+			expect(await replay.currentEpoch('room')).not.toBe(2);
 			platform.reset();
 			await replay.resumeHook()(mockWs({}), { lastSeenSeqs: { room: 50 }, lastSeenEpochs: { room: 2 }, platform });
 			expect(platform.sent.some((s) => s.topic === '__replay:room' && s.event === 'rehydrate')).toBe(true);
@@ -355,16 +356,16 @@ for (const backend of BACKENDS) {
 			expect(await one.currentEpoch('room')).toBeGreaterThan(0);
 		});
 
-		it('clear keeps only the generation counter', async () => {
+		it('clear keeps only the seed state', async () => {
 			const replay = create({ maxTopics: 5 });
 			await publishAt(replay, 1000, 'a');
 			await publishAt(replay, 2000, 'b');
-			const before = Math.max(await replay.currentEpoch('a'), await replay.currentEpoch('b'));
+			const before = await replay.currentEpoch('a');
 			await replay.clear();
 			const [, left] = await client.redis.scan('0', 'MATCH', client.key('replay:*'));
-			expect(left).toEqual([client.key('replay:generation:{replay-topics}')]);
+			expect(left).toEqual([client.key('replay:seed:{replay-topics}')]);
 			await publishAt(replay, 3000, 'a');
-			expect(await replay.currentEpoch('a')).toBeGreaterThan(before);
+			expect(await replay.currentEpoch('a')).not.toBe(before);
 		});
 
 		it('clearTopic counts as a use and registers the topic', async () => {

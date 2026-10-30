@@ -390,7 +390,7 @@ describeIntegration('redis replay (integration)', () => {
 		});
 	});
 
-	describe('maxTopics and generations (real Lua)', () => {
+	describe('maxTopics and epochs (real Lua)', () => {
 		for (const storage of ['sortedset', 'stream']) {
 			it(`${storage}: evicts the least recently published topic and never reuses its epoch`, async () => {
 				const r = createReplay(client, { storage, size: 5, maxTopics: 2 });
@@ -410,51 +410,51 @@ describeIntegration('redis replay (integration)', () => {
 				expect(await client.redis.zcard(client.key('replay:topics:{replay-topics}'))).toBe(2);
 
 				await r.publish(platform, 'b', 'created', { id: 2 });
-				expect(await r.currentEpoch('b')).toBeGreaterThan(bEpoch);
+				expect(await r.currentEpoch('b')).not.toBe(bEpoch);
 				platform.reset();
 				await r.resumeHook()({}, { lastSeenSeqs: { b: 1 }, lastSeenEpochs: { b: bEpoch }, platform });
 				expect(platform.sent.some((s) => s.topic === '__replay:b' && s.event === 'rehydrate')).toBe(true);
 			});
 
-			it(`${storage}: raises the generation counter above epochs stored before it`, async () => {
+			it(`${storage}: enrolls topics stored before the upgrade and recreates them under a new epoch`, async () => {
 				await client.redis.set(client.key('replay:seq:{room}'), '50');
 				await client.redis.set(client.key('replay:epoch:{room}'), '2');
 				await client.redis.set(client.key('replay:epoch:{idle}'), '40');
 				const r = createReplay(client, { storage, size: 5, maxTopics: 1 });
 
 				await r.publish(platform, 'fresh', 'created', { id: 1 });
-				expect(Number(await client.redis.hget(client.key('replay:generation:{replay-topics}'), 'next'))).toBeGreaterThan(40);
-				expect(await r.currentEpoch('fresh')).toBeGreaterThan(40);
-				// Never published since the upgrade, so evicted first.
+				expect(await client.redis.hget(client.key('replay:seed:{replay-topics}'), 'seeded')).toBe('1');
+				// Never used since the upgrade, so evicted first.
 				expect(await r.seq('room')).toBe(0);
 
 				await r.publish(platform, 'room', 'created', { id: 1 });
-				expect(await r.currentEpoch('room')).toBeGreaterThan(40);
+				const epoch = await r.currentEpoch('room');
+				expect(epoch).not.toBe(2);
+				expect(Number.isInteger(epoch) && epoch >= 1 && epoch <= 4294967295).toBe(true);
 			});
 		}
 
 		for (const storage of ['sortedset', 'stream']) {
-			it(`${storage}: ranks topics stored before the upgrade by their last access`, async () => {
+			it(`${storage}: keeps a topic stored before the upgrade that is read after it`, async () => {
+				// 'recent' sorts first, so it is the first candidate: only its
+				// read stamp keeps it.
 				await client.redis.set(client.key('replay:seq:{stale}'), '3');
 				await client.redis.set(client.key('replay:seq:{recent}'), '3');
-				await new Promise((resolve) => setTimeout(resolve, 2100));
-				await client.redis.get(client.key('replay:seq:{recent}'));
 				const r = createReplay(client, { storage, size: 5, maxTopics: 2 });
+				await r.since('recent', 0);
 				await r.publish(platform, 'fresh', 'created', { id: 1 });
 				expect(await r.seq('stale')).toBe(0);
 				expect(await r.seq('recent')).toBe(3);
-			}, 10_000);
+			});
 
-			it(`${storage}: a lost counter restarts above every epoch still stored`, async () => {
+			it(`${storage}: a recreated topic draws a new epoch`, async () => {
 				const r = createReplay(client, { storage, size: 5, maxTopics: 10 });
 				await r.publish(platform, 'a', 'created', { id: 1 });
-				// An epoch issued ahead of the clock by a burst, then the counter is lost.
-				const ahead = Date.now() + 3_600_000;
-				await client.redis.set(client.key('replay:epoch:{a}'), String(ahead));
-				await client.redis.del(client.key('replay:generation:{replay-topics}'));
-				const other = createReplay(client, { storage, size: 5, maxTopics: 10 });
-				await other.publish(platform, 'b', 'created', { id: 1 });
-				expect(await other.currentEpoch('b')).toBeGreaterThan(ahead);
+				const before = await r.currentEpoch('a');
+				await client.redis.del(client.key('replay:seq:{a}'));
+				await r.publish(platform, 'a', 'created', { id: 2 });
+				expect(await r.seq('a')).toBe(1);
+				expect(await r.currentEpoch('a')).not.toBe(before);
 			});
 
 			it(`${storage}: a read stamps the topic's use in the same round trip`, async () => {
@@ -473,14 +473,14 @@ describeIntegration('redis replay (integration)', () => {
 			});
 		}
 
-		it('stream: publishIdempotent creates a topic and dedups within its generation', async () => {
+		it('stream: publishIdempotent creates a topic and dedups within its seq space', async () => {
 			const r = createReplay(client, { storage: 'stream', size: 5, maxTopics: 1 });
 			const first = await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' });
 			expect(first).toEqual({ seq: 1, isDuplicate: false });
 			expect(await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' }))
 				.toEqual({ seq: 1, isDuplicate: true });
 			await r.publish(platform, 'other', 'created', { id: 1 });
-			// room was evicted: the retry is published into the new generation.
+			// room was evicted: the retry is published into the new seq space.
 			const retry = await r.publishIdempotent(platform, 'room', 'created', { id: 1 }, { producerId: 'p', requestId: 'r1' });
 			expect(retry).toEqual({ seq: 1, isDuplicate: false });
 		});

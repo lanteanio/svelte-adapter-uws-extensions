@@ -1,27 +1,15 @@
 /**
  * Topic bookkeeping shared by the sorted-set and stream Redis replay
- * backends: the generation counter that hands out per-topic epochs, and the
- * `maxTopics` registry that bounds how many topics keep replay state.
+ * backends: the `maxTopics` registry that bounds how many topics keep replay
+ * state, and the epoch every new seq space is given.
  *
- * Generations. Every epoch a topic is ever given comes from one counter, the
- * `next` field of `replay:generation:{replay-topics}`, which only grows and
- * never falls below the Redis server's clock in milliseconds. A value is
- * therefore never handed out twice, even after the counter itself is lost to
- * a FLUSH or to memory eviction: the next one starts above every value issued
- * before at no more than one per millisecond. That is what lets a topic's keys
- * be deleted - by eviction, by `ttl` expiry or by `clear()` - without a
- * recreated topic coming back under an epoch a client still holds for its
- * predecessor.
- *
- * Seeding. Topics stored before the registry existed are found once per
- * deployment by a scan of the replay keys. One instance holds a lease and
- * scans; the cursor and the highest epoch seen are kept in the counter hash, so
- * a pass that fails resumes where it stopped, and other instances do not scan
- * at all. A topic created while the scan is still running waits for it at most
- * SEED_WAIT_MS and then takes a generation anyway, from the clock floor above.
- * The scan enrolls each existing topic with its last access as Redis tracks it
- * (OBJECT IDLETIME), because neither buffer stores a time per entry, and raises
- * the counter above the highest stored epoch when it completes.
+ * Epochs. As in the adapter, an epoch is an opaque random 32-bit integer,
+ * compared only for equality: it is drawn from the runtime RNG when a topic's
+ * seq space is created or recreated and stored with it, and carries no time
+ * and no count. A recreated topic draws again, and the creating script makes
+ * sure the draw differs from the epoch still stored for the topic, if any.
+ * The accepted failure is a 2^-32 collision with an epoch the topic had before
+ * and no longer stores: one missed reset, never corruption.
  *
  * Registry. `replay:topics:{replay-topics}` is a sorted set of topics scored
  * by last use. It is written only when a topic is created or cleared and when
@@ -35,6 +23,14 @@
  * used topic. Every time is the Redis server's (TIME), so instance clock skew
  * does not reorder topics.
  *
+ * Seeding. Topics stored before the registry existed are enrolled once per
+ * deployment by a scan of the replay keys, at score 0: neither buffer stores a
+ * time per entry, so they rank as least recently used until a publish or read
+ * after the upgrade stamps them. One instance holds a lease and scans; the
+ * cursor is kept in `replay:seed:{replay-topics}`, so a pass that fails resumes
+ * where it stopped, and other instances do not scan. A topic created before
+ * the deployment is seeded waits for the scan at most SEED_WAIT_MS.
+ *
  * @module svelte-adapter-uws-extensions/redis/_replay-topics
  */
 
@@ -44,7 +40,7 @@ import { scanNodes } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { createLruMap } from '../shared/lru-map.js';
 import { MAX_REPLAY_EPOCH_CACHE_TOPICS, REPLAY_READ_USE_INTERVAL_MS } from '../shared/caps.js';
-import { now, randomUuid, setTimer, clearTimer } from '../shared/runtime.js';
+import { now, randomUuid, randomU32, setTimer, clearTimer } from '../shared/runtime.js';
 
 /** Registry entries checked per eviction round. */
 const EVICTION_BATCH = 16;
@@ -56,7 +52,10 @@ const EVICTION_BATCH = 16;
  */
 const EVICTION_ROUNDS = 4;
 
-/** How long a topic creation waits for a running seed scan before going on. */
+/**
+ * How long a topic creation in an unseeded deployment waits for the seed scan,
+ * so the cap counts the existing topics; it then goes on without them.
+ */
 const SEED_WAIT_MS = 2_000;
 
 /** Seed lease; extended on every scanned batch. */
@@ -65,6 +64,20 @@ const SEED_LEASE_MS = 30_000;
 /** A process that lost the lease, or failed, tries again at most this often. */
 const SEED_RETRY_MS = 10_000;
 
+/**
+ * The epoch a new seq space takes: the drawn value, unless that equals the
+ * epoch still stored for the topic, in which case the next value (wrapping
+ * within 1 .. 2^32 - 1). Returned as text, as stored.
+ */
+export const FRESH_EPOCH = `
+local function freshEpoch(epochKey, drawn)
+  if redis.call('get', epochKey) == drawn then
+    return string.format('%.0f', tonumber(drawn) % 4294967295 + 1)
+  end
+  return drawn
+end
+`;
+
 /** Server time in ms, read by every script that stamps a use. */
 const NOW_MS = `
 local serverTime = redis.call('time')
@@ -72,19 +85,17 @@ local nowMs = tonumber(serverTime[1]) * 1000 + math.floor(tonumber(serverTime[2]
 `;
 
 /**
- * Reserve a generation and record the topic as used now. Returns `{0, 0}`
- * when the counter is missing and ARGV[4] does not allow creating it, else
- * `{generation, seeded, topic1, score1, ...}` with the lowest-scored registry
- * entries when the registry holds more than `maxTopics` topics. The reserving
- * topic is never a candidate: its score can tie the lowest one, and skipping
- * it then would leave the store over the cap.
+ * Record the topic as used now. Returns `{seeded, topic1, score1, ...}` with
+ * the lowest-scored registry entries when the registry holds more than
+ * `maxTopics` topics. The reserving topic is never a candidate: its score can
+ * tie the lowest one, and skipping it then would leave the store over the cap.
  *
- * KEYS[1] = generation hash, KEYS[2] = registry
- * ARGV[1] = topic, ARGV[2] = maxTopics, ARGV[3] = batch, ARGV[4] = '1' to create the counter
+ * KEYS[1] = seed state hash, KEYS[2] = registry
+ * ARGV[1] = topic, ARGV[2] = maxTopics, ARGV[3] = batch
  */
 const RESERVE_SCRIPT = `
 -- REPLAY_TOPIC_RESERVE
-local generationKey = KEYS[1]
+local seedKey = KEYS[1]
 local registryKey = KEYS[2]
 local topic = ARGV[1]
 local maxTopics = tonumber(ARGV[2])
@@ -92,30 +103,21 @@ local batch = tonumber(ARGV[3])
 if maxTopics == nil or batch == nil then
   return redis.error_reply('REPLAY_TOPIC_RESERVE: maxTopics/batch must be numeric')
 end
-local last = tonumber(redis.call('hget', generationKey, 'next') or '')
-if last == nil and ARGV[4] ~= '1' then
-  return {0, 0}
-end
 ${NOW_MS}
-local generation = nowMs
-if last ~= nil and last >= nowMs then
-  generation = last + 1
-end
-redis.call('hset', generationKey, 'next', generation)
 local seeded = 0
-if redis.call('hget', generationKey, 'seeded') == '1' then
+if redis.call('hget', seedKey, 'seeded') == '1' then
   seeded = 1
 end
 redis.call('zadd', registryKey, nowMs, topic)
 local over = redis.call('zcard', registryKey) - maxTopics
-local reply = {generation, seeded}
+local reply = {seeded}
 if over > 0 then
   if over > batch then
     over = batch
   end
   local candidates = redis.call('zrange', registryKey, 0, over, 'WITHSCORES')
   for i = 1, #candidates, 2 do
-    if #reply >= 2 + over * 2 then
+    if #reply >= 1 + over * 2 then
       break
     end
     if candidates[i] ~= topic then
@@ -239,112 +241,96 @@ return 1
  * Take or extend the seed lease. Returns 2 when the deployment is already
  * seeded, 1 when this token holds the lease, 0 when another live one does.
  *
- * KEYS[1] = generation hash
+ * KEYS[1] = seed state hash
  * ARGV[1] = token, ARGV[2] = lease ms
  */
 const SEED_LEASE_SCRIPT = `
 -- REPLAY_SEED_LEASE
-local generationKey = KEYS[1]
-if redis.call('hget', generationKey, 'seeded') == '1' then
+local seedKey = KEYS[1]
+if redis.call('hget', seedKey, 'seeded') == '1' then
   return 2
 end
 ${NOW_MS}
-local owner = redis.call('hget', generationKey, 'lease')
-local untilMs = tonumber(redis.call('hget', generationKey, 'leaseUntil') or '')
+local owner = redis.call('hget', seedKey, 'lease')
+local untilMs = tonumber(redis.call('hget', seedKey, 'leaseUntil') or '')
 if owner and owner ~= ARGV[1] and untilMs ~= nil and untilMs > nowMs then
   return 0
 end
-redis.call('hset', generationKey, 'lease', ARGV[1], 'leaseUntil', nowMs + tonumber(ARGV[2]))
+redis.call('hset', seedKey, 'lease', ARGV[1], 'leaseUntil', nowMs + tonumber(ARGV[2]))
 return 1
 `;
 
 /**
- * Record one scanned batch: enroll its topics (an already registered topic
- * keeps its score), raise the epoch floor, store the node's next cursor and
- * extend the lease. Returns 0 when the lease is no longer this token's.
+ * Record one scanned batch: enroll its topics at score 0 (an already
+ * registered topic keeps its score), store the node's next cursor and extend
+ * the lease. Returns 0 when the lease is no longer this token's.
  *
- * KEYS[1] = generation hash, KEYS[2] = registry
+ * KEYS[1] = seed state hash, KEYS[2] = registry
  * ARGV[1] = token, ARGV[2] = lease ms, ARGV[3] = node, ARGV[4] = next cursor
- * ('done' when the node is finished), ARGV[5] = highest epoch in the batch,
- * then pairs of topic and idle seconds (-1 = unknown)
+ * ('done' when the node is finished), then the topics
  */
 const SEED_PROGRESS_SCRIPT = `
 -- REPLAY_SEED_PROGRESS
-local generationKey = KEYS[1]
+local seedKey = KEYS[1]
 local registryKey = KEYS[2]
-if redis.call('hget', generationKey, 'lease') ~= ARGV[1] then
+if redis.call('hget', seedKey, 'lease') ~= ARGV[1] then
   return 0
 end
 ${NOW_MS}
-for i = 6, #ARGV, 2 do
-  local idle = tonumber(ARGV[i + 1])
-  local score = 0
-  if idle ~= nil and idle >= 0 then
-    score = nowMs - idle * 1000
-  end
-  redis.call('zadd', registryKey, 'NX', score, ARGV[i])
+for i = 5, #ARGV do
+  redis.call('zadd', registryKey, 'NX', 0, ARGV[i])
 end
-local floor = tonumber(ARGV[5]) or 0
-local current = tonumber(redis.call('hget', generationKey, 'floor') or '0') or 0
-if floor > current then
-  redis.call('hset', generationKey, 'floor', ARGV[5])
-end
-redis.call('hset', generationKey, 'cursor:' .. ARGV[3], ARGV[4])
-redis.call('hset', generationKey, 'leaseUntil', nowMs + tonumber(ARGV[2]))
+redis.call('hset', seedKey, 'cursor:' .. ARGV[3], ARGV[4])
+redis.call('hset', seedKey, 'leaseUntil', nowMs + tonumber(ARGV[2]))
 return 1
 `;
 
 /**
- * Finish seeding: raise the counter above every stored epoch and the clock,
- * mark the deployment seeded and drop the scan state. Returns the registry
- * size, or -1 when the lease is no longer this token's.
+ * Finish seeding: mark the deployment seeded and drop the scan state. Returns
+ * the registry size, or -1 when the lease is no longer this token's.
  *
- * KEYS[1] = generation hash, KEYS[2] = registry
+ * KEYS[1] = seed state hash, KEYS[2] = registry
  * ARGV[1] = token
  */
 const SEED_FINISH_SCRIPT = `
 -- REPLAY_SEED_FINISH
-local generationKey = KEYS[1]
-if redis.call('hget', generationKey, 'lease') ~= ARGV[1] then
+local seedKey = KEYS[1]
+if redis.call('hget', seedKey, 'lease') ~= ARGV[1] then
   return -1
 end
-${NOW_MS}
-local next = math.max(tonumber(redis.call('hget', generationKey, 'next') or '0') or 0, tonumber(redis.call('hget', generationKey, 'floor') or '0') or 0, nowMs)
-redis.call('hset', generationKey, 'next', next, 'seeded', '1')
-local fields = redis.call('hkeys', generationKey)
-for i = 1, #fields do
-  if fields[i] == 'lease' or fields[i] == 'leaseUntil' or fields[i] == 'floor' or string.sub(fields[i], 1, 7) == 'cursor:' then
-    redis.call('hdel', generationKey, fields[i])
-  end
-end
+redis.call('del', seedKey)
+redis.call('hset', seedKey, 'seeded', '1')
 return redis.call('zcard', KEYS[2])
 `;
 
 /**
- * Reset a topic's seq space under a new generation: the buffer is dropped,
- * the counter restarts at 0 (kept, so the next publish continues under this
- * generation instead of taking another) and the epoch and use stamp are set.
+ * Reset a topic's seq space under a new epoch: the buffer is dropped, the
+ * counter restarts at 0 (kept, so the next publish continues under this epoch
+ * instead of drawing another) and the epoch and use stamp are set. Returns the
+ * epoch stored, which differs from the one it replaces.
  *
  * KEYS[1] = seq, KEYS[2] = buffer, KEYS[3] = epoch, KEYS[4] = use stamp
- * ARGV[1] = generation, ARGV[2] = ttl seconds (0 = none)
+ * ARGV[1] = drawn epoch (1 .. 2^32 - 1), ARGV[2] = ttl seconds (0 = none)
  */
 const CLEAR_TOPIC_SCRIPT = `
 -- REPLAY_CLEAR_TOPIC
 local ttl = tonumber(ARGV[2])
 if ttl == nil or tonumber(ARGV[1]) == nil then
-  return redis.error_reply('REPLAY_CLEAR_TOPIC: generation/ttl must be numeric')
+  return redis.error_reply('REPLAY_CLEAR_TOPIC: epoch/ttl must be numeric')
 end
 ${NOW_MS}
+${FRESH_EPOCH}
+local epoch = freshEpoch(KEYS[3], ARGV[1])
 redis.call('unlink', KEYS[2])
 redis.call('set', KEYS[1], '0')
-redis.call('set', KEYS[3], ARGV[1])
+redis.call('set', KEYS[3], epoch)
 redis.call('set', KEYS[4], nowMs)
 if ttl > 0 then
   redis.call('expire', KEYS[1], ttl)
   redis.call('expire', KEYS[3], ttl)
   redis.call('expire', KEYS[4], ttl)
 end
-return 1
+return tonumber(epoch)
 `;
 
 /**
@@ -381,7 +367,7 @@ function nodeName(redis, node, index) {
  */
 export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, onSeeded }) {
 	const redis = client.redis;
-	const generationKey = client.key('replay:generation:{replay-topics}');
+	const seedKey = client.key('replay:seed:{replay-topics}');
 	const registryKey = client.key('replay:topics:{replay-topics}');
 	const seqPrefix = client.key('replay:seq:{');
 	const epochPrefix = client.key('replay:epoch:{');
@@ -393,6 +379,12 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 		epoch: (topic) => client.key('replay:epoch:{' + topic + '}'),
 		used: (topic) => client.key('replay:used:{' + topic + '}')
 	};
+
+	// An epoch for a new seq space: random, 1 .. 2^32 - 1 (0 is the baseline
+	// that means "no seq space").
+	function drawEpoch() {
+		return (randomU32() % 4294967295) + 1;
+	}
 
 	// Last read stamp this process sent per topic, bounded like the epoch cache.
 	const readStamps = createLruMap(MAX_REPLAY_EPOCH_CACHE_TOPICS);
@@ -409,13 +401,13 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 
 	async function runSeed() {
 		const token = randomUuid();
-		if (Number(await evalCached(redis, SEED_LEASE_SCRIPT, 1, generationKey, token, SEED_LEASE_MS)) !== 1) return;
+		if (Number(await evalCached(redis, SEED_LEASE_SCRIPT, 1, seedKey, token, SEED_LEASE_MS)) !== 1) return;
 		const pattern = client.key('replay:*');
 		const nodes = scanNodes(redis);
 		for (let index = 0; index < nodes.length; index++) {
 			const node = nodes[index];
 			const name = nodeName(redis, node, index);
-			let cursor = (await redis.hget(generationKey, 'cursor:' + name)) ?? '0';
+			let cursor = (await redis.hget(seedKey, 'cursor:' + name)) ?? '0';
 			while (cursor !== 'done') {
 				const [next, found] = await node.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
 				const topics = new Set();
@@ -424,37 +416,14 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 					if (key.startsWith(seqPrefix)) topics.add(key.slice(seqPrefix.length, -1));
 					else if (key.startsWith(epochPrefix)) topics.add(key.slice(epochPrefix.length, -1));
 				}
-				const list = [...topics];
-				const pairs = [];
-				let floor = 0;
-				if (list.length > 0) {
-					// Asked of the node that returned the keys, which owns their
-					// slots. OBJECT IDLETIME is the last access Redis tracks; it
-					// fails under an LFU memory policy (or an ACL without it), and
-					// such a topic then ranks as oldest (-1).
-					const pipe = node.pipeline();
-					for (const t of list) {
-						pipe.object('IDLETIME', keys.seq(t));
-						pipe.get(keys.epoch(t));
-					}
-					const results = await pipe.exec();
-					for (let i = 0; i < list.length; i++) {
-						const [idleErr, idle] = results[2 * i];
-						const [epochErr, epoch] = results[2 * i + 1];
-						if (epochErr) throw epochErr;
-						const value = parseInt(epoch, 10);
-						if (Number.isSafeInteger(value) && value > floor) floor = value;
-						pairs.push(list[i], !idleErr && Number.isInteger(idle) ? idle : -1);
-					}
-				}
 				const nextCursor = String(next) === '0' ? 'done' : String(next);
-				const kept = await evalCached(redis, SEED_PROGRESS_SCRIPT, 2, generationKey, registryKey,
-					token, SEED_LEASE_MS, name, nextCursor, floor, ...pairs);
+				const kept = await evalCached(redis, SEED_PROGRESS_SCRIPT, 2, seedKey, registryKey,
+					token, SEED_LEASE_MS, name, nextCursor, ...topics);
 				if (Number(kept) !== 1) return;
 				cursor = nextCursor;
 			}
 		}
-		const enrolled = Number(await evalCached(redis, SEED_FINISH_SCRIPT, 2, generationKey, registryKey, token));
+		const enrolled = Number(await evalCached(redis, SEED_FINISH_SCRIPT, 2, seedKey, registryKey, token));
 		if (enrolled >= 0) onSeeded?.(enrolled);
 	}
 
@@ -495,35 +464,31 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 	}
 
 	/**
-	 * Take a fresh generation for `topic`, record the topic as used and, when
-	 * the registry is over `maxTopics`, evict the least recently used topics.
-	 * Eviction failures do not fail the caller: the topic's own write still
-	 * happens and the next creation retries the eviction.
+	 * Record `topic` as used and, when the registry is over `maxTopics`, evict
+	 * the least recently used topics. Eviction failures do not fail the caller:
+	 * the topic's own write still happens and the next creation retries.
 	 *
 	 * @param {string} topic
-	 * @returns {Promise<number>}
+	 * @returns {Promise<void>}
 	 */
 	async function reserve(topic) {
-		const call = (create) => withBreaker(b, () =>
-			evalCached(redis, RESERVE_SCRIPT, 2, generationKey, registryKey, topic, maxTopics, EVICTION_BATCH, create));
-		let reply = await call('0');
-		if (Number(reply[0]) === 0) {
-			// No counter: an unseeded deployment, or one whose counter was lost.
-			// Give the seed scan a bounded head start so the counter can start
-			// above the stored epochs, then create it from the clock floor.
+		const reply = await withBreaker(b, () =>
+			evalCached(redis, RESERVE_SCRIPT, 2, seedKey, registryKey, topic, maxTopics, EVICTION_BATCH));
+		let candidates = reply.slice(1);
+		if (Number(reply[0]) !== 1) {
+			// Not seeded: give the scan a bounded head start so the existing
+			// topics count toward the cap, then read the candidates again.
 			await boundedWait(kickSeed(), SEED_WAIT_MS);
-			reply = await call('1');
+			candidates = await withBreaker(b, () =>
+				evalCached(redis, CANDIDATES_SCRIPT, 1, registryKey, maxTopics, EVICTION_BATCH, topic));
 		}
-		if (Number(reply[1]) !== 1) kickSeed();
-		if (reply.length > 2) {
+		if (candidates.length > 0) {
 			try {
-				await withBreaker(b, () => evict(reply.slice(2), topic));
+				await withBreaker(b, () => evict(candidates, topic));
 			} catch {
-				// Over the cap until the next creation evicts; the reserved
-				// generation is still valid.
+				// Over the cap until the next creation evicts.
 			}
 		}
-		return Number(reply[0]);
 	}
 
 	/**
@@ -542,7 +507,7 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 	}
 
 	/**
-	 * Reset a topic's seq space under a fresh generation.
+	 * Reset a topic's seq space under a new epoch.
 	 *
 	 * @param {string} topic
 	 * @param {string} bufKey - the calling backend's buffer key
@@ -550,14 +515,13 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 	 * @returns {Promise<number>} the new epoch
 	 */
 	async function clearTopic(topic, bufKey, ttl) {
-		const generation = await reserve(topic);
-		await withBreaker(b, () => evalCached(redis, CLEAR_TOPIC_SCRIPT, 4,
-			keys.seq(topic), bufKey, keys.epoch(topic), keys.used(topic), generation, ttl));
-		return generation;
+		await reserve(topic);
+		return Number(await withBreaker(b, () => evalCached(redis, CLEAR_TOPIC_SCRIPT, 4,
+			keys.seq(topic), bufKey, keys.epoch(topic), keys.used(topic), drawEpoch(), ttl)));
 	}
 
 	return {
-		keys, generationKey, registryKey, reserve, clearTopic, readStampDue,
+		keys, seedKey, registryKey, reserve, clearTopic, readStampDue, drawEpoch,
 		touchCommand: () => evalCachedName(redis, TOUCH_SCRIPT)
 	};
 }

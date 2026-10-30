@@ -6,7 +6,7 @@
  * SETSLOT handover MIGRATEs them together: the seq counter and its buffer
  * arrive contiguous on the new owner and the epoch is unchanged, so a resume
  * gap-fills as before. The dangerous case is a handover that drops the keys
- * (the new owner starts seq at 1): the publish Lua sets a new generation
+ * (the new owner starts seq at 1): the publish Lua sets a new epoch
  * atomically with re-populating the space, so a client holding the pre-reset
  * epoch is cold-rehydrated instead of being served the new shard's seq numbering
  * (1, 2, ...) as if it continued the old one.
@@ -183,13 +183,13 @@ describe('replay epoch across a topic slot migration (cluster)', () => {
 		// SETSLOT NODE without MIGRATE on populated keys, or a wipe). The epoch
 		// key is NOT dropped here, mirroring a real reshard where only the data
 		// keys went missing - the point under test is that the next publish on
-		// the empty seq space restarts at 1 under a new generation, set in the
+		// the empty seq space restarts at 1 under a new epoch, set in the
 		// same script as the first write.
 		await client.redis.unlink(seqKey, bufKey);
 
 		// New owner issues seq 1, 2 for the same topic. Their seq numbers sit
 		// BELOW the client's lastSeenSeq of 3, so a naive gap-fill would skip
-		// them and the client would silently lose state. The new generation on
+		// them and the client would silently lose state. The new epoch on
 		// the fresh seq space is what forces a cold rehydrate instead.
 		await replay.publish(platform, topic, 'created', { id: 4 });
 		await replay.publish(platform, topic, 'created', { id: 5 });

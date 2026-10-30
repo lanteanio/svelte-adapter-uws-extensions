@@ -20,7 +20,7 @@
  */
 
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
-import { createReplayTopics, parseMaxTopics } from './_replay-topics.js';
+import { createReplayTopics, parseMaxTopics, FRESH_EPOCH } from './_replay-topics.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
@@ -52,10 +52,10 @@ import { defineOptions, option } from '../shared/options.js';
  * ARGV[5] = event
  * ARGV[6] = data (JSON-encoded)
  * ARGV[7] = hashFieldTTL supported (1 = per-field HPEXPIRE, 0 = whole-hash EXPIRE)
- * ARGV[8] = generation for a fresh seq space (0 = none reserved yet)
+ * ARGV[8] = drawn epoch for a fresh seq space (0 = none yet)
  *
  * Returns {isDuplicate (1|0), seq}, or {-1, 0} without writing anything when
- * the seq space is fresh and no generation was passed.
+ * the seq space is fresh and no epoch was passed.
  *
  * The entry stores `event`, `data`, and a `v` version discriminator. The topic
  * is NOT stored: it is already encoded in the per-topic stream key, so writing
@@ -67,9 +67,9 @@ import { defineOptions, option } from '../shared/options.js';
  * Generation-safe dedup: the dedup VALUE is `epoch:seq`, not a bare seq, so a hit
  * is honored only while the topic still has a seq space under that same epoch.
  * If the seq space reset (expiry, eviction or clearTopic) between the original
- * publish and a retry, the cached seq belongs to a dead generation - returning
+ * publish and a retry, the cached seq belongs to a dead seq space - returning
  * it would point the client at an unrelated entry in the new numbering. Such a
- * request is re-published into the current generation exactly once (and its
+ * request is re-published into the current seq space exactly once (and its
  * dedup value re-stamped). A legacy bare-seq value (no `:`) is honored only
  * while the topic has never reset (epoch 0) and its seq space still exists. The
  * dedup field carries a per-field TTL (HPEXPIRE) when the server supports it
@@ -77,7 +77,7 @@ import { defineOptions, option } from '../shared/options.js';
  * the whole hash's TTL sliding forever; older servers fall back to the
  * whole-hash EXPIRE (no per-field bound, but no regression).
  *
- * A fresh seq space takes the reserved generation as its epoch (see
+ * A fresh seq space takes the drawn epoch (see
  * PUBLISH_SCRIPT below for the rationale).
  */
 const IDMP_PUBLISH_SCRIPT = `
@@ -93,10 +93,11 @@ local idmpTtl = tonumber(ARGV[4])
 local event = ARGV[5]
 local data = ARGV[6]
 local hexpire = ARGV[7] == '1'
-local generation = tonumber(ARGV[8])
-if maxSize == nil or ttl == nil or idmpTtl == nil or generation == nil then
-  return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl/generation must be numeric')
+local drawn = tonumber(ARGV[8])
+if maxSize == nil or ttl == nil or idmpTtl == nil or drawn == nil then
+  return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl/epoch must be numeric')
 end
+${FRESH_EPOCH}
 
 local live = redis.call('exists', seqKey) == 1
 -- The epoch stays text for the dedup value: number formatting of a large
@@ -123,12 +124,12 @@ if cached and live then
 end
 
 if not live then
-  if generation == 0 then
+  if drawn == 0 then
     return {-1, 0}
   end
   redis.call('unlink', bufKey)
-  redis.call('set', epochKey, ARGV[8])
-  epochText = ARGV[8]
+  epochText = freshEpoch(epochKey, ARGV[8])
+  redis.call('set', epochKey, epochText)
 end
 local seq = redis.call('incr', seqKey)
 local id = seq .. '-0'
@@ -167,10 +168,10 @@ return {0, seq}
  * ARGV[2] = ttl seconds (0 = no expiry)
  * ARGV[3] = event
  * ARGV[4] = data (JSON-encoded)
- * ARGV[5] = generation for a fresh seq space (0 = none reserved yet)
+ * ARGV[5] = drawn epoch for a fresh seq space (0 = none yet)
  *
  * Returns the new sequence number, or -1 without writing anything when the
- * seq space is fresh and no generation was passed.
+ * seq space is fresh and no epoch was passed.
  *
  * The entry stores `event`, `data`, and a `v` version discriminator; the topic
  * lives in the per-topic stream key, so storing it per entry is a redundant
@@ -179,8 +180,8 @@ return {0, seq}
  *
  * A missing seq key means the seq space is fresh (brand-new topic, or one
  * whose keys expired or were evicted), so the numbering restarts: the topic
- * takes the reserved generation as its epoch in the same atomic script, a
- * value no topic has held before. A resuming client holding an earlier epoch
+ * takes the drawn epoch in the same atomic script, an opaque random value
+ * different from the epoch still stored for the topic. A resuming client holding an earlier epoch
  * then mismatches and re-reads instead of trusting an offset into the
  * restarted numbering. A stale stream left in the slot is dropped first; its
  * top id would otherwise refuse the restarted ids.
@@ -194,17 +195,17 @@ local maxSize = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local event = ARGV[3]
 local data = ARGV[4]
-local generation = tonumber(ARGV[5])
-if maxSize == nil or ttl == nil or generation == nil then
-  return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl/generation must be numeric')
+local drawn = tonumber(ARGV[5])
+if maxSize == nil or ttl == nil or drawn == nil then
+  return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl/epoch must be numeric')
 end
-
+${FRESH_EPOCH}
 if redis.call('exists', seqKey) == 0 then
-  if generation == 0 then
+  if drawn == 0 then
     return -1
   end
   redis.call('unlink', bufKey)
-  redis.call('set', epochKey, ARGV[5])
+  redis.call('set', epochKey, freshEpoch(epochKey, ARGV[5]))
 end
 local seq = redis.call('incr', seqKey)
 local id = seq .. '-0'
@@ -324,11 +325,11 @@ export function createStreamReplay(client, options = {}) {
 		return client.key('replay:streambuf:{' + topic + '}');
 	}
 
-	// Per-topic seq-space generation. Same hash tag as seq:/buf: so all keys
-	// for one topic co-locate on one slot (the publish eval touches all of
-	// them). Its value comes from the shared generation counter, so the key may
-	// expire or be evicted with the rest of the topic: a recreated topic takes
-	// a generation no client has seen.
+	// Per-topic seq-space epoch. Same hash tag as seq:/buf: so all keys for
+	// one topic co-locate on one slot (the publish eval touches all of them).
+	// Its value is an opaque random draw made when the seq space is created,
+	// so the key may expire or be evicted with the rest of the topic: a
+	// recreated topic draws again.
 	function epochKey(topic) {
 		return client.key('replay:epoch:{' + topic + '}');
 	}
@@ -456,13 +457,14 @@ export function createStreamReplay(client, options = {}) {
 					evalCached(redis, IDMP_PUBLISH_SCRIPT, 5, ik, sk, bk, ek, uk,
 						requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', 0)
 				);
-				// A fresh seq space answers -1 without writing; reserve its
-				// generation (see publish below) and retry with it.
+				// A fresh seq space answers -1 without writing; register the
+				// topic (see publish below) and retry with a drawn epoch.
 				if (Number(result[0]) === -1) {
-					const generation = await topics.reserve(topic);
+					await topics.reserve(topic);
+					const epoch = topics.drawEpoch();
 					result = await withBreaker(b, () =>
 						evalCached(redis, IDMP_PUBLISH_SCRIPT, 5, ik, sk, bk, ek, uk,
-							requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', generation)
+							requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', epoch)
 					);
 				}
 			} catch (err) {
@@ -514,16 +516,17 @@ export function createStreamReplay(client, options = {}) {
 			let seq;
 			try {
 				// One round trip for a topic that already has a seq space. A
-				// fresh one answers -1 without writing; the topic then takes a
-				// generation (and may evict another topic past maxTopics) and
-				// the write is retried with it.
+				// fresh one answers -1 without writing; the topic is then
+				// registered (and may evict another topic past maxTopics) and
+				// the write is retried with a drawn epoch.
 				seq = Number(await withBreaker(b, () =>
 					evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, 0)
 				));
 				if (seq === -1) {
-					const generation = await topics.reserve(topic);
+					await topics.reserve(topic);
+					const epoch = topics.drawEpoch();
 					seq = Number(await withBreaker(b, () =>
-						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, generation)
+						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, epoch)
 					));
 				}
 			} catch (err) {
@@ -730,14 +733,14 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async clear() {
-			// Drop every topic's keys, the registry included. Only the generation
-			// counter survives: a topic published after the clear takes a
-			// generation above every epoch handed out before it, so a client that
-			// straddled the clear mismatches on resume and rehydrates.
+			// Drop every topic's keys, the registry included; the seed state
+			// stays, so the deployment is not scanned again. A topic published
+			// after the clear draws a new random epoch, so a client that straddled
+			// the clear mismatches on resume and rehydrates.
 			await withBreaker(b, () => scanUnlinkExcept(
 				redis,
 				client.key('replay:*'),
-				(k) => k === topics.generationKey,
+				(k) => k === topics.seedKey,
 				async () => {}
 			));
 			epochCache.clear();
@@ -745,7 +748,7 @@ export function createStreamReplay(client, options = {}) {
 
 		async clearTopic(topic) {
 			// One script resets the counter to 0, drops the stream and sets the
-			// epoch to a fresh generation; the next publish continues under it
+			// epoch to a new random draw; the next publish continues under it
 			// (see the sorted-set backend).
 			epochCache.set(topic, await topics.clearTopic(topic, bufKey(topic), ttl));
 		},
@@ -793,7 +796,7 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		/**
-		 * Current stored generation of a topic's seq space (baseline 0 when it
+		 * Current stored epoch of a topic's seq space (baseline 0 when it
 		 * has never reset). The resume hook compares this to the client's
 		 * presented epoch.
 		 * @param {string} topic
