@@ -18,9 +18,14 @@ export interface PubSubBusOptions {
 	 * missed messages (also without a preceding `degraded`), and on the
 	 * other instances after this one's relays were dropped, through one
 	 * `recovered` envelope it relays on this topic when its breaker recovers
-	 * or after its next successful relay. Such an event waits one second so
-	 * the requests of several instances merge into it, and goes through the
-	 * `degradationPolicy` like every `recovered` event.
+	 * or after its next successful relay. Such an event waits one second,
+	 * extended by each request that arrives meanwhile, up to ten seconds, and
+	 * refetch events are at least ten seconds apart.
+	 *
+	 * Every bus with a breaker on the same platform and topic, a sharded bus
+	 * included, announces through one shared announcer: one `degraded` when
+	 * the first of their breakers leaves healthy, one `recovered` when the
+	 * last is healthy again.
 	 *
 	 * @default '__realtime'
 	 */
@@ -45,7 +50,9 @@ export interface PubSubBusOptions {
 	 * policy's precomputed client mitigation alongside the `degraded` event and de-herds
 	 * the push, so connected clients act on the recommendation (go read-only, retry after
 	 * N ms, show a banner) spread across the cooldown instead of all retrying at t+0.
-	 * Requires a `breaker`.
+	 * Requires a `breaker`. When several buses announce on one platform and
+	 * topic, the policy of the first one activated with a policy shapes every
+	 * event until that bus is deactivated.
 	 */
 	degradationPolicy?: DegradationPolicy;
 

@@ -153,13 +153,30 @@ on its `degradation` store).
 In an asymmetric partition, where one instance loses Redis and the others keep
 it, the clients on both sides are therefore asked to refetch.
 
-A `recovered` event that asks for a refetch waits one second, and the reports
-that arrive meanwhile merge into it. After an outage every instance saw, each
-instance relays a request; a client gets one refetch event, not one per
-instance. When the breaker's own `recovered` event asks for one, that event
-waits too; one that does not goes out at once, and a refetch event follows if
-requests arrive. A breaker that opens again during the wait drops the event,
-and its next recovery carries the request.
+A `recovered` event that asks for a refetch waits one second, and every report
+that arrives meanwhile merges into it and extends the wait by another second.
+After an outage every instance saw, each instance relays a request; a client
+gets one refetch event, not one per instance. The wait never exceeds ten
+seconds, and two refetch events are at least ten seconds apart: an instance
+that keeps dropping relays, for example while its relay queue sheds under
+overload, makes the clients of the other instances reload at most once every
+ten seconds, and no client stays stale longer than that after a loss was
+reported. When the breaker's own `recovered` event asks for a refetch, that
+event waits one second but not for the spacing; one that does not goes out at
+once, and a refetch event follows if requests arrive. A breaker that opens
+again during the wait drops the event, and its next recovery carries the
+request.
+
+Every bus with a breaker on one platform and topic shares one announcer, so
+the pub/sub bus and the sharded bus, or two pub/sub buses, never publish
+competing events. It listens to all of their breakers: one `degraded` when the
+first leaves healthy, one `recovered` when the last is healthy again, and none
+while any is open. Their refetch reports merge into the same events. The
+degradation policy of the first bus attached with one (in activation order)
+shapes every event; a different policy passed to a bus attached later applies
+only once the earlier bus is deactivated. When the bus whose breaker kept the
+clients degraded is deactivated and the remaining breakers are healthy, the
+announcer publishes `recovered`.
 
 Every `recovered` event goes through the degradation policy: its `recovery`
 fields and `recoveryJitterMs` apply, and an event outside a breaker transition
@@ -170,9 +187,9 @@ refetch-only ones included. The bookkeeping is two flags per bus, set on the
 failure paths; a successful relay flush checks one of them.
 
 The sharded bus does the same when it is given a `breaker`, on the fixed topic
-`__realtime` (the pub/sub bus's default `systemChannel`): it publishes
-`degraded` and `recovered` events for its breaker, without a degradation
-policy, and follows the shard channel of `__realtime` (`channelPrefix` plus
+`__realtime` (the pub/sub bus's default `systemChannel`): it announces its
+breaker with the shared announcer, takes no degradation policy of its own, and
+follows the shard channel of `__realtime` (`channelPrefix` plus
 `shardKey('__realtime')`), where the instances exchange their requests. The
 Redis user needs that channel; a refused subscription is reported once as
 `EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL` and retried. The sharded bus does not

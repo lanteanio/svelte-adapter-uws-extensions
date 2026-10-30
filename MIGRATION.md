@@ -1178,9 +1178,12 @@ messages, and an instance whose relays were dropped publishes one
 breaker recovers or after its next successful relay, so their clients get such
 a frame too. A client that treated every `recovered` frame as the end of its
 own instance's outage now also sees one without a `degraded` before it. A
-frame that asks for a refetch is published one second late, so requests from
-several instances merge into it; that includes a breaker `recovered` frame
-whose policy sets `refetch: true`. A degradation policy whose `recovery`
+frame that asks for a refetch is published at least one second late, so
+requests from several instances merge into it, and at most one such frame per
+ten seconds; a breaker `recovered` frame whose policy sets `refetch: true`
+waits the one second too. Buses with a breaker on one platform and topic
+announce together: one `degraded` / `recovered` per transition of all their
+breakers, shaped by the first attached bus's policy. A degradation policy whose `recovery`
 envelope sets `refetch` keeps its value, and its `recovery` fields and
 `recoveryJitterMs` apply to every `recovered` frame. `pubsub_recovered_total`
 counts the refetch-only frames too, so it no longer pairs with

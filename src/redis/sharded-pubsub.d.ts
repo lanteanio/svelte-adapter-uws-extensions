@@ -39,7 +39,9 @@ export interface ShardedBusOptions {
 	/**
 	 * Circuit breaker instance. With one, the bus publishes `degraded` /
 	 * `recovered` events for it on the `__realtime` topic, local to this
-	 * worker, and a `recovered` event carries `recovery: { refetch: true }`
+	 * worker, through the announcer it shares with every other bus on the
+	 * platform and topic (one event per transition of all their breakers,
+	 * shaped by a pub/sub bus's `degradationPolicy`), and a `recovered` event carries `recovery: { refetch: true }`
 	 * when messages may have been lost here or on another instance. It
 	 * follows the shard channel of `__realtime` for the requests the
 	 * instances exchange. Subscribe connections to `__realtime` yourself,
