@@ -990,8 +990,11 @@ describe('redis pubsub bus', () => {
 		it('does not re-fire onDegraded on broken -> probing', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30 });
 			let degradedCalls = 0;
+			// Without a systemChannel the bus does not probe the breaker itself,
+			// so it stays probing until a caller decides.
 			const bus = createPubSubBus(client, {
 				breaker,
+				systemChannel: null,
 				onDegraded: () => { degradedCalls++; }
 			});
 			await bus.activate(platform);
@@ -1010,8 +1013,11 @@ describe('redis pubsub bus', () => {
 		it('does not re-fire onDegraded on probing -> broken', async () => {
 			const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 30 });
 			let degradedCalls = 0;
+			// Without a systemChannel the bus does not probe the breaker itself,
+			// so it stays probing until a caller decides.
 			const bus = createPubSubBus(client, {
 				breaker,
+				systemChannel: null,
 				onDegraded: () => { degradedCalls++; }
 			});
 			await bus.activate(platform);

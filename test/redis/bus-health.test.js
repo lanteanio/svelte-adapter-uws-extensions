@@ -11,6 +11,7 @@ import { createDegradationPolicy } from '../../src/shared/degradation.js';
 import { SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../src/shared/redis-subscriber.js';
 import { HINT_HOLD_MS, HINT_MAX_HOLD_MS } from '../../src/shared/delivery-hints.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { createMetrics } from '../../src/prometheus/index.js';
 
 const request = (instanceId) => JSON.stringify({ instanceId, topic: '__realtime', event: 'recovered', data: { at: 1, recovery: { refetch: true } }, s: false });
 
@@ -101,20 +102,20 @@ describe('shared health announcer', () => {
 		expect(refetches(p)).toHaveLength(1);
 	});
 
-	it('uses the policy of the first bus that has one, and the next once that one leaves', async () => {
+	it('uses the policy of the most recently attached bus that has one, and the earlier once that one leaves', async () => {
 		const breaker = createCircuitBreaker({ failureThreshold: 1 });
 		const p = mockPlatform();
 		const first = createPubSubBus(client, { breaker, channel: 'one', degradationPolicy: policy('First') });
 		const second = createPubSubBus(client, { breaker, channel: 'two', degradationPolicy: policy('Second') });
 		await first.activate(p);
 		await second.activate(p);
-		cleanups.push(async () => { await second.deactivate(); breaker.destroy(); });
+		cleanups.push(async () => { await first.deactivate(); breaker.destroy(); });
 		breaker.failure();
-		expect(frames(p, 'degraded').map((f) => f.data.mitigation.bannerCopy)).toEqual(['First unavailable.']);
+		expect(frames(p, 'degraded').map((f) => f.data.mitigation.bannerCopy)).toEqual(['Second unavailable.']);
 		breaker.reset();
-		await first.deactivate();
+		await second.deactivate();
 		breaker.failure();
-		expect(frames(p, 'degraded').map((f) => f.data.mitigation.bannerCopy)).toEqual(['First unavailable.', 'Second unavailable.']);
+		expect(frames(p, 'degraded').map((f) => f.data.mitigation.bannerCopy)).toEqual(['Second unavailable.', 'First unavailable.']);
 	});
 
 	it('announces the recovery when the bus whose breaker was open leaves', async () => {
@@ -186,5 +187,167 @@ describe('shared health announcer', () => {
 		expect(vi.getTimerCount()).toBe(0);
 		await hold();
 		expect(p.published).toEqual([]);
+	});
+	it('publishes one refetch event for an outage that also cost the subscriber its channel', async () => {
+		const p = mockPlatform();
+		const subs = [];
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const bus = createPubSubBus({ ...client, duplicate: (o) => { const d = client.duplicate(o); subs.push(d); return d; } }, { breaker });
+		await bus.activate(p);
+		await tick();
+		cleanups.push(async () => { await bus.deactivate(); breaker.destroy(); });
+		p.reset();
+		breaker.failure();
+		subs.at(-1)._listeners.get(SUBSCRIBER_RESTORING)();
+		subs.at(-1)._listeners.get(SUBSCRIBER_RESTORED)();
+		breaker.reset();
+		await vi.advanceTimersByTimeAsync(100);
+		await client.redis.publish('uws:pubsub', request('peer-1'));
+		await vi.advanceTimersByTimeAsync(200);
+		await client.redis.publish('uws:pubsub', request('peer-2'));
+		await vi.advanceTimersByTimeAsync(HINT_MAX_HOLD_MS * 2);
+		expect(frames(p, 'recovered')).toHaveLength(1);
+		expect(refetches(p)).toHaveLength(1);
+	});
+
+	it('recovers a breaker no traffic passes through by probing its bus connection', async () => {
+		const first = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const idle = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const { p } = await both([first, idle]);
+		first.failure();
+		idle.failure();
+		await vi.advanceTimersByTimeAsync(200);
+		first.reset();
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(idle.state).toBe('healthy');
+		expect(frames(p, 'degraded')).toHaveLength(1);
+		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+
+	it('keeps probing a failing connection at the breaker reset timeout and stops once healthy', async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const pings = [];
+		let fail = true;
+		const ping = client.redis.ping;
+		client.redis.ping = async () => { pings.push(Date.now()); if (fail) throw new Error('down'); return 'PONG'; };
+		cleanups.push(() => { client.redis.ping = ping; });
+		const { p } = await both([breaker, breaker]);
+		breaker.failure();
+		await vi.advanceTimersByTimeAsync(350);
+		expect(pings.length).toBe(3);
+		fail = false;
+		await vi.advanceTimersByTimeAsync(150);
+		expect(breaker.state).toBe('healthy');
+		const settled = pings.length;
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(pings.length).toBe(settled);
+		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+
+	it('takes over the outage of a bus left behind by a reload, with the new policy', async () => {
+		const p = mockPlatform();
+		const staleBreaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const stale = createPubSubBus(client, { breaker: staleBreaker, channel: 'one', degradationPolicy: policy('Old') });
+		await stale.activate(p);
+		await tick();
+		staleBreaker.failure();
+		// The reload creates a new breaker and bus; the old one is never deactivated.
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const bus = createPubSubBus(client, { breaker, channel: 'two', degradationPolicy: policy('New') });
+		await bus.activate(p);
+		await tick();
+		cleanups.push(async () => { await bus.deactivate(); await stale.deactivate(); breaker.destroy(); staleBreaker.destroy(); });
+		await vi.advanceTimersByTimeAsync(500);
+		expect(staleBreaker.state).toBe('healthy');
+		expect(frames(p, 'recovered').map((f) => f.data.recovery.bannerCopy)).toEqual(['New back.']);
+		p.reset();
+		breaker.failure();
+		breaker.reset();
+		await hold();
+		expect(frames(p, 'degraded').map((f) => f.data.mitigation.bannerCopy)).toEqual(['New unavailable.']);
+		expect(frames(p, 'recovered').map((f) => f.data.recovery.bannerCopy)).toEqual(['New back.']);
+	});
+
+	it('detaches a bus whose connection ended for good', async () => {
+		const p = mockPlatform();
+		const ended = mockRedisClient();
+		const first = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const second = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 100 });
+		const live = createPubSubBus(client, { breaker: first, channel: 'one' });
+		const gone = createPubSubBus(ended, { breaker: second, channel: 'two' });
+		await live.activate(p);
+		await gone.activate(p);
+		await tick();
+		cleanups.push(async () => { await live.deactivate(); await gone.deactivate(); first.destroy(); second.destroy(); });
+		p.reset();
+		first.failure();
+		second.failure();
+		ended.redis.status = 'end';
+		first.reset();
+		await vi.advanceTimersByTimeAsync(500);
+		expect(second.state).toBe('probing');
+		expect(frames(p, 'recovered')).toHaveLength(1);
+	});
+
+	it('counts each published event once in a registry the buses share', async () => {
+		const p = mockPlatform();
+		const metrics = createMetrics();
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const one = createPubSubBus(client, { breaker, metrics, channel: 'one' });
+		const two = createPubSubBus(client, { breaker, metrics, channel: 'two' });
+		await one.activate(p);
+		await two.activate(p);
+		cleanups.push(async () => { await one.deactivate(); await two.deactivate(); breaker.destroy(); });
+		breaker.failure();
+		breaker.reset();
+		const text = String(await metrics.serialize());
+		expect(text).toMatch(/^pubsub_degraded_total 1$/m);
+		expect(text).toMatch(/^pubsub_recovered_total 1$/m);
+	});
+
+	it('joins the announcer of the platform a bus wrapped', async () => {
+		const p = mockPlatform();
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const sh = createShardedBus(client, { breaker });
+		const ps = createPubSubBus(client, { breaker, degradationPolicy: policy('Live updates') });
+		await sh.activate(p);
+		await tick();
+		await ps.activate(sh.wrap(p));
+		await tick();
+		cleanups.push(async () => { await ps.deactivate(); await sh.deactivate(); breaker.destroy(); });
+		p.reset();
+		breaker.failure();
+		breaker.reset();
+		await hold();
+		expect(frames(p, 'degraded').map((f) => f.data.mitigation?.bannerCopy)).toEqual(['Live updates unavailable.']);
+		expect(frames(p, 'recovered')).toHaveLength(1);
+		// And the other way round.
+		const q = mockPlatform();
+		const other = createCircuitBreaker({ failureThreshold: 1 });
+		const ps2 = createPubSubBus(client, { breaker: other, channel: 'other' });
+		const sh2 = createShardedBus(client, { breaker: other });
+		await ps2.activate(q);
+		await sh2.activate(ps2.wrap(q));
+		await tick();
+		cleanups.push(async () => { await ps2.deactivate(); await sh2.deactivate(); other.destroy(); });
+		q.reset();
+		other.failure();
+		other.reset();
+		expect(frames(q, 'degraded')).toHaveLength(1);
+		expect(frames(q, 'recovered')).toHaveLength(1);
+	});
+
+	it('publishes recovered for a breaker that was already open when its bus attached', async () => {
+		const p = mockPlatform();
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		breaker.failure();
+		const bus = createPubSubBus(client, { breaker });
+		const pending = bus.activate(p);
+		cleanups.push(async () => { await bus.deactivate(); breaker.destroy(); });
+		breaker.reset();
+		await pending.catch(() => {});
+		await tick();
+		expect(frames(p, 'degraded')).toHaveLength(0);
+		expect(frames(p, 'recovered')).toHaveLength(1);
 	});
 });

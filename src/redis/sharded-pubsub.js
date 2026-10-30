@@ -46,7 +46,7 @@ import {
 	traceEnabled
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
-import { attachHealth, isRefetchRequest } from '../shared/delivery-hints.js';
+import { attachHealth, announcersOf, isRefetchRequest, HEALTH_ANNOUNCERS } from '../shared/delivery-hints.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 import { defineOptions, option } from '../shared/options.js';
 
@@ -159,7 +159,9 @@ export function createShardedBus(client, options = {}) {
 	const hintShard = announcesHealth ? channelFor(HEALTH_TOPIC) : null;
 	const healthSource = announcesHealth ? {
 		breaker: b,
-		relay: (data) => scheduleRelay(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, topic: HEALTH_TOPIC, event: 'recovered', data, s: false }), [HEALTH_TOPIC])
+		relay: (data) => scheduleRelay(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, topic: HEALTH_TOPIC, event: 'recovered', data, s: false }), [HEALTH_TOPIC]),
+		ping: () => client.redis.ping(),
+		gone: () => client.redis.status === 'end'
 	} : null;
 	/** @type {ReturnType<typeof attachHealth> | null} */
 	let hints = null;
@@ -1831,6 +1833,10 @@ export function createShardedBus(client, options = {}) {
 				// The topic-broadcast cluster coordinator; live getter so realtime
 				// detects it on the wrapped seam to fan live.push({ topic }) cluster-wide.
 				get topicBroadcast() { return platform.topicBroadcast; },
+				// The health announcers of the platform this wraps, so a bus
+				// activated with this wrapped platform announces with the buses
+				// activated with the platform itself.
+				get [HEALTH_ANNOUNCERS]() { return announcersOf(platform); },
 				// The adapter's scoped helpers, published through this wrap so they
 				// relay: each forwards its options, the counters default to 1, and
 				// each returns the publish result.

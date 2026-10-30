@@ -35,7 +35,7 @@ import { guardBreaker } from '../shared/breaker-admission.js';
 import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 import { defineOptions, option } from '../shared/options.js';
-import { attachHealth, isRefetchRequest } from '../shared/delivery-hints.js';
+import { attachHealth, announcersOf, isRefetchRequest, HEALTH_ANNOUNCERS } from '../shared/delivery-hints.js';
 
 // How an activation's SUBSCRIBE race ended.
 const SUBSCRIBED = Symbol('subscribed');
@@ -225,7 +225,9 @@ export function createPubSubBus(client, options = {}) {
 		breaker: b,
 		policy: degradationPolicy,
 		relay: (data) => scheduleRelay(JSON.stringify({ instanceId, topic: systemChannel, event: 'recovered', data, s: false }), 1),
-		counted: (event) => (event === 'degraded' ? mDegraded : mRecovered)?.inc()
+		ping: () => client.redis.ping(),
+		gone: () => client.redis.status === 'end',
+		counters: { degraded: mDegraded, recovered: mRecovered }
 	} : null;
 	/** @type {ReturnType<typeof attachHealth> | null} */
 	let hints = null;
@@ -1088,6 +1090,10 @@ export function createPubSubBus(client, options = {}) {
 				// post-wrap assignment propagates; realtime detects it on the wrapped
 				// seam to fan `live.push({ topic })` across instances.
 				get topicBroadcast() { return platform.topicBroadcast; },
+				// The health announcers of the platform this wraps, so a bus
+				// activated with this wrapped platform announces with the buses
+				// activated with the platform itself.
+				get [HEALTH_ANNOUNCERS]() { return announcersOf(platform); },
 				// The adapter's scoped helpers, published through this wrap so they
 				// relay: each forwards its options, the counters default to 1, and
 				// each returns the publish result.

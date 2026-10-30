@@ -4,12 +4,23 @@
  *
  * Every bus with a breaker that publishes on one platform and topic shares one
  * announcer, kept in a `Symbol.for` slot on the platform so bundler-duplicated
- * copies of this module find the same one. It listens to every breaker its
- * buses were given and publishes for all of them together: `degraded` once
- * when the first leaves healthy, `recovered` once when the last is healthy
- * again. The degradation policy of the first attached bus that has one shapes
- * both; a policy passed to a bus attached later is not used while that one
- * stays attached.
+ * copies of this module find the same one. A platform a bus wrapped forwards
+ * the slot of the platform it wraps, so a bus activated with another bus's
+ * wrapped platform joins the same announcer. The announcer listens to every
+ * breaker its buses were given and publishes for all of them together:
+ * `degraded` once when the first leaves healthy, `recovered` once when the last
+ * is healthy again. The degradation policy of the most recently attached bus
+ * that has one shapes both, so a policy edited before a development reload
+ * applies to the bus the reload created.
+ *
+ * A breaker leaves `probing` only on an outcome, so a bus that carries no
+ * traffic would hold its breaker, and with it every other bus's `recovered`,
+ * open for good. While one of its buses' breakers is probing, the announcer
+ * sends that bus's own connection a PING through the breaker, so the breaker
+ * recovers without application traffic. A PING that fails opens the breaker
+ * again, and the breaker's reset timeout spaces the next one; a probe slot
+ * another caller holds is asked again after one second, doubling up to 30 s.
+ * A bus whose connection ended for good is detached.
  *
  * A bus delivers locally while Redis is unreachable and queues nothing for
  * later, so nothing lost is replayed. Instead the clients are asked to reload:
@@ -35,6 +46,7 @@
  */
 
 import { now, monotonicNow, setTimer, clearTimer } from './runtime.js';
+import { guardBreaker } from './breaker-admission.js';
 
 // Frames about this worker's own breakers go to this worker's subscribers
 // only, and they make no monotonic promise.
@@ -48,9 +60,18 @@ export const HINT_HOLD_MS = 1000;
 // than 10 s after a loss was reported.
 export const HINT_MAX_HOLD_MS = 10000;
 
+// A probe slot held by another caller is asked again after these.
+const PROBE_RETRY_MIN_MS = 1000;
+const PROBE_RETRY_MAX_MS = 30000;
+
 const REFETCH = Object.freeze({ refetch: true });
 const NO_TRANSITION = Object.freeze({ from: 'healthy', to: 'healthy' });
-const ANNOUNCERS = Symbol.for('svelte-adapter-uws-extensions.health-announcers.v1');
+
+/**
+ * The platform slot holding its announcers. A bus's wrapped platform
+ * forwards it to the platform it wraps.
+ */
+export const HEALTH_ANNOUNCERS = Symbol.for('svelte-adapter-uws-extensions.health-announcers.v1');
 // Platforms that cannot carry the slot keep their announcers here.
 const FALLBACK = Symbol.for('svelte-adapter-uws-extensions.health-announcers-fallback.v1');
 
@@ -64,13 +85,19 @@ export function isRefetchRequest(parsed) {
 	return parsed.event === 'recovered' && parsed.data?.recovery?.refetch === true;
 }
 
-/** @param {any} platform @returns {Map<string, any>} */
-function announcersOf(platform) {
-	let map = platform[ANNOUNCERS];
+/**
+ * The announcers of `platform`, created on first use. A wrapped platform's
+ * slot getter answers with those of the platform it wraps.
+ *
+ * @param {any} platform
+ * @returns {Map<string, any>}
+ */
+export function announcersOf(platform) {
+	let map = platform[HEALTH_ANNOUNCERS];
 	if (map instanceof Map) return map;
 	map = new Map();
 	try {
-		Object.defineProperty(platform, ANNOUNCERS, { value: map, configurable: true });
+		Object.defineProperty(platform, HEALTH_ANNOUNCERS, { value: map, configurable: true });
 		return map;
 	} catch {
 		/** @type {WeakMap<object, Map<string, any>>} */
@@ -90,14 +117,18 @@ function announcersOf(platform) {
  *   breaker: { state?: string, subscribe(listener: (from: string, to: string) => void): () => void },
  *   policy?: { onDegraded(transition: { from: string, to: string }): any, onRecovered(transition: { from: string, to: string }): any },
  *   relay: (data: object) => void,
- *   counted?: (event: 'degraded' | 'recovered') => void
+ *   ping?: () => unknown,
+ *   gone?: () => boolean,
+ *   counters?: { degraded?: { inc(): void }, recovered?: { inc(): void } }
  * }} HealthSource
  */
 
 /**
  * Attach a bus to the announcer of `platform` and `topic`, creating it on
- * first use. `relay` sends the bus's peer request; `counted` counts each event
- * the announcer publishes.
+ * first use. `relay` sends the bus's peer request; `ping` checks the bus's
+ * own connection; `gone` says whether that connection ended for good;
+ * `counters` count each event the announcer publishes, a counter shared by
+ * several buses once.
  *
  * @param {any} platform
  * @param {string} topic
@@ -121,7 +152,7 @@ export function attachHealth(platform, topic, source) {
 function createAnnouncer(platform, topic, forget) {
 	/** @type {Set<any>} */
 	const handles = new Set();
-	/** @type {Map<any, { unsubscribe: () => void, count: number }>} */
+	/** @type {Map<any, { unsubscribe: () => void, count: number, probe: any, retryMs: number }>} */
 	const breakers = new Map();
 	// Clients were told `degraded` and not yet `recovered`.
 	let degraded = false;
@@ -143,11 +174,19 @@ function createAnnouncer(platform, topic, forget) {
 		return true;
 	}
 	function policy() {
-		for (const h of handles) if (h.source.policy) return h.source.policy;
-		return undefined;
+		let latest;
+		for (const h of handles) if (h.source.policy) latest = h.source.policy;
+		return latest;
 	}
 	function count(event) {
-		for (const h of handles) h.source.counted?.(event);
+		const seen = new Set();
+		for (const h of handles) {
+			const counter = h.source.counters?.[event];
+			if (counter && !seen.has(counter)) {
+				seen.add(counter);
+				counter.inc();
+			}
+		}
 	}
 	function policyOut(kind, transition) {
 		const p = policy();
@@ -172,6 +211,8 @@ function createAnnouncer(platform, topic, forget) {
 		if (timer !== null) {
 			if (due === dueAt) return;
 			clearTimer(timer);
+		} else {
+			windowStart = monotonicNow();
 		}
 		dueAt = due;
 		timer = setTimer(release, Math.max(0, due - monotonicNow()));
@@ -194,14 +235,58 @@ function createAnnouncer(platform, topic, forget) {
 	function announce() {
 		if (!inboundLost || restoring.size > 0 || !allHealthy()) return;
 		const t = monotonicNow();
-		if (timer === null) windowStart = t;
-		let due = Math.min(Math.max(t + HINT_HOLD_MS, lastRefetchAt + HINT_MAX_HOLD_MS), windowStart + HINT_MAX_HOLD_MS);
+		const start = timer === null ? t : windowStart;
+		let due = Math.min(Math.max(t + HINT_HOLD_MS, lastRefetchAt + HINT_MAX_HOLD_MS), start + HINT_MAX_HOLD_MS);
 		// A held `recovered` event is not delayed further.
 		if (held !== null) due = Math.min(due, dueAt);
 		schedule(due);
 	}
 
+	// Probe a breaker that is probing through the connection of one of its
+	// buses. Runs off the breaker's listener, never inside it.
+	function probe(b) {
+		const entry = breakers.get(b);
+		if (!entry) return;
+		entry.probe = null;
+		if (b.state !== 'probing') {
+			entry.retryMs = 0;
+			return;
+		}
+		let pinger = null;
+		for (const h of handles) {
+			if (h.source.breaker !== b || typeof h.source.ping !== 'function') continue;
+			if (h.source.gone?.()) {
+				h.detach();
+				if (!breakers.has(b)) return;
+				continue;
+			}
+			pinger = h;
+			break;
+		}
+		if (pinger === null) return;
+		try {
+			guardBreaker(b);
+		} catch {
+			// Another caller holds the probe slot; its outcome may never come.
+			entry.retryMs = entry.retryMs === 0 ? PROBE_RETRY_MIN_MS : Math.min(entry.retryMs * 2, PROBE_RETRY_MAX_MS);
+			entry.probe = setTimer(() => probe(b), entry.retryMs);
+			entry.probe?.unref?.();
+			return;
+		}
+		entry.retryMs = 0;
+		let reply;
+		try { reply = Promise.resolve(pinger.source.ping()); } catch (err) { reply = Promise.reject(err); }
+		reply.then(() => { /** @type {any} */ (b).success?.(); }, (err) => { /** @type {any} */ (b).failure?.(err); });
+	}
+	function probeSoon(b) {
+		const entry = breakers.get(b);
+		if (!entry || entry.probe !== null) return;
+		entry.probe = setTimer(() => probe(b), 0);
+		entry.probe?.unref?.();
+	}
+
 	function transition(b, from, to) {
+		if (to === 'probing') probeSoon(b);
 		if (from === 'healthy' && to !== 'healthy') {
 			if (degraded) return;
 			degraded = true;
@@ -228,13 +313,14 @@ function createAnnouncer(platform, topic, forget) {
 			const b = source.breaker;
 			let entry = breakers.get(b);
 			if (!entry) {
-				entry = { unsubscribe: b.subscribe((from, to) => transition(b, from, to)), count: 0 };
+				entry = { unsubscribe: b.subscribe((from, to) => transition(b, from, to)), count: 0, probe: null, retryMs: 0 };
 				breakers.set(b, entry);
 			}
 			entry.count++;
 			// A breaker already open when its bus attaches recovers later with a
 			// `recovered` event, as it did when the bus announced alone.
 			if (!healthy(b)) degraded = true;
+			let live = true;
 			const handle = {
 				source,
 				outboundLost: false,
@@ -243,34 +329,40 @@ function createAnnouncer(platform, topic, forget) {
 					source.relay({ at: now(), recovery: REFETCH });
 				},
 				/** Messages from peers may have been missed; announce() says so. */
-				lostInbound() { inboundLost = true; },
-				announce,
+				lostInbound() { if (live) inboundLost = true; },
+				announce() { if (live) announce(); },
 				/** A peer reported dropped relays. */
 				peerLost() {
+					if (!live) return;
 					inboundLost = true;
 					announce();
 				},
 				/** This bus's subscriber lost its channels and is restoring them. */
 				restoreStarted() {
+					if (!live) return;
 					restoring.add(handle);
 					inboundLost = true;
 				},
 				restoreEnded() {
+					if (!live) return;
 					restoring.delete(handle);
 					announce();
 				},
 				/** Relays were dropped. */
-				lostOutbound() { handle.outboundLost = true; },
+				lostOutbound() { if (live) handle.outboundLost = true; },
 				/** A relay succeeded; peers hear of earlier drops now if healthy. */
 				relayed() {
-					if (handle.outboundLost && healthy(b)) handle.relayRequest();
+					if (live && handle.outboundLost && healthy(b)) handle.relayRequest();
 				},
 				detach() {
-					if (!handles.delete(handle)) return;
+					if (!live) return;
+					live = false;
+					handles.delete(handle);
 					restoring.delete(handle);
 					const e = breakers.get(b);
 					if (e && --e.count === 0) {
 						e.unsubscribe();
+						if (e.probe !== null) clearTimer(e.probe);
 						breakers.delete(b);
 					}
 					if (handles.size > 0) {
@@ -291,6 +383,7 @@ function createAnnouncer(platform, topic, forget) {
 				}
 			};
 			handles.add(handle);
+			if (b.state === 'probing') probeSoon(b);
 			return handle;
 		}
 	};

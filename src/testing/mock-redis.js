@@ -939,6 +939,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				return r._info ?? '# Server\nredis_version:7.4.0\n';
 			},
 
+			// PING, as ioredis returns it: 'PONG', or the message when one is given.
+			async ping(message) {
+				return message === undefined ? 'PONG' : String(message);
+			},
+
 			// Redis TIME command. Returns [unixSeconds, microseconds] as strings,
 			// the exact shape real Redis (and ioredis's `.time()`) return, sourced
 			// from the server clock seam. The clock-skew sampler (redis/clock-skew.js)
