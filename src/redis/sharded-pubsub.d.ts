@@ -36,7 +36,15 @@ export interface ShardedBusOptions {
 	subscribersAggregator?: SubscribersAggregatorLike;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
-	/** Circuit breaker instance. */
+	/**
+	 * Circuit breaker instance. With one, the bus publishes `degraded` /
+	 * `recovered` events for it on the `__realtime` topic, local to this
+	 * worker, and a `recovered` event carries `recovery: { refetch: true }`
+	 * when messages may have been lost here or on another instance. It
+	 * follows the shard channel of `__realtime` for the requests the
+	 * instances exchange. Subscribe connections to `__realtime` yourself,
+	 * for example with `platform.subscribe(ws, '__realtime')` in `open`.
+	 */
 	breaker?: CircuitBreaker;
 
 	/**

@@ -8,7 +8,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 78 diagnostic events. Each is one canonical line
+- 79 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -76,6 +76,7 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REGISTRY-SUBSCRIBER](#extensions-err-registry-subscriber) | `redis.registry.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.registry event=redis.registry.subscriber.failed severity=error] The connection-registry subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SHARDED-SUBSCRIBER](#extensions-err-sharded-subscriber) | `redis.sharded-pubsub.subscriber.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.subscriber.failed severity=error] A sharded pub/sub subscriber connection reported an error.` |
 | [EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE](#extensions-err-sharded-channel-reconcile) | `redis.sharded-pubsub.channel-reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.channel-reconcile.failed severity=error] A sharded pub/sub channel could not be re-subscribed on its new owner.` |
+| [EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL](#extensions-err-sharded-health-channel) | `redis.sharded-pubsub.health-channel.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.health-channel.failed severity=error] A sharded pub/sub bus with a breaker could not subscribe the shard channel of its health topic.` |
 | [EXTENSIONS-ERR-SHARDED-RECONCILE](#extensions-err-sharded-reconcile) | `redis.sharded-pubsub.reconcile.failed` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.reconcile.failed severity=error] Sharded pub/sub reconciliation could not refresh slot ownership.` |
 | [EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED](#extensions-err-pubsub-envelope-oversized) | `redis.pubsub.envelope.oversized` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.pubsub event=redis.pubsub.envelope.oversized severity=warn] A publish envelope exceeds maxEnvelopeBytes and was not relayed.` |
 | [EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED](#extensions-err-topic-broadcast-envelope-oversized) | `redis.topic-broadcast.envelope.oversized` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.topic-broadcast event=redis.topic-broadcast.envelope.oversized severity=warn] A topic broadcast reply exceeds maxEnvelopeBytes and was not relayed.` |
@@ -126,7 +127,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 78 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 79 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -168,6 +169,7 @@ Indexed events:
 - `redis.registry.subscriber.failed` - [EXTENSIONS-ERR-REGISTRY-SUBSCRIBER](#extensions-err-registry-subscriber)
 - `redis.sharded-pubsub.subscriber.failed` - [EXTENSIONS-ERR-SHARDED-SUBSCRIBER](#extensions-err-sharded-subscriber)
 - `redis.sharded-pubsub.channel-reconcile.failed` - [EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE](#extensions-err-sharded-channel-reconcile)
+- `redis.sharded-pubsub.health-channel.failed` - [EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL](#extensions-err-sharded-health-channel)
 - `redis.sharded-pubsub.reconcile.failed` - [EXTENSIONS-ERR-SHARDED-RECONCILE](#extensions-err-sharded-reconcile)
 - `redis.pubsub.envelope.oversized` - [EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED](#extensions-err-pubsub-envelope-oversized)
 - `redis.topic-broadcast.envelope.oversized` - [EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED](#extensions-err-topic-broadcast-envelope-oversized)
@@ -797,6 +799,18 @@ the stable ID tag on the line):
 - **Automatic recovery:** Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until every moved channel is subscribed on its owner. A subscriber error retries at once.
 - **Next action:** Check the health of the node that owns the slot attribute (CLUSTER SHARDS or CLUSTER SLOTS), and for NOPERM the Redis user's channel permissions. Delivery resumes on its own once the node accepts the subscription.
 - **Runtime help:** `docs/errors.md#extensions-err-sharded-channel-reconcile`
+- **Runtime sources:** [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)
+
+<a id="extensions-err-sharded-health-channel"></a>
+## `EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL`
+
+- **Code/event:** `redis.sharded-pubsub.health-channel.failed`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.sharded-pubsub event=redis.sharded-pubsub.health-channel.failed severity=error] A sharded pub/sub bus with a breaker could not subscribe the shard channel of its health topic.`
+- **Cause:** SSUBSCRIBE on the shard channel of __realtime (channelPrefix plus shardKey('__realtime')) was refused or timed out, or on a cluster its slot had no reachable owner. The channel is not logged; the slot attribute identifies it.
+- **Consequence:** Refetch requests from other instances do not reach this one, so its clients are not asked to reload after another instance dropped relays. Its own degraded and recovered events and its own requests to the other instances are unaffected. Reported once per failure streak.
+- **Automatic recovery:** Yes: the subscription is retried after 1 s, then with the delay doubling up to 30 s, while the bus is active.
+- **Next action:** Allow the Redis user that channel (for example `&uws:sharded:__realtime` with the default prefix and shard key), and on a cluster check the health of the node that owns the slot attribute.
+- **Runtime help:** `docs/errors.md#extensions-err-sharded-health-channel`
 - **Runtime sources:** [src/redis/sharded-pubsub.js](../src/redis/sharded-pubsub.js)
 
 <a id="extensions-err-sharded-reconcile"></a>

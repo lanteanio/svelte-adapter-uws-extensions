@@ -45,7 +45,8 @@ import {
 	bindTraceContext,
 	traceEnabled
 } from '../shared/trace-context.js';
-import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
+import { openSubscriber, watchLiveness, closeConnection, isReplyError, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
+import { SYSTEM_FRAME, createDeliveryHints, isRefetchRequest } from '../shared/delivery-hints.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 import { defineOptions, option } from '../shared/options.js';
 
@@ -67,6 +68,11 @@ const RECONCILE_RETRY_MAX_MS = 30000;
 // outstanding command absorbs the reply. Inspect that local state off the
 // message path; no additional Redis commands or public options are needed.
 const SHARD_STATE_CHECK_MS = 1000;
+
+// With a breaker, the bus publishes `degraded` / `recovered` on this topic,
+// the pub/sub bus's default systemChannel, and peers exchange refetch
+// requests on its shard channel.
+const HEALTH_TOPIC = '__realtime';
 
 // How an activation step's race against deactivate() ended.
 const CANCELLED = Symbol('cancelled');
@@ -143,6 +149,28 @@ export function createShardedBus(client, options = {}) {
 	function channelFor(topic) {
 		return channelPrefix + shardKey(topic);
 	}
+
+	// Refetch hints after lost delivery (see shared/delivery-hints.js), on a
+	// bus with a breaker. The bus follows the health topic's shard channel
+	// from activation on, where peers send their requests.
+	const announcesHealth = !!(b && typeof b.subscribe === 'function');
+	const hintShard = announcesHealth ? channelFor(HEALTH_TOPIC) : null;
+	const hints = announcesHealth ? createDeliveryHints({
+		breaker: b,
+		channel: HEALTH_TOPIC,
+		platform: () => activePlatform,
+		relay: (data) => scheduleRelay(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, topic: HEALTH_TOPIC, event: 'recovered', data, s: false }), [HEALTH_TOPIC])
+	}) : null;
+	/** @type {(() => void) | null} */
+	let unsubscribeBreaker = null;
+	// An activation failed since the last one that succeeded: the connections
+	// served meanwhile missed what peers published.
+	let activationFailed = false;
+	// The retry of a refused health channel subscription.
+	/** @type {any} */
+	let healthRetry = null;
+	let healthRetryMs = 0;
+	let healthFailing = false;
 
 	const validator = createBusValidator({
 		label: 'sharded bus',
@@ -282,7 +310,10 @@ export function createShardedBus(client, options = {}) {
 	// choice the 0.5.7 cursor always-tick rewrite locked in.
 	const relayQueue = createRelayQueue({
 		submit: flushRelay, metrics: m, prefix: 'sharded_pubsub', maxEnvelopeBytes: validator.maxBytes,
-		dropped: (reason, envelopes, messages) => relayMetrics?.dropped(reason, envelopes, messages),
+		dropped: (reason, envelopes, messages) => {
+			if (reason === 'queue_full') hints?.lostOutbound();
+			relayMetrics?.dropped(reason, envelopes, messages);
+		},
 		overflow: attributes => emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_RELAY_BURST, { attributes })
 	});
 	// UTF-8 uses at most three bytes per UTF-16 code unit. Short strings
@@ -534,6 +565,7 @@ export function createShardedBus(client, options = {}) {
 	function flushRelay(batch) {
 		if (b) {
 			try { b.guard(); } catch {
+				hints?.lostOutbound();
 				if (relayMetrics) relayMetrics.dropped('breaker_open', batch.length, batch.reduce((sum, entry) => sum + entry.count, 0));
 				return;
 			}
@@ -547,6 +579,7 @@ export function createShardedBus(client, options = {}) {
 		}
 		const started = relayMetrics?.start();
 		const failed = (err) => {
+			hints?.lostOutbound();
 			if (relayMetrics) {
 				let messages = 0;
 				for (const topics of commandTopics) messages += topics.length;
@@ -567,8 +600,13 @@ export function createShardedBus(client, options = {}) {
 				}
 				relayMetrics?.settled(started, commands.length, failedEnvelopes, failedMessages);
 				const err = firstCommandError(results);
-				if (err) b?.failure(err);
-				else b?.success();
+				if (err) {
+					hints?.lostOutbound();
+					b?.failure(err);
+				} else {
+					b?.success();
+					hints?.relayed();
+				}
 			}).catch(failed);
 		} catch (err) { failed(err); }
 	}
@@ -594,6 +632,12 @@ export function createShardedBus(client, options = {}) {
 					return;
 				}
 				if (!activePlatform) return;
+				// A peer's refetch request: requests from several peers merge into
+				// one frame, published once this instance's breaker is healthy.
+				if (ch === hintShard && parsed.topic === HEALTH_TOPIC && isRefetchRequest(parsed)) {
+					/** @type {any} */ (hints).peerLost();
+					return;
+				}
 				// Local delivery runs no application code, so a carried trace
 				// context only matters to a tracing provider: with one, delivery is a
 				// consumer operation parented on the producer's context; without one
@@ -851,6 +895,9 @@ export function createShardedBus(client, options = {}) {
 			// A slot with no owner in the map is retried like a refused one.
 			if (ownerId === null || channelNode.get(channel) !== ownerId) moved.push(channel);
 		}
+		// What peers published on a moved channel until it is subscribed again
+		// never arrives.
+		if (moved.length > 0) hints?.restoreStarted();
 		// Re-subscribe the moved channels in parallel for fast recovery; the
 		// topology was refreshed above, so none resolves a stale owner. One
 		// failure does not abort the rest.
@@ -900,6 +947,7 @@ export function createShardedBus(client, options = {}) {
 				if (generation !== subGeneration) return;
 				if (complete) {
 					reconcileRetryMs = 0;
+					hints?.restoreEnded();
 					return;
 				}
 				if (!subReady) return;
@@ -960,6 +1008,10 @@ export function createShardedBus(client, options = {}) {
 			sub.on('smessage', (ch, message) => {
 				if (subStandalone === sub) handleSMessage(ch, message);
 			});
+			if (hints) {
+				sub.on(SUBSCRIBER_RESTORING, () => { if (subStandalone === sub) hints.restoreStarted(); });
+				sub.on(SUBSCRIBER_RESTORED, () => { if (subStandalone === sub) hints.restoreEnded(); });
+			}
 		}
 		subReady = true;
 	}
@@ -1068,6 +1120,7 @@ export function createShardedBus(client, options = {}) {
 		const failed = (err, thrown = err) => {
 			b?.failure(err);
 			if (self.cancelled) throw deactivatedError();
+			activationFailed = true;
 			attempt = null;
 			activePlatform = null;
 			activeTracing = false;
@@ -1116,7 +1169,59 @@ export function createShardedBus(client, options = {}) {
 		attempt = null;
 		active = true;
 		activation = null;
+		if (hintShard !== null) {
+			if (!unsubscribeBreaker) unsubscribeBreaker = b.subscribe(breakerChanged);
+			// Held while active, so an unfollow of a topic on the same shard
+			// channel keeps it.
+			channelRefcounts.set(hintShard, (channelRefcounts.get(hintShard) || 0) + 1);
+			holdHealthChannel();
+		}
+		if (activationFailed) {
+			activationFailed = false;
+			hints?.lostInbound();
+		}
 		b?.success();
+		// The breaker's `recovered` frame carries the hint if it recovered here.
+		hints?.announce();
+	}
+
+	// Subscribe the health topic's shard channel, where peer requests arrive.
+	// Not part of the activation, which subscribes no channel of its own: a
+	// failure is reported once per streak and retried while the bus is active.
+	function holdHealthChannel() {
+		healthRetry = null;
+		if (hintShard === null || !active || subscribedChannels.has(hintShard)) return;
+		const generation = subGeneration;
+		subSubscribe([hintShard]).then(() => {
+			if (generation !== subGeneration) return;
+			healthRetryMs = 0;
+			healthFailing = false;
+			subscribedChannels.add(hintShard);
+		}, (err) => {
+			if (generation !== subGeneration) return;
+			if (!healthFailing) {
+				healthFailing = true;
+				// The channel is built from a topic; cut it should the error repeat it.
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_HEALTH_CHANNEL, {
+					error: err,
+					redact: [hintShard],
+					attributes: { slot: keySlot(hintShard) }
+				});
+			}
+			healthRetryMs = healthRetryMs === 0 ? RECONCILE_RETRY_FIRST_MS : Math.min(healthRetryMs * 2, RECONCILE_RETRY_MAX_MS);
+			healthRetry = setTimer(holdHealthChannel, healthRetryMs);
+			healthRetry.unref?.();
+		});
+	}
+
+	// degraded / recovered for this worker's breaker, from activation until
+	// deactivate().
+	function breakerChanged(from, to) {
+		if (from === 'healthy' && to !== 'healthy') {
+			activePlatform?.publish(HEALTH_TOPIC, 'degraded', { at: now() }, SYSTEM_FRAME);
+		} else if (from !== 'healthy' && to === 'healthy') {
+			hints?.recovered(from, to);
+		}
 	}
 
 	function deactivatedError() {
@@ -1131,6 +1236,18 @@ export function createShardedBus(client, options = {}) {
 		attempt = null;
 		activation = null;
 		if (pending) pending.cancel();
+		if (unsubscribeBreaker) {
+			unsubscribeBreaker();
+			unsubscribeBreaker = null;
+		}
+		hints?.reset();
+		activationFailed = false;
+		if (healthRetry !== null) {
+			clearTimer(healthRetry);
+			healthRetry = null;
+		}
+		healthRetryMs = 0;
+		healthFailing = false;
 		if (!active && !pending) return;
 		active = false;
 		activePlatform = null;

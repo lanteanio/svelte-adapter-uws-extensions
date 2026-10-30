@@ -77,6 +77,7 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	SHARDED_SUBSCRIBER: 'EXTENSIONS-ERR-SHARDED-SUBSCRIBER',
 	SHARDED_CHANNEL_RECONCILE: 'EXTENSIONS-ERR-SHARDED-CHANNEL-RECONCILE',
 	SHARDED_RECONCILE: 'EXTENSIONS-ERR-SHARDED-RECONCILE',
+	SHARDED_HEALTH_CHANNEL: 'EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL',
 	PUBSUB_ENVELOPE_OVERSIZED: 'EXTENSIONS-ERR-PUBSUB-ENVELOPE-OVERSIZED',
 	TOPIC_BROADCAST_ENVELOPE_OVERSIZED: 'EXTENSIONS-ERR-TOPIC-BROADCAST-ENVELOPE-OVERSIZED',
 	PUBSUB_TRACE_OMITTED: 'EXTENSIONS-ERR-PUBSUB-TRACE-OMITTED',
@@ -638,6 +639,16 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'Yes: the reconciliation is retried after 1 s, then with the delay doubling up to 30 s, until every moved channel is subscribed on its owner. A subscriber error retries at once.',
 		nextAction: 'Check the health of the node that owns the slot attribute (CLUSTER SHARDS or CLUSTER SLOTS), and for NOPERM the Redis user\'s channel permissions. Delivery resumes on its own once the node accepts the subscription.',
 		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-channel-reconcile'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.SHARDED_HEALTH_CHANNEL,
+		event: 'redis.sharded-pubsub.health-channel.failed', component: 'runtime.redis.sharded-pubsub', severity: 'error',
+		problemPrefix: 'A sharded pub/sub bus with a breaker could not subscribe the shard channel of its health topic.',
+		cause: 'SSUBSCRIBE on the shard channel of __realtime (channelPrefix plus shardKey(\'__realtime\')) was refused or timed out, or on a cluster its slot had no reachable owner. The channel is not logged; the slot attribute identifies it.',
+		consequence: 'Refetch requests from other instances do not reach this one, so its clients are not asked to reload after another instance dropped relays. Its own degraded and recovered events and its own requests to the other instances are unaffected. Reported once per failure streak.',
+		automaticRecovery: 'Yes: the subscription is retried after 1 s, then with the delay doubling up to 30 s, while the bus is active.',
+		nextAction: 'Allow the Redis user that channel (for example `&uws:sharded:__realtime` with the default prefix and shard key), and on a cluster check the health of the node that owns the slot attribute.',
+		sources: ['src/redis/sharded-pubsub.js'], anchor: 'extensions-err-sharded-health-channel'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.SHARDED_RECONCILE,

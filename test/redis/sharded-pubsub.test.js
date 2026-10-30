@@ -1202,11 +1202,13 @@ describe.each(['follow', 'followBatch'])('sharded %s breaker admission', (method
 			expect(failure).not.toHaveBeenCalled();
 			breaker.reset();
 			await follow();
+			// The breaker's degraded / recovered frames go to __realtime.
+			const chat = () => platform.published.filter((f) => f.topic === 'chat');
 			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 1 }));
-			expect(platform.published).toHaveLength(1);
+			expect(chat()).toHaveLength(1);
 			await bus.unfollow('chat');
 			await client.redis.spublish('uws:sharded:chat', JSON.stringify({ instanceId: 'peer', topic: 'chat', event: 'msg', data: 2 }));
-			expect(platform.published).toHaveLength(1);
+			expect(chat()).toHaveLength(1);
 		} finally {
 			await bus.deactivate();
 			breaker.destroy();
@@ -1217,14 +1219,18 @@ describe.each(['follow', 'followBatch'])('sharded %s breaker admission', (method
 		const client = mockRedisClient();
 		const breaker = createCircuitBreaker({ failureThreshold: 1, resetTimeout: 0 });
 		let resolveSubscribe;
+		// Activation subscribes the health channel; only the follow hangs.
+		let hang = false;
 		const duplicate = client.redis.duplicate.bind(client.redis);
 		client.redis.duplicate = (...args) => {
 			const sub = duplicate(...args);
-			sub.ssubscribe = () => new Promise((resolve) => { resolveSubscribe = resolve; });
+			const ssubscribe = sub.ssubscribe.bind(sub);
+			sub.ssubscribe = (...channels) => hang ? new Promise((resolve) => { resolveSubscribe = resolve; }) : ssubscribe(...channels);
 			return sub;
 		};
 		const bus = createShardedBus(client, { breaker });
 		await bus.activate(mockPlatform());
+		hang = true;
 		try {
 			breaker.failure(new Error('offline'));
 			await settle();
