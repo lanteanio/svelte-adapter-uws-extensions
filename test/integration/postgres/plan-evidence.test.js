@@ -21,7 +21,7 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 		expect(statements.length).toBeGreaterThan(0);
 		expect(statements.some(p => nodes(p.plan).some(n => n.index)), operation).toBe(true);
 	}
-	for (const operation of ['replay.replay.hot', 'replay.replay.cold', 'jobs.claim.hot', 'jobs.claim.cold', 'tasks.claim', 'tasks.reclaim', 'replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup', 'alarms.fail', 'alarms.getExecution', 'alarms.executions', 'alarms.requeue', 'alarms.complete']) {
+	for (const operation of ['replay.replay.hot', 'replay.replay.cold', 'jobs.claim.hot', 'jobs.claim.cold', 'tasks.claim', 'tasks.reclaim', 'replay.cleanup', 'replay.cleanup.size', 'idempotency.cleanup', 'tasks.cleanup', 'deadLetter.evict', 'alarms.fail', 'alarms.getExecution', 'alarms.executions', 'alarms.requeue', 'alarms.complete']) {
 		const statements = report.plans.filter(p => p.operation === operation);
 		expect(statements.length, operation).toBeGreaterThan(0);
 		for (const statement of statements) {
@@ -37,7 +37,7 @@ it('captures real plans, statement I/O and churn across all durable stores in an
 	expect(report.statementStats.records.length).toBeGreaterThan(0);
 	expect(report.statementStats.records.some(r => r.calls > 0 && r.shared_blks_hit > 0)).toBe(true);
 	expect((await client.query('SELECT marker FROM public.plan_jobs')).rows).toEqual([{marker:'preserve-existing'}]);
-	expect(report.storage).toHaveLength(10);
+	expect(report.storage).toHaveLength(11);
 	expect(report.sourceSha256['replay.js']).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.collectorSha256).toMatch(/^[a-f0-9]{64}$/);
 	expect(report.lockfileSha256).toMatch(/^[a-f0-9]{64}$/);

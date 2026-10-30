@@ -27,11 +27,45 @@ describe('PostgreSQL migration contracts', () => {
 	});
 	it('adds bounded dead-letter erasure fences as version 3', () => {
 		const versions = postgresMigrations({ store: 'dead-letter' });
-		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3]);
+		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3, 4]);
+		expect(versions[2].checksum).toBe('5552bd3f6e44ed8eadfe658ff62d7fcaaa44aee25e51cdb87aa2e7f90599fe1b');
 		expect(versions[2].statements).toEqual([
 			'CREATE TABLE IF NOT EXISTS svti_dead_letter_purges (scope TEXT NOT NULL, user_id TEXT NOT NULL, purged_at BIGINT NOT NULL, PRIMARY KEY (scope, user_id))',
 			'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_svti_dead_letter_purges_expiry ON svti_dead_letter_purges (purged_at)'
 		]);
+	});
+	it('adds dead-letter tenant scopes, their counts and the scope index as version 4', () => {
+		const { statements } = postgresMigrations({ store: 'dead-letter' })[3];
+		expect(statements).toHaveLength(4);
+		expect(statements[0]).toBe("ALTER TABLE svti_dead_letter ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT ''::text");
+		expect(statements[1]).toBe('CREATE TABLE IF NOT EXISTS svti_dead_letter_scopes (scope TEXT NOT NULL, records BIGINT NOT NULL, PRIMARY KEY (scope))');
+		expect(statements[3]).toBe('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_svti_dead_letter_scope ON svti_dead_letter (scope, svti_dead_letter_id)');
+		// One locked block replaces the function, recreates the four statement
+		// triggers and rebuilds the counts from the rows already present.
+		expect(statements[2]).toMatch(/^DO \$migration\$ BEGIN LOCK TABLE svti_dead_letter IN SHARE ROW EXCLUSIVE MODE; CREATE OR REPLACE FUNCTION svti_dead_letter_scopes_sync\(\) RETURNS trigger LANGUAGE plpgsql AS \$sync\$/);
+		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_insert AFTER INSERT ON svti_dead_letter REFERENCING NEW TABLE AS added FOR EACH STATEMENT');
+		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_update AFTER UPDATE ON svti_dead_letter REFERENCING OLD TABLE AS removed NEW TABLE AS added FOR EACH STATEMENT');
+		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_delete AFTER DELETE ON svti_dead_letter REFERENCING OLD TABLE AS removed FOR EACH STATEMENT');
+		expect(statements[2]).toContain('CREATE OR REPLACE TRIGGER svti_dead_letter_scopes_truncate AFTER TRUNCATE ON svti_dead_letter FOR EACH STATEMENT');
+		expect(statements[2]).toMatch(/DELETE FROM svti_dead_letter_scopes; INSERT INTO svti_dead_letter_scopes \(scope, records\) SELECT scope, count\(\*\) FROM svti_dead_letter GROUP BY scope; END \$migration\$$/);
+	});
+	it('keeps every generated dead-letter identifier within the PostgreSQL limit for the longest table name', () => {
+		const table = 'a'.repeat(42);
+		const names = postgresMigrations({ store: 'dead-letter', table }).flatMap(entry => entry.statements)
+			.flatMap(statement => [...statement.matchAll(/\bidx_[a-z0-9_]+|\ba{42}_[a-z_]+/g)].map(match => match[0]));
+		expect(names).toContain(table + '_scopes_truncate');
+		for (const name of names) expect(name.length, name).toBeLessThanOrEqual(63);
+	});
+	it('refuses a dead-letter table whose scope-count trigger is disabled', async () => {
+		const client = mockPgClient();
+		await migrate(client, { store: 'dead-letter' });
+		const query = client.query.bind(client);
+		client.query = async (text, ...rest) => {
+			const result = await query(text, ...rest);
+			if (!String(text?.text ?? text).includes('FROM pg_trigger t')) return result;
+			return { ...result, rows: result.rows.map(row => row.name.endsWith('_delete') ? { ...row, enabled: 'D' } : row) };
+		};
+		await expect(validateSchema(client, { store: 'dead-letter' })).rejects.toThrow('missing or incompatible trigger svti_dead_letter_scopes_delete');
 	});
 	it('keeps every generated alarm identifier within the PostgreSQL limit for the longest table name', () => {
 		const table = 'a'.repeat(42);

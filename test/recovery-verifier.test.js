@@ -183,10 +183,10 @@ it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();
 });
 
-it('requires PostgreSQL dead letters and erasure tombstones together', () => {
-	const all = { 'dead-letter': 'svti_dead_letter', 'dead-letter-erasure': 'svti_dead_letter_purges' };
+it('requires PostgreSQL dead letters, erasure tombstones and scope counts together', () => {
+	const all = { 'dead-letter': 'svti_dead_letter', 'dead-letter-erasure': 'svti_dead_letter_purges', 'dead-letter-tenants': 'svti_dead_letter_scopes' };
 	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: all } })).not.toThrow();
-	for (const stores of [{ 'dead-letter': all['dead-letter'] }, { 'dead-letter-erasure': all['dead-letter-erasure'] }]) {
+	for (const stores of [{ 'dead-letter': all['dead-letter'] }, { 'dead-letter-erasure': all['dead-letter-erasure'] }, { 'dead-letter': all['dead-letter'], 'dead-letter-erasure': all['dead-letter-erasure'] }, { 'dead-letter-tenants': all['dead-letter-tenants'] }]) {
 		expect(() => validateConfig({ schemaVersion: 1, postgres: { stores } })).toThrow('incomplete_restore_group');
 	}
 });

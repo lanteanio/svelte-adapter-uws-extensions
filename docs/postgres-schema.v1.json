@@ -82,7 +82,8 @@
 			"subpath": "postgres/dead-letter",
 			"tables": [
 				"svti_dead_letter",
-				"svti_dead_letter_purges"
+				"svti_dead_letter_purges",
+				"svti_dead_letter_scopes"
 			],
 			"restoreTogether": true,
 			"initialization": "first store operation or ready()",
@@ -90,9 +91,10 @@
 			"changeClass": "new store since source release",
 			"additions": [
 				"store table and topic, failed_at, user_id indexes",
-				"version 3: tenant/user erasure tombstones with bounded purged_at pruning"
+				"version 3: tenant/user erasure tombstones with bounded purged_at pruning",
+				"version 4: scope TEXT NOT NULL DEFAULT '' (existing rows share the '' scope); svti_dead_letter_scopes per-scope record counts kept by statement triggers for INSERT, UPDATE, DELETE and TRUNCATE; idx_svti_dead_letter_scope(scope,svti_dead_letter_id)"
 			],
-			"rollbackLimit": "Old writers do not fence racing captures. Stop old writers and drain deliveries before downgrade; preserve captures and tombstones together."
+			"rollbackLimit": "Old writers do not fence racing captures and store their rows in the '' scope. Stop old writers and drain deliveries before downgrade; preserve captures, tombstones and scope counts together."
 		},
 		{
 			"subpath": "postgres/alarm-store",
@@ -133,7 +135,7 @@
 			4
 		],
 		"version3Stores": ["postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
-		"version4Stores": ["postgres/alarm-store"],
+		"version4Stores": ["postgres/dead-letter", "postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true
 	}

@@ -221,6 +221,19 @@ async function validateCatalog(client, schema, known = schema) {
 			const expression = schemaExpression(actual.expression);
 			if (!expected || expression === null || expression !== schemaExpression(expected.expression)) throw new Error(`postgres schema: unexpected or incompatible check ${actual.name}`);
 		}
+		if (!relation.triggers?.length) continue;
+		// Statement triggers that maintain companion state: each must fire for
+		// its event (tgtype carries the event bit, no row/before bits), with its
+		// transition tables, in every session, calling the expected body.
+		const triggers = await client.query(`SELECT t.tgname AS name, t.tgenabled AS enabled, t.tgtype AS type, t.tgoldtable AS old_table, t.tgnewtable AS new_table, p.proname AS function, p.prosrc AS source
+			FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid WHERE t.tgrelid = to_regclass($1) AND NOT t.tgisinternal`, [relation.name]);
+		for (const expected of relation.triggers) {
+			const actual = triggers.rows.find(entry => entry.name === expected.name);
+			if (!actual || !['O', 'A'].includes(actual.enabled) || Number(actual.type) !== expected.type || (actual.old_table ?? null) !== expected.oldTable
+				|| (actual.new_table ?? null) !== expected.newTable || actual.function !== expected.function || actual.source !== expected.source) {
+				throw new Error(`postgres schema: missing or incompatible trigger ${expected.name}`);
+			}
+		}
 	}
 }
 

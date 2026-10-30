@@ -104,8 +104,8 @@ describe('postgres right-to-erasure (purgeUser, integration)', () => {
 
 	describe('dead-letter.purgeUser', () => {
 		const TABLE = 'svti_dlq_forget_it';
-		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges`); await forgetFixtureMigrations(client, [TABLE]); });
-		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges`); await forgetFixtureMigrations(client, [TABLE]); });
+		beforeEach(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges, ${TABLE}_scopes`); await forgetFixtureMigrations(client, [TABLE]); });
+		afterAll(async () => { await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${TABLE}_purges, ${TABLE}_scopes`); await forgetFixtureMigrations(client, [TABLE]); });
 
 		const rec = (u) => ({ webhookId: 'w', topic: 'hooks', event: 'e', data: { user: u }, attempts: 1, error: 'boom', failedAt: 1 });
 

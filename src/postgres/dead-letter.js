@@ -17,9 +17,18 @@
  *     data       JSONB,
  *     attempts   INT    NOT NULL DEFAULT 0,
  *     error      TEXT,
- *     failed_at  BIGINT NOT NULL
+ *     failed_at  BIGINT NOT NULL,
+ *     user_id    TEXT,
+ *     scope      TEXT   NOT NULL DEFAULT ''
  *   )
- *   + index on (topic) and (failed_at)
+ *   + index on (topic), (failed_at), (user_id) and (scope, svti_dead_letter_id)
+ *
+ *   svti_dead_letter_scopes (
+ *     scope   TEXT   PRIMARY KEY,
+ *     records BIGINT NOT NULL
+ *   )
+ *   + statement triggers on svti_dead_letter that keep `records` equal to the
+ *     number of rows per scope for every INSERT, UPDATE, DELETE and TRUNCATE
  *
  *   svti_dead_letter_purges (
  *     scope     TEXT   NOT NULL,
@@ -35,7 +44,13 @@
  * its payload. A fence lives 10 minutes, as in the in-memory store, and expired
  * fences are pruned by the same bounded cleanup passes.
  *
- * Retention uses `max` (oldest captured id first) and optional `ttlMs`.
+ * Retention uses `max` and optional `ttlMs`. Above `max`, cleanup deletes the
+ * oldest ids of the tenant scope holding the most records, so a scope at or
+ * under `max / scopes present` never loses records to another scope's
+ * overflow. `scope` is the tenant scope the erasure fences use (`~` for an
+ * untenanted topic, `''` for a malformed tenant topic and for rows written
+ * before the column existed). Each trim statement reads the per-scope counts
+ * and walks the (scope, id) index, never the whole record table.
  * Writes and periodic maintenance share bounded cleanup transactions; large
  * backlogs drain over multiple passes. Reads exclude expired records even while
  * physical deletion is pending. Replica maintenance uses a per-table lock.
@@ -52,7 +67,7 @@ import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { withBreaker, pgFailure } from './_breaker.js';
 import { createStoreSchema } from './migrations.js';
 import { scheduleCleanup } from './_cleanup.js';
-import { TENANT_TOPIC_NS, tenantTopicSql } from '../shared/tenant-topic.js';
+import { tenantTopicSql, topicTenantScope } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { monotonicNow } from '../shared/runtime.js';
@@ -72,14 +87,16 @@ import { defineOptions, option } from '../shared/options.js';
 /**
  * @typedef {Object} PgDeadLetterOptions
  * @property {string} [table='svti_dead_letter'] - Table name.
- * @property {number} [max=1000] - Retention target (oldest ids evicted in bounded passes).
+ * @property {number} [max=1000] - Retention target. Above it the oldest ids of
+ *   the tenant scope holding the most records are evicted in bounded passes.
  * @property {number} [ttlMs=0] - Drop records older than this many ms (0 = no TTL).
  *   Reads exclude expired rows; bounded write-time and idle cleanup delete them.
  * @property {boolean} [autoMigrate=true] - Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready().
  * @property {number} [cleanupInterval=60000] - Maximum jitter delay between bounded
  *   cleanup passes (ms). 0 disables the timer; write-time cleanup remains.
  * @property {object} [breaker] - Circuit breaker for fault isolation.
- * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total` counter.
+ * @property {object} [metrics] - Prometheus registry for the `dead_letter_added_total`
+ *   and `dead_letter_evicted_total` counters.
  */
 
 const validateOptions = defineOptions({
@@ -121,6 +138,7 @@ export function createDeadLetter(client, options = {}) {
 	const forgetUserId = options.forgetUserId;
 	const table = options.table || 'svti_dead_letter';
 	const purgeTable = table + '_purges';
+	const scopeTable = table + '_scopes';
 	const pkCol = table + '_id';
 	const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 1000;
 	const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs >= 0 ? options.ttlMs : 0;
@@ -136,16 +154,10 @@ export function createDeadLetter(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
+	const mEvicted = m?.counter('dead_letter_evicted_total', 'Dead-letter records evicted by the max cap from the tenant scope holding the most records', ['store']);
 
 	const schema = createStoreSchema(client, 'dead-letter', table, autoMigrate);
 	const ensureTable = schema.ensure;
-
-	function topicScope(topic) {
-		if (typeof topic !== 'string') return null;
-		if (!topic.startsWith(TENANT_TOPIC_NS)) return '~';
-		const end = topic.indexOf('/', TENANT_TOPIC_NS.length);
-		return end > TENANT_TOPIC_NS.length ? topic.slice(TENANT_TOPIC_NS.length, end) : null;
-	}
 
 	// Take the per-identity erasure lock and return the database clock read
 	// after it was granted. The lock key is the fence table's OID (the same
@@ -189,16 +201,31 @@ export function createDeadLetter(client, options = {}) {
 			if (count < limit) break;
 		}
 	}
+	// Fair-share size trim. Each statement reads the per-scope counts (one row
+	// per scope holding records) and deletes the oldest ids of the largest
+	// scope, at most down to the runner-up's count so the next statement can
+	// pick the largest again, through the (scope, id) index. Every deleted row
+	// returns the excess the statement started from, so the loop stops without
+	// a further statement once the excess is gone. Returns the rows evicted.
 	async function trimSize(budget) {
+		let evicted = 0;
 		while (budget.available) {
-			const limit = budget.limit;
-			const count = await budget.remove(`WITH excess AS (
+			const { rows } = await budget.removeReturning(`WITH heaviest AS (
+				SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess,
+				       lead(records) OVER (ORDER BY records DESC, scope) AS runner_up
+				  FROM ${scopeTable} ORDER BY records DESC, scope LIMIT 1
+			), victims AS (
 				SELECT ${pkCol} FROM ${table}
-				WHERE ${pkCol} <= (SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} DESC OFFSET $1 LIMIT 1)
-				ORDER BY ${pkCol} LIMIT $2 FOR UPDATE SKIP LOCKED
-			) DELETE FROM ${table} d USING excess WHERE d.${pkCol} = excess.${pkCol}`, [max, limit]);
-			if (count < limit) break;
+				 WHERE scope = (SELECT scope FROM heaviest)
+				 ORDER BY ${pkCol}
+				 LIMIT (SELECT GREATEST(0, LEAST(excess, $2::bigint, GREATEST(1, records - COALESCE(runner_up, 0)))) FROM heaviest)
+				   FOR UPDATE SKIP LOCKED
+			) DELETE FROM ${table} d USING victims WHERE d.${pkCol} = victims.${pkCol}
+			  RETURNING (SELECT excess FROM heaviest) AS excess`, [max, budget.limit]);
+			evicted += rows.length;
+			if (rows.length === 0 || rows.length >= Number(rows[0].excess)) break;
 		}
+		return evicted;
 	}
 	async function trimPurges(budget) {
 		// Without an extractor purgeUser writes no fences, so the pass would
@@ -220,13 +247,15 @@ export function createDeadLetter(client, options = {}) {
 		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
 		ready: ensureTable, healthy: () => !b || b.isHealthy,
 		success: () => b?.success(), failure: error => pgFailure(b, error),
+		committed: evicted => { if (evicted > 0) mEvicted?.inc({ store: 'postgres' }, evicted); },
 		async work(budget) {
-			const first = ttlFirst ? trimExpired : trimSize;
-			const second = ttlFirst ? trimSize : trimExpired;
+			const expiredFirst = ttlFirst;
 			ttlFirst = !ttlFirst;
-			await first(budget);
-			await second(budget);
+			if (expiredFirst) await trimExpired(budget);
+			const evicted = await trimSize(budget);
+			if (!expiredFirst) await trimExpired(budget);
 			await trimPurges(budget);
+			return evicted;
 		}
 	});
 	const liveRows = ttlMs > 0 ? `failed_at >= (extract(epoch from now()) * 1000)::bigint - ${ttlMs}` : 'TRUE';
@@ -257,15 +286,18 @@ export function createDeadLetter(client, options = {}) {
 				try { const u = forgetUserId(rec); if (typeof u === 'string' && u.length > 0) userId = u; } catch { /* extractor best-effort */ }
 			}
 			// A record with no user, or whose topic is a malformed tenant topic no
-			// purge scope contains, cannot be fenced: one autocommit INSERT.
-			const scope = userId === null ? null : topicScope(rec.topic);
-			const values = [rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId];
+			// purge scope contains, cannot be fenced: one autocommit INSERT. The
+			// row's scope column is the same tenant scope ('' for a malformed
+			// topic) and drives fair-share eviction.
+			const tenantScope = topicTenantScope(rec.topic);
+			const scope = userId === null ? null : tenantScope;
+			const values = [rec.webhookId, rec.topic, rec.event, JSON.stringify(rec.data ?? null), rec.attempts | 0, rec.error, failedAt, userId, tenantScope ?? ''];
 			const res = await withBreaker(b, () => scope === null
 				? client.query(
-					`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
+					`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope)
 					 VALUES ($1, $2, $3, $4, $5, $6,
 					         LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint),
-					         $8) RETURNING ${pkCol}`,
+					         $8, $9) RETURNING ${pkCol}`,
 					values
 				)
 				: withTransaction(client, async (tx) => {
@@ -282,11 +314,12 @@ export function createDeadLetter(client, options = {}) {
 					const startedAt = typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
 						? Math.floor(dbNow - Math.min(dbNow, Math.max(0, monotonicNow() - rec.startedAt)))
 						: dbNow;
-					values.push(scope, startedAt, dbNow);
+					// $9 is the record's scope, which is also the fence scope here.
+					values.push(startedAt, dbNow);
 					return tx.query(
-						`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id)
+						`INSERT INTO ${table} (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope)
 						 SELECT $1::text, $2::text, $3::text, $4::jsonb, $5::integer, $6::text,
-						        LEAST(NULLIF($7::bigint, 0), $11::bigint), $8::text
+						        LEAST(NULLIF($7::bigint, 0), $11::bigint), $8::text, $9::text
 						  WHERE NOT EXISTS (
 						        SELECT 1 FROM ${purgeTable} p
 						         WHERE p.scope = $9 AND p.user_id = $8
@@ -300,7 +333,7 @@ export function createDeadLetter(client, options = {}) {
 			if (res.rows.length === 0) return null;
 			// The row is committed. Retention trims are best-effort from here:
 			// cleanup failure must not reject an acknowledged capture and cause a
-			// duplicate retry. Mirrors the Redis backend's evict().catch().
+			// duplicate retry.
 			await cleanup.run().catch(() => { /* capture already persisted */ });
 			mAdded?.inc({ topic: mt(rec.topic) });
 			return String(res.rows[0][pkCol]);

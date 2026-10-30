@@ -41,7 +41,7 @@ describe('PostgreSQL schema contracts', () => {
 			await postgresReadiness(runtime, [component]);
 			expect(component.status()).toEqual({ state: 'ready', error: null });
 		} finally { await runtime.end(); }
-		expect((await client.query('SELECT version FROM svti_schema_migrations WHERE table_name = $1 ORDER BY version', [table])).rows).toEqual((store === 'alarm-store' ? [1, 2, 3, 4] : store === 'tasks' || store === 'dead-letter' ? [1, 2, 3] : [1, 2]).map(version => ({ version })));
+		expect((await client.query('SELECT version FROM svti_schema_migrations WHERE table_name = $1 ORDER BY version', [table])).rows).toEqual((store === 'alarm-store' || store === 'dead-letter' ? [1, 2, 3, 4] : store === 'tasks' ? [1, 2, 3] : [1, 2]).map(version => ({ version })));
 	});
 
 	it('serializes independent cold starts without duplicate ledger entries', async () => {
@@ -50,8 +50,8 @@ describe('PostgreSQL schema contracts', () => {
 		await validateSchema(client, { store: 'jobs' });
 	});
 	it('supports the longest permitted table names without truncated generated identifiers', async () => {
-		for (const store of ['tasks', 'replay']) {
-			const table = store + '_'.repeat(42 - store.length);
+		for (const [store, prefix] of [['tasks', 'tasks'], ['replay', 'replay'], ['dead-letter', 'dead_letter']]) {
+			const table = prefix + '_'.repeat(42 - prefix.length);
 			await migrate(client, { store, table });
 			await validateSchema(client, { store, table });
 		}

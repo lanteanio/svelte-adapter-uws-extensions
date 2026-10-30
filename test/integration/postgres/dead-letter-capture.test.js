@@ -13,7 +13,8 @@ describe('dead-letter capture survives database housekeeping errors', () => {
 		store?.destroy();
 		breaker?.destroy();
 		breaker = undefined;
-		await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_purges`);
+		await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_purges, ${table}_scopes`);
+		await client.query(`DROP FUNCTION IF EXISTS ${table}_scopes_sync()`);
 		await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1', [table]);
 		await client.query('DROP FUNCTION IF EXISTS svti_dlq_trim_failure()');
 		await client.query('DROP FUNCTION IF EXISTS svti_dlq_pause_capture()');
@@ -24,7 +25,7 @@ describe('dead-letter capture survives database housekeeping errors', () => {
 		store = createDeadLetter(client, { table, max: 1, ttlMs: 60000, cleanupInterval: 0, breaker });
 		await store.add(record());
 		await client.query(`TRUNCATE ${table}`);
-		const fragment = phase === 'ttl' ? 'failed_at <' : 'OFFSET';
+		const fragment = phase === 'ttl' ? 'failed_at <' : 'runner_up';
 		await client.query(`CREATE FUNCTION svti_dlq_trim_failure() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			IF strpos(current_query(), '${fragment}') > 0 THEN

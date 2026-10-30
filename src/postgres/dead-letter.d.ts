@@ -6,7 +6,10 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export interface PgDeadLetterOptions {
 	/** Table name. @default 'svti_dead_letter' */
 	table?: string;
-	/** Retention target; oldest ids are evicted in bounded passes. @default 1000 */
+	/**
+	 * Retention target. Above it the oldest ids of the tenant scope holding the
+	 * most records are evicted in bounded passes. @default 1000
+	 */
 	max?: number;
 	/**
 	 * Drop records older than this many ms (0 = no TTL). Reads exclude expired
@@ -23,7 +26,7 @@ export interface PgDeadLetterOptions {
 	cleanupInterval?: number;
 	/** Circuit breaker for fault isolation. */
 	breaker?: CircuitBreaker;
-	/** Prometheus registry for the `dead_letter_added_total` counter. */
+	/** Prometheus registry for the `dead_letter_added_total` and `dead_letter_evicted_total` counters. */
 	metrics?: MetricsRegistry;
 	/**
 	 * Right-to-erasure: extract a record's owning userId at write time into a

@@ -64,8 +64,9 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			env: { ...process.env, RECOVERY_POSTGRES_URL: readerUrl.href }
 		}));
 		expect(report.ok, JSON.stringify(report)).toBe(true);
-		expect(Object.keys(report.postgres.observations)).toHaveLength(11);
-		expect(report.postgres.observations['schema-migrations'].rows).toBe('16');
+		expect(Object.keys(report.postgres.observations)).toHaveLength(12);
+		expect(report.postgres.observations['schema-migrations'].rows).toBe('17');
+		expect(report.postgres.checks).toContainEqual({ scope: 'dead-letter', name: 'scope_counts', ok: true });
 		expect(report.postgres.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: true });
 		expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|private-key/);
 		await expect(reader.query('DELETE FROM svti_tasks')).rejects.toMatchObject({ code: '25006' });
@@ -89,6 +90,10 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			await restored.query("DELETE FROM svti_alarms_generations WHERE topic = 'private-room'");
 			const missingAuthority = await runVerification(config, { postgres: reader });
 			expect(missingAuthority.postgres.checks).toContainEqual({ scope: 'alarms', name: 'generation_authority', ok: false });
+			await restored.query('UPDATE svti_dead_letter_scopes SET records = records + 1');
+			const miscounted = await runVerification(config, { postgres: reader });
+			expect(miscounted.postgres.checks).toContainEqual({ scope: 'dead-letter', name: 'scope_counts', ok: false });
+			await restored.query('UPDATE svti_dead_letter_scopes SET records = records - 1');
 			await restored.query('DELETE FROM svti_replay_seq');
 			const partial = await runVerification(config, { postgres: reader });
 			expect(partial.ok).toBe(false);

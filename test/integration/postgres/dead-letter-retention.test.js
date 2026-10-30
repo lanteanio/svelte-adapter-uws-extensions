@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createPgClient } from '../../../src/postgres/index.js';
 import { createDeadLetter } from '../../../src/postgres/dead-letter.js';
+import { postgresMigrations, validateSchema } from '../../../src/postgres/migrations.js';
 import { createMetrics } from '../../../src/prometheus/index.js';
 import { resetRuntimeEnv, setRuntimeEnv } from '../../../src/shared/runtime.js';
 
@@ -20,15 +21,23 @@ function timers() {
 	return ticks;
 }
 async function physicalCount() { return (await client.query(`SELECT count(*)::int AS n FROM ${table}`)).rows[0].n; }
+// Rows as the store writes them for the untenanted topic 'retained'.
 async function seed(count, expired = false) {
-	await client.query(`INSERT INTO ${table} (topic, failed_at)
-		SELECT 'retained', (extract(epoch from now()) * 1000)::bigint - $2 FROM generate_series(1, $1::int)`, [count, expired ? 3600000 : 0]);
+	await client.query(`INSERT INTO ${table} (topic, failed_at, scope)
+		SELECT 'retained', (extract(epoch from now()) * 1000)::bigint - $2, '~' FROM generate_series(1, $1::int)`, [count, expired ? 3600000 : 0]);
+}
+async function scopeCounts() {
+	return (await client.query(`SELECT scope, records::int AS records FROM ${table}_scopes ORDER BY scope COLLATE "C"`)).rows;
+}
+async function actualCounts() {
+	return (await client.query(`SELECT scope, count(*)::int AS records FROM ${table} GROUP BY scope ORDER BY scope COLLATE "C"`)).rows;
 }
 beforeAll(() => { client = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false }); });
 afterEach(async () => {
 	for (const item of stores.splice(0)) item.destroy();
 	resetRuntimeEnv();
-	await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_purges`);
+	await client.query(`DROP TABLE IF EXISTS ${table}, ${table}_purges, ${table}_scopes`);
+	await client.query(`DROP FUNCTION IF EXISTS ${table}_scopes_sync()`);
 	await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1', [table]);
 	await client.query('DROP FUNCTION IF EXISTS svti_dlq_slow_delete()');
 });
@@ -121,7 +130,7 @@ describe('bounded PostgreSQL dead-letter retention', () => {
 				return {
 					async query(sql, values) {
 						const result = await tx.query(sql, values);
-						if (sql.text?.trim().startsWith('WITH excess AS') && hold) {
+						if (sql.text?.trim().startsWith('WITH heaviest AS') && hold) {
 							hold = false; entered(); await blocked;
 						}
 						return result;
@@ -151,5 +160,67 @@ describe('bounded PostgreSQL dead-letter retention', () => {
 		await client.query(`UPDATE ${table}_purges SET purged_at = (extract(epoch from now()) * 1000)::bigint - 600100`);
 		expect(await dlq.add({ ...record(), data: { user: 'alice' }, startedAt: 0 })).not.toBeNull();
 		expect((await client.query(`SELECT count(*)::int AS n FROM ${table}_purges`)).rows[0].n).toBe(0);
+	});
+});
+
+describe('fair-share PostgreSQL dead-letter eviction', () => {
+	const tenantRecord = (topic, n) => ({ ...record(), topic, data: { n } });
+
+	it('evicts the tenant holding the most records and never one under its share', async () => {
+		const metrics = createMetrics();
+		const dlq = store(client, { max: 10, cleanupInterval: 0, metrics });
+		for (let n = 0; n < 5; n++) await dlq.add(tenantRecord('@t/victim/orders', n));
+		for (let n = 0; n < 30; n++) await dlq.add(tenantRecord('@t/noisy/orders', n));
+		expect((await dlq.list({ topic: '@t/victim/orders' })).map(r => r.data.n)).toEqual([4, 3, 2, 1, 0]);
+		expect((await dlq.list({ topic: '@t/noisy/orders' })).map(r => r.data.n)).toEqual([29, 28, 27, 26, 25]);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 25');
+		expect(await scopeCounts()).toEqual([{ scope: 'noisy', records: 5 }, { scope: 'victim', records: 5 }]);
+	});
+
+	it('keeps the per-scope counts exact for every statement that changes rows', async () => {
+		const dlq = store(client, { max: 1000, cleanupInterval: 0, forgetUserId: r => r.data?.user });
+		await dlq.add({ ...record(), topic: '@t/a/orders', data: { user: 'u1' } });
+		await dlq.add({ ...record(), topic: '@t/a/orders', data: { user: 'u2' } });
+		const removable = await dlq.add({ ...record(), topic: 'orders' });
+		await dlq.add({ ...record(), topic: '@t/' });
+		expect(await scopeCounts()).toEqual([{ scope: '', records: 1 }, { scope: 'a', records: 2 }, { scope: '~', records: 1 }]);
+		expect(await scopeCounts()).toEqual(await actualCounts());
+		expect(await dlq.remove(removable)).toBe(true);
+		expect(await dlq.purgeUser('a', 'u1')).toBe(1);
+		// Writers outside the store are counted the same way.
+		await client.query(`INSERT INTO ${table} (topic, failed_at, scope) SELECT '@t/b/x', 1, 'b' FROM generate_series(1, 3)`);
+		await client.query(`UPDATE ${table} SET scope = 'c' WHERE ${pk} = (SELECT min(${pk}) FROM ${table} WHERE scope = 'b')`);
+		await client.query(`DELETE FROM ${table} WHERE scope = 'b'`);
+		expect(await scopeCounts()).toEqual(await actualCounts());
+		expect((await scopeCounts()).map(r => r.scope)).not.toContain('b');
+		await client.query(`TRUNCATE ${table}`);
+		expect(await scopeCounts()).toEqual([]);
+		await dlq.clear();
+		expect(await scopeCounts()).toEqual([]);
+	});
+
+	it('migrates rows written before the scope column into one scope that pays for overflow first', async () => {
+		// The table as version 3 left it, holding six captures.
+		const versions = postgresMigrations({ store: 'dead-letter', table });
+		await client.query('CREATE TABLE IF NOT EXISTS svti_schema_migrations (table_name TEXT NOT NULL, store TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (table_name, version))');
+		for (const { statements } of versions.slice(0, 3)) for (const statement of statements) await client.query(statement);
+		for (const { version, checksum } of versions.slice(0, 3)) {
+			await client.query('INSERT INTO svti_schema_migrations (table_name, store, version, checksum) VALUES ($1, $2, $3, $4)', [table, 'dead-letter', version, checksum]);
+		}
+		await client.query(`INSERT INTO ${table} (topic, failed_at) SELECT '@t/earlier/orders', i FROM generate_series(1, 6) i`);
+		const dlq = store(client, { max: 8, cleanupInterval: 0 });
+		await dlq.ready();
+		expect(await scopeCounts()).toEqual([{ scope: '', records: 6 }]);
+		for (let n = 0; n < 4; n++) await dlq.add(tenantRecord('@t/fresh/orders', n));
+		expect(await dlq.count({ topic: '@t/fresh/orders' })).toBe(4);
+		expect((await dlq.list({ topic: '@t/earlier/orders' })).map(r => r.failedAt)).toEqual([6, 5, 4, 3]);
+		expect(await scopeCounts()).toEqual([{ scope: '', records: 4 }, { scope: 'fresh', records: 4 }]);
+	});
+
+	it('refuses readiness when a scope-count trigger is disabled', async () => {
+		const dlq = store(client, { cleanupInterval: 0 });
+		await dlq.ready();
+		await client.query(`ALTER TABLE ${table} DISABLE TRIGGER ${table}_scopes_insert`);
+		await expect(validateSchema(client, { store: 'dead-letter', table })).rejects.toThrow(`missing or incompatible trigger ${table}_scopes_insert`);
 	});
 });

@@ -160,7 +160,8 @@
 				"attempts": "integer",
 				"error": "text",
 				"failed_at": "bigint",
-				"user_id": "text"
+				"user_id": "text",
+				"scope": "text"
 			},
 			"indexColumns": [
 				[
@@ -171,6 +172,10 @@
 				],
 				[
 					"user_id"
+				],
+				[
+					"scope",
+					"$id"
 				]
 			],
 			"serialColumn": "$id",
@@ -191,6 +196,20 @@
 				],
 				[
 					"purged_at"
+				]
+			],
+			"restoreGroup": "postgres-dead-letter"
+		},
+		{
+			"id": "dead-letter-tenants",
+			"table": "svti_dead_letter_scopes",
+			"columns": {
+				"scope": "text",
+				"records": "bigint"
+			},
+			"indexColumns": [
+				[
+					"scope"
 				]
 			],
 			"restoreGroup": "postgres-dead-letter"

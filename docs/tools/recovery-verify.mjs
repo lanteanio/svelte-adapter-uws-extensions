@@ -40,7 +40,7 @@ export function validateConfig(config) {
 			return { ...spec, table };
 		});
 		if (Boolean(stores.replay) !== Boolean(stores['replay-sequence'])) fail('incomplete_restore_group');
-		if (Boolean(stores['dead-letter']) !== Boolean(stores['dead-letter-erasure'])) fail('incomplete_restore_group');
+		if (new Set(['dead-letter', 'dead-letter-erasure', 'dead-letter-tenants'].map(id => Boolean(stores[id]))).size !== 1) fail('incomplete_restore_group');
 		if (new Set(['alarms', 'alarm-generations', 'alarm-executions'].map(id => Boolean(stores[id]))).size !== 1) fail('incomplete_restore_group');
 		if (new Set(Object.values(stores)).size !== Object.keys(stores).length) fail('overlapping_tables');
 	}
@@ -111,6 +111,14 @@ export async function verifyPostgres(client, specs, remaining = () => {}) {
 			const authority = sqlName(specs.find(item => item.id === 'replay-sequence').table);
 			const broken = (await query('SELECT EXISTS(SELECT 1 FROM ' + rows + ' r LEFT JOIN ' + authority + ' s USING(topic) WHERE s.topic IS NULL OR s.seq<r.seq OR s.epoch<0) AS broken')).rows[0].broken;
 			check(result, 'replay', 'sequence_authority', !broken);
+		}
+		if (valid.has('dead-letter') && valid.has('dead-letter-tenants')) {
+			remaining();
+			// Fair-share eviction reads these counts: each must equal its scope's rows.
+			const rows = sqlName(specs.find(item => item.id === 'dead-letter').table);
+			const counts = sqlName(specs.find(item => item.id === 'dead-letter-tenants').table);
+			const broken = (await query('SELECT EXISTS(SELECT 1 FROM (SELECT scope, count(*) AS n FROM ' + rows + ' GROUP BY scope) r FULL JOIN ' + counts + ' c USING(scope) WHERE r.n IS DISTINCT FROM c.records) AS broken')).rows[0].broken;
+			check(result, 'dead-letter', 'scope_counts', !broken);
 		}
 		if (valid.has('alarms') && valid.has('alarm-generations')) {
 			const rows = sqlName(specs.find(item => item.id === 'alarms').table);

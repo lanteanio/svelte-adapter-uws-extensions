@@ -33,7 +33,9 @@ function fakePg(nowFn = () => Date.now()) {
 			webhook_id: values[0], topic: values[1], event: values[2],
 			data: values[3], attempts: values[4], error: values[5],
 			failed_at: v === 0 ? dbNow : Math.min(v, dbNow),
-			user_id: values[7] ?? null
+			user_id: values[7] ?? null,
+			// The column default covers a row written without a scope.
+			scope: values[8] ?? ''
 		});
 		return { rows: [{ svti_dead_letter_id: id }], rowCount: 1 };
 	}
@@ -95,7 +97,7 @@ function fakePg(nowFn = () => Date.now()) {
 			// The fenced capture, INSERT ... SELECT ... WHERE <predicate>. The
 			// predicate is evaluated from the SQL text against the fence rows, so
 			// a capture statement without a working fence keeps the payload.
-			const fenced = /^INSERT INTO svti_dead_letter \(webhook_id, topic, event, data, attempts, error, failed_at, user_id\) SELECT \$1::text, \$2::text, \$3::text, \$4::jsonb, \$5::integer, \$6::text, LEAST\(NULLIF\(\$7::bigint, 0\), \$(\d+)::bigint\), \$8::text WHERE (.+) RETURNING svti_dead_letter_id$/.exec(s);
+			const fenced = /^INSERT INTO svti_dead_letter \(webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope\) SELECT \$1::text, \$2::text, \$3::text, \$4::jsonb, \$5::integer, \$6::text, LEAST\(NULLIF\(\$7::bigint, 0\), \$(\d+)::bigint\), \$8::text, \$9::text WHERE (.+) RETURNING svti_dead_letter_id$/.exec(s);
 			if (fenced) {
 				int8(values[6]); int8(values[9]); int8(values[10]);
 				if (!capturePredicate(fenced[2], values)) return { rows: [], rowCount: 0 };
@@ -103,18 +105,25 @@ function fakePg(nowFn = () => Date.now()) {
 			}
 			// Seeding shorthand some tests use to fill the table directly.
 			if (s === 'INSERT INTO svti_dead_letter') return insert(values, nowFn());
-			if (s === 'INSERT INTO svti_dead_letter (webhook_id, topic, event, data, attempts, error, failed_at, user_id) VALUES ($1, $2, $3, $4, $5, $6, LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint), $8) RETURNING svti_dead_letter_id') {
+			if (s === 'INSERT INTO svti_dead_letter (webhook_id, topic, event, data, attempts, error, failed_at, user_id, scope) VALUES ($1, $2, $3, $4, $5, $6, LEAST(NULLIF($7::bigint, 0), (extract(epoch from now()) * 1000)::bigint), $8, $9) RETURNING svti_dead_letter_id') {
 				return insert(values, nowFn());
 			}
-			if (s.startsWith('WITH excess AS')) {
-				const max = values[0];
-				const desc = rows.slice().sort((a, b) => b.svti_dead_letter_id - a.svti_dead_letter_id);
-				const cutoffRow = desc[max]; // (max+1)-th newest, like OFFSET max LIMIT 1
-				if (!cutoffRow) return { rows: [], rowCount: 0 };
-				const before = rows.length;
-				const victims = new Set(rows.filter(r => r.svti_dead_letter_id <= cutoffRow.svti_dead_letter_id).slice(0, values[1]));
+			// The fair-share size trim. The per-scope counts the triggers keep
+			// equal the rows grouped by scope; the statement deletes the oldest
+			// ids of the largest scope (ties to the lowest scope name), at most
+			// down to the runner-up, and returns the starting excess per row.
+			if (s.startsWith('WITH heaviest AS ( SELECT scope, records, (sum(records) OVER ())::bigint - $1::bigint AS excess, lead(records) OVER (ORDER BY records DESC, scope) AS runner_up FROM svti_dead_letter_scopes ORDER BY records DESC, scope LIMIT 1 ), victims AS ( SELECT svti_dead_letter_id FROM svti_dead_letter WHERE scope = (SELECT scope FROM heaviest) ORDER BY svti_dead_letter_id LIMIT (SELECT GREATEST(0, LEAST(excess, $2::bigint, GREATEST(1, records - COALESCE(runner_up, 0)))) FROM heaviest) FOR UPDATE SKIP LOCKED ) DELETE FROM svti_dead_letter d USING victims WHERE d.svti_dead_letter_id = victims.svti_dead_letter_id RETURNING (SELECT excess FROM heaviest) AS excess')) {
+				int8(values[0]); int8(values[1]);
+				const counts = new Map();
+				for (const r of rows) counts.set(r.scope, (counts.get(r.scope) ?? 0) + 1);
+				const ranked = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+				if (ranked.length === 0) return { rows: [], rowCount: 0 };
+				const [[scope, records], runnerUp] = ranked;
+				const excess = rows.length - Number(values[0]);
+				const take = Math.max(0, Math.min(excess, Number(values[1]), Math.max(1, records - (runnerUp?.[1] ?? 0))));
+				const victims = new Set(rows.filter(r => r.scope === scope).sort((a, b) => a.svti_dead_letter_id - b.svti_dead_letter_id).slice(0, take));
 				rows = rows.filter(r => !victims.has(r));
-				return { rows: [], rowCount: before - rows.length };
+				return { rows: [...victims].map(() => ({ excess: String(excess) })), rowCount: victims.size };
 			}
 			if (s.startsWith('WITH expired AS') && s.includes('FROM svti_dead_letter_purges')) {
 				const cutoff = nowFn() - values[0];
@@ -309,7 +318,9 @@ describe('postgres dead-letter store', () => {
 		const first = await store.add(rec());
 		expect(client._rows()).toHaveLength(503);
 		const last = await store.add(rec());
-		expect((await store.list()).map(r => r.id)).toEqual([last, first]);
+		// The seeded rows carry no scope, so they and the captures each keep
+		// their newest record under the shared cap.
+		expect((await store.list()).map(r => r.id)).toEqual([last, String(Number(first) - 1)]);
 	});
 	it('hides expired rows from every reader while a retained backlog awaits deletion', async () => {
 		let now = 100_000;
@@ -338,7 +349,7 @@ describe('postgres dead-letter store', () => {
 		let held = false;
 		client.query = async (sql, values) => {
 			const result = await query(sql, values);
-			if (sql.trim().startsWith('WITH excess AS') && !held) {
+			if (sql.trim().startsWith('WITH heaviest AS') && !held) {
 				held = true; entered(); await blocked;
 			}
 			return result;
@@ -360,7 +371,7 @@ describe('postgres dead-letter store', () => {
 			...base,
 			async query(sql, values) {
 				const s = sql.replace(/\s+/g, ' ').trim();
-				if (s.startsWith('WITH excess AS')) {
+				if (s.startsWith('WITH heaviest AS')) {
 					throw new Error('deadlock detected');
 				}
 				return base.query(sql, values);
@@ -432,6 +443,70 @@ describe('postgres dead-letter store', () => {
 		await vi.advanceTimersByTimeAsync(5_000);
 		expect(client._rows()).toHaveLength(1); // destroyed -> no physical sweep runs
 		expect(await store.count()).toBe(0); // logical expiry still applies
+	});
+});
+
+describe('postgres dead-letter fair-share eviction', () => {
+	let client, store;
+	beforeEach(() => { client = fakePg(); });
+	afterEach(() => store?.destroy());
+
+	it('keeps every record of a tenant under its share while another tenant overflows', async () => {
+		const metrics = createMetrics();
+		store = createDeadLetter(client, { autoMigrate: false, max: 10, cleanupInterval: 0, metrics });
+		for (let n = 0; n < 5; n++) await store.add(rec({ topic: '@t/victim/orders', data: { n } }));
+		for (let n = 0; n < 10; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		expect(await store.count()).toBe(10);
+		expect(await store.count({ topic: '@t/victim/orders' })).toBe(5);
+		// The noisy tenant lost its own oldest records.
+		expect((await store.list({ topic: '@t/noisy/orders' })).map(r => r.data.n)).toEqual([9, 8, 7, 6, 5]);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 5');
+		for (let n = 10; n < 30; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		expect(await store.count({ topic: '@t/victim/orders' })).toBe(5);
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 25');
+	});
+
+	it('stores the tenant scope of each topic and evicts the largest scope down to the others', async () => {
+		store = createDeadLetter(client, { autoMigrate: false, max: 5, cleanupInterval: 0 });
+		await store.add(rec({ topic: 'orders', data: { n: 0 } }));
+		await store.add(rec({ topic: '@t/a/orders', data: { n: 0 } }));
+		await store.add(rec({ topic: '@t/', data: { n: 0 } }));
+		for (let n = 0; n < 6; n++) await store.add(rec({ topic: '@t/b/orders', data: { n } }));
+		// Untenanted topics share '~', a malformed tenant topic counts in ''.
+		expect([...new Set(client._rows().map(r => r.scope))].sort()).toEqual(['', 'a', 'b', '~']);
+		expect(client._rows().map(r => r.topic + ':' + r.data).sort()).toEqual([
+			'@t/:{"n":0}', '@t/a/orders:{"n":0}', '@t/b/orders:{"n":4}', '@t/b/orders:{"n":5}', 'orders:{"n":0}'
+		]);
+	});
+
+	it('issues one trim statement per capture once the excess is gone', async () => {
+		store = createDeadLetter(client, { autoMigrate: false, max: 3, cleanupInterval: 0 });
+		for (let n = 0; n < 3; n++) await store.add(rec({ topic: '@t/noisy/orders', data: { n } }));
+		const query = client.query.bind(client);
+		let trims = 0;
+		client.query = async (sql, values) => {
+			if (String(sql.text ?? sql).trim().startsWith('WITH heaviest AS')) trims++;
+			return query(sql, values);
+		};
+		await store.add(rec({ topic: '@t/noisy/orders', data: { n: 3 } }));
+		expect(trims).toBe(1);
+		expect(await store.count()).toBe(3);
+	});
+
+	it('counts evictions only from a committed cleanup pass', async () => {
+		const metrics = createMetrics();
+		store = createDeadLetter(client, { autoMigrate: false, max: 1, cleanupInterval: 0, metrics });
+		await store.add(rec({ topic: '@t/a/orders' }));
+		const query = client.query.bind(client);
+		let failCommit = true;
+		client.query = async (sql, values) => {
+			if (failCommit && String(sql.text ?? sql).trim() === 'COMMIT') { failCommit = false; throw new Error('connection lost'); }
+			return query(sql, values);
+		};
+		expect(await store.add(rec({ topic: '@t/a/orders' }))).not.toBeNull();
+		expect(metrics.serialize()).not.toContain('dead_letter_evicted_total{store="postgres"}');
+		await store.add(rec({ topic: '@t/a/orders' }));
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="postgres"} 1');
 	});
 });
 

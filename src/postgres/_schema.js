@@ -136,7 +136,42 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 			`CREATE TABLE IF NOT EXISTS ${erasure.name} (${erasure.columns.map(columnSql).join(', ')}, PRIMARY KEY (scope, user_id))`,
 			indexSql(erasure.name, erasure.indexes[0])
 		]);
-		schema.checkpoints[3] = schema.tables;
+		schema.checkpoints[3] = schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] }));
+		// Fair-share eviction: each record carries its tenant scope ('' for rows
+		// written before the column existed), statement triggers keep the record
+		// count per scope in the companion table for every writer, and the
+		// (scope, id) index yields a scope's oldest records. The migration
+		// rebuilds the counts under a lock that holds writers off meanwhile.
+		const counts = {
+			name: `${table}_scopes`,
+			columns: [text('scope', true), ['records', 'bigint', true]],
+			primary: ['scope'], indexes: [], checks: [], additions: [],
+			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+		};
+		const scopeColumn = ['scope', 'text', true, "''::text"];
+		const byScope = index('scope', ['scope', primary]);
+		const sync = `${table}_scopes_sync`;
+		const source = scopeSyncSource(counts.name);
+		main.columns = [...main.columns, scopeColumn];
+		main.indexes = [...main.indexes, byScope];
+		main.triggers = [
+			{ name: `${table}_scopes_insert`, event: 'INSERT', type: 4, oldTable: null, newTable: 'added', function: sync, source },
+			{ name: `${table}_scopes_update`, event: 'UPDATE', type: 16, oldTable: 'removed', newTable: 'added', function: sync, source },
+			{ name: `${table}_scopes_delete`, event: 'DELETE', type: 8, oldTable: 'removed', newTable: null, function: sync, source },
+			{ name: `${table}_scopes_truncate`, event: 'TRUNCATE', type: 32, oldTable: null, newTable: null, function: sync, source }
+		];
+		schema.tables.push(counts);
+		const triggers = main.triggers.map(entry => {
+			const referencing = [entry.oldTable && `OLD TABLE AS ${entry.oldTable}`, entry.newTable && `NEW TABLE AS ${entry.newTable}`].filter(Boolean).join(' ');
+			return `CREATE OR REPLACE TRIGGER ${entry.name} AFTER ${entry.event} ON ${table} ${referencing ? `REFERENCING ${referencing} ` : ''}FOR EACH STATEMENT EXECUTE FUNCTION ${sync}();`;
+		});
+		versions.push([
+			`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${columnSql(scopeColumn)}`,
+			`CREATE TABLE IF NOT EXISTS ${counts.name} (${counts.columns.map(columnSql).join(', ')}, PRIMARY KEY (scope))`,
+			`DO $migration$ BEGIN LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE; CREATE OR REPLACE FUNCTION ${sync}() RETURNS trigger LANGUAGE plpgsql AS $sync$${source}$sync$; ${triggers.join(' ')} DELETE FROM ${counts.name}; INSERT INTO ${counts.name} (scope, records) SELECT scope, count(*) FROM ${table} GROUP BY scope; END $migration$`,
+			indexSql(table, byScope)
+		]);
+		schema.checkpoints[4] = schema.tables;
 	}
 	for (const [offset, statements] of versions.entries()) {
 		const version = offset + 1;
@@ -144,6 +179,31 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 		schema.versions.push({ version, checksum, statements });
 	}
 	return schema;
+}
+
+// The dead-letter scope-count trigger body, kept on one line so the stored
+// source compares exactly. Each statement applies its change per scope in
+// scope order, so concurrent multi-scope statements take the count rows in
+// one order. A count that reaches zero is deleted.
+function scopeSyncSource(counts) {
+	return [
+		' DECLARE delta record;',
+		'BEGIN',
+		`IF TG_OP = 'TRUNCATE' THEN DELETE FROM ${counts}; RETURN NULL; END IF;`,
+		`IF TG_OP <> 'INSERT' THEN`,
+		'FOR delta IN SELECT scope, count(*) AS n FROM removed GROUP BY scope ORDER BY scope LOOP',
+		`DELETE FROM ${counts} WHERE scope = delta.scope AND records <= delta.n;`,
+		`IF NOT FOUND THEN UPDATE ${counts} SET records = records - delta.n WHERE scope = delta.scope; END IF;`,
+		'END LOOP;',
+		'END IF;',
+		`IF TG_OP <> 'DELETE' THEN`,
+		'FOR delta IN SELECT scope, count(*) AS n FROM added GROUP BY scope ORDER BY scope LOOP',
+		`INSERT INTO ${counts} AS c (scope, records) VALUES (delta.scope, delta.n) ON CONFLICT (scope) DO UPDATE SET records = c.records + EXCLUDED.records;`,
+		'END LOOP;',
+		'END IF;',
+		'RETURN NULL;',
+		'END '
+	].join(' ');
 }
 
 function columnSql([name, type, required, fallback]) {

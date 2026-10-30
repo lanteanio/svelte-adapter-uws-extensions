@@ -62,16 +62,20 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 				return query(text, values);
 			},
 			async remove(text, values) {
+				return (await this.removeReturning(text, values)).rowCount || 0;
+			},
+			// A deleting statement whose RETURNING rows the caller reads.
+			async removeReturning(text, values) {
 				const result = await this.query(text, values);
 				rows += result.rowCount || 0;
-				return result.rowCount || 0;
+				return result;
 			}
 		};
-		await work(budget);
+		const detail = await work(budget);
 		if (failure) throw failure;
 		const exhausted = !budget.available;
 		await query('COMMIT');
-		return { result: exhausted ? 'budget' : 'complete', rows };
+		return { result: exhausted ? 'budget' : 'complete', rows, detail };
 	} catch (error) {
 		failure = error;
 		throw error;
@@ -84,7 +88,8 @@ export async function runCleanupPass(client, table, work, stopped = () => false)
 	}
 }
 
-export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work, coalesce = false }) {
+// `committed(detail)` receives what `work` returned, once its pass committed.
+export function scheduleCleanup({ client, table, kind, interval, metrics, ready, healthy, success, failure, work, committed, coalesce = false }) {
 	if (!Number.isInteger(interval) || interval < 0 || interval > 2147483647) {
 		throw new Error('postgres cleanup: cleanupInterval must be an integer between 0 and 2147483647');
 	}
@@ -118,6 +123,7 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 			const result = await runCleanupPass(client, table, work, () => stopped);
 			runs?.inc({ store: kind, result: result.result });
 			if (result.rows) removed?.inc({ store: kind }, result.rows);
+			if (result.detail !== undefined) committed?.(result.detail);
 			if (result.result !== 'waiting' && result.result !== 'stopped') success?.();
 			return result;
 		} catch (error) {

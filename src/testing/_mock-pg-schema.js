@@ -10,7 +10,8 @@ function splitColumns(body) {
 
 /** Catalog and migration-ledger state for the SQL double. Native tests enforce database constraints. */
 export function mockPgSchema() {
-	const tables = new Map(), indexes = new Map(), checks = new Map(), ledger = new Map();
+	const tables = new Map(), indexes = new Map(), checks = new Map(), ledger = new Map(), functions = new Map(), triggers = new Map();
+	const triggerTypes = { INSERT: 4, DELETE: 8, UPDATE: 16, TRUNCATE: 32 };
 	let lockOwner = null;
 	const waiters = [];
 	const result = rows => ({ rows, rowCount: rows.length });
@@ -73,7 +74,14 @@ export function mockPgSchema() {
 			}
 			const match = /ALTER TABLE (\w+) ADD CONSTRAINT (\w+) CHECK \((.*)\) NOT VALID;/.exec(sql);
 			if (match && !checks.has(match[2])) checks.set(match[2], { table: match[1], name: match[2], expression: match[3], valid: false });
+			for (const fn of sql.matchAll(/CREATE OR REPLACE FUNCTION (\w+)\(\) RETURNS trigger LANGUAGE plpgsql AS \$sync\$([\s\S]*?)\$sync\$;/g)) functions.set(fn[1], fn[2]);
+			for (const trigger of sql.matchAll(/CREATE OR REPLACE TRIGGER (\w+) AFTER (\w+) ON (\w+) (?:REFERENCING (?:OLD TABLE AS (\w+) ?)?(?:NEW TABLE AS (\w+) )?)?FOR EACH STATEMENT EXECUTE FUNCTION (\w+)\(\);/g)) {
+				triggers.set(trigger[1], { table: trigger[3], name: trigger[1], enabled: 'O', type: triggerTypes[trigger[2]], old_table: trigger[4] ?? null, new_table: trigger[5] ?? null, function: trigger[6] });
+			}
 			return result([]);
+		}
+		if (sql.includes('FROM pg_trigger t')) {
+			return result([...triggers.values()].filter(entry => entry.table === values[0]).map(({ table, ...entry }) => ({ ...entry, source: functions.get(entry.function) ?? null })));
 		}
 		if (sql.includes('FROM pg_attribute a')) return result(tables.get(values[0]) ?? []);
 		if (sql.startsWith('SELECT i.indisvalid')) { const entry = indexes.get(values[0]); return result(entry ? [{ indisvalid: entry.valid, owned: entry.table === values[1] }] : []); }

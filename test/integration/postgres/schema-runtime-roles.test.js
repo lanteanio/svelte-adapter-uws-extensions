@@ -12,7 +12,7 @@ import { getRuntimeEnv, resetRuntimeEnv, setRuntimeEnv } from '../../../src/shar
 let admin, deployment, runtime, schema, owner, role;
 const stores = [];
 const definitions = ['replay', 'jobs', 'tasks', 'idempotency', 'alarm-store', 'dead-letter'];
-const tables = ['svti_replay', 'svti_replay_seq', 'svti_jobs', 'svti_tasks', 'svti_idempotency', 'svti_alarms', 'svti_dead_letter', 'svti_dead_letter_purges'];
+const tables = ['svti_replay', 'svti_replay_seq', 'svti_jobs', 'svti_tasks', 'svti_idempotency', 'svti_alarms', 'svti_dead_letter', 'svti_dead_letter_purges', 'svti_dead_letter_scopes'];
 const connect = (name, options = {}) => {
 	const url = new URL(process.env.INTEGRATION_POSTGRES_URL);
 	if (name) { url.username = name; url.password = 'schema-role-fixture'; }
