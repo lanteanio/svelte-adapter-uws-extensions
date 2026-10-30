@@ -2,13 +2,20 @@ import type { Platform } from 'svelte-adapter-uws';
 import type { RedisClient } from './index.js';
 import type { MetricsRegistry } from '../prometheus/index.js';
 import type { CircuitBreaker } from '../shared/breaker.js';
+import type { ForgetIdentity } from '../shared/forget-identity.js';
+
+export type { ForgetIdentity };
 
 export interface RegistryOptions {
 	/**
 	 * Extract the user identity from a WebSocket. Return `null` /
 	 * `undefined` for anonymous connections; the registry skips them.
+	 * User ids are global: `tenantId` does not partition this registry.
 	 */
 	identify(ws: any): string | null | undefined;
+
+	/** Mutually exclusive with `identify`; see `QualifiedRegistryOptions`. */
+	identifyIdentity?: never;
 
 	/**
 	 * Opt-in: extract an app session id from a WebSocket so
@@ -81,6 +88,20 @@ export interface RegistryOptions {
 }
 
 /**
+ * Tenant-qualified registry options. `identifyIdentity` replaces `identify`
+ * (configuring both throws): every connection is keyed by the exact
+ * `{ tenantId, userId }` it returns, and `lookup`, `request`, `send` and
+ * `sendCoalesced` take that identity object instead of a user id string.
+ * Rows, events and push envelopes use the versioned `identity:v1:`
+ * namespace and channels, which registries created with `identify` neither
+ * read nor write. A throwing or malformed extractor registers nothing.
+ */
+export type QualifiedRegistryOptions = Omit<RegistryOptions, 'identify' | 'identifyIdentity'> & {
+	identify?: never;
+	identifyIdentity(ws: any): ForgetIdentity | null | undefined;
+};
+
+/**
  * Stored registry entry. Most-recent-connection-wins; a second device
  * replaces the first.
  */
@@ -92,21 +113,31 @@ export interface RegistryEntry {
 	attrs: Record<string, string>;
 }
 
-export interface ConnectionRegistry {
+/**
+ * `Target` is the user target type: a user id string for a registry created
+ * with `identify`, a `ForgetIdentity` for one created with `identifyIdentity`.
+ */
+export interface ConnectionRegistry<Target = string> {
 	/** Stable id for this instance, also the name of its push channel. */
 	readonly instanceId: string;
 
 	/**
-	 * Resolve a userId to its current owning instance, or `null` if the
-	 * user is offline (no live entry in Redis).
+	 * Resolve a userId (an identity in qualified mode) to its current owning
+	 * instance, or `null` if the user is offline (no live entry in Redis).
 	 */
-	lookup(userId: string): Promise<RegistryEntry | null>;
+	lookup(userId: Target): Promise<RegistryEntry | null>;
 
 	/**
 	 * Right-to-erasure: delete a user's connection entry (conns:{userId})
 	 * unconditionally, clear this instance's in-memory maps, and broadcast a
-	 * forget event so every replica drops the user. Keyed by raw userId, so
-	 * `tenantId` is accepted for the uniform store contract but does not scope.
+	 * forget event so every replica drops the user. With `identify` it is
+	 * keyed by raw userId, so `tenantId` is accepted for the uniform store
+	 * contract but does not scope. With `identifyIdentity` it removes exactly
+	 * `(tenantId, userId)` (`null` is only the untenanted scope) and rejects
+	 * with `code: 'ERASURE_INCOMPLETE'`, `erasureIncomplete: true` and the
+	 * committed `removed` count when the row cannot be removed, or with
+	 * `legacyResidue: true` while a `conns:` row written by `identify` for
+	 * the same raw user id still exists.
 	 * Returns durable rows removed (0 or 1).
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
@@ -141,7 +172,7 @@ export interface ConnectionRegistry {
 	 * ```
 	 */
 	request<TReply = unknown>(
-		target: string,
+		target: Target,
 		event: string,
 		data?: unknown,
 		options?: { timeoutMs?: number }
@@ -207,7 +238,7 @@ export interface ConnectionRegistry {
 	 * ```
 	 */
 	sendCoalesced(
-		target: string,
+		target: Target,
 		message: { key: string; topic: string; event: string; data?: unknown }
 	): Promise<void>;
 
@@ -236,7 +267,7 @@ export interface ConnectionRegistry {
 	 * await registry.send('user-123', 'notifications', 'incoming', { id: 42 });
 	 * ```
 	 */
-	send(target: string, topic: string, event: string, data?: unknown): Promise<void>;
+	send(target: Target, topic: string, event: string, data?: unknown): Promise<void>;
 
 	/**
 	 * Cluster-wide attribute-filtered broadcast. Resolves matching userIds
@@ -313,3 +344,7 @@ export function createConnectionRegistry(
 	client: RedisClient,
 	options: RegistryOptions
 ): ConnectionRegistry;
+export function createConnectionRegistry(
+	client: RedisClient,
+	options: QualifiedRegistryOptions
+): ConnectionRegistry<ForgetIdentity>;

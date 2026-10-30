@@ -55,6 +55,7 @@ import {
 } from '../shared/caps.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
 import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
+import { readIdentity, purgeIdentity, identityKey, identityFromKey, legacyResidueError } from '../shared/forget-identity.js';
 
 /**
  * Lua-atomic compare-and-delete: only removes the registry entry if the
@@ -80,7 +81,8 @@ return 0
 // on ARGV[6] (empty when the registry keeps no attribute index) from inside
 // the script, so the announcement takes the row's place in Redis order: a
 // newer owner's open, written after the restore, is also announced after it.
-// ARGV[7] is the JSON-encoded userId; the envelope matches the open hook's.
+// ARGV[7] is the envelope's identity member (`"userId":<json>`, or the
+// versioned `"v":1,"identity":{...}`); the envelope matches the open hook's.
 // ARGV[8] = '1' also announces a renewal: a restore that finds this
 // instance's own row still has to re-index the user on peers that applied
 // the close which triggered it. The heartbeat leaves it unset.
@@ -91,7 +93,7 @@ local function announce()
   if ARGV[6] == '' then return end
   local attrs = ARGV[4]
   if attrs == '' then attrs = '{}' end
-  redis.call('publish', ARGV[6], '{"type":"open","userId":' .. ARGV[7] .. ',"instanceId":"' .. ARGV[1] .. '","attrs":' .. attrs .. '}')
+  redis.call('publish', ARGV[6], '{"type":"open",' .. ARGV[7] .. ',"instanceId":"' .. ARGV[1] .. '","attrs":' .. attrs .. '}')
 end
 local current = redis.call('hget', KEYS[1], 'instanceId')
 if not current then
@@ -123,7 +125,8 @@ return 1
 
 /**
  * @typedef {Object} RegistryOptions
- * @property {(ws: any) => string | null | undefined} identify - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them.
+ * @property {(ws: any) => string | null | undefined} [identify] - Extract the user identity from a WebSocket. Return `null` / `undefined` for anonymous connections; the registry will skip them. Required unless `identifyIdentity` is given.
+ * @property {(ws: any) => import('../shared/forget-identity.js').ForgetIdentity | null | undefined} [identifyIdentity] - Tenant-qualified alternative to `identify`, mutually exclusive with it. User-targeted methods then take the same identity object; bare strings are rejected.
  * @property {(ws: any) => string | null | undefined} [sessionIdentify] - Opt-in: extract an app session id from a WebSocket so `requestSession(sessionId, ...)` can route cluster-wide. Independent of `identify` - a connection may carry a userId, a session, both, or neither. Return `null` / `undefined` to skip. Omit entirely to disable session tracking (no `regsess:` keys, userId path unchanged).
  * @property {(ws: any) => Record<string, string | number | boolean> | null | undefined} [attributes] - Extract per-user attributes captured at registration time. Used by `sendTo(criteria, ...)` for tenant- / role- / cohort-scoped broadcasts. Shallow values only (string / number / boolean); compound queries are deliberately out of scope.
  * @property {string} [keyPrefix=''] - Prefix prepended to all registry keys and channels. Stacks with the underlying client's `keyPrefix`.
@@ -220,7 +223,18 @@ export function createConnectionRegistry(client, options) {
 	}
 	options = validateOptions(options);
 	const identify = options.identify;
-	if (typeof identify !== 'function') {
+	const identifyIdentity = options.identifyIdentity;
+	if (identify !== undefined && identifyIdentity !== undefined) {
+		throw new Error('registry: identify and identifyIdentity are mutually exclusive');
+	}
+	// Qualified mode keys every user by the exact (tenantId, userId) tuple: rows,
+	// events and push envelopes use the `identity:v1:` namespace and channels, so
+	// a legacy peer never reads a qualified event as a bare user id.
+	const qualified = identifyIdentity !== undefined;
+	if (qualified && typeof identifyIdentity !== 'function') {
+		throw new Error('registry: identifyIdentity must be a function');
+	}
+	if (!qualified && typeof identify !== 'function') {
 		throw new Error('registry: identify must be a function');
 	}
 	const attributes = options.attributes;
@@ -271,8 +285,45 @@ export function createConnectionRegistry(client, options) {
 	const mSendToRecipients = m?.counter('push_sendto_recipients_total', 'Recipients dispatched by attribute-targeted broadcasts');
 	const mBusDropped = m?.counter('push_bus_dropped_total', 'Inbound bus envelopes dropped at the boundary by reason', ['reason']);
 
+	// Every registered user is one internal string: the raw user id, or in
+	// qualified mode the unpadded base64url of JSON [tenantId, userId]. Local
+	// maps, indexes and queued refreshes all key on it.
+	const usersNs = qualified ? 'identity:v1:conns:' : 'conns:';
 	function userKey(userId) {
-		return client.key(keyPrefix + 'conns:' + userId);
+		return client.key(keyPrefix + usersNs + userId);
+	}
+	/** The internal user string for a socket, or null when it names nobody. */
+	function socketUser(ws) {
+		if (!qualified) return identify(ws);
+		const identity = readIdentity(identifyIdentity(ws), 'registry: identifyIdentity');
+		return identity === null ? null : identityKey(identity);
+	}
+	/**
+	 * Validate a public user target. Qualified mode takes only an identity
+	 * object; a bare string is refused, so no call ever falls back to a raw id.
+	 * @param {unknown} target
+	 * @param {string} label
+	 */
+	function targetIdentity(target, label) {
+		const identity = readIdentity(target, label);
+		if (identity === null) throw new TypeError('registry: a user target must be an identity { tenantId, userId }');
+		return identity;
+	}
+	/** The identity members of a registry event for one user. */
+	function userEvent(type, userId) {
+		return qualified
+			? { type, v: 1, identity: identityFromKey(userId), instanceId }
+			: { type, userId, instanceId };
+	}
+	// Owner side of a user-targeted push envelope: in qualified mode the
+	// envelope names its identity, and the transport session must still be the
+	// one this instance holds for it.
+	function inboundOwns(env, sessionId) {
+		if (!qualified) return true;
+		if (env.v !== 1) return false;
+		let identity;
+		try { identity = readIdentity(env.identity, 'registry'); } catch { return false; }
+		return identity !== null && localUsers.get(identityKey(identity)) === sessionId;
 	}
 	function sessionKey(sessionId) {
 		return client.key(keyPrefix + 'regsess:' + sessionId);
@@ -332,13 +383,13 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function pushChannel(targetInstanceId) {
-		return client.key(keyPrefix + '__push:' + targetInstanceId);
+		return client.key(keyPrefix + (qualified ? 'identity:v1:push:' : '__push:') + targetInstanceId);
 	}
 	function userKeyPattern() {
-		return client.key(keyPrefix + 'conns:*');
+		return client.key(keyPrefix + usersNs + '*');
 	}
 	const ownPushChannel = pushChannel(instanceId);
-	const eventsChannel = client.key(keyPrefix + '__registry-events');
+	const eventsChannel = client.key(keyPrefix + (qualified ? 'identity:v1:registry-events' : '__registry-events'));
 	// Inbound bus guard: both channels accept messages from a shared
 	// transport, so cap raw bytes before JSON.parse like every sibling bus
 	// module. Per-type shape checks live in the handlers.
@@ -380,6 +431,13 @@ export function createConnectionRegistry(client, options) {
 	 * @type {WeakSet<object>}
 	 */
 	const closedSockets = new WeakSet();
+
+	/**
+	 * Qualified mode: the internal user each registered socket opened under,
+	 * so its close releases that registration rather than re-deriving one.
+	 * @type {WeakMap<object, string>}
+	 */
+	const socketUsers = new WeakMap();
 
 	/**
 	 * In-flight outbound requests: ref -> { resolve, reject, timer, startTime }.
@@ -539,7 +597,7 @@ export function createConnectionRegistry(client, options) {
 	function dropOwnRow(userId) {
 		if (destroyed) return;
 		deleteIfOurs(userId);
-		if (attributes) publishEvent({ type: 'close', userId, instanceId });
+		if (attributes) publishEvent(userEvent('close', userId), userId);
 	}
 
 	// Right-to-erasure (`live.forget`): clear EVERY in-memory trace of a user on
@@ -640,13 +698,16 @@ export function createConnectionRegistry(client, options) {
 		let openEnvelope = '';
 		if (attributes) {
 			try {
-				openEnvelope = encodeEnvelope({ type: 'open', userId, instanceId, attrs: attrs || {} });
+				openEnvelope = encodeEnvelope({ ...userEvent('open', userId), attrs: attrs || {} });
 				announceChannel = eventsChannel;
 			} catch { /* over maxEnvelopeBytes */ }
 		}
+		const announcedUser = !announceChannel ? ''
+			: qualified ? '"v":1,"identity":' + JSON.stringify(identityFromKey(userId))
+			: '"userId":' + JSON.stringify(userId);
 		localRefresh.set(userId, [
 			evalCachedName(redis, REFRESH_REGISTRATION), 1, key,
-			instanceId, sessionId, now, rawAttrs, ttl, announceChannel, announceChannel ? JSON.stringify(userId) : ''
+			instanceId, sessionId, now, rawAttrs, ttl, announceChannel, announcedUser
 		]);
 		// Pipeline HSET (+ optional HDEL when attrs are absent) and EXPIRE
 		// into a single MULTI/EXEC round-trip. Pre-fix this was 2-3 awaited
@@ -694,7 +755,7 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	async function publishEvent(envelope) {
+	async function publishEvent(envelope, userId) {
 		// Encoded outside the try so an over-cap envelope is not reported to
 		// the breaker as a Redis fault. Index events are genuinely
 		// best-effort - callers do not await an outcome - so this one is
@@ -707,7 +768,7 @@ export function createConnectionRegistry(client, options) {
 			return;
 		}
 		try {
-			await evalCached(redis, ANNOUNCE_EVENT, 1, userKey(envelope.userId), eventsChannel, raw);
+			await evalCached(redis, ANNOUNCE_EVENT, 1, userKey(userId), eventsChannel, raw);
 			breaker?.success();
 		} catch (err) {
 			breaker?.failure(err);
@@ -856,7 +917,7 @@ export function createConnectionRegistry(client, options) {
 		// them in that order.
 		if (attributes) {
 			applyCloseEvent(userId, instanceId);
-			writes.push(publishEvent({ type: 'close', userId, instanceId }));
+			writes.push(publishEvent(userEvent('close', userId), userId));
 		}
 		return writes;
 	}
@@ -871,7 +932,11 @@ export function createConnectionRegistry(client, options) {
 		}
 	}
 
-	async function lookup(userId) {
+	async function lookup(target) {
+		return lookupUser(qualified ? identityKey(targetIdentity(target, 'registry.lookup')) : target);
+	}
+
+	async function lookupUser(userId) {
 		if (!withBreakerGuard()) return null;
 		const observed = userIdAttrs.get(userId);
 		try {
@@ -1146,16 +1211,28 @@ export function createConnectionRegistry(client, options) {
 		// Recover the userId by stripping the longest common prefix the
 		// registry knows about. The full key is `client.keyPrefix +
 		// keyPrefix + 'conns:' + userId`. `client.key(...)` builds it; we
-		// invert by matching the same prefix back off.
-		const builtPrefix = client.key(keyPrefix + 'conns:');
-		if (fullKey.startsWith(builtPrefix)) return fullKey.slice(builtPrefix.length);
-		return null;
+		// invert by matching the same prefix back off. A qualified key whose
+		// segment is not a canonical identity is skipped, never guessed at.
+		const builtPrefix = client.key(keyPrefix + usersNs);
+		if (!fullKey.startsWith(builtPrefix)) return null;
+		const userId = fullKey.slice(builtPrefix.length);
+		return !qualified || identityFromKey(userId) !== null ? userId : null;
+	}
+
+	/** The internal user string an inbound event names, or null. */
+	function eventUser(envelope) {
+		if (!qualified) return typeof envelope.userId === 'string' ? envelope.userId : null;
+		if (envelope.v !== 1) return null;
+		let identity;
+		try { identity = readIdentity(envelope.identity, 'registry'); } catch { return null; }
+		return identity === null ? null : identityKey(identity);
 	}
 
 	function handleRegistryEvent(envelope) {
 		if (!envelope || typeof envelope !== 'object') return;
-		const { type, userId, instanceId: ownerInstanceId } = envelope;
-		if (typeof userId !== 'string' || typeof ownerInstanceId !== 'string') return;
+		const { type, instanceId: ownerInstanceId } = envelope;
+		const userId = eventUser(envelope);
+		if (userId === null || typeof ownerInstanceId !== 'string') return;
 		// An owner id becomes the routing target for that user's `sendTo` and
 		// `send` traffic, so it needs the same shape pin `replyTo` gets. A
 		// single forged `open` naming an id nobody listens on redirects a
@@ -1188,7 +1265,7 @@ export function createConnectionRegistry(client, options) {
 
 	// A refresh queued behind a busy Redis owner skips the entries that left
 	// this instance before it runs.
-	const userKeyPrefix = client.key(keyPrefix + 'conns:');
+	const userKeyPrefix = client.key(keyPrefix + usersNs);
 	const sessionKeyPrefix = client.key(keyPrefix + 'regsess:');
 	function refreshKey(command) { return command[0] === 'expire' ? command[1] : command[2]; }
 	function currentRefresh(command) {
@@ -1274,7 +1351,7 @@ export function createConnectionRegistry(client, options) {
 	function handleInboundSend(env) {
 		const { sessionId, topic, event, data } = env;
 		if (typeof sessionId !== 'string' || typeof topic !== 'string' || typeof event !== 'string') return;
-		const ws = sessionToWs.get(sessionId);
+		const ws = inboundOwns(env, sessionId) ? sessionToWs.get(sessionId) : undefined;
 		if (!ws || !activePlatform) {
 			mSends?.inc({ result: 'late' });
 			return;
@@ -1291,7 +1368,7 @@ export function createConnectionRegistry(client, options) {
 	function handleInboundCoalesced(env) {
 		const { sessionId, key, topic, event, data } = env;
 		if (typeof sessionId !== 'string' || typeof key !== 'string') return;
-		const ws = sessionToWs.get(sessionId);
+		const ws = inboundOwns(env, sessionId) ? sessionToWs.get(sessionId) : undefined;
 		if (!ws || !activePlatform) {
 			mCoalesced?.inc({ result: 'late' });
 			return;
@@ -1316,7 +1393,7 @@ export function createConnectionRegistry(client, options) {
 			return;
 		}
 		const timeoutMs = inboundTimeoutMs(env.timeoutMs);
-		const ws = sessionToWs.get(sessionId);
+		const ws = inboundOwns(env, sessionId) ? sessionToWs.get(sessionId) : undefined;
 		if (!ws || !activePlatform) {
 			await sendReplyEnvelope(replyTo, ref, undefined, 'offline');
 			return;
@@ -1418,7 +1495,8 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	async function request(target, event, data, opts = {}) {
-		if (typeof target !== 'string' || target.length === 0) {
+		const identity = qualified ? targetIdentity(target, 'registry.request') : null;
+		if (!qualified && (typeof target !== 'string' || target.length === 0)) {
 			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_TARGET));
 		}
 		if (typeof event !== 'string' || event.length === 0) {
@@ -1426,7 +1504,7 @@ export function createConnectionRegistry(client, options) {
 		}
 		const timeoutMs = opts.timeoutMs ?? defaultRequestTimeoutMs;
 
-		const entry = await lookup(target);
+		const entry = await lookupUser(identity ? identityKey(identity) : target);
 		if (!entry) {
 			mRequests?.inc({ result: 'offline' });
 			throw operationError('REGISTRY_TARGET_OFFLINE', extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_REQUEST_OFFLINE));
@@ -1467,7 +1545,17 @@ export function createConnectionRegistry(client, options) {
 		}
 
 		const ref = randomBytes(12).toString('hex');
-		const envelope = {
+		const envelope = identity ? {
+			type: 'request',
+			v: 1,
+			identity,
+			ref,
+			sessionId: entry.sessionId,
+			event,
+			data,
+			replyTo: instanceId,
+			timeoutMs
+		} : {
 			type: 'request',
 			ref,
 			sessionId: entry.sessionId,
@@ -1606,7 +1694,8 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	async function sendCoalesced(target, message) {
-		if (typeof target !== 'string' || target.length === 0) {
+		const identity = qualified ? targetIdentity(target, 'registry.sendCoalesced') : null;
+		if (!qualified && (typeof target !== 'string' || target.length === 0)) {
 			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SEND_COALESCED_TARGET));
 		}
 		if (!message || typeof message !== 'object') {
@@ -1617,7 +1706,7 @@ export function createConnectionRegistry(client, options) {
 		}
 		const { key, topic, event, data } = message;
 
-		const entry = await lookup(target);
+		const entry = await lookupUser(identity ? identityKey(identity) : target);
 		if (!entry) {
 			mCoalesced?.inc({ result: 'offline' });
 			return;
@@ -1647,14 +1736,9 @@ export function createConnectionRegistry(client, options) {
 		// Publishing needs no subscription of our own; start it for the
 		// inbound side without making this call wait on or fail with it.
 		startSubscriber(activePlatform);
-		const envelope = {
-			type: 'coalesced',
-			sessionId: entry.sessionId,
-			key,
-			topic,
-			event,
-			data
-		};
+		const envelope = identity
+			? { type: 'coalesced', v: 1, identity, sessionId: entry.sessionId, key, topic, event, data }
+			: { type: 'coalesced', sessionId: entry.sessionId, key, topic, event, data };
 		// Encoded outside the try, for the reason spelled out in `send`: an
 		// over-cap envelope caught by the Redis handler is a silent drop the
 		// caller is told nothing about.
@@ -1670,7 +1754,8 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	async function send(target, topic, event, data) {
-		if (typeof target !== 'string' || target.length === 0) {
+		const identity = qualified ? targetIdentity(target, 'registry.send') : null;
+		if (!qualified && (typeof target !== 'string' || target.length === 0)) {
 			throw new Error(extensionsError(EXTENSIONS_ERROR_IDS.REGISTRY_SEND_TARGET));
 		}
 		if (typeof topic !== 'string' || topic.length === 0) {
@@ -1680,7 +1765,7 @@ export function createConnectionRegistry(client, options) {
 			throw new Error('registry.send: event must be a non-empty string');
 		}
 
-		const entry = await lookup(target);
+		const entry = await lookupUser(identity ? identityKey(identity) : target);
 		if (!entry) {
 			mSends?.inc({ result: 'offline' });
 			return;
@@ -1709,13 +1794,9 @@ export function createConnectionRegistry(client, options) {
 		// Publishing needs no subscription of our own; start it for the
 		// inbound side without making this call wait on or fail with it.
 		startSubscriber(activePlatform);
-		const envelope = {
-			type: 'send',
-			sessionId: entry.sessionId,
-			topic,
-			event,
-			data
-		};
+		const envelope = identity
+			? { type: 'send', v: 1, identity, sessionId: entry.sessionId, topic, event, data }
+			: { type: 'send', sessionId: entry.sessionId, topic, event, data };
 		// Encoded OUTSIDE the try. Inside it, an over-cap envelope is caught by
 		// the Redis-failure handler: the caller's await resolves normally while
 		// the message was never published, and the breaker is told Redis failed
@@ -1887,6 +1968,41 @@ export function createConnectionRegistry(client, options) {
 		return recipients;
 	}
 
+	/**
+	 * Qualified erasure of one identity: local state first, then the row and
+	 * the versioned forget event. The legacy `conns:` row of the same raw user
+	 * id is only checked, never deleted: it names no tenant, so it may belong
+	 * to another tenant's user, and while it exists the erasure is incomplete.
+	 * @param {{ tenantId: string | null, userId: string }} identity
+	 */
+	async function purgeIdentityUser(identity) {
+		const userId = identityKey(identity);
+		applyForgetEvent(userId);
+		let removed = 0;
+		let failure = null;
+		let residue = false;
+		if (!withBreakerGuard()) failure = operationError('CIRCUIT_BROKEN', 'registry: the circuit breaker refused the erasure');
+		else {
+			const [row, legacy] = await Promise.allSettled([
+				redis.del(userKey(userId)),
+				redis.exists(client.key(keyPrefix + 'conns:' + identity.userId))
+			]);
+			if (row.status === 'rejected') failure = row.reason;
+			else removed = Number(row.value) > 0 ? 1 : 0;
+			if (legacy.status === 'rejected') failure ??= legacy.reason;
+			else residue = Number(legacy.value) > 0;
+			if (failure) breaker?.failure(failure);
+			else breaker?.success();
+		}
+		await publishEvent(userEvent('forget', userId), userId);
+		if (failure) {
+			const error = operationError('ERASURE_INCOMPLETE', 'registry: purgeUser could not confirm the routing row was removed');
+			throw Object.assign(error, { cause: failure, erasureIncomplete: true, removed });
+		}
+		if (residue) throw legacyResidueError('ERASURE_INCOMPLETE', 'registry: a registration written by identify() names no tenant and may hold this user id', removed);
+		return removed;
+	}
+
 	const stopDashboard = registerClusterHealth('registry', () => ({
 		backend: 'redis', subscriber: redisConnectionState(subscriber),
 		localConnections: sessionToWs.size, localUsers: localUsers.size,
@@ -1911,15 +2027,19 @@ export function createConnectionRegistry(client, options) {
 		 * admin erasure must remove a user this instance does not own - NOT the
 		 * ownership-gated close path), clears this instance's in-memory maps, and
 		 * broadcasts a `forget` event so every other replica drops the user from
-		 * its own cluster index. The registry keys by raw userId with no tenant
-		 * segment (globally-unique userIds), so `tenantId` is accepted for the
-		 * uniform store contract but does not scope the registry.
+		 * its own cluster index. With `identify` the registry keys by raw userId
+		 * with no tenant segment (globally-unique userIds), so `tenantId` is
+		 * accepted for the uniform store contract but does not scope the
+		 * registry. With `identifyIdentity` the purge addresses exactly
+		 * `(tenantId, userId)` and rejects as incomplete when the row cannot be
+		 * deleted or a legacy `conns:` row for that raw user id still exists.
 		 * @param {string | null} tenantId
 		 * @param {string} userId
 		 * @returns {Promise<number>} durable rows removed (0 or 1)
 		 */
 		async purgeUser(tenantId, userId) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			if (qualified) return purgeIdentityUser(purgeIdentity(tenantId, userId, 'registry: purgeUser'));
 			applyForgetEvent(userId);
 			let n = 0;
 			if (withBreakerGuard()) {
@@ -1931,7 +2051,7 @@ export function createConnectionRegistry(client, options) {
 					breaker?.failure(err);
 				}
 			}
-			await publishEvent({ type: 'forget', userId, instanceId });
+			await publishEvent({ type: 'forget', userId, instanceId }, userId);
 			return n;
 		},
 		hooks: {
@@ -1965,7 +2085,7 @@ export function createConnectionRegistry(client, options) {
 				// A throwing identify or getUserData registers nothing.
 				let userId, ud;
 				try {
-					userId = identify(ws);
+					userId = socketUser(ws);
 					if (!userId) return;
 					ud = ws.getUserData ? ws.getUserData() : {};
 				} catch { return; }
@@ -1993,6 +2113,7 @@ export function createConnectionRegistry(client, options) {
 
 				localUsers.set(userId, sessionId);
 				sessionToWs.set(sessionId, ws);
+				if (qualified) socketUsers.set(ws, userId);
 
 				const attrs = attributes ? normalizeAttrs(attributes(ws)) : {};
 
@@ -2033,7 +2154,18 @@ export function createConnectionRegistry(client, options) {
 					if (sessionId != null && sessionId !== '') releaseAppSession(sessionId, ws, writes);
 				}
 
-				const userId = identify(ws);
+				let userId;
+				if (qualified) {
+					// The identity this socket registered under, even when its
+					// user data now names another; a throwing or malformed
+					// extractor releases nothing, as the open hook registers
+					// nothing for it.
+					userId = socketUsers.get(ws);
+					socketUsers.delete(ws);
+					if (userId === undefined) {
+						try { userId = socketUser(ws); } catch { userId = null; }
+					}
+				} else userId = identify(ws);
 				if (userId) releaseUser(userId, ws, writes);
 				await Promise.all(writes);
 			}

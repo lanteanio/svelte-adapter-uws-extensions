@@ -2446,10 +2446,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		function evalRegistryRefresh(args) {
-			const [key, owner, sessionId, ts, attrs, , channel, userIdJson, announceRenewal] = args;
+			const [key, owner, sessionId, ts, attrs, , channel, userMember, announceRenewal] = args;
 			const announce = () => {
 				if (!channel) return;
-				r.publish(String(channel), '{"type":"open","userId":' + userIdJson + ',"instanceId":"' + owner +
+				r.publish(String(channel), '{"type":"open",' + userMember + ',"instanceId":"' + owner +
 					'","attrs":' + (attrs || '{}') + '}');
 			};
 			let h = hashes.get(key);
